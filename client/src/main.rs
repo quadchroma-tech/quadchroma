@@ -47,6 +47,154 @@ fn client_us() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
+/// Protokoll des Clients: die Decoderzeilen und FFmpegs eigene Meldungen.
+///
+/// FFmpeg schreibt seine Meldungen sonst auf sein eigenes stderr - das
+/// fuehrt in einer Fensteranwendung nirgends hin, und selbst mit
+/// angehaengter Konsole sieht die DLL sie nicht, weil ihre Laufzeit vor dem
+/// Anhaengen gestartet ist. Die Klage eines cuvid-Decoders ueber eine Karte,
+/// die das Profil nicht kann, waere damit unsichtbar. Hier laufen beide
+/// Sorten in EINER Reihe zusammen, in der Reihenfolge, in der sie entstanden
+/// sind: erst die Ursache, dann die Folge. Der Pruefmodus druckt sie, und
+/// jede Zeile landet ausserdem in %APPDATA%\QuadChroma\protokoll.txt, das
+/// bei jedem Start neu beginnt - ein paar Zeilen je Sitzung, mehr nicht.
+mod protokoll {
+    use ffmpeg_next as ffmpeg;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Mutex;
+
+    static STUFE: AtomicI32 = AtomicI32::new(ffmpeg::sys::AV_LOG_WARNING);
+    /// Zeilen seit dem letzten Abholen. Holt niemand ab (Fenstermodus),
+    /// bleibt die Reihe bei 512 stehen - die Datei hat dann alles.
+    static ZEILEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// Die letzten Warnungen und Fehler von FFmpeg, fuer Rueckfallgruende.
+    static FEHLER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// Eine FFmpeg-Meldung kann in Stuecken kommen; der Zeilenumbruch
+    /// schliesst sie ab.
+    static OFFEN: Mutex<String> = Mutex::new(String::new());
+    static PRAEFIX: AtomicI32 = AtomicI32::new(1);
+    /// Die Datei, beim ersten Schreiben geoeffnet und dabei geleert.
+    static DATEI: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+    fn datei_pfad() -> Option<std::path::PathBuf> {
+        let base = std::env::var("APPDATA").or_else(|_| std::env::var("HOME")).ok()?;
+        let dir = std::path::PathBuf::from(base).join("QuadChroma");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join("protokoll.txt"))
+    }
+
+    /// Nur in die Datei - fuer die Taktzeilen des Pruefmodus, die auf der
+    /// Konsole ohnehin stehen.
+    pub fn nur_datei(text: &str) {
+        let Ok(mut d) = DATEI.lock() else { return };
+        if d.is_none() {
+            *d = datei_pfad().and_then(|p| std::fs::File::create(p).ok());
+        }
+        if let Some(f) = d.as_mut() {
+            let _ = writeln!(f, "{text}");
+        }
+    }
+
+    /// Eine Zeile ins Protokoll: Datei und Reihe.
+    pub fn zeile(text: String) {
+        nur_datei(&text);
+        if let Ok(mut z) = ZEILEN.lock() {
+            if z.len() < 512 {
+                z.push(text);
+            }
+        }
+    }
+
+    unsafe extern "C" fn rueckruf(
+        ptr: *mut std::os::raw::c_void,
+        stufe: std::os::raw::c_int,
+        fmt: *const std::os::raw::c_char,
+        vl: ffmpeg::sys::va_list,
+    ) {
+        if stufe > STUFE.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut puffer = [0 as std::os::raw::c_char; 1024];
+        let mut praefix = PRAEFIX.load(Ordering::Relaxed);
+        let n = ffmpeg::sys::av_log_format_line2(
+            ptr, stufe, fmt, vl, puffer.as_mut_ptr(), puffer.len() as std::os::raw::c_int, &mut praefix,
+        );
+        PRAEFIX.store(praefix, Ordering::Relaxed);
+        if n <= 0 {
+            return;
+        }
+        // Wie bei snprintf ist n die Soll-Laenge. Passte die Meldung nicht
+        // in den Puffer, fehlt ihr Zeilenumbruch - dann gilt sie trotzdem
+        // als abgeschlossen, sonst klebte die naechste an ihr.
+        let abgeschnitten = n as usize >= puffer.len();
+        let n = (n as usize).min(puffer.len() - 1);
+        let stueck = String::from_utf8_lossy(std::slice::from_raw_parts(puffer.as_ptr() as *const u8, n)).into_owned();
+        let text = {
+            let Ok(mut offen) = OFFEN.lock() else { return };
+            offen.push_str(&stueck);
+            if !abgeschnitten && !offen.ends_with('\n') {
+                return;
+            }
+            let t = format!("FFmpeg: {}", offen.trim_end());
+            offen.clear();
+            t
+        };
+        if stufe <= ffmpeg::sys::AV_LOG_WARNING {
+            if let Ok(mut f) = FEHLER.lock() {
+                if f.len() >= 6 {
+                    f.remove(0);
+                }
+                f.push(text.clone());
+            }
+        }
+        zeile(text);
+    }
+
+    /// Einsammeln einschalten. Ausfuehrlich heisst bis AV_LOG_VERBOSE - da
+    /// sagt cuvid, welche Formate er gewaehlt hat und was die Karte kann.
+    pub fn einschalten(ausfuehrlich: bool) {
+        let stufe = if ausfuehrlich { ffmpeg::sys::AV_LOG_VERBOSE } else { ffmpeg::sys::AV_LOG_WARNING };
+        STUFE.store(stufe, Ordering::Relaxed);
+        unsafe {
+            ffmpeg::sys::av_log_set_level(stufe);
+            ffmpeg::sys::av_log_set_callback(Some(rueckruf));
+        }
+    }
+
+    /// Alle Zeilen seit dem letzten Abholen.
+    pub fn abholen() -> Vec<String> {
+        ZEILEN.lock().map(|mut z| std::mem::take(&mut *z)).unwrap_or_default()
+    }
+
+    /// Angesammelte Warnungen und Fehler verwerfen - vor einem Versuch, damit
+    /// nur das im Grund landet, was dieser Versuch selbst gesagt hat.
+    pub fn fehler_verwerfen() {
+        if let Ok(mut f) = FEHLER.lock() {
+            f.clear();
+        }
+    }
+
+    /// Die letzten Warnungen und Fehler, ohne den Absender "[hevc_cuvid @
+    /// 000001d4...] " - der steht im Grund ohnehin, und die Adresse sagt
+    /// niemandem etwas. Gleiche Zeilen in Folge nur einmal.
+    pub fn fehler_abholen() -> Vec<String> {
+        let Ok(mut f) = FEHLER.lock() else { return Vec::new() };
+        let mut aus: Vec<String> = Vec::new();
+        for z in f.drain(..) {
+            let z = z.trim_start_matches("FFmpeg: ");
+            let kern = match (z.starts_with('['), z.find("] ")) {
+                (true, Some(i)) => &z[i + 2..],
+                _ => z,
+            };
+            if aus.last().map(|l| l == kern) != Some(true) {
+                aus.push(kern.to_string());
+            }
+        }
+        aus
+    }
+}
+
 /// Urheber. Wird in der Fusszeile des Startbildschirms angezeigt.
 const COPYRIGHT: &str = "© 2026 Robert Brandt";
 /// Projektseite. Steht anklickbar neben der Urheberzeile.
@@ -327,11 +475,6 @@ struct Shared {
     /// Warum NVDEC nicht laeuft, obwohl er gewuenscht war - fuer Anzeige
     /// und Protokoll. None, wenn er laeuft oder gar nicht gewuenscht war.
     decoder_hinweis: Option<String>,
-    /// Eine Protokollzeile je Decoderbau, in Reihenfolge. Der Pruefmodus
-    /// holt sie alle drei Sekunden ab und druckt jede genau einmal - auch
-    /// zwei Bauten in einem Takt (Sitzungsstart und gleich darauf der Wechsel
-    /// auf H.264 aus der Strominfo) gehen so nicht verloren.
-    decoder_meldung: Vec<String>,
 }
 
 impl Shared {
@@ -348,6 +491,9 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
         shared.lock().unwrap().error = Some(format!("FFmpeg-Start fehlgeschlagen: {e}"));
         return;
     }
+    // Im Pruefmodus alles einsammeln, was FFmpeg zu sagen hat; im Fenster
+    // nur Warnungen und Fehler, die dann im Grund eines Rueckfalls stehen.
+    protokoll::einschalten(std::env::args().any(|a| a == "--headless"));
 
     loop {
         let addr = { shared.lock().unwrap().target.clone() };
@@ -424,12 +570,76 @@ struct DecoderBau {
     /// Fehler in Folge, ohne ein gutes Paket dazwischen. Einer ist ein
     /// Aussetzer (etwa cuvids Bildwarteschlange gerade voll), drei ein Defekt.
     fehler_folge: u8,
+    /// Seit wann er ohne Bild ist: erst der Zeitpunkt des ersten Pakets,
+    /// spaeter der des letzten Bildes. Ein Hardware-Decoder, der Pakete
+    /// annimmt, ohne ein Bild zu liefern, meldet keinen Fehler - er
+    /// schweigt. Nach einer Frist gilt das Schweigen als Defekt, ob er nun
+    /// nie ein Bild geliefert hat oder mittendrin verstummt ist.
+    ohne_bild_seit: Option<Instant>,
+    /// Pakete seit dem letzten Bild (oder seit dem Bau).
+    pakete_seit_bild: u32,
+    /// Bilder in Folge, deren Format to_rgb nicht kennt. Ein Hardware-
+    /// Decoder, der nur Unlesbares liefert, taugt so wenig wie einer, der
+    /// schweigt - nur sieht man bei ihm ein dunkles Bild statt keines.
+    format_fehler: u8,
+    /// Wurde sein erstes Bild schon im Protokoll beschrieben?
+    bild_gemeldet: bool,
 }
+
+/// So lange darf ein Hardware-Decoder Pakete schlucken, ohne ein Bild zu
+/// liefern - gerechnet ab dem ersten Paket oder dem letzten Bild. Nach dem
+/// Bau ist das erste Paket ein Schluesselbild, cuvid braucht danach
+/// hoechstens ein weiteres, um es herauszugeben; wer nach dieser Frist noch
+/// nichts hat, gibt auch nichts mehr.
+const DECODER_STUMM_FRIST: Duration = Duration::from_millis(1500);
+/// ... und mindestens so viele Pakete ohne Bild, damit ein stehendes Bild
+/// bei niedriger Bildrate nicht als Schweigen durchgeht.
+const DECODER_STUMM_PAKETE: u32 = 30;
+/// So viele unlesbare Bilder in Folge, und der Hardware-Decoder wird ersetzt.
+const DECODER_FORMAT_FEHLER: u8 = 3;
 
 impl DecoderBau {
     /// Frisch gebaut: noch kein Paket gesehen, kein Bild, kein Fehler.
     fn neu(decoder: ffmpeg::decoder::Video, pfad: DecoderPfad, codec: &'static str, grund: Option<String>) -> Self {
-        DecoderBau { decoder, pfad, codec, grund, pakete: 0, hat_bild: false, fehler_folge: 0 }
+        DecoderBau {
+            decoder,
+            pfad,
+            codec,
+            grund,
+            pakete: 0,
+            hat_bild: false,
+            fehler_folge: 0,
+            ohne_bild_seit: None,
+            pakete_seit_bild: 0,
+            format_fehler: 0,
+            bild_gemeldet: false,
+        }
+    }
+
+    /// Ein Paket geht hinein.
+    fn paket(&mut self) {
+        self.pakete = self.pakete.wrapping_add(1);
+        self.pakete_seit_bild = self.pakete_seit_bild.saturating_add(1);
+        self.ohne_bild_seit.get_or_insert_with(Instant::now);
+    }
+
+    /// Ein Bild kam heraus.
+    fn bild(&mut self) {
+        self.hat_bild = true;
+        self.pakete_seit_bild = 0;
+        self.ohne_bild_seit = Some(Instant::now());
+    }
+
+    /// Schluckt dieser Hardware-Decoder Pakete, ohne Bilder zu liefern?
+    fn stumm(&self) -> bool {
+        self.pfad.hardware()
+            && self.pakete_seit_bild >= DECODER_STUMM_PAKETE
+            && self.ohne_bild_seit.map(|t| t.elapsed() >= DECODER_STUMM_FRIST).unwrap_or(false)
+    }
+
+    /// Wie lange er schon ohne Bild ist.
+    fn stumm_seit(&self) -> Duration {
+        self.ohne_bild_seit.map(|t| t.elapsed()).unwrap_or_default()
     }
 
     /// Eine Zeile fuer das Protokoll.
@@ -480,7 +690,39 @@ fn nvdec_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
         .ok_or_else(|| format!("{name} fehlt in dieser FFmpeg-Fassung"))?;
     let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
     ctx.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
-    ctx.decoder().video().map_err(|e| format!("{name}: {e}"))
+    // FFmpegs eigene Worte zum Scheitern gehoeren in den Grund: "Operation
+    // not permitted" sagt nichts, "Cannot load nvcuvid.dll" alles. Die
+    // erste Zeile ersetzt den Fehlercode; alle stehen im Protokoll.
+    protokoll::fehler_verwerfen();
+    ctx.decoder().video().map_err(|e| {
+        let worte = protokoll::fehler_abholen();
+        match worte.first() {
+            Some(w) => format!("{name}: {w}"),
+            None => format!("{name}: {e}"),
+        }
+    })
+}
+
+/// Den Hardware-Decoder durch Software ersetzen und den Grund festhalten.
+/// Was FFmpeg dazu gesagt hat, steht im Protokoll direkt davor; in den
+/// Grund kommt es nicht, der muss in eine Zeile der Statistik passen.
+fn auf_software(h264: bool, grund: String) -> Result<DecoderBau, String> {
+    protokoll::fehler_verwerfen();
+    let d = software_decoder(h264)?;
+    Ok(DecoderBau::neu(d, DecoderPfad::Software, if h264 { "h264" } else { "hevc" }, Some(grund)))
+}
+
+/// Ein decodiertes Bild fuer das Protokoll beschreiben: Groesse und Format,
+/// so wie der Decoder sie liefert - was to_rgb gleich zu sehen bekommt.
+fn bild_beschreiben(codec: &str, bild: &ffmpeg::frame::Video) -> String {
+    format!(
+        "Erstes Bild aus {}: {}x{} {:?}, Zeilen {}/{}/{} Byte, Ebenen {}",
+        codec, bild.width(), bild.height(), bild.format(),
+        bild.stride(0),
+        if bild.planes() > 1 { bild.stride(1) } else { 0 },
+        if bild.planes() > 2 { bild.stride(2) } else { 0 },
+        bild.planes()
+    )
 }
 
 /// Decoder fuer HEVC oder H.264 nach Wunsch bauen. Wird beim Start, bei
@@ -513,15 +755,10 @@ fn decoder_bauen(h264: bool, wunsch: einstellungen::DecoderWunsch) -> Result<Dec
 /// ein Rueckfall zusaetzlich als Fehler gezeigt - wer die Karte verlangt,
 /// soll erfahren, dass er sie nicht bekommt.
 fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstellungen::DecoderWunsch) {
+    protokoll::zeile(bau.meldung());
     let mut s = shared.lock().unwrap();
     s.decoder_pfad = Some(bau.pfad);
     s.decoder_hinweis = bau.grund.clone();
-    s.decoder_meldung.push(bau.meldung());
-    // Im Fenstermodus holt die Zeilen niemand ab; damit sie dort nicht
-    // ueber Stunden anwachsen, bleiben nur die letzten stehen.
-    if s.decoder_meldung.len() > 32 {
-        s.decoder_meldung.remove(0);
-    }
     if wunsch == einstellungen::DecoderWunsch::Nvidia {
         if let Some(g) = &bau.grund {
             s.error = Some(format!("NVDEC nicht verfuegbar: {g}"));
@@ -597,6 +834,13 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // darf ein gutes Bild wieder loeschen - Fehler anderer Pfade (Ton,
     // Verbindung) bleiben stehen, statt hundertmal je Sekunde zu verschwinden.
     let mut bild_fehler = false;
+    // Versuchsschalter: jedem Paket fuer einen Hardware-Decoder eine
+    // Zugriffseinheiten-Grenze (AUD) ANHAENGEN. NVIDIAs Parser erkennt das
+    // Ende eines Bildes erst am naechsten NAL, das kein Bildinhalt ist -
+    // ohne AUD also erst am naechsten Paket, ein Bild Verzoegerung. FFmpegs
+    // cuvid setzt das Ende-Kennzeichen des Parsers nie; die angehaengte AUD
+    // ist der einzige Weg von aussen. Fuer den Software-Decoder ohne Belang.
+    let aud_anhang = std::env::args().any(|a| a == "--aud");
 
     let mut info: Option<StreamInfo> = None;
     #[cfg(windows)]
@@ -767,7 +1011,20 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 if let Some(e) = ring.iter_mut().find(|(s, ..)| *s == seq) {
                     e.4 = t_empfangen;
                 }
-                let mut packet = ffmpeg::Packet::copy(&payload);
+                let mut packet = if aud_anhang && bau.pfad.hardware() {
+                    // AUD: HEVC NAL-Typ 35 mit pic_type "beliebig", H.264
+                    // NAL-Typ 9 mit primary_pic_type 7 - jeweils samt
+                    // Startcode und Abschlussbit.
+                    const AUD_HEVC: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
+                    const AUD_H264: [u8; 6] = [0, 0, 0, 1, 0x09, 0xF0];
+                    let aud: &[u8] = if decoder_h264 { &AUD_H264 } else { &AUD_HEVC };
+                    let mut mit = Vec::with_capacity(payload.len() + aud.len());
+                    mit.extend_from_slice(&payload);
+                    mit.extend_from_slice(aud);
+                    ffmpeg::Packet::copy(&mit)
+                } else {
+                    ffmpeg::Packet::copy(&payload)
+                };
                 packet.set_pts(Some(seq as i64));
                 packet.set_dts(None);
                 // Decodieren, und zwar so, dass ein Hardware-Decoder, der
@@ -781,57 +1038,68 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // Host schickt alle ein bis zwei Sekunden eines) geht nichts
                 // mehr hinein. Die Karte bleibt; sonst waere sie nach einem
                 // Aussetzer bis zum naechsten Codecwechsel verloren.
+                // Und ein Hardware-Decoder, der alles annimmt und nichts
+                // liefert, meldet gar keinen Fehler - so sah es auf der RTX
+                // 3080 Ti aus: der Host sendete 115 Bilder je Sekunde ohne
+                // Stau, der Client las alles, und es kam nie ein Bild.
+                // Schweigen ueber die Frist hinaus zaehlt deshalb wie ein
+                // Defekt, ob von Anfang an oder mittendrin.
                 // Zwei Anlaeufe: der zweite nur nach einem Rueckfall, und nur,
                 // wenn dieses Paket ein Schluesselbild ist - alles andere ist
-                // fuer den frischen Decoder ohnehin wertlos.
+                // fuer den frischen Decoder ohnehin wertlos. Im zweiten Anlauf
+                // laeuft Software, und die faellt nie zurueck.
                 let mut bilder: Vec<ffmpeg::frame::Video> = Vec::new();
-                for anlauf in 0..2 {
-                    bau.pakete = bau.pakete.wrapping_add(1);
+                for _anlauf in 0..2 {
+                    bau.paket();
                     let vorher = bilder.len();
                     let fehler = decoder_fuettern(&mut bau.decoder, &packet, &mut bilder);
                     if bilder.len() > vorher {
-                        bau.hat_bild = true;
+                        bau.bild();
+                        // Das erste Bild jedes Decoders einmal beschreiben -
+                        // hier, solange `bau` noch der Decoder ist, der es
+                        // geliefert hat.
+                        if !bau.bild_gemeldet {
+                            bau.bild_gemeldet = true;
+                            protokoll::zeile(bild_beschreiben(bau.codec, &bilder[vorher]));
+                        }
                     }
-                    let Some(e) = fehler else {
-                        bau.fehler_folge = 0;
-                        break;
+                    let grund = match fehler {
+                        None => {
+                            bau.fehler_folge = 0;
+                            if !bau.stumm() {
+                                break;
+                            }
+                            format!(
+                                "{} nimmt Pakete an, liefert aber kein Bild ({} Pakete, {:.1} s)",
+                                bau.codec, bau.pakete_seit_bild, bau.stumm_seit().as_secs_f32()
+                            )
+                        }
+                        Some(e) => {
+                            if !bau.pfad.hardware() || !decoder_defekt(&e) {
+                                // Software-Decoder: ein kaputtes Paket ist ein
+                                // kaputtes Paket, das naechste kommt gleich.
+                                break;
+                            }
+                            bau.fehler_folge = bau.fehler_folge.saturating_add(1);
+                            if bau.hat_bild && bau.fehler_folge < 3 {
+                                // Ein Aussetzer, kein Defekt: Paket weg, Decoder bleibt.
+                                warte_auf_schluesselbild = true;
+                                break;
+                            }
+                            format!("{} scheitert an Paket {}: {e}", bau.codec, bau.pakete)
+                        }
                     };
-                    if !bau.pfad.hardware() || !decoder_defekt(&e) {
-                        // Software-Decoder: ein kaputtes Paket ist ein
-                        // kaputtes Paket, das naechste kommt gleich.
-                        break;
-                    }
-                    if anlauf == 1 {
-                        break;
-                    }
-                    bau.fehler_folge = bau.fehler_folge.saturating_add(1);
-                    if bau.hat_bild && bau.fehler_folge < 3 {
-                        // Ein Aussetzer, kein Defekt: Paket weg, Decoder bleibt.
-                        warte_auf_schluesselbild = true;
-                        break;
-                    }
                     // Der Hardware-Decoder ist nichts wert: Software bauen
                     // und den Grund festhalten. Der Wunsch bleibt, wie er
                     // war - beim naechsten Codecwechsel wird die Karte wieder
                     // probiert, mit einem anderen Codec kann sie ja gehen.
-                    let grund = format!("{} scheitert an Paket {}: {e}", bau.codec, bau.pakete);
-                    match software_decoder(decoder_h264) {
-                        Ok(d) => {
-                            bau = DecoderBau::neu(
-                                d,
-                                DecoderPfad::Software,
-                                if decoder_h264 { "h264" } else { "hevc" },
-                                Some(grund),
-                            );
-                            decoder_melden(shared, &bau, wunsch);
-                            ring.clear();
-                            mittel = None;
-                            if flags & 1 == 0 {
-                                warte_auf_schluesselbild = true;
-                                break;
-                            }
-                        }
-                        Err(e) => return Err(e),
+                    bau = auf_software(decoder_h264, grund)?;
+                    decoder_melden(shared, &bau, wunsch);
+                    ring.clear();
+                    mittel = None;
+                    if flags & 1 == 0 {
+                        warte_auf_schluesselbild = true;
+                        break;
                     }
                 }
                 for decoded in bilder.iter() {
@@ -853,9 +1121,13 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     if let Some(e) = fehler {
                         s.error = Some(e);
                         bild_fehler = true;
-                    } else if bild_fehler {
-                        s.error = None;
-                        bild_fehler = false;
+                        bau.format_fehler = bau.format_fehler.saturating_add(1);
+                    } else {
+                        bau.format_fehler = 0;
+                        if bild_fehler {
+                            s.error = None;
+                            bild_fehler = false;
+                        }
                     }
                     if nach_wechsel {
                         // Das erste Bild des neuen Codecs ist da; der Hinweis
@@ -910,6 +1182,20 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                             }
                         }
                     }
+                }
+                // Ein Hardware-Decoder, der Bilder in einem Format liefert,
+                // das to_rgb nicht kennt, zeigt ein dunkles Bild mit Meldung.
+                // Bleibt es dabei, ist Software mit einem lesbaren Format die
+                // bessere Wahl - der Grund nennt das Format, damit es in den
+                // Client eingebaut werden kann.
+                if bau.pfad.hardware() && bau.format_fehler >= DECODER_FORMAT_FEHLER {
+                    let format = bilder.last().map(|b| format!("{:?}", b.format())).unwrap_or_default();
+                    let grund = format!("{} liefert das Format {format}, das der Client nicht wandeln kann", bau.codec);
+                    bau = auf_software(decoder_h264, grund)?;
+                    decoder_melden(shared, &bau, wunsch);
+                    ring.clear();
+                    mittel = None;
+                    warte_auf_schluesselbild = true;
                 }
             }
             MSG_TIME => {
@@ -1124,7 +1410,11 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     use ffmpeg::format::Pixel;
     // (4:2:0, Bits je Wert, U/V als Paare in einer Ebene)
     let (sub, bits, paar) = match src.format() {
-        Pixel::YUV444P => (false, 8u8, false),
+        // Die J-Formate sind FFmpegs alte Schreibweise fuer "voller
+        // Wertebereich" - der H.264-Decoder liefert 4:2:0 8 Bit so. Die
+        // Ebenen sind dieselben, und Vollbereich ist ohnehin, was wir
+        // annehmen.
+        Pixel::YUV444P | Pixel::YUVJ444P => (false, 8u8, false),
         Pixel::YUV444P10LE => (false, 10, false),
         // Die MSB-Formate legen den Wert oben buendig in 16 Bit ab - genau
         // wie YUV444P16, deshalb derselbe Lesepfad (Bits 15..8).
@@ -1134,7 +1424,7 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
         | Pixel::YUV444P10MSBLE
         | Pixel::YUV444P12MSB
         | Pixel::YUV444P12MSBLE => (false, 16, false),
-        Pixel::YUV420P => (true, 8, false),
+        Pixel::YUV420P | Pixel::YUVJ420P => (true, 8, false),
         Pixel::YUV420P10LE => (true, 10, false),
         Pixel::NV12 => (true, 8, true),
         Pixel::P010LE | Pixel::P012LE | Pixel::P016LE => (true, 16, true),
@@ -2938,12 +3228,16 @@ fn main() {
             println!("FFmpeg-Start fehlgeschlagen: {e}");
             return;
         }
+        protokoll::einschalten(true);
         use einstellungen::DecoderWunsch as W;
         for (h264, codec) in [(false, "HEVC"), (true, "H.264")] {
             for w in [W::Automatik, W::Software, W::Nvidia] {
                 match decoder_bauen(h264, w) {
                     Ok(bau) => println!("{codec} / Wunsch {}: {}", w.schluessel(), bau.meldung()),
                     Err(e) => println!("{codec} / Wunsch {}: Fehler: {e}", w.schluessel()),
+                }
+                for z in protokoll::abholen() {
+                    println!("    {z}");
                 }
             }
         }
@@ -3039,16 +3333,16 @@ fn main() {
         let mut last = 0u64;
         loop {
             std::thread::sleep(Duration::from_secs(3));
-            let mut s = shared.lock().unwrap();
+            let s = shared.lock().unwrap();
             let n = s.decoded;
-            // Jeder (Neu-)Bau des Decoders genau eine Zeile: welcher Pfad,
-            // welcher FFmpeg-Decoder, und warum nicht NVDEC, falls so. Alle
-            // Zeilen seit dem letzten Takt abholen - es koennen mehrere sein.
-            for m in std::mem::take(&mut s.decoder_meldung) {
+            // Das Protokoll seit dem letzten Takt: jeder (Neu-)Bau des
+            // Decoders eine Zeile (welcher Pfad, welcher FFmpeg-Decoder, und
+            // warum nicht NVDEC, falls so), das erste Bild jedes Decoders,
+            // und FFmpegs eigene Worte - im Pruefmodus bis zur Stufe
+            // "ausfuehrlich", da sagt cuvid, was die Karte kann und welches
+            // Format er gewaehlt hat. In der Reihenfolge des Entstehens.
+            for m in protokoll::abholen() {
                 println!("{m}");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:\\qc\\client.log") {
-                    writeln!(f, "{m}").ok();
-                }
             }
             let pfad = s.decoder_pfad.map(|p| p.name()).unwrap_or("-");
             let lat = match s.clock {
@@ -3109,9 +3403,7 @@ fn main() {
                 println!("Eingabekanal: {} gesendet | Host meldet: {:?}", l.sent, cur);
             }
             let mut s = shared.lock().unwrap();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:\\qc\\client.log") {
-                writeln!(f, "{line}").ok();
-            }
+            protokoll::nur_datei(&line);
             s.frame = None; // im Pruefmodus nichts anzeigen, Speicher freigeben
             last = n;
         }

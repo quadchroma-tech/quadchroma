@@ -121,8 +121,19 @@ Pruefmodus ohne Fenster, falls etwas klemmt:
 
     quadchroma.exe 192.168.178.194:9001 --headless
 
-Schreibt Zahlen nach C:\qc\client.log: empfangene Bilder, Bildrate,
-Decodierzeit, Verbindungsfehler.
+Gibt alle drei Sekunden eine Zeile aus: empfangene Bilder, Bildrate, Codec,
+Decoder, Verzoegerung, Hostlast, Fehler. Dazu jede Aenderung am Decoder
+(welcher Pfad, und warum nicht NVDEC, falls so), das erste Bild jedes
+Decoders mit Groesse und Format, und FFmpegs eigene Meldungen. Dasselbe
+landet in %APPDATA%\QuadChroma\protokoll.txt, auch im Fensterbetrieb - die
+Datei beginnt bei jedem Start neu.
+
+    quadchroma.exe 192.168.178.194:9001 --headless --decoder nvidia
+
+erzwingt den NVIDIA-Decoder und sagt, was die Karte dazu meint; --decoder
+software erzwingt die CPU. Ein Hardware-Decoder, der Pakete annimmt, aber
+1,5 s lang kein Bild liefert, wird von selbst durch Software ersetzt, und
+der Grund steht in der Statistik und im Protokoll.
 
 Die Dateien neben der Programmdatei gehoeren dazu und muessen mitkopiert
 werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
