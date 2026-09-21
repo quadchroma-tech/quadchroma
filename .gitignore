@@ -1,0 +1,13 @@
+# Bauergebnisse
+build/
+client/target/
+paket/
+
+# Zugang zur Bau-VM - der private Schluessel gehoert nie ins Repository
+vmkey
+vmkey.pub
+known_hosts
+
+# Rohbilder aus dem Schnappschussmodus; die PNGs sind Dokumentation und bleiben
+*.bmp
+.DS_Store

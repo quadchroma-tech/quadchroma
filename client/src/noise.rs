@@ -1,0 +1,149 @@
+// Kryptoschicht der Windows-Seite.
+//
+// Dieselbe Spezifikation wie der Host: Noise_XX_25519_ChaChaPoly_SHA256, der
+// Client faengt an. Hier uebernimmt das snow die Arbeit, auf dem Mac ist es
+// eine eigene Umsetzung derselben Spezifikation - deshalb der Gegentest:
+// beide Seiten muessen dieselbe Pruefsumme und denselben Vergleichscode sehen.
+//
+// Abhaengigkeit: snow = "0.10"  (Apache-2.0 ODER MIT), sha2 = "0.10" (MIT ODER Apache-2.0)
+
+use sha2::{Digest, Sha256};
+use snow::{Builder, HandshakeState, TransportState};
+
+pub const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
+
+/// Prologue je Kanal. Der Eingabekanal bindet sich zusaetzlich an die
+/// Pruefsumme des Bildkanals, damit er allein nichts wert ist.
+pub fn prologue_video() -> Vec<u8> {
+    b"QuadChroma/1 video Noise_XX_25519_ChaChaPoly_SHA256".to_vec()
+}
+
+pub fn prologue_input(h1: &[u8]) -> Vec<u8> {
+    let mut v = b"QuadChroma/1 input Noise_XX_25519_ChaChaPoly_SHA256".to_vec();
+    v.extend_from_slice(h1);
+    v
+}
+
+/// Sechsstelliger Vergleichscode, identisch berechnet wie auf dem Mac.
+pub fn sas(handshake_hash: &[u8]) -> String {
+    let mut h = Sha256::new();
+    let mut label = b"QuadChroma/1 SAS".to_vec();
+    label.push(0);
+    h.update(&label);
+    h.update(handshake_hash);
+    let d = h.finalize();
+    let v = u32::from_be_bytes([d[0], d[1], d[2], d[3]]) % 1_000_000;
+    format!("{:03} {:03}", v / 1000, v % 1000)
+}
+
+/// Fingerabdruck eines oeffentlichen Schluessels, wie ihn der Host anzeigt.
+pub fn fingerprint(pubkey: &[u8]) -> String {
+    let d = Sha256::digest(pubkey);
+    format!(
+        "{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}",
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+    )
+}
+
+pub struct Session {
+    pub transport: TransportState,
+    pub handshake_hash: Vec<u8>,
+    pub remote_static: Vec<u8>,
+}
+
+/// Fuehrt den Handschlag als Anrufer ueber eine beliebige Leitung. Die beiden
+/// Funktionen lesen und schreiben je eine Nachricht mit 2-Byte-Laenge davor.
+pub fn handshake_initiator<R, W>(
+    static_key: &[u8],
+    prologue: &[u8],
+    mut recv: R,
+    mut send: W,
+) -> Result<Session, String>
+where
+    R: FnMut(&mut Vec<u8>) -> Result<(), String>,
+    W: FnMut(&[u8]) -> Result<(), String>,
+{
+    let params = PATTERN.parse().map_err(|e| format!("Muster: {e:?}"))?;
+    let mut hs: HandshakeState = Builder::new(params)
+        .local_private_key(static_key)
+        .map_err(|e| format!("Schluessel: {e:?}"))?
+        .prologue(prologue)
+        .map_err(|e| format!("Prologue: {e:?}"))?
+        .build_initiator()
+        .map_err(|e| format!("Aufbau: {e:?}"))?;
+
+    let mut buf = vec![0u8; 65535];
+    let n = hs.write_message(&[], &mut buf).map_err(|e| format!("Nachricht 1: {e:?}"))?;
+    send(&buf[..n])?;
+
+    let mut incoming = Vec::new();
+    recv(&mut incoming)?;
+    let mut payload = vec![0u8; 65535];
+    hs.read_message(&incoming, &mut payload).map_err(|e| format!("Nachricht 2: {e:?}"))?;
+
+    let n = hs.write_message(b"client", &mut buf).map_err(|e| format!("Nachricht 3: {e:?}"))?;
+    send(&buf[..n])?;
+
+    let handshake_hash = hs.get_handshake_hash().to_vec();
+    let remote_static = hs.get_remote_static().map(|k| k.to_vec()).unwrap_or_default();
+    let transport = hs.into_transport_mode().map_err(|e| format!("Umschalten: {e:?}"))?;
+    Ok(Session { transport, handshake_hash, remote_static })
+}
+
+/// Erzeugt ein langlebiges Schluesselpaar.
+pub fn keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let params = PATTERN.parse().map_err(|e| format!("Muster: {e:?}"))?;
+    let kp = Builder::new(params).generate_keypair().map_err(|e| format!("Schluessel: {e:?}"))?;
+    Ok((kp.private, kp.public))
+}
+
+/// Gegentest gegen den Mac: Handschlag, Pruefsumme, ein verschluesselter Satz
+/// hin und zurueck.
+pub fn selftest_against(addr: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let (priv_key, pub_key) = keypair()?;
+    println!("Client-Fingerabdruck: {}", fingerprint(&pub_key));
+
+    let sock = TcpStream::connect(addr).map_err(|e| format!("Verbindung: {e}"))?;
+    sock.set_nodelay(true).ok();
+    let mut rd = sock.try_clone().map_err(|e| format!("Leitung: {e}"))?;
+
+    let recv = |buf: &mut Vec<u8>| -> Result<(), String> {
+        let mut l = [0u8; 2];
+        rd.read_exact(&mut l).map_err(|e| format!("Laenge: {e}"))?;
+        let n = u16::from_le_bytes(l) as usize;
+        buf.resize(n, 0);
+        rd.read_exact(buf).map_err(|e| format!("Daten: {e}"))
+    };
+    let send = |data: &[u8]| -> Result<(), String> {
+        let mut out = Vec::with_capacity(2 + data.len());
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(data);
+        (&sock).write_all(&out).map_err(|e| format!("Senden: {e}"))
+    };
+
+    let mut s = handshake_initiator(&priv_key, &prologue_video(), recv, send)?;
+    println!("Handschlag fertig");
+    println!("Vergleichscode: {}", sas(&s.handshake_hash));
+    println!("Host-Fingerabdruck: {}", fingerprint(&s.remote_static));
+
+    // Ein verschluesselter Satz hin und zurueck.
+    let mut buf = vec![0u8; 4096];
+    let n = s.transport.write_message(b"Gruss von Windows", &mut buf).map_err(|e| format!("{e:?}"))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&buf[..n]);
+    (&sock).write_all(&out).map_err(|e| format!("Senden: {e}"))?;
+
+    let mut l = [0u8; 2];
+    (&sock).read_exact(&mut l).map_err(|e| format!("Antwortlaenge: {e}"))?;
+    let n = u16::from_le_bytes(l) as usize;
+    let mut ct = vec![0u8; n];
+    (&sock).read_exact(&mut ct).map_err(|e| format!("Antwort: {e}"))?;
+    let mut pt = vec![0u8; 4096];
+    let n = s.transport.read_message(&ct, &mut pt).map_err(|e| format!("Entschluesseln: {e:?}"))?;
+    println!("entschluesselt empfangen: {}", String::from_utf8_lossy(&pt[..n]));
+    Ok(())
+}

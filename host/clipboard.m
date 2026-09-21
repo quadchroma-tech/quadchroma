@@ -1,0 +1,233 @@
+// QuadChroma Host: Abgleich der Zwischenablage, Mac-Seite.
+//
+// NSPasteboard kennt keine Benachrichtigung bei Aenderungen. Der einzige
+// verlaessliche Weg ist, den Zaehler changeCount regelmaessig abzufragen; das
+// kostet praktisch nichts, weil dabei kein Inhalt gelesen wird. Wir fragen alle
+// 150 ms ab: schnell genug, dass Kopieren und Einfuegen am Client sich sofort
+// anfuehlt, selten genug, dass es im Leerlauf nicht auffaellt.
+//
+// Alle Zugriffe auf die Ablage laufen auf der Hauptwarteschlange, also in genau
+// einem Faden. Das haelt AppKit auf der sicheren Seite und macht die
+// Schleifenerkennung trivial: Abfrage und eigenes Schreiben koennen sich nicht
+// ueberholen. Der Dienstbetrieb in main.m haelt den Hauptfaden dauerhaft in
+// einer Runloop, die Hauptwarteschlange wird also bedient.
+//
+// Keine zusaetzlichen Bibliotheken, keine neuen Frameworks: Foundation und
+// AppKit sind ohnehin gebunden.
+//
+// Freigabe: ab macOS 15.4 kann ein programmatisches LESEN der Zwischenablage
+// eine Rueckfrage des Systems ausloesen ("... moechte von ... einfuegen"). Das
+// Abfragen von changeCount ist davon nicht betroffen, nur das Holen des
+// Inhalts. Nach dem Erlauben muss der Prozess neu gestartet werden, sonst bleibt
+// es beim alten Ergebnis. UNGEPRUEFT: aus der Projektvorgabe uebernommen, nicht
+// gegen die Apple-Dokumentation geprueft.
+#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#include "clipboard.h"
+
+// -------------------------------------------------------------- Einstellungen
+
+#define QC_CLIP_MAX      (4 * 1024 * 1024)   // Groesse, ab der wir Inhalte auslassen
+#define QC_CLIP_POLL_MS  150ull              // Abfragetakt
+#define QC_CLIP_LEEWAY_MS 30ull              // Spielraum, damit der Timer buendeln darf
+
+// Kennzeichen aus der Verabredung unter nspasteboard.org: Passwortverwalter
+// markieren damit Inhalte, die nicht mitgeschrieben werden sollen. Ein solcher
+// Eintrag geht nicht ueber die Leitung zum Client.
+// UNGEPRUEFT: Branchenkonvention, keine Apple-Dokumentation.
+static NSString *const kConcealedType = @"org.nspasteboard.ConcealedType";
+
+// ------------------------------------------------------------------ Protokoll
+// Eigener Handle auf dieselbe Datei, die main.m benutzt. Beide haengen im
+// Anhaengemodus und leeren nach jeder Zeile, die Zeilen vermischen sich also
+// nicht.
+
+static FILE *g_clip_log = NULL;
+
+static void clip_log(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    const char *c = s.UTF8String;
+    if (!c) return;
+    fprintf(stdout, "%s\n", c);
+    fflush(stdout);
+    if (!g_clip_log) g_clip_log = fopen("/tmp/quadchroma-m1.log", "a");
+    if (g_clip_log) { fprintf(g_clip_log, "%s\n", c); fflush(g_clip_log); }
+}
+
+// ---------------------------------------------------------------- Zustand
+// Alles hier drunter wird ausschliesslich auf der Hauptwarteschlange angefasst,
+// bis auf g_cb_queue und g_started, die nur beim Start gesetzt werden.
+
+static void (*g_on_change)(const char *utf8, size_t len) = NULL;
+static dispatch_queue_t g_cb_queue = nil;    // liefert den Rueckruf aus
+static dispatch_source_t g_timer = nil;
+static BOOL g_started = NO;
+
+static NSInteger g_seen = -1;          // zuletzt gesehener changeCount, -1 = noch nie abgefragt
+static NSInteger g_self_change = -1;   // changeCount, den unser eigenes Schreiben erzeugt hat
+static NSString *g_last = nil;         // Text, den wir zuletzt gelesen oder geschrieben haben
+
+// ------------------------------------------------------------------- Lesen
+
+// Liest den Text des ERSTEN Eintrags. Bewusst ueber pasteboardItems und nicht
+// ueber [pb stringForType:]: der bequeme Weg auf Brettebene haengt bei mehreren
+// Eintraegen deren Text aneinander, und genau das will hier niemand.
+static NSString *read_first_text(NSPasteboard *pb) {
+    NSArray<NSPasteboardItem *> *items = pb.pasteboardItems;
+    NSPasteboardItem *item = items.firstObject;
+    if (!item) return nil;
+    if (items.count > 1)
+        clip_log(@"Zwischenablage: %lu Eintraege, nur der erste wird uebertragen",
+                 (unsigned long)items.count);
+
+    // Verdeckte Inhalte (Passwoerter) bleiben auf diesem Rechner.
+    if ([item availableTypeFromArray:@[kConcealedType]]) {
+        clip_log(@"Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen");
+        return nil;
+    }
+    // Dateien und Ordner uebertragen wir nicht - nur der Text waere sinnlos,
+    // weil der Pfad auf der Windows-Seite nichts bedeutet.
+    if ([item availableTypeFromArray:@[NSPasteboardTypeFileURL]]) return nil;
+
+    // Bilder und alles andere ohne Textdarstellung fallen hier von selbst raus.
+    return [item stringForType:NSPasteboardTypeString];
+}
+
+static void clip_poll(void) {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    NSInteger now = pb.changeCount;          // nur der Zaehler, kein Inhalt
+
+    if (g_seen < 0) { g_seen = now; return; } // erster Durchlauf: Startinhalt nicht melden
+    if (now == g_seen) return;
+    g_seen = now;
+    if (now == g_self_change) return;         // das waren wir selbst
+
+    NSString *text = read_first_text(pb);
+    if (text.length == 0) {
+        // Seit macOS 15.4 kann genau hier die Systemabfrage zum Einsetzen
+        // dazwischenfunken und nil liefern, ohne dass ein Fenster sichtbar wird.
+        clip_log(@"Zwischenablage: Aenderung erkannt (%ld), aber kein Text lesbar", (long)now);
+        return;
+    }
+    clip_log(@"Zwischenablage: %lu Zeichen vom Mac uebernommen", (unsigned long)text.length);
+
+    // Grobfilter vor dem Umwandeln, damit ein riesiger Text nicht erst noch
+    // kopiert wird. In UTF-8 ist jede Zeichenfolge mindestens so lang wie in
+    // UTF-16-Einheiten, die Abschaetzung liegt also nie zu niedrig.
+    if ((NSUInteger)text.length > (NSUInteger)QC_CLIP_MAX) {
+        clip_log(@"Zwischenablage: %lu Zeichen ueberschreiten die Grenze von %d Bytes, ausgelassen",
+                 (unsigned long)text.length, QC_CLIP_MAX);
+        return;
+    }
+    NSData *utf8 = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (!utf8) return;
+    if (utf8.length > (NSUInteger)QC_CLIP_MAX) {
+        clip_log(@"Zwischenablage: %lu Bytes ueberschreiten die Grenze von %d Bytes, ausgelassen",
+                 (unsigned long)utf8.length, QC_CLIP_MAX);
+        return;
+    }
+    if (g_last && [g_last isEqualToString:text]) return;  // Inhalt unveraendert
+    g_last = text;
+
+    void (*cb)(const char *, size_t) = g_on_change;
+    if (!cb) return;
+
+    // Mit Abschluss-Null, damit auch ein Leser mit strlen() nicht ueberlaeuft.
+    NSMutableData *out = [NSMutableData dataWithCapacity:utf8.length + 1];
+    [out appendData:utf8];
+    [out appendBytes:"\0" length:1];
+    dispatch_async(g_cb_queue, ^{
+        // Der Block haelt out, die Bytes leben also bis zum Ende des Aufrufs.
+        cb((const char *)out.bytes, out.length - 1);
+    });
+}
+
+// ----------------------------------------------------------------- Schreiben
+
+static void clip_write(NSString *text) {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+
+    // Meist ist das der Widerhall dessen, was wir eben selbst zum Client
+    // geschickt haben. Nur ueberspringen, wenn sich seit der letzten Abfrage
+    // nichts geruehrt hat - sonst koennten wir eine fremde Aenderung stehen
+    // lassen, die wir noch gar nicht gesehen haben.
+    if (pb.changeCount == g_seen && g_last && [g_last isEqualToString:text]) return;
+
+    NSPasteboardItem *item = [[NSPasteboardItem alloc] init];
+    if (![item setString:text forType:NSPasteboardTypeString]) {
+        clip_log(@"Zwischenablage: Eintrag liess sich nicht befuellen");
+        return;
+    }
+    // Genau ein Eintrag, in einem Zug: erst leeren, dann schreiben. declareTypes
+    // und writeObjects duerfen nicht gemischt werden, das eine ueberschreibt die
+    // Anmeldung des anderen und hinterlaesst ein halb gefuelltes Brett.
+    [pb clearContents];
+    if (![pb writeObjects:@[item]]) {
+        clip_log(@"Zwischenablage: Schreiben abgelehnt");
+        return;
+    }
+
+    // Den Stand, den unser eigenes Schreiben hinterlaesst, merken und bei der
+    // naechsten Abfrage uebergehen. Ob clearContents und writeObjects den
+    // Zaehler einmal oder zweimal erhoehen, ist dabei egal: wir lesen ihn erst
+    // danach, und die Abfrage laeuft auf derselben Warteschlange, kann also
+    // nicht dazwischenkommen.
+    // UNGEPRUEFT: die genaue Zaehlweise von writeObjects ist nicht dokumentiert.
+    NSInteger now = pb.changeCount;
+    g_self_change = now;
+    g_seen = now;
+    g_last = text;
+}
+
+// -------------------------------------------------------------- Schnittstelle
+
+void qc_clip_start(void (*on_change)(const char *utf8, size_t len)) {
+    if (g_started) { clip_log(@"Zwischenablage: Abgleich laeuft bereits"); return; }
+
+    g_cb_queue = dispatch_queue_create("tech.quadchroma.clipboard", DISPATCH_QUEUE_SERIAL);
+    if (!g_cb_queue) { clip_log(@"Zwischenablage: Warteschlange nicht anlegbar"); return; }
+
+    dispatch_queue_t main_q = dispatch_get_main_queue();
+    g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, main_q);
+    if (!g_timer) { clip_log(@"Zwischenablage: Zeitgeber nicht anlegbar"); g_cb_queue = nil; return; }
+
+    g_on_change = on_change;
+    g_started = YES;
+
+    dispatch_source_set_timer(g_timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(QC_CLIP_POLL_MS * NSEC_PER_MSEC)),
+                              QC_CLIP_POLL_MS * NSEC_PER_MSEC,
+                              QC_CLIP_LEEWAY_MS * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(g_timer, ^{
+        @autoreleasepool { clip_poll(); }
+    });
+    dispatch_resume(g_timer);
+
+    clip_log(@"Zwischenablage: Abgleich laeuft, Abfrage alle %llu ms, Grenze %d Bytes",
+             QC_CLIP_POLL_MS, QC_CLIP_MAX);
+}
+
+void qc_clip_set(const char *utf8, size_t len) {
+    if (!utf8 || len == 0) return;   // Leeres loescht nur die Ablage, das will niemand
+    if (len > (size_t)QC_CLIP_MAX) {
+        clip_log(@"Zwischenablage: %zu Bytes vom Client ueberschreiten die Grenze von %d Bytes, ausgelassen",
+                 len, QC_CLIP_MAX);
+        return;
+    }
+    // Pruefen und umwandeln noch im Faden des Aufrufers: ungueltiges UTF-8
+    // faellt sofort auf und erzeugt gar keine Arbeit fuer den Hauptfaden.
+    NSString *text = [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
+    if (!text) {
+        clip_log(@"Zwischenablage: %zu Bytes vom Client sind kein gueltiges UTF-8, ausgelassen", len);
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool { clip_write(text); }
+    });
+}

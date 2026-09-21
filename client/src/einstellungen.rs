@@ -1,0 +1,172 @@
+// Gespeicherte Einstellungen.
+//
+// Zwei Sorten: solche, die zum Programm gehoeren (Vollbild, Sprache), und
+// solche, die zu einem bestimmten Host gehoeren (Datenrate, Bildrate, die
+// beiden Schalter). Die zweite Sorte haengt am Fingerabdruck des Hosts, nicht
+// an seiner Adresse - die kann sich im Netz jederzeit aendern, der Schluessel
+// nicht.
+//
+// Das Format ist absichtlich stumpf: eine Zeile je Wert, Text. Wer will, kann
+// es mit einem Editor reparieren.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HostWerte {
+    pub mbit: u32,
+    pub fps: u16,
+    pub gaming: bool,
+    pub fest: bool,
+}
+
+/// Welche Zeilen die Statistik zeigt. Nicht jeder will alles sehen - manchem
+/// reicht die Bildrate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatWahl {
+    pub fps: bool,
+    pub latenz: bool,
+    pub teile: bool,
+    pub aufloesung: bool,
+    pub codec: bool,
+    pub verworfen: bool,
+    pub code: bool,
+}
+
+impl Default for StatWahl {
+    fn default() -> Self {
+        StatWahl { fps: true, latenz: true, teile: true, aufloesung: true, codec: true, verworfen: true, code: true }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Einstellungen {
+    pub vollbild: bool,
+    pub pixelgenau: bool,
+    pub overlay: bool,
+    pub sprache: Option<String>,
+    /// Erweiterte Statistik. Muss eigens eingeschaltet werden.
+    pub nerd: bool,
+    pub stats: StatWahl,
+    /// Fingerabdruck des Hosts -> seine Werte.
+    pub hosts: HashMap<String, HostWerte>,
+}
+
+impl Default for Einstellungen {
+    fn default() -> Self {
+        Einstellungen {
+            vollbild: true, // sein Wunsch: standardmaessig im Vollbild
+            pixelgenau: false,
+            overlay: false,
+            sprache: None,
+            nerd: false,
+            stats: StatWahl::default(),
+            hosts: HashMap::new(),
+        }
+    }
+}
+
+fn pfad() -> Option<PathBuf> {
+    let base = std::env::var("APPDATA").or_else(|_| std::env::var("HOME")).ok()?;
+    let dir = PathBuf::from(base).join("QuadChroma");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("einstellungen.txt"))
+}
+
+impl Einstellungen {
+    pub fn laden() -> Einstellungen {
+        let mut e = Einstellungen::default();
+        let Some(p) = pfad() else { return e };
+        let Ok(text) = std::fs::read_to_string(&p) else { return e };
+
+        // Ein fehlerhafter Eintrag darf nie den ganzen Start verhindern:
+        // alles, was nicht gelesen werden kann, bleibt auf der Voreinstellung.
+        let mut aktueller_host: Option<String> = None;
+        for zeile in text.lines() {
+            let z = zeile.trim();
+            if z.is_empty() || z.starts_with('#') {
+                continue;
+            }
+            if let Some(fp) = z.strip_prefix("host ") {
+                aktueller_host = Some(fp.trim().to_string());
+                e.hosts.entry(fp.trim().to_string()).or_insert(HostWerte {
+                    mbit: 50,
+                    fps: 120,
+                    gaming: false,
+                    fest: false,
+                });
+                continue;
+            }
+            let Some((k, v)) = z.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            match (&aktueller_host, k) {
+                (None, "vollbild") => e.vollbild = v == "1",
+                (None, "pixelgenau") => e.pixelgenau = v == "1",
+                (None, "overlay") => e.overlay = v == "1",
+                (None, "sprache") => e.sprache = Some(v.to_string()),
+                (None, "nerd") => e.nerd = v == "1",
+                (None, "stat_fps") => e.stats.fps = v == "1",
+                (None, "stat_latenz") => e.stats.latenz = v == "1",
+                (None, "stat_teile") => e.stats.teile = v == "1",
+                (None, "stat_aufloesung") => e.stats.aufloesung = v == "1",
+                (None, "stat_codec") => e.stats.codec = v == "1",
+                (None, "stat_verworfen") => e.stats.verworfen = v == "1",
+                (None, "stat_code") => e.stats.code = v == "1",
+                (Some(fp), _) => {
+                    if let Some(h) = e.hosts.get_mut(fp) {
+                        match k {
+                            "mbit" => h.mbit = v.parse().unwrap_or(h.mbit),
+                            "fps" => h.fps = v.parse().unwrap_or(h.fps),
+                            "gaming" => h.gaming = v == "1",
+                            "fest" => h.fest = v == "1",
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        e
+    }
+
+    pub fn sichern(&self) {
+        let Some(p) = pfad() else { return };
+        let mut t = String::from("# QuadChroma, gespeicherte Einstellungen\n");
+        t.push_str(&format!("vollbild={}\n", self.vollbild as u8));
+        t.push_str(&format!("pixelgenau={}\n", self.pixelgenau as u8));
+        t.push_str(&format!("overlay={}\n", self.overlay as u8));
+        if let Some(s) = &self.sprache {
+            t.push_str(&format!("sprache={s}\n"));
+        }
+        t.push_str(&format!("nerd={}\n", self.nerd as u8));
+        let w = &self.stats;
+        t.push_str(&format!(
+            "stat_fps={}\nstat_latenz={}\nstat_teile={}\nstat_aufloesung={}\nstat_codec={}\nstat_verworfen={}\nstat_code={}\n",
+            w.fps as u8, w.latenz as u8, w.teile as u8, w.aufloesung as u8,
+            w.codec as u8, w.verworfen as u8, w.code as u8
+        ));
+        // Sortiert schreiben, damit die Datei zwischen zwei Laeufen gleich
+        // aussieht und man Aenderungen erkennt.
+        let mut fps: Vec<&String> = self.hosts.keys().collect();
+        fps.sort();
+        for fp in fps {
+            let h = &self.hosts[fp];
+            t.push_str(&format!(
+                "\nhost {fp}\nmbit={}\nfps={}\ngaming={}\nfest={}\n",
+                h.mbit, h.fps, h.gaming as u8, h.fest as u8
+            ));
+        }
+        std::fs::write(p, t).ok();
+    }
+
+    pub fn fuer_host(&self, fingerabdruck: &str) -> Option<HostWerte> {
+        self.hosts.get(fingerabdruck).copied()
+    }
+
+    pub fn host_merken(&mut self, fingerabdruck: &str, w: HostWerte) {
+        let alt = self.hosts.insert(fingerabdruck.to_string(), w);
+        if alt != Some(w) {
+            self.sichern();
+        }
+    }
+}

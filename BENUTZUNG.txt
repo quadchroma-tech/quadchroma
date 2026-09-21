@@ -1,0 +1,103 @@
+QuadChroma - Windows-Client
+===========================
+
+Starten:
+
+    quadchroma.exe
+
+Ohne Adresse oeffnet sich der Startbildschirm. Der Mac meldet sich im Netz
+selbst, er steht also nach ein paar Sekunden in der Liste; anklicken genuegt.
+Wer die Adresse kennt, kann sie auch eintippen oder gleich mitgeben:
+
+    quadchroma.exe 192.168.178.194:9001
+
+Port 9001 ist Bild und Ton, 9002 Eingaben und Zwischenablage, 9003 die
+Bekanntgabe im Netz. Beim ersten Start fragt die Windows-Firewall, ob das
+Programm ins Netz darf - das muss erlaubt werden, sonst bleibt die Liste leer.
+
+Verschluesselung und Kopplung
+-----------------------------
+
+Die Verbindung ist immer verschluesselt, es gibt keinen Schalter dafuer. Beide
+Seiten legen beim ersten Start einen eigenen dauerhaften Schluessel an und
+erkennen sich danach daran wieder.
+
+Damit nicht jeder im Netz zugreifen kann, muss das Geraet einmal freigegeben
+werden. Beim allerersten Mal passiert das von selbst: der Host nimmt die erste
+Gegenstelle auf, die sich meldet. Danach ist zu: jedes weitere neue Geraet
+braucht einen Host, der mit --pair gestartet wurde.
+
+    open -n build/QuadChroma.app --args --serve 9001 --pair
+
+Im Log des Hosts steht dann ein sechsstelliger Vergleichscode, zum Beispiel
+"628 306". Denselben Code zeigt der Client mit F9 an. Stimmen beide ueberein,
+sitzt niemand dazwischen. Stimmen sie nicht ueberein, Verbindung trennen.
+
+Der Client merkt sich den Fingerabdruck des Hosts. Aendert er sich spaeter,
+verweigert der Client die Verbindung, bis der Eintrag in known_hosts.txt von
+Hand geloescht wird.
+
+Ablage der Schluessel:
+
+    Mac       ~/Library/Application Support/QuadChroma/
+              host.key, authorized.txt
+    Windows   %APPDATA%\QuadChroma\
+              client.key, known_hosts.txt
+
+Alle Freigaben auf dem Mac loeschen: Host einmal mit --forget starten.
+
+Tasten:
+
+    F9         Zahlen einblenden: Bildrate, Decodierzeit, Aufloesung, Codec
+    F10        Einstellungen: Bitrate, Bildrate, Spielmodus, feste Bildrate
+    F11        Vollbild an und aus
+    F12        pixelgenaue Darstellung statt gestreckt
+    Strg+Esc   zurueck zum Startbildschirm
+
+Einstellungen im laufenden Betrieb
+----------------------------------
+
+F10 oeffnet rechts eine Tafel. Bitrate und Bildrate lassen sich dort mit den
+Knoepfen aendern; der Mac stellt sofort um und meldet zurueck, was wirklich
+gilt - angezeigt wird also nie ein Wunsch, sondern der Stand auf der anderen
+Seite. Solange die Tafel offen ist, gehoert die Maus ihr und nicht dem Mac.
+
+Feste Bildrate: normalerweise schickt der Mac nur dann ein neues Bild, wenn
+sich wirklich etwas geaendert hat - die Rate steigt und faellt also mit dem
+Inhalt. Mit diesem Schalter haelt er die eingestellte Rate durch, auch bei
+vollkommen stillem Bildschirm. Das Timing wird gleichmaessig und es geht keine
+Zeit verloren, wenn sich endlich wieder etwas bewegt.
+
+Gemessen auf dem Mac mini M1 bei 1080p, Ziel 120 Bilder/s:
+
+    aus    30 Bilder/s      9 % Prozessorlast
+    an    104 Bilder/s     25 % Prozessorlast
+
+Die Datenrate steigt dabei kaum (51 auf 66 Mbit/s), denn ein unveraendertes
+Bild kostet fast nichts. Was es kostet, ist Dauerlast: die Video-Einheit des
+Macs laeuft durch, solange der Schalter an ist.
+
+Der Spielmodus zieht die Zuegel straffer: haeufigere Vollbilder und ein
+kleinerer erlaubter Rueckstau, damit bei Bewegung nichts auflaeuft. Er kostet
+etwas Bandbreite und bringt dafuer gleichmaessigere Bilder.
+
+Zur Bitrate: der Wert ist eine Obergrenze, und der Encoder nutzt sie auch aus.
+150 Mbit/s bedeuten bei bewegtem Bild tatsaechlich 150 Mbit/s. Fuer das eigene
+Netz ist das in Ordnung, sonst lieber 25 bis 50 einstellen.
+
+Alles andere geht an den Mac. Uebertragen wird die Position der Taste, nicht
+das Zeichen, deshalb stimmen Umlaute und AltGr von selbst. Die Windows-Taste
+ist die Befehlstaste des Macs.
+
+Pruefmodus ohne Fenster, falls etwas klemmt:
+
+    quadchroma.exe 192.168.178.194:9001 --headless
+
+Schreibt Zahlen nach C:\qc\client.log: empfangene Bilder, Bildrate,
+Decodierzeit, Verbindungsfehler.
+
+Die Dateien neben der Programmdatei gehoeren dazu und muessen mitkopiert
+werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
+Bibliothek. Der Quelltext dazu liegt bei https://ffmpeg.org
+
+Stand: 20.09.2026

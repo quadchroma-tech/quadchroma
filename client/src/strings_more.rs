@@ -1,0 +1,36 @@
+// Sammelstelle aller Sprachtabellen. Die Gruppen liegen in strings_west.rs,
+// strings_north.rs, strings_east.rs, strings_balt.rs und strings_asia.rs.
+
+use crate::strings::{Lang, DE, EN};
+
+pub static ALL: &[&Lang] = &[
+    &EN,
+    &DE,
+    &crate::strings_west::FR,
+    &crate::strings_west::ES,
+    &crate::strings_west::IT,
+    &crate::strings_west::PT,
+    &crate::strings_west::NL,
+    &crate::strings_north::SV,
+    &crate::strings_north::DA,
+    &crate::strings_north::NB,
+    &crate::strings_north::FI,
+    &crate::strings_north::IS,
+    &crate::strings_east::PL,
+    &crate::strings_east::CS,
+    &crate::strings_east::SK,
+    &crate::strings_east::HU,
+    &crate::strings_east::RO,
+    &crate::strings_east::BG,
+    &crate::strings_east::EL,
+    &crate::strings_balt::ET,
+    &crate::strings_balt::LV,
+    &crate::strings_balt::LT,
+    &crate::strings_balt::SL,
+    &crate::strings_balt::HR,
+    &crate::strings_balt::UK,
+    &crate::strings_asia::RU,
+    &crate::strings_asia::ZH,
+    &crate::strings_asia::JA,
+    &crate::strings_asia::TR,
+];
