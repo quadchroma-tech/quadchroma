@@ -564,9 +564,14 @@ struct Shared {
     decoder_wunsch_neu: bool,
     /// Welchen Weg der laufende Decoder wirklich nimmt. None = noch keiner.
     decoder_pfad: Option<DecoderPfad>,
-    /// Warum NVDEC nicht laeuft, obwohl er gewuenscht war - fuer Anzeige
-    /// und Protokoll. None, wenn er laeuft oder gar nicht gewuenscht war.
+    /// Warum die Karte nicht decodiert, obwohl sie gewuenscht war - fuer
+    /// Anzeige und Protokoll. None, wenn sie laeuft oder gar nicht
+    /// gewuenscht war.
     decoder_hinweis: Option<String>,
+    /// DXGI-Index des Adapters, auf dem die Anzeige laeuft (Kandidat fuer
+    /// D3D11VA bei Automatik). None: Software, WARP oder ohne Fenster. Der
+    /// Fensterfaden setzt ihn beim Aufbau der Karte, vor der Verbindung.
+    anzeige_adapter: Option<u32>,
 }
 
 impl Shared {
@@ -654,26 +659,103 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
 
 use ffmpeg_next as ffmpeg;
 
+/// Rolle einer Karte im Menue: die dedizierten Karten in der Reihenfolge
+/// der Aufzaehlung (1 = "Grafikkarte", 2 = "Grafikkarte 2"), oder die
+/// integrierte mit gemeinsamem Speicher. Erkannt in
+/// `anzeige::karten_erkennen`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rolle {
+    Grafikkarte(u8),
+    Integriert,
+}
+
+impl Rolle {
+    /// Fuer Protokoll und Statistik (die Knoepfe im Menue kommen aus den
+    /// Sprachtabellen).
+    pub fn name(self) -> String {
+        match self {
+            Rolle::Grafikkarte(1) => "Grafikkarte".into(),
+            Rolle::Grafikkarte(n) => format!("Grafikkarte {n}"),
+            Rolle::Integriert => "Integriert".into(),
+        }
+    }
+}
+
+/// Eine erkannte Karte: was DXGI ueber sie sagt, und ihre Rolle.
+#[derive(Clone, Debug)]
+pub struct Karte {
+    /// Index in der Aufzaehlung von DXGI - derselbe wie bei --adapter n und
+    /// als "device" fuer FFmpegs D3D11VA.
+    pub index: u32,
+    pub name: String,
+    pub vendor: u32,
+    pub speicher_mb: u64,
+    pub hat_ausgang: bool,
+    pub luid: i64,
+    pub rolle: Rolle,
+}
+
+impl Karte {
+    pub fn nvidia(&self) -> bool {
+        self.vendor == 0x10de
+    }
+}
+
+/// Die Karten des Rechners, einmal beim Start erkannt und danach fuer
+/// beide Faeden gleich: der Fensterfaden baut daraus die Knoepfe, der
+/// Empfangsfaden die Decoder.
+static KARTEN: std::sync::OnceLock<Vec<Karte>> = std::sync::OnceLock::new();
+
+fn karten() -> &'static [Karte] {
+    KARTEN.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            anzeige::karten_erkennen()
+        }
+        #[cfg(not(windows))]
+        {
+            Vec::new()
+        }
+    })
+}
+
+/// Die Karte zu einer Rolle, falls es sie gibt.
+fn karte_mit(karten: &[Karte], rolle: Rolle) -> Option<&Karte> {
+    karten.iter().find(|k| k.rolle == rolle)
+}
+
+/// Die Karte, die die Anzeige bei Automatik nimmt - dieselbe Regel wie in
+/// `anzeige::Gpu::neu`: die erste mit Bildschirmausgang, sonst die erste
+/// von NVIDIA, sonst die erste ueberhaupt.
+fn karte_automatik(karten: &[Karte]) -> Option<&Karte> {
+    karten.iter().find(|k| k.hat_ausgang).or_else(|| karten.iter().find(|k| k.nvidia())).or_else(|| karten.first())
+}
+
 /// Welchen Weg der Decoder tatsaechlich nimmt. Das ist das Ergebnis der
-/// Wahl, nicht der Wunsch: bei Automatik kann beides herauskommen.
+/// Wahl, nicht der Wunsch: bei Automatik kann alles herauskommen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecoderPfad {
     /// NVIDIA-Karte ueber die cuvid-Decoder von FFmpeg (hevc_cuvid, h264_cuvid).
     Nvdec,
+    /// Direct3D 11 Video (D3D11VA) auf der Karte dieser Rolle - fuer AMD und
+    /// Intel, nur 4:2:0 und H.264. Die Bilder kommen von der Karte in den
+    /// Hauptspeicher (Kopierstufe).
+    D3d11va(Rolle),
     /// Der eingebaute Software-Decoder von FFmpeg auf der CPU.
     Software,
 }
 
 impl DecoderPfad {
-    pub fn name(self) -> &'static str {
+    pub fn name(self) -> String {
         match self {
-            DecoderPfad::Nvdec => "NVDEC",
-            DecoderPfad::Software => "Software",
+            DecoderPfad::Nvdec => "NVDEC".into(),
+            DecoderPfad::D3d11va(r) => format!("D3D11VA ({})", r.name()),
+            DecoderPfad::Software => "Software".into(),
         }
     }
 
     pub fn hardware(self) -> bool {
-        self == DecoderPfad::Nvdec
+        self != DecoderPfad::Software
     }
 }
 
@@ -684,9 +766,16 @@ struct DecoderBau {
     pfad: DecoderPfad,
     /// FFmpeg-Name des Decoders, etwa "hevc_cuvid" oder "hevc".
     codec: &'static str,
-    /// Warum es nicht NVDEC wurde, obwohl er gewuenscht war. None, wenn er
-    /// laeuft oder Software ausdruecklich gewuenscht war.
+    /// Warum es nicht die Karte wurde, obwohl sie gewuenscht war. None, wenn
+    /// sie laeuft oder Software ausdruecklich gewuenscht war.
     grund: Option<String>,
+    /// Wofuer gebaut wurde: 4:4:4 (Some(true)), 4:2:0 (Some(false)) oder
+    /// noch unbekannt (vor der ersten Strominfo). D3D11VA kann kein 4:4:4 -
+    /// kommt die Strominfo mit einem anderen Wert, muss neu gebaut werden.
+    chroma444: Option<bool>,
+    /// Software nur, weil der Strom 4:4:4 ist und D3D11VA das nicht kann.
+    /// Wird der Strom 4:2:0, lohnt ein neuer Bau.
+    wegen_444: bool,
     /// Wie viele Pakete dieser Decoder schon bekommen hat. Steht im Grund,
     /// wenn er scheitert: "an Paket 1" heisst, er konnte den Strom nie lesen.
     pakete: u32,
@@ -733,6 +822,8 @@ impl DecoderBau {
             pfad,
             codec,
             grund,
+            chroma444: None,
+            wegen_444: false,
             pakete: 0,
             hat_bild: false,
             fehler_folge: 0,
@@ -769,11 +860,13 @@ impl DecoderBau {
         self.ohne_bild_seit.map(|t| t.elapsed()).unwrap_or_default()
     }
 
-    /// Eine Zeile fuer das Protokoll.
+    /// Eine Zeile fuer das Protokoll. Bei einem Rueckfall steht der Grund
+    /// voran, so wie er auch in der Statistik steht: "D3D11VA (Integriert)
+    /// scheitert: ... - Software (hevc)".
     fn meldung(&self) -> String {
         match &self.grund {
             None => format!("Decoder: {} ({})", self.pfad.name(), self.codec),
-            Some(g) => format!("Decoder: {} ({}) - NVDEC nicht verfuegbar: {g}", self.pfad.name(), self.codec),
+            Some(g) => format!("Decoder: {g} - {} ({})", self.pfad.name(), self.codec),
         }
     }
 }
@@ -836,13 +929,131 @@ fn nvdec_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
     })
 }
 
+/// Fehlercode von FFmpeg als Text - mit FFmpegs eigenen Worten dazu, falls
+/// es welche gab (die erste Warnung oder der erste Fehler seit dem letzten
+/// `fehler_verwerfen`).
+fn ffmpeg_grund(was: &str, code: i32) -> String {
+    let worte = protokoll::fehler_abholen();
+    match worte.first() {
+        Some(w) => format!("{was}: {w}"),
+        None => format!("{was}: {}", ffmpeg::Error::from(code)),
+    }
+}
+
+/// get_format-Rueckruf des D3D11VA-Decoders: die Karte, wenn FFmpeg sie
+/// anbietet, sonst das erste Software-Format der Liste. Software wird
+/// angeboten, wenn die Karte das Profil nicht kann (4:4:4, oder ein Treiber
+/// ohne HEVC) - der Decoder rechnet dann auf der CPU weiter, und die
+/// Empfangsschleife merkt das am Format des ersten Bildes.
+unsafe extern "C" fn d3d11va_format(_ctx: *mut ffmpeg::sys::AVCodecContext, liste: *const ffmpeg::sys::AVPixelFormat) -> ffmpeg::sys::AVPixelFormat {
+    use ffmpeg::sys::*;
+    let mut p = liste;
+    let mut erstes_software = AVPixelFormat::AV_PIX_FMT_NONE;
+    while !p.is_null() && *p != AVPixelFormat::AV_PIX_FMT_NONE {
+        if *p == AVPixelFormat::AV_PIX_FMT_D3D11 {
+            return AVPixelFormat::AV_PIX_FMT_D3D11;
+        }
+        if erstes_software == AVPixelFormat::AV_PIX_FMT_NONE {
+            let desc = av_pix_fmt_desc_get(*p);
+            if !desc.is_null() && ((*desc).flags & AV_PIX_FMT_FLAG_HWACCEL as u64) == 0 {
+                erstes_software = *p;
+            }
+        }
+        p = p.add(1);
+    }
+    erstes_software
+}
+
+/// D3D11VA-Decoder auf der Karte dieser Rolle. FFmpeg legt dafuer ein
+/// eigenes Direct3D-11-Geraet auf dem Adapter an ("device" = Index in der
+/// Aufzaehlung von DXGI, dieselbe wie bei --adapter n); die Bilder liegen
+/// danach als Texturen dieses Geraets vor und werden je Bild mit
+/// av_hwframe_transfer_data in den Hauptspeicher geholt (NV12 bzw. P010) -
+/// das ist die Kopierstufe. Null Kopien, also die Texturen direkt in die
+/// Anzeige uebernehmen, waere eine spaetere Stufe: dafuer muessten Decoder
+/// und Anzeige dasselbe Geraet teilen (AVD3D11VADeviceContext mit unserem
+/// ID3D11Device fuellen statt av_hwdevice_ctx_create).
+///
+/// D3D11VA in FFmpeg 9 kann HEVC Main und Main10 (4:2:0) sowie H.264 -
+/// kein 4:4:4 (dxva2.c kennt dafuer keinen Modus). Das prueft
+/// `decoder_bauen` vorher; hier wird nur gebaut.
+///
+/// Scheitern kann schon das Geraet (kein Videodecoder auf dem Adapter, etwa
+/// WARP) - das ist der Fehlercode von av_hwdevice_ctx_create, samt FFmpegs
+/// Worten dazu. Ob der Treiber das Profil kann, zeigt sich erst am ersten
+/// Paket, ueber `d3d11va_format`.
+fn d3d11va_decoder(h264: bool, karte: &Karte) -> Result<ffmpeg::decoder::Video, String> {
+    use ffmpeg::sys::*;
+    let id = if h264 { ffmpeg::codec::Id::H264 } else { ffmpeg::codec::Id::HEVC };
+    let name = if h264 { "H.264" } else { "HEVC" };
+    let codec = ffmpeg::decoder::find(id).ok_or_else(|| format!("kein {name}-Decoder"))?;
+    let geraet = std::ffi::CString::new(karte.index.to_string()).map_err(|e| e.to_string())?;
+    protokoll::fehler_verwerfen();
+    let mut hw: *mut AVBufferRef = std::ptr::null_mut();
+    let r = unsafe { av_hwdevice_ctx_create(&mut hw, AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, geraet.as_ptr(), std::ptr::null_mut(), 0) };
+    if r < 0 || hw.is_null() {
+        return Err(ffmpeg_grund(&format!("D3D11-Geraet auf Adapter {} ({})", karte.index, karte.name), r));
+    }
+    let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+    ctx.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
+    unsafe {
+        let c = ctx.as_mut_ptr();
+        // Der Kontext haelt seine eigene Referenz; unsere geht danach weg.
+        (*c).hw_device_ctx = av_buffer_ref(hw);
+        av_buffer_unref(&mut hw);
+        (*c).get_format = Some(d3d11va_format);
+    }
+    let mut dec = ctx.decoder();
+    dec.set_packet_time_base(ffmpeg::Rational(1, 1_000_000));
+    dec.video().map_err(|e| {
+        let worte = protokoll::fehler_abholen();
+        match worte.first() {
+            Some(w) => format!("{name}-Decoder: {w}"),
+            None => format!("{name}-Decoder: {e}"),
+        }
+    })
+}
+
+/// Die Bilder eines D3D11VA-Decoders ab `von` von der Karte in den
+/// Hauptspeicher holen (Kopierstufe): jedes Bild wird durch einen neuen
+/// Frame in NV12 bzw. P010 ersetzt, Zeitstempel und Kennzeichen bleiben.
+/// Ein Bild, das nicht auf der Karte liegt, heisst: der Treiber kann das
+/// Profil nicht, und FFmpeg hat auf der CPU weitergerechnet (siehe
+/// `d3d11va_format`) - dann ist der eingebaute Software-Decoder mit seinen
+/// Faeden die bessere Wahl, und der Aufrufer wechselt.
+fn d3d11va_holen(bilder: &mut [ffmpeg::frame::Video], von: usize) -> Result<(), String> {
+    use ffmpeg::sys::*;
+    for bild in bilder.iter_mut().skip(von) {
+        let auf_karte = unsafe { (*bild.as_ptr()).format == AVPixelFormat::AV_PIX_FMT_D3D11 as i32 };
+        if !auf_karte {
+            let worte = protokoll::fehler_abholen();
+            return Err(match worte.first() {
+                Some(w) => format!("der Treiber kann das Profil nicht ({w})"),
+                None => format!("der Treiber kann das Profil nicht (Bild kommt als {:?})", bild.format()),
+            });
+        }
+        let mut ziel = ffmpeg::frame::Video::empty();
+        let r = unsafe { av_hwframe_transfer_data(ziel.as_mut_ptr(), bild.as_ptr(), 0) };
+        if r < 0 {
+            return Err(ffmpeg_grund("Bild von der Karte holen (av_hwframe_transfer_data)", r));
+        }
+        unsafe {
+            av_frame_copy_props(ziel.as_mut_ptr(), bild.as_ptr());
+        }
+        *bild = ziel;
+    }
+    Ok(())
+}
+
 /// Den Hardware-Decoder durch Software ersetzen und den Grund festhalten.
 /// Was FFmpeg dazu gesagt hat, steht im Protokoll direkt davor; in den
 /// Grund kommt es nicht, der muss in eine Zeile der Statistik passen.
-fn auf_software(h264: bool, grund: String) -> Result<DecoderBau, String> {
+fn auf_software(bedarf: DecoderBedarf, grund: String) -> Result<DecoderBau, String> {
     protokoll::fehler_verwerfen();
-    let d = software_decoder(h264)?;
-    Ok(DecoderBau::neu(d, DecoderPfad::Software, if h264 { "h264" } else { "hevc" }, Some(grund)))
+    let d = software_decoder(bedarf.h264)?;
+    let mut bau = DecoderBau::neu(d, DecoderPfad::Software, if bedarf.h264 { "h264" } else { "hevc" }, Some(grund));
+    bau.chroma444 = bedarf.chroma444;
+    Ok(bau)
 }
 
 /// Ein decodiertes Bild fuer das Protokoll beschreiben: Groesse und Format,
@@ -858,33 +1069,167 @@ fn bild_beschreiben(codec: &str, bild: &ffmpeg::frame::Video) -> String {
     )
 }
 
+/// Was zum Bau eines Decoders ausser dem Wunsch noch zaehlt: der Codec, ob
+/// der Strom 4:4:4 ist (None: noch nicht bekannt), und der Adapter, auf dem
+/// die Anzeige laeuft (None: Software, WARP oder ohne Fenster).
+#[derive(Clone, Copy)]
+struct DecoderBedarf {
+    h264: bool,
+    chroma444: Option<bool>,
+    anzeige_adapter: Option<u32>,
+}
+
+/// D3D11VA auf dieser Karte versuchen - oder gleich Software, wenn der
+/// Strom 4:4:4 ist. Ergebnis: der fertige Bau, oder der Grund, warum nicht.
+fn d3d11va_bau(bedarf: DecoderBedarf, karte: &Karte) -> Result<DecoderBau, String> {
+    let sw_name = if bedarf.h264 { "h264" } else { "hevc" };
+    let pfad = DecoderPfad::D3d11va(karte.rolle);
+    if bedarf.chroma444 == Some(true) {
+        return Err(format!("{} kann kein 4:4:4", pfad.name()));
+    }
+    match d3d11va_decoder(bedarf.h264, karte) {
+        Ok(decoder) => {
+            let mut bau = DecoderBau::neu(decoder, pfad, sw_name, None);
+            bau.chroma444 = bedarf.chroma444;
+            Ok(bau)
+        }
+        Err(e) => Err(format!("{} scheitert: {e}", pfad.name())),
+    }
+}
+
 /// Decoder fuer HEVC oder H.264 nach Wunsch bauen. Wird beim Start, bei
 /// jedem Codecwechsel und bei jedem Wechsel des Wunsches gerufen - der alte
 /// Decoder wird dann einfach fallen gelassen.
 ///
-/// Reihenfolge bei Automatik und NVIDIA: erst der cuvid-Decoder des Codecs
-/// (hevc_cuvid / h264_cuvid), scheitert der, der Software-Decoder ueber die
-/// Codec-Kennung. Bei Software gleich der. Der Unterschied zwischen Automatik
-/// und NVIDIA liegt beim Aufrufer: bei NVIDIA wird der Grund laut gemeldet.
-fn decoder_bauen(h264: bool, wunsch: einstellungen::DecoderWunsch) -> Result<DecoderBau, String> {
+/// Automatik: NVDEC ueber cuvid, wenn eine NVIDIA-Karte erkannt wurde (oder
+/// die Erkennung nichts ergab - dann wie frueher einfach probieren); sonst
+/// D3D11VA auf der Karte der Anzeige (ohne Anzeige auf der, die Automatik
+/// naehme), wenn der Strom 4:2:0 oder H.264 ist; sonst Software.
+/// Grafikkarte: NVIDIA ueber cuvid, jede andere ueber D3D11VA. Integriert:
+/// D3D11VA. Software: gleich der eingebaute Decoder. Scheitert die Karte,
+/// wird Software gebaut und der Grund festgehalten - bei ausdruecklichem
+/// Kartenwunsch zeigt `decoder_melden` ihn auch als Fehler.
+fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) -> Result<DecoderBau, String> {
     use einstellungen::DecoderWunsch as W;
+    let h264 = bedarf.h264;
     let sw_name = if h264 { "h264" } else { "hevc" };
     let hw_name = if h264 { "h264_cuvid" } else { "hevc_cuvid" };
-    let grund = match wunsch {
-        W::Software => None,
-        W::Automatik | W::Nvidia => match nvdec_decoder(h264) {
-            Ok(decoder) => {
-                return Ok(DecoderBau::neu(decoder, DecoderPfad::Nvdec, hw_name, None));
+    let karten = karten();
+    let nvdec = |grund: &mut Option<String>| -> Option<DecoderBau> {
+        match nvdec_decoder(h264) {
+            Ok(decoder) => Some(DecoderBau::neu(decoder, DecoderPfad::Nvdec, hw_name, None)),
+            Err(e) => {
+                *grund = Some(format!("NVDEC nicht verfuegbar: {e}"));
+                None
             }
-            Err(e) => Some(e),
-        },
+        }
     };
+    let mut grund: Option<String> = None;
+    let mut wegen_444 = false;
+    match wunsch {
+        W::Software => {}
+        W::Automatik => {
+            if karten.is_empty() || karten.iter().any(|k| k.nvidia()) {
+                if let Some(bau) = nvdec(&mut grund) {
+                    return Ok(bau);
+                }
+            }
+            // Die Karte der Anzeige, sonst die, die die Anzeige bei
+            // Automatik naehme.
+            let karte = bedarf
+                .anzeige_adapter
+                .and_then(|i| karten.iter().find(|k| k.index == i))
+                .or_else(|| karte_automatik(karten));
+            match karte {
+                Some(k) => match d3d11va_bau(bedarf, k) {
+                    Ok(bau) => return Ok(bau),
+                    Err(e) => {
+                        wegen_444 = bedarf.chroma444 == Some(true);
+                        grund = Some(match grund {
+                            Some(g) => format!("{g}; {e}"),
+                            None => e,
+                        });
+                    }
+                },
+                None => {
+                    if grund.is_none() {
+                        grund = Some("keine Grafikkarte erkannt".into());
+                    }
+                }
+            }
+        }
+        W::Gpu | W::Gpu2 | W::Integriert => {
+            let rolle = match wunsch {
+                W::Gpu => Rolle::Grafikkarte(1),
+                W::Gpu2 => Rolle::Grafikkarte(2),
+                _ => Rolle::Integriert,
+            };
+            match karte_mit(karten, rolle) {
+                Some(k) if k.nvidia() => {
+                    if let Some(bau) = nvdec(&mut grund) {
+                        return Ok(bau);
+                    }
+                }
+                Some(k) => match d3d11va_bau(bedarf, k) {
+                    Ok(bau) => return Ok(bau),
+                    Err(e) => {
+                        wegen_444 = bedarf.chroma444 == Some(true);
+                        grund = Some(e);
+                    }
+                },
+                None => {
+                    grund = Some(format!("D3D11VA ({}) scheitert: keine Karte mit dieser Rolle erkannt", rolle.name()));
+                }
+            }
+        }
+    }
     let decoder = software_decoder(h264)?;
-    Ok(DecoderBau::neu(decoder, DecoderPfad::Software, sw_name, grund))
+    let mut bau = DecoderBau::neu(decoder, DecoderPfad::Software, sw_name, grund);
+    bau.chroma444 = bedarf.chroma444;
+    bau.wegen_444 = wegen_444;
+    Ok(bau)
+}
+
+/// Passt der laufende Decoder zu diesem Wunsch, so dass ein Neubau nichts
+/// aendern wuerde? Ein Neubau haelt das Bild bis zum naechsten
+/// Schluesselbild an - den gibt es nur, wenn er etwas bringen kann.
+fn wunsch_passt(wunsch: einstellungen::DecoderWunsch, pfad: DecoderPfad) -> bool {
+    use einstellungen::DecoderWunsch as W;
+    match wunsch {
+        W::Software => pfad == DecoderPfad::Software,
+        W::Automatik => pfad.hardware(),
+        W::Gpu | W::Gpu2 | W::Integriert => {
+            let rolle = match wunsch {
+                W::Gpu => Rolle::Grafikkarte(1),
+                W::Gpu2 => Rolle::Grafikkarte(2),
+                _ => Rolle::Integriert,
+            };
+            match pfad {
+                DecoderPfad::Nvdec => karte_mit(karten(), rolle).map(|k| k.nvidia()).unwrap_or(false),
+                DecoderPfad::D3d11va(r) => r == rolle,
+                DecoderPfad::Software => false,
+            }
+        }
+    }
+}
+
+/// Muss der Decoder neu gebaut werden, weil die Strominfo jetzt sagt, ob
+/// der Strom 4:4:4 ist? Nur, wenn das an der Wahl etwas aendert: D3D11VA
+/// laeuft und der Strom ist 4:4:4 (geht nicht), oder Software laeuft nur
+/// wegen 4:4:4 und der Strom ist es nicht mehr.
+fn chroma_erzwingt_neubau(bau: &DecoderBau, chroma444: bool) -> bool {
+    if bau.chroma444 == Some(chroma444) {
+        return false;
+    }
+    match bau.pfad {
+        DecoderPfad::D3d11va(_) => chroma444,
+        DecoderPfad::Software => bau.wegen_444 && !chroma444,
+        DecoderPfad::Nvdec => false,
+    }
 }
 
 /// Ergebnis eines frisch gebauten Decoders in `Shared` eintragen: Pfad,
-/// Hinweis und die Protokollzeile. Bei ausdruecklichem NVIDIA-Wunsch wird
+/// Hinweis und die Protokollzeile. Bei ausdruecklichem Kartenwunsch wird
 /// ein Rueckfall zusaetzlich als Fehler gezeigt - wer die Karte verlangt,
 /// soll erfahren, dass er sie nicht bekommt.
 fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstellungen::DecoderWunsch) {
@@ -892,9 +1237,9 @@ fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstel
     let mut s = shared.lock().unwrap();
     s.decoder_pfad = Some(bau.pfad);
     s.decoder_hinweis = bau.grund.clone();
-    if wunsch == einstellungen::DecoderWunsch::Nvidia {
+    if !matches!(wunsch, einstellungen::DecoderWunsch::Automatik | einstellungen::DecoderWunsch::Software) {
         if let Some(g) = &bau.grund {
-            s.error = Some(format!("NVDEC nicht verfuegbar: {g}"));
+            s.error = Some(g.clone());
         }
     }
 }
@@ -953,11 +1298,13 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.decoder_wunsch_neu = false;
         s.decoder_wunsch
     };
-    let mut bau = decoder_bauen(false, wunsch)?;
+    // Wofuer der Decoder gebaut ist: der Host faengt mit HEVC an, ob 4:4:4,
+    // sagt erst die Strominfo - die entscheidet gleich, ob das passt (der
+    // Host kann laengst auf einem anderen Codec stehen). Der Adapter der
+    // Anzeige ist der Kandidat fuer D3D11VA bei Automatik.
+    let mut bedarf = DecoderBedarf { h264: false, chroma444: None, anzeige_adapter: shared.lock().unwrap().anzeige_adapter };
+    let mut bau = decoder_bauen(bedarf, wunsch)?;
     decoder_melden(shared, &bau, wunsch);
-    // Wofuer der Decoder gebaut ist. Die Strominfo entscheidet gleich, ob
-    // das passt - der Host kann laengst auf einem anderen Codec stehen.
-    let mut decoder_h264 = false;
     // Nach einem Wechsel darf nichts in den neuen Decoder, bevor das erste
     // Schluesselbild da ist - es traegt die Parametersaetze.
     let mut warte_auf_schluesselbild = false;
@@ -1026,12 +1373,8 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         if let Some(w) = wunsch_neu {
             if w != wunsch {
                 wunsch = w;
-                let passt = match w {
-                    einstellungen::DecoderWunsch::Software => bau.pfad == DecoderPfad::Software,
-                    _ => bau.pfad == DecoderPfad::Nvdec,
-                };
-                if !passt {
-                    bau = decoder_bauen(decoder_h264, wunsch)?;
+                if !wunsch_passt(w, bau.pfad) {
+                    bau = decoder_bauen(bedarf, wunsch)?;
                     decoder_melden(shared, &bau, wunsch);
                     warte_auf_schluesselbild = true;
                     ring.clear();
@@ -1067,11 +1410,19 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // den der Decoder gebaut wurde, muss der Decoder jetzt
                     // passen. Sonst versucht ein HEVC-Decoder, H.264 zu lesen,
                     // und es kommt nie ein Bild - so geschehen heute Morgen.
+                    // Ebenso, wenn erst jetzt feststeht, ob der Strom 4:4:4
+                    // ist, und das an der Wahl etwas aendert (D3D11VA kann
+                    // kein 4:4:4).
                     let h264 = i.codec == 2;
-                    if h264 != decoder_h264 {
-                        bau = decoder_bauen(h264, wunsch)?;
+                    let neubau = h264 != bedarf.h264 || chroma_erzwingt_neubau(&bau, i.chroma444);
+                    // Der Bedarf gilt ab jetzt auch fuer spaetere Baue (Wechsel
+                    // des Wunsches), ob jetzt neu gebaut wird oder nicht.
+                    bedarf.h264 = h264;
+                    bedarf.chroma444 = Some(i.chroma444);
+                    bau.chroma444 = Some(i.chroma444);
+                    if neubau {
+                        bau = decoder_bauen(bedarf, wunsch)?;
                         decoder_melden(shared, &bau, wunsch);
-                        decoder_h264 = h264;
                         warte_auf_schluesselbild = true;
                         nach_wechsel = true;
                         ring.clear();
@@ -1106,9 +1457,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 let Some(w) = CodecWechsel::parse(&payload) else { continue };
                 // Mit Bildparallelitaet (--faeden frame) gehen beim Wechsel bis zu
                 // 15 zurueckgehaltene Bilder verloren; sauber leeren ist eine spaetere Verfeinerung.
-                bau = decoder_bauen(w.is_h264, wunsch)?;
+                bedarf.h264 = w.is_h264;
+                bedarf.chroma444 = Some(w.chroma444);
+                bau = decoder_bauen(bedarf, wunsch)?;
                 decoder_melden(shared, &bau, wunsch);
-                decoder_h264 = w.is_h264;
                 warte_auf_schluesselbild = true;
                 nach_wechsel = true;
                 ring.clear();
@@ -1155,7 +1507,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // Startcode und Abschlussbit.
                     const AUD_HEVC: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
                     const AUD_H264: [u8; 6] = [0, 0, 0, 1, 0x09, 0xF0];
-                    let aud: &[u8] = if decoder_h264 { &AUD_H264 } else { &AUD_HEVC };
+                    let aud: &[u8] = if bedarf.h264 { &AUD_H264 } else { &AUD_HEVC };
                     let mut mit = Vec::with_capacity(payload.len() + aud.len());
                     mit.extend_from_slice(&payload);
                     mit.extend_from_slice(aud);
@@ -1191,6 +1543,18 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     bau.paket();
                     let vorher = bilder.len();
                     let fehler = decoder_fuettern(&mut bau.decoder, &packet, &mut bilder);
+                    // D3D11VA: die Bilder liegen auf der Karte und muessen
+                    // erst in den Hauptspeicher (Kopierstufe). Geht das
+                    // nicht - oder rechnet der Decoder in Wahrheit auf der
+                    // CPU, weil der Treiber das Profil nicht kann -, taugt
+                    // er so wenig wie ein cuvid, der Fehler wirft.
+                    let mut holfehler: Option<String> = None;
+                    if matches!(bau.pfad, DecoderPfad::D3d11va(_)) && bilder.len() > vorher {
+                        if let Err(e) = d3d11va_holen(&mut bilder, vorher) {
+                            bilder.truncate(vorher);
+                            holfehler = Some(format!("{} scheitert: {e}", bau.pfad.name()));
+                        }
+                    }
                     if bilder.len() > vorher {
                         bau.bild();
                         // Das erste Bild jedes Decoders einmal beschreiben -
@@ -1201,18 +1565,19 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                             protokoll::zeile(bild_beschreiben(bau.codec, &bilder[vorher]));
                         }
                     }
-                    let grund = match fehler {
-                        None => {
+                    let grund = match (fehler, holfehler) {
+                        (_, Some(h)) => h,
+                        (None, None) => {
                             bau.fehler_folge = 0;
                             if !bau.stumm() {
                                 break;
                             }
                             format!(
-                                "{} nimmt Pakete an, liefert aber kein Bild ({} Pakete, {:.1} s)",
-                                bau.codec, bau.pakete_seit_bild, bau.stumm_seit().as_secs_f32()
+                                "{} ({}) nimmt Pakete an, liefert aber kein Bild ({} Pakete, {:.1} s)",
+                                bau.pfad.name(), bau.codec, bau.pakete_seit_bild, bau.stumm_seit().as_secs_f32()
                             )
                         }
-                        Some(e) => {
+                        (Some(e), None) => {
                             if !bau.pfad.hardware() || !decoder_defekt(&e) {
                                 // Software-Decoder: ein kaputtes Paket ist ein
                                 // kaputtes Paket, das naechste kommt gleich.
@@ -1224,14 +1589,14 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                                 warte_auf_schluesselbild = true;
                                 break;
                             }
-                            format!("{} scheitert an Paket {}: {e}", bau.codec, bau.pakete)
+                            format!("{} ({}) scheitert an Paket {}: {e}", bau.pfad.name(), bau.codec, bau.pakete)
                         }
                     };
                     // Der Hardware-Decoder ist nichts wert: Software bauen
                     // und den Grund festhalten. Der Wunsch bleibt, wie er
                     // war - beim naechsten Codecwechsel wird die Karte wieder
                     // probiert, mit einem anderen Codec kann sie ja gehen.
-                    bau = auf_software(decoder_h264, grund)?;
+                    bau = auf_software(bedarf, grund)?;
                     decoder_melden(shared, &bau, wunsch);
                     ring.clear();
                     mittel = None;
@@ -1347,8 +1712,8 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // Client eingebaut werden kann.
                 if bau.pfad.hardware() && bau.format_fehler >= DECODER_FORMAT_FEHLER {
                     let format = letztes_format.map(|f| format!("{f:?}")).unwrap_or_default();
-                    let grund = format!("{} liefert das Format {format}, das der Client nicht wandeln kann", bau.codec);
-                    bau = auf_software(decoder_h264, grund)?;
+                    let grund = format!("{} ({}) liefert das Format {format}, das der Client nicht wandeln kann", bau.pfad.name(), bau.codec);
+                    bau = auf_software(bedarf, grund)?;
                     decoder_melden(shared, &bau, wunsch);
                     ring.clear();
                     mittel = None;
@@ -2683,6 +3048,12 @@ struct App {
     /// Aus --anzeige oder der Datei, und --adapter n.
     anzeige_wunsch: einstellungen::AnzeigeWunsch,
     adapter_wunsch: Option<u32>,
+    /// Die erkannten Karten (einmal beim Start), fuer die Knoepfe im Menue.
+    karten: Vec<Karte>,
+    /// Welcher Rollen-Knopf der Anzeige wirklich gilt, entschieden in
+    /// `resumed`: Automatik, wenn so gewuenscht und die Karte steht; sonst
+    /// die Rolle der Karte, die zeichnet; Cpu, wenn softbuffer zeichnet.
+    anzeige_aktiv: einstellungen::AnzeigeWunsch,
     /// Praesentation ohne Warten auf den Bildwechsel (ALLOW_TEARING). Vorerst
     /// genau dann, wenn DXGI es erlaubt; der Schalter im Menue kommt spaeter.
     sofort: bool,
@@ -2764,6 +3135,41 @@ struct App {
     bench_konfig: BenchKonfig,
 }
 
+/// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
+fn rolle_als_anzeige(r: Rolle) -> einstellungen::AnzeigeWunsch {
+    use einstellungen::AnzeigeWunsch as W;
+    match r {
+        Rolle::Grafikkarte(1) => W::Gpu,
+        Rolle::Grafikkarte(_) => W::Gpu2,
+        Rolle::Integriert => W::Integriert,
+    }
+}
+
+impl App {
+    /// Welchen Adapter `Gpu::neu` nehmen soll: --adapter n schlaegt alles;
+    /// sonst die Karte der gewuenschten Rolle. Gibt es die nicht, sagt das
+    /// Protokoll es, und die Automatik von `Gpu::neu` entscheidet (None).
+    fn adapter_index(&self) -> Option<u32> {
+        use einstellungen::AnzeigeWunsch as W;
+        if self.adapter_wunsch.is_some() {
+            return self.adapter_wunsch;
+        }
+        let rolle = match self.anzeige_wunsch {
+            W::Gpu => Rolle::Grafikkarte(1),
+            W::Gpu2 => Rolle::Grafikkarte(2),
+            W::Integriert => Rolle::Integriert,
+            _ => return None,
+        };
+        match karte_mit(&self.karten, rolle) {
+            Some(k) => Some(k.index),
+            None => {
+                protokoll::zeile(format!("Anzeige: keine Karte mit der Rolle {} erkannt - Automatik", rolle.name()));
+                None
+            }
+        }
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         // Vollbild ist die Voreinstellung; F11 schaltet um und merkt sich das.
@@ -2780,26 +3186,40 @@ impl ApplicationHandler for App {
         // softbuffer. Nie beides am selben Fenster: erst wenn feststeht, dass
         // keine Swapchain daran haengt, kommt GDI.
         self.anzeige = Anzeige::Keine;
+        self.anzeige_aktiv = einstellungen::AnzeigeWunsch::Cpu;
         #[cfg(windows)]
         {
             use einstellungen::AnzeigeWunsch as W;
             if self.anzeige_wunsch != W::Cpu {
                 let s = window.inner_size();
+                let adapter = self.adapter_index();
                 let bau = fenster_hwnd(&window)
                     .ok_or_else(|| "kein Win32-Fenster".to_string())
-                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, self.adapter_wunsch));
+                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, adapter));
                 match bau {
                     Ok(g) => {
                         self.anzeige_name = format!("D3D11 · {}", g.adapter.name);
                         self.sofort = g.tearing;
+                        // Welche Rolle zeichnet - fuer den hervorgehobenen
+                        // Knopf und als Kandidat fuer D3D11VA.
+                        let karte = self.karten.iter().find(|k| k.luid == g.adapter.luid);
+                        self.anzeige_aktiv = match (self.anzeige_wunsch, karte) {
+                            (W::Automatik, Some(_)) => W::Automatik,
+                            (_, Some(k)) => rolle_als_anzeige(k.rolle),
+                            (W::Warp, None) => W::Warp,
+                            (_, None) => W::Automatik,
+                        };
                         // Ab jetzt legt der Empfangsfaden rohe Bilder ab; die
                         // Umrechnung nach RGB macht Stufe 1 auf der Karte.
-                        self.shared.lock().unwrap().gpu_pfad = true;
+                        let mut sh = self.shared.lock().unwrap();
+                        sh.gpu_pfad = true;
+                        sh.anzeige_adapter = karte.map(|k| k.index);
+                        drop(sh);
                         self.anzeige = Anzeige::Gpu(g);
                     }
                     Err(e) => {
                         protokoll::zeile(format!("Anzeige: Rueckfall auf Software: {e}"));
-                        if self.anzeige_wunsch == W::Gpu {
+                        if !matches!(self.anzeige_wunsch, W::Automatik | W::Warp) {
                             self.shared.lock().unwrap().error = Some(format!("Grafikkarte nicht nutzbar, Anzeige ueber Software: {e}"));
                         }
                     }
@@ -3718,9 +4138,10 @@ impl App {
             if let Some(w) = self.window.clone() {
                 use einstellungen::AnzeigeWunsch as W;
                 let s = w.inner_size();
+                let adapter = self.adapter_index();
                 let bau = fenster_hwnd(&w)
                     .ok_or_else(|| "kein Win32-Fenster".to_string())
-                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, self.adapter_wunsch));
+                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, adapter));
                 match bau {
                     Ok(g) => {
                         protokoll::zeile("Anzeige: Karte neu aufgebaut".into());
@@ -3941,6 +4362,10 @@ impl App {
                         wechsel,
                         decoder: decoder_wunsch,
                         decoder_aktiv,
+                        karten: self.karten.clone(),
+                        anzeige_aktiv: self.anzeige_aktiv,
+                        anzeige_gespeichert: self.cfg.anzeige,
+                        anzeige_name: self.anzeige_name.clone(),
                         bench_konfig: self.bench_konfig.clone(),
                         // Der Abzug kostet je Zeichnung ein paar Dutzend
                         // Ergebnisse - nur, wenn der Reiter offen ist.
@@ -4118,6 +4543,17 @@ impl App {
                     let mut sh = self.shared.lock().unwrap();
                     sh.decoder_wunsch = w;
                     sh.decoder_wunsch_neu = true;
+                }
+            }
+            HudAktion::Anzeige(w) => {
+                // Nur speichern: die Anzeige wird im Lauf nicht umgebaut
+                // (Swapchain und softbuffer am selben Fenster vertragen sich
+                // nicht). Das Menue zeigt "gilt ab dem naechsten Start",
+                // solange Datei und laufende Anzeige auseinanderliegen.
+                if self.cfg.anzeige != w {
+                    self.cfg.anzeige = w;
+                    self.cfg.sichern();
+                    protokoll::zeile(format!("Anzeige: {} gespeichert, gilt ab dem naechsten Start", w.schluessel()));
                 }
             }
             HudAktion::Nichts => {}
@@ -4925,6 +5361,16 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         } else {
             None
         };
+        // Vorgetaeuschte Erkennung, wie sie der Alienware-Laptop ergibt: eine
+        // NVIDIA-Karte ohne Ausgang und die integrierte von Intel mit
+        // Ausgang - so sind alle Knoepfe im Bild, und der Tooltip zeigt den
+        // Kartennamen. Die Anzeige laeuft auf der NVIDIA, gespeichert ist
+        // Integriert: die Zeile "gilt ab dem naechsten Start" ist damit
+        // ebenfalls zu sehen.
+        let karten = vec![
+            Karte { index: 0, name: "NVIDIA GeForce RTX 3080 Ti Laptop GPU".into(), vendor: 0x10de, speicher_mb: 16384, hat_ausgang: false, luid: 1, rolle: Rolle::Grafikkarte(1) },
+            Karte { index: 1, name: "Intel(R) Iris(R) Xe Graphics".into(), vendor: 0x8086, speicher_mb: 128, hat_ausgang: true, luid: 2, rolle: Rolle::Integriert },
+        ];
         let stand = HudStand {
             vollbild: true, pixelgenau: false, statistik: true, nerd: true,
             wahl: einstellungen::StatWahl::default(),
@@ -4933,14 +5379,19 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             wechsel: false,
             decoder: einstellungen::DecoderWunsch::Automatik,
             decoder_aktiv: Some(DecoderPfad::Nvdec),
+            karten,
+            anzeige_aktiv: einstellungen::AnzeigeWunsch::Gpu,
+            anzeige_gespeichert: einstellungen::AnzeigeWunsch::Integriert,
+            anzeige_name: "D3D11 · NVIDIA GeForce RTX 3080 Ti Laptop GPU".into(),
             bench_konfig: BenchKonfig::vorgabe(5, true),
             bench,
         };
         let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, "hud5" => 4, _ => 0 };
-        // "hud2tip": die Maus steht ueber dem Schalter "Vollbild", damit der
-        // Tooltip im Bild ist und sich ueber SSH pruefen laesst.
+        // "hud2tip": die Maus steht ueber dem Knopf "Grafikkarte" der
+        // Decoderzeile, damit der Tooltip samt Kartennamen im Bild ist und
+        // sich ueber SSH pruefen laesst.
         if view == "hud2tip" {
-            u.mouse = (300, 274);
+            u.mouse = (280, 498);
         }
         let _ = hud(
             &mut u, &mut c, lang, w as i32, h as i32, reiter,
@@ -5067,14 +5518,50 @@ fn main() {
         }
         protokoll::einschalten(true);
         use einstellungen::DecoderWunsch as W;
-        for (h264, codec) in [(false, "HEVC"), (true, "H.264")] {
-            for w in [W::Automatik, W::Software, W::Nvidia] {
-                match decoder_bauen(h264, w) {
-                    Ok(bau) => println!("{codec} / Wunsch {}: {}", w.schluessel(), bau.meldung()),
-                    Err(e) => println!("{codec} / Wunsch {}: Fehler: {e}", w.schluessel()),
+        // Erst die Erkennung - ihre Zeilen stehen im Protokoll.
+        let anzahl = karten().len();
+        for z in protokoll::abholen() {
+            println!("{z}");
+        }
+        println!("Karten mit Rolle: {anzahl}");
+        // Das D3D11-Geraet von FFmpeg auf jedem Adapter probieren, auch auf
+        // WARP - so sieht man auf einer Maschine ohne Karte, mit welchen
+        // Worten av_hwdevice_ctx_create scheitert.
+        #[cfg(windows)]
+        if let Ok(liste) = anzeige::adapter_liste() {
+            for (i, a) in liste.iter().enumerate() {
+                let geraet = std::ffi::CString::new(i.to_string()).unwrap();
+                protokoll::fehler_verwerfen();
+                let mut hw: *mut ffmpeg::sys::AVBufferRef = std::ptr::null_mut();
+                let r = unsafe {
+                    ffmpeg::sys::av_hwdevice_ctx_create(&mut hw, ffmpeg::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, geraet.as_ptr(), std::ptr::null_mut(), 0)
+                };
+                if r < 0 {
+                    println!("D3D11VA-Geraet auf Adapter {i} ({}): {}", a.name, ffmpeg_grund("scheitert", r));
+                } else {
+                    println!("D3D11VA-Geraet auf Adapter {i} ({}): ok", a.name);
+                    unsafe { ffmpeg::sys::av_buffer_unref(&mut hw) };
                 }
                 for z in protokoll::abholen() {
                     println!("    {z}");
+                }
+            }
+        }
+        for (h264, codec) in [(false, "HEVC"), (true, "H.264")] {
+            for chroma444 in [Some(true), Some(false)] {
+                if h264 && chroma444 == Some(true) {
+                    continue;
+                }
+                for w in [W::Automatik, W::Software, W::Gpu, W::Gpu2, W::Integriert] {
+                    let bedarf = DecoderBedarf { h264, chroma444, anzeige_adapter: None };
+                    let was = format!("{codec}{} / Wunsch {}", if chroma444 == Some(true) { " 4:4:4" } else if !h264 { " 4:2:0" } else { "" }, w.schluessel());
+                    match decoder_bauen(bedarf, w) {
+                        Ok(bau) => println!("{was}: {}", bau.meldung()),
+                        Err(e) => println!("{was}: Fehler: {e}"),
+                    }
+                    for z in protokoll::abholen() {
+                        println!("    {z}");
+                    }
                 }
             }
         }
@@ -5142,15 +5629,20 @@ fn main() {
     // Vollbild starten - das ist die Voreinstellung. Schon hier geladen,
     // weil der Empfangsfaden den Decoderwunsch vom ersten Bild an kennen soll.
     let cfg = einstellungen::Einstellungen::laden();
-    // --decoder auto|software|nvidia erzwingt fuer diesen Lauf einen Pfad,
-    // ohne die gespeicherte Wahl anzufassen.
+    // Die Karten einmal erkennen, bevor irgendein Faden sie braucht: je
+    // Adapter eine Zeile im Protokoll (Rolle, Name, Speicher, Ausgang).
+    karten();
+    // --decoder auto|software|gpu|gpu2|integriert erzwingt fuer diesen Lauf
+    // einen Pfad, ohne die gespeicherte Wahl anzufassen (dazu die deutschen
+    // und englischen Woerter und die alten Werte nvidia/nvdec/cuvid, siehe
+    // `einstellungen::rolle_wort`).
     let decoder_wunsch = std::env::args()
         .position(|a| a == "--decoder")
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|v| einstellungen::DecoderWunsch::aus(&v))
         .unwrap_or(cfg.decoder);
-    // --anzeige auto|gpu|cpu|warp ebenso fuer die Anzeige; --adapter n nimmt
-    // genau den n-ten Adapter aus der Liste im Protokoll.
+    // --anzeige auto|gpu|gpu2|integriert|cpu|warp ebenso fuer die Anzeige;
+    // --adapter n nimmt genau den n-ten Adapter aus der Liste im Protokoll.
     let anzeige_wunsch = std::env::args()
         .position(|a| a == "--anzeige")
         .and_then(|i| std::env::args().nth(i + 1))
@@ -5306,7 +5798,7 @@ fn main() {
             for m in protokoll::abholen() {
                 println!("{m}");
             }
-            let pfad = s.decoder_pfad.map(|p| p.name()).unwrap_or("-");
+            let pfad = s.decoder_pfad.map(|p| p.name()).unwrap_or_else(|| "-".into());
             // Ohne Fenster gibt es kein Glied Anzeige - das steht auch so da.
             let lat = match s.clock {
                 Some(l) if l.gesamt_ms > 0.0 => format!(
@@ -5418,6 +5910,8 @@ fn main() {
         anzeige: Anzeige::Keine,
         anzeige_wunsch,
         adapter_wunsch,
+        karten: karten().to_vec(),
+        anzeige_aktiv: einstellungen::AnzeigeWunsch::Cpu,
         sofort: false,
         bild_da: None,
         bereit_ausstehend: None,
@@ -5478,6 +5972,8 @@ pub enum HudAktion {
     Codec(u8),
     /// Anderer Decoderpfad gewuenscht.
     Decoder(einstellungen::DecoderWunsch),
+    /// Andere Anzeige gewuenscht - wird gespeichert, gilt ab dem naechsten Start.
+    Anzeige(einstellungen::AnzeigeWunsch),
     /// Benchmark: Kandidat an/aus, Datenrate an/aus, Bildrate an/aus,
     /// Dauer +/-1 s, Testbild an/aus, Start, Abbruch, Empfehlung
     /// uebernehmen (Kandidat, Mbit/s, Bilder/s).
@@ -5528,10 +6024,111 @@ pub struct HudStand {
     /// Gewuenschter Decoderpfad und der, der wirklich laeuft.
     pub decoder: einstellungen::DecoderWunsch,
     pub decoder_aktiv: Option<DecoderPfad>,
+    /// Die erkannten Karten - je Rolle ein Knopf in den Zeilen Anzeige und
+    /// Decoder; Automatik und Prozessor gibt es immer.
+    pub karten: Vec<Karte>,
+    /// Anzeige: welcher Knopf wirklich gilt (der wird hervorgehoben), was
+    /// in der Datei steht (weicht es ab: "gilt ab dem naechsten Start"),
+    /// und der Name dessen, was zeichnet.
+    pub anzeige_aktiv: einstellungen::AnzeigeWunsch,
+    pub anzeige_gespeichert: einstellungen::AnzeigeWunsch,
+    pub anzeige_name: String,
     /// Reiter "Benchmark": was der naechste Lauf probiert, und der
     /// laufende oder letzte Lauf.
     pub bench_konfig: BenchKonfig,
     pub bench: Option<BenchStand>,
+}
+
+/// Ein Rollen-Knopf im Menue - fuer Anzeige und Decoder derselbe Satz,
+/// nur die Wuensche dahinter sind verschiedene Typen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RollenWahl {
+    Automatik,
+    Gpu,
+    Gpu2,
+    Integriert,
+    Prozessor,
+}
+
+impl RollenWahl {
+    fn als_anzeige(self) -> einstellungen::AnzeigeWunsch {
+        use einstellungen::AnzeigeWunsch as W;
+        match self {
+            RollenWahl::Automatik => W::Automatik,
+            RollenWahl::Gpu => W::Gpu,
+            RollenWahl::Gpu2 => W::Gpu2,
+            RollenWahl::Integriert => W::Integriert,
+            RollenWahl::Prozessor => W::Cpu,
+        }
+    }
+
+    fn als_decoder(self) -> einstellungen::DecoderWunsch {
+        use einstellungen::DecoderWunsch as W;
+        match self {
+            RollenWahl::Automatik => W::Automatik,
+            RollenWahl::Gpu => W::Gpu,
+            RollenWahl::Gpu2 => W::Gpu2,
+            RollenWahl::Integriert => W::Integriert,
+            RollenWahl::Prozessor => W::Software,
+        }
+    }
+
+    /// WARP hat keinen Knopf: None.
+    fn von_anzeige(w: einstellungen::AnzeigeWunsch) -> Option<Self> {
+        use einstellungen::AnzeigeWunsch as W;
+        Some(match w {
+            W::Automatik => RollenWahl::Automatik,
+            W::Gpu => RollenWahl::Gpu,
+            W::Gpu2 => RollenWahl::Gpu2,
+            W::Integriert => RollenWahl::Integriert,
+            W::Cpu => RollenWahl::Prozessor,
+            W::Warp => return None,
+        })
+    }
+
+    fn von_decoder(w: einstellungen::DecoderWunsch) -> Self {
+        use einstellungen::DecoderWunsch as W;
+        match w {
+            W::Automatik => RollenWahl::Automatik,
+            W::Gpu => RollenWahl::Gpu,
+            W::Gpu2 => RollenWahl::Gpu2,
+            W::Integriert => RollenWahl::Integriert,
+            W::Software => RollenWahl::Prozessor,
+        }
+    }
+}
+
+/// Die Knoepfe einer Rollen-Zeile in ihrer Reihenfolge: Automatik, die
+/// dedizierten Karten ("Grafikkarte", bei zweien "Grafikkarte 1" und
+/// "Grafikkarte 2" - eine dritte bekommt keinen Knopf), Integriert, falls
+/// erkannt, Prozessor. Zu jedem Knopf die Karte, falls es eine gibt.
+fn rollen_knoepfe<'a>(karten: &'a [Karte], lang: &'static strings::Lang) -> Vec<(RollenWahl, String, Option<&'a Karte>)> {
+    use strings::Key::*;
+    let mut aus = vec![(RollenWahl::Automatik, lang.get(RoleAuto).to_string(), None)];
+    let dedizierte = karten.iter().filter(|k| matches!(k.rolle, Rolle::Grafikkarte(_))).count();
+    for (wahl, n) in [(RollenWahl::Gpu, 1u8), (RollenWahl::Gpu2, 2)] {
+        if let Some(k) = karte_mit(karten, Rolle::Grafikkarte(n)) {
+            let text = if dedizierte == 1 { lang.get(RoleGpu).to_string() } else { lang.get(RoleGpuN).replace("{n}", &n.to_string()) };
+            aus.push((wahl, text, Some(k)));
+        }
+    }
+    if let Some(k) = karte_mit(karten, Rolle::Integriert) {
+        aus.push((RollenWahl::Integriert, lang.get(RoleIntegrated).to_string(), Some(k)));
+    }
+    aus.push((RollenWahl::Prozessor, lang.get(RoleCpu).to_string(), None));
+    aus
+}
+
+/// Die erkannte Karte fuer den Tooltip: Name, Speicher (auf GB gerundet,
+/// unter einem GB in MB - eine integrierte hat kaum eigenen), Ausgang.
+fn karte_beschreibung(k: &Karte, lang: &'static strings::Lang) -> String {
+    use strings::Key::*;
+    let speicher = if k.speicher_mb >= 1024 {
+        format!("{} GB", (k.speicher_mb + 512) / 1024)
+    } else {
+        format!("{} MB", k.speicher_mb)
+    };
+    format!("{} · {speicher} · {}", k.name, lang.get(if k.hat_ausgang { AdapterWithOutput } else { AdapterNoOutput }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5559,6 +6156,9 @@ fn hud(
     // seinen Text; gezeichnet wird er ganz am Ende, ueber allem anderen.
     let maus = u.mouse;
     let mut tip: Option<strings::Key> = None;
+    // Ein zweiter, dynamischer Satz unter dem Text des Schluessels - die
+    // erkannte Karte auf den Rollen-Knoepfen. Nur dort gesetzt.
+    let mut tip_zusatz: Option<String> = None;
 
     let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
     let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
@@ -5789,36 +6389,106 @@ fn hud(
             zeile(u, c, ix, cy + p(34), lang.get(PixelExact), stand.pixelgenau, SCH_PIXELGENAU, &mut aktion, TipPixelExact, &mut tip);
             zeile(u, c, ix, cy + p(68), lang.get(ShowOverlay), stand.statistik, SCH_STATISTIK, &mut aktion, TipShowOverlay, &mut tip);
             zeile(u, c, ix, cy + p(102), lang.get(NerdMode), stand.nerd, SCH_NERD, &mut aktion, TipNerdMode, &mut tip);
-            // --- Decoderwahl: drei Knoepfe, der gewuenschte in Cyan. Dahinter
-            // steht, was wirklich laeuft - bei Automatik ist das die eigentliche
-            // Auskunft, und bei einem Rueckfall sieht man ihn hier sofort.
+            // --- Anzeige und Decoder: je eine Zeile Rollen-Knoepfe --------
+            // Automatik und Prozessor gibt es immer, Grafikkarte(n) und
+            // Integriert nur, wenn die Erkennung eine solche Karte fand. Der
+            // Name der Karte steht im Tooltip, nie auf dem Knopf - AMD-Namen
+            // sind ewig lang. Hervorgehoben ist, was wirklich gilt: bei der
+            // Anzeige die Karte, die zeichnet (oder Automatik, wenn so
+            // gewuenscht), beim Decoder der geltende Wunsch - dahinter steht,
+            // was wirklich laeuft, und bei einem Rueckfall sieht man ihn
+            // hier sofort. Passt eine Zeile nicht in die Spalte, fliesst sie
+            // um (zwei dedizierte Karten).
             {
-                use einstellungen::DecoderWunsch as W;
-                let oy = cy + p(150);
+                let knoepfe = rollen_knoepfe(&stand.karten, lang);
+                // Eine Zeile Knoepfe: der Knopf `aktiv` in Cyan. Liefert den
+                // geklickten Knopf und die Unterkante der Zeile.
+                let zeile_rollen = |u: &mut ui::Ui, c: &mut ui::Canvas, ky: i32, aktiv: Option<RollenWahl>,
+                                    tips: &[(strings::Key, Option<String>)],
+                                    tip: &mut Option<strings::Key>, tip_zusatz: &mut Option<String>| -> (Option<RollenWahl>, i32) {
+                    let mut kx = ix;
+                    let mut ky = ky;
+                    let mut klick = None;
+                    for (i, (wahl, text, _)) in knoepfe.iter().enumerate() {
+                        // Enger gepolstert als die Codec-Knoepfe: vier bis
+                        // fuenf muessen in die linke Spalte passen.
+                        let bw = u.text.width(text, 15, 2) + p(14);
+                        // Die rechte Spalte faengt bei ix + sp an.
+                        if kx + bw > ix + sp - p(20) && kx > ix {
+                            kx = ix;
+                            ky += p(36);
+                        }
+                        let r = ui::Rect { x: kx, y: ky, w: bw, h: p(30) };
+                        if r.hit(maus.0, maus.1) {
+                            *tip = Some(tips[i].0);
+                            *tip_zusatz = tips[i].1.clone();
+                        }
+                        let ist_aktiv = aktiv == Some(*wahl);
+                        let farbe = if ist_aktiv { ui::CYAN } else { ui::DIM };
+                        if u.button(c, r, text, farbe) && !ist_aktiv {
+                            klick = Some(*wahl);
+                        }
+                        kx += bw + p(10);
+                    }
+                    (klick, ky + p(30))
+                };
+                let beschreibung = |k: Option<&Karte>| k.map(|k| karte_beschreibung(k, lang));
+
+                // Zeile 1: die Anzeige. Was gilt, steht im Label.
+                let oy = cy + p(140);
+                let label = kuerzen(u, &format!("{} · {}", lang.get(DisplayLabel), stand.anzeige_name), sp - p(40), sz(11), p(3));
+                u.text.draw(c, ix, oy, &label, sz(11), ui::DIM, p(3));
+                let tips_anzeige: Vec<(strings::Key, Option<String>)> = knoepfe
+                    .iter()
+                    .map(|(wahl, _, karte)| match wahl {
+                        RollenWahl::Automatik => (TipDisplayAuto, beschreibung(karte_automatik(&stand.karten))),
+                        RollenWahl::Gpu | RollenWahl::Gpu2 => (TipDisplayGpu, beschreibung(*karte)),
+                        RollenWahl::Integriert => (TipDisplayIntegrated, beschreibung(*karte)),
+                        RollenWahl::Prozessor => (TipDisplayCpu, None),
+                    })
+                    .collect();
+                let (klick, unten) = zeile_rollen(u, c, oy + p(10), RollenWahl::von_anzeige(stand.anzeige_aktiv), &tips_anzeige, &mut tip, &mut tip_zusatz);
+                if let Some(w) = klick {
+                    aktion = HudAktion::Anzeige(w.als_anzeige());
+                }
+                // Steht in der Datei etwas anderes als das, was laeuft, gilt
+                // es erst beim naechsten Start - das steht dann hier.
+                if stand.anzeige_gespeichert != stand.anzeige_aktiv {
+                    let name = RollenWahl::von_anzeige(stand.anzeige_gespeichert)
+                        .and_then(|w| knoepfe.iter().find(|(k, _, _)| *k == w).map(|(_, t, _)| t.clone()))
+                        .unwrap_or_else(|| stand.anzeige_gespeichert.schluessel().to_string());
+                    u.text.draw(c, ix, unten + p(14), &format!("{name} · {}", lang.get(NextStartHint)), sz(10), ui::AMBER, p(1));
+                }
+
+                // Zeile 2: der Decoder.
+                let oy = unten + p(32);
                 let label = match stand.decoder_aktiv {
                     Some(pf) => format!("{} · {}", lang.get(DecoderLabel), pf.name()),
                     None => lang.get(DecoderLabel).to_string(),
                 };
+                let label = kuerzen(u, &label, sp - p(40), sz(11), p(3));
                 u.text.draw(c, ix, oy, &label, sz(11), ui::DIM, p(3));
-                let mut kx = ix;
-                let ky = oy + p(10);
-                for (w, k) in [(W::Automatik, DecoderAuto), (W::Software, DecoderSoftware), (W::Nvidia, DecoderNvidia)] {
-                    let name = lang.get(k);
-                    let bw = u.text.width(name, 15, 2) + p(28);
-                    // Die rechte Spalte faengt bei ix + sp an; was dort hinein
-                    // ragen wuerde, wird nicht mehr gezeichnet.
-                    if kx + bw > ix + sp - p(20) {
-                        break;
-                    }
-                    let r = ui::Rect { x: kx, y: ky, w: bw, h: p(30) };
-                    if r.hit(maus.0, maus.1) {
-                        tip = Some(match w { W::Automatik => TipDecoderAuto, W::Software => TipDecoderSoftware, W::Nvidia => TipDecoderGpu });
-                    }
-                    let farbe = if stand.decoder == w { ui::CYAN } else { ui::DIM };
-                    if u.button(c, r, name, farbe) && stand.decoder != w {
-                        aktion = HudAktion::Decoder(w);
-                    }
-                    kx += bw + p(10);
+                let tips_decoder: Vec<(strings::Key, Option<String>)> = knoepfe
+                    .iter()
+                    .map(|(wahl, _, karte)| match wahl {
+                        RollenWahl::Automatik => (TipDecoderAuto, None),
+                        RollenWahl::Gpu | RollenWahl::Gpu2 => {
+                            // Nur NVIDIA decodiert 4:4:4 (NVDEC); alle anderen
+                            // gehen ueber D3D11VA, und das kann nur 4:2:0.
+                            let z = match karte {
+                                Some(k) if k.nvidia() => Some(karte_beschreibung(k, lang)),
+                                Some(k) => Some(format!("{}\n{}", karte_beschreibung(k, lang), lang.get(TipOnly420))),
+                                None => None,
+                            };
+                            (TipDecoderGpu, z)
+                        }
+                        RollenWahl::Integriert => (TipDecoderIntegrated, beschreibung(*karte)),
+                        RollenWahl::Prozessor => (TipDecoderCpu, None),
+                    })
+                    .collect();
+                let (klick, _) = zeile_rollen(u, c, oy + p(10), Some(RollenWahl::von_decoder(stand.decoder)), &tips_decoder, &mut tip, &mut tip_zusatz);
+                if let Some(w) = klick {
+                    aktion = HudAktion::Decoder(w.als_decoder());
                 }
             }
             let w = stand.wahl;
@@ -6083,16 +6753,22 @@ fn hud(
     c.hline(ix, fy - p(24), iw, ui::DIM, 60);
     u.text.draw(c, ix, fy, &format!("ESC · {}", lang.get(Back)), sz(11), ui::DIM, p(3));
     if let Some(k) = tip {
-        tooltip(u, c, lang.get(k), maus, ww, wh, sz(11), p(1));
+        let text = match &tip_zusatz {
+            Some(z) => format!("{}\n{z}", lang.get(k)),
+            None => lang.get(k).to_string(),
+        };
+        tooltip(u, c, &text, maus, ww, wh, sz(11), p(1));
     }
     aktion
 }
 
 /// Ein Tooltip neben der Maus: sofort, ohne Wartezeit, ueber allem anderen.
 /// Rechts unterhalb des Zeigers; wo das nicht passt, links bzw. oberhalb.
+/// Ein Zeilenumbruch im Text erzwingt eine neue Zeile (der zweite Satz auf
+/// den Rollen-Knoepfen); sonst wird auf die Breite umbrochen.
 fn tooltip(u: &mut ui::Ui, c: &mut ui::Canvas, text: &str, maus: (i32, i32), ww: i32, wh: i32, size: u32, spacing: i32) {
     let innen = 360.min(ww - 40).max(120);
-    let zeilen = umbruch(u, text, innen, size);
+    let zeilen: Vec<String> = text.split('\n').flat_map(|t| umbruch(u, t, innen, size)).collect();
     let breite = zeilen.iter().map(|z| u.text.width(z, size, spacing)).max().unwrap_or(0) + 24;
     let zh = size as i32 + 5;
     let hoehe = zeilen.len() as i32 * zh + 18;

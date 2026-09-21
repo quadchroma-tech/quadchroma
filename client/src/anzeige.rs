@@ -34,7 +34,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::{ebenen_format, protokoll, ui, EbenenFormat, Frame};
+use crate::{ebenen_format, protokoll, ui, EbenenFormat, Frame, Karte, Rolle};
 
 /// Ein Adapter, wie er im Protokoll und in der Statistik steht.
 pub struct AdapterInfo {
@@ -45,6 +45,11 @@ pub struct AdapterInfo {
     /// Haengt ein Bildschirm daran? Auf Optimus-Laptops ohne MUX hat nur
     /// die iGPU einen Ausgang.
     pub hat_ausgang: bool,
+    /// Kennung des Adapters (AdapterLuid), mit der sich das Geraet der
+    /// Anzeige einer erkannten Karte zuordnen laesst.
+    pub luid: i64,
+    /// Eigener Videospeicher (DedicatedVideoMemory) in MB.
+    pub speicher_mb: u64,
 }
 
 /// Textur mit Lesesicht: Eingangsebenen und die Oberflaeche.
@@ -250,7 +255,103 @@ fn adapter_info(a: &IDXGIAdapter1) -> Result<AdapterInfo, windows::core::Error> 
     // (aeltere WARP-Faelle tragen das Kennzeichen nicht).
     let software = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 || d.VendorId == 0x1414;
     let hat_ausgang = unsafe { a.EnumOutputs(0) }.is_ok();
-    Ok(AdapterInfo { name, vendor: d.VendorId, software, hat_ausgang })
+    let luid = ((d.AdapterLuid.HighPart as i64) << 32) | d.AdapterLuid.LowPart as i64;
+    Ok(AdapterInfo {
+        name,
+        vendor: d.VendorId,
+        software,
+        hat_ausgang,
+        luid,
+        speicher_mb: (d.DedicatedVideoMemory as u64) >> 20,
+    })
+}
+
+/// Hat dieser Adapter gemeinsamen Speicher mit dem Prozessor (Unified
+/// Memory Architecture)? Das ist das Kennzeichen einer integrierten Grafik.
+/// Gefragt wird ein kurz erzeugtes Geraet ohne Fenster nach
+/// D3D11_FEATURE_D3D11_OPTIONS2; das Geraet ist danach wieder weg. None,
+/// wenn sich kein Geraet bauen laesst oder die Abfrage fehlt (Windows vor
+/// 10) - dann greift die Ersatzregel des Aufrufers.
+fn unified_memory(a: &IDXGIAdapter1) -> Option<bool> {
+    let (device, _ctx, _fl) = geraet_bauen(Some(a), false, false).ok()?;
+    let mut opt = D3D11_FEATURE_DATA_D3D11_OPTIONS2::default();
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D11_FEATURE_D3D11_OPTIONS2,
+            &mut opt as *mut D3D11_FEATURE_DATA_D3D11_OPTIONS2 as *mut c_void,
+            std::mem::size_of::<D3D11_FEATURE_DATA_D3D11_OPTIONS2>() as u32,
+        )
+    }
+    .ok()?;
+    Some(opt.UnifiedMemoryArchitecture.as_bool())
+}
+
+/// Die Karten des Rechners mit ihrer Rolle im Menue: "Integriert" ist der
+/// Adapter mit gemeinsamem Speicher (Ersatzregel, wenn die Abfrage nicht
+/// geht: Intel als Hersteller oder weniger als 512 MB eigener Speicher),
+/// "Grafikkarte" jeder andere Hardware-Adapter, in der Reihenfolge, in der
+/// DXGI sie zaehlt. Software-Adapter (WARP) zaehlen nicht mit - auf einer
+/// Maschine ohne Karte ist die Liste leer. Laeuft einmal beim Start und
+/// schreibt je Adapter eine Zeile ins Protokoll.
+pub fn karten_erkennen() -> Vec<Karte> {
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(f) => f,
+        Err(e) => {
+            protokoll::zeile(fehler("Erkennung der Karten: CreateDXGIFactory1", e));
+            return Vec::new();
+        }
+    };
+    let alle = match adapter_objekte(&factory) {
+        Ok(a) => a,
+        Err(e) => {
+            protokoll::zeile(format!("Erkennung der Karten: {e}"));
+            return Vec::new();
+        }
+    };
+    let mut karten = Vec::new();
+    let mut dediziert = 0u8;
+    let mut integriert_da = false;
+    for (i, (adapter, info)) in alle.iter().enumerate() {
+        if info.software {
+            protokoll::zeile(format!("Karte {i}: {} - Software, keine Rolle", info.name));
+            continue;
+        }
+        let uma = unified_memory(adapter);
+        let ist_integriert = match uma {
+            Some(u) => u,
+            None => info.vendor == 0x8086 || info.speicher_mb < 512,
+        };
+        // Eine zweite integrierte gibt es nicht; kaeme doch eine, waere sie
+        // eine Grafikkarte ohne eigenen Speicher - besser als gar kein Knopf.
+        let rolle = if ist_integriert && !integriert_da {
+            integriert_da = true;
+            Rolle::Integriert
+        } else {
+            dediziert += 1;
+            Rolle::Grafikkarte(dediziert)
+        };
+        protokoll::zeile(format!(
+            "Karte {i}: {} - {}, {} MB, Ausgang {}, UMA {}",
+            info.name,
+            rolle.name(),
+            info.speicher_mb,
+            if info.hat_ausgang { "ja" } else { "nein" },
+            match uma { Some(true) => "ja", Some(false) => "nein", None => "unbekannt (Ersatzregel)" }
+        ));
+        karten.push(Karte {
+            index: i as u32,
+            name: info.name.clone(),
+            vendor: info.vendor,
+            speicher_mb: info.speicher_mb,
+            hat_ausgang: info.hat_ausgang,
+            luid: info.luid,
+            rolle,
+        });
+    }
+    if karten.is_empty() {
+        protokoll::zeile("Karten: kein Hardware-Adapter gefunden".into());
+    }
+    karten
 }
 
 /// Alle Adapter einer Factory, samt Objekt (fuer D3D11CreateDevice).
@@ -1092,7 +1193,7 @@ fn adapter_des_geraets(device: &ID3D11Device) -> AdapterInfo {
         let a: IDXGIAdapter1 = unsafe { d.GetAdapter()? }.cast()?;
         adapter_info(&a)
     })();
-    info.unwrap_or_else(|_| AdapterInfo { name: "unbekannt".into(), vendor: 0, software: false, hat_ausgang: false })
+    info.unwrap_or_else(|_| AdapterInfo { name: "unbekannt".into(), vendor: 0, software: false, hat_ausgang: false, luid: 0, speicher_mb: 0 })
 }
 
 // ------------------------------------------------------------ --anzeigetest

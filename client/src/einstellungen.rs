@@ -41,16 +41,22 @@ impl Default for StatWahl {
     }
 }
 
-/// Welcher Decoder gewuenscht ist. Automatik nimmt NVDEC (ueber die
-/// cuvid-Decoder von FFmpeg), wenn eine NVIDIA-Karte da ist, und faellt sonst
-/// auf Software zurueck. Software erzwingt die CPU, NVIDIA verlangt die
-/// Karte und sagt laut Bescheid, wenn sie doch nicht geht.
+/// Welcher Decoder gewuenscht ist. Die Rollen sind dieselben wie bei der
+/// Anzeige: Gpu und Gpu2 sind die dedizierten Karten in der Reihenfolge, in
+/// der DXGI sie zaehlt, Integriert die mit gemeinsamem Speicher (siehe
+/// `anzeige::karten_erkennen`). Automatik nimmt NVDEC (ueber die cuvid-
+/// Decoder von FFmpeg), wenn eine NVIDIA-Karte da ist, sonst D3D11VA auf
+/// dem Adapter der Anzeige (nur 4:2:0 und H.264), sonst Software. Software
+/// erzwingt die CPU; eine Rolle verlangt genau diese Karte und sagt laut
+/// Bescheid, wenn sie doch nicht geht.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DecoderWunsch {
     #[default]
     Automatik,
     Software,
-    Nvidia,
+    Gpu,
+    Gpu2,
+    Integriert,
 }
 
 impl DecoderWunsch {
@@ -59,35 +65,42 @@ impl DecoderWunsch {
         match self {
             DecoderWunsch::Automatik => "auto",
             DecoderWunsch::Software => "software",
-            DecoderWunsch::Nvidia => "nvidia",
+            DecoderWunsch::Gpu => "gpu",
+            DecoderWunsch::Gpu2 => "gpu2",
+            DecoderWunsch::Integriert => "integriert",
         }
     }
 
     /// Umkehrung von `schluessel`. Unbekanntes ergibt None, damit der
-    /// Aufrufer bei der Voreinstellung bleibt.
+    /// Aufrufer bei der Voreinstellung bleibt. Die alten Werte nvidia, nvdec
+    /// und cuvid bleiben lesbar und meinen die (erste) Grafikkarte.
     pub fn aus(text: &str) -> Option<Self> {
-        Some(match text.trim().to_ascii_lowercase().as_str() {
-            "auto" | "automatik" | "automatic" => DecoderWunsch::Automatik,
-            "software" | "cpu" => DecoderWunsch::Software,
-            // Im Menue heisst der Knopf "Grafikkarte" - hinter ihm steht heute
-            // NVDEC, spaeter auch D3D11VA fuer AMD und Intel (4:2:0).
-            "gpu" | "grafikkarte" | "nvidia" | "nvdec" | "cuvid" => DecoderWunsch::Nvidia,
-            _ => return None,
+        Some(match rolle_wort(text) {
+            Some(RollenWort::Automatik) => DecoderWunsch::Automatik,
+            Some(RollenWort::Prozessor) => DecoderWunsch::Software,
+            Some(RollenWort::Gpu) => DecoderWunsch::Gpu,
+            Some(RollenWort::Gpu2) => DecoderWunsch::Gpu2,
+            Some(RollenWort::Integriert) => DecoderWunsch::Integriert,
+            Some(RollenWort::Warp) | None => return None,
         })
     }
 }
 
-/// Wer ins Fenster zeichnet. Automatik nimmt die Grafikkarte (Direct3D 11
-/// auf einem Hardware-Adapter), wenn eine da ist, und faellt sonst auf die
-/// CPU (softbuffer) zurueck. Cpu erzwingt den alten Weg, Gpu verlangt die
-/// Karte und sagt laut Bescheid, wenn sie doch nicht geht; Warp ist der
+/// Wer ins Fenster zeichnet. Automatik nimmt Direct3D 11 auf dem ersten
+/// Hardware-Adapter mit Bildschirmausgang (ohne einen solchen: der erste
+/// von NVIDIA, sonst der erste ueberhaupt) und faellt ohne Karte auf die
+/// CPU (softbuffer) zurueck. Gpu, Gpu2 und Integriert nehmen genau diese
+/// Rolle aus der Erkennung; Cpu erzwingt den alten Weg; Warp ist der
 /// Software-Rasterizer von Windows - nur zum Pruefen auf Maschinen ohne
-/// Karte. Gilt ab dem naechsten Start; im Lauf wird nicht umgeschaltet.
+/// Karte, nur auf der Befehlszeile. Gilt ab dem naechsten Start; im Lauf
+/// wird nicht umgeschaltet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AnzeigeWunsch {
     #[default]
     Automatik,
     Gpu,
+    Gpu2,
+    Integriert,
     Cpu,
     Warp,
 }
@@ -98,6 +111,8 @@ impl AnzeigeWunsch {
         match self {
             AnzeigeWunsch::Automatik => "auto",
             AnzeigeWunsch::Gpu => "gpu",
+            AnzeigeWunsch::Gpu2 => "gpu2",
+            AnzeigeWunsch::Integriert => "integriert",
             AnzeigeWunsch::Cpu => "cpu",
             AnzeigeWunsch::Warp => "warp",
         }
@@ -106,14 +121,40 @@ impl AnzeigeWunsch {
     /// Umkehrung von `schluessel`. Unbekanntes ergibt None, damit der
     /// Aufrufer bei der Voreinstellung bleibt.
     pub fn aus(text: &str) -> Option<Self> {
-        Some(match text.trim().to_ascii_lowercase().as_str() {
-            "auto" | "automatik" | "automatic" => AnzeigeWunsch::Automatik,
-            "gpu" | "grafikkarte" | "karte" | "d3d11" => AnzeigeWunsch::Gpu,
-            "cpu" | "software" | "prozessor" => AnzeigeWunsch::Cpu,
-            "warp" => AnzeigeWunsch::Warp,
-            _ => return None,
+        Some(match rolle_wort(text)? {
+            RollenWort::Automatik => AnzeigeWunsch::Automatik,
+            RollenWort::Gpu => AnzeigeWunsch::Gpu,
+            RollenWort::Gpu2 => AnzeigeWunsch::Gpu2,
+            RollenWort::Integriert => AnzeigeWunsch::Integriert,
+            RollenWort::Prozessor => AnzeigeWunsch::Cpu,
+            RollenWort::Warp => AnzeigeWunsch::Warp,
         })
     }
+}
+
+/// Die Woerter, die --decoder und --anzeige (und die Datei) gemeinsam
+/// verstehen - deutsch, englisch und die Schreibweisen von frueher.
+enum RollenWort {
+    Automatik,
+    Prozessor,
+    Gpu,
+    Gpu2,
+    Integriert,
+    Warp,
+}
+
+fn rolle_wort(text: &str) -> Option<RollenWort> {
+    Some(match text.trim().to_ascii_lowercase().as_str() {
+        "auto" | "automatik" | "automatic" => RollenWort::Automatik,
+        "cpu" | "software" | "prozessor" | "processor" => RollenWort::Prozessor,
+        // "gpu" hiess bei der Anzeige schon immer die Karte; beim Decoder
+        // stand bis 2026-09 "nvidia" in der Datei.
+        "gpu" | "gpu1" | "grafikkarte" | "grafikkarte1" | "karte" | "d3d11" | "nvidia" | "nvdec" | "cuvid" => RollenWort::Gpu,
+        "gpu2" | "grafikkarte2" => RollenWort::Gpu2,
+        "integriert" | "integrated" | "igpu" | "intel" => RollenWort::Integriert,
+        "warp" => RollenWort::Warp,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -125,9 +166,9 @@ pub struct Einstellungen {
     /// Erweiterte Statistik. Muss eigens eingeschaltet werden.
     pub nerd: bool,
     pub stats: StatWahl,
-    /// Gewuenschter Decoderpfad (Datei: decoder=auto|software|nvidia).
+    /// Gewuenschter Decoderpfad (Datei: decoder=auto|software|gpu|gpu2|integriert).
     pub decoder: DecoderWunsch,
-    /// Gewuenschte Anzeige (Datei: anzeige=auto|gpu|cpu|warp).
+    /// Gewuenschte Anzeige (Datei: anzeige=auto|gpu|gpu2|integriert|cpu|warp).
     pub anzeige: AnzeigeWunsch,
     /// Fingerabdruck des Hosts -> seine Werte.
     pub hosts: HashMap<String, HostWerte>,
