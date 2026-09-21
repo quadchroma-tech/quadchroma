@@ -357,6 +357,10 @@ static int zeiger_aktiv(void) {
     return atomic_load(&g_client_fd) >= 0;
 }
 
+static void zeiger_log(const char *text) {
+    logf_(@"%s", text);
+}
+
 // Eckdaten des Stroms, immer aus dem AKTUELLEN Codec abgeleitet.
 static void strominfo_fuellen(uint8_t p[8]) {
     int idx = atomic_load(&g_codec_id);
@@ -1986,7 +1990,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     if (srvIdx != NSNotFound) {
         // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
         qc_clip_start(clip_cb);
-        qc_zeiger_start(zeiger_cb, zeiger_aktiv);
+        qc_zeiger_start(zeiger_cb, zeiger_aktiv, zeiger_log);
         logf_(@"Zeigerform: Abfrage alle 50 ms, nur mit Zuschauer");
     } else {
         // Aufnahme in eine Datei: sofort loslegen.

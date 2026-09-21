@@ -11,14 +11,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// UNGEPRUEFT und wichtig: die Abfrage steht auf [NSCursor currentSystemCursor],
+// und Apples Kopfdatei (SDK macOS 27) sagt dazu: "This property will always be
+// `nil` in a future version of macOS." Einen oeffentlichen Ersatz gibt es nach
+// heutigem Wissen nicht (ScreenCaptureKit kennt nur showsCursor, NSCursor.
+// currentCursor sieht nur die eigene Anwendung). Faellt die Abfrage aus, steht
+// es im Protokoll, und der Client zeigt seinen eigenen Pfeil - nichts bricht.
+
 /// Rueckruf: Groesse in Bildpunkten, Hotspot (von links oben), sichtbar,
-/// RGBA mit gerader (nicht vormultiplizierter) Deckkraft, w*h*4 Byte.
+/// RGBA mit gerader (nicht vormultiplizierter) Deckkraft, w*h*4 Byte. Wird
+/// NICHT auf dem Hauptfaden gerufen.
 typedef void (*qc_zeiger_cb)(uint16_t w, uint16_t h, uint16_t hx, uint16_t hy,
                              int sichtbar, const uint8_t *rgba);
+/// Eine Zeile fuer das Protokoll des Hosts.
+typedef void (*qc_zeiger_log)(const char *text);
 
 /// Abfrage starten: alle 50 ms auf der Hauptwarteschlange. `aktiv` sagt, ob
 /// gerade jemand zuschaut - sonst wird nichts abgefragt und nichts gerechnet.
-void qc_zeiger_start(qc_zeiger_cb cb, int (*aktiv)(void));
+void qc_zeiger_start(qc_zeiger_cb cb, int (*aktiv)(void), qc_zeiger_log log);
 
 /// Beim naechsten Durchlauf die Form auf jeden Fall schicken - ein neuer
 /// Zuschauer kennt sie noch nicht.
