@@ -109,6 +109,11 @@ Der Spielmodus zieht die Zuegel straffer: haeufigere Vollbilder und ein
 kleinerer erlaubter Rueckstau, damit bei Bewegung nichts auflaeuft. Er kostet
 etwas Bandbreite und bringt dafuer gleichmaessigere Bilder.
 
+Der Schalter "Ton" im selben Reiter schaltet die Tonuebertragung ab: der Host
+schickt dann keine Tonpakete mehr (rund 3 Mbit/s weniger), der Client spielt
+nichts ab. Die Stellung wird je Host gespeichert. Im Pruefmodus ist es der
+fuenfte Wert von --set (--set 50,120,0,1,0 = Ton aus).
+
 Zur Bitrate: der Wert ist eine Obergrenze, und der Encoder nutzt sie auch aus.
 150 Mbit/s bedeuten bei bewegtem Bild tatsaechlich 150 Mbit/s. Fuer das eigene
 Netz ist das in Ordnung, sonst lieber 25 bis 50 einstellen.
