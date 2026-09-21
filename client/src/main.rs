@@ -317,6 +317,21 @@ struct Shared {
     /// mit dem ersten Bild aus dem neuen Decoder. Solange steht das Bild
     /// still, und der Hinweis erklaert, warum.
     codec_wechsel: Option<Instant>,
+    /// Gewuenschter Decoderpfad (Menue, Datei oder --decoder).
+    decoder_wunsch: einstellungen::DecoderWunsch,
+    /// Der Wunsch hat sich geaendert: der Empfangsfaden baut den Decoder
+    /// beim naechsten Durchlauf neu, ohne die Verbindung zu trennen.
+    decoder_wunsch_neu: bool,
+    /// Welchen Weg der laufende Decoder wirklich nimmt. None = noch keiner.
+    decoder_pfad: Option<DecoderPfad>,
+    /// Warum NVDEC nicht laeuft, obwohl er gewuenscht war - fuer Anzeige
+    /// und Protokoll. None, wenn er laeuft oder gar nicht gewuenscht war.
+    decoder_hinweis: Option<String>,
+    /// Eine Protokollzeile je Decoderbau, in Reihenfolge. Der Pruefmodus
+    /// holt sie alle drei Sekunden ab und druckt jede genau einmal - auch
+    /// zwei Bauten in einem Takt (Sitzungsstart und gleich darauf der Wechsel
+    /// auf H.264 aus der Strominfo) gehen so nicht verloren.
+    decoder_meldung: Vec<String>,
 }
 
 impl Shared {
@@ -366,9 +381,68 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
 
 use ffmpeg_next as ffmpeg;
 
-/// Decoder fuer HEVC oder H.264 bauen, mit der Fadenkonfiguration der
-/// Sitzung. Wird beim Start und bei jedem Codecwechsel gerufen - der alte
-/// Decoder wird dann einfach fallen gelassen.
+/// Welchen Weg der Decoder tatsaechlich nimmt. Das ist das Ergebnis der
+/// Wahl, nicht der Wunsch: bei Automatik kann beides herauskommen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecoderPfad {
+    /// NVIDIA-Karte ueber die cuvid-Decoder von FFmpeg (hevc_cuvid, h264_cuvid).
+    Nvdec,
+    /// Der eingebaute Software-Decoder von FFmpeg auf der CPU.
+    Software,
+}
+
+impl DecoderPfad {
+    pub fn name(self) -> &'static str {
+        match self {
+            DecoderPfad::Nvdec => "NVDEC",
+            DecoderPfad::Software => "Software",
+        }
+    }
+
+    pub fn hardware(self) -> bool {
+        self == DecoderPfad::Nvdec
+    }
+}
+
+/// Ergebnis von `decoder_bauen`: der Decoder und alles, was man ueber ihn
+/// wissen will, um es anzuzeigen und ins Protokoll zu schreiben.
+struct DecoderBau {
+    decoder: ffmpeg::decoder::Video,
+    pfad: DecoderPfad,
+    /// FFmpeg-Name des Decoders, etwa "hevc_cuvid" oder "hevc".
+    codec: &'static str,
+    /// Warum es nicht NVDEC wurde, obwohl er gewuenscht war. None, wenn er
+    /// laeuft oder Software ausdruecklich gewuenscht war.
+    grund: Option<String>,
+    /// Wie viele Pakete dieser Decoder schon bekommen hat. Steht im Grund,
+    /// wenn er scheitert: "an Paket 1" heisst, er konnte den Strom nie lesen.
+    pakete: u32,
+    /// Hat er schon ein Bild geliefert? Ein Fehler davor heisst: die Karte
+    /// kann das Profil nicht, oder der Treiber streikt - der Decoder taugt
+    /// nicht. Ein Fehler danach ist erst einmal nur ein Aussetzer.
+    hat_bild: bool,
+    /// Fehler in Folge, ohne ein gutes Paket dazwischen. Einer ist ein
+    /// Aussetzer (etwa cuvids Bildwarteschlange gerade voll), drei ein Defekt.
+    fehler_folge: u8,
+}
+
+impl DecoderBau {
+    /// Frisch gebaut: noch kein Paket gesehen, kein Bild, kein Fehler.
+    fn neu(decoder: ffmpeg::decoder::Video, pfad: DecoderPfad, codec: &'static str, grund: Option<String>) -> Self {
+        DecoderBau { decoder, pfad, codec, grund, pakete: 0, hat_bild: false, fehler_folge: 0 }
+    }
+
+    /// Eine Zeile fuer das Protokoll.
+    fn meldung(&self) -> String {
+        match &self.grund {
+            None => format!("Decoder: {} ({})", self.pfad.name(), self.codec),
+            Some(g) => format!("Decoder: {} ({}) - NVDEC nicht verfuegbar: {g}", self.pfad.name(), self.codec),
+        }
+    }
+}
+
+/// Software-Decoder fuer HEVC oder H.264, mit der Fadenkonfiguration der
+/// Sitzung.
 ///
 /// Auf Durchsatz trimmen: mehrere Bilder gleichzeitig decodieren. Ohne das
 /// laeuft alles auf einem Kern und kostet rund 8 ms je Bild.
@@ -378,7 +452,7 @@ use ffmpeg_next as ffmpeg;
 /// Verzoegerung, die niemand sieht, weil die reine Rechenzeit klein bleibt.
 /// Fuer eine Fernsteuerung ist das der falsche Handel, deshalb ist
 /// Scheibenparallelitaet die Voreinstellung.
-fn decoder_bauen(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
+fn software_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
     let id = if h264 { ffmpeg::codec::Id::H264 } else { ffmpeg::codec::Id::HEVC };
     let name = if h264 { "H.264" } else { "HEVC" };
     let codec = ffmpeg::decoder::find(id).ok_or_else(|| format!("kein {name}-Decoder"))?;
@@ -390,6 +464,75 @@ fn decoder_bauen(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
     };
     ctx.set_threading(ffmpeg::threading::Config { kind: art, count: threads });
     ctx.decoder().video().map_err(|e| format!("Decoder ({name}): {e}"))
+}
+
+/// NVDEC-Decoder ueber cuvid. Ohne NVIDIA-Karte (oder ohne deren Treiber)
+/// scheitert schon das Oeffnen: cuvid legt dabei sein CUDA-Geraet an. Auf
+/// einer Karte, die das Profil nicht kann (etwa 4:4:4 auf einer alten),
+/// geht das Oeffnen durch, und erst das erste Paket mit den Parametersaetzen
+/// meldet den Fehler - den faengt die Empfangsschleife.
+///
+/// LOW_DELAY: cuvid haelt sonst bis zu vier Bilder in seiner Anzeigewarte-
+/// schlange zurueck. Fuer eine Fernsteuerung ist jedes davon verlorene Zeit.
+fn nvdec_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
+    let name = if h264 { "h264_cuvid" } else { "hevc_cuvid" };
+    let codec = ffmpeg::decoder::find_by_name(name)
+        .ok_or_else(|| format!("{name} fehlt in dieser FFmpeg-Fassung"))?;
+    let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+    ctx.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
+    ctx.decoder().video().map_err(|e| format!("{name}: {e}"))
+}
+
+/// Decoder fuer HEVC oder H.264 nach Wunsch bauen. Wird beim Start, bei
+/// jedem Codecwechsel und bei jedem Wechsel des Wunsches gerufen - der alte
+/// Decoder wird dann einfach fallen gelassen.
+///
+/// Reihenfolge bei Automatik und NVIDIA: erst der cuvid-Decoder des Codecs
+/// (hevc_cuvid / h264_cuvid), scheitert der, der Software-Decoder ueber die
+/// Codec-Kennung. Bei Software gleich der. Der Unterschied zwischen Automatik
+/// und NVIDIA liegt beim Aufrufer: bei NVIDIA wird der Grund laut gemeldet.
+fn decoder_bauen(h264: bool, wunsch: einstellungen::DecoderWunsch) -> Result<DecoderBau, String> {
+    use einstellungen::DecoderWunsch as W;
+    let sw_name = if h264 { "h264" } else { "hevc" };
+    let hw_name = if h264 { "h264_cuvid" } else { "hevc_cuvid" };
+    let grund = match wunsch {
+        W::Software => None,
+        W::Automatik | W::Nvidia => match nvdec_decoder(h264) {
+            Ok(decoder) => {
+                return Ok(DecoderBau::neu(decoder, DecoderPfad::Nvdec, hw_name, None));
+            }
+            Err(e) => Some(e),
+        },
+    };
+    let decoder = software_decoder(h264)?;
+    Ok(DecoderBau::neu(decoder, DecoderPfad::Software, sw_name, grund))
+}
+
+/// Ergebnis eines frisch gebauten Decoders in `Shared` eintragen: Pfad,
+/// Hinweis und die Protokollzeile. Bei ausdruecklichem NVIDIA-Wunsch wird
+/// ein Rueckfall zusaetzlich als Fehler gezeigt - wer die Karte verlangt,
+/// soll erfahren, dass er sie nicht bekommt.
+fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstellungen::DecoderWunsch) {
+    let mut s = shared.lock().unwrap();
+    s.decoder_pfad = Some(bau.pfad);
+    s.decoder_hinweis = bau.grund.clone();
+    s.decoder_meldung.push(bau.meldung());
+    // Im Fenstermodus holt die Zeilen niemand ab; damit sie dort nicht
+    // ueber Stunden anwachsen, bleiben nur die letzten stehen.
+    if s.decoder_meldung.len() > 32 {
+        s.decoder_meldung.remove(0);
+    }
+    if wunsch == einstellungen::DecoderWunsch::Nvidia {
+        if let Some(g) = &bau.grund {
+            s.error = Some(format!("NVDEC nicht verfuegbar: {g}"));
+        }
+    }
+}
+
+/// Ist das ein Fehler, der einen Hardware-Decoder als kaputt ausweist?
+/// EAGAIN heisst nur "gerade nichts da", EOF "fertig" - beides ist normal.
+fn decoder_defekt(e: &ffmpeg::Error) -> bool {
+    !matches!(e, ffmpeg::Error::Other { errno: ffmpeg::util::error::EAGAIN } | ffmpeg::Error::Eof)
 }
 
 fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), String> {
@@ -430,7 +573,18 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // Der Host faengt immer mit HEVC an; alles Weitere sagt Nachricht 7.
     // Der Decoder ist eine eigene Variable, keine Leihgabe: bei einem Wechsel
     // wird sie schlicht neu zugewiesen, und der alte Decoder faellt weg.
-    let mut decoder = decoder_bauen(false)?;
+    // Der Wunsch, mit dem hier gebaut wird, ist damit der geltende: wurde er
+    // waehrend des Verbindens angeklickt, steht seine Flagge noch - und die
+    // wuerde gleich im ersten Durchlauf denselben Decoder noch einmal bauen.
+    // Wunsch und Flagge unter einem Griff lesen, damit die Flagge auch
+    // wirklich zu diesem Wunsch gehoert.
+    let mut wunsch = {
+        let mut s = shared.lock().unwrap();
+        s.decoder_wunsch_neu = false;
+        s.decoder_wunsch
+    };
+    let mut bau = decoder_bauen(false, wunsch)?;
+    decoder_melden(shared, &bau, wunsch);
     // Wofuer der Decoder gebaut ist. Die Strominfo entscheidet gleich, ob
     // das passt - der Host kann laengst auf einem anderen Codec stehen.
     let mut decoder_h264 = false;
@@ -470,8 +624,41 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     loop {
         // Wurde die Trennung verlangt, ist hier Schluss - auch wenn der Host
         // gerade noch fleissig sendet.
-        if shared.lock().unwrap().target.is_none() {
-            return Ok(());
+        let wunsch_neu = {
+            let mut s = shared.lock().unwrap();
+            if s.target.is_none() {
+                return Ok(());
+            }
+            if s.decoder_wunsch_neu {
+                s.decoder_wunsch_neu = false;
+                Some(s.decoder_wunsch)
+            } else {
+                None
+            }
+        };
+        // Der Wunsch hat sich im Menue geaendert. Nur neu bauen, wenn er
+        // wirklich ein anderer ist als der, mit dem gebaut wurde: eine
+        // Flagge zum selben Wunsch (Klick auf das, was schon gilt) wuerde
+        // sonst denselben Decoder noch einmal bauen und das Bild bis zum
+        // naechsten Schluesselbild anhalten - auf einer Maschine ohne NVIDIA
+        // bei jedem Klick. Und auch bei einem neuen Wunsch nur, wenn das
+        // etwas aendern kann: wer bei Automatik schon auf NVDEC steht,
+        // braucht fuer NVIDIA keinen Stillstand.
+        if let Some(w) = wunsch_neu {
+            if w != wunsch {
+                wunsch = w;
+                let passt = match w {
+                    einstellungen::DecoderWunsch::Software => bau.pfad == DecoderPfad::Software,
+                    _ => bau.pfad == DecoderPfad::Nvdec,
+                };
+                if !passt {
+                    bau = decoder_bauen(decoder_h264, wunsch)?;
+                    decoder_melden(shared, &bau, wunsch);
+                    warte_auf_schluesselbild = true;
+                    ring.clear();
+                    mittel = None;
+                }
+            }
         }
         // Regelmaessig nachfragen: Uhren laufen auseinander, und beim ersten
         // Versuch steht der Eingabekanal oft noch gar nicht.
@@ -503,7 +690,8 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // und es kommt nie ein Bild - so geschehen heute Morgen.
                     let h264 = i.codec == 2;
                     if h264 != decoder_h264 {
-                        decoder = decoder_bauen(h264)?;
+                        bau = decoder_bauen(h264, wunsch)?;
+                        decoder_melden(shared, &bau, wunsch);
                         decoder_h264 = h264;
                         warte_auf_schluesselbild = true;
                         nach_wechsel = true;
@@ -539,7 +727,8 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 let Some(w) = CodecWechsel::parse(&payload) else { continue };
                 // Mit Bildparallelitaet (--faeden frame) gehen beim Wechsel bis zu
                 // 15 zurueckgehaltene Bilder verloren; sauber leeren ist eine spaetere Verfeinerung.
-                decoder = decoder_bauen(w.is_h264)?;
+                bau = decoder_bauen(w.is_h264, wunsch)?;
+                decoder_melden(shared, &bau, wunsch);
                 decoder_h264 = w.is_h264;
                 warte_auf_schluesselbild = true;
                 nach_wechsel = true;
@@ -581,11 +770,71 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 let mut packet = ffmpeg::Packet::copy(&payload);
                 packet.set_pts(Some(seq as i64));
                 packet.set_dts(None);
-                if decoder.send_packet(&packet).is_err() {
-                    continue;
+                // Decodieren, und zwar so, dass ein Hardware-Decoder, der
+                // nichts taugt, stumm durch Software ersetzt wird. Nichts
+                // taugen heisst: er scheitert, bevor er je ein Bild geliefert
+                // hat (Karte kann das Profil nicht, Treiber streikt), oder er
+                // scheitert dreimal in Folge. Ein einzelner Fehler mitten in
+                // der Sitzung - etwa AVERROR_EXTERNAL, weil cuvids
+                // Bildwarteschlange gerade voll ist - kostet nur dieses Paket:
+                // es wird verworfen, und bis zum naechsten Schluesselbild (der
+                // Host schickt alle ein bis zwei Sekunden eines) geht nichts
+                // mehr hinein. Die Karte bleibt; sonst waere sie nach einem
+                // Aussetzer bis zum naechsten Codecwechsel verloren.
+                // Zwei Anlaeufe: der zweite nur nach einem Rueckfall, und nur,
+                // wenn dieses Paket ein Schluesselbild ist - alles andere ist
+                // fuer den frischen Decoder ohnehin wertlos.
+                let mut bilder: Vec<ffmpeg::frame::Video> = Vec::new();
+                for anlauf in 0..2 {
+                    bau.pakete = bau.pakete.wrapping_add(1);
+                    let vorher = bilder.len();
+                    let fehler = decoder_fuettern(&mut bau.decoder, &packet, &mut bilder);
+                    if bilder.len() > vorher {
+                        bau.hat_bild = true;
+                    }
+                    let Some(e) = fehler else {
+                        bau.fehler_folge = 0;
+                        break;
+                    };
+                    if !bau.pfad.hardware() || !decoder_defekt(&e) {
+                        // Software-Decoder: ein kaputtes Paket ist ein
+                        // kaputtes Paket, das naechste kommt gleich.
+                        break;
+                    }
+                    if anlauf == 1 {
+                        break;
+                    }
+                    bau.fehler_folge = bau.fehler_folge.saturating_add(1);
+                    if bau.hat_bild && bau.fehler_folge < 3 {
+                        // Ein Aussetzer, kein Defekt: Paket weg, Decoder bleibt.
+                        warte_auf_schluesselbild = true;
+                        break;
+                    }
+                    // Der Hardware-Decoder ist nichts wert: Software bauen
+                    // und den Grund festhalten. Der Wunsch bleibt, wie er
+                    // war - beim naechsten Codecwechsel wird die Karte wieder
+                    // probiert, mit einem anderen Codec kann sie ja gehen.
+                    let grund = format!("{} scheitert an Paket {}: {e}", bau.codec, bau.pakete);
+                    match software_decoder(decoder_h264) {
+                        Ok(d) => {
+                            bau = DecoderBau::neu(
+                                d,
+                                DecoderPfad::Software,
+                                if decoder_h264 { "h264" } else { "hevc" },
+                                Some(grund),
+                            );
+                            decoder_melden(shared, &bau, wunsch);
+                            ring.clear();
+                            mittel = None;
+                            if flags & 1 == 0 {
+                                warte_auf_schluesselbild = true;
+                                break;
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                let mut decoded = ffmpeg::frame::Video::empty();
-                while decoder.receive_frame(&mut decoded).is_ok() {
+                for decoded in bilder.iter() {
                     // Das Format entscheidet der decodierte Frame selbst, nicht
                     // die Strominfo. Ein unbekanntes Format ergibt ein dunkles
                     // Bild und eine Meldung - nie einen Absturz.
@@ -762,6 +1011,44 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     }
 }
 
+/// Ein Paket in den Decoder und alle fertigen Bilder heraus. Gibt den
+/// ersten Fehler zurueck, der kein blosses "gerade nichts da" ist - der
+/// Aufrufer entscheidet, ob das den Decoder disqualifiziert.
+///
+/// Ein EAGAIN beim Senden heisst bei den cuvid-Decodern: erst Bilder
+/// abholen, dann noch einmal senden. Das Paket geht dabei nicht verloren.
+fn decoder_fuettern(
+    decoder: &mut ffmpeg::decoder::Video,
+    packet: &ffmpeg::Packet,
+    bilder: &mut Vec<ffmpeg::frame::Video>,
+) -> Option<ffmpeg::Error> {
+    let mut fehler = None;
+    let mut abholen = |decoder: &mut ffmpeg::decoder::Video, bilder: &mut Vec<ffmpeg::frame::Video>| loop {
+        let mut f = ffmpeg::frame::Video::empty();
+        match decoder.receive_frame(&mut f) {
+            Ok(()) => bilder.push(f),
+            Err(e) => {
+                if decoder_defekt(&e) {
+                    fehler = Some(e);
+                }
+                break;
+            }
+        }
+    };
+    match decoder.send_packet(packet) {
+        Ok(()) => {}
+        Err(ffmpeg::Error::Other { errno: ffmpeg::util::error::EAGAIN }) => {
+            abholen(decoder, bilder);
+            if let Err(e) = decoder.send_packet(packet) {
+                return Some(e);
+            }
+        }
+        Err(e) => return Some(e),
+    }
+    abholen(decoder, bilder);
+    fehler
+}
+
 /// YUV nach RGB, BT.709, voller Wertebereich.
 ///
 /// Ganzzahlig in 16.16-Festkomma statt mit Kommazahlen, und zeilenweise auf
@@ -773,31 +1060,45 @@ fn clamp8(v: i32) -> u32 {
 }
 
 /// Eine Zeile umrechnen. SUB = 4:2:0 (je zwei Bildpunkte teilen sich einen
-/// Farbwert), ZEHN = 10 Bit je Wert. Als Konstanten, damit der Compiler je
-/// Format eine eigene, verzweigungsfreie Schleife baut.
+/// Farbwert), BITS = Breite der Werte: 8 (ein Byte), 10 (16 Bit LE, Wert in
+/// den unteren zehn Bit, wie die Software-Decoder ihn liefern) oder 16 (16
+/// Bit LE, Wert oben buendig, wie NVDEC ihn liefert - P010/P012/P016,
+/// YUV444P16 und YUV444P10MSB/P12MSB). PAAR = Farbwerte als U/V-Paare in
+/// EINER Ebene (NV12, P010, P012, P016); `ur` und `vr` zeigen dann in
+/// dieselbe Ebene, `vr` um einen Wert versetzt. Als Konstanten, damit der
+/// Compiler je Format eine eigene, verzweigungsfreie Schleife baut.
+///
+/// Die Anzeige braucht acht Bit: bei 10 Bit sind das die Bits 9..2, bei den
+/// oben buendigen 16-Bit-Werten die Bits 15..8 - fuer 10-Bit-Inhalt (Wert
+/// << 6) ist das dieselbe Zahl, nur ohne den Umweg ueber >> 6 und >> 2.
 ///
 /// Bei 4:2:0 wird der naechstgelegene Farbwert genommen (Wiederholung) -
 /// einfach und schnell. Eine weichere Farbaufwertung ist eine spaetere
 /// Verfeinerung; sie aendert am Vergleich 4:4:4 gegen 4:2:0 nichts Wesentliches.
 #[inline(always)]
-fn zeile_rgb<const SUB: bool, const ZEHN: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8]) {
+fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8]) {
     const CR_R: i32 = 103206; // 1.5748
     const CB_G: i32 = 12276;  // 0.1873
     const CR_G: i32 = 30681;  // 0.4681
     const CB_B: i32 = 121609; // 1.8556
 
+    #[inline(always)]
+    fn wert<const BITS: u8>(p: &[u8], i: usize) -> i32 {
+        match BITS {
+            8 => p[i] as i32,
+            10 => (u16::from_le_bytes([p[i * 2], p[i * 2 + 1]]) >> 2) as i32,
+            _ => (u16::from_le_bytes([p[i * 2], p[i * 2 + 1]]) >> 8) as i32,
+        }
+    }
+
     for (x, o) in out.iter_mut().enumerate() {
         let cx = if SUB { x >> 1 } else { x };
-        let (y, cb, cr) = if ZEHN {
-            // 10 Bit auf 8 Bit: die oberen acht Bit reichen fuer die Anzeige.
-            (
-                (u16::from_le_bytes([yr[x * 2], yr[x * 2 + 1]]) >> 2) as i32,
-                (u16::from_le_bytes([ur[cx * 2], ur[cx * 2 + 1]]) >> 2) as i32 - 128,
-                (u16::from_le_bytes([vr[cx * 2], vr[cx * 2 + 1]]) >> 2) as i32 - 128,
-            )
-        } else {
-            (yr[x] as i32, ur[cx] as i32 - 128, vr[cx] as i32 - 128)
-        };
+        // Bei Paaren liegt der U-Wert von Farbspalte cx an Stelle 2*cx, der
+        // V-Wert direkt dahinter - `vr` ist schon um einen Wert versetzt.
+        let ci = if PAAR { cx * 2 } else { cx };
+        let y = wert::<BITS>(yr, x);
+        let cb = wert::<BITS>(ur, ci) - 128;
+        let cr = wert::<BITS>(vr, ci) - 128;
         let r = y + ((CR_R * cr) >> 16);
         let g = y - ((CB_G * cb + CR_G * cr) >> 16);
         let b = y + ((CB_B * cb) >> 16);
@@ -807,17 +1108,36 @@ fn zeile_rgb<const SUB: bool, const ZEHN: bool>(out: &mut [u32], yr: &[u8], ur: 
 
 /// Decodiertes Bild nach RGB. Das Format kommt aus dem Frame selbst
 /// (Pixelformat des Decoders), nicht aus einer Flagge: nach einem
-/// Codecwechsel waere jede Flagge fuer ein paar Bilder falsch. Erkannt werden
-/// YUV444P10LE, YUV444P, YUV420P10LE und YUV420P; alles andere ist ein Fehler
-/// mit Meldung, kein Absturz. Alle Stroeme sind Vollbereich (der Host
-/// garantiert das), deshalb keine Bereichsdehnung.
+/// Codecwechsel waere jede Flagge fuer ein paar Bilder falsch, und der
+/// Hardware-Decoder liefert andere Formate als der Software-Decoder.
+///
+/// Erkannt werden die planaren Formate der Software-Decoder (YUV444P,
+/// YUV444P10LE, YUV420P, YUV420P10LE) und die von NVDEC/cuvid: YUV444P
+/// (4:4:4 8 Bit), YUV444P10MSB/YUV444P12MSB (4:4:4 10/12 Bit, oben buendig -
+/// so nennt FFmpeg 9 die Formate, die aeltere Fassungen als YUV444P16
+/// meldeten; das bleibt fuer die mit dabei), NV12 (4:2:0 8 Bit, U/V
+/// verschraenkt) und P010LE/P012LE/P016LE (4:2:0 10/12/16 Bit, oben
+/// buendig, verschraenkt). Alles andere ist ein Fehler mit Meldung, kein
+/// Absturz. Alle Stroeme sind Vollbereich (der Host garantiert das),
+/// deshalb keine Bereichsdehnung.
 fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     use ffmpeg::format::Pixel;
-    let (sub, zehn) = match src.format() {
-        Pixel::YUV444P => (false, false),
-        Pixel::YUV444P10LE => (false, true),
-        Pixel::YUV420P => (true, false),
-        Pixel::YUV420P10LE => (true, true),
+    // (4:2:0, Bits je Wert, U/V als Paare in einer Ebene)
+    let (sub, bits, paar) = match src.format() {
+        Pixel::YUV444P => (false, 8u8, false),
+        Pixel::YUV444P10LE => (false, 10, false),
+        // Die MSB-Formate legen den Wert oben buendig in 16 Bit ab - genau
+        // wie YUV444P16, deshalb derselbe Lesepfad (Bits 15..8).
+        Pixel::YUV444P16
+        | Pixel::YUV444P16LE
+        | Pixel::YUV444P10MSB
+        | Pixel::YUV444P10MSBLE
+        | Pixel::YUV444P12MSB
+        | Pixel::YUV444P12MSBLE => (false, 16, false),
+        Pixel::YUV420P => (true, 8, false),
+        Pixel::YUV420P10LE => (true, 10, false),
+        Pixel::NV12 => (true, 8, true),
+        Pixel::P010LE | Pixel::P012LE | Pixel::P016LE => (true, 16, true),
         f => return Err(format!("Unbekanntes Bildformat vom Decoder: {f:?}")),
     };
     let w = src.width() as usize;
@@ -825,20 +1145,26 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     if w == 0 || h == 0 {
         return Err("Decoder liefert ein leeres Bild".into());
     }
-    if src.planes() < 3 {
+    if src.planes() < if paar { 2 } else { 3 } {
         return Err("Decoder liefert zu wenige Bildebenen".into());
     }
-    // Breite der Farbebenen: bei 4:2:0 die Haelfte, aufgerundet.
+    // Breite der Farbebenen: bei 4:2:0 die Haelfte, aufgerundet. Bei Paaren
+    // liegen U und V nebeneinander, die Zeile ist also doppelt so breit.
     let cw = if sub { (w + 1) / 2 } else { w };
     let ch = if sub { (h + 1) / 2 } else { h };
-    let bpp = if zehn { 2 } else { 1 };
-    let (yp, up, vp) = (src.data(0), src.data(1), src.data(2));
-    let (ys, us, vs) = (src.stride(0), src.stride(1), src.stride(2));
+    let bpp = if bits == 8 { 1 } else { 2 };
+    let cbreite = if paar { cw * 2 * bpp } else { cw * bpp };
+    let yp = src.data(0);
+    let up = src.data(1);
+    let vp = if paar { up } else { src.data(2) };
+    let ys = src.stride(0);
+    let us = src.stride(1);
+    let vs = if paar { us } else { src.stride(2) };
     // Reichen die Ebenen fuer das, was gleich gelesen wird? Sonst waere das
     // Zerlegen unten ein Absturz mitten im Empfangsfaden.
     if yp.len() < (h - 1) * ys + w * bpp
-        || up.len() < (ch - 1) * us + cw * bpp
-        || vp.len() < (ch - 1) * vs + cw * bpp
+        || up.len() < (ch - 1) * us + cbreite
+        || vp.len() < (ch - 1) * vs + cbreite
     {
         return Err("Bildebenen des Decoders sind zu klein".into());
     }
@@ -847,13 +1173,21 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     pixels.par_chunks_mut(w).enumerate().for_each(|(row, out)| {
         let crow = if sub { row >> 1 } else { row };
         let yr = &yp[row * ys..row * ys + w * bpp];
-        let ur = &up[crow * us..crow * us + cw * bpp];
-        let vr = &vp[crow * vs..crow * vs + cw * bpp];
-        match (sub, zehn) {
-            (false, false) => zeile_rgb::<false, false>(out, yr, ur, vr),
-            (false, true) => zeile_rgb::<false, true>(out, yr, ur, vr),
-            (true, false) => zeile_rgb::<true, false>(out, yr, ur, vr),
-            (true, true) => zeile_rgb::<true, true>(out, yr, ur, vr),
+        let ur = &up[crow * us..crow * us + cbreite];
+        // Bei Paaren: dieselbe Zeile, um einen Wert versetzt - der letzte
+        // gelesene V-Wert liegt dann genau am Ende der Zeile, nie dahinter.
+        let vr = if paar { &up[crow * us + bpp..crow * us + cbreite] } else { &vp[crow * vs..crow * vs + cbreite] };
+        match (sub, bits, paar) {
+            (false, 8, false) => zeile_rgb::<false, 8, false>(out, yr, ur, vr),
+            (false, 10, false) => zeile_rgb::<false, 10, false>(out, yr, ur, vr),
+            (false, _, false) => zeile_rgb::<false, 16, false>(out, yr, ur, vr),
+            (true, 8, false) => zeile_rgb::<true, 8, false>(out, yr, ur, vr),
+            (true, 10, false) => zeile_rgb::<true, 10, false>(out, yr, ur, vr),
+            (true, 8, true) => zeile_rgb::<true, 8, true>(out, yr, ur, vr),
+            (true, _, true) => zeile_rgb::<true, 16, true>(out, yr, ur, vr),
+            // 4:4:4 mit Paaren und 4:2:0 planar 16 Bit erzeugt die Tabelle
+            // oben nie; der Arm steht nur fuer die Vollstaendigkeit.
+            _ => {}
         }
     });
 
@@ -1619,7 +1953,7 @@ impl App {
                     self.ui.text.draw_centered(&mut c, ww as i32 / 2, 42, t, 14, ui::AMBER, 1);
                 }
                 if self.show_overlay {
-                    let (stats, secure, lat, soll, hostlast) = {
+                    let (stats, secure, lat, soll, hostlast, decoder) = {
                         let s = self.shared.lock().unwrap();
                         (
                             (s.last_decode_ms, s.info, s.dropped, s.error.clone(), s.connected),
@@ -1627,12 +1961,13 @@ impl App {
                             s.clock,
                             s.settings.map(|x| x.1 as u32).or_else(|| s.info.map(|i| i.fps)),
                             s.hostlast,
+                            (s.decoder_pfad, s.decoder_hinweis.clone()),
                         )
                     };
                     let hist = self.fps_hist.clone();
                     let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                     overlay(&mut self.ui, &mut c, self.lang, self.fps_shown, &hist, stats, secure,
-                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast);
+                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder);
                 }
                 // Erstkontakt: Code gross anzeigen, solange es noch zaehlt.
                 let (first, sas) = {
@@ -1646,7 +1981,10 @@ impl App {
                     if Instant::now() < until {
                         let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                         let bw = 520.min(ww as i32 - 40);
-                        let bx = (ww as i32 - bw) / 2;
+                        // Neben der Statistiktafel, nicht darueber: die ist im
+                        // Nerd-Modus breit und mit der Decoder-Zeile hoch.
+                        let frei_ab = if self.show_overlay { 18 + if self.cfg.nerd { 620 } else { 300 } + 20 } else { 0 };
+                        let bx = ((ww as i32 - bw) / 2).max(frei_ab).min((ww as i32 - bw - 18).max(0));
                         let t = self.lang.get(strings::Key::FirstContact);
                         // Der Satz ist je nach Sprache verschieden lang, also
                         // erst messen, dann die Tafel darauf zuschneiden.
@@ -1664,11 +2002,16 @@ impl App {
                 }
                 // Nerd-Modus. Liegt ueber allem, deshalb zuletzt gezeichnet.
                 if self.hud_offen {
-                    let (lat, info, stell, secure, codecs, codec_idx, wechsel) = {
+                    // Der geltende Decoderwunsch kommt aus `shared`, nicht aus
+                    // der Datei: mit --decoder auf der Befehlszeile weichen die
+                    // beiden voneinander ab, und das Menue soll zeigen, was
+                    // wirklich gilt - sonst ist der falsche Knopf in Cyan, und
+                    // ein Klick auf den richtigen bewirkt nichts.
+                    let (lat, info, stell, secure, codecs, codec_idx, wechsel, decoder_wunsch, decoder_aktiv) = {
                         let sh = self.shared.lock().unwrap();
                         (
                             sh.clock, sh.info, sh.settings, (sh.sas.clone(), sh.peer_fp.clone()),
-                            sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(),
+                            sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(), sh.decoder_wunsch, sh.decoder_pfad,
                         )
                     };
                     let gespeichert = self
@@ -1690,6 +2033,8 @@ impl App {
                         codecs,
                         codec_idx,
                         wechsel,
+                        decoder: decoder_wunsch,
+                        decoder_aktiv,
                     };
                     let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                     let a = hud(
@@ -1753,6 +2098,21 @@ impl App {
                             // bliebe er bis zum Ablauf der Frist haengen.
                             self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
                             self.input.lock().unwrap().codec(idx);
+                        }
+                        HudAktion::Decoder(w) => {
+                            // Merken, sichern, und dem Empfangsfaden Bescheid
+                            // geben - der baut den Decoder um, ohne die
+                            // Verbindung anzufassen. Verglichen wird mit dem
+                            // geltenden Wunsch (siehe oben); erst der Klick
+                            // macht ihn zur gespeicherten Wahl - ein blosses
+                            // --decoder schreibt nie in die Datei.
+                            if decoder_wunsch != w {
+                                self.cfg.decoder = w;
+                                self.cfg.sichern();
+                                let mut sh = self.shared.lock().unwrap();
+                                sh.decoder_wunsch = w;
+                                sh.decoder_wunsch_neu = true;
+                            }
                         }
                         HudAktion::Nichts => {}
                     }
@@ -2242,6 +2602,7 @@ fn overlay(
     nerd: bool,
     soll_fps: Option<u32>,
     hostlast: Option<HostLast>,
+    decoder: (Option<DecoderPfad>, Option<String>),
 ) {
     use strings::Key::*;
     let (dec_ms, info, dropped, err, connected) = stats;
@@ -2278,6 +2639,15 @@ fn overlay(
         if wahl.codec {
             rows.push((lang.get(Codec), i.codec_name(), ui::TEXT));
         }
+    }
+    // Welcher Decoder das Bild macht: Hardware in Cyan. Im Nerd-Modus steht
+    // dazu, warum es nicht die Karte wurde, falls sie gewuenscht war.
+    if let Some(pfad) = decoder.0 {
+        let txt = match (&decoder.1, nerd) {
+            (Some(g), true) => format!("{} · {g}", pfad.name()),
+            _ => pfad.name().to_string(),
+        };
+        rows.push((lang.get(DecoderLabel), txt, if pfad.hardware() { ui::CYAN } else { ui::TEXT }));
     }
     if wahl.verworfen {
         rows.push((lang.get(Dropped), format!("{dropped}"), ui::TEXT));
@@ -2412,7 +2782,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             };
             overlay(&mut u, &mut c, lang, 98.0, &hist, (2.1, info, 3, None, true), (sas.clone(), fp.clone()),
                     Some(probe), einstellungen::StatWahl::default(), nerd, Some(120),
-                    if nerd { Some(hl) } else { None });
+                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec), None));
             let _ = &fp;
             let bw = 520.min(w as i32 - 40);
             let bx = (w as i32 - bw) / 2;
@@ -2468,6 +2838,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             codecs,
             codec_idx: None,
             wechsel: false,
+            decoder: einstellungen::DecoderWunsch::Automatik,
+            decoder_aktiv: Some(DecoderPfad::Nvdec),
         };
         let reiter = match view { "hud2" => 1u8, "hud3" => 2, _ => 0 };
         let _ = hud(
@@ -2557,6 +2929,27 @@ fn main() {
         return;
     }
 
+    // Decoderwahl ohne Verbindung pruefen: --decodertest baut fuer HEVC und
+    // H.264 je einen Decoder mit jedem Wunsch und sagt, was herauskam. So
+    // laesst sich der Rueckfall auf Software auch auf einer Maschine ohne
+    // NVIDIA-Karte pruefen, ohne einen Host zu belaestigen.
+    if std::env::args().any(|a| a == "--decodertest") {
+        if let Err(e) = ffmpeg::init() {
+            println!("FFmpeg-Start fehlgeschlagen: {e}");
+            return;
+        }
+        use einstellungen::DecoderWunsch as W;
+        for (h264, codec) in [(false, "HEVC"), (true, "H.264")] {
+            for w in [W::Automatik, W::Software, W::Nvidia] {
+                match decoder_bauen(h264, w) {
+                    Ok(bau) => println!("{codec} / Wunsch {}: {}", w.schluessel(), bau.meldung()),
+                    Err(e) => println!("{codec} / Wunsch {}: Fehler: {e}", w.schluessel()),
+                }
+            }
+        }
+        return;
+    }
+
     // Bild der Oberflaeche schreiben und beenden: --shot datei.bmp [sprache]
     if let Some(i) = std::env::args().position(|a| a == "--shot") {
         let args: Vec<String> = std::env::args().collect();
@@ -2592,7 +2985,19 @@ fn main() {
         clipboard::watch(move |text| { let _ = tx.send(text); });
     }
 
-    let shared = Arc::new(Mutex::new(Shared::default()));
+    // Gespeicherte Einstellungen. Sie bestimmen unter anderem, ob wir im
+    // Vollbild starten - das ist die Voreinstellung. Schon hier geladen,
+    // weil der Empfangsfaden den Decoderwunsch vom ersten Bild an kennen soll.
+    let cfg = einstellungen::Einstellungen::laden();
+    // --decoder auto|software|nvidia erzwingt fuer diesen Lauf einen Pfad,
+    // ohne die gespeicherte Wahl anzufassen.
+    let decoder_wunsch = std::env::args()
+        .position(|a| a == "--decoder")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| einstellungen::DecoderWunsch::aus(&v))
+        .unwrap_or(cfg.decoder);
+
+    let shared = Arc::new(Mutex::new(Shared { decoder_wunsch, ..Shared::default() }));
     {
         let shared = shared.clone();
         let inp = input.clone();
@@ -2629,12 +3034,23 @@ fn main() {
             let args: Vec<String> = std::env::args().collect();
             codec_wunsch = args.get(i + 1).and_then(|v| v.parse().ok());
         }
+        println!("Decoderwunsch: {}", decoder_wunsch.schluessel());
         let start = Instant::now();
         let mut last = 0u64;
         loop {
             std::thread::sleep(Duration::from_secs(3));
-            let s = shared.lock().unwrap();
+            let mut s = shared.lock().unwrap();
             let n = s.decoded;
+            // Jeder (Neu-)Bau des Decoders genau eine Zeile: welcher Pfad,
+            // welcher FFmpeg-Decoder, und warum nicht NVDEC, falls so. Alle
+            // Zeilen seit dem letzten Takt abholen - es koennen mehrere sein.
+            for m in std::mem::take(&mut s.decoder_meldung) {
+                println!("{m}");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("C:\\qc\\client.log") {
+                    writeln!(f, "{m}").ok();
+                }
+            }
+            let pfad = s.decoder_pfad.map(|p| p.name()).unwrap_or("-");
             let lat = match s.clock {
                 Some(l) if l.gesamt_ms > 0.0 => format!(
                     "Verzoegerung {:.1} ms (+/-{:.1}) = Encoder {:.1} + Leitung {:.1} + Decoder {:.1}",
@@ -2657,8 +3073,8 @@ fn main() {
             // Protokoll sichtbar wird - derselbe Name wie im Menue und Overlay.
             let codec = s.info.map(|i| i.codec_name()).unwrap_or_else(|| "?".into());
             let line = format!(
-                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, lat, hl, s.error
+                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Decoder {} | {}{} | Fehler {:?}",
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, pfad, lat, hl, s.error
             );
             println!("{line}");
             std::io::stdout().flush().ok();
@@ -2701,9 +3117,6 @@ fn main() {
         }
     }
 
-    // Gespeicherte Einstellungen. Sie bestimmen unter anderem, ob wir im
-    // Vollbild starten - das ist die Voreinstellung.
-    let cfg = einstellungen::Einstellungen::laden();
     let sprache = match &cfg.sprache {
         Some(c) => strings::pick(c),
         None => strings::pick(&system_language()),
@@ -2783,6 +3196,8 @@ pub enum HudAktion {
     Schalter(u8),
     /// Wunsch nach diesem Kandidaten der Koennensliste.
     Codec(u8),
+    /// Anderer Decoderpfad gewuenscht.
+    Decoder(einstellungen::DecoderWunsch),
 }
 
 pub const SCH_VOLLBILD: u8 = 0;
@@ -2819,6 +3234,9 @@ pub struct HudStand {
     pub codec_idx: Option<u8>,
     /// Ein Codecwunsch ist unterwegs.
     pub wechsel: bool,
+    /// Gewuenschter Decoderpfad und der, der wirklich laeuft.
+    pub decoder: einstellungen::DecoderWunsch,
+    pub decoder_aktiv: Option<DecoderPfad>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3042,6 +3460,35 @@ fn hud(
             zeile(u, c, ix, cy + p(34), lang.get(PixelExact), stand.pixelgenau, SCH_PIXELGENAU, &mut aktion);
             zeile(u, c, ix, cy + p(68), lang.get(ShowOverlay), stand.statistik, SCH_STATISTIK, &mut aktion);
             zeile(u, c, ix, cy + p(102), lang.get(NerdMode), stand.nerd, SCH_NERD, &mut aktion);
+            // --- Decoderwahl: drei Knoepfe, der gewuenschte in Cyan. Dahinter
+            // steht, was wirklich laeuft - bei Automatik ist das die eigentliche
+            // Auskunft, und bei einem Rueckfall sieht man ihn hier sofort.
+            {
+                use einstellungen::DecoderWunsch as W;
+                let oy = cy + p(150);
+                let label = match stand.decoder_aktiv {
+                    Some(pf) => format!("{} · {}", lang.get(DecoderLabel), pf.name()),
+                    None => lang.get(DecoderLabel).to_string(),
+                };
+                u.text.draw(c, ix, oy, &label, sz(11), ui::DIM, p(3));
+                let mut kx = ix;
+                let ky = oy + p(10);
+                for (w, k) in [(W::Automatik, DecoderAuto), (W::Software, DecoderSoftware), (W::Nvidia, DecoderNvidia)] {
+                    let name = lang.get(k);
+                    let bw = u.text.width(name, 15, 2) + p(28);
+                    // Die rechte Spalte faengt bei ix + sp an; was dort hinein
+                    // ragen wuerde, wird nicht mehr gezeichnet.
+                    if kx + bw > ix + sp - p(20) {
+                        break;
+                    }
+                    let r = ui::Rect { x: kx, y: ky, w: bw, h: p(30) };
+                    let farbe = if stand.decoder == w { ui::CYAN } else { ui::DIM };
+                    if u.button(c, r, name, farbe) && stand.decoder != w {
+                        aktion = HudAktion::Decoder(w);
+                    }
+                    kx += bw + p(10);
+                }
+            }
             let w = stand.wahl;
             // Ueberschrift ueber die rechte Spalte, nicht unter die linke.
             u.text.draw(c, ix + sp, cy - p(16), lang.get(ShowOverlay), sz(10), ui::DIM, p(3));

@@ -39,6 +39,40 @@ impl Default for StatWahl {
     }
 }
 
+/// Welcher Decoder gewuenscht ist. Automatik nimmt NVDEC (ueber die
+/// cuvid-Decoder von FFmpeg), wenn eine NVIDIA-Karte da ist, und faellt sonst
+/// auf Software zurueck. Software erzwingt die CPU, NVIDIA verlangt die
+/// Karte und sagt laut Bescheid, wenn sie doch nicht geht.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DecoderWunsch {
+    #[default]
+    Automatik,
+    Software,
+    Nvidia,
+}
+
+impl DecoderWunsch {
+    /// Wert in der Datei und auf der Befehlszeile (--decoder).
+    pub fn schluessel(self) -> &'static str {
+        match self {
+            DecoderWunsch::Automatik => "auto",
+            DecoderWunsch::Software => "software",
+            DecoderWunsch::Nvidia => "nvidia",
+        }
+    }
+
+    /// Umkehrung von `schluessel`. Unbekanntes ergibt None, damit der
+    /// Aufrufer bei der Voreinstellung bleibt.
+    pub fn aus(text: &str) -> Option<Self> {
+        Some(match text.trim().to_ascii_lowercase().as_str() {
+            "auto" | "automatik" | "automatic" => DecoderWunsch::Automatik,
+            "software" | "cpu" => DecoderWunsch::Software,
+            "nvidia" | "nvdec" | "cuvid" => DecoderWunsch::Nvidia,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Einstellungen {
     pub vollbild: bool,
@@ -48,6 +82,8 @@ pub struct Einstellungen {
     /// Erweiterte Statistik. Muss eigens eingeschaltet werden.
     pub nerd: bool,
     pub stats: StatWahl,
+    /// Gewuenschter Decoderpfad (Datei: decoder=auto|software|nvidia).
+    pub decoder: DecoderWunsch,
     /// Fingerabdruck des Hosts -> seine Werte.
     pub hosts: HashMap<String, HostWerte>,
 }
@@ -61,6 +97,7 @@ impl Default for Einstellungen {
             sprache: None,
             nerd: false,
             stats: StatWahl::default(),
+            decoder: DecoderWunsch::Automatik,
             hosts: HashMap::new(),
         }
     }
@@ -112,6 +149,7 @@ impl Einstellungen {
                 (None, "stat_codec") => e.stats.codec = v == "1",
                 (None, "stat_verworfen") => e.stats.verworfen = v == "1",
                 (None, "stat_code") => e.stats.code = v == "1",
+                (None, "decoder") => e.decoder = DecoderWunsch::aus(v).unwrap_or(e.decoder),
                 (Some(fp), _) => {
                     if let Some(h) = e.hosts.get_mut(fp) {
                         match k {
@@ -145,6 +183,7 @@ impl Einstellungen {
             w.fps as u8, w.latenz as u8, w.teile as u8, w.aufloesung as u8,
             w.codec as u8, w.verworfen as u8, w.code as u8
         ));
+        t.push_str(&format!("decoder={}\n", self.decoder.schluessel()));
         // Sortiert schreiben, damit die Datei zwischen zwei Laeufen gleich
         // aussieht und man Aenderungen erkennt.
         let mut fps: Vec<&String> = self.hosts.keys().collect();
