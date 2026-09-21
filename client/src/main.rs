@@ -279,6 +279,8 @@ struct Frame {
 
 #[derive(Default)]
 struct Shared {
+    /// Griff an der Bildleitung, um sie beim Trennen von aussen zu kappen.
+    abbruch: Option<std::net::TcpStream>,
     /// Adresse, mit der sich der Empfangsfaden verbinden soll. None = warten.
     target: Option<String>,
     connected: bool,
@@ -342,12 +344,17 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             Ok(()) => {}
             Err(e) => {
                 let mut s = shared.lock().unwrap();
-                s.error = Some(e);
+                // Eine gewollte Trennung kappt die Leitung - der Lesefehler
+                // danach ist kein Fehler und wird nicht angezeigt.
+                if s.target.is_some() {
+                    s.error = Some(e);
+                }
                 s.connected = false;
             }
         }
         {
             let mut s = shared.lock().unwrap();
+            s.abbruch = None;
             s.link = None;
             s.connected = false;
             s.codec_wechsel = None;
@@ -389,6 +396,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // Erst der Handschlag, dann erst Nutzdaten. Vorher geht nichts ueber die
     // Leitung, was jemand mitlesen koennte.
     let mut sock = secure::Secure::connect(addr, &noise::prologue_video())?;
+    shared.lock().unwrap().abbruch = sock.abbruchgriff();
     let first = secure::check_known_host(addr, &sock.peer)?;
     let fp = sock.peer_fingerprint();
     {
@@ -460,6 +468,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let mut mittel: Option<(f32, f32, f32, f32)> = None;
 
     loop {
+        // Wurde die Trennung verlangt, ist hier Schluss - auch wenn der Host
+        // gerade noch fleissig sendet.
+        if shared.lock().unwrap().target.is_none() {
+            return Ok(());
+        }
         // Regelmaessig nachfragen: Uhren laufen auseinander, und beim ersten
         // Versuch steht der Eingabekanal oft noch gar nicht.
         let faellig = if lat.versatz_us == 0 { 1 } else { 5 };
@@ -1041,6 +1054,12 @@ impl InputLink {
     /// Alles loslassen, was noch als gedrueckt gilt. Wird aufgerufen, wenn das
     /// Fenster den Fokus verliert oder das Menue aufgeht - sonst bleiben die
     /// Tasten drueben haengen, und wir bekommen davon gar nichts mit.
+    /// Eingabekanal schliessen. Der naechste Sendeversuch baut ihn neu auf.
+    fn trennen(&mut self) {
+        self.sock = None;
+        self.letzter_versuch = None;
+    }
+
     fn alle_loslassen(&mut self) {
         let offen: Vec<u16> = self.gedrueckt.iter().copied().collect();
         for k in offen {
@@ -1261,13 +1280,7 @@ impl ApplicationHandler for App {
                             if self.esc_mods != 0 {
                                 self.esc_verbraucht = true;
                                 if self.esc_mods & MOD_CTRL != 0 {
-                                    let mut sh = self.shared.lock().unwrap();
-                                    sh.target = None;
-                                    drop(sh);
-                                    self.input.lock().unwrap().alle_loslassen();
-                                    self.screen = Screen::Start;
-                                    self.last_frame = None;
-                                    self.banner_until = None;
+                                    self.verbindung_trennen();
                                 } else if let Some(mac) = mac_keycode(KC::Escape) {
                                     let m = self.esc_mods;
                                     self.input.lock().unwrap().key(mac, true, m);
@@ -1435,6 +1448,31 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Die Sitzung wirklich beenden: Ziel zuruecknehmen, Tasten drueben
+    /// loslassen, den Eingabekanal schliessen und die Bildleitung kappen,
+    /// damit das blockierende Lesen aufwacht. Vorher blieb nach "Trennen"
+    /// alles offen, und der Client decodierte weiter - mit voller Last.
+    fn verbindung_trennen(&mut self) {
+        let griff = {
+            let mut s = self.shared.lock().unwrap();
+            s.target = None;
+            s.abbruch.take()
+        };
+        {
+            let mut l = self.input.lock().unwrap();
+            l.alle_loslassen();
+            l.trennen();
+        }
+        if let Some(g) = griff {
+            let _ = g.shutdown(std::net::Shutdown::Both);
+        }
+        self.hud_offen = false;
+        self.screen = Screen::Start;
+        self.last_frame = None;
+        self.banner_until = None;
+        self.angewandt_fuer = None;
+    }
+
     fn draw(&mut self) {
         let (Some(window), Some(surface)) = (self.window.clone(), self.surface.as_mut()) else {
             return;
@@ -1561,11 +1599,7 @@ impl App {
                     buf.present().ok();
                     self.ui.click = false;
                     if abbrechen {
-                        let mut s = self.shared.lock().unwrap();
-                        s.target = None;
-                        drop(s);
-                        self.screen = Screen::Start;
-                        self.banner_until = None;
+                        self.verbindung_trennen();
                     }
                     return;
                 }
@@ -1700,14 +1734,7 @@ impl App {
                             }
                             self.cfg.sichern();
                         }
-                        HudAktion::Trennen => {
-                            self.shared.lock().unwrap().target = None;
-                            self.input.lock().unwrap().alle_loslassen();
-                            self.hud_offen = false;
-                            self.screen = Screen::Start;
-                            self.last_frame = None;
-                            self.banner_until = None;
-                        }
+                        HudAktion::Trennen => self.verbindung_trennen(),
                         HudAktion::Stellen(m, f, g, fx) => {
                             self.input.lock().unwrap().settings(m, f, g, fx);
                             if let Some(fp) = &self.angewandt_fuer {

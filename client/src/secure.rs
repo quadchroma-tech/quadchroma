@@ -79,6 +79,12 @@ impl Secure {
         })
     }
 
+    /// Eine zweite Hand an derselben Leitung, um sie von aussen zu kappen.
+    /// Ein blockierendes Lesen endet erst, wenn jemand den Socket schliesst.
+    pub fn abbruchgriff(&self) -> Option<TcpStream> {
+        self.sock.try_clone().ok()
+    }
+
     pub fn peer_fingerprint(&self) -> String {
         noise::fingerprint(&self.peer)
     }
