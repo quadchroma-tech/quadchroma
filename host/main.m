@@ -1583,6 +1583,13 @@ static void fixed_tick(void) {
 // Aufnahmestart der andere - das Bild kam vom 4K-Schirm, die Maus lief auf
 // dem 240-Hz-Schirm daneben, weil die Eingabe die Kennung vom Start behielt.
 static CGDirectDisplayID g_display_id = 0;
+// Der Bildschirm, den der Host eigentlich will: der beim Start gewaehlte.
+// Schlaeft der ein oder wird abgezogen, laeuft die Aufnahme auf einem
+// anderen weiter - aber der Wunsch bleibt, und beim naechsten Aufnahmestart
+// gilt wieder er. Ohne diese Trennung wanderte der Host mit dem Hauptstatus:
+// schlief der 4K-Schirm, wurde der zweite Monitor Hauptbildschirm, der Host
+// merkte sich den und blieb dort, auch als der 4K-Schirm laengst zurueck war.
+static CGDirectDisplayID g_display_wunsch = 0;
 // Wurde der Listenplatz mit --display ausdruecklich verlangt?
 static int g_display_explizit = 0;
 
@@ -1594,7 +1601,7 @@ static int g_display_explizit = 0;
 static SCDisplay *pick_display(int idx, size_t *pxW, size_t *pxH, double *hz) {
     __block SCDisplay *display = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    CGDirectDisplayID gewollt = g_display_id;
+    CGDirectDisplayID gewollt = g_display_wunsch;
     int explizit = g_display_explizit;
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *c, NSError *e) {
         if (e) {
@@ -1602,7 +1609,7 @@ static SCDisplay *pick_display(int idx, size_t *pxW, size_t *pxH, double *hz) {
         } else {
             if (gewollt) {
                 for (SCDisplay *d in c.displays) if (d.displayID == gewollt) { display = d; break; }
-                if (!display) logf_(@"Bildschirm %u ist weg", gewollt);
+                if (!display) logf_(@"Bildschirm %u ist weg - Aufnahme weicht aus, bis er zurueck ist", gewollt);
             }
             if (!display && explizit) {
                 if (c.displays.count > (NSUInteger)idx) display = c.displays[idx];
@@ -1619,10 +1626,14 @@ static SCDisplay *pick_display(int idx, size_t *pxW, size_t *pxH, double *hz) {
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
     if (!display) return nil;
     if (display.displayID != g_display_id)
-        logf_(@"Bildschirm gewaehlt: Kennung %u, %ld x %ld Punkte%@", display.displayID,
+        logf_(@"Bildschirm gewaehlt: Kennung %u, %ld x %ld Punkte%@%@", display.displayID,
               (long)display.width, (long)display.height,
-              display.displayID == CGMainDisplayID() ? @" (Hauptbildschirm)" : @"");
+              display.displayID == CGMainDisplayID() ? @" (Hauptbildschirm)" : @"",
+              (g_display_wunsch && display.displayID != g_display_wunsch) ? @" - Ausweichplatz" : @"");
     g_display_id = display.displayID;
+    // Der erste gewaehlte Bildschirm ist der gewollte; ein Ausweichplatz
+    // aendert daran nichts.
+    if (!g_display_wunsch) g_display_wunsch = display.displayID;
     // Die Maus folgt dem Bild - immer, nicht nur beim Programmstart.
     g_input_display = display.displayID;
     CGDisplayModeRef m = CGDisplayCopyDisplayMode(display.displayID);

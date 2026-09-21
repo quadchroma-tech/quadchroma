@@ -2540,7 +2540,14 @@ impl App {
             }
         };
         w.set_cursor(zeiger);
-        w.set_cursor_visible(z.sichtbar);
+        // Die Sichtbarkeit des Mac-Zeigers wird NICHT uebernommen. macOS
+        // blendet ihn beim Tippen aus und laesst ihn ausgeblendet, bis die
+        // physische Maus sich bewegt - vom Client aus bewegt sich die aber
+        // nie. Ergebnis war ein Windows-Zeiger, der ueber dem Bild einfach
+        // verschwand ("Maus geht nicht"). Der Wert reist weiter mit und steht
+        // im Protokoll; sichtbar ist der Zeiger hier immer.
+        w.set_cursor_visible(true);
+        let _ = z.sichtbar;
         self.zeiger_eigen = true;
     }
 
