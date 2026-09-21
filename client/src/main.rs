@@ -637,8 +637,10 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             let mut s = shared.lock().unwrap();
             s.abbruch = None;
             s.link = None;
+            // Die Form geht, die Nummer zaehlt weiter: fiele sie auf null,
+            // ueberspraenge der Fensterfaden nach dem Wiederverbinden genau die
+            // Form mit der alten Nummer.
             s.zeiger = None;
-            s.zeiger_seq = 0;
             s.connected = false;
             s.codec_wechsel = None;
             s.codec_idx = None;
@@ -2075,6 +2077,10 @@ struct App {
     zeiger_seq_gezeigt: u64,
     zeiger_eigen: bool,
     zeiger_vorrat: Vec<(u64, CustomCursor)>,
+    /// Massstab, mit dem die geltende Form gebaut wurde (siehe zeiger_massstab).
+    zeiger_faktor: u32,
+    /// Ist die Maus gerade im Fenster? Nur dann wird eine Form gesetzt.
+    maus_im_fenster: bool,
 }
 
 impl ApplicationHandler for App {
@@ -2136,6 +2142,9 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as i32, position.y as i32);
+                // Eine Bewegung im Fenster ist der sicherste Beleg dafuer,
+                // dass die Maus drin ist - auch wenn CursorEntered ausblieb.
+                self.maus_im_fenster = true;
                 if self.screen == Screen::Start { return; }
                 // Steht die Einstellungstafel offen, gehoert die Maus ihr und
                 // nicht dem Mac - sonst klickt man dort zweimal gleichzeitig.
@@ -2168,6 +2177,14 @@ impl ApplicationHandler for App {
                     _ => return,
                 };
                 self.input.lock().unwrap().mouse_button(b, state == winit::event::ElementState::Pressed);
+            }
+            WindowEvent::CursorEntered { .. } => {
+                self.maus_im_fenster = true;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.maus_im_fenster = false;
+                // Beim Wiedereintritt wird die Form frisch angewandt.
+                self.zeiger_seq_gezeigt = 0;
             }
             WindowEvent::Focused(false) => {
                 // Das Fenster ist weg - Alt-Tab, Sperrbildschirm, ein Dialog.
@@ -2420,15 +2437,30 @@ impl ApplicationHandler for App {
         }
         // Zeigerform: ueber dem Bild traegt der Windows-Zeiger die Form des
         // Macs, ueber der Oberflaeche (Menue, Start, Warten) den eigenen Pfeil.
-        let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden();
-        if im_bild {
-            let neu = {
-                let s = self.shared.lock().unwrap();
-                if s.zeiger_seq != self.zeiger_seq_gezeigt { s.zeiger.clone().map(|z| (s.zeiger_seq, z)) } else { None }
+        // Nur solange die Maus im Fenster ist (Windows' Regel: ein Fenster
+        // setzt den Zeiger nur ueber seiner eigenen Flaeche), und nur solange
+        // der Host eine Form geliefert hat - reisst die Verbindung ab, nimmt
+        // der Empfangsfaden sie weg, und hier faellt der Zeiger auf den Pfeil
+        // zurueck, statt als "unsichtbar" ueber dem stehenden Bild zu bleiben.
+        // Der Massstab folgt dem Bild: so gross, wie das Mac-Bild im Fenster
+        // erscheint, so gross der Zeiger - 1:1 also so gross wie auf dem Mac.
+        let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden() && self.maus_im_fenster;
+        let faktor = self.zeiger_massstab();
+        let (neu, form_da) = {
+            let s = self.shared.lock().unwrap();
+            let form_da = s.zeiger.is_some();
+            let neu = if im_bild && form_da && (s.zeiger_seq != self.zeiger_seq_gezeigt || faktor != self.zeiger_faktor) {
+                s.zeiger.clone().map(|z| (s.zeiger_seq, z))
+            } else {
+                None
             };
+            (neu, form_da)
+        };
+        if im_bild && form_da {
             if let Some((seq, z)) = neu {
                 self.zeiger_seq_gezeigt = seq;
-                self.zeiger_anwenden(el, &z);
+                self.zeiger_faktor = faktor;
+                self.zeiger_anwenden(el, &z, faktor);
             }
         } else if self.zeiger_eigen {
             if let Some(w) = &self.window {
@@ -2471,13 +2503,31 @@ impl App {
     /// einmal gebaut; der Vorrat haelt die letzten 32 (die Wartekugel hat ein
     /// Dutzend Bilder, ein Zeigerwechsel zwischen Pfeil, Hand und Textcursor
     /// soll nichts kosten).
-    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm) {
+    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, faktor: u32) {
         let Some(w) = self.window.clone() else { return };
-        let k = z.kennung();
+        let k = z.kennung().wrapping_mul(31).wrapping_add(faktor as u64);
         let zeiger = match self.zeiger_vorrat.iter().find(|(kk, _)| *kk == k) {
             Some((_, c)) => c.clone(),
             None => {
-                let Ok(quelle) = CustomCursor::from_rgba(z.rgba.clone(), z.w, z.h, z.hx, z.hy) else { return };
+                // Ganzzahlig hochziehen, Punkt fuer Punkt: ein Zeiger ist eine
+                // kleine Strichzeichnung, weich gefiltert saehe er verwaschen aus.
+                let f = faktor.max(1);
+                let (w2, h2) = (z.w as u32 * f, z.h as u32 * f);
+                let rgba = if f == 1 {
+                    z.rgba.clone()
+                } else {
+                    let mut aus = vec![0u8; (w2 * h2 * 4) as usize];
+                    for y in 0..h2 as usize {
+                        let qy = y / f as usize;
+                        for x in 0..w2 as usize {
+                            let q = (qy * z.w as usize + x / f as usize) * 4;
+                            let z4 = (y * w2 as usize + x) * 4;
+                            aus[z4..z4 + 4].copy_from_slice(&z.rgba[q..q + 4]);
+                        }
+                    }
+                    aus
+                };
+                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2 as u16, h2 as u16, z.hx * f as u16, z.hy * f as u16) else { return };
                 let c = el.create_custom_cursor(quelle);
                 if self.zeiger_vorrat.len() >= 32 {
                     self.zeiger_vorrat.remove(0);
@@ -2489,6 +2539,26 @@ impl App {
         w.set_cursor(zeiger);
         w.set_cursor_visible(z.sichtbar);
         self.zeiger_eigen = true;
+    }
+
+    /// Um wie viel das Mac-Bild im Fenster vergroessert erscheint, ganzzahlig
+    /// gerundet - der Zeiger bekommt denselben Massstab. Begrenzt, damit die
+    /// Form unter der Grenze von 256 Bildpunkten bleibt.
+    fn zeiger_massstab(&self) -> u32 {
+        let Some(w) = &self.window else { return 1 };
+        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return 1 };
+        if fw == 0 || fh == 0 {
+            return 1;
+        }
+        let s = w.inner_size();
+        let (_, _, zw, _) = ziel_rechteck(s.width.max(1), s.height.max(1), fw, fh, self.pixel_exact);
+        let mut f = ((zw as f32 / fw as f32) + 0.5).floor().clamp(1.0, 8.0) as u32;
+        if let Some(z) = self.shared.lock().unwrap().zeiger.as_ref() {
+            while f > 1 && (z.w as u32 * f > 256 || z.h as u32 * f > 256) {
+                f -= 1;
+            }
+        }
+        f
     }
 
     fn verbindung_trennen(&mut self) {
@@ -4388,6 +4458,8 @@ fn main() {
         zeiger_seq_gezeigt: 0,
         zeiger_eigen: false,
         zeiger_vorrat: Vec::new(),
+        zeiger_faktor: 1,
+        maus_im_fenster: false,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
