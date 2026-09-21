@@ -149,11 +149,18 @@ impl Default for Einstellungen {
     }
 }
 
-fn pfad() -> Option<PathBuf> {
+/// Eine Datei unter %APPDATA%\QuadChroma (ohne APPDATA: unter HOME). Das
+/// Verzeichnis wird angelegt, falls es fehlt. Fuer die Einstellungen, und
+/// fuer alles andere, was der Client dort ablegt (etwa benchmark.txt).
+pub fn datei_pfad(name: &str) -> Option<PathBuf> {
     let base = std::env::var("APPDATA").or_else(|_| std::env::var("HOME")).ok()?;
     let dir = PathBuf::from(base).join("QuadChroma");
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("einstellungen.txt"))
+    Some(dir.join(name))
+}
+
+fn pfad() -> Option<PathBuf> {
+    datei_pfad("einstellungen.txt")
 }
 
 impl Einstellungen {

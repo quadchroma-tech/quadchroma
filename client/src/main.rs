@@ -521,6 +521,9 @@ struct Shared {
     info: Option<StreamInfo>,
     decoded: u64,
     dropped: u64,
+    /// Nutzlast aller Bildnachrichten seit dem Start, in Byte. Daraus
+    /// rechnet der Benchmark die Datenrate, die wirklich ankommt.
+    bytes_video: u64,
     last_decode_ms: f32,
     error: Option<String>,
     /// Pruefsumme des Bildkanals. Der Eingabekanal braucht sie, sonst laesst
@@ -1123,6 +1126,9 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 s.codec_idx = Some(w.idx);
             }
             MSG_VIDEO => {
+                // Jedes Byte zaehlt, auch das eines Bildes, das gleich
+                // verworfen wird: die Leitung hat es getragen.
+                shared.lock().unwrap().bytes_video += len as u64;
                 // Nach einem Wechsel muss das erste Bild ein Schluesselbild
                 // sein (Flaggenbit 0). Alles andere gehoert noch zum alten
                 // Codec oder ist ohne Parametersaetze nicht decodierbar.
@@ -1719,6 +1725,10 @@ const IN_SETTINGS: u8 = 64;
 const IN_TIME: u8 = 65;
 /// Codecwunsch: ein Byte, der Index aus der Koennensliste.
 const IN_CODEC: u8 = 66;
+/// Testbild: ein Byte, 1 = der Host zeigt sein bewegtes Muster statt des
+/// Bildschirms, 0 = wieder der Bildschirm. Fuer den Benchmark, damit jeder
+/// Schritt denselben Inhalt misst.
+const IN_TESTBILD: u8 = 68;
 
 // Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
 const MOD_SHIFT: u32 = 1;
@@ -1862,6 +1872,13 @@ impl InputLink {
         self.send(IN_CODEC, &[idx]);
     }
 
+    /// Wunsch an den Host: Testbild an oder aus. Ein Host, der die
+    /// Nachricht nicht kennt, uebergeht sie - dann laeuft der Benchmark
+    /// eben auf dem Bildschirminhalt.
+    fn testbild(&mut self, an: bool) {
+        self.send(IN_TESTBILD, &[an as u8]);
+    }
+
     fn mouse_move(&mut self, nx: f32, ny: f32) {
         self.last = (nx, ny);
         let mut p = [0u8; 8];
@@ -1926,6 +1943,663 @@ impl InputLink {
         p[0..4].copy_from_slice(&dx.to_le_bytes());
         p[4..8].copy_from_slice(&dy.to_le_bytes());
         self.send(IN_SCROLL, &p);
+    }
+}
+
+// ---------------------------------------------------------------- Benchmark
+//
+// Misst den Weg Host -> Leitung -> Client der Reihe nach fuer Kombinationen
+// aus Codec, Bildrate und Datenrate und sagt am Ende, welche davon taugt.
+// Der Ablauf ist ein Zustandsautomat, den die Fensterschleife (alle 2 ms)
+// oder der Takt des Pruefmodus anstoesst - er blockiert nie, das Bild
+// laeuft weiter, das Menue darf offen bleiben. Angezeigt und gewertet wird
+// nie ein Wunsch, sondern was der Host bestaetigt hat.
+
+/// Datenraten und Bildraten, die der Reiter anbietet.
+const BENCH_MBITS: [u32; 5] = [10, 25, 50, 100, 150];
+const BENCH_FPSS: [u16; 2] = [60, 120];
+/// So lange darf ein Codecwechsel oder eine Einstellung auf sich warten
+/// lassen; danach gilt der Schritt als gescheitert.
+const BENCH_FRIST: Duration = Duration::from_secs(8);
+/// Ruhe nach dem Einstellen, bevor gemessen wird: die gleitenden Mittel
+/// der Latenz sollen den neuen Zustand zeigen, nicht den alten.
+const BENCH_EINSCHWINGEN: Duration = Duration::from_secs(1);
+/// Abstand der Proben waehrend der Messung.
+const BENCH_PROBE: Duration = Duration::from_secs(1);
+
+/// Was der Benchmark durchprobieren soll. Steht im Reiter und gilt fuer den
+/// naechsten Lauf.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenchKonfig {
+    /// Kandidaten der Koennensliste, die NICHT mitlaufen sollen. Leer
+    /// heisst: alle, die der Host kann - so bleibt die Vorgabe richtig, auch
+    /// wenn die Liste erst nach dem Verbinden kommt.
+    pub codecs_aus: Vec<u8>,
+    pub mbits: Vec<u32>,
+    pub fpss: Vec<u16>,
+    /// Messzeit je Schritt in Sekunden (3..15).
+    pub dauer_s: u32,
+    /// Testbild auf dem Host fuer die Dauer des Laufs.
+    pub testbild: bool,
+}
+
+impl BenchKonfig {
+    fn vorgabe(dauer_s: u32, testbild: bool) -> Self {
+        BenchKonfig {
+            codecs_aus: Vec::new(),
+            mbits: BENCH_MBITS.to_vec(),
+            fpss: BENCH_FPSS.to_vec(),
+            dauer_s: dauer_s.clamp(3, 15),
+            testbild,
+        }
+    }
+
+    /// Auswahl aus der Befehlszeile (Pruefmodus): "codecs:mbit:fps", jeder
+    /// Teil eine Liste mit Kommas, ein leerer Teil laesst die Vorgabe
+    /// stehen - "0,1:50,100:120" heisst Kandidaten 0 und 1, 50 und 100
+    /// Mbit/s, nur 120 Bilder. So bleibt ein Pruefungslauf kurz.
+    fn einschraenken(&mut self, text: &str, codecs: &[CodecEintrag]) {
+        let teile: Vec<&str> = text.split(':').collect();
+        let liste = |i: usize| -> Vec<u32> {
+            teile.get(i).map(|t| t.split(',').filter_map(|v| v.trim().parse().ok()).collect()).unwrap_or_default()
+        };
+        let gewollt = liste(0);
+        if !gewollt.is_empty() {
+            self.codecs_aus = codecs.iter().filter(|e| !gewollt.contains(&(e.idx as u32))).map(|e| e.idx).collect();
+        }
+        let mbits: Vec<u32> = liste(1).into_iter().map(|m| m.clamp(2, 500)).collect();
+        if !mbits.is_empty() {
+            self.mbits = mbits;
+        }
+        let fpss: Vec<u16> = liste(2).into_iter().map(|f| f.clamp(10, 240) as u16).collect();
+        if !fpss.is_empty() {
+            self.fpss = fpss;
+        }
+    }
+
+    /// Die Schrittliste: Codecs x Bildraten x Datenraten, in dieser
+    /// Reihenfolge - ein Codec bleibt stehen, waehrend seine Raten
+    /// durchlaufen; der Wechsel ist der teuerste Schritt.
+    fn schritte(&self, codecs: &[CodecEintrag]) -> Vec<BenchSchritt> {
+        let mut aus = Vec::new();
+        for e in codecs.iter().filter(|e| e.available && !self.codecs_aus.contains(&e.idx)) {
+            for &fps in &self.fpss {
+                for &mbit in &self.mbits {
+                    aus.push(BenchSchritt { idx: e.idx, name: e.name.clone(), qualitaet: qualitaet(e), mbit, fps });
+                }
+            }
+        }
+        aus
+    }
+}
+
+/// Rang der Farbqualitaet eines Kandidaten, fuer die Empfehlung:
+/// HEVC 4:4:4 10 Bit (4) > 4:4:4 8 Bit (3) > 4:2:0 10 Bit (2) > 4:2:0 8 Bit (1)
+/// > H.264 (0). AV1 wird wie HEVC nach Farbaufloesung und Bittiefe eingeordnet.
+fn qualitaet(e: &CodecEintrag) -> u8 {
+    if e.codec() == 2 { 0 } else { 1 + e.ten_bit as u8 + 2 * e.chroma444 as u8 }
+}
+
+#[derive(Clone, Debug)]
+struct BenchSchritt {
+    idx: u8,
+    name: String,
+    qualitaet: u8,
+    mbit: u32,
+    fps: u16,
+}
+
+impl BenchSchritt {
+    /// "HEVC 4:4:4 10 Bit · 50 Mbit/s · 120", wie in der Fortschrittszeile.
+    fn beschreibung(&self) -> String {
+        format!("{} · {} Mbit/s · {}", self.name, self.mbit, self.fps)
+    }
+}
+
+/// Was bei einem Schritt herauskam. Alle Zeiten in Millisekunden, Mittel
+/// ueber die Proben der Messzeit.
+#[derive(Clone, Debug, Default)]
+pub struct Ergebnis {
+    pub idx: u8,
+    pub codec: String,
+    pub qualitaet: u8,
+    pub mbit: u32,
+    pub fps: u16,
+    /// Codecwechsel oder Einstellungen kamen nicht zustande.
+    pub gescheitert: bool,
+    pub fps_gemessen: f32,
+    pub mbit_gemessen: f32,
+    /// Alle Glieder: Aufnahme bis Uebergabe ans Fenster.
+    pub kette_ms: f32,
+    pub encoder_ms: f32,
+    pub leitung_ms: f32,
+    pub decoder_ms: f32,
+    pub anzeige_ms: f32,
+    pub empfangen: u64,
+    pub verworfen: u64,
+    pub ausgelassen: u64,
+    /// Encoderzeit je Bild, wie der Host sie meldet, und sein Budget 1000/fps.
+    pub host_encoder_ms: f32,
+    pub budget_ms: f32,
+    pub host_cpu: f32,
+    pub client_cpu: f32,
+    pub bestanden: bool,
+}
+
+impl Ergebnis {
+    /// Die Regel, nach der ein Schritt besteht - dieselbe, die der Tooltip
+    /// im Reiter nennt:
+    ///   - die Kette ist hoechstens anderthalb Bilder lang: <= 1,5 * 1000/fps,
+    ///   - mindestens 95 % der Zielbildrate kommen an,
+    ///   - mit Anzeige: unter 1 % der empfangenen Bilder wurden verworfen
+    ///     (ohne Fenster wird nichts gezeigt, also auch nichts verworfen),
+    ///   - der Encoder des Hosts bleibt in seinem Budget: <= 1000/fps.
+    /// Ohne eine einzige Latenzprobe (Zeitabgleich stand nicht) kann der
+    /// Schritt nicht bestehen - eine Null waere keine Messung.
+    fn pruefen(&mut self, mit_anzeige: bool, hat_latenz: bool) {
+        let bild = 1000.0 / self.fps.max(1) as f32;
+        self.bestanden = !self.gescheitert
+            && hat_latenz
+            && self.kette_ms <= 1.5 * bild
+            && self.fps_gemessen >= 0.95 * self.fps as f32
+            && (!mit_anzeige || (self.verworfen as f32) < 0.01 * self.empfangen.max(1) as f32)
+            && self.host_encoder_ms <= bild;
+    }
+
+    /// Eine Zeile fuer das Protokoll.
+    fn zeile(&self, nr: usize, gesamt: usize, mit_anzeige: bool) -> String {
+        if self.gescheitert {
+            return format!(
+                "Benchmark {nr}/{gesamt}: {}, {} fps, {} Mbit/s: gescheitert (Codecwechsel oder Einstellung blieb aus)",
+                self.codec, self.fps, self.mbit
+            );
+        }
+        format!(
+            "Benchmark {nr}/{gesamt}: {}, {} fps, {} Mbit/s: {:.1} Bilder/s, {:.1} Mbit/s, Kette {:.1} ms (Encoder {:.1}, Leitung {:.1}, Decoder {:.1}, Anzeige {}), verworfen {}, ausgelassen {}, Host-Encoder {:.1}/{:.1} ms, Host-CPU {:.0} %, Client-CPU {:.1} % - {}",
+            self.codec, self.fps, self.mbit, self.fps_gemessen, self.mbit_gemessen, self.kette_ms,
+            self.encoder_ms, self.leitung_ms, self.decoder_ms,
+            if mit_anzeige { format!("{:.1}", self.anzeige_ms) } else { "-".into() },
+            if mit_anzeige { self.verworfen.to_string() } else { "-".into() },
+            if mit_anzeige { self.ausgelassen.to_string() } else { "-".into() },
+            self.host_encoder_ms, self.budget_ms, self.host_cpu, self.client_cpu,
+            if self.bestanden { "bestanden" } else { "nicht bestanden" }
+        )
+    }
+
+    /// Eine Zeile der Texttabelle (Datei und Konsole).
+    fn tabellenzeile(&self, mit_anzeige: bool) -> String {
+        let strich = |v: f32| if self.gescheitert { "-".to_string() } else { format!("{v:.1}") };
+        let anzeige = if mit_anzeige && !self.gescheitert { format!("{:.1}", self.anzeige_ms) } else { "-".into() };
+        let verworfen = if mit_anzeige && !self.gescheitert { self.verworfen.to_string() } else { "-".into() };
+        format!(
+            "{:<20} {:>8} {:>9} {:>9} {:>8} {:>7} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>8} {:>10}  {}",
+            self.codec, self.fps, self.mbit,
+            strich(self.fps_gemessen), strich(self.mbit_gemessen), strich(self.kette_ms),
+            strich(self.encoder_ms), strich(self.leitung_ms), strich(self.decoder_ms), anzeige,
+            verworfen,
+            if self.gescheitert { "-".into() } else { format!("{:.1}/{:.1}", self.host_encoder_ms, self.budget_ms) },
+            strich(self.host_cpu), strich(self.client_cpu),
+            if self.gescheitert { "gescheitert" } else if self.bestanden { "bestanden" } else { "nicht bestanden" }
+        )
+    }
+
+    fn tabellenkopf() -> String {
+        format!(
+            "{:<20} {:>8} {:>9} {:>9} {:>8} {:>7} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>8} {:>10}  {}",
+            "Codec", "Soll-fps", "Soll-Mbit", "Bilder/s", "Mbit/s", "Kette", "Encoder", "Leitung", "Decoder", "Anzeige",
+            "verworfen", "Host-Enc", "Host-CPU", "Client-CPU", "Ergebnis"
+        )
+    }
+}
+
+/// Die Empfehlung: die beste Farbqualitaet, die bei der hoechsten Bildrate
+/// besteht, mit der hoechsten Datenrate, bei der sie noch besteht. Also
+/// unter allen bestandenen Schritten der mit der groessten (Bildrate,
+/// Qualitaet, Datenrate) - in dieser Rangfolge.
+fn empfehlen(ergebnisse: &[Ergebnis]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, e) in ergebnisse.iter().enumerate().filter(|(_, e)| e.bestanden) {
+        let besser = match best {
+            None => true,
+            Some(b) => {
+                let o = &ergebnisse[b];
+                (e.fps, e.qualitaet, e.mbit) > (o.fps, o.qualitaet, o.mbit)
+            }
+        };
+        if besser {
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// Tabelle plus Empfehlung als Text - fuer benchmark.txt und die Konsole
+/// des Pruefmodus.
+fn bench_text(ergebnisse: &[Ergebnis], mit_anzeige: bool, abgebrochen: bool, adresse: &str) -> String {
+    let mut t = String::new();
+    t.push_str(&format!("QuadChroma Benchmark - Host {adresse}{}\n", if abgebrochen { " (abgebrochen)" } else { "" }));
+    t.push_str("Zeiten in ms, Mittel ueber die Messzeit; Host-Enc = Encoderzeit je Bild / Budget 1000/fps\n\n");
+    t.push_str(&Ergebnis::tabellenkopf());
+    t.push('\n');
+    for e in ergebnisse {
+        t.push_str(&e.tabellenzeile(mit_anzeige));
+        t.push('\n');
+    }
+    t.push('\n');
+    match empfehlen(ergebnisse) {
+        Some(i) => {
+            let e = &ergebnisse[i];
+            t.push_str(&format!(
+                "Empfehlung: {}, {} Bilder/s, {} Mbit/s - Kette {:.1} ms\n",
+                e.codec, e.fps, e.mbit, e.kette_ms
+            ));
+        }
+        None => t.push_str("Empfehlung: kein Schritt hat bestanden.\n"),
+    }
+    t
+}
+
+/// Wo der Automat gerade steht.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BenchPhase {
+    /// Codecwunsch unterwegs; warten auf Nachricht 7 und das erste Bild.
+    Wechsel,
+    /// Einstellungen unterwegs; warten auf die Bestaetigung des Hosts.
+    Einstellen,
+    Einschwingen,
+    Messen,
+    Fertig,
+}
+
+/// Ein Blick auf den Lauf, fuer das Menue - Abzug, keine Leihgabe, damit
+/// das Zeichnen den Automaten nicht festhaelt.
+pub struct BenchStand {
+    pub laeuft: bool,
+    pub abgebrochen: bool,
+    pub pos: usize,
+    pub gesamt: usize,
+    pub schritt: String,
+    pub phase: BenchPhase,
+    pub ergebnisse: Vec<Ergebnis>,
+    pub empfehlung: Option<Ergebnis>,
+    pub mit_anzeige: bool,
+}
+
+pub struct Benchmark {
+    schritte: Vec<BenchSchritt>,
+    codecs: Vec<CodecEintrag>,
+    pos: usize,
+    phase: BenchPhase,
+    /// Beginn der laufenden Phase.
+    seit: Instant,
+    dauer: Duration,
+    testbild: bool,
+    /// Laeuft ein Fenster? Ohne eines gibt es kein Glied Anzeige und nichts,
+    /// das verworfen werden koennte.
+    mit_anzeige: bool,
+    adresse: String,
+    /// Codec und Einstellungen vor dem Start - am Ende wieder gewuenscht.
+    vorher_codec: Option<u8>,
+    vorher_settings: Option<(u32, u16, bool, bool, bool)>,
+    /// Ton bleibt, wie er war.
+    ton: bool,
+    /// Der Wunsch der laufenden Phase ist beim Host - oder wartet noch auf
+    /// den Eingabekanal.
+    gesendet: bool,
+    /// Wechsel: Stand von `decoded`, als Nachricht 7 zum Ziel gesehen
+    /// wurde. Erst ein Bild danach zaehlt als "angekommen".
+    wechsel_gesehen: Option<u64>,
+    /// Messen: decodiert, verworfen, ausgelassen, Bytes zu Beginn.
+    start: (u64, u64, u64, u64),
+    letzte_probe: Instant,
+    /// Latenz (mit Anzeige), Hostlast, Client-CPU je Probe.
+    proben: Vec<(Latenz, Option<HostLast>, f32)>,
+    ergebnisse: Vec<Ergebnis>,
+    empfehlung: Option<usize>,
+    abgebrochen: bool,
+}
+
+impl Benchmark {
+    /// Den Lauf vorbereiten: Schrittliste aus Konfiguration und
+    /// Koennensliste, Ausgangslage merken. None, wenn nichts zu tun ist.
+    fn neu(konfig: &BenchKonfig, shared: &Arc<Mutex<Shared>>, mit_anzeige: bool, adresse: &str) -> Option<Benchmark> {
+        let s = shared.lock().unwrap();
+        let codecs = s.codecs.clone();
+        let schritte = konfig.schritte(&codecs);
+        if schritte.is_empty() {
+            return None;
+        }
+        // Was gerade laeuft: Nachricht 7, sonst der Abgleich mit der Strominfo.
+        let vorher_codec = s
+            .codec_idx
+            .or_else(|| s.info.and_then(|i| codecs.iter().find(|e| e.passt_zu(&i)).map(|e| e.idx)));
+        let ton = s.settings.map(|x| x.4).unwrap_or(s.ton);
+        Some(Benchmark {
+            schritte,
+            codecs,
+            pos: 0,
+            phase: BenchPhase::Fertig,
+            seit: Instant::now(),
+            dauer: Duration::from_secs(konfig.dauer_s.clamp(3, 15) as u64),
+            testbild: konfig.testbild,
+            mit_anzeige,
+            adresse: adresse.to_string(),
+            vorher_codec,
+            vorher_settings: s.settings,
+            ton,
+            gesendet: false,
+            wechsel_gesehen: None,
+            start: (0, 0, 0, 0),
+            letzte_probe: Instant::now(),
+            proben: Vec::new(),
+            ergebnisse: Vec::new(),
+            empfehlung: None,
+            abgebrochen: false,
+        })
+    }
+
+    fn laeuft(&self) -> bool {
+        self.phase != BenchPhase::Fertig
+    }
+
+    fn schritt(&self) -> &BenchSchritt {
+        &self.schritte[self.pos.min(self.schritte.len() - 1)]
+    }
+
+    /// Los: Testbild an, erster Schritt.
+    fn starten(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+        protokoll::zeile(format!(
+            "Benchmark: {} Schritte, {} s je Schritt, Testbild {}",
+            self.schritte.len(),
+            self.dauer.as_secs(),
+            if self.testbild { "an" } else { "aus" }
+        ));
+        if self.testbild {
+            input.lock().unwrap().testbild(true);
+        }
+        self.schritt_beginnen(shared, input);
+    }
+
+    /// Einen Schritt anfangen: laeuft der Codec schon, gleich einstellen,
+    /// sonst erst wechseln.
+    fn schritt_beginnen(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+        self.seit = Instant::now();
+        self.gesendet = false;
+        self.wechsel_gesehen = None;
+        let idx = self.schritt().idx;
+        let laeuft = {
+            let s = shared.lock().unwrap();
+            match (s.codec_idx, s.info) {
+                (Some(i), _) => i == idx,
+                (None, Some(i)) => self.codecs.iter().any(|e| e.idx == idx && e.passt_zu(&i)),
+                (None, None) => false,
+            }
+        };
+        self.phase = if laeuft { BenchPhase::Einstellen } else { BenchPhase::Wechsel };
+        self.senden(shared, input);
+    }
+
+    /// Den Wunsch der laufenden Phase abschicken - nur, wenn der
+    /// Eingabekanal steht; `send` wirft sonst stumm weg, und der Wunsch
+    /// waere verloren. Sonst beim naechsten Takt noch einmal.
+    fn senden(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+        let (idx, mbit, fps) = {
+            let s = self.schritt();
+            (s.idx, s.mbit, s.fps)
+        };
+        let mut l = input.lock().unwrap();
+        l.ensure();
+        if l.sock.is_none() {
+            return;
+        }
+        match self.phase {
+            BenchPhase::Wechsel => {
+                // Wie der Klick im Menue: erst der Hinweis, dann der Wunsch.
+                shared.lock().unwrap().codec_wechsel = Some(Instant::now());
+                l.codec(idx);
+            }
+            // Spielmodus aus, feste Bildrate AN - sonst haengt die Bildrate
+            // am Inhalt, und die Schritte waeren nicht vergleichbar.
+            BenchPhase::Einstellen => l.settings(mbit, fps, false, true, self.ton),
+            _ => {}
+        }
+        self.gesendet = true;
+    }
+
+    /// Ein Takt des Automaten. `client_cpu` ist die eigene Prozessorlast,
+    /// wie der Aufrufer sie misst.
+    fn takt(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>, client_cpu: f32) {
+        if !self.laeuft() {
+            return;
+        }
+        if !shared.lock().unwrap().connected {
+            protokoll::zeile("Benchmark: Verbindung verloren, abgebrochen".into());
+            self.abbrechen(shared, input, false);
+            return;
+        }
+        if !self.gesendet {
+            self.senden(shared, input);
+        }
+        match self.phase {
+            BenchPhase::Wechsel => {
+                let idx = self.schritt().idx;
+                let (codec_idx, decoded, wechsel) = {
+                    let s = shared.lock().unwrap();
+                    (s.codec_idx, s.decoded, s.wechsel_laeuft())
+                };
+                if codec_idx == Some(idx) && self.wechsel_gesehen.is_none() {
+                    self.wechsel_gesehen = Some(decoded);
+                }
+                if let Some(d0) = self.wechsel_gesehen {
+                    if !wechsel && decoded > d0 {
+                        self.phase = BenchPhase::Einstellen;
+                        self.seit = Instant::now();
+                        self.gesendet = false;
+                        self.senden(shared, input);
+                        return;
+                    }
+                }
+                if self.seit.elapsed() > BENCH_FRIST {
+                    self.gescheitert(shared, input);
+                }
+            }
+            BenchPhase::Einstellen => {
+                let ziel = {
+                    let s = self.schritt();
+                    (s.mbit, s.fps, false, true, self.ton)
+                };
+                if shared.lock().unwrap().settings == Some(ziel) {
+                    self.phase = BenchPhase::Einschwingen;
+                    self.seit = Instant::now();
+                } else if self.seit.elapsed() > BENCH_FRIST {
+                    self.gescheitert(shared, input);
+                }
+            }
+            BenchPhase::Einschwingen => {
+                if self.seit.elapsed() >= BENCH_EINSCHWINGEN {
+                    let s = shared.lock().unwrap();
+                    self.start = (s.decoded, s.dropped, s.ausgelassen, s.bytes_video);
+                    drop(s);
+                    self.proben.clear();
+                    self.phase = BenchPhase::Messen;
+                    self.seit = Instant::now();
+                    self.letzte_probe = Instant::now();
+                }
+            }
+            BenchPhase::Messen => {
+                if self.letzte_probe.elapsed() >= BENCH_PROBE {
+                    self.probe(shared, client_cpu);
+                }
+                if self.seit.elapsed() >= self.dauer {
+                    if self.proben.is_empty() {
+                        self.probe(shared, client_cpu);
+                    }
+                    self.auswerten(shared, input);
+                }
+            }
+            BenchPhase::Fertig => {}
+        }
+    }
+
+    fn probe(&mut self, shared: &Arc<Mutex<Shared>>, client_cpu: f32) {
+        let (lat, hl) = {
+            let s = shared.lock().unwrap();
+            (s.latenz(), s.hostlast)
+        };
+        self.letzte_probe = Instant::now();
+        self.proben.push((lat.unwrap_or_default(), hl, client_cpu));
+    }
+
+    /// Der Schritt kam nicht zustande: als gescheitert vermerken, weiter.
+    fn gescheitert(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+        let s = self.schritt().clone();
+        let e = Ergebnis {
+            idx: s.idx, codec: s.name, qualitaet: s.qualitaet, mbit: s.mbit, fps: s.fps,
+            gescheitert: true, budget_ms: 1000.0 / s.fps.max(1) as f32,
+            ..Ergebnis::default()
+        };
+        self.eintragen(e, shared, input);
+    }
+
+    /// Messzeit vorbei: Zaehlerdifferenzen und Mittel der Proben.
+    fn auswerten(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+        let sek = self.seit.elapsed().as_secs_f32().max(0.001);
+        let (decoded, dropped, ausgelassen, bytes) = {
+            let s = shared.lock().unwrap();
+            (s.decoded, s.dropped, s.ausgelassen, s.bytes_video)
+        };
+        let empfangen = decoded.saturating_sub(self.start.0);
+        // Nur Proben mit stehendem Zeitabgleich sagen etwas ueber die Kette.
+        let mit_latenz: Vec<&Latenz> = self.proben.iter().map(|(l, _, _)| l).filter(|l| l.gesamt_ms > 0.0).collect();
+        let mittel = |f: &dyn Fn(&Latenz) -> f32| -> f32 {
+            if mit_latenz.is_empty() { 0.0 } else { mit_latenz.iter().map(|l| f(l)).sum::<f32>() / mit_latenz.len() as f32 }
+        };
+        let hosts: Vec<HostLast> = self.proben.iter().filter_map(|(_, h, _)| *h).collect();
+        let host_mittel = |f: &dyn Fn(&HostLast) -> f32| -> f32 {
+            if hosts.is_empty() { 0.0 } else { hosts.iter().map(|h| f(h)).sum::<f32>() / hosts.len() as f32 }
+        };
+        let client_cpu = self.proben.iter().map(|(_, _, c)| *c).sum::<f32>() / self.proben.len().max(1) as f32;
+        let s = self.schritt().clone();
+        let mut e = Ergebnis {
+            idx: s.idx,
+            codec: s.name,
+            qualitaet: s.qualitaet,
+            mbit: s.mbit,
+            fps: s.fps,
+            gescheitert: false,
+            fps_gemessen: empfangen as f32 / sek,
+            mbit_gemessen: bytes.saturating_sub(self.start.3) as f32 * 8.0 / sek / 1e6,
+            kette_ms: mittel(&|l| l.bis_anzeige()),
+            encoder_ms: mittel(&|l| l.encoder_ms),
+            leitung_ms: mittel(&|l| l.leitung_ms),
+            decoder_ms: mittel(&|l| l.decoder_ms),
+            anzeige_ms: mittel(&|l| l.anzeige_ms),
+            empfangen,
+            verworfen: dropped.saturating_sub(self.start.1),
+            ausgelassen: ausgelassen.saturating_sub(self.start.2),
+            host_encoder_ms: host_mittel(&|h| h.encoder_ms),
+            budget_ms: 1000.0 / s.fps.max(1) as f32,
+            host_cpu: host_mittel(&|h| h.cpu),
+            client_cpu,
+            bestanden: false,
+        };
+        e.pruefen(self.mit_anzeige, !mit_latenz.is_empty());
+        self.eintragen(e, shared, input);
+    }
+
+    /// Ergebnis festhalten, ins Protokoll, Empfehlung nachfuehren, und
+    /// zum naechsten Schritt - oder zum Ende.
+    fn eintragen(&mut self, e: Ergebnis, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+        protokoll::zeile(e.zeile(self.pos + 1, self.schritte.len(), self.mit_anzeige));
+        self.ergebnisse.push(e);
+        self.empfehlung = empfehlen(&self.ergebnisse);
+        self.pos += 1;
+        if self.pos < self.schritte.len() {
+            self.schritt_beginnen(shared, input);
+        } else {
+            self.abschliessen(shared, input, true);
+        }
+    }
+
+    /// Abbruch von aussen: Knopf, ESC, Verbindung weg. Mit
+    /// `wiederherstellen` gehen Codec und Einstellungen von vor dem Start
+    /// wieder an den Host; ohne (Trennen) nur das Testbild aus.
+    fn abbrechen(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>, wiederherstellen: bool) {
+        self.abgebrochen = true;
+        self.abschliessen(shared, input, wiederherstellen);
+    }
+
+    /// Ende des Laufs: Testbild aus, Ausgangslage wieder wuenschen,
+    /// Empfehlung, Datei.
+    fn abschliessen(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>, wiederherstellen: bool) {
+        self.phase = BenchPhase::Fertig;
+        self.empfehlung = empfehlen(&self.ergebnisse);
+        if self.testbild {
+            input.lock().unwrap().testbild(false);
+        }
+        if wiederherstellen {
+            let jetzt = shared.lock().unwrap().codec_idx;
+            if let Some(v) = self.vorher_codec {
+                if jetzt != Some(v) {
+                    shared.lock().unwrap().codec_wechsel = Some(Instant::now());
+                    input.lock().unwrap().codec(v);
+                }
+            }
+            if let Some(w) = self.vorher_settings {
+                input.lock().unwrap().settings(w.0, w.1, w.2, w.3, w.4);
+            }
+        }
+        protokoll::zeile(match (self.abgebrochen, self.empfehlung) {
+            (true, _) => format!("Benchmark abgebrochen nach {} von {} Schritten", self.ergebnisse.len(), self.schritte.len()),
+            (false, Some(i)) => {
+                let e = &self.ergebnisse[i];
+                format!("Benchmark fertig. Empfehlung: {}, {} Bilder/s, {} Mbit/s - Kette {:.1} ms", e.codec, e.fps, e.mbit, e.kette_ms)
+            }
+            (false, None) => "Benchmark fertig. Kein Schritt hat bestanden.".into(),
+        });
+        // Die ganze Tabelle in die Datei - bei jedem Lauf neu, auch nach
+        // einem Abbruch: was gemessen wurde, ist gemessen.
+        if !self.ergebnisse.is_empty() {
+            if let Some(p) = einstellungen::datei_pfad("benchmark.txt") {
+                std::fs::write(p, self.text()).ok();
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        bench_text(&self.ergebnisse, self.mit_anzeige, self.abgebrochen, &self.adresse)
+    }
+
+    /// Der Abzug fuer das Menue.
+    fn stand(&self) -> BenchStand {
+        BenchStand {
+            laeuft: self.laeuft(),
+            abgebrochen: self.abgebrochen,
+            pos: self.pos,
+            gesamt: self.schritte.len(),
+            schritt: self.schritt().beschreibung(),
+            phase: self.phase,
+            ergebnisse: self.ergebnisse.clone(),
+            empfehlung: self.empfehlung.map(|i| self.ergebnisse[i].clone()),
+            mit_anzeige: self.mit_anzeige,
+        }
+    }
+}
+
+/// Eigene Prozessorlast, dasselbe Mass wie der Task-Manager: Kernel- plus
+/// Nutzerzeit des Prozesses seit der letzten Messung, geteilt durch
+/// Wandzeit mal logische Kerne - "Prozent der Maschine". `zeiten` haelt
+/// Prozesszeit und Zeitpunkt der letzten Messung und wird fortgeschrieben.
+fn cpu_eigen_messen(zeiten: &mut (u64, Instant)) -> Option<f32> {
+    let jetzt = prozesszeit_100ns()?;
+    let (vorher, seit) = *zeiten;
+    let wand = seit.elapsed().as_secs_f64() * 1e7;
+    let kerne = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    *zeiten = (jetzt, Instant::now());
+    if wand > 0.0 {
+        Some((jetzt.saturating_sub(vorher) as f64 / (wand * kerne) * 100.0) as f32)
+    } else {
+        None
     }
 }
 
@@ -2084,6 +2758,10 @@ struct App {
     zeiger_faktor: u32,
     /// Ist die Maus gerade im Fenster? Nur dann wird eine Form gesetzt.
     maus_im_fenster: bool,
+    /// Der laufende oder zuletzt gelaufene Benchmark, und was der naechste
+    /// durchprobieren soll.
+    benchmark: Option<Benchmark>,
+    bench_konfig: BenchKonfig,
 }
 
 impl ApplicationHandler for App {
@@ -2252,6 +2930,9 @@ impl ApplicationHandler for App {
                             self.hud_offen = false;
                             self.esc_seit = None;
                             self.esc_verbraucht = true;
+                            // Menue zu heisst: ein laufender Benchmark ist
+                            // abgebrochen - niemand saehe ihn mehr.
+                            self.benchmark_abbrechen(true);
                         }
                         return;
                     }
@@ -2313,6 +2994,8 @@ impl ApplicationHandler for App {
                                     self.input.lock().unwrap().alle_loslassen();
                                     self.mods = 0;
                                     self.hud_reiter = 0;
+                                } else {
+                                    self.benchmark_abbrechen(true);
                                 }
                                 return;
                             }
@@ -2434,6 +3117,13 @@ impl ApplicationHandler for App {
             }
             (None, _) => self.angewandt_fuer = None,
             _ => {}
+        }
+        // Der Benchmark arbeitet im selben Takt: nie blockierend, das Bild
+        // laeuft weiter, das Menue zeigt den Fortschritt.
+        if let Some(b) = self.benchmark.as_mut() {
+            if b.laeuft() {
+                b.takt(&self.shared, &self.input, self.cpu_eigen);
+            }
         }
         // Zeigerform: ueber dem Bild traegt der Windows-Zeiger die Form des
         // Macs, ueber der Oberflaeche (Menue, Start, Warten) den eigenen Pfeil.
@@ -2589,7 +3279,56 @@ impl App {
         f
     }
 
+    /// Einen laufenden Benchmark abbrechen. Mit `wiederherstellen` bekommt
+    /// der Host Codec und Einstellungen von vor dem Start zurueck; beim
+    /// Trennen geht nur noch das Testbild aus.
+    fn benchmark_abbrechen(&mut self, wiederherstellen: bool) {
+        if let Some(b) = self.benchmark.as_mut() {
+            if b.laeuft() {
+                b.abbrechen(&self.shared, &self.input, wiederherstellen);
+            }
+        }
+    }
+
+    /// Den Benchmark mit der Konfiguration des Reiters starten.
+    fn benchmark_starten(&mut self) {
+        if self.benchmark.as_ref().map(|b| b.laeuft()).unwrap_or(false) {
+            return;
+        }
+        match Benchmark::neu(&self.bench_konfig, &self.shared, true, &self.addr_input) {
+            Some(mut b) => {
+                b.starten(&self.shared, &self.input);
+                self.benchmark = Some(b);
+            }
+            None => protokoll::zeile("Benchmark: nichts zu messen (kein Codec, keine Rate gewaehlt)".into()),
+        }
+    }
+
+    /// Wunsch nach Datenrate, Bildrate, Spielmodus, fester Bildrate und Ton
+    /// an den Host, und die Werte fuer diesen Host merken.
+    fn stellen(&mut self, m: u32, f: u16, g: bool, fx: bool, ton: bool) {
+        self.input.lock().unwrap().settings(m, f, g, fx, ton);
+        self.shared.lock().unwrap().ton = ton;
+        if let Some(fp) = &self.angewandt_fuer {
+            let fp = fp.clone();
+            self.cfg.host_merken(&fp, einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton });
+        }
+    }
+
+    /// Wunsch nach einem Kandidaten der Koennensliste. Erst den Hinweis
+    /// setzen, dann den Wunsch abschicken. Andersherum koennte der
+    /// Empfangsfaden Nachricht 7 und das erste Bild dazwischen verarbeiten
+    /// und den Hinweis loeschen, bevor er ueberhaupt steht - dann bliebe er
+    /// bis zum Ablauf der Frist haengen.
+    fn codec_wuenschen(&mut self, idx: u8) {
+        self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
+        self.input.lock().unwrap().codec(idx);
+    }
+
     fn verbindung_trennen(&mut self) {
+        // Ein laufender Benchmark endet mit der Verbindung; wiederherstellen
+        // gibt es nichts mehr, nur das Testbild geht noch aus.
+        self.benchmark_abbrechen(false);
         let griff = {
             let mut s = self.shared.lock().unwrap();
             s.target = None;
@@ -2667,19 +3406,11 @@ impl App {
                     }
                 }
             }
-            // Eigene Prozessorlast, dasselbe Mass wie der Task-Manager: Kernel-
-            // plus Nutzerzeit des Prozesses, geteilt durch Wandzeit mal
-            // logische Kerne - "Prozent der Maschine". So ist die Zahl direkt
-            // mit den 21,8 % vergleichbar, die der Task-Manager auf dem Laptop
-            // fuer den CPU-Weg zeigte.
-            if let Some(jetzt) = prozesszeit_100ns() {
-                let (vorher, seit) = self.cpu_zeiten;
-                let wand = seit.elapsed().as_secs_f64() * 1e7;
-                let kerne = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
-                if wand > 0.0 {
-                    self.cpu_eigen = (jetzt.saturating_sub(vorher) as f64 / (wand * kerne) * 100.0) as f32;
-                }
-                self.cpu_zeiten = (jetzt, Instant::now());
+            // Eigene Prozessorlast, dasselbe Mass wie der Task-Manager. So
+            // ist die Zahl direkt mit den 21,8 % vergleichbar, die der
+            // Task-Manager auf dem Laptop fuer den CPU-Weg zeigte.
+            if let Some(cpu) = cpu_eigen_messen(&mut self.cpu_zeiten) {
+                self.cpu_eigen = cpu;
             }
             self.monitor_hz = window
                 .current_monitor()
@@ -3210,6 +3941,10 @@ impl App {
                         wechsel,
                         decoder: decoder_wunsch,
                         decoder_aktiv,
+                        bench_konfig: self.bench_konfig.clone(),
+                        // Der Abzug kostet je Zeichnung ein paar Dutzend
+                        // Ergebnisse - nur, wenn der Reiter offen ist.
+                        bench: if reiter == 4 { self.benchmark.as_ref().map(|b| b.stand()) } else { None },
                     };
                     n.hud = Some(hud(
                         &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
@@ -3323,25 +4058,51 @@ impl App {
                 self.cfg.sichern();
             }
             HudAktion::Trennen => self.verbindung_trennen(),
-            HudAktion::Stellen(m, f, g, fx, ton) => {
-                self.input.lock().unwrap().settings(m, f, g, fx, ton);
-                self.shared.lock().unwrap().ton = ton;
-                if let Some(fp) = &self.angewandt_fuer {
-                    let fp = fp.clone();
-                    self.cfg.host_merken(
-                        &fp,
-                        einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton },
-                    );
+            HudAktion::Stellen(m, f, g, fx, ton) => self.stellen(m, f, g, fx, ton),
+            HudAktion::Codec(idx) => self.codec_wuenschen(idx),
+            // --- Benchmark: Konfiguration nur, solange keiner laeuft -----
+            HudAktion::BenchCodec(idx) => {
+                let aus = &mut self.bench_konfig.codecs_aus;
+                match aus.iter().position(|&i| i == idx) {
+                    Some(p) => { aus.remove(p); }
+                    None => aus.push(idx),
                 }
             }
-            HudAktion::Codec(idx) => {
-                // Erst den Hinweis setzen, dann den Wunsch abschicken.
-                // Andersherum koennte der Empfangsfaden Nachricht 7
-                // und das erste Bild dazwischen verarbeiten und den
-                // Hinweis loeschen, bevor er ueberhaupt steht - dann
-                // bliebe er bis zum Ablauf der Frist haengen.
-                self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
-                self.input.lock().unwrap().codec(idx);
+            HudAktion::BenchMbit(m) => {
+                let drin = self.bench_konfig.mbits.contains(&m);
+                // Aus der festen Reihe neu aufbauen, damit die Reihenfolge
+                // der Schritte immer die der Knoepfe ist.
+                self.bench_konfig.mbits = BENCH_MBITS
+                    .iter()
+                    .copied()
+                    .filter(|&x| if x == m { !drin } else { self.bench_konfig.mbits.contains(&x) })
+                    .collect();
+            }
+            HudAktion::BenchFps(f) => {
+                let drin = self.bench_konfig.fpss.contains(&f);
+                self.bench_konfig.fpss = BENCH_FPSS
+                    .iter()
+                    .copied()
+                    .filter(|&x| if x == f { !drin } else { self.bench_konfig.fpss.contains(&x) })
+                    .collect();
+            }
+            HudAktion::BenchDauer(d) => {
+                self.bench_konfig.dauer_s = (self.bench_konfig.dauer_s as i32 + d).clamp(3, 15) as u32;
+            }
+            HudAktion::BenchTestbild => self.bench_konfig.testbild = !self.bench_konfig.testbild,
+            HudAktion::BenchStart => self.benchmark_starten(),
+            HudAktion::BenchAbbruch => self.benchmark_abbrechen(true),
+            HudAktion::BenchUebernehmen(idx, m, f) => {
+                // Wie ein Klick auf den Codec und die Steller im Reiter
+                // "Bild": Wunsch an den Host, Werte fuer diesen Host merken.
+                let (jetzt, ton) = {
+                    let s = self.shared.lock().unwrap();
+                    (s.codec_idx, s.settings.map(|x| x.4).unwrap_or(s.ton))
+                };
+                if jetzt != Some(idx) {
+                    self.codec_wuenschen(idx);
+                }
+                self.stellen(m, f, false, true, ton);
             }
             HudAktion::Decoder(w) => {
                 // Merken, sichern, und dem Empfangsfaden Bescheid
@@ -3698,6 +4459,22 @@ fn label_value(
         u.text.draw(c, x + w - vw - 16, ty + 18, value, 13, col, 1);
         40
     }
+}
+
+/// Text auf eine Breite kuerzen, mit Auslassungszeichen am Ende - fuer
+/// Spaltenkoepfe, die in einer Sprache laenger sind als ihre Spalte.
+fn kuerzen(u: &mut ui::Ui, t: &str, breite: i32, size: u32, spacing: i32) -> String {
+    if u.text.width(t, size, spacing) <= breite {
+        return t.to_string();
+    }
+    let zeichen: Vec<char> = t.chars().collect();
+    for n in (1..zeichen.len()).rev() {
+        let probe: String = zeichen[..n].iter().collect::<String>().trim_end().to_string() + "…";
+        if u.text.width(&probe, size, spacing) <= breite {
+            return probe;
+        }
+    }
+    "…".into()
 }
 
 /// Text in Zeilen schneiden, die in die vorgegebene Breite passen.
@@ -4113,6 +4890,41 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             eintrag(4, "H.264 High", true, false, false, false),
             eintrag(5, "AV1", false, false, false, false),
         ];
+        // "hud5": der Benchmark mitten im Lauf - 15 von 30 Schritten, die
+        // Zahlen erfunden, aber so, wie sie auf dem Mac mini aussehen: mit
+        // der Datenrate waechst die Encoderzeit, bei 120 Bildern und 150
+        // Mbit/s reisst das Budget.
+        let bench = if view == "hud5" {
+            let mut ergebnisse = Vec::new();
+            for (name, q, fpss) in [("HEVC 4:4:4 10 Bit", 4u8, &[60u16, 120][..]), ("HEVC 4:4:4 8 Bit", 3, &[60][..])] {
+                for &fps in fpss {
+                    for &mbit in &BENCH_MBITS {
+                        let enc = 4.5 + mbit as f32 / 40.0;
+                        let mut e = Ergebnis {
+                            idx: 4 - q, codec: name.into(), qualitaet: q, mbit, fps, gescheitert: false,
+                            fps_gemessen: fps as f32 - 0.4 - mbit as f32 / 100.0,
+                            mbit_gemessen: mbit as f32 * 0.93,
+                            kette_ms: enc + 2.6 + 1.9 + 1.1 + if fps == 120 { 0.8 } else { 5.8 },
+                            encoder_ms: enc, leitung_ms: 2.6, decoder_ms: 1.9, anzeige_ms: 1.1,
+                            empfangen: fps as u64 * 5, verworfen: if mbit >= 150 { 7 } else { 0 }, ausgelassen: 0,
+                            host_encoder_ms: enc + 0.6, budget_ms: 1000.0 / fps as f32,
+                            host_cpu: 24.0 + mbit as f32 / 10.0, client_cpu: 5.0 + mbit as f32 / 50.0,
+                            bestanden: false,
+                        };
+                        e.pruefen(true, true);
+                        ergebnisse.push(e);
+                    }
+                }
+            }
+            let empfehlung = empfehlen(&ergebnisse).map(|i| ergebnisse[i].clone());
+            Some(BenchStand {
+                laeuft: true, abgebrochen: false, pos: 15, gesamt: 30,
+                schritt: "HEVC 4:4:4 8 Bit · 10 Mbit/s · 120".into(),
+                phase: BenchPhase::Messen, ergebnisse, empfehlung, mit_anzeige: true,
+            })
+        } else {
+            None
+        };
         let stand = HudStand {
             vollbild: true, pixelgenau: false, statistik: true, nerd: true,
             wahl: einstellungen::StatWahl::default(),
@@ -4121,8 +4933,10 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             wechsel: false,
             decoder: einstellungen::DecoderWunsch::Automatik,
             decoder_aktiv: Some(DecoderPfad::Nvdec),
+            bench_konfig: BenchKonfig::vorgabe(5, true),
+            bench,
         };
-        let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, _ => 0 };
+        let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, "hud5" => 4, _ => 0 };
         // "hud2tip": die Maus steht ueber dem Schalter "Vollbild", damit der
         // Tooltip im Bild ist und sich ueber SSH pruefen laesst.
         if view == "hud2tip" {
@@ -4201,6 +5015,7 @@ fn main() {
     const WERTIG: &[(&str, usize)] = &[
         ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1),
         ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
+        ("--benchmark-auswahl", 1),
     ];
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut addr = String::new();
@@ -4209,6 +5024,15 @@ fn main() {
         let a = &args[i];
         if let Some((_, n)) = WERTIG.iter().find(|(s, _)| *s == a.as_str()) {
             i += 1 + n;
+            continue;
+        }
+        // --benchmark [dauer]: die Dauer ist wahlfrei - eine Zahl dahinter
+        // gehoert zum Schalter, alles andere nicht.
+        if a == "--benchmark" {
+            i += 1;
+            if args.get(i).map(|v| v.parse::<u32>().is_ok()).unwrap_or(false) {
+                i += 1;
+            }
             continue;
         }
         if a.starts_with("--") {
@@ -4376,11 +5200,101 @@ fn main() {
             let args: Vec<String> = std::env::args().collect();
             codec_wunsch = args.get(i + 1).and_then(|v| v.parse().ok());
         }
+        // --benchmark [dauer]: derselbe Ablauf wie im Reiter, angetrieben
+        // aus diesem Takt, Tabelle und Empfehlung auf die Konsole, danach
+        // Schluss. Testbild an, ausser mit --ohne-testbild.
+        let benchmark_dauer: Option<u32> = std::env::args().position(|a| a == "--benchmark").map(|i| {
+            std::env::args().nth(i + 1).and_then(|v| v.parse().ok()).unwrap_or(5)
+        });
+        let ohne_testbild = std::env::args().any(|a| a == "--ohne-testbild");
+        // --benchmark-auswahl codecs:mbit:fps grenzt den Lauf ein (siehe
+        // BenchKonfig::einschraenken).
+        let benchmark_auswahl: Option<String> = std::env::args()
+            .position(|a| a == "--benchmark-auswahl")
+            .and_then(|i| std::env::args().nth(i + 1));
+        let mut bench: Option<Benchmark> = None;
+        let mut cpu_zeiten = (prozesszeit_100ns().unwrap_or(0), Instant::now());
+        let mut cpu_eigen = 0.0f32;
         println!("Decoderwunsch: {}", decoder_wunsch.schluessel());
         let start = Instant::now();
         let mut last = 0u64;
         loop {
-            std::thread::sleep(Duration::from_secs(3));
+            // Der Drei-Sekunden-Takt in Scheiben von 50 ms: dazwischen
+            // arbeitet der Benchmark, der seine Fristen selbst misst.
+            let takt_ende = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < takt_ende {
+                std::thread::sleep(Duration::from_millis(50));
+                let Some(dauer) = benchmark_dauer else { continue };
+                match bench.as_mut() {
+                    None => {
+                        // Start, sobald Koennensliste, Strominfo (welcher
+                        // Codec laeuft - sonst wuenschte der erste Schritt
+                        // womoeglich den, der schon laeuft, und der Host
+                        // antwortete nur "laeuft bereits"), Einstellungen,
+                        // die erste Lastmeldung des Hosts (sie kommt je
+                        // Sekunde; ohne sie fehlten dem ersten Schritt
+                        // Encoderzeit und Host-CPU, und der Strom ist bis
+                        // dahin auch erst angelaufen) und der Eingabekanal
+                        // da sind - ohne den kaeme kein Wunsch an.
+                        let (bereit, link) = {
+                            let s = shared.lock().unwrap();
+                            (
+                                s.connected
+                                    && !s.codecs.is_empty()
+                                    && s.info.is_some()
+                                    && s.settings.is_some()
+                                    && s.hostlast.is_some(),
+                                s.link.clone(),
+                            )
+                        };
+                        if !bereit {
+                            continue;
+                        }
+                        let steht = {
+                            let mut l = input.lock().unwrap();
+                            l.set_link(link);
+                            l.ensure();
+                            l.sock.is_some()
+                        };
+                        if !steht {
+                            continue;
+                        }
+                        let mut konfig = BenchKonfig::vorgabe(dauer, !ohne_testbild);
+                        if let Some(a) = &benchmark_auswahl {
+                            let codecs = shared.lock().unwrap().codecs.clone();
+                            konfig.einschraenken(a, &codecs);
+                        }
+                        match Benchmark::neu(&konfig, &shared, false, &addr) {
+                            Some(mut b) => {
+                                b.starten(&shared, &input);
+                                println!("Benchmark gestartet: {} Schritte, {} s je Schritt", b.schritte.len(), konfig.dauer_s);
+                                bench = Some(b);
+                            }
+                            None => {
+                                println!("Benchmark: kein verfuegbarer Codec in der Koennensliste");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Some(b) if b.laeuft() => {
+                        b.takt(&shared, &input, cpu_eigen);
+                        // Im Pruefmodus zeigt niemand Bilder an.
+                        shared.lock().unwrap().frame = None;
+                    }
+                    Some(b) => {
+                        for m in protokoll::abholen() {
+                            println!("{m}");
+                        }
+                        println!();
+                        print!("{}", b.text());
+                        std::io::stdout().flush().ok();
+                        std::process::exit(if b.abgebrochen { 1 } else { 0 });
+                    }
+                }
+            }
+            if let Some(cpu) = cpu_eigen_messen(&mut cpu_zeiten) {
+                cpu_eigen = cpu;
+            }
             let s = shared.lock().unwrap();
             let n = s.decoded;
             // Das Protokoll seit dem letzten Takt: jeder (Neu-)Bau des
@@ -4535,6 +5449,8 @@ fn main() {
         zeiger_vorrat: Vec::new(),
         zeiger_faktor: 1,
         maus_im_fenster: false,
+        benchmark: None,
+        bench_konfig: BenchKonfig::vorgabe(5, true),
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
@@ -4562,6 +5478,17 @@ pub enum HudAktion {
     Codec(u8),
     /// Anderer Decoderpfad gewuenscht.
     Decoder(einstellungen::DecoderWunsch),
+    /// Benchmark: Kandidat an/aus, Datenrate an/aus, Bildrate an/aus,
+    /// Dauer +/-1 s, Testbild an/aus, Start, Abbruch, Empfehlung
+    /// uebernehmen (Kandidat, Mbit/s, Bilder/s).
+    BenchCodec(u8),
+    BenchMbit(u32),
+    BenchFps(u16),
+    BenchDauer(i32),
+    BenchTestbild,
+    BenchStart,
+    BenchAbbruch,
+    BenchUebernehmen(u8, u32, u16),
 }
 
 pub const SCH_VOLLBILD: u8 = 0;
@@ -4601,6 +5528,10 @@ pub struct HudStand {
     /// Gewuenschter Decoderpfad und der, der wirklich laeuft.
     pub decoder: einstellungen::DecoderWunsch,
     pub decoder_aktiv: Option<DecoderPfad>,
+    /// Reiter "Benchmark": was der naechste Lauf probiert, und der
+    /// laufende oder letzte Lauf.
+    pub bench_konfig: BenchKonfig,
+    pub bench: Option<BenchStand>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4647,7 +5578,7 @@ fn hud(
     // --- Kopf mit Reitern -------------------------------------------------
     u.text.draw(c, ix, y0 + p(30), "QUADCHROMA", sz(18), ui::CYAN, p(8));
     u.text.draw_right(c, x0 + breite - rand, y0 + p(30), adresse, sz(12), ui::DIM, p(1));
-    let namen = [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts)];
+    let namen = [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts), lang.get(TabBenchmark)];
     let mut rx = ix + u.text.width("QUADCHROMA", sz(18), p(8)) + p(40);
     for (i, n) in namen.iter().enumerate() {
         let bw = u.text.width(n, sz(12), p(2)) + p(28);
@@ -4670,9 +5601,14 @@ fn hud(
     c.glow_hline(x0, y0 + p(44), breite, ui::MAGENTA);
 
     // --- Befund: die zwei Zahlen, waehrend man dreht ----------------------
+    // Der Reiter "Benchmark" braucht die ganze Hoehe fuer seine Tabelle
+    // und verzichtet auf die beiden Kacheln.
     let soll = stell.map(|x| x.1 as f32).or_else(|| info.map(|i| i.fps as f32)).unwrap_or(60.0);
     let kw = (iw - p(16)) / 2;
     for (kx, welche) in [(ix, 0usize), (ix + kw + p(16), 1usize)] {
+        if reiter == 4 {
+            break;
+        }
         let (label, zahl, zusatz, farbe, hist, lo, hi) = if welche == 0 {
             let l = lat.unwrap_or_default();
             let (lo, hi) = if lat_hist.is_empty() {
@@ -4698,7 +5634,9 @@ fn hud(
         u.text.draw(c, kx + p(16) + zw + p(12), y0 + p(116), &zusatz, sz(12), ui::DIM, p(1));
         u.spark_range(c, ui::Rect { x: kx + p(16), y: y0 + p(124), w: kw - p(32), h: p(24) }, hist, lo, hi, farbe);
     }
-    c.hline(ix, y0 + p(166), iw, ui::DIM, 60);
+    if reiter != 4 {
+        c.hline(ix, y0 + p(166), iw, ui::DIM, 60);
+    }
 
     let cy = y0 + p(186);
     // Fusszeile: schon hier bestimmt, damit die Codecknoepfe wissen, wo
@@ -4919,6 +5857,208 @@ fn hud(
             zy += p(40);
             for (i, z) in umbruch(u, lang.get(ShortcutOthers), iw, sz(11)).iter().enumerate() {
                 u.text.draw(c, ix, zy + p(14) + i as i32 * p(16), z, sz(11), ui::DIM, p(1));
+            }
+        }
+        4 => {
+            // --- Benchmark: oben die Konfiguration, darunter Fortschritt,
+            // Tabelle und Empfehlung. Waehrend eines Laufs ist die
+            // Konfiguration nur zu sehen, nicht zu bedienen.
+            let konfig = &stand.bench_konfig;
+            let laeuft = stand.bench.as_ref().map(|b| b.laeuft).unwrap_or(false);
+            // Kleiner An/Aus-Knopf: Cyan heisst "laeuft mit".
+            let knopf = |u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, t: &str, an: bool| -> bool {
+                let heiss = !laeuft && r.hit(maus.0, maus.1);
+                let farbe = if an { ui::CYAN } else { ui::DIM };
+                c.rect(r.x, r.y, r.w, r.h, farbe, if heiss { 34 } else if an { 22 } else { 8 });
+                c.hline(r.x, r.y + r.h - 1, r.w, farbe, if an { 255 } else { 90 });
+                u.text.draw_centered(c, r.x + r.w / 2, r.y + r.h / 2 + p(4), t, sz(11), if an { ui::TEXT } else { ui::DIM }, p(1));
+                heiss && u.click
+            };
+            let zh = p(24);
+            let by = y0 + p(58);
+            // Zeile 1: die Kandidaten des Hosts, nur die verfuegbaren.
+            u.text.draw(c, ix, by + p(16), lang.get(Codec), sz(11), ui::DIM, p(3));
+            let mut kx = ix + p(96);
+            for e in stand.codecs.iter().filter(|e| e.available) {
+                let bw = u.text.width(&e.name, sz(11), p(1)) + p(18);
+                if kx + bw > ix + iw {
+                    break;
+                }
+                let r = ui::Rect { x: kx, y: by, w: bw, h: zh };
+                if knopf(u, c, r, &e.name, !konfig.codecs_aus.contains(&e.idx)) {
+                    aktion = HudAktion::BenchCodec(e.idx);
+                }
+                kx += bw + p(8);
+            }
+            // Zeile 2: Datenraten und Bildraten.
+            let by2 = by + p(32);
+            u.text.draw(c, ix, by2 + p(16), "Mbit/s", sz(11), ui::DIM, p(3));
+            let mut kx = ix + p(96);
+            for &m in &BENCH_MBITS {
+                let r = ui::Rect { x: kx, y: by2, w: p(44), h: zh };
+                if knopf(u, c, r, &m.to_string(), konfig.mbits.contains(&m)) {
+                    aktion = HudAktion::BenchMbit(m);
+                }
+                kx += p(50);
+            }
+            kx += p(24);
+            let fps_label = lang.get(BenchColFps);
+            u.text.draw(c, kx, by2 + p(16), fps_label, sz(11), ui::DIM, p(3));
+            kx += u.text.width(fps_label, sz(11), p(3)) + p(16);
+            for &f in &BENCH_FPSS {
+                let r = ui::Rect { x: kx, y: by2, w: p(44), h: zh };
+                if knopf(u, c, r, &f.to_string(), konfig.fpss.contains(&f)) {
+                    aktion = HudAktion::BenchFps(f);
+                }
+                kx += p(50);
+            }
+            // Zeile 3: Dauer, Testbild, Start.
+            let by3 = by2 + p(32);
+            let dauer_label = lang.get(BenchDuration);
+            u.text.draw(c, ix, by3 + p(16), dauer_label, sz(11), ui::DIM, p(3));
+            let mut kx = ix + u.text.width(dauer_label, sz(11), p(3)) + p(16);
+            let rm = ui::Rect { x: kx, y: by3, w: p(28), h: zh };
+            let rp = ui::Rect { x: kx + p(80), y: by3, w: p(28), h: zh };
+            if (ui::Rect { x: ix, y: by3, w: rp.x + rp.w - ix, h: zh }).hit(maus.0, maus.1) {
+                tip = Some(TipBenchDuration);
+            }
+            let minus = u.button(c, rm, "", if laeuft { ui::DIM } else { ui::CYAN });
+            let plus = u.button(c, rp, "", if laeuft { ui::DIM } else { ui::CYAN });
+            for d in 0..2 {
+                c.hline(rm.x + p(9), rm.y + rm.h / 2 + d, p(10), ui::CYAN, 255);
+                c.hline(rp.x + p(9), rp.y + rp.h / 2 + d, p(10), ui::CYAN, 255);
+                c.vline(rp.x + rp.w / 2 + d, rp.y + rp.h / 2 - p(5), p(10), ui::CYAN, 255);
+            }
+            u.text.draw_centered(c, kx + p(54), by3 + p(16), &format!("{} s", konfig.dauer_s), sz(13), ui::TEXT, p(1));
+            if !laeuft && minus {
+                aktion = HudAktion::BenchDauer(-1);
+            }
+            if !laeuft && plus {
+                aktion = HudAktion::BenchDauer(1);
+            }
+            kx = rp.x + rp.w + p(36);
+            let r_test = ui::Rect { x: kx, y: by3, w: u.text.width(lang.get(BenchTestPattern), 14, 1) + p(64), h: zh };
+            if r_test.hit(maus.0, maus.1) {
+                tip = Some(TipBenchTestPattern);
+            }
+            if u.toggle(c, r_test, lang.get(BenchTestPattern), konfig.testbild) && !laeuft {
+                aktion = HudAktion::BenchTestbild;
+            }
+            let r_start = ui::Rect { x: ix + iw - p(160), y: by3 - p(3), w: p(160), h: p(30) };
+            if r_start.hit(maus.0, maus.1) {
+                tip = Some(TipBenchStart);
+            }
+            let (start_text, start_farbe) = if laeuft { (lang.get(BenchAbort), ui::MAGENTA) } else { (lang.get(BenchStart), ui::CYAN) };
+            if u.button(c, r_start, start_text, start_farbe) {
+                aktion = if laeuft { HudAktion::BenchAbbruch } else { HudAktion::BenchStart };
+            }
+
+            // Fortschritt - oder, solange nichts lief, der Hinweis.
+            let py = by3 + p(46);
+            match &stand.bench {
+                Some(b) if b.laeuft => {
+                    let phase = match b.phase {
+                        BenchPhase::Wechsel => lang.get(CodecSwitching),
+                        BenchPhase::Einstellen => lang.get(BenchPhaseSettings),
+                        BenchPhase::Einschwingen => lang.get(BenchPhaseSettle),
+                        _ => lang.get(BenchPhaseMeasure),
+                    };
+                    let schritt = lang.get(BenchStep).replace("{n}", &(b.pos + 1).to_string()).replace("{m}", &b.gesamt.to_string());
+                    u.text.draw(c, ix, py, &format!("{schritt} · {} · {phase}", b.schritt), sz(11), ui::TEXT, p(1));
+                }
+                Some(b) => {
+                    let t = format!(
+                        "{} · {} · %APPDATA%\\QuadChroma\\benchmark.txt",
+                        lang.get(if b.abgebrochen { BenchAborted } else { BenchDone }),
+                        lang.get(BenchStep).replace("{n}", &b.ergebnisse.len().to_string()).replace("{m}", &b.gesamt.to_string())
+                    );
+                    u.text.draw(c, ix, py, &t, sz(11), ui::DIM, p(1));
+                }
+                None => {
+                    let t = lang.get(if konfig.testbild { BenchHintPattern } else { BenchHint });
+                    let zeilen = umbruch(u, t, iw, sz(10));
+                    let r_hint = ui::Rect { x: ix, y: py - p(12), w: iw, h: zeilen.len() as i32 * p(15) };
+                    if r_hint.hit(maus.0, maus.1) {
+                        tip = Some(TipBenchHint);
+                    }
+                    for (i, z) in zeilen.iter().enumerate() {
+                        u.text.draw(c, ix, py + i as i32 * p(15), z, sz(10), ui::DIM, p(1));
+                    }
+                }
+            }
+
+            // Tabelle: Codec links, dann elf Zahlenspalten rechtsbuendig.
+            // Bei Platzmangel die letzten Zeilen - die Datei hat alle.
+            if let Some(b) = &stand.bench {
+                let ty0 = py + p(26);
+                let ende = fy - p(24) - p(58);
+                let zeile_h = p(15);
+                let platz = ((ende - ty0 - p(18)) / zeile_h).max(0) as usize;
+                let spalten: [&str; 11] = [
+                    lang.get(BenchColFps), "Mbit/s", lang.get(BenchMeasured), lang.get(BenchChain),
+                    lang.get(EncodeTime), lang.get(NetworkTime), lang.get(DecodeTime), lang.get(DisplayStage),
+                    lang.get(BenchColDropped), lang.get(BenchColHostCpu), lang.get(ClientCpu),
+                ];
+                let cw = (iw - p(170)) / spalten.len() as i32;
+                let sx = |i: usize| ix + p(170) + (i as i32 + 1) * cw;
+                u.text.draw(c, ix, ty0, lang.get(Codec), sz(9), ui::DIM, p(1));
+                for (i, n) in spalten.iter().enumerate() {
+                    // Manche Sprache nennt die Client-CPU in drei Worten;
+                    // was nicht in die Spalte passt, wird gekuerzt.
+                    let t = kuerzen(u, n, cw - p(8), sz(9), p(1));
+                    u.text.draw_right(c, sx(i), ty0, &t, sz(9), ui::DIM, p(1));
+                }
+                c.hline(ix, ty0 + p(5), iw, ui::DIM, 60);
+                let von = b.ergebnisse.len().saturating_sub(platz);
+                let mut ty = ty0 + p(18);
+                for e in &b.ergebnisse[von..] {
+                    let farbe = if e.bestanden { ui::CYAN } else if e.gescheitert { ui::AMBER } else { ui::DIM };
+                    u.text.draw(c, ix, ty, &e.codec, sz(10), farbe, p(1));
+                    let strich = |v: f32| if e.gescheitert { "-".to_string() } else { format!("{v:.1}") };
+                    let werte: [String; 11] = [
+                        e.fps.to_string(),
+                        e.mbit.to_string(),
+                        if e.gescheitert { lang.get(BenchFailed).to_string() } else { format!("{:.1}", e.fps_gemessen) },
+                        strich(e.kette_ms),
+                        strich(e.encoder_ms),
+                        strich(e.leitung_ms),
+                        strich(e.decoder_ms),
+                        if b.mit_anzeige { strich(e.anzeige_ms) } else { "-".into() },
+                        if b.mit_anzeige && !e.gescheitert { e.verworfen.to_string() } else { "-".into() },
+                        if e.gescheitert { "-".into() } else { format!("{:.0} %", e.host_cpu) },
+                        if e.gescheitert { "-".into() } else { format!("{:.0} %", e.client_cpu) },
+                    ];
+                    for (i, w) in werte.iter().enumerate() {
+                        u.text.draw_right(c, sx(i), ty, w, sz(10), farbe, p(1));
+                    }
+                    ty += zeile_h;
+                }
+
+                // Empfehlung, mit Knopf zum Uebernehmen - der erst nach dem
+                // Lauf greift; die Zeile selbst folgt schon jedem Schritt.
+                let ey = fy - p(24) - p(30);
+                c.hline(ix, ey - p(22), iw, ui::DIM, 60);
+                match &b.empfehlung {
+                    Some(e) => {
+                        let t = format!(
+                            "{}: {}, {} {}, {} Mbit/s – {} {:.1} ms",
+                            lang.get(BenchRecommendation), e.codec, e.fps, lang.get(BenchColFps), e.mbit,
+                            lang.get(BenchChain), e.kette_ms
+                        );
+                        u.text.draw(c, ix, ey, &t, sz(13), ui::CYAN, p(1));
+                        let r_ok = ui::Rect { x: ix + iw - p(160), y: ey - p(20), w: p(160), h: p(30) };
+                        if r_ok.hit(maus.0, maus.1) {
+                            tip = Some(TipBenchApply);
+                        }
+                        if u.button(c, r_ok, lang.get(BenchApply), if laeuft { ui::DIM } else { ui::CYAN }) && !laeuft {
+                            aktion = HudAktion::BenchUebernehmen(e.idx, e.mbit, e.fps);
+                        }
+                    }
+                    None if !b.ergebnisse.is_empty() => {
+                        u.text.draw(c, ix, ey, lang.get(BenchNoRecommendation), sz(12), ui::AMBER, p(1));
+                    }
+                    None => {}
+                }
             }
         }
         _ => {

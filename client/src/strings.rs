@@ -115,6 +115,57 @@ pub enum Key {
     ShortcutBack,
     ShortcutWinKey,
     ShortcutOthers,
+    // Benchmark
+    /// Reiter "Benchmark".
+    TabBenchmark,
+    /// Knopf: Lauf starten.
+    BenchStart,
+    /// Knopf: laufenden Lauf abbrechen.
+    BenchAbort,
+    /// Knopf: Empfehlung uebernehmen.
+    BenchApply,
+    /// Steller: Messzeit je Schritt.
+    BenchDuration,
+    /// Schalter: Testbild auf dem Host waehrend des Laufs.
+    BenchTestPattern,
+    /// Fortschritt "Schritt {n} von {m}" - beide Platzhalter bleiben stehen.
+    BenchStep,
+    /// Phase: Einstellungen sind unterwegs zum Host.
+    BenchPhaseSettings,
+    /// Phase: eine Sekunde Ruhe nach dem Einstellen.
+    BenchPhaseSettle,
+    /// Phase: es wird gemessen.
+    BenchPhaseMeasure,
+    /// Schritt kam nicht zustande (Codecwechsel oder Einstellung blieb aus).
+    BenchFailed,
+    /// Lauf zu Ende.
+    BenchDone,
+    /// Lauf abgebrochen.
+    BenchAborted,
+    /// Spalte: gemessene Bildrate.
+    BenchMeasured,
+    /// Kette = alle Glieder von der Aufnahme bis zur Anzeige.
+    BenchChain,
+    /// Kurze Einheit fuer Spalten und Empfehlung ("Bilder/s").
+    BenchColFps,
+    /// Spalte: verworfene Bilder.
+    BenchColDropped,
+    /// Spalte: Prozessorlast des Hosts.
+    BenchColHostCpu,
+    /// Ueberschrift der Empfehlung.
+    BenchRecommendation,
+    /// Kein Schritt hat die Regel erfuellt.
+    BenchNoRecommendation,
+    /// Hinweis ohne Testbild: gemessen wird, was der Mac gerade zeigt.
+    BenchHint,
+    /// Hinweis mit Testbild: jeder Schritt sieht denselben Inhalt.
+    BenchHintPattern,
+    TipBenchStart,
+    TipBenchApply,
+    TipBenchDuration,
+    /// Tooltip auf dem Hinweis: die Regel, nach der ein Schritt besteht.
+    TipBenchHint,
+    TipBenchTestPattern,
 }
 
 pub struct Lang {
@@ -242,6 +293,34 @@ pub static EN: Lang = Lang {
         (ShortcutBack, "Back to the start screen"),
         (ShortcutWinKey, "Windows key = the Mac's Command key"),
         (ShortcutOthers, "All other keys go to the Mac. What travels is the key's position, not the character – accents and AltGr just work."),
+        // Benchmark
+        (TabBenchmark, "Benchmark"),
+        (BenchStart, "Start"),
+        (BenchAbort, "Cancel"),
+        (BenchApply, "Apply"),
+        (BenchDuration, "Duration per step"),
+        (BenchTestPattern, "Test pattern"),
+        (BenchStep, "Step {n} of {m}"),
+        (BenchPhaseSettings, "applying settings"),
+        (BenchPhaseSettle, "settling"),
+        (BenchPhaseMeasure, "measuring"),
+        (BenchFailed, "failed"),
+        (BenchDone, "Finished"),
+        (BenchAborted, "Cancelled"),
+        (BenchMeasured, "measured"),
+        (BenchChain, "Chain"),
+        (BenchColFps, "fps"),
+        (BenchColDropped, "dropped"),
+        (BenchColHostCpu, "Host CPU"),
+        (BenchRecommendation, "Recommendation"),
+        (BenchNoRecommendation, "No step passed. Try lower bitrates or frame rates."),
+        (BenchHint, "Measured is what happens on the Mac right now. Steps are only comparable when something moves – a running video is enough."),
+        (BenchHintPattern, "With the test pattern on, every step sees the same moving content – nothing needs to run on the Mac."),
+        (TipBenchStart, "Runs every combination of the chosen codecs, frame rates and bitrates in turn, each for the set duration. The picture keeps running and the menu may stay open."),
+        (TipBenchApply, "Set the recommended codec and settings and save them for this host."),
+        (TipBenchDuration, "Measuring time per step. Longer is steadier; 5 s is usually enough."),
+        (TipBenchHint, "A step passes when the chain stays within one and a half frames, at least 95 % of the frames arrive, none are dropped and the encoder keeps within its frame budget. Recommended: the best colour quality that passes at the highest frame rate, at the highest bitrate it still passes with."),
+        (TipBenchTestPattern, "For the duration of the run the host shows a fixed moving pattern instead of the screen – every step measures the same content."),
     ],
 };
 
@@ -346,6 +425,34 @@ pub static DE: Lang = Lang {
         (ShortcutBack, "Zurück zum Startbildschirm"),
         (ShortcutWinKey, "Windows-Taste = Befehlstaste des Macs"),
         (ShortcutOthers, "Alle anderen Tasten gehen an den Mac. Übertragen wird die Position der Taste, nicht das Zeichen – Umlaute und AltGr stimmen von selbst."),
+        // Benchmark
+        (TabBenchmark, "Benchmark"),
+        (BenchStart, "Start"),
+        (BenchAbort, "Abbrechen"),
+        (BenchApply, "Übernehmen"),
+        (BenchDuration, "Dauer je Schritt"),
+        (BenchTestPattern, "Testbild"),
+        (BenchStep, "Schritt {n} von {m}"),
+        (BenchPhaseSettings, "Einstellungen werden gesetzt"),
+        (BenchPhaseSettle, "einschwingen"),
+        (BenchPhaseMeasure, "messen"),
+        (BenchFailed, "gescheitert"),
+        (BenchDone, "Fertig"),
+        (BenchAborted, "Abgebrochen"),
+        (BenchMeasured, "gemessen"),
+        (BenchChain, "Kette"),
+        (BenchColFps, "Bilder/s"),
+        (BenchColDropped, "verworfen"),
+        (BenchColHostCpu, "Host-CPU"),
+        (BenchRecommendation, "Empfehlung"),
+        (BenchNoRecommendation, "Kein Schritt hat bestanden. Niedrigere Datenraten oder Bildraten versuchen."),
+        (BenchHint, "Gemessen wird, was gerade auf dem Mac passiert. Vergleichbar sind die Schritte nur, wenn sich etwas bewegt – ein laufendes Video reicht."),
+        (BenchHintPattern, "Mit Testbild sieht jeder Schritt denselben bewegten Inhalt – auf dem Mac muss nichts laufen."),
+        (TipBenchStart, "Misst alle Kombinationen der gewählten Codecs, Bildraten und Datenraten der Reihe nach, jede für die eingestellte Dauer. Das Bild läuft weiter, das Menü darf offen bleiben."),
+        (TipBenchApply, "Empfohlenen Codec und Einstellungen setzen und für diesen Host speichern."),
+        (TipBenchDuration, "Messzeit je Schritt. Länger ist ruhiger; 5 s reichen meist."),
+        (TipBenchHint, "Ein Schritt besteht, wenn die Kette in anderthalb Bildern bleibt, mindestens 95 % der Bilder ankommen, keines verworfen wird und der Encoder in seinem Bildbudget bleibt. Empfohlen wird die beste Farbqualität, die bei der höchsten Bildrate besteht, mit der höchsten Datenrate, bei der sie noch besteht."),
+        (TipBenchTestPattern, "Der Host zeigt für die Dauer des Laufs ein festes, bewegtes Muster statt des Bildschirms – jeder Schritt misst denselben Inhalt."),
     ],
 };
 
