@@ -2023,6 +2023,9 @@ struct App {
     ui_puffer: Vec<u32>,
     /// Was beim letzten Mal gezeichnet wurde - beim naechsten Mal zu loeschen.
     ui_kasten_alt: Option<ui::Rect>,
+    /// Masse, fuer die `ui_puffer` angelegt ist - nach Breite und Hoehe, nicht
+    /// nach der Punktzahl (ein gedrehter Monitor hat dieselbe).
+    ui_masse: (u32, u32),
     /// Oberflaeche gerade sichtbar (Bit 1 in Stufe 2).
     ui_an: bool,
     /// Wann die Oberflaeche zuletzt gerastert wurde - alle 33 ms reicht,
@@ -2778,7 +2781,12 @@ impl App {
         let size = window.inner_size();
         let (ww, wh) = (size.width, size.height);
         if ww == 0 || wh == 0 {
-            return Ok(()); // minimiert: nichts konfigurieren, nichts zeichnen
+            // Minimiert: nichts konfigurieren, nichts zeichnen - aber das
+            // Bild abholen (sonst zaehlt jedes weitere als "verworfen" und
+            // der Takt zeichnet alle 2 ms ins Leere) und die Sekunde fuehren.
+            let _ = self.shared.lock().unwrap().frame.take();
+            self.sekundentakt(window);
+            return Ok(());
         }
         if (ww, wh) != (g.breite, g.hoehe) {
             if let Err(e) = g.groesse(ww, wh) {
@@ -2789,10 +2797,12 @@ impl App {
             }
         }
         let n = (ww as usize) * (wh as usize);
-        if self.ui_puffer.len() != n {
+        if self.ui_masse != (ww, wh) {
             // Erste Zeichnung oder neue Groesse: ganz durchsichtiger Grund,
-            // die Oberflaeche wird komplett neu gerastert.
+            // die Oberflaeche wird komplett neu gerastert. Nach den Massen,
+            // nicht nach der Punktzahl - ein gedrehter Monitor hat dieselbe.
             self.ui_puffer = vec![0xff00_0000u32; n];
+            self.ui_masse = (ww, wh);
             self.ui_kasten_alt = None;
             self.ui_an = false;
         }
@@ -2822,6 +2832,15 @@ impl App {
                     self.shown += 1;
                 }
                 Err(e) => self.gpu_fehler(g, e)?,
+            }
+        }
+        // Erstkontakt: die Frist fuer das Banner beginnt mit dem ersten Bild.
+        // Auf dem CPU-Weg setzt sie oberflaeche_zeichnen - das laeuft hier
+        // aber nur, wenn schon etwas sichtbar ist, und ohne Frist waere das
+        // Banner nie sichtbar geworden.
+        if self.screen == Screen::Session && self.bild_vorhanden() && self.banner_until.is_none() {
+            if self.shared.lock().unwrap().first_time {
+                self.banner_until = Some(Instant::now() + Duration::from_secs(25));
             }
         }
         self.sekundentakt(window);
@@ -2899,12 +2918,20 @@ impl App {
                     }
                     Ok(())
                 }
-                anzeige::Praesentiert::Fehler(e) => Err(Ausfall::Fehler(e)),
+                anzeige::Praesentiert::Fehler(e) => {
+                    // Das Bild liegt hochgeladen da; der naechste Takt zeigt
+                    // es (nach einem Tearing-Rueckfall dann bildsynchron).
+                    self.praesentation_ausstehend = true;
+                    Err(Ausfall::Fehler(e))
+                }
                 anzeige::Praesentiert::GeraetWeg(grund) => Err(Ausfall::GeraetWeg(grund)),
             }
         } else {
+            // Ausgelassen zaehlt Bilder, nicht 2-ms-Takte: nur beim Uebergang.
+            if !self.praesentation_ausstehend {
+                self.shared.lock().unwrap().ausgelassen += 1;
+            }
             self.praesentation_ausstehend = true;
-            self.shared.lock().unwrap().ausgelassen += 1;
             Ok(())
         };
         if let Some(n) = nach {
@@ -4138,12 +4165,29 @@ fn main() {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
-    // Erstes Argument, das kein Schalter ist, ist die Adresse.
-    let addr = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .map(|a| adresse_vollstaendig(&a))
-        .unwrap_or_default();
+    // Erstes Argument, das kein Schalter und kein Wert eines Schalters ist,
+    // ist die Adresse. Ohne die zweite Haelfte wurde aus `--anzeige cpu` die
+    // Adresse "cpu:9001" - und die echte Adresse dahinter ignoriert.
+    const WERTIG: &[(&str, usize)] = &[
+        ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1),
+        ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
+    ];
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut addr = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some((_, n)) = WERTIG.iter().find(|(s, _)| *s == a.as_str()) {
+            i += 1 + n;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        addr = adresse_vollstaendig(a);
+        break;
+    }
 
     let headless = std::env::args().any(|a| a == "--headless");
 
@@ -4435,6 +4479,7 @@ fn main() {
         bereit_ausstehend: None,
         ui_puffer: Vec::new(),
         ui_kasten_alt: None,
+        ui_masse: (0, 0),
         ui_an: false,
         letzte_oberflaeche: Instant::now(),
         praesentation_ausstehend: false,

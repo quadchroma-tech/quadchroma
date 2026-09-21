@@ -127,6 +127,9 @@ pub struct Gpu {
     rtv: Option<ID3D11RenderTargetView>,
     /// Frame-Latency-Warteobjekt; null ohne Swapchain.
     warte: HANDLE,
+    /// Ein Zaehler des Warteobjekts ist abgefragt und noch nicht durch ein
+    /// gelungenes Present zurueckgegeben (siehe `bereit`).
+    warte_gehalten: bool,
     /// Flags, mit denen die Swapchain angelegt wurde - ResizeBuffers will
     /// dieselben.
     flags: u32,
@@ -522,24 +525,37 @@ impl Gpu {
         self.oberflaeche = None;
         // ResizeBuffers verlangt, dass niemand mehr einen Backbuffer haelt -
         // die Freigabe der Sicht soll verarbeitet sein, bevor es losgeht.
+        // Schlaegt es fehl, gilt keine Groesse als eingestellt - der naechste
+        // Takt versucht es wieder, statt fuer immer ohne Sicht zu zeichnen.
+        self.breite = 0;
+        self.hoehe = 0;
         unsafe {
             self.ctx.Flush();
             sc.ResizeBuffers(0, ww, wh, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(self.flags as i32))
         }
         .map_err(|e| fehler(&format!("ResizeBuffers {ww}x{wh}"), e))?;
+        self.backbuffer_sicht()?;
         self.breite = ww;
         self.hoehe = wh;
-        self.backbuffer_sicht()
+        Ok(())
     }
 
     /// Ist DXGI bereit fuer ein weiteres Bild? Fragt das Warteobjekt mit
     /// Timeout 0 - nie warten, der Fensterfaden traegt auch die Eingabe.
-    /// Ohne Swapchain immer ja.
-    pub fn bereit(&self) -> bool {
-        if self.warte.0.is_null() {
+    /// Das Objekt ist ein Semaphor: wer es einmal erfolgreich abgefragt hat,
+    /// haelt einen Zaehler, und den gibt DXGI erst nach einem gelungenen
+    /// Present zurueck. Deshalb wird ein gehaltener Zaehler gemerkt - scheitert
+    /// das Zeichnen dazwischen, fragt der naechste Takt nicht noch einmal
+    /// (er bekaeme nie mehr ein Ja) sondern praesentiert. Ohne Swapchain immer ja.
+    pub fn bereit(&mut self) -> bool {
+        if self.warte.0.is_null() || self.warte_gehalten {
             return true;
         }
-        unsafe { WaitForSingleObject(self.warte, 0) == WAIT_OBJECT_0 }
+        let frei = unsafe { WaitForSingleObject(self.warte, 0) == WAIT_OBJECT_0 };
+        if frei {
+            self.warte_gehalten = true;
+        }
+        frei
     }
 
     /// Ist das Geraet weg? Dann der Grund als Text (GetDeviceRemovedReason).
@@ -569,6 +585,10 @@ impl Gpu {
         let reissen = sofort && self.tearing;
         let flags = if reissen { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
         let hr = unsafe { sc.Present(0, flags) };
+        // Ein gelungenes Present gibt den Zaehler des Warteobjekts frei.
+        if hr == S_OK || hr == DXGI_STATUS_OCCLUDED {
+            self.warte_gehalten = false;
+        }
         if hr == S_OK {
             Praesentiert::Ok
         } else if hr == DXGI_STATUS_OCCLUDED {
@@ -636,6 +656,7 @@ impl Gpu {
             swapchain: None,
             rtv: None,
             warte: HANDLE::default(),
+            warte_gehalten: false,
             flags: 0,
             breite: 0,
             hoehe: 0,
