@@ -74,9 +74,17 @@ static void eigen_lesen(uint16_t *promille, uint32_t *mb) {
     if (g_eigen_zeit_ns && nun > g_eigen_zeit_ns) {
         uint64_t dc = cpu - g_eigen_ns;
         uint64_t dt = nun - g_eigen_zeit_ns;
-        // Ueber einen Kern hinaus ist erlaubt: mehrere Faeden zugleich.
-        uint64_t p = (dc * 1000) / dt;
-        *promille = (uint16_t)(p > 65000 ? 65000 : p);
+        // Auf dieselbe Bezugsgroesse wie die Gesamtauslastung gebracht: Anteil
+        // an ALLEN Kernen. Sonst steht "14 % gesamt, davon 16 % eigen" da -
+        // richtig gerechnet, aber unlesbar, weil das eine je Maschine und das
+        // andere je Kern gemeint war.
+        static uint64_t kerne = 0;
+        if (kerne == 0) {
+            int n = 0; size_t len = sizeof n;
+            kerne = (sysctlbyname("hw.logicalcpu", &n, &len, NULL, 0) == 0 && n > 0) ? (uint64_t)n : 1;
+        }
+        uint64_t p = (dc * 1000) / (dt * kerne);
+        *promille = (uint16_t)(p > 1000 ? 1000 : p);
     } else {
         *promille = 0;
     }

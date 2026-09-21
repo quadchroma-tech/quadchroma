@@ -77,6 +77,28 @@ Die Datenrate steigt dabei kaum (51 auf 66 Mbit/s), denn ein unveraendertes
 Bild kostet fast nichts. Was es kostet, ist Dauerlast: die Video-Einheit des
 Macs laeuft durch, solange der Schalter an ist.
 
+Codecwahl: im Menue (ESC zwei Sekunden halten oder F10), Reiter "Bild", stehen
+die Codecs, die der Mac wirklich beherrscht - er fragt seinen Encoder beim Start
+selbst. Auf dem M1 sind das HEVC in 4:4:4 und 4:2:0, je 8 und 10 Bit, sowie
+H.264; AV1 kann er nicht und ist ausgegraut. Der Wechsel geschieht im laufenden
+Betrieb, das Bild steht dabei fuer einen Wimpernschlag still. Zwei Modi tragen
+den Vermerk "mit Umrechnung": die Aufnahme kennt kein 4:4:4 in 8 Bit, dort
+rechnet der Mac vorher um, und das kostet einen Durchlauf - fuer einen fairen
+Vergleich mit den anderen Modi ist das zu beruecksichtigen.
+
+Gemessen ueber die Leitung, 1080p, 120 Bilder/s Ziel, Software-Decoder:
+
+    HEVC 4:4:4 10 Bit   rund 24 ms, Decoder  8,6 ms
+    HEVC 4:2:0  8 Bit   rund 19 ms, Decoder  6,8 ms
+    H.264 High          rund 33 ms, Decoder 15,0 ms
+
+Im Pruefmodus laesst sich der Wechsel anstossen:
+
+    quadchroma.exe 192.168.178.194:9001 --headless --codec 3
+
+Die Nummer ist der Eintrag in der Liste des Hosts (0 = HEVC 4:4:4 10 Bit,
+3 = HEVC 4:2:0 8 Bit, 4 = H.264). Die Adresse muss vor dem Schalter stehen.
+
 Der Spielmodus zieht die Zuegel straffer: haeufigere Vollbilder und ein
 kleinerer erlaubter Rueckstau, damit bei Bewegung nichts auflaeuft. Er kostet
 etwas Bandbreite und bringt dafuer gleichmaessigere Bilder.

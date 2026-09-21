@@ -80,16 +80,157 @@ const MSG_TIME: u8 = 4;
 const MSG_STAMP: u8 = 5;
 const MSG_LAST: u8 = 6;
 const MSG_VIDEO: u8 = 2;
+/// Ab hier neuer Codec: Decoder wegwerfen, das naechste Bild ist ein
+/// Schluesselbild mit Parametersaetzen.
+const MSG_SWITCH: u8 = 7;
+/// Koennensliste des Hosts: welche Codecs er anbietet, mit Flaggen.
+const MSG_CODECS: u8 = 8;
 const MSG_AUDIO_INFO: u8 = 32;
 const MSG_AUDIO: u8 = 33;
 const MSG_CLIP: u8 = 48;
+
+/// So lange gilt ein Codecwunsch als "unterwegs", falls der Host nie
+/// antwortet. Danach verschwindet der Hinweis von selbst.
+const CODEC_WECHSEL_FRIST: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 struct StreamInfo {
     width: u32,
     height: u32,
     fps: u32,
+    /// 1 = HEVC, 2 = H.264 (Byte 6 der Strominfo).
+    codec: u8,
+    /// Farbaufloesung: true = 4:4:4, false = 4:2:0 (aus Byte 7 der Strominfo).
+    chroma444: bool,
     ten_bit: bool,
+}
+
+impl StreamInfo {
+    /// Aus den acht Bytes der Strominfo. Format-Byte: 1 = 4:4:4 8 Bit,
+    /// 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit. Immer Vollbereich.
+    fn parse(p: &[u8]) -> Option<Self> {
+        if p.len() < 8 {
+            return None;
+        }
+        Some(StreamInfo {
+            width: u16::from_le_bytes([p[0], p[1]]) as u32,
+            height: u16::from_le_bytes([p[2], p[3]]) as u32,
+            fps: u16::from_le_bytes([p[4], p[5]]) as u32,
+            codec: p[6],
+            chroma444: matches!(p[7], 1 | 2),
+            ten_bit: matches!(p[7], 2 | 4),
+        })
+    }
+
+    /// Anzeigename des laufenden Codecs, etwa "HEVC 4:4:4 10" oder
+    /// "H.264 4:2:0 8". Die einzige Stelle, an der der Name entsteht.
+    fn codec_name(&self) -> String {
+        let c = match self.codec { 2 => "H.264", 3 => "AV1", _ => "HEVC" };
+        format!(
+            "{c} {} {}",
+            if self.chroma444 { "4:4:4" } else { "4:2:0" },
+            if self.ten_bit { 10 } else { 8 }
+        )
+    }
+}
+
+/// Ein Eintrag der Koennensliste des Hosts (Nachricht 8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodecEintrag {
+    /// Index des Kandidaten auf dem Host; genau der wird zurueckgewuenscht.
+    idx: u8,
+    /// Kann dieser Mac das ueberhaupt codieren?
+    available: bool,
+    /// Laeuft es in der Video-Einheit statt auf der CPU? Wird mitgefuehrt,
+    /// angezeigt aber noch nicht - auf dem Mac mini ist ohnehin alles Hardware.
+    #[allow(dead_code)]
+    hardware: bool,
+    /// Braucht die Aufnahme einen Umrechnungsschritt (etwa 4:4:4 8 Bit)?
+    conversion: bool,
+    chroma444: bool,
+    ten_bit: bool,
+    name: String,
+}
+
+impl CodecEintrag {
+    /// Welcher Codec hinter dem Eintrag steckt: 1 HEVC, 2 H.264, 3 AV1.
+    /// Die Liste traegt kein eigenes Codec-Byte, also entscheidet der
+    /// Name - die Namen kommen aus einer festen Tabelle auf dem Host.
+    fn codec(&self) -> u8 {
+        if self.name.starts_with("H.264") {
+            2
+        } else if self.name.starts_with("AV1") {
+            3
+        } else {
+            1
+        }
+    }
+
+    /// Passt der Eintrag zu dem, was gerade laeuft?
+    fn passt_zu(&self, i: &StreamInfo) -> bool {
+        self.codec() == i.codec && self.chroma444 == i.chroma444 && self.ten_bit == i.ten_bit
+    }
+}
+
+/// Koennensliste aus den Nutzdaten lesen. Jede Laenge wird geprueft, denn die
+/// Bytes kommen aus dem Netz: ein zu kurzer oder krummer Eintrag beendet die
+/// Liste, statt das Programm zu beenden.
+fn codecs_parsen(p: &[u8]) -> Vec<CodecEintrag> {
+    let mut out = Vec::new();
+    let Some(&anzahl) = p.first() else { return out };
+    let mut o = 1usize;
+    for _ in 0..anzahl {
+        if o + 7 > p.len() {
+            break;
+        }
+        let namelen = p[o + 6] as usize;
+        let name_start = o + 7;
+        let name_ende = name_start + namelen;
+        if name_ende > p.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&p[name_start..name_ende]).into_owned();
+        out.push(CodecEintrag {
+            idx: p[o],
+            available: p[o + 1] != 0,
+            hardware: p[o + 2] != 0,
+            conversion: p[o + 3] != 0,
+            chroma444: p[o + 4] != 0,
+            ten_bit: p[o + 5] != 0,
+            name,
+        });
+        o = name_ende;
+    }
+    out
+}
+
+/// Nachricht 7: ab hier ein anderer Codec.
+#[derive(Clone, Copy, Debug)]
+struct CodecWechsel {
+    idx: u8,
+    is_h264: bool,
+    chroma444: bool,
+    ten_bit: bool,
+    #[allow(dead_code)]
+    full_range: bool,
+    #[allow(dead_code)]
+    conversion: bool,
+}
+
+impl CodecWechsel {
+    fn parse(p: &[u8]) -> Option<Self> {
+        if p.len() < 8 {
+            return None;
+        }
+        Some(CodecWechsel {
+            idx: p[0],
+            is_h264: p[1] != 0,
+            chroma444: p[2] != 0,
+            ten_bit: p[3] != 0,
+            full_range: p[4] != 0,
+            conversion: p[5] != 0,
+        })
+    }
 }
 
 /// Auslastung des Hosts. Was fehlt, fehlt mit Absicht: die Video-Einheit
@@ -163,6 +304,23 @@ struct Shared {
     /// Der Versatz gilt nur so genau wie die halbe Umlaufzeit - deshalb steht
     /// die auch mit in der Anzeige.
     clock: Option<Latenz>,
+    /// Koennensliste des Hosts, so wie sie nach dem Gruss ankam.
+    codecs: Vec<CodecEintrag>,
+    /// Index des Kandidaten, den der Host zuletzt per Nachricht 7 gemeldet
+    /// hat. Vor dem ersten Wechsel unbekannt - dann entscheidet der Abgleich
+    /// mit der Strominfo, welcher Eintrag gerade laeuft.
+    codec_idx: Option<u8>,
+    /// Seit wann ein Codecwunsch unterwegs ist. Gesetzt beim Klick, geloescht
+    /// mit dem ersten Bild aus dem neuen Decoder. Solange steht das Bild
+    /// still, und der Hinweis erklaert, warum.
+    codec_wechsel: Option<Instant>,
+}
+
+impl Shared {
+    /// Laeuft gerade ein Codecwechsel, den man dem Nutzer erklaeren sollte?
+    fn wechsel_laeuft(&self) -> bool {
+        self.codec_wechsel.map(|t| t.elapsed() < CODEC_WECHSEL_FRIST).unwrap_or(false)
+    }
 }
 
 /// Netz- und Decodierschleife. Laeuft in einem eigenen Faden und legt immer nur
@@ -191,12 +349,40 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             let mut s = shared.lock().unwrap();
             s.link = None;
             s.connected = false;
+            s.codec_wechsel = None;
+            s.codec_idx = None;
         }
         std::thread::sleep(Duration::from_secs(2));
     }
 }
 
 use ffmpeg_next as ffmpeg;
+
+/// Decoder fuer HEVC oder H.264 bauen, mit der Fadenkonfiguration der
+/// Sitzung. Wird beim Start und bei jedem Codecwechsel gerufen - der alte
+/// Decoder wird dann einfach fallen gelassen.
+///
+/// Auf Durchsatz trimmen: mehrere Bilder gleichzeitig decodieren. Ohne das
+/// laeuft alles auf einem Kern und kostet rund 8 ms je Bild.
+/// Bildparallelitaet ist schnell, aber sie haelt Bilder zurueck: der
+/// Decoder gibt erst heraus, wenn genug Faeden gefuellt sind. Bei 16 Faeden
+/// sind das rund 15 Bilder - bei 100 Bildern je Sekunde ueber 140 ms
+/// Verzoegerung, die niemand sieht, weil die reine Rechenzeit klein bleibt.
+/// Fuer eine Fernsteuerung ist das der falsche Handel, deshalb ist
+/// Scheibenparallelitaet die Voreinstellung.
+fn decoder_bauen(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
+    let id = if h264 { ffmpeg::codec::Id::H264 } else { ffmpeg::codec::Id::HEVC };
+    let name = if h264 { "H.264" } else { "HEVC" };
+    let codec = ffmpeg::decoder::find(id).ok_or_else(|| format!("kein {name}-Decoder"))?;
+    let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+    let art = match std::env::args().position(|a| a == "--faeden").and_then(|i| std::env::args().nth(i + 1)) {
+        Some(v) if v == "bild" => ffmpeg::threading::Type::Frame,
+        _ => ffmpeg::threading::Type::Slice,
+    };
+    ctx.set_threading(ffmpeg::threading::Config { kind: art, count: threads });
+    ctx.decoder().video().map_err(|e| format!("Decoder ({name}): {e}"))
+}
 
 fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), String> {
     // Erst der Handschlag, dann erst Nutzdaten. Vorher geht nichts ueber die
@@ -213,6 +399,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.sas = Some(sock.sas.clone());
         s.peer_fp = Some(fp.clone());
         s.first_time = first;
+        // Die Liste des vorigen Hosts hat hier nichts mehr zu suchen; die
+        // neue kommt gleich nach dem Gruss.
+        s.codecs.clear();
+        s.codec_idx = None;
+        s.codec_wechsel = None;
     }
 
     // Weist der Host das Geraet ab, macht er die Leitung gleich nach dem
@@ -227,25 +418,19 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         return Err("Gegenstelle spricht ein anderes Protokoll".into());
     }
 
-    let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::HEVC).ok_or("kein HEVC-Decoder")?;
-    let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
-    // Auf Durchsatz trimmen: mehrere Bilder gleichzeitig decodieren. Ohne das
-    // laeuft alles auf einem Kern und kostet rund 8 ms je Bild.
-    // Bildparallelitaet ist schnell, aber sie haelt Bilder zurueck: der
-    // Decoder gibt erst heraus, wenn genug Faeden gefuellt sind. Bei 16 Faeden
-    // sind das rund 15 Bilder - bei 100 Bildern je Sekunde ueber 140 ms
-    // Verzoegerung, die niemand sieht, weil die reine Rechenzeit klein bleibt.
-    // Fuer eine Fernsteuerung ist das der falsche Handel.
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
-    let art = match std::env::args().position(|a| a == "--faeden").and_then(|i| std::env::args().nth(i + 1)) {
-        Some(v) if v == "bild" => ffmpeg::threading::Type::Frame,
-        _ => ffmpeg::threading::Type::Slice,
-    };
-    ctx.set_threading(ffmpeg::threading::Config { kind: art, count: threads });
-    let mut decoder = ctx
-        .decoder()
-        .video()
-        .map_err(|e| format!("Decoder: {e}"))?;
+    // Der Host faengt immer mit HEVC an; alles Weitere sagt Nachricht 7.
+    // Der Decoder ist eine eigene Variable, keine Leihgabe: bei einem Wechsel
+    // wird sie schlicht neu zugewiesen, und der alte Decoder faellt weg.
+    let mut decoder = decoder_bauen(false)?;
+    // Nach einem Wechsel darf nichts in den neuen Decoder, bevor das erste
+    // Schluesselbild da ist - es traegt die Parametersaetze.
+    let mut warte_auf_schluesselbild = false;
+    // Das erste Bild aus dem neuen Decoder beendet den Hinweis "wird gewechselt".
+    let mut nach_wechsel = false;
+    // Steht in `shared.error` gerade ein Fehler aus DIESEM Bildpfad? Nur den
+    // darf ein gutes Bild wieder loeschen - Fehler anderer Pfade (Ton,
+    // Verbindung) bleiben stehen, statt hundertmal je Sekunde zu verschwinden.
+    let mut bild_fehler = false;
 
     let mut info: Option<StreamInfo> = None;
     #[cfg(windows)]
@@ -284,7 +469,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
 
         sock.read_exact(&mut hdr).map_err(|e| format!("Kopf: {e}"))?;
         let msg_type = hdr[0];
-        let _flags = hdr[1];
+        let flags = hdr[1];
         let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
         if len > 64 * 1024 * 1024 {
             return Err("unplausible Nachrichtenlaenge".into());
@@ -294,18 +479,50 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
 
         match msg_type {
             MSG_INFO => {
-                if len >= 8 {
-                    let i = StreamInfo {
-                        width: u16::from_le_bytes([payload[0], payload[1]]) as u32,
-                        height: u16::from_le_bytes([payload[2], payload[3]]) as u32,
-                        fps: u16::from_le_bytes([payload[4], payload[5]]) as u32,
-                        ten_bit: payload[7] == 2,
-                    };
+                if let Some(i) = StreamInfo::parse(&payload) {
                     info = Some(i);
                     shared.lock().unwrap().info = Some(i);
                 }
             }
+            MSG_CODECS => {
+                let liste = codecs_parsen(&payload);
+                shared.lock().unwrap().codecs = liste;
+            }
+            MSG_SWITCH => {
+                // Ab hier spricht der Host einen anderen Codec. Der alte
+                // Decoder wird fallen gelassen, ein neuer gebaut, und alles,
+                // was noch zum alten Strom gehoerte, ist damit wertlos: die
+                // wartenden Stempel und der Latenzmittelwert.
+                let Some(w) = CodecWechsel::parse(&payload) else { continue };
+                // Mit Bildparallelitaet (--faeden frame) gehen beim Wechsel bis zu
+                // 15 zurueckgehaltene Bilder verloren; sauber leeren ist eine spaetere Verfeinerung.
+                decoder = decoder_bauen(w.is_h264)?;
+                warte_auf_schluesselbild = true;
+                nach_wechsel = true;
+                ring.clear();
+                mittel = None;
+                // Die Strominfo kommt gleich hinterher; bis dahin gilt schon,
+                // was der Wechsel selbst gesagt hat - dann zeigt das Menue
+                // ohne Verzug den richtigen Eintrag als laufend.
+                if let Some(i) = info.as_mut() {
+                    i.codec = if w.is_h264 { 2 } else { 1 };
+                    i.chroma444 = w.chroma444;
+                    i.ten_bit = w.ten_bit;
+                }
+                let mut s = shared.lock().unwrap();
+                s.info = info;
+                s.codec_idx = Some(w.idx);
+            }
             MSG_VIDEO => {
+                // Nach einem Wechsel muss das erste Bild ein Schluesselbild
+                // sein (Flaggenbit 0). Alles andere gehoert noch zum alten
+                // Codec oder ist ohne Parametersaetze nicht decodierbar.
+                if warte_auf_schluesselbild {
+                    if flags & 1 == 0 {
+                        continue;
+                    }
+                    warte_auf_schluesselbild = false;
+                }
                 // Ankunftszeit sofort nehmen, noch vor dem Decodieren.
                 let t_empfangen = client_us();
                 let t0 = Instant::now();
@@ -325,7 +542,13 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
                 let mut decoded = ffmpeg::frame::Video::empty();
                 while decoder.receive_frame(&mut decoded).is_ok() {
-                    let frame = to_rgb(&decoded, info.map(|i| i.ten_bit).unwrap_or(true));
+                    // Das Format entscheidet der decodierte Frame selbst, nicht
+                    // die Strominfo. Ein unbekanntes Format ergibt ein dunkles
+                    // Bild und eine Meldung - nie einen Absturz.
+                    let (frame, fehler) = match to_rgb(&decoded) {
+                        Ok(f) => (f, None),
+                        Err(e) => (dunkles_bild(decoded.width(), decoded.height()), Some(e)),
+                    };
                     let ms = t0.elapsed().as_secs_f32() * 1000.0;
                     let mut s = shared.lock().unwrap();
                     if s.frame.is_some() {
@@ -334,7 +557,19 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     s.frame = Some(frame);
                     s.decoded += 1;
                     s.last_decode_ms = ms;
-                    s.error = None;
+                    if let Some(e) = fehler {
+                        s.error = Some(e);
+                        bild_fehler = true;
+                    } else if bild_fehler {
+                        s.error = None;
+                        bild_fehler = false;
+                    }
+                    if nach_wechsel {
+                        // Das erste Bild des neuen Codecs ist da; der Hinweis
+                        // "wird gewechselt" hat seinen Dienst getan.
+                        nach_wechsel = false;
+                        s.codec_wechsel = None;
+                    }
 
                     // Verzoegerung zerlegen. Geht nur, wenn der Zeitabgleich
                     // steht und der Stempel zu genau diesem Bild gefunden wird.
@@ -483,7 +718,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     }
 }
 
-/// YUV 4:4:4 nach RGB, BT.709, voller Wertebereich.
+/// YUV nach RGB, BT.709, voller Wertebereich.
 ///
 /// Ganzzahlig in 16.16-Festkomma statt mit Kommazahlen, und zeilenweise auf
 /// alle Kerne verteilt. Die Zeilen werden einmal als Ausschnitt geholt, damit
@@ -493,50 +728,100 @@ fn clamp8(v: i32) -> u32 {
     if v < 0 { 0 } else if v > 255 { 255 } else { v as u32 }
 }
 
-fn to_rgb(src: &ffmpeg::frame::Video, ten_bit: bool) -> Frame {
+/// Eine Zeile umrechnen. SUB = 4:2:0 (je zwei Bildpunkte teilen sich einen
+/// Farbwert), ZEHN = 10 Bit je Wert. Als Konstanten, damit der Compiler je
+/// Format eine eigene, verzweigungsfreie Schleife baut.
+///
+/// Bei 4:2:0 wird der naechstgelegene Farbwert genommen (Wiederholung) -
+/// einfach und schnell. Eine weichere Farbaufwertung ist eine spaetere
+/// Verfeinerung; sie aendert am Vergleich 4:4:4 gegen 4:2:0 nichts Wesentliches.
+#[inline(always)]
+fn zeile_rgb<const SUB: bool, const ZEHN: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8]) {
     const CR_R: i32 = 103206; // 1.5748
     const CB_G: i32 = 12276;  // 0.1873
     const CR_G: i32 = 30681;  // 0.4681
     const CB_B: i32 = 121609; // 1.8556
 
+    for (x, o) in out.iter_mut().enumerate() {
+        let cx = if SUB { x >> 1 } else { x };
+        let (y, cb, cr) = if ZEHN {
+            // 10 Bit auf 8 Bit: die oberen acht Bit reichen fuer die Anzeige.
+            (
+                (u16::from_le_bytes([yr[x * 2], yr[x * 2 + 1]]) >> 2) as i32,
+                (u16::from_le_bytes([ur[cx * 2], ur[cx * 2 + 1]]) >> 2) as i32 - 128,
+                (u16::from_le_bytes([vr[cx * 2], vr[cx * 2 + 1]]) >> 2) as i32 - 128,
+            )
+        } else {
+            (yr[x] as i32, ur[cx] as i32 - 128, vr[cx] as i32 - 128)
+        };
+        let r = y + ((CR_R * cr) >> 16);
+        let g = y - ((CB_G * cb + CR_G * cr) >> 16);
+        let b = y + ((CB_B * cb) >> 16);
+        *o = (clamp8(r) << 16) | (clamp8(g) << 8) | clamp8(b);
+    }
+}
+
+/// Decodiertes Bild nach RGB. Das Format kommt aus dem Frame selbst
+/// (Pixelformat des Decoders), nicht aus einer Flagge: nach einem
+/// Codecwechsel waere jede Flagge fuer ein paar Bilder falsch. Erkannt werden
+/// YUV444P10LE, YUV444P, YUV420P10LE und YUV420P; alles andere ist ein Fehler
+/// mit Meldung, kein Absturz. Alle Stroeme sind Vollbereich (der Host
+/// garantiert das), deshalb keine Bereichsdehnung.
+fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
+    use ffmpeg::format::Pixel;
+    let (sub, zehn) = match src.format() {
+        Pixel::YUV444P => (false, false),
+        Pixel::YUV444P10LE => (false, true),
+        Pixel::YUV420P => (true, false),
+        Pixel::YUV420P10LE => (true, true),
+        f => return Err(format!("Unbekanntes Bildformat vom Decoder: {f:?}")),
+    };
     let w = src.width() as usize;
     let h = src.height() as usize;
+    if w == 0 || h == 0 {
+        return Err("Decoder liefert ein leeres Bild".into());
+    }
+    if src.planes() < 3 {
+        return Err("Decoder liefert zu wenige Bildebenen".into());
+    }
+    // Breite der Farbebenen: bei 4:2:0 die Haelfte, aufgerundet.
+    let cw = if sub { (w + 1) / 2 } else { w };
+    let ch = if sub { (h + 1) / 2 } else { h };
+    let bpp = if zehn { 2 } else { 1 };
     let (yp, up, vp) = (src.data(0), src.data(1), src.data(2));
     let (ys, us, vs) = (src.stride(0), src.stride(1), src.stride(2));
+    // Reichen die Ebenen fuer das, was gleich gelesen wird? Sonst waere das
+    // Zerlegen unten ein Absturz mitten im Empfangsfaden.
+    if yp.len() < (h - 1) * ys + w * bpp
+        || up.len() < (ch - 1) * us + cw * bpp
+        || vp.len() < (ch - 1) * vs + cw * bpp
+    {
+        return Err("Bildebenen des Decoders sind zu klein".into());
+    }
 
     let mut pixels = vec![0u32; w * h];
     pixels.par_chunks_mut(w).enumerate().for_each(|(row, out)| {
-        if ten_bit {
-            let yr = &yp[row * ys..row * ys + w * 2];
-            let ur = &up[row * us..row * us + w * 2];
-            let vr = &vp[row * vs..row * vs + w * 2];
-            for x in 0..w {
-                // 10 Bit auf 8 Bit: die oberen acht Bit reichen fuer die Anzeige.
-                let y = (u16::from_le_bytes([yr[x * 2], yr[x * 2 + 1]]) >> 2) as i32;
-                let cb = (u16::from_le_bytes([ur[x * 2], ur[x * 2 + 1]]) >> 2) as i32 - 128;
-                let cr = (u16::from_le_bytes([vr[x * 2], vr[x * 2 + 1]]) >> 2) as i32 - 128;
-                let r = y + ((CR_R * cr) >> 16);
-                let g = y - ((CB_G * cb + CR_G * cr) >> 16);
-                let b = y + ((CB_B * cb) >> 16);
-                out[x] = (clamp8(r) << 16) | (clamp8(g) << 8) | clamp8(b);
-            }
-        } else {
-            let yr = &yp[row * ys..row * ys + w];
-            let ur = &up[row * us..row * us + w];
-            let vr = &vp[row * vs..row * vs + w];
-            for x in 0..w {
-                let y = yr[x] as i32;
-                let cb = ur[x] as i32 - 128;
-                let cr = vr[x] as i32 - 128;
-                let r = y + ((CR_R * cr) >> 16);
-                let g = y - ((CB_G * cb + CR_G * cr) >> 16);
-                let b = y + ((CB_B * cb) >> 16);
-                out[x] = (clamp8(r) << 16) | (clamp8(g) << 8) | clamp8(b);
-            }
+        let crow = if sub { row >> 1 } else { row };
+        let yr = &yp[row * ys..row * ys + w * bpp];
+        let ur = &up[crow * us..crow * us + cw * bpp];
+        let vr = &vp[crow * vs..crow * vs + cw * bpp];
+        match (sub, zehn) {
+            (false, false) => zeile_rgb::<false, false>(out, yr, ur, vr),
+            (false, true) => zeile_rgb::<false, true>(out, yr, ur, vr),
+            (true, false) => zeile_rgb::<true, false>(out, yr, ur, vr),
+            (true, true) => zeile_rgb::<true, true>(out, yr, ur, vr),
         }
     });
 
-    Frame { width: w as u32, height: h as u32, pixels }
+    Ok(Frame { width: w as u32, height: h as u32, pixels })
+}
+
+/// Flaches dunkles Bild in Fenstergrundfarbe - was gezeigt wird, wenn das
+/// Decoderformat nicht verstanden wurde. Besser als ein eingefrorenes altes
+/// Bild, das so tut, als waere alles in Ordnung.
+fn dunkles_bild(w: u32, h: u32) -> Frame {
+    let (w, h) = (w.max(1), h.max(1));
+    Frame { width: w, height: h, pixels: vec![ui::BG; (w * h) as usize] }
 }
 
 // ------------------------------------------------------------------ Eingabe
@@ -548,6 +833,8 @@ const IN_KEY: u8 = 19;
 const IN_CLIP: u8 = 48;
 const IN_SETTINGS: u8 = 64;
 const IN_TIME: u8 = 65;
+/// Codecwunsch: ein Byte, der Index aus der Koennensliste.
+const IN_CODEC: u8 = 66;
 
 // Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
 const MOD_SHIFT: u32 = 1;
@@ -682,6 +969,12 @@ impl InputLink {
         p[6] = gaming as u8;
         p[7] = fixed as u8;
         self.send(IN_SETTINGS, &p);
+    }
+
+    /// Wunsch an den Host: auf diesen Kandidaten der Koennensliste wechseln.
+    /// Die Antwort kommt ueber den Bildkanal als Nachricht 7.
+    fn codec(&mut self, idx: u8) {
+        self.send(IN_CODEC, &[idx]);
     }
 
     fn mouse_move(&mut self, nx: f32, ny: f32) {
@@ -1297,9 +1590,12 @@ impl App {
                 }
                 // Nerd-Modus. Liegt ueber allem, deshalb zuletzt gezeichnet.
                 if self.hud_offen {
-                    let (lat, info, stell, secure) = {
+                    let (lat, info, stell, secure, codecs, codec_idx, wechsel) = {
                         let sh = self.shared.lock().unwrap();
-                        (sh.clock, sh.info, sh.settings, (sh.sas.clone(), sh.peer_fp.clone()))
+                        (
+                            sh.clock, sh.info, sh.settings, (sh.sas.clone(), sh.peer_fp.clone()),
+                            sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(),
+                        )
                     };
                     let gespeichert = self
                         .angewandt_fuer
@@ -1317,6 +1613,9 @@ impl App {
                         statistik: self.show_overlay,
                         nerd: self.cfg.nerd,
                         wahl: self.cfg.stats,
+                        codecs,
+                        codec_idx,
+                        wechsel,
                     };
                     let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                     let a = hud(
@@ -1379,9 +1678,32 @@ impl App {
                                 );
                             }
                         }
+                        HudAktion::Codec(idx) => {
+                            // Erst den Hinweis setzen, dann den Wunsch abschicken.
+                            // Andersherum koennte der Empfangsfaden Nachricht 7
+                            // und das erste Bild dazwischen verarbeiten und den
+                            // Hinweis loeschen, bevor er ueberhaupt steht - dann
+                            // bliebe er bis zum Ablauf der Frist haengen.
+                            self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
+                            self.input.lock().unwrap().codec(idx);
+                        }
                         HudAktion::Nichts => {}
                     }
                     return;
+                }
+
+                // Codecwechsel unterwegs: der Host baut den Encoder um, das
+                // Bild steht ein paar hundert Millisekunden. Ohne Hinweis
+                // saehe das nach einem Haenger aus.
+                if self.shared.lock().unwrap().wechsel_laeuft() {
+                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
+                    let t = self.lang.get(strings::Key::CodecSwitching);
+                    let bw = (self.ui.text.width(t, 12, 2) + 60).max(220).min(ww as i32 - 40);
+                    let bh = 44i32;
+                    let bx = ww as i32 / 2 - bw / 2;
+                    let by = wh as i32 - 110;
+                    c.panel(bx, by, bw, bh, ui::AMBER);
+                    self.ui.text.draw_centered(&mut c, bx + bw / 2, by + 27, t, 12, ui::AMBER, 2);
                 }
 
                 // Rueckmeldung beim Halten von ESC. Erst ab einer Weile, damit
@@ -1887,7 +2209,7 @@ fn overlay(
             rows.push((lang.get(Resolution), format!("{}x{}", i.width, i.height), ui::TEXT));
         }
         if wahl.codec {
-            rows.push((lang.get(Codec), if i.ten_bit { "HEVC 4:4:4 10".into() } else { "HEVC 4:4:4 8".into() }, ui::TEXT));
+            rows.push((lang.get(Codec), i.codec_name(), ui::TEXT));
         }
     }
     if wahl.verworfen {
@@ -2006,7 +2328,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             }
         }
         let hist: Vec<f32> = (0..120).map(|i| 90.0 + 25.0 * ((i as f32) / 9.0).sin()).collect();
-        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, ten_bit: true });
+        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true });
         let sas = Some("628 306".to_string());
         let fp = Some("9EB4-EC3D-6856-8AF6".to_string());
         {
@@ -2058,11 +2380,27 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         };
         let lh: Vec<f32> = (0..200).map(|i| 24.0 + 5.0 * ((i as f32) / 11.0).sin()).collect();
         let fh: Vec<f32> = (0..200).map(|i| 104.0 + 9.0 * ((i as f32) / 7.0).cos()).collect();
-        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, ten_bit: true });
+        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true });
         let mut c = ui::Canvas { buf: &mut buf, w, h };
+        // Nachgestellte Koennensliste, wie sie der Mac mini schickt: AV1
+        // fehlt ihm, 4:4:4 8 Bit und 4:2:0 10 Bit brauchen die Umrechnung.
+        let eintrag = |idx: u8, name: &str, available: bool, conversion: bool, chroma444: bool, ten_bit: bool| CodecEintrag {
+            idx, available, hardware: available, conversion, chroma444, ten_bit, name: name.to_string(),
+        };
+        let codecs = vec![
+            eintrag(0, "HEVC 4:4:4 10 Bit", true, false, true, true),
+            eintrag(1, "HEVC 4:4:4 8 Bit", true, true, true, false),
+            eintrag(2, "HEVC 4:2:0 10 Bit", true, true, false, true),
+            eintrag(3, "HEVC 4:2:0 8 Bit", true, false, false, false),
+            eintrag(4, "H.264 High", true, false, false, false),
+            eintrag(5, "AV1", false, false, false, false),
+        ];
         let stand = HudStand {
             vollbild: true, pixelgenau: false, statistik: true, nerd: true,
             wahl: einstellungen::StatWahl::default(),
+            codecs,
+            codec_idx: None,
+            wechsel: false,
         };
         let reiter = match view { "hud2" => 1u8, "hud3" => 2, _ => 0 };
         let _ = hud(
@@ -2217,6 +2555,13 @@ fn main() {
                 }
             }
         }
+        // Einmaliger Codecwunsch aus der Befehlszeile: --codec <idx> nennt den
+        // Index des Kandidaten in der Koennensliste des Hosts (Nachricht 8).
+        let mut codec_wunsch: Option<u8> = None;
+        if let Some(i) = std::env::args().position(|a| a == "--codec") {
+            let args: Vec<String> = std::env::args().collect();
+            codec_wunsch = args.get(i + 1).and_then(|v| v.parse().ok());
+        }
         let start = Instant::now();
         let mut last = 0u64;
         loop {
@@ -2241,9 +2586,12 @@ fn main() {
                 ),
                 None => String::new(),
             };
+            // Der laufende Codec steht in jeder Zeile, damit ein Wechsel im
+            // Protokoll sichtbar wird - derselbe Name wie im Menue und Overlay.
+            let codec = s.info.map(|i| i.codec_name()).unwrap_or_else(|| "?".into());
             let line = format!(
-                "{:.0}s | decodiert {} ({:.1}/s) | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, lat, hl, s.error
+                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | {}{} | Fehler {:?}",
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, lat, hl, s.error
             );
             println!("{line}");
             std::io::stdout().flush().ok();
@@ -2265,6 +2613,15 @@ fn main() {
                         "Einstellung gewuenscht: {} Mbit/s, {} fps, Gaming {}, feste Bildrate {}",
                         w.0, w.1, w.2, w.3
                     );
+                }
+                // --codec <idx> wuenscht einmal einen Kandidaten. Erst, wenn der
+                // Eingabekanal wirklich steht - `send` wirft sonst stumm weg,
+                // und der Wunsch waere verloren, bevor der Host ihn je sah.
+                if l.sock.is_some() {
+                    if let Some(idx) = codec_wunsch.take() {
+                        l.codec(idx);
+                        println!("Codecwunsch gesendet: {idx}");
+                    }
                 }
                 println!("Eingabekanal: {} gesendet | Host meldet: {:?}", l.sent, cur);
             }
@@ -2357,6 +2714,8 @@ pub enum HudAktion {
     Trennen,
     Stellen(u32, u16, bool, bool),
     Schalter(u8),
+    /// Wunsch nach diesem Kandidaten der Koennensliste.
+    Codec(u8),
 }
 
 pub const SCH_VOLLBILD: u8 = 0;
@@ -2387,6 +2746,12 @@ pub struct HudStand {
     pub statistik: bool,
     pub nerd: bool,
     pub wahl: einstellungen::StatWahl,
+    /// Koennensliste des Hosts fuer die Codecwahl im Reiter "Bild".
+    pub codecs: Vec<CodecEintrag>,
+    /// Vom Host zuletzt gemeldeter Kandidat (Nachricht 7), falls bekannt.
+    pub codec_idx: Option<u8>,
+    /// Ein Codecwunsch ist unterwegs.
+    pub wechsel: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2482,6 +2847,9 @@ fn hud(
     c.hline(ix, y0 + p(166), iw, ui::DIM, 60);
 
     let cy = y0 + p(186);
+    // Fusszeile: schon hier bestimmt, damit die Codecknoepfe wissen, wo
+    // Schluss ist, und nicht in die Trennlinie hineinwachsen.
+    let fy = y0 + hoehe - p(22);
     match reiter {
         0 => {
             let (mbit, fps_soll, gaming, fest) = stell.unwrap_or((0, 0, false, false));
@@ -2517,12 +2885,82 @@ fn hud(
             for (i, z) in umbruch(u, lang.get(FixedRateHint), iw / 2 - p(40), sz(10)).iter().enumerate() {
                 u.text.draw(c, ix + iw / 2, cy + p(104) + i as i32 * p(15), z, sz(10), ui::DIM, p(1));
             }
-            if let Some(i) = info {
-                u.text.draw(c, ix, cy + p(146), &format!("{}x{}  ·  {}", i.width, i.height,
-                    if i.ten_bit { "HEVC 4:4:4 10" } else { "HEVC 4:4:4 8" }), sz(11), ui::DIM, p(1));
+            if stand.wechsel {
+                // Waehrend der Host umbaut, steht hier der Grund fuer den
+                // kurzen Stillstand statt der alten Eckdaten.
+                u.text.draw(c, ix, cy + p(146), lang.get(CodecSwitching), sz(11), ui::AMBER, p(1));
+            } else if let Some(i) = info {
+                u.text.draw(c, ix, cy + p(146), &format!("{}x{}  ·  {}", i.width, i.height, i.codec_name()),
+                            sz(11), ui::DIM, p(1));
             }
             if gespeichert {
                 u.text.draw_right(c, x0 + breite - rand, cy + p(146), lang.get(SavedForHost), sz(11), ui::DIM, p(1));
+            }
+
+            // --- Codecwahl: ein Knopf je Eintrag der Koennensliste ----------
+            // Der laufende Eintrag in Cyan, die anderen gedaempft, was der
+            // Mac nicht kann, noch dunkler und ohne Klick. Die Knoepfe
+            // fliessen zeilenweise, damit auch ein schmales Fenster alle zeigt.
+            if !stand.codecs.is_empty() {
+                let oy = cy + p(176);
+                u.text.draw(c, ix, oy, lang.get(Codec), sz(11), ui::DIM, p(3));
+                let suffix = lang.get(CodecConverted);
+                // Farbe fuer "nicht verfuegbar": noch stiller als DIM.
+                const STUMM: u32 = 0x2a3542;
+                let mut kx = ix;
+                let mut ky = oy + p(10);
+                let kh = p(30);
+                let pitch = p(50);
+                let luecke = p(10);
+                // Solange weder Nachricht 7 noch eine Strominfo da war, weiss
+                // niemand, welcher Eintrag laeuft - dann darf ein Klick auch
+                // keinen Wunsch losschicken, sonst wechselt man "auf sich
+                // selbst" und der Hinweis steht bis zum Ablauf der Frist.
+                let bekannt = stand.codec_idx.is_some() || info.is_some();
+                for e in &stand.codecs {
+                    let aktuell = match (stand.codec_idx, info) {
+                        (Some(idx), _) => idx == e.idx,
+                        (None, Some(i)) => e.passt_zu(&i),
+                        (None, None) => false,
+                    };
+                    let bw = u.text.width(&e.name, 15, 2) + p(28);
+                    if kx + bw > ix + iw && kx > ix {
+                        kx = ix;
+                        ky += pitch;
+                    }
+                    // Was mit der Fusszeile kollidieren wuerde, wird schlicht
+                    // nicht gezeichnet - lieber eine Zeile weniger als Salat.
+                    if ky + kh + p(14) > fy - p(24) {
+                        break;
+                    }
+                    let r = ui::Rect { x: kx, y: ky, w: bw, h: kh };
+                    if !e.available {
+                        // Nur zeichnen, nicht bedienen: keine Hervorhebung
+                        // beim Ueberfahren, kein Klick.
+                        c.rect(r.x, r.y, r.w, r.h, STUMM, 10);
+                        let cut = 10;
+                        for (cx_, cy_, dx, dy) in [
+                            (r.x, r.y, 1, 1), (r.x + r.w - 1, r.y, -1, 1),
+                            (r.x, r.y + r.h - 1, 1, -1), (r.x + r.w - 1, r.y + r.h - 1, -1, -1),
+                        ] {
+                            for i in 0..cut {
+                                c.px(cx_ + dx * i, cy_, STUMM, 255);
+                                c.px(cx_, cy_ + dy * i, STUMM, 255);
+                            }
+                        }
+                        u.text.draw_centered(c, r.x + r.w / 2, r.y + r.h / 2 + 5, &e.name, 15, STUMM, 2);
+                    } else {
+                        let farbe = if aktuell { ui::CYAN } else { ui::DIM };
+                        if u.button(c, r, &e.name, farbe) && !aktuell && bekannt {
+                            aktion = HudAktion::Codec(e.idx);
+                        }
+                    }
+                    if e.conversion {
+                        let sf = if e.available { ui::DIM } else { STUMM };
+                        u.text.draw(c, r.x + p(4), r.y + r.h + p(12), suffix, sz(9), sf, p(1));
+                    }
+                    kx += bw + luecke;
+                }
             }
         }
         1 => {
@@ -2565,7 +3003,6 @@ fn hud(
         }
     }
 
-    let fy = y0 + hoehe - p(22);
     c.hline(ix, fy - p(24), iw, ui::DIM, 60);
     u.text.draw(c, ix, fy, &format!("ESC · {}", lang.get(Back)), sz(11), ui::DIM, p(3));
     aktion

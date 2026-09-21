@@ -16,7 +16,8 @@
 
 typedef struct {
     uint16_t cpu_promille;       // Auslastung aller Kerne, 0..1000
-    uint16_t cpu_eigen_promille; // was dieser Prozess davon braucht
+    uint16_t cpu_eigen_promille; // was dieser Prozess davon braucht, gleiche
+                                 // Bezugsgroesse (alle Kerne), 0..1000
     uint16_t gpu_promille;       // Grafikkerne, 0..1000; 0xffff = nicht lesbar
     uint16_t druck;              // 1 normal, 2 erhoeht, 4 kritisch
     uint32_t ram_benutzt_mb;

@@ -7,7 +7,10 @@
 //   quadchroma-host --capture <sekunden> <datei.hevc> [optionen]
 //   quadchroma-host --serve [port]                    [optionen]
 //
-// Optionen: --display N  --out BxH  --fps N  --mbit N  --bgra
+// Optionen: --display N  --out BxH  --fps N  --mbit N  --fest
+//
+// Der Codec laesst sich im Betrieb wechseln (Nachricht 66 vom Client); der
+// Start erfolgt immer mit Kandidat 0, HEVC 4:4:4 10 Bit.
 //
 // Ueber "open -n QuadChroma.app --args ..." starten, damit die Freigaben am
 // Bundle haengen. Ausgaben zusaetzlich in /tmp/quadchroma-m1.log.
@@ -185,7 +188,11 @@ static OSType pixfmt_fuer(int idx) {
 static int umrechnung_fuer(int idx) { return idx == 1 || idx == 2; }
 static int ist_h264(int idx) { return g_kandidaten[idx].codec == kCMVideoCodecType_H264; }
 
-static int g_info_w = 0, g_info_h = 0, g_info_fps = 0, g_info_ten = 1;
+static int g_info_w = 0, g_info_h = 0, g_info_fps = 0;
+
+// Codecwechsel im Betrieb. Laeuft ausschliesslich auf der Aufnahmewarteschlange;
+// die Eingabe reicht den Wunsch nur dorthin weiter.
+static void codec_wechseln(int idx);
 
 // Alle Zeiten des Hosts kommen von derselben Uhr wie die Bildzeitstempel der
 // Aufnahme. Nur so lassen sich Aufnahme, Encoder und Versand vergleichen.
@@ -604,17 +611,23 @@ static void apply_settings(int mbit, int fps, int gaming, int fixed) {
     if (fps < 10) fps = 10;
     if (fps > 240) fps = 240;
 
-    if (g_session) {
-        set_i32(g_session, kVTCompressionPropertyKey_AverageBitRate, mbit * 1000000);
-        set_i32(g_session, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
-        set_i32(g_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, gaming ? fps : fps * 2);
-    }
-    if (g_stream && g_cfg) {
-        g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
-        [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
-            if (e) logf_(@"Bildrate konnte nicht geaendert werden: %@", e.localizedDescription);
-        }];
-    }
+    // Encoder-Sitzung und Aufnahmekonfiguration gehoeren der Aufnahmewarteschlange:
+    // dort tauscht der Codecwechsel die Sitzung aus, also darf sie nur dort
+    // angefasst werden - sonst setzen wir hier Eigenschaften auf einer Sitzung,
+    // die gerade freigegeben wird.
+    dispatch_async(g_capq ?: dispatch_get_main_queue(), ^{
+        if (g_session) {
+            set_i32(g_session, kVTCompressionPropertyKey_AverageBitRate, mbit * 1000000);
+            set_i32(g_session, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
+            set_i32(g_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, gaming ? fps : fps * 2);
+        }
+        if (g_stream && g_cfg) {
+            g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
+            [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
+                if (e) logf_(@"Bildrate konnte nicht geaendert werden: %@", e.localizedDescription);
+            }];
+        }
+    });
     atomic_store(&g_cur_mbit, mbit);
     atomic_store(&g_cur_fps, fps);
     atomic_store(&g_cur_gaming, gaming);
@@ -762,6 +775,15 @@ static void *input_thread(void *arg) {
                         });
                     }
                     break;
+                case QC_IN_CODEC:
+                    // Codecwunsch. Nur weiterreichen - der Wechsel selbst
+                    // gehoert auf die Aufnahmewarteschlange, nie hierher.
+                    if (h.len >= 1) {
+                        int idx = payload[0];
+                        if (g_capq) dispatch_async(g_capq, ^{ codec_wechseln(idx); });
+                        else logf_(@"Codecwunsch %d verworfen: Aufnahme laeuft noch nicht", idx);
+                    }
+                    break;
                 default: break;
             }
         }
@@ -811,6 +833,10 @@ typedef struct {
 
 static EncStats g_stats = {0};
 VTCompressionSessionRef g_session = NULL;
+// Encoder-Fehler je Sitzung. Wird in encoder_start auf 0 gesetzt; gemeldet wird
+// nur der ERSTE Fehler einer Sitzung, sonst kaeme je Bild eine Zeile. Atomar,
+// weil encode_buffer (g_capq) und enc_cb (VideoToolbox-Thread) beide zaehlen.
+static _Atomic int g_enc_fehler = 0;
 
 static const uint8_t kStartCode[4] = {0, 0, 0, 1};
 
@@ -853,13 +879,21 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
     size_t total = 0;
 
     if (keyframe) {
+        // Parametersaetze (VPS/SPS/PPS bei HEVC, SPS/PPS bei H.264) vor jedes
+        // Vollbild. Welche Abfrage gilt, entscheidet der laufende Codec.
         CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
         size_t count = 0; int nal = 4;
-        if (fd && CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, NULL, NULL, &count, &nal) == noErr) {
+        BOOL h264 = ist_h264(atomic_load(&g_codec_id)) ? YES : NO;
+        OSStatus ps_st = !fd ? -1
+                       : h264 ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, 0, NULL, NULL, &count, &nal)
+                              : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, NULL, NULL, &count, &nal);
+        if (ps_st == noErr) {
             g_stats.nal_len = nal;
             for (size_t i = 0; i < count && cnt + 2 < QC_MAX_IOV; i++) {
                 const uint8_t *ps = NULL; size_t psz = 0;
-                if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, i, &ps, &psz, NULL, NULL) == noErr && ps && psz) {
+                OSStatus r = h264 ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, i, &ps, &psz, NULL, NULL)
+                                  : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, i, &ps, &psz, NULL, NULL);
+                if (r == noErr && ps && psz) {
                     iov[cnt].iov_base = (void *)kStartCode; iov[cnt].iov_len = 4; cnt++;
                     iov[cnt].iov_base = (void *)ps;         iov[cnt].iov_len = psz; cnt++;
                     total += 4 + psz;
@@ -898,17 +932,19 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
         // Ein frisch verbundener Zuschauer bekommt erst ab dem naechsten Vollbild
         // Daten, sonst faengt er mitten in einem Bild ohne Kopfdaten an.
         if (!atomic_load(&g_vid_ready)) { pthread_mutex_unlock(&g_send_mtx); return; }
-        if (atomic_load(&g_wait_key)) {
-            if (!keyframe) { pthread_mutex_unlock(&g_send_mtx); return; }
-            atomic_store(&g_wait_key, 0);
-        }
+        if (atomic_load(&g_wait_key) && !keyframe) { pthread_mutex_unlock(&g_send_mtx); return; }
         // Staut es sich, werfen wir lieber ein Bild weg als Verzoegerung aufzubauen.
+        // g_wait_key bleibt dabei stehen: faellt hier das erste Vollbild einer
+        // neuen Sitzung weg, muss der Zuschauer weiter auf ein Vollbild warten -
+        // sonst bekaeme sein Decoder ein Zwischenbild ohne Bezugsbild.
         if (backlog_bytes(fd) > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
             atomic_fetch_add(&g_skipped_backlog, 1);
             atomic_store(&g_force_key, 1);
             pthread_mutex_unlock(&g_send_mtx);
             return;
         }
+        // Erst wenn das Bild wirklich rausgeht, ist das Warten vorbei.
+        atomic_store(&g_wait_key, 0);
         if (qc_chan_send(g_vid, iov, cnt) != 0) {
             logf_(@"Zuschauer weg: %s", strerror(errno));
             atomic_store(&g_vid_ready, 0);
@@ -929,7 +965,14 @@ static void enc_cb(void *ref, void *src, OSStatus status, VTEncodeInfoFlags flag
     uint64_t t_cap_us = zettel >> 1;
     int wiederholt = (int)(zettel & 1u);
     if (flags & kVTEncodeInfo_FrameDropped) g_stats.dropped++;
-    if (status != noErr) { if (!g_stats.first_err) g_stats.first_err = status; return; }
+    if (status != noErr) {
+        if (!g_stats.first_err) g_stats.first_err = status;
+        // Im Dienstbetrieb sieht sonst niemand, dass der Encoder nach einem
+        // Wechsel nichts mehr liefert. Einmal je Sitzung, nicht je Bild.
+        if (atomic_fetch_add(&g_enc_fehler, 1) == 0)
+            logf_(@"Encoder %s meldet Fehler beim Codieren (%d)", g_kandidaten[atomic_load(&g_codec_id)].name, (int)status);
+        return;
+    }
     if (!sb) return;
 
     CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, false);
@@ -1009,43 +1052,259 @@ static void codecs_pruefen(void) {
     }
 }
 
-static BOOL encoder_start(int w, int h, OSType pixfmt, int fps, int mbit, BOOL ten_bit) {
+// Encoder fuer einen Kandidaten aus g_kandidaten oeffnen. Codec, Profil und
+// Aufnahmeformat kommen aus der Tabelle; das Profil muss der Encoder selbst
+// anbieten, sonst brechen wir ab statt still etwas anderes zu liefern.
+// g_session wird erst gesetzt, wenn die Sitzung vollstaendig steht - bei einem
+// Fehlschlag bleibt sie so, wie sie war (beim Codecwechsel: NULL).
+static BOOL encoder_start(int idx, int w, int h, int fps, int mbit) {
+    if (idx < 0 || idx >= (int)QC_KANDIDATEN) return NO;
+    const qc_codec_kandidat *k = &g_kandidaten[idx];
+    OSType pixfmt = pixfmt_fuer(idx);
+
     CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+    // Hardware verlangen, wenn die Pruefung beim Start welche gefunden hat. Sonst
+    // ist der Kandidat nur in Software da - und genau so steht er in der Koennensliste.
+    if (g_befund[idx].hardware)
+        CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
 
-    OSStatus st = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_HEVC, spec, NULL, NULL, enc_cb, NULL, &g_session);
+    VTCompressionSessionRef s = NULL;
+    OSStatus st = VTCompressionSessionCreate(NULL, w, h, k->codec, spec, NULL, NULL, enc_cb, NULL, &s);
     CFRelease(spec);
-    if (st != noErr) { logf_(@"Encoder-Session fehlgeschlagen (%d)", (int)st); return NO; }
+    if (st != noErr || !s) { logf_(@"Encoder-Session fuer %s fehlgeschlagen (%d)", k->name, (int)st); return NO; }
 
-    CFStringRef want = ten_bit ? vt_sym("kVTProfileLevel_HEVC_Main44410_AutoLevel")
-                               : vt_sym("kVTProfileLevel_HEVC_Main444_AutoLevel");
-    if (!profile_supported(g_session, want)) {
-        logf_(@"4:4:4-Profil wird von diesem Encoder nicht angeboten - Abbruch statt stiller 4:2:0-Ausgabe");
+    CFStringRef want = vt_sym(k->profil);
+    if (!profile_supported(s, want)) {
+        logf_(@"Profil %s wird von diesem Encoder nicht angeboten - Abbruch statt stiller Ersatzausgabe", k->profil);
+        VTCompressionSessionInvalidate(s);
+        CFRelease(s);
         return NO;
     }
-    st = VTSessionSetProperty(g_session, kVTCompressionPropertyKey_ProfileLevel, want);
-    if (st != noErr) { logf_(@"Profil abgelehnt (%d)", (int)st); return NO; }
+    st = VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel, want);
+    if (st != noErr) {
+        logf_(@"Profil %s abgelehnt (%d)", k->profil, (int)st);
+        VTCompressionSessionInvalidate(s);
+        CFRelease(s);
+        return NO;
+    }
 
-    VTSessionSetProperty(g_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-    VTSessionSetProperty(g_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-    VTSessionSetProperty(g_session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-    VTSessionSetProperty(g_session, kVTCompressionPropertyKey_ColorPrimaries,   kCVImageBufferColorPrimaries_ITU_R_709_2);
-    VTSessionSetProperty(g_session, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
-    VTSessionSetProperty(g_session, kVTCompressionPropertyKey_YCbCrMatrix,      kCVImageBufferYCbCrMatrix_ITU_R_709_2);
-    set_i32(g_session, kVTCompressionPropertyKey_MaxFrameDelayCount, 1);
-    set_i32(g_session, kVTCompressionPropertyKey_AverageBitRate, mbit * 1000000);
-    set_i32(g_session, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
-    set_i32(g_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, fps * 2);
-    VTCompressionSessionPrepareToEncodeFrames(g_session);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_ColorPrimaries,   kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    VTSessionSetProperty(s, kVTCompressionPropertyKey_YCbCrMatrix,      kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    set_i32(s, kVTCompressionPropertyKey_MaxFrameDelayCount, 1);
+    set_i32(s, kVTCompressionPropertyKey_AverageBitRate, mbit * 1000000);
+    set_i32(s, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
+    set_i32(s, kVTCompressionPropertyKey_MaxKeyFrameInterval, fps * 2);
+    VTCompressionSessionPrepareToEncodeFrames(s);
 
     CFBooleanRef hw = NULL;
-    VTSessionCopyProperty(g_session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &hw);
+    VTSessionCopyProperty(s, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &hw);
     BOOL is_hw = hw && CFBooleanGetValue(hw);
     if (hw) CFRelease(hw);
-    logf_(@"Encoder: %dx%d, %@, Hardware: %@, %d Mbit/s, Eingabe %.4s",
-          w, h, ten_bit ? @"Main444 10 Bit" : @"Main444 8 Bit", is_hw ? @"ja" : @"NEIN", mbit,
-          (char *)&(uint32_t){CFSwapInt32HostToBig(pixfmt)});
-    return is_hw;
+
+    atomic_store(&g_enc_fehler, 0);   // neue Sitzung, neue Meldung erlaubt
+    g_session = s;
+    logf_(@"Encoder: Kandidat %d %s, %dx%d, Hardware: %@, %d Mbit/s, Eingabe %.4s%@",
+          idx, k->name, w, h, is_hw ? @"ja" : @"NEIN", mbit,
+          (char *)&(uint32_t){CFSwapInt32HostToBig(pixfmt)},
+          umrechnung_fuer(idx) ? @" (Umrechnung durch VideoToolbox)" : @"");
+    return YES;
+}
+
+// ------------------------------------------------------------ Codecwechsel
+//
+// Alles hier laeuft AUSSCHLIESSLICH auf der Aufnahmewarteschlange g_capq -
+// derselben, auf der Bilder in den Encoder gehen und der feste Takt nachlegt.
+// Deshalb kann waehrend des Wechsels kein Bild in eine halb abgebaute Sitzung
+// laufen, und deshalb braucht nichts hier eine Sperre.
+//
+// Reihenfolge auf der Leitung: letzte Zugriffseinheit des alten Codecs,
+// dann SWITCH (Typ 7), dann Strominfo (Typ 1), dann das erste Vollbild des
+// neuen Codecs mit Parametersaetzen. SWITCH geht ERST raus, wenn die neue
+// Sitzung wirklich steht (Erfolgszweig von codec_wechsel_abschliessen) - so
+// baut der Client seinen Decoder genau einmal um, und scheitert der Wechsel,
+// bekommt er gar kein SWITCH und behaelt den alten Decoder. Dass SWITCH
+// trotzdem genau zwischen alt und neu landet, liegt daran, dass CompleteFrames
+// erst zurueckkommt, wenn der alte Encoder alles abgeliefert hat, dass die
+// neue Sitzung Bilder nur ueber g_capq bekommt - und codec_wechsel_abschliessen
+// laeuft selbst auf g_capq, sendet SWITCH also, bevor dort das naechste Bild
+// drankommt. send_small nimmt dieselbe Sperre wie der Bildversand.
+
+static int g_wechsel_aktiv = 0;      // nur auf g_capq: ein Wechsel ist unterwegs
+static int g_wechsel_wunsch = -1;    // nur auf g_capq: waehrenddessen eingegangener naechster Wunsch
+
+static void strominfo_senden(void) {
+    uint8_t p[8];
+    strominfo_fuellen(p);
+    send_small(QC_MSG_INFO, p, sizeof p);
+}
+
+// Typ 7: u8 idx, u8 h264, u8 chroma444, u8 zehn_bit, u8 vollbereich (immer 1),
+// u8 umrechnung, u16 frei.
+static void switch_senden(int idx) {
+    const qc_codec_kandidat *k = &g_kandidaten[idx];
+    uint8_t p[8] = {0};
+    p[0] = (uint8_t)idx;
+    p[1] = (uint8_t)ist_h264(idx);
+    p[2] = (uint8_t)k->chroma444;
+    p[3] = (uint8_t)k->zehn_bit;
+    p[4] = 1;
+    p[5] = (uint8_t)umrechnung_fuer(idx);
+    send_small(QC_MSG_SWITCH, p, sizeof p);
+}
+
+// Was der Zuschauer gerade eingestellt hat, auf die frische Sitzung uebertragen.
+// Dieselben Aufrufe wie in apply_settings, aber ohne deren Meldung und ohne
+// Aufnahmekonfiguration - die ist von einem Codecwechsel nicht betroffen.
+static void encoder_einstellungen_nachziehen(void) {
+    int fps = atomic_load(&g_cur_fps), mbit = atomic_load(&g_cur_mbit), gaming = atomic_load(&g_cur_gaming);
+    if (!g_session || fps <= 0 || mbit <= 0) return;
+    set_i32(g_session, kVTCompressionPropertyKey_AverageBitRate, mbit * 1000000);
+    set_i32(g_session, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
+    set_i32(g_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, gaming ? fps : fps * 2);
+}
+
+// Wechsel beendet - ob gelungen oder nicht. Kam waehrenddessen ein weiterer
+// Wunsch herein, wird er jetzt angestossen, statt verloren zu gehen.
+static void codec_wechsel_fertig(void) {
+    g_wechsel_aktiv = 0;
+    int n = g_wechsel_wunsch;
+    g_wechsel_wunsch = -1;
+    if (n >= 0) dispatch_async(g_capq, ^{ codec_wechseln(n); });
+}
+
+// Schritt h: der neue Kandidat liess sich nicht oeffnen, der alte kommt zurueck.
+// Ein SWITCH gab es nicht, der Client decodiert weiter mit dem alten Codec -
+// nur die Strominfo geht noch einmal raus.
+static void codec_alt_aufbauen(int alt) {
+    if (encoder_start(alt, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
+        encoder_einstellungen_nachziehen();
+        atomic_store(&g_force_key, 1);
+        strominfo_senden();
+        logf_(@"Alter Codec laeuft wieder: %s", g_kandidaten[alt].name);
+    } else {
+        logf_(@"Auch der alte Codec %s laesst sich nicht mehr oeffnen - es kommt kein Bild mehr", g_kandidaten[alt].name);
+    }
+    codec_wechsel_fertig();
+}
+
+// Schritt g: neue Sitzung bauen, SWITCH ansagen, Einstellungen nachziehen,
+// Strominfo melden. Die Reihenfolge ist Absicht: erst g_codec_id, damit
+// emit_access_unit die Parametersaetze des neuen Codecs abfragt; dann SWITCH -
+// noch kann kein Bild in der neuen Sitzung sein, weil Bilder nur ueber g_capq
+// hineingehen und wir gerade darauf laufen; dann Vollbild erzwingen und die
+// Strominfo hinterher.
+static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fmt_geaendert) {
+    if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
+        atomic_store(&g_codec_id, idx);
+        switch_senden(idx);
+        encoder_einstellungen_nachziehen();
+        atomic_store(&g_force_key, 1);
+        strominfo_senden();
+        logf_(@"Codec gewechselt: %s", g_kandidaten[idx].name);
+        codec_wechsel_fertig();
+        return;
+    }
+
+    logf_(@"Codecwechsel auf %s fehlgeschlagen - baue %s wieder auf", g_kandidaten[idx].name, g_kandidaten[alt].name);
+    // Kein SWITCH: der Client hat noch seinen alten Decoder und behaelt ihn.
+    if (fmt_geaendert) {
+        g_cfg.pixelFormat = alt_fmt;
+        [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
+            if (e) logf_(@"Aufnahmeformat liess sich nicht zuruecksetzen: %@", e.localizedDescription);
+            dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt); });
+        }];
+    } else {
+        codec_alt_aufbauen(alt);
+    }
+}
+
+static void codec_wechseln(int idx) {
+    // a) Nur, was die Pruefung beim Start als vorhanden gemeldet hat.
+    if (idx < 0 || idx >= (int)QC_KANDIDATEN || !g_befund[idx].vorhanden) {
+        logf_(@"Codecwunsch %d abgelehnt: %@", idx,
+              (idx < 0 || idx >= (int)QC_KANDIDATEN) ? @"kein solcher Kandidat" : @"auf diesem Mac nicht vorhanden");
+        return;
+    }
+    int alt = atomic_load(&g_codec_id);
+    if (g_wechsel_aktiv) {
+        // Ein Wechsel laeuft schon (die Aufnahme stellt gerade um). Den Wunsch
+        // merken und danach ausfuehren - nie zwei Wechsel ineinander.
+        g_wechsel_wunsch = idx;
+        logf_(@"Codecwunsch %s vorgemerkt, ein Wechsel laeuft noch", g_kandidaten[idx].name);
+        return;
+    }
+    // "Laeuft bereits" gilt nur, wenn wirklich eine Sitzung laeuft. Nach einem
+    // doppelten Fehlschlag (neuer Codec kaputt, alter liess sich nicht wieder
+    // oeffnen) steht g_codec_id noch auf dem alten - der darf dann neu versucht werden.
+    if (idx == alt && g_session) {
+        logf_(@"Codecwunsch %s: laeuft bereits", g_kandidaten[idx].name);
+        return;
+    }
+    // Ohne Aufnahme geht nichts. Eine fehlende Encoder-Sitzung ist dagegen kein
+    // Hinderungsgrund: genau dann (nach dem doppelten Fehlschlag) muss der
+    // Zuschauer noch auf einen dritten Kandidaten ausweichen koennen.
+    if (!g_stream || !g_cfg) {
+        logf_(@"Codecwunsch %s abgelehnt: keine laufende Aufnahme", g_kandidaten[idx].name);
+        return;
+    }
+    g_wechsel_aktiv = 1;
+    logf_(@"Codecwechsel: %s -> %s", g_kandidaten[alt].name, g_kandidaten[idx].name);
+
+    // b) Aendert sich das Aufnahmeformat, darf der feste Takt kein altes Bild
+    //    mehr nachlegen - sonst bekaeme der neue Encoder Bilder im alten Format.
+    OSType alt_fmt = g_cfg.pixelFormat;
+    OSType neu_fmt = pixfmt_fuer(idx);
+    BOOL fmt_geaendert = (alt_fmt != neu_fmt);
+    if (fmt_geaendert && g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
+
+    if (g_session) {
+        // c) Alles, was der alte Encoder noch hat, abliefern lassen. Danach feuert
+        //    kein enc_cb der alten Sitzung mehr.
+        VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
+
+        // d) Sitzung aushaengen, dann abbauen. Ab hier verwirft encode_buffer
+        //    ankommende Bilder, bis die neue Sitzung steht - gewollt.
+        VTCompressionSessionRef s = g_session;
+        g_session = NULL;
+        VTCompressionSessionInvalidate(s);
+        CFRelease(s);
+    }
+
+    // e) Der Zuschauer wartet wieder auf ein Vollbild, das erste neue Bild wird
+    //    erzwungen, und die NAL-Laenge kommt frisch aus den neuen Parametersaetzen.
+    //    Das SWITCH (Typ 7) kommt NICHT hier, sondern erst, wenn die neue Sitzung
+    //    steht - siehe codec_wechsel_abschliessen.
+    atomic_store(&g_wait_key, 1);
+    atomic_store(&g_force_key, 1);
+    g_stats.nal_len = 4;
+
+    // f) Aufnahmeformat umstellen, falls noetig. Das geht im Betrieb (gemessen
+    //    mit --formattest); weiter geht es erst, wenn die Aufnahme umgestellt hat.
+    if (fmt_geaendert) {
+        uint32_t a = CFSwapInt32HostToBig(alt_fmt), n = CFSwapInt32HostToBig(neu_fmt);
+        logf_(@"Aufnahmeformat: %.4s -> %.4s", (char *)&a, (char *)&n);
+        g_cfg.pixelFormat = neu_fmt;
+        [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
+            if (e) {
+                // Die Aufnahme liefert weiter das alte Format - dann bleibt es
+                // beim alten Codec. Der Client hat kein SWITCH bekommen und
+                // muss von nichts erfahren.
+                logf_(@"Aufnahmeformat liess sich nicht umstellen: %@ - bleibe bei %s", e.localizedDescription, g_kandidaten[alt].name);
+                dispatch_async(g_capq, ^{
+                    g_cfg.pixelFormat = alt_fmt;
+                    codec_alt_aufbauen(alt);
+                });
+                return;
+            }
+            dispatch_async(g_capq, ^{ codec_wechsel_abschliessen(idx, alt, alt_fmt, fmt_geaendert); });
+        }];
+    } else {
+        codec_wechsel_abschliessen(idx, alt, alt_fmt, fmt_geaendert);
+    }
 }
 
 // ------------------------------------------------------------ Aufnahme-Teil
@@ -1066,13 +1325,33 @@ static BOOL encoder_start(int w, int h, OSType pixfmt, int fps, int mbit, BOOL t
 
 static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int wiederholt) {
     if (!pb || !g_session) return;
+    // Rund um einen Formatwechsel der Aufnahme kann noch ein Bild im alten
+    // Format eintreffen. Das gehoert nicht in den neuen Encoder - verwerfen,
+    // und sagen, dass es passiert ist (einmal je Format, nicht je Bild).
+    OSType ist = CVPixelBufferGetPixelFormatType(pb);
+    OSType soll = pixfmt_fuer(atomic_load(&g_codec_id));
+    if (ist != soll) {
+        static OSType gemeldet = 0;
+        if (gemeldet != ist) {
+            gemeldet = ist;
+            uint32_t a = CFSwapInt32HostToBig(ist), b = CFSwapInt32HostToBig(soll);
+            logf_(@"Bild im Format %.4s verworfen, Encoder erwartet %.4s", (char *)&a, (char *)&b);
+        }
+        return;
+    }
     NSDictionary *opts = nil;
     if (atomic_exchange(&g_force_key, 0))
         opts = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
     OSStatus st = VTCompressionSessionEncodeFrame(g_session, pb, pts, kCMTimeInvalid,
                                                   (__bridge CFDictionaryRef)opts,
                                                   QC_ZETTEL(t_cap_us, wiederholt), NULL);
-    if (st != noErr && !g_stats.first_err) g_stats.first_err = st;
+    if (st != noErr) {
+        if (!g_stats.first_err) g_stats.first_err = st;
+        // Im Dienstbetrieb wuerde ein Encoder, der nach dem Wechsel kein Bild
+        // annimmt, sonst stumm bleiben. Einmal je Sitzung, nicht je Bild.
+        if (atomic_fetch_add(&g_enc_fehler, 1) == 0)
+            logf_(@"Encoder %s nimmt Bild nicht an (%d)", g_kandidaten[atomic_load(&g_codec_id)].name, (int)st);
+    }
 }
 
 // Der Takt. Laeuft auf derselben Warteschlange wie die Aufnahme, kommt ihr
@@ -1235,7 +1514,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     BOOL do_list = [args containsObject:@"--list"];
     if (!do_list && capIdx == NSNotFound && srvIdx == NSNotFound && ![args containsObject:@"--formattest"]) {
         logf_(@"Aufruf: --list | --capture <sekunden> <datei.hevc> | --serve [port]   "
-               "[--display N] [--out BxH] [--fps N] [--mbit N] [--bgra] [--fest] [--pair] [--forget]");
+               "[--display N] [--out BxH] [--fps N] [--mbit N] [--fest] [--pair] [--forget]");
         return 2;
     }
 
@@ -1298,7 +1577,6 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     int displayIdx = 0, fps = 120, mbit = 150, outW = 0, outH = 0, port = 9001;
     double seconds = 0;
     NSString *outPath = nil;
-    BOOL useBGRA = [args containsObject:@"--bgra"];
     if ([args containsObject:@"--fest"] || [args containsObject:@"--fixed"])
         atomic_store(&g_cur_fixed, 1);
     NSInteger i;
@@ -1322,14 +1600,18 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     }
     outW &= ~1; outH &= ~1;
 
-    OSType pixfmt = useBGRA ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    // Start immer mit Kandidat 0 (HEVC 4:4:4 10 Bit); das Aufnahmeformat
+    // gehoert zum Kandidaten, nicht zur Kommandozeile.
+    const int start_idx = 0;
+    OSType pixfmt = pixfmt_fuer(start_idx);
     g_stats.nal_len = 4;
     if (outPath) {
         g_stats.out = fopen(outPath.UTF8String, "wb");
         if (!g_stats.out) { logf_(@"Ausgabedatei nicht schreibbar: %@", outPath); return 5; }
     }
 
-    g_info_w = outW; g_info_h = outH; g_info_fps = fps; g_info_ten = !useBGRA;
+    g_info_w = outW; g_info_h = outH; g_info_fps = fps;
+    atomic_store(&g_codec_id, start_idx);
 
     if (srvIdx != NSNotFound) {
         if (start_server(port) < 0) return 9;
@@ -1344,7 +1626,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
               seconds, displayIdx, pxW, pxH, outW, outH, fps);
     }
 
-    if (!encoder_start(outW, outH, pixfmt, fps, mbit, !useBGRA)) { if (g_stats.out) fclose(g_stats.out); return 6; }
+    if (!encoder_start(start_idx, outW, outH, fps, mbit)) { if (g_stats.out) fclose(g_stats.out); return 6; }
 
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = outW;
