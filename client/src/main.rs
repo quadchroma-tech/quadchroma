@@ -418,10 +418,21 @@ struct Latenz {
     leitung_ms: f32,
     /// Decodieren und Umrechnen nach RGB.
     decoder_ms: f32,
-    /// Summe: Aufnahme bis anzeigebereit.
+    /// Summe: Aufnahme bis anzeigebereit (ohne das Glied Anzeige).
     gesamt_ms: f32,
     /// Wie viele Bilder in den Mittelwert eingegangen sind.
     bilder: u32,
+    /// Anzeigebereit bis Uebergabe an GDI bzw. DXGI, gemessen vom
+    /// Fensterfaden auf der Client-Uhr. Kein Teil des Zeitabgleichs, deshalb
+    /// erst beim Lesen aus `Shared` eingetragen (siehe `Shared::latenz`).
+    anzeige_ms: f32,
+}
+
+impl Latenz {
+    /// Aufnahme bis Uebergabe ans Fenster: alle fuenf Glieder.
+    fn bis_anzeige(&self) -> f32 {
+        self.gesamt_ms + self.anzeige_ms
+    }
 }
 
 /// Fertiges Bild in RGB, bereit zum Anzeigen.
@@ -429,6 +440,9 @@ struct Frame {
     width: u32,
     height: u32,
     pixels: Vec<u32>, // 0x00RRGGBB, wie softbuffer es erwartet
+    /// Client-Uhr bei der Ablage durch den Empfangsfaden: Anfang der
+    /// Anzeigezeit.
+    bereit_us: u64,
 }
 
 /// Was der Empfangsfaden ablegt: fertig gerechnetes RGB, oder - sobald die
@@ -437,7 +451,16 @@ struct Frame {
 /// laesst sich zwischen Faeden verschieben.
 enum Bild {
     Rgb(Frame),
-    Roh { bild: ffmpeg::frame::Video },
+    Roh { bild: ffmpeg::frame::Video, bereit_us: u64 },
+}
+
+impl Bild {
+    fn bereit_us(&self) -> u64 {
+        match self {
+            Bild::Rgb(f) => f.bereit_us,
+            Bild::Roh { bereit_us, .. } => *bereit_us,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -452,6 +475,12 @@ struct Shared {
     /// statt sie auf der CPU umzurechnen. Setzt der Fensterfaden; bis die
     /// Anzeige ueber die Karte da ist, bleibt es false.
     gpu_pfad: bool,
+    /// Anzeigezeit (Ablage bis hinter present), gleitender Mittelwert des
+    /// Fensterfadens.
+    anzeige_ms: f32,
+    /// Praesentationen, die ausgelassen wurden, weil DXGI noch nicht bereit
+    /// war. Auf dem CPU-Weg gibt es das nicht: bleibt null.
+    ausgelassen: u64,
     info: Option<StreamInfo>,
     decoded: u64,
     dropped: u64,
@@ -505,6 +534,36 @@ impl Shared {
     fn wechsel_laeuft(&self) -> bool {
         self.codec_wechsel.map(|t| t.elapsed() < CODEC_WECHSEL_FRIST).unwrap_or(false)
     }
+
+    /// Die Latenzzerlegung samt Anzeige-Glied. Der Empfangsfaden schreibt
+    /// `clock` als Ganzes; die Anzeigezeit misst der Fensterfaden und haelt
+    /// sie in einem eigenen Feld, damit die beiden sich nicht ueberschreiben.
+    fn latenz(&self) -> Option<Latenz> {
+        self.clock.map(|mut l| {
+            l.anzeige_ms = self.anzeige_ms;
+            l
+        })
+    }
+}
+
+/// Kernel- plus Nutzerzeit dieses Prozesses in 100-ns-Einheiten - die
+/// Zaehler, aus denen auch der Task-Manager seine Prozentzahl rechnet.
+#[cfg(windows)]
+fn prozesszeit_100ns() -> Option<u64> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut erstellt = FILETIME::default();
+    let mut beendet = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut nutzer = FILETIME::default();
+    unsafe { GetProcessTimes(GetCurrentProcess(), &mut erstellt, &mut beendet, &mut kernel, &mut nutzer) }.ok()?;
+    let als_u64 = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+    Some(als_u64(kernel) + als_u64(nutzer))
+}
+
+#[cfg(not(windows))]
+fn prozesszeit_100ns() -> Option<u64> {
+    None
 }
 
 /// Netz- und Decodierschleife. Laeuft in einem eigenen Faden und legt immer nur
@@ -1144,12 +1203,14 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // Das Format entscheidet der decodierte Frame selbst, nicht
                     // die Strominfo. Ein unbekanntes Format ergibt ein dunkles
                     // Bild und eine Meldung - nie einen Absturz.
+                    // `bereit_us` ist die Client-Uhr bei der Ablage: ab hier
+                    // zaehlt das Glied Anzeige, das der Fensterfaden misst.
                     let (bild, fehler) = if gpu && ebenen_format(decoded.format()).is_some() {
-                        (Bild::Roh { bild: decoded }, None)
+                        (Bild::Roh { bild: decoded, bereit_us: client_us() }, None)
                     } else {
                         match to_rgb(&decoded) {
-                            Ok(f) => (Bild::Rgb(f), None),
-                            Err(e) => (Bild::Rgb(dunkles_bild(w, h)), Some(e)),
+                            Ok(f) => (Bild::Rgb(Frame { bereit_us: client_us(), ..f }), None),
+                            Err(e) => (Bild::Rgb(Frame { bereit_us: client_us(), ..dunkles_bild(w, h) }), Some(e)),
                         }
                     };
                     let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -1199,7 +1260,12 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                             let net = (an_host - t_enc as i64) as f32 / 1000.0;
                             // Der Decoder-Anteil ist Warten PLUS Arbeit: mit
                             // mehreren Faeden haelt er Bilder zurueck, und
-                            // genau das soll hier sichtbar werden.
+                            // genau das soll hier sichtbar werden. Auf dem
+                            // CPU-Weg steckt auch die Umrechnung nach RGB
+                            // darin; rechnet die Karte, wandert sie ins Glied
+                            // Anzeige - der Decoder wirkt dann um die 1-2 ms
+                            // schneller, ohne dass sich am Decodieren etwas
+                            // geaendert haette.
                             let dec = (fertig_host - an_host) as f32 / 1000.0;
                             let ges = (fertig_host - t_cap as i64) as f32 / 1000.0;
                             // Gleitender Mittelwert, damit einzelne Ausreisser
@@ -1559,7 +1625,7 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
         }
     });
 
-    Ok(Frame { width: w as u32, height: h as u32, pixels })
+    Ok(Frame { width: w as u32, height: h as u32, pixels, bereit_us: 0 })
 }
 
 /// Flaches dunkles Bild in Fenstergrundfarbe - was gezeigt wird, wenn das
@@ -1567,7 +1633,7 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
 /// Bild, das so tut, als waere alles in Ordnung.
 fn dunkles_bild(w: u32, h: u32) -> Frame {
     let (w, h) = (w.max(1), h.max(1));
-    Frame { width: w, height: h, pixels: vec![ui::BG; (w * h) as usize] }
+    Frame { width: w, height: h, pixels: vec![ui::BG; (w * h) as usize], bereit_us: 0 }
 }
 
 // ------------------------------------------------------------------ Eingabe
@@ -1843,6 +1909,14 @@ struct App {
     hud_reiter: u8,
     /// Verlauf der Gesamtverzoegerung, fuer die Kachel im Nerd-Modus.
     lat_hist: Vec<f32>,
+    /// Wer zeichnet, fuer die Statistik: "Software", spaeter die Karte.
+    anzeige_name: String,
+    /// Eigene Prozessorlast in Prozent der ganzen Maschine, und die
+    /// Prozesszeit samt Zeitpunkt der letzten Messung.
+    cpu_eigen: f32,
+    cpu_zeiten: (u64, Instant),
+    /// Bildwiederholrate des Monitors, auf dem das Fenster steht.
+    monitor_hz: Option<f32>,
 }
 
 impl ApplicationHandler for App {
@@ -2227,13 +2301,55 @@ impl App {
             // Ohne ihn haette die Kachel im Nerd-Modus keine Geschichte, und
             // eine erfundene waere schlimmer als gar keine.
             {
-                let g = self.shared.lock().unwrap().clock.map(|l| l.gesamt_ms).unwrap_or(0.0);
-                if g > 0.0 {
+                let g = self.shared.lock().unwrap().latenz().filter(|l| l.gesamt_ms > 0.0).map(|l| l.bis_anzeige());
+                if let Some(g) = g {
                     self.lat_hist.push(g);
                     if self.lat_hist.len() > 240 {
                         self.lat_hist.remove(0);
                     }
                 }
+            }
+            // Eigene Prozessorlast, dasselbe Mass wie der Task-Manager: Kernel-
+            // plus Nutzerzeit des Prozesses, geteilt durch Wandzeit mal
+            // logische Kerne - "Prozent der Maschine". So ist die Zahl direkt
+            // mit den 21,8 % vergleichbar, die der Task-Manager auf dem Laptop
+            // fuer den CPU-Weg zeigte.
+            if let Some(jetzt) = prozesszeit_100ns() {
+                let (vorher, seit) = self.cpu_zeiten;
+                let wand = seit.elapsed().as_secs_f64() * 1e7;
+                let kerne = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+                if wand > 0.0 {
+                    self.cpu_eigen = (jetzt.saturating_sub(vorher) as f64 / (wand * kerne) * 100.0) as f32;
+                }
+                self.cpu_zeiten = (jetzt, Instant::now());
+            }
+            self.monitor_hz = window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz())
+                .map(|mhz| mhz as f32 / 1000.0);
+            // Die Sekundenzeile der Sitzung, nur in die Datei: die Basislinie,
+            // gegen die jede spaetere Behauptung ueber die Anzeige gemessen
+            // wird. "Kette" sind alle fuenf Glieder, wie die Latenz-Zeile.
+            if self.screen == Screen::Session {
+                let (anzeige_ms, kette, verworfen, ausgelassen) = {
+                    let s = self.shared.lock().unwrap();
+                    (
+                        s.anzeige_ms,
+                        s.latenz().filter(|l| l.gesamt_ms > 0.0).map(|l| l.bis_anzeige()),
+                        s.dropped,
+                        s.ausgelassen,
+                    )
+                };
+                protokoll::nur_datei(&format!(
+                    "{:.0}s | {:.0} B/s | Anzeige {:.1} ms | Kette {} ms | verworfen {} | ausgelassen {} | Sync | Client-CPU {:.1} %",
+                    client_us() as f64 / 1e6,
+                    self.fps_shown,
+                    anzeige_ms,
+                    kette.map(|k| format!("{k:.1}")).unwrap_or_else(|| "-".into()),
+                    verworfen,
+                    ausgelassen,
+                    self.cpu_eigen
+                ));
             }
             let (dec_ms, err) = {
                 let s = self.shared.lock().unwrap();
@@ -2291,13 +2407,18 @@ impl App {
 
         // Neues Bild abholen, sonst das letzte weiterverwenden.
         let bild = self.shared.lock().unwrap().frame.take();
+        let mut bereit_us = None;
         if let Some(b) = bild {
+            bereit_us = Some(b.bereit_us());
             self.last_frame = Some(match b {
                 Bild::Rgb(f) => f,
                 // Ein rohes Bild kommt hier nur an, wenn die Anzeige im
                 // laufenden Betrieb von der Karte auf die CPU zurueckfaellt:
                 // dann einmal auf dem Fensterfaden wandeln.
-                Bild::Roh { bild } => to_rgb(&bild).unwrap_or_else(|_| dunkles_bild(bild.width(), bild.height())),
+                Bild::Roh { bild, bereit_us } => Frame {
+                    bereit_us,
+                    ..to_rgb(&bild).unwrap_or_else(|_| dunkles_bild(bild.width(), bild.height()))
+                },
             });
             self.fps_count += 1;
             self.shown += 1;
@@ -2315,6 +2436,15 @@ impl App {
             self.oberflaeche_zeichnen(&mut c, ww, wh)
         };
         buf.present().ok();
+        // Anzeigezeit: von der Ablage durch den Empfangsfaden bis hinter
+        // present() - Warten auf den 2-ms-Takt, blit, Oberflaeche, BitBlt.
+        // Reine Client-Uhr, ohne die halbe Umlaufzeit der Host-Glieder. Was
+        // danach auf dem Panel ankommt, misst nur eine Fotodiode.
+        if let Some(t) = bereit_us {
+            let ms = client_us().saturating_sub(t) as f32 / 1000.0;
+            let mut s = self.shared.lock().unwrap();
+            s.anzeige_ms = if s.anzeige_ms > 0.0 { s.anzeige_ms + (ms - s.anzeige_ms) * 0.1 } else { ms };
+        }
         self.nachwirkung(n);
         self.ui.click = false;
     }
@@ -2365,20 +2495,27 @@ impl App {
                     self.ui.text.draw_centered(c, ww as i32 / 2, 42, t, 14, ui::AMBER, 1);
                 }
                 if self.show_overlay {
-                    let (stats, secure, lat, soll, hostlast, decoder) = {
+                    let (stats, secure, lat, soll, hostlast, decoder, ausgelassen) = {
                         let s = self.shared.lock().unwrap();
                         (
                             (s.last_decode_ms, s.info, s.dropped, s.error.clone(), s.connected),
                             (s.sas.clone(), s.peer_fp.clone()),
-                            s.clock,
+                            s.latenz(),
                             s.settings.map(|x| x.1 as u32).or_else(|| s.info.map(|i| i.fps)),
                             s.hostlast,
                             (s.decoder_pfad, s.decoder_hinweis.clone()),
+                            s.ausgelassen,
                         )
                     };
                     let hist = self.fps_hist.clone();
+                    let client = ClientStand {
+                        anzeige: self.anzeige_name.clone(),
+                        cpu_eigen: self.cpu_eigen,
+                        monitor_hz: self.monitor_hz,
+                        ausgelassen,
+                    };
                     overlay(&mut self.ui, c, self.lang, self.fps_shown, &hist, stats, secure,
-                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder);
+                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder, &client);
                 }
                 // Erstkontakt: Code gross anzeigen, solange es noch zaehlt.
                 let (first, sas) = {
@@ -2420,7 +2557,7 @@ impl App {
                     let (lat, info, stell, secure, codecs, codec_idx, wechsel, decoder_wunsch, decoder_aktiv) = {
                         let sh = self.shared.lock().unwrap();
                         (
-                            sh.clock, sh.info, sh.settings, (sh.sas.clone(), sh.peer_fp.clone()),
+                            sh.latenz(), sh.info, sh.settings, (sh.sas.clone(), sh.peer_fp.clone()),
                             sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(), sh.decoder_wunsch, sh.decoder_pfad,
                         )
                     };
@@ -2953,6 +3090,21 @@ fn umbruch(u: &mut ui::Ui, t: &str, breite: i32, size: u32) -> Vec<String> {
 }
 
 
+/// Farbe des Glieds "Anzeige" in der Latenzkette und des Monitor-Markers.
+const FARBE_ANZEIGE: u32 = 0x7a8cff;
+
+/// Was der Client selbst ueber seine Anzeige weiss - fuer die Statistik.
+struct ClientStand {
+    /// "Software", spaeter "D3D11 · <Adapter> · Sofort/Bildsynchron".
+    anzeige: String,
+    /// Eigene Prozessorlast in Prozent der ganzen Maschine.
+    cpu_eigen: f32,
+    /// Bildwiederholrate des Monitors, auf dem das Fenster steht.
+    monitor_hz: Option<f32>,
+    /// Ausgelassene Praesentationen (nur auf dem Weg ueber die Karte).
+    ausgelassen: u64,
+}
+
 /// Die Latenzkette auf FESTER Millisekundenskala. Dadurch heisst die Laenge
 /// des Balkens "wie langsam" und die Unterteilung "woran liegt es". Ein
 /// Balken, der sich an den eigenen Wert anpasst, sieht bei 12 ms genauso aus
@@ -2967,6 +3119,7 @@ fn kette(
     iw: i32,
     l: Latenz,
     soll_fps: Option<u32>,
+    monitor_hz: Option<f32>,
     s: f32,
 ) -> i32 {
     use strings::Key::*;
@@ -2974,7 +3127,12 @@ fn kette(
     let sz = |v: u32| -> u32 { (v as f32 * s).round() as u32 };
 
     let ein_bild = soll_fps.map(|f| 1000.0 / f.max(1) as f32);
-    let ende = skalenende((l.gesamt_ms * 1.35).max(ein_bild.unwrap_or(0.0) * 1.5).max(10.0));
+    let monitor_bild = monitor_hz.filter(|hz| *hz > 0.0).map(|hz| 1000.0 / hz);
+    // Alle fuenf Glieder, bis zur Uebergabe ans Fenster.
+    let gesamt = l.bis_anzeige();
+    let ende = skalenende(
+        (gesamt * 1.35).max(ein_bild.unwrap_or(0.0) * 1.5).max(monitor_bild.unwrap_or(0.0) * 1.2).max(10.0),
+    );
     let spur_y = y + p(22);
     let spur_h = p(20);
     let spur_ende = ix + iw;
@@ -2988,8 +3146,9 @@ fn kette(
         (lang.get(EncodeTime), l.encoder_ms.max(0.0), ui::MAGENTA),
         (lang.get(NetworkTime), l.leitung_ms.max(0.0), ui::CYAN),
         (lang.get(DecodeTime), l.decoder_ms.max(0.0), ui::TEXT),
+        (lang.get(DisplayStage), l.anzeige_ms.max(0.0), FARBE_ANZEIGE),
     ];
-    let zu_langsam = ein_bild.map(|b| l.gesamt_ms > b).unwrap_or(false);
+    let zu_langsam = ein_bild.map(|b| gesamt > b).unwrap_or(false);
 
     let mut cursor = ix;
     let mut abgeschnitten = false;
@@ -3011,18 +3170,37 @@ fn kette(
         }
     }
     if l.umlauf_ms > 0.0 {
-        let mitte = (ix + (l.gesamt_ms * je_ms) as i32).min(spur_ende);
+        let mitte = (ix + (gesamt * je_ms) as i32).min(spur_ende);
         let halb = ((l.umlauf_ms / 2.0) * je_ms) as i32;
         let von = (mitte - halb).max(ix);
         let bis = (mitte + halb).min(spur_ende);
         if bis > von { c.rect(von, spur_y, bis - von, spur_h, ui::TEXT, 45); }
         c.vline(mitte, spur_y - p(4), spur_h + p(8), ui::TEXT, 255);
     }
+    // Zwei Marken: ein Bild des Stroms (Magenta) und ein Bild des Monitors
+    // (Anzeigefarbe). Bei 120 Bildern je Sekunde auf einem 60-Hz-Fenster ist
+    // jedes zweite Bild verworfen - das ist kein Fehler, und die zweite Marke
+    // sagt, warum. Die Beschriftung des linken Strichs steht links von ihm,
+    // die des rechten rechts, damit sie sich auch bei nahen Raten nie
+    // ueberdecken; mit nur einer Marke bleibt es wie bisher (rechts).
+    let mut marken: Vec<(f32, String, u32)> = Vec::new();
     if let Some(b) = ein_bild {
-        let bx = (ix + (b * je_ms) as i32).min(spur_ende);
-        c.glow_vline(bx, spur_y - p(5), spur_h + p(10), ui::MAGENTA);
-        u.text.draw(c, (bx + p(6)).min(spur_ende - p(90)), spur_y + spur_h + p(26),
-                    &format!("{} · {b:.1} ms", lang.get(OneFrame)), sz(10), ui::DIM, p(1));
+        marken.push((b, format!("{} · {b:.1} ms", lang.get(OneFrame)), ui::MAGENTA));
+    }
+    if let Some(m) = monitor_bild {
+        marken.push((m, format!("{} · {m:.1} ms", lang.get(Monitor)), FARBE_ANZEIGE));
+    }
+    let linke = if marken.len() == 2 && marken[1].0 < marken[0].0 { 1 } else { 0 };
+    for (i, (ms, text, farbe)) in marken.iter().enumerate() {
+        let mx = (ix + (ms * je_ms) as i32).min(spur_ende);
+        c.glow_vline(mx, spur_y - p(5), spur_h + p(10), *farbe);
+        let ty = spur_y + spur_h + p(26);
+        if marken.len() == 2 && i == linke {
+            let tw = u.text.width(text, sz(10), p(1));
+            u.text.draw_right(c, (mx - p(6)).max(ix + tw), ty, text, sz(10), ui::DIM, p(1));
+        } else {
+            u.text.draw(c, (mx + p(6)).min(spur_ende - p(90)), ty, text, sz(10), ui::DIM, p(1));
+        }
     }
     let schritt = if je_ms * 2.0 >= 14.0 { 2.0 } else { 10.0 };
     let mut t = 0.0;
@@ -3033,12 +3211,12 @@ fn kette(
         t += schritt;
     }
 
-    let spalte = iw / 4;
+    let spalte = iw / 5;
     let ly = spur_y + spur_h + p(46);
     for (i, (name, wert, farbe)) in teile.iter().enumerate() {
         let lx = ix + i as i32 * spalte;
         c.rect(lx, ly - p(9), p(9), p(9), *farbe, 230);
-        let gross = zu_langsam && *wert > l.gesamt_ms / 2.0;
+        let gross = zu_langsam && *wert > gesamt / 2.0;
         u.text.draw(c, lx + p(14), ly, name, sz(10), if gross { ui::AMBER } else { ui::DIM }, p(1));
         u.text.draw(c, lx + p(14), ly + p(17), &format!("{wert:.1} ms"), sz(12),
                     if gross { ui::AMBER } else { ui::TEXT }, p(1));
@@ -3067,6 +3245,7 @@ fn overlay(
     soll_fps: Option<u32>,
     hostlast: Option<HostLast>,
     decoder: (Option<DecoderPfad>, Option<String>),
+    client: &ClientStand,
 ) {
     use strings::Key::*;
     let (dec_ms, info, dropped, err, connected) = stats;
@@ -3079,10 +3258,11 @@ fn overlay(
     if wahl.latenz {
         if let Some(l) = lat {
             if l.gesamt_ms > 0.0 {
+                // Alle fuenf Glieder, bis zur Uebergabe ans Fenster.
                 rows.push((
                     lang.get(Latency),
-                    format!("{:.1} ±{:.1} ms", l.gesamt_ms, l.umlauf_ms / 2.0),
-                    if l.gesamt_ms < 40.0 { ui::CYAN } else { ui::AMBER },
+                    format!("{:.1} ±{:.1} ms", l.bis_anzeige(), l.umlauf_ms / 2.0),
+                    if l.bis_anzeige() < 40.0 { ui::CYAN } else { ui::AMBER },
                 ));
             }
         }
@@ -3121,8 +3301,16 @@ fn overlay(
             rows.push((lang.get(SecuredWith), sas.clone(), ui::CYAN));
         }
     }
-    // Im Nerd-Modus dazu, was der Mac gerade zu tun hat.
+    // Im Nerd-Modus dazu, was der Client selbst tut - und was der Mac
+    // gerade zu tun hat.
     if nerd {
+        rows.push((lang.get(DisplayLabel), client.anzeige.clone(), ui::TEXT));
+        rows.push((lang.get(ClientCpu), format!("{:.1} %", client.cpu_eigen), ui::TEXT));
+        // Kennt winit die Rate nicht, steht hier nichts.
+        if let Some(hz) = client.monitor_hz {
+            rows.push((lang.get(Monitor), format!("{hz:.0} Hz"), ui::TEXT));
+        }
+        rows.push((lang.get(Skipped), format!("{}", client.ausgelassen), ui::TEXT));
         if let Some(hl) = hostlast {
             rows.push((
                 lang.get(HostCpu),
@@ -3174,7 +3362,7 @@ fn overlay(
     }
     if kette_h > 0 {
         if let Some(l) = lat {
-            kette(u, c, lang, x + 16, ty + 6, w - 32, l, soll_fps, 1.0);
+            kette(u, c, lang, x + 16, ty + 6, w - 32, l, soll_fps, client.monitor_hz, 1.0);
         }
     }
 
@@ -3236,7 +3424,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             let mut c = ui::Canvas::neu(&mut buf, w, h);
             let probe = Latenz {
                 versatz_us: 1, umlauf_ms: 0.4, encoder_ms: 4.2, leitung_ms: 2.6,
-                decoder_ms: 2.1, gesamt_ms: 17.3, bilder: 900,
+                decoder_ms: 2.1, gesamt_ms: 17.3, bilder: 900, anzeige_ms: 1.4,
             };
             let nerd = view == "nerd";
             let hl = HostLast {
@@ -3244,9 +3432,10 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                 ram_benutzt_mb: 9114, ram_gesamt_mb: 16384, eigen_mb: 310,
                 encoder_ms: 11.4, host_fps: 118.0,
             };
+            let client = ClientStand { anzeige: "Software".into(), cpu_eigen: 5.8, monitor_hz: Some(60.0), ausgelassen: 0 };
             overlay(&mut u, &mut c, lang, 98.0, &hist, (2.1, info, 3, None, true), (sas.clone(), fp.clone()),
                     Some(probe), einstellungen::StatWahl::default(), nerd, Some(120),
-                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec), None));
+                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec), None), &client);
             let _ = &fp;
             let bw = 520.min(w as i32 - 40);
             let bx = (w as i32 - bw) / 2;
@@ -3277,7 +3466,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         }
         let l = Latenz {
             versatz_us: 1, umlauf_ms: 0.9, encoder_ms: 10.8, leitung_ms: 4.3,
-            decoder_ms: 8.6, gesamt_ms: 27.4, bilder: 900,
+            decoder_ms: 8.6, gesamt_ms: 27.4, bilder: 900, anzeige_ms: 1.4,
         };
         let lh: Vec<f32> = (0..200).map(|i| 24.0 + 5.0 * ((i as f32) / 11.0).sin()).collect();
         let fh: Vec<f32> = (0..200).map(|i| 104.0 + 9.0 * ((i as f32) / 7.0).cos()).collect();
@@ -3521,9 +3710,10 @@ fn main() {
                 println!("{m}");
             }
             let pfad = s.decoder_pfad.map(|p| p.name()).unwrap_or("-");
+            // Ohne Fenster gibt es kein Glied Anzeige - das steht auch so da.
             let lat = match s.clock {
                 Some(l) if l.gesamt_ms > 0.0 => format!(
-                    "Verzoegerung {:.1} ms (+/-{:.1}) = Encoder {:.1} + Leitung {:.1} + Decoder {:.1}",
+                    "Verzoegerung {:.1} ms (+/-{:.1}) = Encoder {:.1} + Leitung {:.1} + Decoder {:.1} | Anzeige -",
                     l.gesamt_ms, l.umlauf_ms / 2.0, l.encoder_ms, l.leitung_ms, l.decoder_ms
                 ),
                 Some(l) => format!("Zeitabgleich steht, Umlauf {:.1} ms", l.umlauf_ms),
@@ -3641,6 +3831,10 @@ fn main() {
         hud_offen: false,
         hud_reiter: 0,
         lat_hist: Vec::new(),
+        anzeige_name: "Software".into(),
+        cpu_eigen: 0.0,
+        cpu_zeiten: (prozesszeit_100ns().unwrap_or(0), Instant::now()),
+        monitor_hz: None,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
@@ -3784,8 +3978,9 @@ fn hud(
                 let mx = lat_hist.iter().cloned().fold(0.0f32, f32::max);
                 (mn * 0.95, (mx * 1.05).max(mn * 0.95 + 1.0))
             };
-            (lang.get(Latency), format!("{:.1}", l.gesamt_ms), format!("±{:.1} ms", l.umlauf_ms / 2.0),
-             if l.gesamt_ms > 0.0 && l.gesamt_ms < 40.0 { ui::CYAN } else { ui::AMBER }, lat_hist, lo, hi)
+            // Alle fuenf Glieder, wie die Latenz-Zeile der Statistik und ihr Verlauf.
+            (lang.get(Latency), format!("{:.1}", l.bis_anzeige()), format!("±{:.1} ms", l.umlauf_ms / 2.0),
+             if l.gesamt_ms > 0.0 && l.bis_anzeige() < 40.0 { ui::CYAN } else { ui::AMBER }, lat_hist, lo, hi)
         } else {
             let mn = fps_hist.iter().cloned().fold(f32::MAX, f32::min).min(soll * 0.8);
             let mx = fps_hist.iter().cloned().fold(0.0f32, f32::max).max(soll * 1.05);
