@@ -71,9 +71,13 @@ mod protokoll {
     /// Die letzten Warnungen und Fehler von FFmpeg, fuer Rueckfallgruende.
     static FEHLER: Mutex<Vec<String>> = Mutex::new(Vec::new());
     /// Eine FFmpeg-Meldung kann in Stuecken kommen; der Zeilenumbruch
-    /// schliesst sie ab.
-    static OFFEN: Mutex<String> = Mutex::new(String::new());
-    static PRAEFIX: AtomicI32 = AtomicI32::new(1);
+    /// schliesst sie ab. Der Rest der angefangenen Zeile und FFmpegs
+    /// Praefix-Zustand ("naechstes Stueck bekommt einen Absender") liegen
+    /// unter EINER Sperre, die schon vor dem Formatieren genommen wird -
+    /// FFmpeg ruft den Rueckruf aus jedem Faden, der etwas zu sagen hat,
+    /// auch aus den Arbeitsfaeden eines Decoders, und genau so haelt es
+    /// FFmpegs eigener Rueckruf.
+    static OFFEN: Mutex<(String, std::os::raw::c_int)> = Mutex::new((String::new(), 1));
     /// Die Datei, beim ersten Schreiben geoeffnet und dabei geleert.
     static DATEI: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
@@ -116,28 +120,30 @@ mod protokoll {
             return;
         }
         let mut puffer = [0 as std::os::raw::c_char; 1024];
-        let mut praefix = PRAEFIX.load(Ordering::Relaxed);
-        let n = ffmpeg::sys::av_log_format_line2(
-            ptr, stufe, fmt, vl, puffer.as_mut_ptr(), puffer.len() as std::os::raw::c_int, &mut praefix,
-        );
-        PRAEFIX.store(praefix, Ordering::Relaxed);
-        if n <= 0 {
-            return;
-        }
-        // Wie bei snprintf ist n die Soll-Laenge. Passte die Meldung nicht
-        // in den Puffer, fehlt ihr Zeilenumbruch - dann gilt sie trotzdem
-        // als abgeschlossen, sonst klebte die naechste an ihr.
-        let abgeschnitten = n as usize >= puffer.len();
-        let n = (n as usize).min(puffer.len() - 1);
-        let stueck = String::from_utf8_lossy(std::slice::from_raw_parts(puffer.as_ptr() as *const u8, n)).into_owned();
         let text = {
             let Ok(mut offen) = OFFEN.lock() else { return };
-            offen.push_str(&stueck);
-            if !abgeschnitten && !offen.ends_with('\n') {
+            let (rest, praefix) = &mut *offen;
+            let n = ffmpeg::sys::av_log_format_line2(
+                ptr, stufe, fmt, vl, puffer.as_mut_ptr(), puffer.len() as std::os::raw::c_int, praefix,
+            );
+            if n <= 0 {
                 return;
             }
-            let t = format!("FFmpeg: {}", offen.trim_end());
-            offen.clear();
+            // Wie bei snprintf ist n die Soll-Laenge; was nicht in den Puffer
+            // passte, ist abgeschnitten. Ob die Meldung abgeschlossen ist,
+            // sagt FFmpeg selbst ueber den Praefix-Zustand: er wird aus dem
+            // UNGEKUERZTEN Text bestimmt und kennt auch '\r' als Zeilenende.
+            // Eine abgeschnittene Meldung gilt ebenfalls als abgeschlossen,
+            // sonst klebte die naechste an ihr.
+            let abgeschnitten = n as usize >= puffer.len();
+            let n = (n as usize).min(puffer.len() - 1);
+            rest.push_str(&String::from_utf8_lossy(std::slice::from_raw_parts(puffer.as_ptr() as *const u8, n)));
+            if *praefix == 0 && !abgeschnitten {
+                return;
+            }
+            let t = format!("FFmpeg: {}", rest.trim_end());
+            rest.clear();
+            *praefix = 1;
             t
         };
         if stufe <= ffmpeg::sys::AV_LOG_WARNING {
@@ -492,7 +498,8 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
         return;
     }
     // Im Pruefmodus alles einsammeln, was FFmpeg zu sagen hat; im Fenster
-    // nur Warnungen und Fehler, die dann im Grund eines Rueckfalls stehen.
+    // nur Warnungen und Fehler - fuer die Datei und fuer den Grund, wenn
+    // ein Hardware-Decoder schon beim Oeffnen scheitert.
     protokoll::einschalten(std::env::args().any(|a| a == "--headless"));
 
     loop {
@@ -690,11 +697,17 @@ fn nvdec_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
         .ok_or_else(|| format!("{name} fehlt in dieser FFmpeg-Fassung"))?;
     let mut ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
     ctx.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
+    let mut dec = ctx.decoder();
+    // cuvid rechnet die Zeitstempel ueber die Paketzeitbasis um und warnt
+    // bei jedem Oeffnen, wenn keine gesetzt ist - das waere die erste Zeile
+    // in jedem Protokoll. Die pts sind hier Bildnummern; jede Basis, die
+    // ganzzahlig hin und zurueck geht, ist recht.
+    dec.set_packet_time_base(ffmpeg::Rational(1, 1_000_000));
     // FFmpegs eigene Worte zum Scheitern gehoeren in den Grund: "Operation
     // not permitted" sagt nichts, "Cannot load nvcuvid.dll" alles. Die
     // erste Zeile ersetzt den Fehlercode; alle stehen im Protokoll.
     protokoll::fehler_verwerfen();
-    ctx.decoder().video().map_err(|e| {
+    dec.video().map_err(|e| {
         let worte = protokoll::fehler_abholen();
         match worte.first() {
             Some(w) => format!("{name}: {w}"),
@@ -1398,7 +1411,9 @@ fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32],
 /// Hardware-Decoder liefert andere Formate als der Software-Decoder.
 ///
 /// Erkannt werden die planaren Formate der Software-Decoder (YUV444P,
-/// YUV444P10LE, YUV420P, YUV420P10LE) und die von NVDEC/cuvid: YUV444P
+/// YUV444P10LE, YUV420P, YUV420P10LE, dazu YUVJ420P/YUVJ444P - FFmpegs
+/// alte Schreibweise fuer 8 Bit im vollen Wertebereich, die der
+/// H.264-Decoder liefert) und die von NVDEC/cuvid: YUV444P
 /// (4:4:4 8 Bit), YUV444P10MSB/YUV444P12MSB (4:4:4 10/12 Bit, oben buendig -
 /// so nennt FFmpeg 9 die Formate, die aeltere Fassungen als YUV444P16
 /// meldeten; das bleibt fuer die mit dabei), NV12 (4:2:0 8 Bit, U/V
@@ -1411,7 +1426,7 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     // (4:2:0, Bits je Wert, U/V als Paare in einer Ebene)
     let (sub, bits, paar) = match src.format() {
         // Die J-Formate sind FFmpegs alte Schreibweise fuer "voller
-        // Wertebereich" - der H.264-Decoder liefert 4:2:0 8 Bit so. Die
+        // Wertebereich" - der H.264-Decoder liefert 8 Bit so, 4:2:0 wie 4:4:4. Die
         // Ebenen sind dieselben, und Vollbereich ist ohnehin, was wir
         // annehmen.
         Pixel::YUV444P | Pixel::YUVJ444P => (false, 8u8, false),
