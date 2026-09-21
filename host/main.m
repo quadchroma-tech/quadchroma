@@ -35,6 +35,7 @@
 #import "audio.h"
 #import "clipboard.h"
 #import "zeiger.h"
+#import "testbild.h"
 #include "qc_secure.h"
 #import "last.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
@@ -297,6 +298,11 @@ static void send_small(uint8_t type, const void *data, size_t len) {
 #define QC_MSG_SWITCH     7    // Host -> Client: ab hier neuer Codec, Decoder zuruecksetzen
 #define QC_MSG_CODECS     8    // Host -> Client: was dieser Mac codieren kann
 #define QC_IN_CODEC       66   // Client -> Host: Codecwunsch (u8 Index)
+#define QC_IN_TESTBILD    68   // Client -> Host: Testbild (u8: 1 an, 0 aus) fuer den Benchmark
+
+// Testbild statt Aufnahme: solange es an ist, verwirft die Aufnahme ihre
+// Bilder, und der Takt speist die vorgerenderte Schleife in Zielrate.
+static _Atomic int g_testbild = 0;
 #define QC_MSG_HOSTSTATUS 9    // Host -> Client: u8 Lage (0 = in Ordnung, 1 = kein Bildschirm)
 #define QC_IN_TIME        65   // Client -> Host: Frage zum Zeitabgleich
 #define QC_IN_SETTINGS    64   // Client -> Host: was gewuenscht wird
@@ -866,6 +872,25 @@ static void *input_thread(void *arg) {
                         });
                     }
                     break;
+                case QC_IN_TESTBILD:
+                    // Testbild fuer den Benchmark. Schleife und Schalter
+                    // gehoeren der Aufnahmewarteschlange - dort laeuft der
+                    // Takt, der die Bilder holt.
+                    if (h.len >= 1 && g_capq) {
+                        int an = payload[0] ? 1 : 0;
+                        dispatch_async(g_capq, ^{
+                            if (an) {
+                                qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)));
+                                atomic_store(&g_testbild, 1);
+                                logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark", g_info_w, g_info_h);
+                            } else {
+                                atomic_store(&g_testbild, 0);
+                                qc_testbild_stop();
+                                logf_(@"Testbild aus");
+                            }
+                        });
+                    }
+                    break;
                 case QC_IN_CODEC:
                     // Codecwunsch. Nur weiterreichen - der Wechsel selbst
                     // gehoert auf die Aufnahmewarteschlange, nie hierher.
@@ -1297,6 +1322,8 @@ static void codec_alt_aufbauen(int alt) {
 static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fmt_geaendert) {
     if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
         atomic_store(&g_codec_id, idx);
+        // Das Testbild folgt dem Aufnahmeformat des neuen Codecs.
+        if (atomic_load(&g_testbild)) qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(idx));
         switch_senden(idx);
         encoder_einstellungen_nachziehen();
         atomic_store(&g_force_key, 1);
@@ -1471,11 +1498,13 @@ static int schlitz_frei(double t) {
 // also nie in die Quere. Kam seit dem letzten Schlag ein echtes Bild, passiert
 // hier nichts - nachgelegt wird nur, was sonst ausfallen wuerde.
 static void fixed_tick(void) {
-    if (!atomic_load(&g_cur_fixed)) return;
+    int testbild = atomic_load(&g_testbild);
+    if (!testbild && !atomic_load(&g_cur_fixed)) return;
     // Ohne Zuschauer wird nichts nachgelegt. Sonst laeuft der Encoder mit
     // voller Rate fuer niemanden - gemessen: 24 % Last im Leerlauf.
     if (atomic_load(&g_client_fd) < 0) return;
-    if (!g_last_pb || !g_session) return;
+    if (!g_session) return;
+    if (!testbild && !g_last_pb) return;
     int fps = atomic_load(&g_cur_fps);
     if (fps <= 0) return;
 
@@ -1489,6 +1518,17 @@ static void fixed_tick(void) {
     // Zeitstempel muss immer vorwaerts gehen, sonst weist der Encoder das Bild ab.
     if (CMTIME_COMPARE_INLINE(now, <=, g_last_pts))
         now = CMTimeAdd(g_last_pts, CMTimeMake(1, (int32_t)fps));
+
+    if (testbild) {
+        // Benchmark: das naechste Bild der Schleife, als echtes Bild mit
+        // seiner Entstehungszeit = jetzt. Kein Nachlegen, kein Raster.
+        CVPixelBufferRef pb = qc_testbild_naechstes();
+        if (pb) {
+            encode_buffer(pb, now, cmtime_us(now), 0);
+            g_last_pts = now;
+        }
+        return;
+    }
     // Wichtig: der Zettel traegt die ECHTE Aufnahmezeit des wiederholten
     // Bildes, nicht die Nachlegezeit. Sonst sieht die Messung auf der anderen
     // Seite aus, als waere jedes Bild blitzschnell unterwegs gewesen.
@@ -1521,6 +1561,9 @@ static void fixed_tick(void) {
               pb ? CVPixelBufferGetWidth(pb) : 0, pb ? CVPixelBufferGetHeight(pb) : 0);
     }
     if (!pb || !g_session) return;
+    // Testbild an: die Aufnahme laeuft weiter (der Wechsel zurueck soll
+    // keine Sekunde kosten), aber ihre Bilder gehen nicht in den Encoder.
+    if (atomic_load(&g_testbild)) return;
 
     self.framesIn++;
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
@@ -1800,6 +1843,12 @@ static void stream_herunterfahren_anstossen(void) {
         });
         atomic_store(&g_cur_fixed, 0);
         if (g_wach != kIOPMNullAssertionID) { IOPMAssertionRelease(g_wach); g_wach = kIOPMNullAssertionID; }
+        // Ein Testbild ueberlebt den Zuschauer nicht - die naechste Sitzung
+        // faengt mit dem Bildschirm an.
+        if (atomic_load(&g_testbild) && g_capq) {
+            dispatch_sync(g_capq, ^{ atomic_store(&g_testbild, 0); qc_testbild_stop(); });
+            logf_(@"Testbild aus (Zuschauer weg)");
+        }
         logf_(@"Aufnahme angehalten: kein Zuschauer");
     });
 }

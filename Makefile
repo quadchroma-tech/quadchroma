@@ -12,7 +12,7 @@ IDENT   := QuadChroma Dev
 BUNDLE  := tech.quadchroma.host
 APP     := build/QuadChroma.app
 BIN     := $(APP)/Contents/MacOS/quadchroma-host
-SRC     := host/main.m host/audio.m host/clipboard.m host/zeiger.m host/last.m host/qc_noise.c host/qc_secure.c host/vendor/monocypher/monocypher.c
+SRC     := host/main.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m host/qc_noise.c host/qc_secure.c host/vendor/monocypher/monocypher.c
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
 FRAMEWORKS := -framework Foundation -framework AppKit -framework ScreenCaptureKit \
               -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
