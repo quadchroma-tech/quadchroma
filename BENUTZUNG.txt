@@ -61,13 +61,18 @@ Das Menue
 ---------
 
 ESC zwei Sekunden halten (das ESC selbst kommt dann nicht beim Mac an) oder
-F10. Drei Reiter:
+F10. Vier Reiter:
 
     Bild            Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton,
                     Codecwahl
     Anzeige         Vollbild, pixelgenau, Statistik, Nerd-Modus, welche
-                    Statistikzeilen, Decoderwahl (Automatik, Software, NVIDIA)
+                    Statistikzeilen, Decoderwahl (Automatik, Software,
+                    Grafikkarte)
     Verschluesselung  Verfahren, Vergleichscode, Fingerabdruck, Trennen
+    Tastenkombinationen  alle Tasten, die der Client selbst abfaengt
+
+Wer mit der Maus ueber einen Schalter faehrt, bekommt sofort einen Satz
+dazu, was er tut - in jeder der 29 Sprachen.
 
 Der Mac stellt sofort um und meldet zurueck, was wirklich gilt - angezeigt
 wird also nie ein Wunsch, sondern der Stand auf der anderen Seite. Solange das
