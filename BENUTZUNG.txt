@@ -77,6 +77,12 @@ Die Datenrate steigt dabei kaum (51 auf 66 Mbit/s), denn ein unveraendertes
 Bild kostet fast nichts. Was es kostet, ist Dauerlast: die Video-Einheit des
 Macs laeuft durch, solange der Schalter an ist.
 
+Ohne Zuschauer arbeitet der Host nicht: keine Aufnahme, kein Encoder, und der
+Bildschirm darf einschlafen. Aufnahme und Encoder entstehen erst, wenn sich
+jemand verbindet - die Verbindung dauert dadurch etwa eine Sekunde laenger -
+und verschwinden wieder, sobald der Zuschauer weg ist. Gemessen: 0,6 %
+Prozessorlast im Leerlauf.
+
 Codecwahl: im Menue (ESC zwei Sekunden halten oder F10), Reiter "Bild", stehen
 die Codecs, die der Mac wirklich beherrscht - er fragt seinen Encoder beim Start
 selbst. Auf dem M1 sind das HEVC in 4:4:4 und 4:2:0, je 8 und 10 Bit, sowie

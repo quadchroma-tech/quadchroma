@@ -185,6 +185,13 @@ static int g_kein_bildschirm_gemeldet = 0;
 static IOPMAssertionID g_wach = kIOPMNullAssertionID;
 static void aufnahme_wiederherstellen(void);
 static void hoststatus_senden(uint8_t lage);
+// Kein Zuschauer, keine Arbeit: Aufnahme und Encoder leben nur, solange
+// jemand verbunden ist. Auf- und Abbau laufen streng nacheinander auf einer
+// eigenen Warteschlange, damit ein gehender und ein kommender Zuschauer sich
+// nicht ins Gehege kommen.
+static dispatch_queue_t g_lifeq = NULL;
+static void stream_herunterfahren_anstossen(void);
+static BOOL stream_hochfahren_sync(void);
 
 // Aufnahmeformat je Kandidat. ScreenCaptureKit kennt kein 4:4:4 mit 8 Bit,
 // also muss VideoToolbox dort umrechnen - und das steht dann dran, denn eine
@@ -261,6 +268,7 @@ static void send_small(uint8_t type, const void *data, size_t len) {
             atomic_store(&g_vid_ready, 0);
             atomic_store(&g_client_fd, -1);
             close(fd);
+            stream_herunterfahren_anstossen();
         }
     }
     pthread_mutex_unlock(&g_send_mtx);
@@ -381,6 +389,15 @@ static void *accept_thread(void *arg) {
                 close(fd);
                 continue;
             }
+        }
+
+        // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
+        // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung.
+        if (!stream_hochfahren_sync()) {
+            logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
+            free(chan);
+            close(fd);
+            continue;
         }
 
         // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
@@ -970,6 +987,7 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
             logf_(@"Zuschauer weg: %s", strerror(errno));
             atomic_store(&g_vid_ready, 0);
             atomic_store(&g_client_fd, -1);
+            stream_herunterfahren_anstossen();
             close(fd);
             pthread_mutex_unlock(&g_send_mtx);
             return;
@@ -1457,6 +1475,8 @@ static void fixed_tick(void) {
     });
     // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
     g_stream = nil;
+    // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
+    if (atomic_load(&g_client_fd) < 0) return;
     hoststatus_senden(1);
     // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -1506,10 +1526,14 @@ static void list_displays(void) {
 }
 
 static void aufnahme_wiederherstellen(void) {
-    // Auf einer Hintergrundwarteschlange: pick_display wartet blockierend auf
+    // Nur solange jemand zuschaut. Geht der Zuschauer waehrend des Wartens,
+    // endet die Kette hier.
+    if (atomic_load(&g_client_fd) < 0) return;
+    // Auf der Lebenslauf-Warteschlange: pick_display wartet blockierend auf
     // ScreenCaptureKit, und das darf weder die Aufnahme- noch die Hauptschleife
-    // anhalten.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    // anhalten - und kein Abbau darf dazwischenfunken.
+    dispatch_async(g_lifeq ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (g_stream) return;
         size_t pw = 0, ph = 0; double hz = 0;
         SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
         if (!d) {
@@ -1552,6 +1576,93 @@ static void aufnahme_wiederherstellen(void) {
             hoststatus_senden(0);
             logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
         }];
+    });
+}
+
+// Aufnahme und Encoder fuer einen Zuschauer aufbauen. Wird vom Annahmefaden
+// gerufen, bevor er die Begruessung schickt - die Verbindung dauert dadurch
+// einen Moment laenger, dafuer arbeitet der Mac ohne Zuschauer gar nicht.
+static BOOL stream_hochfahren_sync(void) {
+    __block BOOL ok = NO;
+    dispatch_sync(g_lifeq, ^{
+        if (g_stream) { ok = YES; return; }
+        size_t pw = 0, ph = 0; double hz = 0;
+        SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
+        if (!d) { logf_(@"Kein Bildschirm - Aufnahme kann nicht starten"); return; }
+
+        // Encoder zuerst, auf der Aufnahmewarteschlange - wie beim Codecwechsel.
+        __block BOOL enc = YES;
+        dispatch_sync(g_capq, ^{
+            if (!g_session)
+                enc = encoder_start(atomic_load(&g_codec_id), g_info_w, g_info_h,
+                                    atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit));
+        });
+        if (!enc) { logf_(@"Encoder laesst sich nicht starten"); return; }
+
+        int fps = atomic_load(&g_cur_fps);
+        if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
+        g_cfg.pixelFormat = pixfmt_fuer(atomic_load(&g_codec_id));
+        SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
+        SCStream *st = [[SCStream alloc] initWithFilter:f configuration:g_cfg delegate:g_grab];
+        NSError *err = nil;
+        if (![st addStreamOutput:g_grab type:SCStreamOutputTypeScreen sampleHandlerQueue:g_capq error:&err]) {
+            logf_(@"Aufnahme: Ausgabe nicht anmeldbar (%@)", err.localizedDescription);
+            return;
+        }
+        qc_audio_attach(st, audio_cb);
+        __block BOOL gestartet = NO;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [st startCaptureWithCompletionHandler:^(NSError *e) {
+            if (e) logf_(@"Aufnahme: Start misslungen (%@, Code %ld)", e.localizedDescription, (long)e.code);
+            else gestartet = YES;
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+        if (!gestartet) return;
+
+        g_stream = st;
+        atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
+        atomic_store(&g_force_key, 1);
+        atomic_store(&g_wait_key, 1);
+        g_stats.nal_len = 4;
+        // Solange gestreamt wird, darf der Bildschirm nicht einschlafen.
+        if (g_wach == kIOPMNullAssertionID)
+            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+                                        CFSTR("QuadChroma streamt diesen Bildschirm"), &g_wach);
+        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
+        ok = YES;
+    });
+    return ok;
+}
+
+// Der Zuschauer ist weg: Aufnahme anhalten, Encoder abbauen, Bildschirm
+// freigeben. Darf aus jedem Faden angestossen werden, auch unter g_send_mtx -
+// hier wird nur eingereiht, gearbeitet wird spaeter und nacheinander.
+static void stream_herunterfahren_anstossen(void) {
+    if (!g_lifeq) return;
+    dispatch_async(g_lifeq, ^{
+        if (atomic_load(&g_client_fd) >= 0) return;   // inzwischen ist wieder jemand da
+        if (!g_stream && !g_session) return;
+        if (g_stream) {
+            SCStream *st = g_stream;
+            g_stream = nil;
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            [st stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(sem); }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+        }
+        dispatch_sync(g_capq, ^{
+            if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
+            if (g_session) {
+                VTCompressionSessionRef alt = g_session;
+                g_session = NULL;
+                VTCompressionSessionCompleteFrames(alt, kCMTimeInvalid);
+                VTCompressionSessionInvalidate(alt);
+                CFRelease(alt);
+            }
+        });
+        atomic_store(&g_cur_fixed, 0);
+        if (g_wach != kIOPMNullAssertionID) { IOPMAssertionRelease(g_wach); g_wach = kIOPMNullAssertionID; }
+        logf_(@"Aufnahme angehalten: kein Zuschauer");
     });
 }
 
@@ -1700,12 +1811,6 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         start_input_server(port + 1, display.displayID);
         start_beacon(port);
         BOOL ax = AXIsProcessTrusted();
-        // Im Dienstbetrieb darf der Bildschirm nicht von selbst einschlafen -
-        // genau dann will jemand aus der Ferne darauf. Gegen einen abgeschalteten
-        // Monitor hilft das nicht; dafuer gibt es die Wiederherstellung.
-        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep,
-                                    kIOPMAssertionLevelOn,
-                                    CFSTR("QuadChroma streamt diesen Bildschirm"), &g_wach);
         logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
         logf_(@"Display %d (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", displayIdx, pxW, pxH, hz, outW, outH, fps);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
@@ -1714,7 +1819,10 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
               seconds, displayIdx, pxW, pxH, outW, outH, fps);
     }
 
-    if (!encoder_start(start_idx, outW, outH, fps, mbit)) { if (g_stats.out) fclose(g_stats.out); return 6; }
+    // Im Dienstbetrieb entsteht der Encoder erst mit dem ersten Zuschauer.
+    if (srvIdx == NSNotFound) {
+        if (!encoder_start(start_idx, outW, outH, fps, mbit)) { if (g_stats.out) fclose(g_stats.out); return 6; }
+    }
 
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = outW;
@@ -1730,23 +1838,20 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
     cfg.scalesToFit = YES;
 
-    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
     Grabber *grab = [[Grabber alloc] init];
     g_grab = grab;
     g_display_idx = displayIdx;
-    SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:grab];
-    g_stream = stream;
     g_cfg = cfg;
     atomic_store(&g_cur_mbit, mbit);
     atomic_store(&g_cur_fps, fps);
 
-    NSError *err = nil;
     dispatch_queue_t q = dispatch_queue_create("tech.quadchroma.capture", DISPATCH_QUEUE_SERIAL);
     g_capq = q;
+    g_lifeq = dispatch_queue_create("tech.quadchroma.lebenslauf", DISPATCH_QUEUE_SERIAL);
 
     // Taktgeber fuer die feste Bildrate. Er laeuft immer mit, tut aber nichts,
-    // solange der Schalter aus ist - so kostet er nichts und ist sofort da,
-    // wenn im Betrieb umgeschaltet wird.
+    // solange der Schalter aus ist oder niemand zuschaut - so kostet er nichts
+    // und ist sofort da, wenn im Betrieb umgeschaltet wird.
     g_tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (g_tick) {
         uint64_t iv = (uint64_t)(NSEC_PER_SEC / (uint64_t)(fps > 0 ? fps : 60));
@@ -1754,23 +1859,31 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         dispatch_source_set_event_handler(g_tick, ^{ fixed_tick(); });
         dispatch_resume(g_tick);
     }
-    if (![stream addStreamOutput:grab type:SCStreamOutputTypeScreen sampleHandlerQueue:q error:&err]) {
-        logf_(@"Ausgabe konnte nicht angemeldet werden: %@", err.localizedDescription);
-        return 7;
+
+    if (srvIdx != NSNotFound) {
+        // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
+        qc_clip_start(clip_cb);
+    } else {
+        // Aufnahme in eine Datei: sofort loslegen.
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+        SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:grab];
+        g_stream = stream;
+        NSError *err = nil;
+        if (![stream addStreamOutput:grab type:SCStreamOutputTypeScreen sampleHandlerQueue:q error:&err]) {
+            logf_(@"Ausgabe konnte nicht angemeldet werden: %@", err.localizedDescription);
+            return 7;
+        }
+        qc_audio_attach(stream, audio_cb);
+        __block BOOL started = NO;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [stream startCaptureWithCompletionHandler:^(NSError *e) {
+            if (e) logf_(@"Start fehlgeschlagen: %@ (Code %ld)", e.localizedDescription, (long)e.code);
+            else started = YES;
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15ull * NSEC_PER_SEC));
+        if (!started) { if (g_stats.out) fclose(g_stats.out); return 8; }
     }
-
-    qc_audio_attach(stream, audio_cb);
-    if (srvIdx != NSNotFound) qc_clip_start(clip_cb);
-
-    __block BOOL started = NO;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [stream startCaptureWithCompletionHandler:^(NSError *e) {
-        if (e) logf_(@"Start fehlgeschlagen: %@ (Code %ld)", e.localizedDescription, (long)e.code);
-        else started = YES;
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15ull * NSEC_PER_SEC));
-    if (!started) { if (g_stats.out) fclose(g_stats.out); return 8; }
 
     // Einmal blind messen, damit die erste echte Meldung schon eine Differenz
     // hat und nicht mit Nullen anfaengt.
@@ -1823,10 +1936,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     [[NSRunLoop currentRunLoop] runUntilDate:[t0 dateByAddingTimeInterval:seconds]];
     double dt = -[t0 timeIntervalSinceNow];
-    sem = dispatch_semaphore_create(0);
-    [stream stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(sem); }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
-    VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
+    // Nur die Aufnahme in eine Datei kommt hierher; der Dienstbetrieb kehrt
+    // aus seiner Schleife nie zurueck.
+    dispatch_semaphore_t ende = dispatch_semaphore_create(0);
+    [g_stream stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(ende); }];
+    dispatch_semaphore_wait(ende, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+    if (g_session) VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
     if (g_stats.out) fclose(g_stats.out);
 
     logf_(@"Bilder aufgenommen: %ld (unveraendert uebersprungen: %ld)", grab.framesIn, grab.framesSkipped);
