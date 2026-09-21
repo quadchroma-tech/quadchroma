@@ -69,7 +69,9 @@ impl DecoderWunsch {
         Some(match text.trim().to_ascii_lowercase().as_str() {
             "auto" | "automatik" | "automatic" => DecoderWunsch::Automatik,
             "software" | "cpu" => DecoderWunsch::Software,
-            "nvidia" | "nvdec" | "cuvid" => DecoderWunsch::Nvidia,
+            // Im Menue heisst der Knopf "Grafikkarte" - hinter ihm steht heute
+            // NVDEC, spaeter auch D3D11VA fuer AMD und Intel (4:2:0).
+            "gpu" | "grafikkarte" | "nvidia" | "nvdec" | "cuvid" => DecoderWunsch::Nvidia,
             _ => return None,
         })
     }
