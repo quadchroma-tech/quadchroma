@@ -2152,10 +2152,7 @@ impl ApplicationHandler for App {
                 // Steht die Einstellungstafel offen, gehoert die Maus ihr und
                 // nicht dem Mac - sonst klickt man dort zweimal gleichzeitig.
                 if self.hud_offen || !self.bild_vorhanden() { return; }
-                if let Some(w) = &self.window {
-                    let s = w.inner_size();
-                    let nx = position.x as f32 / s.width.max(1) as f32;
-                    let ny = position.y as f32 / s.height.max(1) as f32;
+                if let Some((nx, ny)) = self.maus_ins_bild(position.x, position.y) {
                     self.input.lock().unwrap().mouse_move(nx, ny);
                 }
             }
@@ -2549,6 +2546,27 @@ impl App {
         w.set_cursor_visible(true);
         let _ = z.sichtbar;
         self.zeiger_eigen = true;
+    }
+
+    /// Fensterpunkt -> Bildpunkt des Macs, normiert auf 0..1. Bezogen auf den
+    /// Ausschnitt, in dem das Bild wirklich liegt (Letterbox, oder bei 1:1
+    /// der sichtbare Teil) - nicht auf das Fenster. Vorher galt das Fenster,
+    /// und sobald das Bild es nicht ausfuellte, klickte man auf dem Mac
+    /// woanders. Ausserhalb des Bildes wird an den Rand geklemmt.
+    fn maus_ins_bild(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        let w = self.window.as_ref()?;
+        let (fw, fh) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height)))?;
+        if fw == 0 || fh == 0 {
+            return None;
+        }
+        let s = w.inner_size();
+        let (rx, ry, rw, rh) = ziel_rechteck(s.width.max(1), s.height.max(1), fw, fh, self.pixel_exact);
+        if rw == 0 || rh == 0 {
+            return None;
+        }
+        let nx = ((x - rx as f64) / rw as f64).clamp(0.0, 1.0) as f32;
+        let ny = ((y - ry as f64) / rh as f64).clamp(0.0, 1.0) as f32;
+        Some((nx, ny))
     }
 
     /// Um wie viel das Mac-Bild im Fenster vergroessert erscheint, ganzzahlig
