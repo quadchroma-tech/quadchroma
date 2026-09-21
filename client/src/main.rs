@@ -1769,6 +1769,9 @@ struct App {
     /// Fuer welchen Host die gespeicherten Werte schon geschickt wurden.
     /// Verhindert, dass wir sie in jedem Bild erneut senden.
     angewandt_fuer: Option<String>,
+    /// Wann zuletzt gezeichnet wurde - Oberflaechen ohne neues Bild werden
+    /// nur alle 33 ms neu gezeichnet.
+    letzte_zeichnung: Instant,
     /// Seit wann ESC gehalten wird, und ob der Druck schon verbraucht ist.
     /// Ein kurzer Druck geht an den Host, ein langer oeffnet das Menue - und
     /// dann darf der Host ihn gerade NICHT sehen.
@@ -2043,7 +2046,10 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if self.quit { el.exit(); return; }
-        el.set_control_flow(ControlFlow::Poll);
+        // Nicht mehr in Dauerschleife: alle zwei Millisekunden nachsehen (das
+        // reicht fuer den ESC-Balken und fuer Bilder mit 240 je Sekunde) und
+        // nur zeichnen, wenn es etwas zu zeichnen gibt - siehe unten.
+        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2)));
 
         // Nachgereichtes ESC-Loslassen.
         if let Some(t) = self.esc_up_faellig {
@@ -2090,8 +2096,27 @@ impl ApplicationHandler for App {
             (None, _) => self.angewandt_fuer = None,
             _ => {}
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        // Zeichnen nur, wenn es etwas zu zeichnen gibt: ein neues Bild - oder
+        // eine Oberflaeche, die sich bewegt (Startbildschirm, Wartebild, Menue,
+        // Statistik, Banner, ESC-Balken, Lagemeldung des Hosts), und die kommt
+        // mit 30 Bildern je Sekunde aus. Vorher lief die Schleife ohne Pause
+        // und schrieb dasselbe Bild 150-mal je Sekunde ins Fenster - auf dem
+        // Laptop ein gutes Viertel der gesamten Prozessorlast des Clients.
+        let (neues_bild, lage) = {
+            let s = self.shared.lock().unwrap();
+            (s.frame.is_some(), s.error_key.is_some())
+        };
+        let oberflaeche = self.screen != Screen::Session
+            || self.last_frame.is_none()
+            || self.hud_offen
+            || self.show_overlay
+            || self.esc_seit.is_some()
+            || lage
+            || self.banner_until.map(|t| Instant::now() < t).unwrap_or(false);
+        if neues_bild || (oberflaeche && self.letzte_zeichnung.elapsed() >= Duration::from_millis(33)) {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 }
@@ -2139,7 +2164,11 @@ impl App {
         {
             return;
         }
-        self.ui.tick += 1;
+        // Der Takt der Oberflaeche haengt an der Uhr, nicht an der Zahl der
+        // Zeichnungen: seit nur noch bei Bedarf gezeichnet wird, liefe das
+        // Suchband des Startbildschirms sonst je nach Bildrate anders schnell.
+        self.ui.tick = client_us() / 8000;
+        self.letzte_zeichnung = Instant::now();
 
         // Neues Bild abholen, sonst das letzte weiterverwenden.
         if let Some(f) = self.shared.lock().unwrap().frame.take() {
@@ -3485,6 +3514,7 @@ fn main() {
         shown: 0,
         banner_until: None,
         angewandt_fuer: None,
+        letzte_zeichnung: Instant::now(),
         esc_seit: None,
         esc_verbraucht: false,
         esc_mods: 0,

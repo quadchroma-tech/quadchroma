@@ -124,6 +124,17 @@ static CVPixelBufferRef g_last_pb = NULL;
 static CMTime g_last_pts;
 static uint64_t g_last_cap_us = 0;   // echte Aufnahmezeit des zuletzt gesehenen Bildes
 static _Atomic long g_repeats = 0;
+// Schrittmacher. ScreenCaptureKit haelt sich nicht an minimumFrameInterval:
+// gemessen 142-149 echte Bilder je Sekunde bei Ziel 120 - und jedes davon
+// ging durch Encoder, Leitung und Decoder. Feste Zeitschlitze im Zielabstand;
+// ein Bild bekommt den naechsten freien Schlitz oder faellt weg.
+static double g_schlitz = 0;                 // Hostuhr in Sekunden: naechster freier Schlitz
+static _Atomic long g_zu_schnell = 0;        // verworfen, weil schneller als die Zielrate
+// Bilder im Encoder, fuer die noch keine Ausgabe kam. Ein langsamer Encoder
+// (H.264 bei 500 Mbit/s: 30 Bilder/s) bekam sonst 120 Bilder je Sekunde in
+// die Warteschlange gelegt - eine halbe Sekunde Verzoegerung statt Auslassern.
+static _Atomic int g_inflight = 0;
+static _Atomic long g_enc_stau = 0;          // verworfen, weil der Encoder noch voll war
 static dispatch_queue_t g_capq = NULL;
 static dispatch_source_t g_tick = NULL;
 
@@ -1017,6 +1028,9 @@ static void enc_cb(void *ref, void *src, OSStatus status, VTEncodeInfoFlags flag
     uint64_t zettel = (uint64_t)(uintptr_t)src;
     uint64_t t_cap_us = zettel >> 1;
     int wiederholt = (int)(zettel & 1u);
+    // Jeder Rueckruf schliesst ein Bild ab - geliefert, verworfen oder mit
+    // Fehler. Unter null darf der Zaehler nie (Rueckrufe einer alten Sitzung).
+    if (atomic_fetch_sub(&g_inflight, 1) <= 0) atomic_store(&g_inflight, 0);
     if (flags & kVTEncodeInfo_FrameDropped) g_stats.dropped++;
     if (status != noErr) {
         if (!g_stats.first_err) g_stats.first_err = status;
@@ -1114,6 +1128,8 @@ static BOOL encoder_start(int idx, int w, int h, int fps, int mbit) {
     if (idx < 0 || idx >= (int)QC_KANDIDATEN) return NO;
     const qc_codec_kandidat *k = &g_kandidaten[idx];
     OSType pixfmt = pixfmt_fuer(idx);
+    // Eine neue Sitzung faengt leer an; Rueckrufe der alten kommen nicht mehr.
+    atomic_store(&g_inflight, 0);
 
     CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     // Hardware verlangen, wenn die Pruefung beim Start welche gefunden hat. Sonst
@@ -1398,6 +1414,7 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
     OSStatus st = VTCompressionSessionEncodeFrame(g_session, pb, pts, kCMTimeInvalid,
                                                   (__bridge CFDictionaryRef)opts,
                                                   QC_ZETTEL(t_cap_us, wiederholt), NULL);
+    if (st == noErr) atomic_fetch_add(&g_inflight, 1);
     if (st != noErr) {
         if (!g_stats.first_err) g_stats.first_err = st;
         // Im Dienstbetrieb wuerde ein Encoder, der nach dem Wechsel kein Bild
@@ -1405,6 +1422,21 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
         if (atomic_fetch_add(&g_enc_fehler, 1) == 0)
             logf_(@"Encoder %s nimmt Bild nicht an (%d)", g_kandidaten[atomic_load(&g_codec_id)].name, (int)st);
     }
+}
+
+// Ist fuer ein Bild zur Zeit t (Hostuhr, Sekunden) ein Schlitz frei? Wenn ja,
+// ist er damit belegt. Das Raster ist fest: der naechste Schlitz liegt eine
+// Bildzeit hinter dem vorigen, nicht hinter diesem Bild - sonst wuerde ein
+// Strom mit 148 Bildern je Sekunde auf jedes zweite Bild halbiert statt auf
+// 120 gedeckelt. Nach einer Pause faengt das Raster bei diesem Bild neu an.
+// Ein Zehntel Bildzeit zu frueh ist noch recht (Zitter der Aufnahme).
+static int schlitz_frei(double t) {
+    int fps = atomic_load(&g_cur_fps);
+    if (fps <= 0) return 1;
+    double T = 1.0 / (double)fps;
+    if (t + 0.1 * T < g_schlitz) return 0;
+    g_schlitz = (t > g_schlitz + T) ? t + T : g_schlitz + T;
+    return 1;
 }
 
 // Der Takt. Laeuft auf derselben Warteschlange wie die Aufnahme, kommt ihr
@@ -1422,6 +1454,9 @@ static void fixed_tick(void) {
     CMTime now = CMClockGetTime(CMClockGetHostTimeClock());
     double seit = CMTimeGetSeconds(CMTimeSubtract(now, g_last_pts));
     if (seit < 0.9 / (double)fps) return;
+    // Haengt der Encoder noch an frueheren Bildern, wird nichts nachgelegt -
+    // ein Auslasser ist billiger als eine wachsende Warteschlange.
+    if (atomic_load(&g_inflight) >= 2) return;
 
     // Zeitstempel muss immer vorwaerts gehen, sonst weist der Encoder das Bild ab.
     if (CMTIME_COMPARE_INLINE(now, <=, g_last_pts))
@@ -1431,6 +1466,10 @@ static void fixed_tick(void) {
     // Seite aus, als waere jedes Bild blitzschnell unterwegs gewesen.
     encode_buffer(g_last_pb, now, g_last_cap_us, 1);
     g_last_pts = now;
+    // Das Raster bleibt unberuehrt: es zaehlt nur echte Bilder. Schoebe ein
+    // nachgelegtes Bild es weiter, fiele ein echtes kurz danach als "zu
+    // schnell" weg - Inhalt verloere gegen Wiederholung. Gemessen: 75 statt
+    // 120 Bilder je Sekunde, ein Drittel davon Wiederholungen.
     atomic_fetch_add(&g_repeats, 1);
 }
 
@@ -1466,17 +1505,25 @@ static void fixed_tick(void) {
     if (g_last_pb && CMTIME_COMPARE_INLINE(pts, <=, g_last_pts))
         pts = CMTimeAdd(g_last_pts, CMTimeMake(1, 1000));
 
-    encode_buffer(pb, pts, t_cap, 0);
-
-    // Fuer den festen Takt das Bild festhalten. Der Puffer gehoert der
-    // Aufnahme; ohne eigene Referenz wird er unter uns wiederverwendet.
+    // Das Bild wird in jedem Fall festgehalten - auch eines, das gleich
+    // wegfaellt: legt der Takt spaeter nach, soll es das neueste sein. Der
+    // Puffer gehoert der Aufnahme; ohne eigene Referenz wird er unter uns
+    // wiederverwendet.
     if (g_last_pb != pb) {
         CVPixelBufferRef alt = g_last_pb;
         g_last_pb = CVPixelBufferRetain(pb);
         if (alt) CVPixelBufferRelease(alt);
     }
-    g_last_pts = pts;
     g_last_cap_us = t_cap;
+
+    // Schneller als die Zielrate: weg damit. Und ist der Encoder noch mit
+    // aelteren Bildern beschaeftigt, ebenfalls - lieber ein Auslasser als
+    // eine Warteschlange, die jede Bewegung um Sekunden verspaetet.
+    if (!schlitz_frei(CMTimeGetSeconds(pts))) { atomic_fetch_add(&g_zu_schnell, 1); return; }
+    if (atomic_load(&g_inflight) >= 3) { atomic_fetch_add(&g_enc_stau, 1); return; }
+
+    encode_buffer(pb, pts, t_cap, 0);
+    g_last_pts = pts;
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -1951,12 +1998,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
             long f = atomic_load(&g_sent_frames);
             long long b = atomic_load(&g_sent_bytes);
             if (atomic_load(&g_client_fd) >= 0)
-                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld",
+                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | zu schnell: %ld | Encoder voll: %ld",
                       -[t0 timeIntervalSinceNow], f, (f - lastFrames) / 5.0,
                       (b - lastBytes) * 8.0 / 5.0 / 1e6,
                       atomic_load(&g_audio_packets), atomic_load(&g_audio_bytes) / 1000.0,
                       atomic_load(&g_skipped_backlog), g_stats.dropped,
-                      atomic_load(&g_repeats));
+                      atomic_load(&g_repeats), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
             lastFrames = f; lastBytes = b;
 
             // Auslastung des Hosts. Nur wenn jemand zuschaut - sonst misst
