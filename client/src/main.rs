@@ -4084,7 +4084,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     }
 
     // Ansicht "hud" und "hud2": der Nerd-Modus ueber einem angedeuteten Bild.
-    if view == "hud" || view == "hud2" {
+    if view.starts_with("hud") {
         for y in 0..h {
             for x in 0..w {
                 let a = (x * 255 / w) as u32;
@@ -4122,7 +4122,12 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             decoder: einstellungen::DecoderWunsch::Automatik,
             decoder_aktiv: Some(DecoderPfad::Nvdec),
         };
-        let reiter = match view { "hud2" => 1u8, "hud3" => 2, _ => 0 };
+        let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, _ => 0 };
+        // "hud2tip": die Maus steht ueber dem Schalter "Vollbild", damit der
+        // Tooltip im Bild ist und sich ueber SSH pruefen laesst.
+        if view == "hud2tip" {
+            u.mouse = (300, 274);
+        }
         let _ = hud(
             &mut u, &mut c, lang, w as i32, h as i32, reiter,
             Some(l), &lh, 104.0, &fh, info, Some((50, 120, false, true, true)),
@@ -4619,6 +4624,10 @@ fn hud(
 ) -> HudAktion {
     use strings::Key::*;
     let mut aktion = HudAktion::Nichts;
+    // Tooltip: der Schalter, ueber dem die Maus gerade steht, merkt sich
+    // seinen Text; gezeichnet wird er ganz am Ende, ueber allem anderen.
+    let maus = u.mouse;
+    let mut tip: Option<strings::Key> = None;
 
     let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
     let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
@@ -4638,7 +4647,7 @@ fn hud(
     // --- Kopf mit Reitern -------------------------------------------------
     u.text.draw(c, ix, y0 + p(30), "QUADCHROMA", sz(18), ui::CYAN, p(8));
     u.text.draw_right(c, x0 + breite - rand, y0 + p(30), adresse, sz(12), ui::DIM, p(1));
-    let namen = [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption)];
+    let namen = [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts)];
     let mut rx = ix + u.text.width("QUADCHROMA", sz(18), p(8)) + p(40);
     for (i, n) in namen.iter().enumerate() {
         let bw = u.text.width(n, sz(12), p(2)) + p(28);
@@ -4712,6 +4721,12 @@ fn hud(
                 }
                 if minus { -1 } else if plus { 1 } else { 0 }
             };
+            if (ui::Rect { x: ix, y: cy, w: p(254), h: p(46) }).hit(maus.0, maus.1) {
+                tip = Some(TipBitrate);
+            }
+            if (ui::Rect { x: ix + iw / 2, y: cy, w: p(254), h: p(46) }).hit(maus.0, maus.1) {
+                tip = Some(TipFps);
+            }
             let d = stellen(u, c, ix, cy, lang.get(MaxBitrate), format!("{mbit} Mbit/s"));
             if d != 0 {
                 let schritt = if mbit >= 100 { 25 } else if mbit >= 30 { 10 } else { 5 };
@@ -4721,16 +4736,22 @@ fn hud(
             if d != 0 {
                 aktion = HudAktion::Stellen(mbit, (fps_soll as i32 + d * 10).clamp(10, 240) as u16, gaming, fest, ton);
             }
-            if u.toggle(c, ui::Rect { x: ix, y: cy + p(70), w: iw / 2 - p(30), h: p(28) }, lang.get(GamingMode), gaming) {
+            let r_gaming = ui::Rect { x: ix, y: cy + p(70), w: iw / 2 - p(30), h: p(28) };
+            let r_fest = ui::Rect { x: ix + iw / 2, y: cy + p(70), w: iw / 2 - p(30), h: p(28) };
+            let r_ton = ui::Rect { x: ix, y: cy + p(104), w: iw / 2 - p(30), h: p(28) };
+            if r_gaming.hit(maus.0, maus.1) { tip = Some(TipGaming); }
+            if r_fest.hit(maus.0, maus.1) { tip = Some(FixedRateHint); }
+            if r_ton.hit(maus.0, maus.1) { tip = Some(TipSound); }
+            if u.toggle(c, r_gaming, lang.get(GamingMode), gaming) {
                 aktion = HudAktion::Stellen(mbit, fps_soll, !gaming, fest, ton);
             }
-            if u.toggle(c, ui::Rect { x: ix + iw / 2, y: cy + p(70), w: iw / 2 - p(30), h: p(28) }, lang.get(FixedRate), fest) {
+            if u.toggle(c, r_fest, lang.get(FixedRate), fest) {
                 aktion = HudAktion::Stellen(mbit, fps_soll, gaming, !fest, ton);
             }
             // Ton: unter dem Spielmodus, neben dem Hinweis zur festen Bildrate.
             // Aus heisst aus - beim Host (kein Paket mehr) und hier (nichts
             // mehr abgespielt, falls der Host den Schalter nicht kennt).
-            if u.toggle(c, ui::Rect { x: ix, y: cy + p(104), w: iw / 2 - p(30), h: p(28) }, lang.get(Sound), ton) {
+            if u.toggle(c, r_ton, lang.get(Sound), ton) {
                 aktion = HudAktion::Stellen(mbit, fps_soll, gaming, fest, !ton);
             }
             for (i, z) in umbruch(u, lang.get(FixedRateHint), iw / 2 - p(40), sz(10)).iter().enumerate() {
@@ -4785,6 +4806,7 @@ fn hud(
                         break;
                     }
                     let r = ui::Rect { x: kx, y: ky, w: bw, h: kh };
+                    if r.hit(maus.0, maus.1) { tip = Some(TipCodec); }
                     if !e.available {
                         // Nur zeichnen, nicht bedienen: keine Hervorhebung
                         // beim Ueberfahren, kein Klick.
@@ -4817,15 +4839,18 @@ fn hud(
         1 => {
             // Alles, was sonst nur auf einer Taste liegt.
             let sp = iw / 2;
-            let zeile = |u: &mut ui::Ui, c: &mut ui::Canvas, sx: i32, sy: i32, t: &str, an: bool, id: u8, akt: &mut HudAktion| {
-                if u.toggle(c, ui::Rect { x: sx, y: sy, w: sp - p(40), h: p(26) }, t, an) {
+            let zeile = |u: &mut ui::Ui, c: &mut ui::Canvas, sx: i32, sy: i32, t: &str, an: bool, id: u8, akt: &mut HudAktion,
+                         tipk: strings::Key, tip: &mut Option<strings::Key>| {
+                let r = ui::Rect { x: sx, y: sy, w: sp - p(40), h: p(26) };
+                if r.hit(maus.0, maus.1) { *tip = Some(tipk); }
+                if u.toggle(c, r, t, an) {
                     *akt = HudAktion::Schalter(id);
                 }
             };
-            zeile(u, c, ix, cy, lang.get(Fullscreen), stand.vollbild, SCH_VOLLBILD, &mut aktion);
-            zeile(u, c, ix, cy + p(34), lang.get(PixelExact), stand.pixelgenau, SCH_PIXELGENAU, &mut aktion);
-            zeile(u, c, ix, cy + p(68), lang.get(ShowOverlay), stand.statistik, SCH_STATISTIK, &mut aktion);
-            zeile(u, c, ix, cy + p(102), lang.get(NerdMode), stand.nerd, SCH_NERD, &mut aktion);
+            zeile(u, c, ix, cy, lang.get(Fullscreen), stand.vollbild, SCH_VOLLBILD, &mut aktion, TipFullscreen, &mut tip);
+            zeile(u, c, ix, cy + p(34), lang.get(PixelExact), stand.pixelgenau, SCH_PIXELGENAU, &mut aktion, TipPixelExact, &mut tip);
+            zeile(u, c, ix, cy + p(68), lang.get(ShowOverlay), stand.statistik, SCH_STATISTIK, &mut aktion, TipShowOverlay, &mut tip);
+            zeile(u, c, ix, cy + p(102), lang.get(NerdMode), stand.nerd, SCH_NERD, &mut aktion, TipNerdMode, &mut tip);
             // --- Decoderwahl: drei Knoepfe, der gewuenschte in Cyan. Dahinter
             // steht, was wirklich laeuft - bei Automatik ist das die eigentliche
             // Auskunft, und bei einem Rueckfall sieht man ihn hier sofort.
@@ -4848,6 +4873,9 @@ fn hud(
                         break;
                     }
                     let r = ui::Rect { x: kx, y: ky, w: bw, h: p(30) };
+                    if r.hit(maus.0, maus.1) {
+                        tip = Some(match w { W::Automatik => TipDecoderAuto, W::Software => TipDecoderSoftware, W::Nvidia => TipDecoderGpu });
+                    }
                     let farbe = if stand.decoder == w { ui::CYAN } else { ui::DIM };
                     if u.button(c, r, name, farbe) && stand.decoder != w {
                         aktion = HudAktion::Decoder(w);
@@ -4858,13 +4886,40 @@ fn hud(
             let w = stand.wahl;
             // Ueberschrift ueber die rechte Spalte, nicht unter die linke.
             u.text.draw(c, ix + sp, cy - p(16), lang.get(ShowOverlay), sz(10), ui::DIM, p(3));
-            zeile(u, c, ix + sp, cy, lang.get(Fps), w.fps, SCH_STAT_FPS, &mut aktion);
-            zeile(u, c, ix + sp, cy + p(30), lang.get(Latency), w.latenz, SCH_STAT_LATENZ, &mut aktion);
-            zeile(u, c, ix + sp, cy + p(60), lang.get(DecodeTime), w.teile, SCH_STAT_TEILE, &mut aktion);
-            zeile(u, c, ix + sp, cy + p(90), lang.get(Resolution), w.aufloesung, SCH_STAT_AUFL, &mut aktion);
-            zeile(u, c, ix + sp, cy + p(120), lang.get(Codec), w.codec, SCH_STAT_CODEC, &mut aktion);
-            zeile(u, c, ix + sp, cy + p(150), lang.get(Dropped), w.verworfen, SCH_STAT_VERW, &mut aktion);
-            zeile(u, c, ix + sp, cy + p(180), lang.get(SecuredWith), w.code, SCH_STAT_CODE, &mut aktion);
+            zeile(u, c, ix + sp, cy, lang.get(Fps), w.fps, SCH_STAT_FPS, &mut aktion, TipStatRows, &mut tip);
+            zeile(u, c, ix + sp, cy + p(30), lang.get(Latency), w.latenz, SCH_STAT_LATENZ, &mut aktion, TipStatRows, &mut tip);
+            zeile(u, c, ix + sp, cy + p(60), lang.get(DecodeTime), w.teile, SCH_STAT_TEILE, &mut aktion, TipStatRows, &mut tip);
+            zeile(u, c, ix + sp, cy + p(90), lang.get(Resolution), w.aufloesung, SCH_STAT_AUFL, &mut aktion, TipStatRows, &mut tip);
+            zeile(u, c, ix + sp, cy + p(120), lang.get(Codec), w.codec, SCH_STAT_CODEC, &mut aktion, TipStatRows, &mut tip);
+            zeile(u, c, ix + sp, cy + p(150), lang.get(Dropped), w.verworfen, SCH_STAT_VERW, &mut aktion, TipStatRows, &mut tip);
+            zeile(u, c, ix + sp, cy + p(180), lang.get(SecuredWith), w.code, SCH_STAT_CODE, &mut aktion, TipStatRows, &mut tip);
+        }
+        3 => {
+            // Die Tasten, die der Client selbst abfaengt - alles andere geht
+            // an den Mac. Jede davon ist auch ein Schalter im Menue; hier
+            // steht sie zum Nachschlagen.
+            let strg = if lang.code == "de" { "Strg+Esc" } else { "Ctrl+Esc" };
+            let zeilen: [(&str, &str); 6] = [
+                ("F9", lang.get(ShowOverlay)),
+                ("F10", lang.get(ShortcutMenu)),
+                ("ESC 2 s", lang.get(ShortcutMenu)),
+                ("F11", lang.get(Fullscreen)),
+                ("F12", lang.get(PixelExact)),
+                (strg, lang.get(ShortcutBack)),
+            ];
+            let mut zy = cy;
+            for (taste, was) in zeilen {
+                u.text.draw(c, ix, zy + p(14), taste, sz(14), ui::CYAN, p(2));
+                u.text.draw(c, ix + p(150), zy + p(14), was, sz(13), ui::TEXT, p(1));
+                c.hline(ix, zy + p(26), iw, ui::DIM, 40);
+                zy += p(34);
+            }
+            u.text.draw(c, ix, zy + p(14), "Win", sz(14), ui::CYAN, p(2));
+            u.text.draw(c, ix + p(150), zy + p(14), lang.get(ShortcutWinKey), sz(13), ui::TEXT, p(1));
+            zy += p(40);
+            for (i, z) in umbruch(u, lang.get(ShortcutOthers), iw, sz(11)).iter().enumerate() {
+                u.text.draw(c, ix, zy + p(14) + i as i32 * p(16), z, sz(11), ui::DIM, p(1));
+            }
         }
         _ => {
             u.text.draw(c, ix, cy, &format!("Noise XX · ChaCha20-Poly1305 · {}", lang.get(EncryptionOn)),
@@ -4877,7 +4932,9 @@ fn hud(
                 u.text.draw(c, ix + iw / 2, cy + p(50), lang.get(HostFingerprint), sz(11), ui::DIM, p(3));
                 u.text.draw(c, ix + iw / 2, cy + p(86), fp, sz(15), ui::TEXT, p(2));
             }
-            if u.button(c, ui::Rect { x: ix, y: cy + p(130), w: p(220), h: p(38) }, lang.get(Disconnect), ui::MAGENTA) {
+            let r_trennen = ui::Rect { x: ix, y: cy + p(130), w: p(220), h: p(38) };
+            if r_trennen.hit(maus.0, maus.1) { tip = Some(TipDisconnect); }
+            if u.button(c, r_trennen, lang.get(Disconnect), ui::MAGENTA) {
                 aktion = HudAktion::Trennen;
             }
         }
@@ -4885,5 +4942,30 @@ fn hud(
 
     c.hline(ix, fy - p(24), iw, ui::DIM, 60);
     u.text.draw(c, ix, fy, &format!("ESC · {}", lang.get(Back)), sz(11), ui::DIM, p(3));
+    if let Some(k) = tip {
+        tooltip(u, c, lang.get(k), maus, ww, wh, sz(11), p(1));
+    }
     aktion
+}
+
+/// Ein Tooltip neben der Maus: sofort, ohne Wartezeit, ueber allem anderen.
+/// Rechts unterhalb des Zeigers; wo das nicht passt, links bzw. oberhalb.
+fn tooltip(u: &mut ui::Ui, c: &mut ui::Canvas, text: &str, maus: (i32, i32), ww: i32, wh: i32, size: u32, spacing: i32) {
+    let innen = 360.min(ww - 40).max(120);
+    let zeilen = umbruch(u, text, innen, size);
+    let breite = zeilen.iter().map(|z| u.text.width(z, size, spacing)).max().unwrap_or(0) + 24;
+    let zh = size as i32 + 5;
+    let hoehe = zeilen.len() as i32 * zh + 18;
+    let mut x = maus.0 + 18;
+    let mut y = maus.1 + 22;
+    if x + breite > ww - 8 { x = (maus.0 - breite - 10).max(8); }
+    if y + hoehe > wh - 8 { y = (maus.1 - hoehe - 12).max(8); }
+    c.fill(x, y, breite, hoehe, 0x0a0f18, 245);
+    c.hline(x, y, breite, ui::CYAN, 120);
+    c.hline(x, y + hoehe - 1, breite, ui::CYAN, 120);
+    c.vline(x, y, hoehe, ui::CYAN, 120);
+    c.vline(x + breite - 1, y, hoehe, ui::CYAN, 120);
+    for (i, z) in zeilen.iter().enumerate() {
+        u.text.draw(c, x + 12, y + 13 + i as i32 * zh + size as i32 / 2, z, size, ui::TEXT, spacing);
+    }
 }
