@@ -48,19 +48,40 @@ Alle Freigaben auf dem Mac loeschen: Host einmal mit --forget starten.
 
 Tasten:
 
-    F9         Zahlen einblenden: Bildrate, Decodierzeit, Aufloesung, Codec
-    F10        Einstellungen: Bitrate, Bildrate, Spielmodus, feste Bildrate
+    F9         Statistik ein und aus (welche Zeilen, steht im Menue)
+    F10        Menue - oder ESC zwei Sekunden gedrueckt halten
     F11        Vollbild an und aus
     F12        pixelgenaue Darstellung statt gestreckt
     Strg+Esc   zurueck zum Startbildschirm
 
-Einstellungen im laufenden Betrieb
-----------------------------------
+Jede Tastenfunktion ist auch im Menue ein Schalter; die Tasten muss sich
+niemand merken.
 
-F10 oeffnet rechts eine Tafel. Bitrate und Bildrate lassen sich dort mit den
-Knoepfen aendern; der Mac stellt sofort um und meldet zurueck, was wirklich
-gilt - angezeigt wird also nie ein Wunsch, sondern der Stand auf der anderen
-Seite. Solange die Tafel offen ist, gehoert die Maus ihr und nicht dem Mac.
+Das Menue
+---------
+
+ESC zwei Sekunden halten (das ESC selbst kommt dann nicht beim Mac an) oder
+F10. Drei Reiter:
+
+    Bild            Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton,
+                    Codecwahl
+    Anzeige         Vollbild, pixelgenau, Statistik, Nerd-Modus, welche
+                    Statistikzeilen, Decoderwahl (Automatik, Software, NVIDIA)
+    Verschluesselung  Verfahren, Vergleichscode, Fingerabdruck, Trennen
+
+Der Mac stellt sofort um und meldet zurueck, was wirklich gilt - angezeigt
+wird also nie ein Wunsch, sondern der Stand auf der anderen Seite. Solange das
+Menue offen ist, gehoeren Maus und Tastatur ihm und nicht dem Mac. Die Werte
+werden je Host gespeichert (am Fingerabdruck, nicht an der Adresse) und beim
+naechsten Verbinden von selbst wieder gesetzt.
+
+Nerd-Modus: die Statistik wird breiter und zeigt die Verzoegerungskette als
+Balken auf fester Millimeterskala - Aufnahme und Warten, Encoder, Leitung,
+Decoder, Anzeige - mit einer Marke fuer "ein Bild" und einer fuer "ein
+Monitorbild", dazu Auslastung des Hosts (Prozessor, Grafik, Speicher,
+Encoderzeit gegen Bildbudget) und des Clients (Prozessorlast, Monitorrate,
+ausgelassene Bilder). Ein Glied wird als Engpass markiert, wenn die Kette
+laenger als ein Bild ist und dieses Glied mehr als die Haelfte davon ausmacht.
 
 Feste Bildrate: normalerweise schickt der Mac nur dann ein neues Bild, wenn
 sich wirklich etwas geaendert hat - die Rate steigt und faellt also mit dem
@@ -103,7 +124,15 @@ Im Pruefmodus laesst sich der Wechsel anstossen:
     quadchroma.exe 192.168.178.194:9001 --headless --codec 3
 
 Die Nummer ist der Eintrag in der Liste des Hosts (0 = HEVC 4:4:4 10 Bit,
-3 = HEVC 4:2:0 8 Bit, 4 = H.264). Die Adresse muss vor dem Schalter stehen.
+3 = HEVC 4:2:0 8 Bit, 4 = H.264). Die Adresse darf an jeder Stelle stehen.
+
+Bildrate: der Host schickt nie mehr Bilder als eingestellt. ScreenCaptureKit
+liefert auf einem 120-Hz-Bildschirm gern 148 echte Bilder je Sekunde - jedes
+ging durch Encoder, Leitung und Decoder. Jetzt bekommt ein Bild den naechsten
+freien Zeitschlitz oder faellt weg ("zu schnell" im Log des Hosts), und der
+Encoder bekommt nie mehr als ein paar Bilder auf einmal ("Encoder voll") -
+lieber ein Auslasser als eine Warteschlange, die jede Bewegung um Sekunden
+verspaetet.
 
 Der Spielmodus zieht die Zuegel straffer: haeufigere Vollbilder und ein
 kleinerer erlaubter Rueckstau, damit bei Bewegung nichts auflaeuft. Er kostet
@@ -116,11 +145,55 @@ fuenfte Wert von --set (--set 50,120,0,1,0 = Ton aus).
 
 Zur Bitrate: der Wert ist eine Obergrenze, und der Encoder nutzt sie auch aus.
 150 Mbit/s bedeuten bei bewegtem Bild tatsaechlich 150 Mbit/s. Fuer das eigene
-Netz ist das in Ordnung, sonst lieber 25 bis 50 einstellen.
+Netz ist das in Ordnung, sonst lieber 25 bis 50 einstellen. H.264 vertraegt
+keine sehr hohen Werte: bei 500 Mbit/s schafft Apples Encoder nur noch rund
+30 Bilder je Sekunde.
+
+Decoder und Anzeige auf Windows
+-------------------------------
+
+Decoder: Automatik nimmt NVDEC (ueber die cuvid-Decoder von FFmpeg), wenn
+eine NVIDIA-Karte da ist, sonst Software. "Software" erzwingt die CPU,
+"NVIDIA" die Karte - und sagt laut, wenn sie nicht geht. Ein Hardware-
+Decoder, der Pakete annimmt, aber 1,5 s lang kein Bild liefert oder nur
+Unlesbares, wird von selbst durch Software ersetzt; der Grund steht in der
+Statistik und im Protokoll. Befehlszeile: --decoder auto|software|nvidia.
+
+Anzeige: mit einer Grafikkarte zeichnet der Client ueber Direct3D 11. Die
+rohen Ebenen des Decoders gehen auf die Karte, Umrechnung nach RGB und
+Skalierung laufen dort in Shadern (bitidentisch zum Weg ueber den
+Prozessor), die Oberflaeche liegt als eigene Ebene darueber. Praesentiert
+wird sofort, hoechstens ein Bild unterwegs, nie wartend. Ohne brauchbare
+Karte laeuft der alte Weg ueber den Prozessor - der Client sagt beim Start
+im Protokoll, was er gewaehlt hat ("Anzeige: D3D11 <Karte>, ..." oder
+"Anzeige: Software"). Befehlszeile: --anzeige auto|gpu|cpu|warp und
+--adapter n; die Wahl laesst sich in einstellungen.txt als anzeige=... fest
+eintragen. Ein Wechsel gilt ab dem naechsten Start.
+
+    quadchroma.exe --anzeigetest C:\ein\verzeichnis
+
+prueft die Karte ohne Verbindung: uebersetzt die Shader, rechnet alle
+Decoderformate einmal ueber die Karte und vergleicht mit dem Prozessorweg
+(Toleranz null bei 1:1), schreibt Differenzbilder ins Verzeichnis. Laeuft auch
+ohne Karte ueber Windows' Software-Rasterizer (WARP).
+
+Mauszeiger: gezeigt wird immer der Zeiger von Windows - so fuehlt sich die
+Maus lokal an. Er traegt aber die Form des Mac-Zeigers: Pfeil, Hand ueber
+Knoepfen, Ziehpfeile am Fensterrand, Textcursor, Wartekugel. Der Host schickt
+die Form nur, wenn sie sich aendert. Ausgeblendet wird der Zeiger hier nie -
+macOS blendet seinen beim Tippen aus und laesst ihn so, bis die physische
+Maus sich bewegt, und das tut sie vom Client aus nie. Die Groesse folgt dem
+Bildmassstab: bei 1:1 so gross wie auf dem Mac.
 
 Alles andere geht an den Mac. Uebertragen wird die Position der Taste, nicht
 das Zeichen, deshalb stimmen Umlaute und AltGr von selbst. Die Windows-Taste
 ist die Befehlstaste des Macs.
+
+Bildschirmwahl auf dem Mac: ohne Angabe nimmt der Host den Hauptbildschirm
+(den mit der Menueleiste) und merkt sich dessen Kennung - Maus und Bild
+gehoeren immer auf denselben Bildschirm. --display n waehlt einen anderen
+Platz aus der Liste (--list zeigt sie). Ein Wechsel gilt ab dem naechsten
+Start des Hosts.
 
 Pruefmodus ohne Fenster, falls etwas klemmt:
 
@@ -129,19 +202,21 @@ Pruefmodus ohne Fenster, falls etwas klemmt:
 Gibt alle drei Sekunden eine Zeile aus: empfangene Bilder, Bildrate, Codec,
 Decoder, Verzoegerung, Hostlast, Fehler. Dazu jede Aenderung am Decoder
 (welcher Pfad, und warum nicht NVDEC, falls so), das erste Bild jedes
-Decoders mit Groesse und Format, und FFmpegs eigene Meldungen. Dasselbe
-landet in %APPDATA%\QuadChroma\protokoll.txt, auch im Fensterbetrieb - die
-Datei beginnt bei jedem Start neu.
+Decoders mit Groesse und Format, die Zeigerform, und FFmpegs eigene
+Meldungen. Dasselbe landet in %APPDATA%\QuadChroma\protokoll.txt, auch im
+Fensterbetrieb - die Datei beginnt bei jedem Start neu und traegt dort
+zusaetzlich die Anzeige (Karte, Feature-Level, Tearing) und je Sekunde eine
+Zeile mit Bildrate, Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern
+und der Prozessorlast des Clients.
 
     quadchroma.exe 192.168.178.194:9001 --headless --decoder nvidia
 
-erzwingt den NVIDIA-Decoder und sagt, was die Karte dazu meint; --decoder
-software erzwingt die CPU. Ein Hardware-Decoder, der Pakete annimmt, aber
-1,5 s lang kein Bild liefert, wird von selbst durch Software ersetzt, und
-der Grund steht in der Statistik und im Protokoll.
+erzwingt den NVIDIA-Decoder und sagt, was die Karte dazu meint.
 
 Die Dateien neben der Programmdatei gehoeren dazu und muessen mitkopiert
 werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
-Bibliothek. Der Quelltext dazu liegt bei https://ffmpeg.org
+Bibliothek. Der Quelltext dazu liegt bei https://ffmpeg.org. Direct3D,
+DXGI und der Shader-Uebersetzer (d3dcompiler_47.dll) sind Bestandteile von
+Windows, nichts davon wird mitgeliefert.
 
-Stand: 20.09.2026
+Stand: 22.09.2026
