@@ -431,6 +431,15 @@ struct Frame {
     pixels: Vec<u32>, // 0x00RRGGBB, wie softbuffer es erwartet
 }
 
+/// Was der Empfangsfaden ablegt: fertig gerechnetes RGB, oder - sobald die
+/// Karte die Umrechnung uebernimmt - das rohe Decoderbild mit seinen Ebenen.
+/// Ein rohes Bild kostet im Empfangsfaden keine Kopie: `ffmpeg::frame::Video`
+/// laesst sich zwischen Faeden verschieben.
+enum Bild {
+    Rgb(Frame),
+    Roh { bild: ffmpeg::frame::Video },
+}
+
 #[derive(Default)]
 struct Shared {
     /// Griff an der Bildleitung, um sie beim Trennen von aussen zu kappen.
@@ -438,7 +447,11 @@ struct Shared {
     /// Adresse, mit der sich der Empfangsfaden verbinden soll. None = warten.
     target: Option<String>,
     connected: bool,
-    frame: Option<Frame>,
+    frame: Option<Bild>,
+    /// Zeichnet die Karte? Dann legt der Empfangsfaden rohe Bilder ab,
+    /// statt sie auf der CPU umzurechnen. Setzt der Fensterfaden; bis die
+    /// Anzeige ueber die Karte da ist, bleibt es false.
+    gpu_pfad: bool,
     info: Option<StreamInfo>,
     decoded: u64,
     dropped: u64,
@@ -1119,20 +1132,32 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         break;
                     }
                 }
-                for decoded in bilder.iter() {
+                // Das Format des letzten Bildes, bevor die Schleife die Bilder
+                // verbraucht - der Rueckfall unten will es nennen.
+                let letztes_format = bilder.last().map(|b| b.format());
+                // Zeichnet die Karte, bleibt das Bild roh; einmal je Paket
+                // nachsehen reicht.
+                let gpu = shared.lock().unwrap().gpu_pfad;
+                for decoded in bilder.drain(..) {
+                    let pts = decoded.pts();
+                    let (w, h) = (decoded.width(), decoded.height());
                     // Das Format entscheidet der decodierte Frame selbst, nicht
                     // die Strominfo. Ein unbekanntes Format ergibt ein dunkles
                     // Bild und eine Meldung - nie einen Absturz.
-                    let (frame, fehler) = match to_rgb(&decoded) {
-                        Ok(f) => (f, None),
-                        Err(e) => (dunkles_bild(decoded.width(), decoded.height()), Some(e)),
+                    let (bild, fehler) = if gpu && ebenen_format(decoded.format()).is_some() {
+                        (Bild::Roh { bild: decoded }, None)
+                    } else {
+                        match to_rgb(&decoded) {
+                            Ok(f) => (Bild::Rgb(f), None),
+                            Err(e) => (Bild::Rgb(dunkles_bild(w, h)), Some(e)),
+                        }
                     };
                     let ms = t0.elapsed().as_secs_f32() * 1000.0;
                     let mut s = shared.lock().unwrap();
                     if s.frame.is_some() {
                         s.dropped += 1; // das vorige wurde nie gezeigt
                     }
-                    s.frame = Some(frame);
+                    s.frame = Some(bild);
                     s.decoded += 1;
                     s.last_decode_ms = ms;
                     if let Some(e) = fehler {
@@ -1155,7 +1180,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
 
                     // Verzoegerung zerlegen. Geht nur, wenn der Zeitabgleich
                     // steht und der Stempel zu genau diesem Bild gefunden wird.
-                    let passend = decoded.pts().and_then(|p| {
+                    let passend = pts.and_then(|p| {
                         let seq = p as u16;
                         ring.iter().position(|(s, ..)| *s == seq).map(|i| {
                             let e = ring[i];
@@ -1206,7 +1231,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // bessere Wahl - der Grund nennt das Format, damit es in den
                 // Client eingebaut werden kann.
                 if bau.pfad.hardware() && bau.format_fehler >= DECODER_FORMAT_FEHLER {
-                    let format = bilder.last().map(|b| format!("{:?}", b.format())).unwrap_or_default();
+                    let format = letztes_format.map(|f| format!("{f:?}")).unwrap_or_default();
                     let grund = format!("{} liefert das Format {format}, das der Client nicht wandeln kann", bau.codec);
                     bau = auf_software(decoder_h264, grund)?;
                     decoder_melden(shared, &bau, wunsch);
@@ -1411,10 +1436,28 @@ fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32],
     }
 }
 
-/// Decodiertes Bild nach RGB. Das Format kommt aus dem Frame selbst
-/// (Pixelformat des Decoders), nicht aus einer Flagge: nach einem
-/// Codecwechsel waere jede Flagge fuer ein paar Bilder falsch, und der
-/// Hardware-Decoder liefert andere Formate als der Software-Decoder.
+/// Aufbau der Ebenen eines Decoderformats. EINE Tabelle fuer `to_rgb` und -
+/// sobald die Karte umrechnet - fuer deren Texturen, damit beide dasselbe
+/// Format auf dieselbe Weise lesen.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct EbenenFormat {
+    /// 4:2:0: je zwei Bildpunkte in beiden Richtungen teilen sich einen Farbwert.
+    pub sub: bool,
+    /// Breite der Werte: 8 (ein Byte), 10 (16 Bit LE, Wert in den unteren
+    /// zehn Bit) oder 16 (16 Bit LE, Wert oben buendig).
+    pub bits: u8,
+    /// U und V als Paare in EINER Ebene (NV12, P010, P012, P016).
+    pub paar: bool,
+}
+
+impl EbenenFormat {
+    /// Bytes je Wert in den Ebenen.
+    pub fn bpp(&self) -> u32 {
+        if self.bits == 8 { 1 } else { 2 }
+    }
+}
+
+/// Welche Decoderformate der Client lesen kann, und wie ihre Ebenen liegen.
 ///
 /// Erkannt werden die planaren Formate der Software-Decoder (YUV444P,
 /// YUV444P10LE, YUV420P, YUV420P10LE, dazu YUVJ420P/YUVJ444P - FFmpegs
@@ -1424,13 +1467,11 @@ fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32],
 /// so nennt FFmpeg 9 die Formate, die aeltere Fassungen als YUV444P16
 /// meldeten; das bleibt fuer die mit dabei), NV12 (4:2:0 8 Bit, U/V
 /// verschraenkt) und P010LE/P012LE/P016LE (4:2:0 10/12/16 Bit, oben
-/// buendig, verschraenkt). Alles andere ist ein Fehler mit Meldung, kein
-/// Absturz. Alle Stroeme sind Vollbereich (der Host garantiert das),
-/// deshalb keine Bereichsdehnung.
-fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
+/// buendig, verschraenkt). Alles andere: None.
+pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
     use ffmpeg::format::Pixel;
     // (4:2:0, Bits je Wert, U/V als Paare in einer Ebene)
-    let (sub, bits, paar) = match src.format() {
+    let (sub, bits, paar) = match p {
         // Die J-Formate sind FFmpegs alte Schreibweise fuer "voller
         // Wertebereich" - der H.264-Decoder liefert 8 Bit so, 4:2:0 wie 4:4:4. Die
         // Ebenen sind dieselben, und Vollbereich ist ohnehin, was wir
@@ -1449,8 +1490,24 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
         Pixel::YUV420P10LE => (true, 10, false),
         Pixel::NV12 => (true, 8, true),
         Pixel::P010LE | Pixel::P012LE | Pixel::P016LE => (true, 16, true),
-        f => return Err(format!("Unbekanntes Bildformat vom Decoder: {f:?}")),
+        _ => return None,
     };
+    Some(EbenenFormat { sub, bits, paar })
+}
+
+/// Decodiertes Bild nach RGB. Das Format kommt aus dem Frame selbst
+/// (Pixelformat des Decoders), nicht aus einer Flagge: nach einem
+/// Codecwechsel waere jede Flagge fuer ein paar Bilder falsch, und der
+/// Hardware-Decoder liefert andere Formate als der Software-Decoder.
+///
+/// Welche Formate gelesen werden, sagt `ebenen_format`; alles andere ist
+/// ein Fehler mit Meldung, kein Absturz. Alle Stroeme sind Vollbereich (der
+/// Host garantiert das), deshalb keine Bereichsdehnung.
+fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
+    let Some(fmt) = ebenen_format(src.format()) else {
+        return Err(format!("Unbekanntes Bildformat vom Decoder: {:?}", src.format()));
+    };
+    let (sub, bits, paar) = (fmt.sub, fmt.bits, fmt.paar);
     let w = src.width() as usize;
     let h = src.height() as usize;
     if w == 0 || h == 0 {
@@ -1463,7 +1520,7 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     // liegen U und V nebeneinander, die Zeile ist also doppelt so breit.
     let cw = if sub { (w + 1) / 2 } else { w };
     let ch = if sub { (h + 1) / 2 } else { h };
-    let bpp = if bits == 8 { 1 } else { 2 };
+    let bpp = fmt.bpp() as usize;
     let cbreite = if paar { cw * 2 * bpp } else { cw * bpp };
     let yp = src.data(0);
     let up = src.data(1);
@@ -1817,7 +1874,7 @@ impl ApplicationHandler for App {
                 if self.screen == Screen::Start { return; }
                 // Steht die Einstellungstafel offen, gehoert die Maus ihr und
                 // nicht dem Mac - sonst klickt man dort zweimal gleichzeitig.
-                if self.hud_offen || self.last_frame.is_none() { return; }
+                if self.hud_offen || !self.bild_vorhanden() { return; }
                 if let Some(w) = &self.window {
                     let s = w.inner_size();
                     let nx = position.x as f32 / s.width.max(1) as f32;
@@ -1833,7 +1890,7 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                if self.hud_offen || self.last_frame.is_none() {
+                if self.hud_offen || !self.bild_vorhanden() {
                     if button == MouseButton::Left && state == winit::event::ElementState::Pressed {
                         self.ui.click = true;
                     }
@@ -2107,7 +2164,7 @@ impl ApplicationHandler for App {
             (s.frame.is_some(), s.error_key.is_some())
         };
         let oberflaeche = self.screen != Screen::Session
-            || self.last_frame.is_none()
+            || !self.bild_vorhanden()
             || self.hud_offen
             || self.show_overlay
             || self.esc_seit.is_some()
@@ -2147,39 +2204,17 @@ impl App {
         self.angewandt_fuer = None;
     }
 
-    fn draw(&mut self) {
-        let (Some(window), Some(surface)) = (self.window.clone(), self.surface.as_mut()) else {
-            return;
-        };
-        let size = window.inner_size();
-        let (ww, wh) = (size.width.max(1), size.height.max(1));
-        // Schlaegt das fehl, liefert buffer_mut() spaeter einen Puffer der alten
-        // Groesse - und jeder Schreibzugriff darauf reisst das Fenster mit.
-        if surface
-            .resize(
-                std::num::NonZeroU32::new(ww).unwrap(),
-                std::num::NonZeroU32::new(wh).unwrap(),
-            )
-            .is_err()
-        {
-            return;
-        }
-        // Der Takt der Oberflaeche haengt an der Uhr, nicht an der Zahl der
-        // Zeichnungen: seit nur noch bei Bedarf gezeichnet wird, liefe das
-        // Suchband des Startbildschirms sonst je nach Bildrate anders schnell.
-        self.ui.tick = client_us() / 8000;
-        self.letzte_zeichnung = Instant::now();
+    /// Steht ein Bild im Fenster? Solange nicht, zeigt die Sitzung den
+    /// Wartebildschirm, und Maus und Tastatur bleiben beim Client.
+    fn bild_vorhanden(&self) -> bool {
+        self.last_frame.is_some()
+    }
 
-        // Neues Bild abholen, sonst das letzte weiterverwenden.
-        if let Some(f) = self.shared.lock().unwrap().frame.take() {
-            self.last_frame = Some(f);
-            self.fps_count += 1;
-            self.shown += 1;
-        }
-
-        // Die Sekundenrechnung gehoert HIERHER, vor jede Verzweigung: stand
-        // sie am Ende, blieb die Bildrate stehen, sobald Menue oder Statistik
-        // offen waren - also genau dann, wenn man sie ablesen will.
+    /// Einmal je Sekunde: Bildrate, Verlauf der Verzoegerung, Fenstertitel.
+    /// Die Sekundenrechnung gehoert VOR jede Verzweigung des Zeichnens: stand
+    /// sie am Ende, blieb die Bildrate stehen, sobald Menue oder Statistik
+    /// offen waren - also genau dann, wenn man sie ablesen will.
+    fn sekundentakt(&mut self, window: &Window) {
         if self.fps_since.elapsed() >= Duration::from_secs(1) {
             self.fps_shown = self.fps_count as f32 / self.fps_since.elapsed().as_secs_f32();
             self.fps_count = 0;
@@ -2216,8 +2251,80 @@ impl App {
                 ),
             });
         }
+    }
 
+    /// Weiche: wer zeichnet. Vorerst gibt es nur den Weg ueber die CPU.
+    fn draw(&mut self) {
+        self.draw_cpu();
+    }
 
+    /// Der Weg ueber softbuffer: Bild auf der CPU einpassen, Oberflaeche
+    /// darueber, per GDI ins Fenster.
+    fn draw_cpu(&mut self) {
+        // Die Flaeche kurz aus dem Zustand nehmen: solange ihr Puffer
+        // beschrieben wird, brauchen die Zeichenschritte `&mut self`.
+        let Some(window) = self.window.clone() else { return };
+        let Some(mut surface) = self.surface.take() else { return };
+        self.draw_cpu_auf(&window, &mut surface);
+        self.surface = Some(surface);
+    }
+
+    fn draw_cpu_auf(&mut self, window: &Window, surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>) {
+        let size = window.inner_size();
+        let (ww, wh) = (size.width.max(1), size.height.max(1));
+        // Schlaegt das fehl, liefert buffer_mut() spaeter einen Puffer der alten
+        // Groesse - und jeder Schreibzugriff darauf reisst das Fenster mit.
+        if surface
+            .resize(
+                std::num::NonZeroU32::new(ww).unwrap(),
+                std::num::NonZeroU32::new(wh).unwrap(),
+            )
+            .is_err()
+        {
+            return;
+        }
+        // Der Takt der Oberflaeche haengt an der Uhr, nicht an der Zahl der
+        // Zeichnungen: seit nur noch bei Bedarf gezeichnet wird, liefe das
+        // Suchband des Startbildschirms sonst je nach Bildrate anders schnell.
+        self.ui.tick = client_us() / 8000;
+        self.letzte_zeichnung = Instant::now();
+
+        // Neues Bild abholen, sonst das letzte weiterverwenden.
+        let bild = self.shared.lock().unwrap().frame.take();
+        if let Some(b) = bild {
+            self.last_frame = Some(match b {
+                Bild::Rgb(f) => f,
+                // Ein rohes Bild kommt hier nur an, wenn die Anzeige im
+                // laufenden Betrieb von der Karte auf die CPU zurueckfaellt:
+                // dann einmal auf dem Fensterfaden wandeln.
+                Bild::Roh { bild } => to_rgb(&bild).unwrap_or_else(|_| dunkles_bild(bild.width(), bild.height())),
+            });
+            self.fps_count += 1;
+            self.shown += 1;
+        }
+        self.sekundentakt(window);
+
+        let Ok(mut buf) = surface.buffer_mut() else { return };
+        if self.screen == Screen::Session {
+            if let Some(frame) = &self.last_frame {
+                blit(&mut buf, ww, wh, frame, self.pixel_exact);
+            }
+        }
+        let n = {
+            let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+            self.oberflaeche_zeichnen(&mut c, ww, wh)
+        };
+        buf.present().ok();
+        self.nachwirkung(n);
+        self.ui.click = false;
+    }
+
+    /// Alles, was ueber dem Bild liegt: Startbildschirm, Wartebildschirm,
+    /// Lagemeldung, Statistik, Erstkontakt-Banner, Menue, Codecwechsel-
+    /// Hinweis, ESC-Balken. Zeichnet nur; was ein Klick bewirkt, kommt als
+    /// Nachwirkung zurueck und wird NACH dem Praesentieren ausgefuehrt.
+    fn oberflaeche_zeichnen(&mut self, c: &mut ui::Canvas, ww: u32, wh: u32) -> Nachwirkung {
+        let mut n = Nachwirkung { act: Action::None, hud: None, abbrechen: false };
         match self.screen {
             Screen::Start => {
                 let hosts = self
@@ -2232,36 +2339,11 @@ impl App {
                         None => s.error.clone(),
                     }
                 };
-                let Ok(mut buf) = surface.buffer_mut() else { return };
-                let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
-                let act = start_screen(&mut self.ui, &mut c, self.lang, &hosts, &self.addr_input, err.as_deref());
-                buf.present().ok();
-                match act {
-                    Action::Connect(addr) => {
-                        let addr = adresse_vollstaendig(&addr);
-                        self.addr_input = addr.clone();
-                        let input_addr = bump_port(&addr, 1);
-                        self.input.lock().unwrap().set_addr(input_addr);
-                        let mut s = self.shared.lock().unwrap();
-                        s.target = Some(addr);
-                        s.error = None;
-                        s.error_key = None;
-                        drop(s);
-                        self.screen = Screen::Session;
-                    }
-                    Action::Quit => self.quit = true,
-                    Action::NextLang => {
-                        let all = strings::all();
-                        let i = all.iter().position(|l| l.code == self.lang.code).unwrap_or(0);
-                        self.lang = all[(i + 1) % all.len()];
-                    }
-                    Action::Website => website_oeffnen(),
-                    Action::None => {}
-                }
+                n.act = start_screen(&mut self.ui, c, self.lang, &hosts, &self.addr_input, err.as_deref());
             }
             Screen::Session => {
                 // Noch kein Bild da: Wartebildschirm zeichnen statt gar nichts.
-                if self.last_frame.is_none() {
+                if !self.bild_vorhanden() {
                     let stand = {
                         let s = self.shared.lock().unwrap();
                         let f = match s.error_key {
@@ -2270,31 +2352,17 @@ impl App {
                         };
                         (s.connected, f, s.sas.clone(), s.info.is_some())
                     };
-                    let Ok(mut buf) = surface.buffer_mut() else { return };
-                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                     let adresse = self.addr_input.clone();
-                    let abbrechen = warte_screen(&mut self.ui, &mut c, self.lang, &adresse, stand);
-                    buf.present().ok();
-                    self.ui.click = false;
-                    if abbrechen {
-                        self.verbindung_trennen();
-                    }
-                    return;
+                    n.abbrechen = warte_screen(&mut self.ui, c, self.lang, &adresse, stand);
+                    return n;
                 }
-                let Some(frame) = self.last_frame.as_ref() else {
-                    self.ui.click = false;
-                    return;
-                };
-                let Ok(mut buf) = surface.buffer_mut() else { return };
-                blit(&mut buf, ww, wh, frame, self.pixel_exact);
                 // Lage des Hosts ueber dem stehenden Bild, falls er selbst
                 // gerade nichts liefern kann.
                 if let Some(k) = { self.shared.lock().unwrap().error_key } {
-                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                     let t = self.lang.get(k);
                     let tw = self.ui.text.width(t, 14, 1);
                     c.fill(ww as i32 / 2 - tw / 2 - 20, 16, tw + 40, 40, ui::BG, 200);
-                    self.ui.text.draw_centered(&mut c, ww as i32 / 2, 42, t, 14, ui::AMBER, 1);
+                    self.ui.text.draw_centered(c, ww as i32 / 2, 42, t, 14, ui::AMBER, 1);
                 }
                 if self.show_overlay {
                     let (stats, secure, lat, soll, hostlast, decoder) = {
@@ -2309,8 +2377,7 @@ impl App {
                         )
                     };
                     let hist = self.fps_hist.clone();
-                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
-                    overlay(&mut self.ui, &mut c, self.lang, self.fps_shown, &hist, stats, secure,
+                    overlay(&mut self.ui, c, self.lang, self.fps_shown, &hist, stats, secure,
                             lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder);
                 }
                 // Erstkontakt: Code gross anzeigen, solange es noch zaehlt.
@@ -2323,7 +2390,6 @@ impl App {
                 }
                 if let (Some(until), Some(sas)) = (self.banner_until, sas) {
                     if Instant::now() < until {
-                        let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                         let bw = 520.min(ww as i32 - 40);
                         // Neben der Statistiktafel, nicht darueber: die ist im
                         // Nerd-Modus breit und mit der Decoder-Zeile hoch.
@@ -2338,10 +2404,10 @@ impl App {
                         c.panel(bx, by, bw, bh, ui::AMBER);
                         let mut ty = by + 28;
                         for z in &zeilen {
-                            self.ui.text.draw_centered(&mut c, bx + bw / 2, ty, z, 13, ui::TEXT, 1);
+                            self.ui.text.draw_centered(c, bx + bw / 2, ty, z, 13, ui::TEXT, 1);
                             ty += 18;
                         }
-                        self.ui.text.draw_centered(&mut c, bx + bw / 2, ty + 24, &sas, 30, ui::AMBER, 6);
+                        self.ui.text.draw_centered(c, bx + bw / 2, ty + 24, &sas, 30, ui::AMBER, 6);
                     }
                 }
                 // Nerd-Modus. Liegt ueber allem, deshalb zuletzt gezeichnet.
@@ -2380,102 +2446,25 @@ impl App {
                         decoder: decoder_wunsch,
                         decoder_aktiv,
                     };
-                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
-                    let a = hud(
-                        &mut self.ui, &mut c, self.lang, ww as i32, wh as i32, reiter,
+                    n.hud = Some(hud(
+                        &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
                         lat, &lhist, fps_jetzt, &hist, info, stell, secure, &adresse, gespeichert,
                         &stand,
-                    );
-                    buf.present().ok();
-                    self.ui.click = false;
-                    match a {
-                        HudAktion::Reiter(r) => self.hud_reiter = r,
-                        HudAktion::Schalter(id) => {
-                            match id {
-                                SCH_VOLLBILD => {
-                                    self.fullscreen = !self.fullscreen;
-                                    self.cfg.vollbild = self.fullscreen;
-                                    if let Some(w) = &self.window {
-                                        w.set_fullscreen(if self.fullscreen {
-                                            Some(winit::window::Fullscreen::Borderless(None))
-                                        } else {
-                                            None
-                                        });
-                                    }
-                                }
-                                SCH_PIXELGENAU => {
-                                    self.pixel_exact = !self.pixel_exact;
-                                    self.cfg.pixelgenau = self.pixel_exact;
-                                }
-                                SCH_STATISTIK => {
-                                    self.show_overlay = !self.show_overlay;
-                                    self.cfg.overlay = self.show_overlay;
-                                }
-                                SCH_NERD => self.cfg.nerd = !self.cfg.nerd,
-                                SCH_STAT_FPS => self.cfg.stats.fps = !self.cfg.stats.fps,
-                                SCH_STAT_LATENZ => self.cfg.stats.latenz = !self.cfg.stats.latenz,
-                                SCH_STAT_TEILE => self.cfg.stats.teile = !self.cfg.stats.teile,
-                                SCH_STAT_AUFL => self.cfg.stats.aufloesung = !self.cfg.stats.aufloesung,
-                                SCH_STAT_CODEC => self.cfg.stats.codec = !self.cfg.stats.codec,
-                                SCH_STAT_VERW => self.cfg.stats.verworfen = !self.cfg.stats.verworfen,
-                                SCH_STAT_CODE => self.cfg.stats.code = !self.cfg.stats.code,
-                                _ => {}
-                            }
-                            self.cfg.sichern();
-                        }
-                        HudAktion::Trennen => self.verbindung_trennen(),
-                        HudAktion::Stellen(m, f, g, fx, ton) => {
-                            self.input.lock().unwrap().settings(m, f, g, fx, ton);
-                            self.shared.lock().unwrap().ton = ton;
-                            if let Some(fp) = &self.angewandt_fuer {
-                                let fp = fp.clone();
-                                self.cfg.host_merken(
-                                    &fp,
-                                    einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton },
-                                );
-                            }
-                        }
-                        HudAktion::Codec(idx) => {
-                            // Erst den Hinweis setzen, dann den Wunsch abschicken.
-                            // Andersherum koennte der Empfangsfaden Nachricht 7
-                            // und das erste Bild dazwischen verarbeiten und den
-                            // Hinweis loeschen, bevor er ueberhaupt steht - dann
-                            // bliebe er bis zum Ablauf der Frist haengen.
-                            self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
-                            self.input.lock().unwrap().codec(idx);
-                        }
-                        HudAktion::Decoder(w) => {
-                            // Merken, sichern, und dem Empfangsfaden Bescheid
-                            // geben - der baut den Decoder um, ohne die
-                            // Verbindung anzufassen. Verglichen wird mit dem
-                            // geltenden Wunsch (siehe oben); erst der Klick
-                            // macht ihn zur gespeicherten Wahl - ein blosses
-                            // --decoder schreibt nie in die Datei.
-                            if decoder_wunsch != w {
-                                self.cfg.decoder = w;
-                                self.cfg.sichern();
-                                let mut sh = self.shared.lock().unwrap();
-                                sh.decoder_wunsch = w;
-                                sh.decoder_wunsch_neu = true;
-                            }
-                        }
-                        HudAktion::Nichts => {}
-                    }
-                    return;
+                    ));
+                    return n;
                 }
 
                 // Codecwechsel unterwegs: der Host baut den Encoder um, das
                 // Bild steht ein paar hundert Millisekunden. Ohne Hinweis
                 // saehe das nach einem Haenger aus.
                 if self.shared.lock().unwrap().wechsel_laeuft() {
-                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                     let t = self.lang.get(strings::Key::CodecSwitching);
                     let bw = (self.ui.text.width(t, 12, 2) + 60).max(220).min(ww as i32 - 40);
                     let bh = 44i32;
                     let bx = ww as i32 / 2 - bw / 2;
                     let by = wh as i32 - 110;
                     c.panel(bx, by, bw, bh, ui::AMBER);
-                    self.ui.text.draw_centered(&mut c, bx + bw / 2, by + 27, t, 12, ui::AMBER, 2);
+                    self.ui.text.draw_centered(c, bx + bw / 2, by + 27, t, 12, ui::AMBER, 2);
                 }
 
                 // Rueckmeldung beim Halten von ESC. Erst ab einer Weile, damit
@@ -2486,13 +2475,12 @@ impl App {
                     let v = t.elapsed();
                     if v >= Duration::from_millis(400) && !self.esc_verbraucht {
                         let anteil = (v.as_secs_f32() / ESC_HALTEDAUER.as_secs_f32()).min(1.0);
-                        let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
                         let (bw, bh) = (340i32, 58i32);
                         let bx = ww as i32 / 2 - bw / 2;
                         let by = wh as i32 - 110;
                         c.panel(bx, by, bw, bh, ui::CYAN);
                         self.ui.text.draw_centered(
-                            &mut c, bx + bw / 2, by + 24,
+                            c, bx + bw / 2, by + 24,
                             self.lang.get(strings::Key::HoldEscHint), 12, ui::TEXT, 2,
                         );
                         c.rect(bx + 20, by + 38, bw - 40, 5, ui::DIM, 120);
@@ -2500,13 +2488,126 @@ impl App {
                         c.rect(bx + 20, by + 38, breit.max(1), 5, ui::CYAN, 240);
                     }
                 }
-
-                buf.present().ok();
             }
         }
-        self.ui.click = false;
-
+        n
     }
+
+    /// Die Folgen eines Klicks, nach dem Praesentieren: Verbinden, Beenden,
+    /// Sprache, Projektseite, Trennen und alles aus dem Menue.
+    fn nachwirkung(&mut self, n: Nachwirkung) {
+        match n.act {
+            Action::Connect(addr) => {
+                let addr = adresse_vollstaendig(&addr);
+                self.addr_input = addr.clone();
+                let input_addr = bump_port(&addr, 1);
+                self.input.lock().unwrap().set_addr(input_addr);
+                let mut s = self.shared.lock().unwrap();
+                s.target = Some(addr);
+                s.error = None;
+                s.error_key = None;
+                drop(s);
+                self.screen = Screen::Session;
+            }
+            Action::Quit => self.quit = true,
+            Action::NextLang => {
+                let all = strings::all();
+                let i = all.iter().position(|l| l.code == self.lang.code).unwrap_or(0);
+                self.lang = all[(i + 1) % all.len()];
+            }
+            Action::Website => website_oeffnen(),
+            Action::None => {}
+        }
+        if n.abbrechen {
+            self.verbindung_trennen();
+        }
+        let Some(a) = n.hud else { return };
+        match a {
+            HudAktion::Reiter(r) => self.hud_reiter = r,
+            HudAktion::Schalter(id) => {
+                match id {
+                    SCH_VOLLBILD => {
+                        self.fullscreen = !self.fullscreen;
+                        self.cfg.vollbild = self.fullscreen;
+                        if let Some(w) = &self.window {
+                            w.set_fullscreen(if self.fullscreen {
+                                Some(winit::window::Fullscreen::Borderless(None))
+                            } else {
+                                None
+                            });
+                        }
+                    }
+                    SCH_PIXELGENAU => {
+                        self.pixel_exact = !self.pixel_exact;
+                        self.cfg.pixelgenau = self.pixel_exact;
+                    }
+                    SCH_STATISTIK => {
+                        self.show_overlay = !self.show_overlay;
+                        self.cfg.overlay = self.show_overlay;
+                    }
+                    SCH_NERD => self.cfg.nerd = !self.cfg.nerd,
+                    SCH_STAT_FPS => self.cfg.stats.fps = !self.cfg.stats.fps,
+                    SCH_STAT_LATENZ => self.cfg.stats.latenz = !self.cfg.stats.latenz,
+                    SCH_STAT_TEILE => self.cfg.stats.teile = !self.cfg.stats.teile,
+                    SCH_STAT_AUFL => self.cfg.stats.aufloesung = !self.cfg.stats.aufloesung,
+                    SCH_STAT_CODEC => self.cfg.stats.codec = !self.cfg.stats.codec,
+                    SCH_STAT_VERW => self.cfg.stats.verworfen = !self.cfg.stats.verworfen,
+                    SCH_STAT_CODE => self.cfg.stats.code = !self.cfg.stats.code,
+                    _ => {}
+                }
+                self.cfg.sichern();
+            }
+            HudAktion::Trennen => self.verbindung_trennen(),
+            HudAktion::Stellen(m, f, g, fx, ton) => {
+                self.input.lock().unwrap().settings(m, f, g, fx, ton);
+                self.shared.lock().unwrap().ton = ton;
+                if let Some(fp) = &self.angewandt_fuer {
+                    let fp = fp.clone();
+                    self.cfg.host_merken(
+                        &fp,
+                        einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton },
+                    );
+                }
+            }
+            HudAktion::Codec(idx) => {
+                // Erst den Hinweis setzen, dann den Wunsch abschicken.
+                // Andersherum koennte der Empfangsfaden Nachricht 7
+                // und das erste Bild dazwischen verarbeiten und den
+                // Hinweis loeschen, bevor er ueberhaupt steht - dann
+                // bliebe er bis zum Ablauf der Frist haengen.
+                self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
+                self.input.lock().unwrap().codec(idx);
+            }
+            HudAktion::Decoder(w) => {
+                // Merken, sichern, und dem Empfangsfaden Bescheid
+                // geben - der baut den Decoder um, ohne die
+                // Verbindung anzufassen. Verglichen wird mit dem
+                // geltenden Wunsch aus `shared` (das Menue zeigt den, nicht
+                // die Datei); erst der Klick macht ihn zur gespeicherten
+                // Wahl - ein blosses --decoder schreibt nie in die Datei.
+                let geltend = self.shared.lock().unwrap().decoder_wunsch;
+                if geltend != w {
+                    self.cfg.decoder = w;
+                    self.cfg.sichern();
+                    let mut sh = self.shared.lock().unwrap();
+                    sh.decoder_wunsch = w;
+                    sh.decoder_wunsch_neu = true;
+                }
+            }
+            HudAktion::Nichts => {}
+        }
+    }
+}
+
+/// Was das Zeichnen der Oberflaeche nach sich zieht: Klicks, die erst NACH
+/// dem Praesentieren ausgefuehrt werden.
+struct Nachwirkung {
+    /// Startbildschirm.
+    act: Action,
+    /// Menue, falls es offen war.
+    hud: Option<HudAktion>,
+    /// Wartebildschirm: "Trennen" gedrueckt.
+    abbrechen: bool,
 }
 
 /// Was zwischen dem Klick auf einen Host und dem ersten Bild zu sehen ist.
@@ -2592,36 +2693,26 @@ fn bump_port(addr: &str, n: u16) -> String {
     }
 }
 
-fn blit(buf: &mut [u32], ww: u32, wh: u32, frame: &Frame, pixel_exact: bool) {
-    if ww == frame.width && wh == frame.height {
-        buf.copy_from_slice(&frame.pixels);
-        return;
-    }
-    let (fw, fh) = (frame.width as usize, frame.height as usize);
+/// Wo das Bild im Fenster liegt: (x, y, Breite, Hoehe). Bei 1:1 mittig und
+/// unskaliert - ist das Bild groesser als das Fenster, liegt es oben links
+/// an und ragt hinaus (blit beschneidet, die Karte spaeter ueber den
+/// Viewport). Sonst eingepasst statt verzerrt: das Bild behaelt sein
+/// Seitenverhaeltnis und bekommt Balken, wo das Fenster nicht passt. Vorher
+/// wurde schlicht auf die Fenstergroesse gezogen - in einem nicht 16:9
+/// grossen Fenster war der Mac-Bildschirm dadurch sichtbar verzerrt.
+///
+/// EINE Ganzzahlrechnung fuer blit und - sobald die Karte zeichnet - fuer
+/// deren Stufe 2, damit beide das Bild an dieselbe Stelle legen.
+pub fn ziel_rechteck(ww: u32, wh: u32, fw: u32, fh: u32, pixelgenau: bool) -> (i32, i32, u32, u32) {
+    let (winw, winh, fw, fh) = (ww as usize, wh as usize, fw as usize, fh as usize);
     if fw == 0 || fh == 0 {
-        return;
+        return (0, 0, 0, 0);
     }
-
-    if pixel_exact {
-        let ox = (ww as usize).saturating_sub(fw) / 2;
-        let oy = (wh as usize).saturating_sub(fh) / 2;
-        buf.fill(0x05070d);
-        let cols = fw.min(ww as usize);
-        let rows = fh.min(wh as usize);
-        buf.par_chunks_mut(ww as usize).enumerate().for_each(|(y, row)| {
-            if y >= oy && y < oy + rows {
-                let sy = y - oy;
-                row[ox..ox + cols].copy_from_slice(&frame.pixels[sy * fw..sy * fw + cols]);
-            }
-        });
-        return;
+    if pixelgenau {
+        let ox = winw.saturating_sub(fw) / 2;
+        let oy = winh.saturating_sub(fh) / 2;
+        return (ox as i32, oy as i32, fw as u32, fh as u32);
     }
-
-    // Einpassen statt verzerren: das Bild behaelt sein Seitenverhaeltnis und
-    // bekommt Balken, wo das Fenster nicht passt. Vorher wurde schlicht auf
-    // die Fenstergroesse gezogen - in einem nicht 16:9 grossen Fenster war
-    // der Mac-Bildschirm dadurch sichtbar verzerrt.
-    let (winw, winh) = (ww as usize, wh as usize);
     let breit = (winw * fh) >= (winh * fw);
     let (zw, zh) = if breit {
         let h = winh;
@@ -2634,7 +2725,35 @@ fn blit(buf: &mut [u32], ww: u32, wh: u32, frame: &Frame, pixel_exact: bool) {
     let zh = zh.max(1).min(winh);
     let ox = (winw - zw) / 2;
     let oy = (winh - zh) / 2;
+    (ox as i32, oy as i32, zw as u32, zh as u32)
+}
 
+fn blit(buf: &mut [u32], ww: u32, wh: u32, frame: &Frame, pixel_exact: bool) {
+    if ww == frame.width && wh == frame.height {
+        buf.copy_from_slice(&frame.pixels);
+        return;
+    }
+    let (fw, fh) = (frame.width as usize, frame.height as usize);
+    if fw == 0 || fh == 0 {
+        return;
+    }
+    let (ox, oy, zw, zh) = ziel_rechteck(ww, wh, frame.width, frame.height, pixel_exact);
+    let (ox, oy, zw, zh) = (ox as usize, oy as usize, zw as usize, zh as usize);
+
+    if pixel_exact {
+        buf.fill(0x05070d);
+        let cols = zw.min(ww as usize);
+        let rows = zh.min(wh as usize);
+        buf.par_chunks_mut(ww as usize).enumerate().for_each(|(y, row)| {
+            if y >= oy && y < oy + rows {
+                let sy = y - oy;
+                row[ox..ox + cols].copy_from_slice(&frame.pixels[sy * fw..sy * fw + cols]);
+            }
+        });
+        return;
+    }
+
+    let winw = ww as usize;
     buf.fill(0x05070d);
 
     // Weiche Abtastung in 16.16-Festkomma. Beim Verkleinern ist das der
@@ -3114,7 +3233,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         let sas = Some("628 306".to_string());
         let fp = Some("9EB4-EC3D-6856-8AF6".to_string());
         {
-            let mut c = ui::Canvas { buf: &mut buf, w, h };
+            let mut c = ui::Canvas::neu(&mut buf, w, h);
             let probe = Latenz {
                 versatz_us: 1, umlauf_ms: 0.4, encoder_ms: 4.2, leitung_ms: 2.6,
                 decoder_ms: 2.1, gesamt_ms: 17.3, bilder: 900,
@@ -3163,7 +3282,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         let lh: Vec<f32> = (0..200).map(|i| 24.0 + 5.0 * ((i as f32) / 11.0).sin()).collect();
         let fh: Vec<f32> = (0..200).map(|i| 104.0 + 9.0 * ((i as f32) / 7.0).cos()).collect();
         let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true });
-        let mut c = ui::Canvas { buf: &mut buf, w, h };
+        let mut c = ui::Canvas::neu(&mut buf, w, h);
         // Nachgestellte Koennensliste, wie sie der Mac mini schickt: AV1
         // fehlt ihm, 4:4:4 8 Bit und 4:2:0 10 Bit brauchen die Umrechnung.
         let eintrag = |idx: u8, name: &str, available: bool, conversion: bool, chroma444: bool, ten_bit: bool| CodecEintrag {
@@ -3209,7 +3328,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         },
     ];
     {
-        let mut c = ui::Canvas { buf: &mut buf, w, h };
+        let mut c = ui::Canvas::neu(&mut buf, w, h);
         let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", None);
     }
 

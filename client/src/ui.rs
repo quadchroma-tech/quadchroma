@@ -18,30 +18,91 @@ pub const AMBER: u32 = 0xffb300;
 pub const TEXT: u32 = 0xd7e3ec;
 pub const DIM: u32 = 0x5d7183;
 
+// Ein Bildpunkt ist 0xTTRRGGBB: das oberste Byte ist die DURCHSICHT T
+// (255 = ganz durchsichtig, 0 = deckend), die Farbe ist mit der Deckung
+// vormultipliziert. Alle Farbkonstanten und jedes hingelegte Videobild
+// haben T = 0; eine Mischung ueber einem deckenden Ziel bleibt deckend, und
+// ihre RGB-Bytes sind dieselben wie ohne das T-Byte - deshalb aendert sich
+// an den Schnappschuessen kein Bit, und softbuffer bekommt weiter eine Null
+// im obersten Byte. Erst eine Oberflaeche, die ueber einem LEEREN Puffer
+// (T = 255, Farbe 0) gezeichnet wird, traegt in T, wie viel vom Bild
+// darunter noch durchscheint: Bild * T/255 + Farbe ist dann genau das, was
+// die sequentielle Mischung hier ergeben haette.
 #[inline(always)]
 fn mix(dst: u32, src: u32, a: u32) -> u32 {
     if a == 0 { return dst; }
     if a >= 255 { return src; }
     let (dr, dg, db) = ((dst >> 16) & 255, (dst >> 8) & 255, dst & 255);
     let (sr, sg, sb) = ((src >> 16) & 255, (src >> 8) & 255, src & 255);
+    // Die Durchsicht schrumpft mit jeder Schicht: was zu a/255 gedeckt
+    // wird, laesst nur noch (255-a)/255 des Darunterliegenden durch.
+    let t = ((dst >> 24) * (255 - a)) / 255;
     let r = (sr * a + dr * (255 - a)) / 255;
     let g = (sg * a + dg * (255 - a)) / 255;
     let b = (sb * a + db * (255 - a)) / 255;
-    (r << 16) | (g << 8) | b
+    (t << 24) | (r << 16) | (g << 8) | b
 }
 
 pub struct Canvas<'a> {
     pub buf: &'a mut [u32],
     pub w: usize,
     pub h: usize,
+    /// Schmutzrechteck: die Vereinigung von allem, was seit dem letzten
+    /// `kasten_nehmen` beschrieben wurde. Wer die Oberflaeche in eine
+    /// Textur laedt, laedt nur das - nicht das ganze Fenster.
+    pub kasten: Option<Rect>,
 }
 
 impl<'a> Canvas<'a> {
+    pub fn neu(buf: &'a mut [u32], w: usize, h: usize) -> Self {
+        Canvas { buf, w, h, kasten: None }
+    }
+
     #[inline(always)]
     pub fn px(&mut self, x: i32, y: i32, color: u32, alpha: u32) {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h { return; }
         let i = y as usize * self.w + x as usize;
         self.buf[i] = mix(self.buf[i], color, alpha);
+        self.merke_punkt(x, y);
+    }
+
+    /// Einen Punkt in den Kasten aufnehmen. Je Punkt vier Vergleiche -
+    /// billig neben der Mischung, und damit ist jeder direkte px-Aufruf
+    /// eines Bedienteils von selbst erfasst.
+    #[inline(always)]
+    fn merke_punkt(&mut self, x: i32, y: i32) {
+        match &mut self.kasten {
+            Some(k) => {
+                if x < k.x { k.w += k.x - x; k.x = x; } else if x >= k.x + k.w { k.w = x - k.x + 1; }
+                if y < k.y { k.h += k.y - y; k.y = y; } else if y >= k.y + k.h { k.h = y - k.y + 1; }
+            }
+            None => self.kasten = Some(Rect { x, y, w: 1, h: 1 }),
+        }
+    }
+
+    /// Ein Rechteck in den Kasten aufnehmen, auf die Flaeche beschnitten.
+    /// Fuer alles, was am px vorbei schreibt (fill, backdrop).
+    pub fn merke(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = x.saturating_add(w).min(self.w as i32);
+        let y1 = y.saturating_add(h).min(self.h as i32);
+        if x1 <= x0 || y1 <= y0 { return; }
+        self.kasten = Some(match self.kasten {
+            None => Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 },
+            Some(k) => {
+                let (nx, ny) = (k.x.min(x0), k.y.min(y0));
+                let (ex, ey) = ((k.x + k.w).max(x1), (k.y + k.h).max(y1));
+                Rect { x: nx, y: ny, w: ex - nx, h: ey - ny }
+            }
+        });
+    }
+
+    /// Den Kasten abholen und leeren. Noch ungenutzt: der Upload der
+    /// Oberflaeche in eine Textur kommt mit der Anzeige ueber die Karte.
+    #[allow(dead_code)]
+    pub fn kasten_nehmen(&mut self) -> Option<Rect> {
+        self.kasten.take()
     }
 
     /// Grosse Flaeche mischen. Anders als rect() wird einmal am Rand
@@ -55,6 +116,7 @@ impl<'a> Canvas<'a> {
         let x1 = (x + w).clamp(0, self.w as i32) as usize;
         let y1 = (y + h).clamp(0, self.h as i32) as usize;
         if x1 <= x0 || y1 <= y0 { return; }
+        self.merke(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
         let a = alpha.min(255);
         let k = 256 - a;
         let cr = ((color & 0x00ff00ff) * a >> 8) & 0x00ff00ff;
@@ -65,7 +127,10 @@ impl<'a> Canvas<'a> {
             for p in zeile.iter_mut() {
                 let rb = ((*p & 0x00ff00ff) * k >> 8) & 0x00ff00ff;
                 let g = ((*p & 0x0000ff00) * k >> 8) & 0x0000ff00;
-                *p = (rb + cr) | (g + cg);
+                // Die Durchsicht mit demselben Faktor wie die Farbe; bei
+                // einem deckenden Ziel (T = 0) bleibt sie null.
+                let t = (((*p >> 24) * k) >> 8) << 24;
+                *p = t | (rb + cr) | (g + cg);
             }
         }
     }
@@ -122,6 +187,7 @@ impl<'a> Canvas<'a> {
     /// Hintergrund: Grundton, Raster, und ein langsam wanderndes Band.
     pub fn backdrop(&mut self, tick: u64) {
         self.buf.fill(BG);
+        self.merke(0, 0, self.w as i32, self.h as i32);
         let step = 28;
         let mut x = 0;
         while x < self.w as i32 { self.vline(x, 0, self.h as i32, GRID, 255); x += step; }
