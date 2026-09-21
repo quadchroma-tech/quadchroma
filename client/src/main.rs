@@ -33,6 +33,8 @@ mod ui;
 mod audio;
 #[cfg(windows)]
 mod clipboard;
+#[cfg(windows)]
+mod anzeige;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -1580,6 +1582,14 @@ impl EbenenFormat {
     /// Bytes je Wert in den Ebenen.
     pub fn bpp(&self) -> u32 {
         if self.bits == 8 { 1 } else { 2 }
+    }
+
+    /// Verschiebung, mit der aus einem Wert die acht Anzeigebits werden -
+    /// dieselbe wie in `wert::<BITS>`: 8 Bit keine, 10 Bit LE zwei, oben
+    /// buendige 16 Bit acht. Die Karte rechnet damit, `zeile_rgb` ueber
+    /// die Konstante.
+    pub fn schieb(&self) -> u32 {
+        match self.bits { 8 => 0, 10 => 2, _ => 8 }
     }
 }
 
@@ -3725,6 +3735,28 @@ fn main() {
             }
         }
         return;
+    }
+
+    // Anzeige ueber die Karte ohne Fenster pruefen: --anzeigetest [verzeichnis]
+    // rechnet jedes Decoderformat einmal auf der Karte und einmal auf der
+    // CPU und vergleicht (Goldbildtest, Differenzbilder ins Verzeichnis).
+    // Laeuft auch ohne Grafikkarte ueber WARP. Exit-Code 0 nur, wenn alles
+    // innerhalb der Toleranz liegt - damit ein Skript es merkt.
+    #[cfg(windows)]
+    {
+        if let Some(i) = std::env::args().position(|a| a == "--anzeigetest") {
+            use std::io::Write;
+            let args: Vec<String> = std::env::args().collect();
+            let verzeichnis = args.get(i + 1).cloned().unwrap_or_else(|| ".".into());
+            if let Err(e) = ffmpeg::init() {
+                println!("FFmpeg-Start fehlgeschlagen: {e}");
+                std::process::exit(2);
+            }
+            protokoll::einschalten(false);
+            let bestanden = anzeige::anzeigetest(&verzeichnis);
+            std::io::stdout().flush().ok();
+            std::process::exit(if bestanden { 0 } else { 1 });
+        }
     }
 
     // Bild der Oberflaeche schreiben und beenden: --shot datei.bmp [sprache]
