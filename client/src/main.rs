@@ -79,6 +79,7 @@ const ESC_TIPPDAUER: Duration = Duration::from_millis(60);
 const MSG_TIME: u8 = 4;
 const MSG_STAMP: u8 = 5;
 const MSG_LAST: u8 = 6;
+const MSG_HOSTSTATUS: u8 = 9;
 const MSG_VIDEO: u8 = 2;
 /// Ab hier neuer Codec: Decoder wegwerfen, das naechste Bild ist ein
 /// Schluesselbild mit Parametersaetzen.
@@ -422,6 +423,9 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // Der Decoder ist eine eigene Variable, keine Leihgabe: bei einem Wechsel
     // wird sie schlicht neu zugewiesen, und der alte Decoder faellt weg.
     let mut decoder = decoder_bauen(false)?;
+    // Wofuer der Decoder gebaut ist. Die Strominfo entscheidet gleich, ob
+    // das passt - der Host kann laengst auf einem anderen Codec stehen.
+    let mut decoder_h264 = false;
     // Nach einem Wechsel darf nichts in den neuen Decoder, bevor das erste
     // Schluesselbild da ist - es traegt die Parametersaetze.
     let mut warte_auf_schluesselbild = false;
@@ -480,8 +484,34 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         match msg_type {
             MSG_INFO => {
                 if let Some(i) = StreamInfo::parse(&payload) {
+                    // Steht der Host schon auf einem anderen Codec als dem, fuer
+                    // den der Decoder gebaut wurde, muss der Decoder jetzt
+                    // passen. Sonst versucht ein HEVC-Decoder, H.264 zu lesen,
+                    // und es kommt nie ein Bild - so geschehen heute Morgen.
+                    let h264 = i.codec == 2;
+                    if h264 != decoder_h264 {
+                        decoder = decoder_bauen(h264)?;
+                        decoder_h264 = h264;
+                        warte_auf_schluesselbild = true;
+                        nach_wechsel = true;
+                        ring.clear();
+                        mittel = None;
+                    }
                     info = Some(i);
                     shared.lock().unwrap().info = Some(i);
+                }
+            }
+            MSG_HOSTSTATUS => {
+                // Der Host sagt selbst, ob er gerade ein Bild liefern kann -
+                // etwa wenn sein Bildschirm weg ist. Sonst saehe das aus wie
+                // eine tote Verbindung.
+                if len >= 1 {
+                    let mut s = shared.lock().unwrap();
+                    if payload[0] == 1 {
+                        s.error_key = Some(strings::Key::NoDisplay);
+                    } else if s.error_key == Some(strings::Key::NoDisplay) {
+                        s.error_key = None;
+                    }
                 }
             }
             MSG_CODECS => {
@@ -497,6 +527,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // Mit Bildparallelitaet (--faeden frame) gehen beim Wechsel bis zu
                 // 15 zurueckgehaltene Bilder verloren; sauber leeren ist eine spaetere Verfeinerung.
                 decoder = decoder_bauen(w.is_h264)?;
+                decoder_h264 = w.is_h264;
                 warte_auf_schluesselbild = true;
                 nach_wechsel = true;
                 ring.clear();
@@ -1544,6 +1575,15 @@ impl App {
                 };
                 let Ok(mut buf) = surface.buffer_mut() else { return };
                 blit(&mut buf, ww, wh, frame, self.pixel_exact);
+                // Lage des Hosts ueber dem stehenden Bild, falls er selbst
+                // gerade nichts liefern kann.
+                if let Some(k) = { self.shared.lock().unwrap().error_key } {
+                    let mut c = ui::Canvas { buf: &mut buf, w: ww as usize, h: wh as usize };
+                    let t = self.lang.get(k);
+                    let tw = self.ui.text.width(t, 14, 1);
+                    c.fill(ww as i32 / 2 - tw / 2 - 20, 16, tw + 40, 40, ui::BG, 200);
+                    self.ui.text.draw_centered(&mut c, ww as i32 / 2, 42, t, 14, ui::AMBER, 1);
+                }
                 if self.show_overlay {
                     let (stats, secure, lat, soll, hostlast) = {
                         let s = self.shared.lock().unwrap();

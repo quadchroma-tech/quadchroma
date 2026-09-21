@@ -36,6 +36,7 @@
 #import "clipboard.h"
 #include "qc_secure.h"
 #import "last.h"
+#import <IOKit/pwr_mgt/IOPMLib.h>
 
 // ------------------------------------------------------------------ Logging
 
@@ -172,6 +173,19 @@ static qc_codec_befund g_befund[QC_KANDIDATEN];
 // wissen muss, leitet sich hieraus ab - nicht aus dem Zustand beim Start.
 static _Atomic int g_codec_id = 0;
 
+// --- Aufnahme wiederherstellen ----------------------------------------
+// Faellt der Bildschirm weg (Monitor aus, Displayschlaf, Neuerkennung),
+// beendet ScreenCaptureKit die Aufnahme. Ein Fernsteuerungs-Host muss das
+// ueberleben: er wartet, bis wieder ein Bildschirm da ist, und baut die
+// Aufnahme dann selbst neu auf. Der Client erfaehrt derweil, woran es liegt.
+static id g_grab = nil;                       // der Empfaenger der Aufnahme, wird wiederverwendet
+static int g_display_idx = 0;
+static _Atomic int g_fixed_gewollt = 0;       // was der Benutzer will, unabhaengig vom Ausfall
+static int g_kein_bildschirm_gemeldet = 0;
+static IOPMAssertionID g_wach = kIOPMNullAssertionID;
+static void aufnahme_wiederherstellen(void);
+static void hoststatus_senden(uint8_t lage);
+
 // Aufnahmeformat je Kandidat. ScreenCaptureKit kennt kein 4:4:4 mit 8 Bit,
 // also muss VideoToolbox dort umrechnen - und das steht dann dran, denn eine
 // stille Umrechnung verfaelscht genau den Vergleich, um den es geht.
@@ -259,8 +273,14 @@ static void send_small(uint8_t type, const void *data, size_t len) {
 #define QC_MSG_SWITCH     7    // Host -> Client: ab hier neuer Codec, Decoder zuruecksetzen
 #define QC_MSG_CODECS     8    // Host -> Client: was dieser Mac codieren kann
 #define QC_IN_CODEC       66   // Client -> Host: Codecwunsch (u8 Index)
+#define QC_MSG_HOSTSTATUS 9    // Host -> Client: u8 Lage (0 = in Ordnung, 1 = kein Bildschirm)
 #define QC_IN_TIME        65   // Client -> Host: Frage zum Zeitabgleich
 #define QC_IN_SETTINGS    64   // Client -> Host: was gewuenscht wird
+static void hoststatus_senden(uint8_t lage) {
+    uint8_t b[2] = { lage, 0 };
+    send_small(QC_MSG_HOSTSTATUS, b, sizeof b);
+}
+
 #define QC_MSG_AUDIO_INFO 32
 #define QC_MSG_AUDIO      33
 #define QC_MSG_CLIP       48
@@ -632,6 +652,7 @@ static void apply_settings(int mbit, int fps, int gaming, int fixed) {
     atomic_store(&g_cur_fps, fps);
     atomic_store(&g_cur_gaming, gaming);
     atomic_store(&g_cur_fixed, fixed);
+    atomic_store(&g_fixed_gewollt, fixed);
     atomic_store(&g_force_key, 1);
 
     // Der Takt fuer die feste Bildrate haengt an der eingestellten Rate.
@@ -1431,6 +1452,13 @@ static void fixed_tick(void) {
     dispatch_async(g_capq ?: dispatch_get_main_queue(), ^{
         if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
     });
+    // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
+    g_stream = nil;
+    hoststatus_senden(1);
+    // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        aufnahme_wiederherstellen();
+    });
 }
 
 @end
@@ -1472,6 +1500,56 @@ static void list_displays(void) {
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+}
+
+static void aufnahme_wiederherstellen(void) {
+    // Auf einer Hintergrundwarteschlange: pick_display wartet blockierend auf
+    // ScreenCaptureKit, und das darf weder die Aufnahme- noch die Hauptschleife
+    // anhalten.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        size_t pw = 0, ph = 0; double hz = 0;
+        SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
+        if (!d) {
+            if (!g_kein_bildschirm_gemeldet) {
+                g_kein_bildschirm_gemeldet = 1;
+                logf_(@"Kein Bildschirm - warte auf seine Rueckkehr");
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                aufnahme_wiederherstellen();
+            });
+            return;
+        }
+        g_kein_bildschirm_gemeldet = 0;
+
+        SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
+        int fps = atomic_load(&g_cur_fps);
+        if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
+        SCStream *st = [[SCStream alloc] initWithFilter:f configuration:g_cfg delegate:g_grab];
+        NSError *err = nil;
+        if (![st addStreamOutput:g_grab type:SCStreamOutputTypeScreen sampleHandlerQueue:g_capq error:&err]) {
+            logf_(@"Aufnahme: Ausgabe nicht anmeldbar (%@), neuer Versuch", err.localizedDescription);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                aufnahme_wiederherstellen();
+            });
+            return;
+        }
+        qc_audio_attach(st, audio_cb);
+        [st startCaptureWithCompletionHandler:^(NSError *e) {
+            if (e) {
+                logf_(@"Aufnahme: Start misslungen (%@, Code %ld), neuer Versuch", e.localizedDescription, (long)e.code);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                    aufnahme_wiederherstellen();
+                });
+                return;
+            }
+            g_stream = st;
+            atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
+            atomic_store(&g_force_key, 1);
+            atomic_store(&g_wait_key, 1);
+            hoststatus_senden(0);
+            logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
+        }];
+    });
 }
 
 int main(int argc, const char *argv[]) { @autoreleasepool {
@@ -1579,6 +1657,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     NSString *outPath = nil;
     if ([args containsObject:@"--fest"] || [args containsObject:@"--fixed"])
         atomic_store(&g_cur_fixed, 1);
+        atomic_store(&g_fixed_gewollt, 1);
     NSInteger i;
     if (capIdx != NSNotFound) {
         seconds = [args[capIdx + 1] doubleValue];
@@ -1618,6 +1697,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         start_input_server(port + 1, display.displayID);
         start_beacon(port);
         BOOL ax = AXIsProcessTrusted();
+        // Im Dienstbetrieb darf der Bildschirm nicht von selbst einschlafen -
+        // genau dann will jemand aus der Ferne darauf. Gegen einen abgeschalteten
+        // Monitor hilft das nicht; dafuer gibt es die Wiederherstellung.
+        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep,
+                                    kIOPMAssertionLevelOn,
+                                    CFSTR("QuadChroma streamt diesen Bildschirm"), &g_wach);
         logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
         logf_(@"Display %d (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", displayIdx, pxW, pxH, hz, outW, outH, fps);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
@@ -1644,6 +1729,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
     Grabber *grab = [[Grabber alloc] init];
+    g_grab = grab;
+    g_display_idx = displayIdx;
     SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:grab];
     g_stream = stream;
     g_cfg = cfg;
