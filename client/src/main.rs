@@ -454,7 +454,11 @@ struct Shared {
     /// Fehler, fuer den es einen uebersetzten Text gibt. Hat Vorrang vor `error`.
     error_key: Option<strings::Key>,
     /// Was auf dem Host gerade gilt: Mbit/s, Bilder je Sekunde, Gaming-Schalter.
-    settings: Option<(u32, u16, bool, bool)>,
+    /// Was beim Host gilt: Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton.
+    settings: Option<(u32, u16, bool, bool, bool)>,
+    /// Ton gewuenscht? Der Client haelt sich selbst daran - auch gegenueber
+    /// einem Host, der den Schalter noch nicht kennt und weiter Ton schickt.
+    ton: bool,
     /// Auslastung des Hosts, einmal je Sekunde.
     hostlast: Option<HostLast>,
     /// Zeitabgleich mit dem Host und die daraus gewonnene Latenzzerlegung.
@@ -1273,7 +1277,9 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 if len >= 8 {
                     let mbit = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     let fps = u16::from_le_bytes([payload[4], payload[5]]);
-                    shared.lock().unwrap().settings = Some((mbit, fps, payload[6] != 0, payload[7] != 0));
+                    // Neuntes Byte: Ton. Ein aelterer Host schickt acht - dann gilt "an".
+                    let ton = if len >= 9 { payload[8] != 0 } else { true };
+                    shared.lock().unwrap().settings = Some((mbit, fps, payload[6] != 0, payload[7] != 0, ton));
                 }
             }
             MSG_AUDIO_INFO => {
@@ -1289,7 +1295,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             }
             MSG_AUDIO => {
                 #[cfg(windows)]
-                if let Some(a) = &sound {
+                if let Some(a) = sound.as_ref().filter(|_| shared.lock().unwrap().ton) {
                     // Der Empfangspuffer ist nicht ausgerichtet, deshalb Wert fuer Wert.
                     pcm.clear();
                     pcm.reserve(len / 4);
@@ -1644,13 +1650,14 @@ impl InputLink {
         self.send(IN_TIME, &t1.to_le_bytes());
     }
 
-    /// Wunsch an den Host: Bitrate, Bildrate, Spielmodus, feste Bildrate.
-    fn settings(&mut self, mbit: u32, fps: u16, gaming: bool, fixed: bool) {
-        let mut p = [0u8; 8];
+    /// Wunsch an den Host: Bitrate, Bildrate, Spielmodus, feste Bildrate, Ton.
+    fn settings(&mut self, mbit: u32, fps: u16, gaming: bool, fixed: bool, ton: bool) {
+        let mut p = [0u8; 9];
         p[0..4].copy_from_slice(&mbit.to_le_bytes());
         p[4..6].copy_from_slice(&fps.to_le_bytes());
         p[6] = gaming as u8;
         p[7] = fixed as u8;
+        p[8] = ton as u8;
         self.send(IN_SETTINGS, &p);
     }
 
@@ -2073,7 +2080,10 @@ impl ApplicationHandler for App {
         match (&fp, &self.angewandt_fuer) {
             (Some(f), keiner) if keiner.as_deref() != Some(f.as_str()) => {
                 if let Some(w) = self.cfg.fuer_host(f) {
-                    self.input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest);
+                    self.input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
+                    self.shared.lock().unwrap().ton = w.ton;
+                } else {
+                    self.shared.lock().unwrap().ton = true;
                 }
                 self.angewandt_fuer = Some(f.clone());
             }
@@ -2385,13 +2395,14 @@ impl App {
                             self.cfg.sichern();
                         }
                         HudAktion::Trennen => self.verbindung_trennen(),
-                        HudAktion::Stellen(m, f, g, fx) => {
-                            self.input.lock().unwrap().settings(m, f, g, fx);
+                        HudAktion::Stellen(m, f, g, fx, ton) => {
+                            self.input.lock().unwrap().settings(m, f, g, fx, ton);
+                            self.shared.lock().unwrap().ton = ton;
                             if let Some(fp) = &self.angewandt_fuer {
                                 let fp = fp.clone();
                                 self.cfg.host_merken(
                                     &fp,
-                                    einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx },
+                                    einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton },
                                 );
                             }
                         }
@@ -3149,7 +3160,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         let reiter = match view { "hud2" => 1u8, "hud3" => 2, _ => 0 };
         let _ = hud(
             &mut u, &mut c, lang, w as i32, h as i32, reiter,
-            Some(l), &lh, 104.0, &fh, info, Some((50, 120, false, true)),
+            Some(l), &lh, 104.0, &fh, info, Some((50, 120, false, true, true)),
             (Some("841 177".into()), Some("9EB4-EC3D-6856-8AF6".into())),
             "192.168.178.194:9001", true, &stand,
         );
@@ -3306,7 +3317,8 @@ fn main() {
         .and_then(|v| einstellungen::DecoderWunsch::aus(&v))
         .unwrap_or(cfg.decoder);
 
-    let shared = Arc::new(Mutex::new(Shared { decoder_wunsch, ..Shared::default() }));
+    // Ton ist an, bis jemand ihn abschaltet - Default waere "aus".
+    let shared = Arc::new(Mutex::new(Shared { decoder_wunsch, ton: true, ..Shared::default() }));
     {
         let shared = shared.clone();
         let inp = input.clone();
@@ -3321,7 +3333,7 @@ fn main() {
     if headless {
         use std::io::Write;
         // Einmaliger Stellwunsch aus der Befehlszeile, nur im Pruefmodus.
-        let mut wish: Option<(u32, u16, bool, bool)> = None;
+        let mut wish: Option<(u32, u16, bool, bool, bool)> = None;
         if let Some(i) = std::env::args().position(|a| a == "--set") {
             let args: Vec<String> = std::env::args().collect();
             if let Some(v) = args.get(i + 1) {
@@ -3332,6 +3344,7 @@ fn main() {
                         p[1].parse().unwrap_or(60),
                         p[2] != "0",
                         p.get(3).map(|x| *x != "0").unwrap_or(false),
+                        p.get(4).map(|x| *x != "0").unwrap_or(true),
                     ));
                 }
             }
@@ -3400,10 +3413,10 @@ fn main() {
                 // --set mbit,fps,gaming stellt einmal um, damit sich die
                 // Einstellungen auch ohne Fenster pruefen lassen.
                 if let Some(w) = wish.take() {
-                    l.settings(w.0, w.1, w.2, w.3);
+                    l.settings(w.0, w.1, w.2, w.3, w.4);
                     println!(
-                        "Einstellung gewuenscht: {} Mbit/s, {} fps, Gaming {}, feste Bildrate {}",
-                        w.0, w.1, w.2, w.3
+                        "Einstellung gewuenscht: {} Mbit/s, {} fps, Gaming {}, feste Bildrate {}, Ton {}",
+                        w.0, w.1, w.2, w.3, w.4
                     );
                 }
                 // --codec <idx> wuenscht einmal einen Kandidaten. Erst, wenn der
@@ -3499,7 +3512,8 @@ pub enum HudAktion {
     Nichts,
     Reiter(u8),
     Trennen,
-    Stellen(u32, u16, bool, bool),
+    /// Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton.
+    Stellen(u32, u16, bool, bool, bool),
     Schalter(u8),
     /// Wunsch nach diesem Kandidaten der Koennensliste.
     Codec(u8),
@@ -3559,7 +3573,7 @@ fn hud(
     fps_jetzt: f32,
     fps_hist: &[f32],
     info: Option<StreamInfo>,
-    stell: Option<(u32, u16, bool, bool)>,
+    stell: Option<(u32, u16, bool, bool, bool)>,
     secure: (Option<String>, Option<String>),
     adresse: &str,
     gespeichert: bool,
@@ -3644,7 +3658,7 @@ fn hud(
     let fy = y0 + hoehe - p(22);
     match reiter {
         0 => {
-            let (mbit, fps_soll, gaming, fest) = stell.unwrap_or((0, 0, false, false));
+            let (mbit, fps_soll, gaming, fest, ton) = stell.unwrap_or((0, 0, false, false, true));
             let stellen = |u: &mut ui::Ui, c: &mut ui::Canvas, sx: i32, sy: i32, label: &str, wert: String| -> i32 {
                 u.text.draw(c, sx, sy + p(14), label, sz(11), ui::DIM, p(1));
                 u.text.draw(c, sx, sy + p(40), &wert, sz(18), ui::TEXT, p(1));
@@ -3662,17 +3676,23 @@ fn hud(
             let d = stellen(u, c, ix, cy, lang.get(MaxBitrate), format!("{mbit} Mbit/s"));
             if d != 0 {
                 let schritt = if mbit >= 100 { 25 } else if mbit >= 30 { 10 } else { 5 };
-                aktion = HudAktion::Stellen((mbit as i32 + d * schritt).clamp(2, 500) as u32, fps_soll, gaming, fest);
+                aktion = HudAktion::Stellen((mbit as i32 + d * schritt).clamp(2, 500) as u32, fps_soll, gaming, fest, ton);
             }
             let d = stellen(u, c, ix + iw / 2, cy, lang.get(MaxFps), format!("{fps_soll}"));
             if d != 0 {
-                aktion = HudAktion::Stellen(mbit, (fps_soll as i32 + d * 10).clamp(10, 240) as u16, gaming, fest);
+                aktion = HudAktion::Stellen(mbit, (fps_soll as i32 + d * 10).clamp(10, 240) as u16, gaming, fest, ton);
             }
             if u.toggle(c, ui::Rect { x: ix, y: cy + p(70), w: iw / 2 - p(30), h: p(28) }, lang.get(GamingMode), gaming) {
-                aktion = HudAktion::Stellen(mbit, fps_soll, !gaming, fest);
+                aktion = HudAktion::Stellen(mbit, fps_soll, !gaming, fest, ton);
             }
             if u.toggle(c, ui::Rect { x: ix + iw / 2, y: cy + p(70), w: iw / 2 - p(30), h: p(28) }, lang.get(FixedRate), fest) {
-                aktion = HudAktion::Stellen(mbit, fps_soll, gaming, !fest);
+                aktion = HudAktion::Stellen(mbit, fps_soll, gaming, !fest, ton);
+            }
+            // Ton: unter dem Spielmodus, neben dem Hinweis zur festen Bildrate.
+            // Aus heisst aus - beim Host (kein Paket mehr) und hier (nichts
+            // mehr abgespielt, falls der Host den Schalter nicht kennt).
+            if u.toggle(c, ui::Rect { x: ix, y: cy + p(104), w: iw / 2 - p(30), h: p(28) }, lang.get(Sound), ton) {
+                aktion = HudAktion::Stellen(mbit, fps_soll, gaming, fest, !ton);
             }
             for (i, z) in umbruch(u, lang.get(FixedRateHint), iw / 2 - p(40), sz(10)).iter().enumerate() {
                 u.text.draw(c, ix + iw / 2, cy + p(104) + i as i32 * p(15), z, sz(10), ui::DIM, p(1));

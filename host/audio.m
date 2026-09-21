@@ -291,11 +291,23 @@ void qc_audio_configure(SCStreamConfiguration *cfg) {
 
 void qc_audio_attach(SCStream *stream, void (*send_cb)(const float *pcm, size_t frames, uint32_t rate, uint8_t channels)) {
     if (!stream || !send_cb) return;
-    if (g_tap) { qc_alog(@"Tonabgriff haengt schon am Strom"); return; }
-
     atomic_store(&g_send, (qc_send_fn)send_cb);
     g_expect = kCMTimeInvalid;
     g_have_expect = NO;
+    if (g_tap) {
+        // Ein neuer Strom nach dem Leerlauf (kein Zuschauer - kein Strom):
+        // der Abgriff bleibt derselbe, aber der neue Strom kennt ihn nicht.
+        // Ohne diese Anmeldung gab es Ton nur in der ersten Sitzung nach
+        // dem Start des Hosts - so geschehen am 21.09.
+        NSError *err = nil;
+        if (![stream addStreamOutput:g_tap type:SCStreamOutputTypeAudio sampleHandlerQueue:g_queue error:&err]) {
+            qc_alog(@"Ton konnte am neuen Strom nicht angemeldet werden: %@", err.localizedDescription);
+            atomic_store(&g_send, (qc_send_fn)0);
+            return;
+        }
+        qc_alog(@"Ton am neuen Strom angemeldet");
+        return;
+    }
 
     // Eigene serielle Warteschlange: der Ton wartet nie hinter einem Vollbild.
     // Hoch eingestufte Guete, damit er unter Last nicht liegen bleibt.

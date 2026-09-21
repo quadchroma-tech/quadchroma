@@ -18,6 +18,8 @@ pub struct HostWerte {
     pub fps: u16,
     pub gaming: bool,
     pub fest: bool,
+    /// Ton uebertragen. Aus spart die rund 3 Mbit/s des unverdichteten Tons.
+    pub ton: bool,
 }
 
 /// Welche Zeilen die Statistik zeigt. Nicht jeder will alles sehen - manchem
@@ -131,6 +133,7 @@ impl Einstellungen {
                     fps: 120,
                     gaming: false,
                     fest: false,
+                    ton: true,
                 });
                 continue;
             }
@@ -157,6 +160,7 @@ impl Einstellungen {
                             "fps" => h.fps = v.parse().unwrap_or(h.fps),
                             "gaming" => h.gaming = v == "1",
                             "fest" => h.fest = v == "1",
+                            "ton" => h.ton = v == "1",
                             _ => {}
                         }
                     }
@@ -191,8 +195,8 @@ impl Einstellungen {
         for fp in fps {
             let h = &self.hosts[fp];
             t.push_str(&format!(
-                "\nhost {fp}\nmbit={}\nfps={}\ngaming={}\nfest={}\n",
-                h.mbit, h.fps, h.gaming as u8, h.fest as u8
+                "\nhost {fp}\nmbit={}\nfps={}\ngaming={}\nfest={}\nton={}\n",
+                h.mbit, h.fps, h.gaming as u8, h.fest as u8, h.ton as u8
             ));
         }
         std::fs::write(p, t).ok();

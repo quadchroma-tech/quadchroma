@@ -110,6 +110,10 @@ static void set_i32(VTCompressionSessionRef s, CFStringRef key, int32_t v);
 static SCStream *g_stream = nil;
 static SCStreamConfiguration *g_cfg = nil;
 static _Atomic int g_cur_mbit = 0, g_cur_fps = 0, g_cur_gaming = 0, g_cur_fixed = 0;
+// Ton uebertragen? Sein Wunsch: als Schalter im Menue. Aus heisst: der
+// Abgriff laeuft weiter, aber es geht kein Paket auf die Leitung - das
+// spart die rund 3 Mbit/s des unverdichteten Tons.
+static _Atomic int g_cur_ton = 1;
 
 // Feste Bildrate: normalerweise liefert die Aufnahme nur dann ein Bild, wenn
 // sich etwas geaendert hat. Mit diesem Schalter legt der Host das zuletzt
@@ -299,6 +303,9 @@ static _Atomic long long g_audio_bytes = 0;
 
 static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t channels) {
     if (atomic_load(&g_client_fd) < 0) return;
+    // Ton abgeschaltet: nichts auf die Leitung. Die Formatansage bleibt
+    // fuer das erste Paket nach dem Wiedereinschalten liegen.
+    if (!atomic_load(&g_cur_ton)) return;
     if (!atomic_exchange(&g_audio_info_sent, 1)) {
         uint8_t info[8] = {0};
         memcpy(info, &rate, 4);
@@ -430,12 +437,13 @@ static void *accept_thread(void *arg) {
         atomic_store(&g_wait_key, 1);
         atomic_store(&g_audio_info_sent, 0);
         {
-            uint8_t cur[8] = {0};
+            uint8_t cur[9] = {0};
             uint32_t m = (uint32_t)atomic_load(&g_cur_mbit);
             uint16_t f = (uint16_t)atomic_load(&g_cur_fps);
             memcpy(cur, &m, 4); memcpy(cur + 4, &f, 2);
             cur[6] = (uint8_t)atomic_load(&g_cur_gaming);
             cur[7] = (uint8_t)atomic_load(&g_cur_fixed);
+            cur[8] = (uint8_t)atomic_load(&g_cur_ton);
             send_small(QC_MSG_SETTINGS, cur, sizeof cur);
         }
         codecs_senden();
@@ -642,7 +650,7 @@ static void inject_key(uint16_t keycode, int down, uint32_t mods) {
 // Einstellungen im laufenden Betrieb. Bitrate und Bildrate gehen ohne
 // Unterbrechung; der Gaming-Schalter zieht die Zuegel straffer: haeufigere
 // Vollbilder und ein kleinerer erlaubter Stau, damit nichts auflaeuft.
-static void apply_settings(int mbit, int fps, int gaming, int fixed) {
+static void apply_settings(int mbit, int fps, int gaming, int fixed, int ton) {
     if (mbit < 2) mbit = 2;
     if (mbit > 500) mbit = 500;
     if (fps < 10) fps = 10;
@@ -670,6 +678,7 @@ static void apply_settings(int mbit, int fps, int gaming, int fixed) {
     atomic_store(&g_cur_gaming, gaming);
     atomic_store(&g_cur_fixed, fixed);
     atomic_store(&g_fixed_gewollt, fixed);
+    atomic_store(&g_cur_ton, ton ? 1 : 0);
     atomic_store(&g_force_key, 1);
 
     // Der Takt fuer die feste Bildrate haengt an der eingestellten Rate.
@@ -679,14 +688,17 @@ static void apply_settings(int mbit, int fps, int gaming, int fixed) {
                                   iv, iv / 10);
     }
 
-    uint8_t out[8] = {0};
+    // Neuntes Byte: Ton. Aeltere Clients lesen nur acht und stoeren sich
+    // nicht an einem mehr.
+    uint8_t out[9] = {0};
     uint32_t m = (uint32_t)mbit; uint16_t f = (uint16_t)fps;
     memcpy(out, &m, 4); memcpy(out + 4, &f, 2);
     out[6] = (uint8_t)gaming;
     out[7] = (uint8_t)fixed;
+    out[8] = (uint8_t)(ton ? 1 : 0);
     send_small(QC_MSG_SETTINGS, out, sizeof out);
-    logf_(@"Einstellungen: %d Mbit/s, %d fps, Gaming %@, feste Bildrate %@",
-          mbit, fps, gaming ? @"an" : @"aus", fixed ? @"an" : @"aus");
+    logf_(@"Einstellungen: %d Mbit/s, %d fps, Gaming %@, feste Bildrate %@, Ton %@",
+          mbit, fps, gaming ? @"an" : @"aus", fixed ? @"an" : @"aus", ton ? @"an" : @"aus");
 }
 
 // Alles loslassen, was noch als gedrueckt vermerkt ist.
@@ -808,8 +820,10 @@ static void *input_thread(void *arg) {
                         memcpy(&f, payload + 4, 2);
                         int g = payload[6] ? 1 : 0;
                         int fx = payload[7] ? 1 : 0;
+                        // Ein Client ohne das neunte Byte will Ton.
+                        int ton = h.len >= 9 ? (payload[8] ? 1 : 0) : 1;
                         dispatch_async(dispatch_get_main_queue(), ^{
-                            apply_settings((int)m, (int)f, g, fx);
+                            apply_settings((int)m, (int)f, g, fx, ton);
                         });
                     }
                     break;
