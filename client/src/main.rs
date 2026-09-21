@@ -36,7 +36,7 @@ mod clipboard;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 const MAGIC: &[u8; 4] = b"QCH1";
 /// Eigene Uhr des Clients. Der Nullpunkt ist beliebig; fuer den Vergleich mit
@@ -243,6 +243,37 @@ const MSG_CODECS: u8 = 8;
 const MSG_AUDIO_INFO: u8 = 32;
 const MSG_AUDIO: u8 = 33;
 const MSG_CLIP: u8 = 48;
+/// Zeigerform des Macs: 12 Byte Kopf (u16 Breite, u16 Hoehe, u16 Hotspot x,
+/// u16 Hotspot y, u8 sichtbar, u8 Massstab, u16 frei), dann RGBA mit gerader
+/// Deckkraft. Kommt nur, wenn sich die Form aendert.
+const MSG_CURSOR: u8 = 49;
+
+/// Die Form des Mac-Zeigers, wie sie der Host zuletzt geschickt hat. Der
+/// Zeiger selbst bleibt der von Windows (Regel des Projekts: kein Zeiger im
+/// Video) - er bekommt nur das Aussehen des Macs: Pfeil, Hand, Ziehpfeile am
+/// Fensterrand, Textcursor, Wartekugel.
+#[derive(Clone)]
+struct ZeigerForm {
+    w: u16,
+    h: u16,
+    hx: u16,
+    hy: u16,
+    sichtbar: bool,
+    rgba: Vec<u8>,
+}
+
+impl ZeigerForm {
+    /// Kennung fuer den Vorrat schon gebauter Zeiger - die Wartekugel dreht
+    /// sich durch ein Dutzend Formen, jede soll nur einmal gebaut werden.
+    fn kennung(&self) -> u64 {
+        let mut h: u64 = 1469598103934665603;
+        for b in self.rgba.iter().chain([self.w as u8, self.h as u8, self.hx as u8, self.hy as u8].iter()) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        h
+    }
+}
 
 /// So lange gilt ein Codecwunsch als "unterwegs", falls der Host nie
 /// antwortet. Danach verschwindet der Hinweis von selbst.
@@ -481,6 +512,10 @@ struct Shared {
     /// Praesentationen, die ausgelassen wurden, weil DXGI noch nicht bereit
     /// war. Auf dem CPU-Weg gibt es das nicht: bleibt null.
     ausgelassen: u64,
+    /// Zuletzt empfangene Zeigerform und eine laufende Nummer dazu, damit der
+    /// Fensterfaden sieht, ob er sie schon uebernommen hat.
+    zeiger: Option<ZeigerForm>,
+    zeiger_seq: u64,
     info: Option<StreamInfo>,
     decoded: u64,
     dropped: u64,
@@ -600,6 +635,8 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             let mut s = shared.lock().unwrap();
             s.abbruch = None;
             s.link = None;
+            s.zeiger = None;
+            s.zeiger_seq = 0;
             s.connected = false;
             s.codec_wechsel = None;
             s.codec_idx = None;
@@ -923,6 +960,8 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // darf ein gutes Bild wieder loeschen - Fehler anderer Pfade (Ton,
     // Verbindung) bleiben stehen, statt hundertmal je Sekunde zu verschwinden.
     let mut bild_fehler = false;
+    // Die erste Zeigerform je Sitzung einmal ins Protokoll.
+    let mut zeiger_gemeldet = false;
     // Versuchsschalter: jedem Paket fuer einen Hardware-Decoder eine
     // Zugriffseinheiten-Grenze (AUD) ANHAENGEN. NVIDIAs Parser erkennt das
     // Ende eines Bildes erst am naechsten NAL, das kein Bildinhalt ist -
@@ -1400,6 +1439,27 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 #[cfg(windows)]
                 if let Ok(text) = std::str::from_utf8(&payload) {
                     clipboard::set(text);
+                }
+            }
+            MSG_CURSOR => {
+                if len >= 12 {
+                    let w = u16::from_le_bytes([payload[0], payload[1]]);
+                    let h = u16::from_le_bytes([payload[2], payload[3]]);
+                    let hx = u16::from_le_bytes([payload[4], payload[5]]);
+                    let hy = u16::from_le_bytes([payload[6], payload[7]]);
+                    let sichtbar = payload[8] != 0;
+                    let n = w as usize * h as usize * 4;
+                    // Nur, was zusammenpasst: Groesse plausibel, Bild vollstaendig,
+                    // Hotspot im Bild. Alles andere ist kein Zeiger.
+                    if (1..=256).contains(&w) && (1..=256).contains(&h) && len == 12 + n && hx < w && hy < h {
+                        if !zeiger_gemeldet {
+                            zeiger_gemeldet = true;
+                            protokoll::zeile(format!("Zeigerform vom Host: {w}x{h}, Hotspot {hx},{hy}, sichtbar {sichtbar}"));
+                        }
+                        let mut s = shared.lock().unwrap();
+                        s.zeiger = Some(ZeigerForm { w, h, hx, hy, sichtbar, rgba: payload[12..].to_vec() });
+                        s.zeiger_seq = s.zeiger_seq.wrapping_add(1);
+                    }
                 }
             }
             _ => {}
@@ -1917,6 +1977,12 @@ struct App {
     cpu_zeiten: (u64, Instant),
     /// Bildwiederholrate des Monitors, auf dem das Fenster steht.
     monitor_hz: Option<f32>,
+    /// Zeigerform: welche Nummer aus `Shared` gerade gilt, ob der Windows-Zeiger
+    /// im Moment eine Mac-Form traegt, und der Vorrat schon gebauter Formen
+    /// (Kennung -> Zeiger), damit die Wartekugel nicht je Bild neu gebaut wird.
+    zeiger_seq_gezeigt: u64,
+    zeiger_eigen: bool,
+    zeiger_vorrat: Vec<(u64, CustomCursor)>,
 }
 
 impl ApplicationHandler for App {
@@ -2227,6 +2293,28 @@ impl ApplicationHandler for App {
             (None, _) => self.angewandt_fuer = None,
             _ => {}
         }
+        // Zeigerform: ueber dem Bild traegt der Windows-Zeiger die Form des
+        // Macs, ueber der Oberflaeche (Menue, Start, Warten) den eigenen Pfeil.
+        let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden();
+        if im_bild {
+            let neu = {
+                let s = self.shared.lock().unwrap();
+                if s.zeiger_seq != self.zeiger_seq_gezeigt { s.zeiger.clone().map(|z| (s.zeiger_seq, z)) } else { None }
+            };
+            if let Some((seq, z)) = neu {
+                self.zeiger_seq_gezeigt = seq;
+                self.zeiger_anwenden(el, &z);
+            }
+        } else if self.zeiger_eigen {
+            if let Some(w) = &self.window {
+                w.set_cursor(CursorIcon::Default);
+                w.set_cursor_visible(true);
+            }
+            self.zeiger_eigen = false;
+            // Zurueck im Bild wird die Form wieder angewandt.
+            self.zeiger_seq_gezeigt = 0;
+        }
+
         // Zeichnen nur, wenn es etwas zu zeichnen gibt: ein neues Bild - oder
         // eine Oberflaeche, die sich bewegt (Startbildschirm, Wartebild, Menue,
         // Statistik, Banner, ESC-Balken, Lagemeldung des Hosts), und die kommt
@@ -2257,6 +2345,30 @@ impl App {
     /// loslassen, den Eingabekanal schliessen und die Bildleitung kappen,
     /// damit das blockierende Lesen aufwacht. Vorher blieb nach "Trennen"
     /// alles offen, und der Client decodierte weiter - mit voller Last.
+    /// Dem Windows-Zeiger die Form des Mac-Zeigers geben. Jede Form wird nur
+    /// einmal gebaut; der Vorrat haelt die letzten 32 (die Wartekugel hat ein
+    /// Dutzend Bilder, ein Zeigerwechsel zwischen Pfeil, Hand und Textcursor
+    /// soll nichts kosten).
+    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm) {
+        let Some(w) = self.window.clone() else { return };
+        let k = z.kennung();
+        let zeiger = match self.zeiger_vorrat.iter().find(|(kk, _)| *kk == k) {
+            Some((_, c)) => c.clone(),
+            None => {
+                let Ok(quelle) = CustomCursor::from_rgba(z.rgba.clone(), z.w, z.h, z.hx, z.hy) else { return };
+                let c = el.create_custom_cursor(quelle);
+                if self.zeiger_vorrat.len() >= 32 {
+                    self.zeiger_vorrat.remove(0);
+                }
+                self.zeiger_vorrat.push((k, c.clone()));
+                c
+            }
+        };
+        w.set_cursor(zeiger);
+        w.set_cursor_visible(z.sichtbar);
+        self.zeiger_eigen = true;
+    }
+
     fn verbindung_trennen(&mut self) {
         let griff = {
             let mut s = self.shared.lock().unwrap();
@@ -2275,6 +2387,14 @@ impl App {
         self.screen = Screen::Start;
         self.last_frame = None;
         self.banner_until = None;
+        if self.zeiger_eigen {
+            if let Some(w) = &self.window {
+                w.set_cursor(CursorIcon::Default);
+                w.set_cursor_visible(true);
+            }
+            self.zeiger_eigen = false;
+        }
+        self.zeiger_seq_gezeigt = 0;
         self.angewandt_fuer = None;
     }
 
@@ -3835,6 +3955,9 @@ fn main() {
         cpu_eigen: 0.0,
         cpu_zeiten: (prozesszeit_100ns().unwrap_or(0), Instant::now()),
         monitor_hz: None,
+        zeiger_seq_gezeigt: 0,
+        zeiger_eigen: false,
+        zeiger_vorrat: Vec::new(),
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,

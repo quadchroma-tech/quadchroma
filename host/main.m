@@ -34,6 +34,7 @@
 #include <net/if.h>
 #import "audio.h"
 #import "clipboard.h"
+#import "zeiger.h"
 #include "qc_secure.h"
 #import "last.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
@@ -307,6 +308,9 @@ static void hoststatus_senden(uint8_t lage) {
 #define QC_MSG_AUDIO_INFO 32
 #define QC_MSG_AUDIO      33
 #define QC_MSG_CLIP       48
+// Host -> Client: Zeigerform. 12 Byte Kopf (u16 Breite, u16 Hoehe, u16 Hotspot x,
+// u16 Hotspot y, u8 sichtbar, u8 Massstab (1 = Punkte), u16 frei), dann RGBA.
+#define QC_MSG_CURSOR     49
 
 static _Atomic int g_audio_info_sent = 0;
 static _Atomic long g_audio_packets = 0;
@@ -332,6 +336,25 @@ static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t cha
 
 static void clip_cb(const char *utf8, size_t len) {
     send_small(QC_MSG_CLIP, utf8, len);
+}
+
+// Zeigerform: Kopf und Bild in einem Stueck, damit send_small sie unter einem
+// Griff schickt - sie darf nie zwischen zwei Bildhaelften landen.
+static void zeiger_cb(uint16_t w, uint16_t h, uint16_t hx, uint16_t hy, int sichtbar, const uint8_t *rgba) {
+    size_t n = (size_t)w * h * 4;
+    uint8_t *p = malloc(12 + n);
+    if (!p) return;
+    memset(p, 0, 12);
+    memcpy(p, &w, 2); memcpy(p + 2, &h, 2); memcpy(p + 4, &hx, 2); memcpy(p + 6, &hy, 2);
+    p[8] = (uint8_t)(sichtbar ? 1 : 0);
+    p[9] = 1;
+    memcpy(p + 12, rgba, n);
+    send_small(QC_MSG_CURSOR, p, 12 + n);
+    free(p);
+}
+
+static int zeiger_aktiv(void) {
+    return atomic_load(&g_client_fd) >= 0;
 }
 
 // Eckdaten des Stroms, immer aus dem AKTUELLEN Codec abgeleitet.
@@ -447,6 +470,7 @@ static void *accept_thread(void *arg) {
         atomic_store(&g_force_key, 1);
         atomic_store(&g_wait_key, 1);
         atomic_store(&g_audio_info_sent, 0);
+        qc_zeiger_neu_senden();
         {
             uint8_t cur[9] = {0};
             uint32_t m = (uint32_t)atomic_load(&g_cur_mbit);
@@ -1962,6 +1986,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     if (srvIdx != NSNotFound) {
         // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
         qc_clip_start(clip_cb);
+        qc_zeiger_start(zeiger_cb, zeiger_aktiv);
+        logf_(@"Zeigerform: Abfrage alle 50 ms, nur mit Zuschauer");
     } else {
         // Aufnahme in eine Datei: sofort loslegen.
         SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
