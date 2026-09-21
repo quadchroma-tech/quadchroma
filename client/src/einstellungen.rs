@@ -75,6 +75,45 @@ impl DecoderWunsch {
     }
 }
 
+/// Wer ins Fenster zeichnet. Automatik nimmt die Grafikkarte (Direct3D 11
+/// auf einem Hardware-Adapter), wenn eine da ist, und faellt sonst auf die
+/// CPU (softbuffer) zurueck. Cpu erzwingt den alten Weg, Gpu verlangt die
+/// Karte und sagt laut Bescheid, wenn sie doch nicht geht; Warp ist der
+/// Software-Rasterizer von Windows - nur zum Pruefen auf Maschinen ohne
+/// Karte. Gilt ab dem naechsten Start; im Lauf wird nicht umgeschaltet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AnzeigeWunsch {
+    #[default]
+    Automatik,
+    Gpu,
+    Cpu,
+    Warp,
+}
+
+impl AnzeigeWunsch {
+    /// Wert in der Datei und auf der Befehlszeile (--anzeige).
+    pub fn schluessel(self) -> &'static str {
+        match self {
+            AnzeigeWunsch::Automatik => "auto",
+            AnzeigeWunsch::Gpu => "gpu",
+            AnzeigeWunsch::Cpu => "cpu",
+            AnzeigeWunsch::Warp => "warp",
+        }
+    }
+
+    /// Umkehrung von `schluessel`. Unbekanntes ergibt None, damit der
+    /// Aufrufer bei der Voreinstellung bleibt.
+    pub fn aus(text: &str) -> Option<Self> {
+        Some(match text.trim().to_ascii_lowercase().as_str() {
+            "auto" | "automatik" | "automatic" => AnzeigeWunsch::Automatik,
+            "gpu" | "grafikkarte" | "karte" | "d3d11" => AnzeigeWunsch::Gpu,
+            "cpu" | "software" | "prozessor" => AnzeigeWunsch::Cpu,
+            "warp" => AnzeigeWunsch::Warp,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Einstellungen {
     pub vollbild: bool,
@@ -86,6 +125,8 @@ pub struct Einstellungen {
     pub stats: StatWahl,
     /// Gewuenschter Decoderpfad (Datei: decoder=auto|software|nvidia).
     pub decoder: DecoderWunsch,
+    /// Gewuenschte Anzeige (Datei: anzeige=auto|gpu|cpu|warp).
+    pub anzeige: AnzeigeWunsch,
     /// Fingerabdruck des Hosts -> seine Werte.
     pub hosts: HashMap<String, HostWerte>,
 }
@@ -100,6 +141,7 @@ impl Default for Einstellungen {
             nerd: false,
             stats: StatWahl::default(),
             decoder: DecoderWunsch::Automatik,
+            anzeige: AnzeigeWunsch::Automatik,
             hosts: HashMap::new(),
         }
     }
@@ -153,6 +195,7 @@ impl Einstellungen {
                 (None, "stat_verworfen") => e.stats.verworfen = v == "1",
                 (None, "stat_code") => e.stats.code = v == "1",
                 (None, "decoder") => e.decoder = DecoderWunsch::aus(v).unwrap_or(e.decoder),
+                (None, "anzeige") => e.anzeige = AnzeigeWunsch::aus(v).unwrap_or(e.anzeige),
                 (Some(fp), _) => {
                     if let Some(h) = e.hosts.get_mut(fp) {
                         match k {
@@ -188,6 +231,7 @@ impl Einstellungen {
             w.codec as u8, w.verworfen as u8, w.code as u8
         ));
         t.push_str(&format!("decoder={}\n", self.decoder.schluessel()));
+        t.push_str(&format!("anzeige={}\n", self.anzeige.schluessel()));
         // Sortiert schreiben, damit die Datei zwischen zwei Laeufen gleich
         // aussieht und man Aenderungen erkennt.
         let mut fps: Vec<&String> = self.hosts.keys().collect();

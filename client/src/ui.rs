@@ -98,9 +98,8 @@ impl<'a> Canvas<'a> {
         });
     }
 
-    /// Den Kasten abholen und leeren. Noch ungenutzt: der Upload der
-    /// Oberflaeche in eine Textur kommt mit der Anzeige ueber die Karte.
-    #[allow(dead_code)]
+    /// Den Kasten abholen und leeren - fuer den Upload der Oberflaeche in
+    /// die Textur der Karte.
     pub fn kasten_nehmen(&mut self) -> Option<Rect> {
         self.kasten.take()
     }

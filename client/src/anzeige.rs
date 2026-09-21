@@ -14,22 +14,25 @@
 // die von der CPU gezeichnete Oberflaeche aus einer zweiten Textur, deren
 // oberstes Byte die Durchsicht ist (siehe ui.rs).
 //
-// Dieser Stand: Geraet, Adapterliste, Shader, Texturen, beide Stufen und die
-// Rueckkopien fuer den Test - ohne Fenster und ohne Swapchain. Die
-// Praesentation (Flip-Swapchain, Warteobjekt, Present ohne Warten) kommt im
-// naechsten Schritt dazu und haengt sich an `stufe2` mit dem Backbuffer als
-// Ziel.
+// Praesentation: eine Flip-Swapchain am Fenster (FLIP_DISCARD, zwei Puffer,
+// hoechstens ein Bild unterwegs), Present immer mit SyncInterval 0 - mit
+// ALLOW_TEARING, wo DXGI es erlaubt. Vor jedem Present wird das
+// Frame-Latency-Warteobjekt mit Timeout 0 abgefragt; ist es nicht frei, wird
+// das Bild uebersprungen, nie gewartet: Maus und Tastatur laufen auf
+// demselben Faden. `ohne_fenster` (--anzeigetest) laesst die Swapchain weg
+// und zeichnet in eine eigene Zieltextur.
 
 use std::ffi::c_void;
 
 use ffmpeg_next as ffmpeg;
 use windows::core::{Interface, BOOL, PCSTR};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{CloseHandle, DXGI_STATUS_OCCLUDED, HANDLE, HMODULE, HWND, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::{ebenen_format, protokoll, ui, EbenenFormat, Frame};
 
@@ -100,12 +103,38 @@ struct KonstAnzeige {
     grund: [f32; 4],
 }
 
-/// Die Karte: Geraet, Shader, Zustaende und die Texturen des laufenden
-/// Bildes. Swapchain, Backbuffer und Warteobjekt kommen mit der
-/// Praesentation im naechsten Schritt als weitere Felder dazu.
+/// Ergebnis eines Praesentierversuchs.
+pub enum Praesentiert {
+    Ok,
+    /// DXGI_STATUS_OCCLUDED: das Fenster ist verdeckt. Kein Fehler.
+    Verdeckt,
+    /// Etwas anderes ging schief, das Geraet lebt aber (Text fuer das
+    /// Protokoll).
+    Fehler(String),
+    /// DXGI_ERROR_DEVICE_REMOVED oder _RESET, mit dem Grund laut
+    /// GetDeviceRemovedReason. Die Karte ist damit unbrauchbar.
+    GeraetWeg(String),
+}
+
+/// Die Karte: Geraet, Shader, Zustaende, die Texturen des laufenden Bildes
+/// und - am Fenster - Swapchain, Backbuffer und Warteobjekt.
 pub struct Gpu {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
+    /// None ohne Fenster (--anzeigetest).
+    swapchain: Option<IDXGISwapChain2>,
+    /// Sicht auf den Backbuffer. Vor ResizeBuffers IMMER fallen lassen.
+    rtv: Option<ID3D11RenderTargetView>,
+    /// Frame-Latency-Warteobjekt; null ohne Swapchain.
+    warte: HANDLE,
+    /// Flags, mit denen die Swapchain angelegt wurde - ResizeBuffers will
+    /// dieselben.
+    flags: u32,
+    /// Groesse der Swapchain.
+    pub breite: u32,
+    pub hoehe: u32,
+    /// Darf Present ohne Warten auf den Bildwechsel (ALLOW_TEARING)?
+    pub tearing: bool,
     vs: ID3D11VertexShader,
     ps_umrechnen: ID3D11PixelShader,
     ps_anzeigen: ID3D11PixelShader,
@@ -221,16 +250,32 @@ fn adapter_info(a: &IDXGIAdapter1) -> Result<AdapterInfo, windows::core::Error> 
     Ok(AdapterInfo { name, vendor: d.VendorId, software, hat_ausgang })
 }
 
-/// Alle Adapter, wie DXGI sie zaehlt (EnumAdapters1 + GetDesc1 + EnumOutputs).
-pub fn adapter_liste() -> Result<Vec<AdapterInfo>, String> {
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| fehler("CreateDXGIFactory1", e))?;
+/// Alle Adapter einer Factory, samt Objekt (fuer D3D11CreateDevice).
+fn adapter_objekte(factory: &IDXGIFactory1) -> Result<Vec<(IDXGIAdapter1, AdapterInfo)>, String> {
     let mut liste = Vec::new();
     let mut i = 0;
     while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
-        liste.push(adapter_info(&a).map_err(|e| fehler("GetDesc1", e))?);
+        let info = adapter_info(&a).map_err(|e| fehler("GetDesc1", e))?;
+        liste.push((a, info));
         i += 1;
     }
     Ok(liste)
+}
+
+/// Alle Adapter, wie DXGI sie zaehlt (EnumAdapters1 + GetDesc1 + EnumOutputs).
+pub fn adapter_liste() -> Result<Vec<AdapterInfo>, String> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| fehler("CreateDXGIFactory1", e))?;
+    Ok(adapter_objekte(&factory)?.into_iter().map(|(_, i)| i).collect())
+}
+
+/// Ein Adapter als Protokollzeile, dieselbe im Test und beim Start.
+fn adapter_zeile(i: usize, a: &AdapterInfo) -> String {
+    format!(
+        "Adapter {i}: {} (VendorId 0x{:04x}, {}, Ausgang {})",
+        a.name, a.vendor,
+        if a.software { "Software" } else { "Hardware" },
+        if a.hat_ausgang { "ja" } else { "nein" }
+    )
 }
 
 /// Erlaubt DXGI ein Present ohne Warten auf den Bildwechsel? Windows 10
@@ -358,11 +403,190 @@ impl Gpu {
             Ok(g) => g,
             Err(_) => geraet_bauen(None, warp, false)?,
         };
-        Gpu::aus_geraet(device, ctx, fl)
+        let gpu = Gpu::aus_geraet(device, ctx, fl)?;
+        protokoll::zeile(format!(
+            "Anzeige: D3D11 {} ({}), FL {}, Ausgang {}",
+            gpu.adapter.name,
+            if gpu.adapter.software { "Software" } else { "Hardware" },
+            gpu.feature_level_name(),
+            if gpu.adapter.hat_ausgang { "ja" } else { "nein" }
+        ));
+        Ok(gpu)
+    }
+
+    /// Geraet und Flip-Swapchain am Fenster. `hwnd` ist der rohe Win32-Griff
+    /// aus winit. `warp`: Software-Rasterizer (nur zum Pruefen); sonst zaehlt
+    /// ein Software-Adapter als "keine Karte" und ist ein Fehler - der
+    /// Aufrufer faellt dann auf softbuffer zurueck. `adapter_idx`: --adapter n
+    /// nimmt genau diesen Adapter, was immer er ist. Automatik: der erste
+    /// Hardware-Adapter mit Ausgang; ohne einen solchen (Optimus ohne MUX)
+    /// der erste von NVIDIA, sonst der erste ueberhaupt.
+    pub fn neu(hwnd: isize, ww: u32, wh: u32, warp: bool, adapter_idx: Option<u32>) -> Result<Gpu, String> {
+        let hwnd = HWND(hwnd as *mut c_void);
+        if hwnd.0.is_null() {
+            return Err("kein Fenstergriff".into());
+        }
+        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.map_err(|e| fehler("CreateDXGIFactory1", e))?;
+        let factory1: IDXGIFactory1 = factory.cast().map_err(|e| fehler("IDXGIFactory1", e))?;
+        let alle = adapter_objekte(&factory1)?;
+        for (i, (_, a)) in alle.iter().enumerate() {
+            protokoll::zeile(adapter_zeile(i, a));
+        }
+        let (device, ctx, fl) = if warp {
+            geraet_bauen(None, true, false)?
+        } else {
+            let wahl = match adapter_idx {
+                Some(n) => alle.get(n as usize).ok_or_else(|| format!("Adapter {n} gibt es nicht ({} gefunden)", alle.len()))?,
+                None => {
+                    let hardware: Vec<&(IDXGIAdapter1, AdapterInfo)> = alle.iter().filter(|(_, a)| !a.software).collect();
+                    hardware
+                        .iter()
+                        .find(|(_, a)| a.hat_ausgang)
+                        .or_else(|| hardware.iter().find(|(_, a)| a.vendor == 0x10de))
+                        .or_else(|| hardware.first())
+                        .copied()
+                        .ok_or_else(|| {
+                            let namen: Vec<&str> = alle.iter().map(|(_, a)| a.name.as_str()).collect();
+                            format!("kein Hardware-Adapter (gefunden: {})", if namen.is_empty() { "keiner".to_string() } else { namen.join(", ") })
+                        })?
+                }
+            };
+            geraet_bauen(Some(&wahl.0), false, false)?
+        };
+        let mut gpu = Gpu::aus_geraet(device, ctx, fl)?;
+        gpu.tearing = tearing_moeglich();
+        gpu.flags = (DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 | if gpu.tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 } else { 0 }) as u32;
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: ww,
+            Height: wh,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: BOOL(0),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_NONE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: gpu.flags,
+        };
+        let swapchain: IDXGISwapChain2 = unsafe { factory.CreateSwapChainForHwnd(&gpu.device, hwnd, &desc, None, None) }
+            .map_err(|e| fehler("CreateSwapChainForHwnd", e))?
+            .cast()
+            .map_err(|e| fehler("IDXGISwapChain2", e))?;
+        // Sonst schaltet Alt+Enter DXGI in den exklusiven Vollbildmodus,
+        // statt als Tastendruck zum Mac zu gehen.
+        if let Err(e) = unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES) } {
+            protokoll::zeile(fehler("MakeWindowAssociation", e));
+        }
+        // Nie mehr als ein Bild ueber das gezeigte hinaus unterwegs.
+        unsafe { swapchain.SetMaximumFrameLatency(1) }.map_err(|e| fehler("SetMaximumFrameLatency", e))?;
+        let warte = unsafe { swapchain.GetFrameLatencyWaitableObject() };
+        if warte.0.is_null() {
+            return Err("GetFrameLatencyWaitableObject lieferte nichts".into());
+        }
+        gpu.swapchain = Some(swapchain);
+        gpu.warte = warte;
+        gpu.breite = ww;
+        gpu.hoehe = wh;
+        gpu.backbuffer_sicht()?;
+        protokoll::zeile(format!(
+            "Anzeige: D3D11 {}{}, FL {}, Tearing {}, Ausgang {}, Latenz 1",
+            gpu.adapter.name,
+            if gpu.adapter.software { " (Software)" } else { "" },
+            gpu.feature_level_name(),
+            if gpu.tearing { "ja" } else { "nein" },
+            if gpu.adapter.hat_ausgang { "ja" } else { "nein" }
+        ));
+        Ok(gpu)
+    }
+
+    /// Sicht auf den Backbuffer der Swapchain anlegen.
+    fn backbuffer_sicht(&mut self) -> Result<(), String> {
+        let sc = self.swapchain.as_ref().ok_or("keine Swapchain")?;
+        let tex: ID3D11Texture2D = unsafe { sc.GetBuffer(0) }.map_err(|e| fehler("GetBuffer", e))?;
+        self.rtv = Some(self.rtv_anlegen(&tex)?);
+        Ok(())
+    }
+
+    /// Das Fenster hat eine andere Groesse: Sicht auf den Backbuffer fallen
+    /// lassen, Puffer der Swapchain neu, Sicht neu. Die Oberflaechentextur
+    /// wird beim naechsten Upload in der neuen Groesse angelegt. 0x0
+    /// (minimiert): nichts tun - der Aufrufer zeichnet dann auch nichts.
+    pub fn groesse(&mut self, ww: u32, wh: u32) -> Result<(), String> {
+        if ww == 0 || wh == 0 || (ww, wh) == (self.breite, self.hoehe) {
+            return Ok(());
+        }
+        let Some(sc) = self.swapchain.clone() else { return Err("keine Swapchain".into()) };
+        self.sichten_loesen();
+        self.rtv = None;
+        self.oberflaeche = None;
+        // ResizeBuffers verlangt, dass niemand mehr einen Backbuffer haelt -
+        // die Freigabe der Sicht soll verarbeitet sein, bevor es losgeht.
+        unsafe {
+            self.ctx.Flush();
+            sc.ResizeBuffers(0, ww, wh, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(self.flags as i32))
+        }
+        .map_err(|e| fehler(&format!("ResizeBuffers {ww}x{wh}"), e))?;
+        self.breite = ww;
+        self.hoehe = wh;
+        self.backbuffer_sicht()
+    }
+
+    /// Ist DXGI bereit fuer ein weiteres Bild? Fragt das Warteobjekt mit
+    /// Timeout 0 - nie warten, der Fensterfaden traegt auch die Eingabe.
+    /// Ohne Swapchain immer ja.
+    pub fn bereit(&self) -> bool {
+        if self.warte.0.is_null() {
+            return true;
+        }
+        unsafe { WaitForSingleObject(self.warte, 0) == WAIT_OBJECT_0 }
+    }
+
+    /// Ist das Geraet weg? Dann der Grund als Text (GetDeviceRemovedReason).
+    pub fn geraet_weg(&self) -> Option<String> {
+        unsafe { self.device.GetDeviceRemovedReason() }.err().map(|e| format!("{} (0x{:08x})", e.message().trim(), e.code().0 as u32))
+    }
+
+    /// Ein Fehler von Map/Draw: war es das Geraet, oder nur dieser Aufruf?
+    fn einordnen(&self, e: String) -> Praesentiert {
+        match self.geraet_weg() {
+            Some(grund) => Praesentiert::GeraetWeg(grund),
+            None => Praesentiert::Fehler(e),
+        }
+    }
+
+    /// Stufe 2 auf den Backbuffer und Present mit SyncInterval 0. `sofort`:
+    /// mit ALLOW_TEARING, wenn die Swapchain es kann - sonst zum naechsten
+    /// Bildwechsel, aber ohne Warteschlange. Das HRESULT wird von Hand
+    /// gelesen: OCCLUDED ist kein Fehler, DEVICE_REMOVED/RESET ist das Ende
+    /// dieses Geraets.
+    pub fn zeichnen(&mut self, rect: Option<(i32, i32, u32, u32)>, ui_an: bool, sofort: bool) -> Praesentiert {
+        let Some(sc) = self.swapchain.clone() else { return Praesentiert::Fehler("keine Swapchain".into()) };
+        let Some(rtv) = self.rtv.clone() else { return Praesentiert::Fehler("keine Sicht auf den Backbuffer".into()) };
+        if let Err(e) = self.stufe2(&rtv, self.breite, self.hoehe, rect, ui_an) {
+            return self.einordnen(e);
+        }
+        let reissen = sofort && self.tearing;
+        let flags = if reissen { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
+        let hr = unsafe { sc.Present(0, flags) };
+        if hr == S_OK {
+            Praesentiert::Ok
+        } else if hr == DXGI_STATUS_OCCLUDED {
+            Praesentiert::Verdeckt
+        } else if hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET {
+            Praesentiert::GeraetWeg(self.geraet_weg().unwrap_or_else(|| format!("Present: 0x{:08x}", hr.0 as u32)))
+        } else if hr == DXGI_ERROR_INVALID_CALL && reissen {
+            // DXGI hatte Tearing zugesagt und nimmt es doch nicht: ab jetzt
+            // ohne, statt jedes Bild zu verlieren.
+            self.tearing = false;
+            Praesentiert::Fehler("Present mit ALLOW_TEARING abgelehnt - ab jetzt bildsynchron".into())
+        } else {
+            Praesentiert::Fehler(format!("Present: 0x{:08x}", hr.0 as u32))
+        }
     }
 
     /// Der gemeinsame Rest: Shader, Zustaende, Konstantenpuffer, Adapter.
-    /// Die Swapchain am Fenster kommt im naechsten Schritt hier obendrauf.
+    /// Ohne Swapchain - `neu` haengt sie danach an.
     fn aus_geraet(device: ID3D11Device, ctx: ID3D11DeviceContext, fl: D3D_FEATURE_LEVEL) -> Result<Gpu, String> {
         let vs_code = uebersetzen(b"vs_main\0", b"vs_4_0\0")?;
         let ps1_code = uebersetzen(b"ps_umrechnen\0", b"ps_4_0\0")?;
@@ -409,6 +633,13 @@ impl Gpu {
         let gpu = Gpu {
             device,
             ctx,
+            swapchain: None,
+            rtv: None,
+            warte: HANDLE::default(),
+            flags: 0,
+            breite: 0,
+            hoehe: 0,
+            tearing: false,
             vs: vs.ok_or("CreateVertexShader lieferte nichts")?,
             ps_umrechnen: ps_umrechnen.ok_or("CreatePixelShader lieferte nichts")?,
             ps_anzeigen: ps_anzeigen.ok_or("CreatePixelShader lieferte nichts")?,
@@ -422,13 +653,6 @@ impl Gpu {
             feature_level: fl,
             adapter,
         };
-        protokoll::zeile(format!(
-            "Anzeige: D3D11 {} ({}), FL {}, Ausgang {}",
-            gpu.adapter.name,
-            if gpu.adapter.software { "Software" } else { "Hardware" },
-            gpu.feature_level_name(),
-            if gpu.adapter.hat_ausgang { "ja" } else { "nein" }
-        ));
         Ok(gpu)
     }
 
@@ -717,8 +941,8 @@ impl Gpu {
     }
 
     /// Stufe 2 in ein Ziel (ww x wh): Grundfarbe, Bild im Rechteck, darueber
-    /// die Oberflaeche. Der Backbuffer der Swapchain kommt spaeter genauso
-    /// hier herein wie jetzt die Testtextur.
+    /// die Oberflaeche. Das Ziel ist der Backbuffer der Swapchain (`zeichnen`)
+    /// oder die Testtextur (`offscreen`).
     fn stufe2(&self, ziel: &ID3D11RenderTargetView, ww: u32, wh: u32, rect: Option<(i32, i32, u32, u32)>, ui_an: bool) -> Result<(), String> {
         let bild = self.zwischen.as_ref();
         let (rect, bild_da) = match (rect, bild) {
@@ -805,6 +1029,23 @@ impl Gpu {
     pub fn zwischen_auslesen(&mut self) -> Result<(Vec<u32>, u32, u32), String> {
         let z = self.zwischen.as_ref().ok_or("Zwischentextur fehlt")?;
         Ok((self.auslesen(&z.tex, z.w, z.h)?, z.w, z.h))
+    }
+}
+
+impl Drop for Gpu {
+    /// Erst alles vom Kontext loesen, dann die Sichten, dann die Swapchain
+    /// (Feldreihenfolge) - so haelt nichts mehr einen Puffer fest, und ein
+    /// Neubau am selben Fenster findet das HWND frei. Das Warteobjekt ist
+    /// ein eigener Griff und wird geschlossen.
+    fn drop(&mut self) {
+        unsafe {
+            self.ctx.ClearState();
+            self.rtv = None;
+            self.ctx.Flush();
+            if !self.warte.0.is_null() {
+                let _ = CloseHandle(self.warte);
+            }
+        }
     }
 }
 
@@ -1105,12 +1346,7 @@ pub fn anzeigetest(verzeichnis: &str) -> bool {
         protokoll::nur_datei(&z);
     };
     for (i, a) in adapter.iter().enumerate() {
-        sagen(format!(
-            "Adapter {i}: {} (VendorId 0x{:04x}, {}, Ausgang {})",
-            a.name, a.vendor,
-            if a.software { "Software" } else { "Hardware" },
-            if a.hat_ausgang { "ja" } else { "nein" }
-        ));
+        sagen(adapter_zeile(i, a));
     }
     let hardware = adapter.iter().any(|a| !a.software);
     sagen(format!("Tearing: {}", if tearing_moeglich() { "ja" } else { "nein" }));

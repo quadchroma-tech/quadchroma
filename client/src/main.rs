@@ -505,8 +505,8 @@ struct Shared {
     connected: bool,
     frame: Option<Bild>,
     /// Zeichnet die Karte? Dann legt der Empfangsfaden rohe Bilder ab,
-    /// statt sie auf der CPU umzurechnen. Setzt der Fensterfaden; bis die
-    /// Anzeige ueber die Karte da ist, bleibt es false.
+    /// statt sie auf der CPU umzurechnen. Setzt der Fensterfaden nach dem
+    /// Aufbau der Swapchain; faellt die Karte weg, nimmt er es zurueck.
     gpu_pfad: bool,
     /// Anzeigezeit (Ablage bis hinter present), gleitender Mittelwert des
     /// Fensterfadens.
@@ -1932,6 +1932,57 @@ impl InputLink {
 #[derive(PartialEq)]
 enum Screen { Start, Session }
 
+/// Wer ins Fenster zeichnet: die Karte ueber eine Flip-Swapchain, oder
+/// softbuffer (GDI) - nie beides am selben Fenster, das ist von DXGI nicht
+/// gedeckt. Entschieden wird beim Start; `Keine` bleibt nach einem
+/// Geraeteverlust, den der Neubau nicht heilen konnte.
+enum Anzeige {
+    #[cfg(windows)]
+    Gpu(anzeige::Gpu),
+    Cpu {
+        /// Wird nach dem Anlegen der Flaeche nicht mehr angefasst, muss
+        /// aber so lange leben wie sie.
+        #[allow(dead_code)]
+        context: softbuffer::Context<Arc<Window>>,
+        surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    },
+    Keine,
+}
+
+/// Was auf dem Weg ueber die Karte schiefgehen kann: ein Aufruf (die Karte
+/// lebt, der Fehler steht im Protokoll) oder das Geraet selbst.
+#[cfg(windows)]
+enum Ausfall {
+    Fehler(String),
+    GeraetWeg(String),
+}
+
+/// Der rohe Win32-Griff des Fensters, wie DXGI ihn braucht.
+#[cfg(windows)]
+fn fenster_hwnd(window: &Window) -> Option<isize> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+/// Zwei Kaesten zu einem: der Ausschnitt der Oberflaeche, der in die Textur
+/// muss - was beim letzten Mal dort stand (zu loeschen) und was jetzt neu
+/// gezeichnet ist.
+#[cfg(windows)]
+fn kasten_vereinigen(a: Option<ui::Rect>, b: Option<ui::Rect>) -> Option<ui::Rect> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+            let (ex, ey) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
+            Some(ui::Rect { x, y, w: ex - x, h: ey - y })
+        }
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
 struct App {
     shared: Arc<Mutex<Shared>>,
     input: Arc<Mutex<InputLink>>,
@@ -1951,8 +2002,39 @@ struct App {
     fps_shown: f32,
     fps_since: Instant,
     window: Option<Arc<Window>>,
-    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    context: Option<softbuffer::Context<Arc<Window>>>,
+    /// Wer zeichnet - Karte oder softbuffer, entschieden in `resumed`.
+    anzeige: Anzeige,
+    /// Aus --anzeige oder der Datei, und --adapter n.
+    anzeige_wunsch: einstellungen::AnzeigeWunsch,
+    adapter_wunsch: Option<u32>,
+    /// Praesentation ohne Warten auf den Bildwechsel (ALLOW_TEARING). Vorerst
+    /// genau dann, wenn DXGI es erlaubt; der Schalter im Menue kommt spaeter.
+    sofort: bool,
+    /// Weg ueber die Karte: Groesse des zuletzt hochgeladenen Bildes (der
+    /// CPU-Weg haelt statt dessen `last_frame`).
+    bild_da: Option<(u32, u32)>,
+    /// Client-Uhr bei der Ablage des zuletzt hochgeladenen, noch nicht
+    /// praesentierten Bildes - Anfang der Anzeigezeit.
+    bereit_ausstehend: Option<u64>,
+    /// Die Oberflaeche in Fenstergroesse, 0xTTRRGGBB ueber einem leeren
+    /// (ganz durchsichtigen) Grund; nur der Kasten geht in die Textur.
+    ui_puffer: Vec<u32>,
+    /// Was beim letzten Mal gezeichnet wurde - beim naechsten Mal zu loeschen.
+    ui_kasten_alt: Option<ui::Rect>,
+    /// Oberflaeche gerade sichtbar (Bit 1 in Stufe 2).
+    ui_an: bool,
+    /// Wann die Oberflaeche zuletzt gerastert wurde - alle 33 ms reicht,
+    /// das Video darunter laeuft mit voller Bildrate weiter.
+    letzte_oberflaeche: Instant,
+    /// Bild hochgeladen, aber Present ausgelassen, weil DXGI noch nicht
+    /// bereit war: beim naechsten Takt wieder versuchen.
+    praesentation_ausstehend: bool,
+    /// Wann die Karte zuletzt verloren ging. Ein zweiter Verlust binnen
+    /// zehn Sekunden heisst: aufgeben, nicht noch einmal bauen.
+    geraet_verloren: Option<Instant>,
+    /// Letzter Fehler der Karte, damit derselbe nicht je Bild ins Protokoll
+    /// laeuft.
+    letzter_gpu_fehler: Option<String>,
     shown: u64,
     /// Beim ersten Kontakt mit einem Host steht der Vergleichscode eine Weile
     /// gross im Bild - genau dann kann man ihn noch pruefen.
@@ -1979,7 +2061,7 @@ struct App {
     hud_reiter: u8,
     /// Verlauf der Gesamtverzoegerung, fuer die Kachel im Nerd-Modus.
     lat_hist: Vec<f32>,
-    /// Wer zeichnet, fuer die Statistik: "Software", spaeter die Karte.
+    /// Wer zeichnet, fuer die Statistik: "Software" oder "D3D11 · <Adapter>".
     anzeige_name: String,
     /// Eigene Prozessorlast in Prozent der ganzen Maschine, und die
     /// Prozesszeit samt Zeitpunkt der letzten Messung.
@@ -2007,10 +2089,43 @@ impl ApplicationHandler for App {
                 None
             });
         let window = Arc::new(el.create_window(attrs).expect("Fenster"));
-        let context = softbuffer::Context::new(window.clone()).expect("Kontext");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("Flaeche");
-        self.context = Some(context);
-        self.surface = Some(surface);
+        // Wer zeichnet: die Karte, wenn sie gewuenscht ist und geht - sonst
+        // softbuffer. Nie beides am selben Fenster: erst wenn feststeht, dass
+        // keine Swapchain daran haengt, kommt GDI.
+        self.anzeige = Anzeige::Keine;
+        #[cfg(windows)]
+        {
+            use einstellungen::AnzeigeWunsch as W;
+            if self.anzeige_wunsch != W::Cpu {
+                let s = window.inner_size();
+                let bau = fenster_hwnd(&window)
+                    .ok_or_else(|| "kein Win32-Fenster".to_string())
+                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, self.adapter_wunsch));
+                match bau {
+                    Ok(g) => {
+                        self.anzeige_name = format!("D3D11 · {}", g.adapter.name);
+                        self.sofort = g.tearing;
+                        // Ab jetzt legt der Empfangsfaden rohe Bilder ab; die
+                        // Umrechnung nach RGB macht Stufe 1 auf der Karte.
+                        self.shared.lock().unwrap().gpu_pfad = true;
+                        self.anzeige = Anzeige::Gpu(g);
+                    }
+                    Err(e) => {
+                        protokoll::zeile(format!("Anzeige: Rueckfall auf Software: {e}"));
+                        if self.anzeige_wunsch == W::Gpu {
+                            self.shared.lock().unwrap().error = Some(format!("Grafikkarte nicht nutzbar, Anzeige ueber Software: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(self.anzeige, Anzeige::Keine) {
+            let context = softbuffer::Context::new(window.clone()).expect("Kontext");
+            let surface = softbuffer::Surface::new(&context, window.clone()).expect("Flaeche");
+            self.anzeige = Anzeige::Cpu { context, surface };
+            self.anzeige_name = "Software".into();
+            protokoll::zeile("Anzeige: Software".into());
+        }
         self.window = Some(window);
     }
 
@@ -2331,18 +2446,15 @@ impl ApplicationHandler for App {
         // mit 30 Bildern je Sekunde aus. Vorher lief die Schleife ohne Pause
         // und schrieb dasselbe Bild 150-mal je Sekunde ins Fenster - auf dem
         // Laptop ein gutes Viertel der gesamten Prozessorlast des Clients.
-        let (neues_bild, lage) = {
+        let (neues_bild, lage, wechsel) = {
             let s = self.shared.lock().unwrap();
-            (s.frame.is_some(), s.error_key.is_some())
+            (s.frame.is_some(), s.error_key.is_some(), s.wechsel_laeuft())
         };
-        let oberflaeche = self.screen != Screen::Session
-            || !self.bild_vorhanden()
-            || self.hud_offen
-            || self.show_overlay
-            || self.esc_seit.is_some()
-            || lage
-            || self.banner_until.map(|t| Instant::now() < t).unwrap_or(false);
-        if neues_bild || (oberflaeche && self.letzte_zeichnung.elapsed() >= Duration::from_millis(33)) {
+        // Ein ausgelassenes Present (DXGI war noch nicht bereit) wird beim
+        // naechsten Takt nachgeholt; der Codecwechsel-Hinweis muss auch ohne
+        // neue Bilder erscheinen und wieder verschwinden.
+        let oberflaeche = self.oberflaeche_sichtbar(lage, wechsel);
+        if neues_bild || self.praesentation_ausstehend || (oberflaeche && self.letzte_zeichnung.elapsed() >= Duration::from_millis(33)) {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -2396,6 +2508,8 @@ impl App {
         self.hud_offen = false;
         self.screen = Screen::Start;
         self.last_frame = None;
+        self.bild_da = None;
+        self.ui_kasten_alt = None;
         self.banner_until = None;
         if self.zeiger_eigen {
             if let Some(w) = &self.window {
@@ -2411,7 +2525,23 @@ impl App {
     /// Steht ein Bild im Fenster? Solange nicht, zeigt die Sitzung den
     /// Wartebildschirm, und Maus und Tastatur bleiben beim Client.
     fn bild_vorhanden(&self) -> bool {
-        self.last_frame.is_some()
+        self.last_frame.is_some() || self.bild_da.is_some()
+    }
+
+    /// Liegt gerade etwas ueber dem Bild, das sich bewegt und deshalb alle
+    /// 33 ms neu gezeichnet werden will? Startbildschirm, Wartebild, Menue,
+    /// Statistik, ESC-Balken, Lagemeldung, Banner, Codecwechsel-Hinweis.
+    /// `lage` und `wechsel` kommen aus `Shared`, damit der Aufrufer die
+    /// Sperre nur einmal nimmt.
+    fn oberflaeche_sichtbar(&self, lage: bool, wechsel: bool) -> bool {
+        self.screen != Screen::Session
+            || !self.bild_vorhanden()
+            || self.hud_offen
+            || self.show_overlay
+            || self.esc_seit.is_some()
+            || lage
+            || wechsel
+            || self.banner_until.map(|t| Instant::now() < t).unwrap_or(false)
     }
 
     /// Einmal je Sekunde: Bildrate, Verlauf der Verzoegerung, Fenstertitel.
@@ -2471,13 +2601,14 @@ impl App {
                     )
                 };
                 protokoll::nur_datei(&format!(
-                    "{:.0}s | {:.0} B/s | Anzeige {:.1} ms | Kette {} ms | verworfen {} | ausgelassen {} | Sync | Client-CPU {:.1} %",
+                    "{:.0}s | {:.0} B/s | Anzeige {:.1} ms | Kette {} ms | verworfen {} | ausgelassen {} | {} | Client-CPU {:.1} %",
                     client_us() as f64 / 1e6,
                     self.fps_shown,
                     anzeige_ms,
                     kette.map(|k| format!("{k:.1}")).unwrap_or_else(|| "-".into()),
                     verworfen,
                     ausgelassen,
+                    if self.sofort { "Sofort" } else { "Sync" },
                     self.cpu_eigen
                 ));
             }
@@ -2499,9 +2630,14 @@ impl App {
         }
     }
 
-    /// Weiche: wer zeichnet. Vorerst gibt es nur den Weg ueber die CPU.
+    /// Weiche: wer zeichnet.
     fn draw(&mut self) {
-        self.draw_cpu();
+        match self.anzeige {
+            Anzeige::Cpu { .. } => self.draw_cpu(),
+            #[cfg(windows)]
+            Anzeige::Gpu(_) => self.draw_gpu(),
+            Anzeige::Keine => {}
+        }
     }
 
     /// Der Weg ueber softbuffer: Bild auf der CPU einpassen, Oberflaeche
@@ -2510,9 +2646,249 @@ impl App {
         // Die Flaeche kurz aus dem Zustand nehmen: solange ihr Puffer
         // beschrieben wird, brauchen die Zeichenschritte `&mut self`.
         let Some(window) = self.window.clone() else { return };
-        let Some(mut surface) = self.surface.take() else { return };
-        self.draw_cpu_auf(&window, &mut surface);
-        self.surface = Some(surface);
+        match std::mem::replace(&mut self.anzeige, Anzeige::Keine) {
+            Anzeige::Cpu { context, mut surface } => {
+                self.draw_cpu_auf(&window, &mut surface);
+                self.anzeige = Anzeige::Cpu { context, surface };
+            }
+            andere => self.anzeige = andere,
+        }
+    }
+
+    /// Der Weg ueber die Karte. Die Karte wird fuer die Dauer des Zeichnens
+    /// aus dem Zustand genommen (wie die Flaeche beim CPU-Weg); geht dabei
+    /// das Geraet verloren, kommt sie nicht zurueck, sondern wird neu gebaut
+    /// oder aufgegeben.
+    #[cfg(windows)]
+    fn draw_gpu(&mut self) {
+        let Some(window) = self.window.clone() else { return };
+        let Anzeige::Gpu(mut g) = std::mem::replace(&mut self.anzeige, Anzeige::Keine) else { return };
+        match self.draw_gpu_auf(&window, &mut g) {
+            Ok(()) => self.anzeige = Anzeige::Gpu(g),
+            Err(Ausfall::Fehler(e)) => {
+                self.gpu_fehler_melden(e);
+                self.anzeige = Anzeige::Gpu(g);
+            }
+            Err(Ausfall::GeraetWeg(grund)) => self.geraet_verloren_behandeln(g, grund),
+        }
+    }
+
+    /// Einen Fehler der Karte ins Protokoll - denselben nur einmal, nicht
+    /// je Bild.
+    #[cfg(windows)]
+    fn gpu_fehler_melden(&mut self, e: String) {
+        if self.letzter_gpu_fehler.as_deref() != Some(e.as_str()) {
+            protokoll::zeile(format!("Anzeige: {e}"));
+            self.letzter_gpu_fehler = Some(e);
+        }
+    }
+
+    /// Ein Fehler eines Aufrufs: war es das Geraet? Dann ist Schluss mit
+    /// dieser Karte; sonst nur eine Protokollzeile, und es geht weiter.
+    #[cfg(windows)]
+    fn gpu_fehler(&mut self, g: &anzeige::Gpu, e: String) -> Result<(), Ausfall> {
+        match g.geraet_weg() {
+            Some(grund) => Err(Ausfall::GeraetWeg(grund)),
+            None => {
+                self.gpu_fehler_melden(e);
+                Ok(())
+            }
+        }
+    }
+
+    /// Ein Durchlauf ueber die Karte: Groesse pruefen, Bild hochladen,
+    /// Oberflaeche rastern und ihren Kasten hochladen, Stufe 2 auf den
+    /// Backbuffer, Present - nur wenn DXGI bereit ist, sonst beim naechsten
+    /// Takt. Klicks aus der Oberflaeche wirken NACH dem Praesentieren, und
+    /// `ui.click` faellt nur, wenn die Oberflaeche in diesem Durchlauf
+    /// gezeichnet wurde - sonst gingen Klicks zwischen zwei Zeichnungen
+    /// verloren.
+    #[cfg(windows)]
+    fn draw_gpu_auf(&mut self, window: &Window, g: &mut anzeige::Gpu) -> Result<(), Ausfall> {
+        let size = window.inner_size();
+        let (ww, wh) = (size.width, size.height);
+        if ww == 0 || wh == 0 {
+            return Ok(()); // minimiert: nichts konfigurieren, nichts zeichnen
+        }
+        if (ww, wh) != (g.breite, g.hoehe) {
+            if let Err(e) = g.groesse(ww, wh) {
+                return Err(match g.geraet_weg() {
+                    Some(grund) => Ausfall::GeraetWeg(grund),
+                    None => Ausfall::Fehler(e),
+                });
+            }
+        }
+        let n = (ww as usize) * (wh as usize);
+        if self.ui_puffer.len() != n {
+            // Erste Zeichnung oder neue Groesse: ganz durchsichtiger Grund,
+            // die Oberflaeche wird komplett neu gerastert.
+            self.ui_puffer = vec![0xff00_0000u32; n];
+            self.ui_kasten_alt = None;
+            self.ui_an = false;
+        }
+        // Der Takt der Oberflaeche haengt an der Uhr (siehe draw_cpu_auf).
+        // `jetzt` gilt fuer die ganze Zeichnung: die Oberflaeche traegt
+        // denselben Zeitstempel wie die Zeichnung selbst, sonst laege sie um
+        // die Rasterzeit hinter dem 33-ms-Takt und fiele jedes zweite Mal aus.
+        let jetzt = Instant::now();
+        self.ui.tick = client_us() / 8000;
+        self.letzte_zeichnung = jetzt;
+
+        // Neues Bild abholen: roh ueber Stufe 1, oder fertig als RGB
+        // (dunkles Bild, unbekanntes Format). Ein rohes Bild faellt gleich
+        // nach dem Upload - der Pufferpool des Decoders will es zurueck.
+        let bild = self.shared.lock().unwrap().frame.take();
+        if let Some(b) = bild {
+            let bereit_us = b.bereit_us();
+            let r = match b {
+                Bild::Rgb(f) => g.bild_rgb(&f).map(|_| (f.width, f.height)),
+                Bild::Roh { bild, .. } => g.bild_roh(&bild).map(|_| (bild.width(), bild.height())),
+            };
+            match r {
+                Ok(groesse) => {
+                    self.bild_da = Some(groesse);
+                    self.bereit_ausstehend = Some(bereit_us);
+                    self.fps_count += 1;
+                    self.shown += 1;
+                }
+                Err(e) => self.gpu_fehler(g, e)?,
+            }
+        }
+        self.sekundentakt(window);
+
+        // Oberflaeche: nur wenn etwas darueberliegt, und nur alle 33 ms -
+        // das Video darunter laeuft mit voller Bildrate weiter, die
+        // Oberflaeche wird nicht mehr je Videobild neu gezeichnet.
+        let (lage, wechsel) = {
+            let s = self.shared.lock().unwrap();
+            (s.error_key.is_some(), s.wechsel_laeuft())
+        };
+        let sichtbar = self.oberflaeche_sichtbar(lage, wechsel);
+        let mut nach = None;
+        if sichtbar {
+            if self.ui_kasten_alt.is_none() || jetzt.duration_since(self.letzte_oberflaeche) >= Duration::from_millis(33) {
+                // Der Puffer gehoert waehrend des Zeichnens der Canvas, nicht
+                // dem App-Zustand - sonst kaeme oberflaeche_zeichnen nicht an
+                // `&mut self`.
+                let mut puffer = std::mem::take(&mut self.ui_puffer);
+                if let Some(k) = self.ui_kasten_alt {
+                    // Was beim letzten Mal dort stand, wieder durchsichtig.
+                    let (x0, x1) = (k.x.max(0) as usize, (k.x + k.w).clamp(0, ww as i32) as usize);
+                    for y in k.y.max(0)..(k.y + k.h).clamp(0, wh as i32) {
+                        let z = y as usize * ww as usize;
+                        puffer[z + x0..z + x1.max(x0)].fill(0xff00_0000);
+                    }
+                }
+                let kasten_neu = {
+                    let mut c = ui::Canvas::neu(&mut puffer, ww as usize, wh as usize);
+                    nach = Some(self.oberflaeche_zeichnen(&mut c, ww, wh));
+                    c.kasten_nehmen()
+                };
+                let hochladen = match kasten_vereinigen(self.ui_kasten_alt, kasten_neu) {
+                    Some(k) => g.oberflaeche_hochladen(&puffer, ww, wh, k),
+                    None => Ok(()),
+                };
+                self.ui_puffer = puffer;
+                self.ui_kasten_alt = kasten_neu;
+                self.ui_an = kasten_neu.is_some();
+                self.letzte_oberflaeche = jetzt;
+                if let Err(e) = hochladen {
+                    self.ui_an = false;
+                    self.gpu_fehler(g, e)?;
+                }
+            }
+        } else {
+            self.ui_an = false;
+        }
+
+        // Rechteck des Bildes im Fenster, dieselbe Rechnung wie blit. Ohne
+        // Bild (Start, Warten) bleibt die Grundfarbe, die Oberflaeche deckt.
+        let rect = match (&self.screen, self.bild_da) {
+            (Screen::Session, Some((fw, fh))) => Some(ziel_rechteck(ww, wh, fw, fh, self.pixel_exact)),
+            _ => None,
+        };
+
+        // Present nur, wenn DXGI bereit ist - nie darauf warten. Sonst beim
+        // naechsten Takt, und das Bild zaehlt als ausgelassen.
+        let ergebnis = if g.bereit() {
+            let p = g.zeichnen(rect, self.ui_an, self.sofort);
+            // Hat DXGI das Tearing im Lauf zurueckgenommen, sagt es auch
+            // die Sekundenzeile.
+            if !g.tearing {
+                self.sofort = false;
+            }
+            match p {
+                anzeige::Praesentiert::Ok | anzeige::Praesentiert::Verdeckt => {
+                    self.praesentation_ausstehend = false;
+                    // Anzeigezeit: Ablage durch den Empfangsfaden bis hinter
+                    // Present - Takt, Upload, zwei Stufen, Uebergabe an DXGI.
+                    if let Some(t) = self.bereit_ausstehend.take() {
+                        let ms = client_us().saturating_sub(t) as f32 / 1000.0;
+                        let mut s = self.shared.lock().unwrap();
+                        s.anzeige_ms = if s.anzeige_ms > 0.0 { s.anzeige_ms + (ms - s.anzeige_ms) * 0.1 } else { ms };
+                    }
+                    Ok(())
+                }
+                anzeige::Praesentiert::Fehler(e) => Err(Ausfall::Fehler(e)),
+                anzeige::Praesentiert::GeraetWeg(grund) => Err(Ausfall::GeraetWeg(grund)),
+            }
+        } else {
+            self.praesentation_ausstehend = true;
+            self.shared.lock().unwrap().ausgelassen += 1;
+            Ok(())
+        };
+        if let Some(n) = nach {
+            self.nachwirkung(n);
+            self.ui.click = false;
+        }
+        ergebnis
+    }
+
+    /// Die Karte ist weg (Treiberupdate, Standby, Win+Strg+Shift+B): Grund
+    /// ins Protokoll, einmal neu auf demselben Fenster - eine Flip-Swapchain
+    /// nach einer Flip-Swapchain ist erlaubt. Kommt der Verlust binnen zehn
+    /// Sekunden wieder oder scheitert der Neubau, bleibt das Fenster stehen
+    /// und der Nutzer bekommt gesagt, wie es weitergeht. Auf softbuffer am
+    /// selben Fenster wird nicht gewechselt: das ist von DXGI nicht gedeckt.
+    #[cfg(windows)]
+    fn geraet_verloren_behandeln(&mut self, alt: anzeige::Gpu, grund: String) {
+        protokoll::zeile(format!("Anzeige: Grafikkarte verloren: {grund}"));
+        drop(alt);
+        self.bild_da = None;
+        self.bereit_ausstehend = None;
+        self.ui_kasten_alt = None;
+        self.ui_an = false;
+        self.praesentation_ausstehend = false;
+        let schon = self.geraet_verloren.map(|t| t.elapsed() < Duration::from_secs(10)).unwrap_or(false);
+        self.geraet_verloren = Some(Instant::now());
+        if !schon {
+            if let Some(w) = self.window.clone() {
+                use einstellungen::AnzeigeWunsch as W;
+                let s = w.inner_size();
+                let bau = fenster_hwnd(&w)
+                    .ok_or_else(|| "kein Win32-Fenster".to_string())
+                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, self.adapter_wunsch));
+                match bau {
+                    Ok(g) => {
+                        protokoll::zeile("Anzeige: Karte neu aufgebaut".into());
+                        self.sofort = g.tearing;
+                        self.anzeige = Anzeige::Gpu(g);
+                        return;
+                    }
+                    Err(e) => protokoll::zeile(format!("Anzeige: Neubau fehlgeschlagen: {e}")),
+                }
+            }
+        }
+        let meldung = "Grafikkarte verloren - bitte mit --anzeige cpu neu starten";
+        protokoll::zeile(format!("Anzeige: {meldung}"));
+        self.anzeige = Anzeige::Keine;
+        let mut s = self.shared.lock().unwrap();
+        s.gpu_pfad = false;
+        s.error = Some(meldung.into());
+        drop(s);
+        if let Some(w) = &self.window {
+            w.set_title(&format!("QuadChroma - {meldung}"));
+        }
     }
 
     fn draw_cpu_auf(&mut self, window: &Window, surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>) {
@@ -3805,6 +4181,17 @@ fn main() {
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|v| einstellungen::DecoderWunsch::aus(&v))
         .unwrap_or(cfg.decoder);
+    // --anzeige auto|gpu|cpu|warp ebenso fuer die Anzeige; --adapter n nimmt
+    // genau den n-ten Adapter aus der Liste im Protokoll.
+    let anzeige_wunsch = std::env::args()
+        .position(|a| a == "--anzeige")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| einstellungen::AnzeigeWunsch::aus(&v))
+        .unwrap_or(cfg.anzeige);
+    let adapter_wunsch: Option<u32> = std::env::args()
+        .position(|a| a == "--adapter")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok());
 
     // Ton ist an, bis jemand ihn abschaltet - Default waere "aus".
     let shared = Arc::new(Mutex::new(Shared { decoder_wunsch, ton: true, ..Shared::default() }));
@@ -3970,8 +4357,19 @@ fn main() {
         fps_shown: 0.0,
         fps_since: Instant::now(),
         window: None,
-        surface: None,
-        context: None,
+        anzeige: Anzeige::Keine,
+        anzeige_wunsch,
+        adapter_wunsch,
+        sofort: false,
+        bild_da: None,
+        bereit_ausstehend: None,
+        ui_puffer: Vec::new(),
+        ui_kasten_alt: None,
+        ui_an: false,
+        letzte_oberflaeche: Instant::now(),
+        praesentation_ausstehend: false,
+        geraet_verloren: None,
+        letzter_gpu_fehler: None,
         shown: 0,
         banner_until: None,
         angewandt_fuer: None,
