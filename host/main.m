@@ -1488,21 +1488,59 @@ static void fixed_tick(void) {
 
 // ------------------------------------------------------------------- Helfer
 
+// Der gewaehlte Bildschirm, an seiner Kennung. Zwei Monitore am Mac haben
+// das noetig gemacht: ScreenCaptureKit sortiert seine Liste nicht stabil,
+// Listenplatz 0 war beim Start der eine Monitor und beim naechsten
+// Aufnahmestart der andere - das Bild kam vom 4K-Schirm, die Maus lief auf
+// dem 240-Hz-Schirm daneben, weil die Eingabe die Kennung vom Start behielt.
+static CGDirectDisplayID g_display_id = 0;
+// Wurde der Listenplatz mit --display ausdruecklich verlangt?
+static int g_display_explizit = 0;
+
+// Bildschirm waehlen. Reihenfolge: der zuletzt gewaehlte (an seiner Kennung,
+// damit ein Neustart der Aufnahme auf demselben Bildschirm landet), sonst der
+// mit --display verlangte Listenplatz, sonst der Hauptbildschirm - der mit der
+// Menueleiste, den man fernsteuern will -, sonst der erste der Liste. Die Wahl
+// gilt danach auch fuer die Maus: Zeiger und Bild gehoeren auf denselben Schirm.
 static SCDisplay *pick_display(int idx, size_t *pxW, size_t *pxH, double *hz) {
     __block SCDisplay *display = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    CGDirectDisplayID gewollt = g_display_id;
+    int explizit = g_display_explizit;
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *c, NSError *e) {
-        if (!e && c.displays.count > (NSUInteger)idx) display = c.displays[idx];
-        else logf_(@"Bildschirm %d nicht verfuegbar: %@", idx, e.localizedDescription);
+        if (e) {
+            logf_(@"Bildschirme nicht abrufbar: %@", e.localizedDescription);
+        } else {
+            if (gewollt) {
+                for (SCDisplay *d in c.displays) if (d.displayID == gewollt) { display = d; break; }
+                if (!display) logf_(@"Bildschirm %u ist weg", gewollt);
+            }
+            if (!display && explizit) {
+                if (c.displays.count > (NSUInteger)idx) display = c.displays[idx];
+                else logf_(@"Bildschirm %d nicht verfuegbar (%lu in der Liste)", idx, (unsigned long)c.displays.count);
+            }
+            if (!display && !explizit) {
+                CGDirectDisplayID haupt = CGMainDisplayID();
+                for (SCDisplay *d in c.displays) if (d.displayID == haupt) { display = d; break; }
+                if (!display && c.displays.count) display = c.displays[0];
+            }
+        }
         dispatch_semaphore_signal(sem);
     }];
     dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
     if (!display) return nil;
+    if (display.displayID != g_display_id)
+        logf_(@"Bildschirm gewaehlt: Kennung %u, %ld x %ld Punkte%@", display.displayID,
+              (long)display.width, (long)display.height,
+              display.displayID == CGMainDisplayID() ? @" (Hauptbildschirm)" : @"");
+    g_display_id = display.displayID;
+    // Die Maus folgt dem Bild - immer, nicht nur beim Programmstart.
+    g_input_display = display.displayID;
     CGDisplayModeRef m = CGDisplayCopyDisplayMode(display.displayID);
-    if (pxW) *pxW = CGDisplayModeGetPixelWidth(m);
-    if (pxH) *pxH = CGDisplayModeGetPixelHeight(m);
-    if (hz) *hz = CGDisplayModeGetRefreshRate(m);
-    CGDisplayModeRelease(m);
+    if (pxW) *pxW = m ? CGDisplayModeGetPixelWidth(m) : 0;
+    if (pxH) *pxH = m ? CGDisplayModeGetPixelHeight(m) : 0;
+    if (hz) *hz = m ? CGDisplayModeGetRefreshRate(m) : 0;
+    if (m) CGDisplayModeRelease(m);
     return display;
 }
 
@@ -1629,7 +1667,7 @@ static BOOL stream_hochfahren_sync(void) {
         if (g_wach == kIOPMNullAssertionID)
             IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
                                         CFSTR("QuadChroma streamt diesen Bildschirm"), &g_wach);
-        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
+        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz, Kennung %u", pw, ph, hz, g_display_id);
         ok = YES;
     });
     return ok;
@@ -1779,7 +1817,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     }
     if (srvIdx != NSNotFound && srvIdx + 1 < (NSInteger)args.count && ![args[srvIdx + 1] hasPrefix:@"--"])
         port = [args[srvIdx + 1] intValue];
-    if ((i = [args indexOfObject:@"--display"]) != NSNotFound) displayIdx = [args[i + 1] intValue];
+    if ((i = [args indexOfObject:@"--display"]) != NSNotFound) { displayIdx = [args[i + 1] intValue]; g_display_explizit = 1; }
     if ((i = [args indexOfObject:@"--fps"]) != NSNotFound) fps = [args[i + 1] intValue];
     if ((i = [args indexOfObject:@"--mbit"]) != NSNotFound) mbit = [args[i + 1] intValue];
     if ((i = [args indexOfObject:@"--out"]) != NSNotFound) sscanf(args[i + 1].UTF8String, "%dx%d", &outW, &outH);
@@ -1812,7 +1850,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         start_beacon(port);
         BOOL ax = AXIsProcessTrusted();
         logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-        logf_(@"Display %d (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", displayIdx, pxW, pxH, hz, outW, outH, fps);
+        logf_(@"Bildschirm Kennung %u (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", display.displayID, pxW, pxH, hz, outW, outH, fps);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {
         logf_(@"\n=== Aufnahme %.1f s: Display %d (%zux%zu Pixel) -> %dx%d, %d fps ===",
