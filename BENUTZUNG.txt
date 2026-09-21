@@ -61,7 +61,7 @@ Das Menue
 ---------
 
 ESC zwei Sekunden halten (das ESC selbst kommt dann nicht beim Mac an) oder
-F10. Vier Reiter:
+F10. Fuenf Reiter:
 
     Bild            Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton,
                     Codecwahl
@@ -70,6 +70,8 @@ F10. Vier Reiter:
                     Grafikkarte)
     Verschluesselung  Verfahren, Vergleichscode, Fingerabdruck, Trennen
     Tastenkombinationen  alle Tasten, die der Client selbst abfaengt
+    Benchmark       misst Codecs, Bildraten und Datenraten der Reihe nach
+                    (siehe unten)
 
 Wer mit der Maus ueber einen Schalter faehrt, bekommt sofort einen Satz
 dazu, was er tut - in jeder der 29 Sprachen.
@@ -199,6 +201,46 @@ Bildschirmwahl auf dem Mac: ohne Angabe nimmt der Host den Hauptbildschirm
 gehoeren immer auf denselben Bildschirm. --display n waehlt einen anderen
 Platz aus der Liste (--list zeigt sie). Ein Wechsel gilt ab dem naechsten
 Start des Hosts.
+
+Benchmark
+---------
+
+Der Reiter "Benchmark" probiert Codecs, Bildraten und Datenraten der Reihe
+nach durch: welche Codecs (alle, die der Host kann, abwaehlbar), 60 und 120
+Bilder, 10 bis 150 Mbit/s, je Schritt 3 bis 15 Sekunden Messzeit. Ein Codec
+bleibt stehen, waehrend seine Raten durchlaufen - der Wechsel ist der
+teuerste Schritt. Das Bild laeuft dabei weiter, das Menue zeigt den
+Fortschritt; wer das Menue schliesst, bricht den Lauf ab (ESC oder F10).
+Am Ende bekommen Host und Client Codec und Einstellungen von vorher zurueck.
+
+Gemessen wird nie ein Wunsch, sondern was der Host bestaetigt hat. Je
+Schritt: angekommene Bildrate, Datenrate, die ganze Kette in Millisekunden
+(Encoder, Leitung, Decoder, Anzeige), verworfene Bilder, Encoderzeit des
+Hosts gegen sein Budget 1000/fps, Prozessorlast auf beiden Seiten. Ein
+Schritt besteht, wenn die Kette in anderthalb Bildern bleibt, mindestens
+95 % der Bilder ankommen, unter 1 % verworfen werden und der Encoder in
+seinem Budget bleibt. Empfohlen wird die beste Farbqualitaet, die bei der
+hoechsten Bildrate besteht, mit der hoechsten Datenrate, bei der sie noch
+besteht; "Uebernehmen" setzt sie und speichert sie fuer diesen Host.
+
+Der Schalter "Testbild" laesst den Host fuer die Dauer des Laufs ein festes,
+bewegtes Muster statt des Bildschirms senden (Farbbalken, feine Streifen,
+Verlauf mit kreisendem Quadrat) - so sieht jeder Schritt denselben Inhalt,
+und auf dem Mac muss nichts laufen. Ohne Testbild wird gemessen, was gerade
+auf dem Mac passiert; vergleichbar sind die Schritte dann nur, wenn sich
+etwas bewegt.
+
+Die Tabelle landet nach jedem Lauf in %APPDATA%\QuadChroma\benchmark.txt,
+auch nach einem Abbruch. Ohne Fenster:
+
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5 --ohne-testbild
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 3 --benchmark-auswahl 0,3:25,50:120
+
+Die Zahl hinter --benchmark ist die Messzeit je Schritt; --benchmark-auswahl
+grenzt auf Kandidaten:Mbit:Bildraten ein (leere Teile lassen die Vorgabe
+stehen). Ohne Fenster gibt es kein Glied "Anzeige" und nichts, das
+verworfen werden koennte - die Spalten zeigen dann "-".
 
 Pruefmodus ohne Fenster, falls etwas klemmt:
 

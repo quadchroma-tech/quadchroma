@@ -49,7 +49,7 @@ im Einzelnen beschreibt `BENUTZUNG.txt`.
 | Taste | Wirkung |
 |---|---|
 | F9 | Statistik ein und aus |
-| F10 oder ESC zwei Sekunden halten | Menü: Bild, Anzeige, Verschlüsselung |
+| F10 oder ESC zwei Sekunden halten | Menü: Bild, Anzeige, Verschlüsselung, Tastenkombinationen, Benchmark |
 | F11 | Vollbild an und aus |
 | F12 | pixelgenaue Darstellung statt gestreckt |
 | Strg+Esc | zurück zum Startbildschirm |
@@ -60,6 +60,14 @@ funktionieren Umlaute und AltGr ohne Zutun. Die Windows-Taste ist die Befehlstas
 Macs. Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton und Codec stellt man im
 laufenden Betrieb um; der Mac meldet zurück, was gilt, und der Client merkt sich die
 Werte je Host.
+
+Der Reiter **Benchmark** misst Codecs, Bildraten und Datenraten der Reihe nach, je
+Schritt einige Sekunden, ohne das Bild anzuhalten: angekommene Bildrate, die ganze
+Kette in Millisekunden, verworfene Bilder, Encoderzeit des Hosts gegen sein Budget,
+Prozessorlast beider Seiten. Auf Wunsch sendet der Host dabei ein festes, bewegtes
+Testbild, damit jeder Schritt denselben Inhalt sieht. Am Ende steht eine Empfehlung,
+die sich mit einem Klick übernehmen lässt; die Tabelle liegt in
+`%APPDATA%\QuadChroma\benchmark.txt`.
 
 ## Gemessen auf einem Mac mini M1
 
@@ -118,7 +126,8 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
 - Auflösungswechsel im laufenden Betrieb (der Client meldet seine Fenstergröße, der Host stellt den Strom um)
 - Bildschirmwahl im Menü statt nur beim Start
 - Anzeige: Wahl Sofort/Bildsynchron im Menü, frisches Fenster nach Geräteverlust; ab 4K der Null-Kopien-Weg (NVDEC-Bild bleibt auf der Karte)
-- Ein Benchmark, der Codecs, Datenraten und Bildraten der Reihe nach durchmisst
+- Wahl der Grafikkarte im Menü (Automatik, Grafikkarte, Integriert, Prozessor) mit Erkennung; D3D11VA-Decodieren für AMD und Intel (4:2:0 und H.264)
+- Später als Zusatz denkbar: beide Bildschirme des Hosts auf Wunsch streamen; ein Relay, an das sich weitere Zuschauer heften (Bild und Ton, ohne Eingabe)
 
 ## Aufbau
 
