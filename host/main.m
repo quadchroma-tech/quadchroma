@@ -1380,6 +1380,9 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
 // hier nichts - nachgelegt wird nur, was sonst ausfallen wuerde.
 static void fixed_tick(void) {
     if (!atomic_load(&g_cur_fixed)) return;
+    // Ohne Zuschauer wird nichts nachgelegt. Sonst laeuft der Encoder mit
+    // voller Rate fuer niemanden - gemessen: 24 % Last im Leerlauf.
+    if (atomic_load(&g_client_fd) < 0) return;
     if (!g_last_pb || !g_session) return;
     int fps = atomic_load(&g_cur_fps);
     if (fps <= 0) return;
