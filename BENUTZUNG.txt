@@ -46,6 +46,27 @@ Ablage der Schluessel:
 
 Alle Freigaben auf dem Mac loeschen: Host einmal mit --forget starten.
 
+Mac als Client (im Aufbau)
+--------------------------
+
+Derselbe Client baut auch auf dem Mac (arm64): Ton ueber AudioToolbox,
+Zwischenablage ueber NSPasteboard, Anzeige vorerst ueber die CPU (kein
+Metal, keine Grafikkarten im Reiter Anzeige). Bauen mit Rust und dem FFmpeg
+aus Homebrew:
+
+    cd client
+    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
+    ./target/release/quadchroma 192.168.178.194:9001
+
+Ablage: ~/Library/Application Support/QuadChroma/ (client.key,
+known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt) - derselbe
+Ordner wie beim Host, getrennte Dateien. Die Kopplung laeuft wie bei jedem
+Client: der Host muss einmal mit --pair gestartet werden.
+
+Lizenzhinweis: das FFmpeg aus Homebrew ist ein GPL-Build (libx264, libx265).
+Fuer den Eigengebrauch in Ordnung; zur Weitergabe des Mac-Clients braucht es
+einen LGPL-Build ohne GPL-Teile.
+
 Tasten:
 
     F9         Statistik ein und aus (welche Zeilen, steht im Menue)

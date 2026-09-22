@@ -44,6 +44,22 @@ im Startbildschirm. Drei Kanäle: 9001 Bild und Ton, 9002 Eingaben und Zwischena
 was FFmpeg dazu sagt, steht in `%APPDATA%\QuadChroma\protokoll.txt`; die Bedienung
 im Einzelnen beschreibt `BENUTZUNG.txt`.
 
+### Mac als Client (im Aufbau)
+
+Derselbe Client baut auch auf dem Mac (arm64), mit Ton über AudioToolbox und
+Zwischenablage über NSPasteboard; die Anzeige läuft dort noch über die CPU
+(softbuffer), Metal kommt später. Bauen mit Rust und dem FFmpeg aus Homebrew:
+
+    cd client
+    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
+    ./target/release/quadchroma 192.168.178.194:9001
+
+Ablage unter `~/Library/Application Support/QuadChroma` (client.key, known_hosts.txt,
+einstellungen.txt, protokoll.txt, benchmark.txt — neben host.key und authorized.txt
+des Hosts, getrennte Dateien). Lizenzhinweis: das Homebrew-FFmpeg ist ein GPL-Build
+(libx264, libx265); für den Eigengebrauch in Ordnung, zur Weitergabe des Mac-Clients
+braucht es einen LGPL-Build ohne GPL-Teile.
+
 ## Bedienung im Client
 
 | Taste | Wirkung |

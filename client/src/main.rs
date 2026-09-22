@@ -30,10 +30,24 @@ mod strings_north;
 mod strings_west;
 mod ui;
 
+/// Ton und Zwischenablage: je Plattform eine Datei mit derselben
+/// Schnittstelle; der Ringpuffer des Tons ist geteilt (audio_ring.rs). Auf
+/// dem Mac laufen die Module unter denselben Namen `audio` und `clipboard`,
+/// damit die Aufrufstellen ohne Weiche auskommen.
+#[cfg(any(windows, target_os = "macos"))]
+mod audio_ring;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
 mod clipboard;
+#[cfg(target_os = "macos")]
+mod audio_mac;
+#[cfg(target_os = "macos")]
+mod clipboard_mac;
+#[cfg(target_os = "macos")]
+use audio_mac as audio;
+#[cfg(target_os = "macos")]
+use clipboard_mac as clipboard;
 #[cfg(windows)]
 mod anzeige;
 /// Windows als Host: eigene Rolle in derselben Programmdatei (--host,
@@ -65,8 +79,10 @@ fn client_us() -> u64 {
 /// die das Profil nicht kann, waere damit unsichtbar. Hier laufen beide
 /// Sorten in EINER Reihe zusammen, in der Reihenfolge, in der sie entstanden
 /// sind: erst die Ursache, dann die Folge. Der Pruefmodus druckt sie, und
-/// jede Zeile landet ausserdem in %APPDATA%\QuadChroma\protokoll.txt, das
-/// bei jedem Start neu beginnt - ein paar Zeilen je Sitzung, mehr nicht.
+/// jede Zeile landet ausserdem in protokoll.txt im Ablageordner des Clients
+/// (%APPDATA%\QuadChroma, auf dem Mac ~/Library/Application Support/
+/// QuadChroma), das bei jedem Start neu beginnt - ein paar Zeilen je
+/// Sitzung, mehr nicht.
 mod protokoll {
     use ffmpeg_next as ffmpeg;
     use std::io::Write;
@@ -91,10 +107,7 @@ mod protokoll {
     static DATEI: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
     fn datei_pfad() -> Option<std::path::PathBuf> {
-        let base = std::env::var("APPDATA").or_else(|_| std::env::var("HOME")).ok()?;
-        let dir = std::path::PathBuf::from(base).join("QuadChroma");
-        std::fs::create_dir_all(&dir).ok()?;
-        Some(dir.join("protokoll.txt"))
+        crate::einstellungen::datei_pfad("protokoll.txt")
     }
 
     /// Nur in die Datei - fuer die Taktzeilen des Pruefmodus, die auf der
@@ -593,7 +606,38 @@ fn prozesszeit_100ns() -> Option<u64> {
     Some(als_u64(kernel) + als_u64(nutzer))
 }
 
-#[cfg(not(windows))]
+/// Dasselbe auf dem Mac ueber getrusage(RUSAGE_SELF): Nutzer- plus
+/// Systemzeit in Mikrosekunden, hier auf 100 ns gebracht. Die Strukturen
+/// sind von Hand deklariert (sys/resource.h, arm64 und x86_64 gleich):
+/// timeval ist time_t (64 Bit) plus suseconds_t (32 Bit, aufgefuellt).
+#[cfg(target_os = "macos")]
+fn prozesszeit_100ns() -> Option<u64> {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct Timeval {
+        sek: i64,
+        usek: i32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rusage {
+        nutzer: Timeval,
+        system: Timeval,
+        rest: [i64; 14],
+    }
+    extern "C" {
+        fn getrusage(wer: std::os::raw::c_int, heraus: *mut Rusage) -> std::os::raw::c_int;
+    }
+    const RUSAGE_SELF: std::os::raw::c_int = 0;
+    let mut r = Rusage::default();
+    if unsafe { getrusage(RUSAGE_SELF, &mut r) } != 0 {
+        return None;
+    }
+    let als_100ns = |t: Timeval| (t.sek.max(0) as u64) * 10_000_000 + (t.usek.max(0) as u64) * 10;
+    Some(als_100ns(r.nutzer) + als_100ns(r.system))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn prozesszeit_100ns() -> Option<u64> {
     None
 }
@@ -1329,7 +1373,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let mut mitschnitt_laeuft = false;
 
     let mut info: Option<StreamInfo> = None;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let mut sound: Option<audio::AudioOut> = None;
     let mut pcm: Vec<f32> = Vec::new();
     let mut hdr = [0u8; 8];
@@ -1802,7 +1846,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
             }
             MSG_AUDIO_INFO => {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 if len >= 8 {
                     let rate = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     let ch = payload[4] as u16;
@@ -1813,7 +1857,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
             }
             MSG_AUDIO => {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 if let Some(a) = sound.as_ref().filter(|_| shared.lock().unwrap().ton) {
                     // Der Empfangspuffer ist nicht ausgerichtet, deshalb Wert fuer Wert.
                     pcm.clear();
@@ -1825,7 +1869,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
             }
             MSG_CLIP => {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 if let Ok(text) = std::str::from_utf8(&payload) {
                     clipboard::set(text);
                 }
@@ -5623,9 +5667,9 @@ fn main() {
     let start_addr = addr.clone();
     let input = Arc::new(Mutex::new(InputLink::new(input_addr)));
 
-    // Zwischenablage: Was auf Windows kopiert wird, geht zum Mac. Die Uebergabe
+    // Zwischenablage: Was hier kopiert wird, geht zum Host. Die Uebergabe
     // aus der Fensterschleife heraus ist bewusst nicht blockierend.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let link = input.clone();
@@ -5911,6 +5955,10 @@ fn main() {
                 );
                 MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), MB_OK | MB_ICONERROR);
             }
+            // Auf dem Mac gibt es kein Meldungsfenster ohne AppKit-Anlauf;
+            // die Konsole muss reichen.
+            #[cfg(not(windows))]
+            eprintln!("Es wurde keine verwendbare Schriftart gefunden. Ohne sie bliebe die Oberflaeche leer.");
             return;
         }
     }
@@ -6663,8 +6711,14 @@ fn hud(
                     u.text.draw(c, ix, py, &format!("{schritt} · {} · {phase}", b.schritt), sz(11), ui::TEXT, p(1));
                 }
                 Some(b) => {
+                    // Wo die Datei liegt, je Plattform in der Schreibweise
+                    // des Systems (siehe secure::config_dir).
+                    #[cfg(target_os = "macos")]
+                    const ABLAGE: &str = "~/Library/Application Support/QuadChroma/benchmark.txt";
+                    #[cfg(not(target_os = "macos"))]
+                    const ABLAGE: &str = "%APPDATA%\\QuadChroma\\benchmark.txt";
                     let t = format!(
-                        "{} · {} · %APPDATA%\\QuadChroma\\benchmark.txt",
+                        "{} · {} · {ABLAGE}",
                         lang.get(if b.abgebrochen { BenchAborted } else { BenchDone }),
                         lang.get(BenchStep).replace("{n}", &b.ergebnisse.len().to_string()).replace("{m}", &b.gesamt.to_string())
                     );

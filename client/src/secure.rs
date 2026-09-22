@@ -182,13 +182,31 @@ impl Secure {
 
 // ------------------------------------------------------------ Schluesselablage
 
+/// Der Ordner fuer alles, was der Client dauerhaft ablegt: client.key,
+/// known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt.
+/// Windows: %APPDATA%\QuadChroma (ohne APPDATA: unter HOME).
+/// macOS: ~/Library/Application Support/QuadChroma - derselbe Ordner, in dem
+/// der Mac-Host host.key und authorized.txt haelt; getrennte Dateinamen, keine
+/// Kollision.
 pub fn config_dir() -> Result<PathBuf, String> {
+    let dir = basis_ordner()?.join("QuadChroma");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Ordner: {e}"))?;
+    Ok(dir)
+}
+
+#[cfg(target_os = "macos")]
+fn basis_ordner() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME")
+        .map_err(|_| "kein Ablageort fuer Einstellungen gefunden".to_string())?;
+    Ok(PathBuf::from(home).join("Library").join("Application Support"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn basis_ordner() -> Result<PathBuf, String> {
     let base = std::env::var("APPDATA")
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "kein Ablageort fuer Einstellungen gefunden".to_string())?;
-    let dir = PathBuf::from(base).join("QuadChroma");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Ordner: {e}"))?;
-    Ok(dir)
+    Ok(PathBuf::from(base))
 }
 
 /// Dauerhafter eigener Schluessel. Entsteht beim ersten Start.
