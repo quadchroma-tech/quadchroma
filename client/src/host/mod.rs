@@ -2,6 +2,7 @@
 //
 //   quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
 //                  [--pair] [--forget] [--konserve datei.hevc]
+//                  [--encoderweg bgra|yuv444|d3d11|auto]
 //   quadchroma.exe --list
 //   quadchroma.exe --messen [--output n] [--sekunden 10]
 //
@@ -11,8 +12,10 @@
 // Client darf den Host nicht erkennen.
 //
 // Stand: Zuschauerplatz (Noise-Responder, Kopplung, Bekanntgabe), Eingaben,
-// Zwischenablage, Konserve als Bildquelle und die Messung (--messen).
-// Aufnahme im Betrieb, Encoder im Betrieb, Ton und Zeigerform folgen.
+// Zwischenablage, Aufnahme (Desktop Duplication) mit Schrittmacher und
+// Encoder im Betrieb (nvenc, ohne NVIDIA h264_mf in Software), Codecwechsel,
+// Testbild, Ton (WASAPI-Loopback), Zeigerform, Last, Wachhalten; die
+// Konserve bleibt als Bildquelle waehlbar (--konserve); die Messung (--messen).
 
 pub mod aufnahme;
 pub mod eingabe;
@@ -20,7 +23,10 @@ pub mod encoder;
 pub mod konserve;
 pub mod messen;
 pub mod netz;
+pub mod takt;
 pub mod testbild;
+pub mod ton;
+pub mod zeiger;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -134,13 +140,33 @@ pub fn ffmpeg_zeilen() {
 
 // --------------------------------------------------------------------- Uhr
 
-/// Uhr des Hosts in Mikrosekunden. std::time::Instant ist auf Windows der
-/// Hochleistungszaehler; Nachricht 4 (Zeitantwort) und Nachricht 5 (Stempel)
+/// Uhr des Hosts in Mikrosekunden: der Hochleistungszaehler ab dem ersten
+/// Aufruf. Nachricht 4 (Zeitantwort), Nachricht 5 (Stempel) und die
+/// Praesentationszeit der Duplication (LastPresentTime, ebenfalls QPC)
 /// lesen dieselbe Uhr.
 pub fn now_us() -> u64 {
+    use windows::Win32::System::Performance::QueryPerformanceCounter;
+    let mut q = 0i64;
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut q);
+    }
+    qpc_us(q)
+}
+
+/// Ein QPC-Stand in Mikrosekunden der Hostuhr.
+pub fn qpc_us(q: i64) -> u64 {
     use std::sync::OnceLock;
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    static START: OnceLock<(i64, i64)> = OnceLock::new();
+    let (q0, hz) = *START.get_or_init(|| {
+        let (mut q0, mut hz) = (0i64, 1i64);
+        unsafe {
+            let _ = QueryPerformanceCounter(&mut q0);
+            let _ = QueryPerformanceFrequency(&mut hz);
+        }
+        (q0, hz.max(1))
+    });
+    ((q - q0).max(0) as u128 * 1_000_000 / hz as u128) as u64
 }
 
 // ------------------------------------------------------------- Befehlszeile
@@ -350,9 +376,9 @@ pub fn main_host(args: &[String]) -> i32 {
                 if a.haupt { " (Hauptbildschirm)" } else { "" }
             ));
             eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
-            let (w, h) = if a.breite >= 3840 { (a.breite / 2, a.hoehe / 2) } else { (a.breite, a.hoehe) };
-            Z.info_w.store((w & !1) as u32, Ordering::Relaxed);
-            Z.info_h.store((h & !1) as u32, Ordering::Relaxed);
+            let (w, h) = aufnahme::stromgroesse(a);
+            Z.info_w.store(w as u32, Ordering::Relaxed);
+            Z.info_h.store(h as u32, Ordering::Relaxed);
         }
         None => {
             log("Kein DXGI-Ausgang - Maus bezieht sich auf den GDI-Hauptbildschirm, Bild nur aus einer Konserve");
@@ -367,9 +393,14 @@ pub fn main_host(args: &[String]) -> i32 {
         }
     }
 
-    // Was dieser Rechner codieren kann - gefragt, nicht geraten.
+    // Was dieser Rechner codieren kann - gefragt, nicht geraten. Der
+    // Startkandidat ist 0 wie beim Mac, sonst der erste vorhandene.
     encoder::pruefen();
     ffmpeg_zeilen();
+    let startkandidat = encoder::startkandidat();
+    if let Some(i) = startkandidat {
+        Z.codec_id.store(i as u32, Ordering::Relaxed);
+    }
 
     // Konserve: ein Annex-B-Strom als Bildquelle (Pruefweg ohne Karte).
     let konserve = match arg_wert(args, "--konserve") {
@@ -382,9 +413,18 @@ pub fn main_host(args: &[String]) -> i32 {
         },
         None => None,
     };
-    if konserve.is_none() {
-        log("Keine Bildquelle: Aufnahme und Encoder im Betrieb folgen (Schritte 4 und 5) - ohne --konserve geht kein Bild raus");
-    }
+
+    // Eingabeweg des Encoders: --encoderweg bgra|yuv444|d3d11|auto.
+    let weg = match arg_wert(args, "--encoderweg") {
+        Some(t) => match encoder::Weg::aus_text(&t) {
+            Some(w) => w,
+            None => {
+                log(format!("--encoderweg {t}: unbekannt (bgra, yuv444, d3d11, auto)"));
+                return 7;
+            }
+        },
+        None => encoder::Weg::Auto,
+    };
 
     // Zuschauerplatz: Bild, Eingabe, Bekanntgabe.
     if let Err(e) = netz::start(port, priv_key) {
@@ -395,9 +435,22 @@ pub fn main_host(args: &[String]) -> i32 {
     // Bildkanal); was von dort kommt, legt der Eingabefaden ab.
     crate::clipboard::watch(|text| netz::send_small(MSG_CLIP, text.as_bytes()));
     eingabe::start();
-    // Die Konserve bestimmt die Eckdaten des Stroms - vor der Zeile dazu.
+    // Ton: Abgriff nur mit Zuschauer; ohne Tongeraet steht der Grund einmal da.
+    ton::start();
+    // Bildquelle: die Konserve bestimmt die Eckdaten des Stroms - vor der
+    // Zeile dazu. Sonst die Aufnahme des gewaehlten Ausgangs mit dem
+    // Encoder aus der Kandidatentabelle - beides erst, wenn jemand zuschaut.
     if let Some(k) = konserve {
         konserve::abspielen(k);
+    } else {
+        match (&ausgang, startkandidat) {
+            (Some(a), Some(_)) => {
+                let weg = encoder::weg_entscheiden(weg, a.index);
+                aufnahme::start(Some(a.clone()), weg);
+            }
+            (None, _) => log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus"),
+            (_, None) => log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus"),
+        }
     }
     log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
     log(format!(

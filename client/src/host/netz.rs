@@ -285,6 +285,9 @@ fn annahme_bild(listener: TcpListener) {
 
         Z.force_key.store(true, Ordering::Relaxed);
         Z.wait_key.store(true, Ordering::Relaxed);
+        // Zeigerform und Tonformat gehen dem neuen Zuschauer erneut zu.
+        super::zeiger::neu_senden();
+        super::ton::info_zuruecksetzen();
         settings_senden();
         send_small(MSG_CODECS, &encoder::codecs_payload());
         log(format!("Zuschauer verbunden: {ip}:{port}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}"));
@@ -364,10 +367,15 @@ fn annahme_eingabe(listener: TcpListener) {
                     }
                 }
                 IN_TESTBILD => {
+                    // Der Aufnahmefaden setzt es um und meldet es; mit einer
+                    // Konserve gibt es keinen Encoder, der es speisen koennte.
                     if len >= 1 {
                         let an = payload[0] != 0;
-                        Z.testbild.store(an, Ordering::Relaxed);
-                        log(if an { "Testbild an: folgt mit dem Encoder (Schritt 5)" } else { "Testbild aus" });
+                        if Z.konserve.load(Ordering::Relaxed) {
+                            log(format!("Testbild {}: mit Konserve nicht moeglich", if an { "an" } else { "aus" }));
+                        } else {
+                            Z.testbild.store(an, Ordering::Relaxed);
+                        }
                     }
                 }
                 IN_CODEC => {
