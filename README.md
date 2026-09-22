@@ -126,7 +126,11 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
 ## Was fehlt
 
 - Kopplungsdialog in der Oberfläche statt Kommandozeilenschalter
-- Rollenwahl (Windows als Host)
+- Rollenwahl (Windows als Host): im Aufbau. Fertig sind `--host` mit Zuschauerplatz
+  (Noise-Responder, Kopplung, Bekanntgabe), Eingaben und Zwischenablage, `--list`
+  und die Messung `--messen`; als Bildquelle dient bis auf Weiteres eine Konserve
+  (`--konserve`). Aufnahme (Desktop Duplication), Encoder (NVENC), Ton und
+  Zeigerform im Betrieb folgen. Beschreibung in `BENUTZUNG.txt`.
 - Tonkomprimierung als Wahlmöglichkeit; unkomprimiert braucht mehr Bandbreite als das Bild
 - Virtuelles Mikrofon auf dem Host, damit Programme dort den Client hören
 - Mehrere Zuschauer gleichzeitig

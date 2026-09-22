@@ -286,6 +286,69 @@ erzwingt die Karte und sagt, was sie dazu meint;
 zaehlt die Karten auf und probiert jede Decoderwahl mit HEVC 4:4:4, 4:2:0
 und H.264 durch, ohne Verbindung.
 
+Windows als Host (im Aufbau)
+----------------------------
+
+Dieselbe quadchroma.exe kann auch der Host sein: sie nimmt den Zuschauer
+an, den sonst der Mac bekommt - gleiche Verschluesselung, gleiche
+Kopplung, gleiche Nachrichten, ein Client merkt keinen Unterschied. Fertig
+sind Zuschauerplatz, Kopplung, Bekanntgabe, Eingaben (Maus, Tastatur,
+Rad) und die Zwischenablage in beide Richtungen; Aufnahme des Bildschirms,
+Encoder und Ton im Betrieb folgen. Bis dahin liefert eine Konserve das
+Bild. Alles laeuft ohne Fenster ueber die Befehlszeile; jede Zeile steht
+auch in %APPDATA%\QuadChroma\host-protokoll.txt.
+
+    quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
+                   [--pair] [--forget] [--konserve datei.hevc]
+    quadchroma.exe --list
+    quadchroma.exe --messen [--output n] [--sekunden 10]
+
+    --host [port]   Host starten: Bild auf port (9001), Eingaben auf port+1,
+                    Bekanntgabe auf port+2. Beim ersten Start entsteht
+                    host.key; der Fingerabdruck steht im Protokoll.
+    --output n      Ausgang aus der Liste von --list (ohne Angabe der
+                    Hauptbildschirm). Bild und Maus beziehen sich auf
+                    denselben Ausgang; gemerkt wird sein Geraetename.
+    --fps N, --mbit N, --fest   wie beim Mac (Vorgabe 120, 150, aus).
+    --pair          die naechste unbekannte Gegenstelle wird aufgenommen
+                    (Vergleichscode im Protokoll); beim allerersten Mal
+                    geschieht das von selbst.
+    --forget        alle Freigaben loeschen (authorized.txt).
+    --konserve datei.hevc   ein Annex-B-Strom (HEVC oder H.264) als
+                    Bildquelle, in Schleife im Takt der Bildrate - der
+                    Pruefweg ohne Karte. Die Koennensliste zeigt dann genau
+                    einen Eintrag, ein Codecwechsel wird abgelehnt. Eine
+                    solche Datei schreibt der Client selbst:
+                        quadchroma.exe 192.168.178.194:9001 --headless --mitschnitt C:\qc\qc.hevc
+    --list          Karten, Ausgaenge und was dieser Rechner codieren kann
+                    (hevc_nvenc, h264_nvenc, av1_nvenc je Kandidat ueber
+                    avcodec_open2; ohne NVIDIA-Treiber steht dort
+                    "Cannot load nvcuda.dll"), dazu ob die Media-Foundation-
+                    Encoder in Software oeffnen und codieren.
+    --messen        die Messung fuer die Aufnahme: je Ausgang Acquire,
+                    Kopie auf der Karte, Staging in den Hauptspeicher,
+                    nvenc aus dem Speicher (bgra, yuv444p) und - an der
+                    NVIDIA - ohne Kopie aus der Textur, je mit delay 0 und 2,
+                    dazu Farbprobe (Testbild durch nvenc und zurueck) und
+                    Vollbildprobe. Waehrend der Messung muss sich auf dem
+                    Ausgang etwas bewegen. Ergebnis in
+                    %APPDATA%\QuadChroma\messung.txt, am Ende ein Satz je
+                    Ausgang ("Null-Kopien, 2,9 ms je Bild" oder "Prozessor,
+                    5,1 ms, hoechstens 120 fps").
+
+Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
+privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,
+Fingerabdruck, Name) - getrennt von client.key und known_hosts.txt.
+
+Tasten kommen ueber die Leitung als Position (macOS-Tastencode) an und
+werden auf Windows in Scancodes uebersetzt; die Befehlstaste des Clients
+ist die Windows-Taste, die Wahltaste Alt. Beim Trennen laesst der Host
+alle gehaltenen Tasten los. Fenster mit hoeheren Rechten (UAC) bekommen
+keine Eingaben - das ist Windows so.
+
+Der Pruefmodus des Clients zeigt jeden Host, der sich im Netz ausruft,
+einmal als Zeile "Host gefunden: Name (Adresse)".
+
 Die Dateien neben der Programmdatei gehoeren dazu und muessen mitkopiert
 werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
 Bibliothek. Der Quelltext dazu liegt bei https://ffmpeg.org. Direct3D,
