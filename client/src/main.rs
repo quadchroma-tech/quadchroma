@@ -5474,6 +5474,14 @@ fn main() {
         let code = host::main_host(&args);
         std::process::exit(code);
     }
+    // Auf dem Mac gibt es die Host-Rolle nicht (dort ist QuadChroma.app der
+    // Host). Ohne diesen Zweig wuerde "--list" zur Adresse und ein Fenster
+    // aufgehen, das auf eine Verbindung wartet.
+    #[cfg(not(windows))]
+    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
+        eprintln!("Die Host-Rolle (--host, --list, --messen) gibt es nur auf Windows.");
+        std::process::exit(2);
+    }
 
     let mut addr = String::new();
     let mut i = 0;
