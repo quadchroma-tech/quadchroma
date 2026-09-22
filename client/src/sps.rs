@@ -408,14 +408,21 @@ mod tests {
         Some((restriction, reorder, puffer))
     }
 
-    /// Das SPS aus der VideoToolbox-Probe, wie es gemeldet wurde: 10 Byte,
-    /// High-Profil, Level 4.2, 1 Referenzbild, POC-Typ 0, 1280x720.
-    const PROBE: [u8; 10] = [0x67, 0x64, 0x00, 0x2A, 0xAC, 0x2C, 0xA8, 0x05, 0x00, 0x5B];
+    /// Echte SPS aus VideoToolbox auf dem M1, mit den Einstellungen des Hosts
+    /// (H.264 High, RealTime, AllowFrameReordering aus, MaxFrameDelayCount 1),
+    /// ausgelesen aus der Formatbeschreibung des ersten Bildes:
+    /// 1920x1080 - Level 5.1, 1 Referenzbild, 120x68 Makrobloecke, unten
+    /// 8 Zeilen beschnitten (frame_crop_bottom_offset 4), KEIN VUI.
+    const VT_1080P: [u8; 12] = [0x27, 0x64, 0x00, 0x33, 0xAC, 0x56, 0x80, 0x78, 0x02, 0x27, 0xE5, 0x40];
+    /// Dasselbe bei 1280x720 - Level 4.2, 80x45 Makrobloecke, kein Beschnitt.
+    const VT_720P: [u8; 10] = [0x27, 0x64, 0x00, 0x2A, 0xAC, 0x56, 0x80, 0x50, 0x05, 0xB9];
 
-    /// Ein SPS mit den Feldern der Probe, aus dem Schreiber - inklusive der
-    /// drei Flags hinter frame_mbs_only_flag (direct_8x8_inference_flag,
-    /// frame_cropping_flag, vui_parameters_present_flag) und dem Abschluss.
-    fn probe_sps(vui: bool, cropping: bool) -> Vec<u8> {
+    /// Ein kuenstliches SPS aus dem Schreiber (Felder aehnlich VideoToolbox,
+    /// 1280x720) - inklusive der drei Flags hinter frame_mbs_only_flag
+    /// (direct_8x8_inference_flag, frame_cropping_flag,
+    /// vui_parameters_present_flag) und dem Abschluss. Damit lassen sich die
+    /// Faelle bauen, die VideoToolbox nicht liefert (mit VUI, mit Beschnitt).
+    fn test_sps(vui: bool, cropping: bool) -> Vec<u8> {
         let mut s = BitSchreiber::neu();
         s.u(8, 100); // profile_idc
         s.u(8, 0); // constraint_set-Flags
@@ -484,24 +491,65 @@ mod tests {
     }
 
     #[test]
-    fn probe_bytes_sind_abgeschnitten() {
-        // Die zehn gemeldeten Bytes enden mit frame_mbs_only_flag; die drei
-        // Flags dahinter und das Abschlussbit fehlen (mindestens ein Byte).
-        // Ein solches SPS geht nicht auf und bleibt liegen - nichts
-        // umschreiben, was man nicht bis zum Ende gelesen hat.
-        let rbsp = entschuetzen(&PROBE[1..]);
-        assert_eq!(sps_lesen(&rbsp), None);
-        assert_eq!(h264_sps_mit_vui(&PROBE), None);
-        // Die zehn Bytes sind aber der Anfang des selbst gebauten SPS.
-        let ganz = probe_sps(false, false);
-        assert_eq!(&ganz[..10], &PROBE[..]);
-        assert_eq!(ganz.len(), 11);
+    fn echte_videotoolbox_sps() {
+        // (SPS, Makrobloecke breit, Karteneinheiten hoch, Beschnitt, Level,
+        // Bitposition des VUI-Flags in der RBSP)
+        let faelle: [(&[u8], u32, u32, Option<[u32; 4]>, u32, usize); 2] = [
+            (&VT_1080P, 120, 68, Some([0, 0, 0, 4]), 51, 80),
+            (&VT_720P, 80, 45, None, 42, 70),
+        ];
+        for (alt, breite, hoehe, beschnitt, level, flag) in faelle {
+            let alt_rbsp = entschuetzen(&alt[1..]);
+            let a = sps_lesen(&alt_rbsp).expect("VideoToolbox-SPS geht auf");
+            assert_eq!(a.profile_idc, 100);
+            assert_eq!(a.level_idc, level);
+            assert_eq!(a.max_num_ref_frames, 1);
+            assert_eq!(a.breite_mb, breite);
+            assert_eq!(a.hoehe_einheiten, hoehe);
+            assert_eq!(a.frame_cropping, beschnitt);
+            assert_eq!(a.vui_flag_pos, flag);
+            assert!(!a.vui_present, "VideoToolbox schreibt kein VUI - deshalb der ganze Umbau");
+
+            let neu = h264_sps_mit_vui(alt).expect("wird umgeschrieben");
+            // Kopfbyte unveraendert (nal_ref_idc 1, Typ 7 - nicht 0x67).
+            assert_eq!(neu[0], 0x27);
+            let rbsp = entschuetzen(&neu[1..]);
+            let n = sps_lesen(&rbsp).unwrap();
+            assert!(n.vui_present);
+            assert_eq!(
+                (n.profile_idc, n.level_idc, n.max_num_ref_frames, n.breite_mb, n.hoehe_einheiten, n.frame_cropping, n.vui_flag_pos),
+                (a.profile_idc, a.level_idc, a.max_num_ref_frames, a.breite_mb, a.hoehe_einheiten, a.frame_cropping, a.vui_flag_pos)
+            );
+            // Alles vor dem Flag ist bitgenau das alte.
+            let mut la = BitLeser::neu(&alt_rbsp);
+            let mut ln = BitLeser::neu(&rbsp);
+            for _ in 0..flag {
+                assert_eq!(la.bit(), ln.bit());
+            }
+            let (restriction, reorder, puffer) = vui_lesen(&rbsp, flag).unwrap();
+            assert!(restriction);
+            assert_eq!(reorder, 0);
+            assert_eq!(puffer, 1);
+        }
+        // Die Laengen, die das Protokoll bei 1080p meldet ("12 -> 16 Byte"):
+        // 80 Bit bis zum Flag, 39 Bit VUI, Abschlussbit = 120 Bit, plus Kopf.
+        assert_eq!(h264_sps_mit_vui(&VT_1080P).unwrap().len(), 16);
+        assert_eq!(h264_sps_mit_vui(&VT_720P).unwrap().len(), 15);
+    }
+
+    #[test]
+    fn abgeschnittenes_sps_bleibt_liegen() {
+        // Fehlen hinter frame_mbs_only_flag die letzten Flags, geht das SPS
+        // nicht auf - nichts umschreiben, was man nicht bis zum Ende gelesen
+        // hat.
+        let kurz = &VT_720P[..VT_720P.len() - 1];
+        assert_eq!(h264_sps_mit_vui(kurz), None);
     }
 
     #[test]
     fn sps_bekommt_vui() {
         for cropping in [false, true] {
-            let alt = probe_sps(false, cropping);
+            let alt = test_sps(false, cropping);
             let alt_felder = sps_lesen(&entschuetzen(&alt[1..])).unwrap();
             assert!(!alt_felder.vui_present);
             let neu = h264_sps_mit_vui(&alt).unwrap();
@@ -533,7 +581,7 @@ mod tests {
 
     #[test]
     fn sps_mit_vui_bleibt() {
-        let alt = probe_sps(true, false);
+        let alt = test_sps(true, false);
         assert!(sps_lesen(&entschuetzen(&alt[1..])).unwrap().vui_present);
         assert_eq!(h264_sps_mit_vui(&alt), None);
         // Kein SPS: ebenfalls None.
@@ -597,7 +645,7 @@ mod tests {
 
     #[test]
     fn au_ersetzt_nur_das_sps() {
-        let sps = probe_sps(false, false);
+        let sps = test_sps(false, false);
         let pps = [0x68u8, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
         let idr = [0x65u8, 0x88, 0x84, 0x00, 0x33, 0xFF];
         let mut au = vec![0, 0, 0, 1];
@@ -625,7 +673,7 @@ mod tests {
         assert_eq!(h264_au_mit_vui(&ohne), None);
         assert_eq!(erstes_sps(&ohne), None);
         let mut mit = vec![0, 0, 0, 1];
-        mit.extend_from_slice(&probe_sps(true, false));
+        mit.extend_from_slice(&test_sps(true, false));
         mit.extend_from_slice(&[0, 0, 0, 1]);
         mit.extend_from_slice(&idr);
         assert_eq!(h264_au_mit_vui(&mit), None);
