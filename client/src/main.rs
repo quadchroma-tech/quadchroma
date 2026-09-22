@@ -21,6 +21,7 @@ mod einstellungen;
 mod noise;
 mod protokoll_konst;
 mod secure;
+mod sps;
 mod strings;
 mod strings_asia;
 mod strings_balt;
@@ -1268,6 +1269,9 @@ fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstel
     if bau.pfad == DecoderPfad::Nvdec && aud_gewuenscht() {
         protokoll::zeile("NVDEC: Zugriffseinheiten-Begrenzer angehaengt".into());
     }
+    if bau.pfad == DecoderPfad::Nvdec && bau.codec.starts_with("h264") && vui_gewuenscht() {
+        protokoll::zeile("NVDEC: SPS um VUI ergaenzt (max_num_reorder_frames 0)".into());
+    }
     let mut s = shared.lock().unwrap();
     s.decoder_pfad = Some(bau.pfad);
     s.decoder_hinweis = bau.grund.clone();
@@ -1291,6 +1295,17 @@ const NAL_AUD_H264: u8 = 9;
 /// mit --ohne-aud - der Schalter ist zum Vergleich auf demselben Rechner da.
 fn aud_gewuenscht() -> bool {
     !std::env::args().any(|a| a == "--ohne-aud")
+}
+
+/// Bekommt jedes H.264-SPS fuer NVDEC ein VUI mit max_num_reorder_frames 0?
+/// Ja, ausser mit --ohne-vui - zum Vergleich auf demselben Rechner.
+///
+/// Der Mac-Host codiert ohne Bildumsortierung, sagt es aber nicht im SPS
+/// (VideoToolbox schreibt kein VUI). cuvids H.264-Parser nimmt dann die
+/// groesste Umsortierungstiefe des Levels an und haelt rund 16 Bilder
+/// zurueck - gemessen 150-290 ms Decoderzeit. Siehe `sps.rs`.
+fn vui_gewuenscht() -> bool {
+    !std::env::args().any(|a| a == "--ohne-vui")
 }
 
 /// Typ des letzten NAL einer Annex-B-Zugriffseinheit: der Kopf hinter dem
@@ -1412,6 +1427,12 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // damit cuvids Parser das Bild sofort abschliesst - siehe `mit_aud`.
     // --ohne-aud laesst es zum Vergleich weg.
     let aud_anhang = aud_gewuenscht();
+    // Jedes H.264-SPS fuer NVDEC um ein VUI mit max_num_reorder_frames 0
+    // ergaenzen, damit cuvids Parser keine Bilder fuer eine Umsortierung
+    // zurueckhaelt, die es nicht gibt - siehe `sps.rs`. --ohne-vui laesst
+    // es zum Vergleich weg. Das erste Umschreiben kommt ins Protokoll.
+    let vui_anhang = vui_gewuenscht();
+    let mut vui_gemeldet = false;
     // --mitschnitt datei.hevc (Pruefmodus): die Zugriffseinheiten roh in
     // eine Datei, ohne unsere Koepfe, ab dem ersten Vollbild - als Konserve
     // fuer den Windows-Host (--konserve) oder zum Abspielen mit ffplay.
@@ -1619,8 +1640,24 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
                 // Nur auf dem NVDEC-Pfad; D3D11VA und Software bekommen
                 // die Einheit, wie sie kam.
-                let mut packet = if aud_anhang && bau.pfad == DecoderPfad::Nvdec {
-                    ffmpeg::Packet::copy(&mit_aud(&payload, bedarf.h264))
+                let mut packet = if bau.pfad == DecoderPfad::Nvdec {
+                    // Erst das SPS (nur H.264, nur wenn eines drin ist -
+                    // sonst keine Kopie), dann der AUD hinten dran.
+                    let mit_vui = if vui_anhang && bedarf.h264 { sps::h264_au_mit_vui(&payload) } else { None };
+                    if let Some(neu) = &mit_vui {
+                        if !vui_gemeldet {
+                            vui_gemeldet = true;
+                            let alt_len = sps::erstes_sps(&payload).map(|s| s.len()).unwrap_or(0);
+                            let neu_len = alt_len + (neu.len() - payload.len());
+                            protokoll::zeile(format!("NVDEC: SPS umgeschrieben, {alt_len} -> {neu_len} Byte (VUI mit max_num_reorder_frames 0)"));
+                        }
+                    }
+                    let einheit: &[u8] = mit_vui.as_deref().unwrap_or(&payload);
+                    if aud_anhang {
+                        ffmpeg::Packet::copy(&mit_aud(einheit, bedarf.h264))
+                    } else {
+                        ffmpeg::Packet::copy(einheit)
+                    }
                 } else {
                     ffmpeg::Packet::copy(&payload)
                 };

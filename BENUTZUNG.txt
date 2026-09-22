@@ -322,7 +322,10 @@ jeder Zugriffseinheit fuer NVDEC anhaengt: NVIDIAs Parser gibt ein Bild
 erst frei, wenn er den Anfang des naechsten sieht - ohne AUD kostet das
 eine Bildperiode Decoderzeit. Der Schalter ist zum Vergleich da; im
 Protokoll steht "NVDEC: Zugriffseinheiten-Begrenzer angehaengt", wenn er
-nicht gesetzt ist.
+nicht gesetzt ist. Ebenso laesst --ohne-vui das VUI weg, das der Client
+sonst bei H.264 ueber NVDEC in jedes SPS schreibt (max_num_reorder_frames
+0 - der Mac-Host codiert ohne Umsortierung, sagt es aber nicht im SPS, und
+NVIDIAs Parser haelt dann rund 16 Bilder zurueck).
 
 Windows als Host
 ----------------
