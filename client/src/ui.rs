@@ -363,11 +363,17 @@ pub struct Ui {
     pub mouse: (i32, i32),
     pub click: bool,
     pub tick: u64,
+    /// Wo die Ergebnistabelle des Benchmarks zuletzt gezeichnet wurde und
+    /// wie viele Zeilen hineinpassen - damit das Mausrad weiss, ob es
+    /// darueber steht und wie weit es rollen darf. None, wenn der Reiter
+    /// nicht offen war.
+    pub bench_tabelle: Option<Rect>,
+    pub bench_sichtbar: usize,
 }
 
 impl Ui {
     pub fn new() -> Self {
-        Ui { text: Text::load(), mouse: (-1, -1), click: false, tick: 0 }
+        Ui { text: Text::load(), mouse: (-1, -1), click: false, tick: 0, bench_tabelle: None, bench_sichtbar: 0 }
     }
 
     /// Knopf mit Eckklammern. Gibt true zurueck, wenn er in diesem Bild geklickt wurde.

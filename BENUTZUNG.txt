@@ -258,11 +258,19 @@ Gemessen wird nie ein Wunsch, sondern was der Host bestaetigt hat. Je
 Schritt: angekommene Bildrate, Datenrate, die ganze Kette in Millisekunden
 (Encoder, Leitung, Decoder, Anzeige), verworfene Bilder, Encoderzeit des
 Hosts gegen sein Budget 1000/fps, Prozessorlast auf beiden Seiten. Ein
-Schritt besteht, wenn die Kette in anderthalb Bildern bleibt, mindestens
-95 % der Bilder ankommen, unter 1 % verworfen werden und der Encoder in
-seinem Budget bleibt. Empfohlen wird die beste Farbqualitaet, die bei der
-hoechsten Bildrate besteht, mit der hoechsten Datenrate, bei der sie noch
-besteht; "Uebernehmen" setzt sie und speichert sie fuer diesen Host.
+Schritt besteht, wenn mindestens 95 % der Zielbildrate ankommen, unter
+1 % verworfen werden und die ganze Kette hoechstens 30 ms lang ist -
+absolut, unabhaengig von der Bildrate: Latenz in Bildern zu messen
+bestraft hohe Bildraten, und 30 ms sind fuer eine Fernsteuerung
+unauffaellig. Die Encoderzeit des Hosts wird nur angezeigt, nicht
+bewertet (sie steckt in der Kette schon drin). Empfohlen wird die beste
+Farbqualitaet, die bei der hoechsten Bildrate besteht, mit der hoechsten
+Datenrate, bei der sie noch besteht; "Uebernehmen" setzt sie und
+speichert sie fuer diesen Host. Passen nicht alle Zeilen in die Tabelle,
+rollt das Mausrad darueber (drei Zeilen je Raste, Bild auf/ab ebenso);
+rechts erscheint dann ein Balken. Waehrend des Laufs folgt die Tabelle
+der neuesten Zeile - wer selbst rollt, behaelt seine Stelle, bis der Lauf
+endet oder er wieder ans Ende rollt.
 
 Der Schalter "Testbild" laesst den Host fuer die Dauer des Laufs ein festes,
 bewegtes Muster statt des Bildschirms senden (Farbbalken, feine Streifen,
@@ -306,6 +314,15 @@ erzwingt die Karte und sagt, was sie dazu meint;
 
 zaehlt die Karten auf und probiert jede Decoderwahl mit HEVC 4:4:4, 4:2:0
 und H.264 durch, ohne Verbindung.
+
+    quadchroma.exe 192.168.178.194:9001 --ohne-aud
+
+laesst den Zugriffseinheiten-Begrenzer (AUD) weg, den der Client sonst
+jeder Zugriffseinheit fuer NVDEC anhaengt: NVIDIAs Parser gibt ein Bild
+erst frei, wenn er den Anfang des naechsten sieht - ohne AUD kostet das
+eine Bildperiode Decoderzeit. Der Schalter ist zum Vergleich da; im
+Protokoll steht "NVDEC: Zugriffseinheiten-Begrenzer angehaengt", wenn er
+nicht gesetzt ist.
 
 Windows als Host
 ----------------

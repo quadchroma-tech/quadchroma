@@ -1265,6 +1265,9 @@ fn chroma_erzwingt_neubau(bau: &DecoderBau, chroma444: bool) -> bool {
 /// soll erfahren, dass er sie nicht bekommt.
 fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstellungen::DecoderWunsch) {
     protokoll::zeile(bau.meldung());
+    if bau.pfad == DecoderPfad::Nvdec && aud_gewuenscht() {
+        protokoll::zeile("NVDEC: Zugriffseinheiten-Begrenzer angehaengt".into());
+    }
     let mut s = shared.lock().unwrap();
     s.decoder_pfad = Some(bau.pfad);
     s.decoder_hinweis = bau.grund.clone();
@@ -1273,6 +1276,64 @@ fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstel
             s.error = Some(g.clone());
         }
     }
+}
+
+/// Zugriffseinheiten-Begrenzer (AUD) als Annex-B-NAL: Startcode, dann bei
+/// HEVC NAL-Typ 35 (Kopf 46 01) mit pic_type 2 = "I, P oder B" (010, dann
+/// das Abschlussbit: 0x50), bei H.264 NAL-Typ 9 (Kopf 09) mit
+/// primary_pic_type 7 = "beliebig" (111, Abschlussbit: 0xF0).
+const AUD_HEVC: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
+const AUD_H264: [u8; 6] = [0, 0, 0, 1, 0x09, 0xF0];
+const NAL_AUD_HEVC: u8 = 35;
+const NAL_AUD_H264: u8 = 9;
+
+/// Bekommt jede Zugriffseinheit fuer NVDEC einen AUD angehaengt? Ja, ausser
+/// mit --ohne-aud - der Schalter ist zum Vergleich auf demselben Rechner da.
+fn aud_gewuenscht() -> bool {
+    !std::env::args().any(|a| a == "--ohne-aud")
+}
+
+/// Typ des letzten NAL einer Annex-B-Zugriffseinheit: der Kopf hinter dem
+/// letzten Startcode 00 00 01 (mit oder ohne fuehrender Null). HEVC traegt
+/// den Typ in den Bits 1..6 des ersten Kopfbytes, H.264 in den Bits 0..4.
+fn letzter_nal_typ(au: &[u8], h264: bool) -> Option<u8> {
+    let mut i = au.len().checked_sub(4)?;
+    loop {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            let kopf = au[i + 3];
+            return Some(if h264 { kopf & 0x1f } else { (kopf >> 1) & 0x3f });
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// Die Zugriffseinheit mit angehaengtem AUD - fuer den cuvid-Decoder.
+///
+/// NVIDIAs Parser (cuvidParseVideoData) gibt ein Bild erst frei, wenn er
+/// den Anfang des NAECHSTEN Bildes sieht: erst ein NAL, das kein Teil des
+/// laufenden Bildes sein kann, schliesst es ab. Ohne Hilfe ist das das
+/// erste Scheiben-NAL des naechsten Pakets - ein Bild Verzoegerung, bei 60
+/// Bildern 16,7 ms Decoderzeit fuer nichts. FFmpegs cuviddec.c setzt das
+/// Ende-Kennzeichen des Parsers (CUVID_PKT_ENDOFPICTURE) nie und hat auch
+/// keine Option dafuer (geprueft an FFmpeg 9, Zweig release/9.0: nur
+/// CUVID_PKT_TIMESTAMP, am Ende ENDOFSTREAM). Ein angehaengter AUD ist der
+/// einzige Weg von aussen: er gehoert per Definition zum naechsten Bild,
+/// also ist das laufende zu Ende - noch in diesem Aufruf. Ein AUD VORNE
+/// (wie ihn manche Encoder setzen) hilft dem letzten Bild nicht; deshalb
+/// hinten, und nur, wenn die Einheit nicht ohnehin mit einem endet. Fuer
+/// die Software-Decoder ohne Belang, die schliessen scheibenparallel ab.
+fn mit_aud(au: &[u8], h264: bool) -> std::borrow::Cow<'_, [u8]> {
+    let (aud, typ): (&[u8], u8) = if h264 { (&AUD_H264, NAL_AUD_H264) } else { (&AUD_HEVC, NAL_AUD_HEVC) };
+    if letzter_nal_typ(au, h264) == Some(typ) {
+        return std::borrow::Cow::Borrowed(au);
+    }
+    let mut mit = Vec::with_capacity(au.len() + aud.len());
+    mit.extend_from_slice(au);
+    mit.extend_from_slice(aud);
+    std::borrow::Cow::Owned(mit)
 }
 
 /// Ist das ein Fehler, der einen Hardware-Decoder als kaputt ausweist?
@@ -1347,13 +1408,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let mut bild_fehler = false;
     // Die erste Zeigerform je Sitzung einmal ins Protokoll.
     let mut zeiger_gemeldet = false;
-    // Versuchsschalter: jedem Paket fuer einen Hardware-Decoder eine
-    // Zugriffseinheiten-Grenze (AUD) ANHAENGEN. NVIDIAs Parser erkennt das
-    // Ende eines Bildes erst am naechsten NAL, das kein Bildinhalt ist -
-    // ohne AUD also erst am naechsten Paket, ein Bild Verzoegerung. FFmpegs
-    // cuvid setzt das Ende-Kennzeichen des Parsers nie; die angehaengte AUD
-    // ist der einzige Weg von aussen. Fuer den Software-Decoder ohne Belang.
-    let aud_anhang = std::env::args().any(|a| a == "--aud");
+    // Jeder Zugriffseinheit fuer NVDEC einen Begrenzer (AUD) anhaengen,
+    // damit cuvids Parser das Bild sofort abschliesst - siehe `mit_aud`.
+    // --ohne-aud laesst es zum Vergleich weg.
+    let aud_anhang = aud_gewuenscht();
     // --mitschnitt datei.hevc (Pruefmodus): die Zugriffseinheiten roh in
     // eine Datei, ohne unsere Koepfe, ab dem ersten Vollbild - als Konserve
     // fuer den Windows-Host (--konserve) oder zum Abspielen mit ffplay.
@@ -1559,17 +1617,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 if let Some(e) = ring.iter_mut().find(|(s, ..)| *s == seq) {
                     e.4 = t_empfangen;
                 }
-                let mut packet = if aud_anhang && bau.pfad.hardware() {
-                    // AUD: HEVC NAL-Typ 35 mit pic_type "beliebig", H.264
-                    // NAL-Typ 9 mit primary_pic_type 7 - jeweils samt
-                    // Startcode und Abschlussbit.
-                    const AUD_HEVC: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
-                    const AUD_H264: [u8; 6] = [0, 0, 0, 1, 0x09, 0xF0];
-                    let aud: &[u8] = if bedarf.h264 { &AUD_H264 } else { &AUD_HEVC };
-                    let mut mit = Vec::with_capacity(payload.len() + aud.len());
-                    mit.extend_from_slice(&payload);
-                    mit.extend_from_slice(aud);
-                    ffmpeg::Packet::copy(&mit)
+                // Nur auf dem NVDEC-Pfad; D3D11VA und Software bekommen
+                // die Einheit, wie sie kam.
+                let mut packet = if aud_anhang && bau.pfad == DecoderPfad::Nvdec {
+                    ffmpeg::Packet::copy(&mit_aud(&payload, bedarf.h264))
                 } else {
                     ffmpeg::Packet::copy(&payload)
                 };
@@ -2369,6 +2420,13 @@ const BENCH_FRIST: Duration = Duration::from_secs(8);
 const BENCH_EINSCHWINGEN: Duration = Duration::from_secs(1);
 /// Abstand der Proben waehrend der Messung.
 const BENCH_PROBE: Duration = Duration::from_secs(1);
+/// So lang darf die ganze Kette (Aufnahme bis Uebergabe an die Anzeige)
+/// sein, damit ein Schritt besteht - absolut, nicht in Bildern: Latenz in
+/// Bildern zu messen bestraft hohe Bildraten (anderthalb Bilder sind bei
+/// 120 fps 12,5 ms, bei 60 fps 25 ms - dieselbe Kette bestuende also nur
+/// bei der niedrigeren Rate, obwohl sie sich gleich anfuehlt). 30 ms sind
+/// fuer eine Fernsteuerung unauffaellig, egal wie viele Bilder darin liegen.
+const BENCH_KETTE_MAX_MS: f32 = 30.0;
 
 /// Was der Benchmark durchprobieren soll. Steht im Reiter und gilt fuer den
 /// naechsten Lauf.
@@ -2492,21 +2550,21 @@ pub struct Ergebnis {
 impl Ergebnis {
     /// Die Regel, nach der ein Schritt besteht - dieselbe, die der Tooltip
     /// im Reiter nennt:
-    ///   - die Kette ist hoechstens anderthalb Bilder lang: <= 1,5 * 1000/fps,
     ///   - mindestens 95 % der Zielbildrate kommen an,
     ///   - mit Anzeige: unter 1 % der empfangenen Bilder wurden verworfen
     ///     (ohne Fenster wird nichts gezeigt, also auch nichts verworfen),
-    ///   - der Encoder des Hosts bleibt in seinem Budget: <= 1000/fps.
-    /// Ohne eine einzige Latenzprobe (Zeitabgleich stand nicht) kann der
-    /// Schritt nicht bestehen - eine Null waere keine Messung.
+    ///   - die Kette ist hoechstens BENCH_KETTE_MAX_MS lang - absolut,
+    ///     unabhaengig von der Bildrate (siehe dort).
+    /// Die Encoderzeit des Hosts ist KEIN Kriterium: sie steckt in der
+    /// Kette schon drin und wird nur angezeigt. Ohne eine einzige
+    /// Latenzprobe (Zeitabgleich stand nicht) kann der Schritt nicht
+    /// bestehen - eine Null waere keine Messung.
     fn pruefen(&mut self, mit_anzeige: bool, hat_latenz: bool) {
-        let bild = 1000.0 / self.fps.max(1) as f32;
         self.bestanden = !self.gescheitert
             && hat_latenz
-            && self.kette_ms <= 1.5 * bild
             && self.fps_gemessen >= 0.95 * self.fps as f32
             && (!mit_anzeige || (self.verworfen as f32) < 0.01 * self.empfangen.max(1) as f32)
-            && self.host_encoder_ms <= bild;
+            && self.kette_ms <= BENCH_KETTE_MAX_MS;
     }
 
     /// Eine Zeile fuer das Protokoll.
@@ -3171,6 +3229,13 @@ struct App {
     /// durchprobieren soll.
     benchmark: Option<Benchmark>,
     bench_konfig: BenchKonfig,
+    /// Ergebnistabelle im Reiter Benchmark: erste sichtbare Zeile, ob die
+    /// Ansicht der neuesten Zeile folgt (bis der Nutzer rollt; wieder,
+    /// sobald er ans Ende rollt oder der Lauf endet), und ob beim letzten
+    /// Zeichnen ein Lauf lief (um sein Ende zu bemerken).
+    bench_scroll: usize,
+    bench_folgt: bool,
+    bench_lief: bool,
 }
 
 /// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
@@ -3469,8 +3534,19 @@ impl ApplicationHandler for App {
                 }
                 // Steht die Tafel offen, gehoert die Tastatur ihr. Bei der Maus
                 // war das schon so, bei der Tastatur fehlte es - jeder Tastendruck
-                // im Menue landete zusaetzlich auf dem Mac.
+                // im Menue landete zusaetzlich auf dem Mac. Bild auf/ab rollt
+                // die Ergebnistabelle des Benchmarks um eine Seite.
                 if self.hud_offen {
+                    if pressed && self.hud_reiter == 4 {
+                        if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                            let seite = self.ui.bench_sichtbar.saturating_sub(1).max(1) as i32;
+                            match code {
+                                KC::PageUp => self.bench_scrollen(-seite),
+                                KC::PageDown => self.bench_scrollen(seite),
+                                _ => {}
+                            }
+                        }
+                    }
                     return;
                 }
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
@@ -3518,6 +3594,18 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
+                // Steht das Menue offen, gehoert auch das Rad ihm und nicht
+                // dem Host - bisher rollte jede Raste im Menue auf dem Mac
+                // mit. Ueber der Ergebnistabelle des Benchmarks rollt es die
+                // Tabelle: drei Zeilen je Raste (40 Punkte).
+                if self.hud_offen {
+                    let ueber_tabelle = self.ui.bench_tabelle.map(|r| r.hit(self.ui.mouse.0, self.ui.mouse.1)).unwrap_or(false);
+                    if ueber_tabelle && dy != 0.0 {
+                        let zeilen = ((dy.abs() / 40.0) * 3.0).round().max(1.0) as i32;
+                        self.bench_scrollen(if dy > 0.0 { -zeilen } else { zeilen });
+                    }
+                    return;
+                }
                 self.input.lock().unwrap().scroll(dx, dy);
             }
             _ => {}
@@ -3757,9 +3845,42 @@ impl App {
             Some(mut b) => {
                 b.starten(&self.shared, &self.input);
                 self.benchmark = Some(b);
+                // Eine neue Tabelle: von vorn, und der neuesten Zeile nach.
+                self.bench_scroll = 0;
+                self.bench_folgt = true;
             }
             None => protokoll::zeile("Benchmark: nichts zu messen (kein Codec, keine Rate gewaehlt)".into()),
         }
+    }
+
+    /// Wie weit die Ergebnistabelle hoechstens rollen kann: Zeilen minus
+    /// Platz (den Platz hat die letzte Zeichnung gemeldet).
+    fn bench_scroll_max(&self) -> usize {
+        let zeilen = self.benchmark.as_ref().map(|b| b.ergebnisse.len()).unwrap_or(0);
+        zeilen.saturating_sub(self.ui.bench_sichtbar)
+    }
+
+    /// Die Tabelle um `delta` Zeilen rollen (negativ: nach oben), geklemmt.
+    /// Wer rollt, loest das Nachfuehren - bis er wieder ganz unten steht.
+    fn bench_scrollen(&mut self, delta: i32) {
+        let max = self.bench_scroll_max();
+        let neu = (self.bench_scroll as i32 + delta).clamp(0, max as i32) as usize;
+        self.bench_scroll = neu;
+        self.bench_folgt = neu >= max;
+    }
+
+    /// Vor dem Zeichnen: waehrend eines Laufs der neuesten Zeile folgen
+    /// (wenn nicht gerade der Nutzer eine Stelle haelt), am Ende des Laufs
+    /// wieder folgen, und nie ueber das Ende hinaus.
+    fn bench_scroll_nachfuehren(&mut self) -> usize {
+        let laeuft = self.benchmark.as_ref().map(|b| b.laeuft()).unwrap_or(false);
+        if self.bench_lief && !laeuft {
+            self.bench_folgt = true;
+        }
+        self.bench_lief = laeuft;
+        let max = self.bench_scroll_max();
+        self.bench_scroll = if self.bench_folgt { max } else { self.bench_scroll.min(max) };
+        self.bench_scroll
     }
 
     /// Wunsch nach Datenrate, Bildrate, Spielmodus, fester Bildrate und Ton
@@ -4389,6 +4510,7 @@ impl App {
                     let lhist = self.lat_hist.clone();
                     let reiter = self.hud_reiter;
                     let fps_jetzt = self.fps_shown;
+                    let bench_scroll = self.bench_scroll_nachfuehren();
                     let stand = HudStand {
                         vollbild: self.fullscreen,
                         pixelgenau: self.pixel_exact,
@@ -4408,6 +4530,7 @@ impl App {
                         // Der Abzug kostet je Zeichnung ein paar Dutzend
                         // Ergebnisse - nur, wenn der Reiter offen ist.
                         bench: if reiter == 4 { self.benchmark.as_ref().map(|b| b.stand()) } else { None },
+                        bench_scroll,
                     };
                     n.hud = Some(hud(
                         &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
@@ -5364,22 +5487,25 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             eintrag(4, "H.264 High", true, false, false, false),
             eintrag(5, "AV1", false, false, false, false),
         ];
-        // "hud5": der Benchmark mitten im Lauf - 15 von 30 Schritten, die
-        // Zahlen erfunden, aber so, wie sie auf dem Mac mini aussehen: mit
-        // der Datenrate waechst die Encoderzeit, bei 120 Bildern und 150
-        // Mbit/s reisst das Budget.
+        // "hud5": der Benchmark mitten im Lauf - 30 von 40 Schritten, mehr
+        // als in die Tabelle passen, damit Ausschnitt und Balken im Bild
+        // sind (gerollt in die Mitte). Die Zahlen erfunden, aber so, wie
+        // sie auf dem Mac mini aussehen: mit der Datenrate waechst die
+        // Encoderzeit, bei 150 Mbit/s werden Bilder verworfen (ueber 1 %:
+        // nicht bestanden), und H.264 ueber NVDEC hat eine Kette weit ueber
+        // 30 ms - nicht bestanden, obwohl alle Bilder ankommen.
         let bench = if view == "hud5" {
             let mut ergebnisse = Vec::new();
-            for (name, q, fpss) in [("HEVC 4:4:4 10 Bit", 4u8, &[60u16, 120][..]), ("HEVC 4:4:4 8 Bit", 3, &[60][..])] {
-                for &fps in fpss {
+            for (name, q, dec) in [("HEVC 4:4:4 10 Bit", 4u8, 1.9f32), ("HEVC 4:4:4 8 Bit", 3, 1.9), ("H.264 High", 0, 38.0)] {
+                for fps in [60u16, 120] {
                     for &mbit in &BENCH_MBITS {
                         let enc = 4.5 + mbit as f32 / 40.0;
                         let mut e = Ergebnis {
                             idx: 4 - q, codec: name.into(), qualitaet: q, mbit, fps, gescheitert: false,
                             fps_gemessen: fps as f32 - 0.4 - mbit as f32 / 100.0,
                             mbit_gemessen: mbit as f32 * 0.93,
-                            kette_ms: enc + 2.6 + 1.9 + 1.1 + if fps == 120 { 0.8 } else { 5.8 },
-                            encoder_ms: enc, leitung_ms: 2.6, decoder_ms: 1.9, anzeige_ms: 1.1,
+                            kette_ms: enc + 2.6 + dec + 1.1 + if fps == 120 { 0.8 } else { 5.8 },
+                            encoder_ms: enc, leitung_ms: 2.6, decoder_ms: dec, anzeige_ms: 1.1,
                             empfangen: fps as u64 * 5, verworfen: if mbit >= 150 { 7 } else { 0 }, ausgelassen: 0,
                             host_encoder_ms: enc + 0.6, budget_ms: 1000.0 / fps as f32,
                             host_cpu: 24.0 + mbit as f32 / 10.0, client_cpu: 5.0 + mbit as f32 / 50.0,
@@ -5392,8 +5518,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             }
             let empfehlung = empfehlen(&ergebnisse).map(|i| ergebnisse[i].clone());
             Some(BenchStand {
-                laeuft: true, abgebrochen: false, pos: 15, gesamt: 30,
-                schritt: "HEVC 4:4:4 8 Bit · 10 Mbit/s · 120".into(),
+                laeuft: true, abgebrochen: false, pos: 30, gesamt: 40,
+                schritt: "HEVC 4:2:0 10 Bit · 10 Mbit/s · 60".into(),
                 phase: BenchPhase::Messen, ergebnisse, empfehlung, mit_anzeige: true,
             })
         } else {
@@ -5423,6 +5549,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             anzeige_name: "D3D11 · NVIDIA GeForce RTX 3080 Ti Laptop GPU".into(),
             bench_konfig: BenchKonfig::vorgabe(5, true),
             bench,
+            // 30 Zeilen, rund 16 passen: 7 ist die Mitte des Rollwegs.
+            bench_scroll: if view == "hud5" { 7 } else { 0 },
         };
         let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, "hud5" => 4, _ => 0 };
         // "hud2tip": die Maus steht ueber dem Knopf "Grafikkarte" der
@@ -6019,6 +6147,9 @@ fn main() {
         maus_im_fenster: false,
         benchmark: None,
         bench_konfig: BenchKonfig::vorgabe(5, true),
+        bench_scroll: 0,
+        bench_folgt: true,
+        bench_lief: false,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
@@ -6111,6 +6242,9 @@ pub struct HudStand {
     /// laufende oder letzte Lauf.
     pub bench_konfig: BenchKonfig,
     pub bench: Option<BenchStand>,
+    /// Erste sichtbare Zeile der Ergebnistabelle (der Stand lebt in der
+    /// App; hier nur der Wert fuer diese Zeichnung).
+    pub bench_scroll: usize,
 }
 
 /// Ein Rollen-Knopf im Menue - fuer Anzeige und Decoder derselbe Satz,
@@ -6233,6 +6367,10 @@ fn hud(
     // Ein zweiter, dynamischer Satz unter dem Text des Schluessels - die
     // erkannte Karte auf den Rollen-Knoepfen. Nur dort gesetzt.
     let mut tip_zusatz: Option<String> = None;
+    // Die Ergebnistabelle meldet sich unten, wenn sie gezeichnet wird -
+    // auf jedem anderen Reiter gibt es nichts zu rollen.
+    u.bench_tabelle = None;
+    u.bench_sichtbar = 0;
 
     let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
     let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
@@ -6738,12 +6876,16 @@ fn hud(
             }
 
             // Tabelle: Codec links, dann elf Zahlenspalten rechtsbuendig.
-            // Bei Platzmangel die letzten Zeilen - die Datei hat alle.
+            // Passen nicht alle Zeilen, zeigt sie den Ausschnitt ab
+            // `bench_scroll` (das Mausrad darueber rollt ihn, die App klemmt
+            // ihn) und rechts daneben einen Balken.
             if let Some(b) = &stand.bench {
                 let ty0 = py + p(26);
                 let ende = fy - p(24) - p(58);
                 let zeile_h = p(15);
                 let platz = ((ende - ty0 - p(18)) / zeile_h).max(0) as usize;
+                u.bench_sichtbar = platz;
+                u.bench_tabelle = Some(ui::Rect { x: ix, y: ty0 - p(10), w: iw + p(14), h: ende - ty0 + p(10) });
                 let spalten: [&str; 11] = [
                     lang.get(BenchColFps), "Mbit/s", lang.get(BenchMeasured), lang.get(BenchChain),
                     lang.get(EncodeTime), lang.get(NetworkTime), lang.get(DecodeTime), lang.get(DisplayStage),
@@ -6759,9 +6901,22 @@ fn hud(
                     u.text.draw_right(c, sx(i), ty0, &t, sz(9), ui::DIM, p(1));
                 }
                 c.hline(ix, ty0 + p(5), iw, ui::DIM, 60);
-                let von = b.ergebnisse.len().saturating_sub(platz);
+                let zeilen = b.ergebnisse.len();
+                let von = stand.bench_scroll.min(zeilen.saturating_sub(platz));
+                let bis = (von + platz).min(zeilen);
+                // Der Balken: schmal, gedaempftes Cyan, Griff so lang wie
+                // der sichtbare Anteil - nur, wenn es etwas zu rollen gibt.
+                if zeilen > platz {
+                    let bx = ix + iw + p(6);
+                    let bh = platz as i32 * zeile_h;
+                    let by = ty0 + p(8);
+                    c.fill(bx, by, p(4), bh, ui::CYAN, 28);
+                    let gh = ((bh as i64 * platz as i64) / zeilen as i64).max(p(12) as i64) as i32;
+                    let gy = by + ((bh - gh) as i64 * von as i64 / (zeilen - platz) as i64) as i32;
+                    c.fill(bx, gy, p(4), gh, ui::CYAN, 130);
+                }
                 let mut ty = ty0 + p(18);
-                for e in &b.ergebnisse[von..] {
+                for e in &b.ergebnisse[von..bis] {
                     let farbe = if e.bestanden { ui::CYAN } else if e.gescheitert { ui::AMBER } else { ui::DIM };
                     u.text.draw(c, ix, ty, &e.codec, sz(10), farbe, p(1));
                     let strich = |v: f32| if e.gescheitert { "-".to_string() } else { format!("{v:.1}") };
@@ -6863,5 +7018,102 @@ fn tooltip(u: &mut ui::Ui, c: &mut ui::Canvas, text: &str, maus: (i32, i32), ww:
     c.vline(x + breite - 1, y, hoehe, ui::CYAN, 120);
     for (i, z) in zeilen.iter().enumerate() {
         u.text.draw(c, x + 12, y + 13 + i as i32 * zh + size as i32 / 2, z, size, ui::TEXT, spacing);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ein gemessener Schritt mit sonst unauffaelligen Werten.
+    fn schritt(fps: u16, kette_ms: f32, fps_gemessen: f32, verworfen: u64, host_encoder_ms: f32) -> Ergebnis {
+        Ergebnis {
+            fps, kette_ms, fps_gemessen, verworfen, host_encoder_ms,
+            empfangen: fps as u64 * 5,
+            budget_ms: 1000.0 / fps as f32,
+            ..Ergebnis::default()
+        }
+    }
+
+    fn besteht(mut e: Ergebnis, mit_anzeige: bool, hat_latenz: bool) -> bool {
+        e.pruefen(mit_anzeige, hat_latenz);
+        e.bestanden
+    }
+
+    #[test]
+    fn bench_regel_kette_absolut_nicht_in_bildern() {
+        // 26 ms bei 120 fps sind gut drei Bilder - nach der alten Regel
+        // (anderthalb Bilder) durchgefallen, nach der neuen bestanden.
+        assert!(besteht(schritt(120, 26.0, 119.0, 0, 8.0), true, true));
+        // Dieselbe Kette bei 60 fps ebenso: die Grenze haengt nicht an fps.
+        assert!(besteht(schritt(60, 26.0, 59.0, 0, 8.0), true, true));
+        // Genau die Grenze besteht, knapp darueber nicht.
+        assert!(besteht(schritt(60, BENCH_KETTE_MAX_MS, 59.0, 0, 8.0), true, true));
+        assert!(!besteht(schritt(60, BENCH_KETTE_MAX_MS + 0.1, 59.0, 0, 8.0), true, true));
+        assert!(!besteht(schritt(120, 31.0, 120.0, 0, 8.0), true, true));
+    }
+
+    #[test]
+    fn bench_regel_encoderzeit_zaehlt_nicht() {
+        // Encoder weit ueber seinem Budget (8,3 ms bei 120 fps) - egal,
+        // solange die Kette selbst kurz genug ist.
+        assert!(besteht(schritt(120, 24.0, 118.0, 0, 15.0), true, true));
+    }
+
+    #[test]
+    fn bench_regel_bilder_und_verworfene() {
+        // 95 % der Zielbildrate: 57 von 60 bestehen, 56 nicht.
+        assert!(besteht(schritt(60, 20.0, 57.0, 0, 8.0), true, true));
+        assert!(!besteht(schritt(60, 20.0, 56.0, 0, 8.0), true, true));
+        // Unter 1 % verworfen: 2 von 300 bestehen, 3 nicht - ohne Anzeige
+        // zaehlt Verworfenes nicht.
+        assert!(besteht(schritt(60, 20.0, 59.0, 2, 8.0), true, true));
+        assert!(!besteht(schritt(60, 20.0, 59.0, 3, 8.0), true, true));
+        assert!(besteht(schritt(60, 20.0, 59.0, 3, 8.0), false, true));
+        // Ohne Latenzprobe kein Bestehen, gescheitert ebenso wenig.
+        assert!(!besteht(schritt(60, 20.0, 59.0, 0, 8.0), true, false));
+        let mut g = schritt(60, 20.0, 59.0, 0, 8.0);
+        g.gescheitert = true;
+        assert!(!besteht(g, true, true));
+    }
+
+    #[test]
+    fn aud_wird_angehaengt() {
+        // Eine HEVC-Zugriffseinheit: VPS-Kopf und eine Scheibe (Typ 1).
+        let au = [0u8, 0, 0, 1, 0x40, 0x01, 0xAA, 0, 0, 1, 0x02, 0x01, 0xBB, 0xCC];
+        let mit = mit_aud(&au, false);
+        assert_eq!(&mit[..au.len()], &au[..]);
+        assert_eq!(&mit[au.len()..], &[0, 0, 0, 1, 0x46, 0x01, 0x50]);
+        // H.264: SPS (Typ 7) und eine IDR-Scheibe (Typ 5).
+        let au = [0u8, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x65, 0xBB];
+        let mit = mit_aud(&au, true);
+        assert_eq!(&mit[..au.len()], &au[..]);
+        assert_eq!(&mit[au.len()..], &[0, 0, 0, 1, 0x09, 0xF0]);
+    }
+
+    #[test]
+    fn aud_nicht_doppelt() {
+        // Endet die Einheit schon mit einem AUD, bleibt sie, wie sie ist.
+        let mut au = vec![0u8, 0, 0, 1, 0x02, 0x01, 0xBB];
+        au.extend_from_slice(&AUD_HEVC);
+        assert_eq!(&*mit_aud(&au, false), &au[..]);
+        let mut au = vec![0u8, 0, 0, 1, 0x65, 0xBB];
+        au.extend_from_slice(&AUD_H264);
+        assert_eq!(&*mit_aud(&au, true), &au[..]);
+        // Ein AUD VORNE genuegt nicht - der Parser braucht das Ende des
+        // letzten Bildes.
+        let mut au = AUD_HEVC.to_vec();
+        au.extend_from_slice(&[0, 0, 0, 1, 0x02, 0x01, 0xBB]);
+        assert_eq!(mit_aud(&au, false).len(), au.len() + AUD_HEVC.len());
+        // Leer oder zu kurz fuer einen Startcode: wird trotzdem ergaenzt.
+        assert_eq!(mit_aud(&[], true).len(), AUD_H264.len());
+    }
+
+    #[test]
+    fn letzter_nal_typ_liest_beide_kopfformen() {
+        assert_eq!(letzter_nal_typ(&[0, 0, 1, 0x46, 0x01, 0x50], false), Some(35));
+        assert_eq!(letzter_nal_typ(&[0, 0, 0, 1, 0x09, 0xF0], true), Some(9));
+        assert_eq!(letzter_nal_typ(&[0, 0, 0, 1, 0x26, 0x01, 0x11, 0, 0, 1, 0x02, 0x01], false), Some(1));
+        assert_eq!(letzter_nal_typ(&[1, 2, 3], false), None);
     }
 }
