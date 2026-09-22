@@ -204,6 +204,59 @@ impl<'a> Canvas<'a> {
 
 // ----------------------------------------------------------------- Schrift
 
+/// fontdue sammelt die Zeichenzuordnung aus ALLEN cmap-Untertabellen der
+/// Reihe nach in eine Karte - die letzte gewinnt. Apple-Schriften (Menlo,
+/// Monaco) fuehren hinter der Unicode-Tabelle noch eine Mac-Roman-Tabelle
+/// (Plattform 1), und die ueberschreibt fuer alle Zeichen unter 256 die
+/// Unicode-Zuordnung: aus "oe" wird ein Zirkumflex, aus dem Mittelpunkt ein
+/// Summenzeichen. Abhilfe ohne Fremdcode: die Eintragsliste der cmap-Tabelle
+/// in der geladenen Kopie so umsortieren, dass die Unicode-Tabellen zuletzt
+/// kommen (Plattform 0, oder 3 mit Kodierung 1 oder 10). Nur die 8-Byte-
+/// Eintraege werden bewegt, die Tabellen selbst bleiben, wo sie sind. Fuer
+/// eine Sammlung (.ttc) gilt die erste Schrift - dieselbe, die fontdue nimmt.
+/// Passt etwas nicht ins Schema, bleibt die Datei unveraendert. Auf Windows
+/// aendert das nichts: dort gewinnt schon heute die Unicode-Tabelle.
+fn cmap_unicode_zuletzt(daten: &mut [u8]) {
+    let u16_bei = |d: &[u8], o: usize| -> Option<u16> { d.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]])) };
+    let u32_bei = |d: &[u8], o: usize| -> Option<u32> { d.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])) };
+    let Some(magic) = u32_bei(daten, 0) else { return };
+    // Sammlung: 'ttcf', Zahl der Schriften bei 8, Versatz der ersten bei 12.
+    let start = if magic == 0x7474_6366 { u32_bei(daten, 12).map(|v| v as usize) } else { Some(0) };
+    let Some(start) = start else { return };
+    let Some(n) = u16_bei(daten, start + 4) else { return };
+    let mut cmap = None;
+    for i in 0..n as usize {
+        let r = start + 12 + 16 * i;
+        if daten.get(r..r + 4) == Some(b"cmap") {
+            cmap = u32_bei(daten, r + 8).map(|v| v as usize);
+            break;
+        }
+    }
+    let Some(cmap) = cmap else { return };
+    let Some(anzahl) = u16_bei(daten, cmap + 2) else { return };
+    let liste = cmap + 4;
+    let ende = liste + 8 * anzahl as usize;
+    let Some(bereich) = daten.get(liste..ende) else { return };
+    let mut eintraege: Vec<[u8; 8]> = bereich
+        .chunks(8)
+        .map(|c| {
+            let mut e = [0u8; 8];
+            e.copy_from_slice(c);
+            e
+        })
+        .collect();
+    let unicode = |e: &[u8; 8]| -> bool {
+        let plattform = u16::from_be_bytes([e[0], e[1]]);
+        let kodierung = u16::from_be_bytes([e[2], e[3]]);
+        plattform == 0 || (plattform == 3 && (kodierung == 1 || kodierung == 10))
+    };
+    // Stabil: Unicode ans Ende, Reihenfolge innerhalb der Gruppen bleibt.
+    eintraege.sort_by_key(|e| unicode(e));
+    for (i, e) in eintraege.iter().enumerate() {
+        daten[liste + 8 * i..liste + 8 * i + 8].copy_from_slice(e);
+    }
+}
+
 pub struct Text {
     fonts: Vec<Font>,
     cache: HashMap<(char, u32, usize), (fontdue::Metrics, Vec<u8>)>,
@@ -220,12 +273,14 @@ impl Text {
             "C:\\Windows\\Fonts\\YuGothM.ttc",   // Yu Gothic: Japanisch
             "C:\\Windows\\Fonts\\meiryo.ttc",
             "C:\\Windows\\Fonts\\segoeui.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Menlo.ttc",                        // Mac: Latein, Kyrillisch, Griechisch
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",   // Mac: Chinesisch, Japanisch (TrueType)
+            "/System/Library/Fonts/PingFang.ttc",                     // Mac: CFF, fontdue kann es meist nicht laden
         ];
         let mut fonts = Vec::new();
         for path in candidates {
-            if let Ok(data) = std::fs::read(path) {
+            if let Ok(mut data) = std::fs::read(path) {
+                cmap_unicode_zuletzt(&mut data);
                 if let Ok(f) = Font::from_bytes(data.as_slice(), FontSettings::default()) {
                     fonts.push(f);
                 }
