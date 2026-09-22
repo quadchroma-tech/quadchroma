@@ -69,6 +69,13 @@ Testbild, damit jeder Schritt denselben Inhalt sieht. Am Ende steht eine Empfehl
 die sich mit einem Klick übernehmen lässt; die Tabelle liegt in
 `%APPDATA%\QuadChroma\benchmark.txt`.
 
+Rechner mit zwei Grafikkarten (Laptop mit Intel-Grafik und NVIDIA-Karte) bekommen im
+Reiter **Anzeige** je eine Zeile für die Anzeige und für den Decoder mit den Rollen
+Automatik, Grafikkarte, Integriert und Prozessor. Der Client erkennt die Karten beim
+Start (gemeinsamer Speicher heißt integriert), zeigt nur Knöpfe, zu denen es eine Karte
+gibt, und nennt die erkannte Karte im Tooltip. Der Decoder wechselt sofort, die
+Anzeige ab dem nächsten Start.
+
 ## Gemessen auf einem Mac mini M1
 
 | | |
@@ -77,7 +84,7 @@ die sich mit einem Klick übernehmen lässt; die Tabelle liegt in
 | Datenrate Bild | 3 bis 11 Mbit/s bei ruhigem Bild, bis zur eingestellten Grenze bei Bewegung |
 | Encoder | Hardware, rund 8 ms je Bild, wenige Prozent eines Kerns |
 | Codecs | HEVC 4:4:4 und 4:2:0 in 8 und 10 Bit, H.264 — alle in Hardware, im Betrieb umschaltbar |
-| Decodieren auf Windows | NVDEC in Hardware; Software 8,6 ms je Bild (scheibenparallel, damit kein Bild zurückgehalten wird) |
+| Decodieren auf Windows | NVDEC in Hardware; auf AMD und Intel D3D11VA (4:2:0 und H.264); Software 8,6 ms je Bild (scheibenparallel, damit kein Bild zurückgehalten wird) |
 | Anzeige auf Windows | Direct3D 11: rohe Decoder-Ebenen auf die Karte, Umrechnung und Skalierung im Shader, bitidentisch zum Prozessorweg |
 | Verzögerung | 15 bis 20 ms von der Aufnahme bis zur Übergabe an die Anzeige, gemessen mit Zeitstempeln je Bild |
 | Ton | unkomprimiert, Stereo, 48 kHz, rund 3 Mbit/s; abschaltbar |
@@ -126,7 +133,7 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
 - Auflösungswechsel im laufenden Betrieb (der Client meldet seine Fenstergröße, der Host stellt den Strom um)
 - Bildschirmwahl im Menü statt nur beim Start
 - Anzeige: Wahl Sofort/Bildsynchron im Menü, frisches Fenster nach Geräteverlust; ab 4K der Null-Kopien-Weg (NVDEC-Bild bleibt auf der Karte)
-- Wahl der Grafikkarte im Menü (Automatik, Grafikkarte, Integriert, Prozessor) mit Erkennung; D3D11VA-Decodieren für AMD und Intel (4:2:0 und H.264)
+- D3D11VA ohne Kopie: das decodierte Bild bleibt auf der Karte, die zeichnet (heute eine Kopie über den Prozessor)
 - Später als Zusatz denkbar: beide Bildschirme des Hosts auf Wunsch streamen; ein Relay, an das sich weitere Zuschauer heften (Bild und Ton, ohne Eingabe)
 
 ## Aufbau

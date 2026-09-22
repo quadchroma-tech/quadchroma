@@ -66,8 +66,8 @@ F10. Fuenf Reiter:
     Bild            Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton,
                     Codecwahl
     Anzeige         Vollbild, pixelgenau, Statistik, Nerd-Modus, welche
-                    Statistikzeilen, Decoderwahl (Automatik, Software,
-                    Grafikkarte)
+                    Statistikzeilen, Karte fuer Anzeige und Decoder
+                    (Automatik, Grafikkarte, Integriert, Prozessor)
     Verschluesselung  Verfahren, Vergleichscode, Fingerabdruck, Trennen
     Tastenkombinationen  alle Tasten, die der Client selbst abfaengt
     Benchmark       misst Codecs, Bildraten und Datenraten der Reihe nach
@@ -159,23 +159,43 @@ keine sehr hohen Werte: bei 500 Mbit/s schafft Apples Encoder nur noch rund
 Decoder und Anzeige auf Windows
 -------------------------------
 
+Grafikkarten: beim Start zaehlt der Client die Karten auf (Protokoll:
+"Karte 0: <Name> - Grafikkarte, <MB> MB, Ausgang ja/nein, UMA ja/nein")
+und gibt ihnen Rollen: "Integriert" ist die Karte mit gemeinsamem Speicher
+(Intel Xe, AMD-APU), "Grafikkarte" jede andere - bei zweien "Grafikkarte 1"
+und "Grafikkarte 2". Im Reiter "Anzeige" stehen zwei Zeilen mit
+Rollen-Knoepfen, fuer die Anzeige und fuer den Decoder:
+
+    Automatik  Grafikkarte  Integriert  Prozessor
+
+Knoepfe ohne passende Karte fehlen; der Tooltip nennt die erkannte Karte
+mit Speicher und ob ein Bildschirm daran haengt.
+
 Decoder: Automatik nimmt NVDEC (ueber die cuvid-Decoder von FFmpeg), wenn
-eine NVIDIA-Karte da ist, sonst Software. "Software" erzwingt die CPU,
-"NVIDIA" die Karte - und sagt laut, wenn sie nicht geht. Ein Hardware-
-Decoder, der Pakete annimmt, aber 1,5 s lang kein Bild liefert oder nur
-Unlesbares, wird von selbst durch Software ersetzt; der Grund steht in der
-Statistik und im Protokoll. Befehlszeile: --decoder auto|software|nvidia.
+eine NVIDIA-Karte da ist, sonst D3D11VA auf der Karte, die zeichnet, sonst
+Software. "Grafikkarte" verlangt die Karte (NVIDIA: NVDEC, andere: D3D11VA),
+"Integriert" D3D11VA auf der integrierten Grafik, "Prozessor" die CPU.
+D3D11VA kann in FFmpeg 9 nur HEVC 4:2:0 und H.264 - bei einem 4:4:4-Codec
+sagt der Client das und decodiert in Software; der Codec laesst sich im
+Reiter "Bild" umstellen. Ein Hardware-Decoder, der Pakete annimmt, aber
+1,5 s lang kein Bild liefert oder nur Unlesbares, wird von selbst durch
+Software ersetzt; der Grund steht in der Statistik und im Protokoll. Die
+Wahl gilt sofort. Befehlszeile: --decoder auto|gpu|gpu2|integriert|software
+(alte Werte nvidia/nvdec/cuvid gelten als gpu).
 
 Anzeige: mit einer Grafikkarte zeichnet der Client ueber Direct3D 11. Die
 rohen Ebenen des Decoders gehen auf die Karte, Umrechnung nach RGB und
 Skalierung laufen dort in Shadern (bitidentisch zum Weg ueber den
 Prozessor), die Oberflaeche liegt als eigene Ebene darueber. Praesentiert
-wird sofort, hoechstens ein Bild unterwegs, nie wartend. Ohne brauchbare
-Karte laeuft der alte Weg ueber den Prozessor - der Client sagt beim Start
-im Protokoll, was er gewaehlt hat ("Anzeige: D3D11 <Karte>, ..." oder
-"Anzeige: Software"). Befehlszeile: --anzeige auto|gpu|cpu|warp und
---adapter n; die Wahl laesst sich in einstellungen.txt als anzeige=... fest
-eintragen. Ein Wechsel gilt ab dem naechsten Start.
+wird sofort, hoechstens ein Bild unterwegs, nie wartend. Automatik nimmt
+die erste Karte mit Bildschirmausgang, sonst die erste von NVIDIA, sonst
+die erste ueberhaupt; ohne Karte laeuft der Weg ueber den Prozessor. Der
+Client sagt beim Start im Protokoll, was er gewaehlt hat ("Anzeige: D3D11
+<Karte>, ..." oder "Anzeige: Software"). Die Wahl im Menue wird gespeichert
+und gilt ab dem naechsten Start - solange zeigt eine Zeile unter den
+Knoepfen "gilt ab dem naechsten Start". Befehlszeile: --anzeige
+auto|gpu|gpu2|integriert|cpu|warp und --adapter n; in einstellungen.txt
+als anzeige=... und decoder=... fest eintragbar.
 
     quadchroma.exe --anzeigetest C:\ein\verzeichnis
 
@@ -256,9 +276,15 @@ zusaetzlich die Anzeige (Karte, Feature-Level, Tearing) und je Sekunde eine
 Zeile mit Bildrate, Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern
 und der Prozessorlast des Clients.
 
-    quadchroma.exe 192.168.178.194:9001 --headless --decoder nvidia
+    quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
+    quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
 
-erzwingt den NVIDIA-Decoder und sagt, was die Karte dazu meint.
+erzwingt die Karte und sagt, was sie dazu meint;
+
+    quadchroma.exe --decodertest
+
+zaehlt die Karten auf und probiert jede Decoderwahl mit HEVC 4:4:4, 4:2:0
+und H.264 durch, ohne Verbindung.
 
 Die Dateien neben der Programmdatei gehoeren dazu und muessen mitkopiert
 werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
