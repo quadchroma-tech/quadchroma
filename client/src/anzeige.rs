@@ -402,7 +402,7 @@ pub fn tearing_moeglich() -> bool {
 
 /// Geraet und Kontext. Mit Adapter: genau der (--adapter n); ohne: der
 /// Hardware-Adapter, den D3D waehlt, oder WARP fuer den Test.
-fn geraet_bauen(
+pub(crate) fn geraet_bauen(
     adapter: Option<&IDXGIAdapter1>,
     warp: bool,
     debug: bool,

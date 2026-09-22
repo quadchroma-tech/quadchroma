@@ -90,6 +90,48 @@ where
     Ok(Session { transport, handshake_hash, remote_static })
 }
 
+/// Fuehrt den Handschlag als Angerufener (Host-Rolle) ueber eine beliebige
+/// Leitung - das Gegenstueck zu qc_chan_accept auf dem Mac: Nachricht 1
+/// lesen, Nachricht 2 ohne Nutzlast schreiben, Nachricht 3 lesen (die
+/// Nutzlast "client" wird uebergangen), dann Pruefsumme und Gegenschluessel
+/// festhalten und in den Betrieb umschalten.
+pub fn handshake_responder<R, W>(
+    static_key: &[u8],
+    prologue: &[u8],
+    mut recv: R,
+    mut send: W,
+) -> Result<Session, String>
+where
+    R: FnMut(&mut Vec<u8>) -> Result<(), String>,
+    W: FnMut(&[u8]) -> Result<(), String>,
+{
+    let params = PATTERN.parse().map_err(|e| format!("Muster: {e:?}"))?;
+    let mut hs: HandshakeState = Builder::new(params)
+        .local_private_key(static_key)
+        .map_err(|e| format!("Schluessel: {e:?}"))?
+        .prologue(prologue)
+        .map_err(|e| format!("Prologue: {e:?}"))?
+        .build_responder()
+        .map_err(|e| format!("Aufbau: {e:?}"))?;
+
+    let mut incoming = Vec::new();
+    let mut payload = vec![0u8; 65535];
+    recv(&mut incoming)?;
+    hs.read_message(&incoming, &mut payload).map_err(|e| format!("Nachricht 1: {e:?}"))?;
+
+    let mut buf = vec![0u8; 65535];
+    let n = hs.write_message(&[], &mut buf).map_err(|e| format!("Nachricht 2: {e:?}"))?;
+    send(&buf[..n])?;
+
+    recv(&mut incoming)?;
+    hs.read_message(&incoming, &mut payload).map_err(|e| format!("Nachricht 3: {e:?}"))?;
+
+    let handshake_hash = hs.get_handshake_hash().to_vec();
+    let remote_static = hs.get_remote_static().map(|k| k.to_vec()).unwrap_or_default();
+    let transport = hs.into_transport_mode().map_err(|e| format!("Umschalten: {e:?}"))?;
+    Ok(Session { transport, handshake_hash, remote_static })
+}
+
 /// Erzeugt ein langlebiges Schluesselpaar.
 pub fn keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
     let params = PATTERN.parse().map_err(|e| format!("Muster: {e:?}"))?;

@@ -10,4 +10,6 @@ known_hosts
 
 # Rohbilder aus dem Schnappschussmodus; die PNGs sind Dokumentation und bleiben
 *.bmp
+# Mitschnitte des Bildstroms (--mitschnitt, Konserve fuer den Windows-Host)
+*.hevc
 .DS_Store

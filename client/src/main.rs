@@ -19,6 +19,7 @@ use rayon::prelude::*;
 mod discovery;
 mod einstellungen;
 mod noise;
+mod protokoll_konst;
 mod secure;
 mod strings;
 mod strings_asia;
@@ -35,12 +36,18 @@ mod audio;
 mod clipboard;
 #[cfg(windows)]
 mod anzeige;
+/// Windows als Host: eigene Rolle in derselben Programmdatei (--host,
+/// --list, --messen), ohne Fenster.
+#[cfg(windows)]
+mod host;
+// Die Nachrichtenkennungen der Leitung liegen in EINEM Modul, das Client-
+// und Host-Rolle teilen (protokoll_konst.rs).
+use protokoll_konst::*;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
-const MAGIC: &[u8; 4] = b"QCH1";
 /// Eigene Uhr des Clients. Der Nullpunkt ist beliebig; fuer den Vergleich mit
 /// dem Host zaehlt nur der Versatz, den der Zeitabgleich ausrechnet.
 fn client_us() -> u64 {
@@ -225,30 +232,10 @@ fn website_oeffnen() {
 
 #[cfg(not(windows))]
 fn website_oeffnen() {}
-const MSG_INFO: u8 = 1;
-const MSG_SETTINGS: u8 = 3;
 /// So lange muss ESC gehalten werden, bis sich das Menue oeffnet.
 const ESC_HALTEDAUER: Duration = Duration::from_secs(2);
 /// So lange gilt ein nachgereichter ESC als gedrueckt.
 const ESC_TIPPDAUER: Duration = Duration::from_millis(60);
-
-const MSG_TIME: u8 = 4;
-const MSG_STAMP: u8 = 5;
-const MSG_LAST: u8 = 6;
-const MSG_HOSTSTATUS: u8 = 9;
-const MSG_VIDEO: u8 = 2;
-/// Ab hier neuer Codec: Decoder wegwerfen, das naechste Bild ist ein
-/// Schluesselbild mit Parametersaetzen.
-const MSG_SWITCH: u8 = 7;
-/// Koennensliste des Hosts: welche Codecs er anbietet, mit Flaggen.
-const MSG_CODECS: u8 = 8;
-const MSG_AUDIO_INFO: u8 = 32;
-const MSG_AUDIO: u8 = 33;
-const MSG_CLIP: u8 = 48;
-/// Zeigerform des Macs: 12 Byte Kopf (u16 Breite, u16 Hoehe, u16 Hotspot x,
-/// u16 Hotspot y, u8 sichtbar, u8 Massstab, u16 frei), dann RGBA mit gerader
-/// Deckkraft. Kommt nur, wenn sich die Form aendert.
-const MSG_CURSOR: u8 = 49;
 
 /// Die Form des Mac-Zeigers, wie sie der Host zuletzt geschickt hat. Der
 /// Zeiger selbst bleibt der von Windows (Regel des Projekts: kein Zeiger im
@@ -1323,6 +1310,23 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // cuvid setzt das Ende-Kennzeichen des Parsers nie; die angehaengte AUD
     // ist der einzige Weg von aussen. Fuer den Software-Decoder ohne Belang.
     let aud_anhang = std::env::args().any(|a| a == "--aud");
+    // --mitschnitt datei.hevc (Pruefmodus): die Zugriffseinheiten roh in
+    // eine Datei, ohne unsere Koepfe, ab dem ersten Vollbild - als Konserve
+    // fuer den Windows-Host (--konserve) oder zum Abspielen mit ffplay.
+    let mut mitschnitt: Option<std::fs::File> = std::env::args()
+        .position(|a| a == "--mitschnitt")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|p| match std::fs::File::create(&p) {
+            Ok(f) => {
+                protokoll::zeile(format!("Mitschnitt nach {p}"));
+                Some(f)
+            }
+            Err(e) => {
+                protokoll::zeile(format!("Mitschnitt nach {p} nicht moeglich: {e}"));
+                None
+            }
+        });
+    let mut mitschnitt_laeuft = false;
 
     let mut info: Option<StreamInfo> = None;
     #[cfg(windows)]
@@ -1489,6 +1493,16 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         continue;
                     }
                     warte_auf_schluesselbild = false;
+                }
+                if let Some(f) = mitschnitt.as_mut() {
+                    use std::io::Write;
+                    if flags & FLAG_KEY != 0 {
+                        mitschnitt_laeuft = true;
+                    }
+                    if mitschnitt_laeuft && f.write_all(&payload).is_err() {
+                        protokoll::zeile("Mitschnitt: Schreiben fehlgeschlagen, beendet".into());
+                        mitschnitt = None;
+                    }
                 }
                 // Ankunftszeit sofort nehmen, noch vor dem Decodieren.
                 let t_empfangen = client_us();
@@ -2080,26 +2094,6 @@ fn dunkles_bild(w: u32, h: u32) -> Frame {
 }
 
 // ------------------------------------------------------------------ Eingabe
-
-const IN_MOVE: u8 = 16;
-const IN_BUTTON: u8 = 17;
-const IN_SCROLL: u8 = 18;
-const IN_KEY: u8 = 19;
-const IN_CLIP: u8 = 48;
-const IN_SETTINGS: u8 = 64;
-const IN_TIME: u8 = 65;
-/// Codecwunsch: ein Byte, der Index aus der Koennensliste.
-const IN_CODEC: u8 = 66;
-/// Testbild: ein Byte, 1 = der Host zeigt sein bewegtes Muster statt des
-/// Bildschirms, 0 = wieder der Bildschirm. Fuer den Benchmark, damit jeder
-/// Schritt denselben Inhalt misst.
-const IN_TESTBILD: u8 = 68;
-
-// Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
-const MOD_SHIFT: u32 = 1;
-const MOD_CTRL: u32 = 2;
-const MOD_ALT: u32 = 4;
-const MOD_CMD: u32 = 8;
 
 /// Physische Taste nach macOS-Tastencode. Bewusst ueber die POSITION der Taste,
 /// nicht ueber das Zeichen: So bleibt jedes Tastaturlayout richtig, weil der Mac
@@ -5466,9 +5460,21 @@ fn main() {
     const WERTIG: &[(&str, usize)] = &[
         ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1),
         ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
-        ("--benchmark-auswahl", 1),
+        ("--benchmark-auswahl", 1), ("--mitschnitt", 1),
+        // Host-Rolle (host/mod.rs liest sie selbst; hier nur, damit ihre
+        // Werte nie fuer eine Adresse gehalten werden)
+        ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1),
     ];
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Windows als Host: --host [port], --list, --messen - ohne Fenster,
+    // Abzweig VOR allem, was ein Fenster oder einen Client braucht.
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
+        let code = host::main_host(&args);
+        std::process::exit(code);
+    }
+
     let mut addr = String::new();
     let mut i = 0;
     while i < args.len() {
@@ -5708,9 +5714,21 @@ fn main() {
         let mut cpu_zeiten = (prozesszeit_100ns().unwrap_or(0), Instant::now());
         let mut cpu_eigen = 0.0f32;
         println!("Decoderwunsch: {}", decoder_wunsch.schluessel());
+        // Auch ohne Fenster zuhoeren, wer sich im Netz ausruft - jede neue
+        // Adresse einmal als Zeile, damit sich die Bekanntgabe eines Hosts
+        // ohne Startbildschirm pruefen laesst.
+        let hosts = discovery::start(9003);
+        let mut gefunden: std::collections::HashSet<String> = std::collections::HashSet::new();
         let start = Instant::now();
         let mut last = 0u64;
         loop {
+            if let Ok(h) = hosts.lock() {
+                for host in h.list() {
+                    if gefunden.insert(host.addr.to_string()) {
+                        println!("Host gefunden: {} ({})", host.name, host.addr);
+                    }
+                }
+            }
             // Der Drei-Sekunden-Takt in Scheiben von 50 ms: dazwischen
             // arbeitet der Benchmark, der seine Fristen selbst misst.
             let takt_ende = Instant::now() + Duration::from_secs(3);

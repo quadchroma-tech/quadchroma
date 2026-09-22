@@ -79,6 +79,50 @@ impl Secure {
         })
     }
 
+    /// Nimmt eine angenommene Leitung als Angerufener (Host-Rolle) an: der
+    /// Handschlag laeuft mit dem uebergebenen dauerhaften Schluessel des
+    /// Hosts, nicht mit client.key. Rahmen und Fristen wie bei `wrap`.
+    pub fn accept(sock: TcpStream, prologue: &[u8], priv_key: &[u8]) -> Result<Secure, String> {
+        sock.set_nodelay(true).ok();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).ok();
+        let mut rd = sock.try_clone().map_err(|e| format!("Leitung: {e}"))?;
+        let wr = sock.try_clone().map_err(|e| format!("Leitung: {e}"))?;
+
+        let recv = |buf: &mut Vec<u8>| -> Result<(), String> {
+            let mut l = [0u8; 2];
+            rd.read_exact(&mut l).map_err(|e| format!("Laenge: {e}"))?;
+            let n = u16::from_le_bytes(l) as usize;
+            buf.resize(n, 0);
+            rd.read_exact(buf).map_err(|e| format!("Daten: {e}"))
+        };
+        let send = |data: &[u8]| -> Result<(), String> {
+            let mut out = Vec::with_capacity(2 + data.len());
+            out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            out.extend_from_slice(data);
+            (&wr).write_all(&out).map_err(|e| format!("Senden: {e}"))
+        };
+
+        let s = noise::handshake_responder(priv_key, prologue, recv, send)?;
+        sock.set_read_timeout(None).ok();
+        sock.set_write_timeout(None).ok();
+        let sas = noise::sas(&s.handshake_hash);
+        Ok(Secure {
+            sock,
+            tx: s.transport,
+            inbuf: Vec::new(),
+            inpos: 0,
+            handshake_hash: s.handshake_hash,
+            peer: s.remote_static,
+            sas,
+        })
+    }
+
+    /// Die Leitung selbst - fuer Socketoptionen der Host-Rolle (Sendepuffer).
+    pub fn socket(&self) -> &TcpStream {
+        &self.sock
+    }
+
     /// Eine zweite Hand an derselben Leitung, um sie von aussen zu kappen.
     /// Ein blockierendes Lesen endet erst, wenn jemand den Socket schliesst.
     pub fn abbruchgriff(&self) -> Option<TcpStream> {
@@ -138,7 +182,7 @@ impl Secure {
 
 // ------------------------------------------------------------ Schluesselablage
 
-fn config_dir() -> Result<PathBuf, String> {
+pub fn config_dir() -> Result<PathBuf, String> {
     let base = std::env::var("APPDATA")
         .or_else(|_| std::env::var("HOME"))
         .map_err(|_| "kein Ablageort fuer Einstellungen gefunden".to_string())?;
@@ -191,4 +235,77 @@ pub fn check_known_host(addr: &str, peer: &[u8]) -> Result<bool, String> {
     text.push_str(&format!("{host} {hex} {}\n", noise::fingerprint(peer)));
     std::fs::write(&path, text).map_err(|e| format!("known_hosts: {e}"))?;
     Ok(true) // erstmals gesehen
+}
+
+// ------------------------------------------------- Ablage der Host-Rolle
+//
+// Der Windows-Host hat seinen eigenen dauerhaften Schluessel (host.key) und
+// seine Liste freigegebener Gegenstellen (authorized.txt), beide unter
+// %APPDATA%\QuadChroma neben client.key und known_hosts.txt - getrennte
+// Dateien, keine Kollision. authorized.txt hat das Format des Macs:
+// 64 Hex + zwei Leerzeichen + Fingerabdruck + zwei Leerzeichen + Name.
+// host.key liegt hier wie client.key mit 64 Byte (privat, dann oeffentlich),
+// damit der eigene Fingerabdruck ohne Nachrechnen im Protokoll stehen kann.
+
+/// Dauerhafter Schluessel des Hosts. Entsteht beim ersten Start.
+pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), String> {
+    let path = config_dir()?.join("host.key");
+    if let Ok(b) = std::fs::read(&path) {
+        if b.len() == 64 {
+            return Ok((b[..32].to_vec(), b[32..].to_vec()));
+        }
+    }
+    let (priv_key, pub_key) = noise::keypair()?;
+    let mut both = priv_key.clone();
+    both.extend_from_slice(&pub_key);
+    std::fs::write(&path, &both).map_err(|e| format!("Schluessel schreiben: {e}"))?;
+    Ok((priv_key, pub_key))
+}
+
+fn hex(peer: &[u8]) -> String {
+    peer.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn authorized_path() -> Option<PathBuf> {
+    config_dir().ok().map(|d| d.join("authorized.txt"))
+}
+
+/// Ist diese Gegenstelle freigegeben? Verglichen werden die ersten 64
+/// Zeichen der Zeile, wie auf dem Mac.
+pub fn is_authorized(peer: &[u8]) -> bool {
+    let Some(p) = authorized_path() else { return false };
+    let h = hex(peer);
+    std::fs::read_to_string(p).map(|t| t.lines().any(|l| l.starts_with(&h))).unwrap_or(false)
+}
+
+/// Gegenstelle aufnehmen. Schon bekannte Zeilen werden nicht verdoppelt.
+pub fn authorize(peer: &[u8], name: &str) -> Result<(), String> {
+    if is_authorized(peer) {
+        return Ok(());
+    }
+    let p = authorized_path().ok_or("kein Ablageort")?;
+    let mut text = std::fs::read_to_string(&p).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "{}  {}  {}\n",
+        hex(peer),
+        noise::fingerprint(peer),
+        if name.is_empty() { "-" } else { name }
+    ));
+    std::fs::write(&p, text).map_err(|e| format!("authorized.txt: {e}"))
+}
+
+/// Anzahl der freigegebenen Gegenstellen.
+pub fn authorized_count() -> usize {
+    let Some(p) = authorized_path() else { return 0 };
+    std::fs::read_to_string(p).map(|t| t.lines().filter(|l| l.len() > 64).count()).unwrap_or(0)
+}
+
+/// Alle Freigaben loeschen (--forget).
+pub fn forget_all() {
+    if let Some(p) = authorized_path() {
+        let _ = std::fs::remove_file(p);
+    }
 }
