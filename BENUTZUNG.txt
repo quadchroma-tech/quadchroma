@@ -307,20 +307,24 @@ erzwingt die Karte und sagt, was sie dazu meint;
 zaehlt die Karten auf und probiert jede Decoderwahl mit HEVC 4:4:4, 4:2:0
 und H.264 durch, ohne Verbindung.
 
-Windows als Host (im Aufbau)
-----------------------------
+Windows als Host
+----------------
 
 Dieselbe quadchroma.exe kann auch der Host sein: sie nimmt den Zuschauer
 an, den sonst der Mac bekommt - gleiche Verschluesselung, gleiche
-Kopplung, gleiche Nachrichten, ein Client merkt keinen Unterschied. Fertig
-sind Zuschauerplatz, Kopplung, Bekanntgabe, Eingaben (Maus, Tastatur,
-Rad) und die Zwischenablage in beide Richtungen; Aufnahme des Bildschirms,
-Encoder und Ton im Betrieb folgen. Bis dahin liefert eine Konserve das
-Bild. Alles laeuft ohne Fenster ueber die Befehlszeile; jede Zeile steht
-auch in %APPDATA%\QuadChroma\host-protokoll.txt.
+Kopplung, gleiche Nachrichten, ein Client merkt keinen Unterschied.
+Aufnahme ueber die Desktop Duplication des gewaehlten Ausgangs, Encoder
+ueber FFmpeg (hevc_nvenc/h264_nvenc auf NVIDIA; ohne NVIDIA nur H.264 in
+Software ueber Media Foundation), Schrittmacher, Codecwechsel, Testbild,
+Ton (WASAPI-Loopback), Zeigerform, Last und Wachhalten wie beim Mac.
+Ohne Zuschauer arbeitet der Host nicht: keine Duplication, kein Encoder,
+kein Wachhalten (Leerlauf unter 1 % eines Kerns). Alles laeuft ohne
+Fenster ueber die Befehlszeile; jede Zeile steht auch in
+%APPDATA%\QuadChroma\host-protokoll.txt.
 
     quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
                    [--pair] [--forget] [--konserve datei.hevc]
+                   [--encoderweg bgra|yuv444|d3d11|auto]
     quadchroma.exe --list
     quadchroma.exe --messen [--output n] [--sekunden 10]
 
@@ -329,18 +333,27 @@ auch in %APPDATA%\QuadChroma\host-protokoll.txt.
                     host.key; der Fingerabdruck steht im Protokoll.
     --output n      Ausgang aus der Liste von --list (ohne Angabe der
                     Hauptbildschirm). Bild und Maus beziehen sich auf
-                    denselben Ausgang; gemerkt wird sein Geraetename.
+                    denselben Ausgang; gemerkt wird sein Geraetename:
+                    faellt er weg, weicht der Host aus, kommt er zurueck,
+                    gilt er wieder. Breiter als 3840 wird halbiert.
     --fps N, --mbit N, --fest   wie beim Mac (Vorgabe 120, 150, aus).
     --pair          die naechste unbekannte Gegenstelle wird aufgenommen
                     (Vergleichscode im Protokoll); beim allerersten Mal
                     geschieht das von selbst.
     --forget        alle Freigaben loeschen (authorized.txt).
     --konserve datei.hevc   ein Annex-B-Strom (HEVC oder H.264) als
-                    Bildquelle, in Schleife im Takt der Bildrate - der
-                    Pruefweg ohne Karte. Die Koennensliste zeigt dann genau
-                    einen Eintrag, ein Codecwechsel wird abgelehnt. Eine
-                    solche Datei schreibt der Client selbst:
+                    Bildquelle statt der Aufnahme, in Schleife im Takt der
+                    Bildrate - der Pruefweg ohne Karte. Die Koennensliste
+                    zeigt dann genau einen Eintrag, ein Codecwechsel wird
+                    abgelehnt. Eine solche Datei schreibt der Client selbst:
                         quadchroma.exe 192.168.178.194:9001 --headless --mitschnitt C:\qc\qc.hevc
+    --encoderweg    wie das Bild in den Encoder kommt: bgra (BGRA direkt in
+                    NVENC, der rechnet auf der Karte um), yuv444 (eigene
+                    Umrechnung auf dem Prozessor), d3d11 (Texturen ohne
+                    Kopie, nur wenn der Ausgang an der NVIDIA haengt) oder
+                    auto (Vorgabe: die Entscheidung aus messung.txt, sonst
+                    bgra). 10-Bit-Kandidaten und Media Foundation gehen
+                    immer ueber den Prozessor.
     --list          Karten, Ausgaenge und was dieser Rechner codieren kann
                     (hevc_nvenc, h264_nvenc, av1_nvenc je Kandidat ueber
                     avcodec_open2; ohne NVIDIA-Treiber steht dort
@@ -355,7 +368,33 @@ auch in %APPDATA%\QuadChroma\host-protokoll.txt.
                     Ausgang etwas bewegen. Ergebnis in
                     %APPDATA%\QuadChroma\messung.txt, am Ende ein Satz je
                     Ausgang ("Null-Kopien, 2,9 ms je Bild" oder "Prozessor,
-                    5,1 ms, hoechstens 120 fps").
+                    5,1 ms, hoechstens 120 fps"); --encoderweg auto liest ihn.
+
+Kandidaten sind dieselben sechs wie beim Mac. Der Desktop ist 8 Bit, also
+sind "10 Bit" auf Windows immer eine Umrechnung (Vermerk in der
+Koennensliste); Startkandidat ist 0, sonst der erste vorhandene. Bitrate
+stellt nvenc im Betrieb um (ohne Neustart, mit Vollbild), eine neue
+Bildrate oder ein anderer Encoder heisst Neustart der Sitzung mit
+Vollbild. Der Host verwaltet die Vollbilder selbst: alle 2*fps Bilder,
+im Gaming-Modus alle fps, dazu bei Stau, Codecwechsel und neuem Zuschauer.
+
+Ohne NVIDIA (etwa in einer virtuellen Maschine) gibt es nur "H.264 High"
+ueber den Software-Encoder von Media Foundation (h264_mf), in der
+Koennensliste als Software gefuehrt. Der haelt bauartbedingt 16 Bilder
+zurueck (bei 60 Bildern je Sekunde rund 300 ms) - das reicht, um die
+ganze Kette Duplication -> Encoder -> Zuschauer zu pruefen, nicht fuer den
+Betrieb. Die Duplication braucht die Konsolensitzung; in einer RDP-Sitzung
+gibt es keinen DXGI-Ausgang ("Duplication nicht moeglich").
+
+Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
+meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es
+alle 2 s neu und erzwingt danach ein Vollbild. Die Zeigerform kommt aus der
+Duplication (Windows-Zeiger sind meist 32x32; einfarbige und maskierte
+Formen werden umgerechnet, Invertier-Punkte deckend genaehert), das Bild
+selbst enthaelt keinen Zeiger. Ton: Loopback des Standard-Ausgabegeraets,
+auf zwei Kanaele gemischt, Rate des Geraets; ein stiller Wiedergabestrom
+im selben Prozess haelt den Loopback am Laufen, Luecken werden mit Stille
+gefuellt. Ohne Ausgabegeraet laeuft der Host ohne Ton und sagt es einmal.
 
 Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
 privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,

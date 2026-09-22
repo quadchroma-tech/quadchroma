@@ -142,11 +142,13 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
 ## Was fehlt
 
 - Kopplungsdialog in der Oberfläche statt Kommandozeilenschalter
-- Rollenwahl (Windows als Host): im Aufbau. Fertig sind `--host` mit Zuschauerplatz
-  (Noise-Responder, Kopplung, Bekanntgabe), Eingaben und Zwischenablage, `--list`
-  und die Messung `--messen`; als Bildquelle dient bis auf Weiteres eine Konserve
-  (`--konserve`). Aufnahme (Desktop Duplication), Encoder (NVENC), Ton und
-  Zeigerform im Betrieb folgen. Beschreibung in `BENUTZUNG.txt`.
+- Rollenwahl (Windows als Host): `--host` ist da (Zuschauerplatz, Kopplung, Bekanntgabe,
+  Eingaben, Zwischenablage, Desktop Duplication, Encoder über NVENC bzw. ohne NVIDIA
+  H.264 in Software, Schrittmacher, Codecwechsel, Testbild, Ton, Zeigerform, Last,
+  Wachhalten), dazu `--list`, `--messen` und die Konserve als Prüfweg. Auf einem Rechner
+  mit NVIDIA-Karte ist der NVENC-Weg (bgra/yuv444/d3d11) noch ungeprüft; es fehlen
+  AMF/QSV, HDR-Ausgänge, Skalierung über 4K auf der Karte, die Bildschirmwahl im Menü
+  und ein Menüeintrag "Diesen Rechner freigeben". Beschreibung in `BENUTZUNG.txt`.
 - Tonkomprimierung als Wahlmöglichkeit; unkomprimiert braucht mehr Bandbreite als das Bild
 - Virtuelles Mikrofon auf dem Host, damit Programme dort den Client hören
 - Mehrere Zuschauer gleichzeitig
@@ -159,7 +161,8 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
 ## Aufbau
 
     host/        Mac: Aufnahme, Encoder, Netz, Eingaben, Ton, Zwischenablage, Zeigerform
-    client/      Windows: Empfang, Decodieren, Anzeige (anzeige.rs: Direct3D 11), Eingaben, Ton, Zwischenablage
+    client/      Windows: Empfang, Decodieren, Anzeige (anzeige.rs: Direct3D 11), Eingaben, Ton, Zwischenablage;
+                 dazu die Host-Rolle (client/src/host/: Aufnahme, Encoder, Netz, Eingaben, Ton, Zeigerform)
     Makefile     baut und signiert das App-Bündel
 
 Der Host ist in C und Objective-C geschrieben, der Client in Rust.
