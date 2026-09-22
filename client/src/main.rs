@@ -5507,7 +5507,7 @@ fn main() {
         ("--benchmark-auswahl", 1), ("--mitschnitt", 1),
         // Host-Rolle (host/mod.rs liest sie selbst; hier nur, damit ihre
         // Werte nie fuer eine Adresse gehalten werden)
-        ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1),
+        ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1), ("--encoderweg", 1),
     ];
     let args: Vec<String> = std::env::args().skip(1).collect();
 

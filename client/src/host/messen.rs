@@ -30,17 +30,15 @@ use std::time::Instant;
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::sys::*;
-use rayon::prelude::*;
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::*;
 // Ausdruecklich, weil ffmpeg::sys dieselben Namen als undurchsichtige
 // Bindgen-Typen mitbringt - die ausdrueckliche Einfuhr hat Vorrang.
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use super::aufnahme::{self, Abholung, Ausgang, Duplication};
-use super::encoder::{Bild, Oeffnung, Paket, Sitzung};
+use super::encoder::{bgra_nach_yuv444, hw_geraet, hw_pool, pool_textur, Bild, Oeffnung, Paket, Sitzung};
 use super::{arg_wert, log, testbild};
 
 // ----------------------------------------------------------------- Helfer
@@ -109,89 +107,8 @@ fn nal_typen(d: &[u8]) -> Vec<u8> {
     aus
 }
 
-/// BGRA -> yuv444p, BT.709 voller Wertebereich, zeilenparallel - die
-/// Umkehrung von zeile_rgb im Client.
-fn bgra_nach_yuv444(src: &[u8], w: usize, y: &mut [u8], u: &mut [u8], v: &mut [u8]) {
-    let zeile = w * 4;
-    y.par_chunks_mut(w).zip(u.par_chunks_mut(w)).zip(v.par_chunks_mut(w)).enumerate().for_each(|(row, ((yz, uz), vz))| {
-        let s = &src[row * zeile..row * zeile + zeile];
-        for x in 0..w {
-            let b = s[x * 4] as f32;
-            let g = s[x * 4 + 1] as f32;
-            let r = s[x * 4 + 2] as f32;
-            let yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            let cb = (b - yy) / 1.8556 + 128.0;
-            let cr = (r - yy) / 1.5748 + 128.0;
-            yz[x] = yy.round().clamp(0.0, 255.0) as u8;
-            uz[x] = cb.round().clamp(0.0, 255.0) as u8;
-            vz[x] = cr.round().clamp(0.0, 255.0) as u8;
-        }
-    });
-}
-
-// ------------------------------------------------- FFmpeg-Geraet aus D3D11
-
-/// AVHWDeviceContext (D3D11VA) aus einem VORHANDENEN Geraet: FFmpeg legt
-/// keines an, sondern nimmt unseres (mit zusaetzlicher Referenz).
-fn hw_geraet(device: &ID3D11Device) -> Result<*mut AVBufferRef, String> {
-    unsafe {
-        let r = av_hwdevice_ctx_alloc(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
-        if r.is_null() {
-            return Err("av_hwdevice_ctx_alloc".into());
-        }
-        let ctx = (*r).data as *mut AVHWDeviceContext;
-        let d3d = (*ctx).hwctx as *mut AVD3D11VADeviceContext;
-        (*d3d).device = aufnahme::geraet_roh(device) as *mut _;
-        let e = av_hwdevice_ctx_init(r);
-        if e < 0 {
-            let mut r = r;
-            av_buffer_unref(&mut r);
-            return Err(crate::ffmpeg_grund("av_hwdevice_ctx_init", e));
-        }
-        Ok(r)
-    }
-}
-
-/// Texturpool fuer den Null-Kopien-Weg: Format D3D11, sw_format BGRA,
-/// RENDER_TARGET, vier Texturen.
-fn hw_pool(geraet: *mut AVBufferRef, w: i32, h: i32) -> Result<*mut AVBufferRef, String> {
-    unsafe {
-        let r = av_hwframe_ctx_alloc(geraet);
-        if r.is_null() {
-            return Err("av_hwframe_ctx_alloc".into());
-        }
-        let fc = (*r).data as *mut AVHWFramesContext;
-        (*fc).format = AVPixelFormat::AV_PIX_FMT_D3D11;
-        (*fc).sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
-        (*fc).width = w;
-        (*fc).height = h;
-        (*fc).initial_pool_size = 4;
-        let d3d = (*fc).hwctx as *mut AVD3D11VAFramesContext;
-        (*d3d).BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
-        let e = av_hwframe_ctx_init(r);
-        if e < 0 {
-            let mut r = r;
-            av_buffer_unref(&mut r);
-            return Err(crate::ffmpeg_grund("av_hwframe_ctx_init", e));
-        }
-        Ok(r)
-    }
-}
-
-/// Eine Textur aus dem Pool in `bild` holen; liefert Textur und Index.
-fn pool_textur(pool: *mut AVBufferRef, bild: &mut Bild) -> Result<(ID3D11Texture2D, u32), String> {
-    unsafe {
-        av_frame_unref(bild.frame);
-        let e = av_hwframe_get_buffer(pool, bild.frame, 0);
-        if e < 0 {
-            return Err(crate::ffmpeg_grund("av_hwframe_get_buffer", e));
-        }
-        let roh = (*bild.frame).data[0] as *mut std::ffi::c_void;
-        let idx = (*bild.frame).data[1] as usize as u32;
-        let t = ID3D11Texture2D::from_raw_borrowed(&roh).ok_or("Pooltextur fehlt")?.clone();
-        Ok((t, idx))
-    }
-}
+// Umrechnung BGRA -> yuv444p, FFmpeg-Geraet aus D3D11, Texturpool und
+// Pooltextur liegen jetzt in encoder.rs (dort braucht sie auch der Betrieb).
 
 // ------------------------------------------------------------------ Wege
 
@@ -385,7 +302,8 @@ fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, ausschnitt: bool, se
                 leer += 1;
                 continue;
             }
-            Abholung::NurZeiger => {
+            Abholung::NurZeiger(_) => {
+                dup.freigeben();
                 nur_zeiger += 1;
                 continue;
             }
