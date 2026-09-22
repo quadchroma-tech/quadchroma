@@ -1,0 +1,16 @@
+# Bauvorgaben fuer den Client.
+#
+# Windows: die C-Laufzeit statisch in die exe binden. Sonst importiert sie
+# VCRUNTIME140.dll aus dem Visual C++ Redistributable, das auf einem frischen
+# Windows fehlen kann - dann bricht schon der Start mit einem Systemdialog ab.
+# Mit crt-static braucht die exe keine Laufzeit-DLL mehr; die FFmpeg-DLLs
+# nutzen die UCRT, die seit Windows 10 zum System gehoert. Zwischen beiden
+# wandert kein Speicher, keine Datei und kein errno: FFmpeg gibt frei, was
+# FFmpeg belegt hat.
+#
+# Achtung: Cargo liest diese Datei nur, wenn aus client\ (oder darunter)
+# gebaut wird, und eine gesetzte Umgebungsvariable RUSTFLAGS ersetzt die
+# Einstellung stillschweigend. Damit das nicht unbemerkt bleibt, bricht der
+# Bau dann ab (Wache oben in src/main.rs).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

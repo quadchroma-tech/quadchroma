@@ -11,6 +11,14 @@
 // dann funktionieren --headless und --shot weiterhin wie gewohnt.
 #![windows_subsystem = "windows"]
 
+// Windows-Bau nur mit statischer C-Laufzeit (client/.cargo/config.toml):
+// ohne sie braucht die exe VCRUNTIME140.dll, und die liegt nicht jedem
+// Windows bei. Greift die Einstellung nicht (Bau von ausserhalb client\,
+// oder RUSTFLAGS ersetzt sie), soll das hier auffallen und nicht erst beim
+// Nutzer.
+#[cfg(all(windows, target_env = "msvc", not(target_feature = "crt-static")))]
+compile_error!("Windows-Bau ohne crt-static: client/.cargo/config.toml greift nicht (aus client\\ bauen, RUSTFLAGS nicht setzen)");
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
