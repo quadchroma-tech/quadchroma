@@ -1,0 +1,455 @@
+// Windows als Host - Rolle in derselben Programmdatei wie der Client.
+//
+//   quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
+//                  [--pair] [--forget] [--konserve datei.hevc]
+//   quadchroma.exe --list
+//   quadchroma.exe --messen [--output n] [--sekunden 10]
+//
+// Ohne Fenster; Konsole ueber AttachConsole wie der Client, jede Zeile
+// ausserdem in %APPDATA%\QuadChroma\host-protokoll.txt. Das Protokoll auf
+// der Leitung ist das des Mac-Hosts (host/main.m), Byte fuer Byte - ein
+// Client darf den Host nicht erkennen.
+//
+// Stand: Zuschauerplatz (Noise-Responder, Kopplung, Bekanntgabe), Eingaben,
+// Zwischenablage, Konserve als Bildquelle und die Messung (--messen).
+// Aufnahme im Betrieb, Encoder im Betrieb, Ton und Zeigerform folgen.
+
+pub mod aufnahme;
+pub mod eingabe;
+pub mod encoder;
+pub mod konserve;
+pub mod messen;
+pub mod netz;
+pub mod testbild;
+
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use crate::protokoll_konst::*;
+use crate::{noise, protokoll, secure};
+
+// ------------------------------------------------------------------ Zustand
+//
+// Wie in main.m: alles, was mehrere Faeden lesen, liegt in Atomics. Der
+// Client schickt Wuensche, der Host setzt sie um und meldet zurueck, was gilt.
+
+pub struct Zustand {
+    pub fps: AtomicU32,
+    pub mbit: AtomicU32,
+    pub gaming: AtomicBool,
+    pub fest: AtomicBool,
+    pub ton: AtomicBool,
+    /// Kopplungsfenster offen (--pair): die naechste unbekannte Gegenstelle
+    /// wird aufgenommen.
+    pub pair_open: AtomicBool,
+    /// Das naechste Bild soll ein Vollbild sein.
+    pub force_key: AtomicBool,
+    /// Frisch verbundener Zuschauer wartet auf ein Vollbild.
+    pub wait_key: AtomicBool,
+    pub sent_frames: AtomicU64,
+    pub sent_bytes: AtomicU64,
+    /// Bilder, die wegen Stau auf der Leitung verworfen wurden.
+    pub stau: AtomicU64,
+    pub repeats: AtomicU64,
+    pub zu_schnell: AtomicU64,
+    pub enc_stau: AtomicU64,
+    pub enc_verworfen: AtomicU64,
+    pub audio_packets: AtomicU64,
+    pub audio_bytes: AtomicU64,
+    pub input_events: AtomicU64,
+    /// Eckdaten des Stroms - immer aus dem laufenden Kandidaten abgeleitet.
+    pub info_w: AtomicU32,
+    pub info_h: AtomicU32,
+    pub codec_id: AtomicU32,
+    /// Encoderzeit je Bild (Summe us, Anzahl) fuer Nachricht 6.
+    pub enc_us: AtomicU64,
+    pub enc_n: AtomicU64,
+    pub testbild: AtomicBool,
+    /// Bildquelle ist eine Konserve (kein Encoder, kein Codecwechsel).
+    pub konserve: AtomicBool,
+}
+
+pub static Z: Zustand = Zustand {
+    fps: AtomicU32::new(120),
+    mbit: AtomicU32::new(150),
+    gaming: AtomicBool::new(false),
+    fest: AtomicBool::new(false),
+    ton: AtomicBool::new(true),
+    pair_open: AtomicBool::new(false),
+    force_key: AtomicBool::new(false),
+    wait_key: AtomicBool::new(false),
+    sent_frames: AtomicU64::new(0),
+    sent_bytes: AtomicU64::new(0),
+    stau: AtomicU64::new(0),
+    repeats: AtomicU64::new(0),
+    zu_schnell: AtomicU64::new(0),
+    enc_stau: AtomicU64::new(0),
+    enc_verworfen: AtomicU64::new(0),
+    audio_packets: AtomicU64::new(0),
+    audio_bytes: AtomicU64::new(0),
+    input_events: AtomicU64::new(0),
+    info_w: AtomicU32::new(0),
+    info_h: AtomicU32::new(0),
+    codec_id: AtomicU32::new(0),
+    enc_us: AtomicU64::new(0),
+    enc_n: AtomicU64::new(0),
+    testbild: AtomicBool::new(false),
+    konserve: AtomicBool::new(false),
+};
+
+// ---------------------------------------------------------------- Protokoll
+
+static DATEI: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// Protokolldatei oeffnen (wird bei jedem Start neu begonnen).
+fn protokoll_oeffnen(name: &str) {
+    if let Some(p) = crate::einstellungen::datei_pfad(name) {
+        if let Ok(f) = std::fs::File::create(&p) {
+            *DATEI.lock().unwrap() = Some(f);
+        }
+    }
+}
+
+/// Eine Zeile auf die Konsole und in die Datei.
+pub fn log(text: impl AsRef<str>) {
+    use std::io::Write;
+    let t = text.as_ref();
+    println!("{t}");
+    let _ = std::io::stdout().flush();
+    if let Ok(mut d) = DATEI.lock() {
+        if let Some(f) = d.as_mut() {
+            let _ = writeln!(f, "{t}");
+        }
+    }
+}
+
+/// Was FFmpeg inzwischen gesagt hat (ueber den Rueckruf des Clients), als
+/// eigene Zeilen ins Hostprotokoll.
+pub fn ffmpeg_zeilen() {
+    for z in protokoll::abholen() {
+        log(z);
+    }
+}
+
+// --------------------------------------------------------------------- Uhr
+
+/// Uhr des Hosts in Mikrosekunden. std::time::Instant ist auf Windows der
+/// Hochleistungszaehler; Nachricht 4 (Zeitantwort) und Nachricht 5 (Stempel)
+/// lesen dieselbe Uhr.
+pub fn now_us() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+// ------------------------------------------------------------- Befehlszeile
+
+/// Wert hinter einem Schalter.
+pub fn arg_wert(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+fn arg_zahl(args: &[String], name: &str) -> Option<u32> {
+    arg_wert(args, name).and_then(|v| v.parse().ok())
+}
+
+// -------------------------------------------------------------- Einstellungen
+
+/// Einstellungen im laufenden Betrieb (Nachricht 64 vom Client). Bitrate,
+/// Bildrate und die Schalter werden uebernommen und mit Nachricht 3
+/// bestaetigt; der Encoder (folgt) liest sie beim naechsten Bild.
+pub fn apply_settings(mbit: u32, fps: u32, gaming: bool, fixed: bool, ton: bool) {
+    let mbit = mbit.clamp(2, 500);
+    let fps = fps.clamp(10, 240);
+    Z.mbit.store(mbit, Ordering::Relaxed);
+    Z.fps.store(fps, Ordering::Relaxed);
+    Z.gaming.store(gaming, Ordering::Relaxed);
+    Z.fest.store(fixed, Ordering::Relaxed);
+    Z.ton.store(ton, Ordering::Relaxed);
+    Z.force_key.store(true, Ordering::Relaxed);
+    netz::settings_senden();
+    log(format!(
+        "Einstellungen: {mbit} Mbit/s, {fps} fps, Gaming {}, feste Bildrate {}, Ton {}",
+        if gaming { "an" } else { "aus" },
+        if fixed { "an" } else { "aus" },
+        if ton { "an" } else { "aus" }
+    ));
+}
+
+/// Strominfo (Nachricht 1), immer aus dem laufenden Kandidaten abgeleitet.
+pub fn strominfo() -> [u8; 8] {
+    let mut p = [0u8; 8];
+    let w = Z.info_w.load(Ordering::Relaxed) as u16;
+    let h = Z.info_h.load(Ordering::Relaxed) as u16;
+    let f = Z.fps.load(Ordering::Relaxed) as u16;
+    p[0..2].copy_from_slice(&w.to_le_bytes());
+    p[2..4].copy_from_slice(&h.to_le_bytes());
+    p[4..6].copy_from_slice(&f.to_le_bytes());
+    let k = encoder::kandidat(Z.codec_id.load(Ordering::Relaxed) as usize);
+    p[6] = if k.h264 { 2 } else { 1 };
+    // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
+    p[7] = if k.chroma444 { if k.zehn_bit { 2 } else { 1 } } else if k.zehn_bit { 4 } else { 3 };
+    p
+}
+
+// ------------------------------------------------------------------- Last
+
+/// Auslastung des Hosts fuer Nachricht 6, Fassung 1 (28 Byte), dieselben
+/// Felder wie last.m: cpu, cpu_eigen, gpu (0xffff = nicht lesbar), druck,
+/// ram_benutzt, ram_gesamt, eigen_mb, enc_zehntel_ms, host_fps_zehntel.
+struct LastProbe {
+    idle: u64,
+    kernel: u64,
+    user: u64,
+    eigen: u64,
+    wann: Instant,
+}
+
+fn filetime_u64(f: windows::Win32::Foundation::FILETIME) -> u64 {
+    ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
+}
+
+fn last_probe() -> Option<LastProbe> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::GetSystemTimes;
+    let mut idle = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }.ok()?;
+    Some(LastProbe {
+        idle: filetime_u64(idle),
+        kernel: filetime_u64(kernel),
+        user: filetime_u64(user),
+        eigen: crate::prozesszeit_100ns().unwrap_or(0),
+        wann: Instant::now(),
+    })
+}
+
+fn last_nachricht(vorher: &LastProbe, jetzt: &LastProbe, enc_zehntel: u16, host_fps_zehntel: u16) -> [u8; 28] {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    // Kernelzeit enthaelt die Leerlaufzeit; Gesamt = kernel + user.
+    let gesamt = (jetzt.kernel + jetzt.user).saturating_sub(vorher.kernel + vorher.user);
+    let leer = jetzt.idle.saturating_sub(vorher.idle);
+    let cpu_promille: u16 = if gesamt > 0 { ((gesamt - leer.min(gesamt)) * 1000 / gesamt) as u16 } else { 0 };
+    // Eigene Last in Promille eines Kerns.
+    let dt_100ns = jetzt.wann.duration_since(vorher.wann).as_nanos() as u64 / 100;
+    let eigen_promille: u16 = if dt_100ns > 0 {
+        (jetzt.eigen.saturating_sub(vorher.eigen) * 1000 / dt_100ns).min(u16::MAX as u64) as u16
+    } else {
+        0
+    };
+    let mut ms = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    let (ram_benutzt, ram_gesamt) = if unsafe { GlobalMemoryStatusEx(&mut ms) }.is_ok() {
+        (((ms.ullTotalPhys - ms.ullAvailPhys) >> 20) as u32, (ms.ullTotalPhys >> 20) as u32)
+    } else {
+        (0, 0)
+    };
+    let mut pmc = PROCESS_MEMORY_COUNTERS { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    let eigen_mb = if unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) }.is_ok() {
+        (pmc.WorkingSetSize >> 20) as u32
+    } else {
+        0
+    };
+    let mut b = [0u8; 28];
+    b[0] = 1;
+    b[2..4].copy_from_slice(&cpu_promille.to_le_bytes());
+    b[4..6].copy_from_slice(&eigen_promille.to_le_bytes());
+    b[6..8].copy_from_slice(&0xffffu16.to_le_bytes()); // GPU: nicht lesbar (spaeter PDH)
+    b[8..10].copy_from_slice(&0u16.to_le_bytes()); // Druck: kennt Windows so nicht
+    b[10..14].copy_from_slice(&ram_benutzt.to_le_bytes());
+    b[14..18].copy_from_slice(&ram_gesamt.to_le_bytes());
+    b[18..22].copy_from_slice(&eigen_mb.to_le_bytes());
+    b[22..24].copy_from_slice(&enc_zehntel.to_le_bytes());
+    b[24..26].copy_from_slice(&host_fps_zehntel.to_le_bytes());
+    b
+}
+
+// ---------------------------------------------------------------- Einstieg
+
+/// Rollenwahl: --list, --messen oder --host. Rueckgabe ist der Exit-Code.
+pub fn main_host(args: &[String]) -> i32 {
+    if let Err(e) = ffmpeg_next::init() {
+        println!("FFmpeg-Start fehlgeschlagen: {e}");
+        return 2;
+    }
+    // FFmpegs Meldungen laufen ueber den Rueckruf des Clients in eine Reihe;
+    // der Host holt sie ab und schreibt sie in sein eigenes Protokoll.
+    protokoll::einschalten(false);
+
+    if args.iter().any(|a| a == "--messen") {
+        protokoll_oeffnen("messung.txt");
+        return messen::laufen(args);
+    }
+
+    protokoll_oeffnen("host-protokoll.txt");
+
+    if args.iter().any(|a| a == "--list") {
+        aufnahme::ausgaenge_melden(&mut Vec::new());
+        encoder::pruefen();
+        encoder::mf_pruefen();
+        ffmpeg_zeilen();
+        return 0;
+    }
+
+    // --host [port]
+    let port: u16 = args
+        .iter()
+        .position(|a| a == "--host")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9001);
+
+    // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und
+    // bleibt danach liegen, damit Gegenstellen den Host wiedererkennen.
+    let (priv_key, pub_key) = match secure::host_identity() {
+        Ok(k) => k,
+        Err(e) => {
+            log(format!("Schluessel konnte nicht angelegt werden - Abbruch: {e}"));
+            return 5;
+        }
+    };
+    if args.iter().any(|a| a == "--forget") {
+        secure::forget_all();
+        log("Alle Freigaben geloescht.");
+    }
+    log(format!(
+        "Fingerabdruck dieses Hosts: {}   freigegebene Gegenstellen: {}",
+        noise::fingerprint(&pub_key),
+        secure::authorized_count()
+    ));
+    if args.iter().any(|a| a == "--pair") {
+        Z.pair_open.store(true, Ordering::Relaxed);
+        log("Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.");
+    }
+
+    if let Some(f) = arg_zahl(args, "--fps") {
+        Z.fps.store(f.clamp(10, 240), Ordering::Relaxed);
+    }
+    if let Some(m) = arg_zahl(args, "--mbit") {
+        Z.mbit.store(m.clamp(2, 500), Ordering::Relaxed);
+    }
+    if args.iter().any(|a| a == "--fest" || a == "--fixed") {
+        Z.fest.store(true, Ordering::Relaxed);
+    }
+
+    // Bildschirm: Liste der Ausgaenge, Wahl per --output n oder Hauptbildschirm.
+    // Gemerkt wird der Geraetename, nicht der Listenplatz. Ohne DXGI-Ausgang
+    // (WARP, RDP) kommt die Geometrie aus der GDI-Liste - fuer die Maus.
+    let mut ausgaenge = Vec::new();
+    aufnahme::ausgaenge_melden(&mut ausgaenge);
+    let wunsch = arg_zahl(args, "--output").map(|n| n as usize);
+    let ausgang = aufnahme::ausgang_waehlen(&ausgaenge, wunsch);
+    match &ausgang {
+        Some(a) => {
+            log(format!(
+                "Ausgang gewaehlt: {} {}x{} bei ({},{}) an Karte {}{}",
+                a.name, a.breite, a.hoehe, a.links, a.oben, a.karte,
+                if a.haupt { " (Hauptbildschirm)" } else { "" }
+            ));
+            eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
+            let (w, h) = if a.breite >= 3840 { (a.breite / 2, a.hoehe / 2) } else { (a.breite, a.hoehe) };
+            Z.info_w.store((w & !1) as u32, Ordering::Relaxed);
+            Z.info_h.store((h & !1) as u32, Ordering::Relaxed);
+        }
+        None => {
+            log("Kein DXGI-Ausgang - Maus bezieht sich auf den GDI-Hauptbildschirm, Bild nur aus einer Konserve");
+            if let Some((l, o, w, h)) = aufnahme::gdi_hauptbildschirm() {
+                eingabe::ausgang_setzen(l, o, w, h);
+                Z.info_w.store((w & !1) as u32, Ordering::Relaxed);
+                Z.info_h.store((h & !1) as u32, Ordering::Relaxed);
+            } else {
+                Z.info_w.store(1920, Ordering::Relaxed);
+                Z.info_h.store(1080, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Was dieser Rechner codieren kann - gefragt, nicht geraten.
+    encoder::pruefen();
+    ffmpeg_zeilen();
+
+    // Konserve: ein Annex-B-Strom als Bildquelle (Pruefweg ohne Karte).
+    let konserve = match arg_wert(args, "--konserve") {
+        Some(p) => match konserve::Konserve::laden(&p) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                log(format!("Konserve {p}: {e}"));
+                return 6;
+            }
+        },
+        None => None,
+    };
+    if konserve.is_none() {
+        log("Keine Bildquelle: Aufnahme und Encoder im Betrieb folgen (Schritte 4 und 5) - ohne --konserve geht kein Bild raus");
+    }
+
+    // Zuschauerplatz: Bild, Eingabe, Bekanntgabe.
+    if let Err(e) = netz::start(port, priv_key) {
+        log(format!("{e}"));
+        return 9;
+    }
+    // Zwischenablage: was hier kopiert wird, geht zum Zuschauer (48 auf dem
+    // Bildkanal); was von dort kommt, legt der Eingabefaden ab.
+    crate::clipboard::watch(|text| netz::send_small(MSG_CLIP, text.as_bytes()));
+    eingabe::start();
+    // Die Konserve bestimmt die Eckdaten des Stroms - vor der Zeile dazu.
+    if let Some(k) = konserve {
+        konserve::abspielen(k);
+    }
+    log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
+    log(format!(
+        "Strom: {}x{}, {} fps, {} Mbit/s, feste Bildrate {}",
+        Z.info_w.load(Ordering::Relaxed),
+        Z.info_h.load(Ordering::Relaxed),
+        Z.fps.load(Ordering::Relaxed),
+        Z.mbit.load(Ordering::Relaxed),
+        if Z.fest.load(Ordering::Relaxed) { "an" } else { "aus" }
+    ));
+
+    // Alle fuenf Sekunden eine Zeile mit dem Stand und Nachricht 6 - nur,
+    // wenn jemand zuschaut; sonst misst sich der Host selbst ohne Zweck.
+    let t0 = Instant::now();
+    let mut vorher = last_probe();
+    let mut last_frames = 0u64;
+    let mut last_bytes = 0u64;
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        ffmpeg_zeilen();
+        let f = Z.sent_frames.load(Ordering::Relaxed);
+        let b = Z.sent_bytes.load(Ordering::Relaxed);
+        if !netz::zuschauer_da() {
+            last_frames = f;
+            last_bytes = b;
+            vorher = last_probe();
+            continue;
+        }
+        log(format!(
+            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | zu schnell: {} | Encoder voll: {}",
+            t0.elapsed().as_secs_f32(),
+            f,
+            (f - last_frames) as f32 / 5.0,
+            (b - last_bytes) as f64 * 8.0 / 5.0 / 1e6,
+            Z.audio_packets.load(Ordering::Relaxed),
+            Z.audio_bytes.load(Ordering::Relaxed) as f64 / 1000.0,
+            Z.stau.load(Ordering::Relaxed),
+            Z.enc_verworfen.load(Ordering::Relaxed),
+            Z.repeats.load(Ordering::Relaxed),
+            Z.zu_schnell.load(Ordering::Relaxed),
+            Z.enc_stau.load(Ordering::Relaxed),
+        ));
+        let jetzt = last_probe();
+        if let (Some(v), Some(j)) = (vorher.as_ref(), jetzt.as_ref()) {
+            let n = Z.enc_n.swap(0, Ordering::Relaxed);
+            let summe = Z.enc_us.swap(0, Ordering::Relaxed);
+            let enc_zehntel = if n > 0 { ((summe / n) / 100).min(u16::MAX as u64) as u16 } else { 0 };
+            let host_fps_zehntel = (((f - last_frames) * 10) / 5).min(u16::MAX as u64) as u16;
+            netz::send_small(MSG_LAST, &last_nachricht(v, j, enc_zehntel, host_fps_zehntel));
+        }
+        vorher = jetzt;
+        last_frames = f;
+        last_bytes = b;
+    }
+}
