@@ -117,7 +117,9 @@ static void cipher_init(qc_cipher *c, const uint8_t k[32]) {
 }
 
 int qc_encrypt(qc_cipher *c, const uint8_t *in, size_t len, uint8_t *out, size_t *out_len) {
-    if (!c->has_key) return -1;
+    // 2^64-1 ist nach der Spezifikation reserviert: dann ist Schluss, neue
+    // Sitzung. Der Zaehler bleibt stehen, er springt nie zurueck auf null.
+    if (!c->has_key || c->n == UINT64_MAX) return -1;
     aead_encrypt(c->k, c->n, NULL, 0, in, len, out);
     c->n++;
     *out_len = len + QC_TAGLEN;
@@ -125,7 +127,7 @@ int qc_encrypt(qc_cipher *c, const uint8_t *in, size_t len, uint8_t *out, size_t
 }
 
 int qc_decrypt(qc_cipher *c, const uint8_t *in, size_t len, uint8_t *out, size_t *out_len) {
-    if (!c->has_key) return -1;
+    if (!c->has_key || c->n == UINT64_MAX) return -1;
     if (aead_decrypt(c->k, c->n, NULL, 0, in, len, out) != 0) return -1;
     c->n++;
     *out_len = len - QC_TAGLEN;
@@ -374,6 +376,19 @@ int qc_noise_selftest(void) {
     qc_encrypt(&is, (const uint8_t *)"x", 1, ct, &ctlen);
     ct[0] ^= 0x40;
     if (qc_decrypt(&rr, ct, ctlen, pt, &ptlen) == 0) return 17;
+
+    // Am Ende des Zaehlers ist Schluss: 2^64-1 ist reserviert, und keine
+    // Nonce darf unter demselben Schluessel ein zweites Mal vorkommen.
+    qc_cipher za = is, zb = rr;
+    za.n = zb.n = UINT64_MAX - 1;
+    if (qc_encrypt(&za, (const uint8_t *)"x", 1, ct, &ctlen)) return 19;
+    if (qc_decrypt(&zb, ct, ctlen, pt, &ptlen)) return 20;
+    // Beide stehen jetzt auf dem reservierten Wert. Einen gueltigen Datensatz
+    // mit dieser Nonce gibt es nur von Hand gebaut - auch der muss abprallen.
+    aead_encrypt(is.k, UINT64_MAX, NULL, 0, (const uint8_t *)"y", 1, ct);
+    if (qc_encrypt(&za, (const uint8_t *)"y", 1, ct + 64, &ctlen) == 0) return 21;
+    if (qc_decrypt(&zb, ct, 1 + QC_TAGLEN, pt, &ptlen) == 0) return 22;
+    if (za.n != UINT64_MAX || zb.n != UINT64_MAX) return 23;
 
     char sas_a[8], sas_b[8], fp[24];
     qc_sas(qc_handshake_hash(&ini), sas_a);
