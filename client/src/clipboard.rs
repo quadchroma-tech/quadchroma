@@ -36,8 +36,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW,
-    RemoveClipboardFormatListener, SetClipboardData,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
@@ -155,11 +155,51 @@ fn create_message_window() -> Result<HWND, String> {
 
 // ------------------------------------------------------------------- Lesen
 
+/// Kennzeichen, mit denen Programme unter Windows einen Eintrag als
+/// vertraulich markieren (Passwortverwalter wie KeePass). Beide heissen: wer
+/// die Ablage beobachtet, soll diesen Inhalt nicht verarbeiten - und genau
+/// das tut watch(). ExcludeClipboardContentFromMonitorProcessing ist
+/// Microsofts Name dafuer, "Clipboard Viewer Ignore" der aeltere, den
+/// Ablageverwalter ebenso beachten. Gegenstueck zu
+/// org.nspasteboard.ConcealedType auf dem Mac (host/clipboard.m,
+/// clipboard_mac.rs): dieselbe Regel auf jeder Rolle, verdeckte Eintraege
+/// bleiben auf dem Rechner, auf dem sie kopiert wurden.
+///
+/// CanIncludeInClipboardHistory = 0 zaehlt bewusst nicht dazu: das sagt nur
+/// "nicht in den Verlauf", nicht "vertraulich".
+const VERDECKT: [&str; 2] = ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"];
+
+/// Ist der Eintrag als vertraulich markiert? `vorhanden` fragt die Ablage
+/// nach einem angemeldeten Format.
+fn verdeckt(vorhanden: impl Fn(&str) -> bool) -> bool {
+    VERDECKT.iter().any(|name| vorhanden(name))
+}
+
+/// Liegt das angemeldete Format `name` in der Ablage? Laesst es sich nicht
+/// anmelden, gilt es als vorhanden - im Zweifel wird nichts gelesen.
+fn format_vorhanden(name: &str) -> bool {
+    let w = wide(name);
+    let format = unsafe { RegisterClipboardFormatW(PCWSTR(w.as_ptr())) };
+    format == 0 || unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+}
+
 /// Liest CF_UNICODETEXT. Gibt None zurueck, wenn nichts Textartiges anliegt, die
-/// Ablage nicht zu bekommen war oder der Inhalt die Obergrenze reisst.
+/// Ablage nicht zu bekommen war, der Eintrag als vertraulich markiert ist
+/// (siehe VERDECKT) oder der Inhalt die Obergrenze reisst.
+///
+/// Was set() ablegt, traegt selbst ExcludeClipboardContentFromMonitorProcessing
+/// und wird hier also nie gelesen - auch dann nicht, wenn die Laufnummer in
+/// on_clipboard_update einmal nicht greift.
 fn read_text() -> Option<String> {
     // Zum Lesen braucht es kein Besitzerfenster.
     let _guard = open_clipboard(None)?;
+
+    // Bei offener Ablage fragen, damit Kennzeichen und Text zum selben
+    // Eintrag gehoeren.
+    if verdeckt(format_vorhanden) {
+        crate::protokoll::zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen".into());
+        return None;
+    }
 
     let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }.ok()?;
     if handle.0.is_null() {
@@ -406,4 +446,71 @@ pub fn watch(cb: impl Fn(String) + Send + 'static) {
             eprintln!("Zwischenablage: Ueberwachung nicht gestartet: {e}");
         }
     });
+}
+
+// --------------------------------------------------------------------- Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdeckt_nach_namen() {
+        assert!(!verdeckt(|_| false));
+        assert!(verdeckt(|n| n == "ExcludeClipboardContentFromMonitorProcessing"));
+        assert!(verdeckt(|n| n == "Clipboard Viewer Ignore"));
+        assert!(!verdeckt(|n| n == "CanIncludeInClipboardHistory" || n == "CanUploadToCloudClipboard"));
+    }
+
+    /// Am echten Windows: ein Eintrag mit Kennzeichen bleibt hier, ohne geht
+    /// er hinaus, und was set() ablegt, liest read_text nie. Schreibt auf die
+    /// Zwischenablage der Sitzung, in der der Test laeuft - auf der Bau-VM
+    /// ueber ssh, also nicht auf die der Konsole, an der womoeglich ein Host
+    /// lauscht. Am Ende ist die Ablage leer. Protokolliert wird unter
+    /// %APPDATA%\QuadChroma\protokoll.txt: den Test mit eigenem APPDATA
+    /// laufen lassen.
+    #[test]
+    fn verdeckt_bleibt_hier() {
+        let fenster = create_message_window().expect("Nachrichtenfenster");
+        let ablegen = |text: &str, marken: &[&str]| {
+            let units = wide(text);
+            let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, units.len() * 2) }.expect("GlobalAlloc");
+            let dst = unsafe { GlobalLock(hmem) } as *mut u16;
+            assert!(!dst.is_null());
+            unsafe { ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len()) };
+            let _ = unsafe { GlobalUnlock(hmem) };
+            let _guard = open_clipboard(Some(fenster)).expect("Ablage nicht zu oeffnen");
+            unsafe { EmptyClipboard() }.expect("EmptyClipboard");
+            unsafe { SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))) }.expect("SetClipboardData");
+            for marke in marken {
+                put_dword(marke, 0);
+            }
+        };
+
+        ablegen("offen", &[]);
+        assert_eq!(read_text().as_deref(), Some("offen"));
+
+        ablegen("geheim123", &["ExcludeClipboardContentFromMonitorProcessing"]);
+        assert_eq!(read_text(), None, "verdeckter Eintrag wurde gelesen");
+
+        ablegen("geheim456", &["Clipboard Viewer Ignore"]);
+        assert_eq!(read_text(), None, "verdeckter Eintrag (Clipboard Viewer Ignore) wurde gelesen");
+
+        // Nur "nicht in den Verlauf" ist nicht vertraulich.
+        ablegen("verlauf", &["CanIncludeInClipboardHistory"]);
+        assert_eq!(read_text().as_deref(), Some("verlauf"));
+
+        // Was von der Gegenseite kommt, traegt das Kennzeichen selbst. Dass
+        // set() wirklich geschrieben hat, zeigen Laufnummer und Textformat.
+        let vorher = unsafe { GetClipboardSequenceNumber() };
+        set("von drueben");
+        assert_ne!(unsafe { GetClipboardSequenceNumber() }, vorher, "set() hat nichts geschrieben");
+        assert!(unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_ok());
+        assert_eq!(read_text(), None, "eigener Schreibvorgang wurde gelesen");
+
+        if let Some(_guard) = open_clipboard(Some(fenster)) {
+            let _ = unsafe { EmptyClipboard() };
+        }
+        let _ = unsafe { DestroyWindow(fenster) };
+    }
 }

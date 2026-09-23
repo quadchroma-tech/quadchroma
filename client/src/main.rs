@@ -11,6 +11,14 @@
 // dann funktionieren --headless und --shot weiterhin wie gewohnt.
 #![windows_subsystem = "windows"]
 
+// Windows-Bau nur mit statischer C-Laufzeit (client/.cargo/config.toml):
+// ohne sie braucht die exe VCRUNTIME140.dll, und die liegt nicht jedem
+// Windows bei. Greift die Einstellung nicht (Bau von ausserhalb client\,
+// oder RUSTFLAGS ersetzt sie), soll das hier auffallen und nicht erst beim
+// Nutzer.
+#[cfg(all(windows, target_env = "msvc", not(target_feature = "crt-static")))]
+compile_error!("Windows-Bau ohne crt-static: client/.cargo/config.toml greift nicht (aus client\\ bauen, RUSTFLAGS nicht setzen)");
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -769,8 +777,10 @@ fn karte_automatik(karten: &[Karte]) -> Option<&Karte> {
 /// Wahl, nicht der Wunsch: bei Automatik kann alles herauskommen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecoderPfad {
-    /// NVIDIA-Karte ueber die cuvid-Decoder von FFmpeg (hevc_cuvid, h264_cuvid).
-    Nvdec,
+    /// NVIDIA-Karte ueber die cuvid-Decoder von FFmpeg (hevc_cuvid, h264_cuvid),
+    /// mit der LUID der Karte, auf der er laeuft - None, wenn sich das nicht
+    /// sagen laesst. Damit unterscheidet `wunsch_passt` zwei NVIDIA-Karten.
+    Nvdec(Option<i64>),
     /// Direct3D 11 Video (D3D11VA) auf der Karte dieser Rolle - fuer AMD und
     /// Intel, nur 4:2:0 und H.264. Die Bilder kommen von der Karte in den
     /// Hauptspeicher (Kopierstufe).
@@ -782,7 +792,7 @@ pub enum DecoderPfad {
 impl DecoderPfad {
     pub fn name(self) -> String {
         match self {
-            DecoderPfad::Nvdec => "NVDEC".into(),
+            DecoderPfad::Nvdec(_) => "NVDEC".into(),
             DecoderPfad::D3d11va(r) => format!("D3D11VA ({})", r.name()),
             DecoderPfad::Software => "Software".into(),
         }
@@ -938,7 +948,11 @@ fn software_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
 ///
 /// LOW_DELAY: cuvid haelt sonst bis zu vier Bilder in seiner Anzeigewarte-
 /// schlange zurueck. Fuer eine Fernsteuerung ist jedes davon verlorene Zeit.
-fn nvdec_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
+///
+/// `gpu`: CUDA-Ordnungszahl der Karte (Option "gpu" von cuvid, siehe
+/// `nvdec_ziel`). Ohne sie nimmt cuvid CUDA-Geraet 0 - bei zwei NVIDIA-Karten
+/// also nicht unbedingt die gewaehlte.
+fn nvdec_decoder(h264: bool, gpu: Option<i32>) -> Result<ffmpeg::decoder::Video, String> {
     let name = if h264 { "h264_cuvid" } else { "hevc_cuvid" };
     let codec = ffmpeg::decoder::find_by_name(name)
         .ok_or_else(|| format!("{name} fehlt in dieser FFmpeg-Fassung"))?;
@@ -954,13 +968,149 @@ fn nvdec_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
     // not permitted" sagt nichts, "Cannot load nvcuvid.dll" alles. Die
     // erste Zeile ersetzt den Fehlercode; alle stehen im Protokoll.
     protokoll::fehler_verwerfen();
-    dec.video().map_err(|e| {
+    let offen = match gpu {
+        Some(n) => {
+            let mut optionen = ffmpeg::Dictionary::new();
+            optionen.set("gpu", &n.to_string());
+            dec.open_as_with(codec, optionen).and_then(|o| o.video())
+        }
+        None => dec.video(),
+    };
+    offen.map_err(|e| {
         let worte = protokoll::fehler_abholen();
         match worte.first() {
             Some(w) => format!("{name}: {w}"),
             None => format!("{name}: {e}"),
         }
     })
+}
+
+/// Die CUDA-Geraete in CUDAs eigener Reihenfolge, je Ordnungszahl die LUID
+/// (None, wenn CUDA fuer dieses Geraet keine nennt, etwa im TCC-Modus).
+/// Genau diese Ordnungszahl erwartet cuvid als "gpu". Sie ist NICHT der
+/// Index bei DXGI: CUDA sortiert nach Leistung (CUDA_DEVICE_ORDER), und
+/// CUDA_VISIBLE_DEVICES kann Karten ausblenden. Die Bruecke ist die LUID, die
+/// DXGI fuer jede Karte nennt (`Karte::luid`).
+///
+/// nvcuda.dll kommt mit dem NVIDIA-Treiber und wird hier zur Laufzeit aus
+/// dem Systemordner geladen, nie freigegeben - cuvid laedt dieselbe DLL
+/// ohnehin. Fehlt sie, ist das ein Err, kein Absturz. Einmal je Prozess,
+/// wie die Kartenerkennung.
+#[cfg(windows)]
+fn cuda_geraete() -> Result<&'static [Option<i64>], String> {
+    static GERAETE: std::sync::OnceLock<Result<Vec<Option<i64>>, String>> = std::sync::OnceLock::new();
+    match GERAETE.get_or_init(|| unsafe { cuda_geraete_lesen() }) {
+        Ok(g) => Ok(g.as_slice()),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+#[cfg(not(windows))]
+fn cuda_geraete() -> Result<&'static [Option<i64>], String> {
+    Err("nur unter Windows".into())
+}
+
+#[cfg(windows)]
+unsafe fn cuda_geraete_lesen() -> Result<Vec<Option<i64>>, String> {
+    use windows::core::{s, w};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    // CUresult und CUdevice sind int, 0 heisst Erfolg. CUDAAPI ist
+    // __stdcall - auf x64 dasselbe wie C.
+    type CuInit = unsafe extern "system" fn(u32) -> i32;
+    type CuDeviceGetCount = unsafe extern "system" fn(*mut i32) -> i32;
+    type CuDeviceGet = unsafe extern "system" fn(*mut i32, i32) -> i32;
+    type CuDeviceGetLuid = unsafe extern "system" fn(*mut u8, *mut u32, i32) -> i32;
+    let dll = LoadLibraryExW(w!("nvcuda.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
+        .map_err(|e| format!("nvcuda.dll fehlt ({e})"))?;
+    let (Some(init), Some(anzahl), Some(geraet), Some(luid)) = (
+        GetProcAddress(dll, s!("cuInit")),
+        GetProcAddress(dll, s!("cuDeviceGetCount")),
+        GetProcAddress(dll, s!("cuDeviceGet")),
+        GetProcAddress(dll, s!("cuDeviceGetLuid")),
+    ) else {
+        return Err("nvcuda.dll ohne cuDeviceGetLuid (Treiber zu alt)".into());
+    };
+    let init: CuInit = std::mem::transmute(init);
+    let anzahl: CuDeviceGetCount = std::mem::transmute(anzahl);
+    let geraet: CuDeviceGet = std::mem::transmute(geraet);
+    let luid: CuDeviceGetLuid = std::mem::transmute(luid);
+    let r = init(0);
+    if r != 0 {
+        return Err(format!("cuInit: CUDA-Fehler {r}"));
+    }
+    let mut n = 0i32;
+    let r = anzahl(&mut n);
+    if r != 0 {
+        return Err(format!("cuDeviceGetCount: CUDA-Fehler {r}"));
+    }
+    let mut aus = Vec::new();
+    for i in 0..n.max(0) {
+        let mut d = 0i32;
+        let mut bytes = [0u8; 8];
+        let mut maske = 0u32;
+        let ok = geraet(&mut d, i) == 0 && luid(bytes.as_mut_ptr(), &mut maske, d) == 0;
+        aus.push(ok.then(|| luid_aus_bytes(bytes)));
+    }
+    Ok(aus)
+}
+
+/// Die LUID, wie CUDA sie liefert (8 Byte, Speicherbild der Windows-
+/// Struktur LUID: LowPart, dann HighPart, beide little-endian), in der Form
+/// von `Karte::luid` ((HighPart << 32) | LowPart, siehe anzeige.rs).
+#[cfg(any(windows, test))]
+fn luid_aus_bytes(bytes: [u8; 8]) -> i64 {
+    i64::from_le_bytes(bytes)
+}
+
+/// Mit welcher CUDA-Ordnungszahl cuvid diese NVIDIA-Karte trifft: Some(n)
+/// fuer die Option "gpu", None fuer CUDAs Vorgabe (Geraet 0), oder der
+/// Grund, warum es die Karte nicht sicher treffen kann. Die Vorgabe ist nur
+/// recht, wenn es ohnehin nur EINE NVIDIA-Karte gibt - dann ist sie die, und
+/// scheitert cuvid, sagt es selbst warum (etwa "Cannot load nvcuvid.dll").
+/// Bei zwei Karten gilt: lieber ehrlich auf Software als auf der falschen.
+fn nvdec_ziel(karte: &Karte, karten: &[Karte], cuda: Result<&[Option<i64>], String>) -> Result<Option<i32>, String> {
+    let einzige = karten.iter().filter(|k| k.nvidia()).count() <= 1;
+    match cuda {
+        Ok(g) => match g.iter().position(|l| *l == Some(karte.luid)) {
+            Some(n) => Ok(Some(n as i32)),
+            None if einzige => Ok(None),
+            None => Err(format!("{} ist unter den {} CUDA-Geraeten nicht zu finden", karte.name, g.len())),
+        },
+        Err(_) if einzige => Ok(None),
+        Err(e) => Err(format!("{} nicht als CUDA-Geraet zuzuordnen: {e}", karte.name)),
+    }
+}
+
+/// Zuletzt protokollierte Zuordnung Karte (LUID) -> CUDA-Geraet.
+static NVDEC_GEMELDET: Mutex<Option<(i64, i32)>> = Mutex::new(None);
+
+/// Die Zuordnung "Karte ist CUDA-Geraet n" gehoert einmal ins Protokoll,
+/// nicht bei jedem Neubau des Decoders. true, wenn sie sich seit der letzten
+/// Meldung geaendert hat (und merkt sie sich dann).
+fn zuordnung_neu(gemeldet: &Mutex<Option<(i64, i32)>>, luid: i64, n: i32) -> bool {
+    let mut g = gemeldet.lock().unwrap_or_else(|e| e.into_inner());
+    if *g == Some((luid, n)) {
+        return false;
+    }
+    *g = Some((luid, n));
+    true
+}
+
+/// Auf welcher Karte cuvid ohne "gpu" laeuft (Automatik): CUDA-Geraet 0.
+/// Laesst sich das nicht sagen, aber es gibt nur eine NVIDIA-Karte, ist es
+/// die. So passt ein NVDEC aus der Automatik zum Wunsch nach genau dieser
+/// Karte, und der Wechsel dorthin baut nicht neu.
+fn nvdec_vorgabe(karten: &[Karte], cuda: Result<&[Option<i64>], String>) -> Option<i64> {
+    match cuda {
+        Ok(g) if !g.is_empty() => g[0],
+        _ => {
+            let mut nv = karten.iter().filter(|k| k.nvidia());
+            match (nv.next(), nv.next()) {
+                (Some(k), None) => Some(k.luid),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Fehlercode von FFmpeg als Text - mit FFmpegs eigenen Worten dazu, falls
@@ -1149,9 +1299,9 @@ fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) ->
     let sw_name = if h264 { "h264" } else { "hevc" };
     let hw_name = if h264 { "h264_cuvid" } else { "hevc_cuvid" };
     let karten = karten();
-    let nvdec = |grund: &mut Option<String>| -> Option<DecoderBau> {
-        match nvdec_decoder(h264) {
-            Ok(decoder) => Some(DecoderBau::neu(decoder, DecoderPfad::Nvdec, hw_name, None)),
+    let nvdec = |grund: &mut Option<String>, gpu: Option<i32>, luid: Option<i64>| -> Option<DecoderBau> {
+        match nvdec_decoder(h264, gpu) {
+            Ok(decoder) => Some(DecoderBau::neu(decoder, DecoderPfad::Nvdec(luid), hw_name, None)),
             Err(e) => {
                 *grund = Some(format!("NVDEC nicht verfuegbar: {e}"));
                 None
@@ -1164,7 +1314,7 @@ fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) ->
         W::Software => {}
         W::Automatik => {
             if karten.is_empty() || karten.iter().any(|k| k.nvidia()) {
-                if let Some(bau) = nvdec(&mut grund) {
+                if let Some(bau) = nvdec(&mut grund, None, nvdec_vorgabe(karten, cuda_geraete())) {
                     return Ok(bau);
                 }
             }
@@ -1199,11 +1349,20 @@ fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) ->
                 _ => Rolle::Integriert,
             };
             match karte_mit(karten, rolle) {
-                Some(k) if k.nvidia() => {
-                    if let Some(bau) = nvdec(&mut grund) {
-                        return Ok(bau);
+                // Genau diese Karte, nicht CUDAs Vorgabe - siehe nvdec_ziel.
+                Some(k) if k.nvidia() => match nvdec_ziel(k, karten, cuda_geraete()) {
+                    Ok(gpu) => {
+                        if let Some(n) = gpu.filter(|&n| zuordnung_neu(&NVDEC_GEMELDET, k.luid, n)) {
+                            protokoll::zeile(format!("NVDEC: {} ist CUDA-Geraet {n}", k.name));
+                        }
+                        if let Some(bau) = nvdec(&mut grund, gpu, Some(k.luid)) {
+                            return Ok(bau);
+                        }
                     }
-                }
+                    Err(e) => {
+                        grund = Some(format!("NVDEC nicht verfuegbar: {e}"));
+                    }
+                },
                 Some(k) => match d3d11va_bau(bedarf, k) {
                     Ok(bau) => return Ok(bau),
                     Err(e) => {
@@ -1228,6 +1387,13 @@ fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) ->
 /// aendern wuerde? Ein Neubau haelt das Bild bis zum naechsten
 /// Schluesselbild an - den gibt es nur, wenn er etwas bringen kann.
 fn wunsch_passt(wunsch: einstellungen::DecoderWunsch, pfad: DecoderPfad) -> bool {
+    wunsch_passt_mit(wunsch, pfad, karten())
+}
+
+/// `wunsch_passt` mit gegebenen Karten. NVDEC passt zu einer Rolle nur, wenn
+/// er auf genau der Karte dieser Rolle laeuft - zwei NVIDIA-Karten sind
+/// zwei verschiedene Wuensche.
+fn wunsch_passt_mit(wunsch: einstellungen::DecoderWunsch, pfad: DecoderPfad, karten: &[Karte]) -> bool {
     use einstellungen::DecoderWunsch as W;
     match wunsch {
         W::Software => pfad == DecoderPfad::Software,
@@ -1239,7 +1405,9 @@ fn wunsch_passt(wunsch: einstellungen::DecoderWunsch, pfad: DecoderPfad) -> bool
                 _ => Rolle::Integriert,
             };
             match pfad {
-                DecoderPfad::Nvdec => karte_mit(karten(), rolle).map(|k| k.nvidia()).unwrap_or(false),
+                DecoderPfad::Nvdec(luid) => {
+                    karte_mit(karten, rolle).map(|k| k.nvidia() && luid == Some(k.luid)).unwrap_or(false)
+                }
                 DecoderPfad::D3d11va(r) => r == rolle,
                 DecoderPfad::Software => false,
             }
@@ -1258,7 +1426,7 @@ fn chroma_erzwingt_neubau(bau: &DecoderBau, chroma444: bool) -> bool {
     match bau.pfad {
         DecoderPfad::D3d11va(_) => chroma444,
         DecoderPfad::Software => bau.wegen_444 && !chroma444,
-        DecoderPfad::Nvdec => false,
+        DecoderPfad::Nvdec(_) => false,
     }
 }
 
@@ -1268,10 +1436,10 @@ fn chroma_erzwingt_neubau(bau: &DecoderBau, chroma444: bool) -> bool {
 /// soll erfahren, dass er sie nicht bekommt.
 fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstellungen::DecoderWunsch) {
     protokoll::zeile(bau.meldung());
-    if bau.pfad == DecoderPfad::Nvdec && aud_gewuenscht() {
+    if matches!(bau.pfad, DecoderPfad::Nvdec(_)) && aud_gewuenscht() {
         protokoll::zeile("NVDEC: Zugriffseinheiten-Begrenzer angehaengt".into());
     }
-    if bau.pfad == DecoderPfad::Nvdec && bau.codec.starts_with("h264") && vui_gewuenscht() {
+    if matches!(bau.pfad, DecoderPfad::Nvdec(_)) && bau.codec.starts_with("h264") && vui_gewuenscht() {
         protokoll::zeile("NVDEC: SPS um VUI ergaenzt (max_num_reorder_frames 0)".into());
     }
     let mut s = shared.lock().unwrap();
@@ -1642,7 +1810,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
                 // Nur auf dem NVDEC-Pfad; D3D11VA und Software bekommen
                 // die Einheit, wie sie kam.
-                let mut packet = if bau.pfad == DecoderPfad::Nvdec {
+                let mut packet = if matches!(bau.pfad, DecoderPfad::Nvdec(_)) {
                     // Erst das SPS (nur H.264, nur wenn eines drin ist -
                     // sonst keine Kopie), dann der AUD hinten dran.
                     let mit_vui = if vui_anhang && bedarf.h264 { sps::h264_au_mit_vui(&payload) } else { None };
@@ -5502,7 +5670,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             let client = ClientStand { anzeige: "Software".into(), cpu_eigen: 5.8, monitor_hz: Some(60.0), ausgelassen: 0 };
             overlay(&mut u, &mut c, lang, 98.0, &hist, (2.1, info, 3, None, true), (sas.clone(), fp.clone()),
                     Some(probe), einstellungen::StatWahl::default(), nerd, Some(120),
-                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec), None), &client);
+                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec(None)), None), &client);
             let _ = &fp;
             let bw = 520.min(w as i32 - 40);
             let bx = (w as i32 - bw) / 2;
@@ -5607,7 +5775,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             codec_idx: None,
             wechsel: false,
             decoder: einstellungen::DecoderWunsch::Automatik,
-            decoder_aktiv: Some(DecoderPfad::Nvdec),
+            decoder_aktiv: Some(DecoderPfad::Nvdec(Some(1))),
             karten,
             anzeige_aktiv: einstellungen::AnzeigeWunsch::Gpu,
             anzeige_gespeichert: einstellungen::AnzeigeWunsch::Integriert,
@@ -5775,6 +5943,17 @@ fn main() {
             println!("{z}");
         }
         println!("Karten mit Rolle: {anzahl}");
+        // Welche Karte hinter welcher CUDA-Ordnungszahl steht - die Zahl,
+        // die cuvid als "gpu" bekommt (siehe nvdec_ziel).
+        match cuda_geraete() {
+            Ok(g) => {
+                for (n, l) in g.iter().enumerate() {
+                    let karte = l.and_then(|l| karten().iter().find(|k| k.luid == l));
+                    println!("CUDA-Geraet {n}: {}", karte.map(|k| k.name.as_str()).unwrap_or("ohne Gegenstueck bei DXGI"));
+                }
+            }
+            Err(e) => println!("CUDA-Geraete: {e}"),
+        }
         // Das D3D11-Geraet von FFmpeg auf jedem Adapter probieren, auch auf
         // WARP - so sieht man auf einer Maschine ohne Karte, mit welchen
         // Worten av_hwdevice_ctx_create scheitert.
@@ -7219,5 +7398,90 @@ mod tests {
         l.ensure();
         assert!(t.join().unwrap());
         assert!(l.sock.is_some());
+    }
+
+    /// Zwei NVIDIA-Karten, wie DXGI sie meldet (luid 1 = Grafikkarte,
+    /// luid 2 = Grafikkarte 2), dazu die integrierte.
+    fn zwei_nvidia() -> Vec<Karte> {
+        vec![
+            Karte { index: 0, name: "NVIDIA A".into(), vendor: 0x10de, speicher_mb: 8192, hat_ausgang: true, luid: 1, rolle: Rolle::Grafikkarte(1) },
+            Karte { index: 1, name: "NVIDIA B".into(), vendor: 0x10de, speicher_mb: 24576, hat_ausgang: false, luid: 2, rolle: Rolle::Grafikkarte(2) },
+            Karte { index: 2, name: "Intel".into(), vendor: 0x8086, speicher_mb: 128, hat_ausgang: false, luid: 3, rolle: Rolle::Integriert },
+        ]
+    }
+
+    #[test]
+    fn nvdec_passt_nur_zur_eigenen_karte() {
+        use einstellungen::DecoderWunsch as W;
+        let k = zwei_nvidia();
+        let auf = DecoderPfad::Nvdec;
+        assert!(wunsch_passt_mit(W::Gpu, auf(Some(1)), &k));
+        assert!(!wunsch_passt_mit(W::Gpu2, auf(Some(1)), &k));
+        assert!(wunsch_passt_mit(W::Gpu2, auf(Some(2)), &k));
+        assert!(!wunsch_passt_mit(W::Gpu, auf(Some(2)), &k));
+        // Karte unbekannt: passt zu keiner ausdruecklichen Rolle, wohl aber
+        // zur Automatik.
+        assert!(!wunsch_passt_mit(W::Gpu, auf(None), &k));
+        assert!(!wunsch_passt_mit(W::Gpu2, auf(None), &k));
+        assert!(wunsch_passt_mit(W::Automatik, auf(None), &k));
+        assert!(!wunsch_passt_mit(W::Integriert, auf(Some(3)), &k));
+        assert!(!wunsch_passt_mit(W::Software, auf(Some(1)), &k));
+        // D3D11VA wie bisher nach Rolle.
+        assert!(wunsch_passt_mit(W::Integriert, DecoderPfad::D3d11va(Rolle::Integriert), &k));
+        assert!(!wunsch_passt_mit(W::Gpu, DecoderPfad::D3d11va(Rolle::Integriert), &k));
+    }
+
+    #[test]
+    fn nvdec_ziel_ueber_luid() {
+        let k = zwei_nvidia();
+        // CUDA sortiert die schnellere Karte B nach vorn: DXGI-Index und
+        // CUDA-Ordnungszahl sind vertauscht.
+        let cuda: &[Option<i64>] = &[Some(2), Some(1)];
+        assert_eq!(nvdec_ziel(&k[0], &k, Ok(cuda)), Ok(Some(1)));
+        assert_eq!(nvdec_ziel(&k[1], &k, Ok(cuda)), Ok(Some(0)));
+        // Karte nicht unter den CUDA-Geraeten (ausgeblendet, TCC) oder
+        // nvcuda.dll fehlt: bei zwei NVIDIA-Karten ein Grund statt der
+        // falschen Karte.
+        assert!(nvdec_ziel(&k[0], &k, Ok(&[Some(2), None])).is_err());
+        assert!(nvdec_ziel(&k[0], &k, Err("nvcuda.dll fehlt".into())).is_err());
+        // Nur eine NVIDIA-Karte: CUDAs Vorgabe ist sie, wie bisher.
+        let eine = vec![k[0].clone(), k[2].clone()];
+        assert_eq!(nvdec_ziel(&eine[0], &eine, Err("nvcuda.dll fehlt".into())), Ok(None));
+        assert_eq!(nvdec_ziel(&eine[0], &eine, Ok(&[Some(1)])), Ok(Some(0)));
+        // Automatik: CUDA-Geraet 0, sonst die einzige NVIDIA-Karte.
+        assert_eq!(nvdec_vorgabe(&k, Ok(cuda)), Some(2));
+        assert_eq!(nvdec_vorgabe(&k, Err("nvcuda.dll fehlt".into())), None);
+        assert_eq!(nvdec_vorgabe(&eine, Err("nvcuda.dll fehlt".into())), Some(1));
+        // Eine Karte aus der Automatik passt danach zum Wunsch nach genau ihr.
+        let l = nvdec_vorgabe(&eine, Ok(&[Some(1)]));
+        assert!(wunsch_passt_mit(einstellungen::DecoderWunsch::Gpu, DecoderPfad::Nvdec(l), &eine));
+    }
+
+    /// "NVDEC: <Karte> ist CUDA-Geraet n" steht nur bei einer neuen Zuordnung
+    /// im Protokoll, nicht bei jedem Neubau.
+    #[test]
+    fn nvdec_zuordnung_einmal() {
+        let gemeldet = Mutex::new(None);
+        assert!(zuordnung_neu(&gemeldet, 1, 1));
+        assert!(!zuordnung_neu(&gemeldet, 1, 1));
+        assert!(!zuordnung_neu(&gemeldet, 1, 1));
+        // Wechsel auf die andere Karte und zurueck: jedes Mal eine Zeile.
+        assert!(zuordnung_neu(&gemeldet, 2, 0));
+        assert!(zuordnung_neu(&gemeldet, 1, 1));
+        // Dieselbe Karte unter anderer Ordnungszahl ist auch neu.
+        assert!(zuordnung_neu(&gemeldet, 1, 0));
+    }
+
+    /// Die LUID aus CUDA (Speicherbild der Struktur) und die aus DXGI
+    /// (anzeige.rs: (HighPart << 32) | LowPart) sind dieselbe Zahl.
+    #[test]
+    fn luid_wie_dxgi() {
+        for (low, high) in [(0x89AB_CDEFu32, 0x12i32), (1, 0), (0xFFFF_FFFF, -1), (0x1234_5678, i32::MIN)] {
+            let mut bytes = [0u8; 8];
+            bytes[..4].copy_from_slice(&low.to_le_bytes());
+            bytes[4..].copy_from_slice(&high.to_le_bytes());
+            let dxgi = ((high as i64) << 32) | low as i64;
+            assert_eq!(luid_aus_bytes(bytes), dxgi);
+        }
     }
 }

@@ -11,10 +11,15 @@
 // Benutzers zurueckgemeldet wird. Waechter und set() laufen unter EINER
 // Sperre, damit der Waechter nie zwischen clearContents und setString liest.
 //
+// Gelesen wird nach derselben Regel wie auf dem Mac-Host (read_first_text in
+// host/clipboard.m): nur der erste Eintrag, und verdeckte Eintraege
+// (Passwoerter) sowie Dateien bleiben auf diesem Rechner.
+//
 // Alles ueber objc_msgSend von Hand, keine Kiste: objc_getClass,
 // sel_registerName, objc_msgSend (mit passendem Funktionszeiger-Typ je
 // Aufruf) und ein Autorelease-Pool je Durchlauf. Gelinkt wird AppKit (fuer
-// NSPasteboard und die Konstante NSPasteboardTypeString) und libobjc.
+// NSPasteboard und die Konstanten NSPasteboardTypeString und
+// NSPasteboardTypeFileURL) und libobjc.
 
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::Mutex;
@@ -29,6 +34,12 @@ const TAKT: Duration = Duration::from_millis(300);
 
 /// NSUTF8StringEncoding
 const NS_UTF8: usize = 4;
+
+/// Kennzeichen aus der Verabredung unter nspasteboard.org: Passwortverwalter
+/// markieren damit Inhalte, die nicht mitgeschrieben werden sollen. Ein
+/// solcher Eintrag geht nicht ueber die Leitung - wie auf dem Mac-Host.
+/// UNGEPRUEFT: Branchenkonvention, keine Apple-Dokumentation.
+const VERDECKT: &CStr = c"org.nspasteboard.ConcealedType";
 
 // ------------------------------------------------------------------- FFI
 
@@ -47,6 +58,7 @@ extern "C" {
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
     static NSPasteboardTypeString: Id;
+    static NSPasteboardTypeFileURL: Id;
 }
 
 fn klasse(name: &CStr) -> Id {
@@ -94,6 +106,25 @@ unsafe fn msg_init_bytes(obj: Id, s: Sel, bytes: *const c_void, len: usize, enc:
     f(obj, s, bytes, len, enc)
 }
 
+/// NSString aus einer C-Zeichenkette. Autoreleased: braucht einen Pool.
+unsafe fn ns_text(s: &CStr) -> Id {
+    let k = klasse(c"NSString");
+    if k.is_null() {
+        return std::ptr::null_mut();
+    }
+    msg_id_1(k, sel(c"stringWithUTF8String:"), s.as_ptr() as Id)
+}
+
+/// Traegt der Eintrag diesen Typ? [item availableTypeFromArray:@[typ]]
+unsafe fn hat_typ(item: Id, typ: Id) -> bool {
+    let k = klasse(c"NSArray");
+    if k.is_null() || typ.is_null() {
+        return false;
+    }
+    let liste = msg_id_1(k, sel(c"arrayWithObject:"), typ);
+    !liste.is_null() && !msg_id_1(item, sel(c"availableTypeFromArray:"), liste).is_null()
+}
+
 /// Ein Autorelease-Pool fuer die Dauer eines Geltungsbereichs.
 struct Pool(*mut c_void);
 
@@ -135,13 +166,44 @@ fn change_count(b: Id) -> isize {
 
 // ------------------------------------------------------------------- Lesen
 
-/// Text vom Brett. None, wenn nichts Textartiges anliegt oder der Inhalt
-/// die Obergrenze reisst. Laeuft im eigenen Pool: die NSString-Rueckgaben
-/// sind autoreleased.
+/// Text des ERSTEN Eintrags auf dem Brett. Bewusst ueber pasteboardItems
+/// und nicht ueber [b stringForType:]: der bequeme Weg auf Brettebene haengt
+/// bei mehreren Eintraegen deren Text aneinander. None, wenn der Eintrag
+/// verdeckt ist, eine Datei ist, nichts Textartiges traegt oder die
+/// Obergrenze reisst. Laeuft im eigenen Pool: die Rueckgaben sind
+/// autoreleased.
 fn lesen(b: Id) -> Option<String> {
     let _pool = Pool::neu();
     unsafe {
-        let s = msg_id_1(b, sel(c"stringForType:"), NSPasteboardTypeString);
+        let eintraege = msg_id(b, sel(c"pasteboardItems"));
+        if eintraege.is_null() {
+            return None;
+        }
+        let item = msg_id(eintraege, sel(c"firstObject"));
+        if item.is_null() {
+            return None;
+        }
+        let anzahl = msg_int(eintraege, sel(c"count"));
+        if anzahl > 1 {
+            crate::protokoll::zeile(format!("Zwischenablage: {anzahl} Eintraege, nur der erste wird uebertragen"));
+        }
+        // Verdeckte Inhalte (Passwoerter) bleiben auf diesem Rechner. Laesst
+        // sich das Kennzeichen nicht einmal anlegen, wird nichts gelesen -
+        // im Zweifel lieber keine Kopie als ein Passwort auf dem Host.
+        let verdeckt = ns_text(VERDECKT);
+        if verdeckt.is_null() {
+            return None;
+        }
+        if hat_typ(item, verdeckt) {
+            crate::protokoll::zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen".into());
+            return None;
+        }
+        // Dateien und Ordner uebertragen wir nicht - nur der Name oder Pfad
+        // waere sinnlos, weil er auf der anderen Seite nichts bedeutet.
+        if hat_typ(item, NSPasteboardTypeFileURL) {
+            return None;
+        }
+        let s = msg_id_1(item, sel(c"stringForType:"), NSPasteboardTypeString);
         if s.is_null() {
             return None;
         }
@@ -279,6 +341,60 @@ mod tests {
 
         if let Some(v) = vorher {
             set(&v);
+        }
+    }
+
+    /// Dieselbe Leseregel wie auf dem Mac-Host: ein verdeckter Eintrag geht
+    /// nicht hinaus, eine Datei auch nicht, und von mehreren Eintraegen
+    /// zaehlt nur der erste. Geschrieben wird auf ein eigenes, namenloses
+    /// Brett - die allgemeine Zwischenablage (und damit ein laufender Host)
+    /// bekommt davon nichts mit.
+    #[test]
+    fn verdeckt_bleibt_hier() {
+        let _pool = Pool::neu();
+        unsafe {
+            let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
+            assert!(!b.is_null(), "kein eigenes Brett");
+            let text_typ = NSPasteboardTypeString;
+            let verdeckt = ns_text(VERDECKT);
+            let datei = NSPasteboardTypeFileURL;
+
+            // Je Eintrag ein Text und wahlweise ein zweiter Typ dazu; alle
+            // Eintraege gehen in EINEM writeObjects: aufs Brett.
+            let schreiben = |eintraege: &[(&CStr, Option<(Id, &CStr)>)]| {
+                let mut items: Vec<Id> = Vec::new();
+                for (text, zusatz) in eintraege {
+                    let item = msg_id(msg_id(klasse(c"NSPasteboardItem"), sel(c"alloc")), sel(c"init"));
+                    assert!(msg_bool_2(item, sel(c"setString:forType:"), ns_text(text), text_typ));
+                    if let Some((typ, wert)) = zusatz {
+                        assert!(msg_bool_2(item, sel(c"setString:forType:"), ns_text(wert), *typ));
+                    }
+                    items.push(item);
+                }
+                let liste: unsafe extern "C" fn(Id, Sel, *const Id, usize) -> Id =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                let liste = liste(klasse(c"NSArray"), sel(c"arrayWithObjects:count:"), items.as_ptr(), items.len());
+                let _ = msg_int(b, sel(c"clearContents"));
+                let schreib: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc_msgSend as *const c_void);
+                assert!(schreib(b, sel(c"writeObjects:"), liste) != 0, "writeObjects: scheitert");
+                for i in items {
+                    let _ = msg_id(i, sel(c"release"));
+                }
+            };
+
+            schreiben(&[(c"geheim123", Some((verdeckt, c"")))]);
+            assert_eq!(lesen(b), None, "verdeckter Eintrag wurde gelesen");
+
+            schreiben(&[(c"offen", None)]);
+            assert_eq!(lesen(b).as_deref(), Some("offen"));
+
+            schreiben(&[(c"eins", None), (c"zwei", None)]);
+            assert_eq!(lesen(b).as_deref(), Some("eins"));
+
+            schreiben(&[(c"probe.txt", Some((datei, c"file:///tmp/probe.txt")))]);
+            assert_eq!(lesen(b), None, "Datei wurde als Text gelesen");
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
         }
     }
 }

@@ -44,6 +44,24 @@ im Startbildschirm. Drei Kanäle: 9001 Bild und Ton, 9002 Eingaben und Zwischena
 was FFmpeg dazu sagt, steht in `%APPDATA%\QuadChroma\protokoll.txt`; die Bedienung
 im Einzelnen beschreibt `BENUTZUNG.txt`.
 
+### Windows-Client bauen
+
+Rust (MSVC), LLVM für bindgen und ein FFmpeg-9-Build unter LGPL als DLLs:
+
+    set FFMPEG_DIR=C:\pfad\zu\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0
+    set LIBCLANG_PATH=C:\Program Files\LLVM\bin
+    cd client
+    cargo build --release
+
+Gebaut wird aus `client\`: nur dort greift `client\.cargo\config.toml`, das die
+C-Laufzeit statisch in die exe bindet — sonst bräuchte sie `VCRUNTIME140.dll`
+aus dem Visual C++ Redistributable. Eine gesetzte Umgebungsvariable `RUSTFLAGS`
+ersetzt diese Einstellung. Fehlt so die statische Laufzeit, bricht der Bau mit
+einem Hinweis ab.
+Neben die exe gehören `avcodec-63.dll`, `avformat-63.dll`, `avutil-61.dll` und
+`swresample-7.dll`; Voraussetzung ist Windows 10 oder 11 (64 Bit), eine
+Visual-C++-Laufzeit braucht es nicht.
+
 ### Mac als Client (im Aufbau)
 
 Derselbe Client baut auch auf dem Mac (arm64), mit Ton über AudioToolbox und
