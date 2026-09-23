@@ -557,6 +557,8 @@ pub fn main_host(args: &[String]) -> i32 {
 
     // Alle fuenf Sekunden eine Zeile mit dem Stand und Nachricht 6 - nur,
     // wenn jemand zuschaut; sonst misst sich der Host selbst ohne Zweck.
+    // Die Drosseln tragen in diesem Takt immer nach, auch ohne Zuschauer:
+    // eine Flut kommt gerade dann, wenn keiner verbunden ist.
     let t0 = Instant::now();
     let mut vorher = last_probe();
     let mut last_frames = 0u64;
@@ -564,6 +566,7 @@ pub fn main_host(args: &[String]) -> i32 {
     loop {
         std::thread::sleep(Duration::from_secs(5));
         ffmpeg_zeilen();
+        netz::drosseln_nachtragen();
         let f = Z.sent_frames.load(Ordering::Relaxed);
         let b = Z.sent_bytes.load(Ordering::Relaxed);
         if !netz::zuschauer_da() {
