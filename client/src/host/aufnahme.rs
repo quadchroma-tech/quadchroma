@@ -561,11 +561,20 @@ pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
             while !netz::zuschauer_da() {
                 std::thread::sleep(Duration::from_millis(100));
             }
+            // Der naechste Zuschauer ist einer mit anderer Nummer - auch wenn
+            // er den jetzigen ohne Luecke abloest und zuschauer_da() dabei
+            // nie false wird. Gemerkt vor der Sitzung: wer schon waehrend
+            // der abgestuerzten Sitzung abgeloest hat, bekommt gleich einen
+            // neuen Anlauf.
+            let nr = netz::zuschauer_nr();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sitzung(wunsch.as_ref(), weg)));
             if r.is_err() {
                 // Wachhalten und Timerperiode hat Drop schon abgebaut.
                 log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
-                while netz::zuschauer_da() {
+                // Dem Zuschauer sagen, dass kein Bild kommt - statt eines
+                // stummen, stehenden Bildes.
+                netz::hoststatus_senden(1);
+                while netz::zuschauer_da() && netz::zuschauer_nr() == nr {
                     std::thread::sleep(Duration::from_millis(500));
                 }
                 // Ein Testbild ueberlebt den Zuschauer auch hier nicht.
@@ -626,20 +635,33 @@ fn oberflaeche_pruefen(t: &ID3D11Texture2D, dw: u32, dh: u32) -> Result<(), Stri
 }
 
 /// Soll der Takt (ohne Testbild) das letzte Bild hineingeben? Mit fester
-/// Bildrate, wenn seit 0,9/fps nichts kam (Grund ""); sonst nur einmal:
-/// nach "Testbild aus" oder fuer einen frischen Encoder, der noch kein Bild
-/// hat (Start, Codecwechsel, Neustart). Ohne feste Bildrate und mit Bild
-/// im Encoder: nichts (wie main.m).
-fn nachlegen_grund(nachholen: bool, hat_bild: bool, fest_faellig: bool) -> Option<&'static str> {
-    if nachholen {
-        Some("Testbild aus")
+/// Bildrate, wenn seit 0,9/fps nichts kam (Grund ""). Ohne sie nur einmal:
+/// aus einem Grund `nachholen` ("Testbild aus", "neuer Zuschauer"), fuer
+/// einen frischen Encoder, der noch kein Bild hat (Start, Codecwechsel,
+/// Neustart), oder wenn das neueste Bild nicht in den Encoder kam (Raster
+/// "zu schnell", Encoder voll, Stau) und seitdem keines mehr (`offen_faellig`,
+/// ohne Protokollzeile) - sonst bliebe beim Zuschauer ein Zwischenstand
+/// stehen, bis sich der Desktop wieder aendert. Ohne feste Bildrate, mit
+/// Bild im Encoder und ohne ausgelassenes: nichts.
+fn nachlegen_grund(nachholen: Option<&'static str>, hat_bild: bool, fest_faellig: bool, offen_faellig: bool) -> Option<&'static str> {
+    if let Some(grund) = nachholen {
+        Some(grund)
     } else if !hat_bild {
         Some("frischer Encoder")
-    } else if fest_faellig {
+    } else if fest_faellig || offen_faellig {
         Some("")
     } else {
         None
     }
+}
+
+/// Kam das neueste Bild (Aufnahmezeit `t_cap`, Hostuhr in us) nicht in den
+/// Encoder, und ist seitdem eine ganze Bildzeit ohne neueres vergangen? Dann
+/// ist die Bewegung zu Ende, und der Takt legt es nach. Waehrend einer
+/// Bewegung kommt das naechste Bild frueher (bei 144 Hz alle 7 ms) - dort
+/// soll nichts ueber die Zielrate hinaus nachgelegt werden.
+fn ausgelassenes_faellig(letztes: Option<(u64, bool)>, jetzt_us: u64, fps: u32) -> bool {
+    matches!(letztes, Some((t, false)) if jetzt_us.saturating_sub(t) >= 1_000_000 / fps.max(1) as u64)
 }
 
 /// Buchfuehrung der Verlustmeldungen: derselbe Verlust ohne ein gutes Bild
@@ -824,13 +846,31 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
     // Letztes echtes Bild: Aufnahmezeit, ob es codiert wurde (fuer die
     // Wiederholung ohne neue Umrechnung).
     let mut letztes: Option<(u64, bool)> = None;
-    // Nach "Testbild aus": das letzte Desktopbild einmal nachlegen, auch
-    // ohne feste Bildrate.
-    let mut nachholen = false;
+    // Nach "Testbild aus" oder fuer einen neuen Zuschauer: das letzte
+    // Desktopbild einmal nachlegen, auch ohne feste Bildrate (mit Grund).
+    let mut nachholen: Option<&'static str> = None;
     let (mut w, mut h) = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
+    let mut zuschauer = netz::zuschauer_nr();
 
     while netz::zuschauer_da() {
         let fps = Z.fps.load(Ordering::Relaxed);
+
+        // 0. Zuschauerwechsel ohne Pause (Abloesung): die Sitzung laeuft
+        //    weiter, der Neue braucht aber, was der Alte schon hatte - die
+        //    Meldung eines laufenden Verlusts (sonst wartete er ohne Hinweis
+        //    auf ein Bild) und ein erstes Bild auch bei stillem Desktop (das
+        //    Vollbild dafuer hat die Annahme schon angefordert). Ein Testbild
+        //    hat die Annahme schon ausgeschaltet.
+        let nr = netz::zuschauer_nr();
+        if nr != zuschauer {
+            zuschauer = nr;
+            if verloren {
+                netz::hoststatus_senden(1);
+            }
+            if letztes.is_some() {
+                nachholen = Some("neuer Zuschauer");
+            }
+        }
 
         // 1. Duplication aufbauen oder wiederherstellen, alle 2 s.
         if auf.is_none() && Instant::now() >= naechster_versuch {
@@ -996,7 +1036,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
             testbild_an = tb;
             if tb {
                 log(format!("Testbild an: {} Bilder {w}x{h}", super::testbild::N));
-                nachholen = false;
+                nachholen = None;
             } else {
                 log("Testbild aus");
                 testbilder = None;
@@ -1016,7 +1056,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                     }
                 }
                 letztes = letztes.map(|(t, _)| (t, false));
-                nachholen = letztes.is_some();
+                nachholen = letztes.is_some().then_some("Testbild aus");
             }
             Z.force_key.store(true, Ordering::Relaxed);
         }
@@ -1101,7 +1141,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                                     };
                                     if e.codieren(q, t_cap, pts, false).is_ok() {
                                         letztes = Some((t_cap, true));
-                                        nachholen = false;
+                                        nachholen = None;
                                     }
                                 }
                             }
@@ -1150,7 +1190,12 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                             let _ = e.codieren(Quelle::Fertig(b), jetzt, pts, false);
                         }
                     }
-                } else if let Some(einmal) = auf.as_ref().and(nachlegen_grund(nachholen, e.hat_bild(), Z.fest.load(Ordering::Relaxed) && takt.nachlegen_faellig(fps))) {
+                } else if let Some(einmal) = auf.as_ref().and(nachlegen_grund(
+                    nachholen,
+                    e.hat_bild(),
+                    Z.fest.load(Ordering::Relaxed) && takt.nachlegen_faellig(fps),
+                    ausgelassenes_faellig(letztes, super::now_us(), fps) && takt.nachlegen_faellig(fps),
+                )) {
                     if let Some((t_cap, codiert)) = letztes {
                         if e.inflight() >= INFLIGHT_TAKT {
                             // Encoder noch voll: dieser Schlag faellt aus.
@@ -1172,7 +1217,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                             // wiederholten Bildes; das Raster bleibt unberuehrt.
                             if e.codieren(q, t_cap, pts, true).is_ok() {
                                 letztes = Some((t_cap, true));
-                                nachholen = false;
+                                nachholen = None;
                                 Z.repeats.fetch_add(1, Ordering::Relaxed);
                                 if !einmal.is_empty() {
                                     log(format!("Takt: letztes Bild nachgelegt ({einmal})"));
@@ -1309,15 +1354,63 @@ mod tests {
 
     #[test]
     fn takt_legt_einmal_nach_ohne_feste_bildrate() {
-        // Ohne feste Bildrate und mit Bild im Encoder: nichts (wie main.m).
-        assert_eq!(nachlegen_grund(false, true, false), None);
-        // Frischer Encoder (Start, Codecwechsel, Neustart) bzw. Testbild aus:
-        // einmal, auch ohne feste Bildrate.
-        assert_eq!(nachlegen_grund(false, false, false), Some("frischer Encoder"));
-        assert_eq!(nachlegen_grund(true, true, false), Some("Testbild aus"));
-        assert_eq!(nachlegen_grund(true, false, true), Some("Testbild aus"));
+        // Ohne feste Bildrate, mit Bild im Encoder und ohne ausgelassenes
+        // Bild: nichts (wie main.m).
+        assert_eq!(nachlegen_grund(None, true, false, false), None);
+        // Frischer Encoder (Start, Codecwechsel, Neustart), Testbild aus bzw.
+        // neuer Zuschauer: einmal, auch ohne feste Bildrate.
+        assert_eq!(nachlegen_grund(None, false, false, false), Some("frischer Encoder"));
+        assert_eq!(nachlegen_grund(Some("Testbild aus"), true, false, false), Some("Testbild aus"));
+        assert_eq!(nachlegen_grund(Some("Testbild aus"), false, true, true), Some("Testbild aus"));
+        assert_eq!(nachlegen_grund(Some("neuer Zuschauer"), true, false, false), Some("neuer Zuschauer"));
         // Feste Bildrate: regulaer nachlegen, ohne Protokollzeile.
-        assert_eq!(nachlegen_grund(false, true, true), Some(""));
+        assert_eq!(nachlegen_grund(None, true, true, false), Some(""));
+        // Ohne feste Bildrate: das ausgelassene letzte Bild einer Bewegung,
+        // ebenfalls ohne Protokollzeile.
+        assert_eq!(nachlegen_grund(None, true, false, true), Some(""));
+    }
+
+    /// Das Endbild einer Bewegung, das als "zu schnell" (Raster), wegen
+    /// Encoder-Grenze oder Stau nicht in den Encoder kam, legt der Takt nach -
+    /// aber erst, wenn eine ganze Bildzeit kein neueres kam, also nie mitten
+    /// in einer Bewegung. Ein codiertes Bild wird ohne feste Bildrate nicht
+    /// wiederholt.
+    #[test]
+    fn ausgelassenes_endbild_wird_nachgelegt() {
+        let fps = 60;
+        let bildzeit = 1_000_000 / fps as u64;
+        let t = 5_000_000;
+        assert!(!ausgelassenes_faellig(None, t + bildzeit, fps));
+        assert!(!ausgelassenes_faellig(Some((t, true)), t + 10 * bildzeit, fps), "codiert: nichts nachzulegen");
+        assert!(!ausgelassenes_faellig(Some((t, false)), t + bildzeit - 1, fps), "Bewegung laeuft vielleicht noch");
+        assert!(ausgelassenes_faellig(Some((t, false)), t + bildzeit, fps));
+        // Pruefer-Probe: Bewegungen aus 2 bis 39 Bildern bei 144 Hz, Ziel 60
+        // fps, nach einer Pause. Ohne Nachlegen blieb bei 23 von 38 das
+        // Endbild ungesendet; jetzt bekommt jede ihr Endbild, und nachgelegt
+        // wird hoechstens einmal je Bewegung und erst nach ihrem Ende.
+        let hz = 144.0;
+        let mut ohne_endbild_vorher = 0;
+        for n in 2..=39u32 {
+            let mut takt = Schrittmacher::neu();
+            let beginn = 100.0 + n as f64;
+            let mut letztes: Option<(u64, bool)> = None;
+            for k in 0..n {
+                let t_s = beginn + k as f64 / hz;
+                let t_us = (t_s * 1e6) as u64;
+                // Waehrend der Bewegung: nie nachlegen, das naechste Bild kommt vor Ablauf einer Bildzeit.
+                if let Some(l) = letztes {
+                    assert!(!ausgelassenes_faellig(Some(l), t_us - 1, fps), "n {n}, Bild {k}");
+                }
+                letztes = Some((t_us, takt.schlitz_frei(t_s, fps)));
+            }
+            let (t_end, codiert) = letztes.unwrap();
+            if !codiert {
+                ohne_endbild_vorher += 1;
+            }
+            // Nach der Bewegung: genau dann faellig, wenn das Endbild fehlt.
+            assert_eq!(ausgelassenes_faellig(letztes, t_end + bildzeit, fps), !codiert, "n {n}");
+        }
+        assert_eq!(ohne_endbild_vorher, 23, "Probe des Pruefers nicht getroffen");
     }
 
     #[test]

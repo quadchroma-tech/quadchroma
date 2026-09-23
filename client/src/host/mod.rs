@@ -65,6 +65,9 @@ pub struct Zustand {
     pub enc_verworfen: AtomicU64,
     pub audio_packets: AtomicU64,
     pub audio_bytes: AtomicU64,
+    /// Tonpakete, die an der Grenze fuer wartenden Ton wegfielen (Leitung
+    /// langsamer als der Ton, netz::ton_grenze).
+    pub ton_verworfen: AtomicU64,
     pub input_events: AtomicU64,
     /// Eckdaten des Stroms - immer aus dem laufenden Kandidaten abgeleitet.
     pub info_w: AtomicU32,
@@ -96,6 +99,7 @@ pub static Z: Zustand = Zustand {
     enc_verworfen: AtomicU64::new(0),
     audio_packets: AtomicU64::new(0),
     audio_bytes: AtomicU64::new(0),
+    ton_verworfen: AtomicU64::new(0),
     input_events: AtomicU64::new(0),
     info_w: AtomicU32::new(0),
     info_h: AtomicU32::new(0),
@@ -108,13 +112,26 @@ pub static Z: Zustand = Zustand {
 
 // ---------------------------------------------------------------- Protokoll
 
-static DATEI: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// Groesse, ab der die Protokolldatei neu beginnt: der bisherige Teil wird
+/// zu <name>.alt.txt (ein aelterer faellt dabei weg). Auf der Platte liegen
+/// so hoechstens zweimal 8 MB - auch wenn der Host tagelang laeuft oder
+/// jemand seine Ports mit Verbindungen bestreicht.
+const PROTOKOLL_GRENZE: u64 = 8 * 1024 * 1024;
+
+/// Die offene Protokolldatei und wie viel schon darin steht.
+struct Protokolldatei {
+    datei: std::fs::File,
+    pfad: std::path::PathBuf,
+    geschrieben: u64,
+}
+
+static DATEI: Mutex<Option<Protokolldatei>> = Mutex::new(None);
 
 /// Protokolldatei oeffnen (wird bei jedem Start neu begonnen).
 fn protokoll_oeffnen(name: &str) {
     if let Some(p) = crate::einstellungen::datei_pfad(name) {
         if let Ok(f) = std::fs::File::create(&p) {
-            *DATEI.lock().unwrap() = Some(f);
+            *DATEI.lock().unwrap() = Some(Protokolldatei { datei: f, pfad: p, geschrieben: 0 });
         }
     }
 }
@@ -126,10 +143,45 @@ pub fn log(text: impl AsRef<str>) {
     println!("{t}");
     let _ = std::io::stdout().flush();
     if let Ok(mut d) = DATEI.lock() {
-        if let Some(f) = d.as_mut() {
-            let _ = writeln!(f, "{t}");
+        zeile_schreiben(&mut d, t, PROTOKOLL_GRENZE);
+    }
+}
+
+/// Eine Zeile in die Datei; braechte sie die Datei ueber `grenze`, beginnt
+/// vorher eine neue (umschichten).
+fn zeile_schreiben(d: &mut Option<Protokolldatei>, t: &str, grenze: u64) {
+    use std::io::Write;
+    let laenge = t.len() as u64 + 1;
+    if let Some(p) = d.take() {
+        *d = if p.geschrieben > 0 && p.geschrieben + laenge > grenze { umschichten(p, grenze) } else { Some(p) };
+    }
+    if let Some(p) = d.as_mut() {
+        if writeln!(p.datei, "{t}").is_ok() {
+            p.geschrieben += laenge;
         }
     }
+}
+
+/// Die volle Datei wird zu <name>.alt.txt, eine neue beginnt mit einem
+/// Hinweis darauf. Laesst sie sich nicht umbenennen (etwa weil jemand die
+/// alte offen haelt), beginnt die Datei selbst von vorn - die Grenze bleibt
+/// hart. Geht auch das nicht, schreibt nur noch die Konsole.
+fn umschichten(p: Protokolldatei, grenze: u64) -> Option<Protokolldatei> {
+    use std::io::Write;
+    let Protokolldatei { datei, pfad, .. } = p;
+    drop(datei);
+    let alt = pfad.with_extension("alt.txt");
+    let name = alt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let hinweis = match std::fs::rename(&pfad, &alt) {
+        Ok(()) => format!("Protokoll ueber {} MB - der vorige Teil steht in {name}", grenze >> 20),
+        Err(e) => format!("Protokoll ueber {} MB - neu begonnen, der vorige Teil liess sich nicht nach {name} umbenennen: {e}", grenze >> 20),
+    };
+    let datei = std::fs::File::create(&pfad).ok()?;
+    let mut neu = Protokolldatei { datei, pfad, geschrieben: 0 };
+    if writeln!(neu.datei, "{hinweis}").is_ok() {
+        neu.geschrieben = hinweis.len() as u64 + 1;
+    }
+    Some(neu)
 }
 
 /// Was FFmpeg inzwischen gesagt hat (ueber den Rueckruf des Clients), als
@@ -517,7 +569,7 @@ pub fn main_host(args: &[String]) -> i32 {
             continue;
         }
         log(format!(
-            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | zu schnell: {} | Encoder voll: {}",
+            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
             t0.elapsed().as_secs_f32(),
             f,
             (f - last_frames) as f32 / 5.0,
@@ -529,6 +581,7 @@ pub fn main_host(args: &[String]) -> i32 {
             Z.repeats.load(Ordering::Relaxed),
             Z.zu_schnell.load(Ordering::Relaxed),
             Z.enc_stau.load(Ordering::Relaxed),
+            Z.ton_verworfen.load(Ordering::Relaxed),
         ));
         let jetzt = last_probe();
         if let (Some(v), Some(j)) = (vorher.as_ref(), jetzt.as_ref()) {
@@ -541,5 +594,44 @@ pub fn main_host(args: &[String]) -> i32 {
         vorher = jetzt;
         last_frames = f;
         last_bytes = b;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Das Protokoll waechst nicht ohne Ende (Integrationstest: jede
+    /// Muell-Verbindung eine Zeile, ohne Grenze): ueber der Grenze wird die
+    /// Datei zu <name>.alt.txt, und eine neue beginnt mit einem Hinweis.
+    /// Auf der Platte liegen nie mehr als zweimal die Grenze, und die
+    /// neueste Zeile steht immer in der Datei selbst.
+    #[test]
+    fn protokoll_hat_eine_obergrenze() {
+        let ordner = std::env::temp_dir().join(format!("qc-protokoll-{}", std::process::id()));
+        std::fs::create_dir_all(&ordner).unwrap();
+        let pfad = ordner.join("host-protokoll.txt");
+        let alt = ordner.join("host-protokoll.alt.txt");
+        let mut d = Some(Protokolldatei { datei: std::fs::File::create(&pfad).unwrap(), pfad: pfad.clone(), geschrieben: 0 });
+        let grenze = 1000;
+        let mut umgeschichtet = 0;
+        for i in 0..500 {
+            let zeile = format!("Handschlag mit 10.0.{}.{} gescheitert", i / 250, i % 250);
+            zeile_schreiben(&mut d, &zeile, grenze);
+            let neu = std::fs::metadata(&pfad).unwrap().len();
+            let vorher = std::fs::metadata(&alt).map(|m| m.len()).unwrap_or(0);
+            assert!(neu <= grenze && vorher <= grenze, "Zeile {i}: {neu} + {vorher} Byte");
+            if neu < zeile.len() as u64 * 2 + 70 {
+                umgeschichtet += 1;
+            }
+            assert!(std::fs::read_to_string(&pfad).unwrap().ends_with(&format!("{zeile}\n")), "Zeile {i} fehlt");
+        }
+        drop(d);
+        assert!(umgeschichtet > 5, "nie umgeschichtet - Probe ohne Wert");
+        let text = std::fs::read_to_string(&pfad).unwrap();
+        assert!(text.starts_with("Protokoll ueber ") && text.lines().next().unwrap().ends_with("der vorige Teil steht in host-protokoll.alt.txt"), "{text}");
+        let vorher = std::fs::read_to_string(&alt).unwrap();
+        assert!(vorher.lines().count() > 10, "{vorher}");
+        std::fs::remove_dir_all(&ordner).ok();
     }
 }

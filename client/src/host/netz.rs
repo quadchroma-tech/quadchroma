@@ -4,11 +4,13 @@
 //
 // Ein Zuschauer zur Zeit; ein neuer ersetzt den alten (wie main.m). Der
 // alte bekommt als letzte Nachricht MSG_ABGELOEST - statt dessen, was noch
-// in seiner Warteschlange lag, und mit kurzer Frist (FRIST_SCHLUSSWORT) -,
-// damit er sich nicht von selbst neu verbindet und den neuen verdraengt;
-// danach sind seine Bildleitung und sein Eingabekanal zu. Der
-// Bildkanal wird nur geschrieben, der Eingabekanal nur gelesen - Antworten
-// (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
+// in seiner Warteschlange lag -, damit er sich nicht von selbst neu
+// verbindet und den neuen verdraengt; danach sind seine Bildleitung und sein
+// Eingabekanal zu. Vor dem Schlusswort geht noch der Rest des Pakets hinaus,
+// das der Sendefaden gerade schreibt: solange der Alte davon abnimmt, wird
+// gewartet (hoechstens ABLOESUNG_HOECHSTENS), erst ohne Fortschritt gekappt.
+// Der Bildkanal wird nur geschrieben, der Eingabekanal nur gelesen -
+// Antworten (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
 //
 // Stauregel: Windows kennt kein SO_NWRITE. Ersatz ist ein eigener
 // Sendefaden mit Warteschlange bei einem Sendepuffer von 256 kB im Kernel:
@@ -23,7 +25,11 @@
 // STAU_FRIST_US lang nichts ab, gilt er als weg. send_small (Ton,
 // Zwischenablage, Zeiger, Info, Einstellungen, Codecs, Switch, Zeit, Last,
 // Hoststatus) geht an der Regel vorbei, aber durch dieselbe Warteschlange -
-// die Reihenfolge Switch -> Info -> Vollbild bleibt damit erhalten.
+// die Reihenfolge Switch -> Info -> Vollbild bleibt damit erhalten. Grenzen
+// hat es trotzdem, je Art gezaehlt: Ton faellt ueber ton_grenze weg (liegt
+// die Leitung unter der Tonrate, fuellte er sonst die Warteschlange ohne
+// Ende, und kein Bild kaeme mehr durch); wer ueber KLEIN_GRENZE an
+// Steuernachrichten nicht abnimmt, ist weg - die werden nie still verworfen.
 //
 // Sitzung: Der Eingabekanal gehoert zu genau einem Zuschauer. Geht der
 // (ersetzt: `Leitung::abloesen`, weg: `Leitung::schliessen`), wird auch
@@ -31,7 +37,8 @@
 // Handschlaege laufen je
 // Verbindung in einem eigenen Faden, mit Frist (secure.rs, FRIST_ANNAHME) und
 // Obergrenze (HANDSCHLAEGE_MAX) - stumme Verbindungen sperren damit niemanden
-// mehr aus.
+// mehr aus. Was jede Verbindung ins Protokoll bringen kann, ohne gekoppelt
+// zu sein (gescheiterter Handschlag, Abweisung), laeuft ueber eine Drossel.
 // Windows bricht ein blockierendes recv/send auf ein shutdown hin nicht ab,
 // solange die Gegenstelle lebt, aber schweigt (eingefrorener Prozess) - der
 // Faden des alten Kanals bliebe samt Leitung stehen, bis sie geht. Deshalb
@@ -77,10 +84,24 @@ const SNDBUF: usize = 256 * 1024;
 const SCHREIBSTUECK: usize = secure::CHUNK_MAX;
 /// So lange darf die letzte Nachricht an einen abgeloesten Zuschauer
 /// brauchen. Seine Warteschlange ist da schon verworfen; vor ihr liegen
-/// hoechstens das Bild, das der Sendefaden gerade schreibt, und der
-/// Kernelpuffer - im LAN in Millisekunden durch. Wer sie in der Frist nicht
-/// abnimmt, ist eingefroren oder weg: seine Leitung wird ohne sie gekappt.
+/// hoechstens der Rest des Pakets, das der Sendefaden gerade schreibt, und
+/// der Kernelpuffer. Wer sie in der Frist nicht abnimmt, ist eingefroren oder
+/// weg: seine Leitung wird ohne sie gekappt. Der Rest des Pakets selbst hat
+/// keine feste Frist - siehe `abloesung_abschliessen`.
 const FRIST_SCHLUSSWORT: Duration = Duration::from_secs(1);
+/// Obergrenze fuer das Warten auf einen abgeloesten Zuschauer, der zwar
+/// abnimmt, aber langsam: den Rest eines Vollbilds oder einer grossen
+/// Zwischenablage ueber eine duenne Leitung. Kappte man ihn vorher, bekaeme
+/// er statt MSG_ABGELOEST einen Abbruch, verbaende sich neu und verdraengte
+/// den Neuen.
+const ABLOESUNG_HOECHSTENS: Duration = Duration::from_secs(15);
+/// Steuernachrichten (alles aus send_small ausser Ton), die hoechstens auf
+/// den Zuschauer warten duerfen: zwei volle Zwischenablagen. Sie werden nie
+/// still verworfen - sonst bricht etwa die Reihenfolge Switch -> Info ->
+/// Vollbild. Wer so weit zurueckliegt, ist weg; ohne diese Grenze liesse ein
+/// Zuschauer, der Zeitfragen stellt und kaum liest, den Speicher des Hosts
+/// ohne Ende wachsen.
+const KLEIN_GRENZE: usize = 2 * HARTE_GRENZE;
 
 /// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
 /// ist. Die Sperren hier schuetzen Abfolgen (EINSPEISEN, FREIGABE) oder Daten,
@@ -119,6 +140,55 @@ fn melden_erlaubt(letzte: &Mutex<Option<Instant>>) -> bool {
     *t = Some(Instant::now());
     true
 }
+
+/// Drossel fuer eine Art Protokollzeile, die jede Verbindung ausloesen kann -
+/// auch eine ohne Schluessel oder von einer ungekoppelten Gegenstelle:
+/// hoechstens eine Zeile alle zehn Sekunden (melden_erlaubt); die
+/// unterdrueckten dazwischen werden gezaehlt und stehen an der naechsten.
+/// Wer einen Port mit Verbindungen bestreicht oder ungekoppelt alle 2 s neu
+/// versucht, fuellt so weder Protokoll noch Platte. Ereignisse gekoppelter
+/// Gegenstellen (Kopplung, Zuschauer verbunden) laufen nie hierueber.
+struct Drossel {
+    letzte: Mutex<Option<Instant>>,
+    unterdrueckt: AtomicU64,
+}
+
+impl Drossel {
+    const fn neu() -> Drossel {
+        Drossel { letzte: Mutex::new(None), unterdrueckt: AtomicU64::new(0) }
+    }
+
+    /// Die Zeile ins Protokoll, wenn die Drossel sie durchlaesst - dann mit
+    /// der Zahl der seit der letzten unterdrueckten -, sonst nur zaehlen. Der
+    /// Text entsteht nur, wenn er geschrieben wird. Liefert die geschriebene
+    /// Zeile.
+    fn melden(&self, text: impl FnOnce() -> String) -> Option<String> {
+        if !melden_erlaubt(&self.letzte) {
+            self.unterdrueckt.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let mut zeile = text();
+        let n = self.unterdrueckt.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            zeile.push_str(&format!(" (und {n} weitere seit der letzten Meldung)"));
+        }
+        log(&zeile);
+        Some(zeile)
+    }
+}
+
+/// Gescheiterte Handschlaege auf dem Bildkanal (Muell, Frist, falsches Protokoll).
+static DROSSEL_HANDSCHLAG_BILD: Drossel = Drossel::neu();
+/// Unbekannte Gegenstellen ohne Kopplungsfenster (etwa ein ungekoppelter
+/// Client, der alle 2 s neu versucht).
+static DROSSEL_UNBEKANNT: Drossel = Drossel::neu();
+/// Abweisungen, weil die Freigabeliste nicht zu lesen oder nicht zu
+/// schreiben ist - auch die kann jede Gegenstelle ausloesen.
+static DROSSEL_FREIGABE: Drossel = Drossel::neu();
+/// Gescheiterte Handschlaege auf dem Eingabekanal.
+static DROSSEL_HANDSCHLAG_EINGABE: Drossel = Drossel::neu();
+/// Eingabekanaele, die nach dem Handschlag abgewiesen werden.
+static DROSSEL_EINGABE_ABGEWIESEN: Drossel = Drossel::neu();
 
 /// Ein laufender Stau: seit wann ohne Fortschritt (Hostuhr in us) und wie
 /// viel der Sendefaden bis dahin geschrieben hatte.
@@ -172,6 +242,16 @@ fn budget(gaming: bool) -> usize {
     if gaming { BACKLOG_LIMIT / 4 } else { BACKLOG_LIMIT }
 }
 
+/// Ton, der hoechstens noch auf den Zuschauer warten darf: ein Viertel des
+/// Budgets (rund 1,3 s, im Spielmodus 0,3 s unkomprimierter Ton). Gezaehlt
+/// wird nur der wartende Ton selbst - ein grosses Vollbild davor laesst ihn
+/// also nicht ausfallen. Liegt die Leitung unter der Tonrate (float32
+/// Stereo, rund 3 Mbit/s), bleibt dem Bild so immer drei Viertel des
+/// Budgets, und der Ton hinkt nicht immer weiter nach.
+fn ton_grenze(gaming: bool) -> usize {
+    budget(gaming) / 4
+}
+
 /// Warum ein Paket nicht in die Warteschlange kam.
 #[derive(Debug, PartialEq, Eq)]
 enum Abgewiesen {
@@ -181,9 +261,25 @@ enum Abgewiesen {
     Voll,
 }
 
+/// Was ein Paket ist - danach richtet sich, woran seine Grenze gemessen
+/// wird (siehe `Leitung::einreihen`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Art {
+    /// Codiertes Bild: am ganzen Rueckstand.
+    Bild,
+    /// Tonpaket: am Ton, der selbst noch wartet.
+    Ton,
+    /// Alles andere - Begruessung und Steuernachrichten: an dem, was davon
+    /// noch wartet.
+    Klein,
+}
+
 struct Warteschlange {
-    pakete: VecDeque<Vec<u8>>,
+    pakete: VecDeque<(Art, Vec<u8>)>,
     bytes: usize,
+    /// Davon Ton bzw. Steuernachrichten.
+    ton: usize,
+    klein: usize,
     /// Rest des Pakets, das der Sendefaden gerade schreibt (noch nicht beim
     /// Kernel) - zaehlt zum Rueckstand.
     im_schreiben: usize,
@@ -205,6 +301,28 @@ struct Warteschlange {
     schlusswort: Option<Vec<u8>>,
     /// Der Sendefaden ist durch (siehe `abloesung_abschliessen`).
     beendet: bool,
+}
+
+impl Warteschlange {
+    /// Alles verwerfen, was noch wartet.
+    fn leeren(&mut self) {
+        self.pakete.clear();
+        self.bytes = 0;
+        self.ton = 0;
+        self.klein = 0;
+    }
+
+    /// Das vorderste Paket herausnehmen, samt Buchfuehrung je Art.
+    fn nehmen(&mut self) -> Option<Vec<u8>> {
+        let (art, p) = self.pakete.pop_front()?;
+        self.bytes -= p.len();
+        match art {
+            Art::Ton => self.ton -= p.len(),
+            Art::Klein => self.klein -= p.len(),
+            Art::Bild => {}
+        }
+        Some(p)
+    }
 }
 
 /// Ein verbundener Zuschauer: Warteschlange zum Sendefaden und die Kennung
@@ -230,6 +348,8 @@ impl Leitung {
             q: Mutex::new(Warteschlange {
                 pakete: VecDeque::new(),
                 bytes: 0,
+                ton: 0,
+                klein: 0,
                 im_schreiben: 0,
                 geschrieben: 0,
                 stau: None,
@@ -272,17 +392,29 @@ impl Leitung {
 
     /// Ein neuer Zuschauer ersetzt diesen. Was noch in der Warteschlange
     /// liegt, wird verworfen; hinaus geht nur noch MSG_ABGELOEST - danach
-    /// schliesst der Sendefaden die Bildleitung selbst. Der Eingabekanal ist
-    /// sofort gekappt. Haengt der Sendefaden an einem Zuschauer, der nichts
-    /// mehr abnimmt, kappt `abloesung_abschliessen` die Bildleitung nach der
-    /// Frist. Unter EINSPEISEN und AKTUELL aufrufen; wartet nie.
+    /// schliesst der Sendefaden die Bildleitung selbst. Nur die Begruessung
+    /// (MAGIC + Strominfo) bleibt, wenn der Sendefaden noch gar nichts
+    /// genommen hat: sie geht mit dem Schlusswort hinaus. Ohne sie laese der
+    /// Client das Schlusswort als MAGIC, hielte es fuer ein fremdes
+    /// Protokoll und verbaende sich neu - und verdraengte den Neuen. Der
+    /// Eingabekanal ist sofort gekappt. Haengt der Sendefaden an einem
+    /// Zuschauer, der nichts mehr abnimmt, kappt `abloesung_abschliessen` die
+    /// Bildleitung. Unter EINSPEISEN und AKTUELL aufrufen; wartet nie.
     fn abloesen(&self) {
         let eingabe = {
             let mut q = sperre(&self.q);
             if q.offen {
-                q.pakete.clear();
-                q.bytes = 0;
-                q.schlusswort = Some(kopf(MSG_ABGELOEST, 0, 0, 0).to_vec());
+                // Die Begruessung reiht bild_annehmen als erstes Paket ein,
+                // bevor andere Faeden die Leitung sehen.
+                let mut wort = Vec::new();
+                if q.geschrieben == 0 && q.im_schreiben == 0 {
+                    if let Some(gruss) = q.nehmen() {
+                        wort = gruss;
+                    }
+                }
+                wort.extend_from_slice(&kopf(MSG_ABGELOEST, 0, 0, 0));
+                q.leeren();
+                q.schlusswort = Some(wort);
                 q.offen = false;
                 self.cv.notify_all();
             }
@@ -294,16 +426,32 @@ impl Leitung {
         }
     }
 
-    /// Nach `abloesen`, ausserhalb aller Sperren: hoechstens `frist` auf das
-    /// Ende des Sendefadens warten, sonst die Bildleitung kappen - auch wenn
-    /// er noch in einem write steckt. true: der Sendefaden ist durch.
+    /// Nach `abloesen`, ausserhalb aller Sperren: auf das Ende des
+    /// Sendefadens warten, solange er binnen `frist` Fortschritt macht
+    /// (`geschrieben` waechst - dasselbe Mass wie in der Stauregel), aber
+    /// hoechstens ABLOESUNG_HOECHSTENS; sonst die Bildleitung kappen, auch
+    /// wenn er noch in einem write steckt. `frist` muss laenger sein als
+    /// FRIST_SCHLUSSWORT: waehrend des Schlussworts waechst `geschrieben`
+    /// nicht. true: der Sendefaden ist durch.
     fn abloesung_abschliessen(&self, frist: Duration) -> bool {
-        let q = sperre(&self.q);
-        let (q, _) = self.ende.wait_timeout_while(q, frist, |q| !q.beendet).unwrap_or_else(|e| e.into_inner());
+        let beginn = Instant::now();
+        let mut q = sperre(&self.q);
+        loop {
+            let stand = q.geschrieben;
+            let rest = ABLOESUNG_HOECHSTENS.saturating_sub(beginn.elapsed());
+            q = self.ende.wait_timeout_while(q, frist.min(rest), |q| !q.beendet).unwrap_or_else(|e| e.into_inner()).0;
+            if q.beendet || q.geschrieben == stand || beginn.elapsed() >= ABLOESUNG_HOECHSTENS {
+                break;
+            }
+        }
         let beendet = q.beendet;
         drop(q);
         if !beendet {
-            log(format!("Abgeloester Zuschauer {} nimmt nichts mehr ab - Bildleitung gekappt", self.ip));
+            log(format!(
+                "Abgeloester Zuschauer {} nimmt nichts mehr ab (nach {:.1} s) - Bildleitung gekappt",
+                self.ip,
+                beginn.elapsed().as_secs_f32()
+            ));
             self.bild_kappen();
         }
         beendet
@@ -353,23 +501,64 @@ impl Leitung {
         false
     }
 
-    /// Ein Paket einreihen. Mit Grenze: nur, wenn der Rueckstand nicht schon
+    /// Ein Paket einreihen. Mit Grenze: nur, wenn der Stand nicht schon
     /// darueber liegt - ein Paket darf sie also um sich selbst
-    /// ueberschreiten, auch ein Vollbild, das allein groesser ist.
-    fn einreihen(&self, paket: Vec<u8>, grenze: Option<usize>) -> Result<(), Abgewiesen> {
+    /// ueberschreiten, auch ein Vollbild, das allein groesser ist. Der Stand
+    /// ist fuer ein Bild der ganze Rueckstand, fuer Ton der wartende Ton, fuer
+    /// alles andere die wartenden Steuernachrichten.
+    fn einreihen(&self, paket: Vec<u8>, art: Art, grenze: Option<usize>) -> Result<(), Abgewiesen> {
         let mut q = sperre(&self.q);
         if !q.offen {
             return Err(Abgewiesen::Zu);
         }
         if let Some(g) = grenze {
-            if q.bytes + q.im_schreiben > g {
+            let stand = match art {
+                Art::Bild => q.bytes + q.im_schreiben,
+                Art::Ton => q.ton,
+                Art::Klein => q.klein,
+            };
+            if stand > g {
                 return Err(Abgewiesen::Voll);
             }
         }
         q.bytes += paket.len();
-        q.pakete.push_back(paket);
+        match art {
+            Art::Ton => q.ton += paket.len(),
+            Art::Klein => q.klein += paket.len(),
+            Art::Bild => {}
+        }
+        q.pakete.push_back((art, paket));
         self.cv.notify_one();
         Ok(())
+    }
+
+    /// Eine Nachricht aus send_small einreihen, mit den Grenzen ihrer Art.
+    /// Ton ueber ton_grenze faellt weg (Zaehler "Ton verworfen"), eine
+    /// Steuernachricht ueber KLEIN_GRENZE heisst: der Zuschauer ist weg. Die
+    /// Frist der Stauregel gilt auch hier: steht das Bild still (kein Bild,
+    /// das nach dem Stau fragt) und laeuft nur der Ton in einen
+    /// eingefrorenen Zuschauer, fiele er sonst nie auf.
+    fn klein_senden(&self, typ: u8, paket: Vec<u8>, gaming: bool, jetzt_us: u64) -> Result<(), Abgewiesen> {
+        let (art, grenze) = if typ == MSG_AUDIO { (Art::Ton, ton_grenze(gaming)) } else { (Art::Klein, KLEIN_GRENZE) };
+        let r = self.einreihen(paket, art, Some(grenze));
+        match r {
+            Ok(()) => {
+                self.stau(budget(gaming), jetzt_us);
+            }
+            Err(Abgewiesen::Zu) => {}
+            Err(Abgewiesen::Voll) if art == Art::Ton => {
+                Z.ton_verworfen.fetch_add(1, Ordering::Relaxed);
+                DROSSEL_TON.melden(|| format!("Leitung langsamer als der Ton: Tonpaket verworfen (ueber {} kB Ton wartet)", grenze / 1024));
+                // Der wartende Ton allein kommt nicht mehr ueber das Budget -
+                // die Frist laeuft deshalb ab seiner eigenen Grenze.
+                self.stau(grenze, jetzt_us);
+            }
+            Err(Abgewiesen::Voll) => {
+                log(format!("Zuschauer weg: nimmt ueber {} kB Steuernachrichten nicht ab", KLEIN_GRENZE / 1024));
+                self.schliessen();
+            }
+        }
+        r
     }
 
     /// Stauregel fuer diesen Zuschauer (stau_urteil) mit Grenze `grenze`.
@@ -397,7 +586,8 @@ impl Leitung {
 static AKTUELL: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
 static PRIV: OnceLock<Vec<u8>> = OnceLock::new();
 static SEQ: AtomicU32 = AtomicU32::new(0);
-/// Laufende Nummer der Zuschauer, fuer das Protokoll.
+/// Laufende Nummer der Zuschauer (zuschauer_nr). Waechst unter AKTUELL,
+/// zugleich mit dem Eintrag des Neuen.
 static NR: AtomicU64 = AtomicU64::new(0);
 /// Laufende Nummer der Eingabekanaele (siehe Leitung::eingabe_loesen).
 static EINGABE_NR: AtomicU64 = AtomicU64::new(0);
@@ -426,16 +616,18 @@ const HANDSCHLAEGE_JE_ABSENDER: usize = 2;
 struct Plaetze {
     /// Absender der laufenden Handschlaege.
     laufend: Mutex<Vec<IpAddr>>,
-    /// Wann zuletzt eine Abweisung im Protokoll stand.
-    gemeldet: Mutex<Option<Instant>>,
+    /// Abweisungen, weil alle Plaetze belegt sind.
+    gemeldet: Drossel,
 }
 
 static PLAETZE_BILD: Plaetze = Plaetze::neu();
 static PLAETZE_EINGABE: Plaetze = Plaetze::neu();
-/// Wann zuletzt "kein Bildkanal offen" im Protokoll stand.
-static KEIN_BILD_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
-/// Wann zuletzt ein Bild an der harten Grenze im Protokoll stand.
-static HART_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
+/// "Kein Bildkanal offen" auf dem Eingabeport.
+static DROSSEL_KEIN_BILD: Drossel = Drossel::neu();
+/// Codierte Bilder, die an der harten Grenze wegfallen.
+static DROSSEL_HART: Drossel = Drossel::neu();
+/// Tonpakete, die an ton_grenze wegfallen.
+static DROSSEL_TON: Drossel = Drossel::neu();
 
 /// Ein belegter Platz; gibt sich beim Wegfallen selbst frei.
 struct Platz {
@@ -445,19 +637,16 @@ struct Platz {
 
 impl Plaetze {
     const fn neu() -> Plaetze {
-        Plaetze { laufend: Mutex::new(Vec::new()), gemeldet: Mutex::new(None) }
+        Plaetze { laufend: Mutex::new(Vec::new()), gemeldet: Drossel::neu() }
     }
 
     fn belegen(&'static self, ip: IpAddr, kanal: &str) -> Option<Platz> {
         let mut l = sperre(&self.laufend);
         let je_absender = l.iter().filter(|x| **x == ip).count();
         if l.len() >= HANDSCHLAEGE_MAX || je_absender >= HANDSCHLAEGE_JE_ABSENDER {
-            if melden_erlaubt(&self.gemeldet) {
-                log(format!(
-                    "{kanal}: Verbindung von {ip} abgewiesen - schon {} Handschlaege offen ({je_absender} von dort)",
-                    l.len()
-                ));
-            }
+            self.gemeldet.melden(|| {
+                format!("{kanal}: Verbindung von {ip} abgewiesen - schon {} Handschlaege offen ({je_absender} von dort)", l.len())
+            });
             return None;
         }
         l.push(ip);
@@ -482,6 +671,15 @@ pub fn zuschauer_da() -> bool {
     sperre(&AKTUELL).is_some()
 }
 
+/// Nummer des aktuellen Zuschauers. Sie aendert sich bei jeder Annahme -
+/// auch wenn ein Neuer den Alten ohne Luecke abloest und zuschauer_da()
+/// dabei nie false wird. Wer sie sieht, sieht auch schon den Neuen in
+/// AKTUELL.
+pub fn zuschauer_nr() -> u64 {
+    let _a = sperre(&AKTUELL);
+    NR.load(Ordering::Relaxed)
+}
+
 fn aktuell() -> Option<Arc<Leitung>> {
     sperre(&AKTUELL).clone()
 }
@@ -498,18 +696,13 @@ fn kopf(typ: u8, flags: u8, reserviert: u16, len: usize) -> [u8; 8] {
 
 /// Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-
 /// Sperre und die Stauregel: Ton und Zwischenablage sind winzig und duerfen
-/// nicht warten. Die Frist der Stauregel gilt aber auch hier: steht das
-/// Bild still (kein Bild, das nach dem Stau fragt) und laeuft nur der Ton
-/// in einen eingefrorenen Zuschauer, fiele er sonst nie auf - und die
-/// Warteschlange wuechse ohne Ende.
+/// nicht warten. Grenzen und Frist: siehe Leitung::klein_senden.
 pub fn send_small(typ: u8, data: &[u8]) {
     let Some(l) = aktuell() else { return };
     let mut p = Vec::with_capacity(8 + data.len());
     p.extend_from_slice(&kopf(typ, 0, 0, data.len()));
     p.extend_from_slice(data);
-    if l.einreihen(p, None).is_ok() {
-        l.stau(budget(Z.gaming.load(Ordering::Relaxed)), now_us());
-    }
+    let _ = l.klein_senden(typ, p, Z.gaming.load(Ordering::Relaxed), now_us());
 }
 
 pub fn settings_senden() {
@@ -584,15 +777,15 @@ pub fn bild_senden(au: &[u8], key: bool, t_cap: u64, wiederholt: bool) -> Versan
     p.extend_from_slice(&t_enc.to_le_bytes());
     p.extend_from_slice(&kopf(MSG_VIDEO, if key { FLAG_KEY } else { 0 }, (seq & 0xffff) as u16, au.len()));
     p.extend_from_slice(au);
-    match l.einreihen(p, Some(HARTE_GRENZE)) {
+    match l.einreihen(p, Art::Bild, Some(HARTE_GRENZE)) {
         Ok(()) => {}
         Err(Abgewiesen::Zu) => return Versand::Verworfen,
         Err(Abgewiesen::Voll) => {
             Z.stau.fetch_add(1, Ordering::Relaxed);
             Z.force_key.store(true, Ordering::Relaxed);
-            if melden_erlaubt(&HART_GEMELDET) {
-                log(format!("Stau ueber der harten Grenze ({} kB): codiertes Bild verworfen, Vollbild erzwungen", HARTE_GRENZE / 1024));
-            }
+            DROSSEL_HART.melden(|| {
+                format!("Stau ueber der harten Grenze ({} kB): codiertes Bild verworfen, Vollbild erzwungen", HARTE_GRENZE / 1024)
+            });
             // Auch hier gilt die Frist - die Konserve fragt nie vor einem
             // Encoder nach dem Stau.
             l.stau(HARTE_GRENZE, now_us());
@@ -623,8 +816,7 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
             // niemandem mehr - nicht in die gekappte Leitung schreiben.
             // Ein Abgeloester bekommt nur noch sein Schlusswort.
             if !q.offen {
-                q.pakete.clear();
-                q.bytes = 0;
+                q.leeren();
                 let schluss = q.schlusswort.take();
                 drop(q);
                 if let Some(s) = schluss {
@@ -632,9 +824,8 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
                 }
                 break;
             }
-            match q.pakete.pop_front() {
+            match q.nehmen() {
                 Some(p) => {
-                    q.bytes -= p.len();
                     q.im_schreiben = p.len();
                     p
                 }
@@ -718,7 +909,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let sock = match secure::Secure::accept(stream, &noise::prologue_video(), PRIV.get().unwrap()) {
         Ok(s) => s,
         Err(e) => {
-            log(format!("Handschlag mit {ip} gescheitert ({e})"));
+            DROSSEL_HANDSCHLAG_BILD.melden(|| format!("Handschlag mit {ip} gescheitert ({e})"));
             return;
         }
     };
@@ -738,7 +929,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
         let liste = match secure::Freigaben::lesen() {
             Ok(l) => l,
             Err(e) => {
-                log(format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
+                DROSSEL_FREIGABE.melden(|| format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
                 return;
             }
         };
@@ -747,7 +938,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
             match aufnehmen {
                 Ok(true) => {
                     if let Err(e) = liste.aufnehmen(&sock.peer, &ip) {
-                        log(format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
+                        DROSSEL_FREIGABE.melden(|| format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
                         return;
                     }
                     log(format!("Neue Gegenstelle gekoppelt: {fp} ({ip}), Vergleichscode {sas}"));
@@ -756,13 +947,13 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
                 // Die Leitung faellt mit `sock` zu - der Client deutet das
                 // Ende nach dem Handschlag als "nicht gekoppelt".
                 Ok(false) => {
-                    log(format!(
-                        "Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen."
-                    ));
+                    DROSSEL_UNBEKANNT.melden(|| {
+                        format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen.")
+                    });
                     return;
                 }
                 Err(e) => {
-                    log(format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip} - {e}"));
+                    DROSSEL_UNBEKANNT.melden(|| format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip} - {e}"));
                     return;
                 }
             }
@@ -779,8 +970,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let leitung = Arc::new(Leitung::neu(sock.abbruchgriff(), sock.peer.clone(), sock.handshake_hash.clone(), ip.clone()));
     // Ein neuer Zuschauer ersetzt den alten: dessen Eingabekanal wird
     // gekappt, seine Warteschlange verworfen; er bekommt nur noch
-    // MSG_ABGELOEST, dann endet sein Sendefaden (spaetestens nach der Frist,
-    // unten).
+    // MSG_ABGELOEST, dann endet sein Sendefaden (unten wird darauf gewartet).
     let alt = {
         let _einspeisen = sperre(&EINSPEISEN);
         let mut a = sperre(&AKTUELL);
@@ -790,25 +980,35 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
             alt.abloesen();
             eingabe::alle_tasten_loslassen();
         }
-        let _ = leitung.einreihen(hello, None);
+        // Ein Testbild ueberlebt den Zuschauer nicht - auch nicht, wenn ihn
+        // ein Neuer ohne Luecke abloest und die Aufnahme dabei weiterlaeuft.
+        // Hier frei von Wettlaeufen: der Eingabekanal des Alten speist nur
+        // unter EINSPEISEN ein, der des Neuen bindet sich erst an AKTUELL.
+        if Z.testbild.swap(false, Ordering::Relaxed) {
+            log("Testbild aus (Zuschauer gewechselt)");
+        }
+        // Vollbild fuer den Neuen, bevor ihn irgendwer in AKTUELL sieht:
+        // ein Bild, das die Aufnahme ab jetzt codiert, ist eines - und geht
+        // an ihn (bild_senden wartet auf AKTUELL).
+        Z.force_key.store(true, Ordering::Relaxed);
+        Z.wait_key.store(true, Ordering::Relaxed);
+        let _ = leitung.einreihen(hello, Art::Klein, None);
+        NR.fetch_add(1, Ordering::Relaxed);
         *a = Some(leitung.clone());
         alt
     };
-    NR.fetch_add(1, Ordering::Relaxed);
     let l2 = leitung.clone();
     std::thread::spawn(move || sendefaden(l2, sock));
 
-    Z.force_key.store(true, Ordering::Relaxed);
-    Z.wait_key.store(true, Ordering::Relaxed);
     // Zeigerform und Tonformat gehen dem neuen Zuschauer erneut zu.
     super::zeiger::neu_senden();
     super::ton::info_zuruecksetzen();
     settings_senden();
     send_small(MSG_CODECS, &encoder::codecs_payload());
     log(format!("Zuschauer verbunden: {ip}:{port}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}"));
-    // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten. Sein
-    // Sendefaden gibt beim Schlusswort nach FRIST_SCHLUSSWORT auf - steckt
-    // er noch in einem aelteren write, wird hier gekappt.
+    // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten: solange
+    // er abnimmt (Rest des laufenden Pakets, dann das Schlusswort), sonst
+    // wird seine Bildleitung gekappt.
     if let Some(alt) = alt {
         alt.abloesung_abschliessen(FRIST_SCHLUSSWORT * 2);
     }
@@ -827,9 +1027,7 @@ fn annahme_eingabe(listener: TcpListener) {
         // Prologue enthaelt dessen Pruefsumme. Wer die nicht kennt, kommt hier
         // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
         let Some(bild) = aktuell() else {
-            if melden_erlaubt(&KEIN_BILD_GEMELDET) {
-                log("Eingabekanal abgewiesen: kein Bildkanal offen");
-            }
+            DROSSEL_KEIN_BILD.melden(|| "Eingabekanal abgewiesen: kein Bildkanal offen".into());
             continue;
         };
         let Some(platz) = PLAETZE_EINGABE.belegen(absender(&stream), "Eingabekanal") else { continue };
@@ -841,13 +1039,13 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
     let mut sock = match secure::Secure::accept(stream, &noise::prologue_input(&bild.hh), PRIV.get().unwrap()) {
         Ok(s) => s,
         Err(e) => {
-            log(format!("Eingabekanal: Handschlag gescheitert ({e})"));
+            DROSSEL_HANDSCHLAG_EINGABE.melden(|| format!("Eingabekanal: Handschlag gescheitert ({e})"));
             return;
         }
     };
     drop(platz);
     if sock.peer != bild.peer {
-        log("Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+        DROSSEL_EINGABE_ABGEWIESEN.melden(|| "Eingabekanal abgewiesen: andere Gegenstelle als beim Bild".into());
         return;
     }
     // Erst jetzt an den Zuschauer binden - und nur, wenn er noch der
@@ -856,11 +1054,11 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
     let nr = EINGABE_NR.fetch_add(1, Ordering::Relaxed);
     let einspeisen = sperre(&EINSPEISEN);
     let Some(griff) = sock.abbruchgriff() else {
-        log("Eingabekanal abgewiesen: Leitung nicht zu fassen");
+        DROSSEL_EINGABE_ABGEWIESEN.melden(|| "Eingabekanal abgewiesen: Leitung nicht zu fassen".into());
         return;
     };
     if !bild.eingabe_binden(nr, griff) {
-        log("Eingabekanal abgewiesen: Zuschauer inzwischen gewechselt");
+        DROSSEL_EINGABE_ABGEWIESEN.melden(|| "Eingabekanal abgewiesen: Zuschauer inzwischen gewechselt".into());
         return;
     }
     drop(einspeisen);
@@ -1158,29 +1356,124 @@ mod tests {
         Arc::new(Leitung::neu(h.abbruchgriff(), h.peer.clone(), h.handshake_hash.clone(), "127.0.0.1".into()))
     }
 
-    /// Beim Abloesen wird verworfen, was noch wartet: beim alten Zuschauer
-    /// kommt nur MSG_ABGELOEST an, danach ist die Leitung zu, und einreihen
-    /// nimmt nichts mehr an.
-    #[test]
-    fn abloesung_verwirft_warteschlange() {
-        let (h, mut c) = paar();
-        let leitung = leitung_zu(&h);
+    /// Drei Zeitantworten 0x11, 0x22, 0x33 fuer die Abloesungs-Tests.
+    fn drei_zeitantworten(leitung: &Leitung) {
         for t in [0x11u64, 0x22, 0x33] {
             let mut p = kopf(MSG_TIME, 0, 0, 16).to_vec();
             p.extend_from_slice(&t.to_le_bytes());
             p.extend_from_slice(&[0u8; 8]);
-            assert!(leitung.einreihen(p, None).is_ok());
+            assert!(leitung.einreihen(p, Art::Klein, None).is_ok());
         }
+    }
+
+    /// Liest einen Kopf: (Typ, Laenge).
+    fn kopf_lesen(c: &mut secure::Secure) -> (u8, usize) {
+        let mut hdr = [0u8; 8];
+        c.read_exact(&mut hdr).unwrap();
+        (hdr[0], u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize)
+    }
+
+    /// Beim Abloesen wird verworfen, was noch wartet: hat der Sendefaden
+    /// schon geschrieben, kommt beim alten Zuschauer nur MSG_ABGELOEST an,
+    /// danach ist die Leitung zu, und einreihen nimmt nichts mehr an.
+    #[test]
+    fn abloesung_verwirft_warteschlange() {
+        let (h, mut c) = paar();
+        let leitung = leitung_zu(&h);
+        // Als haette der Sendefaden die Begruessung schon abgeliefert.
+        sperre(&leitung.q).geschrieben = 20;
+        drei_zeitantworten(&leitung);
         leitung.abloesen();
-        assert_eq!(leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), None), Err(Abgewiesen::Zu));
+        assert_eq!(leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), Art::Klein, None), Err(Abgewiesen::Zu));
         let l2 = leitung.clone();
         std::thread::spawn(move || sendefaden(l2, h));
         assert!(leitung.abloesung_abschliessen(Duration::from_secs(2)));
         c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut hdr = [0u8; 8];
-        c.read_exact(&mut hdr).unwrap();
-        assert_eq!((hdr[0], u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]])), (MSG_ABGELOEST, 0));
+        assert_eq!(kopf_lesen(&mut c), (MSG_ABGELOEST, 0));
         assert!(c.read_exact(&mut [0u8; 1]).is_err());
+    }
+
+    /// Wird ein Zuschauer abgeloest, bevor sein Sendefaden das erste Paket
+    /// genommen hat (zwei Clients verbinden fast gleichzeitig), geht die
+    /// Begruessung noch hinaus - und erst dann MSG_ABGELOEST. Sonst laese der
+    /// Client [10,0,0,0] als MAGIC, meldete ein fremdes Protokoll und
+    /// verbaende sich neu. Alles danach bleibt verworfen.
+    #[test]
+    fn abloesung_vor_dem_ersten_write_behaelt_begruessung() {
+        let (h, mut c) = paar();
+        let leitung = leitung_zu(&h);
+        let mut hello = MAGIC.to_vec();
+        hello.extend_from_slice(&kopf(MSG_INFO, 0, 0, 8));
+        hello.extend_from_slice(&[7u8; 8]);
+        assert!(leitung.einreihen(hello, Art::Klein, None).is_ok());
+        drei_zeitantworten(&leitung);
+        leitung.abloesen();
+        {
+            let q = sperre(&leitung.q);
+            assert_eq!((q.bytes, q.ton, q.klein, q.pakete.len()), (0, 0, 0, 0), "Buchfuehrung nach dem Abloesen");
+        }
+        let l2 = leitung.clone();
+        std::thread::spawn(move || sendefaden(l2, h));
+        assert!(leitung.abloesung_abschliessen(Duration::from_secs(2)));
+        c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut magic = [0u8; 4];
+        c.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, MAGIC);
+        assert_eq!(kopf_lesen(&mut c), (MSG_INFO, 8));
+        let mut info = [0u8; 8];
+        c.read_exact(&mut info).unwrap();
+        assert_eq!(info, [7u8; 8]);
+        // Direkt danach das Schlusswort - keine der drei Zeitantworten.
+        assert_eq!(kopf_lesen(&mut c), (MSG_ABGELOEST, 0));
+        assert!(c.read_exact(&mut [0u8; 1]).is_err());
+    }
+
+    /// Ein abgeloester Zuschauer, der langsam, aber stetig abnimmt, bekommt
+    /// den Rest des laufenden Pakets und danach MSG_ABGELOEST - auch wenn das
+    /// laenger dauert als die Frist ohne Fortschritt. Gekappt wurde er bis
+    /// dahin nach 2 s: der Client sah einen Abbruch statt der Abloesung,
+    /// verband sich neu und verdraengte den Neuen.
+    #[test]
+    fn langsamer_abgeloester_bekommt_rest_und_schlusswort() {
+        let (h, mut c) = paar();
+        sendepuffer_setzen(h.socket());
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let sender = std::thread::spawn(move || sendefaden(l2, h));
+        // Ein Paket von 4 MB (Vollbild oder grosse Zwischenablage).
+        let n = 4 << 20;
+        let mut p = kopf(MSG_CLIP, 0, 0, n).to_vec();
+        p.resize(8 + n, b'x');
+        assert!(leitung.einreihen(p, Art::Klein, None).is_ok());
+        // Der Client liest 64 kB alle 60 ms (rund 1 MB/s).
+        let leser = std::thread::spawn(move || -> Result<(), String> {
+            c.socket().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let (typ, len) = kopf_lesen(&mut c);
+            if (typ, len) != (MSG_CLIP, n) {
+                return Err(format!("erst {typ}/{len} statt der Zwischenablage"));
+            }
+            let mut puffer = vec![0u8; 64 * 1024];
+            let mut rest = len;
+            while rest > 0 {
+                let k = rest.min(puffer.len());
+                c.read_exact(&mut puffer[..k])?;
+                rest -= k;
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            bis_abloesung(&mut c)
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let t0 = Instant::now();
+        leitung.abloesen();
+        let durch = leitung.abloesung_abschliessen(FRIST_SCHLUSSWORT * 2);
+        let dauer = t0.elapsed();
+        println!("Abloesung eines langsamen Zuschauers nach {dauer:?} abgeschlossen: {durch}");
+        assert!(durch, "Sendefaden nicht durch - Bildleitung gekappt");
+        // Sonst haette schon die alte feste Frist gereicht: Probe ohne Wert.
+        assert!(dauer > FRIST_SCHLUSSWORT * 2, "{dauer:?}");
+        assert!(dauer < ABLOESUNG_HOECHSTENS, "{dauer:?}");
+        assert_eq!(endet_binnen(leser, Duration::from_secs(10)), Some(Ok(())));
+        assert!(endet_binnen(sender, Duration::from_secs(5)).is_some());
     }
 
     /// Ein abgeloester Zuschauer, der nichts mehr abnimmt (eingefroren): der
@@ -1195,7 +1488,7 @@ mod tests {
         let faden = std::thread::spawn(move || sendefaden(l2, h));
         // Weit mehr, als beide Kernelpuffer fassen: 16 MB, der Client liest nie.
         for _ in 0..16 {
-            assert!(leitung.einreihen(vec![0u8; 1 << 20], None).is_ok());
+            assert!(leitung.einreihen(vec![0u8; 1 << 20], Art::Bild, None).is_ok());
         }
         std::thread::sleep(Duration::from_millis(500));
         assert!(sperre(&leitung.q).bytes > 0, "Sendefaden haengt nicht - Probe ohne Wert");
@@ -1295,10 +1588,26 @@ mod tests {
         drop(stumm);
         zeitfrage(&mut a_ein, 0xA1).unwrap();
         assert_eq!(zeitantwort(&mut a), Ok(0xA1));
+        // A hat das Testbild eingeschaltet (Nachricht 68).
+        zeitfrage(&mut a_ein, 0xA3).unwrap();
+        let mut m = kopf(IN_TESTBILD, 0, 0, 1).to_vec();
+        m.push(1);
+        a_ein.write_all(&m).unwrap();
+        zeitfrage(&mut a_ein, 0xA4).unwrap();
+        assert_eq!(zeitantwort(&mut a), Ok(0xA3));
+        assert_eq!(zeitantwort(&mut a), Ok(0xA4));
+        assert!(Z.testbild.load(Ordering::Relaxed), "Testbild von A nicht angekommen");
+        let nr_a = zuschauer_nr();
 
         // Zuschauer B loest A ab: A verliert Bild UND Eingabe - und bekommt
         // als letzte Nachricht MSG_ABGELOEST, damit er nicht zurueckkommt.
         let mut b = bild_verbinden(&bild_addr);
+        // Ohne Luecke: ein Zuschauer ist durchgehend da, aber die Nummer ist
+        // eine neue - daran erkennen Aufnahme und Ton den Wechsel. Das
+        // Testbild von A gilt fuer B nicht.
+        assert!(zuschauer_da());
+        assert_eq!(zuschauer_nr(), nr_a + 1);
+        assert!(!Z.testbild.load(Ordering::Relaxed), "Testbild von A ueberlebt die Abloesung");
         a_ein.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let t0 = Instant::now();
@@ -1360,6 +1669,40 @@ mod tests {
         assert!(P.belegen(ip(100), "Test").is_some());
     }
 
+    /// Protokoll-Flut (Integrationstest: 300 Muell-Verbindungen in 0,1 s
+    /// ergaben 300 Zeilen): je Art hoechstens eine Zeile alle zehn Sekunden,
+    /// die naechste nennt die Zahl der unterdrueckten. Der Text einer
+    /// unterdrueckten Zeile wird gar nicht erst gebaut.
+    #[test]
+    fn drossel_laesst_eine_zeile_je_art_durch_und_zaehlt_den_rest() {
+        static D: Drossel = Drossel::neu();
+        static ANDERE: Drossel = Drossel::neu();
+        assert_eq!(D.melden(|| "Handschlag mit 10.0.0.1 gescheitert".into()).as_deref(), Some("Handschlag mit 10.0.0.1 gescheitert"));
+        let mut gebaut = false;
+        assert_eq!(
+            D.melden(|| {
+                gebaut = true;
+                String::new()
+            }),
+            None
+        );
+        assert!(!gebaut, "Text einer unterdrueckten Zeile gebaut");
+        for _ in 0..298 {
+            assert_eq!(D.melden(|| "x".into()), None);
+        }
+        // Eine andere Art hat ihre eigene Drossel.
+        assert!(ANDERE.melden(|| "Abgewiesen: unbekannte Gegenstelle".into()).is_some());
+        // Zehn Sekunden spaeter: eine Zeile, samt Zahl der unterdrueckten.
+        *sperre(&D.letzte) = Instant::now().checked_sub(Duration::from_secs(11));
+        assert_eq!(
+            D.melden(|| "Handschlag mit 10.0.0.2 gescheitert".into()).as_deref(),
+            Some("Handschlag mit 10.0.0.2 gescheitert (und 299 weitere seit der letzten Meldung)")
+        );
+        assert_eq!(D.melden(|| "x".into()), None);
+        *sperre(&D.letzte) = Instant::now().checked_sub(Duration::from_secs(11));
+        assert_eq!(D.melden(|| "wieder".into()).as_deref(), Some("wieder (und 1 weitere seit der letzten Meldung)"));
+    }
+
     /// Die Stauregel als reine Entscheidung: im Budget codieren, darueber
     /// auslassen; ohne Fortschritt ist der Zuschauer nach STAU_FRIST_US weg,
     /// jeder Fortschritt (auch bei wachsendem Rueckstand) startet die Frist
@@ -1402,24 +1745,176 @@ mod tests {
     #[test]
     fn codiertes_bild_geht_bis_zur_harten_grenze_hinaus() {
         let l = Leitung::neu(None, Vec::new(), Vec::new(), String::new());
-        assert_eq!(l.einreihen(vec![0u8; HARTE_GRENZE + 1], Some(HARTE_GRENZE)), Ok(()));
-        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Err(Abgewiesen::Voll));
-        assert_eq!(l.einreihen(vec![0u8; 8], None), Ok(()), "kleine Nachrichten gehen vorbei");
+        assert_eq!(l.einreihen(vec![0u8; HARTE_GRENZE + 1], Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+        assert_eq!(l.einreihen(vec![0u8; 1], Art::Bild, Some(HARTE_GRENZE)), Err(Abgewiesen::Voll));
+        assert_eq!(l.einreihen(vec![0u8; 8], Art::Klein, Some(KLEIN_GRENZE)), Ok(()), "kleine Nachrichten gehen vorbei");
         {
             let mut q = sperre(&l.q);
-            q.pakete.clear();
-            q.bytes = 0;
+            q.leeren();
             q.im_schreiben = HARTE_GRENZE;
         }
-        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Ok(()));
-        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Err(Abgewiesen::Voll));
+        assert_eq!(l.einreihen(vec![0u8; 1], Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+        assert_eq!(l.einreihen(vec![0u8; 1], Art::Bild, Some(HARTE_GRENZE)), Err(Abgewiesen::Voll));
         // Stau ohne Fortschritt ueber die Frist: weg und geschlossen.
         assert_eq!(l.stau(BACKLOG_LIMIT, 1_000), Stauurteil::Stau);
         assert!(l.offen());
         assert_eq!(l.stau(BACKLOG_LIMIT, 1_000 + STAU_FRIST_US), Stauurteil::Weg);
         assert!(!l.offen());
         assert_eq!(l.stau(0, 2 * STAU_FRIST_US), Stauurteil::Frei, "ein geschlossener Zuschauer staut nichts mehr");
-        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Err(Abgewiesen::Zu));
+        assert_eq!(l.einreihen(vec![0u8; 1], Art::Bild, Some(HARTE_GRENZE)), Err(Abgewiesen::Zu));
+    }
+
+    /// Eine Nachricht aus send_small, wie sie in die Warteschlange geht.
+    fn nachricht(typ: u8, n: usize) -> Vec<u8> {
+        let mut p = kopf(typ, 0, 0, n).to_vec();
+        p.resize(8 + n, 0);
+        p
+    }
+
+    /// 10 ms Ton: 480 Rahmen float32 Stereo.
+    const TONPAKET: usize = 480 * 2 * 4;
+
+    /// Ton hat seine eigene Grenze, gemessen am wartenden Ton: ein grosses
+    /// Vollbild davor laesst ihn nicht ausfallen, und mehr als ton_grenze
+    /// kommt nie hinein - Bilder gehen dann weiter durch die Stauregel.
+    /// Nimmt der Zuschauer nichts mehr ab und laeuft nur noch Ton, ist er
+    /// nach der Frist trotzdem weg.
+    #[test]
+    fn ton_hat_eigene_grenze_unter_dem_budget() {
+        for gaming in [false, true] {
+            let l = Leitung::neu(None, Vec::new(), Vec::new(), String::new());
+            let (mut angenommen, mut verworfen) = (0usize, 0usize);
+            for _ in 0..2000 {
+                match l.klein_senden(MSG_AUDIO, nachricht(MSG_AUDIO, TONPAKET), gaming, 1_000) {
+                    Ok(()) => angenommen += 1,
+                    Err(Abgewiesen::Voll) => verworfen += 1,
+                    Err(Abgewiesen::Zu) => panic!("Zuschauer ohne Frist ausgetragen"),
+                }
+            }
+            {
+                let q = sperre(&l.q);
+                assert!(q.ton <= ton_grenze(gaming) + 8 + TONPAKET, "{} Byte Ton", q.ton);
+                assert_eq!(q.ton, q.bytes);
+            }
+            assert!(angenommen * (8 + TONPAKET) > ton_grenze(gaming), "{angenommen}");
+            assert!(verworfen > 0);
+            // Der Ton allein haelt kein Bild auf.
+            assert_eq!(l.stau(budget(gaming), 1_000), Stauurteil::Frei, "gaming {gaming}");
+            // Eingefroren, Bild still, nur Ton: der naechste Ton beginnt die
+            // Frist, nach ihr ist der Zuschauer weg.
+            assert_eq!(l.klein_senden(MSG_AUDIO, nachricht(MSG_AUDIO, TONPAKET), gaming, 2_000), Err(Abgewiesen::Voll));
+            assert!(l.offen());
+            assert_eq!(l.klein_senden(MSG_AUDIO, nachricht(MSG_AUDIO, TONPAKET), gaming, 2_000 + STAU_FRIST_US), Err(Abgewiesen::Voll));
+            assert!(!l.offen(), "gaming {gaming}: eingefrorener Zuschauer bleibt eingetragen");
+        }
+        // Ein wartendes Vollbild von 3 MB zaehlt fuer den Ton nicht mit.
+        let l = Leitung::neu(None, Vec::new(), Vec::new(), String::new());
+        assert_eq!(l.einreihen(vec![0u8; 3 << 20], Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+        assert_eq!(l.klein_senden(MSG_AUDIO, nachricht(MSG_AUDIO, TONPAKET), true, 1_000), Ok(()));
+    }
+
+    /// Steuernachrichten fallen nie weg; wer ueber KLEIN_GRENZE davon nicht
+    /// abnimmt, ist weg. Ein grosses Bild im Rueckstand zaehlt dafuer nicht.
+    #[test]
+    fn steuernachrichten_bis_zur_grenze_dann_weg() {
+        let l = Leitung::neu(None, Vec::new(), Vec::new(), String::new());
+        assert_eq!(l.einreihen(vec![0u8; 6 << 20], Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+        assert_eq!(l.klein_senden(MSG_LAST, nachricht(MSG_LAST, 28), false, 1_000), Ok(()));
+        let zwischenablage = KLEIN_GRENZE / 8;
+        for i in 0..7 {
+            assert_eq!(l.klein_senden(MSG_CLIP, nachricht(MSG_CLIP, zwischenablage), false, 1_000), Ok(()), "{i}");
+        }
+        assert!(l.offen());
+        // Eine darf die Grenze um sich selbst ueberschreiten, dann ist Schluss.
+        assert_eq!(l.klein_senden(MSG_CLIP, nachricht(MSG_CLIP, zwischenablage), false, 1_000), Ok(()));
+        assert_eq!(l.klein_senden(MSG_TIME, nachricht(MSG_TIME, 16), false, 1_000), Err(Abgewiesen::Voll));
+        assert!(!l.offen());
+        assert_eq!(l.klein_senden(MSG_TIME, nachricht(MSG_TIME, 16), false, 1_000), Err(Abgewiesen::Zu));
+    }
+
+    /// Pruefstand fuer den Ton: eine Leitung mit 1 Mbit/s, weit unter der
+    /// Tonrate (3 Mbit/s), Spielmodus. Ton kommt alle 10 ms, dazu Bilder mit
+    /// 30 fps durch die Stauregel. Ohne Grenze fuer den Ton lag der
+    /// Rueckstand nach rund 2 s dauerhaft ueber dem Budget - kein Bild kam
+    /// mehr durch, und die Warteschlange wuchs ohne Ende. Jetzt: der Ton
+    /// bleibt unter seiner Grenze, Bilder gehen auch in der zweiten Haelfte
+    /// hinein, und der lebende Zuschauer wird nicht ausgetragen.
+    #[test]
+    fn ton_auf_zu_langsamer_leitung_sperrt_das_bild_nicht() {
+        let (h, mut c) = paar();
+        sendepuffer_setzen(h.socket());
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let sender = std::thread::spawn(move || sendefaden(l2, h));
+        let leser = std::thread::spawn(move || {
+            c.socket().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let t0 = Instant::now();
+            let mut gelesen = 0u64;
+            let mut puffer = vec![0u8; SCHREIBSTUECK];
+            let (mut bilder, mut ton) = (0u32, 0u32);
+            loop {
+                let mut hdr = [0u8; 8];
+                if gedrosselt_lesen(&mut c, 8, 1, t0, &mut gelesen, &mut hdr).is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                if gedrosselt_lesen(&mut c, len, 1, t0, &mut gelesen, &mut puffer).is_err() {
+                    break;
+                }
+                match hdr[0] {
+                    MSG_VIDEO => bilder += 1,
+                    MSG_AUDIO => ton += 1,
+                    _ => {}
+                }
+            }
+            (bilder, ton)
+        });
+        let dauer = Duration::from_secs(6);
+        let (mut codiert_zweite_haelfte, mut ausgelassen, mut ton_verworfen) = (0u32, 0u32, 0u32);
+        let (mut hoechster_ton, mut hoechster_rueckstand) = (0usize, 0usize);
+        let t0 = Instant::now();
+        let mut i = 0u32;
+        while t0.elapsed() < dauer {
+            if let Some(w) = (t0 + Duration::from_millis(10) * i).checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+            match leitung.klein_senden(MSG_AUDIO, nachricht(MSG_AUDIO, TONPAKET), true, now_us()) {
+                Ok(()) => {}
+                Err(Abgewiesen::Voll) => ton_verworfen += 1,
+                Err(Abgewiesen::Zu) => panic!("lebender Zuschauer ausgetragen"),
+            }
+            if i % 3 == 0 {
+                match leitung.stau(budget(true), now_us()) {
+                    Stauurteil::Frei => {
+                        assert_eq!(leitung.einreihen(nachricht(MSG_VIDEO, 4000), Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+                        if t0.elapsed() > dauer / 2 {
+                            codiert_zweite_haelfte += 1;
+                        }
+                    }
+                    Stauurteil::Stau => ausgelassen += 1,
+                    Stauurteil::Weg => panic!("lebender Zuschauer ausgetragen"),
+                }
+            }
+            {
+                let q = sperre(&leitung.q);
+                hoechster_ton = hoechster_ton.max(q.ton);
+                hoechster_rueckstand = hoechster_rueckstand.max(q.bytes + q.im_schreiben);
+            }
+            i += 1;
+        }
+        leitung.schliessen();
+        let (bilder, ton) = endet_binnen(leser, Duration::from_secs(15)).expect("Gegenstelle endet nicht");
+        assert!(endet_binnen(sender, Duration::from_secs(5)).is_some(), "Sendefaden endet nicht");
+        println!(
+            "Ton auf 1 Mbit/s: Bilder in der zweiten Haelfte {codiert_zweite_haelfte}, ausgelassen {ausgelassen}, Ton verworfen {ton_verworfen}, \
+             hoechster Ton {hoechster_ton}, hoechster Rueckstand {hoechster_rueckstand}, empfangen {bilder} Bilder und {ton} Tonpakete"
+        );
+        assert!(ton_verworfen > 0, "Leitung nicht zu langsam - Probe ohne Wert");
+        assert!(hoechster_ton <= ton_grenze(true) + 8 + TONPAKET, "{hoechster_ton}");
+        // Bilder bis zum Budget, der Ton daneben bis zu seiner Grenze.
+        assert!(hoechster_rueckstand <= budget(true) + ton_grenze(true) + 2 * (8 + TONPAKET) + 8 + 4000, "{hoechster_rueckstand}");
+        assert!(codiert_zweite_haelfte >= 5, "Bild in der zweiten Haelfte gesperrt: {codiert_zweite_haelfte}");
+        assert!(bilder > 0 && ton > 0);
     }
 
     /// Ergebnis eines Laufs im Pruefstand.
@@ -1557,9 +2052,9 @@ mod tests {
             lauf.codiert += 1;
             let r = if alte_stelle {
                 let voll = sperre(&leitung.q).bytes + SNDBUF > grenze;
-                if voll { Err(Abgewiesen::Voll) } else { leitung.einreihen(p, None) }
+                if voll { Err(Abgewiesen::Voll) } else { leitung.einreihen(p, Art::Bild, None) }
             } else {
-                leitung.einreihen(p, Some(HARTE_GRENZE))
+                leitung.einreihen(p, Art::Bild, Some(HARTE_GRENZE))
             };
             match r {
                 Ok(()) => {}
@@ -1573,7 +2068,7 @@ mod tests {
         if lauf.weg_nach.is_none() {
             // Ende des Laufs: die Gegenstelle liest, was noch kommt, bis zum
             // Schlusszeichen; dann ist die Leitung zu.
-            let _ = leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), None);
+            let _ = leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), Art::Klein, None);
         }
         let _ = halt_tx.send(());
         let (empfangen, vollbilder) = endet_binnen(leser, Duration::from_secs(15)).expect("Gegenstelle endet nicht");
