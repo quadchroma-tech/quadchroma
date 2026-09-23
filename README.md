@@ -199,9 +199,11 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Skalierung, an gedrehten Ausgängen und Handhelds mit hochkantem Panel und mit
   echtem Tongerät; die Stauregel beider Hosts auf einer echten, zu langsamen Leitung
   (auch unter der Tonrate) und im Spielmodus bei hoher Datenrate; am laufenden
-  Mac-Host (am Gerät bisher nur der Codecwechsel mit Formatwechsel bei stillem
-  Bildschirm) der Zuschauerwechsel mit Nachricht 10, das Nachreichen bei stillem
-  Bildschirm, Tonformat mit 44,1 kHz, Ablageverwalter, beschädigte Freigabeliste;
+  Mac-Host (dort geprüft: Bild, Eingabekanal, Ton und die Umrechnung nach einem
+  Codecwechsel mit Formatwechsel, alles mit fester Bildrate) der Codecwechsel bei
+  wirklich stillem Bildschirm, der Zuschauerwechsel mit Nachricht 10, das Nachreichen
+  bei stillem Bildschirm, Tonformat mit 44,1 kHz, Ablageverwalter, beschädigte
+  Freigabeliste;
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
   Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern

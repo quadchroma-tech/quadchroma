@@ -336,8 +336,8 @@ Encoder weg und kam eine Bildzeit lang kein neueres, geht es doch noch in
 den Encoder - endet eine Bewegung so, steht beim Zuschauer trotzdem das
 Endbild (beim Software-Encoder h264_mf schiebt der Windows-Host dafuer
 nach, bis es heraus ist, siehe dort). Im Stau wartet es, bis die Leitung
-wieder frei ist. Der Mac-Host
-misst die Bildzeit ab der Ankunft des letzten Bildes und zaehlt es in der
+wieder frei ist. Beide Hosts messen die Bildzeit ab der Ankunft des
+letzten Bildes, nicht ab seiner Aufnahme. Der Mac-Host zaehlt es in der
 Fuenf-Sekunden-Zeile als "nachgereicht"; der Windows-Host zaehlt es unter
 "nachgelegt", ohne eigene Zeile. Nachgereichte Bilder zaehlen nicht zur
 gemessenen Verzoegerung.
