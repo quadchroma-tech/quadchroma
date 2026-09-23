@@ -363,13 +363,24 @@ static void hoststatus_senden(uint8_t lage) {
 static _Atomic int g_audio_info_sent = 0;
 static _Atomic long g_audio_packets = 0;
 static _Atomic long long g_audio_bytes = 0;
+// Was zuletzt angesagt wurde. Nur im Ton-Rueckruf angefasst, und der laeuft
+// auf der seriellen Ton-Warteschlange.
+static uint32_t g_audio_info_rate = 0;
+static uint8_t g_audio_info_ch = 0;
 
 static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t channels) {
     if (atomic_load(&g_client_fd) < 0) return;
     // Ton abgeschaltet: nichts auf die Leitung. Die Formatansage bleibt
     // fuer das erste Paket nach dem Wiedereinschalten liegen.
     if (!atomic_load(&g_cur_ton)) return;
-    if (!atomic_exchange(&g_audio_info_sent, 1)) {
+    // Angesagt wird fuer jeden neuen Zuschauer und immer dann, wenn
+    // ScreenCaptureKit Rate oder Kanalzahl wechselt - sonst rechnete der
+    // Client mit der alten Rate um, und der Ton klaenge zu hoch oder zu tief.
+    int neu = !atomic_exchange(&g_audio_info_sent, 1);
+    if (neu || rate != g_audio_info_rate || channels != g_audio_info_ch) {
+        if (!neu) logf_(@"Tonformat gewechselt: %u Hz, %u Kanaele - neu angesagt", rate, (unsigned)channels);
+        g_audio_info_rate = rate;
+        g_audio_info_ch = channels;
         uint8_t info[8] = {0};
         memcpy(info, &rate, 4);
         info[4] = channels;
