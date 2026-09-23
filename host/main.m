@@ -167,6 +167,14 @@ static _Atomic long g_enc_stau = 0;          // verworfen, weil der Encoder noch
 static dispatch_queue_t g_capq = NULL;
 static dispatch_source_t g_tick = NULL;
 
+// g_stream gehoert der Lebenslauf-Warteschlange (g_lifeq): nur von dort wird
+// er gesetzt und ausgetragen, nacheinander mit Auf- und Abbau. Geschrieben
+// wird er dabei auf der Aufnahmewarteschlange, weil Codecwechsel und
+// Einstellungen ihn dort lesen - so sieht keiner einen halb getauschten Strom.
+static void stream_setzen(SCStream *st) {
+    dispatch_sync(g_capq, ^{ g_stream = st; });
+}
+
 static const char *QC_PRO_VIDEO = "QuadChroma/1 video Noise_XX_25519_ChaChaPoly_SHA256";
 static const char *QC_PRO_INPUT = "QuadChroma/1 input Noise_XX_25519_ChaChaPoly_SHA256";
 
@@ -1912,20 +1920,29 @@ static void fixed_tick(void) {
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     logf_(@"Aufnahme gestoppt: %@ (Code %ld)", error.localizedDescription, (long)error.code);
-    // Ohne Aufnahme darf der Takt nicht weiterlaufen, sonst sendet der Host
-    // bis in alle Ewigkeit dasselbe eingefrorene Bild.
-    atomic_store(&g_cur_fixed, 0);
-    dispatch_async(g_capq ?: dispatch_get_main_queue(), ^{
-        if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
-    });
-    // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
-    g_stream = nil;
-    // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
-    if (atomic_load(&g_client_fd) < 0) return;
-    hoststatus_senden(1);
-    // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        aufnahme_wiederherstellen();
+    // Ohne Lebenslauf-Warteschlange (Pruefmodus --formattest) gibt es keinen
+    // eingetragenen Strom und nichts wiederherzustellen.
+    if (!g_lifeq) return;
+    // Austragen auf der Lebenslauf-Warteschlange, der g_stream gehoert - und
+    // nur, wenn es der laufende Strom ist: der spaete Bescheid eines alten
+    // darf einen inzwischen neu gestarteten nicht austragen.
+    dispatch_async(g_lifeq, ^{
+        if (stream != g_stream) return;
+        // Ohne Aufnahme darf der Takt nicht weiterlaufen, sonst sendet der Host
+        // bis in alle Ewigkeit dasselbe eingefrorene Bild.
+        atomic_store(&g_cur_fixed, 0);
+        dispatch_sync(g_capq, ^{
+            if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
+        });
+        // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
+        stream_setzen(nil);
+        // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
+        if (atomic_load(&g_client_fd) < 0) return;
+        hoststatus_senden(1);
+        // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            aufnahme_wiederherstellen();
+        });
     });
 }
 
@@ -2028,6 +2045,9 @@ static void aufnahme_wiederherstellen(void) {
     // anhalten - und kein Abbau darf dazwischenfunken.
     dispatch_async(g_lifeq ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (g_stream) return;
+        // Hier noch einmal: zwischen der Pruefung oben und diesem Block kann
+        // der Zuschauer gegangen und sein Abbau schon gelaufen sein.
+        if (atomic_load(&g_client_fd) < 0) return;
         size_t pw = 0, ph = 0; double hz = 0;
         SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
         if (!d) {
@@ -2055,21 +2075,48 @@ static void aufnahme_wiederherstellen(void) {
             return;
         }
         qc_audio_attach(st, audio_cb);
+        // Auf den Start hier warten, auf der Lebenslauf-Warteschlange, statt
+        // den Strom im Rueckruf einzutragen: dort lief das an Auf- und Abbau
+        // vorbei. Ein Abbau saehe keinen Strom und liesse ihn ohne Zuschauer
+        // laufen; ein neuer Zuschauer baute einen zweiten auf - zwei Stroeme
+        // am selben Tonabgriff, doppelter Ton.
+        __block BOOL gestartet = NO;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [st startCaptureWithCompletionHandler:^(NSError *e) {
-            if (e) {
-                logf_(@"Aufnahme: Start misslungen (%@, Code %ld), neuer Versuch", e.localizedDescription, (long)e.code);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                    aufnahme_wiederherstellen();
-                });
-                return;
-            }
-            g_stream = st;
-            atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
-            atomic_store(&g_force_key, 1);
-            atomic_store(&g_wait_key, 1);
-            hoststatus_senden(0);
-            logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
+            if (e) logf_(@"Aufnahme: Start misslungen (%@, Code %ld), neuer Versuch", e.localizedDescription, (long)e.code);
+            else gestartet = YES;
+            dispatch_semaphore_signal(sem);
         }];
+        BOOL laeuft = NO;
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
+            // Kommt der Start doch noch, darf dieser Strom nicht neben dem
+            // naechsten Versuch weiterlaufen.
+            logf_(@"Aufnahme: Start meldet sich nicht, neuer Versuch");
+            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
+        } else {
+            laeuft = gestartet;          // nach dem Signal gelesen, also fertig geschrieben
+        }
+        if (!laeuft) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                aufnahme_wiederherstellen();
+            });
+            return;
+        }
+        // Waehrend des Starts gegangen: sein Abbau ist schon durch oder steht
+        // hinter uns an und kennt diesen Strom nicht - also selbst anhalten.
+        if (atomic_load(&g_client_fd) < 0) {
+            dispatch_semaphore_t halt = dispatch_semaphore_create(0);
+            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; dispatch_semaphore_signal(halt); }];
+            dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+            logf_(@"Aufnahme nicht wiederhergestellt: kein Zuschauer mehr");
+            return;
+        }
+        stream_setzen(st);
+        atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
+        atomic_store(&g_force_key, 1);
+        atomic_store(&g_wait_key, 1);
+        hoststatus_senden(0);
+        logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
     });
 }
 
@@ -2112,10 +2159,16 @@ static BOOL stream_hochfahren_sync(void) {
             else gestartet = YES;
             dispatch_semaphore_signal(sem);
         }];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
+            // Kaeme der Start doch noch, liefe dieser Strom unbemerkt neben
+            // dem naechsten - mit Ton am selben Abgriff.
+            logf_(@"Aufnahme: Start meldet sich nicht");
+            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
+            return;
+        }
         if (!gestartet) return;
 
-        g_stream = st;
+        stream_setzen(st);
         atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
         atomic_store(&g_force_key, 1);
         atomic_store(&g_wait_key, 1);
@@ -2140,7 +2193,7 @@ static void stream_herunterfahren_anstossen(void) {
         if (!g_stream && !g_session) return;
         if (g_stream) {
             SCStream *st = g_stream;
-            g_stream = nil;
+            stream_setzen(nil);
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [st stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(sem); }];
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
