@@ -23,19 +23,91 @@ Seiten legen beim ersten Start einen eigenen dauerhaften Schluessel an und
 erkennen sich danach daran wieder.
 
 Damit nicht jeder im Netz zugreifen kann, muss das Geraet einmal freigegeben
-werden. Beim allerersten Mal passiert das von selbst: der Host nimmt die erste
-Gegenstelle auf, die sich meldet. Danach ist zu: jedes weitere neue Geraet
-braucht einen Host, der mit --pair gestartet wurde.
+werden. Beim allerersten Mal passiert das von selbst: solange der Host noch
+keine Freigabeliste (authorized.txt) hat, nimmt er die erste Gegenstelle
+auf, die sich meldet - der Mac-Host auch bei einer leeren Datei mit 0 Byte.
+Danach ist zu: jedes weitere neue Geraet braucht einen Host, der mit --pair
+gestartet wurde.
 
     open -n build/QuadChroma.app --args --serve 9001 --pair
 
-Im Log des Hosts steht dann ein sechsstelliger Vergleichscode, zum Beispiel
-"628 306". Denselben Code zeigt der Client mit F9 an. Stimmen beide ueberein,
-sitzt niemand dazwischen. Stimmen sie nicht ueberein, Verbindung trennen.
+Im Log des Hosts (/tmp/quadchroma-m1.log) steht dann ein sechsstelliger
+Vergleichscode, zum Beispiel "628 306". Denselben Code zeigt der Client mit
+F9 an. Stimmen beide ueberein, sitzt niemand dazwischen. Stimmen sie nicht
+ueberein, Verbindung trennen.
 
-Der Client merkt sich den Fingerabdruck des Hosts. Aendert er sich spaeter,
-verweigert der Client die Verbindung, bis der Eintrag in known_hosts.txt von
-Hand geloescht wird.
+Der Client merkt sich den Fingerabdruck des Hosts je Adresse (ohne Port).
+Aendert er sich spaeter, verweigert der Client die Verbindung, bis der
+Eintrag in known_hosts.txt von Hand geloescht wird; die Meldung nennt
+Adresse, neuen Fingerabdruck und den Pfad der Datei, in der Sprache der
+Oberflaeche. Umgekehrt ist ein Host unter einer neuen Adresse fuer den
+Client ein Erstkontakt, auch unter bekanntem Namen - dann den
+Vergleichscode pruefen.
+
+Ein Zuschauer zur Zeit: verbindet sich ein zweites gekoppeltes Geraet,
+uebernimmt es die Sitzung. Das bisherige bekommt vom Host Nachricht 10,
+zeigt im Startbildschirm "Ein anderes Geraet hat die Sitzung uebernommen."
+und verbindet sich nicht von selbst neu; mit "Verbinden" holt man die
+Sitzung zurueck. Aeltere Clients kennen die Nachricht nicht, verbinden sich
+nach 2 s neu und loesen den neuen Zuschauer wieder ab. Beim Wechsel kappt
+der Host sofort den Eingabekanal des alten Zuschauers und laesst dessen
+gedrueckte Tasten und Maustasten los. Im Log des Mac-Hosts steht
+"Bisheriger Zuschauer <Fingerabdruck> abgeloest und getrennt" (mit " - die
+Abloese-Nachricht kam nicht an", wenn der alte haengt), im Protokoll des
+alten Clients "Sitzung mit <Adresse> von einem anderen Geraet uebernommen
+(Host meldet Abloesung) - keine automatische Neuverbindung". Eine
+Gegenstelle, die ohne Abschied verschwindet (Deckel zu, WLAN weg), bemerkt
+der Mac-Host nach rund 16 s.
+
+Handschlag: jeder hat eine Gesamtfrist (Host 5 s, Client 3 s) und laeuft
+beim Host in einem eigenen Faden - wer schweigt oder troepfelt, haelt nur
+seinen eigenen Platz. Je Port gibt es 32 Plaetze. Der Mac-Host erlaubt 4
+je Adresse und laesst bei vollen Plaetzen den aeltesten laufenden
+Handschlag weichen ("Bildkanal: Andrang - ..."); der Windows-Host erlaubt
+2 je Absender und weist darueber ab ("Bildkanal: Verbindung von <IP>
+abgewiesen - schon N Handschlaege offen ..."). Am Eingabekanal (9002)
+prueft der Client, dass derselbe Host antwortet wie auf dem Bildkanal;
+sonst geht keine Taste hinaus (Protokoll: "Eingabekanal: Gegenstelle
+<Fingerabdruck> ist nicht der Host des Bildkanals - verworfen", hoechstens
+alle 10 s).
+
+Kaputte Dateien fuehren nie zu einer neuen Kopplung. Ein Schluessel
+entsteht nur, wenn seine Datei fehlt. Ist host.key oder client.key
+vorhanden, aber unlesbar oder falsch lang (Mac-Host 32 Byte, sonst 64),
+startet der Host nicht ("Schluessel host.key ist vorhanden, aber nicht
+lesbar oder beschaedigt - Abbruch. ..." bzw. auf Windows "Schluessel konnte
+nicht angelegt werden - Abbruch: ..."), und der Client verbindet nicht.
+Wer die Datei loescht, bekommt eine neue Identitaet: dann muss neu
+gekoppelt werden, und nach einer neuen host.key loeschen die Clients ihren
+Eintrag in known_hosts.txt. Ist known_hosts.txt vorhanden, aber unlesbar
+oder nicht als UTF-8 gespeichert (etwa als ANSI), verbindet der Client
+ebenfalls nicht; UTF-8 mit BOM geht. Fuer eine vorhandene authorized.txt
+gilt:
+
+    Mac       Erlaubt sind nur Zeilen mit 64 Hexziffern vorn, Leerzeilen
+              und Kommentare (#). Ist die Datei unlesbar, groesser als
+              1 MiB oder ein Verweis ins Leere, enthaelt sie Nullbytes,
+              eine andere Zeile (auch ein BOM) oder keine einzige
+              Freigabe, weist der Host JEDE Gegenstelle ab, auch bekannte
+              und auch mit --pair. Startzeile "... Freigabeliste
+              authorized.txt NICHT LESBAR ODER BESCHAEDIGT - jede
+              Gegenstelle wird abgewiesen, bis sie repariert oder mit
+              --forget geloescht ist", je Verbindung "Abgewiesen:
+              <Fingerabdruck> von <IP> - Freigabeliste authorized.txt
+              nicht lesbar oder beschaedigt".
+    Windows   Unlesbar oder kein UTF-8: jede Gegenstelle wird abgewiesen
+              ("Freigabeliste: ... - jede Gegenstelle wird abgewiesen, bis
+              die Datei repariert ist"). Ohne eine einzige gueltige Zeile
+              (leer, nur Kommentare, abgeschnitten) kommen Unbekannte nur
+              mit --pair herein ("Freigabeliste: authorized.txt ist
+              vorhanden, enthaelt aber keine gueltige Freigabe - kein
+              Erstkontakt, ..."). Andere Zeilen werden uebergangen.
+
+Abhilfe: Datei reparieren oder mit --forget loeschen. Neue Freigaben und
+neue Eintraege in known_hosts.txt werden angehaengt, vorhandene Zeilen
+bleiben unberuehrt. Laesst sich eine Freigabe nicht speichern, kommt die
+Gegenstelle nicht herein ("Abgewiesen: ... - Freigabe liess sich nicht
+speichern" auf dem Mac), und das Kopplungsfenster bleibt offen.
 
 Ablage der Schluessel:
 
@@ -60,7 +132,9 @@ aus Homebrew:
 
 Ablage: ~/Library/Application Support/QuadChroma/ (client.key,
 known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt) - derselbe
-Ordner wie beim Host, getrennte Dateien. Die Kopplung laeuft wie bei jedem
+Ordner wie beim Host, getrennte Dateien. Einen neuen Ordner legt der Client
+nur fuer den Eigentuemer an (0700), neue Schluessel und Listen mit 0600;
+Vorhandenes behaelt seine Rechte. Die Kopplung laeuft wie bei jedem
 Client: der Host muss einmal mit --pair gestartet werden.
 
 Lizenzhinweis: das FFmpeg aus Homebrew ist ein GPL-Build (libx264, libx265).
@@ -135,7 +209,9 @@ Prozessorlast im Leerlauf.
 Codecwahl: im Menue (ESC zwei Sekunden halten oder F10), Reiter "Bild", stehen
 die Codecs, die der Mac wirklich beherrscht - er fragt seinen Encoder beim Start
 selbst. Auf dem M1 sind das HEVC in 4:4:4 und 4:2:0, je 8 und 10 Bit, sowie
-H.264; AV1 kann er nicht und ist ausgegraut. Der Wechsel geschieht im laufenden
+H.264. AV1 bietet kein Host an, solange Protokoll und Client ihn nicht
+kennen; er ist ausgegraut und laeuft nicht im Benchmark, auch wenn ein
+aelterer Windows-Host ihn meldet. Der Wechsel geschieht im laufenden
 Betrieb, das Bild steht dabei fuer einen Wimpernschlag still. Zwei Modi tragen
 den Vermerk "mit Umrechnung": die Aufnahme kennt kein 4:4:4 in 8 Bit, dort
 rechnet der Mac vorher um, und das kostet einen Durchlauf - fuer einen fairen
@@ -162,6 +238,20 @@ Encoder bekommt nie mehr als ein paar Bilder auf einmal ("Encoder voll") -
 lieber ein Auslasser als eine Warteschlange, die jede Bewegung um Sekunden
 verspaetet.
 
+Dasselbe gilt bei Stau auf der Leitung: liegen beim Zuschauer mehr als 2 MB
+ungesendet (im Spielmodus 512 kB), geht das naechste Bild gar nicht erst in
+den Encoder ("Stau" in der Fuenf-Sekunden-Zeile des Hosts). Ein codiertes
+Bild geht immer hinaus, so entsteht auf einer knappen Leitung keine Kette
+von Vollbildern, die den Stau nur vergroessert. Nur der Windows-Host wirft
+ein codiertes Bild weg, wenn der Rueckstand schon ueber 4 MB liegt, und
+erzwingt dann ein Vollbild ("Stau ueber der harten Grenze (4096 kB):
+codiertes Bild verworfen, Vollbild erzwungen", hoechstens alle 10 s).
+Nimmt der Zuschauer im Stau 2 s lang nichts ab, gilt er als getrennt
+("Zuschauer weg: nimmt seit 2 s nichts mehr ab (<n> Byte im Stau)"). Ohne
+feste Bildrate wird ein ausgelassenes Bild nicht nachgereicht: endet eine
+Bewegung im Stau, bleibt beim Zuschauer das letzte Bild stehen, bis sich
+wieder etwas aendert.
+
 Der Spielmodus zieht die Zuegel straffer: haeufigere Vollbilder und ein
 kleinerer erlaubter Rueckstau, damit bei Bewegung nichts auflaeuft. Er kostet
 etwas Bandbreite und bringt dafuer gleichmaessigere Bilder.
@@ -178,6 +268,12 @@ Standardgeraet und spielt weiter; neu verbinden muss niemand. Ist gerade
 keines da, versucht er es alle halbe Sekunde wieder. Im Protokoll steht der
 Grund ("Ton: ... - Ausgabegeraet wird neu geoeffnet") und wann es wieder
 geht ("Ton: Ausgabegeraet wieder offen").
+
+Wechselt auf dem Host die Rate oder Kanalzahl des Tons - am Mac etwa ein
+Ausgabegeraet mit 44,1 kHz, auf Windows ein Geraet mit anderer Rate -, sagt
+der Host das Format neu an, und der Client baut seine Ausgabe darauf um. Der
+Mac-Host schreibt dazu "Tonformat gewechselt: <Rate> Hz, <n> Kanaele - neu
+angesagt".
 
 Zur Bitrate: der Wert ist eine Obergrenze, und der Encoder nutzt sie auch aus.
 150 Mbit/s bedeuten bei bewegtem Bild tatsaechlich 150 Mbit/s. Fuer das eigene
@@ -274,9 +370,16 @@ Passwort laesst sich also nicht hinueberkopieren - das ist Absicht. Dateien
 werden nicht uebertragen, und auf dem Mac von mehreren Eintraegen nur der
 erste.
 
-Was auf Windows ankommt, legt QuadChroma so ab, dass es weder in den
-Verlauf (Win+V) noch in die Cloud-Zwischenablage wandert und
-Ablageverwalter es uebergehen.
+Gesendet wird nur, was waehrend einer Sitzung kopiert wird; was vorher
+kopiert wurde, geht auch beim Verbinden nicht hinueber. Der Mac-Client
+liest die Zwischenablage ohne Sitzung gar nicht erst.
+
+Was ankommt, soll in keinem Verlauf landen. Auf Windows wandert es weder in
+den Verlauf (Win+V) noch in die Cloud-Zwischenablage, und Ablageverwalter
+uebergehen es. Auf dem Mac traegt es org.nspasteboard.TransientType (beim
+Mac-Host dazu AutoGeneratedType), die Kennung, an der Ablageverwalter
+Fluechtiges erkennen; der Mac-Host legt es ausserdem nur fuer diesen Mac
+ab, nicht ueber die Universelle Zwischenablage.
 
 Benchmark
 ---------
@@ -338,7 +441,10 @@ Meldungen. Dasselbe landet in %APPDATA%\QuadChroma\protokoll.txt, auch im
 Fensterbetrieb - die Datei beginnt bei jedem Start neu und traegt dort
 zusaetzlich die Anzeige (Karte, Feature-Level, Tearing) und je Sekunde eine
 Zeile mit Bildrate, Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern
-und der Prozessorlast des Clients.
+und der Prozessorlast des Clients. Ein Verbindungsfehler steht dort einmal
+je neuem Grund mit allen Einzelheiten ("Verbindung: <Grund>"); der
+Startbildschirm zeigt ihn in der Sprache der Oberflaeche, einen Wortlaut
+des Systems, wo es einen gibt, in Klammern dahinter.
 
     quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
     quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
@@ -390,7 +496,8 @@ Fenster ueber die Befehlszeile; jede Zeile steht auch in
                     Hauptbildschirm). Bild und Maus beziehen sich auf
                     denselben Ausgang; gemerkt wird sein Geraetename:
                     faellt er weg, weicht der Host aus, kommt er zurueck,
-                    gilt er wieder. Breiter als 3840 wird halbiert.
+                    gilt er wieder. Ab 3840 Breite wird halbiert, bei
+                    ungeraden Massen faellt ein Pixel Rand weg.
     --fps N, --mbit N, --fest   wie beim Mac (Vorgabe 120, 150, aus).
     --pair          die naechste unbekannte Gegenstelle wird aufgenommen
                     (Vergleichscode im Protokoll); beim allerersten Mal
@@ -405,15 +512,21 @@ Fenster ueber die Befehlszeile; jede Zeile steht auch in
     --encoderweg    wie das Bild in den Encoder kommt: bgra (BGRA direkt in
                     NVENC, der rechnet auf der Karte um), yuv444 (eigene
                     Umrechnung auf dem Prozessor), d3d11 (Texturen ohne
-                    Kopie, nur wenn der Ausgang an der NVIDIA haengt) oder
-                    auto (Vorgabe: die Entscheidung aus messung.txt, sonst
-                    bgra). 10-Bit-Kandidaten und Media Foundation gehen
-                    immer ueber den Prozessor.
+                    Kopie, nur fuer die 8-Bit-Kandidaten ueber NVENC und
+                    nur, wenn der Ausgang an der NVIDIA haengt) oder auto
+                    (Vorgabe: die Entscheidung aus messung.txt, sonst
+                    bgra). 10-Bit-Kandidaten, Media Foundation, gedrehte
+                    Ausgaenge und Ausgaenge ab 3840 Breite gehen immer
+                    ueber den Prozessor; der Host stellt die Quelle selbst
+                    um ("Aufnahme: Quelle auf Prozessorweg umgestellt ..."
+                    bzw. "Null-Kopien-Weg: ... - Prozessorweg (bgra)").
     --list          Karten, Ausgaenge und was dieser Rechner codieren kann
-                    (hevc_nvenc, h264_nvenc, av1_nvenc je Kandidat ueber
+                    (hevc_nvenc und h264_nvenc je Kandidat ueber
                     avcodec_open2; ohne NVIDIA-Treiber steht dort
                     "Cannot load nvcuda.dll"), dazu ob die Media-Foundation-
-                    Encoder in Software oeffnen und codieren.
+                    Encoder in Software oeffnen und codieren. AV1 steht
+                    dort ohne Probe als "nein (Protokoll und Client kennen
+                    AV1 noch nicht)".
     --messen        die Messung fuer die Aufnahme: je Ausgang Acquire,
                     Kopie auf der Karte, Staging in den Hauptspeicher,
                     nvenc aus dem Speicher (bgra, yuv444p) und - an der
@@ -431,7 +544,24 @@ Koennensliste); Startkandidat ist 0, sonst der erste vorhandene. Bitrate
 stellt nvenc im Betrieb um (ohne Neustart, mit Vollbild), eine neue
 Bildrate oder ein anderer Encoder heisst Neustart der Sitzung mit
 Vollbild. Der Host verwaltet die Vollbilder selbst: alle 2*fps Bilder,
-im Gaming-Modus alle fps, dazu bei Stau, Codecwechsel und neuem Zuschauer.
+im Gaming-Modus alle fps, dazu bei Codecwechsel und neuem Zuschauer; bei
+Stau nur, wenn ein codiertes Bild ueber der harten Grenze von 4 MB
+wegfallen musste. Nach Codecwechsel, Neustart der Sitzung und "Testbild
+aus" legt der Host das letzte Bild einmal nach, auch ohne feste Bildrate
+("Takt: letztes Bild nachgelegt (frischer Encoder)" bzw. "(Testbild
+aus)"); danach kommen ohne feste Bildrate neue Bilder nur, wenn sich auf
+dem Desktop etwas aendert. Der Mac-Host legt ohne feste Bildrate nichts
+nach.
+
+Der Host arbeitet mit Per-Monitor-DPI: bei Windows-Skalierung (125 %,
+150 %) streamt er die echte Aufloesung des Anzeigemodus. Die erste Zeile
+im Protokoll sagt, ob das geklappt hat ("DPI-Awareness: ..."). Gedrehte
+Ausgaenge (Hochformat, 180 Grad, auch hochkante Panels, die Windows quer
+betreibt, etwa bei Handhelds) dreht der Host auf dem Prozessor, der Strom
+hat die Groesse des Desktops ("Aufnahme gestartet: ... gedreht N Grad
+(Oberflaeche WxH, gedreht wird auf dem Prozessor)"). Das kostet je Bild
+etwas Prozessorzeit, --messen misst dort die ungedrehte Oberflaeche ohne
+die Drehung, und auf echter Hardware ist es noch ungeprueft.
 
 Ohne NVIDIA (etwa in einer virtuellen Maschine) gibt es nur "H.264 High"
 ueber den Software-Encoder von Media Foundation (h264_mf), in der
@@ -443,13 +573,29 @@ gibt es keinen DXGI-Ausgang ("Duplication nicht moeglich").
 
 Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
 meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es
-alle 2 s neu und erzwingt danach ein Vollbild. Die Zeigerform kommt aus der
-Duplication (Windows-Zeiger sind meist 32x32; einfarbige und maskierte
-Formen werden umgerechnet, Invertier-Punkte deckend genaehert), das Bild
-selbst enthaelt keinen Zeiger. Ton: Loopback des Standard-Ausgabegeraets,
+alle 2 s neu und erzwingt danach ein Vollbild. Derselbe Verlust steht dabei
+nur einmal im Protokoll, am Ende "Aufnahme laeuft wieder (derselbe Verlust
+hatte sich N-mal wiederholt)". Die Zeigerform kommt aus der Duplication
+(Windows-Zeiger sind meist 32x32; einfarbige und maskierte Formen werden
+umgerechnet, Invertier-Punkte deckend genaehert), das Bild selbst enthaelt
+keinen Zeiger. Ton: Loopback des Standard-Ausgabegeraets,
 auf zwei Kanaele gemischt, Rate des Geraets; ein stiller Wiedergabestrom
 im selben Prozess haelt den Loopback am Laufen, Luecken werden mit Stille
-gefuellt. Ohne Ausgabegeraet laeuft der Host ohne Ton und sagt es einmal.
+gefuellt. Geht das Geraet verloren (abgezogen, Format umgestellt) oder
+wechselt das Standard-Ausgabegeraet, oeffnet der Host das dann aktuelle
+neu, jede Sekunde ein Versuch, solange jemand zuschaut ("Ton: <Grund> -
+Abgriff wird neu geoeffnet", dann "Ton wieder angemeldet: ..."); dazwischen
+vergehen ein bis zwei Sekunden ohne Ton. Ohne Ausgabegeraet laeuft der Host
+ohne Ton weiter und versucht es ebenso ("Ton: ... - der Host laeuft ohne Ton,
+neuer Versuch alle 1000 ms, solange jemand zuschaut"). Kommt derselbe
+Verlust wieder, ehe das Geraet 30 s lief, wird er nur gezaehlt ("Ton:
+derselbe Verlust (...) noch N-mal, nicht einzeln protokolliert").
+
+Ein neuer Zuschauer ersetzt den alten: dessen Warteschlange wird
+verworfen, er bekommt nur noch Nachricht 10 und ist nach hoechstens 2 s
+getrennt, auch wenn er haengt ("Zuschauer abgeloest: <IP>", dann
+"Abloesung an <IP> gemeldet" oder "Abgeloester Zuschauer <IP> nimmt nichts
+mehr ab - Bildleitung gekappt").
 
 Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
 privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,
@@ -474,4 +620,4 @@ Voraussetzung ist Windows 10 oder 11, 64 Bit. Eine Visual-C++-Laufzeit
 braucht es nicht: die C-Laufzeit steckt in der exe, und die FFmpeg-Dateien
 nutzen nur die Universal C Runtime, die zu Windows 10 und 11 gehoert.
 
-Stand: 22.09.2026
+Stand: 23.09.2026
