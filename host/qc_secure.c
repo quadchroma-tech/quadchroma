@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -225,90 +226,167 @@ static int config_path(const char *file, char *out, size_t cap) {
     return 0;
 }
 
+// Gibt es die Datei wirklich nicht? Ein Verweis ins Leere meldet beim Oeffnen
+// ebenfalls ENOENT - dann ist sie aber nicht weg, sondern verbogen.
+static int fehlt(const char *path, int oeffnen_errno) {
+    struct stat st;
+    return oeffnen_errno == ENOENT && lstat(path, &st) != 0 && errno == ENOENT;
+}
+
+// Nur wenn host.key fehlt, entsteht ein neuer Schluessel. Ist die Datei da,
+// aber nicht lesbar oder nicht genau 32 Byte lang, bleibt sie unangetastet:
+// ein neuer Schluessel waere eine neue Identitaet, und jeder gekoppelte
+// Client wiese den Host danach als fremd ab.
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]) {
     char path[1200];
     if (config_path("host.key", path, sizeof path)) return -1;
 
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
-        ssize_t r = read(fd, priv, 32);
+        uint8_t buf[33];                // ein Byte mehr: zu lang ist auch beschaedigt
+        ssize_t r = read(fd, buf, sizeof buf);
         close(fd);
-        if (r == 32) {
-            qc_pubkey(priv, pub);
-            return 0;
-        }
+        int ok = r == 32;
+        if (ok) memcpy(priv, buf, 32);
+        qc_wipe(buf, sizeof buf);
+        if (!ok) return -2;
+        qc_pubkey(priv, pub);
+        return 0;
     }
+    if (!fehlt(path, errno)) return -2;
 
     qc_keypair(priv, pub);
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    // O_EXCL: nie eine Datei ueberschreiben, die inzwischen doch da ist.
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
-    ssize_t w = write(fd, priv, 32);
-    close(fd);
-    return w == 32 ? 0 : -1;
-}
-
-static int hex_eq(const char *line, const uint8_t pub[32]) {
-    char hex[65];
-    for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", pub[i]);
-    return strncmp(line, hex, 64) == 0;
-}
-
-// Freigabeliste zum Lesen oeffnen. Nur "gibt es nicht" ist ein leerer Anfang
-// (erster Start, oder nach --forget): dann ist *f NULL und das Ergebnis 0.
-// Jeder andere Fehler - Rechte, Besitzer nach einer Wiederherstellung, Ein-
-// und Ausgabe - heisst: unbekannt, was drinsteht. Das ist -1, und dann gilt
-// weder jemand als freigegeben noch als Erstkontakt.
-static int freigaben_oeffnen(FILE **f) {
-    char path[1200];
-    *f = NULL;
-    if (config_path("authorized.txt", path, sizeof path)) return -1;
-    *f = fopen(path, "r");
-    if (!*f) return errno == ENOENT ? 0 : -1;
+    int ok = write(fd, priv, 32) == 32 && fsync(fd) == 0;
+    if (close(fd) != 0) ok = 0;
+    if (!ok) { unlink(path); return -1; }
     return 0;
 }
 
-int qc_is_authorized(const uint8_t pub[32]) {
-    FILE *f;
-    if (freigaben_oeffnen(&f)) return -1;
-    if (!f) return 0;
-    char line[512];
-    int found = 0;
-    while (fgets(line, sizeof line, f)) {
-        if (hex_eq(line, pub)) { found = 1; break; }
+// ---------------------------------------------------------- Freigabeliste
+//
+// Eine Zeile je Gegenstelle: 64 Hexziffern ganz vorn, dann zwei Leerzeichen,
+// Fingerabdruck, zwei Leerzeichen, Name. Leerzeilen und Kommentare (#) sind
+// erlaubt, sonst nichts.
+
+#define QC_FREIGABEN_MAX (1 << 20)     // groesser ist es keine Freigabeliste mehr
+
+static int ist_hex(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Eine Zeile ohne Zeilenwechsel: 1 = Freigabe, 0 = leer oder Kommentar,
+// -1 = etwas anderes - dann ist die Liste beschaedigt.
+static int freigabe_zeile(const char *z, size_t n) {
+    if (n && z[n - 1] == '\r') n--;     // von Hand unter Windows bearbeitet
+    if (memchr(z, 0, n)) return -1;     // Nullbytes: Muell nach einem Absturz
+    size_t i = 0;
+    while (i < n && (z[i] == ' ' || z[i] == '\t')) i++;
+    if (i == n || z[i] == '#') return 0;
+    if (n < 64) return -1;
+    for (i = 0; i < 64; i++) if (!ist_hex((unsigned char)z[i])) return -1;
+    return n == 64 || z[64] == ' ' || z[64] == '\t' ? 1 : -1;
+}
+
+// Liest die ganze Liste und prueft jede Zeile. Ergebnis: Zahl der Freigaben,
+// mit pub steht in *gefunden, ob er darunter ist.
+//
+// Nur "gibt es nicht" ist ein leerer Anfang (erster Start, nach --forget),
+// ebenso eine Datei mit 0 Bytes: dann 0. Alles andere, was nicht glatt geht -
+// Rechte, Besitzer nach einer Wiederherstellung, Ein- und Ausgabe, ein Verweis
+// ins Leere, Nullbytes, eine Zeile, die keine Freigabe ist, eine Datei ohne
+// eine einzige Freigabe - heisst: unbekannt, was gemeint war. Das ist -1, und
+// dann gilt weder jemand als freigegeben noch als Erstkontakt.
+static int freigaben_lesen(const uint8_t *pub, int *gefunden) {
+    char path[1200];
+    int dummy;
+    if (!gefunden) gefunden = &dummy;
+    *gefunden = 0;
+    if (config_path("authorized.txt", path, sizeof path)) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return fehlt(path, errno) ? 0 : -1;
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0 || st.st_size > QC_FREIGABEN_MAX) { fclose(f); return -1; }
+
+    char hex[65];
+    if (pub) for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", pub[i]);
+    char *z = NULL;
+    size_t cap = 0, gelesen = 0;
+    ssize_t len;
+    int n = 0, kaputt = 0;
+    while ((len = getline(&z, &cap, f)) > 0) {
+        gelesen += (size_t)len;
+        size_t l = (size_t)len;
+        if (z[l - 1] == '\n') l--;
+        int art = freigabe_zeile(z, l);
+        if (art < 0) { kaputt = 1; break; }
+        if (art == 1) {
+            n++;
+            if (pub && strncasecmp(z, hex, 64) == 0) *gefunden = 1;
+        }
     }
-    if (!found && ferror(f)) found = -1;
+    if (ferror(f)) kaputt = 1;
+    free(z);
     fclose(f);
-    return found;
+    if (kaputt || (gelesen && !n)) { *gefunden = 0; return -1; }
+    return n;
+}
+
+int qc_is_authorized(const uint8_t pub[32]) {
+    int gefunden;
+    if (freigaben_lesen(pub, &gefunden) < 0) return -1;
+    return gefunden;
+}
+
+int qc_authorized_count(void) {
+    return freigaben_lesen(NULL, NULL);
 }
 
 int qc_authorize(const uint8_t pub[32], const char *name) {
     int bek = qc_is_authorized(pub);
-    if (bek < 0) return -1;             // Liste nicht lesbar: nichts anhaengen
+    if (bek < 0) return -1;             // Liste nicht lesbar oder beschaedigt: nichts anhaengen
     if (bek) return 0;
     char path[1200];
     if (config_path("authorized.txt", path, sizeof path)) return -1;
-    FILE *f = fopen(path, "a");
-    if (!f) return -1;
-    int fehler = 0;
-    for (int i = 0; i < 32; i++) if (fprintf(f, "%02x", pub[i]) < 0) fehler = 1;
-    char fp[24];
-    qc_fingerprint(pub, fp);
-    if (fprintf(f, "  %s  %s\n", fp, name ? name : "-") < 0) fehler = 1;
-    // Geschrieben wird erst beim Schliessen - erst danach steht fest, ob
-    // die Freigabe wirklich in der Liste steht.
-    if (fclose(f) == EOF) fehler = 1;
-    chmod(path, 0600);
-    return fehler ? -1 : 0;
-}
 
-int qc_authorized_count(void) {
-    FILE *f;
-    if (freigaben_oeffnen(&f)) return -1;
-    if (!f) return 0;
-    char line[512];
-    int n = 0;
-    while (fgets(line, sizeof line, f)) if (strlen(line) > 64) n++;
-    if (ferror(f)) n = -1;
-    fclose(f);
-    return n;
+    // Die Zeile entsteht vorher ganz und geht mit einem einzigen write ans
+    // Ende. zeile[0] haelt Platz fuer einen Zeilenwechsel davor frei.
+    char zeile[400], fp[24];
+    size_t n = 1;
+    for (int i = 0; i < 32; i++) n += (size_t)snprintf(zeile + n, sizeof zeile - n, "%02x", pub[i]);
+    qc_fingerprint(pub, fp);
+    n += (size_t)snprintf(zeile + n, sizeof zeile - n, "  %s  ", fp);
+    const char *nm = name && *name ? name : "-";
+    for (size_t i = 0; nm[i] && i < 200; i++) {
+        unsigned char c = (unsigned char)nm[i];
+        zeile[n++] = c < 0x20 || c == 0x7f ? '?' : (char)c;     // ein Name bleibt eine Zeile
+    }
+    zeile[n++] = '\n';
+
+    int fd = open(path, O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    struct stat st;
+    int fehler = fstat(fd, &st) != 0;
+    // Endet die letzte Zeile ohne Zeilenwechsel (von Hand bearbeitet), landete
+    // die neue Freigabe sonst mit in dieser Zeile - und wuerde nie gefunden.
+    const char *von = zeile + 1;
+    if (!fehler && st.st_size > 0) {
+        char letztes = 0;
+        if (pread(fd, &letztes, 1, st.st_size - 1) != 1) fehler = 1;
+        else if (letztes != '\n') { zeile[0] = '\n'; von = zeile; }
+    }
+    size_t soll = (size_t)(zeile + n - von);
+    if (!fehler && (write(fd, von, soll) != (ssize_t)soll || fsync(fd) != 0)) {
+        // Halb oder unsicher geschrieben (Platte voll, Ein- und Ausgabe):
+        // zurueck auf den alten Stand, sonst waere die ganze Liste beschaedigt.
+        (void)ftruncate(fd, st.st_size);
+        fehler = 1;
+    }
+    fchmod(fd, 0600);
+    if (close(fd) != 0) fehler = 1;
+    if (fehler) return -1;
+    // 0 erst, wenn sich die Freigabe aus der Liste wieder lesen laesst.
+    return qc_is_authorized(pub) == 1 ? 0 : -1;
 }

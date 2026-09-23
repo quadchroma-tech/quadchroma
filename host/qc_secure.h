@@ -47,16 +47,21 @@ int qc_chan_read(qc_chan *c, void *buf, size_t n);
 
 /// Dauerhafter eigener Schluessel. Legt ihn beim ersten Start an.
 /// Pfad: ~/Library/Application Support/QuadChroma/host.key
+/// 0 = geladen oder neu angelegt, -1 = liess sich nicht anlegen,
+/// -2 = vorhanden, aber nicht lesbar oder beschaedigt (bleibt unangetastet).
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]);
 
 /// Ist dieser oeffentliche Schluessel schon freigegeben?
-/// 1 = ja, 0 = nein (auch: es gibt noch keine Liste), -1 = Liste nicht lesbar.
+/// 1 = ja, 0 = nein (auch: es gibt noch keine Liste oder sie hat 0 Bytes),
+/// -1 = Liste nicht lesbar oder beschaedigt - dann auch fuer Bekannte.
 int qc_is_authorized(const uint8_t pub[32]);
 
-/// Schluessel dauerhaft freigeben. 0 erst, wenn er wirklich in der Liste steht.
+/// Schluessel dauerhaft freigeben. 0 erst, wenn er wirklich in der Liste
+/// steht und sich von dort wieder lesen laesst.
 int qc_authorize(const uint8_t pub[32], const char *name);
 
-/// Wie viele Gegenstellen sind bisher freigegeben? -1 = Liste nicht lesbar.
+/// Wie viele Gegenstellen sind bisher freigegeben? 0 nur, wenn es keine
+/// Liste gibt oder sie 0 Bytes hat. -1 = nicht lesbar oder beschaedigt.
 int qc_authorized_count(void);
 
 #endif
