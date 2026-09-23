@@ -881,6 +881,9 @@ pub fn hw_pool(geraet: *mut AVBufferRef, w: i32, h: i32) -> Result<*mut AVBuffer
 
 /// Eine Textur aus dem Pool in `bild` holen; liefert Textur und Index.
 pub fn pool_textur(pool: *mut AVBufferRef, bild: &mut Bild) -> Result<(ID3D11Texture2D, u32), String> {
+    if bild.frame.is_null() || pool.is_null() {
+        return Err("Pooltextur: kein Rahmen oder kein Pool".into());
+    }
     unsafe {
         av_frame_unref(bild.frame);
         let e = av_hwframe_get_buffer(pool, bild.frame, 0);
@@ -1057,6 +1060,15 @@ impl Betrieb {
     /// geoeffnete hat keines - auch wenn ihre Vorgaengerin es hatte.
     pub fn hat_bild(&self) -> bool {
         self.hat_bild
+    }
+
+    /// Testbild aus: die Pooltextur, die `tb_rahmen` noch haelt, geht an
+    /// den Pool zurueck (der Encoder haelt seine eigene Referenz, solange er
+    /// sie braucht). Ohne Pool haelt `tb_rahmen` nichts.
+    pub fn testbild_freigeben(&mut self) {
+        if self.pool.is_some() {
+            unsafe { av_frame_unref(self.tb_rahmen.frame) };
+        }
     }
 
     /// Bilder, deren Paket noch aussteht - ohne den Vorlauf des Encoders.
@@ -1401,25 +1413,21 @@ mod tests {
     fn texturweg_folgt_dem_encoder() {
         // Die Aufnahme liefert Texturen nur, wenn der Encoder sie auch
         // nimmt: 8 Bit ueber nvenc auf dem Weg d3d11 - nicht 10 Bit, nicht
-        // Media Foundation, nicht die anderen Wege.
-        let nv = |e: &'static str| Befund { vorhanden: true, hardware: true, encoder: e, vorlauf: 0 };
-        {
-            let mut b = BEFUND.lock().unwrap();
-            b[0] = nv("hevc_nvenc");
-            b[1] = nv("hevc_nvenc");
-            b[2] = nv("hevc_nvenc");
-            b[3] = nv("hevc_nvenc");
-            b[4] = Befund { vorhanden: true, hardware: false, encoder: MF_H264, vorlauf: 15 };
-        }
-        assert!(!texturweg(0, Weg::D3d11));
-        assert!(texturweg(1, Weg::D3d11));
-        assert!(!texturweg(2, Weg::D3d11));
-        assert!(texturweg(3, Weg::D3d11));
-        assert!(!texturweg(4, Weg::D3d11));
-        assert!(!texturweg(1, Weg::Bgra));
-        assert!(!texturweg(1, Weg::Yuv444));
-        BEFUND.lock().unwrap()[4] = nv("h264_nvenc");
-        assert!(texturweg(4, Weg::D3d11));
-        *BEFUND.lock().unwrap() = [KEIN_BEFUND; 6];
+        // Media Foundation, nicht die anderen Wege. texturweg ist genau
+        // eingabeformat(..).1 mit dem Encoder aus dem Befund; getestet wird
+        // mit dem Encodernamen direkt, ohne den gemeinsamen BEFUND
+        // anzufassen (die Tests laufen parallel).
+        let tex = |idx: usize, weg: Weg, enc: &str| eingabeformat(idx, weg, enc).1;
+        assert!(!tex(0, Weg::D3d11, "hevc_nvenc"));
+        assert!(tex(1, Weg::D3d11, "hevc_nvenc"));
+        assert!(!tex(2, Weg::D3d11, "hevc_nvenc"));
+        assert!(tex(3, Weg::D3d11, "hevc_nvenc"));
+        assert!(!tex(4, Weg::D3d11, MF_H264));
+        assert!(tex(4, Weg::D3d11, "h264_nvenc"));
+        assert!(!tex(1, Weg::Bgra, "hevc_nvenc"));
+        assert!(!tex(1, Weg::Yuv444, "hevc_nvenc"));
+        assert!(!tex(1, Weg::Auto, "hevc_nvenc"));
+        // Media Foundation nimmt immer NV12 im Systemspeicher.
+        assert!(eingabeformat(4, Weg::D3d11, MF_H264) == (AVPixelFormat::AV_PIX_FMT_NV12, false));
     }
 }

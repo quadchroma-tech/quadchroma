@@ -274,10 +274,12 @@ pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
     if format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB {
         return Err(format!("Desktopformat {} - vorerst nur BGRA 8 Bit", format.0));
     }
-    // Gedreht (Hochformat, 180 Grad): der Modus ist gedreht, die Oberflaeche
-    // aus AcquireNextFrame aber nicht - die Kopie in eine Textur der
-    // Modusgroesse ginge still verloren. Drehen kann der Host noch nicht,
-    // also klar ablehnen (Nachricht 9, neuer Versuch alle 2 s).
+    // Gedreht (Hochformat, 180 Grad, auch ein hochkantes Panel, das Windows
+    // quer betreibt): die Oberflaeche aus AcquireNextFrame liegt ungedreht
+    // vor (so gross wie ModeDesc), der Desktop (DesktopCoordinates) gedreht.
+    // Ungedreht gestreamt saehe der Zuschauer ein seitliches Bild, und die
+    // Maus traefe daneben. Drehen kann der Host noch nicht, also klar
+    // ablehnen (Nachricht 9, neuer Versuch alle 2 s).
     let grad = match desc.Rotation {
         DXGI_MODE_ROTATION_ROTATE90 => 90,
         DXGI_MODE_ROTATION_ROTATE180 => 180,
@@ -285,7 +287,10 @@ pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
         _ => 0,
     };
     if grad != 0 {
-        return Err(format!("gedrehter Ausgang ({grad} Grad, Anzeigemodus {}x{}) - vorerst nicht unterstuetzt", desc.ModeDesc.Width, desc.ModeDesc.Height));
+        return Err(format!(
+            "gedrehter Ausgang ({grad} Grad, Desktop {}x{}, Anzeigemodus {}x{}) - vorerst nicht unterstuetzt",
+            ausgang.breite, ausgang.hoehe, desc.ModeDesc.Width, desc.ModeDesc.Height
+        ));
     }
     Ok(Duplication {
         device,
@@ -496,6 +501,66 @@ fn oberflaeche_pruefen(t: &ID3D11Texture2D, dw: u32, dh: u32) -> Result<(), Stri
     Ok(())
 }
 
+/// Soll der Takt (ohne Testbild) das letzte Bild hineingeben? Mit fester
+/// Bildrate, wenn seit 0,9/fps nichts kam (Grund ""); sonst nur einmal:
+/// nach "Testbild aus" oder fuer einen frischen Encoder, der noch kein Bild
+/// hat (Start, Codecwechsel, Neustart). Ohne feste Bildrate und mit Bild
+/// im Encoder: nichts (wie main.m).
+fn nachlegen_grund(nachholen: bool, hat_bild: bool, fest_faellig: bool) -> Option<&'static str> {
+    if nachholen {
+        Some("Testbild aus")
+    } else if !hat_bild {
+        Some("frischer Encoder")
+    } else if fest_faellig {
+        Some("")
+    } else {
+        None
+    }
+}
+
+/// Buchfuehrung der Verlustmeldungen: derselbe Verlust ohne ein gutes Bild
+/// dazwischen (etwa eine Oberflaeche, die dauerhaft nicht zum Modus passt)
+/// kommt einmal ins Protokoll, samt der Wiederherstellung danach - nicht
+/// alle 2 s zwei Zeilen. Das erste gute Bild beendet den Verlust.
+#[derive(Default)]
+struct Verlustmeldung {
+    letzter: String,
+    /// Wie oft sich `letzter` seitdem still wiederholt hat.
+    still: u32,
+}
+
+impl Verlustmeldung {
+    /// Ein Verlust; true = ins Protokoll (neu oder ein anderer als zuletzt).
+    fn verlust(&mut self, e: &str) -> bool {
+        if !self.letzter.is_empty() && self.letzter == e {
+            self.still += 1;
+            false
+        } else {
+            self.letzter = e.to_string();
+            self.still = 0;
+            true
+        }
+    }
+
+    /// Die Aufnahme steht wieder; true = ins Protokoll (nicht nach einem
+    /// still wiederholten Verlust).
+    fn aufgebaut(&self) -> bool {
+        self.still == 0
+    }
+
+    /// Ein gutes Bild: der Verlust ist vorbei. Liefert, wie oft er sich
+    /// still wiederholt hat, falls ueberhaupt (fuer eine Abschlusszeile).
+    fn bild_ok(&mut self) -> Option<u32> {
+        if self.letzter.is_empty() {
+            return None;
+        }
+        let n = self.still;
+        self.letzter.clear();
+        self.still = 0;
+        (n > 0).then_some(n)
+    }
+}
+
 /// Alles, was zur laufenden Aufnahme gehoert.
 struct Aufnahme {
     dup: Duplication,
@@ -596,10 +661,14 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
     let mut dup_fehler_gemeldet = String::new();
     let mut enc_fehler_gemeldet = String::new();
     let mut zeiger_fehler_gemeldet = false;
+    let mut verlustmeldung = Verlustmeldung::default();
     let mut weg = weg_wunsch;
     // Letztes echtes Bild: Aufnahmezeit, ob es codiert wurde (fuer die
     // Wiederholung ohne neue Umrechnung).
     let mut letztes: Option<(u64, bool)> = None;
+    // Nach "Testbild aus": das letzte Desktopbild einmal nachlegen, auch
+    // ohne feste Bildrate.
+    let mut nachholen = false;
     let (mut w, mut h) = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
 
     while netz::zuschauer_da() {
@@ -642,17 +711,19 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                             log("Null-Kopien-Weg: Ausgang ab 3840 Breite wird noch nicht auf der Karte skaliert - Prozessorweg (bgra)");
                             weg = Weg::Bgra;
                         }
-                        if (a.breite, a.hoehe) != (d.breite as i32, d.hoehe as i32) {
-                            log(format!("Ausgang {} meldet {}x{}, der Anzeigemodus ist {}x{} - der Strom folgt dem Anzeigemodus", a.name, a.breite, a.hoehe, d.breite, d.hoehe));
+                        if verlustmeldung.aufgebaut() {
+                            if (a.breite, a.hoehe) != (d.breite as i32, d.hoehe as i32) {
+                                log(format!("Ausgang {} meldet {}x{}, der Anzeigemodus ist {}x{} - der Strom folgt dem Anzeigemodus", a.name, a.breite, a.hoehe, d.breite, d.hoehe));
+                            }
+                            log(format!(
+                                "Aufnahme {}: {} {}x{} an Karte {} ({}), Format {}, Desktopbild im Systemspeicher: {}, Strom {}x{}{}, Quelle {}",
+                                if verloren { "wiederhergestellt" } else { "gestartet" },
+                                a.name, d.breite, d.hoehe, a.karte, a.karte_name, d.format.0,
+                                if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
+                                if halb { " (halbiert)" } else if (w, h) != (d.breite as i32, d.hoehe as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
+                                if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
+                            ));
                         }
-                        log(format!(
-                            "Aufnahme {}: {} {}x{} an Karte {} ({}), Format {}, Desktopbild im Systemspeicher: {}, Strom {}x{}{}, Quelle {}",
-                            if verloren { "wiederhergestellt" } else { "gestartet" },
-                            a.name, d.breite, d.hoehe, a.karte, a.karte_name, d.format.0,
-                            if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
-                            if halb { " (halbiert)" } else if (w, h) != (d.breite as i32, d.hoehe as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
-                            if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
-                        ));
                         // Texturen gehoeren zum Geraet: mit ihm faellt auch der Pool.
                         if enc.as_ref().map(|e| e.texturen()).unwrap_or(false) {
                             enc = None;
@@ -759,10 +830,27 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
             testbild_an = tb;
             if tb {
                 log(format!("Testbild an: {} Bilder {w}x{h}", super::testbild::N));
+                nachholen = false;
             } else {
                 log("Testbild aus");
                 testbilder = None;
+                // Die Pooltextur des letzten Testbilds geht an den Pool zurueck.
+                if let Some(e) = enc.as_mut() {
+                    e.testbild_freigeben();
+                }
+                // Die Aufnahme lief weiter: das neueste Desktopbild liegt in
+                // STAGING bzw. in der Kopie. Im Prozessorweg traegt der
+                // Hauptspeicher noch das Bild von vor dem Testbild - also
+                // jetzt einlesen, damit der Takt das aktuelle nachlegt.
+                if let (Some(a), Some(_)) = (auf.as_mut(), letztes) {
+                    if verlust.is_none() {
+                        if let Err(err) = a.einlesen(w, h) {
+                            verlust = Some(err);
+                        }
+                    }
+                }
                 letztes = letztes.map(|(t, _)| (t, false));
+                nachholen = letztes.is_some();
             }
             Z.force_key.store(true, Ordering::Relaxed);
         }
@@ -805,12 +893,19 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                     }
                     a.dup.freigeben();
                     drop(textur);
+                    if let Some(n) = passt.as_ref().ok().and_then(|_| verlustmeldung.bild_ok()) {
+                        log(format!("Aufnahme laeuft wieder (derselbe Verlust hatte sich {n}-mal wiederholt)"));
+                    }
                     if let Err(e) = passt {
                         verlust = Some(e);
-                    } else if !testbild_an {
+                    } else if testbild_an {
                         // Testbild an: die Aufnahme laeuft weiter (der Wechsel
                         // zurueck soll keine Sekunde kosten), aber ihre Bilder
-                        // gehen nicht in den Encoder.
+                        // gehen nicht in den Encoder. Gemerkt wird nur, dass
+                        // die Kopie ein neueres Bild traegt - "Testbild aus"
+                        // liest es ein.
+                        letztes = Some((super::qpc_us(praesentiert_qpc), false));
+                    } else {
                         let t_cap = super::qpc_us(praesentiert_qpc);
                         // Das Bild wird in jedem Fall festgehalten - auch
                         // eines, das gleich wegfaellt: legt der Takt spaeter
@@ -833,6 +928,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                                     };
                                     if e.codieren(q, t_cap, pts, false).is_ok() {
                                         letztes = Some((t_cap, true));
+                                        nachholen = false;
                                     }
                                 }
                             }
@@ -843,7 +939,9 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
             },
         }
         if let Some(e) = verlust {
-            log(format!("Aufnahme verloren: {e} - Nachricht 9, neuer Versuch alle 2 s"));
+            if verlustmeldung.verlust(&e) {
+                log(format!("Aufnahme verloren: {e} - Nachricht 9, neuer Versuch alle 2 s"));
+            }
             if enc.as_ref().map(|x| x.texturen()).unwrap_or(false) {
                 enc = None;
             }
@@ -857,7 +955,11 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
         }
 
         // 7. Der Takt: Testbild als echte Bilder in Zielrate; feste Bildrate
-        //    legt das letzte Bild nach, wenn seit 0,9/fps nichts kam.
+        //    legt das letzte Bild nach, wenn seit 0,9/fps nichts kam. Auch
+        //    ohne feste Bildrate geht das letzte Bild EINMAL hinein, wenn
+        //    der Encoder frisch ist (Start, Codecwechsel, Neustart) oder das
+        //    Testbild endet - sonst sieht der Zuschauer bei stillem Desktop
+        //    bis zur naechsten Aenderung nichts bzw. die Balken.
         if takt.tick_faellig(fps) {
             if let Some(e) = enc.as_mut() {
                 if testbild_an {
@@ -871,7 +973,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                             let _ = e.codieren(Quelle::Fertig(b), jetzt, pts, false);
                         }
                     }
-                } else if Z.fest.load(Ordering::Relaxed) && auf.is_some() && takt.nachlegen_faellig(fps) {
+                } else if let Some(einmal) = auf.as_ref().and(nachlegen_grund(nachholen, e.hat_bild(), Z.fest.load(Ordering::Relaxed) && takt.nachlegen_faellig(fps))) {
                     if let Some((t_cap, codiert)) = letztes {
                         if e.inflight() < INFLIGHT_TAKT {
                             let pts = takt.pts_vorwaerts(super::now_us() as i64, fps);
@@ -887,7 +989,11 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                             // wiederholten Bildes; das Raster bleibt unberuehrt.
                             if e.codieren(q, t_cap, pts, true).is_ok() {
                                 letztes = Some((t_cap, true));
+                                nachholen = false;
                                 Z.repeats.fetch_add(1, Ordering::Relaxed);
+                                if !einmal.is_empty() {
+                                    log(format!("Takt: letztes Bild nachgelegt ({einmal})"));
+                                }
                             }
                         }
                     }
@@ -1019,6 +1125,44 @@ mod tests {
             }
             assert_eq!(ram.len(), w * h * 4, "{dw}x{dh}");
         }
+    }
+
+    #[test]
+    fn takt_legt_einmal_nach_ohne_feste_bildrate() {
+        // Ohne feste Bildrate und mit Bild im Encoder: nichts (wie main.m).
+        assert_eq!(nachlegen_grund(false, true, false), None);
+        // Frischer Encoder (Start, Codecwechsel, Neustart) bzw. Testbild aus:
+        // einmal, auch ohne feste Bildrate.
+        assert_eq!(nachlegen_grund(false, false, false), Some("frischer Encoder"));
+        assert_eq!(nachlegen_grund(true, true, false), Some("Testbild aus"));
+        assert_eq!(nachlegen_grund(true, false, true), Some("Testbild aus"));
+        // Feste Bildrate: regulaer nachlegen, ohne Protokollzeile.
+        assert_eq!(nachlegen_grund(false, true, true), Some(""));
+    }
+
+    #[test]
+    fn derselbe_verlust_kommt_einmal_ins_protokoll() {
+        // Bleibt ein Verlust bestehen (Neuaufbau alle 2 s, gleich wieder
+        // verloren), gibt es je eine Zeile fuer Verlust und Wiederherstellung,
+        // danach Ruhe - bis ein gutes Bild kommt oder ein anderer Verlust.
+        let mut m = Verlustmeldung::default();
+        assert!(m.aufgebaut(), "erster Start");
+        assert!(m.bild_ok().is_none(), "gutes Bild ohne Verlust: keine Zeile");
+        assert!(m.verlust("Bildgroesse passt nicht"));
+        assert!(m.aufgebaut(), "erste Wiederherstellung wird gemeldet");
+        for _ in 0..5 {
+            assert!(!m.verlust("Bildgroesse passt nicht"));
+            assert!(!m.aufgebaut());
+        }
+        assert!(m.verlust("Zugriff verloren"), "ein anderer Verlust wird gemeldet");
+        assert!(m.aufgebaut());
+        assert!(!m.verlust("Zugriff verloren"));
+        assert_eq!(m.bild_ok(), Some(1), "Abschlusszeile mit der Zahl der stillen Wiederholungen");
+        assert!(m.bild_ok().is_none());
+        // Nach einem guten Bild ist derselbe Verlust wieder eine Meldung wert.
+        assert!(m.verlust("Zugriff verloren"));
+        assert!(m.aufgebaut());
+        assert_eq!(m.bild_ok(), None, "ohne stille Wiederholung keine Abschlusszeile");
     }
 
     #[test]
