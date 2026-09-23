@@ -1343,6 +1343,16 @@ static void codecs_pruefen(void) {
     logf_(@"--- Was dieser Mac codieren kann ---");
     for (size_t i = 0; i < QC_KANDIDATEN; i++) {
         const qc_codec_kandidat *k = &g_kandidaten[i];
+        // AV1 nie anbieten, egal was der Encoder kann: Strominfo und
+        // Codecwechsel kennen nur HEVC und H.264 - der Host saehe AV1 als
+        // HEVC an und laese HEVC-Parametersaetze -, und der Client hat
+        // keinen AV1-Weg. Bisher verhinderte das nur das fehlende Profil.
+        if (k->codec == 'av01') {
+            g_befund[i].vorhanden = 0;
+            g_befund[i].hardware = 0;
+            logf_(@"  %-18s nein  (nicht angeboten: Protokoll und Client kennen AV1 noch nicht)", k->name);
+            continue;
+        }
         int hw = 0;
         int da = kandidat_pruefen(k, 1, &hw);   // erst mit Hardware-Pflicht
         if (da) {
