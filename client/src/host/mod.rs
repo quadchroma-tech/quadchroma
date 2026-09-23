@@ -213,6 +213,7 @@ pub fn strominfo() -> [u8; 8] {
     p[2..4].copy_from_slice(&h.to_le_bytes());
     p[4..6].copy_from_slice(&f.to_le_bytes());
     let k = encoder::kandidat(Z.codec_id.load(Ordering::Relaxed) as usize);
+    debug_assert!(encoder::im_protokoll(k), "{}: Codec nicht im Protokoll", k.name);
     p[6] = if k.h264 { 2 } else { 1 };
     // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
     p[7] = if k.chroma444 { if k.zehn_bit { 2 } else { 1 } } else if k.zehn_bit { 4 } else { 3 };

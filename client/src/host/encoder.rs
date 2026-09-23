@@ -86,6 +86,14 @@ pub fn kandidat(idx: usize) -> &'static Kandidat {
     &KANDIDATEN[idx.min(KANDIDATEN.len() - 1)]
 }
 
+/// Kennt das Protokoll den Codec? Strominfo (Nachricht 1) und Codecwechsel
+/// (Nachricht 7) unterscheiden nur HEVC und H.264 - AV1 kaeme beim
+/// Zuschauer als HEVC an und bliebe schwarz. Bis Protokoll und Client AV1
+/// kennen, gilt er als nicht vorhanden.
+pub fn im_protokoll(k: &Kandidat) -> bool {
+    if k.h264 { k.encoder.starts_with("h264_") } else { k.encoder.starts_with("hevc_") }
+}
+
 pub fn befund(idx: usize) -> Befund {
     BEFUND.lock().unwrap()[idx.min(KANDIDATEN.len() - 1)]
 }
@@ -223,6 +231,11 @@ pub fn pruefen() {
     log("--- Was dieser Rechner codieren kann ---");
     let mut befund = BEFUND.lock().unwrap();
     for (i, k) in KANDIDATEN.iter().enumerate() {
+        if !im_protokoll(k) {
+            befund[i] = KEIN_BEFUND;
+            log(format!("  {:<18} nein (Protokoll und Client kennen {} noch nicht)", k.name, k.name));
+            continue;
+        }
         crate::protokoll::fehler_verwerfen();
         match Sitzung::oeffnen(&Oeffnung { encoder: k.encoder, pix_fmt: k.pix_fmt, profil: k.profil, rgb_444: k.chroma444, ..Oeffnung::vorgabe(1920, 1080) }) {
             Ok(_) => {
@@ -324,6 +337,7 @@ pub fn codecs_payload() -> Vec<u8> {
 /// u8 umrechnung, u16 frei.
 pub fn switch_senden(idx: usize) {
     let k = kandidat(idx);
+    debug_assert!(im_protokoll(k), "{}: Codec nicht im Protokoll", k.name);
     let b = befund(idx);
     let p = [idx as u8, k.h264 as u8, k.chroma444 as u8, k.zehn_bit as u8, 1, umrechnung_fuer(idx, &b) as u8, 0, 0];
     netz::send_small(crate::protokoll_konst::MSG_SWITCH, &p);
@@ -1110,5 +1124,18 @@ mod tests {
         let mut halb = Vec::new();
         bgra_halbieren(&src, w as usize, h as usize, &mut halb);
         assert_eq!(halb.len(), (w * h) as usize);
+    }
+
+    #[test]
+    fn nur_codecs_des_protokolls() {
+        // Strominfo und Codecwechsel kennen nur HEVC (h264 = false) und
+        // H.264 (h264 = true); AV1 darf nie als vorhanden gelten.
+        for k in KANDIDATEN.iter() {
+            if im_protokoll(k) {
+                assert!((k.encoder.starts_with("hevc_") && !k.h264) || (k.encoder.starts_with("h264_") && k.h264), "{}", k.name);
+            }
+        }
+        assert!(KANDIDATEN.iter().filter(|k| k.encoder == "av1_nvenc").all(|k| !im_protokoll(k)));
+        assert_eq!(KANDIDATEN.iter().filter(|k| im_protokoll(k)).count(), 5);
     }
 }
