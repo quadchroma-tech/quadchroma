@@ -326,8 +326,9 @@ Ohne feste Bildrate reichen beide Hosts ein ausgelassenes letztes Bild
 nach: fiel das neueste Bild als "zu schnell", im Stau oder bei vollem
 Encoder weg und kam eine Bildzeit lang kein neueres, geht es doch noch in
 den Encoder - endet eine Bewegung so, steht beim Zuschauer trotzdem das
-Endbild (Ausnahme: der Software-Encoder h264_mf des Windows-Hosts, siehe
-dort). Im Stau wartet es, bis die Leitung wieder frei ist. Der Mac-Host
+Endbild (beim Software-Encoder h264_mf schiebt der Windows-Host dafuer
+nach, bis es heraus ist, siehe dort). Im Stau wartet es, bis die Leitung
+wieder frei ist. Der Mac-Host
 misst die Bildzeit ab der Ankunft des letzten Bildes und zaehlt es in der
 Fuenf-Sekunden-Zeile als "nachgereicht"; der Windows-Host zaehlt es unter
 "nachgelegt", ohne eigene Zeile. Nachgereichte Bilder zaehlen nicht zur
@@ -671,14 +672,13 @@ ueber den Software-Encoder von Media Foundation (h264_mf), in der
 Koennensliste als Software gefuehrt. Der haelt bauartbedingt 16 Bilder
 zurueck (bei 60 Bildern je Sekunde rund 300 ms) - das reicht, um die
 ganze Kette Duplication -> Encoder -> Zuschauer zu pruefen, nicht fuer den
-Betrieb. Weil er ein Bild erst nach weiteren Eingaben herausgibt, kommt
-ohne feste Bildrate, was vor einer Ruhepause zuletzt in den Encoder ging,
-erst mit den naechsten Aenderungen auf dem Desktop beim Zuschauer an: ein
-neuer Zuschauer sieht bei stillem Desktop gar kein Bild, vom Ende einer
-Bewegung fehlen die letzten Bilder samt Endbild, und ein nach "Testbild
-aus" nachgelegtes Bild bleibt ebenso stecken. Mit fester Bildrate tritt
-das nicht auf. Die Duplication braucht die Konsolensitzung; in einer
-RDP-Sitzung gibt es keinen DXGI-Ausgang ("Duplication nicht moeglich").
+Betrieb. Damit ohne feste Bildrate nichts darin stecken bleibt (das
+Endbild einer Bewegung, das erste Bild fuer einen neuen Zuschauer), schiebt
+der Host eine Bildzeit nach dem letzten neuen Bild das letzte Bild in
+Zielrate nach, bis es heraus ist (im 5-s-Protokoll "nachgeschoben: n",
+je Anlass 16); danach ist Ruhe. Die Duplication braucht die
+Konsolensitzung; in einer RDP-Sitzung gibt es keinen DXGI-Ausgang
+("Duplication nicht moeglich").
 
 Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
 meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es
@@ -727,8 +727,7 @@ Der neue Zuschauer erbt nichts vom alten: ein Testbild endet ("Testbild
 aus (Zuschauer gewechselt)"), eine laufende Meldung "kein Bildschirm"
 bekommt er erneut, und der Host legt ihm das letzte Bild einmal nach, auch
 bei stillem Desktop ("Takt: letztes Bild nachgelegt (neuer Zuschauer)";
-mit h264_mf ohne feste Bildrate kommt es erst mit der naechsten Aenderung
-an, siehe oben).
+mit h264_mf schiebt er nach, bis es heraus ist, siehe oben).
 
 Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
 laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.

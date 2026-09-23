@@ -642,7 +642,9 @@ fn oberflaeche_pruefen(t: &ID3D11Texture2D, dw: u32, dh: u32) -> Result<(), Stri
 /// "zu schnell", Encoder voll, Stau) und seitdem keines mehr (`offen_faellig`,
 /// ohne Protokollzeile) - sonst bliebe beim Zuschauer ein Zwischenstand
 /// stehen, bis sich der Desktop wieder aendert. Ohne feste Bildrate, mit
-/// Bild im Encoder und ohne ausgelassenes: nichts.
+/// Bild im Encoder und ohne ausgelassenes: nichts - haelt der Encoder es
+/// noch zurueck (Vorlauf), schiebt der Takt danach nach
+/// (takt::vorlauf_nachschieben).
 fn nachlegen_grund(nachholen: Option<&'static str>, hat_bild: bool, fest_faellig: bool, offen_faellig: bool) -> Option<&'static str> {
     if let Some(grund) = nachholen {
         Some(grund)
@@ -846,6 +848,9 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
     // Letztes echtes Bild: Aufnahmezeit, ob es codiert wurde (fuer die
     // Wiederholung ohne neue Umrechnung).
     let mut letztes: Option<(u64, bool)> = None;
+    // Wann zuletzt ein neues Bild ankam (Hostuhr, us) - fuer den Nachschub
+    // bei Vorlauf: waehrend einer Bewegung schieben die neuen Bilder selbst.
+    let mut letzte_ankunft_us = 0u64;
     // Nach "Testbild aus" oder fuer einen neuen Zuschauer: das letzte
     // Desktopbild einmal nachlegen, auch ohne feste Bildrate (mit Grund).
     let mut nachholen: Option<&'static str> = None;
@@ -1099,6 +1104,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                     }
                     a.dup.freigeben();
                     drop(textur);
+                    letzte_ankunft_us = super::now_us();
                     if let Some(n) = passt.as_ref().ok().and_then(|_| verlustmeldung.bild_ok()) {
                         log(format!("Aufnahme laeuft wieder (derselbe Verlust hatte sich {n}-mal wiederholt)"));
                     }
@@ -1172,7 +1178,10 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
         //    ohne feste Bildrate geht das letzte Bild EINMAL hinein, wenn
         //    der Encoder frisch ist (Start, Codecwechsel, Neustart) oder das
         //    Testbild endet - sonst sieht der Zuschauer bei stillem Desktop
-        //    bis zur naechsten Aenderung nichts bzw. die Balken.
+        //    bis zur naechsten Aenderung nichts bzw. die Balken. Haelt der
+        //    Encoder Bilder zurueck (Vorlauf, h264_mf), schiebt der Takt
+        //    ohne feste Bildrate danach das letzte Bild in Zielrate nach,
+        //    bis das letzte echte Bild heraus ist - dann ist Ruhe.
         if takt.tick_faellig(fps) {
             if let Some(e) = enc.as_mut() {
                 if testbild_an {
@@ -1223,6 +1232,32 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                                     log(format!("Takt: letztes Bild nachgelegt ({einmal})"));
                                 }
                             }
+                        }
+                    }
+                } else if let (Some(_), Some((t_cap, true))) = (auf.as_ref(), letztes) {
+                    // Vorlauf leeren: das Endbild einer Bewegung, das erste
+                    // Bild fuer einen neuen Zuschauer, das Bild nach
+                    // Codecwechsel, Neustart oder Testbild stecken sonst im
+                    // Encoder, bis sich der Desktop wieder aendert. Die
+                    // Wiederholung traegt die echte Aufnahmezeit und ist als
+                    // wiederholt gestempelt (ausserhalb der Latenzmessung);
+                    // das Raster bleibt unberuehrt. Ein ausgelassenes Bild
+                    // (codiert = false) legt oben der Grund "" zuerst nach.
+                    let nachschieben = super::takt::vorlauf_nachschieben(
+                        e.vorlauf(),
+                        e.ausstehend(),
+                        super::now_us().saturating_sub(letzte_ankunft_us),
+                        fps,
+                        Z.fest.load(Ordering::Relaxed),
+                    ) && takt.nachlegen_faellig(fps);
+                    if !nachschieben || e.inflight() >= INFLIGHT_TAKT {
+                        // Nichts auszugeben, oder der Encoder ist noch voll.
+                    } else if netz::stau_vor_dem_encoder() {
+                        takt.ausgelassen();
+                    } else {
+                        let pts = takt.pts_vorwaerts(super::now_us() as i64, fps);
+                        if e.codieren(Quelle::Nachschub, t_cap, pts, true).is_ok() {
+                            Z.nachgeschoben.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
