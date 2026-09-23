@@ -20,12 +20,13 @@
 // Groesse; sie gehen wie in encode_buffer erst durch stau_vor_dem_encoder
 // und dann durch emit_access_unit - Stauregel und Versand sind also die des
 // Hosts, nur der Encoder ist nachgebildet (liefert sofort, nichts im Flug).
-// Dauer rund 50 s. Rueckgabe: Zahl der Fehler.
+// Dauer rund 40 s. Rueckgabe: Zahl der Fehler.
 
 #define main host_main
 #include "main.m"
 #undef main
 
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 
@@ -80,6 +81,25 @@ static int paar(int *host, int *client, int rcvbuf) {
     *host = h;
     *client = c;
     return 0;
+}
+
+// Sendepuffer bis zum letzten Byte fuellen. MSG_DONTWAIT allein wartet auf
+// diesem macOS bei vollem Puffer bis SO_SNDTIMEO (2 s je Schritt, rund 40 s
+// je Fuellung) - daher kurz O_NONBLOCK, und danach wieder zuruecknehmen:
+// zuschauer_abloesen verlaesst sich auf ein blockierendes Senden mit Frist.
+static long puffer_fuellen(int h) {
+    static uint8_t fuell[64 * 1024];
+    long gefuellt = 0;
+    int fl = fcntl(h, F_GETFL);
+    fcntl(h, F_SETFL, fl | O_NONBLOCK);
+    for (size_t stueck = sizeof fuell; stueck; stueck /= 2)
+        for (;;) {
+            ssize_t w = send(h, fuell, stueck, 0);
+            if (w <= 0) break;
+            gefuellt += w;
+        }
+    fcntl(h, F_SETFL, fl);
+    return gefuellt;
 }
 
 static qc_chan *kanal(int fd, uint8_t schluessel) {
@@ -221,15 +241,7 @@ static void abloesen_pruefen(void) {
     printf("\n-- Abloesen: eingefrorener alter Zuschauer\n");
     if (paar(&h, &c, 16 * 1024)) { pruefe(0, "Verbindung"); return; }
     // Gegenstelle liest nie: Sendepuffer bis zum letzten Byte fuellen.
-    static uint8_t fuell[64 * 1024];
-    long gefuellt = 0;
-    for (size_t stueck = sizeof fuell; stueck; stueck /= 2) {
-        for (;;) {
-            ssize_t w = send(h, fuell, stueck, MSG_DONTWAIT);
-            if (w <= 0) break;
-            gefuellt += w;
-        }
-    }
+    long gefuellt = puffer_fuellen(h);
     printf("         (Sendepuffer mit %ld Byte gefuellt)\n", gefuellt);
     zuschauer_setzen(h, kanal(h, 0x22));
     t0 = sek();
@@ -418,9 +430,7 @@ static void stau_pruefen(void) {
         if (alt) { int snd = 1 << 21; setsockopt(h, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd); }
         int puffer = 0; socklen_t pl = sizeof puffer;
         getsockopt(h, SOL_SOCKET, SO_SNDBUF, &puffer, &pl);
-        static uint8_t fuell[64 * 1024];
-        for (size_t stueck = sizeof fuell; stueck; stueck /= 2)
-            while (send(h, fuell, stueck, MSG_DONTWAIT) > 0) {}
+        puffer_fuellen(h);
         int voll = backlog_bytes(h);
         printf("         (SO_SNDBUF %d: SO_NWRITE bei vollem Puffer %d)\n", puffer, voll);
         if (alt) pruefe(voll <= QC_BACKLOG_LIMIT, "mit 2 MB Sendepuffer (vorher) kommt SO_NWRITE nie ueber die 2-MB-Grenze");
