@@ -1202,6 +1202,7 @@ static void nachreichen_pruefen(int bild_port) {
     dispatch_sync(g_capq, ^{
         g_last_pb = CVPixelBufferRetain(pb);
         g_last_cap_us = cmtime_us(vor);
+        g_last_ankunft_us = cmtime_us(vor);
         g_last_pts = vor;
         g_schlitz = 0;
     });
@@ -1268,7 +1269,11 @@ static void nachreichen_pruefen(int bild_port) {
 
     // Mitten in einer Bewegung (juengstes Bild juenger als eine Bildzeit)
     // legt der Takt nichts dazu; die naechste Aufnahme kommt ohnehin.
-    dispatch_sync(g_capq, ^{ g_last_cap_us = now_us(); g_last_pts = CMTimeSubtract(uhr(), CMTimeMake(1, 10)); });
+    // Das juengste Bild ist gerade angekommen, aufgenommen aber schon 20 ms
+    // vorher - mehr als eine Bildzeit bei 60 fps (ScreenCaptureKit liefert mit
+    // Verzug). Massgeblich ist die Ankunft; mit der Aufnahmezeit reichte der
+    // Takt hier das aeltere Bild nach.
+    dispatch_sync(g_capq, ^{ g_last_ankunft_us = now_us(); g_last_cap_us = g_last_ankunft_us - 20000; g_last_pts = CMTimeSubtract(uhr(), CMTimeMake(1, 10)); });
     atomic_store(&g_bild_offen, 1);
     long frames0 = atomic_load(&g_sent_frames);
     dispatch_sync(g_capq, ^{ fixed_tick(); });
@@ -1289,6 +1294,7 @@ static void nachreichen_pruefen(int bild_port) {
     long gefuellt = hfd >= 0 ? puffer_fuellen(hfd) : 0;
     dispatch_sync(g_capq, ^{
         g_last_cap_us = now_us() - 1000000ull;
+        g_last_ankunft_us = g_last_cap_us;
         g_last_pts = CMTimeSubtract(uhr(), CMTimeMake(1, 1));
     });
     atomic_store(&g_bild_offen, 1);

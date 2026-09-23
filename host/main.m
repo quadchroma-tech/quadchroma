@@ -337,6 +337,12 @@ static _Atomic int g_cur_ton = 1;
 static CVPixelBufferRef g_last_pb = NULL;
 static CMTime g_last_pts;
 static uint64_t g_last_cap_us = 0;   // echte Aufnahmezeit des zuletzt gesehenen Bildes
+// Ankunft des zuletzt gesehenen Bildes beim Grabber (Hostuhr, us). Fuer die
+// Frage "kam seit einer Bildzeit nichts Neues?" zaehlt die Ankunft, nicht die
+// Aufnahmezeit: ScreenCaptureKit liefert ein Bild einige Millisekunden nach
+// seiner Aufnahme, mit der Aufnahmezeit reichte der Takt sonst mitten in einer
+// Bewegung das aeltere Bild nach und verdraengte damit das neuere.
+static uint64_t g_last_ankunft_us = 0;
 static _Atomic long g_repeats = 0;
 // Das zuletzt gesehene Bild ist noch nicht in den Encoder gegangen: es fiel
 // als zu schnell, im Stau oder bei vollem Encoder weg. Ohne feste Bildrate
@@ -2205,7 +2211,7 @@ static void fixed_tick(void) {
         // Waehrend einer Bewegung kommt alle paar Millisekunden ein neueres
         // Bild; erst wenn eine Bildzeit lang keins kam, ist dieses das letzte.
         // Es ist ein echtes Bild, also belegt es einen Schlitz im Raster.
-        if (now_us() < g_last_cap_us + 1000000ull / (uint64_t)fps) return;
+        if (now_us() < g_last_ankunft_us + 1000000ull / (uint64_t)fps) return;
         // Wer auf sein erstes Vollbild wartet, bekommt eins - aber eins zur
         // Zeit: steckt schon ein Bild im Encoder, kommt es gleich an.
         if (wartet && atomic_load(&g_inflight) > 0) return;
@@ -2289,6 +2295,7 @@ static void fixed_tick(void) {
         if (alt) CVPixelBufferRelease(alt);
     }
     g_last_cap_us = t_cap;
+    g_last_ankunft_us = now_us();
     // Noch nicht beim Zuschauer. Geht es gleich in den Encoder, ist der
     // Merker wieder weg; sonst reicht der Takt es nach. Auch waehrend des
     // Testbilds und eines Codecwechsels: danach soll das Neueste kommen.
@@ -2663,10 +2670,25 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     }
     if ([args containsObject:@"--forget"]) {
         // Alle Freigaben loeschen. Danach koppelt sich die naechste Gegenstelle neu.
+        // Scheitert das Loeschen, gelten die bisherigen Freigaben weiter - ein
+        // verlorenes Geraet kaeme also weiter herein. Dann nicht mit der alten
+        // Liste weiterlaufen und "geloescht" melden, sondern abbrechen (wie der
+        // Windows-Host). Eine fehlende Liste ist Erfolg.
         const char *home = getenv("HOME");
-        if (home) {
-            NSString *pf = [NSString stringWithFormat:@"%s/Library/Application Support/QuadChroma/authorized.txt", home];
-            [[NSFileManager defaultManager] removeItemAtPath:pf error:nil];
+        if (!home) {
+            logf_(@"Freigaben NICHT geloescht: HOME fehlt - Abbruch, die bisherigen Gegenstellen waeren weiter freigegeben.");
+            return 8;
+        }
+        NSString *pf = [NSString stringWithFormat:@"%s/Library/Application Support/QuadChroma/authorized.txt", home];
+        NSError *fehler = nil;
+        if (![[NSFileManager defaultManager] removeItemAtPath:pf error:&fehler]) {
+            BOOL fehlt = [fehler.domain isEqualToString:NSCocoaErrorDomain] && fehler.code == NSFileNoSuchFileError;
+            NSError *posix = fehler.userInfo[NSUnderlyingErrorKey];
+            if (!fehlt && !([posix.domain isEqualToString:NSPOSIXErrorDomain] && posix.code == ENOENT)) {
+                logf_(@"Freigaben NICHT geloescht: %@ - Abbruch, die bisherigen Gegenstellen waeren weiter freigegeben.",
+                      fehler.localizedDescription ?: @"unbekannter Fehler");
+                return 8;
+            }
         }
         logf_(@"Alle Freigaben geloescht.");
     }
