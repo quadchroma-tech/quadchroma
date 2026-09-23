@@ -18,6 +18,7 @@ pub const CHUNK_MAX: usize = 65519;
 /// Anrufer liest nur Nachricht 2 und bleibt bei den bisherigen 3 s; der
 /// Angerufene liest zwei Nachrichten mit einem Hin und Her dazwischen.
 const FRIST_ANRUFER: Duration = Duration::from_secs(3);
+#[cfg_attr(not(windows), allow(dead_code))]
 const FRIST_ANNAHME: Duration = Duration::from_secs(5);
 
 /// Rahmen des Handschlags: 2 Byte Laenge, dann die Nachricht. Alle Lese-
@@ -313,14 +314,21 @@ fn geheim_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
 /// die naechste fremde Gegenstelle auf. Ein fuehrendes BOM (Editor "UTF-8
 /// mit BOM") wird uebergangen - sonst traefe die erste Zeile nie.
 fn liste_lesen(path: &Path) -> Result<String, String> {
+    liste_lesen_falls_da(path).map(Option::unwrap_or_default)
+}
+
+/// Wie `liste_lesen`, aber eine fehlende Datei ergibt None statt eines
+/// leeren Texts - fuer die Freigabeliste, bei der "leer" und "fehlt" nicht
+/// dasselbe heissen.
+fn liste_lesen_falls_da(path: &Path) -> Result<Option<String>, String> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let b = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{name} nicht lesbar: {e}")),
     };
     let text = String::from_utf8(b).map_err(|_| format!("{name} ist kein UTF-8"))?;
-    Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text))
+    Ok(Some(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)))
 }
 
 /// Haengt eine Zeile an eine Vertrauensliste an. Die vorhandenen Zeilen
@@ -395,54 +403,82 @@ fn authorized_path() -> Option<PathBuf> {
     config_dir().ok().map(|d| d.join("authorized.txt"))
 }
 
-/// Die Freigabeliste; ohne Ablageort ein Fehler, keine leere Liste.
-fn freigaben_lesen() -> Result<(PathBuf, String), String> {
-    let p = authorized_path().ok_or("kein Ablageort fuer authorized.txt")?;
-    let text = liste_lesen(&p)?;
-    Ok((p, text))
+/// Die Freigabeliste, einmal gelesen. Wer ueber eine Gegenstelle
+/// entscheidet, liest sie genau einmal und entscheidet auf diesem Stand -
+/// Pruefen, Erstkontakt und Eintragen sehen dieselbe Datei. Nur die
+/// Host-Rolle (Windows) braucht sie.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Freigaben {
+    pfad: PathBuf,
+    text: String,
+    /// Gab es die Datei? Nur wenn nicht, ist es ein Erstkontakt.
+    vorhanden: bool,
 }
 
-fn freigegeben_in(text: &str, peer: &[u8]) -> bool {
-    let h = hex(peer);
-    text.lines().any(|l| l.starts_with(&h))
-}
-
-fn freigaben_in(text: &str) -> usize {
-    text.lines().filter(|l| l.len() > 64).count()
-}
-
-/// Ist diese Gegenstelle freigegeben? Verglichen werden die ersten 64
-/// Zeichen der Zeile, wie auf dem Mac. Err, wenn die Liste vorhanden, aber
-/// nicht lesbar ist - der Aufrufer weist dann ab.
-pub fn is_authorized(peer: &[u8]) -> Result<bool, String> {
-    freigaben_lesen().map(|(_, t)| freigegeben_in(&t, peer))
-}
-
-/// Gegenstelle aufnehmen. Schon bekannte Zeilen werden nicht verdoppelt.
-/// Ist die Liste nicht lesbar, wird NICHTS geschrieben.
-pub fn authorize(peer: &[u8], name: &str) -> Result<(), String> {
-    let (p, text) = freigaben_lesen()?;
-    freigabe_anhaengen(&p, &text, peer, name)
-}
-
-fn freigabe_anhaengen(p: &Path, text: &str, peer: &[u8], name: &str) -> Result<(), String> {
-    if freigegeben_in(text, peer) {
-        return Ok(());
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Freigaben {
+    /// Liest authorized.txt. Err, wenn sie vorhanden, aber nicht lesbar ist
+    /// (Rechte, Sperre, kein UTF-8) - dann entscheidet der Aufrufer auf
+    /// Abweisen, nicht auf Erstkontakt. Ohne Ablageort ebenfalls Err.
+    pub fn lesen() -> Result<Freigaben, String> {
+        let p = authorized_path().ok_or("kein Ablageort fuer authorized.txt")?;
+        Freigaben::lesen_aus(p)
     }
-    let zeile = format!("{}  {}  {}", hex(peer), noise::fingerprint(peer), if name.is_empty() { "-" } else { name });
-    liste_anhaengen(p, text, &zeile).map_err(|e| format!("authorized.txt: {e}"))
-}
 
-/// Anzahl der freigegebenen Gegenstellen. Err, wenn die Liste vorhanden,
-/// aber nicht lesbar ist - dann ist es KEIN Erstkontakt.
-pub fn freigaben_zaehlen() -> Result<usize, String> {
-    freigaben_lesen().map(|(_, t)| freigaben_in(&t))
+    fn lesen_aus(pfad: PathBuf) -> Result<Freigaben, String> {
+        let gelesen = liste_lesen_falls_da(&pfad)?;
+        let vorhanden = gelesen.is_some();
+        Ok(Freigaben { pfad, text: gelesen.unwrap_or_default(), vorhanden })
+    }
+
+    /// Ist diese Gegenstelle freigegeben? Verglichen werden die ersten 64
+    /// Zeichen der Zeile, wie auf dem Mac.
+    pub fn enthaelt(&self, peer: &[u8]) -> bool {
+        let h = hex(peer);
+        self.text.lines().any(|l| l.starts_with(&h))
+    }
+
+    /// Gueltige Eintraege: Zeilen, die mit 64 Hexziffern beginnen.
+    pub fn anzahl(&self) -> usize {
+        self.text
+            .lines()
+            .filter(|l| l.len() >= 64 && l.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit))
+            .count()
+    }
+
+    /// Darf die naechste unbekannte Gegenstelle ohne --pair herein? Nur,
+    /// wenn es authorized.txt noch gar nicht gibt. Ist sie vorhanden, aber
+    /// ohne einen einzigen gueltigen Eintrag (leer, nur Kommentare, von Hand
+    /// verdorben, beim Schreiben abgeschnitten), ist das KEIN Erststart: Err
+    /// mit dem Grund. Neu koppeln geht dann mit --pair oder nach Loeschen.
+    pub fn erstkontakt(&self) -> Result<bool, String> {
+        if !self.vorhanden {
+            return Ok(true);
+        }
+        if self.anzahl() == 0 {
+            return Err("authorized.txt ist vorhanden, enthaelt aber keine gueltige Freigabe - kein Erstkontakt, \
+                 neue Gegenstellen nur mit --pair (oder Datei loeschen)"
+                .into());
+        }
+        Ok(false)
+    }
+
+    /// Gegenstelle aufnehmen. Schon bekannte Zeilen werden nicht verdoppelt;
+    /// die vorhandenen Zeilen bleiben unberuehrt (angehaengt, nicht neu
+    /// geschrieben). Err heisst: nicht gespeichert - dann nicht zulassen.
+    pub fn aufnehmen(&self, peer: &[u8], name: &str) -> Result<(), String> {
+        if self.enthaelt(peer) {
+            return Ok(());
+        }
+        let zeile = format!("{}  {}  {}", hex(peer), noise::fingerprint(peer), if name.is_empty() { "-" } else { name });
+        liste_anhaengen(&self.pfad, &self.text, &zeile).map_err(|e| format!("authorized.txt: {e}"))
+    }
 }
 
 /// Anzahl der freigegebenen Gegenstellen, nur fuer die Startzeile im
-/// Protokoll (unlesbar: 0). Entscheidungen laufen ueber `freigaben_zaehlen`.
+/// Protokoll (unlesbar: 0). Entscheidungen laufen ueber `Freigaben`.
 pub fn authorized_count() -> usize {
-    freigaben_zaehlen().unwrap_or(0)
+    Freigaben::lesen().map(|f| f.anzahl()).unwrap_or(0)
 }
 
 /// Alle Freigaben loeschen (--forget).
@@ -542,24 +578,47 @@ mod tests {
         let mut inhalt = format!("{}  {}  ", hex(&A), noise::fingerprint(&A)).into_bytes();
         inhalt.extend_from_slice(b"Rechner\xff\n");
         std::fs::write(&p, &inhalt).unwrap();
-        // is_authorized, freigaben_zaehlen und authorize lesen alle ueber
-        // liste_lesen - scheitert es, gibt es weder Erstkontakt noch Schreiben.
-        assert!(liste_lesen(&p).is_err());
+        // Pruefen, Erstkontakt und Eintragen haengen alle an diesem einen
+        // Lesen - scheitert es, gibt es weder Erstkontakt noch Schreiben.
+        assert!(Freigaben::lesen_aus(p.clone()).is_err());
         assert_eq!(std::fs::read(&p).unwrap(), inhalt);
 
         // Fehlt die Datei: Erstkontakt, dann genau eine Zeile.
         let q = d.join("neu.txt");
-        let t = liste_lesen(&q).unwrap();
-        assert_eq!((freigaben_in(&t), freigegeben_in(&t, &A)), (0, false));
-        freigabe_anhaengen(&q, &t, &A, "10.0.0.5").unwrap();
-        let t = liste_lesen(&q).unwrap();
-        assert_eq!((freigaben_in(&t), freigegeben_in(&t, &A)), (1, true));
+        let f = Freigaben::lesen_aus(q.clone()).unwrap();
+        assert_eq!((f.anzahl(), f.enthaelt(&A), f.erstkontakt()), (0, false, Ok(true)));
+        f.aufnehmen(&A, "10.0.0.5").unwrap();
+        let f = Freigaben::lesen_aus(q.clone()).unwrap();
+        assert_eq!((f.anzahl(), f.enthaelt(&A), f.erstkontakt()), (1, true, Ok(false)));
         // Schon bekannt: keine zweite Zeile. Neuer: angehaengt.
-        freigabe_anhaengen(&q, &t, &A, "10.0.0.5").unwrap();
-        freigabe_anhaengen(&q, &t, &B, "").unwrap();
-        let t = liste_lesen(&q).unwrap();
-        assert_eq!(freigaben_in(&t), 2);
-        assert!(t.lines().next().unwrap().starts_with(&hex(&A)));
+        f.aufnehmen(&A, "10.0.0.5").unwrap();
+        f.aufnehmen(&B, "").unwrap();
+        let f = Freigaben::lesen_aus(q.clone()).unwrap();
+        assert_eq!(f.anzahl(), 2);
+        assert!(f.text.lines().next().unwrap().starts_with(&hex(&A)));
+    }
+
+    /// Vorhanden, lesbar, aber ohne gueltigen Eintrag: kein Erstkontakt.
+    /// Aufnehmen (der Weg von --pair) geht trotzdem, und die Zeilen davor
+    /// bleiben stehen.
+    #[test]
+    fn freigaben_ohne_gueltigen_eintrag_sind_kein_erstkontakt() {
+        let d = ordner("auth-leer");
+        let p = d.join("authorized.txt");
+        let kaputt = format!("# Freigaben\n{}\n\n", &hex(&A)[..40]);
+        for inhalt in ["", "\n", "\u{feff}", "# nur ein Kommentar, lang genug fuer 64 Zeichen ........................\n", &kaputt] {
+            std::fs::write(&p, inhalt).unwrap();
+            let f = Freigaben::lesen_aus(p.clone()).unwrap();
+            assert_eq!(f.anzahl(), 0, "{inhalt:?}");
+            let e = f.erstkontakt().unwrap_err();
+            assert!(e.contains("keine gueltige Freigabe"), "{e}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), inhalt);
+        }
+        let f = Freigaben::lesen_aus(p.clone()).unwrap();
+        f.aufnehmen(&B, "10.0.0.6").unwrap();
+        let f = Freigaben::lesen_aus(p.clone()).unwrap();
+        assert!(f.text.starts_with(&kaputt));
+        assert_eq!((f.anzahl(), f.enthaelt(&B), f.erstkontakt()), (1, true, Ok(false)));
     }
 
     #[test]

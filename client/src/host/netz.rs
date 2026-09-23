@@ -20,7 +20,8 @@
 // (ersetzt oder weg), kappt `Leitung::schliessen` auch dessen Eingabe, und
 // die Eingabeschleife speist nichts mehr ein. Handschlaege laufen je
 // Verbindung in einem eigenen Faden, mit Frist (secure.rs, FRIST_ANNAHME) und
-// Obergrenze - eine stumme Verbindung sperrt damit niemanden mehr aus.
+// Obergrenze (HANDSCHLAEGE_MAX) - stumme Verbindungen sperren damit niemanden
+// mehr aus.
 // Windows bricht ein blockierendes recv/send auf ein shutdown hin nicht ab,
 // solange die Gegenstelle lebt, aber schweigt (eingefrorener Prozess): Der
 // Faden des alten Kanals bleibt dann stehen, bis sie geht - harmlos, weil er
@@ -30,7 +31,7 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{eingabe, encoder, log, now_us, Z};
@@ -41,6 +42,26 @@ use crate::{noise, secure};
 const BACKLOG_LIMIT: usize = 2 * 1024 * 1024;
 /// Sendepuffer im Kernel; zaehlt als geschaetzter Anteil zum Stau dazu.
 const SNDBUF: usize = 256 * 1024;
+
+/// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
+/// ist. Die Sperren hier schuetzen Abfolgen (EINSPEISEN, FREIGABE) oder Daten,
+/// die jeder Schritt heil hinterlaesst; mit einem blossen unwrap zoege eine
+/// einzige Panik beim Einspeisen jede weitere Annahme mit - und der Sendefaden
+/// raeumte AKTUELL nie mehr ab ("kein Zuschauer, keine Arbeit").
+fn sperre<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hoechstens alle zehn Sekunden eine Protokollzeile derselben Art: wer
+/// einen Port mit Verbindungen bestreicht, soll das Protokoll nicht fuellen.
+fn melden_erlaubt(letzte: &Mutex<Option<Instant>>) -> bool {
+    let mut t = sperre(letzte);
+    if t.map(|t| t.elapsed() < Duration::from_secs(10)).unwrap_or(false) {
+        return false;
+    }
+    *t = Some(Instant::now());
+    true
+}
 
 struct Warteschlange {
     pakete: VecDeque<Vec<u8>>,
@@ -83,7 +104,7 @@ impl Leitung {
     /// nichts, auch wenn er seine Leitungen selbst offen hielte.
     fn schliessen(&self) {
         let eingabe = {
-            let mut q = self.q.lock().unwrap();
+            let mut q = sperre(&self.q);
             q.offen = false;
             self.cv.notify_all();
             q.eingabe.take()
@@ -99,13 +120,13 @@ impl Leitung {
 
     #[cfg(test)]
     fn offen(&self) -> bool {
-        self.q.lock().unwrap().offen
+        sperre(&self.q).offen
     }
 
     /// Gilt Eingabekanal `nr` noch? Nur, solange sein Zuschauer da ist und
     /// kein neuerer Eingabekanal desselben Zuschauers ihn abgeloest hat.
     fn gilt(&self, nr: u64) -> bool {
-        let q = self.q.lock().unwrap();
+        let q = sperre(&self.q);
         q.offen && q.eingabe.as_ref().map(|(n, _)| *n == nr).unwrap_or(false)
     }
 
@@ -115,7 +136,7 @@ impl Leitung {
     /// Tasten losgelassen. Unter EINSPEISEN aufrufen.
     fn eingabe_binden(&self, nr: u64, griff: TcpStream) -> bool {
         let alt = {
-            let mut q = self.q.lock().unwrap();
+            let mut q = sperre(&self.q);
             if !q.offen {
                 return false;
             }
@@ -133,7 +154,7 @@ impl Leitung {
     /// hielte die Kopie die Leitung offen, nachdem die Schleife sie verlassen
     /// hat. true: der Kanal galt bis zuletzt.
     fn eingabe_loesen(&self, nr: u64) -> bool {
-        let mut q = self.q.lock().unwrap();
+        let mut q = sperre(&self.q);
         if q.eingabe.as_ref().map(|(n, _)| *n == nr).unwrap_or(false) {
             q.eingabe = None;
             return true;
@@ -144,7 +165,7 @@ impl Leitung {
     /// Ein Paket einreihen. Mit Budget: nur, wenn Warteschlange plus
     /// Kernelanteil darunter bleiben - sonst false (Stau).
     fn einreihen(&self, paket: Vec<u8>, budget: Option<usize>) -> bool {
-        let mut q = self.q.lock().unwrap();
+        let mut q = sperre(&self.q);
         if !q.offen {
             return false;
         }
@@ -179,21 +200,27 @@ static FREIGABE: Mutex<()> = Mutex::new(());
 /// bleiben. Reihenfolge: erst EINSPEISEN, dann AKTUELL.
 static EINSPEISEN: Mutex<()> = Mutex::new(());
 
-/// Handschlaege, die gerade laufen - je Port hoechstens vier, je Absender
+/// Handschlaege, die gerade laufen - je Port hoechstens 32, je Absender
 /// hoechstens zwei. Mit nur einem Annahmefaden genuegte eine einzige stumme
 /// Verbindung, um jeden weiteren Zuschauer auszusperren; ohne Grenze banden
-/// Verbindungen ohne Schluessel beliebig viele Faeden.
-const HANDSCHLAEGE_MAX: usize = 4;
+/// Verbindungen ohne Schluessel beliebig viele Faeden. Die Gesamtgrenze ist
+/// bewusst weit: wer alle Plaetze stumm halten will, um einen Zuschauer
+/// auszusperren, braucht 16 Absenderadressen, nicht zwei. Ein Faden, der im
+/// recv wartet, kostet kaum etwas, und jeder endet nach der Frist.
+const HANDSCHLAEGE_MAX: usize = 32;
 const HANDSCHLAEGE_JE_ABSENDER: usize = 2;
 
 struct Plaetze {
-    /// Absender der laufenden Handschlaege, und wann zuletzt eine Abweisung
-    /// im Protokoll stand (hoechstens alle zehn Sekunden eine).
-    laufend: Mutex<(Vec<IpAddr>, Option<Instant>)>,
+    /// Absender der laufenden Handschlaege.
+    laufend: Mutex<Vec<IpAddr>>,
+    /// Wann zuletzt eine Abweisung im Protokoll stand.
+    gemeldet: Mutex<Option<Instant>>,
 }
 
-static PLAETZE_BILD: Plaetze = Plaetze { laufend: Mutex::new((Vec::new(), None)) };
-static PLAETZE_EINGABE: Plaetze = Plaetze { laufend: Mutex::new((Vec::new(), None)) };
+static PLAETZE_BILD: Plaetze = Plaetze::neu();
+static PLAETZE_EINGABE: Plaetze = Plaetze::neu();
+/// Wann zuletzt "kein Bildkanal offen" im Protokoll stand.
+static KEIN_BILD_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Ein belegter Platz; gibt sich beim Wegfallen selbst frei.
 struct Platz {
@@ -202,29 +229,32 @@ struct Platz {
 }
 
 impl Plaetze {
+    const fn neu() -> Plaetze {
+        Plaetze { laufend: Mutex::new(Vec::new()), gemeldet: Mutex::new(None) }
+    }
+
     fn belegen(&'static self, ip: IpAddr, kanal: &str) -> Option<Platz> {
-        let mut l = self.laufend.lock().unwrap();
-        let je_absender = l.0.iter().filter(|x| **x == ip).count();
-        if l.0.len() >= HANDSCHLAEGE_MAX || je_absender >= HANDSCHLAEGE_JE_ABSENDER {
-            if l.1.map(|t| t.elapsed() >= Duration::from_secs(10)).unwrap_or(true) {
-                l.1 = Some(Instant::now());
+        let mut l = sperre(&self.laufend);
+        let je_absender = l.iter().filter(|x| **x == ip).count();
+        if l.len() >= HANDSCHLAEGE_MAX || je_absender >= HANDSCHLAEGE_JE_ABSENDER {
+            if melden_erlaubt(&self.gemeldet) {
                 log(format!(
                     "{kanal}: Verbindung von {ip} abgewiesen - schon {} Handschlaege offen ({je_absender} von dort)",
-                    l.0.len()
+                    l.len()
                 ));
             }
             return None;
         }
-        l.0.push(ip);
+        l.push(ip);
         Some(Platz { p: self, ip })
     }
 }
 
 impl Drop for Platz {
     fn drop(&mut self) {
-        let mut l = self.p.laufend.lock().unwrap();
-        if let Some(i) = l.0.iter().position(|x| *x == self.ip) {
-            l.0.swap_remove(i);
+        let mut l = sperre(&self.p.laufend);
+        if let Some(i) = l.iter().position(|x| *x == self.ip) {
+            l.swap_remove(i);
         }
     }
 }
@@ -234,11 +264,11 @@ fn absender(s: &TcpStream) -> IpAddr {
 }
 
 pub fn zuschauer_da() -> bool {
-    AKTUELL.lock().unwrap().is_some()
+    sperre(&AKTUELL).is_some()
 }
 
 fn aktuell() -> Option<Arc<Leitung>> {
-    AKTUELL.lock().unwrap().clone()
+    sperre(&AKTUELL).clone()
 }
 
 /// Kopf einer Nachricht.
@@ -333,9 +363,16 @@ pub fn bild_senden(au: &[u8], key: bool, t_cap: u64, wiederholt: bool) -> Versan
 fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
     loop {
         let paket = {
-            let mut q = l.q.lock().unwrap();
+            let mut q = sperre(&l.q);
             while q.pakete.is_empty() && q.offen {
-                q = l.cv.wait(q).unwrap();
+                q = l.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+            // Geschlossen (abgeloest oder weg): Was noch wartet, gehoert
+            // niemandem mehr - nicht in die gekappte Leitung schreiben.
+            if !q.offen {
+                q.pakete.clear();
+                q.bytes = 0;
+                break;
             }
             match q.pakete.pop_front() {
                 Some(p) => {
@@ -346,13 +383,17 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
             }
         };
         if let Err(e) = sock.write_all(&paket) {
-            log(format!("Zuschauer weg: {e}"));
+            // Scheitert das Schreiben, weil `schliessen` die Leitung eben
+            // gekappt hat, ist der Zuschauer nicht weg, sondern abgeloest.
+            if sperre(&l.q).offen {
+                log(format!("Zuschauer weg: {e}"));
+            }
             l.schliessen();
             break;
         }
     }
-    let _einspeisen = EINSPEISEN.lock().unwrap();
-    let mut a = AKTUELL.lock().unwrap();
+    let _einspeisen = sperre(&EINSPEISEN);
+    let mut a = sperre(&AKTUELL);
     if a.as_ref().map(|x| Arc::ptr_eq(x, &l)).unwrap_or(false) {
         *a = None;
         drop(a);
@@ -400,40 +441,44 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let sas = sock.sas.clone();
 
     // Freigabe: bekannte Gegenstelle, oder das Kopplungsfenster steht
-    // offen, oder es gibt noch gar keine Freigabe (Erstkontakt). Eine
-    // vorhandene, aber unlesbare Liste ist KEIN Erstkontakt - dann wird
-    // abgewiesen, ebenso wenn sich die neue Freigabe nicht speichern laesst.
+    // offen, oder es gibt authorized.txt noch gar nicht (Erstkontakt). Eine
+    // vorhandene, aber unlesbare Liste ist KEIN Erstkontakt, ebenso wenig
+    // eine vorhandene ohne gueltigen Eintrag (secure::Freigaben::erstkontakt)
+    // - dann wird abgewiesen, ebenso wenn sich die neue Freigabe nicht
+    // speichern laesst. Die Liste wird dafuer genau einmal gelesen; Pruefen,
+    // Erstkontakt und Eintragen entscheiden auf demselben Stand.
     {
-        let _freigabe = FREIGABE.lock().unwrap();
-        let bekannt = match secure::is_authorized(&sock.peer) {
-            Ok(b) => b,
+        let _freigabe = sperre(&FREIGABE);
+        let liste = match secure::Freigaben::lesen() {
+            Ok(l) => l,
             Err(e) => {
                 log(format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
                 return;
             }
         };
-        if !bekannt {
-            let anzahl = match secure::freigaben_zaehlen() {
-                Ok(n) => n,
-                Err(e) => {
-                    log(format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
-                    return;
+        if !liste.enthaelt(&sock.peer) {
+            let aufnehmen = if Z.pair_open.load(Ordering::Relaxed) { Ok(true) } else { liste.erstkontakt() };
+            match aufnehmen {
+                Ok(true) => {
+                    if let Err(e) = liste.aufnehmen(&sock.peer, &ip) {
+                        log(format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
+                        return;
+                    }
+                    log(format!("Neue Gegenstelle gekoppelt: {fp} ({ip}), Vergleichscode {sas}"));
+                    Z.pair_open.store(false, Ordering::Relaxed);
                 }
-            };
-            if Z.pair_open.load(Ordering::Relaxed) || anzahl == 0 {
-                if let Err(e) = secure::authorize(&sock.peer, &ip) {
-                    log(format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
-                    return;
-                }
-                log(format!("Neue Gegenstelle gekoppelt: {fp} ({ip}), Vergleichscode {sas}"));
-                Z.pair_open.store(false, Ordering::Relaxed);
-            } else {
-                log(format!(
-                    "Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen."
-                ));
                 // Die Leitung faellt mit `sock` zu - der Client deutet das
                 // Ende nach dem Handschlag als "nicht gekoppelt".
-                return;
+                Ok(false) => {
+                    log(format!(
+                        "Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen."
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    log(format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip} - {e}"));
+                    return;
+                }
             }
         }
     }
@@ -449,9 +494,10 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     // Ein neuer Zuschauer ersetzt den alten: dessen Bildleitung und
     // Eingabekanal werden gekappt, sein Sendefaden endet.
     {
-        let _einspeisen = EINSPEISEN.lock().unwrap();
-        let mut a = AKTUELL.lock().unwrap();
+        let _einspeisen = sperre(&EINSPEISEN);
+        let mut a = sperre(&AKTUELL);
         if let Some(alt) = a.take() {
+            log(format!("Zuschauer abgeloest: {}", alt.ip));
             alt.schliessen();
             eingabe::alle_tasten_loslassen();
         }
@@ -485,7 +531,9 @@ fn annahme_eingabe(listener: TcpListener) {
         // Prologue enthaelt dessen Pruefsumme. Wer die nicht kennt, kommt hier
         // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
         let Some(bild) = aktuell() else {
-            log("Eingabekanal abgewiesen: kein Bildkanal offen");
+            if melden_erlaubt(&KEIN_BILD_GEMELDET) {
+                log("Eingabekanal abgewiesen: kein Bildkanal offen");
+            }
             continue;
         };
         let Some(platz) = PLAETZE_EINGABE.belegen(absender(&stream), "Eingabekanal") else { continue };
@@ -510,7 +558,7 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
     // aktuelle ist: ein Wechsel waehrend des Handschlags macht diese
     // Leitung wertlos. Ohne Abbruchgriff liesse sie sich nicht kappen.
     let nr = EINGABE_NR.fetch_add(1, Ordering::Relaxed);
-    let einspeisen = EINSPEISEN.lock().unwrap();
+    let einspeisen = sperre(&EINSPEISEN);
     let Some(griff) = sock.abbruchgriff() else {
         log("Eingabekanal abgewiesen: Leitung nicht zu fassen");
         return;
@@ -541,7 +589,7 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
         }
         // Abgeloest? Dann nichts mehr einspeisen - auch nicht, was schon
         // entschluesselt im Puffer lag. Pruefen und Ausfuehren unter EINSPEISEN.
-        let _einspeisen = EINSPEISEN.lock().unwrap();
+        let _einspeisen = sperre(&EINSPEISEN);
         if !bild.gilt(nr) {
             break;
         }
@@ -594,7 +642,7 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
     // Galt der Kanal bis zuletzt, gibt er seine Tasten selbst frei. Sonst hat
     // das schon getan, wer ihn abgeloest hat - und ein spaet endender alter
     // Faden liesse sonst die Tasten des neuen Zuschauers los.
-    let _einspeisen = EINSPEISEN.lock().unwrap();
+    let _einspeisen = sperre(&EINSPEISEN);
     let galt = bild.eingabe_loesen(nr);
     log("Eingabekanal getrennt");
     if galt {
@@ -705,8 +753,13 @@ fn bekanntgabe(port: u16) {
 pub fn start(port: u16, priv_key: Vec<u8>) -> Result<(), String> {
     PRIV.set(priv_key).ok();
     // Die Startzeile zaehlt eine unlesbare Liste als 0 - hier steht, was das heisst.
-    if let Err(e) = secure::freigaben_zaehlen() {
-        log(format!("Freigabeliste: {e} - jede Gegenstelle wird abgewiesen, bis die Datei repariert ist"));
+    match secure::Freigaben::lesen() {
+        Err(e) => log(format!("Freigabeliste: {e} - jede Gegenstelle wird abgewiesen, bis die Datei repariert ist")),
+        Ok(l) => {
+            if let Err(e) = l.erstkontakt() {
+                log(format!("Freigabeliste: {e}"));
+            }
+        }
     }
     let bild = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("Bild-Port {port} nicht verfuegbar: {e}"))?;
     let eingabe = TcpListener::bind(("0.0.0.0", port + 1))
@@ -795,6 +848,22 @@ mod tests {
         let (host_priv, _) = noise::keypair().unwrap();
         PRIV.set(host_priv).unwrap();
         secure::test_identitaet();
+        // Ist irgendwann ein Faden unter einer der Sperren in Panik geraten,
+        // muss der Zuschauerplatz trotzdem weiterlaufen. Hier mit Absicht:
+        // alle drei vergiftet, bevor es losgeht.
+        for m in [&EINSPEISEN, &FREIGABE] {
+            let _ = std::thread::spawn(move || {
+                let _g = m.lock();
+                panic!("mit Absicht: Sperre vergiften (Test)");
+            })
+            .join();
+        }
+        let _ = std::thread::spawn(|| {
+            let _g = AKTUELL.lock();
+            panic!("mit Absicht: Sperre vergiften (Test)");
+        })
+        .join();
+        assert!(EINSPEISEN.is_poisoned() && FREIGABE.is_poisoned() && AKTUELL.is_poisoned());
         let bild_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let ein_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let bild_addr = bild_l.local_addr().unwrap().to_string();
@@ -844,5 +913,37 @@ mod tests {
         drop((s1, s2));
         std::thread::sleep(Duration::from_millis(200));
         let _c = bild_verbinden(&bild_addr);
+    }
+
+    /// Die Grenzen der laufenden Handschlaege: je Absender zwei, insgesamt
+    /// so viele, dass zwei oder drei Adressen niemanden aussperren. Erst
+    /// HANDSCHLAEGE_MAX / 2 Absender fuellen die Tabelle.
+    #[test]
+    fn handschlagplaetze_brauchen_viele_absender() {
+        static P: Plaetze = Plaetze::neu();
+        let ip = |n: u8| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n));
+        let mut belegt = Vec::new();
+        // Zwei Angreiferadressen mit je zwei stummen Verbindungen.
+        for n in 1..=2 {
+            for _ in 0..2 {
+                belegt.push(P.belegen(ip(n), "Test").unwrap());
+            }
+            assert!(P.belegen(ip(n), "Test").is_none(), "je Absender hoechstens zwei");
+        }
+        // Ein Zuschauer von einer dritten Adresse kommt trotzdem an die Reihe.
+        assert!(P.belegen(ip(100), "Test").is_some());
+        // Voll ist die Tabelle erst mit HANDSCHLAEGE_MAX / 2 Absendern.
+        let absender = (HANDSCHLAEGE_MAX / HANDSCHLAEGE_JE_ABSENDER) as u8;
+        assert!(absender >= 16, "{absender}");
+        for n in 3..=absender {
+            for _ in 0..2 {
+                belegt.push(P.belegen(ip(n), "Test").unwrap());
+            }
+        }
+        assert_eq!(belegt.len(), HANDSCHLAEGE_MAX);
+        assert!(P.belegen(ip(100), "Test").is_none());
+        // Ein Handschlag endet (Frist, Fehler oder fertig): Platz wieder frei.
+        belegt.pop();
+        assert!(P.belegen(ip(100), "Test").is_some());
     }
 }

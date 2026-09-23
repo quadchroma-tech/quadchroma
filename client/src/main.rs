@@ -2281,6 +2281,9 @@ struct InputLink {
     /// Wann zuletzt ein Verbindungsversuch lief. Bremst die Wiederholungen,
     /// damit ein toter Host die Oberflaeche nicht im Sekundentakt anhaelt.
     letzter_versuch: Option<Instant>,
+    /// Wann zuletzt ein fremder Schluessel am Eingabeport im Protokoll stand -
+    /// hoechstens alle zehn Sekunden eine Zeile, nicht eine je Versuch.
+    fremd_gemeldet: Option<Instant>,
 }
 
 impl InputLink {
@@ -2293,6 +2296,7 @@ impl InputLink {
             link: None,
             gedrueckt: std::collections::HashSet::new(),
             letzter_versuch: None,
+            fremd_gemeldet: None,
         }
     }
 
@@ -2337,10 +2341,13 @@ impl InputLink {
             Ok(s) => {
                 // Die Leitung faellt mit `s` zu; `letzter_versuch` bleibt,
                 // also hoechstens ein Versuch je Sekunde.
-                protokoll::zeile(format!(
-                    "Eingabekanal: Gegenstelle {} ist nicht der Host des Bildkanals - verworfen",
-                    s.peer_fingerprint()
-                ));
+                if self.fremd_gemeldet.map(|t| t.elapsed() >= Duration::from_secs(10)).unwrap_or(true) {
+                    self.fremd_gemeldet = Some(Instant::now());
+                    protokoll::zeile(format!(
+                        "Eingabekanal: Gegenstelle {} ist nicht der Host des Bildkanals - verworfen",
+                        s.peer_fingerprint()
+                    ));
+                }
             }
             Err(_) => {}
         }
@@ -7202,6 +7209,7 @@ mod tests {
         l.ensure();
         assert!(t.join().unwrap(), "Handschlag mit dem Fremden muss gelingen");
         assert!(l.sock.is_none());
+        assert!(l.fremd_gemeldet.is_some());
         l.send(IN_CLIP, b"geheim");
         assert_eq!(l.sent, 0);
 
