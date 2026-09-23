@@ -33,6 +33,9 @@ Datenschutz & Sicherheit:
 
 Ohne Zuschauer tut der Host nichts: keine Aufnahme, kein Encoder (0,6 % Last im
 Leerlauf). Aufgenommen wird der Hauptbildschirm, `--display n` wählt einen anderen.
+`--fest` schickt Bilder im festen Takt von `--fps`, auch bei stillem Bildschirm;
+ohne die Angabe kommen neue Bilder nur bei Änderungen (umschaltbar im Menü des
+Clients, dort je Host gespeichert).
 Sein Protokoll steht in `/tmp/quadchroma-m1.log`; über 8 MB wandert es nach
 `/tmp/quadchroma-m1.alt.log` und beginnt neu.
 
@@ -173,9 +176,9 @@ in einem eigenen Faden, höchstens 32 gleichzeitig je Port und nur wenige je
 Absender. Wer schweigt oder tröpfelt, hält nur seinen eigenen Platz. Was jeder im
 Netz ohne Kopplung auslösen kann — gescheiterte Handschläge, unbekannte
 Gegenstellen, Eingabekanäle ohne Bild —, steht gedrosselt im Hostprotokoll:
-höchstens alle 10 s eine Zeile je Art (beim Mac-Host je Art und Adresse), mit
-der Zahl der unterdrückten. Beide Hosts begrenzen ihr Protokoll auf 8 MB und
-schieben den älteren Teil in eine `.alt`-Datei.
+höchstens alle 10 s eine Zeile je Art und Adresse (Mac-Host 4, Windows-Host 64
+Adressen je Art, darüber gemeinsam), mit der Zahl der unterdrückten. Beide Hosts
+begrenzen ihr Protokoll auf 8 MB und schieben den älteren Teil in eine `.alt`-Datei.
 
 Ein Zuschauer zur Zeit: Verbindet sich ein anderes gekoppeltes Gerät, übernimmt
 es die Sitzung. Das bisherige bekommt vorher Nachricht 10, zeigt "Ein anderes
@@ -195,9 +198,10 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Testbild und Codecwechsel auf d3d11, eine AV1-fähige Karte), bei 125/150 %
   Skalierung, an gedrehten Ausgängen und Handhelds mit hochkantem Panel und mit
   echtem Tongerät; die Stauregel beider Hosts auf einer echten, zu langsamen Leitung
-  (auch unter der Tonrate) und im Spielmodus bei hoher Datenrate; der Mac-Host nach
-  einem Neubau (Zuschauerwechsel mit Nachricht 10, Nachreichen bei stillem
-  Bildschirm, Tonformat mit 44,1 kHz, Ablageverwalter, beschädigte Freigabeliste);
+  (auch unter der Tonrate) und im Spielmodus bei hoher Datenrate; am laufenden
+  Mac-Host (am Gerät bisher nur der Codecwechsel mit Formatwechsel bei stillem
+  Bildschirm) der Zuschauerwechsel mit Nachricht 10, das Nachreichen bei stillem
+  Bildschirm, Tonformat mit 44,1 kHz, Ablageverwalter, beschädigte Freigabeliste;
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
   Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern
@@ -210,8 +214,8 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   bekanntem Namen ein anderes Gerät von einer neuen Adresse, gilt es als Erstkontakt;
   dann schützt nur der Vergleichscode.
 - Die Zwischenablage geht während einer Sitzung auch dann hinüber, wenn das Fenster
-  des Clients keinen Fokus hat. Der Mac-Host fragt sie auch ohne Zuschauer ab
-  (gesendet wird dann nichts); Client und Windows-Host lesen sie nur mit Gegenüber.
+  des Clients keinen Fokus hat. Gelesen wird sie auf allen Seiten nur mit Gegenüber;
+  der Mac-Host zählt ohne Zuschauer nur mit, dass sich etwas geändert hat.
 - Kopplungsdialog in der Oberfläche statt Kommandozeilenschalter
 - Rollenwahl (Windows als Host): `--host` ist da (Zuschauerplatz, Kopplung, Bekanntgabe,
   Eingaben, Zwischenablage, Desktop Duplication, Encoder über NVENC bzw. ohne NVIDIA
@@ -242,12 +246,12 @@ Rückgabe ist die Zahl der Fehler.
 - `host/hosttest.m`: bindet `main.m` ein und prüft Drossel (je Art und Adresse) und
   Obergrenze des Protokolls, Zuschauerwechsel (Nachricht 10) samt Testbild-Rest,
   Abbau zwischen Hochfahren und Eintragen, Nachreichen bei stillem Bildschirm,
-  Codecwechsel ohne Zuschauer, Stauregel samt Ton im Stau, Ansage des Tonformats
-  und AV1 in der Könnensliste. Loopback ab Port 19100 und 19400/19450, eigenes
+  Codecwechsel ohne Zuschauer und mit Formatwechsel (echte VT-Encoder), `--fest`,
+  Stauregel samt Ton im Stau, Ansage des Tonformats und AV1 in der Könnensliste. Loopback ab Port 19100 und 19400/19450, eigenes
   `HOME` unter `$TMPDIR`, rund 80 s. Nutzt kurz einen echten kleinen
   HEVC-Encoder (640×360) — nicht während eines Streams starten.
-- `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, auf einer eigenen
-  benannten Ablage statt der allgemeinen.
+- `host/ablagetest.m`: Kennzeichnung des empfangenen Texts und die Regel „nur mit
+  Zuschauer lesen", auf einer eigenen benannten Ablage statt der allgemeinen.
 
 ```
 clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \

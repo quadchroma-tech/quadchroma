@@ -78,24 +78,25 @@ Gegenstelle <Fingerabdruck> ist nicht der Host des Bildkanals - vor
 Nachricht 3 abgebrochen", hoechstens alle 10 s). Der Eingabekanal baut
 sich im Hintergrund auf; Einstellungen, Codec, Testbild und Zwischenablage,
 die davor kommen, reicht der Client nach (je Art die letzte), Mausbewegungen
-und Tasten nicht.
+und Tasten nicht. Die gespeicherten Werte eines Hosts (siehe "Das Menue")
+gelten schon ab dem Bildkanal - ein gespeichertes "Ton aus" also sofort -;
+zum Host schickt der Client sie, sobald der Eingabekanal steht.
 
 Protokoll der Hosts: Zeilen, die jeder im Netz ohne Kopplung ausloesen
 kann - gescheiterter Handschlag, unbekannte Gegenstelle, kaputte oder nicht
 speicherbare Freigabeliste, Eingabekanal ohne Bild, beim Windows-Host auch
 volle Handschlagplaetze -, stehen gedrosselt da: die erste sofort, danach
-hoechstens alle 10 s eine derselben Art.
-Der Mac-Host zaehlt dabei je Art und Adresse (vier Adressen je Art,
-weitere gemeinsam) und haengt die Zahl an ("<Zeile> - dazu N weitere von
-dieser Adresse seit der letzten Meldung"); was danach nicht mehr kommt,
-steht nach der Frist als Sammelzeile da ("<Art>: N weitere von <IP> seit
-der letzten Meldung" bzw. "<Art>: N weitere von anderen Adressen seit der
-letzten Meldung, zuletzt von <IP>"). Der Windows-Host zaehlt nur je Art,
-ueber alle Adressen hinweg, und haengt die Zahl an die naechste Zeile
-derselben Art ("(und N weitere seit der letzten Meldung)"); die Adresse
-darin ist die dieser Zeile, die mitgezaehlten koennen von anderen Adressen
-stammen. "Neue Gegenstelle gekoppelt" und "Zuschauer verbunden" stehen
-immer da.
+hoechstens alle 10 s eine derselben Art und Adresse.
+Beide Hosts zaehlen je Art und Adresse (der Mac-Host vier Adressen je Art,
+der Windows-Host 64, weitere gemeinsam) und haengen die Zahl an ("<Zeile>
+- dazu N weitere von dieser Adresse seit der letzten Meldung"); was danach
+nicht mehr kommt, steht nach der Frist als Sammelzeile da ("<Art>: N
+weitere von <IP> seit der letzten Meldung" bzw. "<Art>: N weitere von
+anderen Adressen seit der letzten Meldung, zuletzt von <IP>"), beim
+Windows-Host spaetestens 15 s nach der letzten durchgelassenen Zeile. Die
+gedrosselten Zeilen nennen die Adresse, auch die des Eingabekanals
+("Eingabekanal abgewiesen: kein Bildkanal offen (<IP>)"). "Neue
+Gegenstelle gekoppelt" und "Zuschauer verbunden" stehen immer da.
 
 Beide Hosts begrenzen ihr Protokoll auf 8 MB. Der Mac-Host schiebt
 /tmp/quadchroma-m1.log dann nach /tmp/quadchroma-m1.alt.log (ein
@@ -267,7 +268,14 @@ selbst. Auf dem M1 sind das HEVC in 4:4:4 und 4:2:0, je 8 und 10 Bit, sowie
 H.264. AV1 bietet kein Host an, solange Protokoll und Client ihn nicht
 kennen; er ist ausgegraut und laeuft nicht im Benchmark, auch wenn ein
 aelterer Windows-Host ihn meldet. Der Wechsel geschieht im laufenden
-Betrieb, das Bild steht dabei fuer einen Wimpernschlag still. Zwei Modi tragen
+Betrieb, das Bild steht dabei fuer einen Wimpernschlag still. Auch bei
+stillem Bildschirm kommt danach gleich ein Vollbild: wechselt mit dem Codec
+das Aufnahmeformat (4:4:4 und 4:2:0 nimmt der Mac verschieden auf) und kommt
+kein neues Bild, rechnet der Mac-Host das letzte ins neue Format um
+("Takt: letztes Bild von xf44 nach 420f umgerechnet (Aufnahmeformat
+gewechselt, kein neueres Bild)"; scheitert das, "... liess sich nicht ...
+umrechnen - verworfen, das naechste kommt von der Aufnahme"). Das erste
+echte Bild danach geht wieder als Vollbild hinaus. Zwei Modi tragen
 den Vermerk "mit Umrechnung": die Aufnahme kennt kein 4:4:4 in 8 Bit, dort
 rechnet der Mac vorher um, und das kostet einen Durchlauf - fuer einen fairen
 Vergleich mit den anderen Modi ist das zu beruecksichtigen.
