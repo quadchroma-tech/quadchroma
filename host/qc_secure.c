@@ -3,12 +3,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 // ---------------------------------------------------------------- Loeschen
@@ -21,42 +23,73 @@ void qc_wipe(void *p, size_t n) {
 }
 
 // ------------------------------------------------------------- Rohes Lesen
+//
+// frist ist ein Zeitpunkt auf der monotonen Uhr in Millisekunden, 0 heisst
+// ohne Frist. Der Handschlag hat eine, der Transport nicht: ein stiller
+// Bildkanal ist kein Fehler.
 
-static int raw_read(int fd, void *buf, size_t n) {
+static int64_t jetzt_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+// Wartet, bis fd lesbar bzw. schreibbar ist - hoechstens bis zur Frist.
+static int warten(int fd, short was, int64_t frist) {
+    for (;;) {
+        int64_t rest = frist - jetzt_ms();
+        if (rest <= 0) return -1;
+        struct pollfd p = { .fd = fd, .events = was, .revents = 0 };
+        int r = poll(&p, 1, rest > 1000000 ? 1000000 : (int)rest);
+        if (r > 0) return 0;          // bereit, oder Fehler - das sagt dann recv/send
+        if (r == 0) return -1;        // Frist verstrichen
+        if (errno != EINTR) return -1;
+    }
+}
+
+static int raw_read(int fd, void *buf, size_t n, int64_t frist) {
     uint8_t *p = buf;
     while (n) {
-        ssize_t r = recv(fd, p, n, 0);
+        if (frist && warten(fd, POLLIN, frist)) return -1;
+        ssize_t r = recv(fd, p, n, frist ? MSG_DONTWAIT : 0);
         if (r == 0) return -1;
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
+        if (r < 0) {
+            if (errno == EINTR || (frist && (errno == EAGAIN || errno == EWOULDBLOCK))) continue;
+            return -1;
+        }
         p += r; n -= (size_t)r;
     }
     return 0;
 }
 
-static int raw_write(int fd, const void *buf, size_t n) {
+static int raw_write(int fd, const void *buf, size_t n, int64_t frist) {
     const uint8_t *p = buf;
     while (n) {
-        ssize_t w = send(fd, p, n, 0);
-        if (w <= 0) { if (w < 0 && errno == EINTR) continue; return -1; }
+        if (frist && warten(fd, POLLOUT, frist)) return -1;
+        ssize_t w = send(fd, p, n, frist ? MSG_DONTWAIT : 0);
+        if (w <= 0) {
+            if (w < 0 && (errno == EINTR || (frist && (errno == EAGAIN || errno == EWOULDBLOCK)))) continue;
+            return -1;
+        }
         p += w; n -= (size_t)w;
     }
     return 0;
 }
 
-static int read_frame(int fd, uint8_t *buf, size_t cap, size_t *len) {
+static int read_frame(int fd, uint8_t *buf, size_t cap, size_t *len, int64_t frist) {
     uint8_t l[2];
-    if (raw_read(fd, l, 2)) return -1;
+    if (raw_read(fd, l, 2, frist)) return -1;
     size_t n = (size_t)l[0] | ((size_t)l[1] << 8);
     if (n > cap) return -1;
-    if (raw_read(fd, buf, n)) return -1;
+    if (raw_read(fd, buf, n, frist)) return -1;
     *len = n;
     return 0;
 }
 
-static int write_frame(int fd, const uint8_t *buf, size_t len) {
+static int write_frame(int fd, const uint8_t *buf, size_t len, int64_t frist) {
     uint8_t l[2] = { (uint8_t)(len & 255), (uint8_t)(len >> 8) };
-    if (raw_write(fd, l, 2)) return -1;
-    return raw_write(fd, buf, len);
+    if (raw_write(fd, l, 2, frist)) return -1;
+    return raw_write(fd, buf, len, frist);
 }
 
 // -------------------------------------------------------------- Handschlag
@@ -66,6 +99,11 @@ int qc_chan_accept(qc_chan *c, int fd, const uint8_t s_priv[32],
     memset(c, 0, sizeof *c);
     c->fd = fd;
 
+    // Eine feste Frist fuer den ganzen Handschlag, nicht je Lesen: sonst
+    // haelt eine Gegenstelle, die alle paar Sekunden ein Byte schickt, die
+    // Verbindung beliebig lange fest - ohne je einen Schluessel zu zeigen.
+    int64_t frist = jetzt_ms() + QC_HANDSCHLAG_MS;
+
     qc_handshake hs;
     qc_handshake_init(&hs, 0, s_priv, prologue, prologue_len);
 
@@ -73,13 +111,13 @@ int qc_chan_accept(qc_chan *c, int fd, const uint8_t s_priv[32],
     size_t mlen = 0, plen = 0;
     int r = 0;
 
-    if (read_frame(fd, msg, sizeof msg, &mlen)) { r = -1; goto ende; }
+    if (read_frame(fd, msg, sizeof msg, &mlen, frist)) { r = -1; goto ende; }
     if (qc_handshake_read(&hs, msg, mlen, payload, &plen)) { r = -2; goto ende; }
 
     if (qc_handshake_write(&hs, NULL, 0, msg, &mlen)) { r = -3; goto ende; }
-    if (write_frame(fd, msg, mlen)) { r = -4; goto ende; }
+    if (write_frame(fd, msg, mlen, frist)) { r = -4; goto ende; }
 
-    if (read_frame(fd, msg, sizeof msg, &mlen)) { r = -5; goto ende; }
+    if (read_frame(fd, msg, sizeof msg, &mlen, frist)) { r = -5; goto ende; }
     if (qc_handshake_read(&hs, msg, mlen, payload, &plen)) { r = -6; goto ende; }
 
     memcpy(c->hh, qc_handshake_hash(&hs), QC_HASHLEN);
@@ -143,7 +181,7 @@ int qc_chan_send(qc_chan *c, const struct iovec *iov, int cnt) {
         total -= want;
     }
 
-    int r = raw_write(c->fd, out, outp);
+    int r = raw_write(c->fd, out, outp, 0);
     qc_wipe(plain, benutzt);
     free(out);
     return r;
@@ -155,7 +193,7 @@ int qc_chan_read(qc_chan *c, void *buf, size_t n) {
     while (n) {
         if (c->in_pos == c->in_len) {
             size_t ctlen = 0;
-            if (read_frame(c->fd, c->ct, sizeof c->ct, &ctlen)) return -1;
+            if (read_frame(c->fd, c->ct, sizeof c->ct, &ctlen, 0)) return -1;
             size_t pt = 0;
             if (qc_decrypt(&c->rx, c->ct, ctlen, c->in, &pt)) return -1;
             c->in_len = pt;

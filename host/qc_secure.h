@@ -14,6 +14,7 @@
 #include <sys/uio.h>
 
 #define QC_CHUNK_MAX 65519          // groesstes Klartextstueck je Datensatz
+#define QC_HANDSCHLAG_MS 5000       // Frist fuer den ganzen Handschlag
 
 typedef struct {
     int fd;
@@ -27,7 +28,8 @@ typedef struct {
 } qc_chan;
 
 /// Handschlag als Antwortender (der Host wartet, der Client faengt an).
-/// Gibt 0 zurueck bei Erfolg.
+/// Gibt 0 zurueck bei Erfolg. Nach QC_HANDSCHLAG_MS ist Schluss, auch wenn
+/// die Gegenstelle noch tropfenweise sendet.
 int qc_chan_accept(qc_chan *c, int fd, const uint8_t s_priv[32],
                    const uint8_t *prologue, size_t prologue_len);
 
