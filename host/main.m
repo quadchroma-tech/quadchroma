@@ -85,7 +85,20 @@ static BOOL profile_supported(VTCompressionSessionRef s, CFStringRef profile) {
 // --------------------------------------------------------------- Netzwerk
 
 // Ein Zuschauer zur Zeit. Mehrere Sitzungen kommen spaeter, wenn das Protokoll steht.
-#define QC_BACKLOG_LIMIT (2 * 1024 * 1024)   // ungesendete Bytes, ab denen wir Bilder verwerfen
+// Ungesendete Bytes, ab denen Bilder gar nicht erst in den Encoder gehen
+// (stau_vor_dem_encoder). 2 MB, weil ein einzelnes Vollbild selbst fast so
+// gross wird - aus dem Hostprotokoll: im Stau des Spielmodus bei 500 Mbit/s
+// ging nur noch ein Vollbild nach dem anderen raus, je 1,2-2,0 MB -, und
+// nach einem Vollbild soll auf einer gesunden Leitung kein Bild ausfallen.
+// Auf einer zu langsamen Leitung sind das hoechstens 2 MB Warteschlange, so
+// viel wie vorher der volle Sendepuffer. Der Sendepuffer (tune_socket) ist
+// doppelt so gross, damit die Regel ueberhaupt greifen kann.
+#define QC_BACKLOG_LIMIT (2 * 1024 * 1024)
+// Stau ohne jeden Fortschritt: so lange, dann gilt der Zuschauer als weg -
+// dieselbe Frist wie SO_SNDTIMEO in tune_socket. Die greift im Stau nicht
+// mehr, weil dann nichts mehr codiert und gesendet wird; ohne diese Frist
+// bliebe ein eingefrorener Zuschauer (Ton aus) fuer immer eingetragen.
+#define QC_STAU_FRIST_US (2 * 1000000ull)
 
 static _Atomic int g_client_fd = -1;
 static _Atomic int g_force_key = 0;
@@ -108,6 +121,10 @@ static char g_last_sas[8] = {0};
 // jeder Verlust des Bildkanals beginnt eine neue Sitzung und bricht den
 // Eingabekanal der alten ab.
 static uint64_t g_sitzung = 0;              // durch g_send_mtx geschuetzt
+// Laufender Stau: seit wann ohne Fortschritt (Hostuhr in us, 0 = kein Stau)
+// und der Rueckstand zu diesem Zeitpunkt. Durch g_send_mtx geschuetzt.
+static uint64_t g_stau_seit = 0;
+static int g_stau_rueckstand = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
 // Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
 // nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
@@ -149,6 +166,14 @@ static _Atomic int g_inflight = 0;
 static _Atomic long g_enc_stau = 0;          // verworfen, weil der Encoder noch voll war
 static dispatch_queue_t g_capq = NULL;
 static dispatch_source_t g_tick = NULL;
+
+// g_stream gehoert der Lebenslauf-Warteschlange (g_lifeq): nur von dort wird
+// er gesetzt und ausgetragen, nacheinander mit Auf- und Abbau. Geschrieben
+// wird er dabei auf der Aufnahmewarteschlange, weil Codecwechsel und
+// Einstellungen ihn dort lesen - so sieht keiner einen halb getauschten Strom.
+static void stream_setzen(SCStream *st) {
+    dispatch_sync(g_capq, ^{ g_stream = st; });
+}
 
 static const char *QC_PRO_VIDEO = "QuadChroma/1 video Noise_XX_25519_ChaChaPoly_SHA256";
 static const char *QC_PRO_INPUT = "QuadChroma/1 input Noise_XX_25519_ChaChaPoly_SHA256";
@@ -279,7 +304,12 @@ static void tune_socket(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-    int snd = 1 << 21;                       // 2 MB Sendepuffer
+    // 4 MB Sendepuffer: die Stauregel (QC_BACKLOG_LIMIT) soll die Grenze
+    // sein, nicht ein blockierendes Senden. SO_NWRITE kann nie ueber die
+    // Puffergroesse steigen - mit 2 MB griff die 2-MB-Regel ohne Spielmodus
+    // nie. Unter der Regel liegen hoechstens 2 MB plus die Bilder, die schon
+    // im Encoder stecken, im Kernel; mehr Verzoegerung als vorher entsteht nicht.
+    int snd = 1 << 22;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd);
     int lowat = 64 * 1024;                   // nicht mehr als das im Kernel stauen lassen
     setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat);
@@ -346,6 +376,7 @@ static void send_small(uint8_t type, const void *data, size_t len) {
 // Bilder, und der Takt speist die vorgerenderte Schleife in Zielrate.
 static _Atomic int g_testbild = 0;
 #define QC_MSG_HOSTSTATUS 9    // Host -> Client: u8 Lage (0 = in Ordnung, 1 = kein Bildschirm)
+#define QC_MSG_ABGELOEST  10   // Host -> Client: ein anderer Zuschauer hat uebernommen, Laenge 0, letzte Nachricht
 #define QC_IN_TIME        65   // Client -> Host: Frage zum Zeitabgleich
 #define QC_IN_SETTINGS    64   // Client -> Host: was gewuenscht wird
 static void hoststatus_senden(uint8_t lage) {
@@ -363,13 +394,24 @@ static void hoststatus_senden(uint8_t lage) {
 static _Atomic int g_audio_info_sent = 0;
 static _Atomic long g_audio_packets = 0;
 static _Atomic long long g_audio_bytes = 0;
+// Was zuletzt angesagt wurde. Nur im Ton-Rueckruf angefasst, und der laeuft
+// auf der seriellen Ton-Warteschlange.
+static uint32_t g_audio_info_rate = 0;
+static uint8_t g_audio_info_ch = 0;
 
 static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t channels) {
     if (atomic_load(&g_client_fd) < 0) return;
     // Ton abgeschaltet: nichts auf die Leitung. Die Formatansage bleibt
     // fuer das erste Paket nach dem Wiedereinschalten liegen.
     if (!atomic_load(&g_cur_ton)) return;
-    if (!atomic_exchange(&g_audio_info_sent, 1)) {
+    // Angesagt wird fuer jeden neuen Zuschauer und immer dann, wenn
+    // ScreenCaptureKit Rate oder Kanalzahl wechselt - sonst rechnete der
+    // Client mit der alten Rate um, und der Ton klaenge zu hoch oder zu tief.
+    int neu = !atomic_exchange(&g_audio_info_sent, 1);
+    if (neu || rate != g_audio_info_rate || channels != g_audio_info_ch) {
+        if (!neu) logf_(@"Tonformat gewechselt: %u Hz, %u Kanaele - neu angesagt", rate, (unsigned)channels);
+        g_audio_info_rate = rate;
+        g_audio_info_ch = channels;
         uint8_t info[8] = {0};
         memcpy(info, &rate, 4);
         info[4] = channels;
@@ -468,6 +510,45 @@ static void annahme_andrang(long verdraengt, const struct sockaddr_in *verdraeng
     }
 }
 
+// So lange darf die Abloese-Nachricht hoechstens auf Platz im Sendepuffer
+// warten. Sie braucht nur 28 Byte; bei einem lebenden Zuschauer macht jede
+// Quittung Platz (LAN rund 1 ms, WLAN einige 10 ms). Wer in 100 ms nichts
+// abnimmt, ist eingefroren - dann wird trotzdem geschlossen, und g_send_mtx
+// haengt nicht fest.
+#define QC_ABLOESUNG_MS 100
+
+// Den bisherigen Zuschauer abloesen, weil ein neuer, gekoppelter kommt. Er
+// bekommt als letzte Nachricht auf seinem Bildkanal Typ 10 - sonst verbaende
+// sich sein Client nach zwei Sekunden von selbst neu und loeste seinerseits
+// den neuen ab, endlos hin und her. Danach sind Bild- und Eingabekanal zu.
+// Nur unter g_send_mtx rufen; neu_fd ist die Verbindung des Neuen.
+// Rueckgabe: -1 = es gab keinen, 1 = Nachricht abgeschickt, 0 = kam nicht an.
+static int zuschauer_abloesen(int neu_fd, char fp_alt[24]) {
+    int alt = atomic_exchange(&g_client_fd, -1);
+    atomic_store(&g_vid_ready, 0);
+    int gemeldet = -1;
+    if (alt >= 0 && alt != neu_fd) {
+        if (g_vid) {
+            qc_fingerprint(g_vid_peer, fp_alt);
+            // Derselbe Weg wie send_small, nur mit kurzer Frist statt der
+            // zwei Sekunden aus tune_socket. Die Frist bleibt am Socket, er
+            // wird gleich geschlossen.
+            struct timeval kurz = { .tv_sec = 0, .tv_usec = QC_ABLOESUNG_MS * 1000 };
+            setsockopt(alt, SOL_SOCKET, SO_SNDTIMEO, &kurz, sizeof kurz);
+            qc_hdr h = { .type = QC_MSG_ABGELOEST, .flags = 0, .reserved = 0, .len = 0 };
+            struct iovec iov = { .iov_base = &h, .iov_len = sizeof h };
+            gemeldet = qc_chan_send(g_vid, &iov, 1) == 0;
+        }
+        // close laesst den Kernel alles noch Gepufferte samt dieser letzten
+        // Nachricht zustellen, bevor die Verbindung endet.
+        close(alt);
+    }
+    eingabe_abbrechen();
+    qc_chan_free(g_vid);
+    g_vid = NULL;
+    return gemeldet;
+}
+
 static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     struct sockaddr_in peer = *von;
     tune_socket(fd);
@@ -547,12 +628,10 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     strominfo_fuellen(hello + 4 + sizeof h);
 
     pthread_mutex_lock(&g_send_mtx);
-    int old = atomic_exchange(&g_client_fd, -1);
-    atomic_store(&g_vid_ready, 0);
-    if (old >= 0 && old != fd) close(old);
-    eingabe_abbrechen();
-    qc_chan_free(g_vid);
+    char fp_alt[24] = {0};
+    int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
+    g_stau_seit = 0;                    // ein Stau des Vorgaengers zaehlt nicht fuer ihn
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
     memcpy(g_last_sas, sas, sizeof g_last_sas);
@@ -569,6 +648,9 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         stream_herunterfahren_anstossen();
     }
     pthread_mutex_unlock(&g_send_mtx);
+    if (abgeloest >= 0)
+        logf_(@"Bisheriger Zuschauer %s abgeloest und getrennt%s", fp_alt,
+              abgeloest ? "" : " - die Abloese-Nachricht kam nicht an");
     if (sent != 0) {
         logf_(@"Zuschauer %s: Begruessung liess sich nicht senden", ip);
         close(fd);
@@ -1234,16 +1316,12 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
         // Daten, sonst faengt er mitten in einem Bild ohne Kopfdaten an.
         if (!atomic_load(&g_vid_ready)) { pthread_mutex_unlock(&g_send_mtx); return; }
         if (atomic_load(&g_wait_key) && !keyframe) { pthread_mutex_unlock(&g_send_mtx); return; }
-        // Staut es sich, werfen wir lieber ein Bild weg als Verzoegerung aufzubauen.
-        // g_wait_key bleibt dabei stehen: faellt hier das erste Vollbild einer
-        // neuen Sitzung weg, muss der Zuschauer weiter auf ein Vollbild warten -
-        // sonst bekaeme sein Decoder ein Zwischenbild ohne Bezugsbild.
-        if (backlog_bytes(fd) > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
-            atomic_fetch_add(&g_skipped_backlog, 1);
-            atomic_store(&g_force_key, 1);
-            pthread_mutex_unlock(&g_send_mtx);
-            return;
-        }
+        // Gegen Stau wird VOR dem Encoder verworfen (stau_vor_dem_encoder):
+        // ein codiertes Bild geht immer raus. Fiele es hier weg, fehlte den
+        // folgenden Zwischenbildern ihr Bezug, das naechste Bild muesste ein
+        // Vollbild sein - und auf einer knappen Leitung kaemen dann nur noch
+        // Vollbilder: so geschehen im Spielmodus bei 500 Mbit/s, rund 20
+        // Bilder je Sekunde, jedes ein Vollbild (Hostprotokoll).
         // Erst wenn das Bild wirklich rausgeht, ist das Warten vorbei.
         atomic_store(&g_wait_key, 0);
         if (qc_chan_send(g_vid, iov, cnt) != 0) {
@@ -1343,6 +1421,16 @@ static void codecs_pruefen(void) {
     logf_(@"--- Was dieser Mac codieren kann ---");
     for (size_t i = 0; i < QC_KANDIDATEN; i++) {
         const qc_codec_kandidat *k = &g_kandidaten[i];
+        // AV1 nie anbieten, egal was der Encoder kann: Strominfo und
+        // Codecwechsel kennen nur HEVC und H.264 - der Host saehe AV1 als
+        // HEVC an und laese HEVC-Parametersaetze -, und der Client hat
+        // keinen AV1-Weg. Bisher verhinderte das nur das fehlende Profil.
+        if (k->codec == 'av01') {
+            g_befund[i].vorhanden = 0;
+            g_befund[i].hardware = 0;
+            logf_(@"  %-18s nein  (nicht angeboten: Protokoll und Client kennen AV1 noch nicht)", k->name);
+            continue;
+        }
         int hw = 0;
         int da = kandidat_pruefen(k, 1, &hw);   // erst mit Hardware-Pflicht
         if (da) {
@@ -1635,6 +1723,48 @@ static void codec_wechseln(int idx) {
 // Verwerfen oder bei einem Fehler liegen bleiben koennte.
 #define QC_ZETTEL(t_cap_us, wiederholt) ((void *)(uintptr_t)(((uint64_t)(t_cap_us) << 1) | ((wiederholt) ? 1u : 0u)))
 
+// Stauregel. Liegt beim Zuschauer mehr als QC_BACKLOG_LIMIT (Spielmodus: ein
+// Viertel) ungesendet im Kernel, geht das naechste Bild gar nicht erst in den
+// Encoder - wie beim vollen Encoder: lieber ein Auslasser als eine
+// Warteschlange. Der Encoder sieht dann nur weniger Bilder, jedes codierte
+// hat sein Bezugsbild, und es braucht kein erzwungenes Vollbild.
+// Nimmt der Zuschauer im Stau QC_STAU_FRIST_US lang gar nichts ab, gilt er
+// als weg; sonst liefe fuer eine eingefrorene Gegenstelle alles weiter.
+// YES = dieses Bild auslassen.
+static BOOL stau_vor_dem_encoder(void) {
+    BOOL stau = NO;
+    pthread_mutex_lock(&g_send_mtx);
+    int fd = atomic_load(&g_client_fd);
+    if (fd >= 0 && atomic_load(&g_vid_ready)) {
+        int rueckstand = backlog_bytes(fd);
+        if (rueckstand > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
+            stau = YES;
+            // Fortschritt heisst: der Rueckstand ist seit dem letzten Blick
+            // kleiner geworden, die Gegenstelle nimmt also noch etwas ab.
+            uint64_t jetzt = now_us();
+            if (!g_stau_seit || rueckstand < g_stau_rueckstand) {
+                g_stau_seit = jetzt;
+                g_stau_rueckstand = rueckstand;
+            } else if (jetzt - g_stau_seit >= QC_STAU_FRIST_US) {
+                logf_(@"Zuschauer weg: nimmt seit %llu s nichts mehr ab (%d Byte im Stau)",
+                      QC_STAU_FRIST_US / 1000000ull, rueckstand);
+                atomic_store(&g_vid_ready, 0);
+                atomic_store(&g_client_fd, -1);
+                stream_herunterfahren_anstossen();
+                close(fd);
+                eingabe_abbrechen();
+                qc_chan_free(g_vid);
+                g_vid = NULL;
+                g_stau_seit = 0;
+            }
+        } else {
+            g_stau_seit = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_send_mtx);
+    return stau;
+}
+
 static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int wiederholt) {
     if (!pb || !g_session) return;
     // Rund um einen Formatwechsel der Aufnahme kann noch ein Bild im alten
@@ -1651,6 +1781,9 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
         }
         return;
     }
+    // Vor dem Abholen eines erzwungenen Vollbilds: das kommt dann mit dem
+    // naechsten Bild, das wirklich codiert wird.
+    if (stau_vor_dem_encoder()) { atomic_fetch_add(&g_skipped_backlog, 1); return; }
     NSDictionary *opts = nil;
     if (atomic_exchange(&g_force_key, 0))
         opts = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
@@ -1787,20 +1920,29 @@ static void fixed_tick(void) {
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
     logf_(@"Aufnahme gestoppt: %@ (Code %ld)", error.localizedDescription, (long)error.code);
-    // Ohne Aufnahme darf der Takt nicht weiterlaufen, sonst sendet der Host
-    // bis in alle Ewigkeit dasselbe eingefrorene Bild.
-    atomic_store(&g_cur_fixed, 0);
-    dispatch_async(g_capq ?: dispatch_get_main_queue(), ^{
-        if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
-    });
-    // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
-    g_stream = nil;
-    // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
-    if (atomic_load(&g_client_fd) < 0) return;
-    hoststatus_senden(1);
-    // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        aufnahme_wiederherstellen();
+    // Ohne Lebenslauf-Warteschlange (Pruefmodus --formattest) gibt es keinen
+    // eingetragenen Strom und nichts wiederherzustellen.
+    if (!g_lifeq) return;
+    // Austragen auf der Lebenslauf-Warteschlange, der g_stream gehoert - und
+    // nur, wenn es der laufende Strom ist: der spaete Bescheid eines alten
+    // darf einen inzwischen neu gestarteten nicht austragen.
+    dispatch_async(g_lifeq, ^{
+        if (stream != g_stream) return;
+        // Ohne Aufnahme darf der Takt nicht weiterlaufen, sonst sendet der Host
+        // bis in alle Ewigkeit dasselbe eingefrorene Bild.
+        atomic_store(&g_cur_fixed, 0);
+        dispatch_sync(g_capq, ^{
+            if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
+        });
+        // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
+        stream_setzen(nil);
+        // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
+        if (atomic_load(&g_client_fd) < 0) return;
+        hoststatus_senden(1);
+        // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            aufnahme_wiederherstellen();
+        });
     });
 }
 
@@ -1903,6 +2045,9 @@ static void aufnahme_wiederherstellen(void) {
     // anhalten - und kein Abbau darf dazwischenfunken.
     dispatch_async(g_lifeq ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         if (g_stream) return;
+        // Hier noch einmal: zwischen der Pruefung oben und diesem Block kann
+        // der Zuschauer gegangen und sein Abbau schon gelaufen sein.
+        if (atomic_load(&g_client_fd) < 0) return;
         size_t pw = 0, ph = 0; double hz = 0;
         SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
         if (!d) {
@@ -1930,21 +2075,48 @@ static void aufnahme_wiederherstellen(void) {
             return;
         }
         qc_audio_attach(st, audio_cb);
+        // Auf den Start hier warten, auf der Lebenslauf-Warteschlange, statt
+        // den Strom im Rueckruf einzutragen: dort lief das an Auf- und Abbau
+        // vorbei. Ein Abbau saehe keinen Strom und liesse ihn ohne Zuschauer
+        // laufen; ein neuer Zuschauer baute einen zweiten auf - zwei Stroeme
+        // am selben Tonabgriff, doppelter Ton.
+        __block BOOL gestartet = NO;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         [st startCaptureWithCompletionHandler:^(NSError *e) {
-            if (e) {
-                logf_(@"Aufnahme: Start misslungen (%@, Code %ld), neuer Versuch", e.localizedDescription, (long)e.code);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                    aufnahme_wiederherstellen();
-                });
-                return;
-            }
-            g_stream = st;
-            atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
-            atomic_store(&g_force_key, 1);
-            atomic_store(&g_wait_key, 1);
-            hoststatus_senden(0);
-            logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
+            if (e) logf_(@"Aufnahme: Start misslungen (%@, Code %ld), neuer Versuch", e.localizedDescription, (long)e.code);
+            else gestartet = YES;
+            dispatch_semaphore_signal(sem);
         }];
+        BOOL laeuft = NO;
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
+            // Kommt der Start doch noch, darf dieser Strom nicht neben dem
+            // naechsten Versuch weiterlaufen.
+            logf_(@"Aufnahme: Start meldet sich nicht, neuer Versuch");
+            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
+        } else {
+            laeuft = gestartet;          // nach dem Signal gelesen, also fertig geschrieben
+        }
+        if (!laeuft) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                aufnahme_wiederherstellen();
+            });
+            return;
+        }
+        // Waehrend des Starts gegangen: sein Abbau ist schon durch oder steht
+        // hinter uns an und kennt diesen Strom nicht - also selbst anhalten.
+        if (atomic_load(&g_client_fd) < 0) {
+            dispatch_semaphore_t halt = dispatch_semaphore_create(0);
+            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; dispatch_semaphore_signal(halt); }];
+            dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+            logf_(@"Aufnahme nicht wiederhergestellt: kein Zuschauer mehr");
+            return;
+        }
+        stream_setzen(st);
+        atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
+        atomic_store(&g_force_key, 1);
+        atomic_store(&g_wait_key, 1);
+        hoststatus_senden(0);
+        logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
     });
 }
 
@@ -1987,10 +2159,16 @@ static BOOL stream_hochfahren_sync(void) {
             else gestartet = YES;
             dispatch_semaphore_signal(sem);
         }];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
+            // Kaeme der Start doch noch, liefe dieser Strom unbemerkt neben
+            // dem naechsten - mit Ton am selben Abgriff.
+            logf_(@"Aufnahme: Start meldet sich nicht");
+            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
+            return;
+        }
         if (!gestartet) return;
 
-        g_stream = st;
+        stream_setzen(st);
         atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
         atomic_store(&g_force_key, 1);
         atomic_store(&g_wait_key, 1);
@@ -2015,7 +2193,7 @@ static void stream_herunterfahren_anstossen(void) {
         if (!g_stream && !g_session) return;
         if (g_stream) {
             SCStream *st = g_stream;
-            g_stream = nil;
+            stream_setzen(nil);
             dispatch_semaphore_t sem = dispatch_semaphore_create(0);
             [st stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(sem); }];
             dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));

@@ -136,7 +136,7 @@ typedef struct {
     const float *p;
     uint32_t     stride;
     size_t       frames;
-} qc_chan;
+} ton_kanal;
 
 // ------------------------------------------------------------------- Abgriff
 
@@ -173,7 +173,9 @@ typedef struct {
     if (rate != atomic_load(&g_rate)) {
         atomic_store(&g_rate, rate);
         g_have_expect = NO;
-        qc_alog(@"Ton laeuft mit %u Hz statt %d Hz - die Strominfo an den Client muss das mitbekommen",
+        // Die Formatansage an den Zuschauer wiederholt main.m (audio_cb),
+        // sobald die Rate im Rueckruf eine andere ist.
+        qc_alog(@"Ton laeuft mit %u Hz statt %d Hz - das Tonformat wird neu angesagt",
                 rate, QC_AUDIO_RATE);
     }
 
@@ -199,7 +201,7 @@ typedef struct {
     }
 
     BOOL planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-    qc_chan ch[QC_AUDIO_CHANNELS];
+    ton_kanal ch[QC_AUDIO_CHANNELS];
     BOOL ok = YES;
 
     if (planar) {

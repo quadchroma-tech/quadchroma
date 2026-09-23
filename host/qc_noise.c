@@ -327,15 +327,10 @@ static void fixed_random(uint8_t *out, size_t len) {
     for (size_t i = 0; i < len; i++) out[i] = g_fixed[(g_fixed_pos++) % 64];
 }
 
-int qc_noise_selftest(void) {
+// Der eigentliche Ablauf. Laeuft mit dem festen Zufall; jeder Fehler kehrt
+// sofort mit seiner Nummer zurueck - das Zuruecksetzen erledigt der Aufrufer.
+static int selbsttest_ablauf(void) {
     uint8_t i_priv[32], i_pub[32], r_priv[32], r_pub[32];
-    static const uint8_t seed[64] = {
-        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
-        33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64
-    };
-    g_fixed = seed; g_fixed_pos = 0;
-    void (*save)(uint8_t *, size_t) = qc_random;
-    qc_random = fixed_random;
     qc_keypair(i_priv, i_pub);
     qc_keypair(r_priv, r_pub);
 
@@ -396,7 +391,20 @@ int qc_noise_selftest(void) {
     qc_fingerprint(r_pub, fp);
     if (strcmp(sas_a, sas_b)) return 18;
     printf("Noise-Selbsttest: bestanden. Vergleichscode %s, Fingerabdruck des Hosts %s\n", sas_a, fp);
-
-    qc_random = save;
     return 0;
+}
+
+int qc_noise_selftest(void) {
+    static const uint8_t seed[64] = {
+        1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+        33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64
+    };
+    g_fixed = seed; g_fixed_pos = 0;
+    void (*save)(uint8_t *, size_t) = qc_random;
+    qc_random = fixed_random;
+    int r = selbsttest_ablauf();
+    // Auf jedem Weg zurueck, auch nach einem Fehler: sonst waere jeder
+    // spaetere Schluessel dieses Prozesses vorhersagbar.
+    qc_random = save;
+    return r;
 }
