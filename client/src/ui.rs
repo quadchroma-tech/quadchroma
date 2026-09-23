@@ -272,7 +272,6 @@ impl Text {
             "C:\\Windows\\Fonts\\msyh.ttc",      // Microsoft YaHei: Chinesisch
             "C:\\Windows\\Fonts\\YuGothM.ttc",   // Yu Gothic: Japanisch
             "C:\\Windows\\Fonts\\meiryo.ttc",
-            "C:\\Windows\\Fonts\\segoeui.ttf",
             "/System/Library/Fonts/Menlo.ttc",                        // Mac: Latein, Kyrillisch, Griechisch
             "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",   // Mac: Chinesisch, Japanisch (TrueType)
             "/System/Library/Fonts/PingFang.ttc",                     // Mac: CFF, fontdue kann es meist nicht laden

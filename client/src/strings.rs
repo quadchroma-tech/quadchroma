@@ -109,6 +109,43 @@ pub enum Key {
     ErrorTimeout,
     ErrorProtocol,
     ErrorNoDecoder,
+    /// Der Host meldet: ein anderes Geraet hat die Sitzung uebernommen
+    /// (Nachricht 10). Keine automatische Neuverbindung.
+    SessionTakenOver,
+    /// Fingerabdruck einer bekannten Adresse geaendert: {n} Adresse, {m} neuer
+    /// Fingerabdruck, {p} Pfad von known_hosts.txt - alle bleiben stehen.
+    HostKeyChanged,
+    /// client.key hat die falsche Laenge; {p} ist der Pfad.
+    KeyFileDamaged,
+    /// Datei vorhanden, aber nicht lesbar; {p} ist der Pfad. Dahinter in
+    /// Klammern der Wortlaut des Systems.
+    FileUnreadable,
+    /// Vertrauensliste nicht in UTF-8; {p} ist der Pfad.
+    FileNotUtf8,
+    /// Neuer Schluessel oder Eintrag laesst sich nicht schreiben; {p} ist der
+    /// Pfad, dahinter der Wortlaut des Systems.
+    FileNotWritable,
+    /// Kein Ablageordner fuer Schluessel und Einstellungen.
+    StorageUnavailable,
+    /// Adresse ergibt kein Ziel; {n} ist die Adresse.
+    ErrorAddress,
+    /// Verbindung scheitert aus anderem Grund als Ablehnung oder Frist;
+    /// dahinter der Wortlaut des Systems.
+    ErrorNoConnection,
+    /// Der Noise-Handschlag scheitert (nicht an der Frist).
+    ErrorHandshake,
+    /// FFmpeg laesst sich nicht starten; dahinter FFmpegs Wortlaut.
+    ErrorFfmpegStart,
+    /// Tonausgabe laesst sich nicht oeffnen; dahinter der Grund.
+    ErrorSound,
+    /// Anzeige auf der Karte gewuenscht, laeuft aber ueber Software.
+    ErrorGpuDisplay,
+    /// Grafikkarte waehrend der Sitzung verloren, Neubau gescheitert.
+    ErrorGpuLost,
+    /// Der Decoder liefert ein Bildformat, das der Client nicht wandeln kann.
+    ErrorPixelFormat,
+    /// Kartenwunsch fuer den Decoder nicht erfuellt, Software laeuft.
+    DecoderFallback,
     // Tooltips im Menue: erscheinen sofort, sobald die Maus ueber einem
     // Schalter steht - damit jeder weiss, was er tut, ohne die Doku zu lesen.
     TipBitrate,
@@ -303,6 +340,22 @@ pub static EN: Lang = Lang {
         (ErrorTimeout, "Host did not answer"),
         (ErrorProtocol, "The other side speaks a different protocol"),
         (ErrorNoDecoder, "No decoder for this format"),
+        (SessionTakenOver, "Another device has taken over the session."),
+        (HostKeyChanged, "The fingerprint of {n} has changed (now {m}). Connection refused. If the host was set up again, delete its line in {p}."),
+        (KeyFileDamaged, "The key file {p} is damaged and was left as it is. Check or delete it – a new key is then created, and the host has to pair this device again."),
+        (FileUnreadable, "{p} cannot be read – not connecting."),
+        (FileNotUtf8, "{p} is not saved as UTF-8 – not connecting."),
+        (FileNotWritable, "{p} cannot be written – not connecting."),
+        (StorageUnavailable, "The folder for keys and settings is not available – not connecting."),
+        (ErrorAddress, "The address {n} cannot be resolved"),
+        (ErrorNoConnection, "No connection to the host"),
+        (ErrorHandshake, "The secure connection could not be established"),
+        (ErrorFfmpegStart, "FFmpeg could not be started"),
+        (ErrorSound, "Sound is not available"),
+        (ErrorGpuDisplay, "Graphics card not usable, display runs in software"),
+        (ErrorGpuLost, "Graphics card lost – please restart with --anzeige cpu"),
+        (ErrorPixelFormat, "The decoder delivers pictures this client cannot display"),
+        (DecoderFallback, "The selected graphics card does not decode – software decoder in use"),
         (TipBitrate, "Upper limit of the bitrate. The encoder uses all of it when things move; 25 to 50 on networks that are not your own."),
         (TipFps, "Target frame rate. It cannot exceed what the Mac's display delivers."),
         (TipGaming, "More keyframes and less backlog allowed: steadier when things move, costs some bitrate."),
@@ -446,6 +499,22 @@ pub static DE: Lang = Lang {
         (ErrorTimeout, "Host antwortet nicht"),
         (ErrorProtocol, "Die Gegenstelle spricht ein anderes Protokoll"),
         (ErrorNoDecoder, "Kein Decoder für dieses Format"),
+        (SessionTakenOver, "Ein anderes Gerät hat die Sitzung übernommen."),
+        (HostKeyChanged, "Der Fingerabdruck von {n} hat sich geändert (jetzt {m}). Verbindung abgelehnt. Wurde der Host neu aufgesetzt, seine Zeile in {p} löschen."),
+        (KeyFileDamaged, "Die Schlüsseldatei {p} ist beschädigt und bleibt, wie sie ist. Datei prüfen oder löschen – dann entsteht ein neuer Schlüssel, und der Host muss dieses Gerät neu koppeln."),
+        (FileUnreadable, "{p} lässt sich nicht lesen – keine Verbindung."),
+        (FileNotUtf8, "{p} ist nicht als UTF-8 gespeichert – keine Verbindung."),
+        (FileNotWritable, "{p} lässt sich nicht schreiben – keine Verbindung."),
+        (StorageUnavailable, "Der Ordner für Schlüssel und Einstellungen ist nicht verfügbar – keine Verbindung."),
+        (ErrorAddress, "Die Adresse {n} lässt sich nicht auflösen"),
+        (ErrorNoConnection, "Keine Verbindung zum Host"),
+        (ErrorHandshake, "Die gesicherte Verbindung kam nicht zustande"),
+        (ErrorFfmpegStart, "FFmpeg ließ sich nicht starten"),
+        (ErrorSound, "Ton nicht verfügbar"),
+        (ErrorGpuDisplay, "Grafikkarte nicht nutzbar, Anzeige über Software"),
+        (ErrorGpuLost, "Grafikkarte verloren – bitte mit --anzeige cpu neu starten"),
+        (ErrorPixelFormat, "Der Decoder liefert Bilder, die dieser Client nicht darstellen kann"),
+        (DecoderFallback, "Die gewählte Grafikkarte decodiert nicht – Software-Decoder läuft"),
         (TipBitrate, "Obergrenze der Datenrate. Bei Bewegung nutzt der Encoder sie aus; in fremden Netzen lieber 25 bis 50."),
         (TipFps, "Zielbildrate. Mehr, als der Bildschirm des Macs liefert, geht nicht."),
         (TipGaming, "Häufigere Vollbilder und weniger erlaubter Rückstau: gleichmäßiger bei Bewegung, kostet etwas Datenrate."),

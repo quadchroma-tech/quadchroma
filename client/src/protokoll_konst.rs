@@ -37,6 +37,12 @@ pub const MSG_SWITCH: u8 = 7;
 pub const MSG_CODECS: u8 = 8;
 /// Lage des Hosts: u8 (0 = in Ordnung, 1 = kein Bildschirm).
 pub const MSG_HOSTSTATUS: u8 = 9;
+/// Abgeloest: ein neuer, gekoppelter Zuschauer hat diesen ersetzt. Ohne
+/// Nutzlast; die letzte Nachricht, danach macht der Host Bild- und
+/// Eingabekanal zu. Der Client verbindet sich darauf NICHT von selbst neu -
+/// sonst loesten zwei Clients einander endlos ab. Ein aelterer Client
+/// uebergeht sie wie jeden unbekannten Typ.
+pub const MSG_ABGELOEST: u8 = 10;
 /// Tonformat: u32 Rate, u8 Kanaele, u8 1 = float32 verschachtelt, 2 frei.
 pub const MSG_AUDIO_INFO: u8 = 32;
 /// Ton: float32 LE verschachtelt.

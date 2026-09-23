@@ -3,6 +3,10 @@
 // mit Stauregel, Kopplung.
 //
 // Ein Zuschauer zur Zeit; ein neuer ersetzt den alten (wie main.m). Der
+// alte bekommt als letzte Nachricht MSG_ABGELOEST - statt dessen, was noch
+// in seiner Warteschlange lag, und mit kurzer Frist (FRIST_SCHLUSSWORT) -,
+// damit er sich nicht von selbst neu verbindet und den neuen verdraengt;
+// danach sind seine Bildleitung und sein Eingabekanal zu. Der
 // Bildkanal wird nur geschrieben, der Eingabekanal nur gelesen - Antworten
 // (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
 //
@@ -17,16 +21,17 @@
 // Reihenfolge Switch -> Info -> Vollbild bleibt damit erhalten.
 //
 // Sitzung: Der Eingabekanal gehoert zu genau einem Zuschauer. Geht der
-// (ersetzt oder weg), kappt `Leitung::schliessen` auch dessen Eingabe, und
-// die Eingabeschleife speist nichts mehr ein. Handschlaege laufen je
+// (ersetzt: `Leitung::abloesen`, weg: `Leitung::schliessen`), wird auch
+// dessen Eingabe gekappt, und die Eingabeschleife speist nichts mehr ein.
+// Handschlaege laufen je
 // Verbindung in einem eigenen Faden, mit Frist (secure.rs, FRIST_ANNAHME) und
 // Obergrenze (HANDSCHLAEGE_MAX) - stumme Verbindungen sperren damit niemanden
 // mehr aus.
 // Windows bricht ein blockierendes recv/send auf ein shutdown hin nicht ab,
-// solange die Gegenstelle lebt, aber schweigt (eingefrorener Prozess): Der
-// Faden des alten Kanals bleibt dann stehen, bis sie geht - harmlos, weil er
-// vor jedem Einspeisen prueft, ob er noch gilt. Ist das Geraet ganz weg,
-// endet er, wenn TCP das FIN aufgibt.
+// solange die Gegenstelle lebt, aber schweigt (eingefrorener Prozess) - der
+// Faden des alten Kanals bliebe samt Leitung stehen, bis sie geht. Deshalb
+// bricht `kappen` zusaetzlich mit CancelIoEx ab, was an der Leitung haengt.
+// Die Eingabeschleife prueft ohnehin vor jedem Einspeisen, ob sie noch gilt.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
@@ -42,6 +47,12 @@ use crate::{noise, secure};
 const BACKLOG_LIMIT: usize = 2 * 1024 * 1024;
 /// Sendepuffer im Kernel; zaehlt als geschaetzter Anteil zum Stau dazu.
 const SNDBUF: usize = 256 * 1024;
+/// So lange darf die letzte Nachricht an einen abgeloesten Zuschauer
+/// brauchen. Seine Warteschlange ist da schon verworfen; vor ihr liegen
+/// hoechstens das Bild, das der Sendefaden gerade schreibt, und der
+/// Kernelpuffer - im LAN in Millisekunden durch. Wer sie in der Frist nicht
+/// abnimmt, ist eingefroren oder weg: seine Leitung wird ohne sie gekappt.
+const FRIST_SCHLUSSWORT: Duration = Duration::from_secs(1);
 
 /// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
 /// ist. Die Sperren hier schuetzen Abfolgen (EINSPEISEN, FREIGABE) oder Daten,
@@ -50,6 +61,24 @@ const SNDBUF: usize = 256 * 1024;
 /// raeumte AKTUELL nie mehr ab ("kein Zuschauer, keine Arbeit").
 fn sperre<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Eine Leitung kappen - auch mitten in einem send oder recv. Ein shutdown
+/// allein bricht unter Windows ein blockierendes send oder recv nicht ab,
+/// solange die Gegenstelle lebt, aber nichts abnimmt oder schickt (gemessen:
+/// Test abgeloester_zuschauer_der_nichts_abnimmt); der Faden hinge samt
+/// Leitung, bis der Zuschauer irgendwann geht. CancelIoEx bricht jede
+/// ausstehende Ein-/Ausgabe auf dem Socket ab, gleich aus welchem Faden. `s`
+/// ist ein eigener Griff (try_clone) auf denselben Socket, den der Aufrufer
+/// haelt - er kann also nicht schon geschlossen und neu vergeben sein.
+fn kappen(s: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::CancelIoEx;
+    let _ = s.shutdown(Shutdown::Both);
+    unsafe {
+        let _ = CancelIoEx(HANDLE(s.as_raw_socket() as *mut std::ffi::c_void), None);
+    }
 }
 
 /// Hoechstens alle zehn Sekunden eine Protokollzeile derselben Art: wer
@@ -72,6 +101,12 @@ struct Warteschlange {
     /// eben eingetragenen Griff sicher, und wer eintragen will, sieht sicher,
     /// dass der Zuschauer schon weg ist.
     eingabe: Option<(u64, TcpStream)>,
+    /// Letzte Nachricht an einen abgeloesten Zuschauer (MSG_ABGELOEST). Der
+    /// Sendefaden schreibt sie statt der verworfenen Warteschlange, mit
+    /// Frist, und macht danach die Leitung zu.
+    schlusswort: Option<Vec<u8>>,
+    /// Der Sendefaden ist durch (siehe `abloesung_abschliessen`).
+    beendet: bool,
 }
 
 /// Ein verbundener Zuschauer: Warteschlange zum Sendefaden und die Kennung
@@ -79,6 +114,10 @@ struct Warteschlange {
 pub struct Leitung {
     q: Mutex<Warteschlange>,
     cv: Condvar,
+    /// Meldet das Ende des Sendefadens. Eigene Bedingung, damit ein Wecken
+    /// fuer den Sendefaden nie beim Wartenden in `abloesung_abschliessen`
+    /// landet.
+    ende: Condvar,
     /// Zweite Hand an der Bildleitung: `schliessen` kappt sie auch dann,
     /// wenn der Sendefaden in einem write haengt (Zuschauer eingefroren).
     bild_griff: Option<TcpStream>,
@@ -90,8 +129,16 @@ pub struct Leitung {
 impl Leitung {
     fn neu(bild_griff: Option<TcpStream>, peer: Vec<u8>, hh: Vec<u8>, ip: String) -> Leitung {
         Leitung {
-            q: Mutex::new(Warteschlange { pakete: VecDeque::new(), bytes: 0, offen: true, eingabe: None }),
+            q: Mutex::new(Warteschlange {
+                pakete: VecDeque::new(),
+                bytes: 0,
+                offen: true,
+                eingabe: None,
+                schlusswort: None,
+                beendet: false,
+            }),
             cv: Condvar::new(),
+            ende: Condvar::new(),
             bild_griff,
             peer,
             hh,
@@ -110,12 +157,55 @@ impl Leitung {
             q.eingabe.take()
         };
         if let Some((_, s)) = eingabe {
-            let _ = s.shutdown(Shutdown::Both);
+            kappen(&s);
             log("Eingabekanal gekappt: sein Zuschauer ist abgeloest oder weg");
         }
+        self.bild_kappen();
+    }
+
+    fn bild_kappen(&self) {
         if let Some(s) = &self.bild_griff {
-            let _ = s.shutdown(Shutdown::Both);
+            kappen(s);
         }
+    }
+
+    /// Ein neuer Zuschauer ersetzt diesen. Was noch in der Warteschlange
+    /// liegt, wird verworfen; hinaus geht nur noch MSG_ABGELOEST - danach
+    /// schliesst der Sendefaden die Bildleitung selbst. Der Eingabekanal ist
+    /// sofort gekappt. Haengt der Sendefaden an einem Zuschauer, der nichts
+    /// mehr abnimmt, kappt `abloesung_abschliessen` die Bildleitung nach der
+    /// Frist. Unter EINSPEISEN und AKTUELL aufrufen; wartet nie.
+    fn abloesen(&self) {
+        let eingabe = {
+            let mut q = sperre(&self.q);
+            if q.offen {
+                q.pakete.clear();
+                q.bytes = 0;
+                q.schlusswort = Some(kopf(MSG_ABGELOEST, 0, 0, 0).to_vec());
+                q.offen = false;
+                self.cv.notify_all();
+            }
+            q.eingabe.take()
+        };
+        if let Some((_, s)) = eingabe {
+            kappen(&s);
+            log("Eingabekanal gekappt: sein Zuschauer ist abgeloest oder weg");
+        }
+    }
+
+    /// Nach `abloesen`, ausserhalb aller Sperren: hoechstens `frist` auf das
+    /// Ende des Sendefadens warten, sonst die Bildleitung kappen - auch wenn
+    /// er noch in einem write steckt. true: der Sendefaden ist durch.
+    fn abloesung_abschliessen(&self, frist: Duration) -> bool {
+        let q = sperre(&self.q);
+        let (q, _) = self.ende.wait_timeout_while(q, frist, |q| !q.beendet).unwrap_or_else(|e| e.into_inner());
+        let beendet = q.beendet;
+        drop(q);
+        if !beendet {
+            log(format!("Abgeloester Zuschauer {} nimmt nichts mehr ab - Bildleitung gekappt", self.ip));
+            self.bild_kappen();
+        }
+        beendet
     }
 
     #[cfg(test)]
@@ -143,7 +233,7 @@ impl Leitung {
             q.eingabe.replace((nr, griff))
         };
         if let Some((_, s)) = alt {
-            let _ = s.shutdown(Shutdown::Both);
+            kappen(&s);
             log("Eingabekanal gekappt: derselbe Zuschauer hat einen neuen aufgebaut");
             eingabe::alle_tasten_loslassen();
         }
@@ -369,9 +459,15 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
             }
             // Geschlossen (abgeloest oder weg): Was noch wartet, gehoert
             // niemandem mehr - nicht in die gekappte Leitung schreiben.
+            // Ein Abgeloester bekommt nur noch sein Schlusswort.
             if !q.offen {
                 q.pakete.clear();
                 q.bytes = 0;
+                let schluss = q.schlusswort.take();
+                drop(q);
+                if let Some(s) = schluss {
+                    schlusswort_senden(&mut sock, &s, &l.ip);
+                }
                 break;
             }
             match q.pakete.pop_front() {
@@ -392,14 +488,31 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
             break;
         }
     }
-    let _einspeisen = sperre(&EINSPEISEN);
-    let mut a = sperre(&AKTUELL);
-    if a.as_ref().map(|x| Arc::ptr_eq(x, &l)).unwrap_or(false) {
-        *a = None;
-        drop(a);
-        eingabe::alle_tasten_loslassen();
-        log("Zuschauer getrennt - kein Zuschauer");
+    {
+        let _einspeisen = sperre(&EINSPEISEN);
+        let mut a = sperre(&AKTUELL);
+        if a.as_ref().map(|x| Arc::ptr_eq(x, &l)).unwrap_or(false) {
+            *a = None;
+            drop(a);
+            eingabe::alle_tasten_loslassen();
+            log("Zuschauer getrennt - kein Zuschauer");
+        }
     }
+    let mut q = sperre(&l.q);
+    q.beendet = true;
+    l.ende.notify_all();
+}
+
+/// Die letzte Nachricht an einen abgeloesten Zuschauer, mit Frist: wer sie
+/// nicht abnimmt, haelt den Faden nicht fest. Danach ist die Leitung zu -
+/// das Schlusswort liegt dann schon im Kernel und geht vor dem FIN hinaus.
+fn schlusswort_senden(sock: &mut secure::Secure, s: &[u8], ip: &str) {
+    sock.socket().set_write_timeout(Some(FRIST_SCHLUSSWORT)).ok();
+    match sock.write_all(s) {
+        Ok(()) => log(format!("Abloesung an {ip} gemeldet")),
+        Err(e) => log(format!("Abloesung an {ip} nicht zugestellt: {e}")),
+    }
+    let _ = sock.socket().shutdown(Shutdown::Both);
 }
 
 /// Sendepuffer im Kernel klein halten, damit ein blockierender write die
@@ -491,19 +604,23 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     hello.extend_from_slice(&super::strominfo());
 
     let leitung = Arc::new(Leitung::neu(sock.abbruchgriff(), sock.peer.clone(), sock.handshake_hash.clone(), ip.clone()));
-    // Ein neuer Zuschauer ersetzt den alten: dessen Bildleitung und
-    // Eingabekanal werden gekappt, sein Sendefaden endet.
-    {
+    // Ein neuer Zuschauer ersetzt den alten: dessen Eingabekanal wird
+    // gekappt, seine Warteschlange verworfen; er bekommt nur noch
+    // MSG_ABGELOEST, dann endet sein Sendefaden (spaetestens nach der Frist,
+    // unten).
+    let alt = {
         let _einspeisen = sperre(&EINSPEISEN);
         let mut a = sperre(&AKTUELL);
-        if let Some(alt) = a.take() {
+        let alt = a.take();
+        if let Some(alt) = &alt {
             log(format!("Zuschauer abgeloest: {}", alt.ip));
-            alt.schliessen();
+            alt.abloesen();
             eingabe::alle_tasten_loslassen();
         }
         leitung.einreihen(hello, None);
         *a = Some(leitung.clone());
-    }
+        alt
+    };
     NR.fetch_add(1, Ordering::Relaxed);
     let l2 = leitung.clone();
     std::thread::spawn(move || sendefaden(l2, sock));
@@ -516,6 +633,12 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     settings_senden();
     send_small(MSG_CODECS, &encoder::codecs_payload());
     log(format!("Zuschauer verbunden: {ip}:{port}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}"));
+    // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten. Sein
+    // Sendefaden gibt beim Schlusswort nach FRIST_SCHLUSSWORT auf - steckt
+    // er noch in einem aelteren write, wird hier gekappt.
+    if let Some(alt) = alt {
+        alt.abloesung_abschliessen(FRIST_SCHLUSSWORT * 2);
+    }
 }
 
 // ------------------------------------------------------------ Eingabe-Teil
@@ -823,6 +946,122 @@ mod tests {
         }
     }
 
+    /// Liest vom Bildkanal bis zu MSG_ABGELOEST; danach muss die Leitung zu
+    /// sein. Err, wenn sie vorher endet oder danach noch etwas kommt.
+    fn bis_abloesung(s: &mut secure::Secure) -> Result<(), String> {
+        loop {
+            let mut h = [0u8; 8];
+            s.read_exact(&mut h)?;
+            let len = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+            let mut p = vec![0u8; len];
+            s.read_exact(&mut p)?;
+            if h[0] == MSG_ABGELOEST {
+                if len != 0 {
+                    return Err(format!("Schlusswort mit {len} Byte Nutzlast"));
+                }
+                return match s.read_exact(&mut [0u8; 1]) {
+                    Err(_) => Ok(()),
+                    Ok(()) => Err("nach dem Schlusswort kam noch etwas".into()),
+                };
+            }
+        }
+    }
+
+    /// Ein Paar gesicherter Leitungen ueber Loopback: (Host, Client).
+    fn paar() -> (secure::Secure, secure::Secure) {
+        secure::test_identitaet();
+        let (host_priv, _) = noise::keypair().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let t = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            secure::Secure::accept(s, &noise::prologue_video(), &host_priv).unwrap()
+        });
+        let c = secure::Secure::connect(&addr, &noise::prologue_video()).unwrap();
+        (t.join().unwrap(), c)
+    }
+
+    fn leitung_zu(h: &secure::Secure) -> Arc<Leitung> {
+        Arc::new(Leitung::neu(h.abbruchgriff(), h.peer.clone(), h.handshake_hash.clone(), "127.0.0.1".into()))
+    }
+
+    /// Beim Abloesen wird verworfen, was noch wartet: beim alten Zuschauer
+    /// kommt nur MSG_ABGELOEST an, danach ist die Leitung zu, und einreihen
+    /// nimmt nichts mehr an.
+    #[test]
+    fn abloesung_verwirft_warteschlange() {
+        let (h, mut c) = paar();
+        let leitung = leitung_zu(&h);
+        for t in [0x11u64, 0x22, 0x33] {
+            let mut p = kopf(MSG_TIME, 0, 0, 16).to_vec();
+            p.extend_from_slice(&t.to_le_bytes());
+            p.extend_from_slice(&[0u8; 8]);
+            assert!(leitung.einreihen(p, None));
+        }
+        leitung.abloesen();
+        assert!(!leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), None));
+        let l2 = leitung.clone();
+        std::thread::spawn(move || sendefaden(l2, h));
+        assert!(leitung.abloesung_abschliessen(Duration::from_secs(2)));
+        c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut hdr = [0u8; 8];
+        c.read_exact(&mut hdr).unwrap();
+        assert_eq!((hdr[0], u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]])), (MSG_ABGELOEST, 0));
+        assert!(c.read_exact(&mut [0u8; 1]).is_err());
+    }
+
+    /// Ein abgeloester Zuschauer, der nichts mehr abnimmt (eingefroren): der
+    /// Sendefaden steckt in einem write. Er darf danach nicht haengen
+    /// bleiben - die Frist kappt die Leitung, der Faden endet.
+    #[test]
+    fn abgeloester_zuschauer_der_nichts_abnimmt() {
+        let (h, c) = paar();
+        sendepuffer_setzen(h.socket());
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let faden = std::thread::spawn(move || sendefaden(l2, h));
+        // Weit mehr, als beide Kernelpuffer fassen: 16 MB, der Client liest nie.
+        for _ in 0..16 {
+            assert!(leitung.einreihen(vec![0u8; 1 << 20], None));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(sperre(&leitung.q).bytes > 0, "Sendefaden haengt nicht - Probe ohne Wert");
+        let t0 = Instant::now();
+        leitung.abloesen();
+        assert!(!leitung.abloesung_abschliessen(Duration::from_millis(300)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = faden.join();
+            let _ = tx.send(());
+        });
+        let fertig = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let dauer = t0.elapsed();
+        drop(c);
+        assert!(fertig, "Sendefaden haengt nach dem Kappen weiter");
+        assert!(dauer < Duration::from_secs(3), "{dauer:?}");
+        println!("Sendefaden {dauer:?} nach dem Abloesen beendet");
+    }
+
+    /// `kappen` bricht auch ein recv ab, auf das die Gegenstelle nie
+    /// antwortet (Eingabekanal eines eingefrorenen Zuschauers).
+    #[test]
+    fn kappen_bricht_haengendes_lesen_ab() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (h, _) = l.accept().unwrap();
+        let griff = h.try_clone().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = (&h).read(&mut [0u8; 1]);
+            let _ = tx.send(r.is_err() || matches!(r, Ok(0)));
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let t0 = Instant::now();
+        kappen(&griff);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)), Ok(true), "Lesen haengt nach dem Kappen weiter");
+        assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    }
+
     fn zeitfrage(s: &mut secure::Secure, t: u64) -> Result<(), String> {
         let mut m = kopf(IN_TIME, 0, 0, 8).to_vec();
         m.extend_from_slice(&t.to_le_bytes());
@@ -884,13 +1123,14 @@ mod tests {
         zeitfrage(&mut a_ein, 0xA1).unwrap();
         assert_eq!(zeitantwort(&mut a), Ok(0xA1));
 
-        // Zuschauer B loest A ab: A verliert Bild UND Eingabe.
+        // Zuschauer B loest A ab: A verliert Bild UND Eingabe - und bekommt
+        // als letzte Nachricht MSG_ABGELOEST, damit er nicht zurueckkommt.
         let mut b = bild_verbinden(&bild_addr);
         a_ein.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let t0 = Instant::now();
         assert!(a_ein.read_exact(&mut [0u8; 1]).is_err());
-        assert!(zeitantwort(&mut a).is_err());
+        assert_eq!(bis_abloesung(&mut a), Ok(()));
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
         let _ = zeitfrage(&mut a_ein, 0xA2);
         // B bekommt einen eigenen, funktionierenden Eingabekanal; die
