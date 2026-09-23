@@ -1079,6 +1079,21 @@ fn nvdec_ziel(karte: &Karte, karten: &[Karte], cuda: Result<&[Option<i64>], Stri
     }
 }
 
+/// Zuletzt protokollierte Zuordnung Karte (LUID) -> CUDA-Geraet.
+static NVDEC_GEMELDET: Mutex<Option<(i64, i32)>> = Mutex::new(None);
+
+/// Die Zuordnung "Karte ist CUDA-Geraet n" gehoert einmal ins Protokoll,
+/// nicht bei jedem Neubau des Decoders. true, wenn sie sich seit der letzten
+/// Meldung geaendert hat (und merkt sie sich dann).
+fn zuordnung_neu(gemeldet: &Mutex<Option<(i64, i32)>>, luid: i64, n: i32) -> bool {
+    let mut g = gemeldet.lock().unwrap_or_else(|e| e.into_inner());
+    if *g == Some((luid, n)) {
+        return false;
+    }
+    *g = Some((luid, n));
+    true
+}
+
 /// Auf welcher Karte cuvid ohne "gpu" laeuft (Automatik): CUDA-Geraet 0.
 /// Laesst sich das nicht sagen, aber es gibt nur eine NVIDIA-Karte, ist es
 /// die. So passt ein NVDEC aus der Automatik zum Wunsch nach genau dieser
@@ -1335,7 +1350,7 @@ fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) ->
                 // Genau diese Karte, nicht CUDAs Vorgabe - siehe nvdec_ziel.
                 Some(k) if k.nvidia() => match nvdec_ziel(k, karten, cuda_geraete()) {
                     Ok(gpu) => {
-                        if let Some(n) = gpu {
+                        if let Some(n) = gpu.filter(|&n| zuordnung_neu(&NVDEC_GEMELDET, k.luid, n)) {
                             protokoll::zeile(format!("NVDEC: {} ist CUDA-Geraet {n}", k.name));
                         }
                         if let Some(bau) = nvdec(&mut grund, gpu, Some(k.luid)) {
@@ -7373,6 +7388,21 @@ mod tests {
         // Eine Karte aus der Automatik passt danach zum Wunsch nach genau ihr.
         let l = nvdec_vorgabe(&eine, Ok(&[Some(1)]));
         assert!(wunsch_passt_mit(einstellungen::DecoderWunsch::Gpu, DecoderPfad::Nvdec(l), &eine));
+    }
+
+    /// "NVDEC: <Karte> ist CUDA-Geraet n" steht nur bei einer neuen Zuordnung
+    /// im Protokoll, nicht bei jedem Neubau.
+    #[test]
+    fn nvdec_zuordnung_einmal() {
+        let gemeldet = Mutex::new(None);
+        assert!(zuordnung_neu(&gemeldet, 1, 1));
+        assert!(!zuordnung_neu(&gemeldet, 1, 1));
+        assert!(!zuordnung_neu(&gemeldet, 1, 1));
+        // Wechsel auf die andere Karte und zurueck: jedes Mal eine Zeile.
+        assert!(zuordnung_neu(&gemeldet, 2, 0));
+        assert!(zuordnung_neu(&gemeldet, 1, 1));
+        // Dieselbe Karte unter anderer Ordnungszahl ist auch neu.
+        assert!(zuordnung_neu(&gemeldet, 1, 0));
     }
 
     /// Die LUID aus CUDA (Speicherbild der Struktur) und die aus DXGI
