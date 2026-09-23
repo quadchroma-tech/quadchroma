@@ -441,10 +441,14 @@ Meldungen. Dasselbe landet in %APPDATA%\QuadChroma\protokoll.txt, auch im
 Fensterbetrieb - die Datei beginnt bei jedem Start neu und traegt dort
 zusaetzlich die Anzeige (Karte, Feature-Level, Tearing) und je Sekunde eine
 Zeile mit Bildrate, Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern
-und der Prozessorlast des Clients. Ein Verbindungsfehler steht dort einmal
-je neuem Grund mit allen Einzelheiten ("Verbindung: <Grund>"); der
-Startbildschirm zeigt ihn in der Sprache der Oberflaeche, einen Wortlaut
-des Systems, wo es einen gibt, in Klammern dahinter.
+und der Prozessorlast des Clients. Ein Verbindungsfehler bis einschliesslich
+Handschlag und Pruefung des Host-Schluessels (Host nicht erreichbar,
+Fingerabdruck geaendert) steht dort einmal je neuem Grund mit allen
+Einzelheiten ("Verbindung: <Grund>"). Ein Fehler danach, etwa "Host hat die
+Leitung nach dem Handschlag geschlossen - dieses Geraet ist dort nicht
+gekoppelt", steht vorerst bei jedem Versuch da, also alle 2 s. Der
+Startbildschirm zeigt den Fehler in der Sprache der Oberflaeche, einen
+Wortlaut des Systems, wo es einen gibt, in Klammern dahinter.
 
     quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
     quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
@@ -593,9 +597,26 @@ derselbe Verlust (...) noch N-mal, nicht einzeln protokolliert").
 
 Ein neuer Zuschauer ersetzt den alten: dessen Warteschlange wird
 verworfen, er bekommt nur noch Nachricht 10 und ist nach hoechstens 2 s
-getrennt, auch wenn er haengt ("Zuschauer abgeloest: <IP>", dann
-"Abloesung an <IP> gemeldet" oder "Abgeloester Zuschauer <IP> nimmt nichts
-mehr ab - Bildleitung gekappt").
+getrennt, auch wenn er haengt. Im Protokoll steht "Zuschauer abgeloest:
+<IP>", danach je nach Zustand des alten:
+
+    "Abloesung an <IP> gemeldet"
+                    Nachricht 10 liegt im Sendepuffer des Kernels;
+                    dass sie ankommt, ist damit nicht sicher.
+    "Abloesung an <IP> nicht zugestellt: <Fehler>"
+                    der alte war schon weg oder hat sie binnen 1 s
+                    nicht abgenommen.
+    "Abgeloester Zuschauer <IP> nimmt nichts mehr ab - Bildleitung gekappt"
+                    er hing noch an einem aelteren Paket; Nachricht 10
+                    erreicht ihn dann nicht.
+
+Meist steht nur eine davon da. Wird das aeltere Paket erst nach mehr als
+1 s fertig, kann die Frist von 2 s ablaufen, waehrend Nachricht 10 noch
+haengt: dann steht erst "... gekappt" und gleich danach "... nicht
+zugestellt: <Fehler>".
+
+Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
+laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.
 
 Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
 privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,
