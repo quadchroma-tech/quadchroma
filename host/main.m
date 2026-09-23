@@ -343,6 +343,10 @@ static uint64_t g_last_cap_us = 0;   // echte Aufnahmezeit des zuletzt gesehenen
 // seiner Aufnahme, mit der Aufnahmezeit reichte der Takt sonst mitten in einer
 // Bewegung das aeltere Bild nach und verdraengte damit das neuere.
 static uint64_t g_last_ankunft_us = 0;
+// g_last_pb ist ein umgerechnetes Behelfsbild (letztes_bild_angleichen, nach
+// einem Codecwechsel mit anderem Aufnahmeformat): das erste echte Bild danach
+// geht als Vollbild in den Encoder.
+static int g_behelf = 0;
 static _Atomic long g_repeats = 0;
 // Das zuletzt gesehene Bild ist noch nicht in den Encoder gegangen: es fiel
 // als zu schnell, im Stau oder bei vollem Encoder weg. Ohne feste Bildrate
@@ -1986,12 +1990,20 @@ static void codec_wechseln(int idx) {
     g_wechsel_aktiv = 1;
     logf_(@"Codecwechsel: %s -> %s", g_kandidaten[alt].name, g_kandidaten[idx].name);
 
-    // b) Aendert sich das Aufnahmeformat, darf der feste Takt kein altes Bild
-    //    mehr nachlegen - sonst bekaeme der neue Encoder Bilder im alten Format.
+    // b) Das letzte Bild bleibt liegen, auch wenn sich das Aufnahmeformat
+    //    aendert: bei stillem Bildschirm ist es womoeglich das einzige, das
+    //    der Zuschauer nach dem Wechsel bekommen kann - dass ScreenCaptureKit
+    //    nach updateConfiguration von selbst ein neues liefert, ist nicht
+    //    belegt. Im alten Format geht es trotzdem nie in den neuen Encoder:
+    //    waehrend des Wechsels gibt es keine Sitzung, danach rechnet der Takt
+    //    es einmal um (letztes_bild_angleichen), und encode_buffer weist
+    //    fremde Formate ab. Frueher wurde es hier freigegeben; dann wartete
+    //    der Zuschauer bis zur naechsten Aenderung, und ein Bild, das waehrend
+    //    des Umstellens noch im alten Format kam, lag danach fest und wurde
+    //    bei jedem Taktschlag abgewiesen.
     OSType alt_fmt = g_cfg.pixelFormat;
     OSType neu_fmt = pixfmt_fuer(idx);
     BOOL fmt_geaendert = (alt_fmt != neu_fmt);
-    if (fmt_geaendert && g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
 
     if (g_session) {
         // c) Alles, was der alte Encoder noch hat, abliefern lassen. Danach feuert
@@ -2120,6 +2132,8 @@ static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
     // Rund um einen Formatwechsel der Aufnahme kann noch ein Bild im alten
     // Format eintreffen. Das gehoert nicht in den neuen Encoder - verwerfen,
     // und sagen, dass es passiert ist (einmal je Format, nicht je Bild).
+    // Bleibt es als letztes Bild liegen, rechnet der Takt es um
+    // (letztes_bild_angleichen).
     OSType ist = CVPixelBufferGetPixelFormatType(pb);
     OSType soll = pixfmt_fuer(atomic_load(&g_codec_id));
     if (ist != soll) {
@@ -2149,6 +2163,52 @@ static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
             logf_(@"Encoder %s nimmt Bild nicht an (%d)", g_kandidaten[atomic_load(&g_codec_id)].name, (int)st);
     }
     return st == noErr;
+}
+
+// Ein Bild in ein anderes Aufnahmeformat umrechnen, mit VideoToolbox - wie
+// die Umrechnung, die der Encoder fuer die Kandidaten 1 und 2 selbst macht.
+// Farbangaben (Matrix, Primaerfarben, Uebertragung) setzt VTPixelTransfer am
+// Ziel passend zum Quellbild. Rueckgabe: neuer Puffer (+1) oder NULL.
+static CVPixelBufferRef bild_umrechnen(CVPixelBufferRef pb, OSType fmt) {
+    NSDictionary *attr = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    CVPixelBufferRef neu = NULL;
+    if (CVPixelBufferCreate(NULL, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb), fmt,
+                            (__bridge CFDictionaryRef)attr, &neu) != kCVReturnSuccess || !neu)
+        return NULL;
+    VTPixelTransferSessionRef ts = NULL;
+    OSStatus st = VTPixelTransferSessionCreate(NULL, &ts);
+    if (st == noErr) st = VTPixelTransferSessionTransferImage(ts, pb, neu);
+    if (ts) { VTPixelTransferSessionInvalidate(ts); CFRelease(ts); }
+    if (st != noErr) { CVPixelBufferRelease(neu); return NULL; }
+    return neu;
+}
+
+// Das festgehaltene Bild in das Format des laufenden Encoders bringen, bevor
+// der Takt es nachlegt. Nach einem Codecwechsel mit anderem Aufnahmeformat
+// (etwa xf44 -> 420f) liegt dort noch ein Bild im alten Format: das letzte vor
+// dem Umstellen oder eines, das die Aufnahme waehrend des Umstellens noch
+// lieferte. encode_buffer weist es ab; ohne Umrechnung wartete der Zuschauer
+// bei stillem Bildschirm auf sein Vollbild bis zur naechsten Aenderung, und
+// jeder Taktschlag versuchte es erneut. Umgerechnet wird einmal, danach passt
+// das Format. Kommt ein echtes Bild, ersetzt es den Behelf und geht als
+// Vollbild hinaus (g_behelf) - nach einem Wechsel auf 4:4:4 soll der
+// Zuschauer nicht auf einem Bild mit Farbe aus 4:2:0 weiterbauen.
+// Nur auf g_capq. NO = kein Bild im passenden Format da.
+static BOOL letztes_bild_angleichen(void) {
+    if (!g_last_pb) return NO;
+    OSType ist = CVPixelBufferGetPixelFormatType(g_last_pb);
+    OSType soll = pixfmt_fuer(atomic_load(&g_codec_id));
+    if (ist == soll) return YES;
+    CVPixelBufferRef neu = bild_umrechnen(g_last_pb, soll);
+    uint32_t a = CFSwapInt32HostToBig(ist), b = CFSwapInt32HostToBig(soll);
+    if (neu) logf_(@"Takt: letztes Bild von %.4s nach %.4s umgerechnet (Aufnahmeformat gewechselt, kein neueres Bild)",
+                   (char *)&a, (char *)&b);
+    else     logf_(@"Takt: letztes Bild liess sich nicht von %.4s nach %.4s umrechnen - verworfen, das naechste kommt von der Aufnahme",
+                   (char *)&a, (char *)&b);
+    CVPixelBufferRelease(g_last_pb);
+    g_last_pb = neu;
+    g_behelf = neu != NULL;
+    return neu != NULL;
 }
 
 // Ist fuer ein Bild zur Zeit t (Hostuhr, Sekunden) ein Schlitz frei? Wenn ja,
@@ -2192,6 +2252,9 @@ static void fixed_tick(void) {
     // Haengt der Encoder noch an frueheren Bildern, wird nichts nachgelegt -
     // ein Auslasser ist billiger als eine wachsende Warteschlange.
     if (atomic_load(&g_inflight) >= 2) return;
+    // Nach einem Codecwechsel mit anderem Aufnahmeformat: das letzte Bild
+    // einmal umrechnen, statt es bei jedem Schlag abweisen zu lassen.
+    if (!testbild && !letztes_bild_angleichen()) return;
 
     // Zeitstempel muss immer vorwaerts gehen, sonst weist der Encoder das Bild ab.
     if (CMTIME_COMPARE_INLINE(now, <=, g_last_pts))
@@ -2304,6 +2367,13 @@ static void fixed_tick(void) {
     // Testbild an: die Aufnahme laeuft weiter (der Wechsel zurueck soll
     // keine Sekunde kosten), aber ihre Bilder gehen nicht in den Encoder.
     if (atomic_load(&g_testbild)) return;
+    // Das erste echte Bild nach einem umgerechneten Behelf wird ein Vollbild
+    // (siehe letztes_bild_angleichen). Faellt es gleich als zu schnell weg,
+    // bleibt die Forderung stehen, und der Takt reicht es als Vollbild nach.
+    if (g_behelf && CVPixelBufferGetPixelFormatType(pb) == pixfmt_fuer(atomic_load(&g_codec_id))) {
+        g_behelf = 0;
+        atomic_store(&g_force_key, 1);
+    }
     self.framesIn++;
 
     // Schneller als die Zielrate: weg damit. Und ist der Encoder noch mit
@@ -2628,6 +2698,18 @@ static void stream_herunterfahren_anstossen(void) {
     });
 }
 
+// --fest (oder --fixed): feste Bildrate von Anfang an. Ohne die Angabe ist sie
+// aus (BENUTZUNG: "Vorgabe ... aus"), bis der Client etwas anderes wuenscht.
+// Frueher stand hier nur die erste Zuweisung im if (Klammern fehlten):
+// g_fixed_gewollt war immer 1, und jeder neue Strom lief mit fester Bildrate,
+// bei einem Client ohne eigene Einstellung die ganze Sitzung.
+static void fest_einlesen(NSArray<NSString *> *args) {
+    if ([args containsObject:@"--fest"] || [args containsObject:@"--fixed"]) {
+        atomic_store(&g_cur_fixed, 1);
+        atomic_store(&g_fixed_gewollt, 1);
+    }
+}
+
 int main(int argc, const char *argv[]) { @autoreleasepool {
     pthread_mutex_lock(&g_log_mtx);
     log_oeffnen("a");
@@ -2761,9 +2843,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     int displayIdx = 0, fps = 120, mbit = 150, outW = 0, outH = 0, port = 9001;
     double seconds = 0;
     NSString *outPath = nil;
-    if ([args containsObject:@"--fest"] || [args containsObject:@"--fixed"])
-        atomic_store(&g_cur_fixed, 1);
-        atomic_store(&g_fixed_gewollt, 1);
+    fest_einlesen(args);
     NSInteger i;
     if (capIdx != NSNotFound) {
         seconds = [args[capIdx + 1] doubleValue];
@@ -2798,15 +2878,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     g_info_w = outW; g_info_h = outH; g_info_fps = fps;
     atomic_store(&g_codec_id, start_idx);
 
-    if (srvIdx != NSNotFound) {
-        if (start_server(port) < 0) return 9;
-        start_input_server(port + 1, display.displayID);
-        start_beacon(port);
-        BOOL ax = AXIsProcessTrusted();
-        logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-        logf_(@"Bildschirm Kennung %u (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", display.displayID, pxW, pxH, hz, outW, outH, fps);
-        logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
-    } else {
+    // Im Dienstbetrieb startet die Annahme erst weiter unten, wenn alles steht.
+    if (srvIdx == NSNotFound) {
         logf_(@"\n=== Aufnahme %.1f s: Display %d (%zux%zu Pixel) -> %dx%d, %d fps ===",
               seconds, displayIdx, pxW, pxH, outW, outH, fps);
     }
@@ -2858,6 +2931,21 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         qc_clip_start(clip_cb);
         qc_zeiger_start(zeiger_cb, zeiger_aktiv, zeiger_log);
         logf_(@"Zeigerform: Abfrage alle 50 ms, nur mit Zuschauer");
+        // Die Annahme zuletzt. Ihre Faeden laufen sofort los; ein Client, der
+        // beim Neustart des Hosts schon wartet und neu verbindet, kann durch
+        // Handschlag und Freigabe sein, bevor main weiter unten ankaeme.
+        // bild_verbindung braucht dann g_lifeq und g_capq
+        // (stream_hochfahren_sync; dispatch_sync auf eine NULL-Warteschlange
+        // endet mit SIGSEGV), g_cfg, g_grab, g_display_idx und die Werte
+        // g_cur_*; apply_settings aus dem Eingabekanal liest g_tick. Frueher
+        // startete die Annahme vor all dem.
+        if (start_server(port) < 0) return 9;
+        start_input_server(port + 1, display.displayID);
+        start_beacon(port);
+        BOOL ax = AXIsProcessTrusted();
+        logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
+        logf_(@"Bildschirm Kennung %u (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", display.displayID, pxW, pxH, hz, outW, outH, fps);
+        logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {
         // Aufnahme in eine Datei: sofort loslegen.
         SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];

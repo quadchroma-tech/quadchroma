@@ -4,8 +4,9 @@
 // laufenden Strom, Testbild-Rest beim neuen Zuschauer, Abbau zwischen
 // Hochfahren und Eintragen, Nachreichen bei stillem Bildschirm (als
 // wiederholt gestempelt, im Stau ohne Taktversuche), Abschluss eines
-// Codecwechsels ohne Zuschauer, Stauregel samt Ton im Stau, Ansage des
-// Tonformats, Koennensliste (AV1).
+// Codecwechsels ohne Zuschauer, Codecwechsel mit anderem Aufnahmeformat bei
+// stillem Bildschirm (Umrechnung des letzten Bildes), --fest beim Start,
+// Stauregel samt Ton im Stau, Ansage des Tonformats, Koennensliste (AV1).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -1397,6 +1398,262 @@ static void codec_abschluss_pruefen(void) {
     atomic_store(&g_codec_id, 0);
 }
 
+// ------------------------------- Codecwechsel mit anderem Aufnahmeformat
+
+// Ein Bild im Aufnahmeformat fmt (xf44 oder 420f), jeder Bildpunkt gleich.
+// Die Werte in 10 Bit; 420f bekommt sie auf 8 Bit gekuerzt, xf44 traegt sie
+// in den oberen 10 Bit von 16. Farbangaben wie bei der Aufnahme (BT.709).
+static CVPixelBufferRef formatpuffer(int w, int h, OSType fmt, int y10, int cb10, int cr10) {
+    NSDictionary *attr = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(NULL, (size_t)w, (size_t)h, fmt, (__bridge CFDictionaryRef)attr, &pb);
+    if (!pb) return NULL;
+    int breit = fmt == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    for (size_t e = 0; e < 2; e++) {
+        uint8_t *basis = CVPixelBufferGetBaseAddressOfPlane(pb, e);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, e);
+        size_t pw = CVPixelBufferGetWidthOfPlane(pb, e), ph = CVPixelBufferGetHeightOfPlane(pb, e);
+        for (size_t zeile = 0; zeile < ph; zeile++) {
+            uint8_t *z = basis + zeile * bpr;
+            for (size_t x = 0; x < pw * (e ? 2 : 1); x++) {
+                int v = e == 0 ? y10 : (x & 1) ? cr10 : cb10;
+                if (breit) ((uint16_t *)z)[x] = (uint16_t)(v << 6);
+                else z[x] = (uint8_t)(v >> 2);
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    return pb;
+}
+
+// Wert eines Bildpunkts in der Mitte, auf 10 Bit umgerechnet.
+// ebene 0: Y; ebene 1: komp 0 = Cb, komp 1 = Cr.
+static int bildpunkt(CVPixelBufferRef pb, size_t ebene, size_t komp) {
+    int breit = CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    uint8_t *basis = CVPixelBufferGetBaseAddressOfPlane(pb, ebene);
+    size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, ebene);
+    size_t x = CVPixelBufferGetWidthOfPlane(pb, ebene) / 2, y = CVPixelBufferGetHeightOfPlane(pb, ebene) / 2;
+    size_t i = ebene ? 2 * x + komp : x;
+    int v = breit ? ((uint16_t *)(basis + y * bpr))[i] >> 6 : (basis + y * bpr)[i] << 2;
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return v;
+}
+
+static int nahe(int a, int b) { return abs(a - b) <= 8; }   // 2 Stufen in 8 Bit
+
+// Wie bilder_lesen, zaehlt dazu die Wechselansagen (SWITCH).
+static void wechsel_lesen(leser *l, int frist_ms, int *wechsel, int *bilder, int *vollbilder, int *erstes_voll) {
+    qc_hdr m;
+    uint8_t anf[8];
+    while (nachricht(l, &m, anf, frist_ms) == 1) {
+        if (m.type == QC_MSG_SWITCH) (*wechsel)++;
+        if (m.type != QC_MSG_VIDEO) continue;
+        int key = (m.flags & QC_FLAG_KEY) ? 1 : 0;
+        if (*bilder == 0) *erstes_voll = key;
+        (*bilder)++;
+        *vollbilder += key;
+    }
+}
+
+static OSType format_letztes(void) {
+    __block OSType f = 0;
+    dispatch_sync(g_capq, ^{ f = g_last_pb ? CVPixelBufferGetPixelFormatType(g_last_pb) : 0; });
+    return f;
+}
+
+// Hinweis der Gegenpruefung (C9), im Protokoll des Hosts nach einem
+// Codecwechsel 0 -> 3 gesehen: "Bild im Format xf44 verworfen, Encoder
+// erwartet 420f". Ein Bild im alten Aufnahmeformat lag danach fest, der Takt
+// scheiterte damit bei jedem Schlag, und bei stillem Bildschirm bekam der
+// Zuschauer kein Vollbild im neuen Codec. Die Aufnahme ist eine Attrappe,
+// die Encoder sind echt.
+static void formatwechsel_pruefen(int bild_port) {
+    printf("\n-- Codecwechsel mit anderem Aufnahmeformat bei stillem Bildschirm (echter Encoder, 640x360)\n");
+    OSType f444 = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, f420 = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+
+    // a) Die Umrechnung selbst: Werte und Farbangaben bleiben, hin und zurueck.
+    CVPixelBufferRef q = formatpuffer(64, 32, f444, 800, 300, 700);
+    CVPixelBufferRef z = q ? bild_umrechnen(q, f420) : NULL;
+    CVPixelBufferRef r = z ? bild_umrechnen(z, f444) : NULL;
+    int ok_z = z && CVPixelBufferGetPixelFormatType(z) == f420 && CVPixelBufferGetWidth(z) == 64 && CVPixelBufferGetHeight(z) == 32 &&
+               nahe(bildpunkt(z, 0, 0), 800) && nahe(bildpunkt(z, 1, 0), 300) && nahe(bildpunkt(z, 1, 1), 700);
+    int ok_r = r && CVPixelBufferGetPixelFormatType(r) == f444 &&
+               nahe(bildpunkt(r, 0, 0), 800) && nahe(bildpunkt(r, 1, 0), 300) && nahe(bildpunkt(r, 1, 1), 700);
+    CFTypeRef mz = z ? CVBufferCopyAttachment(z, kCVImageBufferYCbCrMatrixKey, NULL) : NULL;
+    int ok_m = mz && CFEqual(mz, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    printf("         (xf44 Y/Cb/Cr 800/300/700 -> 420f %d/%d/%d -> xf44 %d/%d/%d, Matrix %s)\n",
+           z ? bildpunkt(z, 0, 0) : -1, z ? bildpunkt(z, 1, 0) : -1, z ? bildpunkt(z, 1, 1) : -1,
+           r ? bildpunkt(r, 0, 0) : -1, r ? bildpunkt(r, 1, 0) : -1, r ? bildpunkt(r, 1, 1) : -1,
+           mz ? [(__bridge NSString *)mz UTF8String] : "keine");
+    pruefe(ok_z && ok_r && ok_m, "Umrechnung xf44 -> 420f -> xf44: Groesse, Werte (auf 2 Stufen in 8 Bit) und Farbmatrix bleiben");
+    if (mz) CFRelease(mz);
+    if (q) CVPixelBufferRelease(q);
+    if (z) CVPixelBufferRelease(z);
+    if (r) CVPixelBufferRelease(r);
+
+    // b) Ein Paar Kandidaten mit verschiedenem Aufnahmeformat.
+    stdout_stumm(1);
+    codecs_pruefen();
+    stdout_stumm(0);
+    int von = -1, nach = -1;
+    for (int i = 0; i < 3 && von < 0; i++) if (g_befund[i].vorhanden) von = i;       // xf44
+    for (int i = 3; i < 5 && nach < 0; i++) if (g_befund[i].vorhanden) nach = i;     // 420f
+    if (von < 0 || nach < 0) { pruefe(0, "zwei Kandidaten mit verschiedenem Aufnahmeformat"); return; }
+    printf("         (Wechsel zwischen Kandidat %d %s und %d %s)\n", von, g_kandidaten[von].name, nach, g_kandidaten[nach].name);
+
+    atomic_store(&g_codec_id, von);
+    g_info_w = 640; g_info_h = 360; g_info_fps = 60;
+    atomic_store(&g_cur_fps, 60);
+    atomic_store(&g_cur_mbit, 10);
+    atomic_store(&g_cur_fixed, 0);
+    atomic_store(&g_cur_gaming, 0);
+    atomic_store(&g_testbild, 0);
+    g_cfg = [[SCStreamConfiguration alloc] init];
+    g_cfg.pixelFormat = pixfmt_fuer(von);
+    __block BOOL enc = NO;
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{ enc = encoder_start(von, 640, 360, 60, 10); });
+    stdout_stumm(0);
+    CVPixelBufferRef still = formatpuffer(640, 360, f444, 600, 400, 620);
+    CVPixelBufferRef nachz = formatpuffer(640, 360, f420, 600, 400, 620);
+    CVPixelBufferRef echt = formatpuffer(640, 360, f444, 610, 400, 620);
+    if (!enc || !still || !nachz || !echt) { pruefe(0, "Encoder und Bildpuffer"); return; }
+    strom_attrappe_setzen();
+    SCStream *fs = strom_jetzt();
+    Grabber *grab = [[Grabber alloc] init];
+    // Der Bildschirm ist seit einer Sekunde still; sein letztes Bild liegt fest.
+    CMTime vor = CMTimeSubtract(uhr(), CMTimeMake(1, 1));
+    dispatch_sync(g_capq, ^{
+        g_last_pb = CVPixelBufferRetain(still);
+        g_last_cap_us = cmtime_us(vor);
+        g_last_ankunft_us = cmtime_us(vor);
+        g_last_pts = vor;
+        g_schlitz = 0;
+        g_behelf = 0;
+    });
+    atomic_store(&g_bild_offen, 0);
+
+    uint8_t e_priv[32], e_pub[32];
+    qc_keypair(e_priv, e_pub);
+    qc_authorize(e_pub, "hosttest E");
+    qc_cipher rx;
+    stdout_stumm(1);
+    int b = client_verbinden(bild_port, e_priv, &rx, NULL);
+    leser l;
+    leser_init(&l, b, 0);
+    l.rx = rx;
+    char magic[4];
+    int ok = b >= 0 && klartext(&l, magic, 4, 2000) == 1;
+    usleep(50 * 1000);
+    takt(5);
+    int w0 = 0, n0 = 0, v0 = 0, e0 = -1;
+    wechsel_lesen(&l, 300, &w0, &n0, &v0, &e0);
+    stdout_stumm(0);
+    pruefe(ok && n0 == 1 && e0 == 1, "vor dem Wechsel: der Zuschauer hat sein Vollbild");
+
+    // c) Wechsel ohne ein einziges Bild der Aufnahme, weder waehrend noch
+    //    danach: bei stillem Bildschirm ist das letzte Bild von vorher alles,
+    //    was es gibt.
+    long vorher_n = atomic_load(&g_nachgereicht);
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{ codec_wechseln(nach); });
+    dispatch_sync(g_capq, ^{});                      // Abschluss nach dem Umstellen der Attrappe
+    int steht = atomic_load(&g_codec_id) == nach && !wechsel_aktiv();
+    takt(5);
+    int w1 = 0, n1 = 0, v1 = 0, e1 = -1;
+    wechsel_lesen(&l, 300, &w1, &n1, &v1, &e1);
+    stdout_stumm(0);
+    OSType f1 = format_letztes();
+    uint32_t f1be = CFSwapInt32HostToBig(f1);
+    printf("         (%s -> %s: Ansage %d, danach %d Bild(er), das erste %s, %ld nachgereicht, letztes Bild jetzt %.4s)\n",
+           g_kandidaten[von].name, g_kandidaten[nach].name, w1, n1,
+           e1 == 1 ? "ein Vollbild" : e1 == 0 ? "ein Zwischenbild" : "-",
+           atomic_load(&g_nachgereicht) - vorher_n, f1 ? (char *)&f1be : "----");
+    pruefe(steht && w1 == 1 && n1 == 1 && e1 == 1 && f1 == f420 && !atomic_load(&g_wait_key),
+           "stiller Bildschirm, kein neues Bild: der Zuschauer bekommt sein Vollbild im neuen Codec, genau einmal "
+           "(das letzte Bild, umgerechnet)");
+
+    // d) Zurueck, und diesmal liefert die Aufnahme nach dem Umstellen noch ein
+    //    Bild im alten Format nach - der Fall aus dem Protokoll.
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{ codec_wechseln(von); });
+    dispatch_sync(g_capq, ^{});
+    steht = atomic_load(&g_codec_id) == von && !wechsel_aktiv();
+    CMSampleBufferRef s_nachz = aufnahme_bild(nachz, uhr());
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s_nachz ofType:SCStreamOutputTypeScreen]; });
+    usleep(30 * 1000);                               // eine Bildzeit ohne Neues
+    takt(5);
+    int w2 = 0, n2 = 0, v2 = 0, e2 = -1;
+    wechsel_lesen(&l, 300, &w2, &n2, &v2, &e2);
+    stdout_stumm(0);
+    OSType f2 = format_letztes();
+    __block int behelf = 0;
+    dispatch_sync(g_capq, ^{ behelf = g_behelf; });
+    printf("         (%s -> %s mit Nachzuegler in 420f: Ansage %d, danach %d Bild(er), das erste %s)\n",
+           g_kandidaten[nach].name, g_kandidaten[von].name, w2, n2,
+           e2 == 1 ? "ein Vollbild" : e2 == 0 ? "ein Zwischenbild" : "-");
+    pruefe(steht && w2 == 1 && n2 == 1 && e2 == 1 && f2 == f444 && behelf,
+           "Nachzuegler im alten Format nach dem Wechsel: er liegt nicht fest, der Zuschauer bekommt sein Vollbild");
+
+    // e) Das erste echte Bild danach ersetzt den Behelf als Vollbild, das
+    //    naechste ist wieder ein gewoehnliches Zwischenbild.
+    CMSampleBufferRef s_echt1 = aufnahme_bild(echt, uhr());
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s_echt1 ofType:SCStreamOutputTypeScreen]; });
+    int w3 = 0, n3 = 0, v3 = 0, e3 = -1;
+    stdout_stumm(1);
+    wechsel_lesen(&l, 300, &w3, &n3, &v3, &e3);
+    CMSampleBufferRef s_echt2 = aufnahme_bild(echt, uhr());
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s_echt2 ofType:SCStreamOutputTypeScreen]; });
+    int w4 = 0, n4 = 0, v4 = 0, e4 = -1;
+    wechsel_lesen(&l, 300, &w4, &n4, &v4, &e4);
+    stdout_stumm(0);
+    dispatch_sync(g_capq, ^{ behelf = g_behelf; });
+    printf("         (erstes echtes Bild danach: %s, das naechste: %s)\n",
+           e3 == 1 ? "Vollbild" : e3 == 0 ? "Zwischenbild" : "-", e4 == 1 ? "Vollbild" : e4 == 0 ? "Zwischenbild" : "-");
+    pruefe(n3 == 1 && e3 == 1 && n4 == 1 && e4 == 0 && !behelf,
+           "das erste echte Bild nach dem umgerechneten kommt als Vollbild, danach wieder Zwischenbilder");
+
+    zuschauer_weg();
+    stdout_stumm(1);
+    stream_herunterfahren_anstossen();
+    SCStream *st = strom_jetzt();
+    stdout_stumm(0);
+    pruefe(st == nil && !g_session && format_letztes() == 0, "ohne Zuschauer: Strom, Encoder und letztes Bild weg");
+    atomic_store(&g_bild_offen, 0);
+    close(b); free(l.buf);
+    CFRelease(s_nachz); CFRelease(s_echt1); CFRelease(s_echt2);
+    CVPixelBufferRelease(still); CVPixelBufferRelease(nachz); CVPixelBufferRelease(echt);
+    g_cfg = nil;
+    atomic_store(&g_codec_id, 0);
+}
+
+// ------------------------------------------------ --fest beim Start (C10)
+
+static void fest_pruefen(void) {
+    printf("\n-- Feste Bildrate beim Start\n");
+    atomic_store(&g_cur_fixed, 0);
+    atomic_store(&g_fixed_gewollt, 0);
+    fest_einlesen(@[@"quadchroma-host", @"--serve", @"9001", @"--fps", @"120", @"--mbit", @"50"]);
+    int ohne_cur = atomic_load(&g_cur_fixed), ohne_gewollt = atomic_load(&g_fixed_gewollt);
+    fest_einlesen(@[@"quadchroma-host", @"--serve", @"9001", @"--fest"]);
+    int mit = atomic_load(&g_cur_fixed) == 1 && atomic_load(&g_fixed_gewollt) == 1;
+    atomic_store(&g_cur_fixed, 0);
+    atomic_store(&g_fixed_gewollt, 0);
+    fest_einlesen(@[@"quadchroma-host", @"--fixed"]);
+    int mit2 = atomic_load(&g_cur_fixed) == 1 && atomic_load(&g_fixed_gewollt) == 1;
+    atomic_store(&g_cur_fixed, 0);
+    atomic_store(&g_fixed_gewollt, 0);
+    printf("         (ohne --fest: g_cur_fixed %d, g_fixed_gewollt %d)\n", ohne_cur, ohne_gewollt);
+    pruefe(ohne_cur == 0 && ohne_gewollt == 0,
+           "ohne --fest ist die feste Bildrate aus - auch der Wunsch, den jeder neue Strom uebernimmt");
+    pruefe(mit && mit2, "mit --fest oder --fixed ist sie an");
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -1440,6 +1697,8 @@ int main(void) {
         abbau_wettlauf_pruefen(bild_port);
         nachreichen_pruefen(bild_port);
         codec_abschluss_pruefen();
+        formatwechsel_pruefen(bild_port);
+        fest_pruefen();
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();

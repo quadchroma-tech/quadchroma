@@ -120,8 +120,13 @@ static void clip_poll(void) {
     // und der Mac-Client: kein Zuschauer, keine Arbeit, und ab macOS 15.4 kann
     // jedes Lesen die Systemabfrage zum Einsetzen ausloesen. Der Zaehler ist
     // oben schon weitergefuehrt, die Aenderung gilt damit als gesehen.
+    // g_last kennt den neuen Inhalt dann nicht mehr - also vergessen. Sonst
+    // fiele eine spaetere Kopie desselben Textes mit Zuschauer als
+    // "unveraendert" weg (erst "A" mit Zuschauer, ohne ihn "B", mit dem
+    // naechsten wieder "A": gesendet wurde nichts). Den eigenen Widerhall
+    // faengt weiter g_self_change ab, oben vor dieser Stelle.
     int (*aktiv)(void) = g_aktiv;
-    if (aktiv && !aktiv()) return;
+    if (aktiv && !aktiv()) { g_last = nil; return; }
 
     NSString *text = read_first_text(pb);
     if (text.length == 0) {

@@ -1,5 +1,6 @@
 // Pruefprogramm fuer host/clipboard.m: Kennzeichnung des empfangenen Textes,
-// Widerhall, Uebertragung dessen, was der Nutzer am Mac kopiert.
+// Widerhall, Uebertragung dessen, was der Nutzer am Mac kopiert, und Lesen
+// nur mit Zuschauer (qc_clip_bedingung).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 \
 //         -framework Foundation -framework AppKit host/ablagetest.m -o /tmp/ablagetest
@@ -14,6 +15,7 @@
 #import <AppKit/AppKit.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static FILE *pruef_fopen(const char *pfad, const char *modus) {
     if (strcmp(pfad, "/tmp/quadchroma-m1.log") == 0) pfad = "/dev/null";
@@ -48,6 +50,10 @@ static NSUInteger anzahl(void) {
 static NSString *zuletzt(void) {
     @synchronized (g_empfangen) { return g_empfangen.lastObject; }
 }
+
+// Schaut gerade jemand zu? Im Host ist das g_client_fd >= 0.
+static _Atomic int g_zuschauer = 1;
+static int zuschauer_da(void) { return atomic_load(&g_zuschauer); }
 
 static void laufen(double s) {
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:s]];
@@ -119,6 +125,35 @@ int main(void) {
         laufen(0.5);
         printf("         (voruebergehender Eintrag eines anderen Programms: %s)\n",
                anzahl() == 4 ? "uebertragen" : "nicht uebertragen");
+
+        // Wie im Dienstbetrieb (main.m): gelesen wird nur mit Zuschauer.
+        printf("\n-- Nur mit Zuschauer (qc_clip_bedingung)\n");
+        qc_clip_bedingung(zuschauer_da);
+        atomic_store(&g_zuschauer, 1);
+        NSUInteger n0 = anzahl();
+        kopieren(pb, @"Text A", nil);
+        laufen(0.5);
+        pruefe(anzahl() == n0 + 1 && [zuletzt() isEqualToString:@"Text A"], "mit Zuschauer: uebertragen");
+        atomic_store(&g_zuschauer, 0);
+        kopieren(pb, @"Text B", nil);
+        laufen(0.5);
+        pruefe(anzahl() == n0 + 1 && ![g_last isEqualToString:@"Text B"],
+               "ohne Zuschauer: weder gelesen noch gesendet");
+        atomic_store(&g_zuschauer, 1);
+        laufen(0.5);
+        pruefe(anzahl() == n0 + 1, "die Aenderung ohne Zuschauer wird spaeter nicht nachgereicht");
+        // Der Nutzer kopiert wieder den Text von vorhin. In der Ablage stand
+        // inzwischen "Text B" - das ist eine echte Aenderung und muss hinaus,
+        // auch zu einem Zuschauer, der "Text A" nie bekommen hat.
+        kopieren(pb, @"Text A", nil);
+        laufen(0.5);
+        pruefe(anzahl() == n0 + 2 && [zuletzt() isEqualToString:@"Text A"],
+               "danach mit Zuschauer: derselbe Text wie vor der Pause wird wieder uebertragen");
+        NSUInteger n1 = anzahl();
+        qc_clip_set("vom Client 2", 12);
+        laufen(0.5);
+        pruefe(anzahl() == n1, "auch danach kein Widerhall zum Client");
+        qc_clip_bedingung(NULL);
 
         [pb releaseGlobally];
         printf("\n%s: %d Fehler\n", g_fehler ? "NICHT BESTANDEN" : "bestanden", g_fehler);
