@@ -183,6 +183,7 @@ int qc_chan_send(qc_chan *c, const struct iovec *iov, int cnt) {
     }
 
     int r = raw_write(c->fd, out, outp, 0);
+    if (r == 0) c->gesendet += outp;
     qc_wipe(plain, benutzt);
     free(out);
     return r;

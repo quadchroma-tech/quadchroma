@@ -25,6 +25,10 @@ typedef struct {
     uint8_t in[QC_CHUNK_MAX + QC_TAGLEN];   // entschluesselt
     size_t in_len, in_pos;
     int ok;
+    // Bytes, die qc_chan_send bisher dem Socket uebergeben hat, samt Laengen
+    // und Tags - dieselbe Zaehlung wie SO_NWRITE. Aus beiden zusammen folgt,
+    // wie viel die Gegenstelle abgenommen hat (Stauregel in main.m).
+    uint64_t gesendet;
 } qc_chan;
 
 /// Handschlag als Antwortender (der Host wartet, der Client faengt an).

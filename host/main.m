@@ -224,6 +224,8 @@ static BOOL profile_supported(VTCompressionSessionRef s, CFStringRef profile) {
 // dieselbe Frist wie SO_SNDTIMEO in tune_socket. Die greift im Stau nicht
 // mehr, weil dann nichts mehr codiert und gesendet wird; ohne diese Frist
 // bliebe ein eingefrorener Zuschauer (Ton aus) fuer immer eingetragen.
+// Geprueft wird vor jedem Bild, das in den Encoder soll, und zusaetzlich im
+// 5-s-Takt des Dienstes: bei stillem Bildschirm kommt kein Bild mehr an.
 #define QC_STAU_FRIST_US (2 * 1000000ull)
 
 static _Atomic int g_client_fd = -1;
@@ -247,10 +249,12 @@ static char g_last_sas[8] = {0};
 // jeder Verlust des Bildkanals beginnt eine neue Sitzung und bricht den
 // Eingabekanal der alten ab.
 static uint64_t g_sitzung = 0;              // durch g_send_mtx geschuetzt
-// Laufender Stau: seit wann ohne Fortschritt (Hostuhr in us, 0 = kein Stau)
-// und der Rueckstand zu diesem Zeitpunkt. Durch g_send_mtx geschuetzt.
+// Laufender Stau: seit wann ohne Fortschritt (Hostuhr in us, 0 = kein Stau),
+// dazu Rueckstand und gesendete Bytes beim letzten Blick. Durch g_send_mtx
+// geschuetzt.
 static uint64_t g_stau_seit = 0;
 static int g_stau_rueckstand = 0;
+static uint64_t g_stau_gesendet = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
 // Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
 // nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
@@ -478,10 +482,34 @@ static int backlog_bytes(int fd) {
 
 // Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-Sperre
 // und die Stauregel: Ton und Zwischenablage sind winzig und duerfen nicht warten.
-static void send_small(uint8_t type, const void *data, size_t len) {
+// Ton im Dauerstau. Ton geht an der Stauregel vorbei - er ist klein und soll
+// nicht warten. Liegt die Leitung aber unter der Tonrate (unverdichtet rund
+// 3 Mbit/s: VPN, schwaches WLAN), fuellt er allein den Sendepuffer bis oben:
+// kein Bild kaeme mehr durch die Stauregel, und der Zuschauer bliebe (er
+// nimmt ja ab) mit stehendem Bild und einem Ton, der immer weiter nachhinkt.
+// Deshalb faellt Ton weg, wenn der Rueckstand QC_STAU_FRIST_US lang ohne
+// Unterbrechung ueber der Staugrenze liegt. Liegt er nur kurz darueber - nach
+// einem grossen Vollbild, oder im gewoehnlichen Stau, in dem die Stauregel
+// ein Bild durchlaesst, sobald er darunter faellt -, bleibt der Ton ganz. Die
+// Luecken ueberbrueckt der Tonpuffer des Clients. Nur unter g_send_mtx.
+static uint64_t g_ton_stau_seit = 0;          // 0 = Rueckstand gerade unter der Grenze
+static int ton_verwerfen(int fd) {
+    int grenze = atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT;
+    if (backlog_bytes(fd) <= grenze) { g_ton_stau_seit = 0; return 0; }
+    uint64_t jetzt = now_us();
+    if (!g_ton_stau_seit) g_ton_stau_seit = jetzt;
+    return jetzt - g_ton_stau_seit >= QC_STAU_FRIST_US;
+}
+
+// ton: Ton, der im Dauerstau wegfaellt (ton_verwerfen). Rueckgabe 1 = deshalb
+// verworfen, sonst 0 (gesendet oder niemand da).
+static int send_small_bis(uint8_t type, const void *data, size_t len, int ton) {
+    int verworfen = 0;
     pthread_mutex_lock(&g_send_mtx);
     int fd = atomic_load(&g_client_fd);
-    if (fd >= 0 && atomic_load(&g_vid_ready)) {
+    if (fd >= 0 && atomic_load(&g_vid_ready) && ton && ton_verwerfen(fd)) {
+        verworfen = 1;
+    } else if (fd >= 0 && atomic_load(&g_vid_ready)) {
         qc_hdr h = { .type = type, .flags = 0, .reserved = 0, .len = (uint32_t)len };
         struct iovec iov[2];
         iov[0].iov_base = &h;   iov[0].iov_len = sizeof h;
@@ -498,6 +526,11 @@ static void send_small(uint8_t type, const void *data, size_t len) {
         }
     }
     pthread_mutex_unlock(&g_send_mtx);
+    return verworfen;
+}
+
+static void send_small(uint8_t type, const void *data, size_t len) {
+    (void)send_small_bis(type, data, len, 0);
 }
 
 #define QC_MSG_SETTINGS   3    // Host -> Client: was gerade gilt
@@ -531,6 +564,7 @@ static void hoststatus_senden(uint8_t lage) {
 static _Atomic int g_audio_info_sent = 0;
 static _Atomic long g_audio_packets = 0;
 static _Atomic long long g_audio_bytes = 0;
+static _Atomic long g_audio_verworfen = 0;      // im Dauerstau (ton_verwerfen)
 // Was zuletzt angesagt wurde. Nur im Ton-Rueckruf angefasst, und der laeuft
 // auf der seriellen Ton-Warteschlange.
 static uint32_t g_audio_info_rate = 0;
@@ -556,9 +590,14 @@ static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t cha
         send_small(QC_MSG_AUDIO_INFO, info, sizeof info);
     }
     size_t bytes = frames * channels * sizeof(float);
+    if (send_small_bis(QC_MSG_AUDIO, pcm, bytes, 1)) {
+        atomic_fetch_add(&g_audio_verworfen, 1);
+        logf_gedrosselt(&d_ton_verworfen, NULL, @"Ton verworfen: Rueckstand seit %llu s ueber der Staugrenze - Leitung langsamer als der Ton",
+                        QC_STAU_FRIST_US / 1000000ull);
+        return;
+    }
     atomic_fetch_add(&g_audio_packets, 1);
     atomic_fetch_add(&g_audio_bytes, (long long)bytes);
-    send_small(QC_MSG_AUDIO, pcm, bytes);
 }
 
 static void clip_cb(const char *utf8, size_t len) {
@@ -777,6 +816,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
     g_stau_seit = 0;                    // ein Stau des Vorgaengers zaehlt nicht fuer ihn
+    g_ton_stau_seit = 0;
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
     memcpy(g_last_sas, sas, sizeof g_last_sas);
@@ -1907,16 +1947,25 @@ static BOOL stau_vor_dem_encoder(void) {
     BOOL stau = NO;
     pthread_mutex_lock(&g_send_mtx);
     int fd = atomic_load(&g_client_fd);
-    if (fd >= 0 && atomic_load(&g_vid_ready)) {
+    if (fd >= 0 && atomic_load(&g_vid_ready) && g_vid) {
         int rueckstand = backlog_bytes(fd);
         if (rueckstand > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
             stau = YES;
-            // Fortschritt heisst: der Rueckstand ist seit dem letzten Blick
-            // kleiner geworden, die Gegenstelle nimmt also noch etwas ab.
+            // Fortschritt heisst: seit dem letzten Blick hat die Gegenstelle
+            // etwas abgenommen - was in den Puffer ging, weniger dem, was dort
+            // jetzt mehr liegt. Am Rueckstand allein laesst sich das nicht
+            // ablesen: Ton, Zwischenablage und Zeiger gehen auch im Stau
+            // hinaus (send_small) und heben ihn, auch wenn die Gegenstelle die
+            // ganze Zeit liest. Und so zaehlt auch ein Blick nach langer Pause
+            // (stiller Bildschirm) richtig: abgenommen ist abgenommen.
             uint64_t jetzt = now_us();
-            if (!g_stau_seit || rueckstand < g_stau_rueckstand) {
+            uint64_t gesendet = g_vid->gesendet;
+            int64_t abgenommen = (int64_t)(gesendet - g_stau_gesendet) - ((int64_t)rueckstand - g_stau_rueckstand);
+            int neu = !g_stau_seit || abgenommen > 0;
+            g_stau_gesendet = gesendet;
+            g_stau_rueckstand = rueckstand;
+            if (neu) {
                 g_stau_seit = jetzt;
-                g_stau_rueckstand = rueckstand;
             } else if (jetzt - g_stau_seit >= QC_STAU_FRIST_US) {
                 logf_(@"Zuschauer weg: nimmt seit %llu s nichts mehr ab (%d Byte im Stau)",
                       QC_STAU_FRIST_US / 1000000ull, rueckstand);
@@ -1935,6 +1984,14 @@ static BOOL stau_vor_dem_encoder(void) {
     }
     pthread_mutex_unlock(&g_send_mtx);
     return stau;
+}
+
+// Die Frist auch ohne neues Bild pruefen: bei stillem Bildschirm kommt nichts
+// in encode_buffer an, und ein eingefrorener Zuschauer (Ton aus) bliebe sonst
+// eingetragen - Aufnahme, Encoder und die Wachhalte-Zusicherung liefen fuer
+// niemanden weiter. Codiert wird hier nichts.
+static void stau_frist_pruefen(void) {
+    (void)stau_vor_dem_encoder();
 }
 
 static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int wiederholt) {
@@ -2650,13 +2707,15 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         for (;;) {
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5.0]];
             drosseln_nachtragen();
+            if (atomic_load(&g_client_fd) >= 0) stau_frist_pruefen();
             long f = atomic_load(&g_sent_frames);
             long long b = atomic_load(&g_sent_bytes);
             if (atomic_load(&g_client_fd) >= 0)
-                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | zu schnell: %ld | Encoder voll: %ld",
+                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB, %ld verworfen | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | zu schnell: %ld | Encoder voll: %ld",
                       -[t0 timeIntervalSinceNow], f, (f - lastFrames) / 5.0,
                       (b - lastBytes) * 8.0 / 5.0 / 1e6,
                       atomic_load(&g_audio_packets), atomic_load(&g_audio_bytes) / 1000.0,
+                      atomic_load(&g_audio_verworfen),
                       atomic_load(&g_skipped_backlog), g_stats.dropped,
                       atomic_load(&g_repeats), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
             lastFrames = f; lastBytes = b;

@@ -122,6 +122,7 @@ static void zuschauer_setzen(int host_fd, qc_chan *c) {
     g_vid = c;
     memset(g_vid_peer, 0x77, sizeof g_vid_peer);
     g_stau_seit = 0;
+    g_ton_stau_seit = 0;
     atomic_store(&g_force_key, 1);
     atomic_store(&g_wait_key, 1);
     atomic_store(&g_audio_info_sent, 0);
@@ -472,6 +473,11 @@ typedef struct {
     int spiel;              // Spielmodus
     int sndbuf_alt;         // Sendepuffer wie vor der Aenderung (2 MB)
     double sekunden;
+    // Ab hier: was im Stau zusaetzlich geschieht.
+    size_t ablage;          // so viel Text vom Mac (clip_cb), 0,3 s nach Staubeginn
+    double pause_s;         // vor der Ablage so lange kein Bild (stiller Bildschirm)
+    int still;              // nach Staubeginn kein Bild mehr, nur noch die Frist im Takt
+    int ton;                // Ton im Dauerlauf (3 Mbit/s, wie ScreenCaptureKit liefert)
 } strom;
 
 typedef struct {
@@ -480,7 +486,22 @@ typedef struct {
     int max_rueckstand;              // vor einem gesendeten Bild
     int weg;
     double weg_nach_stau_s;
+    long ton_verworfen;
+    long gesendet_spaet;             // Bilder in der zweiten Haelfte des Laufs
 } ergebnis;
+
+static _Atomic int g_ton_lauf = 0;
+
+// Ton wie aus ScreenCaptureKit: alle 10 ms 480 Stereo-Abtastwerte float32.
+static void *ton_faden(void *arg) {
+    (void)arg;
+    static float pcm[2 * 480];
+    while (atomic_load(&g_ton_lauf)) {
+        audio_cb(pcm, 480, 48000, 2);
+        usleep(10 * 1000);
+    }
+    return NULL;
+}
 
 static ergebnis strom_fahren(const strom *s) {
     ergebnis e = {0};
@@ -497,17 +518,35 @@ static ergebnis strom_fahren(const strom *s) {
     int gop = s->fps * 2;                 // MaxKeyFrameInterval = 2 * fps
     size_t p = (size_t)((s->mbit * 1e6 / 8 * 2 - (double)s->vollbild) / (gop - 1));
     CMSampleBufferRef kb = bild(s->vollbild), pb = bild(p);
-    long verworfen0 = atomic_load(&g_skipped_backlog);
+    long verworfen0 = atomic_load(&g_skipped_backlog), ton0 = atomic_load(&g_audio_verworfen);
+    pthread_t tt;
+    if (s->ton) {
+        atomic_store(&g_cur_ton, 1);
+        atomic_store(&g_ton_lauf, 1);
+        pthread_create(&tt, NULL, ton_faden, NULL);
+    }
+    int ablage_raus = 0;
     double t0 = sek(), erster_stau = 0;
     long n = (long)(s->sekunden * s->fps), codiert = 0;
     for (long i = 0; i < n; i++) {
+        if (s->still && erster_stau) {
+            // Stiller Bildschirm: kein Bild kommt mehr in encode_buffer. Nur
+            // der 5-s-Takt des Dienstes prueft die Frist - hier nach 2,5 s.
+            usleep(2500 * 1000);
+            stau_frist_pruefen();
+            if (atomic_load(&g_client_fd) < 0) { e.weg = 1; e.weg_nach_stau_s = sek() - erster_stau; }
+            break;
+        }
+
         e.bilder++;
         // Wie encode_buffer: erst die Stauregel, dann in den Encoder. Der
         // Encoder hier liefert sofort; Vollbild im festen Abstand der
         // codierten Bilder (MaxKeyFrameInterval) oder wenn erzwungen.
+        int war_stau = 0;
         if (stau_vor_dem_encoder()) {
             atomic_fetch_add(&g_skipped_backlog, 1);
             if (!erster_stau) erster_stau = sek();
+            war_stau = 1;
         } else {
             int key = (codiert++ % gop) == 0;
             if (atomic_exchange(&g_force_key, 0)) key = 1;
@@ -519,9 +558,20 @@ static ergebnis strom_fahren(const strom *s) {
             if (d > e.max_emit_ms) e.max_emit_ms = d;
             if (atomic_load(&g_sent_frames) > gesendet0) {
                 e.gesendet++;
+                if (sek() - t0 >= s->sekunden / 2) e.gesendet_spaet++;
                 if (key) e.vollbilder++;
                 if (rueck > e.max_rueckstand) e.max_rueckstand = rueck;
             }
+        }
+        // Die Ablage kommt direkt nach einem Blick im Stau: der gilt dann als
+        // laufend, auch ueber die Pause hinweg (stiller Bildschirm).
+        if (s->ablage && war_stau && !ablage_raus && sek() - erster_stau >= 0.3) {
+            ablage_raus = 1;
+            if (s->pause_s > 0) usleep((useconds_t)(s->pause_s * 1e6));
+            static uint8_t text[4 * 1024 * 1024];
+            memset(text, 'x', s->ablage);
+            clip_cb((const char *)text, s->ablage);
+            t0 = sek() - (double)(i + 1) / s->fps;     // der Takt der Bilder geht danach weiter
         }
         if (atomic_load(&g_client_fd) < 0) {
             e.weg = 1;
@@ -532,6 +582,11 @@ static ergebnis strom_fahren(const strom *s) {
         if (soll > jetzt) usleep((useconds_t)((soll - jetzt) * 1e6));
     }
     e.verworfen = atomic_load(&g_skipped_backlog) - verworfen0;
+    if (s->ton) {
+        atomic_store(&g_ton_lauf, 0);
+        pthread_join(tt, NULL);
+    }
+    e.ton_verworfen = atomic_load(&g_audio_verworfen) - ton0;
     atomic_store(&ab.stop, 1);
     pthread_join(t, NULL);
     zuschauer_weg();
@@ -607,6 +662,38 @@ static void stau_pruefen(void) {
     strom ds = { "dasselbe im Spielmodus", 120, 150, K, 0, 1, 0, 6 };
     ergebnis eds = strom_fahren(&ds);
     pruefe(eds.weg && eds.weg_nach_stau_s < 2.6, "auch im Spielmodus (vorher dort laut Code: nie)");
+    strom dst = { "Gegenstelle liest nicht, danach stiller Bildschirm", 120, 150, K, 0, 0, 0, 6, .still = 1 };
+    ergebnis edst = strom_fahren(&dst);
+    pruefe(edst.weg, "auch ohne ein weiteres Bild: die Frist im Takt des Dienstes traegt ihn aus");
+
+    printf("\n-- Stauregel: lebender Zuschauer, im Stau geht mehr hinaus als Bilder\n");
+    strom ab1 = { "Ablage 2,5 MB im Stau, Leitung 8 Mbit/s", 60, 150, K, 8, 0, 0, 4, .ablage = 2500 * 1024 };
+    ergebnis eab1 = strom_fahren(&ab1);
+    pruefe(!eab1.weg, "eine grosse Ablage im Stau trennt den Zuschauer nicht, der die ganze Zeit liest");
+    // 3,5 MB: der Leser hat in der Pause Guthaben angesammelt und nimmt die
+    // ersten rund 600 KB auf einen Schlag - danach liegt noch deutlich mehr
+    // als der alte Stau im Puffer.
+    strom ab2 = { "Stau, 3 s kein Bild, dann Ablage 3,5 MB, 8 Mbit/s", 60, 150, K, 8, 0, 0, 4, .ablage = 3500 * 1024, .pause_s = 3 };
+    ergebnis eab2 = strom_fahren(&ab2);
+    pruefe(!eab2.weg, "nach einer Pause ohne Bilder zaehlt der alte Stau nicht gegen ihn");
+
+    printf("\n-- Ton im Stau\n");
+    // Leitung unter der Tonrate: der Ton allein fuellte den Puffer, kein Bild
+    // kaeme mehr durch. Im Spielmodus (512 KB), damit der Lauf kurz bleibt.
+    strom tl = { "Spielmodus, Ton 3 Mbit/s, Bild 0,5 Mbit/s, Leitung 1 Mbit/s", 60, 0.5, 8 * 1024, 1, 1, 0, 8, .ton = 1 };
+    ergebnis etl = strom_fahren(&tl);
+    printf("         (%ld Tonpakete verworfen, %ld Bilder in der zweiten Haelfte gesendet)\n", etl.ton_verworfen, etl.gesendet_spaet);
+    pruefe(etl.ton_verworfen > 0 && etl.gesendet_spaet > 0 && !etl.weg,
+           "Leitung langsamer als der Ton: Ton faellt weg, das Bild bleibt nicht stehen, der Zuschauer bleibt");
+    // Gewoehnlicher Stau und gesunde Leitung mit grossen Vollbildern: der
+    // Rueckstand liegt nur kurz ueber der Grenze, kein Tonpaket faellt weg.
+    strom ts = { "150 Mbit/s auf 100 Mbit/s, mit Ton", 120, 150, K, 100, 0, 0, 4, .ton = 1 };
+    ergebnis ets = strom_fahren(&ts);
+    strom tg = { "150 Mbit/s auf 400 Mbit/s, 1,9-MB-Vollbilder, mit Ton", 120, 150, K, 400, 0, 0, 3, .ton = 1 };
+    ergebnis etg = strom_fahren(&tg);
+    printf("         (verworfene Tonpakete: %ld im Stau, %ld auf der gesunden Leitung)\n", ets.ton_verworfen, etg.ton_verworfen);
+    pruefe(ets.ton_verworfen == 0 && etg.ton_verworfen == 0 && !ets.weg && !etg.weg,
+           "im gewoehnlichen Stau und nach grossen Vollbildern bleibt der Ton ganz");
     atomic_store(&g_cur_ton, 1);
 }
 
