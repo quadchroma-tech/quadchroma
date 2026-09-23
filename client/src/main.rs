@@ -545,6 +545,16 @@ impl Meldung {
         self
     }
 
+    /// Ein Fehler, der sich mit dem naechsten Versuch nicht von selbst gibt:
+    /// Pin geaendert, Ablage oder Schluesseldatei kaputt, Liste nicht
+    /// les- oder schreibbar. Dann verbindet der Empfangsfaden nicht alle
+    /// 2 s neu, sondern nimmt das Ziel zurueck (wie bei einer Abloesung);
+    /// der Nutzer verbindet nach dem Beheben selbst wieder.
+    fn dauerhaft(&self) -> bool {
+        use strings::Key::*;
+        matches!(self.key, HostKeyChanged | FileUnreadable | FileNotUtf8 | FileNotWritable | KeyFileDamaged | StorageUnavailable)
+    }
+
     /// Der Text in dieser Sprache: Platzhalter ersetzt, Anhang in Klammern.
     fn text(&self, lang: &strings::Lang) -> String {
         let mut t = lang.get(self.key).to_string();
@@ -594,6 +604,10 @@ impl From<secure::Fehler> for Meldung {
             F::Verbindung { art: ErrorKind::TimedOut | ErrorKind::WouldBlock, .. } => Meldung::neu(ErrorTimeout, protokoll),
             F::Verbindung { grund, .. } => Meldung::neu(ErrorNoConnection, protokoll).anhang(grund),
             F::Handschlag { frist: true, .. } => Meldung::neu(ErrorTimeout, protokoll),
+            // Der Satz kommt aus der Tabelle; dahinter nur der Wortlaut des
+            // Systems, wenn die Leitung selbst scheiterte - nicht der
+            // deutsche Grund (der steht im Protokoll).
+            F::Handschlag { system: Some(s), .. } => Meldung::neu(ErrorHandshake, protokoll).anhang(s),
             F::Handschlag { .. } => Meldung::neu(ErrorHandshake, protokoll),
         }
     }
@@ -753,6 +767,17 @@ fn prozesszeit_100ns() -> Option<u64> {
     None
 }
 
+/// Gehoert diese Verbindungsmeldung ins Protokoll? Nur, wenn sie neu ist
+/// oder seit der letzten gleichen ein Bild ankam (`decoded` zaehlt nur
+/// hoch) - dann war dazwischen eine echte Sitzung.
+fn neu_zu_melden(gemeldet: &mut Option<(Meldung, u64)>, e: &Meldung, decoded: u64) -> bool {
+    if matches!(gemeldet, Some((m, n)) if m == e && *n == decoded) {
+        return false;
+    }
+    *gemeldet = Some((e.clone(), decoded));
+    true
+}
+
 /// Netz- und Decodierschleife. Laeuft in einem eigenen Faden und legt immer nur
 /// das neueste Bild ab: lieber eines auslassen als Verzoegerung aufbauen.
 fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
@@ -767,9 +792,17 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
     // ein Hardware-Decoder schon beim Oeffnen scheitert.
     protokoll::einschalten(std::env::args().any(|a| a == "--headless"));
 
+    // Zuletzt protokollierte Verbindungsmeldung und der Bildzaehler dazu:
+    // dieselbe Meldung ohne ein einziges Bild dazwischen steht nur einmal im
+    // Protokoll. `error` taugt dafuer nicht - run_session loescht es schon
+    // nach dem Handschlag, also vor "nicht gekoppelt" und allem danach.
+    let mut gemeldet: Option<(Meldung, u64)> = None;
     loop {
         let addr = { shared.lock().unwrap().target.clone() };
         let Some(addr) = addr else {
+            // Ohne Ziel beginnt die Entdoppelung von vorn: verbindet der
+            // Nutzer neu, steht der erste Fehler wieder im Protokoll.
+            gemeldet = None;
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
@@ -782,11 +815,17 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             Err(e) => {
                 let mut s = shared.lock().unwrap();
                 // Eine gewollte Trennung kappt die Leitung - der Lesefehler
-                // danach ist kein Fehler und wird nicht angezeigt. Dieselbe
-                // Meldung bei jedem neuen Versuch nur einmal ins Protokoll.
+                // danach ist kein Fehler und wird nicht angezeigt.
                 if s.target.is_some() {
-                    if s.error.as_ref() != Some(&e) {
+                    if neu_zu_melden(&mut gemeldet, &e, s.decoded) {
                         protokoll::zeile(format!("Verbindung: {}", e.protokoll));
+                    }
+                    // Was sich mit dem naechsten Versuch nicht gibt, wird
+                    // nicht alle 2 s wiederholt: das Ziel geht zurueck, die
+                    // Meldung bleibt stehen (siehe Meldung::dauerhaft).
+                    if e.dauerhaft() {
+                        protokoll::zeile(format!("Verbindung zu {addr} beendet: der Fehler bleibt bis zur Behebung - kein neuer Versuch"));
+                        s.target = None;
                     }
                     s.error = Some(e);
                 }
@@ -1642,9 +1681,17 @@ fn decoder_defekt(e: &ffmpeg::Error) -> bool {
 fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), Meldung> {
     // Erst der Handschlag, dann erst Nutzdaten. Vorher geht nichts ueber die
     // Leitung, was jemand mitlesen koennte.
-    let mut sock = secure::Secure::connect(addr, &noise::prologue_video())?;
+    //
+    // known_hosts.txt wird VOR dem Verbinden gelesen: ist sie unlesbar, geht
+    // keine Leitung auf. Den Schluessel des Hosts prueft der Handschlag nach
+    // Nachricht 2, bevor Nachricht 3 den eigenen zeigt - der Host nimmt
+    // diesen Client erst mit Nachricht 3 an und loest dafuer den laufenden
+    // Zuschauer ab. Mit falschem Pin kommt es dazu also nicht mehr.
+    let pin = secure::HostPin::laden(addr)?;
+    let mut sock = secure::Secure::connect_pruefend(addr, &noise::prologue_video(), |k| pin.pruefen(k))?;
     shared.lock().unwrap().abbruch = sock.abbruchgriff();
-    let first = secure::check_known_host(addr, &sock.peer)?;
+    // Erster Kontakt: der Schluessel kommt erst nach dem Handschlag in die Liste.
+    let first = pin.eintragen(&sock.peer)?;
     let fp = sock.peer_fingerprint();
     {
         let mut s = shared.lock().unwrap();
@@ -2628,10 +2675,23 @@ fn mac_keycode(code: winit::keyboard::KeyCode) -> Option<u16> {
 
 /// Zweite, eigene Verbindung nur fuer Maus und Tastatur. Klein, dringend,
 /// niemals hinter einem Bild in der Warteschlange.
+///
+/// Wer sendet, haelt die Sperre um diesen Kanal: der Fensterfaden bei jeder
+/// Maus- und Tastennachricht und alle 2 ms, der Empfangsfaden fuer den
+/// Zeitabgleich, der Faden der Zwischenablage. Deshalb wartet hier nichts
+/// auf das Netz. Der Aufbau (Namensaufloesung, Verbindung, Handschlag)
+/// laeuft in einem eigenen Faden; geschrieben wird in einem Schreibfaden,
+/// der die Leitung besitzt, und `send` reiht nur ein. Sonst stuende bei
+/// einem Eingabeport, der Verbindungen still verwirft, jedes Mal die ganze
+/// Oberflaeche zwei Sekunden, und 4 MB Zwischenablage ueber langsames WLAN
+/// hielten Fenster und Bildempfang an. Ein einziger Schreibfaden je
+/// Leitung haelt die Reihenfolge - und damit die Folge der Nonces.
 struct InputLink {
-    sock: Option<secure::Secure>,
+    /// Der stehende Kanal: Nachrichten gehen an seinen Schreibfaden.
+    kanal: Option<Schreiber>,
     addr: String,
     last: (f32, f32),
+    /// Eingereihte Nachrichten.
     sent: u64,
     /// Pruefsumme des Bildkanals und Schluessel seines Hosts. Ohne die
     /// Pruefsumme laesst der Host diesen Kanal nicht zu; der Schluessel muss
@@ -2641,18 +2701,60 @@ struct InputLink {
     /// beim Fokusverlust Tasten auf dem Mac haengen - WASD laeuft dann gegen
     /// die Wand, und ein haengendes Strg macht aus jedem Klick einen Rechtsklick.
     gedrueckt: std::collections::HashSet<u16>,
-    /// Wann zuletzt ein Verbindungsversuch lief. Bremst die Wiederholungen,
-    /// damit ein toter Host die Oberflaeche nicht im Sekundentakt anhaelt.
+    /// Wann zuletzt ein Verbindungsversuch zu Ende ging. Bremst die
+    /// Wiederholungen auf einen je Sekunde - gezaehlt ab dem Ende, nicht ab
+    /// dem Anfang: ein Versuch, der zwei Sekunden auf die Frist wartet, liesse
+    /// sonst den naechsten gleich folgen.
     letzter_versuch: Option<Instant>,
     /// Wann zuletzt ein fremder Schluessel am Eingabeport im Protokoll stand -
     /// hoechstens alle zehn Sekunden eine Zeile, nicht eine je Versuch.
     fremd_gemeldet: Option<Instant>,
+    /// Laufender Aufbau: sein Ergebnis kommt ueber diesen Kanal. Faellt er
+    /// weg (neue Adresse, neue Bindung, Trennen), schliesst der Aufbaufaden
+    /// eine fertige Leitung selbst wieder.
+    aufbau: Option<std::sync::mpsc::Receiver<Aufbau>>,
+}
+
+/// Ergebnis eines Aufbaus: die Leitung oder der Fehler, dazu der
+/// Fingerabdruck, falls am Eingabeport ein fremder Schluessel antwortete.
+type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
+
+/// Schreibseite eines stehenden Eingabekanals.
+struct Schreiber {
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Gesetzt, sobald der Schreibfaden an der Leitung gescheitert ist.
+    kaputt: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Schreiber {
+    /// Uebernimmt die Leitung und startet ihren Schreibfaden. Er endet, wenn
+    /// das Schreiben scheitert - oder wenn der Schreiber fallen gelassen ist
+    /// und die Warteschlange leer: was schon eingereiht war, geht noch
+    /// hinaus (etwa das Loslassen aller Tasten beim Trennen).
+    fn neu(mut sock: secure::Secure) -> Schreiber {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let kaputt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let k = kaputt.clone();
+        std::thread::spawn(move || {
+            while let Ok(b) = rx.recv() {
+                if sock.write_all(&b).is_err() {
+                    k.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+        Schreiber { tx, kaputt }
+    }
+
+    fn steht(&self) -> bool {
+        !self.kaputt.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl InputLink {
     fn new(addr: String) -> Self {
         Self {
-            sock: None,
+            kanal: None,
             addr,
             last: (0.5, 0.5),
             sent: 0,
@@ -2660,6 +2762,7 @@ impl InputLink {
             gedrueckt: std::collections::HashSet::new(),
             letzter_versuch: None,
             fremd_gemeldet: None,
+            aufbau: None,
         }
     }
 
@@ -2667,7 +2770,8 @@ impl InputLink {
     fn set_addr(&mut self, addr: String) {
         if addr != self.addr {
             self.addr = addr;
-            self.sock = None;
+            self.kanal = None;
+            self.aufbau = None;
         }
     }
 
@@ -2675,60 +2779,108 @@ impl InputLink {
     fn set_link(&mut self, link: Option<(Vec<u8>, Vec<u8>)>) {
         if self.link != link {
             self.link = link;
-            self.sock = None;
+            self.kanal = None;
+            self.aufbau = None;
         }
     }
 
+    /// Steht der Kanal? Nur dann kommt an, was jetzt gesendet wird.
+    fn steht(&self) -> bool {
+        self.kanal.as_ref().is_some_and(Schreiber::steht)
+    }
+
+    /// Sorgt dafuer, dass der Kanal steht oder im Aufbau ist - ohne je zu
+    /// warten. Ein fertiger Aufbau wird hier abgeholt.
     fn ensure(&mut self) {
-        if self.sock.is_some() || self.addr.is_empty() {
+        // Ist der Schreibfaden gescheitert, gleich neu aufbauen - wie frueher
+        // nach einem Schreibfehler.
+        if self.kanal.as_ref().is_some_and(|k| !k.steht()) {
+            self.kanal = None;
+        }
+        if self.kanal.is_some() || self.addr.is_empty() || self.link.is_none() {
             return;
         }
-        let Some((hh, host)) = self.link.as_ref() else { return };
+        if let Some(rx) = &self.aufbau {
+            let (ergebnis, fremd) = match rx.try_recv() {
+                Ok(a) => a,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => (
+                    Err(secure::Fehler::Handschlag { grund: "Aufbaufaden beendet".into(), frist: false, system: None }),
+                    None,
+                ),
+            };
+            self.aufbau = None;
+            match ergebnis {
+                Ok(s) => {
+                    self.kanal = Some(Schreiber::neu(s));
+                    self.letzter_versuch = None;
+                }
+                Err(_) => {
+                    self.letzter_versuch = Some(Instant::now());
+                    if let Some(fp) = fremd {
+                        if self.fremd_gemeldet.map(|t| t.elapsed() >= Duration::from_secs(10)).unwrap_or(true) {
+                            self.fremd_gemeldet = Some(Instant::now());
+                            protokoll::zeile(format!(
+                                "Eingabekanal: Gegenstelle {fp} ist nicht der Host des Bildkanals - vor Nachricht 3 abgebrochen"
+                            ));
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if let Some(t) = self.letzter_versuch {
             if t.elapsed() < Duration::from_secs(1) {
                 return;
             }
         }
+        let Some((hh, host)) = self.link.clone() else { return };
         self.letzter_versuch = Some(Instant::now());
         // Die Pruefsumme im Prologue weist nur die Sitzung aus, nicht den
         // Host: wer den Bild-Handschlag mitgelesen hat, kann sie ausrechnen.
         // Also muss der Schluessel am anderen Ende derselbe sein wie beim
         // Bildkanal - sonst gingen Tasten und Zwischenablage an einen
-        // Fremden. Bis hier ist ausser dem Handschlag nichts gesendet; ein
-        // unbekannter Schluessel wird auch nicht als neuer Host gemerkt.
-        match secure::Secure::connect(&self.addr, &noise::prologue_input(hh)) {
-            Ok(s) if s.peer == *host => {
-                self.sock = Some(s);
-                self.letzter_versuch = None;
-            }
-            Ok(s) => {
-                // Die Leitung faellt mit `s` zu; `letzter_versuch` bleibt,
-                // also hoechstens ein Versuch je Sekunde.
-                if self.fremd_gemeldet.map(|t| t.elapsed() >= Duration::from_secs(10)).unwrap_or(true) {
-                    self.fremd_gemeldet = Some(Instant::now());
-                    protokoll::zeile(format!(
-                        "Eingabekanal: Gegenstelle {} ist nicht der Host des Bildkanals - verworfen",
-                        s.peer_fingerprint()
-                    ));
+        // Fremden. Geprueft wird im Handschlag vor Nachricht 3: ein Fremder
+        // bekommt nicht einmal den eigenen Schluessel zu sehen, und er wird
+        // auch nicht als neuer Host gemerkt.
+        let (tx, rx) = std::sync::mpsc::channel::<Aufbau>();
+        let addr = self.addr.clone();
+        let prologue = noise::prologue_input(&hh);
+        std::thread::spawn(move || {
+            let mut fremd = None;
+            let r = secure::Secure::connect_pruefend(&addr, &prologue, |k| {
+                if k == host.as_slice() {
+                    return Ok(());
                 }
-            }
-            Err(_) => {}
-        }
+                fremd = Some(noise::fingerprint(k));
+                Err(secure::Fehler::Handschlag {
+                    grund: "Gegenstelle ist nicht der Host des Bildkanals".into(),
+                    frist: false,
+                    system: None,
+                })
+            });
+            // Hoert niemand mehr zu, faellt die Leitung hier mit `r` zu.
+            let _ = tx.send((r, fremd));
+        });
+        self.aufbau = Some(rx);
     }
 
+    /// Eine Nachricht einreihen. Steht der Kanal nicht, faellt sie weg - wie
+    /// bisher bei einem Kanal, der nicht aufging.
     fn send(&mut self, t: u8, payload: &[u8]) {
         self.ensure();
-        let Some(sock) = self.sock.as_mut() else { return };
+        let Some(k) = self.kanal.as_ref().filter(|k| k.steht()) else { return };
         let mut buf = Vec::with_capacity(8 + payload.len());
         buf.push(t);
         buf.push(0);
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(payload);
-        if sock.write_all(&buf).is_err() {
-            self.sock = None;
-        } else {
+        let eingereiht = k.tx.send(buf).is_ok();
+        if eingereiht {
             self.sent += 1;
+        } else {
+            self.kanal = None;
         }
     }
 
@@ -2795,8 +2947,10 @@ impl InputLink {
     /// Fenster den Fokus verliert oder das Menue aufgeht - sonst bleiben die
     /// Tasten drueben haengen, und wir bekommen davon gar nichts mit.
     /// Eingabekanal schliessen. Der naechste Sendeversuch baut ihn neu auf.
+    /// Was schon eingereiht ist, schreibt der Schreibfaden noch.
     fn trennen(&mut self) {
-        self.sock = None;
+        self.kanal = None;
+        self.aufbau = None;
         self.letzter_versuch = None;
     }
 
@@ -3238,7 +3392,7 @@ impl Benchmark {
         };
         let mut l = input.lock().unwrap();
         l.ensure();
-        if l.sock.is_none() {
+        if !l.steht() {
             return;
         }
         match self.phase {
@@ -4098,13 +4252,22 @@ impl ApplicationHandler for App {
         let fp = { self.shared.lock().unwrap().peer_fp.clone() };
         match (&fp, &self.angewandt_fuer) {
             (Some(f), keiner) if keiner.as_deref() != Some(f.as_str()) => {
-                if let Some(w) = self.cfg.fuer_host(f) {
-                    self.input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
-                    self.shared.lock().unwrap().ton = w.ton;
-                } else {
-                    self.shared.lock().unwrap().ton = true;
+                // Erst, wenn der Eingabekanal steht: er baut sich im
+                // Hintergrund auf, und was vorher gesendet wird, faellt weg.
+                let steht = {
+                    let mut l = self.input.lock().unwrap();
+                    l.ensure();
+                    l.steht()
+                };
+                if steht {
+                    if let Some(w) = self.cfg.fuer_host(f) {
+                        self.input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
+                        self.shared.lock().unwrap().ton = w.ton;
+                    } else {
+                        self.shared.lock().unwrap().ton = true;
+                    }
+                    self.angewandt_fuer = Some(f.clone());
                 }
-                self.angewandt_fuer = Some(f.clone());
             }
             (None, _) => self.angewandt_fuer = None,
             _ => {}
@@ -6420,7 +6583,7 @@ fn main() {
                             let mut l = input.lock().unwrap();
                             l.set_link(link);
                             l.ensure();
-                            l.sock.is_some()
+                            l.steht()
                         };
                         if !steht {
                             continue;
@@ -6513,18 +6676,22 @@ fn main() {
                 let t = start.elapsed().as_secs_f32();
                 l.mouse_move(0.5 + 0.2 * t.sin(), 0.5 + 0.2 * t.cos());
                 // --set mbit,fps,gaming stellt einmal um, damit sich die
-                // Einstellungen auch ohne Fenster pruefen lassen.
-                if let Some(w) = wish.take() {
-                    l.settings(w.0, w.1, w.2, w.3, w.4);
-                    println!(
-                        "Einstellung gewuenscht: {} Mbit/s, {} fps, Gaming {}, feste Bildrate {}, Ton {}",
-                        w.0, w.1, w.2, w.3, w.4
-                    );
+                // Einstellungen auch ohne Fenster pruefen lassen. Erst, wenn
+                // der Eingabekanal steht: er baut sich im Hintergrund auf,
+                // und `send` wirft bis dahin stumm weg.
+                if l.steht() {
+                    if let Some(w) = wish.take() {
+                        l.settings(w.0, w.1, w.2, w.3, w.4);
+                        println!(
+                            "Einstellung gewuenscht: {} Mbit/s, {} fps, Gaming {}, feste Bildrate {}, Ton {}",
+                            w.0, w.1, w.2, w.3, w.4
+                        );
+                    }
                 }
-                // --codec <idx> wuenscht einmal einen Kandidaten. Erst, wenn der
-                // Eingabekanal wirklich steht - `send` wirft sonst stumm weg,
-                // und der Wunsch waere verloren, bevor der Host ihn je sah.
-                if l.sock.is_some() {
+                // --codec <idx> wuenscht einmal einen Kandidaten. Ebenso erst,
+                // wenn der Eingabekanal wirklich steht - sonst waere der
+                // Wunsch verloren, bevor der Host ihn je sah.
+                if l.steht() {
                     if let Some(idx) = codec_wunsch.take() {
                         l.codec(idx);
                         println!("Codecwunsch gesendet: {idx}");
@@ -7594,10 +7761,28 @@ mod tests {
         assert_eq!(letzter_nal_typ(&[1, 2, 3], false), None);
     }
 
+    /// Schluessel aller Test-Hosts auf 127.0.0.1: die Tests teilen sich
+    /// eine known_hosts.txt, und dort steht 127.0.0.1 nur einmal.
+    fn test_host() -> (Vec<u8>, Vec<u8>) {
+        static K: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+        K.get_or_init(|| noise::keypair().unwrap()).clone()
+    }
+
+    /// Ruft ensure, bis der Eingabekanal steht oder ein fremder Schluessel
+    /// gemeldet ist - der Aufbau laeuft im Hintergrund.
+    fn eingabe_abwarten(l: &mut InputLink) {
+        let t0 = Instant::now();
+        while !l.steht() && l.fremd_gemeldet.is_none() && t0.elapsed() < Duration::from_secs(10) {
+            l.ensure();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Gegenstelle am Eingabeport mit richtigem Prologue, aber eigenem
-    /// Schluessel: Der Handschlag gelingt (die Pruefsumme kennt jeder, der
-    /// den Bild-Handschlag gesehen hat), der Client verwirft die Leitung
-    /// trotzdem. Mit dem Schluessel des Bildhosts wird sie genommen.
+    /// Schluessel (die Pruefsumme kennt jeder, der den Bild-Handschlag gesehen
+    /// hat): der Client bricht vor Nachricht 3 ab, der Fremde bekommt den
+    /// Schluessel des Clients also nie zu sehen, und nichts geht hinaus. Mit
+    /// dem Schluessel des Bildhosts wird der Kanal genommen.
     #[test]
     fn eingabekanal_nur_zum_host_des_bildkanals() {
         use std::net::TcpListener;
@@ -7618,9 +7803,9 @@ mod tests {
         let (addr, t) = gegenstelle(fremd_priv, hh.clone());
         let mut l = InputLink::new(addr);
         l.set_link(Some((hh.clone(), host_pub.clone())));
-        l.ensure();
-        assert!(t.join().unwrap(), "Handschlag mit dem Fremden muss gelingen");
-        assert!(l.sock.is_none());
+        eingabe_abwarten(&mut l);
+        assert!(!t.join().unwrap(), "Nachricht 3 kam beim Fremden an");
+        assert!(!l.steht());
         assert!(l.fremd_gemeldet.is_some());
         l.send(IN_CLIP, b"geheim");
         assert_eq!(l.sent, 0);
@@ -7628,9 +7813,65 @@ mod tests {
         let (addr, t) = gegenstelle(host_priv, hh.clone());
         let mut l = InputLink::new(addr);
         l.set_link(Some((hh, host_pub)));
-        l.ensure();
+        eingabe_abwarten(&mut l);
         assert!(t.join().unwrap());
-        assert!(l.sock.is_some());
+        assert!(l.steht());
+    }
+
+    /// Der Eingabekanal haelt niemanden auf, der seine Sperre nimmt: ein
+    /// Handschlag, auf den keine Antwort kommt, laeuft im Hintergrund, und
+    /// ein Host, der nichts abnimmt, staut nur den Schreibfaden - nicht
+    /// `send`. Frueher stand dabei der Fensterfaden (2 s je Versuch, bzw. so
+    /// lange, wie 4 MB Zwischenablage brauchen).
+    #[test]
+    fn eingabekanal_wartet_nie() {
+        use std::net::TcpListener;
+        secure::test_identitaet();
+        let hh = vec![0x3c; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+
+        // Stumm: nimmt die Verbindung an und antwortet nie.
+        let stumm = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut l = InputLink::new(stumm.local_addr().unwrap().to_string());
+        l.set_link(Some((hh.clone(), host_pub.clone())));
+        let t0 = Instant::now();
+        let mut laengster = Duration::ZERO;
+        while t0.elapsed() < Duration::from_millis(3500) {
+            let t = Instant::now();
+            l.mouse_move(0.5, 0.5);
+            laengster = laengster.max(t.elapsed());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(laengster < Duration::from_millis(100), "send wartete {laengster:?}");
+        assert!(!l.steht());
+        drop(stumm);
+
+        // Nimmt nichts ab: der Handschlag gelingt, dann liest der Host nie.
+        let taub = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taub.local_addr().unwrap().to_string();
+        let (fertig_tx, fertig_rx) = std::sync::mpsc::channel::<()>();
+        let (hh2, k) = (hh.clone(), host_priv.clone());
+        let host = std::thread::spawn(move || {
+            let (s, _) = taub.accept().unwrap();
+            let h = secure::Secure::accept(s, &noise::prologue_input(&hh2), &k).unwrap();
+            // Leitung offen halten, bis der Test fertig ist.
+            let _ = fertig_rx.recv();
+            drop(h);
+        });
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        let gross = vec![b'x'; 4 * 1024 * 1024];
+        let t = Instant::now();
+        for _ in 0..6 {
+            l.send(IN_CLIP, &gross);
+        }
+        l.mouse_move(0.1, 0.2);
+        assert!(t.elapsed() < Duration::from_millis(1000), "send wartete {:?}", t.elapsed());
+        assert_eq!(l.sent, 7);
+        let _ = fertig_tx.send(());
+        host.join().unwrap();
     }
 
     /// Der Host meldet MSG_ABGELOEST: der Empfangsfaden nimmt das Ziel
@@ -7642,7 +7883,7 @@ mod tests {
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
         secure::test_identitaet();
-        let (host_priv, _) = noise::keypair().unwrap();
+        let (host_priv, _) = test_host();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let verbindungen = Arc::new(AtomicUsize::new(0));
@@ -7688,6 +7929,117 @@ mod tests {
         );
     }
 
+    /// Ein Host mit anderem Schluessel als dem Pin: der Client bricht im
+    /// Handschlag vor Nachricht 3 ab - der Host kennt ihn danach nicht, hat
+    /// ihn also auch nicht als Zuschauer angenommen und niemanden
+    /// abgeloest -, und er versucht es nicht alle 2 s erneut: das Ziel geht
+    /// zurueck, die Meldung bleibt.
+    #[test]
+    fn falscher_pin_ohne_nachricht_3_und_ohne_wiederholung() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        secure::test_identitaet();
+        // 127.0.0.1 ist auf den gemeinsamen Test-Host gepinnt.
+        secure::HostPin::laden("127.0.0.1:1").unwrap().eintragen(&test_host().1).unwrap();
+        let (fremd_priv, _) = noise::keypair().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let verbindungen = Arc::new(AtomicUsize::new(0));
+        let angenommen = Arc::new(AtomicUsize::new(0));
+        let (v, a) = (verbindungen.clone(), angenommen.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { continue };
+                v.fetch_add(1, Ordering::SeqCst);
+                if secure::Secure::accept(s, &noise::prologue_video(), &fremd_priv).is_ok() {
+                    a.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        let t0 = Instant::now();
+        while shared.lock().unwrap().target.is_some() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.target.is_none(), "Ziel nicht zurueckgenommen");
+            assert_eq!(s.error.as_ref().map(|m| m.key), Some(strings::Key::HostKeyChanged));
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
+        assert_eq!(angenommen.load(Ordering::SeqCst), 0, "Nachricht 3 kam beim Host an");
+    }
+
+    /// Dieselbe Meldung ohne ein Bild dazwischen steht nur einmal im
+    /// Protokoll - auch die, die erst nach dem Handschlag entsteht ("nicht
+    /// gekoppelt"); nach einer echten Sitzung (Bilder) wieder.
+    #[test]
+    fn verbindungsfehler_nur_einmal_im_protokoll() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let e = Meldung::neu(strings::Key::NotPaired, "nicht gekoppelt");
+        let f = Meldung::neu(strings::Key::ErrorProtocol, "anderes Protokoll");
+        let mut gemeldet = None;
+        assert!(neu_zu_melden(&mut gemeldet, &e, 0));
+        assert!(!neu_zu_melden(&mut gemeldet, &e, 0));
+        assert!(neu_zu_melden(&mut gemeldet, &e, 7), "nach einer Sitzung mit Bildern");
+        assert!(!neu_zu_melden(&mut gemeldet, &e, 7));
+        assert!(neu_zu_melden(&mut gemeldet, &f, 7));
+        assert!(neu_zu_melden(&mut gemeldet, &e, 7));
+        assert!(!e.dauerhaft() && !f.dauerhaft());
+
+        // Echt: ein Host, der nach dem Handschlag zumacht. Der Client
+        // versucht es weiter (kein Dauerfehler), protokolliert aber einmal.
+        secure::test_identitaet();
+        let (host_priv, _) = test_host();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let verbindungen = Arc::new(AtomicUsize::new(0));
+        let v = verbindungen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { continue };
+                v.fetch_add(1, Ordering::SeqCst);
+                let _ = secure::Secure::accept(s, &noise::prologue_video(), &host_priv);
+            }
+        });
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        let t0 = Instant::now();
+        while verbindungen.load(Ordering::SeqCst) < 3 && t0.elapsed() < Duration::from_secs(15) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let ziel = {
+            let mut s = shared.lock().unwrap();
+            assert_eq!(s.error_key, Some(strings::Key::NotPaired));
+            s.target.take()
+        };
+        assert!(ziel.is_some(), "Ziel zurueckgenommen - nicht gekoppelt ist kein Dauerfehler");
+        assert!(verbindungen.load(Ordering::SeqCst) >= 3);
+        let text = std::fs::read_to_string(einstellungen::datei_pfad("protokoll.txt").unwrap()).unwrap();
+        let zeilen = text.lines().filter(|z| z.starts_with("Verbindung: Host hat die Leitung nach dem Handschlag")).count();
+        assert_eq!(zeilen, 1, "{text}");
+    }
+
     /// Fehler von Leitung und Ablage erscheinen ueber Schluessel: in jeder
     /// Sprache der eigene Satz mit eingesetzten Werten; der deutsche Text mit
     /// Einzelheiten bleibt fuers Protokoll.
@@ -7727,8 +8079,8 @@ mod tests {
             (F::Verbindung { addr: "a".into(), art: E::ConnectionRefused, grund: "g".into() }, ErrorConnectRefused),
             (F::Verbindung { addr: "a".into(), art: E::TimedOut, grund: "g".into() }, ErrorTimeout),
             (F::Verbindung { addr: "a".into(), art: E::AddrNotAvailable, grund: "g".into() }, ErrorNoConnection),
-            (F::Handschlag { grund: "Laenge: Frist fuer den Handschlag abgelaufen".into(), frist: true }, ErrorTimeout),
-            (F::Handschlag { grund: "Decrypt".into(), frist: false }, ErrorHandshake),
+            (F::Handschlag { grund: "Laenge: Frist fuer den Handschlag abgelaufen".into(), frist: true, system: None }, ErrorTimeout),
+            (F::Handschlag { grund: "Decrypt".into(), frist: false, system: None }, ErrorHandshake),
         ];
         for (f, k) in faelle {
             let m = Meldung::from(f);
@@ -7737,6 +8089,28 @@ mod tests {
                 assert!(!m.text(lang).contains('{'), "{k:?} ({}): {}", lang.code, m.text(lang));
             }
         }
+        // Handschlag abgebrochen: der Satz aus der Tabelle, dahinter nur der
+        // Wortlaut des Systems - nicht der deutsche Grund.
+        let m = Meldung::from(F::Handschlag {
+            grund: "Laenge: An existing connection was forcibly closed by the remote host. (os error 10054)".into(),
+            frist: false,
+            system: Some("An existing connection was forcibly closed by the remote host. (os error 10054)".into()),
+        });
+        assert_eq!(
+            m.text(&strings::EN),
+            "The secure connection could not be established (An existing connection was forcibly closed by the remote host. (os error 10054))"
+        );
+        assert!(m.protokoll.starts_with("Handschlag: Laenge:"));
+        // Dauerfehler: Pin und Ablage; Leitung und Handschlag nicht.
+        let dauer = |f: F| Meldung::from(f).dauerhaft();
+        assert!(dauer(F::FingerabdruckGeaendert { host: "h".into(), fingerabdruck: "f".into(), pfad: pfad.clone() }));
+        assert!(dauer(F::KeinUtf8 { pfad: pfad.clone() }));
+        assert!(dauer(F::Unlesbar { pfad: pfad.clone(), grund: "g".into() }));
+        assert!(dauer(F::Schreiben { pfad: pfad.clone(), grund: "g".into() }));
+        assert!(dauer(F::SchluesselBeschaedigt { pfad: pfad.clone(), laenge: 3 }));
+        assert!(dauer(F::Ablage("x".into())));
+        assert!(!dauer(F::Verbindung { addr: "a".into(), art: E::ConnectionRefused, grund: "g".into() }));
+        assert!(!dauer(F::Handschlag { grund: "g".into(), frist: true, system: None }));
         // Alle neuen Schluessel stehen englisch und deutsch da.
         for k in [
             SessionTakenOver, HostKeyChanged, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
