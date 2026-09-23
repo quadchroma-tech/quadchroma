@@ -387,7 +387,7 @@ fn codecs_parsen(p: &[u8]) -> Vec<CodecEintrag> {
             break;
         }
         let name = String::from_utf8_lossy(&p[name_start..name_ende]).into_owned();
-        out.push(CodecEintrag {
+        let mut e = CodecEintrag {
             idx: p[o],
             available: p[o + 1] != 0,
             hardware: p[o + 2] != 0,
@@ -395,7 +395,17 @@ fn codecs_parsen(p: &[u8]) -> Vec<CodecEintrag> {
             chroma444: p[o + 4] != 0,
             ten_bit: p[o + 5] != 0,
             name,
-        });
+        };
+        // AV1 kann dieser Client nicht empfangen: Strominfo und Wechsel
+        // (Nachricht 1 und 7) kennen nur HEVC und H.264, ein AV1-Strom kaeme
+        // als HEVC beim Decoder an und bliebe schwarz. Bietet ein Host ihn
+        // trotzdem an (ein aelterer Windows-Host mit AV1-faehiger NVENC),
+        // gilt er hier als nicht verfuegbar - nicht waehlbar, nicht im
+        // Benchmark.
+        if e.codec() == 3 {
+            e.available = false;
+        }
+        out.push(e);
         o = name_ende;
     }
     out
@@ -7675,6 +7685,25 @@ mod tests {
             assert!(strings::DE.table.iter().any(|(x, _)| *x == k), "{k:?} fehlt deutsch");
             assert_ne!(strings::EN.get(k), strings::DE.get(k), "{k:?}");
         }
+    }
+
+    /// Ein AV1-Eintrag der Koennensliste gilt nie als verfuegbar, auch wenn
+    /// ein Host ihn anbietet: nicht waehlbar, nicht im Benchmark.
+    #[test]
+    fn av1_nie_verfuegbar() {
+        let mut p = vec![3u8];
+        for (idx, name, c444, zehn) in [(0u8, "HEVC 4:4:4 10 Bit", 1u8, 1u8), (4, "H.264 High", 0, 0), (5, "AV1", 0, 0)] {
+            p.extend_from_slice(&[idx, 1, 1, 0, c444, zehn, name.len() as u8]);
+            p.extend_from_slice(name.as_bytes());
+        }
+        let liste = codecs_parsen(&p);
+        assert_eq!(
+            liste.iter().map(|e| (e.idx, e.available)).collect::<Vec<_>>(),
+            vec![(0, true), (4, true), (5, false)]
+        );
+        let schritte = BenchKonfig::vorgabe(5, true).schritte(&liste);
+        assert!(!schritte.is_empty());
+        assert!(schritte.iter().all(|s| s.idx != 5), "AV1 im Benchmark");
     }
 
     /// Zwei NVIDIA-Karten, wie DXGI sie meldet (luid 1 = Grafikkarte,
