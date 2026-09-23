@@ -60,6 +60,9 @@ pub struct Zustand {
     /// codiert ueber der harten Grenze wegfielen (eigene Protokollzeile).
     pub stau: AtomicU64,
     pub repeats: AtomicU64,
+    /// Ohne feste Bildrate nachgeschoben, damit ein Encoder mit Vorlauf
+    /// (h264_mf) die echten Bilder herausgibt (takt::vorlauf_nachschieben).
+    pub nachgeschoben: AtomicU64,
     pub zu_schnell: AtomicU64,
     pub enc_stau: AtomicU64,
     pub enc_verworfen: AtomicU64,
@@ -94,6 +97,7 @@ pub static Z: Zustand = Zustand {
     sent_bytes: AtomicU64::new(0),
     stau: AtomicU64::new(0),
     repeats: AtomicU64::new(0),
+    nachgeschoben: AtomicU64::new(0),
     zu_schnell: AtomicU64::new(0),
     enc_stau: AtomicU64::new(0),
     enc_verworfen: AtomicU64::new(0),
@@ -569,7 +573,7 @@ pub fn main_host(args: &[String]) -> i32 {
             continue;
         }
         log(format!(
-            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
+            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | nachgeschoben: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
             t0.elapsed().as_secs_f32(),
             f,
             (f - last_frames) as f32 / 5.0,
@@ -579,6 +583,7 @@ pub fn main_host(args: &[String]) -> i32 {
             Z.stau.load(Ordering::Relaxed),
             Z.enc_verworfen.load(Ordering::Relaxed),
             Z.repeats.load(Ordering::Relaxed),
+            Z.nachgeschoben.load(Ordering::Relaxed),
             Z.zu_schnell.load(Ordering::Relaxed),
             Z.enc_stau.load(Ordering::Relaxed),
             Z.ton_verworfen.load(Ordering::Relaxed),

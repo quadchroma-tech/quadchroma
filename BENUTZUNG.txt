@@ -572,8 +572,13 @@ ueber den Software-Encoder von Media Foundation (h264_mf), in der
 Koennensliste als Software gefuehrt. Der haelt bauartbedingt 16 Bilder
 zurueck (bei 60 Bildern je Sekunde rund 300 ms) - das reicht, um die
 ganze Kette Duplication -> Encoder -> Zuschauer zu pruefen, nicht fuer den
-Betrieb. Die Duplication braucht die Konsolensitzung; in einer RDP-Sitzung
-gibt es keinen DXGI-Ausgang ("Duplication nicht moeglich").
+Betrieb. Damit ohne feste Bildrate nichts darin stecken bleibt (das
+Endbild einer Bewegung, das erste Bild fuer einen neuen Zuschauer), schiebt
+der Host eine Bildzeit nach dem letzten neuen Bild das letzte Bild in
+Zielrate nach, bis es heraus ist (im 5-s-Protokoll "nachgeschoben: n",
+je Anlass 16); danach ist Ruhe. Die Duplication braucht die
+Konsolensitzung; in einer RDP-Sitzung gibt es keinen DXGI-Ausgang
+("Duplication nicht moeglich").
 
 Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
 meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es

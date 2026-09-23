@@ -944,6 +944,10 @@ pub enum Quelle<'a> {
     Fertig(&'a mut Bild),
     /// Das zuletzt gegebene Bild noch einmal (feste Bildrate).
     Wiederholung,
+    /// Wie Wiederholung, aber nur, damit ein Encoder mit Vorlauf die echten
+    /// Bilder herausgibt (takt::vorlauf_nachschieben): zaehlt selbst nicht
+    /// als ausstehend - ausser es wird ein erzwungenes Vollbild.
+    Nachschub,
 }
 
 /// Antwort von codieren auf eine Wiederholung, bevor diese Sitzung je ein
@@ -987,8 +991,10 @@ pub struct Betrieb {
     gaming: bool,
     /// Bilder seit dem letzten IDR (der Host verwaltet die GOP selbst).
     seit_idr: i32,
-    /// Bilder, deren Paket noch aussteht: pts -> (Aufnahmezeit, nachgelegt).
-    unterwegs: VecDeque<(i64, u64, bool)>,
+    /// Bilder, deren Paket noch aussteht: pts -> (Aufnahmezeit, nachgelegt,
+    /// echt). Echt = neuer Inhalt oder erzwungenes Vollbild - das muss beim
+    /// Zuschauer ankommen; ein Nachschub fuer den Vorlauf muss es nicht.
+    unterwegs: VecDeque<(i64, u64, bool, bool)>,
     /// Was der Encoder bauartbedingt zurueckhaelt - zaehlt nicht als Stau.
     vorlauf: usize,
     /// Ob schon ein Bild gegeben wurde (fuer Wiederholung ohne Vorbild).
@@ -1076,6 +1082,18 @@ impl Betrieb {
         self.unterwegs.len().saturating_sub(self.vorlauf)
     }
 
+    /// Bilder, die der Encoder bauartbedingt zurueckhaelt (0 bei nvenc).
+    pub fn vorlauf(&self) -> usize {
+        self.vorlauf
+    }
+
+    /// Echte Bilder (neuer Inhalt, erzwungenes Vollbild), deren Paket noch
+    /// nicht heraus ist - mit Vorlauf stecken sie fest, bis weitere Bilder
+    /// nachkommen.
+    pub fn ausstehend(&self) -> usize {
+        self.unterwegs.iter().filter(|u| u.3).count()
+    }
+
     /// Was der Zuschauer eingestellt hat, auf die Sitzung uebertragen:
     /// Bitrate bei nvenc im Betrieb (reconfig), sonst und bei einer neuen
     /// Bildrate ein Neustart mit Vollbild. Liefert Ok(true), wenn die
@@ -1109,9 +1127,10 @@ impl Betrieb {
         // Erst der Rahmen, dann das Vollbild: kehrt codieren vorher zurueck,
         // bleibt force_key fuer das naechste Bild stehen. Eine Wiederholung
         // ohne Vorbild ist kein gesendetes Bild (und nichts fuers Protokoll).
+        let nachschub = matches!(quelle, Quelle::Nachschub);
         let frame = match quelle {
-            Quelle::Wiederholung if !self.hat_bild => return Err(KEIN_VORBILD.into()),
-            Quelle::Wiederholung => self.bild.frame,
+            Quelle::Wiederholung | Quelle::Nachschub if !self.hat_bild => return Err(KEIN_VORBILD.into()),
+            Quelle::Wiederholung | Quelle::Nachschub => self.bild.frame,
             q => match self.rahmen(q) {
                 Ok(f) => f,
                 Err(e) => return Err(self.verworfen(e)),
@@ -1120,7 +1139,8 @@ impl Betrieb {
         if !rahmen_passt(frame, self.pool.as_ref().map(|p| p.pool), self.pix_fmt, self.w, self.h) {
             return Err(self.verworfen("Bild passt nicht zur Sitzung (Systemspeicher/Textur, Format oder Groesse)".into()));
         }
-        let vollbild = Z.force_key.swap(false, Ordering::Relaxed) || self.seit_idr >= if self.gaming { self.fps } else { self.fps * 2 };
+        let erzwungen = Z.force_key.swap(false, Ordering::Relaxed);
+        let vollbild = erzwungen || self.seit_idr >= if self.gaming { self.fps } else { self.fps * 2 };
         if let Err(e) = self.sitzung.senden(frame, pts_us, vollbild) {
             if vollbild {
                 Z.force_key.store(true, Ordering::Relaxed);
@@ -1128,7 +1148,9 @@ impl Betrieb {
             return Err(self.verworfen(e));
         }
         self.seit_idr = if vollbild { 1 } else { self.seit_idr + 1 };
-        self.unterwegs.push_back((pts_us, t_cap_us, wiederholt));
+        // Ein erzwungenes Vollbild muss heraus, auch als Nachschub - sonst
+        // steckte die Anforderung (neuer Zuschauer, Stau) im Vorlauf fest.
+        self.unterwegs.push_back((pts_us, t_cap_us, wiederholt, !nachschub || erzwungen));
         self.pakete_abholen()
     }
 
@@ -1179,7 +1201,7 @@ impl Betrieb {
                 }
                 None => b.frame,
             },
-            Quelle::Wiederholung => self.bild.frame,
+            Quelle::Wiederholung | Quelle::Nachschub => self.bild.frame,
         })
     }
 
