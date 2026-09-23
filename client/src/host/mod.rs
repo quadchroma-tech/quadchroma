@@ -425,7 +425,11 @@ pub fn main_host(args: &[String]) -> i32 {
     }
 
     // Was dieser Rechner codieren kann - gefragt, nicht geraten. Der
-    // Startkandidat ist 0 wie beim Mac, sonst der erste vorhandene.
+    // Startkandidat ist 0 wie beim Mac, sonst der erste vorhandene. Ein
+    // Codecwechsel (66) gilt danach fuer den Host, auch fuer den naechsten
+    // Zuschauer - wie beim Mac (g_codec_id in main.m setzen nur der Start
+    // und der Wechsel); Begruessung (1) und Koennensliste (8) sagen ihm, was
+    // laeuft.
     encoder::pruefen();
     ffmpeg_zeilen();
     let startkandidat = encoder::startkandidat();

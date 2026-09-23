@@ -29,6 +29,8 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
 
 use super::encoder::{self, Betrieb, Bild, Quelle, Weg};
 use super::takt::{Schrittmacher, INFLIGHT_AUFNAHME, INFLIGHT_TAKT};
@@ -444,9 +446,14 @@ pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
             }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sitzung(wunsch.as_ref(), weg)));
             if r.is_err() {
+                // Wachhalten und Timerperiode hat Drop schon abgebaut.
                 log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
                 while netz::zuschauer_da() {
                     std::thread::sleep(Duration::from_millis(500));
+                }
+                // Ein Testbild ueberlebt den Zuschauer auch hier nicht.
+                if Z.testbild.swap(false, Ordering::Relaxed) {
+                    log("Testbild aus (Zuschauer weg)");
                 }
             }
         })
@@ -634,17 +641,37 @@ impl Aufnahme {
     }
 }
 
+/// Wachhalten und 1-ms-Timerperiode fuer die Dauer einer Aufnahmesitzung.
+/// Der Abbau steckt in Drop, damit er auch nach einer Panik in sitzung()
+/// laeuft (catch_unwind in start, derselbe Faden) - sonst bliebe der
+/// Bildschirm ohne Zuschauer wach, und jede weitere Panik forderte die
+/// Timerperiode erneut an, ohne sie je abzugeben.
+struct Wachhalten;
+
+impl Wachhalten {
+    fn an() -> Wachhalten {
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+            timeBeginPeriod(1);
+        }
+        Wachhalten
+    }
+}
+
+impl Drop for Wachhalten {
+    fn drop(&mut self) {
+        unsafe {
+            timeEndPeriod(1);
+            SetThreadExecutionState(ES_CONTINUOUS);
+        }
+    }
+}
+
 /// Eine Aufnahmesitzung fuer die Dauer eines Zuschauers.
 fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
-    use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
-    use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
-
     // Solange gestreamt wird, darf der Bildschirm nicht einschlafen; die
     // Fristen des Takts brauchen die Millisekunde.
-    unsafe {
-        SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-        timeBeginPeriod(1);
-    }
+    let wach = Wachhalten::an();
 
     let mut auf: Option<Aufnahme> = None;
     let mut enc: Option<Betrieb> = None;
@@ -1018,10 +1045,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
     if Z.testbild.swap(false, Ordering::Relaxed) {
         log("Testbild aus (Zuschauer weg)");
     }
-    unsafe {
-        timeEndPeriod(1);
-        SetThreadExecutionState(ES_CONTINUOUS);
-    }
+    drop(wach);
     log("Aufnahme angehalten: kein Zuschauer");
 }
 
@@ -1179,5 +1203,30 @@ mod tests {
         // Die letzte Zeile braucht nur ihre eigenen Bytes, nicht den ganzen Abstand.
         zeilen_holen(&quelle[..1280 * 4 * 719 + 100 * 4], 1280 * 4, 100, 720, &mut ziel).unwrap();
         assert_eq!(ziel.len(), 100 * 720 * 4);
+    }
+
+    #[test]
+    fn wachhalten_endet_auch_nach_einer_panik() {
+        // SetThreadExecutionState gilt je Faden und liefert den vorigen
+        // Zustand: waehrend der Sitzung wach, nach einer Panik in ihr wieder
+        // nur ES_CONTINUOUS. Eigener Faden, weil die Tests parallel laufen.
+        // Auf der Bau-VM (ssh, Sitzung 0) kommt ES_DISPLAY_REQUIRED nicht
+        // zurueck, ES_SYSTEM_REQUIRED schon.
+        use windows::Win32::System::Power::EXECUTION_STATE;
+        std::thread::spawn(|| {
+            let mut waehrend = EXECUTION_STATE(0);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _wach = Wachhalten::an();
+                waehrend = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+                // resume_unwind ruft den Panik-Haken nicht: keine Zeile im Testlauf.
+                std::panic::resume_unwind(Box::new("Probe"));
+            }));
+            assert!(r.is_err());
+            assert!(waehrend.0 & ES_CONTINUOUS.0 != 0 && waehrend.0 & ES_SYSTEM_REQUIRED.0 != 0, "waehrend der Sitzung nicht wach: {waehrend:?}");
+            let danach = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+            assert_eq!(danach, ES_CONTINUOUS, "nach der Panik noch wach");
+        })
+        .join()
+        .unwrap();
     }
 }
