@@ -199,7 +199,9 @@ unsafe impl Send for AudioOut {}
 impl AudioOut {
     /// Oeffnet das Standard-Ausgabegeraet ueber eine AudioQueue. Gibt einen
     /// Text zurueck statt zu stuerzen: ohne Ton laeuft der Rest weiter.
-    pub fn new(rate: u32, channels: u16) -> Result<Self, String> {
+    /// Dieselbe Form wie unter Windows (audio.rs); der Hinweis "steht, aber
+    /// noch ohne Geraet" kommt hier nie - fehlt das Geraet, ist es ein Fehler.
+    pub fn new(rate: u32, channels: u16) -> Result<(Self, Option<String>), String> {
         format_pruefen(rate, channels)?;
         let (_geraet, geraet_rate) = standardgeraet()?;
 
@@ -269,7 +271,7 @@ impl AudioOut {
             "Ton: AudioQueue {rate} Hz, {channels} Kanaele, float32; Geraet {:.0} Hz",
             geraet_rate
         ));
-        Ok(aus)
+        Ok((aus, None))
     }
 
     /// Verschraenkte float32-Frames annehmen, siehe audio_ring.rs.
@@ -280,6 +282,11 @@ impl AudioOut {
     /// Fuellstand in Millisekunden und Anzahl der Aussetzer, fuer die Anzeige.
     pub fn stats(&self) -> (f32, u64) {
         self.gemeinsam.stats()
+    }
+
+    /// Ist das Geraet offen? Nach einem gelungenen new() immer.
+    pub fn offen(&self) -> bool {
+        self.gemeinsam.offen()
     }
 
     /// Queue anhalten und entsorgen, danach den Griff des Rueckrufs
@@ -365,7 +372,7 @@ mod tests {
     #[test]
     #[ignore]
     fn ton_hoerbar() {
-        let aus = AudioOut::new(48_000, 2).expect("Tongeraet");
+        let (aus, _) = AudioOut::new(48_000, 2).expect("Tongeraet");
         let stueck = 480; // 10 ms
         let mut pcm = vec![0.0f32; stueck * 2];
         let mut t = 0usize;

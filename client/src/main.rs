@@ -1742,6 +1742,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let mut info: Option<StreamInfo> = None;
     #[cfg(any(windows, target_os = "macos"))]
     let mut sound: Option<audio::AudioOut> = None;
+    // Steht in `shared.error` die Meldung "Ton nicht verfuegbar", waehrend
+    // der Tonfaden weiter nach einem Geraet sucht? Dann loescht sie das
+    // erste Tonpaket, das ein offenes Geraet vorfindet.
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut ton_fehler = false;
     let mut pcm: Vec<f32> = Vec::new();
     let mut hdr = [0u8; 8];
     let mut payload: Vec<u8> = Vec::with_capacity(1 << 20);
@@ -2245,16 +2250,41 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 if len >= 8 {
                     let rate = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     let ch = payload[4] as u16;
+                    // Beide Hosts sagen das Format auch mitten in der Sitzung
+                    // neu an. Der alte Ausgang rechnet mit dem alten Format um:
+                    // zuerst freigeben - scheitert der Neubau, bleibt es lieber
+                    // still als falsch.
+                    sound = None;
+                    // Der Satz kommt aus der Tabelle, ohne Anhang: der Grund
+                    // ist eigener deutscher Text und steht im Protokoll.
+                    let meldung = |e: &str| Meldung::neu(strings::Key::ErrorSound, format!("Ton: {e}"));
                     match audio::AudioOut::new(rate, ch) {
-                        Ok(a) => { sound = Some(a); }
+                        Ok((a, hinweis)) => {
+                            sound = Some(a);
+                            // Noch kein Geraet, der Tonfaden sucht weiter und
+                            // hat den Grund schon protokolliert.
+                            if let Some(e) = hinweis {
+                                shared.lock().unwrap().error = Some(meldung(&e));
+                                ton_fehler = true;
+                            }
+                        }
                         Err(e) => {
-                            let m = Meldung::neu(strings::Key::ErrorSound, format!("Ton: {e}")).anhang(e);
+                            let m = meldung(&e);
+                            protokoll::zeile(m.protokoll.clone());
                             shared.lock().unwrap().error = Some(m);
                         }
                     }
                 }
             }
             MSG_AUDIO => {
+                #[cfg(any(windows, target_os = "macos"))]
+                if ton_fehler && sound.as_ref().is_some_and(|a| a.offen()) {
+                    ton_fehler = false;
+                    let mut s = shared.lock().unwrap();
+                    if s.error.as_ref().is_some_and(|m| m.key == strings::Key::ErrorSound) {
+                        s.error = None;
+                    }
+                }
                 #[cfg(any(windows, target_os = "macos"))]
                 if let Some(a) = sound.as_ref().filter(|_| shared.lock().unwrap().ton) {
                     // Der Empfangspuffer ist nicht ausgerichtet, deshalb Wert fuer Wert.
