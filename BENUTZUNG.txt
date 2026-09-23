@@ -171,6 +171,14 @@ schickt dann keine Tonpakete mehr (rund 3 Mbit/s weniger), der Client spielt
 nichts ab. Die Stellung wird je Host gespeichert. Im Pruefmodus ist es der
 fuenfte Wert von --set (--set 50,120,0,1,0 = Ton aus).
 
+Faellt auf Windows das Ausgabegeraet weg - Kopfhoerer abgezogen, Format in
+den Soundeinstellungen umgestellt, anderes Standardgeraet gewaehlt -,
+oeffnet der Client nach etwa einer Sekunde von selbst das dann aktuelle
+Standardgeraet und spielt weiter; neu verbinden muss niemand. Ist gerade
+keines da, versucht er es alle halbe Sekunde wieder. Im Protokoll steht der
+Grund ("Ton: ... - Ausgabegeraet wird neu geoeffnet") und wann es wieder
+geht ("Ton: Ausgabegeraet wieder offen").
+
 Zur Bitrate: der Wert ist eine Obergrenze, und der Encoder nutzt sie auch aus.
 150 Mbit/s bedeuten bei bewegtem Bild tatsaechlich 150 Mbit/s. Fuer das eigene
 Netz ist das in Ordnung, sonst lieber 25 bis 50 einstellen. H.264 vertraegt
@@ -203,6 +211,14 @@ Reiter "Bild" umstellen. Ein Hardware-Decoder, der Pakete annimmt, aber
 Software ersetzt; der Grund steht in der Statistik und im Protokoll. Die
 Wahl gilt sofort. Befehlszeile: --decoder auto|gpu|gpu2|integriert|software
 (alte Werte nvidia/nvdec/cuvid gelten als gpu).
+
+Zwei NVIDIA-Karten: "Grafikkarte 1" und "Grafikkarte 2" decodieren auf
+genau der gewaehlten Karte. CUDA zaehlt die Karten anders als Windows; der
+Client ordnet sie ueber die LUID zu (Protokoll: "NVDEC: <Karte> ist
+CUDA-Geraet n", --decodertest listet "CUDA-Geraet n: <Karte>"). Laesst sich
+die gewaehlte Karte nicht zuordnen, decodiert er lieber in Software und
+nennt den Grund, als auf der falschen Karte. Automatik nimmt, was CUDA als
+Geraet 0 fuehrt.
 
 Anzeige: mit einer Grafikkarte zeichnet der Client ueber Direct3D 11. Die
 rohen Ebenen des Decoders gehen auf die Karte, Umrechnung nach RGB und
@@ -242,6 +258,25 @@ Bildschirmwahl auf dem Mac: ohne Angabe nimmt der Host den Hauptbildschirm
 gehoeren immer auf denselben Bildschirm. --display n waehlt einen anderen
 Platz aus der Liste (--list zeigt sie). Ein Wechsel gilt ab dem naechsten
 Start des Hosts.
+
+Zwischenablage
+--------------
+
+Kopierter Text geht in beide Richtungen ueber den Eingabekanal (9002), nur
+Text, bis 4 MB. Auf jeder Seite - Mac oder Windows, Host oder Client - gilt
+dieselbe Regel: was ein Programm als vertraulich markiert, bleibt auf dem
+Rechner, auf dem es kopiert wurde. Auf dem Mac ist das die Markierung
+org.nspasteboard.ConcealedType (Passwortverwalter wie 1Password oder
+KeePassXC), auf Windows ExcludeClipboardContentFromMonitorProcessing oder
+"Clipboard Viewer Ignore" (etwa KeePass). Im Protokoll steht dann
+"Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen". Ein
+Passwort laesst sich also nicht hinueberkopieren - das ist Absicht. Dateien
+werden nicht uebertragen, und auf dem Mac von mehreren Eintraegen nur der
+erste.
+
+Was auf Windows ankommt, legt QuadChroma so ab, dass es weder in den
+Verlauf (Win+V) noch in die Cloud-Zwischenablage wandert und
+Ablageverwalter es uebergehen.
 
 Benchmark
 ---------
@@ -434,5 +469,9 @@ werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
 Bibliothek. Der Quelltext dazu liegt bei https://ffmpeg.org. Direct3D,
 DXGI und der Shader-Uebersetzer (d3dcompiler_47.dll) sind Bestandteile von
 Windows, nichts davon wird mitgeliefert.
+
+Voraussetzung ist Windows 10 oder 11, 64 Bit. Eine Visual-C++-Laufzeit
+braucht es nicht: die C-Laufzeit steckt in der exe, und die FFmpeg-Dateien
+nutzen nur die Universal C Runtime, die zu Windows 10 und 11 gehoert.
 
 Stand: 22.09.2026
