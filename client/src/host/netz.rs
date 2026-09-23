@@ -4,11 +4,13 @@
 //
 // Ein Zuschauer zur Zeit; ein neuer ersetzt den alten (wie main.m). Der
 // alte bekommt als letzte Nachricht MSG_ABGELOEST - statt dessen, was noch
-// in seiner Warteschlange lag, und mit kurzer Frist (FRIST_SCHLUSSWORT) -,
-// damit er sich nicht von selbst neu verbindet und den neuen verdraengt;
-// danach sind seine Bildleitung und sein Eingabekanal zu. Der
-// Bildkanal wird nur geschrieben, der Eingabekanal nur gelesen - Antworten
-// (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
+// in seiner Warteschlange lag -, damit er sich nicht von selbst neu
+// verbindet und den neuen verdraengt; danach sind seine Bildleitung und sein
+// Eingabekanal zu. Vor dem Schlusswort geht noch der Rest des Pakets hinaus,
+// das der Sendefaden gerade schreibt: solange der Alte davon abnimmt, wird
+// gewartet (hoechstens ABLOESUNG_HOECHSTENS), erst ohne Fortschritt gekappt.
+// Der Bildkanal wird nur geschrieben, der Eingabekanal nur gelesen -
+// Antworten (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
 //
 // Stauregel: Windows kennt kein SO_NWRITE. Ersatz ist ein eigener
 // Sendefaden mit Warteschlange bei einem Sendepuffer von 256 kB im Kernel:
@@ -82,10 +84,17 @@ const SNDBUF: usize = 256 * 1024;
 const SCHREIBSTUECK: usize = secure::CHUNK_MAX;
 /// So lange darf die letzte Nachricht an einen abgeloesten Zuschauer
 /// brauchen. Seine Warteschlange ist da schon verworfen; vor ihr liegen
-/// hoechstens das Bild, das der Sendefaden gerade schreibt, und der
-/// Kernelpuffer - im LAN in Millisekunden durch. Wer sie in der Frist nicht
-/// abnimmt, ist eingefroren oder weg: seine Leitung wird ohne sie gekappt.
+/// hoechstens der Rest des Pakets, das der Sendefaden gerade schreibt, und
+/// der Kernelpuffer. Wer sie in der Frist nicht abnimmt, ist eingefroren oder
+/// weg: seine Leitung wird ohne sie gekappt. Der Rest des Pakets selbst hat
+/// keine feste Frist - siehe `abloesung_abschliessen`.
 const FRIST_SCHLUSSWORT: Duration = Duration::from_secs(1);
+/// Obergrenze fuer das Warten auf einen abgeloesten Zuschauer, der zwar
+/// abnimmt, aber langsam: den Rest eines Vollbilds oder einer grossen
+/// Zwischenablage ueber eine duenne Leitung. Kappte man ihn vorher, bekaeme
+/// er statt MSG_ABGELOEST einen Abbruch, verbaende sich neu und verdraengte
+/// den Neuen.
+const ABLOESUNG_HOECHSTENS: Duration = Duration::from_secs(15);
 /// Steuernachrichten (alles aus send_small ausser Ton), die hoechstens auf
 /// den Zuschauer warten duerfen: zwei volle Zwischenablagen. Sie werden nie
 /// still verworfen - sonst bricht etwa die Reihenfolge Switch -> Info ->
@@ -383,16 +392,29 @@ impl Leitung {
 
     /// Ein neuer Zuschauer ersetzt diesen. Was noch in der Warteschlange
     /// liegt, wird verworfen; hinaus geht nur noch MSG_ABGELOEST - danach
-    /// schliesst der Sendefaden die Bildleitung selbst. Der Eingabekanal ist
-    /// sofort gekappt. Haengt der Sendefaden an einem Zuschauer, der nichts
-    /// mehr abnimmt, kappt `abloesung_abschliessen` die Bildleitung nach der
-    /// Frist. Unter EINSPEISEN und AKTUELL aufrufen; wartet nie.
+    /// schliesst der Sendefaden die Bildleitung selbst. Nur die Begruessung
+    /// (MAGIC + Strominfo) bleibt, wenn der Sendefaden noch gar nichts
+    /// genommen hat: sie geht mit dem Schlusswort hinaus. Ohne sie laese der
+    /// Client das Schlusswort als MAGIC, hielte es fuer ein fremdes
+    /// Protokoll und verbaende sich neu - und verdraengte den Neuen. Der
+    /// Eingabekanal ist sofort gekappt. Haengt der Sendefaden an einem
+    /// Zuschauer, der nichts mehr abnimmt, kappt `abloesung_abschliessen` die
+    /// Bildleitung. Unter EINSPEISEN und AKTUELL aufrufen; wartet nie.
     fn abloesen(&self) {
         let eingabe = {
             let mut q = sperre(&self.q);
             if q.offen {
+                // Die Begruessung reiht bild_annehmen als erstes Paket ein,
+                // bevor andere Faeden die Leitung sehen.
+                let mut wort = Vec::new();
+                if q.geschrieben == 0 && q.im_schreiben == 0 {
+                    if let Some(gruss) = q.nehmen() {
+                        wort = gruss;
+                    }
+                }
+                wort.extend_from_slice(&kopf(MSG_ABGELOEST, 0, 0, 0));
                 q.leeren();
-                q.schlusswort = Some(kopf(MSG_ABGELOEST, 0, 0, 0).to_vec());
+                q.schlusswort = Some(wort);
                 q.offen = false;
                 self.cv.notify_all();
             }
@@ -404,16 +426,32 @@ impl Leitung {
         }
     }
 
-    /// Nach `abloesen`, ausserhalb aller Sperren: hoechstens `frist` auf das
-    /// Ende des Sendefadens warten, sonst die Bildleitung kappen - auch wenn
-    /// er noch in einem write steckt. true: der Sendefaden ist durch.
+    /// Nach `abloesen`, ausserhalb aller Sperren: auf das Ende des
+    /// Sendefadens warten, solange er binnen `frist` Fortschritt macht
+    /// (`geschrieben` waechst - dasselbe Mass wie in der Stauregel), aber
+    /// hoechstens ABLOESUNG_HOECHSTENS; sonst die Bildleitung kappen, auch
+    /// wenn er noch in einem write steckt. `frist` muss laenger sein als
+    /// FRIST_SCHLUSSWORT: waehrend des Schlussworts waechst `geschrieben`
+    /// nicht. true: der Sendefaden ist durch.
     fn abloesung_abschliessen(&self, frist: Duration) -> bool {
-        let q = sperre(&self.q);
-        let (q, _) = self.ende.wait_timeout_while(q, frist, |q| !q.beendet).unwrap_or_else(|e| e.into_inner());
+        let beginn = Instant::now();
+        let mut q = sperre(&self.q);
+        loop {
+            let stand = q.geschrieben;
+            let rest = ABLOESUNG_HOECHSTENS.saturating_sub(beginn.elapsed());
+            q = self.ende.wait_timeout_while(q, frist.min(rest), |q| !q.beendet).unwrap_or_else(|e| e.into_inner()).0;
+            if q.beendet || q.geschrieben == stand || beginn.elapsed() >= ABLOESUNG_HOECHSTENS {
+                break;
+            }
+        }
         let beendet = q.beendet;
         drop(q);
         if !beendet {
-            log(format!("Abgeloester Zuschauer {} nimmt nichts mehr ab - Bildleitung gekappt", self.ip));
+            log(format!(
+                "Abgeloester Zuschauer {} nimmt nichts mehr ab (nach {:.1} s) - Bildleitung gekappt",
+                self.ip,
+                beginn.elapsed().as_secs_f32()
+            ));
             self.bild_kappen();
         }
         beendet
@@ -922,8 +960,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let leitung = Arc::new(Leitung::neu(sock.abbruchgriff(), sock.peer.clone(), sock.handshake_hash.clone(), ip.clone()));
     // Ein neuer Zuschauer ersetzt den alten: dessen Eingabekanal wird
     // gekappt, seine Warteschlange verworfen; er bekommt nur noch
-    // MSG_ABGELOEST, dann endet sein Sendefaden (spaetestens nach der Frist,
-    // unten).
+    // MSG_ABGELOEST, dann endet sein Sendefaden (unten wird darauf gewartet).
     let alt = {
         let _einspeisen = sperre(&EINSPEISEN);
         let mut a = sperre(&AKTUELL);
@@ -949,9 +986,9 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     settings_senden();
     send_small(MSG_CODECS, &encoder::codecs_payload());
     log(format!("Zuschauer verbunden: {ip}:{port}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}"));
-    // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten. Sein
-    // Sendefaden gibt beim Schlusswort nach FRIST_SCHLUSSWORT auf - steckt
-    // er noch in einem aelteren write, wird hier gekappt.
+    // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten: solange
+    // er abnimmt (Rest des laufenden Pakets, dann das Schlusswort), sonst
+    // wird seine Bildleitung gekappt.
     if let Some(alt) = alt {
         alt.abloesung_abschliessen(FRIST_SCHLUSSWORT * 2);
     }
@@ -1299,27 +1336,124 @@ mod tests {
         Arc::new(Leitung::neu(h.abbruchgriff(), h.peer.clone(), h.handshake_hash.clone(), "127.0.0.1".into()))
     }
 
-    /// Beim Abloesen wird verworfen, was noch wartet: beim alten Zuschauer
-    /// kommt nur MSG_ABGELOEST an, danach ist die Leitung zu, und einreihen
-    /// nimmt nichts mehr an.
-    #[test]
-    fn abloesung_verwirft_warteschlange() {
-        let (h, mut c) = paar();
-        let leitung = leitung_zu(&h);
+    /// Drei Zeitantworten 0x11, 0x22, 0x33 fuer die Abloesungs-Tests.
+    fn drei_zeitantworten(leitung: &Leitung) {
         for t in [0x11u64, 0x22, 0x33] {
             let mut p = kopf(MSG_TIME, 0, 0, 16).to_vec();
             p.extend_from_slice(&t.to_le_bytes());
             p.extend_from_slice(&[0u8; 8]);
+            assert!(leitung.einreihen(p, Art::Klein, None).is_ok());
         }
+    }
+
+    /// Liest einen Kopf: (Typ, Laenge).
+    fn kopf_lesen(c: &mut secure::Secure) -> (u8, usize) {
+        let mut hdr = [0u8; 8];
+        c.read_exact(&mut hdr).unwrap();
+        (hdr[0], u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize)
+    }
+
+    /// Beim Abloesen wird verworfen, was noch wartet: hat der Sendefaden
+    /// schon geschrieben, kommt beim alten Zuschauer nur MSG_ABGELOEST an,
+    /// danach ist die Leitung zu, und einreihen nimmt nichts mehr an.
+    #[test]
+    fn abloesung_verwirft_warteschlange() {
+        let (h, mut c) = paar();
+        let leitung = leitung_zu(&h);
+        // Als haette der Sendefaden die Begruessung schon abgeliefert.
+        sperre(&leitung.q).geschrieben = 20;
+        drei_zeitantworten(&leitung);
         leitung.abloesen();
+        assert_eq!(leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), Art::Klein, None), Err(Abgewiesen::Zu));
         let l2 = leitung.clone();
         std::thread::spawn(move || sendefaden(l2, h));
         assert!(leitung.abloesung_abschliessen(Duration::from_secs(2)));
         c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut hdr = [0u8; 8];
-        c.read_exact(&mut hdr).unwrap();
-        assert_eq!((hdr[0], u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]])), (MSG_ABGELOEST, 0));
+        assert_eq!(kopf_lesen(&mut c), (MSG_ABGELOEST, 0));
         assert!(c.read_exact(&mut [0u8; 1]).is_err());
+    }
+
+    /// Wird ein Zuschauer abgeloest, bevor sein Sendefaden das erste Paket
+    /// genommen hat (zwei Clients verbinden fast gleichzeitig), geht die
+    /// Begruessung noch hinaus - und erst dann MSG_ABGELOEST. Sonst laese der
+    /// Client [10,0,0,0] als MAGIC, meldete ein fremdes Protokoll und
+    /// verbaende sich neu. Alles danach bleibt verworfen.
+    #[test]
+    fn abloesung_vor_dem_ersten_write_behaelt_begruessung() {
+        let (h, mut c) = paar();
+        let leitung = leitung_zu(&h);
+        let mut hello = MAGIC.to_vec();
+        hello.extend_from_slice(&kopf(MSG_INFO, 0, 0, 8));
+        hello.extend_from_slice(&[7u8; 8]);
+        assert!(leitung.einreihen(hello, Art::Klein, None).is_ok());
+        drei_zeitantworten(&leitung);
+        leitung.abloesen();
+        {
+            let q = sperre(&leitung.q);
+            assert_eq!((q.bytes, q.ton, q.klein, q.pakete.len()), (0, 0, 0, 0), "Buchfuehrung nach dem Abloesen");
+        }
+        let l2 = leitung.clone();
+        std::thread::spawn(move || sendefaden(l2, h));
+        assert!(leitung.abloesung_abschliessen(Duration::from_secs(2)));
+        c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut magic = [0u8; 4];
+        c.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, MAGIC);
+        assert_eq!(kopf_lesen(&mut c), (MSG_INFO, 8));
+        let mut info = [0u8; 8];
+        c.read_exact(&mut info).unwrap();
+        assert_eq!(info, [7u8; 8]);
+        // Direkt danach das Schlusswort - keine der drei Zeitantworten.
+        assert_eq!(kopf_lesen(&mut c), (MSG_ABGELOEST, 0));
+        assert!(c.read_exact(&mut [0u8; 1]).is_err());
+    }
+
+    /// Ein abgeloester Zuschauer, der langsam, aber stetig abnimmt, bekommt
+    /// den Rest des laufenden Pakets und danach MSG_ABGELOEST - auch wenn das
+    /// laenger dauert als die Frist ohne Fortschritt. Gekappt wurde er bis
+    /// dahin nach 2 s: der Client sah einen Abbruch statt der Abloesung,
+    /// verband sich neu und verdraengte den Neuen.
+    #[test]
+    fn langsamer_abgeloester_bekommt_rest_und_schlusswort() {
+        let (h, mut c) = paar();
+        sendepuffer_setzen(h.socket());
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let sender = std::thread::spawn(move || sendefaden(l2, h));
+        // Ein Paket von 4 MB (Vollbild oder grosse Zwischenablage).
+        let n = 4 << 20;
+        let mut p = kopf(MSG_CLIP, 0, 0, n).to_vec();
+        p.resize(8 + n, b'x');
+        assert!(leitung.einreihen(p, Art::Klein, None).is_ok());
+        // Der Client liest 64 kB alle 60 ms (rund 1 MB/s).
+        let leser = std::thread::spawn(move || -> Result<(), String> {
+            c.socket().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let (typ, len) = kopf_lesen(&mut c);
+            if (typ, len) != (MSG_CLIP, n) {
+                return Err(format!("erst {typ}/{len} statt der Zwischenablage"));
+            }
+            let mut puffer = vec![0u8; 64 * 1024];
+            let mut rest = len;
+            while rest > 0 {
+                let k = rest.min(puffer.len());
+                c.read_exact(&mut puffer[..k])?;
+                rest -= k;
+                std::thread::sleep(Duration::from_millis(60));
+            }
+            bis_abloesung(&mut c)
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let t0 = Instant::now();
+        leitung.abloesen();
+        let durch = leitung.abloesung_abschliessen(FRIST_SCHLUSSWORT * 2);
+        let dauer = t0.elapsed();
+        println!("Abloesung eines langsamen Zuschauers nach {dauer:?} abgeschlossen: {durch}");
+        assert!(durch, "Sendefaden nicht durch - Bildleitung gekappt");
+        // Sonst haette schon die alte feste Frist gereicht: Probe ohne Wert.
+        assert!(dauer > FRIST_SCHLUSSWORT * 2, "{dauer:?}");
+        assert!(dauer < ABLOESUNG_HOECHSTENS, "{dauer:?}");
+        assert_eq!(endet_binnen(leser, Duration::from_secs(10)), Some(Ok(())));
+        assert!(endet_binnen(sender, Duration::from_secs(5)).is_some());
     }
 
     /// Ein abgeloester Zuschauer, der nichts mehr abnimmt (eingefroren): der
