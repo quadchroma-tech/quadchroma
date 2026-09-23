@@ -10,25 +10,17 @@
 // wenn es verloren geht (abgezogen, Format umgestellt, anderes Standardgeraet),
 // das dann aktuelle Standardgeraet neu oeffnen, siehe `betreiben`.
 //
-// Neue Abhaengigkeit, genau diese Zeile nach client/Cargo.toml unter
-// [dependencies] (MIT ODER Apache-2.0, passt zur Lizenzvorgabe):
+// Gebraucht wird nur die windows-Kiste mit den Merkmalen aus client/Cargo.toml
+// (Win32_Media_Audio, Win32_System_Com, Win32_System_Threading und
+// Win32_Foundation). Das Modul ist reines Windows; auf dem Mac laesst es sich
+// nicht uebersetzen.
 //
-//   windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Threading"] }
-//
-// Sonst kommt keine Kiste dazu. Das Modul ist reines Windows; auf dem Mac laesst
-// es sich nicht uebersetzen.
-//
-// UNGEPRUEFT: die Signaturen von CoCreateInstance, IMMDevice::Activate,
-// IAudioClient (Initialize, GetMixFormat, SetEventHandle, GetService),
-// IAudioRenderClient, CreateEventW, WaitForSingleObject und CoTaskMemFree sind
-// gegen microsoft.github.io/windows-docs-rs abgeglichen, aber nichts davon ist
-// hier gebaut worden. Ungeprueft bleiben ausserdem PCWSTR::null(), das Feld .0
-// des Rueckgabewerts von WaitForSingleObject und die obige Merkmalsliste.
-//
-// Der Wiederaufbau nach einem Geraeteverlust (`betreiben`) ist mit einem
-// vorgetaeuschten Geraet getestet (Tests unten). UNGEPRUEFT am echten Geraet:
-// Abziehen, Umstellen des Standardformats, Wechsel des Standardgeraets - die
-// Bau-VM hat kein Tongeraet.
+// Gebaut und getestet wird es auf der Bau-VM. Die hat kein Tongeraet: der
+// echte Weg kommt dort nur bis "kein Standard-Ausgabegeraet" (Test
+// echtes_geraet_oder_fehler). Der Wiederaufbau nach einem Geraeteverlust
+// (`betreiben`) ist mit einem vorgetaeuschten Geraet getestet (Tests unten).
+// UNGEPRUEFT am echten Geraet: Abziehen, Umstellen des Standardformats,
+// Wechsel des Standardgeraets.
 
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
@@ -57,6 +49,11 @@ const NEU_MS: u64 = 500;
 /// So oft schauen wir nach, ob Windows inzwischen ein anderes Standardgeraet
 /// hat.
 const STANDARD_PRUEFEN: Duration = Duration::from_secs(1);
+/// Laeuft ein Geraet mindestens so lange, gilt der naechste Verlust wieder
+/// als neu und kommt ins Protokoll. Kuerzer: derselbe Grund wie zuletzt wird
+/// nur gezaehlt - ein Geraet, das sich oeffnen laesst, aber nie ein Ereignis
+/// liefert, schriebe sonst alle 2,5 s zwei Zeilen, ohne Ende.
+const STABIL: Duration = Duration::from_secs(30);
 
 // Als Zahlen hingeschrieben, damit wir kein weiteres Modul der windows-Kiste
 // freischalten muessen.
@@ -163,7 +160,7 @@ unsafe fn lauf_com(
     let aufzaehler: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
         .map_err(|e| format!("Geraeteliste: {e}"))?;
     let mut wasapi = Wasapi { aufzaehler, rate, kanaele };
-    betreiben(&mut wasapi, geteilt, tx, Duration::from_millis(NEU_MS), &mut |z| crate::protokoll::zeile(z))
+    betreiben(&mut wasapi, geteilt, tx, Duration::from_millis(NEU_MS), STABIL, &mut |z| crate::protokoll::zeile(z))
 }
 
 // ------------------------------------------------------------------ Wiederaufbau
@@ -192,25 +189,54 @@ trait Treiber {
 /// derselbe Fehler nur einmal in Folge. Solange kein Geraet offen ist, gibt es
 /// keinen Ring: push() verwirft dann, es staut sich nichts, und die Anzeige
 /// zeigt 0 ms Vorlauf.
+///
+/// Das Protokoll hat keine Groessengrenze, also bleibt auch ein Geraet, das
+/// immer wieder gleich verloren geht, bei wenigen Zeilen: kommt derselbe Grund
+/// wie zuletzt, bevor das Geraet `stabil` lang lief, wird er nur gezaehlt
+/// (auch "wieder offen" entfaellt dann), und die Zahl steht einmal da, wenn die
+/// Folge endet - anderer Grund, stabiler Lauf oder Ende des Ausgangs.
 fn betreiben<T: Treiber>(
     t: &mut T,
     geteilt: &Geteilt,
     tx: &mpsc::Sender<Result<(), String>>,
     pause: Duration,
+    stabil: Duration,
     melden: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let mut geraet = t.oeffnen(geteilt)?;
     let _ = tx.send(Ok(()));
+    // Zuletzt protokollierter Verlustgrund und wie oft er seitdem still
+    // wiederkam; zuletzt protokollierter Oeffnungsfehler.
+    let mut folge: Option<(String, u32)> = None;
+    let mut zuletzt: Option<String> = None;
     loop {
+        let seit = Instant::now();
         let Some(grund) = t.pumpen(&geraet, geteilt) else {
+            folge_abschliessen(&mut folge, melden);
             return Ok(());
         };
+        let lief_stabil = seit.elapsed() >= stabil;
         *sperre(&geteilt.ring) = None;
         drop(geraet);
-        melden(format!("Ton: {grund} - Ausgabegeraet wird neu geoeffnet"));
-        let mut zuletzt: Option<String> = None;
+        if lief_stabil {
+            folge_abschliessen(&mut folge, melden);
+        }
+        let mut still = match folge.as_mut() {
+            Some((alt, n)) if *alt == grund => {
+                *n += 1;
+                true
+            }
+            _ => false,
+        };
+        if !still {
+            folge_abschliessen(&mut folge, melden);
+            melden(format!("Ton: {grund} - Ausgabegeraet wird neu geoeffnet"));
+            folge = Some((grund, 0));
+            zuletzt = None;
+        }
         geraet = loop {
             if warten(geteilt, pause) {
+                folge_abschliessen(&mut folge, melden);
                 return Ok(());
             }
             match t.oeffnen(geteilt) {
@@ -219,11 +245,26 @@ fn betreiben<T: Treiber>(
                     if zuletzt.as_deref() != Some(e.as_str()) {
                         melden(format!("Ton: Ausgabegeraet oeffnen: {e}"));
                         zuletzt = Some(e);
+                        // Wer den Fehler liest, soll auch lesen, dass es
+                        // danach wieder ging.
+                        still = false;
                     }
                 }
             }
         };
-        melden("Ton: Ausgabegeraet wieder offen".into());
+        if !still {
+            melden("Ton: Ausgabegeraet wieder offen".into());
+        }
+    }
+}
+
+/// Eine Folge gleicher Verluste abschliessen: stehen stille Wiederholungen
+/// aus, ihre Zahl einmal ins Protokoll.
+fn folge_abschliessen(folge: &mut Option<(String, u32)>, melden: &mut dyn FnMut(String)) {
+    if let Some((grund, n)) = folge.take() {
+        if n > 0 {
+            melden(format!("Ton: derselbe Verlust ({grund}) noch {n}-mal, nicht einzeln protokolliert"));
+        }
     }
 }
 
@@ -508,9 +549,19 @@ mod tests {
     }
 
     fn lauf_mit(t: &mut Attrappe, geteilt: &Geteilt, pause: Duration) -> (Result<(), String>, Vec<Result<(), String>>, Vec<String>) {
+        // stabil = 0: jeder Lauf gilt als stabil, jeder Verlust als neu.
+        lauf_stabil(t, geteilt, pause, Duration::ZERO)
+    }
+
+    fn lauf_stabil(
+        t: &mut Attrappe,
+        geteilt: &Geteilt,
+        pause: Duration,
+        stabil: Duration,
+    ) -> (Result<(), String>, Vec<Result<(), String>>, Vec<String>) {
         let (tx, rx) = mpsc::channel();
         let mut zeilen = Vec::new();
-        let ergebnis = betreiben(t, geteilt, &tx, pause, &mut |z| zeilen.push(z));
+        let ergebnis = betreiben(t, geteilt, &tx, pause, stabil, &mut |z| zeilen.push(z));
         (ergebnis, rx.try_iter().collect(), zeilen)
     }
 
@@ -568,6 +619,68 @@ mod tests {
         assert_eq!(gemeldet.len(), 1);
         assert_eq!(t.versuche, 3);
         assert_eq!(zeilen.iter().filter(|z| z.ends_with("wieder offen")).count(), 2);
+    }
+
+    /// Ein Geraet, das sich oeffnen laesst, aber immer gleich wieder verloren
+    /// geht (etwa nie ein Ereignis liefert): der Grund steht einmal da, die
+    /// Wiederholungen nur als Zahl am Ende der Folge. Ein anderer Grund oder
+    /// ein stabiler Lauf beendet die Folge.
+    #[test]
+    fn gleicher_verlust_nur_gezaehlt() {
+        const G: &str = "kein Geraeteereignis seit 2000 ms";
+        let neu = format!("Ton: {G} - Ausgabegeraet wird neu geoeffnet");
+        let offen = "Ton: Ausgabegeraet wieder offen".to_string();
+
+        // Fuenfmal derselbe Grund, nie stabil: drei Zeilen statt zehn.
+        let geteilt = Geteilt::neu();
+        let mut t = Attrappe::neu(vec![Ok(()); 6], vec![G; 5]);
+        let (ergebnis, gemeldet, zeilen) =
+            lauf_stabil(&mut t, &geteilt, Duration::from_millis(1), Duration::from_secs(3600));
+        assert_eq!(ergebnis, Ok(()));
+        assert_eq!(gemeldet, vec![Ok(())]);
+        assert_eq!(t.versuche, 6);
+        assert_eq!(t.ring_beim_versuch, vec![false; 6]);
+        assert_eq!(
+            zeilen,
+            vec![
+                neu.clone(),
+                offen.clone(),
+                format!("Ton: derselbe Verlust ({G}) noch 4-mal, nicht einzeln protokolliert"),
+            ]
+        );
+
+        // Dazwischen ein anderer Grund: die Folge endet mit ihrer Zahl, der
+        // neue Grund steht da, und danach ist der alte wieder neu. Ein
+        // Oeffnungsfehler mitten in einer stillen Folge kommt ins Protokoll -
+        // und dann auch, dass es wieder ging.
+        let geteilt = Geteilt::neu();
+        let mut t = Attrappe::neu(
+            vec![Ok(()), Ok(()), Err("weg"), Ok(()), Ok(()), Ok(())],
+            vec![G, G, "anderes Standardgeraet", G],
+        );
+        let (ergebnis, _, zeilen) =
+            lauf_stabil(&mut t, &geteilt, Duration::from_millis(1), Duration::from_secs(3600));
+        assert_eq!(ergebnis, Ok(()));
+        assert_eq!(
+            zeilen,
+            vec![
+                neu.clone(),
+                offen.clone(),
+                "Ton: Ausgabegeraet oeffnen: weg".to_string(),
+                offen.clone(),
+                format!("Ton: derselbe Verlust ({G}) noch 1-mal, nicht einzeln protokolliert"),
+                "Ton: anderes Standardgeraet - Ausgabegeraet wird neu geoeffnet".to_string(),
+                offen.clone(),
+                neu.clone(),
+                offen.clone(),
+            ]
+        );
+
+        // Lief das Geraet jedes Mal stabil, ist jeder Verlust wieder neu.
+        let geteilt = Geteilt::neu();
+        let mut t = Attrappe::neu(vec![Ok(()); 3], vec![G; 2]);
+        let (_, _, zeilen) = lauf_mit(&mut t, &geteilt, Duration::from_millis(1));
+        assert_eq!(zeilen, vec![neu.clone(), offen.clone(), neu, offen]);
     }
 
     /// Kommt kein Geraet wieder, wird weiter versucht - bis der Ausgang endet
