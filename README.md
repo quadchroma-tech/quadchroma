@@ -181,8 +181,8 @@ Ein Zuschauer zur Zeit: Verbindet sich ein anderes gekoppeltes Gerät, übernimm
 es die Sitzung. Das bisherige bekommt vorher Nachricht 10, zeigt "Ein anderes
 Gerät hat die Sitzung übernommen." und verbindet sich nicht von selbst neu. Der
 neue Zuschauer erbt nichts vom alten: Ein Testbild endet, und er bekommt auch bei
-stillem Bildschirm gleich ein erstes Bild (Ausnahme: der Software-Encoder des
-Windows-Hosts, siehe `BENUTZUNG.txt`).
+stillem Bildschirm gleich ein erstes Bild (Ausnahme ohne feste Bildrate: der
+Software-Encoder `h264_mf` des Windows-Hosts, siehe `BENUTZUNG.txt`).
 
 Auf der Mac-Seite ist das Muster eigens umgesetzt (rund 400 Zeilen C auf
 Monocypher), auf der Windows-Seite kommt die bekannte Rust-Umsetzung zum

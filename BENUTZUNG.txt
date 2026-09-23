@@ -82,17 +82,20 @@ und Tasten nicht.
 
 Protokoll der Hosts: Zeilen, die jeder im Netz ohne Kopplung ausloesen
 kann - gescheiterter Handschlag, unbekannte Gegenstelle, kaputte oder nicht
-speicherbare Freigabeliste, Eingabekanal ohne Bild -, stehen gedrosselt
-da: die erste sofort, danach hoechstens alle 10 s eine derselben Art.
+speicherbare Freigabeliste, Eingabekanal ohne Bild, beim Windows-Host auch
+volle Handschlagplaetze -, stehen gedrosselt da: die erste sofort, danach
+hoechstens alle 10 s eine derselben Art.
 Der Mac-Host zaehlt dabei je Art und Adresse (vier Adressen je Art,
 weitere gemeinsam) und haengt die Zahl an ("<Zeile> - dazu N weitere von
 dieser Adresse seit der letzten Meldung"); was danach nicht mehr kommt,
 steht nach der Frist als Sammelzeile da ("<Art>: N weitere von <IP> seit
 der letzten Meldung" bzw. "<Art>: N weitere von anderen Adressen seit der
-letzten Meldung, zuletzt von <IP>"). Der Windows-Host zaehlt nur je Art
-und haengt die Zahl an die naechste Zeile derselben Art ("(und N weitere
-seit der letzten Meldung)"). "Neue Gegenstelle gekoppelt" und "Zuschauer
-verbunden" stehen immer da.
+letzten Meldung, zuletzt von <IP>"). Der Windows-Host zaehlt nur je Art,
+ueber alle Adressen hinweg, und haengt die Zahl an die naechste Zeile
+derselben Art ("(und N weitere seit der letzten Meldung)"); die Adresse
+darin ist die dieser Zeile, die mitgezaehlten koennen von anderen Adressen
+stammen. "Neue Gegenstelle gekoppelt" und "Zuschauer verbunden" stehen
+immer da.
 
 Beide Hosts begrenzen ihr Protokoll auf 8 MB. Der Mac-Host schiebt
 /tmp/quadchroma-m1.log dann nach /tmp/quadchroma-m1.alt.log (ein
@@ -323,7 +326,8 @@ Ohne feste Bildrate reichen beide Hosts ein ausgelassenes letztes Bild
 nach: fiel das neueste Bild als "zu schnell", im Stau oder bei vollem
 Encoder weg und kam eine Bildzeit lang kein neueres, geht es doch noch in
 den Encoder - endet eine Bewegung so, steht beim Zuschauer trotzdem das
-Endbild. Im Stau wartet es, bis die Leitung wieder frei ist. Der Mac-Host
+Endbild (Ausnahme: der Software-Encoder h264_mf des Windows-Hosts, siehe
+dort). Im Stau wartet es, bis die Leitung wieder frei ist. Der Mac-Host
 misst die Bildzeit ab der Ankunft des letzten Bildes und zaehlt es in der
 Fuenf-Sekunden-Zeile als "nachgereicht"; der Windows-Host zaehlt es unter
 "nachgelegt", ohne eigene Zeile. Nachgereichte Bilder zaehlen nicht zur
@@ -668,11 +672,13 @@ Koennensliste als Software gefuehrt. Der haelt bauartbedingt 16 Bilder
 zurueck (bei 60 Bildern je Sekunde rund 300 ms) - das reicht, um die
 ganze Kette Duplication -> Encoder -> Zuschauer zu pruefen, nicht fuer den
 Betrieb. Weil er ein Bild erst nach weiteren Eingaben herausgibt, kommt
-ohne feste Bildrate ein einmal nachgelegtes Bild (neuer Zuschauer, Ende
-einer Bewegung, "Testbild aus") erst mit den naechsten Aenderungen auf dem
-Desktop beim Zuschauer an. Die Duplication braucht die Konsolensitzung; in
-einer RDP-Sitzung gibt es keinen DXGI-Ausgang ("Duplication nicht
-moeglich").
+ohne feste Bildrate, was vor einer Ruhepause zuletzt in den Encoder ging,
+erst mit den naechsten Aenderungen auf dem Desktop beim Zuschauer an: ein
+neuer Zuschauer sieht bei stillem Desktop gar kein Bild, vom Ende einer
+Bewegung fehlen die letzten Bilder samt Endbild, und ein nach "Testbild
+aus" nachgelegtes Bild bleibt ebenso stecken. Mit fester Bildrate tritt
+das nicht auf. Die Duplication braucht die Konsolensitzung; in einer
+RDP-Sitzung gibt es keinen DXGI-Ausgang ("Duplication nicht moeglich").
 
 Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
 meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es
@@ -720,7 +726,9 @@ zugestellt: <Fehler>".
 Der neue Zuschauer erbt nichts vom alten: ein Testbild endet ("Testbild
 aus (Zuschauer gewechselt)"), eine laufende Meldung "kein Bildschirm"
 bekommt er erneut, und der Host legt ihm das letzte Bild einmal nach, auch
-bei stillem Desktop ("Takt: letztes Bild nachgelegt (neuer Zuschauer)").
+bei stillem Desktop ("Takt: letztes Bild nachgelegt (neuer Zuschauer)";
+mit h264_mf ohne feste Bildrate kommt es erst mit der naechsten Aenderung
+an, siehe oben).
 
 Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
 laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.
