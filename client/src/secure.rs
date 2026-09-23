@@ -12,6 +12,75 @@ use std::time::{Duration, Instant};
 
 pub const CHUNK_MAX: usize = 65519;
 
+/// Was an Leitung und Ablage schiefgehen kann, so dass es der Nutzer zu
+/// sehen bekommt. Die Oberflaeche macht daraus einen Satz in seiner Sprache
+/// (main.rs, `Meldung`); `Display` ist der deutsche Text mit allen
+/// Einzelheiten - fuers Protokoll, und fuer die Host-Rolle, die nur
+/// protokolliert.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fehler {
+    /// Kein Ablageordner (APPDATA/HOME fehlt, Ordner nicht anzulegen).
+    Ablage(String),
+    /// Schluesseldatei vorhanden, aber mit falscher Laenge.
+    SchluesselBeschaedigt { pfad: PathBuf, laenge: usize },
+    /// Datei vorhanden, aber nicht lesbar (Rechte, Sperre durch ein
+    /// anderes Programm). `grund` ist der Wortlaut des Systems.
+    Unlesbar { pfad: PathBuf, grund: String },
+    /// Vertrauensliste vorhanden, aber kein UTF-8 (etwa als ANSI gespeichert).
+    KeinUtf8 { pfad: PathBuf },
+    /// Schreiben gescheitert (neuer Schluessel, neuer Eintrag).
+    Schreiben { pfad: PathBuf, grund: String },
+    /// Der Fingerabdruck einer bekannten Adresse hat sich geaendert;
+    /// `fingerabdruck` ist der neue, `pfad` die Liste mit dem alten.
+    FingerabdruckGeaendert { host: String, fingerabdruck: String, pfad: PathBuf },
+    /// Die Adresse ergibt kein Ziel; `grund` ist der Wortlaut des Systems,
+    /// None: aufgeloest, aber ohne eine einzige Adresse.
+    Adresse { addr: String, grund: Option<String> },
+    /// Die Verbindung kam nicht zustande; `art` sagt, warum (abgelehnt,
+    /// keine Antwort, Netz nicht erreichbar ...).
+    Verbindung { addr: String, art: std::io::ErrorKind, grund: String },
+    /// Der Handschlag scheiterte; `frist`: die Gegenstelle hat nicht
+    /// rechtzeitig geantwortet.
+    Handschlag { grund: String, frist: bool },
+}
+
+impl std::fmt::Display for Fehler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fehler::Ablage(g) => write!(f, "{g}"),
+            Fehler::SchluesselBeschaedigt { pfad, laenge } => write!(
+                f,
+                "{} ist beschaedigt ({laenge} statt 64 Byte) und wird nicht ueberschrieben. \
+                 Datei pruefen oder loeschen - dann entsteht ein neuer Schluessel.",
+                pfad.display()
+            ),
+            Fehler::Unlesbar { pfad, grund } => write!(f, "{} nicht lesbar: {grund}", pfad.display()),
+            Fehler::KeinUtf8 { pfad } => write!(f, "{} ist kein UTF-8", pfad.display()),
+            Fehler::Schreiben { pfad, grund } => write!(f, "{} nicht zu schreiben: {grund}", pfad.display()),
+            Fehler::FingerabdruckGeaendert { host, fingerabdruck, pfad } => write!(
+                f,
+                "Der Fingerabdruck von {host} hat sich geaendert (jetzt {fingerabdruck}). Verbindung abgelehnt. \
+                 Wenn der Host neu aufgesetzt wurde, den Eintrag in {} loeschen.",
+                pfad.display()
+            ),
+            Fehler::Adresse { addr, grund: Some(g) } => write!(f, "Adresse {addr}: {g}"),
+            Fehler::Adresse { addr, grund: None } => write!(f, "Adresse {addr} ergibt kein Ziel"),
+            Fehler::Verbindung { addr, grund, .. } => write!(f, "Verbindung zu {addr}: {grund}"),
+            Fehler::Handschlag { grund, .. } => write!(f, "Handschlag: {grund}"),
+        }
+    }
+}
+
+/// Wer nur protokolliert (Host-Rolle, Freigabeliste), nimmt den Text.
+impl From<Fehler> for String {
+    fn from(f: Fehler) -> String {
+        f.to_string()
+    }
+}
+
+/// Woran ein Handschlag erkennt, dass seine Frist ablief (siehe `Rahmen`).
+const FRIST_ABGELAUFEN: &str = "Frist fuer den Handschlag abgelaufen";
+
 /// Frist fuer den GANZEN Handschlag, nicht je Leseaufruf. Eine Frist je
 /// Aufruf haelt ein Gegenueber, das alle zwei Sekunden ein Byte schickt,
 /// jedes Mal ein - und bindet den Annehmenden damit stundenlang. Der
@@ -32,7 +101,7 @@ impl Rahmen<'_> {
     fn rest(&self) -> Result<Duration, String> {
         let r = self.frist.saturating_duration_since(Instant::now());
         if r.is_zero() {
-            return Err("Frist fuer den Handschlag abgelaufen".into());
+            return Err(FRIST_ABGELAUFEN.into());
         }
         Ok(r)
     }
@@ -47,7 +116,7 @@ impl Rahmen<'_> {
                 Ok(n) => fertig += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                    return Err(format!("{was}: Frist fuer den Handschlag abgelaufen"))
+                    return Err(format!("{was}: {FRIST_ABGELAUFEN}"))
                 }
                 Err(e) => return Err(format!("{was}: {e}")),
             }
@@ -85,28 +154,33 @@ pub struct Secure {
 
 impl Secure {
     /// Verbindet und fuehrt den Handschlag als Anrufer.
-    pub fn connect(addr: &str, prologue: &[u8]) -> Result<Secure, String> {
+    pub fn connect(addr: &str, prologue: &[u8]) -> Result<Secure, Fehler> {
         // Mit Frist verbinden. Ohne sie haengt ein Aufruf an einer toten
         // Adresse gut zwanzig Sekunden - und wenn das im Fensterfaden
         // passiert, steht so lange die ganze Oberflaeche.
+        let adresse = |grund: Option<String>| Fehler::Adresse { addr: addr.to_string(), grund };
         let ziel = addr
             .to_socket_addrs()
-            .map_err(|e| format!("Adresse {addr}: {e}"))?
+            .map_err(|e| adresse(Some(e.to_string())))?
             .next()
-            .ok_or_else(|| format!("Adresse {addr} ergibt kein Ziel"))?;
-        let sock = TcpStream::connect_timeout(&ziel, Duration::from_secs(2))
-            .map_err(|e| format!("Verbindung zu {addr}: {e}"))?;
+            .ok_or_else(|| adresse(None))?;
+        let sock = TcpStream::connect_timeout(&ziel, Duration::from_secs(2)).map_err(|e| Fehler::Verbindung {
+            addr: addr.to_string(),
+            art: e.kind(),
+            grund: e.to_string(),
+        })?;
         sock.set_nodelay(true).ok();
         Secure::wrap(sock, prologue)
     }
 
-    pub fn wrap(sock: TcpStream, prologue: &[u8]) -> Result<Secure, String> {
+    pub fn wrap(sock: TcpStream, prologue: &[u8]) -> Result<Secure, Fehler> {
         let (priv_key, _pub_key) = identity()?;
         // Waehrend des Handschlags gilt eine Frist. Danach wird sie wieder
         // aufgehoben: der Bildkanal darf beliebig lange still sein, ohne dass
         // daraus ein Fehler wird.
         let r = Rahmen { sock: &sock, frist: Instant::now() + FRIST_ANRUFER };
-        let s = noise::handshake_initiator(&priv_key, prologue, |b| r.recv(b), |d| r.send(d))?;
+        let s = noise::handshake_initiator(&priv_key, prologue, |b| r.recv(b), |d| r.send(d))
+            .map_err(|grund| Fehler::Handschlag { frist: grund.contains(FRIST_ABGELAUFEN), grund })?;
         sock.set_read_timeout(None).ok();
         sock.set_write_timeout(None).ok();
         let sas = noise::sas(&s.handshake_hash);
@@ -252,34 +326,28 @@ fn basis_ordner() -> Result<PathBuf, String> {
 }
 
 /// Dauerhafter eigener Schluessel. Entsteht beim ersten Start.
-pub fn identity() -> Result<(Vec<u8>, Vec<u8>), String> {
+pub fn identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     // Im Ablauf stehen privater und oeffentlicher Teil hintereinander, damit
     // beim Start nichts nachgerechnet werden muss.
-    schluessel_laden(&config_dir()?.join("client.key"))
+    schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("client.key"))
 }
 
 /// Liest einen Schluessel (64 Byte: privat, dann oeffentlich) oder legt ihn
 /// an - aber NUR, wenn die Datei fehlt. Ist sie unlesbar oder hat sie die
 /// falsche Laenge, bleibt sie liegen: ein stilles Ueberschreiben machte aus
 /// einem Dateifehler eine neue Identitaet, und jede Kopplung waere weg.
-fn schluessel_laden(path: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn schluessel_laden(path: &Path) -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     match std::fs::read(path) {
         Ok(b) if b.len() == 64 => return Ok((b[..32].to_vec(), b[32..].to_vec())),
-        Ok(b) => {
-            return Err(format!(
-                "{} ist beschaedigt ({} statt 64 Byte) und wird nicht ueberschrieben. \
-                 Datei pruefen oder loeschen - dann entsteht ein neuer Schluessel.",
-                path.display(),
-                b.len()
-            ))
-        }
+        Ok(b) => return Err(Fehler::SchluesselBeschaedigt { pfad: path.to_path_buf(), laenge: b.len() }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{} nicht lesbar: {e}", path.display())),
+        Err(e) => return Err(Fehler::Unlesbar { pfad: path.to_path_buf(), grund: e.to_string() }),
     }
-    let (priv_key, pub_key) = noise::keypair()?;
+    let schreiben = |grund: String| Fehler::Schreiben { pfad: path.to_path_buf(), grund };
+    let (priv_key, pub_key) = noise::keypair().map_err(schreiben)?;
     let mut both = priv_key.clone();
     both.extend_from_slice(&pub_key);
-    geheim_schreiben(path, &both).map_err(|e| format!("Schluessel schreiben: {e}"))?;
+    geheim_schreiben(path, &both).map_err(|e| schreiben(e.to_string()))?;
     Ok((priv_key, pub_key))
 }
 
@@ -313,21 +381,20 @@ fn geheim_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
 /// unlesbare Liste aus wie der allererste Start, und der Erstkontakt nahme
 /// die naechste fremde Gegenstelle auf. Ein fuehrendes BOM (Editor "UTF-8
 /// mit BOM") wird uebergangen - sonst traefe die erste Zeile nie.
-fn liste_lesen(path: &Path) -> Result<String, String> {
+fn liste_lesen(path: &Path) -> Result<String, Fehler> {
     liste_lesen_falls_da(path).map(Option::unwrap_or_default)
 }
 
 /// Wie `liste_lesen`, aber eine fehlende Datei ergibt None statt eines
 /// leeren Texts - fuer die Freigabeliste, bei der "leer" und "fehlt" nicht
 /// dasselbe heissen.
-fn liste_lesen_falls_da(path: &Path) -> Result<Option<String>, String> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+fn liste_lesen_falls_da(path: &Path) -> Result<Option<String>, Fehler> {
     let b = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{name} nicht lesbar: {e}")),
+        Err(e) => return Err(Fehler::Unlesbar { pfad: path.to_path_buf(), grund: e.to_string() }),
     };
-    let text = String::from_utf8(b).map_err(|_| format!("{name} ist kein UTF-8"))?;
+    let text = String::from_utf8(b).map_err(|_| Fehler::KeinUtf8 { pfad: path.to_path_buf() })?;
     Ok(Some(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)))
 }
 
@@ -353,15 +420,16 @@ fn liste_anhaengen(path: &Path, bisher: &str, zeile: &str) -> std::io::Result<()
 
 /// Merkt sich den Schluessel eines Hosts. Gibt Err zurueck, wenn sich der
 /// Fingerabdruck einer bekannten Adresse geaendert hat - dann stimmt etwas nicht.
-/// Ebenso, wenn known_hosts.txt vorhanden, aber nicht lesbar ist.
-pub fn check_known_host(addr: &str, peer: &[u8]) -> Result<bool, String> {
-    known_host_pruefen(&config_dir()?.join("known_hosts.txt"), addr, peer)
+/// Ebenso, wenn known_hosts.txt vorhanden, aber nicht lesbar ist: dann wird
+/// nicht verbunden.
+pub fn check_known_host(addr: &str, peer: &[u8]) -> Result<bool, Fehler> {
+    known_host_pruefen(&config_dir().map_err(Fehler::Ablage)?.join("known_hosts.txt"), addr, peer)
 }
 
-fn known_host_pruefen(path: &Path, addr: &str, peer: &[u8]) -> Result<bool, String> {
+fn known_host_pruefen(path: &Path, addr: &str, peer: &[u8]) -> Result<bool, Fehler> {
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr).to_string();
     let hex: String = peer.iter().map(|b| format!("{b:02x}")).collect();
-    let text = liste_lesen(path).map_err(|e| format!("{e} - Verbindung abgelehnt"))?;
+    let text = liste_lesen(path)?;
     for line in text.lines() {
         let mut it = line.split_whitespace();
         let (Some(h), Some(k)) = (it.next(), it.next()) else { continue };
@@ -369,14 +437,15 @@ fn known_host_pruefen(path: &Path, addr: &str, peer: &[u8]) -> Result<bool, Stri
             if k == hex {
                 return Ok(false); // bekannt und unveraendert
             }
-            return Err(format!(
-                "Der Fingerabdruck von {host} hat sich geaendert. Verbindung abgelehnt. \
-                 Wenn der Host neu aufgesetzt wurde, den Eintrag in known_hosts.txt loeschen."
-            ));
+            return Err(Fehler::FingerabdruckGeaendert {
+                host,
+                fingerabdruck: noise::fingerprint(peer),
+                pfad: path.to_path_buf(),
+            });
         }
     }
     liste_anhaengen(path, &text, &format!("{host} {hex} {}", noise::fingerprint(peer)))
-        .map_err(|e| format!("known_hosts: {e}"))?;
+        .map_err(|e| Fehler::Schreiben { pfad: path.to_path_buf(), grund: e.to_string() })?;
     Ok(true) // erstmals gesehen
 }
 
@@ -391,8 +460,8 @@ fn known_host_pruefen(path: &Path, addr: &str, peer: &[u8]) -> Result<bool, Stri
 // damit der eigene Fingerabdruck ohne Nachrechnen im Protokoll stehen kann.
 
 /// Dauerhafter Schluessel des Hosts. Entsteht beim ersten Start.
-pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), String> {
-    schluessel_laden(&config_dir()?.join("host.key"))
+pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
+    schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("host.key"))
 }
 
 fn hex(peer: &[u8]) -> String {
@@ -534,7 +603,11 @@ mod tests {
         let p = d.join("known_hosts.txt");
         std::fs::write(&p, format!("\u{feff}10.0.0.5 {} x\n", hex(&A))).unwrap();
         let e = known_host_pruefen(&p, "10.0.0.5:9001", &C).unwrap_err();
-        assert!(e.contains("geaendert"), "{e}");
+        assert_eq!(
+            e,
+            Fehler::FingerabdruckGeaendert { host: "10.0.0.5".into(), fingerabdruck: noise::fingerprint(&C), pfad: p.clone() }
+        );
+        assert!(e.to_string().contains("geaendert"), "{e}");
         assert_eq!(known_host_pruefen(&p, "10.0.0.5:9001", &A), Ok(false));
     }
 

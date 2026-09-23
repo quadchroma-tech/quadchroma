@@ -505,6 +505,96 @@ impl Bild {
     }
 }
 
+/// Eine Meldung fuer die Oberflaeche. Der Satz kommt aus den Sprachtabellen
+/// (Schluessel; die Platzhalter {n}, {m} und {p} werden eingesetzt),
+/// dahinter darf in Klammern ein technischer Anhang roh stehen - der
+/// Wortlaut von FFmpeg oder vom System, den niemand uebersetzen kann.
+/// `protokoll` ist derselbe Fall auf Deutsch mit allen Einzelheiten, fuer
+/// protokoll.txt und den Pruefmodus.
+#[derive(Clone, Debug, PartialEq)]
+struct Meldung {
+    key: strings::Key,
+    werte: Vec<(&'static str, String)>,
+    anhang: Option<String>,
+    protokoll: String,
+}
+
+impl Meldung {
+    fn neu(key: strings::Key, protokoll: impl Into<String>) -> Meldung {
+        Meldung { key, werte: Vec::new(), anhang: None, protokoll: protokoll.into() }
+    }
+
+    /// Wert fuer einen Platzhalter ("{n}", "{m}", "{p}").
+    fn mit(mut self, platzhalter: &'static str, wert: impl Into<String>) -> Meldung {
+        self.werte.push((platzhalter, wert.into()));
+        self
+    }
+
+    fn anhang(mut self, anhang: impl Into<String>) -> Meldung {
+        self.anhang = Some(anhang.into());
+        self
+    }
+
+    /// Der Text in dieser Sprache: Platzhalter ersetzt, Anhang in Klammern.
+    fn text(&self, lang: &strings::Lang) -> String {
+        let mut t = lang.get(self.key).to_string();
+        for (p, w) in &self.werte {
+            t = t.replace(p, w);
+        }
+        match &self.anhang {
+            Some(a) => format!("{t} ({a})"),
+            None => t,
+        }
+    }
+}
+
+/// Fehler von Leitung und Ablage in Worten der Oberflaeche. Der Wortlaut des
+/// Systems bleibt als Anhang, wo er etwas sagt; alles andere steht mit
+/// Einzelheiten im Protokoll.
+impl From<secure::Fehler> for Meldung {
+    fn from(f: secure::Fehler) -> Meldung {
+        use secure::Fehler as F;
+        use std::io::ErrorKind;
+        use strings::Key::*;
+        let protokoll = f.to_string();
+        match f {
+            F::Ablage(_) => Meldung::neu(StorageUnavailable, protokoll),
+            F::SchluesselBeschaedigt { pfad, .. } => {
+                Meldung::neu(KeyFileDamaged, protokoll).mit("{p}", pfad.display().to_string())
+            }
+            F::Unlesbar { pfad, grund } => {
+                Meldung::neu(FileUnreadable, protokoll).mit("{p}", pfad.display().to_string()).anhang(grund)
+            }
+            F::KeinUtf8 { pfad } => Meldung::neu(FileNotUtf8, protokoll).mit("{p}", pfad.display().to_string()),
+            F::Schreiben { pfad, grund } => {
+                Meldung::neu(FileNotWritable, protokoll).mit("{p}", pfad.display().to_string()).anhang(grund)
+            }
+            F::FingerabdruckGeaendert { host, fingerabdruck, pfad } => Meldung::neu(HostKeyChanged, protokoll)
+                .mit("{n}", host)
+                .mit("{m}", fingerabdruck)
+                .mit("{p}", pfad.display().to_string()),
+            F::Adresse { addr, grund } => {
+                let m = Meldung::neu(ErrorAddress, protokoll).mit("{n}", addr);
+                match grund {
+                    Some(g) => m.anhang(g),
+                    None => m,
+                }
+            }
+            F::Verbindung { art: ErrorKind::ConnectionRefused, .. } => Meldung::neu(ErrorConnectRefused, protokoll),
+            F::Verbindung { art: ErrorKind::TimedOut | ErrorKind::WouldBlock, .. } => Meldung::neu(ErrorTimeout, protokoll),
+            F::Verbindung { grund, .. } => Meldung::neu(ErrorNoConnection, protokoll).anhang(grund),
+            F::Handschlag { frist: true, .. } => Meldung::neu(ErrorTimeout, protokoll),
+            F::Handschlag { .. } => Meldung::neu(ErrorHandshake, protokoll),
+        }
+    }
+}
+
+/// Kein Decoder zu bauen: der Grund (deutsch, mit FFmpegs Worten) geht ins
+/// Protokoll, die Oberflaeche sagt es mit ihrem Schluessel.
+fn kein_decoder(grund: String) -> Meldung {
+    Meldung::neu(strings::Key::ErrorNoDecoder, grund)
+}
+
 #[derive(Default)]
 struct Shared {
     /// Griff an der Bildleitung, um sie beim Trennen von aussen zu kappen.
@@ -534,7 +624,7 @@ struct Shared {
     /// rechnet der Benchmark die Datenrate, die wirklich ankommt.
     bytes_video: u64,
     last_decode_ms: f32,
-    error: Option<String>,
+    error: Option<Meldung>,
     /// Pruefsumme des Bildkanals und Schluessel seines Hosts, immer als Paar.
     /// Der Eingabekanal braucht die Pruefsumme, sonst laesst ihn der Host
     /// nicht herein - und den Schluessel, um zu pruefen, dass am anderen
@@ -657,7 +747,9 @@ fn prozesszeit_100ns() -> Option<u64> {
 /// das neueste Bild ab: lieber eines auslassen als Verzoegerung aufbauen.
 fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
     if let Err(e) = ffmpeg::init() {
-        shared.lock().unwrap().error = Some(format!("FFmpeg-Start fehlgeschlagen: {e}"));
+        let m = Meldung::neu(strings::Key::ErrorFfmpegStart, format!("FFmpeg-Start fehlgeschlagen: {e}")).anhang(e.to_string());
+        protokoll::zeile(m.protokoll.clone());
+        shared.lock().unwrap().error = Some(m);
         return;
     }
     // Im Pruefmodus alles einsammeln, was FFmpeg zu sagen hat; im Fenster
@@ -676,8 +768,12 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             Err(e) => {
                 let mut s = shared.lock().unwrap();
                 // Eine gewollte Trennung kappt die Leitung - der Lesefehler
-                // danach ist kein Fehler und wird nicht angezeigt.
+                // danach ist kein Fehler und wird nicht angezeigt. Dieselbe
+                // Meldung bei jedem neuen Versuch nur einmal ins Protokoll.
                 if s.target.is_some() {
+                    if s.error.as_ref() != Some(&e) {
+                        protokoll::zeile(format!("Verbindung: {}", e.protokoll));
+                    }
                     s.error = Some(e);
                 }
                 s.connected = false;
@@ -1447,7 +1543,9 @@ fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstel
     s.decoder_hinweis = bau.grund.clone();
     if !matches!(wunsch, einstellungen::DecoderWunsch::Automatik | einstellungen::DecoderWunsch::Software) {
         if let Some(g) = &bau.grund {
-            s.error = Some(g.clone());
+            // Der Grund steht schon im Protokoll (bau.meldung) und in der
+            // Decoderzeile der Statistik; die Oberflaeche sagt den Satz.
+            s.error = Some(Meldung::neu(strings::Key::DecoderFallback, g.clone()));
         }
     }
 }
@@ -1527,7 +1625,7 @@ fn decoder_defekt(e: &ffmpeg::Error) -> bool {
     !matches!(e, ffmpeg::Error::Other { errno: ffmpeg::util::error::EAGAIN } | ffmpeg::Error::Eof)
 }
 
-fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), String> {
+fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), Meldung> {
     // Erst der Handschlag, dann erst Nutzdaten. Vorher geht nichts ueber die
     // Leitung, was jemand mitlesen koennte.
     let mut sock = secure::Secure::connect(addr, &noise::prologue_video())?;
@@ -1556,10 +1654,13 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let mut magic = [0u8; 4];
     if sock.read_exact(&mut magic).is_err() {
         shared.lock().unwrap().error_key = Some(strings::Key::NotPaired);
-        return Err(strings::EN.get(strings::Key::NotPaired).to_string());
+        return Err(Meldung::neu(
+            strings::Key::NotPaired,
+            "Host hat die Leitung nach dem Handschlag geschlossen - dieses Geraet ist dort nicht gekoppelt",
+        ));
     }
     if &magic != MAGIC {
-        return Err("Gegenstelle spricht ein anderes Protokoll".into());
+        return Err(Meldung::neu(strings::Key::ErrorProtocol, "Gegenstelle spricht ein anderes Protokoll"));
     }
 
     // Der Host faengt immer mit HEVC an; alles Weitere sagt Nachricht 7.
@@ -1580,7 +1681,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // Host kann laengst auf einem anderen Codec stehen). Der Adapter der
     // Anzeige ist der Kandidat fuer D3D11VA bei Automatik.
     let mut bedarf = DecoderBedarf { h264: false, chroma444: None, anzeige_adapter: shared.lock().unwrap().anzeige_adapter };
-    let mut bau = decoder_bauen(bedarf, wunsch)?;
+    let mut bau = decoder_bauen(bedarf, wunsch).map_err(kein_decoder)?;
     decoder_melden(shared, &bau, wunsch);
     // Nach einem Wechsel darf nichts in den neuen Decoder, bevor das erste
     // Schluesselbild da ist - es traegt die Parametersaetze.
@@ -1671,7 +1772,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             if w != wunsch {
                 wunsch = w;
                 if !wunsch_passt(w, bau.pfad) {
-                    bau = decoder_bauen(bedarf, wunsch)?;
+                    bau = decoder_bauen(bedarf, wunsch).map_err(kein_decoder)?;
                     decoder_melden(shared, &bau, wunsch);
                     warte_auf_schluesselbild = true;
                     ring.clear();
@@ -1690,15 +1791,16 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             }
         }
 
-        sock.read_exact(&mut hdr).map_err(|e| format!("Kopf: {e}"))?;
+        let verloren = |e: String| Meldung::neu(strings::Key::ConnectionLost, e);
+        sock.read_exact(&mut hdr).map_err(|e| verloren(format!("Kopf: {e}")))?;
         let msg_type = hdr[0];
         let flags = hdr[1];
         let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
         if len > 64 * 1024 * 1024 {
-            return Err("unplausible Nachrichtenlaenge".into());
+            return Err(Meldung::neu(strings::Key::ErrorProtocol, "unplausible Nachrichtenlaenge"));
         }
         payload.resize(len, 0);
-        sock.read_exact(&mut payload).map_err(|e| format!("Daten: {e}"))?;
+        sock.read_exact(&mut payload).map_err(|e| verloren(format!("Daten: {e}")))?;
 
         match msg_type {
             MSG_INFO => {
@@ -1718,7 +1820,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     bedarf.chroma444 = Some(i.chroma444);
                     bau.chroma444 = Some(i.chroma444);
                     if neubau {
-                        bau = decoder_bauen(bedarf, wunsch)?;
+                        bau = decoder_bauen(bedarf, wunsch).map_err(kein_decoder)?;
                         decoder_melden(shared, &bau, wunsch);
                         warte_auf_schluesselbild = true;
                         nach_wechsel = true;
@@ -1756,7 +1858,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // 15 zurueckgehaltene Bilder verloren; sauber leeren ist eine spaetere Verfeinerung.
                 bedarf.h264 = w.is_h264;
                 bedarf.chroma444 = Some(w.chroma444);
-                bau = decoder_bauen(bedarf, wunsch)?;
+                bau = decoder_bauen(bedarf, wunsch).map_err(kein_decoder)?;
                 decoder_melden(shared, &bau, wunsch);
                 warte_auf_schluesselbild = true;
                 nach_wechsel = true;
@@ -1912,7 +2014,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // und den Grund festhalten. Der Wunsch bleibt, wie er
                     // war - beim naechsten Codecwechsel wird die Karte wieder
                     // probiert, mit einem anderen Codec kann sie ja gehen.
-                    bau = auf_software(bedarf, grund)?;
+                    bau = auf_software(bedarf, grund).map_err(kein_decoder)?;
                     decoder_melden(shared, &bau, wunsch);
                     ring.clear();
                     mittel = None;
@@ -1940,7 +2042,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     } else {
                         match to_rgb(&decoded) {
                             Ok(f) => (Bild::Rgb(Frame { bereit_us: client_us(), ..f }), None),
-                            Err(e) => (Bild::Rgb(Frame { bereit_us: client_us(), ..dunkles_bild(w, h) }), Some(e)),
+                            Err(e) => {
+                                let m = Meldung::neu(strings::Key::ErrorPixelFormat, e).anhang(format!("{:?}", decoded.format()));
+                                (Bild::Rgb(Frame { bereit_us: client_us(), ..dunkles_bild(w, h) }), Some(m))
+                            }
                         }
                     };
                     let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -2029,7 +2134,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 if bau.pfad.hardware() && bau.format_fehler >= DECODER_FORMAT_FEHLER {
                     let format = letztes_format.map(|f| format!("{f:?}")).unwrap_or_default();
                     let grund = format!("{} ({}) liefert das Format {format}, das der Client nicht wandeln kann", bau.pfad.name(), bau.codec);
-                    bau = auf_software(bedarf, grund)?;
+                    bau = auf_software(bedarf, grund).map_err(kein_decoder)?;
                     decoder_melden(shared, &bau, wunsch);
                     ring.clear();
                     mittel = None;
@@ -2110,7 +2215,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     let ch = payload[4] as u16;
                     match audio::AudioOut::new(rate, ch) {
                         Ok(a) => { sound = Some(a); }
-                        Err(e) => { shared.lock().unwrap().error = Some(format!("Ton: {e}")); }
+                        Err(e) => {
+                            let m = Meldung::neu(strings::Key::ErrorSound, format!("Ton: {e}")).anhang(e);
+                            shared.lock().unwrap().error = Some(m);
+                        }
                     }
                 }
             }
@@ -3556,7 +3664,12 @@ impl ApplicationHandler for App {
                     Err(e) => {
                         protokoll::zeile(format!("Anzeige: Rueckfall auf Software: {e}"));
                         if !matches!(self.anzeige_wunsch, W::Automatik | W::Warp) {
-                            self.shared.lock().unwrap().error = Some(format!("Grafikkarte nicht nutzbar, Anzeige ueber Software: {e}"));
+                            let m = Meldung::neu(
+                                strings::Key::ErrorGpuDisplay,
+                                format!("Grafikkarte nicht nutzbar, Anzeige ueber Software: {e}"),
+                            )
+                            .anhang(e);
+                            self.shared.lock().unwrap().error = Some(m);
                         }
                     }
                 }
@@ -4255,7 +4368,7 @@ impl App {
             }
             let (dec_ms, err) = {
                 let s = self.shared.lock().unwrap();
-                (s.last_decode_ms, s.error.clone())
+                (s.last_decode_ms, s.error.as_ref().map(|m| m.text(self.lang)))
             };
             window.set_title(&match (&self.screen, err) {
                 (Screen::Start, _) => "QuadChroma".to_string(),
@@ -4545,15 +4658,16 @@ impl App {
                 }
             }
         }
-        let meldung = "Grafikkarte verloren - bitte mit --anzeige cpu neu starten";
-        protokoll::zeile(format!("Anzeige: {meldung}"));
+        let meldung = Meldung::neu(strings::Key::ErrorGpuLost, "Grafikkarte verloren - bitte mit --anzeige cpu neu starten");
+        protokoll::zeile(format!("Anzeige: {}", meldung.protokoll));
         self.anzeige = Anzeige::Keine;
+        let titel = format!("QuadChroma - {}", meldung.text(self.lang));
         let mut s = self.shared.lock().unwrap();
         s.gpu_pfad = false;
-        s.error = Some(meldung.into());
+        s.error = Some(meldung);
         drop(s);
         if let Some(w) = &self.window {
-            w.set_title(&format!("QuadChroma - {meldung}"));
+            w.set_title(&titel);
         }
     }
 
@@ -4638,7 +4752,7 @@ impl App {
                     let s = self.shared.lock().unwrap();
                     match s.error_key {
                         Some(k) => Some(self.lang.get(k).to_string()),
-                        None => s.error.clone(),
+                        None => s.error.as_ref().map(|m| m.text(self.lang)),
                     }
                 };
                 n.act = start_screen(&mut self.ui, c, self.lang, &hosts, &self.addr_input, err.as_deref());
@@ -4650,7 +4764,7 @@ impl App {
                         let s = self.shared.lock().unwrap();
                         let f = match s.error_key {
                             Some(k) => Some(self.lang.get(k).to_string()),
-                            None => s.error.clone(),
+                            None => s.error.as_ref().map(|m| m.text(self.lang)),
                         };
                         (s.connected, f, s.sas.clone(), s.info.is_some())
                     };
@@ -4670,7 +4784,7 @@ impl App {
                     let (stats, secure, lat, soll, hostlast, decoder, ausgelassen) = {
                         let s = self.shared.lock().unwrap();
                         (
-                            (s.last_decode_ms, s.info, s.dropped, s.error.clone(), s.connected),
+                            (s.last_decode_ms, s.info, s.dropped, s.error.as_ref().map(|m| m.text(self.lang)), s.connected),
                             (s.sas.clone(), s.peer_fp.clone()),
                             s.latenz(),
                             s.settings.map(|x| x.1 as u32).or_else(|| s.info.map(|i| i.fps)),
@@ -5222,8 +5336,12 @@ fn start_screen(
         action = Action::Quit;
     }
 
+    // Meldungen mit Pfad oder Fingerabdruck sind laenger als eine Zeile -
+    // umbrechen statt am Fensterrand abschneiden.
     if let Some(e) = error {
-        u.text.draw_centered(c, cx, by + 76, e, 13, ui::AMBER, 1);
+        for (i, z) in umbruch(u, e, c.w as i32 - 60, 13).iter().enumerate() {
+            u.text.draw_centered(c, cx, by + 76 + i as i32 * 18, z, 13, ui::AMBER, 1);
+        }
     }
 
     // Fussleiste: zwei Zeilen. Oben die Urheberzeile, darunter Version,
@@ -5813,9 +5931,23 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             seen: Instant::now(),
         },
     ];
+    // "fingerabdruck": der Startbildschirm mit der Meldung, wie sie bei
+    // geaendertem Host-Schluessel dasteht - ueber denselben Schluessel wie im
+    // Betrieb, in der Sprache der Ansicht.
+    let meldung = match view {
+        "fingerabdruck" => Some(
+            Meldung::from(secure::Fehler::FingerabdruckGeaendert {
+                host: "192.168.178.194".into(),
+                fingerabdruck: "9EB4-EC3D-6856-8AF6".into(),
+                pfad: std::path::PathBuf::from("C:\\Users\\Robert\\AppData\\Roaming\\QuadChroma\\known_hosts.txt"),
+            })
+            .text(lang),
+        ),
+        _ => None,
+    };
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
-        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", None);
+        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", meldung.as_deref());
     }
 
     write_bmp(path, w, h, &buf, lang);
@@ -6265,7 +6397,8 @@ fn main() {
             let codec = s.info.map(|i| i.codec_name()).unwrap_or_else(|| "?".into());
             let line = format!(
                 "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Decoder {} | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, pfad, lat, hl, s.error
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, pfad, lat, hl,
+                s.error.as_ref().map(|m| &m.protokoll)
             );
             println!("{line}");
             std::io::stdout().flush().ok();
@@ -7398,6 +7531,67 @@ mod tests {
         l.ensure();
         assert!(t.join().unwrap());
         assert!(l.sock.is_some());
+    }
+
+    /// Fehler von Leitung und Ablage erscheinen ueber Schluessel: in jeder
+    /// Sprache der eigene Satz mit eingesetzten Werten; der deutsche Text mit
+    /// Einzelheiten bleibt fuers Protokoll.
+    #[test]
+    fn meldungen_ueber_schluessel() {
+        use secure::Fehler as F;
+        use strings::Key::*;
+        let pfad = std::path::PathBuf::from("/ablage/known_hosts.txt");
+        let f = F::FingerabdruckGeaendert {
+            host: "10.0.0.5".into(),
+            fingerabdruck: "AAAA-BBBB-CCCC-DDDD".into(),
+            pfad: pfad.clone(),
+        };
+        let m = Meldung::from(f.clone());
+        assert_eq!(m.key, HostKeyChanged);
+        assert_eq!(m.protokoll, f.to_string());
+        assert_eq!(
+            m.text(&strings::EN),
+            "The fingerprint of 10.0.0.5 has changed (now AAAA-BBBB-CCCC-DDDD). Connection refused. \
+             If the host was set up again, delete its line in /ablage/known_hosts.txt."
+        );
+        assert!(m.text(strings::pick("de")).starts_with("Der Fingerabdruck von 10.0.0.5 hat sich geändert (jetzt AAAA-BBBB-CCCC-DDDD)"));
+        // Der Wortlaut des Systems bleibt als Anhang; der Satz davor ist uebersetzt.
+        let m = Meldung::from(F::Unlesbar { pfad: pfad.clone(), grund: "Zugriff verweigert (os error 5)".into() });
+        assert_eq!(
+            m.text(&strings::EN),
+            "/ablage/known_hosts.txt cannot be read – not connecting. (Zugriff verweigert (os error 5))"
+        );
+        // Jede Art hat ihren Schluessel, und kein Platzhalter bleibt offen.
+        use std::io::ErrorKind as E;
+        let faelle = [
+            (F::Ablage("kein Ablageort".into()), StorageUnavailable),
+            (F::SchluesselBeschaedigt { pfad: pfad.clone(), laenge: 10 }, KeyFileDamaged),
+            (F::KeinUtf8 { pfad: pfad.clone() }, FileNotUtf8),
+            (F::Schreiben { pfad: pfad.clone(), grund: "voll".into() }, FileNotWritable),
+            (F::Adresse { addr: "x:9001".into(), grund: None }, ErrorAddress),
+            (F::Verbindung { addr: "a".into(), art: E::ConnectionRefused, grund: "g".into() }, ErrorConnectRefused),
+            (F::Verbindung { addr: "a".into(), art: E::TimedOut, grund: "g".into() }, ErrorTimeout),
+            (F::Verbindung { addr: "a".into(), art: E::AddrNotAvailable, grund: "g".into() }, ErrorNoConnection),
+            (F::Handschlag { grund: "Laenge: Frist fuer den Handschlag abgelaufen".into(), frist: true }, ErrorTimeout),
+            (F::Handschlag { grund: "Decrypt".into(), frist: false }, ErrorHandshake),
+        ];
+        for (f, k) in faelle {
+            let m = Meldung::from(f);
+            assert_eq!(m.key, k);
+            for lang in strings::all() {
+                assert!(!m.text(lang).contains('{'), "{k:?} ({}): {}", lang.code, m.text(lang));
+            }
+        }
+        // Alle neuen Schluessel stehen englisch und deutsch da.
+        for k in [
+            HostKeyChanged, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
+            StorageUnavailable, ErrorAddress, ErrorNoConnection, ErrorHandshake, ErrorFfmpegStart, ErrorSound,
+            ErrorGpuDisplay, ErrorGpuLost, ErrorPixelFormat, DecoderFallback,
+        ] {
+            assert!(strings::EN.table.iter().any(|(x, _)| *x == k), "{k:?} fehlt englisch");
+            assert!(strings::DE.table.iter().any(|(x, _)| *x == k), "{k:?} fehlt deutsch");
+            assert_ne!(strings::EN.get(k), strings::DE.get(k), "{k:?}");
+        }
     }
 
     /// Zwei NVIDIA-Karten, wie DXGI sie meldet (luid 1 = Grafikkarte,
