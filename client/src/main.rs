@@ -546,13 +546,22 @@ impl Meldung {
     }
 
     /// Ein Fehler, der sich mit dem naechsten Versuch nicht von selbst gibt:
-    /// Pin geaendert, Ablage oder Schluesseldatei kaputt, Liste nicht
-    /// les- oder schreibbar. Dann verbindet der Empfangsfaden nicht alle
+    /// Pin geaendert, Ablage oder Schluesseldatei kaputt, Liste kein UTF-8
+    /// oder nicht schreibbar. Dann verbindet der Empfangsfaden nicht alle
     /// 2 s neu, sondern nimmt das Ziel zurueck (wie bei einer Abloesung);
     /// der Nutzer verbindet nach dem Beheben selbst wieder.
+    ///
+    /// "Nicht lesbar" gehoert nicht dazu: das ist oft nur eine kurze Sperre
+    /// (Virenscanner, Sicherung), und client.key wie known_hosts.txt werden
+    /// VOR dem Verbinden gelesen - ein neuer Versuch alle 2 s oeffnet also
+    /// keine Leitung, solange die Sperre besteht, der Host merkt nichts davon,
+    /// und im Protokoll steht es dank der Entdoppelung einmal. (Nur beim
+    /// ersten Kontakt liest HostPin::eintragen die Liste nach dem Handschlag
+    /// noch einmal; scheitert das, haelt der naechste Versuch schon vor dem
+    /// Verbinden an.) Ist die Sperre weg, verbindet der Client von selbst.
     fn dauerhaft(&self) -> bool {
         use strings::Key::*;
-        matches!(self.key, HostKeyChanged | FileUnreadable | FileNotUtf8 | FileNotWritable | KeyFileDamaged | StorageUnavailable)
+        matches!(self.key, HostKeyChanged | FileNotUtf8 | FileNotWritable | KeyFileDamaged | StorageUnavailable)
     }
 
     /// Der Text in dieser Sprache: Platzhalter ersetzt, Anhang in Klammern.
@@ -778,6 +787,29 @@ fn neu_zu_melden(gemeldet: &mut Option<(Meldung, u64)>, e: &Meldung, decoded: u6
     true
 }
 
+/// Eine Sitzung zu `addr` endete mit `e`: anzeigen, protokollieren, bei
+/// einem Dauerfehler das Ziel zuruecknehmen. Nur, solange das Ziel noch
+/// `addr` ist - eine gewollte Trennung kappt die Leitung (der Lesefehler
+/// danach ist kein Fehler), und hat der Nutzer inzwischen einen anderen Host
+/// gewaehlt, gehoert der Fehler nicht zu dem, und dessen Ziel bleibt stehen.
+fn fehler_verbuchen(s: &mut Shared, addr: &str, e: Meldung, gemeldet: &mut Option<(Meldung, u64)>) {
+    s.connected = false;
+    if s.target.as_deref() != Some(addr) {
+        return;
+    }
+    if neu_zu_melden(gemeldet, &e, s.decoded) {
+        protokoll::zeile(format!("Verbindung: {}", e.protokoll));
+    }
+    // Was sich mit dem naechsten Versuch nicht gibt, wird nicht alle 2 s
+    // wiederholt: das Ziel geht zurueck, die Meldung bleibt stehen (siehe
+    // Meldung::dauerhaft).
+    if e.dauerhaft() {
+        protokoll::zeile(format!("Verbindung zu {addr} beendet: der Fehler bleibt bis zur Behebung - kein neuer Versuch"));
+        s.target = None;
+    }
+    s.error = Some(e);
+}
+
 /// Netz- und Decodierschleife. Laeuft in einem eigenen Faden und legt immer nur
 /// das neueste Bild ab: lieber eines auslassen als Verzoegerung aufbauen.
 fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
@@ -810,27 +842,8 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
         // Ohne Sitzung liest der Client die Zwischenablage nicht mehr.
         #[cfg(any(windows, target_os = "macos"))]
         clipboard::sitzung(false);
-        match ergebnis {
-            Ok(()) => {}
-            Err(e) => {
-                let mut s = shared.lock().unwrap();
-                // Eine gewollte Trennung kappt die Leitung - der Lesefehler
-                // danach ist kein Fehler und wird nicht angezeigt.
-                if s.target.is_some() {
-                    if neu_zu_melden(&mut gemeldet, &e, s.decoded) {
-                        protokoll::zeile(format!("Verbindung: {}", e.protokoll));
-                    }
-                    // Was sich mit dem naechsten Versuch nicht gibt, wird
-                    // nicht alle 2 s wiederholt: das Ziel geht zurueck, die
-                    // Meldung bleibt stehen (siehe Meldung::dauerhaft).
-                    if e.dauerhaft() {
-                        protokoll::zeile(format!("Verbindung zu {addr} beendet: der Fehler bleibt bis zur Behebung - kein neuer Versuch"));
-                        s.target = None;
-                    }
-                    s.error = Some(e);
-                }
-                s.connected = false;
-            }
+        if let Err(e) = ergebnis {
+            fehler_verbuchen(&mut shared.lock().unwrap(), &addr, e, &mut gemeldet);
         }
         {
             let mut s = shared.lock().unwrap();
@@ -2713,41 +2726,140 @@ struct InputLink {
     /// weg (neue Adresse, neue Bindung, Trennen), schliesst der Aufbaufaden
     /// eine fertige Leitung selbst wieder.
     aufbau: Option<std::sync::mpsc::Receiver<Aufbau>>,
+    /// Zustandsnachrichten (siehe NACHREICHEN), die ohne stehenden Kanal
+    /// kamen - je Art die letzte, fertig gerahmt. Sie gehen als erste an den
+    /// naechsten Kanal dieser Sitzung.
+    nachreichen: Vec<Vec<u8>>,
+    /// Frist fuer den Schreibfaden, siehe SCHREIBFRIST (Tests kuerzen sie).
+    schreibfrist: Duration,
 }
 
 /// Ergebnis eines Aufbaus: die Leitung oder der Fehler, dazu der
 /// Fingerabdruck, falls am Eingabeport ein fremder Schluessel antwortete.
 type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
 
+/// Nachrichten, die einen Zustand setzen statt ein Ereignis zu melden:
+/// Einstellungen, Codec, Testbild, Zwischenablage. Steht der Kanal gerade
+/// nicht (Aufbau im Hintergrund, Schreibfaden gescheitert), wird je Art die
+/// letzte gemerkt und nachgereicht, sobald er steht - frueher baute das
+/// naechste `send` den Kanal selbst auf und lieferte sie so aus. Maus,
+/// Tasten und Zeitfragen nicht: eine alte Lage oder Frage ist wertlos
+/// (Latenz vor Bandbreite), und gedrueckte Tasten und Maustasten gibt jeder
+/// Host selbst frei, wenn ein Eingabekanal endet oder ersetzt wird
+/// (host/main.m alle_tasten_loslassen, host/netz.rs eingabe_binden und
+/// Ende der Eingabeschleife) - ein verlorenes Loslassen laesst also nichts
+/// haengen.
+const NACHREICHEN: [u8; 4] = [IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP];
+
+/// So lange darf ein Schreibaufruf des Eingabekanals ohne Fortschritt
+/// haengen, dann gilt der Kanal als kaputt und wird neu aufgebaut. Ohne
+/// Frist hinge der Schreibfaden an einer Leitung, die stockt, ohne dass der
+/// Host sie schliesst, bis TCP aufgibt (Minuten), und alles dahinter
+/// wartete mit. Geschrieben wird in Stuecken zu hoechstens einem
+/// Noise-Datensatz (64 KB) - die Frist heisst also "kein Fortschritt", nicht
+/// "4 MB Zwischenablage in 5 s".
+const SCHREIBFRIST: Duration = Duration::from_secs(5);
+
+/// So viele eingereihte Nachrichten nimmt der Schreibfaden hoechstens auf
+/// einmal, um darin Mausbewegungen zusammenzufassen.
+const STAPEL_MAX: usize = 4096;
+
+/// Rahmen einer Eingabenachricht: Art, frei, frei (u16), Laenge (u32), Nutzlast.
+fn eingabe_rahmen(t: u8, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + payload.len());
+    buf.push(t);
+    buf.push(0);
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Aufeinanderfolgende Mausbewegungen eines Stapels: nur die letzte bleibt -
+/// die Lage ist absolut. Nach einem Stocken gingen sonst alle alten Lagen
+/// einzeln hinaus, und der Zeiger fuehre drueben den ganzen Weg nach (frueher
+/// fasste Windows WM_MOUSEMOVE zusammen, solange das blockierende Schreiben
+/// den Fensterfaden aufhielt). Alles andere bleibt in seiner Reihenfolge:
+/// Klicks tragen ihre eigene Lage, und eine Bewegung zwischen zwei Klicks
+/// (Ziehen) bleibt stehen.
+fn bewegungen_zusammenfassen(stapel: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut aus: Vec<Vec<u8>> = Vec::with_capacity(stapel.len());
+    for b in stapel {
+        match aus.last_mut() {
+            Some(l) if b.first() == Some(&IN_MOVE) && l.first() == Some(&IN_MOVE) => *l = b,
+            _ => aus.push(b),
+        }
+    }
+    aus
+}
+
 /// Schreibseite eines stehenden Eingabekanals.
 struct Schreiber {
     tx: std::sync::mpsc::Sender<Vec<u8>>,
     /// Gesetzt, sobald der Schreibfaden an der Leitung gescheitert ist.
     kaputt: Arc<std::sync::atomic::AtomicBool>,
+    /// Zweiter Griff an der Leitung: beim Verwerfen wird sie hierueber
+    /// gekappt, auch wenn der Schreibfaden gerade in einem Schreibaufruf haengt.
+    griff: Option<std::net::TcpStream>,
 }
 
 impl Schreiber {
-    /// Uebernimmt die Leitung und startet ihren Schreibfaden. Er endet, wenn
-    /// das Schreiben scheitert - oder wenn der Schreiber fallen gelassen ist
-    /// und die Warteschlange leer: was schon eingereiht war, geht noch
-    /// hinaus (etwa das Loslassen aller Tasten beim Trennen).
-    fn neu(mut sock: secure::Secure) -> Schreiber {
+    /// Uebernimmt die Leitung und startet ihren Schreibfaden. Er nimmt, was
+    /// eingereiht ist, fasst Mausbewegungen zusammen und schreibt es in
+    /// Stuecken mit `frist` (siehe SCHREIBFRIST). Er endet, wenn das Schreiben
+    /// scheitert oder der Schreiber verworfen ist; was dann noch eingereiht
+    /// ist, faellt weg - der Host gibt beim Ende des Kanals ohnehin alle
+    /// Tasten frei.
+    fn neu(mut sock: secure::Secure, frist: Duration) -> Schreiber {
         let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let kaputt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let k = kaputt.clone();
+        sock.socket().set_write_timeout(Some(frist)).ok();
+        let griff = sock.abbruchgriff();
         std::thread::spawn(move || {
-            while let Ok(b) = rx.recv() {
-                if sock.write_all(&b).is_err() {
-                    k.store(true, std::sync::atomic::Ordering::Relaxed);
-                    break;
+            while let Ok(erste) = rx.recv() {
+                let mut stapel = vec![erste];
+                while stapel.len() < STAPEL_MAX {
+                    match rx.try_recv() {
+                        Ok(b) => stapel.push(b),
+                        Err(_) => break,
+                    }
+                }
+                for b in bewegungen_zusammenfassen(stapel) {
+                    // Je Stueck ein Datensatz, wie write_all am Stueck ihn
+                    // bilden wuerde: auf der Leitung dieselben Bytes.
+                    for stueck in b.chunks(secure::CHUNK_MAX) {
+                        if sock.write_all(stueck).is_err() {
+                            k.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // Gleich zu, nicht erst mit dem naechsten ensure:
+                            // der zweite Griff hielte die Leitung sonst offen,
+                            // und der Host saehe das Ende (und gaebe die
+                            // Tasten frei) erst spaeter.
+                            let _ = sock.socket().shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                    }
                 }
             }
         });
-        Schreiber { tx, kaputt }
+        Schreiber { tx, kaputt, griff }
     }
 
     fn steht(&self) -> bool {
         !self.kaputt.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Schreiber {
+    /// Verworfen (Trennen, neue Bindung, neue Adresse, gescheitert): die
+    /// Leitung sofort kappen. Ein Schreibfaden, der gerade an einer stockenden
+    /// Leitung haengt, kehrt damit gleich zurueck, statt samt Leitung und
+    /// Warteschlange weiterzuleben; der Host sieht das Ende des Kanals und
+    /// gibt die Tasten frei.
+    fn drop(&mut self) {
+        if let Some(g) = self.griff.take() {
+            let _ = g.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -2763,24 +2875,30 @@ impl InputLink {
             letzter_versuch: None,
             fremd_gemeldet: None,
             aufbau: None,
+            nachreichen: Vec::new(),
+            schreibfrist: SCHREIBFRIST,
         }
     }
 
-    /// Adresse wechseln, etwa wenn ein anderer Host gewaehlt wurde.
+    /// Adresse wechseln, etwa wenn ein anderer Host gewaehlt wurde. Was fuer
+    /// den alten nachzureichen war, faellt weg.
     fn set_addr(&mut self, addr: String) {
         if addr != self.addr {
             self.addr = addr;
             self.kanal = None;
             self.aufbau = None;
+            self.nachreichen.clear();
         }
     }
 
-    /// Bindung an den Bildkanal setzen. Wechselt sie, wird neu verbunden.
+    /// Bindung an den Bildkanal setzen. Wechselt sie, wird neu verbunden; was
+    /// fuer die alte Sitzung nachzureichen war, faellt weg.
     fn set_link(&mut self, link: Option<(Vec<u8>, Vec<u8>)>) {
         if self.link != link {
             self.link = link;
             self.kanal = None;
             self.aufbau = None;
+            self.nachreichen.clear();
         }
     }
 
@@ -2812,7 +2930,14 @@ impl InputLink {
             self.aufbau = None;
             match ergebnis {
                 Ok(s) => {
-                    self.kanal = Some(Schreiber::neu(s));
+                    let k = Schreiber::neu(s, self.schreibfrist);
+                    // Was ohne Kanal kam und einen Zustand setzt, zuerst.
+                    for b in std::mem::take(&mut self.nachreichen) {
+                        if k.tx.send(b).is_ok() {
+                            self.sent += 1;
+                        }
+                    }
+                    self.kanal = Some(k);
                     self.letzter_versuch = None;
                 }
                 Err(_) => {
@@ -2865,22 +2990,27 @@ impl InputLink {
         self.aufbau = Some(rx);
     }
 
-    /// Eine Nachricht einreihen. Steht der Kanal nicht, faellt sie weg - wie
-    /// bisher bei einem Kanal, der nicht aufging.
+    /// Eine Nachricht einreihen. Steht der Kanal nicht, faellt sie weg - bis
+    /// auf Zustandsnachrichten: die kommen nach, sobald er steht (siehe
+    /// NACHREICHEN).
     fn send(&mut self, t: u8, payload: &[u8]) {
         self.ensure();
-        let Some(k) = self.kanal.as_ref().filter(|k| k.steht()) else { return };
-        let mut buf = Vec::with_capacity(8 + payload.len());
-        buf.push(t);
-        buf.push(0);
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        buf.extend_from_slice(payload);
-        let eingereiht = k.tx.send(buf).is_ok();
-        if eingereiht {
-            self.sent += 1;
-        } else {
-            self.kanal = None;
+        let mut buf = eingabe_rahmen(t, payload);
+        if let Some(k) = self.kanal.as_ref().filter(|k| k.steht()) {
+            match k.tx.send(buf) {
+                Ok(()) => {
+                    self.sent += 1;
+                    return;
+                }
+                Err(std::sync::mpsc::SendError(b)) => {
+                    buf = b;
+                    self.kanal = None;
+                }
+            }
+        }
+        if NACHREICHEN.contains(&t) {
+            self.nachreichen.retain(|b| b.first() != Some(&t));
+            self.nachreichen.push(buf);
         }
     }
 
@@ -2943,17 +3073,20 @@ impl InputLink {
         self.send(IN_KEY, &p);
     }
 
-    /// Alles loslassen, was noch als gedrueckt gilt. Wird aufgerufen, wenn das
-    /// Fenster den Fokus verliert oder das Menue aufgeht - sonst bleiben die
-    /// Tasten drueben haengen, und wir bekommen davon gar nichts mit.
     /// Eingabekanal schliessen. Der naechste Sendeversuch baut ihn neu auf.
-    /// Was schon eingereiht ist, schreibt der Schreibfaden noch.
+    /// Die Leitung wird sofort gekappt (siehe Drop fuer Schreiber); der Host
+    /// gibt dabei alles frei, was ueber sie gedrueckt wurde. Nachzureichendes
+    /// faellt weg.
     fn trennen(&mut self) {
         self.kanal = None;
         self.aufbau = None;
         self.letzter_versuch = None;
+        self.nachreichen.clear();
     }
 
+    /// Alles loslassen, was noch als gedrueckt gilt. Wird aufgerufen, wenn das
+    /// Fenster den Fokus verliert oder das Menue aufgeht - sonst bleiben die
+    /// Tasten drueben haengen, und wir bekommen davon gar nichts mit.
     fn alle_loslassen(&mut self) {
         let offen: Vec<u16> = self.gedrueckt.iter().copied().collect();
         for k in offen {
@@ -7885,6 +8018,219 @@ mod tests {
         host.join().unwrap();
     }
 
+    /// Ein Eingabekanal-Host fuer die Tests unten: nimmt eine Verbindung an
+    /// (nach `vorher`), wartet auf das Zeichen und liest dann Nachrichten,
+    /// bis eine mit der Art `ende` kam oder die Leitung zu ist. Ergebnis:
+    /// Art und Nutzlast jeder Nachricht, dazu, ob die Leitung zuging.
+    fn eingabe_host(
+        hh: Vec<u8>,
+        k: Vec<u8>,
+        vorher: Duration,
+        ende: u8,
+    ) -> (String, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<(Vec<(u8, Vec<u8>)>, bool)>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (los_tx, los_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(vorher);
+            let (s, _) = l.accept().unwrap();
+            let mut h = secure::Secure::accept(s, &noise::prologue_input(&hh), &k).unwrap();
+            let _ = los_rx.recv();
+            let mut gelesen = Vec::new();
+            loop {
+                let mut kopf = [0u8; 8];
+                if h.read_exact(&mut kopf).is_err() {
+                    return (gelesen, true);
+                }
+                let mut p = vec![0u8; u32::from_le_bytes(kopf[4..8].try_into().unwrap()) as usize];
+                if h.read_exact(&mut p).is_err() {
+                    return (gelesen, true);
+                }
+                gelesen.push((kopf[0], p));
+                if kopf[0] == ende {
+                    return (gelesen, false);
+                }
+            }
+        });
+        (addr, los_tx, t)
+    }
+
+    /// Aufeinanderfolgende Bewegungen: nur die letzte; dazwischen liegende
+    /// Klicks und Tasten trennen die Laeufe, die Reihenfolge bleibt.
+    #[test]
+    fn bewegungen_werden_zusammengefasst() {
+        let b = |t: u8, x: u8| eingabe_rahmen(t, &[x]);
+        let stapel = vec![
+            b(IN_MOVE, 1), b(IN_MOVE, 2), b(IN_BUTTON, 3), b(IN_MOVE, 4), b(IN_MOVE, 5), b(IN_MOVE, 6),
+            b(IN_KEY, 7), b(IN_MOVE, 8), b(IN_CLIP, 9), b(IN_MOVE, 10),
+        ];
+        let aus: Vec<(u8, u8)> = bewegungen_zusammenfassen(stapel).iter().map(|r| (r[0], r[8])).collect();
+        assert_eq!(
+            aus,
+            vec![(IN_MOVE, 2), (IN_BUTTON, 3), (IN_MOVE, 6), (IN_KEY, 7), (IN_MOVE, 8), (IN_CLIP, 9), (IN_MOVE, 10)]
+        );
+    }
+
+    /// Stockt die Leitung, gehen danach nicht alle alten Lagen einzeln
+    /// hinaus, sondern nur die letzte - Zwischenablage und Tasten bleiben
+    /// vollstaendig und in Reihenfolge. Und trennen() kappt die Leitung
+    /// sofort, statt die Warteschlange noch abzuarbeiten.
+    #[test]
+    fn eingabekanal_nach_stocken_nur_die_letzte_lage() {
+        secure::test_identitaet();
+        let hh = vec![0x71; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let gross = vec![b'x'; 4 * 1024 * 1024];
+
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv.clone(), Duration::ZERO, IN_KEY);
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh.clone(), host_pub.clone())));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        // Verstopfen: der Host liest noch nicht, der Schreibfaden haengt.
+        for _ in 0..6 {
+            l.send(IN_CLIP, &gross);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        for i in 0..2000 {
+            l.mouse_move(i as f32 / 2000.0, 0.25);
+        }
+        l.key(4, true, 0);
+        let _ = los.send(());
+        let (gelesen, zu) = host.join().unwrap();
+        assert!(!zu);
+        let arten: Vec<u8> = gelesen.iter().map(|(a, _)| *a).collect();
+        let bewegungen = arten.iter().filter(|a| **a == IN_MOVE).count();
+        assert!(bewegungen <= 3, "{bewegungen} Bewegungen kamen einzeln an");
+        assert_eq!(arten.iter().filter(|a| **a == IN_CLIP).count(), 6);
+        assert!(gelesen.iter().filter(|(a, _)| *a == IN_CLIP).all(|(_, p)| *p == gross));
+        let mut erwartet = (1999.0f32 / 2000.0).to_le_bytes().to_vec();
+        erwartet.extend_from_slice(&0.25f32.to_le_bytes());
+        assert_eq!(gelesen.iter().rev().find(|(a, _)| *a == IN_MOVE).map(|(_, p)| p.clone()), Some(erwartet));
+        assert_eq!(arten.last(), Some(&IN_KEY));
+
+        // trennen() mit voller Warteschlange: der Host sieht das Ende, bevor
+        // alles Eingereihte bei ihm ist.
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_KEY);
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        for _ in 0..6 {
+            l.send(IN_CLIP, &gross);
+        }
+        l.key(5, true, 0);
+        std::thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        l.trennen();
+        let _ = los.send(());
+        let (gelesen, zu) = host.join().unwrap();
+        assert!(zu, "Leitung nicht gekappt");
+        assert!(gelesen.len() < 6, "Warteschlange nach dem Trennen noch abgearbeitet ({} Nachrichten)", gelesen.len());
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Nimmt der Host nichts mehr ab, gilt der Kanal nach der Schreibfrist
+    /// als kaputt, statt dass der Schreibfaden unbegrenzt haengt.
+    #[test]
+    fn eingabekanal_schreibfrist() {
+        secure::test_identitaet();
+        let hh = vec![0x72; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_KEY);
+        let mut l = InputLink::new(addr);
+        l.schreibfrist = Duration::from_millis(300);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        let gross = vec![b'x'; 4 * 1024 * 1024];
+        for _ in 0..6 {
+            l.send(IN_CLIP, &gross);
+        }
+        let t0 = Instant::now();
+        while l.steht() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!l.steht(), "Schreibfaden haengt ohne Frist");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        let _ = los.send(());
+        let (_, zu) = host.join().unwrap();
+        assert!(zu);
+    }
+
+    /// Einstellungen, Codec, Testbild und Zwischenablage, die ohne stehenden
+    /// Kanal kamen, gehen hinaus, sobald er steht - je Art die letzte.
+    /// Bewegungen und Tasten aus dieser Zeit fallen weg. Eine neue Bindung
+    /// verwirft, was fuer die alte gemerkt war.
+    #[test]
+    fn zustand_wird_nachgereicht() {
+        secure::test_identitaet();
+        let hh = vec![0x73; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        // Der Host nimmt erst nach 300 ms an: so lange steht der Kanal sicher nicht.
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::from_millis(300), IN_KEY);
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh.clone(), host_pub.clone())));
+        l.testbild(true);
+        l.settings(10, 60, false, false, true);
+        l.mouse_move(0.3, 0.3);
+        l.key(7, true, 0);
+        l.codec(2);
+        l.settings(20, 120, true, true, false);
+        assert!(!l.steht());
+        assert_eq!(l.sent, 0);
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        assert_eq!(l.sent, 3);
+        l.key(9, true, 0);
+        let _ = los.send(());
+        let (gelesen, _) = host.join().unwrap();
+        let mut einst = 20u32.to_le_bytes().to_vec();
+        einst.extend_from_slice(&120u16.to_le_bytes());
+        einst.extend_from_slice(&[1, 1, 0]);
+        let mut taste = 9u16.to_le_bytes().to_vec();
+        taste.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
+        assert_eq!(gelesen, vec![(IN_TESTBILD, vec![1]), (IN_CODEC, vec![2]), (IN_SETTINGS, einst), (IN_KEY, taste)]);
+
+        // Neue Bindung: nichts von der alten wird nachgereicht.
+        let mut l = InputLink::new("127.0.0.1:1".into());
+        l.set_link(Some((hh.clone(), host_pub.clone())));
+        l.codec(3);
+        assert_eq!(l.nachreichen.len(), 1);
+        l.set_link(Some((vec![0x74; 32], host_pub)));
+        assert!(l.nachreichen.is_empty());
+        l.codec(3);
+        l.trennen();
+        assert!(l.nachreichen.is_empty());
+    }
+
+    /// Ein Fehler zaehlt nur fuer das Ziel, zu dem er gehoert: hat der
+    /// Nutzer inzwischen einen anderen Host gewaehlt, bleibt dessen Ziel
+    /// stehen, auch bei einem Dauerfehler des alten; nach einer gewollten
+    /// Trennung (kein Ziel) wird nichts angezeigt.
+    #[test]
+    fn fehler_gilt_nur_fuer_das_eigene_ziel() {
+        let dauer = Meldung::from(secure::Fehler::FingerabdruckGeaendert {
+            host: "10.0.0.5".into(),
+            fingerabdruck: "AAAA".into(),
+            pfad: "/ablage/known_hosts.txt".into(),
+        });
+        assert!(dauer.dauerhaft());
+        let mut s = Shared { target: Some("10.0.0.6:9001".into()), connected: true, ..Shared::default() };
+        let mut gemeldet = None;
+        fehler_verbuchen(&mut s, "10.0.0.5:9001", dauer.clone(), &mut gemeldet);
+        assert_eq!(s.target.as_deref(), Some("10.0.0.6:9001"));
+        assert_eq!(s.error, None);
+        assert!(gemeldet.is_none());
+        assert!(!s.connected);
+        s.target = None;
+        fehler_verbuchen(&mut s, "10.0.0.5:9001", dauer.clone(), &mut gemeldet);
+        assert_eq!(s.error, None);
+        s.target = Some("10.0.0.5:9001".into());
+        fehler_verbuchen(&mut s, "10.0.0.5:9001", dauer.clone(), &mut gemeldet);
+        assert_eq!(s.target, None);
+        assert_eq!(s.error, Some(dauer));
+    }
+
     /// Der Host meldet MSG_ABGELOEST: der Empfangsfaden nimmt das Ziel
     /// zurueck, die Meldung steht ueber ihren Schluessel da, und es gibt
     /// keine zweite Verbindung - auch nicht nach der Pause von 2 s, nach der
@@ -8116,7 +8462,9 @@ mod tests {
         let dauer = |f: F| Meldung::from(f).dauerhaft();
         assert!(dauer(F::FingerabdruckGeaendert { host: "h".into(), fingerabdruck: "f".into(), pfad: pfad.clone() }));
         assert!(dauer(F::KeinUtf8 { pfad: pfad.clone() }));
-        assert!(dauer(F::Unlesbar { pfad: pfad.clone(), grund: "g".into() }));
+        // Nicht lesbar ist oft nur eine kurze Sperre - und gelesen wird vor
+        // dem Verbinden, ein neuer Versuch stoert also niemanden.
+        assert!(!dauer(F::Unlesbar { pfad: pfad.clone(), grund: "g".into() }));
         assert!(dauer(F::Schreiben { pfad: pfad.clone(), grund: "g".into() }));
         assert!(dauer(F::SchluesselBeschaedigt { pfad: pfad.clone(), laenge: 3 }));
         assert!(dauer(F::Ablage("x".into())));

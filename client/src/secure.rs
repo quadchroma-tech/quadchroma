@@ -434,11 +434,29 @@ fn schluessel_laden_mit(
 
 /// Liest eine Schluesseldatei. None: sie fehlt.
 fn schluessel_lesen(path: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>, Fehler> {
-    match std::fs::read(path) {
-        Ok(b) if b.len() == 64 => Ok(Some((b[..32].to_vec(), b[32..].to_vec()))),
-        Ok(b) => Err(Fehler::SchluesselBeschaedigt { pfad: path.to_path_buf(), laenge: b.len() }),
+    schluessel_lesen_mit(path, || std::thread::sleep(Duration::from_millis(200)))
+}
+
+/// Wie `schluessel_lesen`. Ist die Datei zu KURZ, wird nach `warten` einmal
+/// neu gelesen, bevor sie als beschaedigt gilt: auf einem Dateisystem ohne
+/// harte Verweise legt ein zweiter Prozess sie direkt an (siehe
+/// `geheim_schreiben`), und wer genau dann liest, saehe sie halb. Zu lang
+/// wird sie dabei nie - das ist gleich ein Fehler.
+fn schluessel_lesen_mit(path: &Path, warten: impl FnOnce()) -> Result<Option<(Vec<u8>, Vec<u8>)>, Fehler> {
+    let lesen = || match std::fs::read(path) {
+        Ok(b) => Ok(Some(b)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Fehler::Unlesbar { pfad: path.to_path_buf(), grund: wortlaut(&e) }),
+    };
+    let mut b = lesen()?;
+    if b.as_ref().is_some_and(|b| b.len() < 64) {
+        warten();
+        b = lesen()?;
+    }
+    match b {
+        None => Ok(None),
+        Some(b) if b.len() == 64 => Ok(Some((b[..32].to_vec(), b[32..].to_vec()))),
+        Some(b) => Err(Fehler::SchluesselBeschaedigt { pfad: path.to_path_buf(), laenge: b.len() }),
     }
 }
 
@@ -458,7 +476,8 @@ fn geheim_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
         // Dateisystem ohne harte Verweise (FAT, manche Freigaben): direkt
         // und exklusiv anlegen. Das ersetzt ebenso nie etwas; nur ein Abbruch
         // mitten im Schreiben hinterliesse dort eine zu kurze Datei, die
-        // `schluessel_lesen` dann als beschaedigt meldet.
+        // `schluessel_lesen` dann als beschaedigt meldet. Wer genau waehrend
+        // des Schreibens liest, wartet dort kurz und liest noch einmal.
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => exklusiv_schreiben(path, inhalt),
         x => x,
     });
@@ -761,8 +780,12 @@ impl Freigaben {
             // keine leere Datei hinterlassen - sonst waere der Erstkontakt
             // verloren (der Mac-Host wertet eine leere Liste ohnehin als
             // Erstkontakt). Geloescht wird erst hier, mit geschlossenem Griff:
-            // eine offene Datei loescht Windows nicht.
-            if !self.vorhanden {
+            // eine offene Datei loescht Windows nicht. Und nur, wenn sie nach
+            // dem Zurueckkuerzen leer ist: hat ein zweiter Host-Prozess mit
+            // derselben Ablage sie inzwischen angelegt und beschrieben, bleibt
+            // seine Zeile stehen.
+            let leer = std::fs::metadata(&self.pfad).map(|m| m.len() == 0).unwrap_or(false);
+            if !self.vorhanden && leer {
                 let _ = std::fs::remove_file(&self.pfad);
             }
             format!("authorized.txt: {}", wortlaut(&e))
@@ -1122,6 +1145,41 @@ mod tests {
         let f = Freigaben::lesen_aus(p.clone()).unwrap();
         assert!(f.aufnehmen_mit(&B, "10.0.0.6", halb).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), alt);
+
+        // Beim Lesen fehlte die Liste, dann legt ein zweiter Host-Prozess sie
+        // mit seiner Zeile an, und erst danach scheitert das eigene
+        // Anhaengen: seine Liste bleibt stehen, nur der halbe eigene Teil geht.
+        std::fs::remove_file(&p).unwrap();
+        let f = Freigaben::lesen_aus(p.clone()).unwrap();
+        std::fs::write(&p, &alt).unwrap();
+        assert!(f.aufnehmen_mit(&B, "10.0.0.6", halb).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), alt);
+    }
+
+    /// Eine zu kurze Schluesseldatei wird einmal neu gelesen, bevor sie als
+    /// beschaedigt gilt: ohne harte Verweise legt ein zweiter Prozess sie
+    /// direkt an, und wer mitten darin liest, saehe sie halb.
+    #[test]
+    fn halber_schluessel_wird_nachgelesen() {
+        let d = ordner("key-halb");
+        let p = d.join("client.key");
+        let ganz: Vec<u8> = (0..64u8).collect();
+        std::fs::write(&p, &ganz[..20]).unwrap();
+        let k = schluessel_lesen_mit(&p, || std::fs::write(&p, &ganz).unwrap()).unwrap();
+        assert_eq!(k, Some((ganz[..32].to_vec(), ganz[32..].to_vec())));
+        // Bleibt sie kurz, ist sie beschaedigt - und bleibt liegen.
+        std::fs::write(&p, &ganz[..20]).unwrap();
+        let mut gewartet = false;
+        let e = schluessel_lesen_mit(&p, || gewartet = true).unwrap_err();
+        assert!(gewartet);
+        assert_eq!(e, Fehler::SchluesselBeschaedigt { pfad: p.clone(), laenge: 20 });
+        // Zu lang: gleich beschaedigt, ohne zu warten.
+        std::fs::write(&p, [1u8; 65]).unwrap();
+        let e = schluessel_lesen_mit(&p, || panic!("gewartet")).unwrap_err();
+        assert_eq!(e, Fehler::SchluesselBeschaedigt { pfad: p.clone(), laenge: 65 });
+        // Fehlt sie, ist das kein Fehler.
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(schluessel_lesen_mit(&p, || panic!("gewartet")), Ok(None));
     }
 
     /// Der Wortlaut des Systems steht in einer Zeile.
