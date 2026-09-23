@@ -527,9 +527,11 @@ struct Shared {
     bytes_video: u64,
     last_decode_ms: f32,
     error: Option<String>,
-    /// Pruefsumme des Bildkanals. Der Eingabekanal braucht sie, sonst laesst
-    /// ihn der Host nicht herein.
-    link: Option<Vec<u8>>,
+    /// Pruefsumme des Bildkanals und Schluessel seines Hosts, immer als Paar.
+    /// Der Eingabekanal braucht die Pruefsumme, sonst laesst ihn der Host
+    /// nicht herein - und den Schluessel, um zu pruefen, dass am anderen
+    /// Ende wirklich derselbe Host sitzt.
+    link: Option<(Vec<u8>, Vec<u8>)>,
     /// Vergleichscode und Fingerabdruck der Gegenstelle, zum Anzeigen.
     sas: Option<String>,
     peer_fp: Option<String>,
@@ -1369,7 +1371,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.connected = true;
         s.error = None;
         s.error_key = None;
-        s.link = Some(sock.handshake_hash.clone());
+        s.link = Some((sock.handshake_hash.clone(), sock.peer.clone()));
         s.sas = Some(sock.sas.clone());
         s.peer_fp = Some(fp.clone());
         s.first_time = first;
@@ -2268,8 +2270,10 @@ struct InputLink {
     addr: String,
     last: (f32, f32),
     sent: u64,
-    /// Pruefsumme des Bildkanals. Ohne sie laesst der Host diesen Kanal nicht zu.
-    link: Option<Vec<u8>>,
+    /// Pruefsumme des Bildkanals und Schluessel seines Hosts. Ohne die
+    /// Pruefsumme laesst der Host diesen Kanal nicht zu; der Schluessel muss
+    /// zu dem passen, der am Eingabekanal antwortet.
+    link: Option<(Vec<u8>, Vec<u8>)>,
     /// Welche Tasten gerade als gedrueckt gelten. Ohne diese Liste bleiben
     /// beim Fokusverlust Tasten auf dem Mac haengen - WASD laeuft dann gegen
     /// die Wand, und ein haengendes Strg macht aus jedem Klick einen Rechtsklick.
@@ -2301,7 +2305,7 @@ impl InputLink {
     }
 
     /// Bindung an den Bildkanal setzen. Wechselt sie, wird neu verbunden.
-    fn set_link(&mut self, link: Option<Vec<u8>>) {
+    fn set_link(&mut self, link: Option<(Vec<u8>, Vec<u8>)>) {
         if self.link != link {
             self.link = link;
             self.sock = None;
@@ -2312,16 +2316,33 @@ impl InputLink {
         if self.sock.is_some() || self.addr.is_empty() {
             return;
         }
-        let Some(link) = self.link.as_ref() else { return };
+        let Some((hh, host)) = self.link.as_ref() else { return };
         if let Some(t) = self.letzter_versuch {
             if t.elapsed() < Duration::from_secs(1) {
                 return;
             }
         }
         self.letzter_versuch = Some(Instant::now());
-        if let Ok(s) = secure::Secure::connect(&self.addr, &noise::prologue_input(link)) {
-            self.sock = Some(s);
-            self.letzter_versuch = None;
+        // Die Pruefsumme im Prologue weist nur die Sitzung aus, nicht den
+        // Host: wer den Bild-Handschlag mitgelesen hat, kann sie ausrechnen.
+        // Also muss der Schluessel am anderen Ende derselbe sein wie beim
+        // Bildkanal - sonst gingen Tasten und Zwischenablage an einen
+        // Fremden. Bis hier ist ausser dem Handschlag nichts gesendet; ein
+        // unbekannter Schluessel wird auch nicht als neuer Host gemerkt.
+        match secure::Secure::connect(&self.addr, &noise::prologue_input(hh)) {
+            Ok(s) if s.peer == *host => {
+                self.sock = Some(s);
+                self.letzter_versuch = None;
+            }
+            Ok(s) => {
+                // Die Leitung faellt mit `s` zu; `letzter_versuch` bleibt,
+                // also hoechstens ein Versuch je Sekunde.
+                protokoll::zeile(format!(
+                    "Eingabekanal: Gegenstelle {} ist nicht der Host des Bildkanals - verworfen",
+                    s.peer_fingerprint()
+                ));
+            }
+            Err(_) => {}
         }
     }
 
@@ -7152,5 +7173,43 @@ mod tests {
         assert_eq!(letzter_nal_typ(&[0, 0, 0, 1, 0x09, 0xF0], true), Some(9));
         assert_eq!(letzter_nal_typ(&[0, 0, 0, 1, 0x26, 0x01, 0x11, 0, 0, 1, 0x02, 0x01], false), Some(1));
         assert_eq!(letzter_nal_typ(&[1, 2, 3], false), None);
+    }
+
+    /// Gegenstelle am Eingabeport mit richtigem Prologue, aber eigenem
+    /// Schluessel: Der Handschlag gelingt (die Pruefsumme kennt jeder, der
+    /// den Bild-Handschlag gesehen hat), der Client verwirft die Leitung
+    /// trotzdem. Mit dem Schluessel des Bildhosts wird sie genommen.
+    #[test]
+    fn eingabekanal_nur_zum_host_des_bildkanals() {
+        use std::net::TcpListener;
+        secure::test_identitaet();
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (fremd_priv, _) = noise::keypair().unwrap();
+        let hh = vec![0x5a; 32];
+        let gegenstelle = |k: Vec<u8>, hh: Vec<u8>| {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            let t = std::thread::spawn(move || {
+                let (s, _) = l.accept().unwrap();
+                secure::Secure::accept(s, &noise::prologue_input(&hh), &k).is_ok()
+            });
+            (addr, t)
+        };
+
+        let (addr, t) = gegenstelle(fremd_priv, hh.clone());
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh.clone(), host_pub.clone())));
+        l.ensure();
+        assert!(t.join().unwrap(), "Handschlag mit dem Fremden muss gelingen");
+        assert!(l.sock.is_none());
+        l.send(IN_CLIP, b"geheim");
+        assert_eq!(l.sent, 0);
+
+        let (addr, t) = gegenstelle(host_priv, hh.clone());
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        l.ensure();
+        assert!(t.join().unwrap());
+        assert!(l.sock.is_some());
     }
 }
