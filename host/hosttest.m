@@ -13,10 +13,14 @@
 //
 // main.m wird hier eingebunden; sein main heisst dann host_main und laeuft
 // nie. Es startet also kein Dienst, keine Aufnahme, und nichts schreibt in
-// /tmp/quadchroma-m1.log (g_log bleibt leer, alles geht nach stdout). Die
+// /tmp/quadchroma-m1.log: g_log bleibt leer, alles geht nach stdout - nur die
+// Protokollpruefung lenkt g_log fuer sich auf eine Datei im eigenen HOME. Die
 // Zuschauer sind echte TCP-Verbindungen ueber 127.0.0.1 ab Port 19100 mit
 // tune_socket aus main.m; der Kanal hat einen festen Schluessel statt eines
-// Handschlags. Die Bilder sind kuenstliche Zugriffseinheiten gegebener
+// Handschlags. Wo es auf den Weg durch die Annahme ankommt, laufen echte
+// Handschlaege gegen bild_verbindung und eingabe_verbindung (Ports ab 19400);
+// HOME ist dann ein frischer Ordner unter $TMPDIR, die Freigabeliste des
+// Nutzers und ein laufender Host bleiben unberuehrt. Die Bilder sind kuenstliche Zugriffseinheiten gegebener
 // Groesse; sie gehen wie in encode_buffer erst durch stau_vor_dem_encoder
 // und dann durch emit_access_unit - Stauregel und Versand sind also die des
 // Hosts, nur der Encoder ist nachgebildet (liefert sofort, nichts im Flug).
@@ -134,6 +138,106 @@ static void zuschauer_weg(void) {
     qc_chan_free(g_vid);
     g_vid = NULL;
     pthread_mutex_unlock(&g_send_mtx);
+}
+
+// ------------------------------------------------- Annahme und Handschlag
+
+// Lauschender Socket auf 127.0.0.1 ab Port `ab`, mit der Annahme aus
+// qc_annahme.c und dem Rueckruf des Hosts. Rueckgabe: der Port, sonst -1.
+static int annahme_lauschen(int ab, qc_verbindung_fn fn, const char *name) {
+    for (int port = ab; port < ab + 50; port++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in a = {0};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr *)&a, sizeof a) == 0 && listen(fd, QC_LISTEN_WARTESCHLANGE) == 0) {
+            qc_annahme_cfg cfg = { QC_HANDSCHLAEGE, QC_HANDSCHLAEGE_JE_IP, fn, annahme_andrang, (void *)name };
+            if (qc_annahme_starten(fd, &cfg) == 0) return port;
+        }
+        close(fd);
+    }
+    return -1;
+}
+
+static int verbinden(int port) {
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((uint16_t)port);
+    if (connect(c, (struct sockaddr *)&a, sizeof a) != 0) { close(c); return -1; }
+    return c;
+}
+
+static int rahmen_schreiben(int fd, const uint8_t *b, size_t n) {
+    uint8_t l[2] = { (uint8_t)(n & 255), (uint8_t)(n >> 8) };
+    if (send(fd, l, 2, 0) != 2) return -1;
+    return send(fd, b, n, 0) == (ssize_t)n ? 0 : -1;
+}
+
+static int rahmen_lesen(int fd, uint8_t *b, size_t cap, size_t *n) {
+    uint8_t l[2];
+    struct pollfd pf = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&pf, 1, 3000) != 1 || recv(fd, l, 2, MSG_WAITALL) != 2) return -1;
+    *n = (size_t)l[0] | ((size_t)l[1] << 8);
+    if (*n > cap) return -1;
+    return recv(fd, b, *n, MSG_WAITALL) == (ssize_t)*n ? 0 : -1;
+}
+
+// Ein Client mit dem Schluessel priv: Handschlag wie der echte (Anrufer).
+// rx bekommt den Empfangsschluessel, hh die Pruefsumme. -1 = gescheitert.
+static int client_verbinden(int port, const uint8_t priv[32], qc_cipher *rx, uint8_t hh[QC_HASHLEN]) {
+    int c = verbinden(port);
+    if (c < 0) return -1;
+    qc_handshake hs;
+    qc_handshake_init(&hs, 1, priv, (const uint8_t *)QC_PRO_VIDEO, strlen(QC_PRO_VIDEO));
+    uint8_t msg[8192], pl[8192];
+    size_t ml = 0, pln = 0;
+    if (qc_handshake_write(&hs, NULL, 0, msg, &ml) || rahmen_schreiben(c, msg, ml) ||
+        rahmen_lesen(c, msg, sizeof msg, &ml) || qc_handshake_read(&hs, msg, ml, pl, &pln) ||
+        qc_handshake_write(&hs, NULL, 0, msg, &ml) || rahmen_schreiben(c, msg, ml)) {
+        close(c);
+        return -1;
+    }
+    qc_cipher tx, empfang;
+    qc_handshake_split(&hs, &tx, &empfang);
+    if (rx) *rx = empfang;
+    if (hh) memcpy(hh, qc_handshake_hash(&hs), QC_HASHLEN);
+    return c;
+}
+
+// stdout zeitweise stumm schalten: logf_ schreibt jede Zeile auch dorthin.
+static int g_stdout_alt = -1;
+static void stdout_stumm(int stumm) {
+    fflush(stdout);
+    if (stumm) {
+        g_stdout_alt = dup(1);
+        int n = open("/dev/null", O_WRONLY);
+        dup2(n, 1);
+        close(n);
+    } else if (g_stdout_alt >= 0) {
+        dup2(g_stdout_alt, 1);
+        close(g_stdout_alt);
+        g_stdout_alt = -1;
+    }
+}
+
+static char g_home[1024];
+
+// Zeilen der Datei, die `was` enthalten.
+static int zeilen_mit(const char *pfad, const char *was) {
+    FILE *f = fopen(pfad, "r");
+    if (!f) return -1;
+    char z[2048];
+    int n = 0;
+    while (fgets(z, sizeof z, f)) if (strstr(z, was)) n++;
+    fclose(f);
+    return n;
 }
 
 // ---------------------------------------------------------------- Lesen
@@ -486,6 +590,151 @@ static void stau_pruefen(void) {
     atomic_store(&g_cur_ton, 1);
 }
 
+// ------------------------------------------ Protokoll: Drossel und Grenze
+
+typedef struct { int port; _Atomic int stop; _Atomic long n; } flut_arg;
+
+// Verbinden und sofort schliessen, so schnell es geht. SO_LINGER 0: ein RST
+// statt TIME_WAIT, sonst gingen die Ports fuer die spaeteren Pruefungen aus.
+static void *fluten(void *arg) {
+    flut_arg *a = arg;
+    struct linger lg = { 1, 0 };
+    while (!atomic_load(&a->stop)) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+        struct sockaddr_in ad = {0};
+        ad.sin_family = AF_INET;
+        ad.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ad.sin_port = htons((uint16_t)a->port);
+        if (connect(c, (struct sockaddr *)&ad, sizeof ad) == 0) atomic_fetch_add(&a->n, 1);
+        close(c);
+    }
+    return NULL;
+}
+
+static long drossel_weitere(qc_drossel *d) {
+    pthread_mutex_lock(&d->m);
+    long n = d->weitere;
+    pthread_mutex_unlock(&d->m);
+    return n;
+}
+
+// Frist der Drossel als abgelaufen behandeln, ohne zehn Sekunden zu warten.
+static void drossel_altern(qc_drossel *d) {
+    pthread_mutex_lock(&d->m);
+    d->zuletzt_s -= QC_MELDEN_S;
+    pthread_mutex_unlock(&d->m);
+}
+
+static void protokoll_pruefen(int bild_port, int ein_port) {
+    printf("\n-- Protokoll: Flut ungepruefter Verbindungen\n");
+    char pfad[1100], alt[1100];
+    snprintf(pfad, sizeof pfad, "%s/hosttest.log", g_home);
+    snprintf(alt, sizeof alt, "%s/hosttest.alt.log", g_home);
+    g_log_pfad = pfad;
+    g_log_alt_pfad = alt;
+    pthread_mutex_lock(&g_log_mtx);
+    log_oeffnen();
+    pthread_mutex_unlock(&g_log_mtx);
+    if (!g_log) { pruefe(0, "eigene Protokolldatei"); return; }
+
+    // Wie die Probe des Pruefers: 8 Faeden, die verbinden und sofort
+    // schliessen - je 4 auf den Bild- und den Eingabeport (kein Bildkanal offen).
+    flut_arg fa[8];
+    pthread_t t[8];
+    stdout_stumm(1);
+    for (int i = 0; i < 8; i++) {
+        fa[i].port = i < 4 ? bild_port : ein_port;
+        atomic_store(&fa[i].stop, 0);
+        atomic_store(&fa[i].n, 0);
+        pthread_create(&t[i], NULL, fluten, &fa[i]);
+    }
+    usleep(2000 * 1000);
+    long n_bild = 0, n_ein = 0;
+    for (int i = 0; i < 8; i++) atomic_store(&fa[i].stop, 1);
+    for (int i = 0; i < 8; i++) {
+        pthread_join(t[i], NULL);
+        if (i < 4) n_bild += atomic_load(&fa[i].n); else n_ein += atomic_load(&fa[i].n);
+    }
+    usleep(300 * 1000);                     // die letzten Verbindungsfaeden enden
+    stdout_stumm(0);
+    int z_bild = zeilen_mit(pfad, "Handschlag mit 127.0.0.1 gescheitert");
+    int z_ein = zeilen_mit(pfad, "kein Bildkanal offen");
+    int z_alle = zeilen_mit(pfad, "");
+    long w_bild = drossel_weitere(&d_bild_handschlag), w_ein = drossel_weitere(&d_ein_ohne_bild);
+    printf("         (%ld Verbindungen auf den Bildport, %ld auf den Eingabeport in 2 s; "
+           "im Protokoll %d + %d Zeilen, %d insgesamt; zurueckgehalten %ld + %ld)\n",
+           n_bild, n_ein, z_bild, z_ein, z_alle, w_bild, w_ein);
+    pruefe(n_bild > 200 && n_ein > 200, "die Flut kommt an (je Port mehr als 100 Verbindungen je Sekunde)");
+    pruefe(z_bild == 1 && z_ein == 1, "je Art genau eine Zeile, die erste sofort");
+    pruefe(z_alle <= 6, "insgesamt nur eine Handvoll Zeilen (dazu hoechstens die Andrang-Meldungen)");
+    // Nicht jede Verbindung kommt bis zur Zeile: viele verdraengt die Annahme
+    // vorher (gezaehlt in ihrer eigenen, ebenfalls gedrosselten Andrang-Meldung).
+    pruefe(w_bild > 100 && w_ein > 100, "die zurueckgehaltenen werden gezaehlt, nicht vergessen");
+
+    // Nach der Frist kommt die Sammelzeile auch ohne neue Verbindung.
+    drossel_altern(&d_bild_handschlag);
+    drossel_altern(&d_ein_ohne_bild);
+    stdout_stumm(1);
+    drosseln_nachtragen();
+    drosseln_nachtragen();
+    stdout_stumm(0);
+    char erwartet[160];
+    snprintf(erwartet, sizeof erwartet, "Bildkanal: Handschlag gescheitert: %ld weitere seit der letzten Meldung, zuletzt von 127.0.0.1", w_bild);
+    int s_bild = zeilen_mit(pfad, erwartet);
+    snprintf(erwartet, sizeof erwartet, "kein Bildkanal offen: %ld weitere seit der letzten Meldung", w_ein);
+    int s_ein = zeilen_mit(pfad, erwartet);
+    pruefe(s_bild == 1 && s_ein == 1 && drossel_weitere(&d_bild_handschlag) == 0,
+           "nach der Frist genau eine Sammelzeile je Art mit der Zahl und der letzten Adresse");
+
+    // Voller Handschlag mit Wegwerfschluessel, wie ein ungekoppelter Client,
+    // der alle zwei Sekunden neu versucht - nur schneller.
+    uint8_t anderer_priv[32], anderer_pub[32];
+    qc_keypair(anderer_priv, anderer_pub);
+    // Liste nicht leer: kein Erstkontakt, der Wegwerfschluessel ist unbekannt.
+    pruefe(qc_authorize(anderer_pub, "hosttest") == 0, "Freigabeliste im eigenen HOME angelegt");
+    int gelungen = 0;
+    stdout_stumm(1);
+    for (int i = 0; i < 6; i++) {
+        uint8_t wegwerf[32], wp[32];
+        qc_keypair(wegwerf, wp);
+        int c = client_verbinden(bild_port, wegwerf, NULL, NULL);
+        if (c >= 0) { gelungen++; usleep(30 * 1000); close(c); }
+    }
+    usleep(200 * 1000);
+    stdout_stumm(0);
+    int z_unb = zeilen_mit(pfad, "Abgewiesen: unbekannte Gegenstelle");
+    printf("         (%d Handschlaege mit fremden Schluesseln, %d Zeilen 'unbekannte Gegenstelle', zurueckgehalten %ld)\n",
+           gelungen, z_unb, drossel_weitere(&d_unbekannt));
+    pruefe(gelungen == 6 && z_unb == 1 && drossel_weitere(&d_unbekannt) == 5,
+           "unbekannte Gegenstelle: eine Zeile, der Rest gezaehlt");
+
+    printf("\n-- Protokoll: Obergrenze der Datei\n");
+    long grenze_vorher = g_log_grenze;
+    g_log_grenze = 4096;
+    stdout_stumm(1);
+    for (int i = 0; i < 300; i++) logf_(@"Pruefzeile %03d - so lang wie eine gewoehnliche Zeile im Hostprotokoll", i);
+    stdout_stumm(0);
+    struct stat sa, sn;
+    int ok_alt = stat(alt, &sa) == 0, ok_neu = stat(pfad, &sn) == 0;
+    int kopf = 0;
+    FILE *f = fopen(pfad, "r");
+    char erste[256] = {0};
+    if (f) { if (fgets(erste, sizeof erste, f)) kopf = strstr(erste, "Protokoll war ueber 4 KB") != NULL; fclose(f); }
+    printf("         (Datei %lld Byte, .alt %lld Byte, Grenze %ld)\n",
+           ok_neu ? (long long)sn.st_size : -1, ok_alt ? (long long)sa.st_size : -1, g_log_grenze);
+    pruefe(ok_alt && ok_neu && sn.st_size < g_log_grenze + 256 && sa.st_size < g_log_grenze + 256,
+           "ueber der Grenze wandert die Datei nach .alt.log, beide bleiben unter der Grenze plus einer Zeile");
+    pruefe(kopf, "die neue Datei sagt in ihrer ersten Zeile, wo die alten Zeilen stehen");
+    pruefe(zeilen_mit(pfad, "Pruefzeile 299") == 1, "die juengste Zeile steht in der neuen Datei");
+
+    pthread_mutex_lock(&g_log_mtx);
+    fclose(g_log);
+    g_log = NULL;
+    pthread_mutex_unlock(&g_log_mtx);
+    g_log_grenze = grenze_vorher;
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -501,8 +750,27 @@ int main(void) {
     @autoreleasepool {
         setvbuf(stdout, NULL, _IONBF, 0);
         signal(SIGPIPE, SIG_IGN);
+        // Eigenes HOME: Freigabeliste und Protokollpruefung schreiben dorthin.
+        const char *tmp = getenv("TMPDIR");
+        snprintf(g_home, sizeof g_home, "%s/qc-hosttest-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+        if (!mkdtemp(g_home)) { printf("kein eigenes HOME\n"); return 1; }
+        char lib[1100];
+        snprintf(lib, sizeof lib, "%s/Library", g_home);
+        mkdir(lib, 0700);
+        snprintf(lib, sizeof lib, "%s/Library/Application Support", g_home);
+        mkdir(lib, 0700);
+        setenv("HOME", g_home, 1);
+        printf("HOME %s\n", g_home);
+        qc_keypair(g_id_priv, g_id_pub);
+        g_capq = dispatch_queue_create("hosttest.aufnahme", DISPATCH_QUEUE_SERIAL);
+        g_lifeq = dispatch_queue_create("hosttest.lebenslauf", DISPATCH_QUEUE_SERIAL);
+        int bild_port = annahme_lauschen(19400, bild_verbindung, "Bildkanal");
+        int ein_port = annahme_lauschen(19450, eingabe_verbindung, "Eingabekanal");
+        printf("Annahme: Bildport %d, Eingabeport %d\n", bild_port, ein_port);
+        if (bild_port < 0 || ein_port < 0) return 1;
         g_stats.nal_len = 4;
         atomic_store(&g_cur_fps, 120);
+        protokoll_pruefen(bild_port, ein_port);
         abloesen_pruefen();
         ton_pruefen();
         stau_pruefen();

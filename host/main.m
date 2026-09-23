@@ -32,6 +32,8 @@
 #include <stdatomic.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <sys/stat.h>
+#include <time.h>
 #import "audio.h"
 #import "clipboard.h"
 #import "zeiger.h"
@@ -43,7 +45,26 @@
 
 // ------------------------------------------------------------------ Logging
 
+// Das Protokoll hat eine Obergrenze. Ueber g_log_grenze wandert die Datei nach
+// g_log_alt_pfad (ein frueheres .alt.log faellt dabei weg), und eine neue
+// beginnt: hoechstens das Doppelte auf der Platte, auch wenn jemand aus dem
+// Netz die Ports flutet, und die juengsten Zeilen bleiben erhalten. Gezaehlt
+// werden die Zeilen von logf_; die wenigen aus audio.m und clipboard.m, die
+// die Datei selbst oeffnen, landen in derselben, zaehlen aber nicht mit.
 static FILE *g_log = NULL;
+static const char *g_log_pfad = "/tmp/quadchroma-m1.log";
+static const char *g_log_alt_pfad = "/tmp/quadchroma-m1.alt.log";
+static long g_log_grenze = 8L * 1024 * 1024;     // nur der Pruefstand setzt sie herab
+static long g_log_bytes = 0;                      // unter g_log_mtx
+// Nur um g_log und seinen Zaehler; darunter wird keine andere Sperre genommen.
+static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// Nur beim Start und unter g_log_mtx.
+static void log_oeffnen(void) {
+    g_log = fopen(g_log_pfad, "a");
+    struct stat st;
+    g_log_bytes = g_log && fstat(fileno(g_log), &st) == 0 ? (long)st.st_size : 0;
+}
 
 static void logf_(NSString *fmt, ...) {
     va_list ap;
@@ -53,7 +74,112 @@ static void logf_(NSString *fmt, ...) {
     const char *c = s.UTF8String;
     fprintf(stdout, "%s\n", c);
     fflush(stdout);
-    if (g_log) { fprintf(g_log, "%s\n", c); fflush(g_log); }
+    pthread_mutex_lock(&g_log_mtx);
+    if (g_log && g_log_bytes >= g_log_grenze) {
+        fclose(g_log);
+        rename(g_log_pfad, g_log_alt_pfad);
+        log_oeffnen();
+        if (g_log) {
+            int n = fprintf(g_log, "Protokoll war ueber %ld KB - die Zeilen davor stehen in %s\n",
+                            g_log_grenze / 1024, g_log_alt_pfad);
+            if (n > 0) g_log_bytes += n;
+        }
+    }
+    if (g_log) {
+        int n = fprintf(g_log, "%s\n", c);
+        if (n > 0) g_log_bytes += n;
+        fflush(g_log);
+    }
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
+// Zeilen, die jeder im Netz ohne Anmeldung ausloesen kann - gescheiterter
+// Handschlag, unbekannte Gegenstelle, Eingabekanal ohne Bild -, gehen
+// gedrosselt ins Protokoll: die erste sofort, danach je Art hoechstens alle
+// QC_MELDEN_S Sekunden eine, mit der Zahl der dazwischen unterdrueckten. Sonst
+// schriebe jede Verbindung eine Zeile, und eine Flut aus dem Netz fuellte die
+// Platte (gemessen: rund 2500 Zeilen je Sekunde, seit die Handschlaege
+// nebeneinander laufen) - und die echten Zeilen gingen darin unter. Was erst
+// nach einer Freigabe geschieht (gekoppelt, Zuschauer verbunden), bleibt
+// ungedrosselt.
+typedef struct {
+    const char *art;                  // fuer die Sammelzeile
+    pthread_mutex_t m;
+    int64_t zuletzt_s;                // wann zuletzt eine Zeile durchkam (monotone Uhr)
+    long weitere;                     // seitdem unterdrueckt
+    char von[INET_ADDRSTRLEN];        // Adresse der zuletzt unterdrueckten
+} qc_drossel;
+#define QC_DROSSEL(art) { art, PTHREAD_MUTEX_INITIALIZER, -QC_MELDEN_S, 0, "" }
+
+static qc_drossel d_bild_handschlag = QC_DROSSEL("Bildkanal: Handschlag gescheitert");
+static qc_drossel d_liste_defekt    = QC_DROSSEL("Abgewiesen: Freigabeliste nicht lesbar oder beschaedigt");
+static qc_drossel d_nicht_speicherbar = QC_DROSSEL("Abgewiesen: Freigabe liess sich nicht speichern");
+static qc_drossel d_unbekannt       = QC_DROSSEL("Abgewiesen: unbekannte Gegenstelle");
+static qc_drossel d_ein_ohne_bild   = QC_DROSSEL("Eingabekanal abgewiesen: kein Bildkanal offen");
+static qc_drossel d_ein_handschlag  = QC_DROSSEL("Eingabekanal: Handschlag gescheitert");
+static qc_drossel d_ein_fremd       = QC_DROSSEL("Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+static qc_drossel d_ton_verworfen   = QC_DROSSEL("Ton verworfen: Leitung langsamer als der Ton");
+static qc_drossel *const g_drosseln[] = {
+    &d_bild_handschlag, &d_liste_defekt, &d_nicht_speicherbar, &d_unbekannt,
+    &d_ein_ohne_bild, &d_ein_handschlag, &d_ein_fremd, &d_ton_verworfen,
+};
+
+static int64_t mono_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec;
+}
+
+// Wie logf_, aber ueber die Drossel d. von: Adresse der Gegenstelle oder NULL.
+// Formatiert wird nur, was durchkommt - eine Flut kostet so je Verbindung
+// nur einen Griff an die Sperre.
+static void logf_gedrosselt(qc_drossel *d, const char *von, NSString *fmt, ...) {
+    int64_t t = mono_s();
+    long vorher = 0;
+    char vorher_von[INET_ADDRSTRLEN] = {0};
+    pthread_mutex_lock(&d->m);
+    BOOL durch = t - d->zuletzt_s >= QC_MELDEN_S;
+    if (durch) {
+        vorher = d->weitere;
+        memcpy(vorher_von, d->von, sizeof vorher_von);
+        d->weitere = 0;
+        d->zuletzt_s = t;
+    } else {
+        d->weitere++;
+        strlcpy(d->von, von ? von : "", sizeof d->von);
+    }
+    pthread_mutex_unlock(&d->m);
+    if (!durch) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (vorher)
+        logf_(@"%@ - dazu %ld weitere seit der letzten Meldung%s%s", s, vorher,
+              vorher_von[0] ? ", zuletzt von " : "", vorher_von);
+    else
+        logf_(@"%@", s);
+}
+
+// Unterdrueckte Zeilen bleiben nicht liegen, auch wenn danach keine derselben
+// Art mehr kommt: der Dienst ruft das alle fuenf Sekunden, und nach der Frist
+// geht die Zahl als Sammelzeile hinaus.
+static void drosseln_nachtragen(void) {
+    int64_t t = mono_s();
+    for (size_t i = 0; i < sizeof g_drosseln / sizeof g_drosseln[0]; i++) {
+        qc_drossel *d = g_drosseln[i];
+        long n = 0;
+        char von[INET_ADDRSTRLEN] = {0};
+        pthread_mutex_lock(&d->m);
+        if (d->weitere && t - d->zuletzt_s >= QC_MELDEN_S) {
+            n = d->weitere;
+            memcpy(von, d->von, sizeof von);
+            d->weitere = 0;
+            d->zuletzt_s = t;
+        }
+        pthread_mutex_unlock(&d->m);
+        if (n) logf_(@"%s: %ld weitere seit der letzten Meldung%s%s", d->art, n, von[0] ? ", zuletzt von " : "", von);
+    }
 }
 
 // ------------------------------------------------- Undokumentierte Profile
@@ -568,7 +694,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         return;
     }
     if (hr != 0) {
-        logf_(@"Handschlag mit %s gescheitert (%d)", ip, hr);
+        logf_gedrosselt(&d_bild_handschlag, ip, @"Handschlag mit %s gescheitert (%d)", ip, hr);
         qc_chan_free(chan);
         close(fd);
         return;
@@ -587,20 +713,20 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     int anz = known == 0 ? qc_authorized_count() : 0;
     BOOL rein = known > 0;
     if (known < 0 || anz < 0) {
-        logf_(@"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar oder beschaedigt", fp, ip);
+        logf_gedrosselt(&d_liste_defekt, ip, @"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar oder beschaedigt", fp, ip);
     } else if (!known) {
         if (atomic_load(&g_pair_open) || anz == 0) {
             if (qc_authorize(chan->peer, ip) != 0) {
                 // Ohne gespeicherte Freigabe keine Sitzung - und das
                 // Kopplungsfenster bleibt, wie es war.
-                logf_(@"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
+                logf_gedrosselt(&d_nicht_speicherbar, ip, @"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
             } else {
                 logf_(@"Neue Gegenstelle gekoppelt: %s (%s), Vergleichscode %s", fp, ip, sas);
                 atomic_store(&g_pair_open, 0);
                 rein = YES;
             }
         } else {
-            logf_(@"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
+            logf_gedrosselt(&d_unbekannt, ip, @"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
         }
     }
     pthread_mutex_unlock(&g_freigabe_mtx);
@@ -1006,6 +1132,8 @@ static void alle_tasten_loslassen(uint64_t kanal) {
 
 static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     uint8_t payload[256];
+    char ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &von->sin_addr, ip, sizeof ip);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
@@ -1016,7 +1144,7 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
     // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
     // Den fd immer erst nach qc_platz_frei schliessen (siehe qc_annahme.h).
     if (!atomic_load(&g_vid_ready)) {
-        logf_(@"Eingabekanal abgewiesen: kein Bildkanal offen");
+        logf_gedrosselt(&d_ein_ohne_bild, ip, @"Eingabekanal abgewiesen: kein Bildkanal offen (%s)", ip);
         qc_platz_frei(platz);
         close(fd);
         return;
@@ -1042,13 +1170,13 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
         return;
     }
     if (hr != 0) {
-        logf_(@"Eingabekanal: Handschlag gescheitert (%d)", hr);
+        logf_gedrosselt(&d_ein_handschlag, ip, @"Eingabekanal: Handschlag mit %s gescheitert (%d)", ip, hr);
         qc_chan_free(in);
         close(fd);
         return;
     }
     if (memcmp(in->peer, expect, 32) != 0) {
-        logf_(@"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+        logf_gedrosselt(&d_ein_fremd, ip, @"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild (%s)", ip);
         qc_chan_free(in);
         close(fd);
         return;
@@ -2221,7 +2349,9 @@ static void stream_herunterfahren_anstossen(void) {
 }
 
 int main(int argc, const char *argv[]) { @autoreleasepool {
-    g_log = fopen("/tmp/quadchroma-m1.log", "a");
+    pthread_mutex_lock(&g_log_mtx);
+    log_oeffnen();
+    pthread_mutex_unlock(&g_log_mtx);
     setvbuf(stdout, NULL, _IONBF, 0);
 
     [NSApplication sharedApplication];
@@ -2465,6 +2595,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         long lastFrames2 = 0;   // eigener Bezugspunkt fuer die gemeldete Bildrate
         for (;;) {
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5.0]];
+            drosseln_nachtragen();
             long f = atomic_load(&g_sent_frames);
             long long b = atomic_load(&g_sent_bytes);
             if (atomic_load(&g_client_fd) >= 0)
