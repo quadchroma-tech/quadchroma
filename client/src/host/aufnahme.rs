@@ -19,10 +19,16 @@
 // bei Erfolg 9 = 0 und Vollbild erzwingen. Gemerkt wird der Geraetename des
 // Ausgangs, nicht der Listenplatz: faellt er weg, wird ausgewichen, kommt er
 // zurueck, gilt er wieder.
+//
+// Gedrehte Ausgaenge (Hochformat, 180 Grad, hochkantes Panel, das Windows
+// quer betreibt): die Oberflaeche kommt ungedreht, gedreht wird beim
+// Einlesen auf dem Prozessor (Drehung, bgra_drehen); der Strom hat die
+// Groesse des Desktops, die Maus bleibt beim Desktop (DesktopCoordinates).
 
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
 use windows::core::{Interface, BOOL};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -173,6 +179,120 @@ pub fn zeilen_holen(quelle: &[u8], abstand: usize, w: usize, h: usize, ziel: &mu
     Ok(())
 }
 
+// ---------------------------------------------------------------- Drehung
+
+/// Drehung eines Ausgangs (DXGI_OUTDUPL_DESC::Rotation). Die Oberflaeche aus
+/// AcquireNextFrame liegt immer ungedreht vor, der Desktop gedreht darin
+/// (Microsoft, "Desktop Duplication API", Abschnitt "Rotating the desktop
+/// image": Desktop 768x1024 bei 90 Grad -> Oberflaeche 1024x768). Die
+/// Richtung steht im Beispiel DXGIDesktopDuplication (DisplayManager.cpp,
+/// SetDirtyVert und SetMoveRect): bei ROTATE90 kommt der Desktoppunkt
+/// (x, y) aus der Oberflaeche bei (y, H-1-x) - die Oberflaeche wird fuer den
+/// Desktop um 90 Grad im Uhrzeigersinn gedreht, bei ROTATE270 gegen ihn.
+/// WebRTC (dxgi_output_duplicator.cc) dreht ebenso (CLOCK_WISE_90 ->
+/// libyuv kRotate90).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Drehung {
+    Keine,
+    Grad90,
+    Grad180,
+    Grad270,
+}
+
+/// Zielzeilen je Streifen beim Drehen um 90/270 Grad: die Quelle wird
+/// zeilenweise gelesen, geschrieben wird in so viele Zeilen zugleich.
+const DREH_STREIFEN: usize = 16;
+
+impl Drehung {
+    pub fn aus_dxgi(r: DXGI_MODE_ROTATION) -> Drehung {
+        match r {
+            DXGI_MODE_ROTATION_ROTATE90 => Drehung::Grad90,
+            DXGI_MODE_ROTATION_ROTATE180 => Drehung::Grad180,
+            DXGI_MODE_ROTATION_ROTATE270 => Drehung::Grad270,
+            _ => Drehung::Keine,
+        }
+    }
+
+    pub fn grad(self) -> u32 {
+        match self {
+            Drehung::Keine => 0,
+            Drehung::Grad90 => 90,
+            Drehung::Grad180 => 180,
+            Drehung::Grad270 => 270,
+        }
+    }
+
+    /// Hoch- und Querformat vertauscht (90/270 Grad)?
+    pub fn vertauscht(self) -> bool {
+        matches!(self, Drehung::Grad90 | Drehung::Grad270)
+    }
+
+    /// Groesse des Desktops aus der Groesse der Oberflaeche (und umgekehrt).
+    pub fn groesse<T>(self, w: T, h: T) -> (T, T) {
+        if self.vertauscht() { (h, w) } else { (w, h) }
+    }
+
+    /// Woher der Desktoppunkt (x, y) in der Oberflaeche sw x sh kommt.
+    fn quelle(self, sw: usize, sh: usize, x: usize, y: usize) -> (usize, usize) {
+        match self {
+            Drehung::Keine => (x, y),
+            Drehung::Grad90 => (y, sh - 1 - x),
+            Drehung::Grad180 => (sw - 1 - x, sh - 1 - y),
+            Drehung::Grad270 => (sw - 1 - y, x),
+        }
+    }
+}
+
+/// Groesse der Oberflaeche aus AcquireNextFrame (so gross werden die eigenen
+/// Texturen). Microsofts Tabelle nennt den Modus, "wie GDI oder DXGI ihn
+/// liefern", gedreht (768x1024 bei 90 Grad), und WebRTC prueft ModeDesc
+/// gegen DesktopCoordinates - ModeDesc waere dann bei 90/270 Grad zu
+/// vertauschen. Verlassen wird sich darauf nicht: steht ModeDesc schon im
+/// anderen Format (hoch/quer) als der Desktop, ist es die Oberflaeche
+/// selbst. Kommt sie doch anders an, faengt oberflaeche_pruefen das ab.
+pub fn oberflaeche_groesse(d: Drehung, modus_w: u32, modus_h: u32, desktop_w: i32, desktop_h: i32) -> (u32, u32) {
+    if d.vertauscht() && (modus_w >= modus_h) == (desktop_w >= desktop_h) {
+        (modus_h, modus_w)
+    } else {
+        (modus_w, modus_h)
+    }
+}
+
+/// BGRA (dicht gepackt, sw x sh, ungedreht) so drehen, wie der Desktop
+/// steht: das Ziel hat die Groesse d.groesse(sw, sh), dicht gepackt.
+/// Zeilenparallel; bei 90/270 Grad in Streifen, damit die Quelle zeilenweise
+/// gelesen wird statt spaltenweise. Reicht die Quelle nicht, ein Fehler.
+pub fn bgra_drehen(src: &[u8], sw: usize, sh: usize, d: Drehung, ziel: &mut Vec<u8>) -> Result<(), String> {
+    if sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
+        return Err(format!("Drehen {sw}x{sh}: Quelle {} Byte reicht nicht", src.len()));
+    }
+    let (gw, gh) = d.groesse(sw, sh);
+    ziel.resize(gw * gh * 4, 0);
+    let pixel = |z: &mut [u8], o: usize, x: usize, y: usize| {
+        let (qx, qy) = d.quelle(sw, sh, x, y);
+        let i = (qy * sw + qx) * 4;
+        z[o..o + 4].copy_from_slice(&src[i..i + 4]);
+    };
+    match d {
+        Drehung::Keine => ziel.copy_from_slice(&src[..sw * sh * 4]),
+        Drehung::Grad180 => ziel.par_chunks_mut(gw * 4).enumerate().for_each(|(y, z)| {
+            for x in 0..gw {
+                pixel(z, x * 4, x, y);
+            }
+        }),
+        Drehung::Grad90 | Drehung::Grad270 => ziel.par_chunks_mut(gw * 4 * DREH_STREIFEN).enumerate().for_each(|(s, z)| {
+            let y0 = s * DREH_STREIFEN;
+            let zeilen = z.len() / (gw * 4);
+            for x in 0..gw {
+                for dy in 0..zeilen {
+                    pixel(z, (dy * gw + x) * 4, x, y0 + dy);
+                }
+            }
+        }),
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------- GDI-Rueckfall
 
 unsafe extern "system" fn monitor_cb(m: HMONITOR, _dc: HDC, _r: *mut RECT, lp: LPARAM) -> BOOL {
@@ -211,8 +331,11 @@ pub struct Duplication {
     pub ctx: ID3D11DeviceContext,
     pub dup: IDXGIOutputDuplication,
     pub adapter: IDXGIAdapter1,
+    /// Groesse der Oberflaeche aus AcquireNextFrame (ungedreht) - so gross
+    /// sind die eigenen Texturen. Den Desktop nennt desktop_groesse.
     pub breite: u32,
     pub hoehe: u32,
+    pub drehung: Drehung,
     pub format: DXGI_FORMAT,
     pub im_systemspeicher: bool,
     /// Noch kein Bild abgeholt: das erste Abholen liefert den ganzen
@@ -243,8 +366,8 @@ pub fn dxgi_fehler_text(e: &windows::core::Error) -> String {
 /// Duplication auf dem Ausgang mit diesem Listenplatz aufbauen: Geraet auf
 /// seinem Adapter (D3D_DRIVER_TYPE_UNKNOWN mit dem IDXGIAdapter),
 /// ID3D11Multithread an (Aufnahme- und Encoderfaden teilen das Geraet),
-/// IDXGIOutput1::DuplicateOutput. HDR-Ausgaenge (R16G16B16A16_FLOAT),
-/// alles ausser BGRA 8 Bit und gedrehte Ausgaenge werden vorerst abgelehnt.
+/// IDXGIOutput1::DuplicateOutput. HDR-Ausgaenge (R16G16B16A16_FLOAT) und
+/// alles ausser BGRA 8 Bit werden vorerst abgelehnt.
 pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| fehler("CreateDXGIFactory1", e))?;
     let adapter = unsafe { factory.EnumAdapters1(ausgang.karte as u32) }.map_err(|e| fehler("EnumAdapters1", e))?;
@@ -278,29 +401,18 @@ pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
     }
     // Gedreht (Hochformat, 180 Grad, auch ein hochkantes Panel, das Windows
     // quer betreibt): die Oberflaeche aus AcquireNextFrame liegt ungedreht
-    // vor (so gross wie ModeDesc), der Desktop (DesktopCoordinates) gedreht.
-    // Ungedreht gestreamt saehe der Zuschauer ein seitliches Bild, und die
-    // Maus traefe daneben. Drehen kann der Host noch nicht, also klar
-    // ablehnen (Nachricht 9, neuer Versuch alle 2 s).
-    let grad = match desc.Rotation {
-        DXGI_MODE_ROTATION_ROTATE90 => 90,
-        DXGI_MODE_ROTATION_ROTATE180 => 180,
-        DXGI_MODE_ROTATION_ROTATE270 => 270,
-        _ => 0,
-    };
-    if grad != 0 {
-        return Err(format!(
-            "gedrehter Ausgang ({grad} Grad, Desktop {}x{}, Anzeigemodus {}x{}) - vorerst nicht unterstuetzt",
-            ausgang.breite, ausgang.hoehe, desc.ModeDesc.Width, desc.ModeDesc.Height
-        ));
-    }
+    // vor, der Desktop (DesktopCoordinates) gedreht. Die eigenen Texturen
+    // haben die Groesse der Oberflaeche, gedreht wird beim Einlesen.
+    let drehung = Drehung::aus_dxgi(desc.Rotation);
+    let (breite, hoehe) = oberflaeche_groesse(drehung, desc.ModeDesc.Width, desc.ModeDesc.Height, ausgang.breite, ausgang.hoehe);
     Ok(Duplication {
         device,
         ctx,
         dup,
         adapter,
-        breite: desc.ModeDesc.Width,
-        hoehe: desc.ModeDesc.Height,
+        breite,
+        hoehe,
+        drehung,
         format,
         im_systemspeicher: desc.DesktopImageInSystemMemory.as_bool(),
         erstes_offen: std::cell::Cell::new(true),
@@ -330,6 +442,11 @@ pub enum Abholung {
 }
 
 impl Duplication {
+    /// Groesse des Desktops (gedreht wie er steht) - daraus der Strom.
+    pub fn desktop_groesse(&self) -> (u32, u32) {
+        self.drehung.groesse(self.breite, self.hoehe)
+    }
+
     /// AcquireNextFrame mit Frist in ms. Der Aufrufer muss nach `Bild`
     /// SOFORT kopieren und `freigeben` rufen.
     pub fn abholen(&self, frist_ms: u32) -> Result<Abholung, windows::core::Error> {
@@ -579,13 +696,15 @@ struct Aufnahme {
     /// Bild im Hauptspeicher (Prozessorweg), in Stromgroesse.
     ram: Vec<u8>,
     ram_voll: Vec<u8>,
+    /// Gedrehter Ausgang: das ganze Bild, wie der Desktop steht.
+    ram_gedreht: Vec<u8>,
 }
 
 impl Aufnahme {
     /// Die Aufnahme auf einer Duplication, mit der Quelle, die der Encoder
     /// nimmt (Texturen oder Systemspeicher).
     fn neu(dup: Duplication, texturen: bool, halb: bool) -> Result<Aufnahme, String> {
-        let mut a = Aufnahme { dup, staging: None, kopie: None, halb, ram: Vec::new(), ram_voll: Vec::new() };
+        let mut a = Aufnahme { dup, staging: None, kopie: None, halb, ram: Vec::new(), ram_voll: Vec::new(), ram_gedreht: Vec::new() };
         a.quelle_anlegen(texturen, 0, 0)?;
         Ok(a)
     }
@@ -610,6 +729,7 @@ impl Aufnahme {
             self.kopie = Some(k);
             self.ram = Vec::new();
             self.ram_voll = Vec::new();
+            self.ram_gedreht = Vec::new();
             Ok(mit)
         } else {
             let s = self.dup.textur(dw, dh, true)?;
@@ -628,11 +748,22 @@ impl Aufnahme {
 
     /// Das Bild aus der STAGING-Textur in den Hauptspeicher, in
     /// Stromgroesse w x h: halbiert oder abgeschnitten, wie der Plan es
-    /// sagt - nie aus einer Annahme.
+    /// sagt - nie aus einer Annahme. Gedreht: erst die ganze Oberflaeche
+    /// lesen und drehen, dann nach Plan.
     fn einlesen(&mut self, w: i32, h: i32) -> Result<(), String> {
         let Some(s) = self.staging.as_ref() else { return Ok(()) };
         let (dw, dh) = (self.dup.breite, self.dup.hoehe);
-        if self.halb {
+        let d = self.dup.drehung;
+        if d != Drehung::Keine {
+            self.dup.auslesen(s, dw, dh, &mut self.ram_voll)?;
+            bgra_drehen(&self.ram_voll, dw as usize, dh as usize, d, &mut self.ram_gedreht)?;
+            let (gw, gh) = d.groesse(dw as usize, dh as usize);
+            if self.halb {
+                encoder::bgra_halbieren(&self.ram_gedreht, gw, gh, w as usize, h as usize, &mut self.ram)
+            } else {
+                zeilen_holen(&self.ram_gedreht, gw * 4, w as usize, h as usize, &mut self.ram)
+            }
+        } else if self.halb {
             self.dup.auslesen(s, dw, dh, &mut self.ram_voll)?;
             encoder::bgra_halbieren(&self.ram_voll, dw as usize, dh as usize, w as usize, h as usize, &mut self.ram)
         } else {
@@ -715,17 +846,20 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                 }
                 // Die Quelle (Textur oder STAGING) richtet sich nach dem, was
                 // der Encoder des laufenden Kandidaten nimmt, nicht nach dem
-                // Weg allein; der Null-Kopien-Weg kennt noch keine Skalierung.
+                // Weg allein; der Null-Kopien-Weg kennt noch keine Skalierung
+                // und keine Drehung.
                 Some(a) => match duplication_aufbauen(&a).and_then(move |d| {
-                    let (_, _, halb) = stromplan(d.breite as i32, d.hoehe as i32);
-                    let weg_hier = if weg == Weg::D3d11 && halb { Weg::Bgra } else { weg };
+                    let (gw, gh) = d.desktop_groesse();
+                    let (_, _, halb) = stromplan(gw as i32, gh as i32);
+                    let weg_hier = if weg == Weg::D3d11 && (halb || d.drehung != Drehung::Keine) { Weg::Bgra } else { weg };
                     Aufnahme::neu(d, encoder::texturweg(Z.codec_id.load(Ordering::Relaxed) as usize, weg_hier), halb)
                 }) {
                     Ok(neu) => {
                         kein_bildschirm_gemeldet = false;
                         dup_fehler_gemeldet.clear();
                         let d = &neu.dup;
-                        let ((nw, nh, halb), geaendert) = strom_anpassen(&a, d.breite as i32, d.hoehe as i32);
+                        let (gw, gh) = d.desktop_groesse();
+                        let ((nw, nh, halb), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
                         if geaendert || nw != w || nh != h {
                             w = nw;
                             h = nh;
@@ -737,17 +871,22 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                         if weg == Weg::D3d11 && halb {
                             log("Null-Kopien-Weg: Ausgang ab 3840 Breite wird noch nicht auf der Karte skaliert - Prozessorweg (bgra)");
                             weg = Weg::Bgra;
+                        } else if weg == Weg::D3d11 && d.drehung != Drehung::Keine {
+                            log("Null-Kopien-Weg: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg (bgra)");
+                            weg = Weg::Bgra;
                         }
                         if verlustmeldung.aufgebaut() {
-                            if (a.breite, a.hoehe) != (d.breite as i32, d.hoehe as i32) {
-                                log(format!("Ausgang {} meldet {}x{}, der Anzeigemodus ist {}x{} - der Strom folgt dem Anzeigemodus", a.name, a.breite, a.hoehe, d.breite, d.hoehe));
+                            if (a.breite, a.hoehe) != (gw as i32, gh as i32) {
+                                log(format!("Ausgang {} meldet {}x{}, der Anzeigemodus ist {}x{} - der Strom folgt dem Anzeigemodus", a.name, a.breite, a.hoehe, gw, gh));
                             }
                             log(format!(
-                                "Aufnahme {}: {} {}x{} an Karte {} ({}), Format {}, Desktopbild im Systemspeicher: {}, Strom {}x{}{}, Quelle {}",
+                                "Aufnahme {}: {} {}x{}{} an Karte {} ({}), Format {}, Desktopbild im Systemspeicher: {}, Strom {}x{}{}, Quelle {}",
                                 if verloren { "wiederhergestellt" } else { "gestartet" },
-                                a.name, d.breite, d.hoehe, a.karte, a.karte_name, d.format.0,
+                                a.name, gw, gh,
+                                if d.drehung != Drehung::Keine { format!(" gedreht {} Grad (Oberflaeche {}x{}, gedreht wird auf dem Prozessor)", d.drehung.grad(), d.breite, d.hoehe) } else { String::new() },
+                                a.karte, a.karte_name, d.format.0,
                                 if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
-                                if halb { " (halbiert)" } else if (w, h) != (d.breite as i32, d.hoehe as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
+                                if halb { " (halbiert)" } else if (w, h) != (gw as i32, gh as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
                                 if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                             ));
                         }
@@ -1203,6 +1342,149 @@ mod tests {
         // Die letzte Zeile braucht nur ihre eigenen Bytes, nicht den ganzen Abstand.
         zeilen_holen(&quelle[..1280 * 4 * 719 + 100 * 4], 1280 * 4, 100, 720, &mut ziel).unwrap();
         assert_eq!(ziel.len(), 100 * 720 * 4);
+    }
+
+    /// Testbild: jeder Punkt traegt seine Lage (x, y) in der Oberflaeche.
+    fn lagebild(w: usize, h: usize) -> Vec<u8> {
+        let mut b = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                b.extend_from_slice(&[x as u8, y as u8, (x >> 8) as u8, (y >> 8) as u8]);
+            }
+        }
+        b
+    }
+
+    fn punkt(b: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * w + x) * 4;
+        [b[i], b[i + 1], b[i + 2], b[i + 3]]
+    }
+
+    #[test]
+    fn drehung_ecken_alle_vier() {
+        // Oberflaeche 5x3, die Ecken: oben links (OL), oben rechts (OR),
+        // unten links (UL), unten rechts (UR). 90 Grad = im Uhrzeigersinn
+        // (MS-Beispiel DisplayManager.cpp, SetDirtyVert): OL landet oben
+        // rechts im Desktop, OR unten rechts, UR unten links, UL oben links.
+        let (sw, sh) = (5usize, 3usize);
+        let src = lagebild(sw, sh);
+        let (ol, or, ul, ur) = (punkt(&src, sw, 0, 0), punkt(&src, sw, 4, 0), punkt(&src, sw, 0, 2), punkt(&src, sw, 4, 2));
+        let mut z = Vec::new();
+
+        bgra_drehen(&src, sw, sh, Drehung::Keine, &mut z).unwrap();
+        assert_eq!(z, src);
+
+        bgra_drehen(&src, sw, sh, Drehung::Grad90, &mut z).unwrap();
+        assert_eq!(Drehung::Grad90.groesse(sw, sh), (3, 5));
+        assert_eq!(z.len(), 3 * 5 * 4);
+        assert_eq!(punkt(&z, 3, 2, 0), ol, "90: OL -> oben rechts");
+        assert_eq!(punkt(&z, 3, 2, 4), or, "90: OR -> unten rechts");
+        assert_eq!(punkt(&z, 3, 0, 4), ur, "90: UR -> unten links");
+        assert_eq!(punkt(&z, 3, 0, 0), ul, "90: UL -> oben links");
+
+        bgra_drehen(&src, sw, sh, Drehung::Grad180, &mut z).unwrap();
+        assert_eq!(z.len(), 5 * 3 * 4);
+        assert_eq!(punkt(&z, 5, 4, 2), ol, "180: OL -> unten rechts");
+        assert_eq!(punkt(&z, 5, 0, 2), or, "180: OR -> unten links");
+        assert_eq!(punkt(&z, 5, 0, 0), ur, "180: UR -> oben links");
+        assert_eq!(punkt(&z, 5, 4, 0), ul, "180: UL -> oben rechts");
+
+        bgra_drehen(&src, sw, sh, Drehung::Grad270, &mut z).unwrap();
+        assert_eq!(z.len(), 3 * 5 * 4);
+        assert_eq!(punkt(&z, 3, 0, 4), ol, "270: OL -> unten links");
+        assert_eq!(punkt(&z, 3, 0, 0), or, "270: OR -> oben links");
+        assert_eq!(punkt(&z, 3, 2, 0), ur, "270: UR -> oben rechts");
+        assert_eq!(punkt(&z, 3, 2, 4), ul, "270: UL -> unten rechts");
+    }
+
+    #[test]
+    fn drehung_jeder_punkt_wie_im_ms_beispiel() {
+        // Jeder Punkt der Oberflaeche (xs, ys) landet im Desktop dort, wo
+        // DisplayManager.cpp (SetDirtyVert: DestDirty.left = Width -
+        // Dirty->bottom, DestDirty.top = Dirty->left fuer ROTATE90 usw.) ihn
+        // hinlegt - auch ueber mehrere Streifen mit Rest (37 x 21).
+        for (sw, sh) in [(37usize, 21usize), (21, 37), (1, 1), (2, 1), (16, 33)] {
+            let src = lagebild(sw, sh);
+            for d in [Drehung::Keine, Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
+                let mut z = Vec::new();
+                bgra_drehen(&src, sw, sh, d, &mut z).unwrap();
+                let (gw, gh) = d.groesse(sw, sh);
+                assert_eq!(z.len(), gw * gh * 4);
+                for ys in 0..sh {
+                    for xs in 0..sw {
+                        let (xd, yd) = match d {
+                            Drehung::Keine => (xs, ys),
+                            Drehung::Grad90 => (sh - 1 - ys, xs),
+                            Drehung::Grad180 => (sw - 1 - xs, sh - 1 - ys),
+                            Drehung::Grad270 => (ys, sw - 1 - xs),
+                        };
+                        assert_eq!(punkt(&z, gw, xd, yd), punkt(&src, sw, xs, ys), "{d:?} {sw}x{sh} ({xs},{ys})");
+                    }
+                }
+            }
+            // Hin und zurueck ist das Bild wieder dasselbe.
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            bgra_drehen(&src, sw, sh, Drehung::Grad90, &mut a).unwrap();
+            bgra_drehen(&a, sh, sw, Drehung::Grad270, &mut b).unwrap();
+            assert_eq!(b, src);
+            bgra_drehen(&src, sw, sh, Drehung::Grad180, &mut a).unwrap();
+            bgra_drehen(&a, sw, sh, Drehung::Grad180, &mut b).unwrap();
+            assert_eq!(b, src);
+        }
+        // Zu kurze Quelle: Fehler statt Lesen hinter dem Ende.
+        let mut z = Vec::new();
+        assert!(bgra_drehen(&vec![0u8; 5 * 3 * 4 - 1], 5, 3, Drehung::Grad90, &mut z).is_err());
+        assert!(bgra_drehen(&[], 0, 3, Drehung::Grad180, &mut z).is_err());
+    }
+
+    #[test]
+    fn oberflaeche_ist_ungedreht() {
+        // Desktop 1080x1920 bei 90/270 Grad: die Oberflaeche ist 1920x1080 -
+        // ob ModeDesc gedreht (1080x1920) oder schon ungedreht (1920x1080)
+        // dasteht. Hochkantes Panel quer betrieben (Desktop 1920x1200):
+        // Oberflaeche 1200x1920. 0/180 Grad: ModeDesc, wie er ist.
+        for d in [Drehung::Grad90, Drehung::Grad270] {
+            assert_eq!(oberflaeche_groesse(d, 1080, 1920, 1080, 1920), (1920, 1080));
+            assert_eq!(oberflaeche_groesse(d, 1920, 1080, 1080, 1920), (1920, 1080));
+            assert_eq!(oberflaeche_groesse(d, 1920, 1200, 1920, 1200), (1200, 1920));
+            assert_eq!(oberflaeche_groesse(d, 1200, 1920, 1920, 1200), (1200, 1920));
+            // Skalierung ohne DPI-Awareness verkleinert DesktopCoordinates,
+            // das Format (hoch/quer) bleibt.
+            assert_eq!(oberflaeche_groesse(d, 1080, 1920, 720, 1280), (1920, 1080));
+        }
+        for d in [Drehung::Keine, Drehung::Grad180] {
+            assert_eq!(oberflaeche_groesse(d, 1920, 1080, 1920, 1080), (1920, 1080));
+            assert_eq!(oberflaeche_groesse(d, 1367, 769, 1367, 769), (1367, 769));
+        }
+    }
+
+    #[test]
+    fn gedreht_ergeben_plan_und_quelle_genau_die_stromgroesse() {
+        // Wie plan_und_quelle_ergeben_genau_die_stromgroesse, mit Drehung:
+        // gemappte Oberflaeche -> drehen -> abschneiden bzw. halbieren.
+        for (sw, sh, d) in [
+            (1920usize, 1080usize, Drehung::Grad90),
+            (1920, 1080, Drehung::Grad270),
+            (1367, 769, Drehung::Grad90),
+            (3840, 2160, Drehung::Grad180),
+            (1200, 1920, Drehung::Grad90),
+            (2160, 3840, Drehung::Grad270),
+        ] {
+            let (gw, gh) = d.groesse(sw, sh);
+            let (w, h, halb) = stromplan(gw as i32, gh as i32);
+            let (w, h) = (w as usize, h as usize);
+            let abstand = (sw * 4 + 255) & !255;
+            let gemappt = vec![9u8; abstand * sh];
+            let (mut voll, mut gedreht, mut ram) = (Vec::new(), Vec::new(), Vec::new());
+            zeilen_holen(&gemappt, abstand, sw, sh, &mut voll).unwrap();
+            bgra_drehen(&voll, sw, sh, d, &mut gedreht).unwrap();
+            if halb {
+                encoder::bgra_halbieren(&gedreht, gw, gh, w, h, &mut ram).unwrap();
+            } else {
+                zeilen_holen(&gedreht, gw * 4, w, h, &mut ram).unwrap();
+            }
+            assert_eq!(ram.len(), w * h * 4, "{sw}x{sh} {d:?}");
+        }
     }
 
     #[test]

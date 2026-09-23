@@ -708,6 +708,12 @@ pub fn laufen(args: &[String]) -> i32 {
         };
         let w = dup.breite;
         let h = dup.hoehe;
+        if dup.drehung != aufnahme::Drehung::Keine {
+            log(format!(
+                "Ausgang {}: gedreht ({} Grad) - gemessen wird die ungedrehte Oberflaeche {w}x{h} ohne die Drehung; der Host dreht auf dem Prozessor und nimmt fuer diesen Ausgang immer den Prozessorweg",
+                a.index, dup.drehung.grad()
+            ));
+        }
         let mut laeufe: Vec<(String, Ergebnis)> = Vec::new();
         MEDIANE.with(|m| m.borrow_mut().clear());
         match messlauf(a, &dup, w, h, false, sekunden, nvidia.as_ref()) {
