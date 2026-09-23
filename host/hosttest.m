@@ -1009,6 +1009,165 @@ static void abbau_wettlauf_pruefen(int bild_port) {
     pruefe(strom_jetzt() == nil, "ohne Zuschauer haelt der Abbau den Strom an");
 }
 
+// ------------------------------------ Nachreichen bei stillem Bildschirm
+
+static CVPixelBufferRef testpuffer(int w, int h) {
+    NSDictionary *attr = @{ (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    CVPixelBufferRef pb = NULL;
+    CVPixelBufferCreate(NULL, (size_t)w, (size_t)h, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                        (__bridge CFDictionaryRef)attr, &pb);
+    if (!pb) return NULL;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    for (size_t i = 0; i < CVPixelBufferGetPlaneCount(pb); i++)
+        memset(CVPixelBufferGetBaseAddressOfPlane(pb, i), 0x80,
+               CVPixelBufferGetBytesPerRowOfPlane(pb, i) * CVPixelBufferGetHeightOfPlane(pb, i));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    return pb;
+}
+
+// Ein Bild, wie es ScreenCaptureKit liefert: vollstaendig, mit Zeitstempel.
+static CMSampleBufferRef aufnahme_bild(CVPixelBufferRef pb, CMTime pts) {
+    CMVideoFormatDescriptionRef fd = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(NULL, pb, &fd);
+    CMSampleTimingInfo ti = { .duration = kCMTimeInvalid, .presentationTimeStamp = pts, .decodeTimeStamp = kCMTimeInvalid };
+    CMSampleBufferRef sb = NULL;
+    CMSampleBufferCreateReadyWithImageBuffer(NULL, pb, fd, &ti, &sb);
+    if (fd) CFRelease(fd);
+    if (!sb) return NULL;
+    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, true);
+    CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
+    int v = SCFrameStatusComplete;
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &v);
+    CFDictionarySetValue(d, (__bridge CFStringRef)SCStreamFrameInfoStatus, n);
+    CFRelease(n);
+    return sb;
+}
+
+static CMTime uhr(void) { return CMClockGetTime(CMClockGetHostTimeClock()); }
+
+// Nachrichten lesen, bis frist_ms lang nichts kommt; Bilder und Vollbilder zaehlen.
+static void bilder_lesen(leser *l, int frist_ms, int *bilder, int *vollbilder, int *erstes_voll) {
+    qc_hdr m;
+    uint8_t anf[8];
+    while (nachricht(l, &m, anf, frist_ms) == 1) {
+        if (m.type != QC_MSG_VIDEO) continue;
+        int key = (m.flags & QC_FLAG_KEY) ? 1 : 0;
+        if (*bilder == 0) *erstes_voll = key;
+        (*bilder)++;
+        *vollbilder += key;
+    }
+}
+
+static void takt(int schlaege) {
+    for (int i = 0; i < schlaege; i++) {
+        dispatch_sync(g_capq, ^{ fixed_tick(); });
+        usleep(20 * 1000);
+    }
+}
+
+static void nachreichen_pruefen(int bild_port) {
+    printf("\n-- Nachreichen bei stillem Bildschirm (echter Encoder, HEVC 4:2:0, 640x360)\n");
+    atomic_store(&g_codec_id, 3);
+    g_info_w = 640; g_info_h = 360; g_info_fps = 60;
+    atomic_store(&g_cur_fps, 60);
+    atomic_store(&g_cur_mbit, 10);
+    atomic_store(&g_cur_fixed, 0);
+    atomic_store(&g_cur_gaming, 0);
+    atomic_store(&g_testbild, 0);
+    __block BOOL enc = NO;
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{ enc = encoder_start(3, 640, 360, 60, 10); });
+    stdout_stumm(0);
+    CVPixelBufferRef pb = testpuffer(640, 360);
+    if (!enc || !pb) { pruefe(0, "Encoder und Bildpuffer"); return; }
+    strom_attrappe_setzen();
+    SCStream *fs = strom_jetzt();
+    Grabber *grab = [[Grabber alloc] init];
+    // Der Bildschirm aenderte sich zuletzt vor einer Sekunde; der Vorgaenger
+    // hat dieses Bild laengst bekommen.
+    CMTime vor = CMTimeSubtract(uhr(), CMTimeMake(1, 1));
+    dispatch_sync(g_capq, ^{
+        g_last_pb = CVPixelBufferRetain(pb);
+        g_last_cap_us = cmtime_us(vor);
+        g_last_pts = vor;
+        g_schlitz = 0;
+    });
+    atomic_store(&g_bild_offen, 0);
+
+    uint8_t d_priv[32], d_pub[32];
+    qc_keypair(d_priv, d_pub);
+    qc_authorize(d_pub, "hosttest D");
+    qc_cipher rx;
+    stdout_stumm(1);
+    int b = client_verbinden(bild_port, d_priv, &rx, NULL);
+    leser l;
+    leser_init(&l, b, 0);
+    l.rx = rx;
+    char magic[4];
+    int ok = b >= 0 && klartext(&l, magic, 4, 2000) == 1;
+    usleep(50 * 1000);                               // eingetragen
+    long nach0 = atomic_load(&g_nachgereicht);
+    takt(5);
+    int bilder = 0, voll = 0, erstes = -1;
+    bilder_lesen(&l, 300, &bilder, &voll, &erstes);
+    stdout_stumm(0);
+    printf("         (neuer Zuschauer, stiller Bildschirm: %d Bild(er), das erste %s)\n", bilder,
+           erstes == 1 ? "ein Vollbild" : erstes == 0 ? "ein Zwischenbild" : "-");
+    pruefe(ok && bilder == 1 && erstes == 1 && !atomic_load(&g_wait_key),
+           "der Neue bekommt das zuletzt gesehene Bild als Vollbild, genau einmal");
+
+    // Eine kurze Bewegung: zwei Bilder im Abstand von 3 ms, das zweite ist
+    // das Endbild und faellt als zu schnell weg.
+    // Die Zeitstempel sind die der Aufnahme, nicht die der Zustellung: ein
+    // erster Aufruf an einen frischen Encoder kann selbst 40 ms dauern.
+    long zs0 = atomic_load(&g_zu_schnell);
+    CMTime t1 = uhr();
+    CMSampleBufferRef s1 = aufnahme_bild(pb, t1);
+    CMSampleBufferRef s2 = aufnahme_bild(pb, CMTimeAdd(t1, CMTimeMake(3, 1000)));
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s1 ofType:SCStreamOutputTypeScreen]; });
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s2 ofType:SCStreamOutputTypeScreen]; });
+    int weg = atomic_load(&g_zu_schnell) == zs0 + 1 && atomic_load(&g_bild_offen);
+    // Der Takt innerhalb derselben Bildzeit legt nichts dazu.
+    dispatch_sync(g_capq, ^{ fixed_tick(); });
+    long vorher = atomic_load(&g_nachgereicht);
+    takt(4);
+    bilder = 0; voll = 0; erstes = -1;
+    stdout_stumm(1);
+    bilder_lesen(&l, 300, &bilder, &voll, &erstes);
+    stdout_stumm(0);
+    printf("         (Bewegung aus 2 Bildern, Endbild zu schnell: %d Bild(er) beim Zuschauer, %ld nachgereicht)\n",
+           bilder, atomic_load(&g_nachgereicht) - vorher);
+    pruefe(weg, "das Endbild der Bewegung faellt im Raster weg und bleibt als offen stehen");
+    pruefe(bilder == 2 && !atomic_load(&g_bild_offen) && atomic_load(&g_nachgereicht) - vorher == 1,
+           "der Takt reicht es genau einmal nach - der Zuschauer sieht den Endstand");
+
+    // Mitten in einer Bewegung (juengstes Bild juenger als eine Bildzeit)
+    // legt der Takt nichts dazu; die naechste Aufnahme kommt ohnehin.
+    dispatch_sync(g_capq, ^{ g_last_cap_us = now_us(); g_last_pts = CMTimeSubtract(uhr(), CMTimeMake(1, 10)); });
+    atomic_store(&g_bild_offen, 1);
+    long frames0 = atomic_load(&g_sent_frames);
+    dispatch_sync(g_capq, ^{ fixed_tick(); });
+    usleep(100 * 1000);
+    int still = atomic_load(&g_sent_frames) == frames0 && atomic_load(&g_bild_offen);
+    usleep(20 * 1000);
+    takt(1);
+    usleep(100 * 1000);
+    pruefe(still && atomic_load(&g_sent_frames) == frames0 + 1 && !atomic_load(&g_bild_offen),
+           "waehrend einer Bewegung nichts dazu, erst eine Bildzeit nach dem juengsten Bild");
+    printf("         (insgesamt %ld nachgereicht)\n", atomic_load(&g_nachgereicht) - nach0);
+
+    zuschauer_weg();
+    stdout_stumm(1);
+    stream_herunterfahren_anstossen();
+    SCStream *st = strom_jetzt();
+    stdout_stumm(0);
+    pruefe(st == nil && !g_session && !g_last_pb, "ohne Zuschauer: Strom, Encoder und letztes Bild weg");
+    close(b); free(l.buf);
+    CFRelease(s1); CFRelease(s2);
+    CVPixelBufferRelease(pb);
+    atomic_store(&g_codec_id, 0);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -1049,6 +1208,7 @@ int main(void) {
         abloesen_pruefen();
         wechsel_pruefen(bild_port);
         abbau_wettlauf_pruefen(bild_port);
+        nachreichen_pruefen(bild_port);
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();
