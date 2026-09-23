@@ -369,11 +369,10 @@ fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, ausschnitt: bool, se
             if wg.fehler.is_some() {
                 continue;
             }
-            if let Err(e) = wg.bild.schreibbar() {
+            if let Err(e) = wg.bild.schreibbar().and_then(|_| wg.bild.ebene_fuellen(0, &ram, (w * 4) as usize, h as usize)) {
                 wg.fehler = Some(e);
                 continue;
             }
-            wg.bild.ebene_fuellen(0, &ram, (w * 4) as usize, h as usize);
             wg.durchlauf(pts, vollbild, a_ms + b_ms + c_ms);
         }
         // D2: eigene Umrechnung, dann yuv444p.
@@ -384,11 +383,13 @@ fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, ausschnitt: bool, se
                 bgra_nach_yuv444(&ram, w as usize, &mut y444, &mut u444, &mut v444);
                 let u_ms = ms(t);
                 umrechnung.push(u_ms);
-                match wg.bild.schreibbar() {
+                let gefuellt = wg.bild.schreibbar().and_then(|_| {
+                    wg.bild.ebene_fuellen(0, &y444, w as usize, h as usize)?;
+                    wg.bild.ebene_fuellen(1, &u444, w as usize, h as usize)?;
+                    wg.bild.ebene_fuellen(2, &v444, w as usize, h as usize)
+                });
+                match gefuellt {
                     Ok(()) => {
-                        wg.bild.ebene_fuellen(0, &y444, w as usize, h as usize);
-                        wg.bild.ebene_fuellen(1, &u444, w as usize, h as usize);
-                        wg.bild.ebene_fuellen(2, &v444, w as usize, h as usize);
                         wg.durchlauf(pts, vollbild, a_ms + b_ms + c_ms + u_ms);
                     }
                     Err(e) => wg.fehler = Some(e),
@@ -524,12 +525,12 @@ fn farbprobe_weg(name: &str, pix_fmt: AVPixelFormat, w: i32, h: i32) -> Result<b
     for k in 0..testbild::N {
         bild.schreibbar()?;
         match pix_fmt {
-            AVPixelFormat::AV_PIX_FMT_BGRA => bild.ebene_fuellen(0, &testbild::bgra(w, h, k), (w * 4) as usize, h as usize),
+            AVPixelFormat::AV_PIX_FMT_BGRA => bild.ebene_fuellen(0, &testbild::bgra(w, h, k), (w * 4) as usize, h as usize)?,
             _ => {
                 let [y, u, v] = testbild::yuv444p(w, h, k);
-                bild.ebene_fuellen(0, &y, w as usize, h as usize);
-                bild.ebene_fuellen(1, &u, w as usize, h as usize);
-                bild.ebene_fuellen(2, &v, w as usize, h as usize);
+                bild.ebene_fuellen(0, &y, w as usize, h as usize)?;
+                bild.ebene_fuellen(1, &u, w as usize, h as usize)?;
+                bild.ebene_fuellen(2, &v, w as usize, h as usize)?;
             }
         }
         s.senden(bild.frame, (k as i64) * 16_667, k == 0)?;
@@ -617,10 +618,11 @@ fn vollbildprobe() {
             break;
         }
         let [y, u, v] = testbild::yuv444p(w, h, n % testbild::N);
-        bild.ebene_fuellen(0, &y, w as usize, h as usize);
-        bild.ebene_fuellen(1, &u, w as usize, h as usize);
-        bild.ebene_fuellen(2, &v, w as usize, h as usize);
-        if let Err(e) = s.senden(bild.frame, (n as i64) * 16_667, n == 0 || n == 20) {
+        let gefuellt = bild
+            .ebene_fuellen(0, &y, w as usize, h as usize)
+            .and_then(|_| bild.ebene_fuellen(1, &u, w as usize, h as usize))
+            .and_then(|_| bild.ebene_fuellen(2, &v, w as usize, h as usize));
+        if let Err(e) = gefuellt.and_then(|_| s.senden(bild.frame, (n as i64) * 16_667, n == 0 || n == 20)) {
             log(format!("  I: {e}"));
             return;
         }
@@ -664,11 +666,7 @@ fn vollbildprobe() {
 // ------------------------------------------------------------------ Lauf
 
 pub fn laufen(args: &[String]) -> i32 {
-    // Per-Monitor-DPI, damit die Desktopkoordinaten in Pixeln kommen.
-    unsafe {
-        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    // Per-Monitor-DPI setzt main_host schon fuer alle Hostrollen.
     let sekunden: f64 = arg_wert(args, "--sekunden").and_then(|v| v.parse().ok()).unwrap_or(10.0);
     let wunsch: Option<usize> = arg_wert(args, "--output").and_then(|v| v.parse().ok());
     log(format!("=== QuadChroma Messung, {sekunden} s je Lauf ==="));

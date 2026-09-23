@@ -30,7 +30,7 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::sys::*;
 use rayon::prelude::*;
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BOX, D3D11_TEXTURE2D_DESC};
 
 use super::{log, netz, Z};
 
@@ -84,6 +84,14 @@ static WEG: AtomicU8 = AtomicU8::new(0);
 
 pub fn kandidat(idx: usize) -> &'static Kandidat {
     &KANDIDATEN[idx.min(KANDIDATEN.len() - 1)]
+}
+
+/// Kennt das Protokoll den Codec? Strominfo (Nachricht 1) und Codecwechsel
+/// (Nachricht 7) unterscheiden nur HEVC und H.264 - AV1 kaeme beim
+/// Zuschauer als HEVC an und bliebe schwarz. Bis Protokoll und Client AV1
+/// kennen, gilt er als nicht vorhanden.
+pub fn im_protokoll(k: &Kandidat) -> bool {
+    if k.h264 { k.encoder.starts_with("h264_") } else { k.encoder.starts_with("hevc_") }
 }
 
 pub fn befund(idx: usize) -> Befund {
@@ -204,6 +212,14 @@ fn eingabeformat(idx: usize, weg: Weg, encoder: &str) -> (AVPixelFormat, bool) {
     }
 }
 
+/// Nimmt der Encoder dieses Kandidaten auf diesem Weg Texturen? Danach
+/// richtet sich die Aufnahme (DEFAULT-Kopie oder STAGING) - nicht nach dem
+/// Weg allein: 10 Bit und Media Foundation nehmen auch bei d3d11 den
+/// Systemspeicher.
+pub fn texturweg(idx: usize, weg: Weg) -> bool {
+    eingabeformat(idx, weg, befund(idx).encoder).1
+}
+
 /// Umrechnungsvermerk fuer die Koennensliste: die Tabelle, plus alles, was
 /// auf dem gewaehlten Weg ueber den Prozessor geht.
 fn umrechnung_fuer(idx: usize, b: &Befund) -> bool {
@@ -223,6 +239,11 @@ pub fn pruefen() {
     log("--- Was dieser Rechner codieren kann ---");
     let mut befund = BEFUND.lock().unwrap();
     for (i, k) in KANDIDATEN.iter().enumerate() {
+        if !im_protokoll(k) {
+            befund[i] = KEIN_BEFUND;
+            log(format!("  {:<18} nein (Protokoll und Client kennen {} noch nicht)", k.name, k.name));
+            continue;
+        }
         crate::protokoll::fehler_verwerfen();
         match Sitzung::oeffnen(&Oeffnung { encoder: k.encoder, pix_fmt: k.pix_fmt, profil: k.profil, rgb_444: k.chroma444, ..Oeffnung::vorgabe(1920, 1080) }) {
             Ok(_) => {
@@ -263,8 +284,8 @@ fn mf_probe(name: &'static str) -> Result<usize, String> {
     for k in 0..40usize {
         b.schreibbar()?;
         let [y, uv] = super::testbild::nv12(1920, 1080, k % super::testbild::N);
-        b.ebene_fuellen(0, &y, 1920, 1080);
-        b.ebene_fuellen(1, &uv, 1920, 540);
+        b.ebene_fuellen(0, &y, 1920, 1080)?;
+        b.ebene_fuellen(1, &uv, 1920, 540)?;
         s.senden(b.frame, (k as i64) * 16_667, k == 0)?;
         if !s.empfangen()?.is_empty() {
             erstes = k + 1;
@@ -324,6 +345,7 @@ pub fn codecs_payload() -> Vec<u8> {
 /// u8 umrechnung, u16 frei.
 pub fn switch_senden(idx: usize) {
     let k = kandidat(idx);
+    debug_assert!(im_protokoll(k), "{}: Codec nicht im Protokoll", k.name);
     let b = befund(idx);
     let p = [idx as u8, k.h264 as u8, k.chroma444 as u8, k.zehn_bit as u8, 1, umrechnung_fuer(idx, &b) as u8, 0, 0];
     netz::send_small(crate::protokoll_konst::MSG_SWITCH, &p);
@@ -592,15 +614,27 @@ impl Bild {
         unsafe { std::mem::transmute((*self.frame).format) }
     }
 
-    /// Ebene `i` zeilenweise fuellen (bytes_je_zeile aus der Quelle, Hoehe rows).
-    pub fn ebene_fuellen(&mut self, i: usize, quelle: &[u8], bytes_je_zeile: usize, zeilen: usize) {
+    /// Ebene `i` zeilenweise fuellen (bytes_je_zeile aus der Quelle, Hoehe
+    /// zeilen). Vorher geprueft: die Quelle reicht, die Zeile passt in den
+    /// Zeilenabstand, die Ebene hat so viele Zeilen - sonst ein Fehler statt
+    /// eines Zugriffs hinter das Ende.
+    pub fn ebene_fuellen(&mut self, i: usize, quelle: &[u8], bytes_je_zeile: usize, zeilen: usize) -> Result<(), String> {
+        let (hat, ls) = unsafe {
+            let f = self.frame;
+            if i >= 4 || !(*f).hw_frames_ctx.is_null() || (*f).data[i].is_null() {
+                (0, 0)
+            } else {
+                (ebene_zeilen(self.format(), i, (*f).height.max(0) as usize), (*f).linesize[i].max(0) as usize)
+            }
+        };
+        ebene_pruefen(i, quelle.len(), bytes_je_zeile, zeilen, ls, hat)?;
         unsafe {
-            let ls = (*self.frame).linesize[i] as usize;
             let dst = (*self.frame).data[i];
             for y in 0..zeilen {
                 std::ptr::copy_nonoverlapping(quelle.as_ptr().add(y * bytes_je_zeile), dst.add(y * ls), bytes_je_zeile);
             }
         }
+        Ok(())
     }
 
     /// Ebene `i` als Zeilen (Schrittweite = linesize), fuer die parallele Umrechnung.
@@ -615,12 +649,19 @@ impl Bild {
     /// Kopie fuer BGRA, sonst Umrechnung BT.709 voller Wertebereich (die
     /// Umkehrung von zeile_rgb im Client), zeilenparallel. 10-Bit-Formate
     /// legen den 8-Bit-Wert oben buendig ab (v << 8), wie das Testbild.
+    /// Passt die Quelle nicht (zu kurz, groesser als der Rahmen), kommt ein
+    /// Fehler - vor jedem Zugriff.
     pub fn aus_bgra(&mut self, src: &[u8], w: usize, h: usize) -> Result<(), String> {
-        self.schreibbar()?;
+        let (fw, fh, hw) = unsafe { ((*self.frame).width.max(0) as usize, (*self.frame).height.max(0) as usize, !(*self.frame).hw_frames_ctx.is_null()) };
+        if hw {
+            return Err("Umrechnung in eine Textur nicht vorgesehen".into());
+        }
+        bgra_pruefen(src.len(), w, h, fw, fh)?;
         let zeile = w * 4;
+        self.schreibbar()?;
         match self.format() {
             AVPixelFormat::AV_PIX_FMT_BGRA => {
-                self.ebene_fuellen(0, src, zeile, h);
+                self.ebene_fuellen(0, src, zeile, h)?;
             }
             AVPixelFormat::AV_PIX_FMT_YUV444P | AVPixelFormat::AV_PIX_FMT_YUV444P16LE => {
                 let sechzehn = self.format() == AVPixelFormat::AV_PIX_FMT_YUV444P16LE;
@@ -698,6 +739,46 @@ impl Drop for Bild {
     }
 }
 
+/// Zeilen der Ebene `i` eines Rahmens im Format `f` mit der Hoehe h, fuer
+/// die Formate, die der Host fuellt (0 = keine solche Ebene): die
+/// Farbebene von NV12/P010 hat die halbe Hoehe, aufgerundet wie bei
+/// av_frame_get_buffer.
+fn ebene_zeilen(f: AVPixelFormat, i: usize, h: usize) -> usize {
+    use AVPixelFormat::*;
+    match (f, i) {
+        (AV_PIX_FMT_BGRA, 0) => h,
+        (AV_PIX_FMT_YUV444P | AV_PIX_FMT_YUV444P16LE, 0..=2) => h,
+        (AV_PIX_FMT_NV12 | AV_PIX_FMT_P010LE, 0) => h,
+        (AV_PIX_FMT_NV12 | AV_PIX_FMT_P010LE, 1) => h.div_ceil(2),
+        _ => 0,
+    }
+}
+
+/// Vor jeder Kopie in eine Ebene: die Zeile passt in den Zeilenabstand, die
+/// Ebene hat so viele Zeilen, die Quelle reicht.
+fn ebene_pruefen(i: usize, quelle: usize, bytes_je_zeile: usize, zeilen: usize, abstand: usize, hat: usize) -> Result<(), String> {
+    if bytes_je_zeile > abstand || zeilen > hat {
+        return Err(format!("Ebene {i}: {zeilen} Zeilen zu {bytes_je_zeile} Byte passen nicht in den Rahmen ({hat} Zeilen zu {abstand} Byte)"));
+    }
+    if quelle < bytes_je_zeile * zeilen {
+        return Err(format!("Ebene {i}: Quelle zu kurz: {quelle} statt {} Byte", bytes_je_zeile * zeilen));
+    }
+    Ok(())
+}
+
+/// Vor der Umrechnung aus BGRA: w x h passt in den Rahmen fw x fh, und die
+/// Quelle reicht fuer w x h - im Pruefbericht kam bei 150 % Skalierung ein
+/// halb so grosses Bild fuer einen 1280x720-Strom an.
+fn bgra_pruefen(quelle: usize, w: usize, h: usize, fw: usize, fh: usize) -> Result<(), String> {
+    if w == 0 || h == 0 || w > fw || h > fh {
+        return Err(format!("Bild {w}x{h} passt nicht in den Rahmen {fw}x{fh}"));
+    }
+    if quelle < w * h * 4 {
+        return Err(format!("Quelle zu kurz: {quelle} statt {} Byte ({w}x{h} BGRA)", w * h * 4));
+    }
+    Ok(())
+}
+
 /// RGB -> Y/Cb/Cr, BT.709, voller Wertebereich, ganzzahlig (Koeffizienten
 /// mal 256: 54/183/19 fuer Y, 138 = 256/1.8556, 163 = 256/1.5748).
 #[inline]
@@ -723,9 +804,17 @@ pub fn bgra_nach_yuv444(src: &[u8], w: usize, y: &mut [u8], u: &mut [u8], v: &mu
     });
 }
 
-/// BGRA auf die Haelfte (Mittel aus 2x2), fuer Ausgaenge breiter als 3840.
-pub fn bgra_halbieren(src: &[u8], w: usize, h: usize, ziel: &mut Vec<u8>) {
-    let (w2, h2) = (w / 2, h / 2);
+/// BGRA auf die Haelfte (Mittel aus 2x2), fuer Ausgaenge ab 3840 Breite:
+/// Quelle w x h, Ziel w2 x h2 - hoechstens die Haelfte, ein ungerader Rand
+/// faellt weg. Passt das nicht zusammen, kommt ein Fehler statt eines
+/// Zugriffs hinter das Ende.
+pub fn bgra_halbieren(src: &[u8], w: usize, h: usize, w2: usize, h2: usize, ziel: &mut Vec<u8>) -> Result<(), String> {
+    if w2 == 0 || h2 == 0 || w2 > w / 2 || h2 > h / 2 {
+        return Err(format!("Halbieren {w}x{h} -> {w2}x{h2} geht nicht"));
+    }
+    if src.len() < w * h * 4 {
+        return Err(format!("Halbieren: Quelle zu kurz: {} statt {} Byte", src.len(), w * h * 4));
+    }
     ziel.resize(w2 * h2 * 4, 0);
     ziel.par_chunks_mut(w2 * 4).enumerate().for_each(|(row, z)| {
         let a = &src[2 * row * w * 4..(2 * row + 1) * w * 4];
@@ -737,6 +826,7 @@ pub fn bgra_halbieren(src: &[u8], w: usize, h: usize, ziel: &mut Vec<u8>) {
             }
         }
     });
+    Ok(())
 }
 
 // ---------------------------------------------- FFmpeg-Geraet aus D3D11
@@ -763,7 +853,8 @@ pub fn hw_geraet(device: &ID3D11Device) -> Result<*mut AVBufferRef, String> {
 }
 
 /// Texturpool fuer den Null-Kopien-Weg: Format D3D11, sw_format BGRA,
-/// RENDER_TARGET, vier Texturen.
+/// RENDER_TARGET, sechs Texturen (bis zu drei beim Encoder, das zuletzt
+/// gegebene Bild fuer die Wiederholung, das Testbild und eine Reserve).
 pub fn hw_pool(geraet: *mut AVBufferRef, w: i32, h: i32) -> Result<*mut AVBufferRef, String> {
     unsafe {
         let r = av_hwframe_ctx_alloc(geraet);
@@ -775,7 +866,7 @@ pub fn hw_pool(geraet: *mut AVBufferRef, w: i32, h: i32) -> Result<*mut AVBuffer
         (*fc).sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
         (*fc).width = w;
         (*fc).height = h;
-        (*fc).initial_pool_size = 4;
+        (*fc).initial_pool_size = 6;
         let d3d = (*fc).hwctx as *mut AVD3D11VAFramesContext;
         (*d3d).BindFlags = D3D11_BIND_RENDER_TARGET.0 as u32;
         let e = av_hwframe_ctx_init(r);
@@ -790,6 +881,9 @@ pub fn hw_pool(geraet: *mut AVBufferRef, w: i32, h: i32) -> Result<*mut AVBuffer
 
 /// Eine Textur aus dem Pool in `bild` holen; liefert Textur und Index.
 pub fn pool_textur(pool: *mut AVBufferRef, bild: &mut Bild) -> Result<(ID3D11Texture2D, u32), String> {
+    if bild.frame.is_null() || pool.is_null() {
+        return Err("Pooltextur: kein Rahmen oder kein Pool".into());
+    }
     unsafe {
         av_frame_unref(bild.frame);
         let e = av_hwframe_get_buffer(pool, bild.frame, 0);
@@ -800,6 +894,41 @@ pub fn pool_textur(pool: *mut AVBufferRef, bild: &mut Bild) -> Result<(ID3D11Tex
         let idx = (*bild.frame).data[1] as usize as u32;
         let t = ID3D11Texture2D::from_raw_borrowed(&roh).ok_or("Pooltextur fehlt")?.clone();
         Ok((t, idx))
+    }
+}
+
+/// Ein Bild im Systemspeicher (BGRA in Poolgroesse, das Testbild) in eine
+/// Textur des Pools laden; `rahmen` haelt danach diese Textur. Eine
+/// Sitzung mit hw_frames_ctx nimmt nur Texturen - nvenc liest bei ihr
+/// frame->hw_frames_ctx, ohne zu pruefen, ob es ihn gibt.
+pub fn pool_hochladen(pool: *mut AVBufferRef, ctx: &ID3D11DeviceContext, quelle: &Bild, rahmen: &mut Bild) -> Result<(), String> {
+    let (w, h) = unsafe {
+        let fc = (*pool).data as *const AVHWFramesContext;
+        ((*fc).width, (*fc).height)
+    };
+    if !rahmen_passt(quelle.frame, None, AVPixelFormat::AV_PIX_FMT_BGRA, w, h) {
+        return Err(format!("Bild fuer den Pool ({w}x{h} BGRA) passt nicht"));
+    }
+    let (t, idx) = pool_textur(pool, rahmen)?;
+    unsafe {
+        ctx.UpdateSubresource(&t, idx, None, (*quelle.frame).data[0] as *const _, (*quelle.frame).linesize[0] as u32, 0);
+    }
+    Ok(())
+}
+
+/// Passt ein Rahmen zur Sitzung? Mit Pool nur Texturen aus genau diesem
+/// Pool, ohne Pool nur Systemspeicher im Eingabeformat - immer in der
+/// Groesse der Sitzung. Was nicht passt, erreicht avcodec_send_frame nie.
+fn rahmen_passt(frame: *const AVFrame, pool: Option<*mut AVBufferRef>, pix_fmt: AVPixelFormat, w: i32, h: i32) -> bool {
+    unsafe {
+        if frame.is_null() || (*frame).data[0].is_null() || (*frame).width != w || (*frame).height != h {
+            return false;
+        }
+        let hw = (*frame).hw_frames_ctx;
+        match pool {
+            Some(p) => !hw.is_null() && !p.is_null() && (*hw).data == (*p).data && (*frame).format == AVPixelFormat::AV_PIX_FMT_D3D11 as i32,
+            None => hw.is_null() && (*frame).format == pix_fmt as i32,
+        }
     }
 }
 
@@ -816,6 +945,10 @@ pub enum Quelle<'a> {
     /// Das zuletzt gegebene Bild noch einmal (feste Bildrate).
     Wiederholung,
 }
+
+/// Antwort von codieren auf eine Wiederholung, bevor diese Sitzung je ein
+/// Bild hatte (frisch geoeffnet): nichts gesendet, nichts zu zaehlen.
+pub const KEIN_VORBILD: &str = "kein Bild fuer die Wiederholung";
 
 /// Geraet und Texturpool fuer den Null-Kopien-Weg. Wird als Feld NACH
 /// Sitzung und Bild abgebaut - die halten Referenzen auf den Pool.
@@ -840,6 +973,9 @@ pub struct Betrieb {
     sitzung: Sitzung,
     /// Eingabebild (Systemspeicher) bzw. leerer Rahmen fuer den Pool.
     bild: Bild,
+    /// Leerer Rahmen fuer das Testbild im Pool - `bild` behaelt derweil das
+    /// letzte Desktopbild fuer die Wiederholung.
+    tb_rahmen: Bild,
     pool: Option<Pool>,
     /// Fuer Texturquellen: der Kontext, der in den Pool kopiert.
     ctx: Option<ID3D11DeviceContext>,
@@ -913,11 +1049,26 @@ impl Betrieb {
             if texturen { "d3d11/bgra ohne Kopie".to_string() } else { pix_fmt_name(pix_fmt) },
             if umrechnung_fuer(idx, &b) { " (mit Umrechnung)" } else { "" }
         ) + &if b.vorlauf > 0 { format!(", Vorlauf {} Bilder", b.vorlauf) } else { String::new() });
-        Ok(Betrieb { idx, sitzung, bild, pool, ctx, pix_fmt, w, h, fps, mbit, gaming, seit_idr: 0, unterwegs: VecDeque::new(), vorlauf: b.vorlauf, hat_bild: false, fehler_gemeldet: false })
+        Ok(Betrieb { idx, sitzung, bild, tb_rahmen: Bild::leer(), pool, ctx, pix_fmt, w, h, fps, mbit, gaming, seit_idr: 0, unterwegs: VecDeque::new(), vorlauf: b.vorlauf, hat_bild: false, fehler_gemeldet: false })
     }
 
     pub fn texturen(&self) -> bool {
         self.pool.is_some()
+    }
+
+    /// Hat diese Sitzung ein Bild, das sie wiederholen kann? Eine frisch
+    /// geoeffnete hat keines - auch wenn ihre Vorgaengerin es hatte.
+    pub fn hat_bild(&self) -> bool {
+        self.hat_bild
+    }
+
+    /// Testbild aus: die Pooltextur, die `tb_rahmen` noch haelt, geht an
+    /// den Pool zurueck (der Encoder haelt seine eigene Referenz, solange er
+    /// sie braucht). Ohne Pool haelt `tb_rahmen` nichts.
+    pub fn testbild_freigeben(&mut self) {
+        if self.pool.is_some() {
+            unsafe { av_frame_unref(self.tb_rahmen.frame) };
+        }
     }
 
     /// Bilder, deren Paket noch aussteht - ohne den Vorlauf des Encoders.
@@ -955,10 +1106,43 @@ impl Betrieb {
     /// t_cap ist die ECHTE Aufnahmezeit (bei Wiederholungen die des
     /// wiederholten Bildes), pts die fuer den Encoder aufsteigende Zeit.
     pub fn codieren(&mut self, quelle: Quelle, t_cap_us: u64, pts_us: i64, wiederholt: bool) -> Result<(), String> {
-        let vollbild = Z.force_key.swap(false, Ordering::Relaxed) || self.seit_idr >= if self.gaming { self.fps } else { self.fps * 2 };
+        // Erst der Rahmen, dann das Vollbild: kehrt codieren vorher zurueck,
+        // bleibt force_key fuer das naechste Bild stehen. Eine Wiederholung
+        // ohne Vorbild ist kein gesendetes Bild (und nichts fuers Protokoll).
         let frame = match quelle {
+            Quelle::Wiederholung if !self.hat_bild => return Err(KEIN_VORBILD.into()),
+            Quelle::Wiederholung => self.bild.frame,
+            q => match self.rahmen(q) {
+                Ok(f) => f,
+                Err(e) => return Err(self.verworfen(e)),
+            },
+        };
+        if !rahmen_passt(frame, self.pool.as_ref().map(|p| p.pool), self.pix_fmt, self.w, self.h) {
+            return Err(self.verworfen("Bild passt nicht zur Sitzung (Systemspeicher/Textur, Format oder Groesse)".into()));
+        }
+        let vollbild = Z.force_key.swap(false, Ordering::Relaxed) || self.seit_idr >= if self.gaming { self.fps } else { self.fps * 2 };
+        if let Err(e) = self.sitzung.senden(frame, pts_us, vollbild) {
+            if vollbild {
+                Z.force_key.store(true, Ordering::Relaxed);
+            }
+            return Err(self.verworfen(e));
+        }
+        self.seit_idr = if vollbild { 1 } else { self.seit_idr + 1 };
+        self.unterwegs.push_back((pts_us, t_cap_us, wiederholt));
+        self.pakete_abholen()
+    }
+
+    /// Den Rahmen fuer die Sitzung bereitstellen, in dem, was sie nimmt:
+    /// Systemspeicher im Eingabeformat oder eine Textur aus ihrem Pool.
+    fn rahmen(&mut self, quelle: Quelle) -> Result<*mut AVFrame, String> {
+        Ok(match quelle {
             Quelle::Ram(bgra) => {
+                self.hat_bild = false;
                 if let Some(p) = self.pool.as_ref() {
+                    let noetig = (self.w * self.h * 4) as usize;
+                    if bgra.len() < noetig {
+                        return Err(format!("Quelle zu kurz: {} statt {noetig} Byte ({}x{} BGRA)", bgra.len(), self.w, self.h));
+                    }
                     let (t, idx) = pool_textur(p.pool, &mut self.bild)?;
                     unsafe {
                         self.ctx.as_ref().unwrap().UpdateSubresource(&t, idx, None, bgra.as_ptr() as *const _, (self.w * 4) as u32, 0);
@@ -971,32 +1155,43 @@ impl Betrieb {
             }
             Quelle::Textur(tex) => {
                 let Some(p) = self.pool.as_ref() else { return Err("Textur ohne Pool".into()) };
+                let mut d = D3D11_TEXTURE2D_DESC::default();
+                unsafe { tex.GetDesc(&mut d) };
+                if (d.Width as i32) < self.w || (d.Height as i32) < self.h {
+                    return Err(format!("Textur {}x{} kleiner als der Strom {}x{}", d.Width, d.Height, self.w, self.h));
+                }
+                self.hat_bild = false;
                 let (t, idx) = pool_textur(p.pool, &mut self.bild)?;
+                // Nur der Ausschnitt in Stromgroesse: ein ungerader Rand faellt weg.
+                let kasten = D3D11_BOX { left: 0, top: 0, front: 0, right: self.w as u32, bottom: self.h as u32, back: 1 };
                 unsafe {
-                    self.ctx.as_ref().unwrap().CopySubresourceRegion(&t, idx, 0, 0, 0, tex, 0, None);
+                    self.ctx.as_ref().unwrap().CopySubresourceRegion(&t, idx, 0, 0, 0, tex, 0, Some(&kasten));
                 }
                 self.hat_bild = true;
                 self.bild.frame
             }
-            Quelle::Fertig(b) => b.frame,
-            Quelle::Wiederholung => {
-                if !self.hat_bild {
-                    return Ok(());
+            // Das Testbild liegt immer im Systemspeicher; eine Sitzung mit
+            // Pool bekommt es als Textur, `bild` bleibt das letzte Desktopbild.
+            Quelle::Fertig(b) => match self.pool.as_ref() {
+                Some(p) => {
+                    pool_hochladen(p.pool, self.ctx.as_ref().unwrap(), b, &mut self.tb_rahmen)?;
+                    self.tb_rahmen.frame
                 }
-                self.bild.frame
-            }
-        };
-        if let Err(e) = self.sitzung.senden(frame, pts_us, vollbild) {
-            if !self.fehler_gemeldet {
-                self.fehler_gemeldet = true;
-                log(format!("Encoder {}: {e}", kandidat(self.idx).name));
-            }
-            Z.enc_verworfen.fetch_add(1, Ordering::Relaxed);
-            return Err(e);
+                None => b.frame,
+            },
+            Quelle::Wiederholung => self.bild.frame,
+        })
+    }
+
+    /// Ein Bild, das nicht in den Encoder kam: einmal ins Protokoll, es
+    /// zaehlt als verworfen.
+    fn verworfen(&mut self, e: String) -> String {
+        if !self.fehler_gemeldet {
+            self.fehler_gemeldet = true;
+            log(format!("Encoder {}: {e}", kandidat(self.idx).name));
         }
-        self.seit_idr = if vollbild { 1 } else { self.seit_idr + 1 };
-        self.unterwegs.push_back((pts_us, t_cap_us, wiederholt));
-        self.pakete_abholen()
+        Z.enc_verworfen.fetch_add(1, Ordering::Relaxed);
+        e
     }
 
     /// Fertige Pakete an den Zuschauer, jedes mit dem Stempel seines Bildes.
@@ -1047,38 +1242,40 @@ impl Betrieb {
 }
 
 /// Die zwoelf Testbilder im Eingabeformat der Sitzung, vorgerechnet - so
-/// wie qc_testbild_start auf dem Mac sie im Aufnahmeformat anlegt. Fuer
-/// Texturen (d3d11) und BGRA-Sitzungen aus dem BGRA-Testbild, sonst direkt
-/// aus den Y/Cb/Cr-Ganzzahlen (dieselben Werte wie auf dem Mac).
+/// wie qc_testbild_start auf dem Mac sie im Aufnahmeformat anlegt. Immer im
+/// Systemspeicher: fuer BGRA-Sitzungen und den Null-Kopien-Weg (dessen
+/// pix_fmt ist BGRA; codieren laedt das Bild in eine Textur des Pools) aus
+/// dem BGRA-Testbild, sonst direkt aus den Y/Cb/Cr-Ganzzahlen (dieselben
+/// Werte wie auf dem Mac).
 pub fn testbilder(pix_fmt: AVPixelFormat, w: i32, h: i32) -> Result<Vec<Bild>, String> {
     use super::testbild;
     let mut aus = Vec::with_capacity(testbild::N);
     for k in 0..testbild::N {
-        let mut b = Bild::neu(if pix_fmt == AVPixelFormat::AV_PIX_FMT_D3D11 { AVPixelFormat::AV_PIX_FMT_BGRA } else { pix_fmt }, w, h)?;
+        let mut b = Bild::neu(pix_fmt, w, h)?;
         match b.format() {
-            AVPixelFormat::AV_PIX_FMT_BGRA => b.ebene_fuellen(0, &testbild::bgra(w, h, k), (w * 4) as usize, h as usize),
+            AVPixelFormat::AV_PIX_FMT_BGRA => b.ebene_fuellen(0, &testbild::bgra(w, h, k), (w * 4) as usize, h as usize)?,
             AVPixelFormat::AV_PIX_FMT_YUV444P => {
                 let [y, u, v] = testbild::yuv444p(w, h, k);
-                b.ebene_fuellen(0, &y, w as usize, h as usize);
-                b.ebene_fuellen(1, &u, w as usize, h as usize);
-                b.ebene_fuellen(2, &v, w as usize, h as usize);
+                b.ebene_fuellen(0, &y, w as usize, h as usize)?;
+                b.ebene_fuellen(1, &u, w as usize, h as usize)?;
+                b.ebene_fuellen(2, &v, w as usize, h as usize)?;
             }
             AVPixelFormat::AV_PIX_FMT_YUV444P16LE => {
                 let [y, u, v] = testbild::yuv444p16(w, h, k);
-                b.ebene_fuellen(0, &y, 2 * w as usize, h as usize);
-                b.ebene_fuellen(1, &u, 2 * w as usize, h as usize);
-                b.ebene_fuellen(2, &v, 2 * w as usize, h as usize);
+                b.ebene_fuellen(0, &y, 2 * w as usize, h as usize)?;
+                b.ebene_fuellen(1, &u, 2 * w as usize, h as usize)?;
+                b.ebene_fuellen(2, &v, 2 * w as usize, h as usize)?;
             }
             AVPixelFormat::AV_PIX_FMT_NV12 => {
                 let [y, uv] = testbild::nv12(w, h, k);
-                b.ebene_fuellen(0, &y, w as usize, h as usize);
-                b.ebene_fuellen(1, &uv, w as usize, (h / 2) as usize);
+                b.ebene_fuellen(0, &y, w as usize, h as usize)?;
+                b.ebene_fuellen(1, &uv, w as usize, (h / 2) as usize)?;
             }
             AVPixelFormat::AV_PIX_FMT_P010LE => {
                 let [y, uv] = testbild::nv12(w, h, k);
                 let f = |p: Vec<u8>| -> Vec<u8> { p.iter().flat_map(|&b| [0u8, b]).collect() };
-                b.ebene_fuellen(0, &f(y), 2 * w as usize, h as usize);
-                b.ebene_fuellen(1, &f(uv), 2 * w as usize, (h / 2) as usize);
+                b.ebene_fuellen(0, &f(y), 2 * w as usize, h as usize)?;
+                b.ebene_fuellen(1, &f(uv), 2 * w as usize, (h / 2) as usize)?;
             }
             f => return Err(format!("Testbild in {} nicht vorgesehen", pix_fmt_name(f))),
         }
@@ -1108,7 +1305,129 @@ mod tests {
             assert!((v[i] as i32 - super::super::testbild::BALKEN_CR[b] as i32).abs() <= 2, "Cr Balken {b}");
         }
         let mut halb = Vec::new();
-        bgra_halbieren(&src, w as usize, h as usize, &mut halb);
+        bgra_halbieren(&src, w as usize, h as usize, (w / 2) as usize, (h / 2) as usize, &mut halb).unwrap();
         assert_eq!(halb.len(), (w * h) as usize);
+    }
+
+    #[test]
+    fn halbieren_liefert_genau_die_zielgroesse() {
+        // Ziel = die Haelfte, auch bei ungeradem Rand; zu kurze Quelle oder
+        // zu grosses Ziel sind Fehler, kein Lesen hinter dem Ende.
+        for (sw, sh, w2, h2) in [(5120usize, 1440usize, 2560usize, 720usize), (3842, 2160, 1920, 1080), (3840, 2160, 1920, 1080), (7, 5, 2, 2)] {
+            let src = vec![7u8; sw * sh * 4];
+            let mut ziel = Vec::new();
+            bgra_halbieren(&src, sw, sh, w2, h2, &mut ziel).unwrap();
+            assert_eq!(ziel.len(), w2 * h2 * 4, "{sw}x{sh}");
+            assert!(ziel.iter().all(|&b| b == 7));
+        }
+        let mut ziel = Vec::new();
+        assert!(bgra_halbieren(&vec![0u8; 1280 * 720 * 4], 1920, 1080, 960, 540, &mut ziel).is_err());
+        assert!(bgra_halbieren(&vec![0u8; 1920 * 1080 * 4], 1920, 1080, 961, 540, &mut ziel).is_err());
+        assert!(bgra_halbieren(&vec![0u8; 16], 2, 2, 0, 1, &mut ziel).is_err());
+    }
+
+    // Die Tests kommen ohne FFmpeg-Aufrufe aus: die Testdatei darf die
+    // FFmpeg-DLLs nicht importieren (sie liegen beim Testlauf nicht im PATH).
+
+    #[test]
+    fn zu_kurze_quelle_ist_ein_fehler() {
+        // Der Fall aus dem Pruefbericht: 1920x1080 bei 150 % - Strom
+        // 1280x720, die Quelle aber nur 960x540 (halbiert). Fehler statt
+        // Lesen (BGRA) oder Panik (Umrechnung).
+        assert!(bgra_pruefen(960 * 540 * 4, 1280, 720, 1280, 720).is_err());
+        assert!(bgra_pruefen(1280 * 720 * 4, 1282, 720, 1280, 720).is_err(), "breiter als der Rahmen");
+        assert!(bgra_pruefen(1280 * 720 * 4, 1280, 722, 1280, 720).is_err(), "hoeher als der Rahmen");
+        assert!(bgra_pruefen(0, 0, 720, 1280, 720).is_err());
+        bgra_pruefen(1280 * 720 * 4, 1280, 720, 1280, 720).unwrap();
+        bgra_pruefen(1280 * 720 * 4, 1278, 718, 1280, 720).unwrap();
+        // Ebenen: Quelle zu kurz, Zeile laenger als der Zeilenabstand, mehr
+        // Zeilen als die Ebene hat.
+        assert!(ebene_pruefen(0, 960 * 540 * 4, 1280 * 4, 720, 1280 * 4, 720).is_err());
+        assert!(ebene_pruefen(0, 4096 * 48, 4096, 48, 64, 48).is_err());
+        assert!(ebene_pruefen(1, 64 * 48, 64, 48, 64, 24).is_err());
+        ebene_pruefen(0, 1280 * 720 * 4, 1280 * 4, 720, 1280 * 4 + 64, 720).unwrap();
+        // Zeilen je Ebene der Formate, die der Host fuellt.
+        use AVPixelFormat::*;
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_BGRA, 0, 720), 720);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_BGRA, 1, 720), 0);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_YUV444P16LE, 2, 720), 720);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_YUV444P, 3, 720), 0);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_NV12, 1, 720), 360);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_P010LE, 1, 721), 361);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_NV12, 2, 720), 0);
+        assert_eq!(ebene_zeilen(AV_PIX_FMT_D3D11, 0, 720), 0);
+    }
+
+    #[test]
+    fn rahmen_passt_nur_zur_sitzung() {
+        // Ein Bild im Systemspeicher erreicht eine Sitzung mit Pool nie
+        // (nvenc wuerde frame->hw_frames_ctx lesen), eine Textur nur die
+        // Sitzung ihres Pools, und ohne Pool zaehlen Format und Groesse.
+        let mut puffer = vec![0u8; 64 * 48 * 4];
+        let mut ram: AVFrame = unsafe { std::mem::zeroed() };
+        ram.format = AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+        ram.width = 64;
+        ram.height = 48;
+        ram.data[0] = puffer.as_mut_ptr();
+        let bgra = AVPixelFormat::AV_PIX_FMT_BGRA;
+        assert!(rahmen_passt(&ram, None, bgra, 64, 48));
+        assert!(!rahmen_passt(&ram, Some(std::ptr::null_mut()), bgra, 64, 48));
+        assert!(!rahmen_passt(&ram, None, AVPixelFormat::AV_PIX_FMT_NV12, 64, 48));
+        assert!(!rahmen_passt(&ram, None, bgra, 66, 48));
+        assert!(!rahmen_passt(std::ptr::null(), None, bgra, 64, 48));
+        let (mut a, mut b) = (1u8, 2u8);
+        let mut pool_a: AVBufferRef = unsafe { std::mem::zeroed() };
+        let mut pool_b: AVBufferRef = unsafe { std::mem::zeroed() };
+        pool_a.data = &mut a;
+        pool_b.data = &mut b;
+        let mut tex: AVFrame = unsafe { std::mem::zeroed() };
+        tex.format = AVPixelFormat::AV_PIX_FMT_D3D11 as i32;
+        tex.width = 64;
+        tex.height = 48;
+        tex.data[0] = puffer.as_mut_ptr();
+        tex.hw_frames_ctx = &mut pool_a;
+        assert!(rahmen_passt(&tex, Some(&mut pool_a), bgra, 64, 48));
+        assert!(!rahmen_passt(&tex, Some(&mut pool_b), bgra, 64, 48), "anderer Pool");
+        assert!(!rahmen_passt(&tex, None, bgra, 64, 48), "Textur an eine Sitzung ohne Pool");
+        let mut leer: AVFrame = unsafe { std::mem::zeroed() };
+        leer.format = AVPixelFormat::AV_PIX_FMT_BGRA as i32;
+        leer.width = 64;
+        leer.height = 48;
+        assert!(!rahmen_passt(&leer, None, bgra, 64, 48), "ohne Daten");
+    }
+
+    #[test]
+    fn nur_codecs_des_protokolls() {
+        // Strominfo und Codecwechsel kennen nur HEVC (h264 = false) und
+        // H.264 (h264 = true); AV1 darf nie als vorhanden gelten.
+        for k in KANDIDATEN.iter() {
+            if im_protokoll(k) {
+                assert!((k.encoder.starts_with("hevc_") && !k.h264) || (k.encoder.starts_with("h264_") && k.h264), "{}", k.name);
+            }
+        }
+        assert!(KANDIDATEN.iter().filter(|k| k.encoder == "av1_nvenc").all(|k| !im_protokoll(k)));
+        assert_eq!(KANDIDATEN.iter().filter(|k| im_protokoll(k)).count(), 5);
+    }
+
+    #[test]
+    fn texturweg_folgt_dem_encoder() {
+        // Die Aufnahme liefert Texturen nur, wenn der Encoder sie auch
+        // nimmt: 8 Bit ueber nvenc auf dem Weg d3d11 - nicht 10 Bit, nicht
+        // Media Foundation, nicht die anderen Wege. texturweg ist genau
+        // eingabeformat(..).1 mit dem Encoder aus dem Befund; getestet wird
+        // mit dem Encodernamen direkt, ohne den gemeinsamen BEFUND
+        // anzufassen (die Tests laufen parallel).
+        let tex = |idx: usize, weg: Weg, enc: &str| eingabeformat(idx, weg, enc).1;
+        assert!(!tex(0, Weg::D3d11, "hevc_nvenc"));
+        assert!(tex(1, Weg::D3d11, "hevc_nvenc"));
+        assert!(!tex(2, Weg::D3d11, "hevc_nvenc"));
+        assert!(tex(3, Weg::D3d11, "hevc_nvenc"));
+        assert!(!tex(4, Weg::D3d11, MF_H264));
+        assert!(tex(4, Weg::D3d11, "h264_nvenc"));
+        assert!(!tex(1, Weg::Bgra, "hevc_nvenc"));
+        assert!(!tex(1, Weg::Yuv444, "hevc_nvenc"));
+        assert!(!tex(1, Weg::Auto, "hevc_nvenc"));
+        // Media Foundation nimmt immer NV12 im Systemspeicher.
+        assert!(eingabeformat(4, Weg::D3d11, MF_H264) == (AVPixelFormat::AV_PIX_FMT_NV12, false));
     }
 }
