@@ -73,6 +73,7 @@ static void clip_log(NSString *fmt, ...) {
 // bis auf g_cb_queue und g_started, die nur beim Start gesetzt werden.
 
 static void (*g_on_change)(const char *utf8, size_t len) = NULL;
+static int (*g_aktiv)(void) = NULL;          // NULL = immer lesen
 static dispatch_queue_t g_cb_queue = nil;    // liefert den Rueckruf aus
 static dispatch_source_t g_timer = nil;
 static BOOL g_started = NO;
@@ -115,6 +116,12 @@ static void clip_poll(void) {
     if (now == g_seen) return;
     g_seen = now;
     if (now == g_self_change) return;         // das waren wir selbst
+    // Ohne Gegenueber den Inhalt gar nicht erst lesen - so wie der Windows-Host
+    // und der Mac-Client: kein Zuschauer, keine Arbeit, und ab macOS 15.4 kann
+    // jedes Lesen die Systemabfrage zum Einsetzen ausloesen. Der Zaehler ist
+    // oben schon weitergefuehrt, die Aenderung gilt damit als gesehen.
+    int (*aktiv)(void) = g_aktiv;
+    if (aktiv && !aktiv()) return;
 
     NSString *text = read_first_text(pb);
     if (text.length == 0) {
@@ -202,6 +209,12 @@ static void clip_write(NSString *text) {
 }
 
 // -------------------------------------------------------------- Schnittstelle
+
+void qc_clip_bedingung(int (*aktiv)(void)) {
+    // Gesetzt wird vor qc_clip_start auf dem Hauptfaden; clip_poll liest es
+    // ebenfalls auf dem Hauptfaden.
+    g_aktiv = aktiv;
+}
 
 void qc_clip_start(void (*on_change)(const char *utf8, size_t len)) {
     if (g_started) { clip_log(@"Zwischenablage: Abgleich laeuft bereits"); return; }

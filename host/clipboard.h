@@ -31,6 +31,12 @@ extern "C" {
 // erst die naechste Aenderung loest den Rueckruf aus.
 void qc_clip_start(void (*on_change)(const char *utf8, size_t len));
 
+// Liest den Inhalt nur, solange aktiv() nicht 0 liefert (Hauptlauf: nur mit
+// Zuschauer). Ohne Gegenueber wird nur der Zaehler weitergefuehrt: Aenderungen
+// aus dieser Zeit werden weder gelesen noch spaeter nachgereicht. Ohne Aufruf
+// (oder mit NULL) liest der Abgleich wie bisher immer.
+void qc_clip_bedingung(int (*aktiv)(void));
+
 // Legt Text vom Client in die Zwischenablage. Darf aus jedem Faden aufgerufen
 // werden und kehrt sofort zurueck; geschrieben wird versetzt auf dem Hauptfaden.
 // Loest den Rueckruf von qc_clip_start() nicht aus. Ungueltiges UTF-8 und

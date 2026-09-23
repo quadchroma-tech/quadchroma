@@ -461,8 +461,8 @@ kopiert wurde, geht auch beim Verbinden nicht hinueber. Ohne Gegenueber
 liest der Client (Windows wie Mac) die Zwischenablage gar nicht erst, der
 Windows-Host ebenso nur mit Zuschauer - sonst stuende auch ohne jede
 Verbindung jede Passwortkopie als "verdeckt" im Protokoll. Der Mac-Host
-fragt sie auch ohne Zuschauer ab und protokolliert, was er sieht, schickt
-aber nichts.
+liest den Inhalt ebenso nur mit Zuschauer; ohne ihn zaehlt er nur mit,
+dass sich etwas geaendert hat.
 
 Was ankommt, soll in keinem Verlauf landen. Auf Windows wandert es weder in
 den Verlauf (Win+V) noch in die Cloud-Zwischenablage, und Ablageverwalter

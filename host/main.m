@@ -2854,6 +2854,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     if (srvIdx != NSNotFound) {
         // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
+        qc_clip_bedingung(zeiger_aktiv);   // Inhalt nur mit Zuschauer lesen
         qc_clip_start(clip_cb);
         qc_zeiger_start(zeiger_cb, zeiger_aktiv, zeiger_log);
         logf_(@"Zeigerform: Abfrage alle 50 ms, nur mit Zuschauer");
