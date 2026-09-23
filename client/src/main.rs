@@ -3905,11 +3905,12 @@ impl ApplicationHandler for App {
                     Err(e) => {
                         protokoll::zeile(format!("Anzeige: Rueckfall auf Software: {e}"));
                         if !matches!(self.anzeige_wunsch, W::Automatik | W::Warp) {
+                            // Ohne Anhang: `e` ist eigener deutscher Text
+                            // (anzeige.rs) und steht schon im Protokoll.
                             let m = Meldung::neu(
                                 strings::Key::ErrorGpuDisplay,
                                 format!("Grafikkarte nicht nutzbar, Anzeige ueber Software: {e}"),
-                            )
-                            .anhang(e);
+                            );
                             self.shared.lock().unwrap().error = Some(m);
                         }
                     }
@@ -6637,7 +6638,10 @@ fn main() {
             }
             let pfad = s.decoder_pfad.map(|p| p.name()).unwrap_or_else(|| "-".into());
             // Ohne Fenster gibt es kein Glied Anzeige - das steht auch so da.
+            // Ohne Verbindung keine Zahlen von gestern: Verzoegerung und
+            // Hostlast gelten nur fuer eine stehende Sitzung.
             let lat = match s.clock {
+                _ if !s.connected => "nicht verbunden".into(),
                 Some(l) if l.gesamt_ms > 0.0 => format!(
                     "Verzoegerung {:.1} ms (+/-{:.1}) = Encoder {:.1} + Leitung {:.1} + Decoder {:.1} | Anzeige -",
                     l.gesamt_ms, l.umlauf_ms / 2.0, l.encoder_ms, l.leitung_ms, l.decoder_ms
@@ -6646,22 +6650,29 @@ fn main() {
                 None => "Zeitabgleich laeuft noch".into(),
             };
             let hl = match s.hostlast {
-                Some(h) => format!(
+                Some(h) if s.connected => format!(
                     " | Host: CPU {:.0}% (eigen {:.0}%), GPU {}, RAM {:.1}/{:.0} GB, Encoder {:.1} ms, {:.0} Bilder/s",
                     h.cpu, h.cpu_eigen,
                     match h.gpu { Some(g) => format!("{g:.0}%"), None => "n/v".into() },
                     h.ram_benutzt_mb as f32 / 1024.0, h.ram_gesamt_mb as f32 / 1024.0,
                     h.encoder_ms, h.host_fps
                 ),
-                None => String::new(),
+                _ => String::new(),
+            };
+            // Der Fehler, wie ihn die Oberflaeche zeigt - auf Englisch, mit
+            // seinem Schluessel davor; ein Schluessel ohne Meldung (Abloesung,
+            // nicht gekoppelt, kein Bildschirm) hat wie im Fenster Vorrang.
+            // Die deutschen Einzelheiten stehen in den Protokollzeilen darueber.
+            let fehler = match s.error_key {
+                Some(k) => Some(format!("{k:?}: {}", strings::EN.get(k))),
+                None => s.error.as_ref().map(|m| format!("{:?}: {}", m.key, m.text(&strings::EN))),
             };
             // Der laufende Codec steht in jeder Zeile, damit ein Wechsel im
             // Protokoll sichtbar wird - derselbe Name wie im Menue und Overlay.
             let codec = s.info.map(|i| i.codec_name()).unwrap_or_else(|| "?".into());
             let line = format!(
                 "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Decoder {} | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, pfad, lat, hl,
-                s.error.as_ref().map(|m| &m.protokoll)
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, pfad, lat, hl, fehler
             );
             println!("{line}");
             std::io::stdout().flush().ok();
