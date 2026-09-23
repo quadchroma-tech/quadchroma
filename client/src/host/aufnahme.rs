@@ -572,8 +572,13 @@ pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
                 // Wachhalten und Timerperiode hat Drop schon abgebaut.
                 log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
                 // Dem Zuschauer sagen, dass kein Bild kommt - statt eines
-                // stummen, stehenden Bildes.
-                netz::hoststatus_senden(1);
+                // stummen, stehenden Bildes. Nur dem, fuer den die Sitzung
+                // lief: hat inzwischen ein anderer abgeloest, bekommt der
+                // gleich einen neuen Anlauf (die Schleife unten endet
+                // sofort), und dessen Sitzung schickt 0 nur nach einem
+                // eigenen Verlust - mit 1 saehe er dauerhaft "kein
+                // Bildschirm" ueber dem laufenden Bild.
+                netz::hoststatus_senden_an(nr, 1);
                 while netz::zuschauer_da() && netz::zuschauer_nr() == nr {
                     std::thread::sleep(Duration::from_millis(500));
                 }
@@ -657,13 +662,27 @@ fn nachlegen_grund(nachholen: Option<&'static str>, hat_bild: bool, fest_faellig
     }
 }
 
-/// Kam das neueste Bild (Aufnahmezeit `t_cap`, Hostuhr in us) nicht in den
-/// Encoder, und ist seitdem eine ganze Bildzeit ohne neueres vergangen? Dann
-/// ist die Bewegung zu Ende, und der Takt legt es nach. Waehrend einer
-/// Bewegung kommt das naechste Bild frueher (bei 144 Hz alle 7 ms) - dort
-/// soll nichts ueber die Zielrate hinaus nachgelegt werden.
-fn ausgelassenes_faellig(letztes: Option<(u64, bool)>, jetzt_us: u64, fps: u32) -> bool {
-    matches!(letztes, Some((t, false)) if jetzt_us.saturating_sub(t) >= 1_000_000 / fps.max(1) as u64)
+/// Kam das neueste Bild (`letztes`: Aufnahmezeit, codiert) nicht in den
+/// Encoder, und ist seit seiner ANKUNFT beim Aufnahmefaden (`ankunft_us`,
+/// Hostuhr in us) eine ganze Bildzeit ohne neueres vergangen? Dann ist die
+/// Bewegung zu Ende, und der Takt legt es nach. Waehrend einer Bewegung
+/// kommt das naechste Bild frueher (bei 144 Hz alle 7 ms) - dort soll nichts
+/// ueber die Zielrate hinaus nachgelegt werden.
+///
+/// Gezaehlt wird - wie beim Mac-Host seit b3e9055 - ab der Ankunft, nicht
+/// ab der Aufnahmezeit (LastPresentTime der Duplication). Der Faden holt
+/// erst ab, wenn er mit dem Vorigen fertig ist (Encoder, Einlesen,
+/// Halbieren, Drehen); was dazwischen praesentiert wurde, liefert
+/// AcquireNextFrame zusammen, mit der Zeit der juengsten Praesentation. Die
+/// liegt also bis zu einem Bildabstand der Quelle vor dem Abholen, und bis
+/// zum Takt kommt noch das Einlesen dieses Bildes dazu. Bei Zielraten nahe
+/// der Quelle (Voreinstellung 120 an einem 144-Hz-Schirm: Bildzeit 8,3 ms,
+/// Bildabstand 6,9 ms) ist das mehr als eine Bildzeit; ab der Aufnahmezeit
+/// gerechnet legte der Takt dann mitten in einer Bewegung das aeltere Bild
+/// nach, waehrend das neuere schon wartete. Die Aufnahmezeit bleibt fuer
+/// den Stempel.
+fn ausgelassenes_faellig(letztes: Option<(u64, bool)>, ankunft_us: u64, jetzt_us: u64, fps: u32) -> bool {
+    matches!(letztes, Some((_, false)) if jetzt_us.saturating_sub(ankunft_us) >= 1_000_000 / fps.max(1) as u64)
 }
 
 /// Buchfuehrung der Verlustmeldungen: derselbe Verlust ohne ein gutes Bild
@@ -849,7 +868,9 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
     // Wiederholung ohne neue Umrechnung).
     let mut letztes: Option<(u64, bool)> = None;
     // Wann zuletzt ein neues Bild ankam (Hostuhr, us) - fuer den Nachschub
-    // bei Vorlauf: waehrend einer Bewegung schieben die neuen Bilder selbst.
+    // bei Vorlauf und fuer das Nachlegen eines ausgelassenen Bildes
+    // (ausgelassenes_faellig): waehrend einer Bewegung schieben die neuen
+    // Bilder selbst. Die Ankunft ist das Abholen, nicht LastPresentTime.
     let mut letzte_ankunft_us = 0u64;
     // Nach "Testbild aus" oder fuer einen neuen Zuschauer: das letzte
     // Desktopbild einmal nachlegen, auch ohne feste Bildrate (mit Grund).
@@ -1176,9 +1197,14 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
         // 7. Der Takt: Testbild als echte Bilder in Zielrate; feste Bildrate
         //    legt das letzte Bild nach, wenn seit 0,9/fps nichts kam. Auch
         //    ohne feste Bildrate geht das letzte Bild EINMAL hinein, wenn
-        //    der Encoder frisch ist (Start, Codecwechsel, Neustart) oder das
-        //    Testbild endet - sonst sieht der Zuschauer bei stillem Desktop
-        //    bis zur naechsten Aenderung nichts bzw. die Balken. Haelt der
+        //    der Encoder frisch ist (Start, Codecwechsel, Neustart), das
+        //    Testbild endet, ein neuer Zuschauer ohne Pause abgeloest hat
+        //    oder das neueste Bild nicht in den Encoder kam (Raster "zu
+        //    schnell", Encoder voll, Stau) und seit seiner Ankunft eine
+        //    Bildzeit lang kein neueres (nachlegen_grund,
+        //    ausgelassenes_faellig) - sonst sieht der Zuschauer bei stillem
+        //    Desktop bis zur naechsten Aenderung nichts, die Balken oder
+        //    einen Zwischenstand der Bewegung. Haelt der
         //    Encoder Bilder zurueck (Vorlauf, h264_mf), schiebt der Takt
         //    ohne feste Bildrate danach das letzte Bild in Zielrate nach,
         //    bis das letzte echte Bild heraus ist - dann ist Ruhe.
@@ -1203,7 +1229,7 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                     nachholen,
                     e.hat_bild(),
                     Z.fest.load(Ordering::Relaxed) && takt.nachlegen_faellig(fps),
-                    ausgelassenes_faellig(letztes, super::now_us(), fps) && takt.nachlegen_faellig(fps),
+                    ausgelassenes_faellig(letztes, letzte_ankunft_us, super::now_us(), fps) && takt.nachlegen_faellig(fps),
                 )) {
                     if let Some((t_cap, codiert)) = letztes {
                         if e.inflight() >= INFLIGHT_TAKT {
@@ -1415,10 +1441,10 @@ mod tests {
         let fps = 60;
         let bildzeit = 1_000_000 / fps as u64;
         let t = 5_000_000;
-        assert!(!ausgelassenes_faellig(None, t + bildzeit, fps));
-        assert!(!ausgelassenes_faellig(Some((t, true)), t + 10 * bildzeit, fps), "codiert: nichts nachzulegen");
-        assert!(!ausgelassenes_faellig(Some((t, false)), t + bildzeit - 1, fps), "Bewegung laeuft vielleicht noch");
-        assert!(ausgelassenes_faellig(Some((t, false)), t + bildzeit, fps));
+        assert!(!ausgelassenes_faellig(None, t, t + bildzeit, fps));
+        assert!(!ausgelassenes_faellig(Some((t, true)), t, t + 10 * bildzeit, fps), "codiert: nichts nachzulegen");
+        assert!(!ausgelassenes_faellig(Some((t, false)), t, t + bildzeit - 1, fps), "Bewegung laeuft vielleicht noch");
+        assert!(ausgelassenes_faellig(Some((t, false)), t, t + bildzeit, fps));
         // Pruefer-Probe: Bewegungen aus 2 bis 39 Bildern bei 144 Hz, Ziel 60
         // fps, nach einer Pause. Ohne Nachlegen blieb bei 23 von 38 das
         // Endbild ungesendet; jetzt bekommt jede ihr Endbild, und nachgelegt
@@ -1434,7 +1460,7 @@ mod tests {
                 let t_us = (t_s * 1e6) as u64;
                 // Waehrend der Bewegung: nie nachlegen, das naechste Bild kommt vor Ablauf einer Bildzeit.
                 if let Some(l) = letztes {
-                    assert!(!ausgelassenes_faellig(Some(l), t_us - 1, fps), "n {n}, Bild {k}");
+                    assert!(!ausgelassenes_faellig(Some(l), l.0, t_us - 1, fps), "n {n}, Bild {k}");
                 }
                 letztes = Some((t_us, takt.schlitz_frei(t_s, fps)));
             }
@@ -1443,9 +1469,63 @@ mod tests {
                 ohne_endbild_vorher += 1;
             }
             // Nach der Bewegung: genau dann faellig, wenn das Endbild fehlt.
-            assert_eq!(ausgelassenes_faellig(letztes, t_end + bildzeit, fps), !codiert, "n {n}");
+            assert_eq!(ausgelassenes_faellig(letztes, t_end, t_end + bildzeit, fps), !codiert, "n {n}");
         }
         assert_eq!(ohne_endbild_vorher, 23, "Probe des Pruefers nicht getroffen");
+    }
+
+    /// Wie hosttest.m "waehrend einer Bewegung nichts dazu" (Mac-Host,
+    /// b3e9055): ob seit einer Bildzeit nichts Neues kam, zaehlt ab der
+    /// Ankunft beim Aufnahmefaden, nicht ab LastPresentTime. Mit der alten
+    /// Rechnung (jetzt - Aufnahmezeit) scheitern beide Teile.
+    #[test]
+    fn ausgelassenes_zaehlt_ab_der_ankunft() {
+        // 20 ms zwischen Praesentation und Ankunft - mehr als eine Bildzeit
+        // bei 60 fps: gleich nach der Ankunft ist nichts faellig, erst eine
+        // ganze Bildzeit spaeter.
+        let fps = 60;
+        let bildzeit = 1_000_000 / fps as u64;
+        let t_cap = 5_000_000;
+        let ankunft = t_cap + 20_000;
+        assert!(!ausgelassenes_faellig(Some((t_cap, false)), ankunft, ankunft + 2_000, fps), "20 ms Versatz: mitten in der Bewegung nachgelegt");
+        assert!(!ausgelassenes_faellig(Some((t_cap, false)), ankunft, ankunft + bildzeit - 1, fps));
+        assert!(ausgelassenes_faellig(Some((t_cap, false)), ankunft, ankunft + bildzeit, fps));
+
+        // Der Fall des Windows-Hosts: Zielrate 120 (Voreinstellung), Quelle
+        // 144 Hz. Der Faden war beschaeftigt und holt jedes Bild 6 ms nach
+        // seiner Praesentation ab (weniger als ein Bildabstand von 6,9 ms -
+        // sonst laege schon ein juengeres an), der Takt fragt nach 3 ms
+        // Einlesen. Waehrend der Bewegung wird nie nachgelegt, nach ihrem
+        // Ende genau das fehlende Endbild, eine Bildzeit nach seiner Ankunft.
+        let fps = 120;
+        let bildzeit = 1_000_000 / fps as u64;
+        let (versatz, einlesen) = (6_000u64, 3_000u64);
+        let mut ausgelassen = 0;
+        let mut enden = Vec::new();
+        for n in 2..=39u32 {
+            let mut takt = Schrittmacher::neu();
+            let beginn = 100.0 + n as f64;
+            let mut letztes: Option<(u64, bool)> = None;
+            let mut ankunft = 0;
+            for k in 0..n {
+                let t_s = beginn + k as f64 / 144.0;
+                let t_us = (t_s * 1e6) as u64;
+                ankunft = t_us + versatz;
+                let codiert = takt.schlitz_frei(t_s, fps);
+                ausgelassen += !codiert as u32;
+                letztes = Some((t_us, codiert));
+                if k + 1 < n {
+                    assert!(!ausgelassenes_faellig(letztes, ankunft, ankunft + einlesen, fps), "n {n}, Bild {k}: mitten in der Bewegung nachgelegt");
+                }
+            }
+            enden.push((n, letztes, ankunft));
+        }
+        assert!(ausgelassen > 30, "Probe ohne ausgelassene Bilder ({ausgelassen})");
+        for (n, letztes, ankunft) in enden {
+            let codiert = letztes.unwrap().1;
+            assert!(!ausgelassenes_faellig(letztes, ankunft, ankunft + bildzeit - 1, fps), "n {n}: Endbild vor Ablauf einer Bildzeit nachgelegt");
+            assert_eq!(ausgelassenes_faellig(letztes, ankunft, ankunft + bildzeit, fps), !codiert, "n {n}");
+        }
     }
 
     #[test]

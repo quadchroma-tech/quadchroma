@@ -2892,14 +2892,18 @@ impl InputLink {
     }
 
     /// Bindung an den Bildkanal setzen. Wechselt sie, wird neu verbunden; was
-    /// fuer die alte Sitzung nachzureichen war, faellt weg.
-    fn set_link(&mut self, link: Option<(Vec<u8>, Vec<u8>)>) {
-        if self.link != link {
-            self.link = link;
-            self.kanal = None;
-            self.aufbau = None;
-            self.nachreichen.clear();
+    /// fuer die alte Sitzung nachzureichen war, faellt weg. Liefert, ob
+    /// darunter Einstellungen waren - die hat der Host dann nie bekommen.
+    fn set_link(&mut self, link: Option<(Vec<u8>, Vec<u8>)>) -> bool {
+        if self.link == link {
+            return false;
         }
+        self.link = link;
+        self.kanal = None;
+        self.aufbau = None;
+        let einstellungen = self.nachreichen.iter().any(|b| b.first() == Some(&IN_SETTINGS));
+        self.nachreichen.clear();
+        einstellungen
     }
 
     /// Steht der Kanal? Nur dann kommt an, was jetzt gesendet wird.
@@ -3112,6 +3116,55 @@ impl InputLink {
         p[0..4].copy_from_slice(&dx.to_le_bytes());
         p[4..8].copy_from_slice(&dy.to_le_bytes());
         self.send(IN_SCROLL, &p);
+    }
+}
+
+/// Je Durchlauf des Fensterfadens (about_to_wait): Der Eingabekanal haengt am
+/// Bildkanal. Sobald dessen Handschlag steht, reichen wir die Bindung
+/// weiter; faellt er weg, trennt sich auch die Eingabe - niemand soll
+/// Tastatur ohne Bild bekommen. Steht fest, mit welchem Host wir sprechen,
+/// gelten einmal die Werte, die beim letzten Mal fuer genau diesen Host
+/// galten: lokal sofort (ein gespeichertes "Ton aus" auch dann, wenn der
+/// Eingabekanal ausbleibt), zum Host ueber den Eingabekanal - steht der
+/// noch nicht, reicht InputLink sie nach, sobald er steht (NACHREICHEN).
+/// Bindung und Host kommen aus einem Blick auf `shared`: run_session setzt
+/// beide zugleich. Wechselt die Sitzung, bevor die Einstellungen hinaus
+/// waren, gelten sie in der neuen noch einmal. `angewandt_fuer`: fuer
+/// welchen Host das schon geschehen ist.
+fn gespeicherte_werte_anwenden(
+    cfg: &einstellungen::Einstellungen,
+    shared: &Mutex<Shared>,
+    input: &Mutex<InputLink>,
+    angewandt_fuer: &mut Option<String>,
+) {
+    let (link, fp) = {
+        let s = shared.lock().unwrap();
+        (s.link.clone(), s.peer_fp.clone())
+    };
+    let bildkanal = link.is_some();
+    {
+        let mut l = input.lock().unwrap();
+        if l.set_link(link) {
+            *angewandt_fuer = None;
+        }
+        // Den Aufbau treiben, solange der Kanal nicht steht - nie wartend,
+        // hoechstens ein Versuch je Sekunde. Sonst kaeme Nachzureichendes
+        // erst mit der naechsten Eingabe oder Zeitfrage an.
+        if bildkanal && !l.steht() {
+            l.ensure();
+        }
+    }
+    match (&fp, &*angewandt_fuer) {
+        (Some(f), keiner) if bildkanal && keiner.as_deref() != Some(f.as_str()) => {
+            let werte = cfg.fuer_host(f);
+            shared.lock().unwrap().ton = werte.map_or(true, |w| w.ton);
+            if let Some(w) = werte {
+                input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
+            }
+            *angewandt_fuer = Some(f.clone());
+        }
+        (None, _) => *angewandt_fuer = None,
+        _ => {}
     }
 }
 
@@ -4375,37 +4428,8 @@ impl ApplicationHandler for App {
                 self.hud_reiter = 0;
             }
         }
-        // Der Eingabekanal haengt am Bildkanal. Sobald dessen Handschlag steht,
-        // reichen wir die Bindung weiter; faellt er weg, trennt sich auch die
-        // Eingabe - niemand soll Tastatur ohne Bild bekommen.
-        let link = { self.shared.lock().unwrap().link.clone() };
-        self.input.lock().unwrap().set_link(link);
-
-        // Steht fest, mit welchem Host wir sprechen, schicken wir ihm einmal
-        // die Werte, die beim letzten Mal fuer genau diesen Host galten.
-        let fp = { self.shared.lock().unwrap().peer_fp.clone() };
-        match (&fp, &self.angewandt_fuer) {
-            (Some(f), keiner) if keiner.as_deref() != Some(f.as_str()) => {
-                // Erst, wenn der Eingabekanal steht: er baut sich im
-                // Hintergrund auf, und was vorher gesendet wird, faellt weg.
-                let steht = {
-                    let mut l = self.input.lock().unwrap();
-                    l.ensure();
-                    l.steht()
-                };
-                if steht {
-                    if let Some(w) = self.cfg.fuer_host(f) {
-                        self.input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
-                        self.shared.lock().unwrap().ton = w.ton;
-                    } else {
-                        self.shared.lock().unwrap().ton = true;
-                    }
-                    self.angewandt_fuer = Some(f.clone());
-                }
-            }
-            (None, _) => self.angewandt_fuer = None,
-            _ => {}
-        }
+        // Bindung des Eingabekanals und die fuer diesen Host gespeicherten Werte.
+        gespeicherte_werte_anwenden(&self.cfg, &self.shared, &self.input, &mut self.angewandt_fuer);
         // Der Benchmark arbeitet im selben Takt: nie blockierend, das Bild
         // laeuft weiter, das Menue zeigt den Fortschritt.
         if let Some(b) = self.benchmark.as_mut() {
@@ -8201,6 +8225,70 @@ mod tests {
         l.codec(3);
         l.trennen();
         assert!(l.nachreichen.is_empty());
+    }
+
+    /// Ein fuer diesen Host gespeichertes "Ton aus" gilt lokal, sobald der
+    /// Bildkanal steht - auch wenn der Eingabekanal ausbleibt. Die
+    /// Einstellungen liegen dann zum Nachreichen bereit, einmal je Host.
+    /// Wechselt die Sitzung, bevor sie hinaus waren, kommen sie in der neuen
+    /// noch einmal. Frueher wartete das alles auf den Eingabekanal.
+    #[test]
+    fn gespeicherte_werte_gelten_ohne_eingabekanal() {
+        let mut cfg = einstellungen::Einstellungen::default();
+        let w = einstellungen::HostWerte { mbit: 30, fps: 60, gaming: false, fest: true, ton: false };
+        cfg.hosts.insert("fp-a".into(), w);
+        let shared = Mutex::new(Shared { ton: true, ..Shared::default() });
+        // Ohne Adresse baut sich der Eingabekanal nie auf.
+        let input = Mutex::new(InputLink::new(String::new()));
+        let mut angewandt = None;
+        let einst = eingabe_rahmen(IN_SETTINGS, &[30, 0, 0, 0, 60, 0, 0, 1, 0]);
+
+        // Noch kein Bildkanal: nichts.
+        gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
+        assert_eq!(angewandt, None);
+        assert!(shared.lock().unwrap().ton);
+
+        // Der Bildkanal steht (run_session setzt Bindung und Host zugleich).
+        {
+            let mut s = shared.lock().unwrap();
+            s.link = Some((vec![1; 32], vec![2; 32]));
+            s.peer_fp = Some("fp-a".into());
+        }
+        gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
+        assert!(!input.lock().unwrap().steht());
+        assert!(!shared.lock().unwrap().ton, "gespeichertes Ton aus gilt lokal nicht");
+        assert_eq!(angewandt.as_deref(), Some("fp-a"));
+        assert_eq!(input.lock().unwrap().nachreichen, vec![einst.clone()]);
+        // Einmal je Host: der naechste Durchlauf schickt nichts dazu, und
+        // ein Ton an aus dem Menue bleibt stehen.
+        shared.lock().unwrap().ton = true;
+        input.lock().unwrap().nachreichen.clear();
+        gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
+        assert!(input.lock().unwrap().nachreichen.is_empty());
+        assert!(shared.lock().unwrap().ton);
+
+        // Die Einstellungen liegen wieder bereit, dann faellt die Sitzung weg
+        // und eine neue kommt (derselbe Host): in ihr noch einmal.
+        input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
+        shared.lock().unwrap().link = None;
+        gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
+        assert!(input.lock().unwrap().nachreichen.is_empty());
+        shared.lock().unwrap().link = Some((vec![3; 32], vec![2; 32]));
+        gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
+        assert_eq!(angewandt.as_deref(), Some("fp-a"));
+        assert_eq!(input.lock().unwrap().nachreichen, vec![einst]);
+        assert!(!shared.lock().unwrap().ton);
+
+        // Ein Host ohne gespeicherte Werte: Ton an, nichts zu senden.
+        {
+            let mut s = shared.lock().unwrap();
+            s.link = Some((vec![4; 32], vec![5; 32]));
+            s.peer_fp = Some("fp-b".into());
+        }
+        gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
+        assert_eq!(angewandt.as_deref(), Some("fp-b"));
+        assert!(shared.lock().unwrap().ton);
+        assert!(input.lock().unwrap().nachreichen.is_empty());
     }
 
     /// Ein Fehler zaehlt nur fuer das Ziel, zu dem er gehoert: hat der
