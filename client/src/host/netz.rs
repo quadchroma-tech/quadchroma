@@ -11,14 +11,19 @@
 // (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
 //
 // Stauregel: Windows kennt kein SO_NWRITE. Ersatz ist ein eigener
-// Sendefaden mit Warteschlange und Byte-Budget (2 MB, Gaming 512 kB) bei
-// einem Sendepuffer von 256 kB im Kernel: ein blockierender write im
-// Sendefaden spiegelt die Leitung, die Warteschlange davor ist der Stau.
-// Ueberschreitet Warteschlange + Kernelanteil das Budget, faellt das Bild
-// weg und ein Vollbild wird erzwungen. send_small (Ton, Zwischenablage,
-// Zeiger, Info, Einstellungen, Codecs, Switch, Zeit, Last, Hoststatus)
-// geht an der Regel vorbei, aber durch dieselbe Warteschlange - die
-// Reihenfolge Switch -> Info -> Vollbild bleibt damit erhalten.
+// Sendefaden mit Warteschlange bei einem Sendepuffer von 256 kB im Kernel:
+// ein blockierender write im Sendefaden spiegelt die Leitung, die
+// Warteschlange davor ist der Stau. Rueckstand = Warteschlange plus der
+// Rest des Pakets, das der Sendefaden gerade schreibt. Entschieden wird wie
+// auf dem Mac (stau_vor_dem_encoder in main.m) VOR dem Encoder: liegt mehr
+// als das Budget (2 MB, Gaming 512 kB) im Rueckstand, geht das naechste
+// Bild gar nicht erst in den Encoder (Zaehler "Stau"). Ein codiertes Bild
+// geht immer hinaus - nur ueber der harten Grenze (HARTE_GRENZE) faellt es
+// weg, und dann wird ein Vollbild erzwungen. Nimmt der Zuschauer im Stau
+// STAU_FRIST_US lang nichts ab, gilt er als weg. send_small (Ton,
+// Zwischenablage, Zeiger, Info, Einstellungen, Codecs, Switch, Zeit, Last,
+// Hoststatus) geht an der Regel vorbei, aber durch dieselbe Warteschlange -
+// die Reihenfolge Switch -> Info -> Vollbild bleibt damit erhalten.
 //
 // Sitzung: Der Eingabekanal gehoert zu genau einem Zuschauer. Geht der
 // (ersetzt: `Leitung::abloesen`, weg: `Leitung::schliessen`), wird auch
@@ -43,10 +48,33 @@ use super::{eingabe, encoder, log, now_us, Z};
 use crate::protokoll_konst::*;
 use crate::{noise, secure};
 
-/// Ungesendete Bytes, ab denen Bilder verworfen werden.
+/// Rueckstand, ab dem Bilder gar nicht erst in den Encoder gehen
+/// (stau_vor_dem_encoder); im Spielmodus ein Viertel. Wie QC_BACKLOG_LIMIT
+/// in main.m: ein Vollbild wird selbst fast so gross, und nach einem
+/// Vollbild soll auf einer gesunden Leitung kein Bild ausfallen.
 const BACKLOG_LIMIT: usize = 2 * 1024 * 1024;
-/// Sendepuffer im Kernel; zaehlt als geschaetzter Anteil zum Stau dazu.
+/// Harte Grenze fuer schon codierte Bilder: nur wenn der Rueckstand darueber
+/// liegt, faellt eines weg (mit erzwungenem Vollbild). Die Regel vor dem
+/// Encoder haelt ihn bei BACKLOG_LIMIT plus dem, was beim Einsetzen des
+/// Staus noch im Encoder steckt (hoechstens INFLIGHT_AUFNAHME Bilder); die
+/// harte Grenze faengt nur ungebremstes Wachstum ab - etwa die Konserve,
+/// die an keinem Encoder vorbeikommt. So gross wie der Sendepuffer des
+/// Mac-Hosts, ueber den hinaus dort das Senden blockiert.
+const HARTE_GRENZE: usize = 2 * BACKLOG_LIMIT;
+/// Stau ohne Fortschritt: so lange, dann gilt der Zuschauer als weg - wie
+/// QC_STAU_FRIST_US in main.m. Ohne diese Frist bliebe ein eingefrorener
+/// Zuschauer (Ton aus) fuer immer eingetragen: im Stau geht nichts mehr in
+/// den Encoder, und der Sendefaden haengt ohne Frist in seinem write.
+const STAU_FRIST_US: u64 = 2_000_000;
+/// Sendepuffer im Kernel. Was dort liegt, zaehlt nicht zum Rueckstand -
+/// hoechstens so viel kommt zur Warteschlange noch dazu.
 const SNDBUF: usize = 256 * 1024;
+/// Der Sendefaden schreibt ein Paket in Stuecken dieser Groesse: genau ein
+/// Noise-Stueck (secure::write_all teilt ebenso), auf der Leitung also
+/// dieselben Bytes wie am Stueck. So sieht die Stauregel, wie weit ein
+/// grosses Paket (Vollbild) schon ist, und ein langsamer, aber lebender
+/// Zuschauer macht auch mitten in einem Vollbild Fortschritt.
+const SCHREIBSTUECK: usize = secure::CHUNK_MAX;
 /// So lange darf die letzte Nachricht an einen abgeloesten Zuschauer
 /// brauchen. Seine Warteschlange ist da schon verworfen; vor ihr liegen
 /// hoechstens das Bild, das der Sendefaden gerade schreibt, und der
@@ -92,9 +120,79 @@ fn melden_erlaubt(letzte: &Mutex<Option<Instant>>) -> bool {
     true
 }
 
+/// Ein laufender Stau: seit wann ohne Fortschritt (Hostuhr in us) und wie
+/// viel der Sendefaden bis dahin geschrieben hatte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stau {
+    seit_us: u64,
+    geschrieben: u64,
+}
+
+/// Was die Stauregel mit dem naechsten Bild tut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stauurteil {
+    /// Rueckstand im Budget: codieren.
+    Frei,
+    /// Ueber dem Budget: dieses Bild auslassen.
+    Stau,
+    /// Ueber dem Budget, und seit STAU_FRIST_US nimmt der Zuschauer nichts
+    /// mehr ab: er ist weg.
+    Weg,
+}
+
+/// Die Stauregel als reine Entscheidung, wie stau_vor_dem_encoder in
+/// main.m. Fortschritt heisst: der Sendefaden hat seit dem letzten Blick
+/// etwas abgeliefert (`geschrieben` ist gewachsen). Anders als auf dem Mac
+/// (Rueckstand kleiner als beim letzten Blick) gilt damit auch ein langsamer
+/// Zuschauer als lebendig, waehrend noch Bilder aus dem Encoder nachkommen
+/// und der Rueckstand deshalb nicht sinkt.
+fn stau_urteil(stau: &mut Option<Stau>, rueckstand: usize, grenze: usize, geschrieben: u64, jetzt_us: u64) -> Stauurteil {
+    if rueckstand <= grenze {
+        *stau = None;
+        return Stauurteil::Frei;
+    }
+    match *stau {
+        Some(s) if s.geschrieben == geschrieben => {
+            if jetzt_us.saturating_sub(s.seit_us) >= STAU_FRIST_US {
+                *stau = None;
+                Stauurteil::Weg
+            } else {
+                Stauurteil::Stau
+            }
+        }
+        _ => {
+            *stau = Some(Stau { seit_us: jetzt_us, geschrieben });
+            Stauurteil::Stau
+        }
+    }
+}
+
+/// Budget der Stauregel: 2 MB, im Spielmodus ein Viertel.
+fn budget(gaming: bool) -> usize {
+    if gaming { BACKLOG_LIMIT / 4 } else { BACKLOG_LIMIT }
+}
+
+/// Warum ein Paket nicht in die Warteschlange kam.
+#[derive(Debug, PartialEq, Eq)]
+enum Abgewiesen {
+    /// Der Zuschauer ist abgeloest oder weg.
+    Zu,
+    /// Der Rueckstand liegt schon ueber der Grenze.
+    Voll,
+}
+
 struct Warteschlange {
     pakete: VecDeque<Vec<u8>>,
     bytes: usize,
+    /// Rest des Pakets, das der Sendefaden gerade schreibt (noch nicht beim
+    /// Kernel) - zaehlt zum Rueckstand.
+    im_schreiben: usize,
+    /// Bytes, die der Sendefaden bisher beim Kernel abgeliefert hat; waechst
+    /// nur. Ist der Kernelpuffer voll, kommt nur hinein, was der Zuschauer
+    /// abnimmt - daran misst die Stauregel Fortschritt.
+    geschrieben: u64,
+    /// Laufender Stau dieses Zuschauers (siehe stau_urteil).
+    stau: Option<Stau>,
     offen: bool,
     /// Abbruchgriff des Eingabekanals dieses Zuschauers, mit seiner Nummer.
     /// Liegt unter derselben Sperre wie `offen`: wer schliesst, sieht einen
@@ -132,6 +230,9 @@ impl Leitung {
             q: Mutex::new(Warteschlange {
                 pakete: VecDeque::new(),
                 bytes: 0,
+                im_schreiben: 0,
+                geschrieben: 0,
+                stau: None,
                 offen: true,
                 eingabe: None,
                 schlusswort: None,
@@ -252,22 +353,44 @@ impl Leitung {
         false
     }
 
-    /// Ein Paket einreihen. Mit Budget: nur, wenn Warteschlange plus
-    /// Kernelanteil darunter bleiben - sonst false (Stau).
-    fn einreihen(&self, paket: Vec<u8>, budget: Option<usize>) -> bool {
+    /// Ein Paket einreihen. Mit Grenze: nur, wenn der Rueckstand nicht schon
+    /// darueber liegt - ein Paket darf sie also um sich selbst
+    /// ueberschreiten, auch ein Vollbild, das allein groesser ist.
+    fn einreihen(&self, paket: Vec<u8>, grenze: Option<usize>) -> Result<(), Abgewiesen> {
         let mut q = sperre(&self.q);
         if !q.offen {
-            return false;
+            return Err(Abgewiesen::Zu);
         }
-        if let Some(b) = budget {
-            if q.bytes + SNDBUF > b {
-                return false;
+        if let Some(g) = grenze {
+            if q.bytes + q.im_schreiben > g {
+                return Err(Abgewiesen::Voll);
             }
         }
         q.bytes += paket.len();
         q.pakete.push_back(paket);
         self.cv.notify_one();
-        true
+        Ok(())
+    }
+
+    /// Stauregel fuer diesen Zuschauer (stau_urteil) mit Grenze `grenze`.
+    /// Ist er weg: ins Protokoll (wie main.m) und die Leitung schliessen -
+    /// der Sendefaden endet dann und traegt ihn aus. Ein geschlossener
+    /// Zuschauer staut nichts mehr.
+    fn stau(&self, grenze: usize, jetzt_us: u64) -> Stauurteil {
+        let (urteil, rueckstand) = {
+            let mut q = sperre(&self.q);
+            if !q.offen {
+                return Stauurteil::Frei;
+            }
+            let rueckstand = q.bytes + q.im_schreiben;
+            let geschrieben = q.geschrieben;
+            (stau_urteil(&mut q.stau, rueckstand, grenze, geschrieben, jetzt_us), rueckstand)
+        };
+        if urteil == Stauurteil::Weg {
+            log(format!("Zuschauer weg: nimmt seit {} s nichts mehr ab ({rueckstand} Byte im Stau)", STAU_FRIST_US / 1_000_000));
+            self.schliessen();
+        }
+        urteil
     }
 }
 
@@ -311,6 +434,8 @@ static PLAETZE_BILD: Plaetze = Plaetze::neu();
 static PLAETZE_EINGABE: Plaetze = Plaetze::neu();
 /// Wann zuletzt "kein Bildkanal offen" im Protokoll stand.
 static KEIN_BILD_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
+/// Wann zuletzt ein Bild an der harten Grenze im Protokoll stand.
+static HART_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Ein belegter Platz; gibt sich beim Wegfallen selbst frei.
 struct Platz {
@@ -373,13 +498,18 @@ fn kopf(typ: u8, flags: u8, reserviert: u16, len: usize) -> [u8; 8] {
 
 /// Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-
 /// Sperre und die Stauregel: Ton und Zwischenablage sind winzig und duerfen
-/// nicht warten.
+/// nicht warten. Die Frist der Stauregel gilt aber auch hier: steht das
+/// Bild still (kein Bild, das nach dem Stau fragt) und laeuft nur der Ton
+/// in einen eingefrorenen Zuschauer, fiele er sonst nie auf - und die
+/// Warteschlange wuechse ohne Ende.
 pub fn send_small(typ: u8, data: &[u8]) {
     let Some(l) = aktuell() else { return };
     let mut p = Vec::with_capacity(8 + data.len());
     p.extend_from_slice(&kopf(typ, 0, 0, data.len()));
     p.extend_from_slice(data);
-    l.einreihen(p, None);
+    if l.einreihen(p, None).is_ok() {
+        l.stau(budget(Z.gaming.load(Ordering::Relaxed)), now_us());
+    }
 }
 
 pub fn settings_senden() {
@@ -400,20 +530,40 @@ pub fn hoststatus_senden(lage: u8) {
     send_small(MSG_HOSTSTATUS, &[lage, 0]);
 }
 
+/// Stauregel vor dem Encoder, wie stau_vor_dem_encoder in main.m: true =
+/// dieses Bild auslassen (zaehlt als "Stau"). Der Aufnahmefaden fragt nach
+/// Raster und Encoder-Grenze und vor dem Abholen eines erzwungenen
+/// Vollbilds, fuer jedes Bild, das in den Encoder soll - aufgenommen,
+/// nachgelegt oder Testbild. Der Encoder sieht dann nur weniger Bilder,
+/// jedes codierte hat sein Bezugsbild, und es braucht kein Vollbild.
+pub fn stau_vor_dem_encoder() -> bool {
+    let Some(l) = aktuell() else { return false };
+    if l.stau(budget(Z.gaming.load(Ordering::Relaxed)), now_us()) == Stauurteil::Frei {
+        return false;
+    }
+    Z.stau.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 /// Ergebnis eines Bildversands.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Versand {
     Gesendet,
     /// Kein Zuschauer, oder der wartet noch auf ein Vollbild.
     Verworfen,
-    /// Stau auf der Leitung: verworfen, Vollbild erzwungen.
+    /// Rueckstand ueber der harten Grenze: verworfen, Vollbild erzwungen.
     Stau,
 }
 
 /// Eine Zugriffseinheit samt Stempel (Nachricht 5) in EINEM Paket. Ein
 /// frisch verbundener Zuschauer bekommt erst ab dem naechsten Vollbild
-/// Daten; staut es sich, faellt das Bild weg und ein Vollbild wird
-/// erzwungen - g_wait_key bleibt dabei stehen, wie auf dem Mac.
+/// Daten. Gegen Stau wird vor dem Encoder ausgelassen (stau_vor_dem_encoder):
+/// ein codiertes Bild geht immer hinaus. Fiele es hier weg, fehlte den
+/// folgenden Zwischenbildern ihr Bezug, das naechste Bild muesste ein
+/// Vollbild sein - und auf einer zu langsamen Leitung kaemen dann nur noch
+/// Vollbilder, die den Stau ihrerseits vergroessern. Nur ueber HARTE_GRENZE
+/// faellt es doch weg, mit erzwungenem Vollbild; g_wait_key bleibt dabei
+/// stehen, wie auf dem Mac.
 pub fn bild_senden(au: &[u8], key: bool, t_cap: u64, wiederholt: bool) -> Versand {
     let Some(l) = aktuell() else { return Versand::Verworfen };
     if Z.wait_key.load(Ordering::Relaxed) && !key {
@@ -434,11 +584,20 @@ pub fn bild_senden(au: &[u8], key: bool, t_cap: u64, wiederholt: bool) -> Versan
     p.extend_from_slice(&t_enc.to_le_bytes());
     p.extend_from_slice(&kopf(MSG_VIDEO, if key { FLAG_KEY } else { 0 }, (seq & 0xffff) as u16, au.len()));
     p.extend_from_slice(au);
-    let budget = if Z.gaming.load(Ordering::Relaxed) { BACKLOG_LIMIT / 4 } else { BACKLOG_LIMIT };
-    if !l.einreihen(p, Some(budget)) {
-        Z.stau.fetch_add(1, Ordering::Relaxed);
-        Z.force_key.store(true, Ordering::Relaxed);
-        return Versand::Stau;
+    match l.einreihen(p, Some(HARTE_GRENZE)) {
+        Ok(()) => {}
+        Err(Abgewiesen::Zu) => return Versand::Verworfen,
+        Err(Abgewiesen::Voll) => {
+            Z.stau.fetch_add(1, Ordering::Relaxed);
+            Z.force_key.store(true, Ordering::Relaxed);
+            if melden_erlaubt(&HART_GEMELDET) {
+                log(format!("Stau ueber der harten Grenze ({} kB): codiertes Bild verworfen, Vollbild erzwungen", HARTE_GRENZE / 1024));
+            }
+            // Auch hier gilt die Frist - die Konserve fragt nie vor einem
+            // Encoder nach dem Stau.
+            l.stau(HARTE_GRENZE, now_us());
+            return Versand::Stau;
+        }
     }
     // Erst wenn das Bild wirklich rausgeht, ist das Warten vorbei.
     Z.wait_key.store(false, Ordering::Relaxed);
@@ -448,8 +607,11 @@ pub fn bild_senden(au: &[u8], key: bool, t_cap: u64, wiederholt: bool) -> Versan
 }
 
 /// Sendefaden eines Zuschauers: nimmt Pakete aus der Warteschlange und
-/// schreibt sie verschluesselt auf die Leitung. Ein Fehler beim Schreiben
-/// heisst: der Zuschauer ist weg.
+/// schreibt sie verschluesselt auf die Leitung, in Stuecken (SCHREIBSTUECK)
+/// und nach jedem Stueck mit Buchfuehrung fuer die Stauregel. Ein Paket geht
+/// immer ganz hinaus, auch nach einer Abloesung - das Schlusswort muss an
+/// einer Nachrichtengrenze beginnen. Ein Fehler beim Schreiben heisst: der
+/// Zuschauer ist weg.
 fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
     loop {
         let paket = {
@@ -473,12 +635,23 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
             match q.pakete.pop_front() {
                 Some(p) => {
                     q.bytes -= p.len();
+                    q.im_schreiben = p.len();
                     p
                 }
                 None => break,
             }
         };
-        if let Err(e) = sock.write_all(&paket) {
+        let mut fehler = None;
+        for stueck in paket.chunks(SCHREIBSTUECK) {
+            if let Err(e) = sock.write_all(stueck) {
+                fehler = Some(e);
+                break;
+            }
+            let mut q = sperre(&l.q);
+            q.im_schreiben -= stueck.len();
+            q.geschrieben += stueck.len() as u64;
+        }
+        if let Some(e) = fehler {
             // Scheitert das Schreiben, weil `schliessen` die Leitung eben
             // gekappt hat, ist der Zuschauer nicht weg, sondern abgeloest.
             if sperre(&l.q).offen {
@@ -617,7 +790,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
             alt.abloesen();
             eingabe::alle_tasten_loslassen();
         }
-        leitung.einreihen(hello, None);
+        let _ = leitung.einreihen(hello, None);
         *a = Some(leitung.clone());
         alt
     };
@@ -996,10 +1169,10 @@ mod tests {
             let mut p = kopf(MSG_TIME, 0, 0, 16).to_vec();
             p.extend_from_slice(&t.to_le_bytes());
             p.extend_from_slice(&[0u8; 8]);
-            assert!(leitung.einreihen(p, None));
+            assert!(leitung.einreihen(p, None).is_ok());
         }
         leitung.abloesen();
-        assert!(!leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), None));
+        assert_eq!(leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), None), Err(Abgewiesen::Zu));
         let l2 = leitung.clone();
         std::thread::spawn(move || sendefaden(l2, h));
         assert!(leitung.abloesung_abschliessen(Duration::from_secs(2)));
@@ -1022,7 +1195,7 @@ mod tests {
         let faden = std::thread::spawn(move || sendefaden(l2, h));
         // Weit mehr, als beide Kernelpuffer fassen: 16 MB, der Client liest nie.
         for _ in 0..16 {
-            assert!(leitung.einreihen(vec![0u8; 1 << 20], None));
+            assert!(leitung.einreihen(vec![0u8; 1 << 20], None).is_ok());
         }
         std::thread::sleep(Duration::from_millis(500));
         assert!(sperre(&leitung.q).bytes > 0, "Sendefaden haengt nicht - Probe ohne Wert");
@@ -1185,5 +1358,284 @@ mod tests {
         // Ein Handschlag endet (Frist, Fehler oder fertig): Platz wieder frei.
         belegt.pop();
         assert!(P.belegen(ip(100), "Test").is_some());
+    }
+
+    /// Die Stauregel als reine Entscheidung: im Budget codieren, darueber
+    /// auslassen; ohne Fortschritt ist der Zuschauer nach STAU_FRIST_US weg,
+    /// jeder Fortschritt (auch bei wachsendem Rueckstand) startet die Frist
+    /// neu, und unter dem Budget ist der Stau vorbei.
+    #[test]
+    fn stauregel_entscheidet_vor_dem_encoder() {
+        assert_eq!(budget(false), 2 * 1024 * 1024);
+        assert_eq!(budget(true), 512 * 1024);
+        let g = budget(false);
+        let mut s = None;
+        assert_eq!(stau_urteil(&mut s, g, g, 0, 0), Stauurteil::Frei, "genau das Budget ist noch frei");
+        assert_eq!(s, None);
+        assert_eq!(stau_urteil(&mut s, g + 1, g, 100, 1_000), Stauurteil::Stau);
+        assert_eq!(s, Some(Stau { seit_us: 1_000, geschrieben: 100 }));
+        assert_eq!(stau_urteil(&mut s, g + 1, g, 100, 1_000 + STAU_FRIST_US - 1), Stauurteil::Stau);
+        // Fortschritt: der Sendefaden hat etwas abgeliefert - die Frist
+        // beginnt neu, obwohl der Rueckstand gewachsen ist (Bilder aus dem
+        // Encoder kamen nach).
+        let t = 1_000 + STAU_FRIST_US;
+        assert_eq!(stau_urteil(&mut s, g + 900_000, g, 165_619, t), Stauurteil::Stau);
+        assert_eq!(s, Some(Stau { seit_us: t, geschrieben: 165_619 }));
+        assert_eq!(stau_urteil(&mut s, g + 900_000, g, 165_619, t + STAU_FRIST_US - 1), Stauurteil::Stau);
+        // Die Frist ohne Fortschritt: weg, der Stand ist zurueckgesetzt.
+        assert_eq!(stau_urteil(&mut s, g + 900_000, g, 165_619, t + STAU_FRIST_US), Stauurteil::Weg);
+        assert_eq!(s, None);
+        // Unter dem Budget ist der Stau vorbei; der naechste beginnt von vorn.
+        assert_eq!(stau_urteil(&mut s, g + 1, g, 5, 10), Stauurteil::Stau);
+        assert_eq!(stau_urteil(&mut s, g, g, 5, 10 + STAU_FRIST_US - 1), Stauurteil::Frei);
+        assert_eq!(s, None);
+        assert_eq!(stau_urteil(&mut s, g + 1, g, 5, 10 + STAU_FRIST_US + 1), Stauurteil::Stau);
+        assert_eq!(stau_urteil(&mut s, g + 1, g, 5, 10 + 2 * STAU_FRIST_US), Stauurteil::Stau);
+        assert_eq!(stau_urteil(&mut s, g + 1, g, 5, 10 + 2 * STAU_FRIST_US + 1), Stauurteil::Weg);
+    }
+
+    /// Ein codiertes Bild geht hinaus, solange der Rueckstand nicht schon
+    /// ueber der harten Grenze liegt - auch eines, das allein groesser ist
+    /// (ein Vollbild bei 500 Mbit/s und 10 fps hat bis 6 MB). Was der
+    /// Sendefaden gerade schreibt, zaehlt mit. Ist der Zuschauer weg, meldet
+    /// `stau` das einmal und schliesst ihn; danach staut er nichts mehr.
+    #[test]
+    fn codiertes_bild_geht_bis_zur_harten_grenze_hinaus() {
+        let l = Leitung::neu(None, Vec::new(), Vec::new(), String::new());
+        assert_eq!(l.einreihen(vec![0u8; HARTE_GRENZE + 1], Some(HARTE_GRENZE)), Ok(()));
+        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Err(Abgewiesen::Voll));
+        assert_eq!(l.einreihen(vec![0u8; 8], None), Ok(()), "kleine Nachrichten gehen vorbei");
+        {
+            let mut q = sperre(&l.q);
+            q.pakete.clear();
+            q.bytes = 0;
+            q.im_schreiben = HARTE_GRENZE;
+        }
+        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Ok(()));
+        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Err(Abgewiesen::Voll));
+        // Stau ohne Fortschritt ueber die Frist: weg und geschlossen.
+        assert_eq!(l.stau(BACKLOG_LIMIT, 1_000), Stauurteil::Stau);
+        assert!(l.offen());
+        assert_eq!(l.stau(BACKLOG_LIMIT, 1_000 + STAU_FRIST_US), Stauurteil::Weg);
+        assert!(!l.offen());
+        assert_eq!(l.stau(0, 2 * STAU_FRIST_US), Stauurteil::Frei, "ein geschlossener Zuschauer staut nichts mehr");
+        assert_eq!(l.einreihen(vec![0u8; 1], Some(HARTE_GRENZE)), Err(Abgewiesen::Zu));
+    }
+
+    /// Ergebnis eines Laufs im Pruefstand.
+    #[derive(Debug, Default)]
+    struct Lauf {
+        /// Bilder, die in den "Encoder" gingen.
+        codiert: u32,
+        /// Von der Stauregel vor dem Encoder ausgelassen.
+        ausgelassen: u32,
+        /// Schon codiert und doch verworfen (harte Grenze bzw. alte Stelle).
+        verworfen: u32,
+        /// Bei der Gegenstelle angekommen, davon Vollbilder.
+        empfangen: u32,
+        vollbilder: u32,
+        /// Hoechster Rueckstand, den die Stauregel vor einem Bild sah.
+        hoechster_rueckstand: usize,
+        /// Vom ersten ausgelassenen Bild bis "Zuschauer weg".
+        weg_nach: Option<Duration>,
+    }
+
+    /// Liest `n` Byte im Takt von `mbit`, gerechnet ab `t0` mit `gelesen`
+    /// Byte bisher.
+    fn gedrosselt_lesen(c: &mut secure::Secure, mut n: usize, mbit: u32, t0: Instant, gelesen: &mut u64, puffer: &mut [u8]) -> Result<(), String> {
+        while n > 0 {
+            let k = n.min(puffer.len());
+            c.read_exact(&mut puffer[..k])?;
+            n -= k;
+            *gelesen += k as u64;
+            let soll = Duration::from_secs_f64(*gelesen as f64 * 8.0 / (mbit as f64 * 1e6));
+            if let Some(w) = soll.checked_sub(t0.elapsed()) {
+                std::thread::sleep(w);
+            }
+        }
+        Ok(())
+    }
+
+    /// Endet der Faden binnen `frist`? Sonst false (und er laeuft weiter).
+    fn endet_binnen<T: Send + 'static>(f: std::thread::JoinHandle<T>, frist: Duration) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f.join());
+        });
+        rx.recv_timeout(frist).ok().and_then(|r| r.ok())
+    }
+
+    /// Pruefstand wie hosttest.m auf dem Mac: kuenstliche Bilder mit `fps`
+    /// durch die Stauregel (Leitung::stau) und den Versand
+    /// (Leitung::einreihen mit HARTE_GRENZE, wie bild_senden) einer echten
+    /// Leitung samt Sendefaden, auf Loopback. Die Gegenstelle liest mit
+    /// `lese_mbit` (0 = gar nicht: eingefroren) und zaehlt Bilder und
+    /// Vollbilder. Ein Zwischenbild hat mbit/fps, ein Vollbild `vollbild`
+    /// Byte; eines kommt zu Beginn und nach jedem verworfenen Bild.
+    /// `alte_stelle`: die Regel wie bis 77c4564 - nach dem Codieren
+    /// verwerfen, wenn Warteschlange + SNDBUF ueber dem Budget liegen, und
+    /// ein Vollbild erzwingen (Gegenprobe).
+    fn pruefstand(mbit: u32, fps: u32, vollbild: usize, lese_mbit: u32, dauer: Duration, alte_stelle: bool) -> Lauf {
+        let (h, mut c) = paar();
+        sendepuffer_setzen(h.socket());
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let sender = std::thread::spawn(move || sendefaden(l2, h));
+        let (halt_tx, halt_rx) = std::sync::mpsc::channel::<()>();
+        let leser = std::thread::spawn(move || {
+            let (mut empfangen, mut vollbilder) = (0u32, 0u32);
+            if lese_mbit == 0 {
+                // Eingefroren: nichts lesen, die Leitung nur offen halten.
+                let _ = halt_rx.recv();
+                return (empfangen, vollbilder);
+            }
+            c.socket().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let t0 = Instant::now();
+            let mut gelesen = 0u64;
+            let mut puffer = vec![0u8; SCHREIBSTUECK];
+            loop {
+                let mut hdr = [0u8; 8];
+                if gedrosselt_lesen(&mut c, 8, lese_mbit, t0, &mut gelesen, &mut hdr).is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                if gedrosselt_lesen(&mut c, len, lese_mbit, t0, &mut gelesen, &mut puffer).is_err() {
+                    break;
+                }
+                match hdr[0] {
+                    MSG_VIDEO => {
+                        empfangen += 1;
+                        if hdr[1] & FLAG_KEY != 0 {
+                            vollbilder += 1;
+                        }
+                    }
+                    // Das Ende des Laufs.
+                    MSG_TIME => break,
+                    _ => {}
+                }
+            }
+            (empfangen, vollbilder)
+        });
+
+        let mut lauf = Lauf::default();
+        let grenze = budget(false);
+        let zwischen = (mbit as usize * 1_000_000 / 8 / fps as usize).max(1);
+        let bildzeit = Duration::from_secs_f64(1.0 / fps as f64);
+        let mut vollbild_faellig = true;
+        let mut erstes_auslassen: Option<Instant> = None;
+        let t0 = Instant::now();
+        let mut i = 0u32;
+        while t0.elapsed() < dauer {
+            if let Some(w) = (t0 + bildzeit * i).checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+            i += 1;
+            {
+                let q = sperre(&leitung.q);
+                lauf.hoechster_rueckstand = lauf.hoechster_rueckstand.max(q.bytes + q.im_schreiben);
+            }
+            if !alte_stelle {
+                match leitung.stau(grenze, now_us()) {
+                    Stauurteil::Frei => {}
+                    Stauurteil::Stau => {
+                        lauf.ausgelassen += 1;
+                        if erstes_auslassen.is_none() {
+                            erstes_auslassen = Some(Instant::now());
+                        }
+                        continue;
+                    }
+                    Stauurteil::Weg => {
+                        lauf.weg_nach = erstes_auslassen.map(|t| t.elapsed());
+                        break;
+                    }
+                }
+            }
+            let key = std::mem::take(&mut vollbild_faellig);
+            let n = if key { vollbild } else { zwischen };
+            let mut p = kopf(MSG_VIDEO, if key { FLAG_KEY } else { 0 }, 0, n).to_vec();
+            p.resize(8 + n, 0);
+            lauf.codiert += 1;
+            let r = if alte_stelle {
+                let voll = sperre(&leitung.q).bytes + SNDBUF > grenze;
+                if voll { Err(Abgewiesen::Voll) } else { leitung.einreihen(p, None) }
+            } else {
+                leitung.einreihen(p, Some(HARTE_GRENZE))
+            };
+            match r {
+                Ok(()) => {}
+                Err(Abgewiesen::Voll) => {
+                    lauf.verworfen += 1;
+                    vollbild_faellig = true;
+                }
+                Err(Abgewiesen::Zu) => break,
+            }
+        }
+        if lauf.weg_nach.is_none() {
+            // Ende des Laufs: die Gegenstelle liest, was noch kommt, bis zum
+            // Schlusszeichen; dann ist die Leitung zu.
+            let _ = leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), None);
+        }
+        let _ = halt_tx.send(());
+        let (empfangen, vollbilder) = endet_binnen(leser, Duration::from_secs(15)).expect("Gegenstelle endet nicht");
+        lauf.empfangen = empfangen;
+        lauf.vollbilder = vollbilder;
+        leitung.schliessen();
+        assert!(endet_binnen(sender, Duration::from_secs(5)).is_some(), "Sendefaden endet nicht");
+        lauf
+    }
+
+    /// Normale Last (hosttest.m: 50 Mbit/s auf 100 Mbit/s): nichts
+    /// ausgelassen, nichts verworfen, jedes Bild kommt an, nur das erste ist
+    /// ein Vollbild.
+    #[test]
+    fn stauregel_laesst_bei_normaler_last_nichts_aus() {
+        let lauf = pruefstand(30, 60, 1 << 20, 80, Duration::from_secs(3), false);
+        println!("normale Last: {lauf:?}");
+        assert_eq!((lauf.ausgelassen, lauf.verworfen), (0, 0), "{lauf:?}");
+        assert!(lauf.codiert >= 150, "{lauf:?}");
+        assert_eq!(lauf.empfangen, lauf.codiert, "{lauf:?}");
+        assert_eq!(lauf.vollbilder, 1, "{lauf:?}");
+    }
+
+    /// Zu langsame Leitung (60 Mbit/s auf 40): ausgelassen wird vor dem
+    /// Encoder, jedes codierte Bild kommt an, und es bleibt beim einen
+    /// Vollbild vom Anfang - Zwischenbilder statt einer Vollbild-Kaskade.
+    /// Der Rueckstand bleibt beim Budget plus einem Bild. Gegenprobe mit der
+    /// alten Stelle: dort folgt nach dem ersten Verwerfen Vollbild auf
+    /// Vollbild, und es kommen weniger Bilder an (auf der VM gemessen: 55
+    /// Bilder, davon 18 Vollbilder, gegen 175 mit einem).
+    #[test]
+    fn stauregel_zu_langsame_leitung_ohne_vollbild_kaskade() {
+        let (mbit, fps, vollbild, lese, dauer) = (60, 60, 1usize << 20, 40, Duration::from_secs(4));
+        let neu = pruefstand(mbit, fps, vollbild, lese, dauer, false);
+        let alt = pruefstand(mbit, fps, vollbild, lese, dauer, true);
+        println!("zu langsam, vor dem Encoder: {neu:?}");
+        println!("zu langsam, alte Stelle:     {alt:?}");
+        assert!(neu.ausgelassen > 0, "Leitung nicht zu langsam - Probe ohne Wert: {neu:?}");
+        assert_eq!(neu.verworfen, 0, "{neu:?}");
+        assert_eq!(neu.empfangen, neu.codiert, "{neu:?}");
+        assert_eq!(neu.vollbilder, 1, "{neu:?}");
+        assert!(neu.hoechster_rueckstand <= BACKLOG_LIMIT + vollbild, "{neu:?}");
+        // So viele Zwischenbilder, wie die Leitung in der Zeit fasst - mit
+        // Abschlag fuer das Vollbild und das Zittern der Uhr.
+        let fasst = (lese as f64 * 1e6 / 8.0 * dauer.as_secs_f64() / (mbit as f64 * 1e6 / 8.0 / fps as f64)) as u32;
+        assert!(neu.empfangen * 10 >= fasst * 7, "{} von {fasst}: {neu:?}", neu.empfangen);
+        // Gegenprobe: der Pruefstand erkennt eine Kaskade.
+        assert!(alt.verworfen > 0 && alt.vollbilder >= 5, "alte Stelle ohne Kaskade: {alt:?}");
+        assert!(neu.empfangen > alt.empfangen, "neu {neu:?} alt {alt:?}");
+    }
+
+    /// Eingefrorener Zuschauer bei ausgeschaltetem Ton: im Stau nimmt er
+    /// nichts mehr ab und ist STAU_FRIST_US nach dem ersten ausgelassenen
+    /// Bild weg - die Leitung ist zu, der Sendefaden endet, obwohl er in
+    /// einem write hing.
+    #[test]
+    fn stauregel_traegt_eingefrorenen_zuschauer_nach_2_s_aus() {
+        let lauf = pruefstand(40, 60, 1 << 20, 0, Duration::from_secs(12), false);
+        println!("eingefroren: {lauf:?}");
+        let weg = lauf.weg_nach.expect("Zuschauer nicht ausgetragen");
+        assert!(weg >= Duration::from_micros(STAU_FRIST_US) - Duration::from_millis(50), "{weg:?}");
+        assert!(weg <= Duration::from_micros(STAU_FRIST_US) + Duration::from_millis(500), "{weg:?}");
+        assert_eq!(lauf.verworfen, 0, "{lauf:?}");
     }
 }

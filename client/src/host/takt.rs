@@ -3,7 +3,10 @@
 // schnell" weg; der Encoder darf hoechstens drei Bilder (Aufnahme) bzw. zwei
 // (Takt) unterwegs haben; die feste Bildrate legt das letzte Bild nach, wenn
 // seit 0,9/fps nichts kam - nachgelegte Bilder ruecken das Raster NICHT
-// weiter; der Stempel traegt die ECHTE Aufnahmezeit.
+// weiter; der Stempel traegt die ECHTE Aufnahmezeit. Nach Raster und
+// Encoder-Grenze fragt jedes Bild noch die Stauregel (netz.rs,
+// stau_vor_dem_encoder); ein Bild, das sie auslaesst, geht nicht in den
+// Encoder.
 //
 // Der Takt selbst laeuft auf dem Aufnahmefaden: AcquireNextFrame wartet
 // hoechstens bis zum naechsten Schlag (frist_ms), danach entscheidet
@@ -87,6 +90,13 @@ impl Schrittmacher {
         self.last_pts_us = pts;
         self.letztes_bild = Instant::now();
         pts
+    }
+
+    /// Ein Bild, das die Stauregel vor dem Encoder ausgelassen hat, zaehlt
+    /// fuer "seit 0,9/fps nichts" wie eines, das hineinging (g_last_pts in
+    /// main.m wird auch dann gesetzt); die pts bleiben, wie sie sind.
+    pub fn ausgelassen(&mut self) {
+        self.letztes_bild = Instant::now();
     }
 }
 

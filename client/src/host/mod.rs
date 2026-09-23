@@ -55,7 +55,9 @@ pub struct Zustand {
     pub wait_key: AtomicBool,
     pub sent_frames: AtomicU64,
     pub sent_bytes: AtomicU64,
-    /// Bilder, die wegen Stau auf der Leitung verworfen wurden.
+    /// Bilder, die wegen Stau auf der Leitung gar nicht erst in den Encoder
+    /// gingen (netz::stau_vor_dem_encoder) - dazu die seltenen, die schon
+    /// codiert ueber der harten Grenze wegfielen (eigene Protokollzeile).
     pub stau: AtomicU64,
     pub repeats: AtomicU64,
     pub zu_schnell: AtomicU64,

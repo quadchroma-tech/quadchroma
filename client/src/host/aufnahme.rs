@@ -1086,6 +1086,13 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                             } else if let Some(e) = enc.as_mut() {
                                 if e.inflight() >= INFLIGHT_AUFNAHME {
                                     Z.enc_stau.fetch_add(1, Ordering::Relaxed);
+                                } else if netz::stau_vor_dem_encoder() {
+                                    // Die Leitung staut: das Bild geht gar
+                                    // nicht erst in den Encoder (festgehalten
+                                    // ist es schon), und fuer den Takt zaehlt
+                                    // es wie eines, das hineinging - wie
+                                    // g_last_pts auf dem Mac.
+                                    takt.ausgelassen();
                                 } else {
                                     let pts = takt.pts_vorwaerts(t_cap as i64, fps);
                                     let q = match a.kopie.as_ref() {
@@ -1130,7 +1137,11 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
             if let Some(e) = enc.as_mut() {
                 if testbild_an {
                     if let Some(tb) = testbilder.as_mut() {
-                        if e.inflight() < INFLIGHT_TAKT {
+                        if e.inflight() >= INFLIGHT_TAKT {
+                            // Encoder noch voll: dieser Schlag faellt aus.
+                        } else if netz::stau_vor_dem_encoder() {
+                            takt.ausgelassen();
+                        } else {
                             let jetzt = super::now_us();
                             let pts = takt.pts_vorwaerts(jetzt as i64, fps);
                             let n = tb.len();
@@ -1141,7 +1152,13 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                     }
                 } else if let Some(einmal) = auf.as_ref().and(nachlegen_grund(nachholen, e.hat_bild(), Z.fest.load(Ordering::Relaxed) && takt.nachlegen_faellig(fps))) {
                     if let Some((t_cap, codiert)) = letztes {
-                        if e.inflight() < INFLIGHT_TAKT {
+                        if e.inflight() >= INFLIGHT_TAKT {
+                            // Encoder noch voll: dieser Schlag faellt aus.
+                        } else if netz::stau_vor_dem_encoder() {
+                            // Ein Grund "einmal" bleibt stehen: nachgelegt
+                            // wird, sobald die Leitung wieder frei ist.
+                            takt.ausgelassen();
+                        } else {
                             let pts = takt.pts_vorwaerts(super::now_us() as i64, fps);
                             let a = auf.as_ref().unwrap();
                             let q = if codiert {
