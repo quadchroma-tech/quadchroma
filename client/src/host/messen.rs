@@ -664,11 +664,7 @@ fn vollbildprobe() {
 // ------------------------------------------------------------------ Lauf
 
 pub fn laufen(args: &[String]) -> i32 {
-    // Per-Monitor-DPI, damit die Desktopkoordinaten in Pixeln kommen.
-    unsafe {
-        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    // Per-Monitor-DPI setzt main_host schon fuer alle Hostrollen.
     let sekunden: f64 = arg_wert(args, "--sekunden").and_then(|v| v.parse().ok()).unwrap_or(10.0);
     let wunsch: Option<usize> = arg_wert(args, "--output").and_then(|v| v.parse().ok());
     log(format!("=== QuadChroma Messung, {sekunden} s je Lauf ==="));

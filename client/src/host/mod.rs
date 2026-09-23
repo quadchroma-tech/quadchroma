@@ -296,8 +296,36 @@ fn last_nachricht(vorher: &LastProbe, jetzt: &LastProbe, enc_zehntel: u16, host_
 
 // ---------------------------------------------------------------- Einstieg
 
+/// Per-Monitor-DPI (v2) fuer den ganzen Prozess. Ohne sie meldet DXGI bei
+/// 125/150 % Skalierung virtualisierte Ausgangsgroessen (GetDesc), die
+/// Duplication aber den echten Anzeigemodus; die Maus rechnet dann ebenfalls
+/// in anderen Punkten. Liefert die Zeile fuers Protokoll.
+fn dpi_bewusst() -> String {
+    use windows::Win32::UI::HiDpi::{AreDpiAwarenessContextsEqual, GetDpiForSystem, GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    unsafe {
+        match SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+            Ok(()) => {
+                let dpi = GetDpiForSystem();
+                format!("DPI-Awareness: Per-Monitor v2 gesetzt (System {dpi} dpi = {} %)", dpi * 100 / 96)
+            }
+            // Zugriff verweigert heisst auch "war schon gesetzt".
+            Err(_) if AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).as_bool() => {
+                "DPI-Awareness: Per-Monitor v2 (war schon gesetzt)".to_string()
+            }
+            Err(e) => format!(
+                "DPI-Awareness nicht gesetzt: {} (0x{:08x}) - bei Skalierung koennen Groessen virtualisiert sein",
+                e.message().trim(),
+                e.code().0 as u32
+            ),
+        }
+    }
+}
+
 /// Rollenwahl: --list, --messen oder --host. Rueckgabe ist der Exit-Code.
 pub fn main_host(args: &[String]) -> i32 {
+    // Vor allem anderen, das Ausgaenge, Bildschirm oder Maus anfasst -
+    // fuer alle Hostrollen.
+    let dpi = dpi_bewusst();
     if let Err(e) = ffmpeg_next::init() {
         println!("FFmpeg-Start fehlgeschlagen: {e}");
         return 2;
@@ -308,10 +336,12 @@ pub fn main_host(args: &[String]) -> i32 {
 
     if args.iter().any(|a| a == "--messen") {
         protokoll_oeffnen("messung.txt");
+        log(&dpi);
         return messen::laufen(args);
     }
 
     protokoll_oeffnen("host-protokoll.txt");
+    log(&dpi);
 
     if args.iter().any(|a| a == "--list") {
         aufnahme::ausgaenge_melden(&mut Vec::new());
