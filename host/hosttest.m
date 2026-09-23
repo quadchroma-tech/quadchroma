@@ -1,6 +1,9 @@
 // Pruefprogramm fuer die Teile von main.m, die ohne Bildschirmaufnahme laufen:
-// Abloesen eines Zuschauers (Typ 10), Stauregel, Ansage des Tonformats,
-// Koennensliste (AV1).
+// Protokoll (Drossel, Obergrenze), Abloesen eines Zuschauers (Typ 10),
+// Zuschauerwechsel im laufenden Strom, Abbau zwischen Hochfahren und
+// Eintragen, Nachreichen bei stillem Bildschirm, Abschluss eines
+// Codecwechsels ohne Zuschauer, Stauregel samt Ton im Stau, Ansage des
+// Tonformats, Koennensliste (AV1).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -24,7 +27,9 @@
 // Groesse; sie gehen wie in encode_buffer erst durch stau_vor_dem_encoder
 // und dann durch emit_access_unit - Stauregel und Versand sind also die des
 // Hosts, nur der Encoder ist nachgebildet (liefert sofort, nichts im Flug).
-// Dauer rund 40 s. Rueckgabe: Zahl der Fehler.
+// Nachreichen und Codecwechsel nehmen einen echten, kleinen Encoder (HEVC
+// 4:2:0, 640x360, wenige Bilder); die Aufnahme ist dort eine Attrappe.
+// Dauer rund 80 s. Rueckgabe: Zahl der Fehler.
 
 #define main host_main
 #include "main.m"

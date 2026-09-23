@@ -488,8 +488,6 @@ static int backlog_bytes(int fd) {
 }
 
 
-// Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-Sperre
-// und die Stauregel: Ton und Zwischenablage sind winzig und duerfen nicht warten.
 // Ton im Dauerstau. Ton geht an der Stauregel vorbei - er ist klein und soll
 // nicht warten. Liegt die Leitung aber unter der Tonrate (unverdichtet rund
 // 3 Mbit/s: VPN, schwaches WLAN), fuellt er allein den Sendepuffer bis oben:
@@ -509,6 +507,8 @@ static int ton_verwerfen(int fd) {
     return jetzt - g_ton_stau_seit >= QC_STAU_FRIST_US;
 }
 
+// Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-Sperre
+// und die Stauregel: Ton und Zwischenablage sind winzig und duerfen nicht warten.
 // ton: Ton, der im Dauerstau wegfaellt (ton_verwerfen). Rueckgabe 1 = deshalb
 // verworfen, sonst 0 (gesendet oder niemand da).
 static int send_small_bis(uint8_t type, const void *data, size_t len, int ton) {
@@ -833,11 +833,11 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     int testbild_aus = 0;
     if (sent == 0) {
         // Der Neue faengt beim naechsten Vollbild an und bekommt den Ton neu
-        // angesagt - gesetzt, bevor er als bereit gilt. Laeuft der Strom
-        // schon und ist der Bildschirm still, reicht der Takt ihm das zuletzt
-        // gesehene Bild als Vollbild nach (fixed_tick, solange g_wait_key). Sonst erbte er beim
+        // angesagt - gesetzt, bevor er als bereit gilt. Sonst erbte er beim
         // Abloesen fuer einen Augenblick den Stand des Vorgaengers: ein
-        // Zwischenbild ohne Kopfdaten, Ton ohne Ansage.
+        // Zwischenbild ohne Kopfdaten, Ton ohne Ansage. Laeuft der Strom schon
+        // und ist der Bildschirm still, reicht ihm der Takt das zuletzt
+        // gesehene Bild als Vollbild nach (fixed_tick, solange g_wait_key).
         atomic_store(&g_force_key, 1);
         atomic_store(&g_wait_key, 1);
         atomic_store(&g_audio_info_sent, 0);
@@ -2135,12 +2135,17 @@ static void fixed_tick(void) {
         // Wer auf sein erstes Vollbild wartet, bekommt eins - aber eins zur
         // Zeit: steckt schon ein Bild im Encoder, kommt es gleich an.
         if (wartet && atomic_load(&g_inflight) > 0) return;
+        double schlitz_vorher = g_schlitz;
         if (!schlitz_frei(CMTimeGetSeconds(now))) return;
         if (wartet) atomic_store(&g_force_key, 1);
         if (encode_buffer(g_last_pb, now, g_last_cap_us, 0)) {
             atomic_store(&g_bild_offen, 0);
             atomic_fetch_add(&g_nachgereicht, 1);
             g_last_pts = now;
+        } else {
+            // Im Stau geblieben: der Schlitz gehoert dann dem naechsten
+            // echten Bild, nicht diesem Versuch.
+            g_schlitz = schlitz_vorher;
         }
         return;
     }
