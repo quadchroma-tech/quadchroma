@@ -1168,6 +1168,72 @@ static void nachreichen_pruefen(int bild_port) {
     atomic_store(&g_codec_id, 0);
 }
 
+// ------------------------------------------- Codecwechsel ohne Zuschauer
+
+static int wechsel_aktiv(void) {
+    __block int a = 0;
+    dispatch_sync(g_capq, ^{ a = g_wechsel_aktiv; });
+    return a;
+}
+
+static void codec_abschluss_pruefen(void) {
+    printf("\n-- Codecwechsel, dessen Abschluss nach dem Zuschauer kommt (echter Encoder)\n");
+    atomic_store(&g_codec_id, 3);
+    g_info_w = 640; g_info_h = 360;
+    atomic_store(&g_cur_fps, 60);
+    atomic_store(&g_cur_mbit, 10);
+    OSType f420 = pixfmt_fuer(3);
+
+    // a) Ein neuer Zuschauer hat den Strom schon neu aufgebaut, mit eigener
+    //    Sitzung - dann erst kommt der Abschluss des alten Wechsels (3 -> 4).
+    __block VTCompressionSessionRef vorher = NULL, nachher = NULL;
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{
+        encoder_start(3, 640, 360, 60, 10);
+        vorher = g_session;
+        g_wechsel_aktiv = 1;
+        codec_wechsel_abschliessen(4, 3, f420, NO);
+        nachher = g_session;
+    });
+    stdout_stumm(0);
+    pruefe(vorher && nachher == vorher && atomic_load(&g_codec_id) == 3 && !wechsel_aktiv(),
+           "Strom inzwischen neu aufgebaut: der Wechsel wird verworfen, die Sitzung des Neuen bleibt");
+    dispatch_sync(g_capq, ^{
+        VTCompressionSessionInvalidate(g_session);
+        CFRelease(g_session);
+        g_session = NULL;
+    });
+
+    // b) Der Zuschauer ist weg, sein Abbau lief schon (keine Sitzung, kein
+    //    Strom) - dann baut der Abschluss eine Sitzung fuer niemanden.
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{
+        g_wechsel_aktiv = 1;
+        codec_wechsel_abschliessen(3, 4, f420, NO);
+    });
+    SCStream *st = strom_jetzt();                    // der angestossene Abbau ist durch
+    __block VTCompressionSessionRef rest = NULL;
+    dispatch_sync(g_capq, ^{ rest = g_session; });
+    stdout_stumm(0);
+    pruefe(st == nil && rest == NULL && !wechsel_aktiv(), "Zuschauer weg: die frische Sitzung wird gleich wieder abgebaut");
+
+    // c) Wie b, aber der neue Codec laesst sich nicht oeffnen und das Format
+    //    war gewechselt: ohne Strom kaeme der Abschluss des Zuruecksetzens nie.
+    //    (AV1 codiert hier niemand; kann ein spaeterer Mac es doch, gilt der
+    //    Erfolgszweig - auch dann darf nichts haengen bleiben.)
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{
+        g_wechsel_aktiv = 1;
+        codec_wechsel_abschliessen(5, 3, f420, YES);
+    });
+    st = strom_jetzt();
+    dispatch_sync(g_capq, ^{ rest = g_session; });
+    stdout_stumm(0);
+    pruefe(!wechsel_aktiv() && rest == NULL, "fehlgeschlagener Wechsel ohne Strom: nicht fuer immer unterwegs, keine Sitzung bleibt");
+    g_cfg = nil;
+    atomic_store(&g_codec_id, 0);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -1209,6 +1275,7 @@ int main(void) {
         wechsel_pruefen(bild_port);
         abbau_wettlauf_pruefen(bild_port);
         nachreichen_pruefen(bild_port);
+        codec_abschluss_pruefen();
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();

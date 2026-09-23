@@ -1796,15 +1796,38 @@ static void codec_wechsel_fertig(void) {
     if (n >= 0) dispatch_async(g_capq, ^{ codec_wechseln(n); });
 }
 
+// Der Abschluss eines Wechsels kommt spaeter auf g_capq an (nach
+// updateConfiguration). Ging der Zuschauer inzwischen, und hat ein neuer den
+// Strom schon frisch aufgebaut - mit eigener Sitzung im Format von
+// g_codec_id -, gehoert dieser Wechsel zu einem Strom, den es nicht mehr
+// gibt: keine zweite Sitzung daneben (die erste liefe ungebremst weiter),
+// kein SWITCH an den Neuen. YES = verworfen, der Wechsel ist beendet.
+static BOOL codec_wechsel_ueberholt(int idx) {
+    if (!g_session) return NO;
+    logf_(@"Codecwechsel auf %s verworfen: der Strom wurde inzwischen neu aufgebaut", g_kandidaten[idx].name);
+    codec_wechsel_fertig();
+    return YES;
+}
+
+// Ging der Zuschauer waehrend des Umstellens, fand sein Abbau womoeglich noch
+// keine Sitzung vor - die eben gebaute liefe dann fuer niemanden. Also noch
+// einmal anstossen; der Abbau prueft selbst, ob inzwischen wieder jemand da
+// ist, und laeuft auf g_capq erst nach diesem Block.
+static void codec_ohne_zuschauer_abbauen(void) {
+    if (atomic_load(&g_client_fd) < 0) stream_herunterfahren_anstossen();
+}
+
 // Schritt h: der neue Kandidat liess sich nicht oeffnen, der alte kommt zurueck.
 // Ein SWITCH gab es nicht, der Client decodiert weiter mit dem alten Codec -
 // nur die Strominfo geht noch einmal raus.
 static void codec_alt_aufbauen(int alt) {
+    if (codec_wechsel_ueberholt(alt)) return;
     if (encoder_start(alt, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
         encoder_einstellungen_nachziehen();
         atomic_store(&g_force_key, 1);
         strominfo_senden();
         logf_(@"Alter Codec laeuft wieder: %s", g_kandidaten[alt].name);
+        codec_ohne_zuschauer_abbauen();
     } else {
         logf_(@"Auch der alte Codec %s laesst sich nicht mehr oeffnen - es kommt kein Bild mehr", g_kandidaten[alt].name);
     }
@@ -1818,6 +1841,7 @@ static void codec_alt_aufbauen(int alt) {
 // hineingehen und wir gerade darauf laufen; dann Vollbild erzwingen und die
 // Strominfo hinterher.
 static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fmt_geaendert) {
+    if (codec_wechsel_ueberholt(idx)) return;
     if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
         atomic_store(&g_codec_id, idx);
         // Das Testbild folgt dem Aufnahmeformat des neuen Codecs.
@@ -1827,14 +1851,20 @@ static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fm
         atomic_store(&g_force_key, 1);
         strominfo_senden();
         logf_(@"Codec gewechselt: %s", g_kandidaten[idx].name);
+        codec_ohne_zuschauer_abbauen();
         codec_wechsel_fertig();
         return;
     }
 
     logf_(@"Codecwechsel auf %s fehlgeschlagen - baue %s wieder auf", g_kandidaten[idx].name, g_kandidaten[alt].name);
     // Kein SWITCH: der Client hat noch seinen alten Decoder und behaelt ihn.
-    if (fmt_geaendert) {
-        g_cfg.pixelFormat = alt_fmt;
+    // Ohne Strom (inzwischen abgebaut) kaeme der Abschluss von
+    // updateConfiguration nie - eine Nachricht an nil tut nichts -, und der
+    // Wechsel bliebe fuer immer unterwegs; jeder weitere Wunsch wuerde nur
+    // noch vorgemerkt. Dann gleich zurueck, das Format baut der naechste
+    // Zuschauer ohnehin aus g_codec_id.
+    if (fmt_geaendert) g_cfg.pixelFormat = alt_fmt;
+    if (fmt_geaendert && g_stream) {
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
             if (e) logf_(@"Aufnahmeformat liess sich nicht zuruecksetzen: %@", e.localizedDescription);
             dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt); });
