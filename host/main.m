@@ -48,9 +48,11 @@
 // Das Protokoll hat eine Obergrenze. Ueber g_log_grenze wandert die Datei nach
 // g_log_alt_pfad (ein frueheres .alt.log faellt dabei weg), und eine neue
 // beginnt: hoechstens das Doppelte auf der Platte, auch wenn jemand aus dem
-// Netz die Ports flutet, und die juengsten Zeilen bleiben erhalten. Gezaehlt
-// werden die Zeilen von logf_; die wenigen aus audio.m und clipboard.m, die
-// die Datei selbst oeffnen, landen in derselben, zaehlen aber nicht mit.
+// Netz die Ports flutet, und die juengsten Zeilen bleiben erhalten. Laesst
+// sich die Datei nicht umbenennen, wird sie geleert - die Grenze haelt in
+// jedem Fall. Gezaehlt werden die Zeilen von logf_; die wenigen aus audio.m
+// und clipboard.m, die die Datei selbst oeffnen, landen in derselben,
+// zaehlen aber nicht mit.
 static FILE *g_log = NULL;
 static const char *g_log_pfad = "/tmp/quadchroma-m1.log";
 static const char *g_log_alt_pfad = "/tmp/quadchroma-m1.alt.log";
@@ -59,9 +61,9 @@ static long g_log_bytes = 0;                      // unter g_log_mtx
 // Nur um g_log und seinen Zaehler; darunter wird keine andere Sperre genommen.
 static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-// Nur beim Start und unter g_log_mtx.
-static void log_oeffnen(void) {
-    g_log = fopen(g_log_pfad, "a");
+// Beim Start und unter g_log_mtx. modus: "a" haengt an, "w" beginnt leer.
+static void log_oeffnen(const char *modus) {
+    g_log = fopen(g_log_pfad, modus);
     struct stat st;
     g_log_bytes = g_log && fstat(fileno(g_log), &st) == 0 ? (long)st.st_size : 0;
 }
@@ -77,11 +79,19 @@ static void logf_(NSString *fmt, ...) {
     pthread_mutex_lock(&g_log_mtx);
     if (g_log && g_log_bytes >= g_log_grenze) {
         fclose(g_log);
-        rename(g_log_pfad, g_log_alt_pfad);
-        log_oeffnen();
+        // Scheitert das Umbenennen - etwa weil in /tmp schon ein .alt.log
+        // liegt, das einem anderen Nutzer gehoert (Sticky-Bit) -, beginnt die
+        // Datei leer. Sonst hielte die Grenze nicht, und jede weitere Zeile
+        // oeffnete die Datei neu und schriebe den Hinweis noch einmal.
+        int umbenannt = rename(g_log_pfad, g_log_alt_pfad) == 0;
+        int fehler = errno;
+        log_oeffnen(umbenannt ? "a" : "w");
         if (g_log) {
-            int n = fprintf(g_log, "Protokoll war ueber %ld KB - die Zeilen davor stehen in %s\n",
-                            g_log_grenze / 1024, g_log_alt_pfad);
+            int n = umbenannt
+                ? fprintf(g_log, "Protokoll war ueber %ld KB - die Zeilen davor stehen in %s\n",
+                          g_log_grenze / 1024, g_log_alt_pfad)
+                : fprintf(g_log, "Protokoll war ueber %ld KB und liess sich nicht nach %s umbenennen (%s) - "
+                          "die Zeilen davor sind verworfen\n", g_log_grenze / 1024, g_log_alt_pfad, strerror(fehler));
             if (n > 0) g_log_bytes += n;
         }
     }
@@ -95,21 +105,35 @@ static void logf_(NSString *fmt, ...) {
 
 // Zeilen, die jeder im Netz ohne Anmeldung ausloesen kann - gescheiterter
 // Handschlag, unbekannte Gegenstelle, Eingabekanal ohne Bild -, gehen
-// gedrosselt ins Protokoll: die erste sofort, danach je Art hoechstens alle
-// QC_MELDEN_S Sekunden eine, mit der Zahl der dazwischen unterdrueckten. Sonst
-// schriebe jede Verbindung eine Zeile, und eine Flut aus dem Netz fuellte die
-// Platte (gemessen: rund 2500 Zeilen je Sekunde, seit die Handschlaege
-// nebeneinander laufen) - und die echten Zeilen gingen darin unter. Was erst
-// nach einer Freigabe geschieht (gekoppelt, Zuschauer verbunden), bleibt
-// ungedrosselt.
+// gedrosselt ins Protokoll. Sonst schriebe jede Verbindung eine Zeile, und
+// eine Flut aus dem Netz fuellte die Platte (gemessen: rund 2500 Zeilen je
+// Sekunde, seit die Handschlaege nebeneinander laufen) - und die echten
+// Zeilen gingen darin unter. Gedrosselt wird je Art und Adresse: die erste
+// Zeile einer Adresse kommt sofort, danach hoechstens alle QC_MELDEN_S
+// Sekunden eine, mit der Zahl der dazwischen unterdrueckten. So geht die
+// Zeile eines eigenen Geraets nicht in der Flut eines anderen unter. Je Art
+// merkt sich die Drossel QC_DROSSEL_ADRESSEN Adressen; was darueber hinaus
+// von weiteren Adressen kommt, solange die gemerkten noch Unterdruecktes
+// offen haben, zaehlt nur noch gemeinsam ("von anderen Adressen"). Mehr als
+// QC_DROSSEL_ADRESSEN + 1 Zeilen je Art und Frist gibt es also nie, auch
+// nicht bei einer Flut von vielen Adressen. Was erst nach einer Freigabe
+// geschieht (gekoppelt, Zuschauer verbunden), bleibt ungedrosselt.
+#define QC_DROSSEL_ADRESSEN 4
+typedef struct {
+    int belegt;
+    char von[INET_ADDRSTRLEN];        // "" = ohne Adresse (Ton)
+    int64_t zuletzt_s;                // wann zuletzt eine Zeile fuer sie durchkam (monotone Uhr)
+    long weitere;                     // seitdem unterdrueckt
+} qc_drossel_platz;
 typedef struct {
     const char *art;                  // fuer die Sammelzeile
     pthread_mutex_t m;
-    int64_t zuletzt_s;                // wann zuletzt eine Zeile durchkam (monotone Uhr)
-    long weitere;                     // seitdem unterdrueckt
-    char von[INET_ADDRSTRLEN];        // Adresse der zuletzt unterdrueckten
+    qc_drossel_platz platz[QC_DROSSEL_ADRESSEN];
+    int64_t sonst_s;                  // letzte Sammelzeile fuer die uebrigen Adressen
+    long sonst;                       // seitdem unterdrueckt, ohne eigenen Platz
+    char sonst_von[INET_ADDRSTRLEN];  // die letzte davon
 } qc_drossel;
-#define QC_DROSSEL(art) { art, PTHREAD_MUTEX_INITIALIZER, -QC_MELDEN_S, 0, "" }
+#define QC_DROSSEL(name) { .art = name, .m = PTHREAD_MUTEX_INITIALIZER, .sonst_s = -QC_MELDEN_S }
 
 static qc_drossel d_bild_handschlag = QC_DROSSEL("Bildkanal: Handschlag gescheitert");
 static qc_drossel d_liste_defekt    = QC_DROSSEL("Abgewiesen: Freigabeliste nicht lesbar oder beschaedigt");
@@ -132,21 +156,39 @@ static int64_t mono_s(void) {
 
 // Wie logf_, aber ueber die Drossel d. von: Adresse der Gegenstelle oder NULL.
 // Formatiert wird nur, was durchkommt - eine Flut kostet so je Verbindung
-// nur einen Griff an die Sperre.
+// nur einen Griff an die Sperre und einen Blick auf ein paar Adressen.
 static void logf_gedrosselt(qc_drossel *d, const char *von, NSString *fmt, ...) {
     int64_t t = mono_s();
+    const char *a = von ? von : "";
     long vorher = 0;
-    char vorher_von[INET_ADDRSTRLEN] = {0};
+    BOOL durch = NO;
     pthread_mutex_lock(&d->m);
-    BOOL durch = t - d->zuletzt_s >= QC_MELDEN_S;
-    if (durch) {
-        vorher = d->weitere;
-        memcpy(vorher_von, d->von, sizeof vorher_von);
-        d->weitere = 0;
-        d->zuletzt_s = t;
+    qc_drossel_platz *p = NULL, *frei = NULL;
+    for (int i = 0; i < QC_DROSSEL_ADRESSEN; i++) {
+        qc_drossel_platz *q = &d->platz[i];
+        if (q->belegt && strcmp(q->von, a) == 0) { p = q; break; }
+        // Ein Platz wird frei, wenn seine Adresse nichts mehr offen hat und
+        // ihre Frist um ist - vorher zaehlt sie noch gegen die Obergrenze.
+        if (!frei && (!q->belegt || (!q->weitere && t - q->zuletzt_s >= QC_MELDEN_S))) frei = q;
+    }
+    if (p) {
+        durch = t - p->zuletzt_s >= QC_MELDEN_S;
+        if (durch) {
+            vorher = p->weitere;
+            p->weitere = 0;
+            p->zuletzt_s = t;
+        } else {
+            p->weitere++;
+        }
+    } else if (frei) {
+        frei->belegt = 1;
+        strlcpy(frei->von, a, sizeof frei->von);
+        frei->zuletzt_s = t;
+        frei->weitere = 0;
+        durch = YES;
     } else {
-        d->weitere++;
-        strlcpy(d->von, von ? von : "", sizeof d->von);
+        d->sonst++;
+        strlcpy(d->sonst_von, a, sizeof d->sonst_von);
     }
     pthread_mutex_unlock(&d->m);
     if (!durch) return;
@@ -155,30 +197,43 @@ static void logf_gedrosselt(qc_drossel *d, const char *von, NSString *fmt, ...) 
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     if (vorher)
-        logf_(@"%@ - dazu %ld weitere seit der letzten Meldung%s%s", s, vorher,
-              vorher_von[0] ? ", zuletzt von " : "", vorher_von);
+        logf_(@"%@ - dazu %ld weitere%s seit der letzten Meldung", s, vorher,
+              a[0] ? " von dieser Adresse" : "");
     else
         logf_(@"%@", s);
 }
 
 // Unterdrueckte Zeilen bleiben nicht liegen, auch wenn danach keine derselben
-// Art mehr kommt: der Dienst ruft das alle fuenf Sekunden, und nach der Frist
-// geht die Zahl als Sammelzeile hinaus.
+// Art und Adresse mehr kommt: der Dienst ruft das alle fuenf Sekunden, und
+// nach der Frist geht die Zahl als Sammelzeile hinaus.
 static void drosseln_nachtragen(void) {
     int64_t t = mono_s();
     for (size_t i = 0; i < sizeof g_drosseln / sizeof g_drosseln[0]; i++) {
         qc_drossel *d = g_drosseln[i];
-        long n = 0;
-        char von[INET_ADDRSTRLEN] = {0};
+        long n[QC_DROSSEL_ADRESSEN + 1] = {0};
+        char von[QC_DROSSEL_ADRESSEN + 1][INET_ADDRSTRLEN];
         pthread_mutex_lock(&d->m);
-        if (d->weitere && t - d->zuletzt_s >= QC_MELDEN_S) {
-            n = d->weitere;
-            memcpy(von, d->von, sizeof von);
-            d->weitere = 0;
-            d->zuletzt_s = t;
+        for (int k = 0; k < QC_DROSSEL_ADRESSEN; k++) {
+            qc_drossel_platz *q = &d->platz[k];
+            if (q->belegt && q->weitere && t - q->zuletzt_s >= QC_MELDEN_S) {
+                n[k] = q->weitere;
+                memcpy(von[k], q->von, sizeof von[k]);
+                q->weitere = 0;
+                q->zuletzt_s = t;
+            }
+        }
+        if (d->sonst && t - d->sonst_s >= QC_MELDEN_S) {
+            n[QC_DROSSEL_ADRESSEN] = d->sonst;
+            memcpy(von[QC_DROSSEL_ADRESSEN], d->sonst_von, sizeof von[0]);
+            d->sonst = 0;
+            d->sonst_s = t;
         }
         pthread_mutex_unlock(&d->m);
-        if (n) logf_(@"%s: %ld weitere seit der letzten Meldung%s%s", d->art, n, von[0] ? ", zuletzt von " : "", von);
+        for (int k = 0; k < QC_DROSSEL_ADRESSEN; k++)
+            if (n[k]) logf_(@"%s: %ld weitere%s%s seit der letzten Meldung", d->art, n[k], von[k][0] ? " von " : "", von[k]);
+        if (n[QC_DROSSEL_ADRESSEN])
+            logf_(@"%s: %ld weitere von anderen Adressen seit der letzten Meldung, zuletzt von %s", d->art,
+                  n[QC_DROSSEL_ADRESSEN], von[QC_DROSSEL_ADRESSEN][0] ? von[QC_DROSSEL_ADRESSEN] : "?");
     }
 }
 
@@ -1449,8 +1504,17 @@ static const uint8_t kStartCode[4] = {0, 0, 0, 1};
 // in EINEM Aufruf weg: weniger Systemaufrufe, keine halben Bilder auf der Leitung.
 #define QC_MAX_IOV 256
 
-static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap_us, int wiederholt) {
+// Merker, die ein Bild vom Encoder bis zum Versand begleiten (Begleitzettel,
+// QC_ZETTEL). WIEDERHOLT: ein altes Bild, noch einmal in den Encoder gegeben
+// (feste Bildrate) oder nachgereicht (stiller Bildschirm) - es zaehlt nicht
+// in die Latenzmessung, sein Alter sagt nichts ueber die Strecke. TESTBILD:
+// aus der Testbild-Schleife, nicht vom Bildschirm.
+#define QC_BILD_WIEDERHOLT 1u
+#define QC_BILD_TESTBILD   2u
+
+static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap_us, int merker) {
     struct iovec iov[QC_MAX_IOV];
+    int wiederholt = (merker & QC_BILD_WIEDERHOLT) != 0;
 
     // Vor jedem Bild geht ein Zeitstempel raus: wann es aufgenommen wurde und
     // wann der Encoder fertig war. Beides auf der Uhr des Hosts. Der Client
@@ -1538,6 +1602,16 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
         // Daten, sonst faengt er mitten in einem Bild ohne Kopfdaten an.
         if (!atomic_load(&g_vid_ready)) { pthread_mutex_unlock(&g_send_mtx); return; }
         if (atomic_load(&g_wait_key) && !keyframe) { pthread_mutex_unlock(&g_send_mtx); return; }
+        // Ein Testbild-Rahmen, der noch im Encoder steckte oder gerade in ihn
+        // ging, als ein neuer Zuschauer das Testbild abschaltete
+        // (bild_verbindung), gehoert nicht zu ihm - auch nicht als Vollbild
+        // (die kommen im Testbild alle zwei Sekunden von selbst). Er wartet
+        // weiter, und das naechste Bild vom Bildschirm wird ein Vollbild.
+        if (atomic_load(&g_wait_key) && (merker & QC_BILD_TESTBILD) && !atomic_load(&g_testbild)) {
+            atomic_store(&g_force_key, 1);
+            pthread_mutex_unlock(&g_send_mtx);
+            return;
+        }
         // Gegen Stau wird VOR dem Encoder verworfen (stau_vor_dem_encoder):
         // ein codiertes Bild geht immer raus. Fiele es hier weg, fehlte den
         // folgenden Zwischenbildern ihr Bezug, das naechste Bild muesste ein
@@ -1567,8 +1641,8 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
 static void enc_cb(void *ref, void *src, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sb) {
     (void)ref;
     uint64_t zettel = (uint64_t)(uintptr_t)src;
-    uint64_t t_cap_us = zettel >> 1;
-    int wiederholt = (int)(zettel & 1u);
+    uint64_t t_cap_us = zettel >> 2;
+    int merker = (int)(zettel & 3u);
     // Jeder Rueckruf schliesst ein Bild ab - geliefert, verworfen oder mit
     // Fehler. Unter null darf der Zaehler nie (Rueckrufe einer alten Sitzung).
     if (atomic_fetch_sub(&g_inflight, 1) <= 0) atomic_store(&g_inflight, 0);
@@ -1591,7 +1665,7 @@ static void enc_cb(void *ref, void *src, OSStatus status, VTEncodeInfoFlags flag
     }
     if (!g_stats.wrote_ps) { keyframe = YES; g_stats.wrote_ps = YES; }
 
-    emit_access_unit(sb, keyframe, t_cap_us, wiederholt);
+    emit_access_unit(sb, keyframe, t_cap_us, merker);
     g_stats.encoded++;
 }
 
@@ -1970,10 +2044,10 @@ static void codec_wechseln(int idx) {
 // nachgelegt - laufen hier zusammen, damit sie sich nicht auseinander
 // entwickeln koennen.
 // Der Begleitzettel reist als Zahl mit, nicht als Zeiger: die echte
-// Aufnahmezeit in Mikrosekunden, nach links geschoben, im untersten Bit das
-// Kennzeichen "nachgelegt". So haengt am Bild kein Speicher, der beim
+// Aufnahmezeit in Mikrosekunden, nach links geschoben, in den untersten zwei
+// Bits die Merker QC_BILD_*. So haengt am Bild kein Speicher, der beim
 // Verwerfen oder bei einem Fehler liegen bleiben koennte.
-#define QC_ZETTEL(t_cap_us, wiederholt) ((void *)(uintptr_t)(((uint64_t)(t_cap_us) << 1) | ((wiederholt) ? 1u : 0u)))
+#define QC_ZETTEL(t_cap_us, merker) ((void *)(uintptr_t)(((uint64_t)(t_cap_us) << 2) | ((merker) & 3u)))
 
 // Stauregel. Liegt beim Zuschauer mehr als QC_BACKLOG_LIMIT (Spielmodus: ein
 // Viertel) ungesendet im Kernel, geht das naechste Bild gar nicht erst in den
@@ -2035,7 +2109,7 @@ static void stau_frist_pruefen(void) {
 }
 
 // YES = das Bild ging in den Encoder.
-static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int wiederholt) {
+static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int merker) {
     if (!pb || !g_session) return NO;
     // Rund um einen Formatwechsel der Aufnahme kann noch ein Bild im alten
     // Format eintreffen. Das gehoert nicht in den neuen Encoder - verwerfen,
@@ -2059,7 +2133,7 @@ static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
         opts = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
     OSStatus st = VTCompressionSessionEncodeFrame(g_session, pb, pts, kCMTimeInvalid,
                                                   (__bridge CFDictionaryRef)opts,
-                                                  QC_ZETTEL(t_cap_us, wiederholt), NULL);
+                                                  QC_ZETTEL(t_cap_us, merker), NULL);
     if (st == noErr) atomic_fetch_add(&g_inflight, 1);
     if (st != noErr) {
         if (!g_stats.first_err) g_stats.first_err = st;
@@ -2122,7 +2196,7 @@ static void fixed_tick(void) {
         // seiner Entstehungszeit = jetzt. Kein Nachlegen, kein Raster.
         CVPixelBufferRef pb = qc_testbild_naechstes();
         if (pb) {
-            encode_buffer(pb, now, cmtime_us(now), 0);
+            encode_buffer(pb, now, cmtime_us(now), QC_BILD_TESTBILD);
             g_last_pts = now;
         }
         return;
@@ -2135,10 +2209,19 @@ static void fixed_tick(void) {
         // Wer auf sein erstes Vollbild wartet, bekommt eins - aber eins zur
         // Zeit: steckt schon ein Bild im Encoder, kommt es gleich an.
         if (wartet && atomic_load(&g_inflight) > 0) return;
+        // Im Stau gar nicht erst versuchen: sonst zaehlte jeder Schlag als
+        // ausgelassenes Bild ("Stau" im 5-s-Protokoll, bis zu fps je
+        // Sekunde), obwohl nur ein einziges Bild wartet. Die Frist prueft
+        // dieser Blick mit.
+        if (stau_vor_dem_encoder()) return;
         double schlitz_vorher = g_schlitz;
         if (!schlitz_frei(CMTimeGetSeconds(now))) return;
         if (wartet) atomic_store(&g_force_key, 1);
-        if (encode_buffer(g_last_pb, now, g_last_cap_us, 0)) {
+        // Als wiederholt gekennzeichnet: die Aufnahmezeit ist die echte, das
+        // Bild aber alt - fuer einen neuen Zuschauer bei stillem Bildschirm
+        // womoeglich Minuten. In der Latenzmessung (Host: Encoderzeit, Client:
+        // Gesamtverzoegerung) staende sonst dieses Alter als Verzoegerung.
+        if (encode_buffer(g_last_pb, now, g_last_cap_us, QC_BILD_WIEDERHOLT)) {
             atomic_store(&g_bild_offen, 0);
             atomic_fetch_add(&g_nachgereicht, 1);
             g_last_pts = now;
@@ -2152,7 +2235,7 @@ static void fixed_tick(void) {
     // Wichtig: der Zettel traegt die ECHTE Aufnahmezeit des wiederholten
     // Bildes, nicht die Nachlegezeit. Sonst sieht die Messung auf der anderen
     // Seite aus, als waere jedes Bild blitzschnell unterwegs gewesen.
-    if (encode_buffer(g_last_pb, now, g_last_cap_us, 1)) atomic_store(&g_bild_offen, 0);
+    if (encode_buffer(g_last_pb, now, g_last_cap_us, QC_BILD_WIEDERHOLT)) atomic_store(&g_bild_offen, 0);
     g_last_pts = now;
     // Das Raster bleibt unberuehrt: es zaehlt nur echte Bilder. Schoebe ein
     // nachgelegtes Bild es weiter, fiele ein echtes kurz danach als "zu
@@ -2181,6 +2264,11 @@ static void fixed_tick(void) {
               pb ? CVPixelBufferGetWidth(pb) : 0, pb ? CVPixelBufferGetHeight(pb) : 0);
     }
     if (!pb) return;
+    // Ohne Encoder nur waehrend eines Codecwechsels festhalten. Sonst ist der
+    // Strom abgebaut, und ein Nachzuegler der anhaltenden Aufnahme (stopCapture
+    // mit Frist) laege nach dem Aufraeumen wieder in g_last_pb - bis zur
+    // naechsten Sitzung.
+    if (!g_session && !g_wechsel_aktiv) return;
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
     if (!CMTIME_IS_VALID(pts)) pts = CMClockGetTime(CMClockGetHostTimeClock());
 
@@ -2535,7 +2623,7 @@ static void stream_herunterfahren_anstossen(void) {
 
 int main(int argc, const char *argv[]) { @autoreleasepool {
     pthread_mutex_lock(&g_log_mtx);
-    log_oeffnen();
+    log_oeffnen("a");
     pthread_mutex_unlock(&g_log_mtx);
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -2801,7 +2889,9 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
                 qc_last_probe(&l);
                 long n = atomic_exchange(&g_enc_n, 0);
                 long long summe = atomic_exchange(&g_enc_us, 0);
-                uint16_t enc_zehntel = n ? (uint16_t)((summe / n) / 100) : 0;
+                // Gedeckelt: ueber 6,5 s liefe das Feld sonst ueber und zeigte wenig.
+                long long zehntel = n ? (summe / n) / 100 : 0;
+                uint16_t enc_zehntel = (uint16_t)(zehntel > 65535 ? 65535 : zehntel);
                 uint16_t host_fps_zehntel = (uint16_t)(((f - lastFrames2) * 10) / 5);
                 lastFrames2 = f;
 

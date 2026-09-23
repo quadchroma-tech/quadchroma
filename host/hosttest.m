@@ -1,7 +1,9 @@
 // Pruefprogramm fuer die Teile von main.m, die ohne Bildschirmaufnahme laufen:
-// Protokoll (Drossel, Obergrenze), Abloesen eines Zuschauers (Typ 10),
-// Zuschauerwechsel im laufenden Strom, Abbau zwischen Hochfahren und
-// Eintragen, Nachreichen bei stillem Bildschirm, Abschluss eines
+// Protokoll (Drossel je Art und Adresse, Obergrenze, auch wenn das Umbenennen
+// scheitert), Abloesen eines Zuschauers (Typ 10), Zuschauerwechsel im
+// laufenden Strom, Testbild-Rest beim neuen Zuschauer, Abbau zwischen
+// Hochfahren und Eintragen, Nachreichen bei stillem Bildschirm (als
+// wiederholt gestempelt, im Stau ohne Taktversuche), Abschluss eines
 // Codecwechsels ohne Zuschauer, Stauregel samt Ton im Stau, Ansage des
 // Tonformats, Koennensliste (AV1).
 //
@@ -493,6 +495,7 @@ typedef struct {
     double weg_nach_stau_s;
     long ton_verworfen;
     long gesendet_spaet;             // Bilder in der zweiten Haelfte des Laufs
+    int blicke;                      // stiller Bildschirm: Blicke im Takt bis zum Austragen
 } ergebnis;
 
 static _Atomic int g_ton_lauf = 0;
@@ -536,9 +539,16 @@ static ergebnis strom_fahren(const strom *s) {
     for (long i = 0; i < n; i++) {
         if (s->still && erster_stau) {
             // Stiller Bildschirm: kein Bild kommt mehr in encode_buffer. Nur
-            // der 5-s-Takt des Dienstes prueft die Frist - hier nach 2,5 s.
-            usleep(2500 * 1000);
-            stau_frist_pruefen();
+            // der 5-s-Takt des Dienstes prueft die Frist - hier alle 2,5 s.
+            // Wie dort darf es einen Blick mehr brauchen: einmal in 14
+            // Laeufen unter ASan reichte der erste nicht - vermutlich nahm
+            // der Kernel der Gegenstelle nach dem Blick im Stau noch etwas
+            // ab (nicht gemessen), dann zaehlt die Frist ab dort.
+            for (int blick = 1; blick <= 2 && atomic_load(&g_client_fd) >= 0; blick++) {
+                usleep(2500 * 1000);
+                stau_frist_pruefen();
+                e.blicke = blick;
+            }
             if (atomic_load(&g_client_fd) < 0) { e.weg = 1; e.weg_nach_stau_s = sek() - erster_stau; }
             break;
         }
@@ -669,6 +679,7 @@ static void stau_pruefen(void) {
     pruefe(eds.weg && eds.weg_nach_stau_s < 2.6, "auch im Spielmodus (vorher dort laut Code: nie)");
     strom dst = { "Gegenstelle liest nicht, danach stiller Bildschirm", 120, 150, K, 0, 0, 0, 6, .still = 1 };
     ergebnis edst = strom_fahren(&dst);
+    printf("         (ausgetragen beim %d. Blick im Takt, %.1f s nach Staubeginn)\n", edst.blicke, edst.weg_nach_stau_s);
     pruefe(edst.weg, "auch ohne ein weiteres Bild: die Frist im Takt des Dienstes traegt ihn aus");
 
     printf("\n-- Stauregel: lebender Zuschauer, im Stau geht mehr hinaus als Bilder\n");
@@ -724,9 +735,11 @@ static void *fluten(void *arg) {
     return NULL;
 }
 
+// Zurueckgehaltene Zeilen einer Art: alle Adressen zusammen.
 static long drossel_weitere(qc_drossel *d) {
     pthread_mutex_lock(&d->m);
-    long n = d->weitere;
+    long n = d->sonst;
+    for (int i = 0; i < QC_DROSSEL_ADRESSEN; i++) n += d->platz[i].weitere;
     pthread_mutex_unlock(&d->m);
     return n;
 }
@@ -734,7 +747,8 @@ static long drossel_weitere(qc_drossel *d) {
 // Frist der Drossel als abgelaufen behandeln, ohne zehn Sekunden zu warten.
 static void drossel_altern(qc_drossel *d) {
     pthread_mutex_lock(&d->m);
-    d->zuletzt_s -= QC_MELDEN_S;
+    for (int i = 0; i < QC_DROSSEL_ADRESSEN; i++) d->platz[i].zuletzt_s -= QC_MELDEN_S;
+    d->sonst_s -= QC_MELDEN_S;
     pthread_mutex_unlock(&d->m);
 }
 
@@ -746,7 +760,7 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
     g_log_pfad = pfad;
     g_log_alt_pfad = alt;
     pthread_mutex_lock(&g_log_mtx);
-    log_oeffnen();
+    log_oeffnen("a");
     pthread_mutex_unlock(&g_log_mtx);
     if (!g_log) { pruefe(0, "eigene Protokolldatei"); return; }
 
@@ -784,20 +798,45 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
     // vorher (gezaehlt in ihrer eigenen, ebenfalls gedrosselten Andrang-Meldung).
     pruefe(w_bild > 100 && w_ein > 100, "die zurueckgehaltenen werden gezaehlt, nicht vergessen");
 
-    // Nach der Frist kommt die Sammelzeile auch ohne neue Verbindung.
+    // Mitten in der Flut von 127.0.0.1 versucht es ein anderes Geraet: seine
+    // erste Zeile kommt sofort. Weitere Adressen bekommen einen der
+    // QC_DROSSEL_ADRESSEN Plaetze; sind alle belegt, zaehlen sie gemeinsam.
+    // Ueber Loopback gibt es nur eine Absenderadresse, also direkt ueber die
+    // Drossel, mit denselben Zeilen wie bild_verbindung.
+    stdout_stumm(1);
+    const char *andere[] = { "192.0.2.1", "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4", "192.0.2.5" };
+    for (size_t i = 0; i < sizeof andere / sizeof andere[0]; i++)
+        logf_gedrosselt(&d_bild_handschlag, andere[i], @"Handschlag mit %s gescheitert (%d)", andere[i], -1);
+    stdout_stumm(0);
+    int z1 = zeilen_mit(pfad, "Handschlag mit 192.0.2.1 gescheitert");
+    int z2 = zeilen_mit(pfad, "Handschlag mit 192.0.2.2 gescheitert");
+    int z3 = zeilen_mit(pfad, "Handschlag mit 192.0.2.3 gescheitert");
+    int z45 = zeilen_mit(pfad, "Handschlag mit 192.0.2.4 gescheitert") + zeilen_mit(pfad, "Handschlag mit 192.0.2.5 gescheitert");
+    printf("         (andere Adressen waehrend der Flut: je eine Zeile fuer 192.0.2.1-3: %d/%d/%d, "
+           "ohne Platz 192.0.2.4-5: %d, zurueckgehalten jetzt %ld)\n", z1, z2, z3, z45, drossel_weitere(&d_bild_handschlag));
+    pruefe(z1 == 1 && z2 == 1 && z3 == 1,
+           "je Adresse: die erste Zeile eines anderen Geraets kommt mitten in der Flut sofort, eine Wiederholung nicht");
+    pruefe(z45 == 0 && drossel_weitere(&d_bild_handschlag) == w_bild + 3,
+           "mehr Adressen als Plaetze: nur noch gezaehlt - hoechstens QC_DROSSEL_ADRESSEN Zeilen je Art und Frist");
+
+    // Nach der Frist kommt die Sammelzeile auch ohne neue Verbindung, je
+    // Adresse eine, fuer die ohne Platz eine gemeinsame.
     drossel_altern(&d_bild_handschlag);
     drossel_altern(&d_ein_ohne_bild);
     stdout_stumm(1);
     drosseln_nachtragen();
     drosseln_nachtragen();
     stdout_stumm(0);
-    char erwartet[160];
-    snprintf(erwartet, sizeof erwartet, "Bildkanal: Handschlag gescheitert: %ld weitere seit der letzten Meldung, zuletzt von 127.0.0.1", w_bild);
+    char erwartet[200];
+    snprintf(erwartet, sizeof erwartet, "Bildkanal: Handschlag gescheitert: %ld weitere von 127.0.0.1 seit der letzten Meldung", w_bild);
     int s_bild = zeilen_mit(pfad, erwartet);
-    snprintf(erwartet, sizeof erwartet, "kein Bildkanal offen: %ld weitere seit der letzten Meldung", w_ein);
+    snprintf(erwartet, sizeof erwartet, "kein Bildkanal offen: %ld weitere von 127.0.0.1 seit der letzten Meldung", w_ein);
     int s_ein = zeilen_mit(pfad, erwartet);
-    pruefe(s_bild == 1 && s_ein == 1 && drossel_weitere(&d_bild_handschlag) == 0,
-           "nach der Frist genau eine Sammelzeile je Art mit der Zahl und der letzten Adresse");
+    int s_1 = zeilen_mit(pfad, "Bildkanal: Handschlag gescheitert: 1 weitere von 192.0.2.1 seit der letzten Meldung");
+    int s_sonst = zeilen_mit(pfad, "Bildkanal: Handschlag gescheitert: 2 weitere von anderen Adressen seit der letzten Meldung, zuletzt von 192.0.2.5");
+    int s_alle = zeilen_mit(pfad, "Handschlag gescheitert: ");
+    pruefe(s_bild == 1 && s_ein == 1 && s_1 == 1 && s_sonst == 1 && s_alle == 3 && drossel_weitere(&d_bild_handschlag) == 0,
+           "nach der Frist genau eine Sammelzeile je Adresse mit der Zahl, eine fuer die Adressen ohne Platz");
 
     // Voller Handschlag mit Wegwerfschluessel, wie ein ungekoppelter Client,
     // der alle zwei Sekunden neu versucht - nur schneller.
@@ -839,6 +878,31 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
            "ueber der Grenze wandert die Datei nach .alt.log, beide bleiben unter der Grenze plus einer Zeile");
     pruefe(kopf, "die neue Datei sagt in ihrer ersten Zeile, wo die alten Zeilen stehen");
     pruefe(zeilen_mit(pfad, "Pruefzeile 299") == 1, "die juengste Zeile steht in der neuen Datei");
+
+    // Laesst sich die Datei nicht umbenennen (hier: an der Stelle des .alt.log
+    // liegt ein Ordner; in /tmp genuegte eine fremde Datei), haelt die Grenze
+    // trotzdem: die Datei beginnt leer, und der Hinweis steht einmal darin.
+    unlink(alt);
+    mkdir(alt, 0700);
+    char drin[1200];
+    snprintf(drin, sizeof drin, "%s/fremd", alt);
+    FILE *fr = fopen(drin, "w");
+    if (fr) fclose(fr);
+    stdout_stumm(1);
+    for (int i = 0; i < 300; i++) logf_(@"Zweite Runde %03d - so lang wie eine gewoehnliche Zeile im Hostprotokoll", i);
+    stdout_stumm(0);
+    int ok_neu2 = stat(pfad, &sn) == 0;
+    int kopf2 = 0;
+    f = fopen(pfad, "r");
+    memset(erste, 0, sizeof erste);
+    if (f) { if (fgets(erste, sizeof erste, f)) kopf2 = strstr(erste, "liess sich nicht nach") != NULL; fclose(f); }
+    int hinweise = zeilen_mit(pfad, "Protokoll war ueber");
+    printf("         (Umbenennen gesperrt: Datei %lld Byte, Hinweiszeilen %d)\n", ok_neu2 ? (long long)sn.st_size : -1, hinweise);
+    pruefe(ok_neu2 && sn.st_size < g_log_grenze + 512 && kopf2 && hinweise == 1 &&
+           zeilen_mit(pfad, "Zweite Runde 299") == 1,
+           "Umbenennen gescheitert: die Datei wird geleert, die Grenze haelt, der Hinweis steht einmal vorn");
+    unlink(drin);
+    rmdir(alt);
 
     pthread_mutex_lock(&g_log_mtx);
     fclose(g_log);
@@ -1050,16 +1114,22 @@ static CMSampleBufferRef aufnahme_bild(CVPixelBufferRef pb, CMTime pts) {
 
 static CMTime uhr(void) { return CMClockGetTime(CMClockGetHostTimeClock()); }
 
-// Nachrichten lesen, bis frist_ms lang nichts kommt; Bilder und Vollbilder zaehlen.
-static void bilder_lesen(leser *l, int frist_ms, int *bilder, int *vollbilder, int *erstes_voll) {
+// Nachrichten lesen, bis frist_ms lang nichts kommt; Bilder und Vollbilder
+// zaehlen, dazu die Bilder, deren Stempel "wiederholt" traegt (aus der
+// Latenzmessung heraus).
+static void bilder_lesen(leser *l, int frist_ms, int *bilder, int *vollbilder, int *erstes_voll, int *wiederholt) {
     qc_hdr m;
     uint8_t anf[8];
+    int stempel_wiederholt = 0;
     while (nachricht(l, &m, anf, frist_ms) == 1) {
+        if (m.type == QC_MSG_STAMP) { stempel_wiederholt = anf[4] & 1; continue; }
         if (m.type != QC_MSG_VIDEO) continue;
         int key = (m.flags & QC_FLAG_KEY) ? 1 : 0;
         if (*bilder == 0) *erstes_voll = key;
         (*bilder)++;
         *vollbilder += key;
+        if (wiederholt) *wiederholt += stempel_wiederholt;
+        stempel_wiederholt = 0;
     }
 }
 
@@ -1068,6 +1138,44 @@ static void takt(int schlaege) {
         dispatch_sync(g_capq, ^{ fixed_tick(); });
         usleep(20 * 1000);
     }
+}
+
+// Ein Testbild-Rahmen, der beim Wechsel noch im Encoder steckte (oder den der
+// Takt gerade noch aus der Schleife nahm), kommt erst nach dem Eintragen des
+// Neuen heraus - im Testbild alle zwei Sekunden auch als Vollbild. Er darf
+// nicht dessen erstes Bild werden; das naechste vom Bildschirm wird erzwungen.
+static void testbild_rest_pruefen(void) {
+    printf("\n-- Testbild-Rest beim neuen Zuschauer\n");
+    int h, c;
+    if (paar(&h, &c, 0)) { pruefe(0, "Verbindung"); return; }
+    zuschauer_setzen(h, kanal(h, 0x51));             // wartet auf ein Vollbild
+    atomic_store(&g_testbild, 0);                    // bild_verbindung hat es abgeschaltet
+    atomic_store(&g_force_key, 0);
+    CMSampleBufferRef kb = bild(8 * 1024), pb = bild(1024);
+    emit_access_unit(kb, YES, now_us(), QC_BILD_TESTBILD);    // Testbild-Vollbild aus dem Encoder
+    emit_access_unit(pb, NO, now_us(), QC_BILD_TESTBILD);     // und ein Zwischenbild dahinter
+    int wartet = atomic_load(&g_wait_key), erzwungen = atomic_load(&g_force_key);
+    atomic_store(&g_force_key, 0);
+    emit_access_unit(kb, YES, now_us(), 0);                   // Vollbild vom Bildschirm
+    emit_access_unit(pb, NO, now_us(), 0);
+    // Gegenprobe: hat der Zuschauer das Testbild selbst eingeschaltet
+    // (Benchmark), gehoert es zu ihm - auch wenn er auf ein Vollbild wartet.
+    atomic_store(&g_testbild, 1);
+    atomic_store(&g_wait_key, 1);
+    emit_access_unit(kb, YES, now_us(), QC_BILD_TESTBILD);
+    atomic_store(&g_testbild, 0);
+    leser l;
+    leser_init(&l, c, 0x51);
+    int bilder = 0, voll = 0, erstes = -1;
+    bilder_lesen(&l, 300, &bilder, &voll, &erstes, NULL);
+    printf("         (%d Bilder beim Zuschauer, %d Vollbilder)\n", bilder, voll);
+    pruefe(wartet && erzwungen, "ein veralteter Testbild-Rahmen geht nicht hinaus, der Zuschauer wartet weiter, "
+                                "und das naechste Bild wird ein Vollbild");
+    pruefe(bilder == 3 && voll == 2 && erstes == 1,
+           "beim Zuschauer: Vollbild und Zwischenbild vom Bildschirm, dann sein eigenes Testbild");
+    zuschauer_weg();
+    close(c); free(l.buf);
+    CFRelease(kb); CFRelease(pb);
 }
 
 static void nachreichen_pruefen(int bild_port) {
@@ -1112,14 +1220,23 @@ static void nachreichen_pruefen(int bild_port) {
     int ok = b >= 0 && klartext(&l, magic, 4, 2000) == 1;
     usleep(50 * 1000);                               // eingetragen
     long nach0 = atomic_load(&g_nachgereicht);
+    long enc_n0 = atomic_load(&g_enc_n);
+    long long enc_us0 = atomic_load(&g_enc_us);
     takt(5);
-    int bilder = 0, voll = 0, erstes = -1;
-    bilder_lesen(&l, 300, &bilder, &voll, &erstes);
+    int bilder = 0, voll = 0, erstes = -1, wiederholt = 0;
+    bilder_lesen(&l, 300, &bilder, &voll, &erstes, &wiederholt);
     stdout_stumm(0);
-    printf("         (neuer Zuschauer, stiller Bildschirm: %d Bild(er), das erste %s)\n", bilder,
-           erstes == 1 ? "ein Vollbild" : erstes == 0 ? "ein Zwischenbild" : "-");
+    printf("         (neuer Zuschauer, stiller Bildschirm: %d Bild(er), das erste %s, %d als wiederholt gestempelt; "
+           "Encoderzeit %ld Bild(er), %lld us)\n", bilder,
+           erstes == 1 ? "ein Vollbild" : erstes == 0 ? "ein Zwischenbild" : "-", wiederholt,
+           atomic_load(&g_enc_n) - enc_n0, atomic_load(&g_enc_us) - enc_us0);
     pruefe(ok && bilder == 1 && erstes == 1 && !atomic_load(&g_wait_key),
            "der Neue bekommt das zuletzt gesehene Bild als Vollbild, genau einmal");
+    // Das Bild ist eine Sekunde alt. Ginge es als frisch hinaus, stuende
+    // dieses Alter als Encoderzeit (Host) und als Verzoegerung (Client) in
+    // der Messung - bei einem seit Minuten stillen Bildschirm Minuten.
+    pruefe(wiederholt == 1 && atomic_load(&g_enc_n) == enc_n0 && atomic_load(&g_enc_us) == enc_us0,
+           "das nachgereichte Bild ist als wiederholt gestempelt und bleibt aus der Latenzmessung");
 
     // Eine kurze Bewegung: zwei Bilder im Abstand von 3 ms, das zweite ist
     // das Endbild und faellt als zu schnell weg.
@@ -1136,15 +1253,18 @@ static void nachreichen_pruefen(int bild_port) {
     dispatch_sync(g_capq, ^{ fixed_tick(); });
     long vorher = atomic_load(&g_nachgereicht);
     takt(4);
-    bilder = 0; voll = 0; erstes = -1;
+    bilder = 0; voll = 0; erstes = -1; wiederholt = 0;
     stdout_stumm(1);
-    bilder_lesen(&l, 300, &bilder, &voll, &erstes);
+    bilder_lesen(&l, 300, &bilder, &voll, &erstes, &wiederholt);
     stdout_stumm(0);
-    printf("         (Bewegung aus 2 Bildern, Endbild zu schnell: %d Bild(er) beim Zuschauer, %ld nachgereicht)\n",
-           bilder, atomic_load(&g_nachgereicht) - vorher);
+    printf("         (Bewegung aus 2 Bildern, Endbild zu schnell: %d Bild(er) beim Zuschauer, %ld nachgereicht, "
+           "%d als wiederholt gestempelt, Encoderzeit %ld Bild(er))\n",
+           bilder, atomic_load(&g_nachgereicht) - vorher, wiederholt, atomic_load(&g_enc_n) - enc_n0);
     pruefe(weg, "das Endbild der Bewegung faellt im Raster weg und bleibt als offen stehen");
     pruefe(bilder == 2 && !atomic_load(&g_bild_offen) && atomic_load(&g_nachgereicht) - vorher == 1,
            "der Takt reicht es genau einmal nach - der Zuschauer sieht den Endstand");
+    pruefe(wiederholt == 1 && atomic_load(&g_enc_n) == enc_n0 + 1,
+           "nur das frisch aufgenommene Bild zaehlt in die Encoderzeit, das nachgereichte ist als wiederholt gestempelt");
 
     // Mitten in einer Bewegung (juengstes Bild juenger als eine Bildzeit)
     // legt der Takt nichts dazu; die naechste Aufnahme kommt ohnehin.
@@ -1161,14 +1281,46 @@ static void nachreichen_pruefen(int bild_port) {
            "waehrend einer Bewegung nichts dazu, erst eine Bildzeit nach dem juengsten Bild");
     printf("         (insgesamt %ld nachgereicht)\n", atomic_load(&g_nachgereicht) - nach0);
 
+    // Im Stau: das Endbild wartet, aber der Takt versucht es nicht bei jedem
+    // Schlag - "Stau" im 5-s-Protokoll zaehlt ausgelassene Bilder, nicht
+    // Taktschlaege -, und er belegt keinen Schlitz. Ein echtes Bild zaehlt
+    // wie bisher einmal. (Die Frist von 2 s laeuft hier nicht ab.)
+    int hfd = atomic_load(&g_client_fd);
+    long gefuellt = hfd >= 0 ? puffer_fuellen(hfd) : 0;
+    dispatch_sync(g_capq, ^{
+        g_last_cap_us = now_us() - 1000000ull;
+        g_last_pts = CMTimeSubtract(uhr(), CMTimeMake(1, 1));
+    });
+    atomic_store(&g_bild_offen, 1);
+    long stau0 = atomic_load(&g_skipped_backlog), fr_stau0 = atomic_load(&g_sent_frames);
+    __block double schlitz0 = 0, schlitz1 = 0;
+    dispatch_sync(g_capq, ^{ schlitz0 = g_schlitz; });
+    takt(5);
+    dispatch_sync(g_capq, ^{ schlitz1 = g_schlitz; });
+    long stau_takt = atomic_load(&g_skipped_backlog) - stau0;
+    CMSampleBufferRef s3 = aufnahme_bild(pb, uhr());
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s3 ofType:SCStreamOutputTypeScreen]; });
+    long stau_echt = atomic_load(&g_skipped_backlog) - stau0 - stau_takt;
+    printf("         (Stau mit %ld Byte: 5 Taktschlaege zaehlen %ld, ein echtes Bild %ld)\n", gefuellt, stau_takt, stau_echt);
+    pruefe(hfd >= 0 && atomic_load(&g_client_fd) == hfd && stau_takt == 0 && schlitz1 == schlitz0 &&
+           atomic_load(&g_sent_frames) == fr_stau0 && atomic_load(&g_bild_offen) && stau_echt == 1,
+           "im Stau: der Takt zaehlt keine Schlaege als Stau und belegt keinen Schlitz, das Endbild bleibt offen");
+
     zuschauer_weg();
     stdout_stumm(1);
     stream_herunterfahren_anstossen();
     SCStream *st = strom_jetzt();
     stdout_stumm(0);
     pruefe(st == nil && !g_session && !g_last_pb, "ohne Zuschauer: Strom, Encoder und letztes Bild weg");
+    // Ein Nachzuegler der anhaltenden Aufnahme bleibt nicht liegen.
+    CMSampleBufferRef s4 = aufnahme_bild(pb, uhr());
+    dispatch_sync(g_capq, ^{ [grab stream:fs didOutputSampleBuffer:s4 ofType:SCStreamOutputTypeScreen]; });
+    __block int liegt = 0;
+    dispatch_sync(g_capq, ^{ liegt = g_last_pb != NULL; });
+    pruefe(!liegt, "ein Bild nach dem Abbau wird nicht mehr festgehalten");
+    atomic_store(&g_bild_offen, 0);
     close(b); free(l.buf);
-    CFRelease(s1); CFRelease(s2);
+    CFRelease(s1); CFRelease(s2); CFRelease(s3); CFRelease(s4);
     CVPixelBufferRelease(pb);
     atomic_store(&g_codec_id, 0);
 }
@@ -1278,6 +1430,7 @@ int main(void) {
         protokoll_pruefen(bild_port, ein_port);
         abloesen_pruefen();
         wechsel_pruefen(bild_port);
+        testbild_rest_pruefen();
         abbau_wettlauf_pruefen(bild_port);
         nachreichen_pruefen(bild_port);
         codec_abschluss_pruefen();
