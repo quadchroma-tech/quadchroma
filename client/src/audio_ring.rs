@@ -206,6 +206,11 @@ impl Ausgang {
         }
     }
 
+    /// Ist gerade ein Geraet offen (Ring da)? Solange nicht, verwirft push().
+    pub fn offen(&self) -> bool {
+        !self.geteilt.tot.load(Ordering::Relaxed) && sperre(&self.geteilt.ring).is_some()
+    }
+
     /// Fuellstand in Millisekunden und Anzahl der Aussetzer, fuer die Anzeige.
     pub fn stats(&self) -> (f32, u64) {
         let aussetzer = self.geteilt.aussetzer.load(Ordering::Relaxed);

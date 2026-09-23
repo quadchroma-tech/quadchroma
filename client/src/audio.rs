@@ -77,14 +77,19 @@ pub struct AudioOut {
 impl AudioOut {
     /// Oeffnet das Standard-Ausgabegeraet. Gibt einen Text zurueck statt zu
     /// stuerzen: ohne Ton laeuft der Rest des Programms weiter.
-    pub fn new(rate: u32, channels: u16) -> Result<Self, String> {
+    ///
+    /// Ok mit Hinweis: der Ausgang steht, aber noch ohne Geraet - der
+    /// Geraetefaden versucht es weiter (siehe `betreiben`), und der Hinweis
+    /// ist der Grund fuer die Anzeige. Err nur, wenn es gar nichts zu
+    /// versuchen gibt (unsinniges Format, keine Geraeteliste, Faden weg).
+    pub fn new(rate: u32, channels: u16) -> Result<(Self, Option<String>), String> {
         format_pruefen(rate, channels)?;
 
         let geteilt = Geteilt::neu();
 
         // Das Geraet wird im Geraetefaden geoeffnet: COM gehoert dem Faden, der
         // es benutzt. new() wartet hier nur auf die Rueckmeldung.
-        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        let (tx, rx) = mpsc::channel::<Result<Option<String>, String>>();
         let mit = geteilt.clone();
         std::thread::Builder::new()
             .name("quadchroma-audio".into())
@@ -92,7 +97,7 @@ impl AudioOut {
             .map_err(|e| format!("Tonfaden startet nicht: {e}"))?;
 
         match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(AudioOut { gemeinsam: Ausgang { geteilt } }),
+            Ok(Ok(hinweis)) => Ok((AudioOut { gemeinsam: Ausgang { geteilt } }, hinweis)),
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 geteilt.ende.store(true, Ordering::Relaxed);
@@ -110,11 +115,16 @@ impl AudioOut {
     pub fn stats(&self) -> (f32, u64) {
         self.gemeinsam.stats()
     }
+
+    /// Ist ein Geraet offen? Solange der Geraetefaden noch sucht, nicht.
+    pub fn offen(&self) -> bool {
+        self.gemeinsam.offen()
+    }
 }
 
 // ------------------------------------------------------------------ Geraetefaden
 
-fn faden(rate: u32, kanaele: usize, geteilt: Arc<Geteilt>, tx: mpsc::Sender<Result<(), String>>) {
+fn faden(rate: u32, kanaele: usize, geteilt: Arc<Geteilt>, tx: mpsc::Sender<Result<Option<String>, String>>) {
     // Kein Sturz darf aus diesem Faden heraus: schlimmstenfalls ist der Ton weg.
     let ergebnis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         lauf(rate, kanaele, &geteilt, &tx)
@@ -138,7 +148,7 @@ unsafe fn lauf(
     rate: u32,
     kanaele: usize,
     geteilt: &Geteilt,
-    tx: &mpsc::Sender<Result<(), String>>,
+    tx: &mpsc::Sender<Result<Option<String>, String>>,
 ) -> Result<(), String> {
     // COM fuer diesen Faden. Ein bereits eingerichtetes Apartment (S_FALSE)
     // ist kein Fehler; abgebaut wird, was hier erfolgreich aufgebaut wurde -
@@ -155,7 +165,7 @@ unsafe fn lauf_com(
     rate: u32,
     kanaele: usize,
     geteilt: &Geteilt,
-    tx: &mpsc::Sender<Result<(), String>>,
+    tx: &mpsc::Sender<Result<Option<String>, String>>,
 ) -> Result<(), String> {
     let aufzaehler: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
         .map_err(|e| format!("Geraeteliste: {e}"))?;
@@ -182,13 +192,17 @@ trait Treiber {
 /// verloren geht, das dann aktuelle Standardgeraet neu oeffnen - so lange,
 /// bis es klappt oder der Ausgang endet. Ohne das bliebe der Ton bis zur
 /// naechsten Verbindung weg: beide Hosts sagen das Tonformat nur einmal je
-/// Zuschauer an, ein neues AudioOut entsteht also nicht von selbst.
+/// Zuschauer an (und bei einem Formatwechsel), ein neues AudioOut entsteht
+/// also nicht von selbst.
 ///
-/// Nur der ERSTE Fehler beim Oeffnen geht an new() und damit in die Anzeige.
+/// Das gilt auch, wenn schon das ERSTE Oeffnen scheitert (Kopfhoerer erst
+/// nach Sitzungsbeginn eingesteckt): new() bekommt dann Ok mit dem Grund als
+/// Hinweis fuer die Anzeige, und es wird in derselben Weise weiter versucht.
 /// Danach wird still weiter versucht und nur ins Protokoll geschrieben,
 /// derselbe Fehler nur einmal in Folge. Solange kein Geraet offen ist, gibt es
 /// keinen Ring: push() verwirft dann, es staut sich nichts, und die Anzeige
-/// zeigt 0 ms Vorlauf.
+/// zeigt 0 ms Vorlauf. Das alles nur, solange der Ausgang besteht - also nur
+/// mit Verbindung.
 ///
 /// Das Protokoll hat keine Groessengrenze, also bleibt auch ein Geraet, das
 /// immer wieder gleich verloren geht, bei wenigen Zeilen: kommt derselbe Grund
@@ -198,13 +212,41 @@ trait Treiber {
 fn betreiben<T: Treiber>(
     t: &mut T,
     geteilt: &Geteilt,
-    tx: &mpsc::Sender<Result<(), String>>,
+    tx: &mpsc::Sender<Result<Option<String>, String>>,
     pause: Duration,
     stabil: Duration,
     melden: &mut dyn FnMut(String),
 ) -> Result<(), String> {
-    let mut geraet = t.oeffnen(geteilt)?;
-    let _ = tx.send(Ok(()));
+    let mut geraet = match t.oeffnen(geteilt) {
+        Ok(g) => {
+            let _ = tx.send(Ok(None));
+            g
+        }
+        Err(e) => {
+            // Der erste Fehler geht wie bisher in die Anzeige, aber der
+            // Ausgang steht und sucht weiter.
+            let _ = tx.send(Ok(Some(e.clone())));
+            melden(format!("Ton: Ausgabegeraet oeffnen: {e} - neuer Versuch alle {} ms", pause.as_millis()));
+            let mut zuletzt = e;
+            loop {
+                if warten(geteilt, pause) {
+                    return Ok(());
+                }
+                match t.oeffnen(geteilt) {
+                    Ok(g) => {
+                        melden("Ton: Ausgabegeraet offen".into());
+                        break g;
+                    }
+                    Err(e) => {
+                        if e != zuletzt {
+                            melden(format!("Ton: Ausgabegeraet oeffnen: {e}"));
+                            zuletzt = e;
+                        }
+                    }
+                }
+            }
+        }
+    };
     // Zuletzt protokollierter Verlustgrund und wie oft er seitdem still
     // wiederkam; zuletzt protokollierter Oeffnungsfehler.
     let mut folge: Option<(String, u32)> = None;
@@ -548,7 +590,9 @@ mod tests {
         }
     }
 
-    fn lauf_mit(t: &mut Attrappe, geteilt: &Geteilt, pause: Duration) -> (Result<(), String>, Vec<Result<(), String>>, Vec<String>) {
+    type Gemeldet = Vec<Result<Option<String>, String>>;
+
+    fn lauf_mit(t: &mut Attrappe, geteilt: &Geteilt, pause: Duration) -> (Result<(), String>, Gemeldet, Vec<String>) {
         // stabil = 0: jeder Lauf gilt als stabil, jeder Verlust als neu.
         lauf_stabil(t, geteilt, pause, Duration::ZERO)
     }
@@ -558,24 +602,61 @@ mod tests {
         geteilt: &Geteilt,
         pause: Duration,
         stabil: Duration,
-    ) -> (Result<(), String>, Vec<Result<(), String>>, Vec<String>) {
+    ) -> (Result<(), String>, Gemeldet, Vec<String>) {
         let (tx, rx) = mpsc::channel();
         let mut zeilen = Vec::new();
         let ergebnis = betreiben(t, geteilt, &tx, pause, stabil, &mut |z| zeilen.push(z));
         (ergebnis, rx.try_iter().collect(), zeilen)
     }
 
-    /// Scheitert schon das erste Oeffnen, geht der Fehler an new() - wie
-    /// bisher -, und es wird nicht weiter versucht.
+    /// Scheitert schon das erste Oeffnen, geht der Grund als Hinweis an
+    /// new() - der Ausgang steht aber, und es wird weiter versucht, bis ein
+    /// Geraet da ist (Kopfhoerer nach Sitzungsbeginn eingesteckt). Derselbe
+    /// Grund steht nur einmal im Protokoll.
     #[test]
-    fn erster_fehler_geht_an_new() {
+    fn erster_fehler_versucht_weiter() {
         let geteilt = Geteilt::neu();
-        let mut t = Attrappe::neu(vec![Err("kein Standard-Ausgabegeraet")], vec![]);
+        let mut t = Attrappe::neu(
+            vec![Err("kein Standard-Ausgabegeraet"), Err("kein Standard-Ausgabegeraet"), Ok(())],
+            vec![],
+        );
         let (ergebnis, gemeldet, zeilen) = lauf_mit(&mut t, &geteilt, Duration::from_millis(1));
-        assert_eq!(ergebnis, Err("kein Standard-Ausgabegeraet".to_string()));
-        assert!(gemeldet.is_empty());
-        assert!(zeilen.is_empty());
-        assert_eq!(t.versuche, 1);
+        assert_eq!(ergebnis, Ok(()));
+        assert_eq!(gemeldet, vec![Ok(Some("kein Standard-Ausgabegeraet".to_string()))]);
+        assert_eq!(
+            zeilen,
+            vec![
+                "Ton: Ausgabegeraet oeffnen: kein Standard-Ausgabegeraet - neuer Versuch alle 1 ms".to_string(),
+                "Ton: Ausgabegeraet offen".to_string(),
+            ]
+        );
+        assert_eq!(t.versuche, 3);
+        // Das Ende kam von der Attrappe (kein Verlust mehr); bis dahin lief
+        // der Ring, und der Ausgang nahm Ton an.
+        assert!(sperre(&geteilt.ring).is_some());
+        let ausgang = Ausgang { geteilt: geteilt.clone() };
+        assert!(ausgang.offen());
+        ausgang.push(&[0.5; 96]);
+        assert!(ausgang.stats().0 > 0.0);
+    }
+
+    /// Kommt nie ein Geraet, sucht der Faden, bis der Ausgang endet - und
+    /// endet dann ohne Warten auf die Pause.
+    #[test]
+    fn ohne_geraet_bis_zum_ende() {
+        let geteilt = Geteilt::neu();
+        let mut t = Attrappe::neu(vec![], vec![]);
+        let aussen = geteilt.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            aussen.ende.store(true, Ordering::Relaxed);
+        });
+        let (ergebnis, gemeldet, zeilen) = lauf_mit(&mut t, &geteilt, Duration::from_millis(10));
+        stopper.join().unwrap();
+        assert_eq!(ergebnis, Ok(()));
+        assert_eq!(gemeldet, vec![Ok(Some("kein Geraet".to_string()))]);
+        assert_eq!(zeilen.len(), 1, "{zeilen:?}");
+        assert!(t.versuche > 2);
         assert!(sperre(&geteilt.ring).is_none());
     }
 
@@ -591,7 +672,7 @@ mod tests {
         );
         let (ergebnis, gemeldet, zeilen) = lauf_mit(&mut t, &geteilt, Duration::from_millis(1));
         assert_eq!(ergebnis, Ok(()));
-        assert_eq!(gemeldet, vec![Ok(())]);
+        assert_eq!(gemeldet, vec![Ok(None)]);
         assert_eq!(t.versuche, 5);
         assert_eq!(t.ring_beim_versuch, vec![false; 5]);
         assert_eq!(
@@ -637,7 +718,7 @@ mod tests {
         let (ergebnis, gemeldet, zeilen) =
             lauf_stabil(&mut t, &geteilt, Duration::from_millis(1), Duration::from_secs(3600));
         assert_eq!(ergebnis, Ok(()));
-        assert_eq!(gemeldet, vec![Ok(())]);
+        assert_eq!(gemeldet, vec![Ok(None)]);
         assert_eq!(t.versuche, 6);
         assert_eq!(t.ring_beim_versuch, vec![false; 6]);
         assert_eq!(
@@ -711,21 +792,27 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
     }
 
-    /// Am echten WASAPI: ohne Tongeraet (Bau-VM) kommt der Fehler des ersten
-    /// Versuchs zurueck, mit Geraet ein laufender Ausgang, der beim
-    /// Fallenlassen endet (spielt 20 ms Stille). Haengen darf beides nicht.
+    /// Am echten WASAPI: ohne Tongeraet (Bau-VM) steht der Ausgang mit dem
+    /// Grund des ersten Versuchs als Hinweis und sucht weiter; mit Geraet ein
+    /// laufender Ausgang (spielt 20 ms Stille). Beide enden beim
+    /// Fallenlassen. Haengen darf nichts.
     #[test]
     fn echtes_geraet_oder_fehler() {
         let start = Instant::now();
         match AudioOut::new(48_000, 2) {
-            Ok(a) => {
+            Ok((a, None)) => {
+                assert!(a.offen());
                 a.push(&[0.0; 1_920]);
                 println!("Tongeraet offen");
             }
-            Err(e) => {
-                println!("Tongeraet: {e}");
+            Ok((a, Some(e))) => {
+                println!("Tongeraet: {e} - Ausgang sucht weiter");
                 assert!(!e.is_empty());
+                assert!(!a.offen());
+                a.push(&[0.0; 1_920]);
+                assert_eq!(a.stats().0, 0.0);
             }
+            Err(e) => panic!("Ausgang nicht angelegt: {e}"),
         }
         assert!(start.elapsed() < Duration::from_secs(5), "haengt: {:?}", start.elapsed());
     }

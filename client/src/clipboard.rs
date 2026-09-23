@@ -9,6 +9,13 @@
 // Nachrichtenfenster; Windows schickt dann WM_CLIPBOARDUPDATE. Kein Abfragen im
 // Takt, kein SetClipboardViewer (dessen Kette bricht, sobald ein Glied abstuerzt).
 //
+// Gelesen wird nur mit Gegenueber ("kein Zuschauer, keine Arbeit"), wie auf
+// dem Mac (clipboard_mac.rs): im Client waehrend einer Sitzung (`sitzung`),
+// in der Host-Rolle, solange ein Zuschauer da ist. Ohne Gegenueber wird die
+// Ablage nicht einmal geoeffnet - sonst stuende auch ohne jede Verbindung
+// jede Passwortkopie als Zeile "verdeckt" im Protokoll. Was davor kopiert
+// wurde, geht beim Sitzungsbeginn nicht nachtraeglich hinaus.
+//
 // Benoetigte Abhaengigkeit in Cargo.toml (Lizenz MIT OR Apache-2.0):
 //
 //   [target.'cfg(windows)'.dependencies]
@@ -27,7 +34,7 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::time::Duration;
 
 use windows::core::PCWSTR;
@@ -73,6 +80,21 @@ static OWN_SEQ_CLOSED: AtomicU32 = AtomicU32::new(0);
 /// es aber auch nicht. Scheitert es doch, faellt set() still aus, ohne die
 /// Ablage vorher zu leeren.
 static OWNER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// Laeuft eine Sitzung des Clients? Setzt der Empfangsfaden (main.rs).
+static SITZUNG: AtomicBool = AtomicBool::new(false);
+
+/// Sitzung des Clients beginnt (true, der Host hat angenommen) oder endet.
+pub fn sitzung(an: bool) {
+    SITZUNG.store(an, Ordering::Relaxed);
+}
+
+/// Darf der Waechter jetzt lesen? Im Client mit Sitzung, in der Host-Rolle
+/// mit Zuschauer. Die Host-Rolle setzt `sitzung` nicht; ihren Zuschauer
+/// kennt das Netzteil (netz::zuschauer_da), und im Client ist dort nie einer.
+fn darf_lesen() -> bool {
+    SITZUNG.load(Ordering::Relaxed) || crate::host::netz::zuschauer_da()
+}
 
 thread_local! {
     /// Empfaenger des Ueberwachungsfadens. Liegt im Faden selbst, weil die
@@ -369,17 +391,9 @@ fn write_locked(hmem: HGLOBAL, owner: HWND) {
 /// geraten, sonst reisst es den Faden und die Ueberwachung ist bis zum Neustart
 /// des Clients tot.
 fn on_clipboard_update() {
-    let seq = unsafe { GetClipboardSequenceNumber() };
-    // Null bedeutet, dass wir die Nummer nicht lesen duerfen; dann greift die
-    // Schleifensperre nicht und wir melden lieber einmal zu viel.
-    if seq != 0
-        && (seq == OWN_SEQ_OPEN.load(Ordering::SeqCst)
-            || seq == OWN_SEQ_CLOSED.load(Ordering::SeqCst))
-    {
-        return; // unser eigener Schreibvorgang, nicht zuruecksenden
-    }
-
-    let Some(text) = read_text() else { return };
+    let Some(text) = nachsehen(darf_lesen(), unsafe { GetClipboardSequenceNumber() }, read_text) else {
+        return;
+    };
     if text.is_empty() {
         return;
     }
@@ -393,6 +407,25 @@ fn on_clipboard_update() {
             }
         }
     });
+}
+
+/// Nach einer Aenderung der Ablage: gelesen wird nur mit Gegenueber (`darf`,
+/// siehe `darf_lesen`) - ohne wird die Ablage weder geoeffnet noch
+/// protokolliert - und nur, wenn die Aenderung nicht von unserem eigenen
+/// set() stammt (`seq`).
+fn nachsehen(darf: bool, seq: u32, lesen: impl FnOnce() -> Option<String>) -> Option<String> {
+    if !darf {
+        return None;
+    }
+    // Null bedeutet, dass wir die Nummer nicht lesen duerfen; dann greift die
+    // Schleifensperre nicht und wir melden lieber einmal zu viel.
+    if seq != 0
+        && (seq == OWN_SEQ_OPEN.load(Ordering::SeqCst)
+            || seq == OWN_SEQ_CLOSED.load(Ordering::SeqCst))
+    {
+        return None; // unser eigener Schreibvorgang, nicht zuruecksenden
+    }
+    lesen()
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -437,8 +470,9 @@ fn run_listener() -> Result<(), String> {
 }
 
 /// Startet die Ueberwachung in einem eigenen Faden. `cb` bekommt jeden Text, den
-/// der Benutzer auf der Windows-Seite kopiert hat; eigene Schreibvorgaenge aus
-/// `set` sind bereits herausgefiltert.
+/// der Benutzer auf der Windows-Seite mit Gegenueber kopiert hat (siehe
+/// `darf_lesen`); eigene Schreibvorgaenge aus `set` sind bereits
+/// herausgefiltert.
 pub fn watch(cb: impl Fn(String) + Send + 'static) {
     std::thread::spawn(move || {
         SINK.with(|s| *s.borrow_mut() = Some(Box::new(cb)));
@@ -453,6 +487,21 @@ pub fn watch(cb: impl Fn(String) + Send + 'static) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ohne Gegenueber liest der Waechter nicht - die Ablage wird gar nicht
+    /// erst angefasst; mit Gegenueber schon.
+    #[test]
+    fn ohne_sitzung_wird_nicht_gelesen() {
+        let gelesen = std::cell::Cell::new(0);
+        let lesen = || {
+            gelesen.set(gelesen.get() + 1);
+            Some("kopiert".to_string())
+        };
+        assert_eq!(nachsehen(false, 0, lesen), None);
+        assert_eq!(gelesen.get(), 0, "ohne Gegenueber gelesen");
+        assert_eq!(nachsehen(true, 0, lesen).as_deref(), Some("kopiert"));
+        assert_eq!(gelesen.get(), 1);
+    }
 
     #[test]
     fn verdeckt_nach_namen() {
