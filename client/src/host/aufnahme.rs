@@ -572,8 +572,13 @@ pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
                 // Wachhalten und Timerperiode hat Drop schon abgebaut.
                 log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
                 // Dem Zuschauer sagen, dass kein Bild kommt - statt eines
-                // stummen, stehenden Bildes.
-                netz::hoststatus_senden(1);
+                // stummen, stehenden Bildes. Nur dem, fuer den die Sitzung
+                // lief: hat inzwischen ein anderer abgeloest, bekommt der
+                // gleich einen neuen Anlauf (die Schleife unten endet
+                // sofort), und dessen Sitzung schickt 0 nur nach einem
+                // eigenen Verlust - mit 1 saehe er dauerhaft "kein
+                // Bildschirm" ueber dem laufenden Bild.
+                netz::hoststatus_senden_an(nr, 1);
                 while netz::zuschauer_da() && netz::zuschauer_nr() == nr {
                     std::thread::sleep(Duration::from_millis(500));
                 }

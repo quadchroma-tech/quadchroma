@@ -699,10 +699,37 @@ fn kopf(typ: u8, flags: u8, reserviert: u16, len: usize) -> [u8; 8] {
 /// nicht warten. Grenzen und Frist: siehe Leitung::klein_senden.
 pub fn send_small(typ: u8, data: &[u8]) {
     let Some(l) = aktuell() else { return };
+    klein_auf(&l, typ, data);
+}
+
+/// Eine kleine Nachricht auf diese Leitung (siehe send_small).
+fn klein_auf(l: &Leitung, typ: u8, data: &[u8]) {
     let mut p = Vec::with_capacity(8 + data.len());
     p.extend_from_slice(&kopf(typ, 0, 0, data.len()));
     p.extend_from_slice(data);
     let _ = l.klein_senden(typ, p, Z.gaming.load(Ordering::Relaxed), now_us());
+}
+
+/// Die Leitung des Zuschauers `nr` aus `platz` - nur, solange er noch der
+/// aktuelle ist (`zaehler` steht auf `nr`). Nummer und Eintrag werden unter
+/// derselben Sperre gelesen (NR waechst unter AKTUELL). Loest danach einer
+/// ab, landet eine Nachricht an `nr` schlimmstenfalls in der Warteschlange
+/// des Abgeloesten, die die Abloesung zumacht - nie beim Neuen.
+fn leitung_von(platz: &Mutex<Option<Arc<Leitung>>>, zaehler: &AtomicU64, nr: u64) -> Option<Arc<Leitung>> {
+    let a = sperre(platz);
+    if zaehler.load(Ordering::Relaxed) != nr {
+        return None;
+    }
+    a.clone()
+}
+
+/// Kleine Nachricht nur an den Zuschauer mit dieser Nummer (zuschauer_nr);
+/// ist inzwischen ein anderer da oder keiner, geht sie nirgendwohin. Liefert,
+/// ob sie an ihn ging.
+fn send_small_an(platz: &Mutex<Option<Arc<Leitung>>>, zaehler: &AtomicU64, nr: u64, typ: u8, data: &[u8]) -> bool {
+    let Some(l) = leitung_von(platz, zaehler, nr) else { return false };
+    klein_auf(&l, typ, data);
+    true
 }
 
 pub fn settings_senden() {
@@ -721,6 +748,14 @@ pub fn strominfo_senden() {
 
 pub fn hoststatus_senden(lage: u8) {
     send_small(MSG_HOSTSTATUS, &[lage, 0]);
+}
+
+/// Hoststatus nur an den Zuschauer `nr` (siehe send_small_an) - fuer den
+/// Aufnahmefaden nach einer Panik: ein Zuschauer, der inzwischen abgeloest
+/// hat, bekommt eine eigene Sitzung und darf die Meldung des alten nicht
+/// erben. Liefert, ob sie an ihn ging.
+pub fn hoststatus_senden_an(nr: u64, lage: u8) -> bool {
+    send_small_an(&AKTUELL, &NR, nr, MSG_HOSTSTATUS, &[lage, 0])
 }
 
 /// Stauregel vor dem Encoder, wie stau_vor_dem_encoder in main.m: true =
@@ -1701,6 +1736,50 @@ mod tests {
         assert_eq!(D.melden(|| "x".into()), None);
         *sperre(&D.letzte) = Instant::now().checked_sub(Duration::from_secs(11));
         assert_eq!(D.melden(|| "wieder".into()).as_deref(), Some("wieder (und 1 weitere seit der letzten Meldung)"));
+    }
+
+    /// Nach einer Panik im Aufnahmefaden geht Hoststatus 1 nur an den
+    /// Zuschauer, fuer den die Sitzung lief (aufnahme::start merkt sich
+    /// seine Nummer). Hat inzwischen ein anderer abgeloest, bekommt der
+    /// nichts davon - mit dem frueheren hoststatus_senden(1) landete die
+    /// Meldung bei ihm, und er saehe dauerhaft "kein Bildschirm".
+    #[test]
+    fn hoststatus_nach_panik_nur_an_den_gemerkten_zuschauer() {
+        let platz: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        let zaehler = AtomicU64::new(0);
+        // Ohne Zuschauer geht nichts hinaus.
+        assert!(!send_small_an(&platz, &zaehler, 0, MSG_HOSTSTATUS, &[1, 0]));
+        // Zuschauer A (Nummer 1), wie in bild_annehmen unter der Sperre.
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "A".into()));
+        {
+            let mut p = sperre(&platz);
+            zaehler.fetch_add(1, Ordering::Relaxed);
+            *p = Some(a.clone());
+        }
+        let nr_a = zaehler.load(Ordering::Relaxed);
+        assert!(send_small_an(&platz, &zaehler, nr_a, MSG_HOSTSTATUS, &[1, 0]));
+        assert_eq!(sperre(&a.q).pakete.len(), 1);
+        // B loest A ab.
+        let b = Arc::new(Leitung::neu(None, vec![2], vec![2], "B".into()));
+        {
+            let mut p = sperre(&platz);
+            if let Some(alt) = p.take() {
+                alt.abloesen();
+            }
+            zaehler.fetch_add(1, Ordering::Relaxed);
+            *p = Some(b.clone());
+        }
+        assert!(!send_small_an(&platz, &zaehler, nr_a, MSG_HOSTSTATUS, &[1, 0]), "Meldung fuer A ging an B");
+        assert!(sperre(&b.q).pakete.is_empty(), "B hat die Meldung fuer A bekommen");
+        // An B selbst geht sie, mit Kopf und Lage.
+        assert!(send_small_an(&platz, &zaehler, nr_a + 1, MSG_HOSTSTATUS, &[0, 0]));
+        {
+            let q = sperre(&b.q);
+            assert_eq!(q.pakete.len(), 1);
+            assert_eq!(q.pakete[0].1, [&kopf(MSG_HOSTSTATUS, 0, 0, 2)[..], &[0u8, 0][..]].concat());
+        }
+        // Die Nummer, die nie vergeben wird, trifft auch im Dienst niemanden.
+        assert!(!hoststatus_senden_an(u64::MAX, 1));
     }
 
     /// Die Stauregel als reine Entscheidung: im Budget codieren, darueber
