@@ -31,7 +31,8 @@
 // Handschlaege laufen je
 // Verbindung in einem eigenen Faden, mit Frist (secure.rs, FRIST_ANNAHME) und
 // Obergrenze (HANDSCHLAEGE_MAX) - stumme Verbindungen sperren damit niemanden
-// mehr aus.
+// mehr aus. Was jede Verbindung ins Protokoll bringen kann, ohne gekoppelt
+// zu sein (gescheiterter Handschlag, Abweisung), laeuft ueber eine Drossel.
 // Windows bricht ein blockierendes recv/send auf ein shutdown hin nicht ab,
 // solange die Gegenstelle lebt, aber schweigt (eingefrorener Prozess) - der
 // Faden des alten Kanals bliebe samt Leitung stehen, bis sie geht. Deshalb
@@ -119,6 +120,55 @@ fn melden_erlaubt(letzte: &Mutex<Option<Instant>>) -> bool {
     *t = Some(Instant::now());
     true
 }
+
+/// Drossel fuer eine Art Protokollzeile, die jede Verbindung ausloesen kann -
+/// auch eine ohne Schluessel oder von einer ungekoppelten Gegenstelle:
+/// hoechstens eine Zeile alle zehn Sekunden (melden_erlaubt); die
+/// unterdrueckten dazwischen werden gezaehlt und stehen an der naechsten.
+/// Wer einen Port mit Verbindungen bestreicht oder ungekoppelt alle 2 s neu
+/// versucht, fuellt so weder Protokoll noch Platte. Ereignisse gekoppelter
+/// Gegenstellen (Kopplung, Zuschauer verbunden) laufen nie hierueber.
+struct Drossel {
+    letzte: Mutex<Option<Instant>>,
+    unterdrueckt: AtomicU64,
+}
+
+impl Drossel {
+    const fn neu() -> Drossel {
+        Drossel { letzte: Mutex::new(None), unterdrueckt: AtomicU64::new(0) }
+    }
+
+    /// Die Zeile ins Protokoll, wenn die Drossel sie durchlaesst - dann mit
+    /// der Zahl der seit der letzten unterdrueckten -, sonst nur zaehlen. Der
+    /// Text entsteht nur, wenn er geschrieben wird. Liefert die geschriebene
+    /// Zeile.
+    fn melden(&self, text: impl FnOnce() -> String) -> Option<String> {
+        if !melden_erlaubt(&self.letzte) {
+            self.unterdrueckt.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let mut zeile = text();
+        let n = self.unterdrueckt.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            zeile.push_str(&format!(" (und {n} weitere seit der letzten Meldung)"));
+        }
+        log(&zeile);
+        Some(zeile)
+    }
+}
+
+/// Gescheiterte Handschlaege auf dem Bildkanal (Muell, Frist, falsches Protokoll).
+static DROSSEL_HANDSCHLAG_BILD: Drossel = Drossel::neu();
+/// Unbekannte Gegenstellen ohne Kopplungsfenster (etwa ein ungekoppelter
+/// Client, der alle 2 s neu versucht).
+static DROSSEL_UNBEKANNT: Drossel = Drossel::neu();
+/// Abweisungen, weil die Freigabeliste nicht zu lesen oder nicht zu
+/// schreiben ist - auch die kann jede Gegenstelle ausloesen.
+static DROSSEL_FREIGABE: Drossel = Drossel::neu();
+/// Gescheiterte Handschlaege auf dem Eingabekanal.
+static DROSSEL_HANDSCHLAG_EINGABE: Drossel = Drossel::neu();
+/// Eingabekanaele, die nach dem Handschlag abgewiesen werden.
+static DROSSEL_EINGABE_ABGEWIESEN: Drossel = Drossel::neu();
 
 /// Ein laufender Stau: seit wann ohne Fortschritt (Hostuhr in us) und wie
 /// viel der Sendefaden bis dahin geschrieben hatte.
@@ -426,16 +476,16 @@ const HANDSCHLAEGE_JE_ABSENDER: usize = 2;
 struct Plaetze {
     /// Absender der laufenden Handschlaege.
     laufend: Mutex<Vec<IpAddr>>,
-    /// Wann zuletzt eine Abweisung im Protokoll stand.
-    gemeldet: Mutex<Option<Instant>>,
+    /// Abweisungen, weil alle Plaetze belegt sind.
+    gemeldet: Drossel,
 }
 
 static PLAETZE_BILD: Plaetze = Plaetze::neu();
 static PLAETZE_EINGABE: Plaetze = Plaetze::neu();
-/// Wann zuletzt "kein Bildkanal offen" im Protokoll stand.
-static KEIN_BILD_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
-/// Wann zuletzt ein Bild an der harten Grenze im Protokoll stand.
-static HART_GEMELDET: Mutex<Option<Instant>> = Mutex::new(None);
+/// "Kein Bildkanal offen" auf dem Eingabeport.
+static DROSSEL_KEIN_BILD: Drossel = Drossel::neu();
+/// Codierte Bilder, die an der harten Grenze wegfallen.
+static DROSSEL_HART: Drossel = Drossel::neu();
 
 /// Ein belegter Platz; gibt sich beim Wegfallen selbst frei.
 struct Platz {
@@ -445,19 +495,16 @@ struct Platz {
 
 impl Plaetze {
     const fn neu() -> Plaetze {
-        Plaetze { laufend: Mutex::new(Vec::new()), gemeldet: Mutex::new(None) }
+        Plaetze { laufend: Mutex::new(Vec::new()), gemeldet: Drossel::neu() }
     }
 
     fn belegen(&'static self, ip: IpAddr, kanal: &str) -> Option<Platz> {
         let mut l = sperre(&self.laufend);
         let je_absender = l.iter().filter(|x| **x == ip).count();
         if l.len() >= HANDSCHLAEGE_MAX || je_absender >= HANDSCHLAEGE_JE_ABSENDER {
-            if melden_erlaubt(&self.gemeldet) {
-                log(format!(
-                    "{kanal}: Verbindung von {ip} abgewiesen - schon {} Handschlaege offen ({je_absender} von dort)",
-                    l.len()
-                ));
-            }
+            self.gemeldet.melden(|| {
+                format!("{kanal}: Verbindung von {ip} abgewiesen - schon {} Handschlaege offen ({je_absender} von dort)", l.len())
+            });
             return None;
         }
         l.push(ip);
@@ -590,9 +637,9 @@ pub fn bild_senden(au: &[u8], key: bool, t_cap: u64, wiederholt: bool) -> Versan
         Err(Abgewiesen::Voll) => {
             Z.stau.fetch_add(1, Ordering::Relaxed);
             Z.force_key.store(true, Ordering::Relaxed);
-            if melden_erlaubt(&HART_GEMELDET) {
-                log(format!("Stau ueber der harten Grenze ({} kB): codiertes Bild verworfen, Vollbild erzwungen", HARTE_GRENZE / 1024));
-            }
+            DROSSEL_HART.melden(|| {
+                format!("Stau ueber der harten Grenze ({} kB): codiertes Bild verworfen, Vollbild erzwungen", HARTE_GRENZE / 1024)
+            });
             // Auch hier gilt die Frist - die Konserve fragt nie vor einem
             // Encoder nach dem Stau.
             l.stau(HARTE_GRENZE, now_us());
@@ -718,7 +765,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let sock = match secure::Secure::accept(stream, &noise::prologue_video(), PRIV.get().unwrap()) {
         Ok(s) => s,
         Err(e) => {
-            log(format!("Handschlag mit {ip} gescheitert ({e})"));
+            DROSSEL_HANDSCHLAG_BILD.melden(|| format!("Handschlag mit {ip} gescheitert ({e})"));
             return;
         }
     };
@@ -738,7 +785,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
         let liste = match secure::Freigaben::lesen() {
             Ok(l) => l,
             Err(e) => {
-                log(format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
+                DROSSEL_FREIGABE.melden(|| format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
                 return;
             }
         };
@@ -747,7 +794,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
             match aufnehmen {
                 Ok(true) => {
                     if let Err(e) = liste.aufnehmen(&sock.peer, &ip) {
-                        log(format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
+                        DROSSEL_FREIGABE.melden(|| format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
                         return;
                     }
                     log(format!("Neue Gegenstelle gekoppelt: {fp} ({ip}), Vergleichscode {sas}"));
@@ -756,13 +803,13 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
                 // Die Leitung faellt mit `sock` zu - der Client deutet das
                 // Ende nach dem Handschlag als "nicht gekoppelt".
                 Ok(false) => {
-                    log(format!(
-                        "Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen."
-                    ));
+                    DROSSEL_UNBEKANNT.melden(|| {
+                        format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen.")
+                    });
                     return;
                 }
                 Err(e) => {
-                    log(format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip} - {e}"));
+                    DROSSEL_UNBEKANNT.melden(|| format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip} - {e}"));
                     return;
                 }
             }
@@ -827,9 +874,7 @@ fn annahme_eingabe(listener: TcpListener) {
         // Prologue enthaelt dessen Pruefsumme. Wer die nicht kennt, kommt hier
         // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
         let Some(bild) = aktuell() else {
-            if melden_erlaubt(&KEIN_BILD_GEMELDET) {
-                log("Eingabekanal abgewiesen: kein Bildkanal offen");
-            }
+            DROSSEL_KEIN_BILD.melden(|| "Eingabekanal abgewiesen: kein Bildkanal offen".into());
             continue;
         };
         let Some(platz) = PLAETZE_EINGABE.belegen(absender(&stream), "Eingabekanal") else { continue };
@@ -841,13 +886,13 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
     let mut sock = match secure::Secure::accept(stream, &noise::prologue_input(&bild.hh), PRIV.get().unwrap()) {
         Ok(s) => s,
         Err(e) => {
-            log(format!("Eingabekanal: Handschlag gescheitert ({e})"));
+            DROSSEL_HANDSCHLAG_EINGABE.melden(|| format!("Eingabekanal: Handschlag gescheitert ({e})"));
             return;
         }
     };
     drop(platz);
     if sock.peer != bild.peer {
-        log("Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+        DROSSEL_EINGABE_ABGEWIESEN.melden(|| "Eingabekanal abgewiesen: andere Gegenstelle als beim Bild".into());
         return;
     }
     // Erst jetzt an den Zuschauer binden - und nur, wenn er noch der
@@ -856,11 +901,11 @@ fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
     let nr = EINGABE_NR.fetch_add(1, Ordering::Relaxed);
     let einspeisen = sperre(&EINSPEISEN);
     let Some(griff) = sock.abbruchgriff() else {
-        log("Eingabekanal abgewiesen: Leitung nicht zu fassen");
+        DROSSEL_EINGABE_ABGEWIESEN.melden(|| "Eingabekanal abgewiesen: Leitung nicht zu fassen".into());
         return;
     };
     if !bild.eingabe_binden(nr, griff) {
-        log("Eingabekanal abgewiesen: Zuschauer inzwischen gewechselt");
+        DROSSEL_EINGABE_ABGEWIESEN.melden(|| "Eingabekanal abgewiesen: Zuschauer inzwischen gewechselt".into());
         return;
     }
     drop(einspeisen);
@@ -1358,6 +1403,40 @@ mod tests {
         // Ein Handschlag endet (Frist, Fehler oder fertig): Platz wieder frei.
         belegt.pop();
         assert!(P.belegen(ip(100), "Test").is_some());
+    }
+
+    /// Protokoll-Flut (Integrationstest: 300 Muell-Verbindungen in 0,1 s
+    /// ergaben 300 Zeilen): je Art hoechstens eine Zeile alle zehn Sekunden,
+    /// die naechste nennt die Zahl der unterdrueckten. Der Text einer
+    /// unterdrueckten Zeile wird gar nicht erst gebaut.
+    #[test]
+    fn drossel_laesst_eine_zeile_je_art_durch_und_zaehlt_den_rest() {
+        static D: Drossel = Drossel::neu();
+        static ANDERE: Drossel = Drossel::neu();
+        assert_eq!(D.melden(|| "Handschlag mit 10.0.0.1 gescheitert".into()).as_deref(), Some("Handschlag mit 10.0.0.1 gescheitert"));
+        let mut gebaut = false;
+        assert_eq!(
+            D.melden(|| {
+                gebaut = true;
+                String::new()
+            }),
+            None
+        );
+        assert!(!gebaut, "Text einer unterdrueckten Zeile gebaut");
+        for _ in 0..298 {
+            assert_eq!(D.melden(|| "x".into()), None);
+        }
+        // Eine andere Art hat ihre eigene Drossel.
+        assert!(ANDERE.melden(|| "Abgewiesen: unbekannte Gegenstelle".into()).is_some());
+        // Zehn Sekunden spaeter: eine Zeile, samt Zahl der unterdrueckten.
+        *sperre(&D.letzte) = Instant::now().checked_sub(Duration::from_secs(11));
+        assert_eq!(
+            D.melden(|| "Handschlag mit 10.0.0.2 gescheitert".into()).as_deref(),
+            Some("Handschlag mit 10.0.0.2 gescheitert (und 299 weitere seit der letzten Meldung)")
+        );
+        assert_eq!(D.melden(|| "x".into()), None);
+        *sperre(&D.letzte) = Instant::now().checked_sub(Duration::from_secs(11));
+        assert_eq!(D.melden(|| "wieder".into()).as_deref(), Some("wieder (und 1 weitere seit der letzten Meldung)"));
     }
 
     /// Die Stauregel als reine Entscheidung: im Budget codieren, darueber
