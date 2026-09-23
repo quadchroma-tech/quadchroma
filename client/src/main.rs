@@ -774,8 +774,8 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             continue;
         };
         let ergebnis = run_session(&addr, &shared, &input);
-        // Ohne Sitzung liest der Mac-Client die Zwischenablage nicht mehr.
-        #[cfg(target_os = "macos")]
+        // Ohne Sitzung liest der Client die Zwischenablage nicht mehr.
+        #[cfg(any(windows, target_os = "macos"))]
         clipboard::sitzung(false);
         match ergebnis {
             Ok(()) => {}
@@ -1677,7 +1677,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         return Err(Meldung::neu(strings::Key::ErrorProtocol, "Gegenstelle spricht ein anderes Protokoll"));
     }
     // Erst jetzt ist es eine Sitzung: der Host hat dieses Geraet angenommen.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos"))]
     clipboard::sitzung(true);
 
     // Der Host faengt immer mit HEVC an; alles Weitere sagt Nachricht 7.
@@ -2269,7 +2269,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             MSG_CLIP => {
                 #[cfg(any(windows, target_os = "macos"))]
                 if let Ok(text) = std::str::from_utf8(&payload) {
-                    clipboard::set(text);
+                    ablage_setzen(text.to_owned());
                 }
             }
             MSG_CURSOR => {
@@ -2296,6 +2296,31 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             _ => {}
         }
     }
+}
+
+/// Text vom Host in die Zwischenablage - in einem eigenen Faden, nie im
+/// Empfangsfaden: set() wartet auf die Sperre des Waechters (Mac) bzw. auf
+/// die Ablage selbst (Windows: OpenClipboard mit Wiederholungen), und
+/// solange lage der Bildkanal still - nach der 2-s-Stauregel der Hosts
+/// floege der Zuschauer hinaus. Kommen mehrere Texte, waehrend einer
+/// abgelegt wird, zaehlt nur der neueste.
+#[cfg(any(windows, target_os = "macos"))]
+fn ablage_setzen(text: String) {
+    use std::sync::mpsc;
+    static FADEN: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
+    let tx = FADEN.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(mut t) = rx.recv() {
+                while let Ok(neuer) = rx.try_recv() {
+                    t = neuer;
+                }
+                clipboard::set(&t);
+            }
+        });
+        tx
+    });
+    let _ = tx.send(text);
 }
 
 /// Ein Paket in den Decoder und alle fertigen Bilder heraus. Gibt den
