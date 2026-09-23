@@ -251,42 +251,47 @@ int qc_handshake_read(qc_handshake *hs, const uint8_t *msg, size_t msg_len,
                       uint8_t *payload, size_t *payload_len) {
     size_t o = 0, n = 0;
     uint8_t shared[32], tmp[64];
+    int r = -1;
 
     if (hs->step == 0 && !hs->initiator) {
-        if (msg_len < 32) return -1;
+        if (msg_len < 32) goto ende;
         memcpy(hs->re, msg, 32); hs->have_re = 1; o = 32;
         sym_mix_hash(&hs->sym, hs->re, 32);
-        if (sym_decrypt_and_hash(&hs->sym, msg + o, msg_len - o, payload, &n) != 0) return -1;
+        if (sym_decrypt_and_hash(&hs->sym, msg + o, msg_len - o, payload, &n) != 0) goto ende;
         *payload_len = n;
         hs->step = 1;
     } else if (hs->step == 1 && hs->initiator) {
-        if (msg_len < 32 + 32 + QC_TAGLEN) return -1;
+        if (msg_len < 32 + 32 + QC_TAGLEN) goto ende;
         memcpy(hs->re, msg, 32); hs->have_re = 1; o = 32;
         sym_mix_hash(&hs->sym, hs->re, 32);
         dh(shared, hs->e_priv, hs->re); sym_mix_key(&hs->sym, shared);        // ee
-        if (sym_decrypt_and_hash(&hs->sym, msg + o, 32 + QC_TAGLEN, tmp, &n) != 0) return -1;
-        if (n != 32) return -1;
+        if (sym_decrypt_and_hash(&hs->sym, msg + o, 32 + QC_TAGLEN, tmp, &n) != 0) goto ende;
+        if (n != 32) goto ende;
         memcpy(hs->rs, tmp, 32); hs->have_rs = 1; o += 32 + QC_TAGLEN;        // s
         dh(shared, hs->e_priv, hs->rs); sym_mix_key(&hs->sym, shared);        // es
-        if (sym_decrypt_and_hash(&hs->sym, msg + o, msg_len - o, payload, &n) != 0) return -1;
+        if (sym_decrypt_and_hash(&hs->sym, msg + o, msg_len - o, payload, &n) != 0) goto ende;
         *payload_len = n;
         hs->step = 2;
     } else if (hs->step == 2 && !hs->initiator) {
-        if (msg_len < 32 + QC_TAGLEN) return -1;
-        if (sym_decrypt_and_hash(&hs->sym, msg, 32 + QC_TAGLEN, tmp, &n) != 0) return -1;
-        if (n != 32) return -1;
+        if (msg_len < 32 + QC_TAGLEN) goto ende;
+        if (sym_decrypt_and_hash(&hs->sym, msg, 32 + QC_TAGLEN, tmp, &n) != 0) goto ende;
+        if (n != 32) goto ende;
         memcpy(hs->rs, tmp, 32); hs->have_rs = 1; o = 32 + QC_TAGLEN;         // s
         dh(shared, hs->e_priv, hs->rs); sym_mix_key(&hs->sym, shared);        // se
-        if (sym_decrypt_and_hash(&hs->sym, msg + o, msg_len - o, payload, &n) != 0) return -1;
+        if (sym_decrypt_and_hash(&hs->sym, msg + o, msg_len - o, payload, &n) != 0) goto ende;
         *payload_len = n;
         hs->step = 3;
         hs->done = 1;
     } else {
-        return -1;
+        goto ende;
     }
+    r = 0;
+ende:
+    // Auf jedem Weg, auch nach einer verfaelschten Nachricht: kein
+    // DH-Ergebnis und kein entschluesselter Schluessel bleibt auf dem Stapel.
     crypto_wipe(shared, 32);
     crypto_wipe(tmp, sizeof tmp);
-    return 0;
+    return r;
 }
 
 void qc_handshake_split(qc_handshake *hs, qc_cipher *send, qc_cipher *recv) {

@@ -27,6 +27,10 @@
 
 typedef struct qc_platz qc_platz;
 
+// Hoechstens so oft (Sekunden) eine Andrang-Meldung. main.m drosselt seine
+// Zeilen ueber ungepruefte Gegenstellen im selben Takt.
+#define QC_MELDEN_S 10
+
 // Laeuft im eigenen Faden der Verbindung und gehoert ihr ganz: fn schliesst fd
 // selbst - aber erst nach qc_platz_frei. Bis dahin kann die Annahme den Socket
 // per shutdown abbrechen, und eine Nummer, die nach close schon einer anderen

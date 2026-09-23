@@ -32,6 +32,8 @@
 #include <stdatomic.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <sys/stat.h>
+#include <time.h>
 #import "audio.h"
 #import "clipboard.h"
 #import "zeiger.h"
@@ -43,7 +45,28 @@
 
 // ------------------------------------------------------------------ Logging
 
+// Das Protokoll hat eine Obergrenze. Ueber g_log_grenze wandert die Datei nach
+// g_log_alt_pfad (ein frueheres .alt.log faellt dabei weg), und eine neue
+// beginnt: hoechstens das Doppelte auf der Platte, auch wenn jemand aus dem
+// Netz die Ports flutet, und die juengsten Zeilen bleiben erhalten. Laesst
+// sich die Datei nicht umbenennen, wird sie geleert - die Grenze haelt in
+// jedem Fall. Gezaehlt werden die Zeilen von logf_; die wenigen aus audio.m
+// und clipboard.m, die die Datei selbst oeffnen, landen in derselben,
+// zaehlen aber nicht mit.
 static FILE *g_log = NULL;
+static const char *g_log_pfad = "/tmp/quadchroma-m1.log";
+static const char *g_log_alt_pfad = "/tmp/quadchroma-m1.alt.log";
+static long g_log_grenze = 8L * 1024 * 1024;     // nur der Pruefstand setzt sie herab
+static long g_log_bytes = 0;                      // unter g_log_mtx
+// Nur um g_log und seinen Zaehler; darunter wird keine andere Sperre genommen.
+static pthread_mutex_t g_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// Beim Start und unter g_log_mtx. modus: "a" haengt an, "w" beginnt leer.
+static void log_oeffnen(const char *modus) {
+    g_log = fopen(g_log_pfad, modus);
+    struct stat st;
+    g_log_bytes = g_log && fstat(fileno(g_log), &st) == 0 ? (long)st.st_size : 0;
+}
 
 static void logf_(NSString *fmt, ...) {
     va_list ap;
@@ -53,7 +76,165 @@ static void logf_(NSString *fmt, ...) {
     const char *c = s.UTF8String;
     fprintf(stdout, "%s\n", c);
     fflush(stdout);
-    if (g_log) { fprintf(g_log, "%s\n", c); fflush(g_log); }
+    pthread_mutex_lock(&g_log_mtx);
+    if (g_log && g_log_bytes >= g_log_grenze) {
+        fclose(g_log);
+        // Scheitert das Umbenennen - etwa weil in /tmp schon ein .alt.log
+        // liegt, das einem anderen Nutzer gehoert (Sticky-Bit) -, beginnt die
+        // Datei leer. Sonst hielte die Grenze nicht, und jede weitere Zeile
+        // oeffnete die Datei neu und schriebe den Hinweis noch einmal.
+        int umbenannt = rename(g_log_pfad, g_log_alt_pfad) == 0;
+        int fehler = errno;
+        log_oeffnen(umbenannt ? "a" : "w");
+        if (g_log) {
+            int n = umbenannt
+                ? fprintf(g_log, "Protokoll war ueber %ld KB - die Zeilen davor stehen in %s\n",
+                          g_log_grenze / 1024, g_log_alt_pfad)
+                : fprintf(g_log, "Protokoll war ueber %ld KB und liess sich nicht nach %s umbenennen (%s) - "
+                          "die Zeilen davor sind verworfen\n", g_log_grenze / 1024, g_log_alt_pfad, strerror(fehler));
+            if (n > 0) g_log_bytes += n;
+        }
+    }
+    if (g_log) {
+        int n = fprintf(g_log, "%s\n", c);
+        if (n > 0) g_log_bytes += n;
+        fflush(g_log);
+    }
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
+// Zeilen, die jeder im Netz ohne Anmeldung ausloesen kann - gescheiterter
+// Handschlag, unbekannte Gegenstelle, Eingabekanal ohne Bild -, gehen
+// gedrosselt ins Protokoll. Sonst schriebe jede Verbindung eine Zeile, und
+// eine Flut aus dem Netz fuellte die Platte (gemessen: rund 2500 Zeilen je
+// Sekunde, seit die Handschlaege nebeneinander laufen) - und die echten
+// Zeilen gingen darin unter. Gedrosselt wird je Art und Adresse: die erste
+// Zeile einer Adresse kommt sofort, danach hoechstens alle QC_MELDEN_S
+// Sekunden eine, mit der Zahl der dazwischen unterdrueckten. So geht die
+// Zeile eines eigenen Geraets nicht in der Flut eines anderen unter. Je Art
+// merkt sich die Drossel QC_DROSSEL_ADRESSEN Adressen; was darueber hinaus
+// von weiteren Adressen kommt, solange die gemerkten noch Unterdruecktes
+// offen haben, zaehlt nur noch gemeinsam ("von anderen Adressen"). Mehr als
+// QC_DROSSEL_ADRESSEN + 1 Zeilen je Art und Frist gibt es also nie, auch
+// nicht bei einer Flut von vielen Adressen. Was erst nach einer Freigabe
+// geschieht (gekoppelt, Zuschauer verbunden), bleibt ungedrosselt.
+#define QC_DROSSEL_ADRESSEN 4
+typedef struct {
+    int belegt;
+    char von[INET_ADDRSTRLEN];        // "" = ohne Adresse (Ton)
+    int64_t zuletzt_s;                // wann zuletzt eine Zeile fuer sie durchkam (monotone Uhr)
+    long weitere;                     // seitdem unterdrueckt
+} qc_drossel_platz;
+typedef struct {
+    const char *art;                  // fuer die Sammelzeile
+    pthread_mutex_t m;
+    qc_drossel_platz platz[QC_DROSSEL_ADRESSEN];
+    int64_t sonst_s;                  // letzte Sammelzeile fuer die uebrigen Adressen
+    long sonst;                       // seitdem unterdrueckt, ohne eigenen Platz
+    char sonst_von[INET_ADDRSTRLEN];  // die letzte davon
+} qc_drossel;
+#define QC_DROSSEL(name) { .art = name, .m = PTHREAD_MUTEX_INITIALIZER, .sonst_s = -QC_MELDEN_S }
+
+static qc_drossel d_bild_handschlag = QC_DROSSEL("Bildkanal: Handschlag gescheitert");
+static qc_drossel d_liste_defekt    = QC_DROSSEL("Abgewiesen: Freigabeliste nicht lesbar oder beschaedigt");
+static qc_drossel d_nicht_speicherbar = QC_DROSSEL("Abgewiesen: Freigabe liess sich nicht speichern");
+static qc_drossel d_unbekannt       = QC_DROSSEL("Abgewiesen: unbekannte Gegenstelle");
+static qc_drossel d_ein_ohne_bild   = QC_DROSSEL("Eingabekanal abgewiesen: kein Bildkanal offen");
+static qc_drossel d_ein_handschlag  = QC_DROSSEL("Eingabekanal: Handschlag gescheitert");
+static qc_drossel d_ein_fremd       = QC_DROSSEL("Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+static qc_drossel d_ton_verworfen   = QC_DROSSEL("Ton verworfen: Leitung langsamer als der Ton");
+static qc_drossel *const g_drosseln[] = {
+    &d_bild_handschlag, &d_liste_defekt, &d_nicht_speicherbar, &d_unbekannt,
+    &d_ein_ohne_bild, &d_ein_handschlag, &d_ein_fremd, &d_ton_verworfen,
+};
+
+static int64_t mono_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec;
+}
+
+// Wie logf_, aber ueber die Drossel d. von: Adresse der Gegenstelle oder NULL.
+// Formatiert wird nur, was durchkommt - eine Flut kostet so je Verbindung
+// nur einen Griff an die Sperre und einen Blick auf ein paar Adressen.
+static void logf_gedrosselt(qc_drossel *d, const char *von, NSString *fmt, ...) {
+    int64_t t = mono_s();
+    const char *a = von ? von : "";
+    long vorher = 0;
+    BOOL durch = NO;
+    pthread_mutex_lock(&d->m);
+    qc_drossel_platz *p = NULL, *frei = NULL;
+    for (int i = 0; i < QC_DROSSEL_ADRESSEN; i++) {
+        qc_drossel_platz *q = &d->platz[i];
+        if (q->belegt && strcmp(q->von, a) == 0) { p = q; break; }
+        // Ein Platz wird frei, wenn seine Adresse nichts mehr offen hat und
+        // ihre Frist um ist - vorher zaehlt sie noch gegen die Obergrenze.
+        if (!frei && (!q->belegt || (!q->weitere && t - q->zuletzt_s >= QC_MELDEN_S))) frei = q;
+    }
+    if (p) {
+        durch = t - p->zuletzt_s >= QC_MELDEN_S;
+        if (durch) {
+            vorher = p->weitere;
+            p->weitere = 0;
+            p->zuletzt_s = t;
+        } else {
+            p->weitere++;
+        }
+    } else if (frei) {
+        frei->belegt = 1;
+        strlcpy(frei->von, a, sizeof frei->von);
+        frei->zuletzt_s = t;
+        frei->weitere = 0;
+        durch = YES;
+    } else {
+        d->sonst++;
+        strlcpy(d->sonst_von, a, sizeof d->sonst_von);
+    }
+    pthread_mutex_unlock(&d->m);
+    if (!durch) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (vorher)
+        logf_(@"%@ - dazu %ld weitere%s seit der letzten Meldung", s, vorher,
+              a[0] ? " von dieser Adresse" : "");
+    else
+        logf_(@"%@", s);
+}
+
+// Unterdrueckte Zeilen bleiben nicht liegen, auch wenn danach keine derselben
+// Art und Adresse mehr kommt: der Dienst ruft das alle fuenf Sekunden, und
+// nach der Frist geht die Zahl als Sammelzeile hinaus.
+static void drosseln_nachtragen(void) {
+    int64_t t = mono_s();
+    for (size_t i = 0; i < sizeof g_drosseln / sizeof g_drosseln[0]; i++) {
+        qc_drossel *d = g_drosseln[i];
+        long n[QC_DROSSEL_ADRESSEN + 1] = {0};
+        char von[QC_DROSSEL_ADRESSEN + 1][INET_ADDRSTRLEN];
+        pthread_mutex_lock(&d->m);
+        for (int k = 0; k < QC_DROSSEL_ADRESSEN; k++) {
+            qc_drossel_platz *q = &d->platz[k];
+            if (q->belegt && q->weitere && t - q->zuletzt_s >= QC_MELDEN_S) {
+                n[k] = q->weitere;
+                memcpy(von[k], q->von, sizeof von[k]);
+                q->weitere = 0;
+                q->zuletzt_s = t;
+            }
+        }
+        if (d->sonst && t - d->sonst_s >= QC_MELDEN_S) {
+            n[QC_DROSSEL_ADRESSEN] = d->sonst;
+            memcpy(von[QC_DROSSEL_ADRESSEN], d->sonst_von, sizeof von[0]);
+            d->sonst = 0;
+            d->sonst_s = t;
+        }
+        pthread_mutex_unlock(&d->m);
+        for (int k = 0; k < QC_DROSSEL_ADRESSEN; k++)
+            if (n[k]) logf_(@"%s: %ld weitere%s%s seit der letzten Meldung", d->art, n[k], von[k][0] ? " von " : "", von[k]);
+        if (n[QC_DROSSEL_ADRESSEN])
+            logf_(@"%s: %ld weitere von anderen Adressen seit der letzten Meldung, zuletzt von %s", d->art,
+                  n[QC_DROSSEL_ADRESSEN], von[QC_DROSSEL_ADRESSEN][0] ? von[QC_DROSSEL_ADRESSEN] : "?");
+    }
 }
 
 // ------------------------------------------------- Undokumentierte Profile
@@ -98,6 +279,8 @@ static BOOL profile_supported(VTCompressionSessionRef s, CFStringRef profile) {
 // dieselbe Frist wie SO_SNDTIMEO in tune_socket. Die greift im Stau nicht
 // mehr, weil dann nichts mehr codiert und gesendet wird; ohne diese Frist
 // bliebe ein eingefrorener Zuschauer (Ton aus) fuer immer eingetragen.
+// Geprueft wird vor jedem Bild, das in den Encoder soll, und zusaetzlich im
+// 5-s-Takt des Dienstes: bei stillem Bildschirm kommt kein Bild mehr an.
 #define QC_STAU_FRIST_US (2 * 1000000ull)
 
 static _Atomic int g_client_fd = -1;
@@ -121,10 +304,12 @@ static char g_last_sas[8] = {0};
 // jeder Verlust des Bildkanals beginnt eine neue Sitzung und bricht den
 // Eingabekanal der alten ab.
 static uint64_t g_sitzung = 0;              // durch g_send_mtx geschuetzt
-// Laufender Stau: seit wann ohne Fortschritt (Hostuhr in us, 0 = kein Stau)
-// und der Rueckstand zu diesem Zeitpunkt. Durch g_send_mtx geschuetzt.
+// Laufender Stau: seit wann ohne Fortschritt (Hostuhr in us, 0 = kein Stau),
+// dazu Rueckstand und gesendete Bytes beim letzten Blick. Durch g_send_mtx
+// geschuetzt.
 static uint64_t g_stau_seit = 0;
 static int g_stau_rueckstand = 0;
+static uint64_t g_stau_gesendet = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
 // Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
 // nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
@@ -153,6 +338,14 @@ static CVPixelBufferRef g_last_pb = NULL;
 static CMTime g_last_pts;
 static uint64_t g_last_cap_us = 0;   // echte Aufnahmezeit des zuletzt gesehenen Bildes
 static _Atomic long g_repeats = 0;
+// Das zuletzt gesehene Bild ist noch nicht in den Encoder gegangen: es fiel
+// als zu schnell, im Stau oder bei vollem Encoder weg. Ohne feste Bildrate
+// liefert die Aufnahme bei stillem Bildschirm nichts mehr nach - der Takt
+// reicht es dann nach (fixed_tick), ebenso fuer einen Zuschauer, der noch auf
+// sein erstes Vollbild wartet (g_wait_key). Gesetzt von der Aufnahme,
+// geloescht, wenn es codiert ist.
+static _Atomic int g_bild_offen = 0;
+static _Atomic long g_nachgereicht = 0;
 // Schrittmacher. ScreenCaptureKit haelt sich nicht an minimumFrameInterval:
 // gemessen 142-149 echte Bilder je Sekunde bei Ziel 120 - und jedes davon
 // ging durch Encoder, Leitung und Decoder. Feste Zeitschlitze im Zielabstand;
@@ -244,6 +437,16 @@ static void hoststatus_senden(uint8_t lage);
 static dispatch_queue_t g_lifeq = NULL;
 static void stream_herunterfahren_anstossen(void);
 static BOOL stream_hochfahren_sync(void);
+// Zuschauer zwischen dem Hochfahren der Aufnahme und dem Eintragen. Auch sie
+// brauchen Aufnahme und Encoder: ein Abbau, der in diesem Fenster laeuft (der
+// Vorgaenger ging genau jetzt - Senden gescheitert, Stau), hielte sonst den
+// Strom an, und der Neue saesse eingetragen, aber ohne Bild da.
+static _Atomic int g_anmeldend = 0;
+
+// Braucht noch jemand Aufnahme und Encoder? Wer zuschaut oder gerade
+// eingetragen wird. Erst g_anmeldend, dann g_client_fd lesen: bild_verbindung
+// traegt erst ein und zaehlt dann ab - so entgeht keiner beiden Blicken.
+static BOOL zuschauer_braucht_strom(void);
 
 // Aufnahmeformat je Kandidat. ScreenCaptureKit kennt kein 4:4:4 mit 8 Bit,
 // also muss VideoToolbox dort umrechnen - und das steht dann dran, denn eine
@@ -340,17 +543,42 @@ static int backlog_bytes(int fd) {
 }
 
 
+// Ton im Dauerstau. Ton geht an der Stauregel vorbei - er ist klein und soll
+// nicht warten. Liegt die Leitung aber unter der Tonrate (unverdichtet rund
+// 3 Mbit/s: VPN, schwaches WLAN), fuellt er allein den Sendepuffer bis oben:
+// kein Bild kaeme mehr durch die Stauregel, und der Zuschauer bliebe (er
+// nimmt ja ab) mit stehendem Bild und einem Ton, der immer weiter nachhinkt.
+// Deshalb faellt Ton weg, wenn der Rueckstand QC_STAU_FRIST_US lang ohne
+// Unterbrechung ueber der Staugrenze liegt. Liegt er nur kurz darueber - nach
+// einem grossen Vollbild, oder im gewoehnlichen Stau, in dem die Stauregel
+// ein Bild durchlaesst, sobald er darunter faellt -, bleibt der Ton ganz. Die
+// Luecken ueberbrueckt der Tonpuffer des Clients. Nur unter g_send_mtx.
+static uint64_t g_ton_stau_seit = 0;          // 0 = Rueckstand gerade unter der Grenze
+static int ton_verwerfen(int fd) {
+    int grenze = atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT;
+    if (backlog_bytes(fd) <= grenze) { g_ton_stau_seit = 0; return 0; }
+    uint64_t jetzt = now_us();
+    if (!g_ton_stau_seit) g_ton_stau_seit = jetzt;
+    return jetzt - g_ton_stau_seit >= QC_STAU_FRIST_US;
+}
+
 // Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-Sperre
 // und die Stauregel: Ton und Zwischenablage sind winzig und duerfen nicht warten.
-static void send_small(uint8_t type, const void *data, size_t len) {
+// ton: Ton, der im Dauerstau wegfaellt (ton_verwerfen). Rueckgabe 1 = deshalb
+// verworfen, sonst 0 (gesendet oder niemand da).
+static int send_small_bis(uint8_t type, const void *data, size_t len, int ton) {
+    int verworfen = 0;
     pthread_mutex_lock(&g_send_mtx);
     int fd = atomic_load(&g_client_fd);
-    if (fd >= 0 && atomic_load(&g_vid_ready)) {
+    if (fd >= 0 && atomic_load(&g_vid_ready) && ton && ton_verwerfen(fd)) {
+        verworfen = 1;
+    } else if (fd >= 0 && atomic_load(&g_vid_ready)) {
         qc_hdr h = { .type = type, .flags = 0, .reserved = 0, .len = (uint32_t)len };
         struct iovec iov[2];
         iov[0].iov_base = &h;   iov[0].iov_len = sizeof h;
         iov[1].iov_base = (void *)data; iov[1].iov_len = len;
         if (qc_chan_send(g_vid, iov, len ? 2 : 1) != 0) {
+            logf_(@"Zuschauer weg: Senden gescheitert (%s)", strerror(errno));
             atomic_store(&g_vid_ready, 0);
             atomic_store(&g_client_fd, -1);
             close(fd);
@@ -361,6 +589,11 @@ static void send_small(uint8_t type, const void *data, size_t len) {
         }
     }
     pthread_mutex_unlock(&g_send_mtx);
+    return verworfen;
+}
+
+static void send_small(uint8_t type, const void *data, size_t len) {
+    (void)send_small_bis(type, data, len, 0);
 }
 
 #define QC_MSG_SETTINGS   3    // Host -> Client: was gerade gilt
@@ -394,6 +627,7 @@ static void hoststatus_senden(uint8_t lage) {
 static _Atomic int g_audio_info_sent = 0;
 static _Atomic long g_audio_packets = 0;
 static _Atomic long long g_audio_bytes = 0;
+static _Atomic long g_audio_verworfen = 0;      // im Dauerstau (ton_verwerfen)
 // Was zuletzt angesagt wurde. Nur im Ton-Rueckruf angefasst, und der laeuft
 // auf der seriellen Ton-Warteschlange.
 static uint32_t g_audio_info_rate = 0;
@@ -419,9 +653,14 @@ static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t cha
         send_small(QC_MSG_AUDIO_INFO, info, sizeof info);
     }
     size_t bytes = frames * channels * sizeof(float);
+    if (send_small_bis(QC_MSG_AUDIO, pcm, bytes, 1)) {
+        atomic_fetch_add(&g_audio_verworfen, 1);
+        logf_gedrosselt(&d_ton_verworfen, NULL, @"Ton verworfen: Rueckstand seit %llu s ueber der Staugrenze - Leitung langsamer als der Ton",
+                        QC_STAU_FRIST_US / 1000000ull);
+        return;
+    }
     atomic_fetch_add(&g_audio_packets, 1);
     atomic_fetch_add(&g_audio_bytes, (long long)bytes);
-    send_small(QC_MSG_AUDIO, pcm, bytes);
 }
 
 static void clip_cb(const char *utf8, size_t len) {
@@ -568,7 +807,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         return;
     }
     if (hr != 0) {
-        logf_(@"Handschlag mit %s gescheitert (%d)", ip, hr);
+        logf_gedrosselt(&d_bild_handschlag, ip, @"Handschlag mit %s gescheitert (%d)", ip, hr);
         qc_chan_free(chan);
         close(fd);
         return;
@@ -587,20 +826,20 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     int anz = known == 0 ? qc_authorized_count() : 0;
     BOOL rein = known > 0;
     if (known < 0 || anz < 0) {
-        logf_(@"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar oder beschaedigt", fp, ip);
+        logf_gedrosselt(&d_liste_defekt, ip, @"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar oder beschaedigt", fp, ip);
     } else if (!known) {
         if (atomic_load(&g_pair_open) || anz == 0) {
             if (qc_authorize(chan->peer, ip) != 0) {
                 // Ohne gespeicherte Freigabe keine Sitzung - und das
                 // Kopplungsfenster bleibt, wie es war.
-                logf_(@"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
+                logf_gedrosselt(&d_nicht_speicherbar, ip, @"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
             } else {
                 logf_(@"Neue Gegenstelle gekoppelt: %s (%s), Vergleichscode %s", fp, ip, sas);
                 atomic_store(&g_pair_open, 0);
                 rein = YES;
             }
         } else {
-            logf_(@"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
+            logf_gedrosselt(&d_unbekannt, ip, @"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
         }
     }
     pthread_mutex_unlock(&g_freigabe_mtx);
@@ -611,42 +850,68 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     }
 
     // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
-    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung.
+    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung. Ab hier
+    // zaehlt dieser Zuschauer als unterwegs (g_anmeldend), bis er eingetragen
+    // ist oder aufgibt - jeder Weg unten zieht ihn wieder ab.
+    atomic_fetch_add(&g_anmeldend, 1);
     if (!stream_hochfahren_sync()) {
+        atomic_fetch_sub(&g_anmeldend, 1);
+        // Was halb steht (Encoder ohne Aufnahme), raeumt der Abbau weg; er
+        // prueft selbst, ob noch jemand zuschaut.
+        stream_herunterfahren_anstossen();
         logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
         qc_chan_free(chan);
         close(fd);
         return;
     }
 
-    // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
-    // Fenstergroesse und Format kennt, bevor das erste Bild kommt.
     uint8_t hello[4 + sizeof(qc_hdr) + 8];
+    pthread_mutex_lock(&g_send_mtx);
+    // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
+    // Fenstergroesse und Format kennt, bevor das erste Bild kommt. Erst unter
+    // der Sperre gefuellt: ein Codecwechsel, der gerade fertig wird, steht
+    // dann entweder schon hier drin, oder sein SWITCH kommt danach beim Neuen an.
     memcpy(hello, QC_MAGIC, 4);
     qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = 8 };
     memcpy(hello + 4, &h, sizeof h);
     strominfo_fuellen(hello + 4 + sizeof h);
-
-    pthread_mutex_lock(&g_send_mtx);
     char fp_alt[24] = {0};
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
     g_stau_seit = 0;                    // ein Stau des Vorgaengers zaehlt nicht fuer ihn
+    g_ton_stau_seit = 0;
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
     memcpy(g_last_sas, sas, sizeof g_last_sas);
     struct iovec iov = { .iov_base = hello, .iov_len = sizeof hello };
     int sent = qc_chan_send(g_vid, &iov, 1);
+    int testbild_aus = 0;
     if (sent == 0) {
+        // Der Neue faengt beim naechsten Vollbild an und bekommt den Ton neu
+        // angesagt - gesetzt, bevor er als bereit gilt. Sonst erbte er beim
+        // Abloesen fuer einen Augenblick den Stand des Vorgaengers: ein
+        // Zwischenbild ohne Kopfdaten, Ton ohne Ansage. Laeuft der Strom schon
+        // und ist der Bildschirm still, reicht ihm der Takt das zuletzt
+        // gesehene Bild als Vollbild nach (fixed_tick, solange g_wait_key).
+        atomic_store(&g_force_key, 1);
+        atomic_store(&g_wait_key, 1);
+        atomic_store(&g_audio_info_sent, 0);
+        // Ein Testbild ueberlebt den Zuschauer nicht, auch keine Abloesung:
+        // der Neue faengt mit dem Bildschirm an. Den Schalter schon hier, damit
+        // der Takt ihm keinen Balken mehr schickt; Aufraeumen auf g_capq unten.
+        testbild_aus = atomic_exchange(&g_testbild, 0);
         atomic_store(&g_client_fd, fd);
         atomic_store(&g_vid_ready, 1);
     } else {
         qc_chan_free(g_vid);
         g_vid = NULL;
-        // Der alte Zuschauer ist schon getrennt, der neue kam nicht an:
-        // niemand schaut zu, also laufen auch Aufnahme und Encoder nicht weiter.
-        stream_herunterfahren_anstossen();
     }
+    // Eingetragen oder nicht: ab hier entscheidet g_client_fd. Erst abziehen,
+    // dann den Abbau anstossen - sonst saehe er den Neuen noch als unterwegs.
+    atomic_fetch_sub(&g_anmeldend, 1);
+    // Der alte Zuschauer ist schon getrennt, der neue kam nicht an: niemand
+    // schaut zu, also laufen auch Aufnahme und Encoder nicht weiter.
+    if (sent != 0) stream_herunterfahren_anstossen();
     pthread_mutex_unlock(&g_send_mtx);
     if (abgeloest >= 0)
         logf_(@"Bisheriger Zuschauer %s abgeloest und getrennt%s", fp_alt,
@@ -656,10 +921,13 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         close(fd);
         return;
     }
+    if (testbild_aus) {
+        // Nach einem noch eingereihten "Testbild an" des Vorgaengers - die
+        // Warteschlange ist seriell, also bleibt es aus.
+        dispatch_async(g_capq, ^{ atomic_store(&g_testbild, 0); qc_testbild_stop(); });
+        logf_(@"Testbild aus (neuer Zuschauer)");
+    }
 
-    atomic_store(&g_force_key, 1);
-    atomic_store(&g_wait_key, 1);
-    atomic_store(&g_audio_info_sent, 0);
     qc_zeiger_neu_senden();
     {
         uint8_t cur[9] = {0};
@@ -1006,6 +1274,8 @@ static void alle_tasten_loslassen(uint64_t kanal) {
 
 static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     uint8_t payload[256];
+    char ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &von->sin_addr, ip, sizeof ip);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
@@ -1016,7 +1286,7 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
     // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
     // Den fd immer erst nach qc_platz_frei schliessen (siehe qc_annahme.h).
     if (!atomic_load(&g_vid_ready)) {
-        logf_(@"Eingabekanal abgewiesen: kein Bildkanal offen");
+        logf_gedrosselt(&d_ein_ohne_bild, ip, @"Eingabekanal abgewiesen: kein Bildkanal offen (%s)", ip);
         qc_platz_frei(platz);
         close(fd);
         return;
@@ -1042,13 +1312,13 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
         return;
     }
     if (hr != 0) {
-        logf_(@"Eingabekanal: Handschlag gescheitert (%d)", hr);
+        logf_gedrosselt(&d_ein_handschlag, ip, @"Eingabekanal: Handschlag mit %s gescheitert (%d)", ip, hr);
         qc_chan_free(in);
         close(fd);
         return;
     }
     if (memcmp(in->peer, expect, 32) != 0) {
-        logf_(@"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+        logf_gedrosselt(&d_ein_fremd, ip, @"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild (%s)", ip);
         qc_chan_free(in);
         close(fd);
         return;
@@ -1139,6 +1409,13 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                     int an = payload[0] ? 1 : 0;
                     dispatch_async(g_capq, ^{
                         if (an) {
+                            // Kommt das erst nach einer Abloesung dran, war es
+                            // der Wunsch des Vorgaengers: der Neue faengt mit
+                            // dem Bildschirm an.
+                            pthread_mutex_lock(&g_send_mtx);
+                            BOOL gilt = sitzung == g_sitzung;
+                            pthread_mutex_unlock(&g_send_mtx);
+                            if (!gilt) return;
                             qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)));
                             atomic_store(&g_testbild, 1);
                             logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark", g_info_w, g_info_h);
@@ -1227,8 +1504,17 @@ static const uint8_t kStartCode[4] = {0, 0, 0, 1};
 // in EINEM Aufruf weg: weniger Systemaufrufe, keine halben Bilder auf der Leitung.
 #define QC_MAX_IOV 256
 
-static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap_us, int wiederholt) {
+// Merker, die ein Bild vom Encoder bis zum Versand begleiten (Begleitzettel,
+// QC_ZETTEL). WIEDERHOLT: ein altes Bild, noch einmal in den Encoder gegeben
+// (feste Bildrate) oder nachgereicht (stiller Bildschirm) - es zaehlt nicht
+// in die Latenzmessung, sein Alter sagt nichts ueber die Strecke. TESTBILD:
+// aus der Testbild-Schleife, nicht vom Bildschirm.
+#define QC_BILD_WIEDERHOLT 1u
+#define QC_BILD_TESTBILD   2u
+
+static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap_us, int merker) {
     struct iovec iov[QC_MAX_IOV];
+    int wiederholt = (merker & QC_BILD_WIEDERHOLT) != 0;
 
     // Vor jedem Bild geht ein Zeitstempel raus: wann es aufgenommen wurde und
     // wann der Encoder fertig war. Beides auf der Uhr des Hosts. Der Client
@@ -1316,6 +1602,16 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
         // Daten, sonst faengt er mitten in einem Bild ohne Kopfdaten an.
         if (!atomic_load(&g_vid_ready)) { pthread_mutex_unlock(&g_send_mtx); return; }
         if (atomic_load(&g_wait_key) && !keyframe) { pthread_mutex_unlock(&g_send_mtx); return; }
+        // Ein Testbild-Rahmen, der noch im Encoder steckte oder gerade in ihn
+        // ging, als ein neuer Zuschauer das Testbild abschaltete
+        // (bild_verbindung), gehoert nicht zu ihm - auch nicht als Vollbild
+        // (die kommen im Testbild alle zwei Sekunden von selbst). Er wartet
+        // weiter, und das naechste Bild vom Bildschirm wird ein Vollbild.
+        if (atomic_load(&g_wait_key) && (merker & QC_BILD_TESTBILD) && !atomic_load(&g_testbild)) {
+            atomic_store(&g_force_key, 1);
+            pthread_mutex_unlock(&g_send_mtx);
+            return;
+        }
         // Gegen Stau wird VOR dem Encoder verworfen (stau_vor_dem_encoder):
         // ein codiertes Bild geht immer raus. Fiele es hier weg, fehlte den
         // folgenden Zwischenbildern ihr Bezug, das naechste Bild muesste ein
@@ -1345,8 +1641,8 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
 static void enc_cb(void *ref, void *src, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sb) {
     (void)ref;
     uint64_t zettel = (uint64_t)(uintptr_t)src;
-    uint64_t t_cap_us = zettel >> 1;
-    int wiederholt = (int)(zettel & 1u);
+    uint64_t t_cap_us = zettel >> 2;
+    int merker = (int)(zettel & 3u);
     // Jeder Rueckruf schliesst ein Bild ab - geliefert, verworfen oder mit
     // Fehler. Unter null darf der Zaehler nie (Rueckrufe einer alten Sitzung).
     if (atomic_fetch_sub(&g_inflight, 1) <= 0) atomic_store(&g_inflight, 0);
@@ -1369,7 +1665,7 @@ static void enc_cb(void *ref, void *src, OSStatus status, VTEncodeInfoFlags flag
     }
     if (!g_stats.wrote_ps) { keyframe = YES; g_stats.wrote_ps = YES; }
 
-    emit_access_unit(sb, keyframe, t_cap_us, wiederholt);
+    emit_access_unit(sb, keyframe, t_cap_us, merker);
     g_stats.encoded++;
 }
 
@@ -1574,15 +1870,38 @@ static void codec_wechsel_fertig(void) {
     if (n >= 0) dispatch_async(g_capq, ^{ codec_wechseln(n); });
 }
 
+// Der Abschluss eines Wechsels kommt spaeter auf g_capq an (nach
+// updateConfiguration). Ging der Zuschauer inzwischen, und hat ein neuer den
+// Strom schon frisch aufgebaut - mit eigener Sitzung im Format von
+// g_codec_id -, gehoert dieser Wechsel zu einem Strom, den es nicht mehr
+// gibt: keine zweite Sitzung daneben (die erste liefe ungebremst weiter),
+// kein SWITCH an den Neuen. YES = verworfen, der Wechsel ist beendet.
+static BOOL codec_wechsel_ueberholt(int idx) {
+    if (!g_session) return NO;
+    logf_(@"Codecwechsel auf %s verworfen: der Strom wurde inzwischen neu aufgebaut", g_kandidaten[idx].name);
+    codec_wechsel_fertig();
+    return YES;
+}
+
+// Ging der Zuschauer waehrend des Umstellens, fand sein Abbau womoeglich noch
+// keine Sitzung vor - die eben gebaute liefe dann fuer niemanden. Also noch
+// einmal anstossen; der Abbau prueft selbst, ob inzwischen wieder jemand da
+// ist, und laeuft auf g_capq erst nach diesem Block.
+static void codec_ohne_zuschauer_abbauen(void) {
+    if (atomic_load(&g_client_fd) < 0) stream_herunterfahren_anstossen();
+}
+
 // Schritt h: der neue Kandidat liess sich nicht oeffnen, der alte kommt zurueck.
 // Ein SWITCH gab es nicht, der Client decodiert weiter mit dem alten Codec -
 // nur die Strominfo geht noch einmal raus.
 static void codec_alt_aufbauen(int alt) {
+    if (codec_wechsel_ueberholt(alt)) return;
     if (encoder_start(alt, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
         encoder_einstellungen_nachziehen();
         atomic_store(&g_force_key, 1);
         strominfo_senden();
         logf_(@"Alter Codec laeuft wieder: %s", g_kandidaten[alt].name);
+        codec_ohne_zuschauer_abbauen();
     } else {
         logf_(@"Auch der alte Codec %s laesst sich nicht mehr oeffnen - es kommt kein Bild mehr", g_kandidaten[alt].name);
     }
@@ -1596,6 +1915,7 @@ static void codec_alt_aufbauen(int alt) {
 // hineingehen und wir gerade darauf laufen; dann Vollbild erzwingen und die
 // Strominfo hinterher.
 static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fmt_geaendert) {
+    if (codec_wechsel_ueberholt(idx)) return;
     if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
         atomic_store(&g_codec_id, idx);
         // Das Testbild folgt dem Aufnahmeformat des neuen Codecs.
@@ -1605,14 +1925,20 @@ static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fm
         atomic_store(&g_force_key, 1);
         strominfo_senden();
         logf_(@"Codec gewechselt: %s", g_kandidaten[idx].name);
+        codec_ohne_zuschauer_abbauen();
         codec_wechsel_fertig();
         return;
     }
 
     logf_(@"Codecwechsel auf %s fehlgeschlagen - baue %s wieder auf", g_kandidaten[idx].name, g_kandidaten[alt].name);
     // Kein SWITCH: der Client hat noch seinen alten Decoder und behaelt ihn.
-    if (fmt_geaendert) {
-        g_cfg.pixelFormat = alt_fmt;
+    // Ohne Strom (inzwischen abgebaut) kaeme der Abschluss von
+    // updateConfiguration nie - eine Nachricht an nil tut nichts -, und der
+    // Wechsel bliebe fuer immer unterwegs; jeder weitere Wunsch wuerde nur
+    // noch vorgemerkt. Dann gleich zurueck, das Format baut der naechste
+    // Zuschauer ohnehin aus g_codec_id.
+    if (fmt_geaendert) g_cfg.pixelFormat = alt_fmt;
+    if (fmt_geaendert && g_stream) {
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
             if (e) logf_(@"Aufnahmeformat liess sich nicht zuruecksetzen: %@", e.localizedDescription);
             dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt); });
@@ -1718,10 +2044,10 @@ static void codec_wechseln(int idx) {
 // nachgelegt - laufen hier zusammen, damit sie sich nicht auseinander
 // entwickeln koennen.
 // Der Begleitzettel reist als Zahl mit, nicht als Zeiger: die echte
-// Aufnahmezeit in Mikrosekunden, nach links geschoben, im untersten Bit das
-// Kennzeichen "nachgelegt". So haengt am Bild kein Speicher, der beim
+// Aufnahmezeit in Mikrosekunden, nach links geschoben, in den untersten zwei
+// Bits die Merker QC_BILD_*. So haengt am Bild kein Speicher, der beim
 // Verwerfen oder bei einem Fehler liegen bleiben koennte.
-#define QC_ZETTEL(t_cap_us, wiederholt) ((void *)(uintptr_t)(((uint64_t)(t_cap_us) << 1) | ((wiederholt) ? 1u : 0u)))
+#define QC_ZETTEL(t_cap_us, merker) ((void *)(uintptr_t)(((uint64_t)(t_cap_us) << 2) | ((merker) & 3u)))
 
 // Stauregel. Liegt beim Zuschauer mehr als QC_BACKLOG_LIMIT (Spielmodus: ein
 // Viertel) ungesendet im Kernel, geht das naechste Bild gar nicht erst in den
@@ -1735,16 +2061,25 @@ static BOOL stau_vor_dem_encoder(void) {
     BOOL stau = NO;
     pthread_mutex_lock(&g_send_mtx);
     int fd = atomic_load(&g_client_fd);
-    if (fd >= 0 && atomic_load(&g_vid_ready)) {
+    if (fd >= 0 && atomic_load(&g_vid_ready) && g_vid) {
         int rueckstand = backlog_bytes(fd);
         if (rueckstand > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
             stau = YES;
-            // Fortschritt heisst: der Rueckstand ist seit dem letzten Blick
-            // kleiner geworden, die Gegenstelle nimmt also noch etwas ab.
+            // Fortschritt heisst: seit dem letzten Blick hat die Gegenstelle
+            // etwas abgenommen - was in den Puffer ging, weniger dem, was dort
+            // jetzt mehr liegt. Am Rueckstand allein laesst sich das nicht
+            // ablesen: Ton, Zwischenablage und Zeiger gehen auch im Stau
+            // hinaus (send_small) und heben ihn, auch wenn die Gegenstelle die
+            // ganze Zeit liest. Und so zaehlt auch ein Blick nach langer Pause
+            // (stiller Bildschirm) richtig: abgenommen ist abgenommen.
             uint64_t jetzt = now_us();
-            if (!g_stau_seit || rueckstand < g_stau_rueckstand) {
+            uint64_t gesendet = g_vid->gesendet;
+            int64_t abgenommen = (int64_t)(gesendet - g_stau_gesendet) - ((int64_t)rueckstand - g_stau_rueckstand);
+            int neu = !g_stau_seit || abgenommen > 0;
+            g_stau_gesendet = gesendet;
+            g_stau_rueckstand = rueckstand;
+            if (neu) {
                 g_stau_seit = jetzt;
-                g_stau_rueckstand = rueckstand;
             } else if (jetzt - g_stau_seit >= QC_STAU_FRIST_US) {
                 logf_(@"Zuschauer weg: nimmt seit %llu s nichts mehr ab (%d Byte im Stau)",
                       QC_STAU_FRIST_US / 1000000ull, rueckstand);
@@ -1765,8 +2100,17 @@ static BOOL stau_vor_dem_encoder(void) {
     return stau;
 }
 
-static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int wiederholt) {
-    if (!pb || !g_session) return;
+// Die Frist auch ohne neues Bild pruefen: bei stillem Bildschirm kommt nichts
+// in encode_buffer an, und ein eingefrorener Zuschauer (Ton aus) bliebe sonst
+// eingetragen - Aufnahme, Encoder und die Wachhalte-Zusicherung liefen fuer
+// niemanden weiter. Codiert wird hier nichts.
+static void stau_frist_pruefen(void) {
+    (void)stau_vor_dem_encoder();
+}
+
+// YES = das Bild ging in den Encoder.
+static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int merker) {
+    if (!pb || !g_session) return NO;
     // Rund um einen Formatwechsel der Aufnahme kann noch ein Bild im alten
     // Format eintreffen. Das gehoert nicht in den neuen Encoder - verwerfen,
     // und sagen, dass es passiert ist (einmal je Format, nicht je Bild).
@@ -1779,17 +2123,17 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
             uint32_t a = CFSwapInt32HostToBig(ist), b = CFSwapInt32HostToBig(soll);
             logf_(@"Bild im Format %.4s verworfen, Encoder erwartet %.4s", (char *)&a, (char *)&b);
         }
-        return;
+        return NO;
     }
     // Vor dem Abholen eines erzwungenen Vollbilds: das kommt dann mit dem
     // naechsten Bild, das wirklich codiert wird.
-    if (stau_vor_dem_encoder()) { atomic_fetch_add(&g_skipped_backlog, 1); return; }
+    if (stau_vor_dem_encoder()) { atomic_fetch_add(&g_skipped_backlog, 1); return NO; }
     NSDictionary *opts = nil;
     if (atomic_exchange(&g_force_key, 0))
         opts = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
     OSStatus st = VTCompressionSessionEncodeFrame(g_session, pb, pts, kCMTimeInvalid,
                                                   (__bridge CFDictionaryRef)opts,
-                                                  QC_ZETTEL(t_cap_us, wiederholt), NULL);
+                                                  QC_ZETTEL(t_cap_us, merker), NULL);
     if (st == noErr) atomic_fetch_add(&g_inflight, 1);
     if (st != noErr) {
         if (!g_stats.first_err) g_stats.first_err = st;
@@ -1798,6 +2142,7 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
         if (atomic_fetch_add(&g_enc_fehler, 1) == 0)
             logf_(@"Encoder %s nimmt Bild nicht an (%d)", g_kandidaten[atomic_load(&g_codec_id)].name, (int)st);
     }
+    return st == noErr;
 }
 
 // Ist fuer ein Bild zur Zeit t (Hostuhr, Sekunden) ein Schlitz frei? Wenn ja,
@@ -1818,9 +2163,15 @@ static int schlitz_frei(double t) {
 // Der Takt. Laeuft auf derselben Warteschlange wie die Aufnahme, kommt ihr
 // also nie in die Quere. Kam seit dem letzten Schlag ein echtes Bild, passiert
 // hier nichts - nachgelegt wird nur, was sonst ausfallen wuerde.
+// Ohne feste Bildrate reicht er nur nach, was beim Zuschauer noch fehlt
+// (g_bild_offen): das letzte Bild einer Bewegung, das als zu schnell, im Stau
+// oder bei vollem Encoder wegfiel - danach ist der Bildschirm still, und es
+// kaeme sonst nie -, und fuer einen neuen Zuschauer das zuletzt gesehene.
 static void fixed_tick(void) {
     int testbild = atomic_load(&g_testbild);
-    if (!testbild && !atomic_load(&g_cur_fixed)) return;
+    int fest = atomic_load(&g_cur_fixed);
+    int wartet = atomic_load(&g_wait_key);      // Zuschauer ohne erstes Vollbild
+    if (!testbild && !fest && !wartet && !atomic_load(&g_bild_offen)) return;
     // Ohne Zuschauer wird nichts nachgelegt. Sonst laeuft der Encoder mit
     // voller Rate fuer niemanden - gemessen: 24 % Last im Leerlauf.
     if (atomic_load(&g_client_fd) < 0) return;
@@ -1845,15 +2196,46 @@ static void fixed_tick(void) {
         // seiner Entstehungszeit = jetzt. Kein Nachlegen, kein Raster.
         CVPixelBufferRef pb = qc_testbild_naechstes();
         if (pb) {
-            encode_buffer(pb, now, cmtime_us(now), 0);
+            encode_buffer(pb, now, cmtime_us(now), QC_BILD_TESTBILD);
             g_last_pts = now;
+        }
+        return;
+    }
+    if (!fest) {
+        // Waehrend einer Bewegung kommt alle paar Millisekunden ein neueres
+        // Bild; erst wenn eine Bildzeit lang keins kam, ist dieses das letzte.
+        // Es ist ein echtes Bild, also belegt es einen Schlitz im Raster.
+        if (now_us() < g_last_cap_us + 1000000ull / (uint64_t)fps) return;
+        // Wer auf sein erstes Vollbild wartet, bekommt eins - aber eins zur
+        // Zeit: steckt schon ein Bild im Encoder, kommt es gleich an.
+        if (wartet && atomic_load(&g_inflight) > 0) return;
+        // Im Stau gar nicht erst versuchen: sonst zaehlte jeder Schlag als
+        // ausgelassenes Bild ("Stau" im 5-s-Protokoll, bis zu fps je
+        // Sekunde), obwohl nur ein einziges Bild wartet. Die Frist prueft
+        // dieser Blick mit.
+        if (stau_vor_dem_encoder()) return;
+        double schlitz_vorher = g_schlitz;
+        if (!schlitz_frei(CMTimeGetSeconds(now))) return;
+        if (wartet) atomic_store(&g_force_key, 1);
+        // Als wiederholt gekennzeichnet: die Aufnahmezeit ist die echte, das
+        // Bild aber alt - fuer einen neuen Zuschauer bei stillem Bildschirm
+        // womoeglich Minuten. In der Latenzmessung (Host: Encoderzeit, Client:
+        // Gesamtverzoegerung) staende sonst dieses Alter als Verzoegerung.
+        if (encode_buffer(g_last_pb, now, g_last_cap_us, QC_BILD_WIEDERHOLT)) {
+            atomic_store(&g_bild_offen, 0);
+            atomic_fetch_add(&g_nachgereicht, 1);
+            g_last_pts = now;
+        } else {
+            // Im Stau geblieben: der Schlitz gehoert dann dem naechsten
+            // echten Bild, nicht diesem Versuch.
+            g_schlitz = schlitz_vorher;
         }
         return;
     }
     // Wichtig: der Zettel traegt die ECHTE Aufnahmezeit des wiederholten
     // Bildes, nicht die Nachlegezeit. Sonst sieht die Messung auf der anderen
     // Seite aus, als waere jedes Bild blitzschnell unterwegs gewesen.
-    encode_buffer(g_last_pb, now, g_last_cap_us, 1);
+    if (encode_buffer(g_last_pb, now, g_last_cap_us, QC_BILD_WIEDERHOLT)) atomic_store(&g_bild_offen, 0);
     g_last_pts = now;
     // Das Raster bleibt unberuehrt: es zaehlt nur echte Bilder. Schoebe ein
     // nachgelegtes Bild es weiter, fiele ein echtes kurz danach als "zu
@@ -1881,12 +2263,12 @@ static void fixed_tick(void) {
         logf_(@"   angekommen: %.4s  (%zux%zu)", (char *)&be,
               pb ? CVPixelBufferGetWidth(pb) : 0, pb ? CVPixelBufferGetHeight(pb) : 0);
     }
-    if (!pb || !g_session) return;
-    // Testbild an: die Aufnahme laeuft weiter (der Wechsel zurueck soll
-    // keine Sekunde kosten), aber ihre Bilder gehen nicht in den Encoder.
-    if (atomic_load(&g_testbild)) return;
-
-    self.framesIn++;
+    if (!pb) return;
+    // Ohne Encoder nur waehrend eines Codecwechsels festhalten. Sonst ist der
+    // Strom abgebaut, und ein Nachzuegler der anhaltenden Aufnahme (stopCapture
+    // mit Frist) laege nach dem Aufraeumen wieder in g_last_pb - bis zur
+    // naechsten Sitzung.
+    if (!g_session && !g_wechsel_aktiv) return;
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
     if (!CMTIME_IS_VALID(pts)) pts = CMClockGetTime(CMClockGetHostTimeClock());
 
@@ -1907,6 +2289,15 @@ static void fixed_tick(void) {
         if (alt) CVPixelBufferRelease(alt);
     }
     g_last_cap_us = t_cap;
+    // Noch nicht beim Zuschauer. Geht es gleich in den Encoder, ist der
+    // Merker wieder weg; sonst reicht der Takt es nach. Auch waehrend des
+    // Testbilds und eines Codecwechsels: danach soll das Neueste kommen.
+    atomic_store(&g_bild_offen, 1);
+    if (!g_session) return;
+    // Testbild an: die Aufnahme laeuft weiter (der Wechsel zurueck soll
+    // keine Sekunde kosten), aber ihre Bilder gehen nicht in den Encoder.
+    if (atomic_load(&g_testbild)) return;
+    self.framesIn++;
 
     // Schneller als die Zielrate: weg damit. Und ist der Encoder noch mit
     // aelteren Bildern beschaeftigt, ebenfalls - lieber ein Auslasser als
@@ -1914,7 +2305,7 @@ static void fixed_tick(void) {
     if (!schlitz_frei(CMTimeGetSeconds(pts))) { atomic_fetch_add(&g_zu_schnell, 1); return; }
     if (atomic_load(&g_inflight) >= 3) { atomic_fetch_add(&g_enc_stau, 1); return; }
 
-    encode_buffer(pb, pts, t_cap, 0);
+    if (encode_buffer(pb, pts, t_cap, 0)) atomic_store(&g_bild_offen, 0);
     g_last_pts = pts;
 }
 
@@ -1936,8 +2327,10 @@ static void fixed_tick(void) {
         });
         // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
         stream_setzen(nil);
-        // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
-        if (atomic_load(&g_client_fd) < 0) return;
+        // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut
+        // neu auf. Einer, der gerade eingetragen wird, hat sein Hochfahren
+        // aber schon hinter sich und braucht die Wiederherstellung.
+        if (!zuschauer_braucht_strom()) return;
         hoststatus_senden(1);
         // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -2037,9 +2430,9 @@ static void list_displays(void) {
 }
 
 static void aufnahme_wiederherstellen(void) {
-    // Nur solange jemand zuschaut. Geht der Zuschauer waehrend des Wartens,
-    // endet die Kette hier.
-    if (atomic_load(&g_client_fd) < 0) return;
+    // Nur solange jemand zuschaut (oder gerade eingetragen wird). Geht der
+    // Zuschauer waehrend des Wartens, endet die Kette hier.
+    if (!zuschauer_braucht_strom()) return;
     // Auf der Lebenslauf-Warteschlange: pick_display wartet blockierend auf
     // ScreenCaptureKit, und das darf weder die Aufnahme- noch die Hauptschleife
     // anhalten - und kein Abbau darf dazwischenfunken.
@@ -2047,7 +2440,7 @@ static void aufnahme_wiederherstellen(void) {
         if (g_stream) return;
         // Hier noch einmal: zwischen der Pruefung oben und diesem Block kann
         // der Zuschauer gegangen und sein Abbau schon gelaufen sein.
-        if (atomic_load(&g_client_fd) < 0) return;
+        if (!zuschauer_braucht_strom()) return;
         size_t pw = 0, ph = 0; double hz = 0;
         SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
         if (!d) {
@@ -2104,7 +2497,7 @@ static void aufnahme_wiederherstellen(void) {
         }
         // Waehrend des Starts gegangen: sein Abbau ist schon durch oder steht
         // hinter uns an und kennt diesen Strom nicht - also selbst anhalten.
-        if (atomic_load(&g_client_fd) < 0) {
+        if (!zuschauer_braucht_strom()) {
             dispatch_semaphore_t halt = dispatch_semaphore_create(0);
             [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; dispatch_semaphore_signal(halt); }];
             dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
@@ -2183,13 +2576,21 @@ static BOOL stream_hochfahren_sync(void) {
     return ok;
 }
 
+static BOOL zuschauer_braucht_strom(void) {
+    if (atomic_load(&g_anmeldend) > 0) return YES;
+    return atomic_load(&g_client_fd) >= 0;
+}
+
 // Der Zuschauer ist weg: Aufnahme anhalten, Encoder abbauen, Bildschirm
 // freigeben. Darf aus jedem Faden angestossen werden, auch unter g_send_mtx -
 // hier wird nur eingereiht, gearbeitet wird spaeter und nacheinander.
+// Ob wirklich niemand mehr da ist, entscheidet erst der Block: ist inzwischen
+// wieder jemand da oder unterwegs, bleibt alles stehen. Wer unterwegs aufgibt,
+// stoesst den Abbau selbst noch einmal an.
 static void stream_herunterfahren_anstossen(void) {
     if (!g_lifeq) return;
     dispatch_async(g_lifeq, ^{
-        if (atomic_load(&g_client_fd) >= 0) return;   // inzwischen ist wieder jemand da
+        if (zuschauer_braucht_strom()) return;
         if (!g_stream && !g_session) return;
         if (g_stream) {
             SCStream *st = g_stream;
@@ -2221,7 +2622,9 @@ static void stream_herunterfahren_anstossen(void) {
 }
 
 int main(int argc, const char *argv[]) { @autoreleasepool {
-    g_log = fopen("/tmp/quadchroma-m1.log", "a");
+    pthread_mutex_lock(&g_log_mtx);
+    log_oeffnen("a");
+    pthread_mutex_unlock(&g_log_mtx);
     setvbuf(stdout, NULL, _IONBF, 0);
 
     [NSApplication sharedApplication];
@@ -2465,15 +2868,18 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         long lastFrames2 = 0;   // eigener Bezugspunkt fuer die gemeldete Bildrate
         for (;;) {
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5.0]];
+            drosseln_nachtragen();
+            if (atomic_load(&g_client_fd) >= 0) stau_frist_pruefen();
             long f = atomic_load(&g_sent_frames);
             long long b = atomic_load(&g_sent_bytes);
             if (atomic_load(&g_client_fd) >= 0)
-                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | zu schnell: %ld | Encoder voll: %ld",
+                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB, %ld verworfen | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | nachgereicht: %ld | zu schnell: %ld | Encoder voll: %ld",
                       -[t0 timeIntervalSinceNow], f, (f - lastFrames) / 5.0,
                       (b - lastBytes) * 8.0 / 5.0 / 1e6,
                       atomic_load(&g_audio_packets), atomic_load(&g_audio_bytes) / 1000.0,
+                      atomic_load(&g_audio_verworfen),
                       atomic_load(&g_skipped_backlog), g_stats.dropped,
-                      atomic_load(&g_repeats), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
+                      atomic_load(&g_repeats), atomic_load(&g_nachgereicht), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
             lastFrames = f; lastBytes = b;
 
             // Auslastung des Hosts. Nur wenn jemand zuschaut - sonst misst
@@ -2483,7 +2889,9 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
                 qc_last_probe(&l);
                 long n = atomic_exchange(&g_enc_n, 0);
                 long long summe = atomic_exchange(&g_enc_us, 0);
-                uint16_t enc_zehntel = n ? (uint16_t)((summe / n) / 100) : 0;
+                // Gedeckelt: ueber 6,5 s liefe das Feld sonst ueber und zeigte wenig.
+                long long zehntel = n ? (summe / n) / 100 : 0;
+                uint16_t enc_zehntel = (uint16_t)(zehntel > 65535 ? 65535 : zehntel);
                 uint16_t host_fps_zehntel = (uint16_t)(((f - lastFrames2) * 10) / 5);
                 lastFrames2 = f;
 

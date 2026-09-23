@@ -12,7 +12,6 @@
 #include <unistd.h>
 
 #define QC_ANNAHME_PLAETZE 32       // obere Grenze fuer max_gesamt
-#define QC_MELDEN_S 10              // hoechstens so oft eine Andrang-Meldung
 
 typedef struct {
     int listen_fd;
