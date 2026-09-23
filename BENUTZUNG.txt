@@ -593,9 +593,21 @@ derselbe Verlust (...) noch N-mal, nicht einzeln protokolliert").
 
 Ein neuer Zuschauer ersetzt den alten: dessen Warteschlange wird
 verworfen, er bekommt nur noch Nachricht 10 und ist nach hoechstens 2 s
-getrennt, auch wenn er haengt ("Zuschauer abgeloest: <IP>", dann
-"Abloesung an <IP> gemeldet" oder "Abgeloester Zuschauer <IP> nimmt nichts
-mehr ab - Bildleitung gekappt").
+getrennt, auch wenn er haengt. Im Protokoll steht "Zuschauer abgeloest:
+<IP>", danach je nach Zustand des alten:
+
+    "Abloesung an <IP> gemeldet"
+                    Nachricht 10 liegt im Sendepuffer des Kernels;
+                    dass sie ankommt, ist damit nicht sicher.
+    "Abloesung an <IP> nicht zugestellt: <Fehler>"
+                    der alte war schon weg oder hat sie binnen 1 s
+                    nicht abgenommen.
+    "Abgeloester Zuschauer <IP> nimmt nichts mehr ab - Bildleitung gekappt"
+                    er hing noch an einem aelteren Paket; Nachricht 10
+                    erreicht ihn dann nicht.
+
+Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
+laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.
 
 Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
 privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,
