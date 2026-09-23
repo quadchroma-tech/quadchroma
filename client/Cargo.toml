@@ -58,4 +58,7 @@ windows = { version = "0.62", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # Host-Rolle: einen haengenden write an einen abgeloesten Zuschauer
+    # abbrechen (CancelIoEx, siehe host/netz.rs)
+    "Win32_System_IO",
 ] }
