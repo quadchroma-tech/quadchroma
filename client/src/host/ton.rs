@@ -499,12 +499,15 @@ pub fn start() {
                 while !netz::zuschauer_da() {
                     std::thread::sleep(Duration::from_millis(200));
                 }
+                // Der naechste Zuschauer ist einer mit anderer Nummer - auch
+                // wenn er ohne Luecke abloest (wie in aufnahme::start).
+                let nr = netz::zuschauer_nr();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     betreiben(&mut Wasapi, &netz::zuschauer_da, Duration::from_millis(NEU_MS), STABIL, &mut zuletzt, &mut |z| log(z))
                 }));
                 if r.is_err() {
                     log("Ton: Abgriff abgestuerzt - der Host laeuft ohne Ton bis zum naechsten Zuschauer");
-                    while netz::zuschauer_da() {
+                    while netz::zuschauer_da() && netz::zuschauer_nr() == nr {
                         std::thread::sleep(Duration::from_millis(500));
                     }
                 }

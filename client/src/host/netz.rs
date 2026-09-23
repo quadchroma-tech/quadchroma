@@ -586,7 +586,8 @@ impl Leitung {
 static AKTUELL: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
 static PRIV: OnceLock<Vec<u8>> = OnceLock::new();
 static SEQ: AtomicU32 = AtomicU32::new(0);
-/// Laufende Nummer der Zuschauer, fuer das Protokoll.
+/// Laufende Nummer der Zuschauer (zuschauer_nr). Waechst unter AKTUELL,
+/// zugleich mit dem Eintrag des Neuen.
 static NR: AtomicU64 = AtomicU64::new(0);
 /// Laufende Nummer der Eingabekanaele (siehe Leitung::eingabe_loesen).
 static EINGABE_NR: AtomicU64 = AtomicU64::new(0);
@@ -668,6 +669,15 @@ fn absender(s: &TcpStream) -> IpAddr {
 
 pub fn zuschauer_da() -> bool {
     sperre(&AKTUELL).is_some()
+}
+
+/// Nummer des aktuellen Zuschauers. Sie aendert sich bei jeder Annahme -
+/// auch wenn ein Neuer den Alten ohne Luecke abloest und zuschauer_da()
+/// dabei nie false wird. Wer sie sieht, sieht auch schon den Neuen in
+/// AKTUELL.
+pub fn zuschauer_nr() -> u64 {
+    let _a = sperre(&AKTUELL);
+    NR.load(Ordering::Relaxed)
 }
 
 fn aktuell() -> Option<Arc<Leitung>> {
@@ -970,16 +980,26 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
             alt.abloesen();
             eingabe::alle_tasten_loslassen();
         }
+        // Ein Testbild ueberlebt den Zuschauer nicht - auch nicht, wenn ihn
+        // ein Neuer ohne Luecke abloest und die Aufnahme dabei weiterlaeuft.
+        // Hier frei von Wettlaeufen: der Eingabekanal des Alten speist nur
+        // unter EINSPEISEN ein, der des Neuen bindet sich erst an AKTUELL.
+        if Z.testbild.swap(false, Ordering::Relaxed) {
+            log("Testbild aus (Zuschauer gewechselt)");
+        }
+        // Vollbild fuer den Neuen, bevor ihn irgendwer in AKTUELL sieht:
+        // ein Bild, das die Aufnahme ab jetzt codiert, ist eines - und geht
+        // an ihn (bild_senden wartet auf AKTUELL).
+        Z.force_key.store(true, Ordering::Relaxed);
+        Z.wait_key.store(true, Ordering::Relaxed);
         let _ = leitung.einreihen(hello, Art::Klein, None);
+        NR.fetch_add(1, Ordering::Relaxed);
         *a = Some(leitung.clone());
         alt
     };
-    NR.fetch_add(1, Ordering::Relaxed);
     let l2 = leitung.clone();
     std::thread::spawn(move || sendefaden(l2, sock));
 
-    Z.force_key.store(true, Ordering::Relaxed);
-    Z.wait_key.store(true, Ordering::Relaxed);
     // Zeigerform und Tonformat gehen dem neuen Zuschauer erneut zu.
     super::zeiger::neu_senden();
     super::ton::info_zuruecksetzen();
@@ -1568,10 +1588,26 @@ mod tests {
         drop(stumm);
         zeitfrage(&mut a_ein, 0xA1).unwrap();
         assert_eq!(zeitantwort(&mut a), Ok(0xA1));
+        // A hat das Testbild eingeschaltet (Nachricht 68).
+        zeitfrage(&mut a_ein, 0xA3).unwrap();
+        let mut m = kopf(IN_TESTBILD, 0, 0, 1).to_vec();
+        m.push(1);
+        a_ein.write_all(&m).unwrap();
+        zeitfrage(&mut a_ein, 0xA4).unwrap();
+        assert_eq!(zeitantwort(&mut a), Ok(0xA3));
+        assert_eq!(zeitantwort(&mut a), Ok(0xA4));
+        assert!(Z.testbild.load(Ordering::Relaxed), "Testbild von A nicht angekommen");
+        let nr_a = zuschauer_nr();
 
         // Zuschauer B loest A ab: A verliert Bild UND Eingabe - und bekommt
         // als letzte Nachricht MSG_ABGELOEST, damit er nicht zurueckkommt.
         let mut b = bild_verbinden(&bild_addr);
+        // Ohne Luecke: ein Zuschauer ist durchgehend da, aber die Nummer ist
+        // eine neue - daran erkennen Aufnahme und Ton den Wechsel. Das
+        // Testbild von A gilt fuer B nicht.
+        assert!(zuschauer_da());
+        assert_eq!(zuschauer_nr(), nr_a + 1);
+        assert!(!Z.testbild.load(Ordering::Relaxed), "Testbild von A ueberlebt die Abloesung");
         a_ein.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let t0 = Instant::now();
