@@ -109,6 +109,9 @@ pub enum Key {
     ErrorTimeout,
     ErrorProtocol,
     ErrorNoDecoder,
+    /// Der Host meldet: ein anderes Geraet hat die Sitzung uebernommen
+    /// (Nachricht 10). Keine automatische Neuverbindung.
+    SessionTakenOver,
     /// Fingerabdruck einer bekannten Adresse geaendert: {n} Adresse, {m} neuer
     /// Fingerabdruck, {p} Pfad von known_hosts.txt - alle bleiben stehen.
     HostKeyChanged,
@@ -337,6 +340,7 @@ pub static EN: Lang = Lang {
         (ErrorTimeout, "Host did not answer"),
         (ErrorProtocol, "The other side speaks a different protocol"),
         (ErrorNoDecoder, "No decoder for this format"),
+        (SessionTakenOver, "Another device has taken over the session."),
         (HostKeyChanged, "The fingerprint of {n} has changed (now {m}). Connection refused. If the host was set up again, delete its line in {p}."),
         (KeyFileDamaged, "The key file {p} is damaged and was left as it is. Check or delete it – a new key is then created, and the host has to pair this device again."),
         (FileUnreadable, "{p} cannot be read – not connecting."),
@@ -495,6 +499,7 @@ pub static DE: Lang = Lang {
         (ErrorTimeout, "Host antwortet nicht"),
         (ErrorProtocol, "Die Gegenstelle spricht ein anderes Protokoll"),
         (ErrorNoDecoder, "Kein Decoder für dieses Format"),
+        (SessionTakenOver, "Ein anderes Gerät hat die Sitzung übernommen."),
         (HostKeyChanged, "Der Fingerabdruck von {n} hat sich geändert (jetzt {m}). Verbindung abgelehnt. Wurde der Host neu aufgesetzt, seine Zeile in {p} löschen."),
         (KeyFileDamaged, "Die Schlüsseldatei {p} ist beschädigt und bleibt, wie sie ist. Datei prüfen oder löschen – dann entsteht ein neuer Schlüssel, und der Host muss dieses Gerät neu koppeln."),
         (FileUnreadable, "{p} lässt sich nicht lesen – keine Verbindung."),

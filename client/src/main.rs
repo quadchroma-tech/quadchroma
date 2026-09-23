@@ -1844,6 +1844,21 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     }
                 }
             }
+            MSG_ABGELOEST => {
+                // Ein anderes Geraet hat die Sitzung uebernommen, der Host
+                // macht gleich zu. Nicht von selbst neu verbinden - sonst
+                // verdraengte dieser Client den neuen, und der ihn wieder:
+                // zwei Clients loesten einander endlos ab. Das Ziel geht
+                // zurueck; der Fensterfaden zeigt daraufhin den
+                // Startbildschirm mit der Meldung.
+                protokoll::zeile(format!(
+                    "Sitzung mit {addr} von einem anderen Geraet uebernommen (Host meldet Abloesung) - keine automatische Neuverbindung"
+                ));
+                let mut s = shared.lock().unwrap();
+                s.target = None;
+                s.error_key = Some(strings::Key::SessionTakenOver);
+                return Ok(());
+            }
             MSG_CODECS => {
                 let liste = codecs_parsen(&payload);
                 shared.lock().unwrap().codecs = liste;
@@ -3768,6 +3783,7 @@ impl ApplicationHandler for App {
                                     let mut sh = self.shared.lock().unwrap();
                                     sh.target = Some(a);
                                     sh.error = None;
+                                    sh.error_key = None;
                                     drop(sh);
                                     self.screen = Screen::Session;
                                 }
@@ -3964,6 +3980,17 @@ impl ApplicationHandler for App {
         // reicht fuer den ESC-Balken und fuer Bilder mit 240 je Sekunde) und
         // nur zeichnen, wenn es etwas zu zeichnen gibt - siehe unten.
         el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2)));
+
+        // Hat ein anderes Geraet die Sitzung uebernommen, nimmt der
+        // Empfangsfaden das Ziel selbst zurueck (MSG_ABGELOEST, keine
+        // Wiederverbindung). Dann zurueck zum Startbildschirm - die Meldung
+        // steht dort, und verbinden geht wieder nur auf Wunsch. Den
+        // Eingabekanal hat der Host schon zu und die Tasten losgelassen:
+        // erst die Bindung loesen, dann geht beim Trennen nichts mehr hin.
+        if self.screen == Screen::Session && self.shared.lock().unwrap().target.is_none() {
+            self.input.lock().unwrap().set_link(None);
+            self.verbindung_trennen();
+        }
 
         // Nachgereichtes ESC-Loslassen.
         if let Some(t) = self.esc_up_faellig {
@@ -5931,10 +5958,11 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             seen: Instant::now(),
         },
     ];
-    // "fingerabdruck": der Startbildschirm mit der Meldung, wie sie bei
-    // geaendertem Host-Schluessel dasteht - ueber denselben Schluessel wie im
-    // Betrieb, in der Sprache der Ansicht.
+    // "abgeloest" und "fingerabdruck": der Startbildschirm mit der Meldung,
+    // wie sie nach Nachricht 10 bzw. bei geaendertem Host-Schluessel dasteht -
+    // ueber dieselben Schluessel wie im Betrieb, in der Sprache der Ansicht.
     let meldung = match view {
+        "abgeloest" => Some(lang.get(strings::Key::SessionTakenOver).to_string()),
         "fingerabdruck" => Some(
             Meldung::from(secure::Fehler::FingerabdruckGeaendert {
                 host: "192.168.178.194".into(),
@@ -7533,6 +7561,61 @@ mod tests {
         assert!(l.sock.is_some());
     }
 
+    /// Der Host meldet MSG_ABGELOEST: der Empfangsfaden nimmt das Ziel
+    /// zurueck, die Meldung steht ueber ihren Schluessel da, und es gibt
+    /// keine zweite Verbindung - auch nicht nach der Pause von 2 s, nach der
+    /// ein getrennter Client sonst neu verbindet (und den neuen verdraengte).
+    #[test]
+    fn abgeloest_heisst_nicht_wiederverbinden() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        secure::test_identitaet();
+        let (host_priv, _) = noise::keypair().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let verbindungen = Arc::new(AtomicUsize::new(0));
+        let v = verbindungen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { continue };
+                v.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut h) = secure::Secure::accept(s, &noise::prologue_video(), &host_priv) else { continue };
+                // Gruss wie beim echten Host, danach gleich die Abloesung.
+                let mut m = MAGIC.to_vec();
+                m.extend_from_slice(&[MSG_ABGELOEST, 0, 0, 0, 0, 0, 0, 0]);
+                let _ = h.write_all(&m);
+            }
+        });
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        let t0 = Instant::now();
+        while shared.lock().unwrap().target.is_some() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.target.is_none(), "Ziel nicht zurueckgenommen");
+            assert_eq!(s.error_key, Some(strings::Key::SessionTakenOver));
+            assert_eq!(s.error, None);
+        }
+        // Frueher: nach 2 s die naechste Verbindung. Drei Sekunden zusehen.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
+        assert!(!shared.lock().unwrap().connected);
+        assert_eq!(
+            strings::pick("de").get(strings::Key::SessionTakenOver),
+            "Ein anderes Gerät hat die Sitzung übernommen."
+        );
+    }
+
     /// Fehler von Leitung und Ablage erscheinen ueber Schluessel: in jeder
     /// Sprache der eigene Satz mit eingesetzten Werten; der deutsche Text mit
     /// Einzelheiten bleibt fuers Protokoll.
@@ -7584,7 +7667,7 @@ mod tests {
         }
         // Alle neuen Schluessel stehen englisch und deutsch da.
         for k in [
-            HostKeyChanged, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
+            SessionTakenOver, HostKeyChanged, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
             StorageUnavailable, ErrorAddress, ErrorNoConnection, ErrorHandshake, ErrorFfmpegStart, ErrorSound,
             ErrorGpuDisplay, ErrorGpuLost, ErrorPixelFormat, DecoderFallback,
         ] {
