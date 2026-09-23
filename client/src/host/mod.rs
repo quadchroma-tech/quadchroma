@@ -65,6 +65,9 @@ pub struct Zustand {
     pub enc_verworfen: AtomicU64,
     pub audio_packets: AtomicU64,
     pub audio_bytes: AtomicU64,
+    /// Tonpakete, die an der Grenze fuer wartenden Ton wegfielen (Leitung
+    /// langsamer als der Ton, netz::ton_grenze).
+    pub ton_verworfen: AtomicU64,
     pub input_events: AtomicU64,
     /// Eckdaten des Stroms - immer aus dem laufenden Kandidaten abgeleitet.
     pub info_w: AtomicU32,
@@ -96,6 +99,7 @@ pub static Z: Zustand = Zustand {
     enc_verworfen: AtomicU64::new(0),
     audio_packets: AtomicU64::new(0),
     audio_bytes: AtomicU64::new(0),
+    ton_verworfen: AtomicU64::new(0),
     input_events: AtomicU64::new(0),
     info_w: AtomicU32::new(0),
     info_h: AtomicU32::new(0),
@@ -565,7 +569,7 @@ pub fn main_host(args: &[String]) -> i32 {
             continue;
         }
         log(format!(
-            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | zu schnell: {} | Encoder voll: {}",
+            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
             t0.elapsed().as_secs_f32(),
             f,
             (f - last_frames) as f32 / 5.0,
@@ -577,6 +581,7 @@ pub fn main_host(args: &[String]) -> i32 {
             Z.repeats.load(Ordering::Relaxed),
             Z.zu_schnell.load(Ordering::Relaxed),
             Z.enc_stau.load(Ordering::Relaxed),
+            Z.ton_verworfen.load(Ordering::Relaxed),
         ));
         let jetzt = last_probe();
         if let (Some(v), Some(j)) = (vorher.as_ref(), jetzt.as_ref()) {
