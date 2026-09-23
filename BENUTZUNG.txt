@@ -441,10 +441,14 @@ Meldungen. Dasselbe landet in %APPDATA%\QuadChroma\protokoll.txt, auch im
 Fensterbetrieb - die Datei beginnt bei jedem Start neu und traegt dort
 zusaetzlich die Anzeige (Karte, Feature-Level, Tearing) und je Sekunde eine
 Zeile mit Bildrate, Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern
-und der Prozessorlast des Clients. Ein Verbindungsfehler steht dort einmal
-je neuem Grund mit allen Einzelheiten ("Verbindung: <Grund>"); der
-Startbildschirm zeigt ihn in der Sprache der Oberflaeche, einen Wortlaut
-des Systems, wo es einen gibt, in Klammern dahinter.
+und der Prozessorlast des Clients. Ein Verbindungsfehler bis einschliesslich
+Handschlag und Pruefung des Host-Schluessels (Host nicht erreichbar,
+Fingerabdruck geaendert) steht dort einmal je neuem Grund mit allen
+Einzelheiten ("Verbindung: <Grund>"). Ein Fehler danach, etwa "Host hat die
+Leitung nach dem Handschlag geschlossen - dieses Geraet ist dort nicht
+gekoppelt", steht vorerst bei jedem Versuch da, also alle 2 s. Der
+Startbildschirm zeigt den Fehler in der Sprache der Oberflaeche, einen
+Wortlaut des Systems, wo es einen gibt, in Klammern dahinter.
 
     quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
     quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
