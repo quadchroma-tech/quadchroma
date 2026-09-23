@@ -11,9 +11,10 @@ Wer die Adresse kennt, kann sie auch eintippen oder gleich mitgeben:
 
     quadchroma.exe 192.168.178.194:9001
 
-Port 9001 ist Bild und Ton, 9002 Eingaben und Zwischenablage, 9003 die
-Bekanntgabe im Netz. Beim ersten Start fragt die Windows-Firewall, ob das
-Programm ins Netz darf - das muss erlaubt werden, sonst bleibt die Liste leer.
+Port 9001 ist Bild und Ton (und alles vom Host zum Client), 9002 Eingaben
+und Zwischenablage vom Client, 9003 die Bekanntgabe im Netz. Beim ersten
+Start fragt die Windows-Firewall, ob das Programm ins Netz darf - das muss
+erlaubt werden, sonst bleibt die Liste leer.
 
 Verschluesselung und Kopplung
 -----------------------------
@@ -36,13 +37,16 @@ Vergleichscode, zum Beispiel "628 306". Denselben Code zeigt der Client mit
 F9 an. Stimmen beide ueberein, sitzt niemand dazwischen. Stimmen sie nicht
 ueberein, Verbindung trennen.
 
-Der Client merkt sich den Fingerabdruck des Hosts je Adresse (ohne Port).
-Aendert er sich spaeter, verweigert der Client die Verbindung, bis der
-Eintrag in known_hosts.txt von Hand geloescht wird; die Meldung nennt
-Adresse, neuen Fingerabdruck und den Pfad der Datei, in der Sprache der
-Oberflaeche. Umgekehrt ist ein Host unter einer neuen Adresse fuer den
-Client ein Erstkontakt, auch unter bekanntem Namen - dann den
-Vergleichscode pruefen.
+Der Client merkt sich den Fingerabdruck des Hosts je Adresse (ohne Port)
+und prueft ihn noch im Handschlag, bevor er sich selbst ausweist
+(Nachricht 3). Aendert er sich spaeter, bricht der Client dort ab: der
+Host nimmt ihn gar nicht erst an, und ein laufender Zuschauer merkt
+nichts. Der Client geht mit der Meldung zum Startbildschirm und versucht
+es nicht erneut; die Meldung nennt Adresse, neuen Fingerabdruck und den
+Pfad der Datei, in der Sprache der Oberflaeche. Erst wenn der Eintrag in
+known_hosts.txt von Hand geloescht ist, verbindet man selbst neu.
+Umgekehrt ist ein Host unter einer neuen Adresse fuer den Client ein
+Erstkontakt, auch unter bekanntem Namen - dann den Vergleichscode pruefen.
 
 Ein Zuschauer zur Zeit: verbindet sich ein zweites gekoppeltes Geraet,
 uebernimmt es die Sitzung. Das bisherige bekommt vom Host Nachricht 10,
@@ -55,9 +59,11 @@ gedrueckte Tasten und Maustasten los. Im Log des Mac-Hosts steht
 "Bisheriger Zuschauer <Fingerabdruck> abgeloest und getrennt" (mit " - die
 Abloese-Nachricht kam nicht an", wenn der alte haengt), im Protokoll des
 alten Clients "Sitzung mit <Adresse> von einem anderen Geraet uebernommen
-(Host meldet Abloesung) - keine automatische Neuverbindung". Eine
-Gegenstelle, die ohne Abschied verschwindet (Deckel zu, WLAN weg), bemerkt
-der Mac-Host nach rund 16 s.
+(Host meldet Abloesung) - keine automatische Neuverbindung". Der neue
+Zuschauer erbt nichts vom alten: ein Testbild endet ("Testbild aus (neuer
+Zuschauer)"), und der Host reicht ihm auch bei stillem Bildschirm gleich
+ein Vollbild nach. Eine Gegenstelle, die ohne Abschied verschwindet
+(Deckel zu, WLAN weg), bemerkt der Mac-Host nach rund 16 s.
 
 Handschlag: jeder hat eine Gesamtfrist (Host 5 s, Client 3 s) und laeuft
 beim Host in einem eigenen Faden - wer schweigt oder troepfelt, haelt nur
@@ -66,23 +72,64 @@ je Adresse und laesst bei vollen Plaetzen den aeltesten laufenden
 Handschlag weichen ("Bildkanal: Andrang - ..."); der Windows-Host erlaubt
 2 je Absender und weist darueber ab ("Bildkanal: Verbindung von <IP>
 abgewiesen - schon N Handschlaege offen ..."). Am Eingabekanal (9002)
-prueft der Client, dass derselbe Host antwortet wie auf dem Bildkanal;
-sonst geht keine Taste hinaus (Protokoll: "Eingabekanal: Gegenstelle
-<Fingerabdruck> ist nicht der Host des Bildkanals - verworfen", hoechstens
-alle 10 s).
+prueft der Client noch im Handschlag, dass derselbe Host antwortet wie auf
+dem Bildkanal; sonst geht keine Taste hinaus (Protokoll: "Eingabekanal:
+Gegenstelle <Fingerabdruck> ist nicht der Host des Bildkanals - vor
+Nachricht 3 abgebrochen", hoechstens alle 10 s). Der Eingabekanal baut
+sich im Hintergrund auf; Einstellungen, Codec, Testbild und Zwischenablage,
+die davor kommen, reicht der Client nach (je Art die letzte), Mausbewegungen
+und Tasten nicht.
+
+Protokoll der Hosts: Zeilen, die jeder im Netz ohne Kopplung ausloesen
+kann - gescheiterter Handschlag, unbekannte Gegenstelle, kaputte oder nicht
+speicherbare Freigabeliste, Eingabekanal ohne Bild -, stehen gedrosselt
+da: die erste sofort, danach hoechstens alle 10 s eine derselben Art.
+Der Mac-Host zaehlt dabei je Art und Adresse (vier Adressen je Art,
+weitere gemeinsam) und haengt die Zahl an ("<Zeile> - dazu N weitere von
+dieser Adresse seit der letzten Meldung"); was danach nicht mehr kommt,
+steht nach der Frist als Sammelzeile da ("<Art>: N weitere von <IP> seit
+der letzten Meldung" bzw. "<Art>: N weitere von anderen Adressen seit der
+letzten Meldung, zuletzt von <IP>"). Der Windows-Host zaehlt nur je Art
+und haengt die Zahl an die naechste Zeile derselben Art ("(und N weitere
+seit der letzten Meldung)"). "Neue Gegenstelle gekoppelt" und "Zuschauer
+verbunden" stehen immer da.
+
+Beide Hosts begrenzen ihr Protokoll auf 8 MB. Der Mac-Host schiebt
+/tmp/quadchroma-m1.log dann nach /tmp/quadchroma-m1.alt.log (ein
+frueheres faellt weg) und schreibt als erste neue Zeile "Protokoll war
+ueber 8192 KB - die Zeilen davor stehen in /tmp/quadchroma-m1.alt.log";
+laesst sich die Datei nicht umbenennen, beginnt sie leer ("... - die
+Zeilen davor sind verworfen"). Die Datei waechst ueber Neustarts hinweg;
+die wenigen Zeilen, die Ton und Zwischenablage selbst hineinschreiben,
+zaehlen nicht mit. Der Windows-Host beginnt host-protokoll.txt bei jedem
+Start neu und schiebt sie bei 8 MB nach host-protokoll.alt.txt ("Protokoll
+ueber 8 MB - der vorige Teil steht in host-protokoll.alt.txt"), ebenso
+messung.txt nach messung.alt.txt.
 
 Kaputte Dateien fuehren nie zu einer neuen Kopplung. Ein Schluessel
-entsteht nur, wenn seine Datei fehlt. Ist host.key oder client.key
-vorhanden, aber unlesbar oder falsch lang (Mac-Host 32 Byte, sonst 64),
-startet der Host nicht ("Schluessel host.key ist vorhanden, aber nicht
-lesbar oder beschaedigt - Abbruch. ..." bzw. auf Windows "Schluessel konnte
-nicht angelegt werden - Abbruch: ..."), und der Client verbindet nicht.
-Wer die Datei loescht, bekommt eine neue Identitaet: dann muss neu
-gekoppelt werden, und nach einer neuen host.key loeschen die Clients ihren
-Eintrag in known_hosts.txt. Ist known_hosts.txt vorhanden, aber unlesbar
-oder nicht als UTF-8 gespeichert (etwa als ANSI), verbindet der Client
-ebenfalls nicht; UTF-8 mit BOM geht. Fuer eine vorhandene authorized.txt
-gilt:
+entsteht nur, wenn seine Datei fehlt. Ist host.key vorhanden, aber
+unlesbar oder falsch lang (Mac-Host 32 Byte, Windows 64), startet der Host
+nicht ("Schluessel host.key ist vorhanden, aber nicht lesbar oder
+beschaedigt - Abbruch. ..." bzw. auf Windows "Schluessel konnte nicht
+angelegt werden - Abbruch: ..."). Der Client liest client.key und
+known_hosts.txt, bevor er eine Leitung oeffnet:
+
+    nicht lesbar   (Sperre durch Virenscanner oder Sicherung, Rechte):
+                   keine Leitung zum Host. Der Client versucht es alle
+                   2 s wieder, schreibt es einmal ins Protokoll und
+                   verbindet von selbst, sobald die Datei lesbar ist.
+    beschaedigt    (client.key falsch lang, known_hosts.txt kein UTF-8,
+                   etwa ANSI) oder nicht schreibbar, ebenso ein
+                   geaenderter Fingerabdruck: der Client versucht es nicht
+                   erneut ("Verbindung zu <Adresse> beendet: der Fehler
+                   bleibt bis zur Behebung - kein neuer Versuch"). Nach
+                   der Behebung selbst neu verbinden.
+
+UTF-8 mit BOM geht. Wer eine Schluesseldatei loescht, bekommt eine neue
+Identitaet. Eine neue host.key heisst: authorized.txt bleibt gueltig,
+jeder Client loescht nur seine Zeile fuer diesen Host in known_hosts.txt
+und vergleicht beim naechsten Verbinden den Vergleichscode. Eine neue
+client.key heisst: neu koppeln. Fuer eine vorhandene authorized.txt gilt:
 
     Mac       Erlaubt sind nur Zeilen mit 64 Hexziffern vorn, Leerzeilen
               und Kommentare (#). Ist die Datei unlesbar, groesser als
@@ -92,9 +139,9 @@ gilt:
               und auch mit --pair. Startzeile "... Freigabeliste
               authorized.txt NICHT LESBAR ODER BESCHAEDIGT - jede
               Gegenstelle wird abgewiesen, bis sie repariert oder mit
-              --forget geloescht ist", je Verbindung "Abgewiesen:
-              <Fingerabdruck> von <IP> - Freigabeliste authorized.txt
-              nicht lesbar oder beschaedigt".
+              --forget geloescht ist", je Verbindung (gedrosselt)
+              "Abgewiesen: <Fingerabdruck> von <IP> - Freigabeliste
+              authorized.txt nicht lesbar oder beschaedigt".
     Windows   Unlesbar oder kein UTF-8: jede Gegenstelle wird abgewiesen
               ("Freigabeliste: ... - jede Gegenstelle wird abgewiesen, bis
               die Datei repariert ist"). Ohne eine einzige gueltige Zeile
@@ -117,6 +164,11 @@ Ablage der Schluessel:
               client.key, known_hosts.txt
 
 Alle Freigaben auf dem Mac loeschen: Host einmal mit --forget starten.
+Laesst sich authorized.txt nicht loeschen, bricht er mit Rueckgabe 8 ab
+("Freigaben NICHT geloescht: <Grund> - Abbruch, die bisherigen
+Gegenstellen waeren weiter freigegeben."), statt mit den alten Freigaben
+weiterzulaufen; der Windows-Host ebenso. Eine fehlende Datei gilt als
+geloescht.
 
 Mac als Client (im Aufbau)
 --------------------------
@@ -247,10 +299,35 @@ ein codiertes Bild weg, wenn der Rueckstand schon ueber 4 MB liegt, und
 erzwingt dann ein Vollbild ("Stau ueber der harten Grenze (4096 kB):
 codiertes Bild verworfen, Vollbild erzwungen", hoechstens alle 10 s).
 Nimmt der Zuschauer im Stau 2 s lang nichts ab, gilt er als getrennt
-("Zuschauer weg: nimmt seit 2 s nichts mehr ab (<n> Byte im Stau)"). Ohne
-feste Bildrate wird ein ausgelassenes Bild nicht nachgereicht: endet eine
-Bewegung im Stau, bleibt beim Zuschauer das letzte Bild stehen, bis sich
-wieder etwas aendert.
+("Zuschauer weg: nimmt seit 2 s nichts mehr ab (<n> Byte im Stau)"). Als
+Fortschritt zaehlt, was er abnimmt - Ton, Zwischenablage und Zeiger, die
+auch im Stau hinausgehen, lassen einen lebenden Zuschauer also nicht als
+haengend erscheinen. Der Mac-Host prueft das auch bei stillem Bildschirm,
+alle 5 s.
+
+Ton und Steuernachrichten gehen an der Stauregel vorbei, haben aber eigene
+Grenzen. Ist die Leitung langsamer als der unkomprimierte Ton (rund
+3 Mbit/s), faellt Ton weg, statt das Bild zu verdraengen: der Mac-Host
+wirft ihn weg, solange der Rueckstand seit 2 s ueber der Staugrenze liegt
+("Ton verworfen: Rueckstand seit 2 s ueber der Staugrenze - Leitung
+langsamer als der Ton"), der Windows-Host, sobald mehr als 512 kB Ton
+warten (Spielmodus 128 kB; "Leitung langsamer als der Ton: Tonpaket
+verworfen (ueber 512 kB Ton wartet)").
+Beide Zeilen sind gedrosselt, die Zahl steht in der Fuenf-Sekunden-Zeile
+("Ton: ..., N verworfen" bzw. "| Ton verworfen: N"). Steuernachrichten
+wirft der Windows-Host nie weg; wer mehr als 8 MB davon nicht abnimmt,
+gilt als getrennt ("Zuschauer weg: nimmt ueber 8192 kB Steuernachrichten
+nicht ab").
+
+Ohne feste Bildrate reichen beide Hosts ein ausgelassenes letztes Bild
+nach: fiel das neueste Bild als "zu schnell", im Stau oder bei vollem
+Encoder weg und kam eine Bildzeit lang kein neueres, geht es doch noch in
+den Encoder - endet eine Bewegung so, steht beim Zuschauer trotzdem das
+Endbild. Im Stau wartet es, bis die Leitung wieder frei ist. Der Mac-Host
+misst die Bildzeit ab der Ankunft des letzten Bildes und zaehlt es in der
+Fuenf-Sekunden-Zeile als "nachgereicht"; der Windows-Host zaehlt es unter
+"nachgelegt", ohne eigene Zeile. Nachgereichte Bilder zaehlen nicht zur
+gemessenen Verzoegerung.
 
 Der Spielmodus zieht die Zuegel straffer: haeufigere Vollbilder und ein
 kleinerer erlaubter Rueckstau, damit bei Bewegung nichts auflaeuft. Er kostet
@@ -267,13 +344,16 @@ oeffnet der Client nach etwa einer Sekunde von selbst das dann aktuelle
 Standardgeraet und spielt weiter; neu verbinden muss niemand. Ist gerade
 keines da, versucht er es alle halbe Sekunde wieder. Im Protokoll steht der
 Grund ("Ton: ... - Ausgabegeraet wird neu geoeffnet") und wann es wieder
-geht ("Ton: Ausgabegeraet wieder offen").
+geht ("Ton: Ausgabegeraet wieder offen"). Fehlt schon beim Verbinden ein
+Geraet, sucht er ebenso weiter ("Ton: Ausgabegeraet oeffnen: <Grund> -
+neuer Versuch alle 500 ms", dann "Ton: Ausgabegeraet offen").
 
 Wechselt auf dem Host die Rate oder Kanalzahl des Tons - am Mac etwa ein
 Ausgabegeraet mit 44,1 kHz, auf Windows ein Geraet mit anderer Rate -, sagt
-der Host das Format neu an, und der Client baut seine Ausgabe darauf um. Der
-Mac-Host schreibt dazu "Tonformat gewechselt: <Rate> Hz, <n> Kanaele - neu
-angesagt".
+der Host das Format neu an, und der Client baut seine Ausgabe darauf um;
+den alten Ausgang gibt er vorher frei - scheitert der Umbau, bleibt es
+still statt falsch. Der Mac-Host schreibt dazu "Tonformat gewechselt:
+<Rate> Hz, <n> Kanaele - neu angesagt".
 
 Zur Bitrate: der Wert ist eine Obergrenze, und der Encoder nutzt sie auch aus.
 150 Mbit/s bedeuten bei bewegtem Bild tatsaechlich 150 Mbit/s. Fuer das eigene
@@ -358,8 +438,9 @@ Start des Hosts.
 Zwischenablage
 --------------
 
-Kopierter Text geht in beide Richtungen ueber den Eingabekanal (9002), nur
-Text, bis 4 MB. Auf jeder Seite - Mac oder Windows, Host oder Client - gilt
+Kopierter Text geht in beide Richtungen, vom Client zum Host ueber den
+Eingabekanal (9002), zurueck ueber den Bildkanal (9001); nur Text, bis
+4 MB. Auf jeder Seite - Mac oder Windows, Host oder Client - gilt
 dieselbe Regel: was ein Programm als vertraulich markiert, bleibt auf dem
 Rechner, auf dem es kopiert wurde. Auf dem Mac ist das die Markierung
 org.nspasteboard.ConcealedType (Passwortverwalter wie 1Password oder
@@ -371,15 +452,19 @@ werden nicht uebertragen, und auf dem Mac von mehreren Eintraegen nur der
 erste.
 
 Gesendet wird nur, was waehrend einer Sitzung kopiert wird; was vorher
-kopiert wurde, geht auch beim Verbinden nicht hinueber. Der Mac-Client
-liest die Zwischenablage ohne Sitzung gar nicht erst.
+kopiert wurde, geht auch beim Verbinden nicht hinueber. Ohne Gegenueber
+liest der Client (Windows wie Mac) die Zwischenablage gar nicht erst, der
+Windows-Host ebenso nur mit Zuschauer - sonst stuende auch ohne jede
+Verbindung jede Passwortkopie als "verdeckt" im Protokoll. Der Mac-Host
+fragt sie auch ohne Zuschauer ab und protokolliert, was er sieht, schickt
+aber nichts.
 
 Was ankommt, soll in keinem Verlauf landen. Auf Windows wandert es weder in
 den Verlauf (Win+V) noch in die Cloud-Zwischenablage, und Ablageverwalter
-uebergehen es. Auf dem Mac traegt es org.nspasteboard.TransientType (beim
-Mac-Host dazu AutoGeneratedType), die Kennung, an der Ablageverwalter
-Fluechtiges erkennen; der Mac-Host legt es ausserdem nur fuer diesen Mac
-ab, nicht ueber die Universelle Zwischenablage.
+uebergehen es. Auf dem Mac - Host wie Client - traegt es
+org.nspasteboard.TransientType und AutoGeneratedType, die Kennungen, an
+denen Ablageverwalter Fluechtiges erkennen, und es liegt nur auf diesem
+Mac, nicht in der Universellen Zwischenablage fuer iPhone und iPad.
 
 Benchmark
 ---------
@@ -434,21 +519,28 @@ Pruefmodus ohne Fenster, falls etwas klemmt:
     quadchroma.exe 192.168.178.194:9001 --headless
 
 Gibt alle drei Sekunden eine Zeile aus: empfangene Bilder, Bildrate, Codec,
-Decoder, Verzoegerung, Hostlast, Fehler. Dazu jede Aenderung am Decoder
-(welcher Pfad, und warum nicht NVDEC, falls so), das erste Bild jedes
-Decoders mit Groesse und Format, die Zeigerform, und FFmpegs eigene
-Meldungen. Dasselbe landet in %APPDATA%\QuadChroma\protokoll.txt, auch im
-Fensterbetrieb - die Datei beginnt bei jedem Start neu und traegt dort
-zusaetzlich die Anzeige (Karte, Feature-Level, Tearing) und je Sekunde eine
-Zeile mit Bildrate, Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern
-und der Prozessorlast des Clients. Ein Verbindungsfehler bis einschliesslich
-Handschlag und Pruefung des Host-Schluessels (Host nicht erreichbar,
-Fingerabdruck geaendert) steht dort einmal je neuem Grund mit allen
-Einzelheiten ("Verbindung: <Grund>"). Ein Fehler danach, etwa "Host hat die
-Leitung nach dem Handschlag geschlossen - dieses Geraet ist dort nicht
-gekoppelt", steht vorerst bei jedem Versuch da, also alle 2 s. Der
-Startbildschirm zeigt den Fehler in der Sprache der Oberflaeche, einen
-Wortlaut des Systems, wo es einen gibt, in Klammern dahinter.
+Decoder, Verzoegerung, Hostlast, Fehler. Ohne Verbindung steht statt der
+Verzoegerung "nicht verbunden"; der Fehler steht so da, wie ihn die
+Oberflaeche zeigt, auf Englisch mit seinem Schluessel davor, etwa
+'Fehler Some("SessionTakenOver: Another device has taken over the
+session.")', die deutschen Einzelheiten in den Protokollzeilen darueber.
+Dazu jede Aenderung am Decoder (welcher Pfad, und warum nicht NVDEC, falls
+so), das erste Bild jedes Decoders mit Groesse und Format, die Zeigerform,
+und FFmpegs eigene Meldungen. Dasselbe landet in
+%APPDATA%\QuadChroma\protokoll.txt, auch im Fensterbetrieb - die Datei
+beginnt bei jedem Start neu und traegt dort zusaetzlich die Anzeige (Karte,
+Feature-Level, Tearing) und je Sekunde eine Zeile mit Bildrate,
+Anzeigezeit, Kette, verworfenen und ausgelassenen Bildern und der
+Prozessorlast des Clients. Ein Verbindungsfehler steht dort mit
+allen Einzelheiten ("Verbindung: <Grund>"), derselbe aber nur einmal,
+solange dazwischen kein Bild ankam - auch "Host hat die Leitung nach dem
+Handschlag geschlossen - dieses Geraet ist dort nicht gekoppelt" steht
+also nicht alle 2 s da. Fehler, die sich mit dem naechsten Versuch nicht
+geben (Fingerabdruck geaendert, Datei beschaedigt oder nicht schreibbar),
+beenden die Versuche mit "Verbindung zu <Adresse> beendet: der Fehler
+bleibt bis zur Behebung - kein neuer Versuch". Der Startbildschirm zeigt
+den Fehler in der Sprache der Oberflaeche, einen Wortlaut des Systems, wo
+es einen gibt, in Klammern dahinter.
 
     quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
     quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
@@ -485,7 +577,8 @@ Ton (WASAPI-Loopback), Zeigerform, Last und Wachhalten wie beim Mac.
 Ohne Zuschauer arbeitet der Host nicht: keine Duplication, kein Encoder,
 kein Wachhalten (Leerlauf unter 1 % eines Kerns). Alles laeuft ohne
 Fenster ueber die Befehlszeile; jede Zeile steht auch in
-%APPDATA%\QuadChroma\host-protokoll.txt.
+%APPDATA%\QuadChroma\host-protokoll.txt (Drossel und Obergrenze: siehe
+"Protokoll der Hosts" oben).
 
     quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
                    [--pair] [--forget] [--konserve datei.hevc]
@@ -506,7 +599,8 @@ Fenster ueber die Befehlszeile; jede Zeile steht auch in
     --pair          die naechste unbekannte Gegenstelle wird aufgenommen
                     (Vergleichscode im Protokoll); beim allerersten Mal
                     geschieht das von selbst.
-    --forget        alle Freigaben loeschen (authorized.txt).
+    --forget        alle Freigaben loeschen (authorized.txt); scheitert
+                    das, Abbruch mit Rueckgabe 8 (wie beim Mac).
     --konserve datei.hevc   ein Annex-B-Strom (HEVC oder H.264) als
                     Bildquelle statt der Aufnahme, in Schleife im Takt der
                     Bildrate - der Pruefweg ohne Karte. Die Koennensliste
@@ -550,12 +644,13 @@ Bildrate oder ein anderer Encoder heisst Neustart der Sitzung mit
 Vollbild. Der Host verwaltet die Vollbilder selbst: alle 2*fps Bilder,
 im Gaming-Modus alle fps, dazu bei Codecwechsel und neuem Zuschauer; bei
 Stau nur, wenn ein codiertes Bild ueber der harten Grenze von 4 MB
-wegfallen musste. Nach Codecwechsel, Neustart der Sitzung und "Testbild
-aus" legt der Host das letzte Bild einmal nach, auch ohne feste Bildrate
-("Takt: letztes Bild nachgelegt (frischer Encoder)" bzw. "(Testbild
-aus)"); danach kommen ohne feste Bildrate neue Bilder nur, wenn sich auf
-dem Desktop etwas aendert. Der Mac-Host legt ohne feste Bildrate nichts
-nach.
+wegfallen musste. Nach Codecwechsel, Neustart der Sitzung, "Testbild
+aus" und fuer einen neuen Zuschauer legt der Host das letzte Bild einmal
+nach, auch ohne feste Bildrate ("Takt: letztes Bild nachgelegt (frischer
+Encoder)" bzw. "(Testbild aus)" bzw. "(neuer Zuschauer)"), dazu ohne
+eigene Zeile ein ausgelassenes Endbild (siehe Stauregel oben); sonst
+kommen ohne feste Bildrate neue Bilder nur, wenn sich auf dem Desktop
+etwas aendert.
 
 Der Host arbeitet mit Per-Monitor-DPI: bei Windows-Skalierung (125 %,
 150 %) streamt er die echte Aufloesung des Anzeigemodus. Die erste Zeile
@@ -572,8 +667,12 @@ ueber den Software-Encoder von Media Foundation (h264_mf), in der
 Koennensliste als Software gefuehrt. Der haelt bauartbedingt 16 Bilder
 zurueck (bei 60 Bildern je Sekunde rund 300 ms) - das reicht, um die
 ganze Kette Duplication -> Encoder -> Zuschauer zu pruefen, nicht fuer den
-Betrieb. Die Duplication braucht die Konsolensitzung; in einer RDP-Sitzung
-gibt es keinen DXGI-Ausgang ("Duplication nicht moeglich").
+Betrieb. Weil er ein Bild erst nach weiteren Eingaben herausgibt, kommt
+ohne feste Bildrate ein einmal nachgelegtes Bild (neuer Zuschauer, Ende
+einer Bewegung, "Testbild aus") erst mit den naechsten Aenderungen auf dem
+Desktop beim Zuschauer an. Die Duplication braucht die Konsolensitzung; in
+einer RDP-Sitzung gibt es keinen DXGI-Ausgang ("Duplication nicht
+moeglich").
 
 Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
 meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es
@@ -596,9 +695,12 @@ Verlust wieder, ehe das Geraet 30 s lief, wird er nur gezaehlt ("Ton:
 derselbe Verlust (...) noch N-mal, nicht einzeln protokolliert").
 
 Ein neuer Zuschauer ersetzt den alten: dessen Warteschlange wird
-verworfen, er bekommt nur noch Nachricht 10 und ist nach hoechstens 2 s
-getrennt, auch wenn er haengt. Im Protokoll steht "Zuschauer abgeloest:
-<IP>", danach je nach Zustand des alten:
+verworfen; er bekommt nur noch den Rest des Pakets, das gerade hinausgeht,
+und dann Nachricht 10 (kam er ganz frisch, vorher noch seine Begruessung).
+Solange er dabei abnimmt, wartet der Host, hoechstens 15 s; nimmt er 2 s
+lang nichts ab, wird seine Leitung gekappt. Der neue Zuschauer laeuft
+waehrenddessen schon. Im Protokoll steht "Zuschauer abgeloest: <IP>",
+danach je nach Zustand des alten:
 
     "Abloesung an <IP> gemeldet"
                     Nachricht 10 liegt im Sendepuffer des Kernels;
@@ -606,14 +708,19 @@ getrennt, auch wenn er haengt. Im Protokoll steht "Zuschauer abgeloest:
     "Abloesung an <IP> nicht zugestellt: <Fehler>"
                     der alte war schon weg oder hat sie binnen 1 s
                     nicht abgenommen.
-    "Abgeloester Zuschauer <IP> nimmt nichts mehr ab - Bildleitung gekappt"
-                    er hing noch an einem aelteren Paket; Nachricht 10
-                    erreicht ihn dann nicht.
+    "Abgeloester Zuschauer <IP> nimmt nichts mehr ab (nach N s) -
+     Bildleitung gekappt"
+                    er hat 2 s lang nichts abgenommen, oder die 15 s
+                    sind um; Nachricht 10 erreicht ihn dann nicht.
 
-Meist steht nur eine davon da. Wird das aeltere Paket erst nach mehr als
-1 s fertig, kann die Frist von 2 s ablaufen, waehrend Nachricht 10 noch
-haengt: dann steht erst "... gekappt" und gleich danach "... nicht
+Meist steht nur eine davon da. Laufen die 15 s ab, waehrend Nachricht 10
+noch haengt, steht erst "... gekappt" und gleich danach "... nicht
 zugestellt: <Fehler>".
+
+Der neue Zuschauer erbt nichts vom alten: ein Testbild endet ("Testbild
+aus (Zuschauer gewechselt)"), eine laufende Meldung "kein Bildschirm"
+bekommt er erneut, und der Host legt ihm das letzte Bild einmal nach, auch
+bei stillem Desktop ("Takt: letztes Bild nachgelegt (neuer Zuschauer)").
 
 Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
 laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.

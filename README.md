@@ -33,16 +33,19 @@ Datenschutz & Sicherheit:
 
 Ohne Zuschauer tut der Host nichts: keine Aufnahme, kein Encoder (0,6 % Last im
 Leerlauf). Aufgenommen wird der Hauptbildschirm, `--display n` wählt einen anderen.
+Sein Protokoll steht in `/tmp/quadchroma-m1.log`; über 8 MB wandert es nach
+`/tmp/quadchroma-m1.alt.log` und beginnt neu.
 
 Auf Windows einfach starten:
 
     quadchroma.exe
 
 Der Host ruft sich alle zwei Sekunden im lokalen Netz aus, erscheint also von selbst
-im Startbildschirm. Drei Kanäle: 9001 Bild und Ton, 9002 Eingaben und Zwischenablage,
-9003 die Bekanntgabe. Was der Client entscheidet (Decoder, Anzeige, Zeigerform) und
-was FFmpeg dazu sagt, steht in `%APPDATA%\QuadChroma\protokoll.txt`; die Bedienung
-im Einzelnen beschreibt `BENUTZUNG.txt`.
+im Startbildschirm. Drei Kanäle: 9001 Bild und Ton (und alles vom Host zum Client),
+9002 Eingaben und Zwischenablage vom Client, 9003 die Bekanntgabe. Was der Client
+entscheidet (Decoder, Anzeige, Zeigerform) und was FFmpeg dazu sagt, steht in
+`%APPDATA%\QuadChroma\protokoll.txt`; die Bedienung im Einzelnen beschreibt
+`BENUTZUNG.txt`.
 
 ### Windows-Client bauen
 
@@ -147,26 +150,39 @@ Bildkanals in seinen Handschlag auf — wer sie nicht hat, kommt dort nicht
 hinein. Damit kann niemand die Tastatur des Macs übernehmen, ohne vorher den
 Bildkanal legitim aufgebaut zu haben. Die Prüfsumme weist nur die Sitzung aus,
 nicht den Host; deshalb vergleicht der Client am Eingabekanal zusätzlich den
-Schlüssel der Gegenstelle mit dem des Bildkanals, und Tasten und Zwischenablage
-gehen nur an denselben Host. Der Host bindet den Eingabekanal an genau einen
-Zuschauer: Löst ein neuer ihn ab oder reißt sein Bild ab, kappt er ihn und
-lässt dessen gedrückte Tasten und Maustasten los.
+Schlüssel der Gegenstelle mit dem des Bildkanals, noch im Handschlag und bevor
+er sich selbst ausweist, und Tasten und Zwischenablage gehen nur an denselben
+Host. Der Host bindet den Eingabekanal an genau einen Zuschauer: Löst ein neuer
+ihn ab oder reißt sein Bild ab, kappt er ihn und lässt dessen gedrückte Tasten
+und Maustasten los.
 
 Freigabe: Solange der Host noch keine Freigabeliste hat, nimmt er die erste
 Gegenstelle von selbst auf (der Mac-Host auch bei einer leeren Datei mit 0 Byte),
 danach braucht jedes neue Gerät einen Host, der mit `--pair` gestartet wurde. Der
-Client merkt sich den Fingerabdruck des Hosts und verweigert die Verbindung,
-wenn er sich ändert. Eine Liste oder ein Schlüssel, die vorhanden, aber unlesbar
-oder beschädigt sind, gelten nie als erster Start: Dann wird abgewiesen statt neu
-gekoppelt, und kein Schlüssel wird still ersetzt (Einzelheiten in `BENUTZUNG.txt`).
+Client merkt sich den Fingerabdruck des Hosts und prüft ihn ebenfalls im
+Handschlag, bevor er sich ausweist. Hat er sich geändert, bricht der Client dort
+ab: Der Host nimmt ihn gar nicht erst an, ein laufender Zuschauer bleibt
+ungestört, und der Client versucht es nicht alle 2 s erneut, sondern wartet, bis
+man selbst neu verbindet. Eine Liste oder ein Schlüssel, die vorhanden, aber
+unlesbar oder beschädigt sind, gelten nie als erster Start: Dann wird abgewiesen
+statt neu gekoppelt, und kein Schlüssel wird still ersetzt (Einzelheiten in
+`BENUTZUNG.txt`).
 
 Jeder Handschlag hat eine Gesamtfrist (Host 5 s, Client 3 s) und läuft beim Host
 in einem eigenen Faden, höchstens 32 gleichzeitig je Port und nur wenige je
-Absender. Wer schweigt oder tröpfelt, hält nur seinen eigenen Platz.
+Absender. Wer schweigt oder tröpfelt, hält nur seinen eigenen Platz. Was jeder im
+Netz ohne Kopplung auslösen kann — gescheiterte Handschläge, unbekannte
+Gegenstellen, Eingabekanäle ohne Bild —, steht gedrosselt im Hostprotokoll:
+höchstens alle 10 s eine Zeile je Art (beim Mac-Host je Art und Adresse), mit
+der Zahl der unterdrückten. Beide Hosts begrenzen ihr Protokoll auf 8 MB und
+schieben den älteren Teil in eine `.alt`-Datei.
 
 Ein Zuschauer zur Zeit: Verbindet sich ein anderes gekoppeltes Gerät, übernimmt
 es die Sitzung. Das bisherige bekommt vorher Nachricht 10, zeigt "Ein anderes
-Gerät hat die Sitzung übernommen." und verbindet sich nicht von selbst neu.
+Gerät hat die Sitzung übernommen." und verbindet sich nicht von selbst neu. Der
+neue Zuschauer erbt nichts vom alten: Ein Testbild endet, und er bekommt auch bei
+stillem Bildschirm gleich ein erstes Bild (Ausnahme: der Software-Encoder des
+Windows-Hosts, siehe `BENUTZUNG.txt`).
 
 Auf der Mac-Seite ist das Muster eigens umgesetzt (rund 400 Zeilen C auf
 Monocypher), auf der Windows-Seite kommt die bekannte Rust-Umsetzung zum
@@ -180,10 +196,12 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Testbild und Codecwechsel auf d3d11, eine AV1-fähige Karte), bei 125/150 %
   Skalierung, an gedrehten Ausgängen und Handhelds mit hochkantem Panel und mit
   echtem Tongerät; die Stauregel beider Hosts auf einer echten, zu langsamen Leitung
-  und im Spielmodus bei hoher Datenrate; der Mac-Host nach einem Neubau
-  (Zuschauerwechsel mit Nachricht 10, Tonformat mit 44,1 kHz, Ablageverwalter,
-  beschädigte Freigabeliste); der Windows-Client mit zwei NVIDIA-Karten, bei
-  Tonverlust und auf einem frischen Windows ohne Visual-C++-Laufzeit
+  (auch unter der Tonrate) und im Spielmodus bei hoher Datenrate; der Mac-Host nach
+  einem Neubau (Zuschauerwechsel mit Nachricht 10, Nachreichen bei stillem
+  Bildschirm, Tonformat mit 44,1 kHz, Ablageverwalter, beschädigte Freigabeliste);
+  der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
+  das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
+  Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern
 - Veröffentlichung: ein Lizenzpaket für die Binärdateien (GPL- und LGPL-Text, Hinweise
   der Rust-Abhängigkeiten, der zu den DLLs passende FFmpeg-Quellstand samt
   Bauangaben) und eine Lizenz für das Projekt selbst; Developer-ID-Signatur und
@@ -193,7 +211,8 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   bekanntem Namen ein anderes Gerät von einer neuen Adresse, gilt es als Erstkontakt;
   dann schützt nur der Vergleichscode.
 - Die Zwischenablage geht während einer Sitzung auch dann hinüber, wenn das Fenster
-  des Clients keinen Fokus hat.
+  des Clients keinen Fokus hat. Der Mac-Host fragt sie auch ohne Zuschauer ab
+  (gesendet wird dann nichts); Client und Windows-Host lesen sie nur mit Gegenüber.
 - Kopplungsdialog in der Oberfläche statt Kommandozeilenschalter
 - Rollenwahl (Windows als Host): `--host` ist da (Zuschauerplatz, Kopplung, Bekanntgabe,
   Eingaben, Zwischenablage, Desktop Duplication, Encoder über NVENC bzw. ohne NVIDIA
@@ -221,9 +240,13 @@ Rückgabe ist die Zahl der Fehler.
 
 - `host/annahmetest.c`: Handschlagfrist, Plätze und Verdrängen, Freigabeliste,
   `host.key`. Loopback ab Port 19000, eigenes `HOME`, rund 25 s.
-- `host/hosttest.m`: bindet `main.m` ein und prüft Zuschauerwechsel (Nachricht 10),
-  Stauregel, Ansage des Tonformats und AV1 in der Könnensliste. Loopback ab Port
-  19100, rund 50 s.
+- `host/hosttest.m`: bindet `main.m` ein und prüft Drossel (je Art und Adresse) und
+  Obergrenze des Protokolls, Zuschauerwechsel (Nachricht 10) samt Testbild-Rest,
+  Abbau zwischen Hochfahren und Eintragen, Nachreichen bei stillem Bildschirm,
+  Codecwechsel ohne Zuschauer, Stauregel samt Ton im Stau, Ansage des Tonformats
+  und AV1 in der Könnensliste. Loopback ab Port 19100 und 19400/19450, eigenes
+  `HOME` unter `$TMPDIR`, rund 80 s. Nutzt kurz einen echten kleinen
+  HEVC-Encoder (640×360) — nicht während eines Streams starten.
 - `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, auf einer eigenen
   benannten Ablage statt der allgemeinen.
 
@@ -244,14 +267,16 @@ clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c
 ```
 
 `noisetest` ohne Argument ist der Selbsttest der Kryptoschicht ("OK", sonst die
-Stelle des Fehlers); mit einem Port wartet er auf den Gegentest der Rust-Seite
-(`quadchroma --noisetest adresse:port`).
+Stelle des Fehlers), einschließlich eines gescheiterten Handschlags, nach dem kein
+DH-Ergebnis auf dem Stapel bleiben darf; mit einem Port wartet er auf den
+Gegentest der Rust-Seite (`quadchroma --noisetest adresse:port`).
 
-Die Rust-Seite prüft sich mit `cargo test --release` in `client\` bzw. `client/`. Auf
-Windows gehört der `bin`-Ordner von FFmpeg in den `PATH`, und `APPDATA` sollte auf
-einen eigenen Ordner zeigen: Ein Test beschreibt die Zwischenablage der Sitzung und
-schreibt ins Protokoll. Auf dem Mac mit `-- --skip clipboard`, sonst lesen und
-beschreiben Tests die echte Zwischenablage.
+Die Rust-Seite prüft sich mit `cargo test --release` in `client\` bzw. `client/`;
+mehrere Tests brauchen Loopback (TCP über 127.0.0.1). Auf Windows gehört der
+`bin`-Ordner von FFmpeg in den `PATH`, und `APPDATA` sollte auf einen eigenen Ordner
+zeigen: Ein Test beschreibt die Zwischenablage der Sitzung und schreibt ins
+Protokoll. Auf dem Mac mit `-- --skip clipboard`, sonst lesen und beschreiben Tests
+die echte Zwischenablage.
 
 ## Aufbau
 
