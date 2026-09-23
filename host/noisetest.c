@@ -45,7 +45,10 @@ static int write_msg(int fd, const uint8_t *buf, size_t len) {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
+        void (*vorher)(uint8_t *, size_t) = qc_random;
         int r = qc_noise_selftest();
+        // Der Selbsttest leiht sich den Zufall nur aus (Stelle 99: nicht zurueckgegeben).
+        if (r == 0 && qc_random != vorher) r = 99;
         printf(r == 0 ? "OK\n" : "FEHLER an Stelle %d\n", r);
         return r;
     }

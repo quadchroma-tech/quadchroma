@@ -136,7 +136,7 @@ typedef struct {
     const float *p;
     uint32_t     stride;
     size_t       frames;
-} qc_chan;
+} ton_kanal;
 
 // ------------------------------------------------------------------- Abgriff
 
@@ -199,7 +199,7 @@ typedef struct {
     }
 
     BOOL planar = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-    qc_chan ch[QC_AUDIO_CHANNELS];
+    ton_kanal ch[QC_AUDIO_CHANNELS];
     BOOL ok = YES;
 
     if (planar) {
