@@ -189,43 +189,62 @@ static int hex_eq(const char *line, const uint8_t pub[32]) {
     return strncmp(line, hex, 64) == 0;
 }
 
-int qc_is_authorized(const uint8_t pub[32]) {
+// Freigabeliste zum Lesen oeffnen. Nur "gibt es nicht" ist ein leerer Anfang
+// (erster Start, oder nach --forget): dann ist *f NULL und das Ergebnis 0.
+// Jeder andere Fehler - Rechte, Besitzer nach einer Wiederherstellung, Ein-
+// und Ausgabe - heisst: unbekannt, was drinsteht. Das ist -1, und dann gilt
+// weder jemand als freigegeben noch als Erstkontakt.
+static int freigaben_oeffnen(FILE **f) {
     char path[1200];
-    if (config_path("authorized.txt", path, sizeof path)) return 0;
-    FILE *f = fopen(path, "r");
+    *f = NULL;
+    if (config_path("authorized.txt", path, sizeof path)) return -1;
+    *f = fopen(path, "r");
+    if (!*f) return errno == ENOENT ? 0 : -1;
+    return 0;
+}
+
+int qc_is_authorized(const uint8_t pub[32]) {
+    FILE *f;
+    if (freigaben_oeffnen(&f)) return -1;
     if (!f) return 0;
     char line[512];
     int found = 0;
     while (fgets(line, sizeof line, f)) {
         if (hex_eq(line, pub)) { found = 1; break; }
     }
+    if (!found && ferror(f)) found = -1;
     fclose(f);
     return found;
 }
 
 int qc_authorize(const uint8_t pub[32], const char *name) {
-    if (qc_is_authorized(pub)) return 0;
+    int bek = qc_is_authorized(pub);
+    if (bek < 0) return -1;             // Liste nicht lesbar: nichts anhaengen
+    if (bek) return 0;
     char path[1200];
     if (config_path("authorized.txt", path, sizeof path)) return -1;
     FILE *f = fopen(path, "a");
     if (!f) return -1;
-    for (int i = 0; i < 32; i++) fprintf(f, "%02x", pub[i]);
+    int fehler = 0;
+    for (int i = 0; i < 32; i++) if (fprintf(f, "%02x", pub[i]) < 0) fehler = 1;
     char fp[24];
     qc_fingerprint(pub, fp);
-    fprintf(f, "  %s  %s\n", fp, name ? name : "-");
-    fclose(f);
+    if (fprintf(f, "  %s  %s\n", fp, name ? name : "-") < 0) fehler = 1;
+    // Geschrieben wird erst beim Schliessen - erst danach steht fest, ob
+    // die Freigabe wirklich in der Liste steht.
+    if (fclose(f) == EOF) fehler = 1;
     chmod(path, 0600);
-    return 0;
+    return fehler ? -1 : 0;
 }
 
 int qc_authorized_count(void) {
-    char path[1200];
-    if (config_path("authorized.txt", path, sizeof path)) return 0;
-    FILE *f = fopen(path, "r");
+    FILE *f;
+    if (freigaben_oeffnen(&f)) return -1;
     if (!f) return 0;
     char line[512];
     int n = 0;
     while (fgets(line, sizeof line, f)) if (strlen(line) > 64) n++;
+    if (ferror(f)) n = -1;
     fclose(f);
     return n;
 }

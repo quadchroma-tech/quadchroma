@@ -42,12 +42,13 @@ int qc_chan_read(qc_chan *c, void *buf, size_t n);
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]);
 
 /// Ist dieser oeffentliche Schluessel schon freigegeben?
+/// 1 = ja, 0 = nein (auch: es gibt noch keine Liste), -1 = Liste nicht lesbar.
 int qc_is_authorized(const uint8_t pub[32]);
 
-/// Schluessel dauerhaft freigeben.
+/// Schluessel dauerhaft freigeben. 0 erst, wenn er wirklich in der Liste steht.
 int qc_authorize(const uint8_t pub[32], const char *name);
 
-/// Wie viele Gegenstellen sind bisher freigegeben?
+/// Wie viele Gegenstellen sind bisher freigegeben? -1 = Liste nicht lesbar.
 int qc_authorized_count(void);
 
 #endif

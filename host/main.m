@@ -428,18 +428,33 @@ static void *accept_thread(void *arg) {
         qc_sas(chan->hh, sas);
 
         // Freigabe: bekannte Gegenstelle, oder das Kopplungsfenster steht offen.
-        BOOL known = qc_is_authorized(chan->peer) ? YES : NO;
-        if (!known) {
-            if (atomic_load(&g_pair_open) || qc_authorized_count() == 0) {
-                qc_authorize(chan->peer, ip);
-                logf_(@"Neue Gegenstelle gekoppelt: %s (%s), Vergleichscode %s", fp, ip, sas);
-                atomic_store(&g_pair_open, 0);
+        // Erstkontakt heisst: es gibt nachweislich noch keine Freigabe. Eine Liste,
+        // die da ist, sich aber nicht lesen laesst, ist kein Erstkontakt - dann
+        // kommt niemand herein, auch kein Bekannter.
+        int known = qc_is_authorized(chan->peer);
+        int anz = known == 0 ? qc_authorized_count() : 0;
+        BOOL rein = known > 0;
+        if (known < 0 || anz < 0) {
+            logf_(@"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar", fp, ip);
+        } else if (!known) {
+            if (atomic_load(&g_pair_open) || anz == 0) {
+                if (qc_authorize(chan->peer, ip) != 0) {
+                    // Ohne gespeicherte Freigabe keine Sitzung - und das
+                    // Kopplungsfenster bleibt, wie es war.
+                    logf_(@"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
+                } else {
+                    logf_(@"Neue Gegenstelle gekoppelt: %s (%s), Vergleichscode %s", fp, ip, sas);
+                    atomic_store(&g_pair_open, 0);
+                    rein = YES;
+                }
             } else {
                 logf_(@"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
-                free(chan);
-                close(fd);
-                continue;
             }
+        }
+        if (!rein) {
+            free(chan);
+            close(fd);
+            continue;
         }
 
         // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
@@ -1871,8 +1886,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     {
         char fp[24];
         qc_fingerprint(g_id_pub, fp);
-        logf_(@"Fingerabdruck dieses Hosts: %s   freigegebene Gegenstellen: %d",
-              fp, qc_authorized_count());
+        int anz = qc_authorized_count();
+        if (anz < 0)
+            logf_(@"Fingerabdruck dieses Hosts: %s   Freigabeliste authorized.txt NICHT LESBAR - "
+                   "jede Gegenstelle wird abgewiesen, bis sie wieder lesbar ist", fp);
+        else
+            logf_(@"Fingerabdruck dieses Hosts: %s   freigegebene Gegenstellen: %d", fp, anz);
     }
     if ([args containsObject:@"--pair"]) {
         atomic_store(&g_pair_open, 1);
