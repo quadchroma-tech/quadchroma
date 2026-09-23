@@ -85,7 +85,20 @@ static BOOL profile_supported(VTCompressionSessionRef s, CFStringRef profile) {
 // --------------------------------------------------------------- Netzwerk
 
 // Ein Zuschauer zur Zeit. Mehrere Sitzungen kommen spaeter, wenn das Protokoll steht.
-#define QC_BACKLOG_LIMIT (2 * 1024 * 1024)   // ungesendete Bytes, ab denen wir Bilder verwerfen
+// Ungesendete Bytes, ab denen Bilder gar nicht erst in den Encoder gehen
+// (stau_vor_dem_encoder). 2 MB, weil ein einzelnes Vollbild selbst fast so
+// gross wird - aus dem Hostprotokoll: im Stau des Spielmodus bei 500 Mbit/s
+// ging nur noch ein Vollbild nach dem anderen raus, je 1,2-2,0 MB -, und
+// nach einem Vollbild soll auf einer gesunden Leitung kein Bild ausfallen.
+// Auf einer zu langsamen Leitung sind das hoechstens 2 MB Warteschlange, so
+// viel wie vorher der volle Sendepuffer. Der Sendepuffer (tune_socket) ist
+// doppelt so gross, damit die Regel ueberhaupt greifen kann.
+#define QC_BACKLOG_LIMIT (2 * 1024 * 1024)
+// Stau ohne jeden Fortschritt: so lange, dann gilt der Zuschauer als weg -
+// dieselbe Frist wie SO_SNDTIMEO in tune_socket. Die greift im Stau nicht
+// mehr, weil dann nichts mehr codiert und gesendet wird; ohne diese Frist
+// bliebe ein eingefrorener Zuschauer (Ton aus) fuer immer eingetragen.
+#define QC_STAU_FRIST_US (2 * 1000000ull)
 
 static _Atomic int g_client_fd = -1;
 static _Atomic int g_force_key = 0;
@@ -108,6 +121,10 @@ static char g_last_sas[8] = {0};
 // jeder Verlust des Bildkanals beginnt eine neue Sitzung und bricht den
 // Eingabekanal der alten ab.
 static uint64_t g_sitzung = 0;              // durch g_send_mtx geschuetzt
+// Laufender Stau: seit wann ohne Fortschritt (Hostuhr in us, 0 = kein Stau)
+// und der Rueckstand zu diesem Zeitpunkt. Durch g_send_mtx geschuetzt.
+static uint64_t g_stau_seit = 0;
+static int g_stau_rueckstand = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
 // Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
 // nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
@@ -279,7 +296,12 @@ static void tune_socket(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-    int snd = 1 << 21;                       // 2 MB Sendepuffer
+    // 4 MB Sendepuffer: die Stauregel (QC_BACKLOG_LIMIT) soll die Grenze
+    // sein, nicht ein blockierendes Senden. SO_NWRITE kann nie ueber die
+    // Puffergroesse steigen - mit 2 MB griff die 2-MB-Regel ohne Spielmodus
+    // nie. Unter der Regel liegen hoechstens 2 MB plus die Bilder, die schon
+    // im Encoder stecken, im Kernel; mehr Verzoegerung als vorher entsteht nicht.
+    int snd = 1 << 22;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd);
     int lowat = 64 * 1024;                   // nicht mehr als das im Kernel stauen lassen
     setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat);
@@ -601,6 +623,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     char fp_alt[24] = {0};
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
+    g_stau_seit = 0;                    // ein Stau des Vorgaengers zaehlt nicht fuer ihn
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
     memcpy(g_last_sas, sas, sizeof g_last_sas);
@@ -1285,16 +1308,12 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
         // Daten, sonst faengt er mitten in einem Bild ohne Kopfdaten an.
         if (!atomic_load(&g_vid_ready)) { pthread_mutex_unlock(&g_send_mtx); return; }
         if (atomic_load(&g_wait_key) && !keyframe) { pthread_mutex_unlock(&g_send_mtx); return; }
-        // Staut es sich, werfen wir lieber ein Bild weg als Verzoegerung aufzubauen.
-        // g_wait_key bleibt dabei stehen: faellt hier das erste Vollbild einer
-        // neuen Sitzung weg, muss der Zuschauer weiter auf ein Vollbild warten -
-        // sonst bekaeme sein Decoder ein Zwischenbild ohne Bezugsbild.
-        if (backlog_bytes(fd) > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
-            atomic_fetch_add(&g_skipped_backlog, 1);
-            atomic_store(&g_force_key, 1);
-            pthread_mutex_unlock(&g_send_mtx);
-            return;
-        }
+        // Gegen Stau wird VOR dem Encoder verworfen (stau_vor_dem_encoder):
+        // ein codiertes Bild geht immer raus. Fiele es hier weg, fehlte den
+        // folgenden Zwischenbildern ihr Bezug, das naechste Bild muesste ein
+        // Vollbild sein - und auf einer knappen Leitung kaemen dann nur noch
+        // Vollbilder: so geschehen im Spielmodus bei 500 Mbit/s, rund 20
+        // Bilder je Sekunde, jedes ein Vollbild (Hostprotokoll).
         // Erst wenn das Bild wirklich rausgeht, ist das Warten vorbei.
         atomic_store(&g_wait_key, 0);
         if (qc_chan_send(g_vid, iov, cnt) != 0) {
@@ -1696,6 +1715,48 @@ static void codec_wechseln(int idx) {
 // Verwerfen oder bei einem Fehler liegen bleiben koennte.
 #define QC_ZETTEL(t_cap_us, wiederholt) ((void *)(uintptr_t)(((uint64_t)(t_cap_us) << 1) | ((wiederholt) ? 1u : 0u)))
 
+// Stauregel. Liegt beim Zuschauer mehr als QC_BACKLOG_LIMIT (Spielmodus: ein
+// Viertel) ungesendet im Kernel, geht das naechste Bild gar nicht erst in den
+// Encoder - wie beim vollen Encoder: lieber ein Auslasser als eine
+// Warteschlange. Der Encoder sieht dann nur weniger Bilder, jedes codierte
+// hat sein Bezugsbild, und es braucht kein erzwungenes Vollbild.
+// Nimmt der Zuschauer im Stau QC_STAU_FRIST_US lang gar nichts ab, gilt er
+// als weg; sonst liefe fuer eine eingefrorene Gegenstelle alles weiter.
+// YES = dieses Bild auslassen.
+static BOOL stau_vor_dem_encoder(void) {
+    BOOL stau = NO;
+    pthread_mutex_lock(&g_send_mtx);
+    int fd = atomic_load(&g_client_fd);
+    if (fd >= 0 && atomic_load(&g_vid_ready)) {
+        int rueckstand = backlog_bytes(fd);
+        if (rueckstand > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
+            stau = YES;
+            // Fortschritt heisst: der Rueckstand ist seit dem letzten Blick
+            // kleiner geworden, die Gegenstelle nimmt also noch etwas ab.
+            uint64_t jetzt = now_us();
+            if (!g_stau_seit || rueckstand < g_stau_rueckstand) {
+                g_stau_seit = jetzt;
+                g_stau_rueckstand = rueckstand;
+            } else if (jetzt - g_stau_seit >= QC_STAU_FRIST_US) {
+                logf_(@"Zuschauer weg: nimmt seit %llu s nichts mehr ab (%d Byte im Stau)",
+                      QC_STAU_FRIST_US / 1000000ull, rueckstand);
+                atomic_store(&g_vid_ready, 0);
+                atomic_store(&g_client_fd, -1);
+                stream_herunterfahren_anstossen();
+                close(fd);
+                eingabe_abbrechen();
+                qc_chan_free(g_vid);
+                g_vid = NULL;
+                g_stau_seit = 0;
+            }
+        } else {
+            g_stau_seit = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_send_mtx);
+    return stau;
+}
+
 static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, int wiederholt) {
     if (!pb || !g_session) return;
     // Rund um einen Formatwechsel der Aufnahme kann noch ein Bild im alten
@@ -1712,6 +1773,9 @@ static void encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
         }
         return;
     }
+    // Vor dem Abholen eines erzwungenen Vollbilds: das kommt dann mit dem
+    // naechsten Bild, das wirklich codiert wird.
+    if (stau_vor_dem_encoder()) { atomic_fetch_add(&g_skipped_backlog, 1); return; }
     NSDictionary *opts = nil;
     if (atomic_exchange(&g_force_key, 0))
         opts = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
