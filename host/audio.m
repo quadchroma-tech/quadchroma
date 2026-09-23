@@ -292,9 +292,15 @@ void qc_audio_configure(SCStreamConfiguration *cfg) {
 void qc_audio_attach(SCStream *stream, void (*send_cb)(const float *pcm, size_t frames, uint32_t rate, uint8_t channels)) {
     if (!stream || !send_cb) return;
     atomic_store(&g_send, (qc_send_fn)send_cb);
-    g_expect = kCMTimeInvalid;
-    g_have_expect = NO;
     if (g_tap) {
+        // g_expect gehoert der Ton-Warteschlange. Ein spaeter Rueckruf des
+        // alten Stroms kann dort noch laufen, deshalb wird auch das Vergessen
+        // dort eingereiht - vor jedem Puffer des neuen Stroms, der erst nach
+        // startCapture kommt.
+        dispatch_async(g_queue, ^{
+            g_expect = kCMTimeInvalid;
+            g_have_expect = NO;
+        });
         // Ein neuer Strom nach dem Leerlauf (kein Zuschauer - kein Strom):
         // der Abgriff bleibt derselbe, aber der neue Strom kennt ihn nicht.
         // Ohne diese Anmeldung gab es Ton nur in der ersten Sitzung nach
@@ -311,6 +317,9 @@ void qc_audio_attach(SCStream *stream, void (*send_cb)(const float *pcm, size_t 
 
     // Eigene serielle Warteschlange: der Ton wartet nie hinter einem Vollbild.
     // Hoch eingestufte Guete, damit er unter Last nicht liegen bleibt.
+    // Noch kein Abgriff, also auch noch kein Rueckruf: direkt setzen.
+    g_expect = kCMTimeInvalid;
+    g_have_expect = NO;
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
         DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
     g_queue = dispatch_queue_create("tech.quadchroma.audio", attr);

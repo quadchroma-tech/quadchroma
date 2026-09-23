@@ -37,6 +37,7 @@
 #import "zeiger.h"
 #import "testbild.h"
 #include "qc_secure.h"
+#include "qc_annahme.h"
 #import "last.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
@@ -103,6 +104,15 @@ static uint8_t g_vid_hh[QC_HASHLEN];        // Pruefsumme des Bildkanals
 static uint8_t g_vid_peer[32];              // Schluessel des verbundenen Clients
 static _Atomic int g_pair_open = 0;         // Kopplungsfenster offen?
 static char g_last_sas[8] = {0};
+// Der Eingabekanal gilt nur, solange sein Bildkanal lebt. Jeder Wechsel und
+// jeder Verlust des Bildkanals beginnt eine neue Sitzung und bricht den
+// Eingabekanal der alten ab.
+static uint64_t g_sitzung = 0;              // durch g_send_mtx geschuetzt
+static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
+// Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
+// nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
+// Kopplungsfenster schluepfen.
+static pthread_mutex_t g_freigabe_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 // Was sich im Betrieb verstellen laesst. Der Client schickt Wuensche, der Host
 // setzt sie um und meldet zurueck, was wirklich gilt.
@@ -254,6 +264,17 @@ static _Atomic int g_formattest = 0;
 static _Atomic long long g_enc_us = 0;
 static _Atomic long g_enc_n = 0;
 
+// Gegen halboffene Leichen: eine Gegenstelle, die ohne Abschied verschwindet
+// (Deckel zu, WLAN weg), faellt nach rund 16 s Stille auf - 10 s warten, dann
+// drei Proben im Abstand von 2 s.
+static void keepalive_setzen(int fd) {
+    int one = 1, idle = 10, intv = 2, cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intv, sizeof intv);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt);
+}
+
 static void tune_socket(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -262,6 +283,24 @@ static void tune_socket(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &snd, sizeof snd);
     int lowat = 64 * 1024;                   // nicht mehr als das im Kernel stauen lassen
     setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof lowat);
+    keepalive_setzen(fd);
+    // Eine Gegenstelle, die nichts mehr annimmt (eingefroren, Deckel zu),
+    // darf den Versand nicht fuer immer anhalten: er laeuft unter g_send_mtx,
+    // und dahinter wartet auch der naechste Zuschauer. Zwei Sekunden ohne
+    // jeden Fortschritt, dann gilt sie als weg.
+    struct timeval sto = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof sto);
+}
+
+// Kein Bild, keine Eingabe: neue Sitzung, und der Eingabekanal der alten wird
+// abgebrochen. Nur unter g_send_mtx rufen. shutdown statt close: der
+// Eingabefaden kehrt aus seinem Lesen zurueck und schliesst seinen fd selbst,
+// ebenfalls unter g_send_mtx - so trifft das shutdown nie eine Nummer, die
+// inzwischen einer anderen Verbindung gehoert.
+static void eingabe_abbrechen(void) {
+    g_sitzung++;
+    int alt = atomic_exchange(&g_in_fd, -1);
+    if (alt >= 0) shutdown(alt, SHUT_RDWR);
 }
 
 static int backlog_bytes(int fd) {
@@ -285,6 +324,9 @@ static void send_small(uint8_t type, const void *data, size_t len) {
             atomic_store(&g_vid_ready, 0);
             atomic_store(&g_client_fd, -1);
             close(fd);
+            eingabe_abbrechen();
+            qc_chan_free(g_vid);
+            g_vid = NULL;
             stream_herunterfahren_anstossen();
         }
     }
@@ -401,101 +443,155 @@ static void codecs_senden(void) {
     send_small(QC_MSG_CODECS, buf, n);
 }
 
-static void *accept_thread(void *arg) {
-    int listen_fd = (int)(intptr_t)arg;
-    for (;;) {
-        struct sockaddr_in peer; socklen_t plen = sizeof peer;
-        int fd = accept(listen_fd, (struct sockaddr *)&peer, &plen);
-        if (fd < 0) { if (errno == EINTR) continue; break; }
-        tune_socket(fd);
-        char ip[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+// Annahme: Handschlaege laufen je Verbindung in einem eigenen Faden (siehe
+// qc_annahme.h). Bis zu 32 gleichzeitig je Port, 4 je Adresse; ist alles
+// belegt, weicht der aelteste Handschlag dem neuen. Faeden sind billig, und
+// ein Zuschauer braucht je Port nur einen Platz fuer ein paar Millisekunden.
+#define QC_HANDSCHLAEGE        32
+#define QC_HANDSCHLAEGE_JE_IP  4
+// Warteschlange im Kernel: die Annahme ist schnell, aber bei Andrang soll eine
+// neue Verbindung nicht schon dort verworfen werden.
+#define QC_LISTEN_WARTESCHLANGE 32
 
-        // Zuerst der Handschlag. Vor ihm geht kein einziges Byte Nutzlast raus.
-        qc_chan *chan = malloc(sizeof *chan);
-        if (!chan) { close(fd); continue; }
-        int hr = qc_chan_accept(chan, fd, g_id_priv,
-                                (const uint8_t *)QC_PRO_VIDEO, strlen(QC_PRO_VIDEO));
-        if (hr != 0) {
-            logf_(@"Handschlag mit %s gescheitert (%d)", ip, hr);
-            free(chan);
-            close(fd);
-            continue;
-        }
+static void annahme_andrang(long verdraengt, const struct sockaddr_in *verdraengt_von,
+                            long abgewiesen, const struct sockaddr_in *abgewiesen_von, void *ctx) {
+    char ip[INET_ADDRSTRLEN] = {0};
+    if (verdraengt) {
+        inet_ntop(AF_INET, &verdraengt_von->sin_addr, ip, sizeof ip);
+        logf_(@"%s: Andrang - %ld laufende(r) Handschlag/Handschlaege fuer neuere Verbindungen abgebrochen, zuletzt der von %s",
+              (const char *)ctx, verdraengt, ip);
+    }
+    if (abgewiesen) {
+        inet_ntop(AF_INET, &abgewiesen_von->sin_addr, ip, sizeof ip);
+        logf_(@"%s: Andrang - %ld Verbindung(en) sofort geschlossen (zu viele Faeden), zuletzt von %s",
+              (const char *)ctx, abgewiesen, ip);
+    }
+}
 
-        char fp[24], sas[8];
-        qc_fingerprint(chan->peer, fp);
-        qc_sas(chan->hh, sas);
+static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
+    struct sockaddr_in peer = *von;
+    tune_socket(fd);
+    char ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
 
-        // Freigabe: bekannte Gegenstelle, oder das Kopplungsfenster steht offen.
-        BOOL known = qc_is_authorized(chan->peer) ? YES : NO;
-        if (!known) {
-            if (atomic_load(&g_pair_open) || qc_authorized_count() == 0) {
-                qc_authorize(chan->peer, ip);
+    // Zuerst der Handschlag. Vor ihm geht kein einziges Byte Nutzlast raus.
+    // Den fd erst nach qc_platz_frei schliessen (siehe qc_annahme.h).
+    qc_chan *chan = malloc(sizeof *chan);
+    if (!chan) { qc_platz_frei(platz); close(fd); return; }
+    int hr = qc_chan_accept(chan, fd, g_id_priv,
+                            (const uint8_t *)QC_PRO_VIDEO, strlen(QC_PRO_VIDEO));
+    if (qc_platz_frei(platz)) {
+        // Fuer eine neuere Verbindung verdraengt: schon gezaehlt und gemeldet.
+        qc_chan_free(chan);
+        close(fd);
+        return;
+    }
+    if (hr != 0) {
+        logf_(@"Handschlag mit %s gescheitert (%d)", ip, hr);
+        qc_chan_free(chan);
+        close(fd);
+        return;
+    }
+
+    char fp[24], sas[8];
+    qc_fingerprint(chan->peer, fp);
+    qc_sas(chan->hh, sas);
+
+    // Freigabe: bekannte Gegenstelle, oder das Kopplungsfenster steht offen.
+    // Erstkontakt heisst: es gibt nachweislich noch keine Freigabe. Eine Liste,
+    // die da ist, sich aber nicht lesen laesst oder beschaedigt ist, ist kein
+    // Erstkontakt - dann kommt niemand herein, auch kein Bekannter.
+    pthread_mutex_lock(&g_freigabe_mtx);
+    int known = qc_is_authorized(chan->peer);
+    int anz = known == 0 ? qc_authorized_count() : 0;
+    BOOL rein = known > 0;
+    if (known < 0 || anz < 0) {
+        logf_(@"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar oder beschaedigt", fp, ip);
+    } else if (!known) {
+        if (atomic_load(&g_pair_open) || anz == 0) {
+            if (qc_authorize(chan->peer, ip) != 0) {
+                // Ohne gespeicherte Freigabe keine Sitzung - und das
+                // Kopplungsfenster bleibt, wie es war.
+                logf_(@"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
+            } else {
                 logf_(@"Neue Gegenstelle gekoppelt: %s (%s), Vergleichscode %s", fp, ip, sas);
                 atomic_store(&g_pair_open, 0);
-            } else {
-                logf_(@"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
-                free(chan);
-                close(fd);
-                continue;
+                rein = YES;
             }
+        } else {
+            logf_(@"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
         }
-
-        // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
-        // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung.
-        if (!stream_hochfahren_sync()) {
-            logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
-            free(chan);
-            close(fd);
-            continue;
-        }
-
-        // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
-        // Fenstergroesse und Format kennt, bevor das erste Bild kommt.
-        uint8_t hello[4 + sizeof(qc_hdr) + 8];
-        memcpy(hello, QC_MAGIC, 4);
-        qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = 8 };
-        memcpy(hello + 4, &h, sizeof h);
-        strominfo_fuellen(hello + 4 + sizeof h);
-
-        pthread_mutex_lock(&g_send_mtx);
-        int old = atomic_exchange(&g_client_fd, -1);
-        atomic_store(&g_vid_ready, 0);
-        if (old >= 0 && old != fd) close(old);
-        free(g_vid);
-        g_vid = chan;
-        memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
-        memcpy(g_vid_peer, chan->peer, 32);
-        memcpy(g_last_sas, sas, sizeof g_last_sas);
-        struct iovec iov = { .iov_base = hello, .iov_len = sizeof hello };
-        int sent = qc_chan_send(g_vid, &iov, 1);
-        if (sent == 0) {
-            atomic_store(&g_client_fd, fd);
-            atomic_store(&g_vid_ready, 1);
-        }
-        pthread_mutex_unlock(&g_send_mtx);
-        if (sent != 0) { close(fd); continue; }
-
-        atomic_store(&g_force_key, 1);
-        atomic_store(&g_wait_key, 1);
-        atomic_store(&g_audio_info_sent, 0);
-        qc_zeiger_neu_senden();
-        {
-            uint8_t cur[9] = {0};
-            uint32_t m = (uint32_t)atomic_load(&g_cur_mbit);
-            uint16_t f = (uint16_t)atomic_load(&g_cur_fps);
-            memcpy(cur, &m, 4); memcpy(cur + 4, &f, 2);
-            cur[6] = (uint8_t)atomic_load(&g_cur_gaming);
-            cur[7] = (uint8_t)atomic_load(&g_cur_fixed);
-            cur[8] = (uint8_t)atomic_load(&g_cur_ton);
-            send_small(QC_MSG_SETTINGS, cur, sizeof cur);
-        }
-        codecs_senden();
-        logf_(@"Zuschauer verbunden: %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
-              ip, ntohs(peer.sin_port), fp, sas);
     }
-    return NULL;
+    pthread_mutex_unlock(&g_freigabe_mtx);
+    if (!rein) {
+        qc_chan_free(chan);
+        close(fd);
+        return;
+    }
+
+    // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
+    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung.
+    if (!stream_hochfahren_sync()) {
+        logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
+        qc_chan_free(chan);
+        close(fd);
+        return;
+    }
+
+    // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
+    // Fenstergroesse und Format kennt, bevor das erste Bild kommt.
+    uint8_t hello[4 + sizeof(qc_hdr) + 8];
+    memcpy(hello, QC_MAGIC, 4);
+    qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = 8 };
+    memcpy(hello + 4, &h, sizeof h);
+    strominfo_fuellen(hello + 4 + sizeof h);
+
+    pthread_mutex_lock(&g_send_mtx);
+    int old = atomic_exchange(&g_client_fd, -1);
+    atomic_store(&g_vid_ready, 0);
+    if (old >= 0 && old != fd) close(old);
+    eingabe_abbrechen();
+    qc_chan_free(g_vid);
+    g_vid = chan;
+    memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
+    memcpy(g_vid_peer, chan->peer, 32);
+    memcpy(g_last_sas, sas, sizeof g_last_sas);
+    struct iovec iov = { .iov_base = hello, .iov_len = sizeof hello };
+    int sent = qc_chan_send(g_vid, &iov, 1);
+    if (sent == 0) {
+        atomic_store(&g_client_fd, fd);
+        atomic_store(&g_vid_ready, 1);
+    } else {
+        qc_chan_free(g_vid);
+        g_vid = NULL;
+        // Der alte Zuschauer ist schon getrennt, der neue kam nicht an:
+        // niemand schaut zu, also laufen auch Aufnahme und Encoder nicht weiter.
+        stream_herunterfahren_anstossen();
+    }
+    pthread_mutex_unlock(&g_send_mtx);
+    if (sent != 0) {
+        logf_(@"Zuschauer %s: Begruessung liess sich nicht senden", ip);
+        close(fd);
+        return;
+    }
+
+    atomic_store(&g_force_key, 1);
+    atomic_store(&g_wait_key, 1);
+    atomic_store(&g_audio_info_sent, 0);
+    qc_zeiger_neu_senden();
+    {
+        uint8_t cur[9] = {0};
+        uint32_t m = (uint32_t)atomic_load(&g_cur_mbit);
+        uint16_t f = (uint16_t)atomic_load(&g_cur_fps);
+        memcpy(cur, &m, 4); memcpy(cur + 4, &f, 2);
+        cur[6] = (uint8_t)atomic_load(&g_cur_gaming);
+        cur[7] = (uint8_t)atomic_load(&g_cur_fixed);
+        cur[8] = (uint8_t)atomic_load(&g_cur_ton);
+        send_small(QC_MSG_SETTINGS, cur, sizeof cur);
+    }
+    codecs_senden();
+    logf_(@"Zuschauer verbunden: %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
+          ip, ntohs(peer.sin_port), fp, sas);
 }
 
 static int start_server(int port) {
@@ -508,10 +604,9 @@ static int start_server(int port) {
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { logf_(@"bind fehlgeschlagen: %s", strerror(errno)); close(fd); return -1; }
-    if (listen(fd, 4) != 0) { logf_(@"listen fehlgeschlagen: %s", strerror(errno)); close(fd); return -1; }
-    pthread_t t;
-    pthread_create(&t, NULL, accept_thread, (void *)(intptr_t)fd);
-    pthread_detach(t);
+    if (listen(fd, QC_LISTEN_WARTESCHLANGE) != 0) { logf_(@"listen fehlgeschlagen: %s", strerror(errno)); close(fd); return -1; }
+    qc_annahme_cfg cfg = { QC_HANDSCHLAEGE, QC_HANDSCHLAEGE_JE_IP, bild_verbindung, annahme_andrang, (void *)"Bildkanal" };
+    if (qc_annahme_starten(fd, &cfg) != 0) { logf_(@"Annahme fuer Port %d nicht startbar", port); close(fd); return -1; }
     return fd;
 }
 
@@ -588,10 +683,18 @@ static void start_beacon(int port) {
 #define QC_IN_SCROLL  18
 #define QC_IN_KEY     19
 
+// Einspeisen und das Mitschreiben dessen, was gedrueckt ist, laufen unter
+// g_inject_mtx. Beim Abloesen eines Eingabekanals arbeiten kurz zwei Faeden
+// (der alte beendet sein letztes Ereignis und gibt frei, der neue speist
+// schon ein) - die Sperre reiht sie hintereinander. Sie wird nie zusammen mit
+// g_send_mtx gehalten.
+static pthread_mutex_t g_inject_mtx = PTHREAD_MUTEX_INITIALIZER;
 static CGEventSourceRef g_evsrc = NULL;
 static CGEventFlags g_mods = 0;
+static uint64_t g_mods_kanal = 0;         // welcher Eingabekanal g_mods zuletzt setzte
 static CGPoint g_pos = {0, 0};
-static int g_buttons = 0;                 // Bitmaske der gedrueckten Tasten
+static int g_buttons = 0;                 // Bitmaske der gedrueckten Maustasten
+static uint64_t g_button_kanal[3] = {0};  // wer sie gedrueckt hat: links, rechts, Mitte
 static CGDirectDisplayID g_input_display = 0;
 static _Atomic long g_input_events = 0;
 
@@ -621,7 +724,7 @@ static void inject_move(float nx, float ny) {
     post(t, b);
 }
 
-static void inject_button(int button, int down, float nx, float ny) {
+static void inject_button(uint64_t kanal, int button, int down, float nx, float ny) {
     g_pos = to_display_point(nx, ny);
     CGEventType t;
     CGMouseButton b;
@@ -630,8 +733,9 @@ static void inject_button(int button, int down, float nx, float ny) {
         case 2: b = kCGMouseButtonCenter; t = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp; break;
         default: b = kCGMouseButtonLeft;  t = down ? kCGEventLeftMouseDown  : kCGEventLeftMouseUp;  break;
     }
-    if (down) g_buttons |= (1 << (button == 1 ? 1 : button == 2 ? 2 : 0));
-    else      g_buttons &= ~(1 << (button == 1 ? 1 : button == 2 ? 2 : 0));
+    int bit = button == 1 ? 1 : button == 2 ? 2 : 0;
+    if (down) { g_buttons |= (1 << bit); g_button_kanal[bit] = kanal; }
+    else      { g_buttons &= ~(1 << bit); g_button_kanal[bit] = 0; }
 
     CGEventRef e = CGEventCreateMouseEvent(g_evsrc, t, g_pos, b);
     if (!e) return;
@@ -659,13 +763,13 @@ static void inject_scroll(float dx, float dy) {
     atomic_fetch_add(&g_input_events, 1);
 }
 
-// Welche Tasten wir selbst gedrueckt haben. Reisst die Verbindung ab, geben
-// wir sie frei - sonst haelt der Mac sie fuer immer gedrueckt, und ein
-// haengendes Strg macht aus jedem weiteren Klick einen Rechtsklick.
-static uint8_t g_key_down[256] = {0};
-static pthread_mutex_t g_key_mtx = PTHREAD_MUTEX_INITIALIZER;
+// Welche Tasten wir selbst gedrueckt haben, und ueber welchen Eingabekanal
+// (0 = losgelassen). Reisst die Verbindung ab, geben wir sie frei - sonst
+// haelt der Mac sie fuer immer gedrueckt, und ein haengendes Strg macht aus
+// jedem weiteren Klick einen Rechtsklick. Nur unter g_inject_mtx.
+static uint64_t g_key_down[256] = {0};
 
-static void inject_key(uint16_t keycode, int down, uint32_t mods) {
+static void inject_key(uint64_t kanal, uint16_t keycode, int down, uint32_t mods) {
     // Umschalter aus der Client-Sicht uebernehmen: so sieht der Mac genau den
     // Zustand, den der Benutzer an seiner Tastatur haelt.
     CGEventFlags f = 0;
@@ -674,6 +778,7 @@ static void inject_key(uint16_t keycode, int down, uint32_t mods) {
     if (mods & 4) f |= kCGEventFlagMaskAlternate;
     if (mods & 8) f |= kCGEventFlagMaskCommand;
     g_mods = f;
+    g_mods_kanal = kanal;
 
     CGEventRef e = CGEventCreateKeyboardEvent(g_evsrc, (CGKeyCode)keycode, down ? true : false);
     if (!e) return;
@@ -683,12 +788,41 @@ static void inject_key(uint16_t keycode, int down, uint32_t mods) {
 
     // Mitschreiben, was gerade gedrueckt ist - das ist die Grundlage fuer das
     // Freigeben, wenn die Verbindung wegbricht.
-    if (keycode < 256) {
-        pthread_mutex_lock(&g_key_mtx);
-        g_key_down[keycode] = down ? 1 : 0;
-        pthread_mutex_unlock(&g_key_mtx);
-    }
+    if (keycode < 256) g_key_down[keycode] = down ? kanal : 0;
     atomic_fetch_add(&g_input_events, 1);
+}
+
+// Ein Ereignis aus dem Eingabekanal einspeisen - nur, solange dieser Kanal
+// noch der aktuelle ist. NO = abgeloest, nichts eingespeist. Ein Ereignis,
+// das beim Abbrechen schon hinter der Pruefung war, geht noch durch; was es
+// drueckt, traegt die Nummer dieses Kanals, und sein Faden gibt es beim
+// Beenden mit alle_tasten_loslassen wieder frei.
+static BOOL einspeisen(int fd, uint64_t kanal, uint8_t typ, const uint8_t *payload, uint32_t len) {
+    pthread_mutex_lock(&g_inject_mtx);
+    BOOL aktuell = atomic_load(&g_in_fd) == fd;
+    float f[2];
+    if (aktuell) switch (typ) {
+        case QC_IN_MOVE:
+            if (len >= 8) { memcpy(f, payload, 8); inject_move(f[0], f[1]); }
+            break;
+        case QC_IN_BUTTON:
+            if (len >= 12) { memcpy(f, payload + 4, 8); inject_button(kanal, payload[0], payload[1], f[0], f[1]); }
+            break;
+        case QC_IN_SCROLL:
+            if (len >= 8) { memcpy(f, payload, 8); inject_scroll(f[0], f[1]); }
+            break;
+        case QC_IN_KEY:
+            if (len >= 8) {
+                uint16_t kc; uint32_t mods;
+                memcpy(&kc, payload, 2);
+                memcpy(&mods, payload + 4, 4);
+                inject_key(kanal, kc, payload[2], mods);
+            }
+            break;
+        default: break;
+    }
+    pthread_mutex_unlock(&g_inject_mtx);
+    return aktuell;
 }
 
 
@@ -746,12 +880,19 @@ static void apply_settings(int mbit, int fps, int gaming, int fixed, int ton) {
           mbit, fps, gaming ? @"an" : @"aus", fixed ? @"an" : @"aus", ton ? @"an" : @"aus");
 }
 
-// Alles loslassen, was noch als gedrueckt vermerkt ist.
-static void alle_tasten_loslassen(void) {
-    pthread_mutex_lock(&g_key_mtx);
+// Alles loslassen, was dieser Eingabekanal noch als gedrueckt hinterlassen
+// hat: Tasten und Maustasten. Was ein neuerer Kanal inzwischen drueckt,
+// bleibt gedrueckt.
+static void alle_tasten_loslassen(uint64_t kanal) {
+    static const struct { CGEventType typ; CGMouseButton taste; } maus_los[3] = {
+        { kCGEventLeftMouseUp,  kCGMouseButtonLeft },
+        { kCGEventRightMouseUp, kCGMouseButtonRight },
+        { kCGEventOtherMouseUp, kCGMouseButtonCenter },
+    };
+    pthread_mutex_lock(&g_inject_mtx);
     int offen = 0;
     for (int k = 0; k < 256; k++) {
-        if (g_key_down[k]) {
+        if (g_key_down[k] == kanal) {
             g_key_down[k] = 0;
             offen++;
             CGEventRef e = CGEventCreateKeyboardEvent(g_evsrc, (CGKeyCode)k, false);
@@ -762,153 +903,194 @@ static void alle_tasten_loslassen(void) {
             }
         }
     }
-    g_mods = 0;
-    pthread_mutex_unlock(&g_key_mtx);
+    // Eine gedrueckte Maustaste machte sonst jede Bewegung des naechsten
+    // Zuschauers zum Ziehen, bis der einmal klickt.
+    for (int i = 0; i < 3; i++) {
+        if ((g_buttons & (1 << i)) && g_button_kanal[i] == kanal) {
+            g_buttons &= ~(1 << i);
+            g_button_kanal[i] = 0;
+            offen++;
+            CGEventRef e = CGEventCreateMouseEvent(g_evsrc, maus_los[i].typ, g_pos, maus_los[i].taste);
+            if (e) {
+                CGEventPost(kCGHIDEventTap, e);
+                CFRelease(e);
+            }
+        }
+    }
+    if (g_mods_kanal == kanal) g_mods = 0;
+    pthread_mutex_unlock(&g_inject_mtx);
     if (offen) logf_(@"Verbindung weg: %d haengende Taste(n) freigegeben", offen);
 }
 
-static void *input_thread(void *arg) {
-    int listen_fd = (int)(intptr_t)arg;
+static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     uint8_t payload[256];
-    for (;;) {
-        int fd = accept(listen_fd, NULL, NULL);
-        if (fd < 0) { if (errno == EINTR) continue; break; }
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    keepalive_setzen(fd);
 
-        // Der Eingabekanal darf erst aufmachen, wenn der Bildkanal steht: sein
-        // Prologue enthaelt dessen Pruefsumme. Wer die nicht kennt, kommt hier
-        // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
-        if (!atomic_load(&g_vid_ready)) {
-            logf_(@"Eingabekanal abgewiesen: kein Bildkanal offen");
-            close(fd);
-            continue;
-        }
-        uint8_t pro[256];
-        size_t prolen = strlen(QC_PRO_INPUT);
-        memcpy(pro, QC_PRO_INPUT, prolen);
-        pthread_mutex_lock(&g_send_mtx);
-        memcpy(pro + prolen, g_vid_hh, QC_HASHLEN);
-        uint8_t expect[32];
-        memcpy(expect, g_vid_peer, 32);
-        pthread_mutex_unlock(&g_send_mtx);
-        prolen += QC_HASHLEN;
-
-        qc_chan *in = malloc(sizeof *in);
-        if (!in) { close(fd); continue; }
-        int hr = qc_chan_accept(in, fd, g_id_priv, pro, prolen);
-        if (hr != 0) {
-            logf_(@"Eingabekanal: Handschlag gescheitert (%d)", hr);
-            free(in);
-            close(fd);
-            continue;
-        }
-        if (memcmp(in->peer, expect, 32) != 0) {
-            logf_(@"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
-            free(in);
-            close(fd);
-            continue;
-        }
-        logf_(@"Eingabekanal verbunden, verschluesselt");
-
-        for (;;) {
-            qc_hdr h;
-            if (qc_chan_read(in, &h, sizeof h) != 0) break;
-            if (h.type == QC_MSG_CLIP) {
-                // Text kann gross sein, deshalb hier ein eigener Puffer.
-                if (h.len > 4 * 1024 * 1024) break;
-                char *big = h.len ? malloc(h.len + 1) : NULL;
-                if (h.len && (!big || qc_chan_read(in, big, h.len) != 0)) { free(big); break; }
-                if (big) { big[h.len] = 0; qc_clip_set(big, h.len); free(big); }
-                continue;
-            }
-            if (h.len > sizeof payload) break;
-            if (h.len && qc_chan_read(in, payload, h.len) != 0) break;
-            float f[2];
-            switch (h.type) {
-                case QC_IN_MOVE:
-                    if (h.len >= 8) { memcpy(f, payload, 8); inject_move(f[0], f[1]); }
-                    break;
-                case QC_IN_BUTTON:
-                    if (h.len >= 12) { memcpy(f, payload + 4, 8); inject_button(payload[0], payload[1], f[0], f[1]); }
-                    break;
-                case QC_IN_SCROLL:
-                    if (h.len >= 8) { memcpy(f, payload, 8); inject_scroll(f[0], f[1]); }
-                    break;
-                case QC_IN_KEY:
-                    if (h.len >= 8) {
-                        uint16_t kc; uint32_t mods;
-                        memcpy(&kc, payload, 2);
-                        memcpy(&mods, payload + 4, 4);
-                        inject_key(kc, payload[2], mods);
-                    }
-                    break;
-                case QC_IN_TIME:
-                    // Zeitabgleich: die Frage traegt die Uhrzeit des Clients,
-                    // die Antwort gibt sie zurueck und haengt die des Hosts an.
-                    // Der Client rechnet daraus Versatz und Umlaufzeit aus.
-                    if (h.len >= 8) {
-                        uint64_t t_client;
-                        memcpy(&t_client, payload, 8);
-                        uint8_t out[16];
-                        uint64_t t_host = now_us();
-                        memcpy(out, &t_client, 8);
-                        memcpy(out + 8, &t_host, 8);
-                        send_small(QC_MSG_TIME, out, sizeof out);
-                    }
-                    break;
-                case QC_IN_SETTINGS:
-                    if (h.len >= 8) {
-                        uint32_t m; uint16_t f;
-                        memcpy(&m, payload, 4);
-                        memcpy(&f, payload + 4, 2);
-                        int g = payload[6] ? 1 : 0;
-                        int fx = payload[7] ? 1 : 0;
-                        // Ein Client ohne das neunte Byte will Ton.
-                        int ton = h.len >= 9 ? (payload[8] ? 1 : 0) : 1;
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            apply_settings((int)m, (int)f, g, fx, ton);
-                        });
-                    }
-                    break;
-                case QC_IN_TESTBILD:
-                    // Testbild fuer den Benchmark. Schleife und Schalter
-                    // gehoeren der Aufnahmewarteschlange - dort laeuft der
-                    // Takt, der die Bilder holt.
-                    if (h.len >= 1 && g_capq) {
-                        int an = payload[0] ? 1 : 0;
-                        dispatch_async(g_capq, ^{
-                            if (an) {
-                                qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)));
-                                atomic_store(&g_testbild, 1);
-                                logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark", g_info_w, g_info_h);
-                            } else {
-                                atomic_store(&g_testbild, 0);
-                                qc_testbild_stop();
-                                logf_(@"Testbild aus");
-                            }
-                        });
-                    }
-                    break;
-                case QC_IN_CODEC:
-                    // Codecwunsch. Nur weiterreichen - der Wechsel selbst
-                    // gehoert auf die Aufnahmewarteschlange, nie hierher.
-                    if (h.len >= 1) {
-                        int idx = payload[0];
-                        if (g_capq) dispatch_async(g_capq, ^{ codec_wechseln(idx); });
-                        else logf_(@"Codecwunsch %d verworfen: Aufnahme laeuft noch nicht", idx);
-                    }
-                    break;
-                default: break;
-            }
-        }
-        logf_(@"Eingabekanal getrennt");
-        alle_tasten_loslassen();
-        free(in);
+    // Der Eingabekanal darf erst aufmachen, wenn der Bildkanal steht: sein
+    // Prologue enthaelt dessen Pruefsumme. Wer die nicht kennt, kommt hier
+    // nicht durch - damit kann niemand nur die Tastatur uebernehmen.
+    // Den fd immer erst nach qc_platz_frei schliessen (siehe qc_annahme.h).
+    if (!atomic_load(&g_vid_ready)) {
+        logf_(@"Eingabekanal abgewiesen: kein Bildkanal offen");
+        qc_platz_frei(platz);
         close(fd);
+        return;
     }
-    return NULL;
+    uint8_t pro[256];
+    size_t prolen = strlen(QC_PRO_INPUT);
+    memcpy(pro, QC_PRO_INPUT, prolen);
+    pthread_mutex_lock(&g_send_mtx);
+    memcpy(pro + prolen, g_vid_hh, QC_HASHLEN);
+    uint8_t expect[32];
+    memcpy(expect, g_vid_peer, 32);
+    uint64_t sitzung = g_sitzung;
+    pthread_mutex_unlock(&g_send_mtx);
+    prolen += QC_HASHLEN;
+
+    qc_chan *in = malloc(sizeof *in);
+    if (!in) { qc_platz_frei(platz); close(fd); return; }
+    int hr = qc_chan_accept(in, fd, g_id_priv, pro, prolen);
+    if (qc_platz_frei(platz)) {
+        // Fuer eine neuere Verbindung verdraengt: schon gezaehlt und gemeldet.
+        qc_chan_free(in);
+        close(fd);
+        return;
+    }
+    if (hr != 0) {
+        logf_(@"Eingabekanal: Handschlag gescheitert (%d)", hr);
+        qc_chan_free(in);
+        close(fd);
+        return;
+    }
+    if (memcmp(in->peer, expect, 32) != 0) {
+        logf_(@"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
+        qc_chan_free(in);
+        close(fd);
+        return;
+    }
+    // Waehrend des Handschlags kann der Zuschauer gewechselt haben oder
+    // weg sein; dann gehoert dieser Kanal zu einer Sitzung, die es nicht
+    // mehr gibt. Sonst loest er einen aelteren Eingabekanal derselben
+    // Sitzung ab (der Client hat neu verbunden).
+    // Jeder angenommene Kanal bekommt eine eigene Nummer: danach richtet
+    // sich, welche gedrueckten Tasten er am Ende freigibt.
+    static uint64_t kanaele = 0;        // durch g_send_mtx geschuetzt
+    uint64_t kanal = 0;
+    pthread_mutex_lock(&g_send_mtx);
+    BOOL aktuell = sitzung == g_sitzung && atomic_load(&g_vid_ready);
+    if (aktuell) {
+        kanal = ++kanaele;
+        int alt = atomic_exchange(&g_in_fd, fd);
+        if (alt >= 0) shutdown(alt, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&g_send_mtx);
+    if (!aktuell) {
+        logf_(@"Eingabekanal abgewiesen: Zuschauer inzwischen gewechselt");
+        qc_chan_free(in);
+        close(fd);
+        return;
+    }
+    logf_(@"Eingabekanal verbunden, verschluesselt");
+
+    for (;;) {
+        qc_hdr h;
+        if (qc_chan_read(in, &h, sizeof h) != 0) break;
+        if (h.type == QC_MSG_CLIP) {
+            // Text kann gross sein, deshalb hier ein eigener Puffer.
+            if (h.len > 4 * 1024 * 1024) break;
+            char *big = h.len ? malloc(h.len + 1) : NULL;
+            BOOL ok = !h.len || (big && qc_chan_read(in, big, h.len) == 0);
+            // Abgeloest: der Text geht nicht mehr in die Ablage dieses Macs.
+            if (ok && atomic_load(&g_in_fd) != fd) ok = NO;
+            if (ok && big) { big[h.len] = 0; qc_clip_set(big, h.len); }
+            // Die Ablage kann Geheimes tragen: nichts davon bleibt im Speicher liegen.
+            if (big) { qc_wipe(big, h.len + 1); free(big); }
+            if (!ok) break;
+            continue;
+        }
+        if (h.len > sizeof payload) break;
+        if (h.len && qc_chan_read(in, payload, h.len) != 0) break;
+        // Abgeloest (neuer Zuschauer, Bild weg, neuerer Eingabekanal):
+        // was jetzt noch kommt, wird nicht mehr eingespeist.
+        if (h.type == QC_IN_MOVE || h.type == QC_IN_BUTTON || h.type == QC_IN_SCROLL || h.type == QC_IN_KEY) {
+            if (!einspeisen(fd, kanal, h.type, payload, h.len)) break;
+            continue;
+        }
+        if (atomic_load(&g_in_fd) != fd) break;
+        switch (h.type) {
+            case QC_IN_TIME:
+                // Zeitabgleich: die Frage traegt die Uhrzeit des Clients,
+                // die Antwort gibt sie zurueck und haengt die des Hosts an.
+                // Der Client rechnet daraus Versatz und Umlaufzeit aus.
+                if (h.len >= 8) {
+                    uint64_t t_client;
+                    memcpy(&t_client, payload, 8);
+                    uint8_t out[16];
+                    uint64_t t_host = now_us();
+                    memcpy(out, &t_client, 8);
+                    memcpy(out + 8, &t_host, 8);
+                    send_small(QC_MSG_TIME, out, sizeof out);
+                }
+                break;
+            case QC_IN_SETTINGS:
+                if (h.len >= 8) {
+                    uint32_t m; uint16_t f;
+                    memcpy(&m, payload, 4);
+                    memcpy(&f, payload + 4, 2);
+                    int g = payload[6] ? 1 : 0;
+                    int fx = payload[7] ? 1 : 0;
+                    // Ein Client ohne das neunte Byte will Ton.
+                    int ton = h.len >= 9 ? (payload[8] ? 1 : 0) : 1;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        apply_settings((int)m, (int)f, g, fx, ton);
+                    });
+                }
+                break;
+            case QC_IN_TESTBILD:
+                // Testbild fuer den Benchmark. Schleife und Schalter
+                // gehoeren der Aufnahmewarteschlange - dort laeuft der
+                // Takt, der die Bilder holt.
+                if (h.len >= 1 && g_capq) {
+                    int an = payload[0] ? 1 : 0;
+                    dispatch_async(g_capq, ^{
+                        if (an) {
+                            qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)));
+                            atomic_store(&g_testbild, 1);
+                            logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark", g_info_w, g_info_h);
+                        } else {
+                            atomic_store(&g_testbild, 0);
+                            qc_testbild_stop();
+                            logf_(@"Testbild aus");
+                        }
+                    });
+                }
+                break;
+            case QC_IN_CODEC:
+                // Codecwunsch. Nur weiterreichen - der Wechsel selbst
+                // gehoert auf die Aufnahmewarteschlange, nie hierher.
+                if (h.len >= 1) {
+                    int idx = payload[0];
+                    if (g_capq) dispatch_async(g_capq, ^{ codec_wechseln(idx); });
+                    else logf_(@"Codecwunsch %d verworfen: Aufnahme laeuft noch nicht", idx);
+                }
+                break;
+            default: break;
+        }
+    }
+    logf_(@"Eingabekanal getrennt");
+    // Austragen und schliessen unter derselben Sperre wie das Abbrechen:
+    // so kann eingabe_abbrechen nie eine schon neu vergebene Nummer treffen.
+    pthread_mutex_lock(&g_send_mtx);
+    int selbst = fd;
+    atomic_compare_exchange_strong(&g_in_fd, &selbst, -1);
+    close(fd);
+    pthread_mutex_unlock(&g_send_mtx);
+    alle_tasten_loslassen(kanal);
+    qc_chan_free(in);
+    qc_wipe(payload, sizeof payload);
 }
 
 static int start_input_server(int port, CGDirectDisplayID display) {
@@ -924,14 +1106,17 @@ static int start_input_server(int port, CGDirectDisplayID display) {
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 4) != 0) {
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, QC_LISTEN_WARTESCHLANGE) != 0) {
         logf_(@"Eingabe-Port %d nicht verfuegbar: %s", port, strerror(errno));
         close(fd);
         return -1;
     }
-    pthread_t t;
-    pthread_create(&t, NULL, input_thread, (void *)(intptr_t)fd);
-    pthread_detach(t);
+    qc_annahme_cfg cfg = { QC_HANDSCHLAEGE, QC_HANDSCHLAEGE_JE_IP, eingabe_verbindung, annahme_andrang, (void *)"Eingabekanal" };
+    if (qc_annahme_starten(fd, &cfg) != 0) {
+        logf_(@"Eingabe-Port %d: Annahme nicht startbar", port);
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -1067,6 +1252,9 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
             atomic_store(&g_client_fd, -1);
             stream_herunterfahren_anstossen();
             close(fd);
+            eingabe_abbrechen();
+            qc_chan_free(g_vid);
+            g_vid = NULL;
             pthread_mutex_unlock(&g_send_mtx);
             return;
         }
@@ -1760,9 +1948,10 @@ static void aufnahme_wiederherstellen(void) {
     });
 }
 
-// Aufnahme und Encoder fuer einen Zuschauer aufbauen. Wird vom Annahmefaden
-// gerufen, bevor er die Begruessung schickt - die Verbindung dauert dadurch
-// einen Moment laenger, dafuer arbeitet der Mac ohne Zuschauer gar nicht.
+// Aufnahme und Encoder fuer einen Zuschauer aufbauen. Wird vom Faden der
+// Verbindung gerufen, bevor er die Begruessung schickt - die Verbindung
+// dauert dadurch einen Moment laenger, dafuer arbeitet der Mac ohne
+// Zuschauer gar nicht.
 static BOOL stream_hochfahren_sync(void) {
     __block BOOL ok = NO;
     dispatch_sync(g_lifeq, ^{
@@ -1864,15 +2053,28 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und bleibt
     // danach liegen, damit Gegenstellen den Host wiedererkennen.
-    if (qc_identity_load(g_id_priv, g_id_pub) != 0) {
+    int schluessel = qc_identity_load(g_id_priv, g_id_pub);
+    if (schluessel == -2) {
+        // Nie still einen neuen anlegen: das waere ein anderer Host, und
+        // jeder gekoppelte Client wiese ihn ab.
+        logf_(@"Schluessel host.key ist vorhanden, aber nicht lesbar oder beschaedigt - Abbruch. "
+               "Ein neuer Schluessel waere eine neue Identitaet; die Datei erst entfernen, "
+               "wenn alle Clients neu koppeln sollen.");
+        return 5;
+    }
+    if (schluessel != 0) {
         logf_(@"Schluessel konnte nicht angelegt werden - Abbruch.");
         return 5;
     }
     {
         char fp[24];
         qc_fingerprint(g_id_pub, fp);
-        logf_(@"Fingerabdruck dieses Hosts: %s   freigegebene Gegenstellen: %d",
-              fp, qc_authorized_count());
+        int anz = qc_authorized_count();
+        if (anz < 0)
+            logf_(@"Fingerabdruck dieses Hosts: %s   Freigabeliste authorized.txt NICHT LESBAR ODER BESCHAEDIGT - "
+                   "jede Gegenstelle wird abgewiesen, bis sie repariert oder mit --forget geloescht ist", fp);
+        else
+            logf_(@"Fingerabdruck dieses Hosts: %s   freigegebene Gegenstellen: %d", fp, anz);
     }
     if ([args containsObject:@"--pair"]) {
         atomic_store(&g_pair_open, 1);
