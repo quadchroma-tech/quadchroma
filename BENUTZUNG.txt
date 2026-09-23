@@ -610,6 +610,11 @@ getrennt, auch wenn er haengt. Im Protokoll steht "Zuschauer abgeloest:
                     er hing noch an einem aelteren Paket; Nachricht 10
                     erreicht ihn dann nicht.
 
+Meist steht nur eine davon da. Wird das aeltere Paket erst nach mehr als
+1 s fertig, kann die Frist von 2 s ablaufen, waehrend Nachricht 10 noch
+haengt: dann steht erst "... gekappt" und gleich danach "... nicht
+zugestellt: <Fehler>".
+
 Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
 laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.
 
