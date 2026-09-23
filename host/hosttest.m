@@ -115,18 +115,19 @@ static qc_chan *kanal(int fd, uint8_t schluessel) {
     return c;
 }
 
-// Zuschauer eintragen, wie bild_verbindung es nach der Begruessung tut.
+// Zuschauer eintragen, wie bild_verbindung es nach der Begruessung tut -
+// in derselben Reihenfolge: erst die Flaggen, dann gilt er als bereit.
 static void zuschauer_setzen(int host_fd, qc_chan *c) {
     pthread_mutex_lock(&g_send_mtx);
     g_vid = c;
     memset(g_vid_peer, 0x77, sizeof g_vid_peer);
     g_stau_seit = 0;
-    atomic_store(&g_client_fd, host_fd);
-    atomic_store(&g_vid_ready, 1);
-    pthread_mutex_unlock(&g_send_mtx);
     atomic_store(&g_force_key, 1);
     atomic_store(&g_wait_key, 1);
     atomic_store(&g_audio_info_sent, 0);
+    atomic_store(&g_client_fd, host_fd);
+    atomic_store(&g_vid_ready, 1);
+    pthread_mutex_unlock(&g_send_mtx);
 }
 
 // Zuschauer austragen, falls der Host es nicht schon getan hat.
@@ -270,6 +271,35 @@ static int lies_genau(int fd, void *p, size_t n, int frist_ms) {
     return 1;
 }
 
+// Einen Datensatz lesen und entschluesseln. 1 = gelesen, sonst wie lies_genau.
+static int datensatz(leser *l, int frist_ms) {
+    uint8_t lb[2];
+    int r = lies_genau(l->fd, lb, 2, frist_ms);
+    if (r <= 0) return r;
+    size_t n = (size_t)lb[0] | ((size_t)lb[1] << 8);
+    if (lies_genau(l->fd, l->ct, n, frist_ms) != 1) return -1;
+    if (l->len + n > l->cap) {
+        l->cap = (l->len + n) * 2;
+        l->buf = realloc(l->buf, l->cap);
+    }
+    size_t pt = 0;
+    if (qc_decrypt(&l->rx, l->ct, n, l->buf + l->len, &pt)) return -1;
+    l->len += pt;
+    return 1;
+}
+
+// n Byte Klartext am Stueck (die Kennung "QCH1" vor der ersten Nachricht).
+static int klartext(leser *l, void *p, size_t n, int frist_ms) {
+    while (l->len < n) {
+        int r = datensatz(l, frist_ms);
+        if (r != 1) return r;
+    }
+    memcpy(p, l->buf, n);
+    memmove(l->buf, l->buf + n, l->len - n);
+    l->len -= n;
+    return 1;
+}
+
 // 1 = Nachricht, 0 = Verbindung ordentlich zu, -1 = Fehler oder Frist.
 // Von der Nutzlast landen hoechstens 8 Byte in anfang.
 static int nachricht(leser *l, qc_hdr *h, uint8_t anfang[8], int frist_ms) {
@@ -285,18 +315,8 @@ static int nachricht(leser *l, qc_hdr *h, uint8_t anfang[8], int frist_ms) {
                 return 1;
             }
         }
-        uint8_t lb[2];
-        int r = lies_genau(l->fd, lb, 2, frist_ms);
-        if (r <= 0) return r;
-        size_t n = (size_t)lb[0] | ((size_t)lb[1] << 8);
-        if (lies_genau(l->fd, l->ct, n, frist_ms) != 1) return -1;
-        if (l->len + n > l->cap) {
-            l->cap = (l->len + n) * 2;
-            l->buf = realloc(l->buf, l->cap);
-        }
-        size_t pt = 0;
-        if (qc_decrypt(&l->rx, l->ct, n, l->buf + l->len, &pt)) return -1;
-        l->len += pt;
+        int r = datensatz(l, frist_ms);
+        if (r != 1) return r;
     }
 }
 
@@ -735,6 +755,173 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
     g_log_grenze = grenze_vorher;
 }
 
+// --------------------------------------------- Zuschauerwechsel, Abbau
+
+// Attrappe fuer einen laufenden Strom: ScreenCaptureKit gehoert nicht in den
+// Pruefstand. Anhalten und Umstellen melden sofort Erfolg.
+@interface FakeStrom : SCStream
+@end
+@implementation FakeStrom
+- (void)stopCaptureWithCompletionHandler:(void (^)(NSError *))h { if (h) h(nil); }
+- (void)updateConfiguration:(SCStreamConfiguration *)c completionHandler:(void (^)(NSError *))h { if (h) h(nil); }
+@end
+
+// Nie freigeben: eine nie initialisierte Attrappe darf nicht in dealloc laufen.
+static NSMutableArray *g_attrappen;
+
+static void strom_attrappe_setzen(void) {
+    FakeStrom *fs = [FakeStrom alloc];
+    [g_attrappen addObject:fs];
+    stream_setzen(fs);
+}
+
+static SCStream *strom_jetzt(void) {
+    dispatch_sync(g_lifeq, ^{});            // eingereihter Auf- oder Abbau ist durch
+    __block SCStream *st = nil;
+    dispatch_sync(g_capq, ^{ st = g_stream; });
+    return st;
+}
+
+typedef struct { _Atomic int stop; CMSampleBufferRef kb, pb; } hammer_arg;
+
+// Encoder und Ton im Dauerlauf: ein Zwischenbild nach dem anderen, ein
+// Vollbild nur, wenn es erzwungen ist - wie encode_buffer -, dazu Ton.
+static void *hammern(void *arg) {
+    hammer_arg *a = arg;
+    static float pcm[2 * 480];
+    while (!atomic_load(&a->stop)) {
+        int key = atomic_exchange(&g_force_key, 0);
+        emit_access_unit(key ? a->kb : a->pb, key ? YES : NO, now_us(), 0);
+        audio_cb(pcm, 480, 48000, 2);
+        usleep(300);
+    }
+    return NULL;
+}
+
+// Ein Wechsel: A schaut und bekommt laufend Bilder und Ton, B loest ab.
+// Rueckgabe: 1 = alles in Ordnung; was schiefging, steht in *was.
+static int wechsel_einmal(int bild_port, const uint8_t b_priv[32], char *was, size_t wl) {
+    strom_attrappe_setzen();
+    int h, c;
+    if (paar(&h, &c, 0)) { snprintf(was, wl, "Verbindung"); return 0; }
+    zuschauer_setzen(h, kanal(h, 0x61));
+    abnehmer ab = { .fd = c, .rate = 1e10 };        // A liest alles
+    atomic_store(&ab.stop, 0);
+    pthread_t ta;
+    pthread_create(&ta, NULL, abnehmen, &ab);
+    atomic_store(&g_testbild, 1);                    // hat A fuer den Benchmark eingeschaltet
+    hammer_arg ha = { .kb = bild(20 * 1024), .pb = bild(2 * 1024) };
+    atomic_store(&ha.stop, 0);
+    pthread_t th;
+    pthread_create(&th, NULL, hammern, &ha);
+    usleep(100 * 1000);                              // A bekommt Bilder und Ton, wartet auf nichts mehr
+
+    qc_cipher rx;
+    int b = client_verbinden(bild_port, b_priv, &rx, NULL);
+    leser l;
+    leser_init(&l, b, 0);
+    l.rx = rx;
+    char magic[5] = {0};
+    int ok_magic = b >= 0 && klartext(&l, magic, 4, 2000) == 1 && memcmp(magic, QC_MAGIC, 4) == 0;
+    int n = 0, erster_typ = -1, video = 0, erstes_video_key = -1, ansage_an = -1, ton_an = -1;
+    double t0 = sek();
+    qc_hdr m;
+    uint8_t anf[8];
+    while (ok_magic && sek() - t0 < 0.3 && nachricht(&l, &m, anf, 1000) == 1) {
+        if (n == 0) erster_typ = m.type;
+        if (m.type == QC_MSG_VIDEO && video++ == 0) erstes_video_key = (m.flags & QC_FLAG_KEY) ? 1 : 0;
+        if (m.type == QC_MSG_AUDIO_INFO && ansage_an < 0) ansage_an = n;
+        if (m.type == QC_MSG_AUDIO && ton_an < 0) ton_an = n;
+        n++;
+    }
+    atomic_store(&ha.stop, 1);
+    pthread_join(th, NULL);
+    dispatch_sync(g_capq, ^{});                      // Aufraeumen des Testbilds ist durch
+    int testbild = atomic_load(&g_testbild);
+    SCStream *st = strom_jetzt();
+    was[0] = 0;
+    if (!ok_magic || erster_typ != QC_MSG_INFO) snprintf(was, wl, "Kennung/Strominfo nicht zuerst (Typ %d)", erster_typ);
+    else if (erstes_video_key != 1) snprintf(was, wl, "erstes Bild %s", erstes_video_key == 0 ? "ein ZWISCHENBILD" : "fehlt");
+    else if (ansage_an < 0 || ton_an <= ansage_an) snprintf(was, wl, "Ton an Stelle %d, Ansage an Stelle %d", ton_an, ansage_an);
+    else if (testbild) snprintf(was, wl, "Testbild noch an");
+    else if (atomic_load(&g_anmeldend) != 0 || st == nil) snprintf(was, wl, "unterwegs %d, Strom %s", atomic_load(&g_anmeldend), st ? "da" : "weg");
+    zuschauer_weg();
+    atomic_store(&ab.stop, 1);
+    pthread_join(ta, NULL);
+    close(b); close(c); free(l.buf);
+    CFRelease(ha.kb); CFRelease(ha.pb);
+    return was[0] == 0;
+}
+
+static void wechsel_pruefen(int bild_port) {
+    printf("\n-- Zuschauerwechsel im laufenden Strom\n");
+    uint8_t b_priv[32], b_pub[32];
+    qc_keypair(b_priv, b_pub);
+    qc_authorize(b_pub, "hosttest B");
+    atomic_store(&g_cur_ton, 1);
+    // Das Fenster, in dem der Neue den Stand des Vorgaengers erbte, ist kurz:
+    // mehrere Wechsel, jeder mit Bildern und Ton im Dauerlauf.
+    int gut = 0, laeufe = 4;
+    char was[128];
+    for (int i = 0; i < laeufe; i++) {
+        stdout_stumm(1);
+        int r = wechsel_einmal(bild_port, b_priv, was, sizeof was);
+        stdout_stumm(0);
+        if (r) gut++;
+        else printf("         (Wechsel %d: %s)\n", i, was);
+    }
+    printf("         (%d von %d Wechseln in Ordnung)\n", gut, laeufe);
+    pruefe(gut == laeufe, "der Neue bekommt Kennung und Strominfo zuerst, als erstes Bild ein Vollbild, "
+                          "Ton erst nach der Ansage, das Testbild des Vorgaengers ist aus");
+}
+
+static void *ablage_senden(void *arg) {
+    static uint8_t text[1 << 20];
+    memset(text, 'x', sizeof text);
+    clip_cb((const char *)text, sizeof text);
+    return NULL;
+}
+
+// Die Probe des Pruefers als Pruefung: der Vorgaenger ist eingefroren, ein
+// Senden an ihn haengt unter g_send_mtx; der Neue hat das Hochfahren hinter
+// sich und wartet auf die Sperre. Laeuft die Sendefrist ab, traegt der
+// Fehlerweg den Alten aus und reiht den Abbau ein - der darf den Strom des
+// Neuen nicht anhalten.
+static void abbau_wettlauf_pruefen(int bild_port) {
+    printf("\n-- Abbau zwischen Hochfahren und Eintragen\n");
+    uint8_t c_priv[32], c_pub[32];
+    qc_keypair(c_priv, c_pub);
+    qc_authorize(c_pub, "hosttest C");
+    int schlecht = 0, laeufe = 2;
+    for (int i = 0; i < laeufe; i++) {
+        strom_attrappe_setzen();
+        int h, c;
+        if (paar(&h, &c, 16 * 1024)) { pruefe(0, "Verbindung"); return; }
+        puffer_fuellen(h);
+        zuschauer_setzen(h, kanal(h, 0x71));
+        pthread_t t;
+        pthread_create(&t, NULL, ablage_senden, NULL);   // haengt bis zu 2 s unter der Sperre
+        usleep(300 * 1000);
+        int neu = client_verbinden(bild_port, c_priv, NULL, NULL);
+        pthread_join(t, NULL);                            // Sendefrist abgelaufen, Alter ausgetragen
+        usleep(300 * 1000);
+        SCStream *st = strom_jetzt();
+        int fd = atomic_load(&g_client_fd);
+        int gut = neu >= 0 && fd >= 0 && st != nil && atomic_load(&g_anmeldend) == 0;
+        printf("         (Lauf %d: neuer Zuschauer eingetragen: %s, Aufnahme laeuft: %s)\n", i,
+               fd >= 0 ? "ja" : "nein", st ? "ja" : "NEIN");
+        schlecht += !gut;
+        zuschauer_weg();
+        if (neu >= 0) close(neu);
+        close(c);
+    }
+    pruefe(schlecht == 0, "der Neue ist eingetragen, und seine Aufnahme laeuft weiter");
+    // Gegenprobe: ohne Zuschauer und ohne einen, der unterwegs ist, baut der
+    // Abbau weiter ab.
+    stream_herunterfahren_anstossen();
+    pruefe(strom_jetzt() == nil, "ohne Zuschauer haelt der Abbau den Strom an");
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -770,8 +957,11 @@ int main(void) {
         if (bild_port < 0 || ein_port < 0) return 1;
         g_stats.nal_len = 4;
         atomic_store(&g_cur_fps, 120);
+        g_attrappen = [NSMutableArray array];
         protokoll_pruefen(bild_port, ein_port);
         abloesen_pruefen();
+        wechsel_pruefen(bild_port);
+        abbau_wettlauf_pruefen(bild_port);
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();

@@ -370,6 +370,16 @@ static void hoststatus_senden(uint8_t lage);
 static dispatch_queue_t g_lifeq = NULL;
 static void stream_herunterfahren_anstossen(void);
 static BOOL stream_hochfahren_sync(void);
+// Zuschauer zwischen dem Hochfahren der Aufnahme und dem Eintragen. Auch sie
+// brauchen Aufnahme und Encoder: ein Abbau, der in diesem Fenster laeuft (der
+// Vorgaenger ging genau jetzt - Senden gescheitert, Stau), hielte sonst den
+// Strom an, und der Neue saesse eingetragen, aber ohne Bild da.
+static _Atomic int g_anmeldend = 0;
+
+// Braucht noch jemand Aufnahme und Encoder? Wer zuschaut oder gerade
+// eingetragen wird. Erst g_anmeldend, dann g_client_fd lesen: bild_verbindung
+// traegt erst ein und zaehlt dann ab - so entgeht keiner beiden Blicken.
+static BOOL zuschauer_braucht_strom(void);
 
 // Aufnahmeformat je Kandidat. ScreenCaptureKit kennt kein 4:4:4 mit 8 Bit,
 // also muss VideoToolbox dort umrechnen - und das steht dann dran, denn eine
@@ -477,6 +487,7 @@ static void send_small(uint8_t type, const void *data, size_t len) {
         iov[0].iov_base = &h;   iov[0].iov_len = sizeof h;
         iov[1].iov_base = (void *)data; iov[1].iov_len = len;
         if (qc_chan_send(g_vid, iov, len ? 2 : 1) != 0) {
+            logf_(@"Zuschauer weg: Senden gescheitert (%s)", strerror(errno));
             atomic_store(&g_vid_ready, 0);
             atomic_store(&g_client_fd, -1);
             close(fd);
@@ -737,23 +748,31 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     }
 
     // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
-    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung.
+    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung. Ab hier
+    // zaehlt dieser Zuschauer als unterwegs (g_anmeldend), bis er eingetragen
+    // ist oder aufgibt - jeder Weg unten zieht ihn wieder ab.
+    atomic_fetch_add(&g_anmeldend, 1);
     if (!stream_hochfahren_sync()) {
+        atomic_fetch_sub(&g_anmeldend, 1);
+        // Was halb steht (Encoder ohne Aufnahme), raeumt der Abbau weg; er
+        // prueft selbst, ob noch jemand zuschaut.
+        stream_herunterfahren_anstossen();
         logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
         qc_chan_free(chan);
         close(fd);
         return;
     }
 
-    // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
-    // Fenstergroesse und Format kennt, bevor das erste Bild kommt.
     uint8_t hello[4 + sizeof(qc_hdr) + 8];
+    pthread_mutex_lock(&g_send_mtx);
+    // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
+    // Fenstergroesse und Format kennt, bevor das erste Bild kommt. Erst unter
+    // der Sperre gefuellt: ein Codecwechsel, der gerade fertig wird, steht
+    // dann entweder schon hier drin, oder sein SWITCH kommt danach beim Neuen an.
     memcpy(hello, QC_MAGIC, 4);
     qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = 8 };
     memcpy(hello + 4, &h, sizeof h);
     strominfo_fuellen(hello + 4 + sizeof h);
-
-    pthread_mutex_lock(&g_send_mtx);
     char fp_alt[24] = {0};
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
@@ -763,16 +782,31 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     memcpy(g_last_sas, sas, sizeof g_last_sas);
     struct iovec iov = { .iov_base = hello, .iov_len = sizeof hello };
     int sent = qc_chan_send(g_vid, &iov, 1);
+    int testbild_aus = 0;
     if (sent == 0) {
+        // Der Neue faengt beim naechsten Vollbild an und bekommt den Ton neu
+        // angesagt - gesetzt, bevor er als bereit gilt. Sonst erbte er beim
+        // Abloesen fuer einen Augenblick den Stand des Vorgaengers: ein
+        // Zwischenbild ohne Kopfdaten, Ton ohne Ansage.
+        atomic_store(&g_force_key, 1);
+        atomic_store(&g_wait_key, 1);
+        atomic_store(&g_audio_info_sent, 0);
+        // Ein Testbild ueberlebt den Zuschauer nicht, auch keine Abloesung:
+        // der Neue faengt mit dem Bildschirm an. Den Schalter schon hier, damit
+        // der Takt ihm keinen Balken mehr schickt; Aufraeumen auf g_capq unten.
+        testbild_aus = atomic_exchange(&g_testbild, 0);
         atomic_store(&g_client_fd, fd);
         atomic_store(&g_vid_ready, 1);
     } else {
         qc_chan_free(g_vid);
         g_vid = NULL;
-        // Der alte Zuschauer ist schon getrennt, der neue kam nicht an:
-        // niemand schaut zu, also laufen auch Aufnahme und Encoder nicht weiter.
-        stream_herunterfahren_anstossen();
     }
+    // Eingetragen oder nicht: ab hier entscheidet g_client_fd. Erst abziehen,
+    // dann den Abbau anstossen - sonst saehe er den Neuen noch als unterwegs.
+    atomic_fetch_sub(&g_anmeldend, 1);
+    // Der alte Zuschauer ist schon getrennt, der neue kam nicht an: niemand
+    // schaut zu, also laufen auch Aufnahme und Encoder nicht weiter.
+    if (sent != 0) stream_herunterfahren_anstossen();
     pthread_mutex_unlock(&g_send_mtx);
     if (abgeloest >= 0)
         logf_(@"Bisheriger Zuschauer %s abgeloest und getrennt%s", fp_alt,
@@ -782,10 +816,13 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         close(fd);
         return;
     }
+    if (testbild_aus) {
+        // Nach einem noch eingereihten "Testbild an" des Vorgaengers - die
+        // Warteschlange ist seriell, also bleibt es aus.
+        dispatch_async(g_capq, ^{ atomic_store(&g_testbild, 0); qc_testbild_stop(); });
+        logf_(@"Testbild aus (neuer Zuschauer)");
+    }
 
-    atomic_store(&g_force_key, 1);
-    atomic_store(&g_wait_key, 1);
-    atomic_store(&g_audio_info_sent, 0);
     qc_zeiger_neu_senden();
     {
         uint8_t cur[9] = {0};
@@ -1267,6 +1304,13 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                     int an = payload[0] ? 1 : 0;
                     dispatch_async(g_capq, ^{
                         if (an) {
+                            // Kommt das erst nach einer Abloesung dran, war es
+                            // der Wunsch des Vorgaengers: der Neue faengt mit
+                            // dem Bildschirm an.
+                            pthread_mutex_lock(&g_send_mtx);
+                            BOOL gilt = sitzung == g_sitzung;
+                            pthread_mutex_unlock(&g_send_mtx);
+                            if (!gilt) return;
                             qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)));
                             atomic_store(&g_testbild, 1);
                             logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark", g_info_w, g_info_h);
@@ -2064,8 +2108,10 @@ static void fixed_tick(void) {
         });
         // Solange keine Aufnahme laeuft, gibt es auch keinen Codecwechsel.
         stream_setzen(nil);
-        // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut neu auf.
-        if (atomic_load(&g_client_fd) < 0) return;
+        // Ohne Zuschauer gibt es nichts wiederherzustellen - der naechste baut
+        // neu auf. Einer, der gerade eingetragen wird, hat sein Hochfahren
+        // aber schon hinter sich und braucht die Wiederherstellung.
+        if (!zuschauer_braucht_strom()) return;
         hoststatus_senden(1);
         // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -2165,9 +2211,9 @@ static void list_displays(void) {
 }
 
 static void aufnahme_wiederherstellen(void) {
-    // Nur solange jemand zuschaut. Geht der Zuschauer waehrend des Wartens,
-    // endet die Kette hier.
-    if (atomic_load(&g_client_fd) < 0) return;
+    // Nur solange jemand zuschaut (oder gerade eingetragen wird). Geht der
+    // Zuschauer waehrend des Wartens, endet die Kette hier.
+    if (!zuschauer_braucht_strom()) return;
     // Auf der Lebenslauf-Warteschlange: pick_display wartet blockierend auf
     // ScreenCaptureKit, und das darf weder die Aufnahme- noch die Hauptschleife
     // anhalten - und kein Abbau darf dazwischenfunken.
@@ -2175,7 +2221,7 @@ static void aufnahme_wiederherstellen(void) {
         if (g_stream) return;
         // Hier noch einmal: zwischen der Pruefung oben und diesem Block kann
         // der Zuschauer gegangen und sein Abbau schon gelaufen sein.
-        if (atomic_load(&g_client_fd) < 0) return;
+        if (!zuschauer_braucht_strom()) return;
         size_t pw = 0, ph = 0; double hz = 0;
         SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
         if (!d) {
@@ -2232,7 +2278,7 @@ static void aufnahme_wiederherstellen(void) {
         }
         // Waehrend des Starts gegangen: sein Abbau ist schon durch oder steht
         // hinter uns an und kennt diesen Strom nicht - also selbst anhalten.
-        if (atomic_load(&g_client_fd) < 0) {
+        if (!zuschauer_braucht_strom()) {
             dispatch_semaphore_t halt = dispatch_semaphore_create(0);
             [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; dispatch_semaphore_signal(halt); }];
             dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
@@ -2311,13 +2357,21 @@ static BOOL stream_hochfahren_sync(void) {
     return ok;
 }
 
+static BOOL zuschauer_braucht_strom(void) {
+    if (atomic_load(&g_anmeldend) > 0) return YES;
+    return atomic_load(&g_client_fd) >= 0;
+}
+
 // Der Zuschauer ist weg: Aufnahme anhalten, Encoder abbauen, Bildschirm
 // freigeben. Darf aus jedem Faden angestossen werden, auch unter g_send_mtx -
 // hier wird nur eingereiht, gearbeitet wird spaeter und nacheinander.
+// Ob wirklich niemand mehr da ist, entscheidet erst der Block: ist inzwischen
+// wieder jemand da oder unterwegs, bleibt alles stehen. Wer unterwegs aufgibt,
+// stoesst den Abbau selbst noch einmal an.
 static void stream_herunterfahren_anstossen(void) {
     if (!g_lifeq) return;
     dispatch_async(g_lifeq, ^{
-        if (atomic_load(&g_client_fd) >= 0) return;   // inzwischen ist wieder jemand da
+        if (zuschauer_braucht_strom()) return;
         if (!g_stream && !g_session) return;
         if (g_stream) {
             SCStream *st = g_stream;
