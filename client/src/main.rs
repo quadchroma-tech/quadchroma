@@ -773,7 +773,11 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
-        match run_session(&addr, &shared, &input) {
+        let ergebnis = run_session(&addr, &shared, &input);
+        // Ohne Sitzung liest der Mac-Client die Zwischenablage nicht mehr.
+        #[cfg(target_os = "macos")]
+        clipboard::sitzung(false);
+        match ergebnis {
             Ok(()) => {}
             Err(e) => {
                 let mut s = shared.lock().unwrap();
@@ -1672,6 +1676,9 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     if &magic != MAGIC {
         return Err(Meldung::neu(strings::Key::ErrorProtocol, "Gegenstelle spricht ein anderes Protokoll"));
     }
+    // Erst jetzt ist es eine Sitzung: der Host hat dieses Geraet angenommen.
+    #[cfg(target_os = "macos")]
+    clipboard::sitzung(true);
 
     // Der Host faengt immer mit HEVC an; alles Weitere sagt Nachricht 7.
     // Der Decoder ist eine eigene Variable, keine Leihgabe: bei einem Wechsel

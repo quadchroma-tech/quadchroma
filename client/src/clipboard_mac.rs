@@ -15,6 +15,19 @@
 // host/clipboard.m): nur der erste Eintrag, und verdeckte Eintraege
 // (Passwoerter) sowie Dateien bleiben auf diesem Rechner.
 //
+// Gelesen wird nur waehrend einer Sitzung (`sitzung`). Ohne sie zaehlt der
+// Waechter nur den changeCount mit: ab macOS 15.4 kann jedes Lesen des
+// Inhalts durch ein Programm die Rueckfrage des Systems ausloesen (siehe
+// host/clipboard.m), und was ohne Sitzung kopiert wurde, braucht niemand -
+// es geht auch beim Sitzungsbeginn nicht nachtraeglich hinaus. Das ist die
+// Regel des Windows-Clients: dort zaehlt ebenfalls nur, was waehrend einer
+// Sitzung kopiert wird (vorher faellt es mangels Eingabekanal weg).
+//
+// Was vom Host kommt, traegt org.nspasteboard.TransientType: Verwalter der
+// Zwischenablage nehmen es dann nicht in ihren Verlauf auf - wie
+// CanIncludeInClipboardHistory = 0 unter Windows (clipboard.rs). Der eigene
+// Lesefilter bleibt davon unberuehrt: fluechtig heisst nicht verdeckt.
+//
 // Alles ueber objc_msgSend von Hand, keine Kiste: objc_getClass,
 // sel_registerName, objc_msgSend (mit passendem Funktionszeiger-Typ je
 // Aufruf) und ein Autorelease-Pool je Durchlauf. Gelinkt wird AppKit (fuer
@@ -22,6 +35,7 @@
 // NSPasteboardTypeFileURL) und libobjc.
 
 use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -40,6 +54,11 @@ const NS_UTF8: usize = 4;
 /// solcher Eintrag geht nicht ueber die Leitung - wie auf dem Mac-Host.
 /// UNGEPRUEFT: Branchenkonvention, keine Apple-Dokumentation.
 const VERDECKT: &CStr = c"org.nspasteboard.ConcealedType";
+
+/// Kennzeichen aus derselben Verabredung: der Inhalt ist fluechtig und
+/// gehoert in keinen Verlauf. Setzt set() an allem, was vom Host kommt.
+/// UNGEPRUEFT wie VERDECKT: Branchenkonvention.
+const FLUECHTIG: &CStr = c"org.nspasteboard.TransientType";
 
 // ------------------------------------------------------------------- FFI
 
@@ -150,6 +169,14 @@ static EIGEN: Mutex<(isize, isize)> = Mutex::new((-1, -1));
 /// Serialisiert set() gegen den Waechter (siehe Kopf).
 static SPERRE: Mutex<()> = Mutex::new(());
 
+/// Laeuft eine Sitzung? Nur dann liest der Waechter den Inhalt.
+static SITZUNG: AtomicBool = AtomicBool::new(false);
+
+/// Sitzung beginnt (true, der Host hat angenommen) oder endet (false).
+pub fn sitzung(an: bool) {
+    SITZUNG.store(an, Ordering::Relaxed);
+}
+
 /// Das allgemeine Brett. Null, wenn AppKit nicht da ist - dann tut alles
 /// hier still nichts.
 fn brett() -> Id {
@@ -234,11 +261,22 @@ pub fn set(text: &str) {
     if b.is_null() {
         return;
     }
+    if let Some(zaehler) = ablegen(b, text) {
+        if let Ok(mut e) = EIGEN.lock() {
+            *e = zaehler;
+        }
+    }
+}
+
+/// Legt `text` als einzigen Eintrag auf `b`, als fluechtig gekennzeichnet
+/// (FLUECHTIG). Gibt den changeCount nach dem Leeren und nach dem letzten
+/// Schreiben zurueck - beide muss der Waechter als eigenen Vorgang erkennen.
+fn ablegen(b: Id, text: &str) -> Option<(isize, isize)> {
     let _pool = Pool::neu();
     unsafe {
         let ns_klasse = klasse(c"NSString");
         if ns_klasse.is_null() {
-            return;
+            return None;
         }
         // initWithBytes statt stringWithUTF8String: kein Abschneiden an
         // einem NUL im Text, und die Laenge steht fest.
@@ -251,15 +289,21 @@ pub fn set(text: &str) {
             NS_UTF8,
         );
         if s.is_null() {
-            return;
+            return None;
         }
         let nach_leeren = msg_int(b, sel(c"clearContents"));
         let ok = msg_bool_2(b, sel(c"setString:forType:"), s, NSPasteboardTypeString);
         let _ = msg_id(s, sel(c"release"));
-        let nach_setzen = if ok { change_count(b) } else { nach_leeren };
-        if let Ok(mut e) = EIGEN.lock() {
-            *e = (nach_leeren, nach_setzen);
+        // Das Kennzeichen an denselben (ersten) Eintrag, mit leerem Wert -
+        // gezaehlt wird der Stand danach, damit auch dieser Schritt als
+        // eigener Vorgang gilt.
+        let fluechtig = ns_text(FLUECHTIG);
+        let leer = ns_text(c"");
+        if ok && !fluechtig.is_null() && !leer.is_null() {
+            let _ = msg_bool_2(b, sel(c"setString:forType:"), leer, fluechtig);
         }
+        let nach_setzen = if ok { change_count(b) } else { nach_leeren };
+        Some((nach_leeren, nach_setzen))
     }
 }
 
@@ -273,10 +317,27 @@ fn eigener_vorgang(count: isize) -> bool {
 
 // -------------------------------------------------------------- Ueberwachung
 
+/// Ein Blick des Waechters auf `b`: hat sich der changeCount seit `zuletzt`
+/// bewegt, und stammt die Aenderung nicht von uns, wird gelesen - aber nur
+/// mit laufender Sitzung. Ohne sie wird nur mitgezaehlt; eine Aenderung von
+/// vorher holt auch der Sitzungsbeginn nicht nach.
+fn nachsehen(b: Id, zuletzt: &mut isize, sitzung: bool, lesen: impl FnOnce(Id) -> Option<String>) -> Option<String> {
+    let jetzt = change_count(b);
+    if jetzt == *zuletzt {
+        return None;
+    }
+    *zuletzt = jetzt;
+    if eigener_vorgang(jetzt) || !sitzung {
+        return None; // unser eigener Schreibvorgang, oder niemand zum Senden
+    }
+    lesen(b)
+}
+
 /// Startet die Ueberwachung in einem eigenen Faden. `cb` bekommt jeden Text,
-/// den der Benutzer auf dem Mac kopiert hat; eigene Schreibvorgaenge aus `set`
-/// sind bereits herausgefiltert. Was beim Start schon auf dem Brett liegt,
-/// wird nicht gemeldet - wie auf Windows, wo erst die naechste Aenderung zaehlt.
+/// den der Benutzer auf dem Mac waehrend einer Sitzung kopiert hat; eigene
+/// Schreibvorgaenge aus `set` sind bereits herausgefiltert. Was beim Start
+/// oder ohne Sitzung auf das Brett kam, wird nicht gemeldet - wie auf
+/// Windows, wo erst die naechste Aenderung in einer Sitzung zaehlt.
 pub fn watch(cb: impl Fn(String) + Send + 'static) {
     std::thread::spawn(move || {
         let b = brett();
@@ -289,15 +350,7 @@ pub fn watch(cb: impl Fn(String) + Send + 'static) {
             std::thread::sleep(TAKT);
             let text = {
                 let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
-                let jetzt = change_count(b);
-                if jetzt == zuletzt {
-                    continue;
-                }
-                zuletzt = jetzt;
-                if eigener_vorgang(jetzt) {
-                    continue; // unser eigener Schreibvorgang, nicht zuruecksenden
-                }
-                lesen(b)
+                nachsehen(b, &mut zuletzt, SITZUNG.load(Ordering::Relaxed), lesen)
             };
             if let Some(t) = text {
                 if !t.is_empty() {
@@ -394,6 +447,63 @@ mod tests {
             schreiben(&[(c"probe.txt", Some((datei, c"file:///tmp/probe.txt")))]);
             assert_eq!(lesen(b), None, "Datei wurde als Text gelesen");
 
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+    }
+
+    /// Ohne Sitzung zaehlt der Waechter nur mit und liest nichts - auch beim
+    /// Sitzungsbeginn nicht nachtraeglich. Eine neue Kopie in der Sitzung
+    /// wird gelesen. Eigenes, namenloses Brett.
+    #[test]
+    fn ohne_sitzung_wird_nicht_gelesen() {
+        let _pool = Pool::neu();
+        unsafe {
+            let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
+            assert!(!b.is_null(), "kein eigenes Brett");
+            let mut zuletzt = change_count(b);
+            let gelesen = std::cell::Cell::new(0);
+            let zaehlend = |b: Id| {
+                gelesen.set(gelesen.get() + 1);
+                lesen(b)
+            };
+
+            assert!(ablegen(b, "kopiert ohne Sitzung").is_some());
+            assert_eq!(nachsehen(b, &mut zuletzt, false, zaehlend), None);
+            assert_eq!(gelesen.get(), 0, "ohne Sitzung gelesen");
+            assert_eq!(zuletzt, change_count(b), "Aenderung nicht mitgezaehlt");
+
+            // Die Sitzung beginnt: die Kopie von vorher bleibt hier.
+            assert_eq!(nachsehen(b, &mut zuletzt, true, zaehlend), None);
+            assert_eq!(gelesen.get(), 0, "alte Kopie beim Sitzungsbeginn gelesen");
+
+            assert!(ablegen(b, "kopiert in der Sitzung").is_some());
+            assert_eq!(nachsehen(b, &mut zuletzt, true, zaehlend).as_deref(), Some("kopiert in der Sitzung"));
+            assert_eq!(gelesen.get(), 1);
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+    }
+
+    /// Was vom Host kommt, liegt als ein Eintrag mit Text und dem
+    /// Kennzeichen FLUECHTIG auf dem Brett; der zurueckgegebene Zaehler ist
+    /// der Stand nach dem letzten Schreiben (sonst erkennte der Waechter den
+    /// eigenen Vorgang nicht). Der Lesefilter nimmt fluechtige Eintraege
+    /// weiter an - fluechtig heisst nicht verdeckt.
+    #[test]
+    fn vom_host_fluechtig() {
+        let _pool = Pool::neu();
+        unsafe {
+            let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
+            assert!(!b.is_null(), "kein eigenes Brett");
+            let (nach_leeren, nach_setzen) = ablegen(b, "von drueben").expect("ablegen");
+            assert_eq!(nach_setzen, change_count(b));
+            assert!(nach_setzen >= nach_leeren);
+            let eintraege = msg_id(b, sel(c"pasteboardItems"));
+            assert_eq!(msg_int(eintraege, sel(c"count")), 1);
+            let item = msg_id(eintraege, sel(c"firstObject"));
+            assert!(hat_typ(item, ns_text(FLUECHTIG)), "Kennzeichen fehlt");
+            assert!(hat_typ(item, NSPasteboardTypeString));
+            assert_eq!(lesen(b).as_deref(), Some("von drueben"));
             let _ = msg_id(b, sel(c"releaseGlobally"));
         }
     }
