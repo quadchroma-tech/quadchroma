@@ -285,6 +285,8 @@ static void send_small(uint8_t type, const void *data, size_t len) {
             atomic_store(&g_vid_ready, 0);
             atomic_store(&g_client_fd, -1);
             close(fd);
+            qc_chan_free(g_vid);
+            g_vid = NULL;
             stream_herunterfahren_anstossen();
         }
     }
@@ -418,7 +420,7 @@ static void *accept_thread(void *arg) {
                                 (const uint8_t *)QC_PRO_VIDEO, strlen(QC_PRO_VIDEO));
         if (hr != 0) {
             logf_(@"Handschlag mit %s gescheitert (%d)", ip, hr);
-            free(chan);
+            qc_chan_free(chan);
             close(fd);
             continue;
         }
@@ -452,7 +454,7 @@ static void *accept_thread(void *arg) {
             }
         }
         if (!rein) {
-            free(chan);
+            qc_chan_free(chan);
             close(fd);
             continue;
         }
@@ -461,7 +463,7 @@ static void *accept_thread(void *arg) {
         // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung.
         if (!stream_hochfahren_sync()) {
             logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
-            free(chan);
+            qc_chan_free(chan);
             close(fd);
             continue;
         }
@@ -478,7 +480,7 @@ static void *accept_thread(void *arg) {
         int old = atomic_exchange(&g_client_fd, -1);
         atomic_store(&g_vid_ready, 0);
         if (old >= 0 && old != fd) close(old);
-        free(g_vid);
+        qc_chan_free(g_vid);
         g_vid = chan;
         memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
         memcpy(g_vid_peer, chan->peer, 32);
@@ -488,6 +490,9 @@ static void *accept_thread(void *arg) {
         if (sent == 0) {
             atomic_store(&g_client_fd, fd);
             atomic_store(&g_vid_ready, 1);
+        } else {
+            qc_chan_free(g_vid);
+            g_vid = NULL;
         }
         pthread_mutex_unlock(&g_send_mtx);
         if (sent != 0) { close(fd); continue; }
@@ -815,13 +820,13 @@ static void *input_thread(void *arg) {
         int hr = qc_chan_accept(in, fd, g_id_priv, pro, prolen);
         if (hr != 0) {
             logf_(@"Eingabekanal: Handschlag gescheitert (%d)", hr);
-            free(in);
+            qc_chan_free(in);
             close(fd);
             continue;
         }
         if (memcmp(in->peer, expect, 32) != 0) {
             logf_(@"Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
-            free(in);
+            qc_chan_free(in);
             close(fd);
             continue;
         }
@@ -834,8 +839,11 @@ static void *input_thread(void *arg) {
                 // Text kann gross sein, deshalb hier ein eigener Puffer.
                 if (h.len > 4 * 1024 * 1024) break;
                 char *big = h.len ? malloc(h.len + 1) : NULL;
-                if (h.len && (!big || qc_chan_read(in, big, h.len) != 0)) { free(big); break; }
-                if (big) { big[h.len] = 0; qc_clip_set(big, h.len); free(big); }
+                BOOL ok = !h.len || (big && qc_chan_read(in, big, h.len) == 0);
+                if (ok && big) { big[h.len] = 0; qc_clip_set(big, h.len); }
+                // Die Ablage kann Geheimes tragen: nichts davon bleibt im Speicher liegen.
+                if (big) { qc_wipe(big, h.len + 1); free(big); }
+                if (!ok) break;
                 continue;
             }
             if (h.len > sizeof payload) break;
@@ -920,8 +928,9 @@ static void *input_thread(void *arg) {
         }
         logf_(@"Eingabekanal getrennt");
         alle_tasten_loslassen();
-        free(in);
+        qc_chan_free(in);
         close(fd);
+        qc_wipe(payload, sizeof payload);
     }
     return NULL;
 }
@@ -1082,6 +1091,8 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
             atomic_store(&g_client_fd, -1);
             stream_herunterfahren_anstossen();
             close(fd);
+            qc_chan_free(g_vid);
+            g_vid = NULL;
             pthread_mutex_unlock(&g_send_mtx);
             return;
         }

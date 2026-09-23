@@ -31,6 +31,12 @@ typedef struct {
 int qc_chan_accept(qc_chan *c, int fd, const uint8_t s_priv[32],
                    const uint8_t *prologue, size_t prologue_len);
 
+/// Loescht Schluessel und Puffer und gibt den Kanal frei. NULL ist erlaubt.
+void qc_chan_free(qc_chan *c);
+
+/// Speicher loeschen, ohne dass der Uebersetzer das wegoptimiert.
+void qc_wipe(void *p, size_t n);
+
 /// Verschluesselt die Teile und schreibt sie am Stueck. 0 = Erfolg.
 int qc_chan_send(qc_chan *c, const struct iovec *iov, int cnt);
 
