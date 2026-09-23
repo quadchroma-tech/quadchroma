@@ -7,6 +7,7 @@
 // ueberein, sprechen C und Rust nachweislich dieselbe Sprache.
 
 #include "qc_noise.h"
+#include "monocypher.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -42,6 +43,46 @@ static int write_msg(int fd, const uint8_t *buf, size_t len) {
     return send(fd, buf, len, 0) == (ssize_t)len ? 0 : -1;
 }
 
+// Ein gescheiterter Handschlag laesst kein DH-Ergebnis liegen: Nachricht 3
+// mit verfaelschtem Nutzlast-Tag, danach wird in den 16 KB unterhalb des
+// Aufrufers - dort lagen eben noch die Rahmen von qc_handshake_read und
+// seinen Helfern - nach dem se-Wert gesucht. Den kennt hier nur der Test.
+static uint8_t g_se[32];
+
+__attribute__((noinline)) static int stapel_treffer(void) {
+    volatile uint8_t marke[1];
+    const uint8_t *p = (const uint8_t *)marke - 16384;
+    int treffer = 0;
+    for (size_t i = 0; i + 32 <= 16384; i++) if (!memcmp(p + i, g_se, 32)) treffer++;
+    return treffer;
+}
+
+// 0 = wie erwartet abgelehnt, sonst Rueckgabe von qc_handshake_read.
+__attribute__((noinline)) static int nachricht3_verfaelscht(int verfaelschen) {
+    const char *pro = "QuadChroma/1 video Noise_XX_25519_ChaChaPoly_SHA256";
+    uint8_t ip[32], ipub[32], rp[32], rpub[32];
+    qc_keypair(ip, ipub);
+    qc_keypair(rp, rpub);
+    qc_handshake ini, res;
+    qc_handshake_init(&ini, 1, ip, (const uint8_t *)pro, strlen(pro));
+    qc_handshake_init(&res, 0, rp, (const uint8_t *)pro, strlen(pro));
+    uint8_t m[512], p[512];
+    size_t ml = 0, pl = 0;
+    qc_handshake_write(&ini, NULL, 0, m, &ml);
+    qc_handshake_read(&res, m, ml, p, &pl);
+    qc_handshake_write(&res, NULL, 0, m, &ml);
+    qc_handshake_read(&ini, m, ml, p, &pl);
+    qc_handshake_write(&ini, (const uint8_t *)"hallo", 5, m, &ml);
+    crypto_x25519(g_se, ini.s_priv, res.e_pub);      // se, von der Anruferseite aus
+    if (verfaelschen) m[ml - 1] ^= 1;
+    int r = qc_handshake_read(&res, m, ml, p, &pl);
+    crypto_wipe(&ini, sizeof ini);
+    crypto_wipe(&res, sizeof res);
+    crypto_wipe(ip, sizeof ip);
+    crypto_wipe(rp, sizeof rp);
+    return verfaelschen ? (r == -1 ? 0 : 1) : r;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
@@ -49,6 +90,19 @@ int main(int argc, char **argv) {
         int r = qc_noise_selftest();
         // Der Selbsttest leiht sich den Zufall nur aus (Stelle 99: nicht zurueckgegeben).
         if (r == 0 && qc_random != vorher) r = 99;
+        // Stelle 98: nach einer verfaelschten Nachricht 3 lag se noch auf dem
+        // Stapel. Die Gegenprobe mit gueltiger Nachricht muss ebenso sauber sein.
+        if (r == 0) {
+            int ab = nachricht3_verfaelscht(1), t_ab = stapel_treffer();
+            int gut = nachricht3_verfaelscht(0), t_gut = stapel_treffer();
+            crypto_wipe(g_se, sizeof g_se);
+            if (ab != 0 || gut != 0 || t_ab != 0 || t_gut != 0) {
+                printf("Fehlerweg: abgelehnt %s, se-Treffer %d (gueltig: %d)\n", ab ? "NEIN" : "ja", t_ab, t_gut);
+                r = 98;
+            } else {
+                printf("Fehlerweg: verfaelschte Nachricht 3 abgelehnt, kein DH-Ergebnis auf dem Stapel\n");
+            }
+        }
         printf(r == 0 ? "OK\n" : "FEHLER an Stelle %d\n", r);
         return r;
     }
