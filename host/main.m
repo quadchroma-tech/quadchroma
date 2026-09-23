@@ -346,6 +346,7 @@ static void send_small(uint8_t type, const void *data, size_t len) {
 // Bilder, und der Takt speist die vorgerenderte Schleife in Zielrate.
 static _Atomic int g_testbild = 0;
 #define QC_MSG_HOSTSTATUS 9    // Host -> Client: u8 Lage (0 = in Ordnung, 1 = kein Bildschirm)
+#define QC_MSG_ABGELOEST  10   // Host -> Client: ein anderer Zuschauer hat uebernommen, Laenge 0, letzte Nachricht
 #define QC_IN_TIME        65   // Client -> Host: Frage zum Zeitabgleich
 #define QC_IN_SETTINGS    64   // Client -> Host: was gewuenscht wird
 static void hoststatus_senden(uint8_t lage) {
@@ -479,6 +480,45 @@ static void annahme_andrang(long verdraengt, const struct sockaddr_in *verdraeng
     }
 }
 
+// So lange darf die Abloese-Nachricht hoechstens auf Platz im Sendepuffer
+// warten. Sie braucht nur 28 Byte; bei einem lebenden Zuschauer macht jede
+// Quittung Platz (LAN rund 1 ms, WLAN einige 10 ms). Wer in 100 ms nichts
+// abnimmt, ist eingefroren - dann wird trotzdem geschlossen, und g_send_mtx
+// haengt nicht fest.
+#define QC_ABLOESUNG_MS 100
+
+// Den bisherigen Zuschauer abloesen, weil ein neuer, gekoppelter kommt. Er
+// bekommt als letzte Nachricht auf seinem Bildkanal Typ 10 - sonst verbaende
+// sich sein Client nach zwei Sekunden von selbst neu und loeste seinerseits
+// den neuen ab, endlos hin und her. Danach sind Bild- und Eingabekanal zu.
+// Nur unter g_send_mtx rufen; neu_fd ist die Verbindung des Neuen.
+// Rueckgabe: -1 = es gab keinen, 1 = Nachricht abgeschickt, 0 = kam nicht an.
+static int zuschauer_abloesen(int neu_fd, char fp_alt[24]) {
+    int alt = atomic_exchange(&g_client_fd, -1);
+    atomic_store(&g_vid_ready, 0);
+    int gemeldet = -1;
+    if (alt >= 0 && alt != neu_fd) {
+        if (g_vid) {
+            qc_fingerprint(g_vid_peer, fp_alt);
+            // Derselbe Weg wie send_small, nur mit kurzer Frist statt der
+            // zwei Sekunden aus tune_socket. Die Frist bleibt am Socket, er
+            // wird gleich geschlossen.
+            struct timeval kurz = { .tv_sec = 0, .tv_usec = QC_ABLOESUNG_MS * 1000 };
+            setsockopt(alt, SOL_SOCKET, SO_SNDTIMEO, &kurz, sizeof kurz);
+            qc_hdr h = { .type = QC_MSG_ABGELOEST, .flags = 0, .reserved = 0, .len = 0 };
+            struct iovec iov = { .iov_base = &h, .iov_len = sizeof h };
+            gemeldet = qc_chan_send(g_vid, &iov, 1) == 0;
+        }
+        // close laesst den Kernel alles noch Gepufferte samt dieser letzten
+        // Nachricht zustellen, bevor die Verbindung endet.
+        close(alt);
+    }
+    eingabe_abbrechen();
+    qc_chan_free(g_vid);
+    g_vid = NULL;
+    return gemeldet;
+}
+
 static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     struct sockaddr_in peer = *von;
     tune_socket(fd);
@@ -558,11 +598,8 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     strominfo_fuellen(hello + 4 + sizeof h);
 
     pthread_mutex_lock(&g_send_mtx);
-    int old = atomic_exchange(&g_client_fd, -1);
-    atomic_store(&g_vid_ready, 0);
-    if (old >= 0 && old != fd) close(old);
-    eingabe_abbrechen();
-    qc_chan_free(g_vid);
+    char fp_alt[24] = {0};
+    int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
@@ -580,6 +617,9 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         stream_herunterfahren_anstossen();
     }
     pthread_mutex_unlock(&g_send_mtx);
+    if (abgeloest >= 0)
+        logf_(@"Bisheriger Zuschauer %s abgeloest und getrennt%s", fp_alt,
+              abgeloest ? "" : " - die Abloese-Nachricht kam nicht an");
     if (sent != 0) {
         logf_(@"Zuschauer %s: Begruessung liess sich nicht senden", ip);
         close(fd);
