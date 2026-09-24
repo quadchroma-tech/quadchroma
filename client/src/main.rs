@@ -715,6 +715,169 @@ struct Shared {
     /// D3D11VA bei Automatik). None: Software, WARP oder ohne Fenster. Der
     /// Fensterfaden setzt ihn beim Aufbau der Karte, vor der Verbindung.
     anzeige_adapter: Option<u32>,
+    /// Laufende Nummer der Sitzung, run_session zaehlt sie beim Aufbau hoch.
+    /// Sender und Empfaenger melden ihren Stand nur, solange sie gilt: ein
+    /// spaetes "abgebrochen" der vorigen Sitzung gehoert nicht in die neue.
+    sitzung_nr: u64,
+    /// Der Host kann Dateien: MSG_FAEHIGKEITEN mit FAEHIG_DATEIEN in DIESER
+    /// Sitzung (Spezifikation 2.2). Zurueck bei jedem Sitzungsende.
+    host_dateien: bool,
+    /// FilesPeerOld stand in dieser Sitzung schon da (einmal je Sitzung).
+    host_zu_alt_gemeldet: bool,
+    /// Die laufende Datei-Sendung Client -> Host, hoechstens eine. Fallen
+    /// lassen bricht sie ab (Griff::drop); DATEI_QUITTUNG vom Host geht an sie.
+    datei_senden: Option<DateiSendung>,
+    /// Was die Zeile ueber dem Bild zu Dateiuebertragungen zeigt.
+    datei_stand: DateiStaende,
+    /// Pruefnaht: Basis und Ablage-Aktion fuer empfangene Dateien. None in
+    /// der Produktion (dateien::ablage_basis(), clipboard::set_dateien);
+    /// Tests setzen einen eigenen Ordner und einen Rekorder, damit weder die
+    /// echte Ablage noch die Basis anderer Tests angefasst wird.
+    datei_ablage: Option<DateiAblage>,
+}
+
+/// Wohin empfangene Dateien gehen und wie sie in die Ablage kommen.
+#[derive(Clone)]
+struct DateiAblage {
+    basis: std::path::PathBuf,
+    ablegen: Arc<dyn Fn(Vec<std::path::PathBuf>) -> bool + Send + Sync>,
+}
+
+impl DateiAblage {
+    /// Die der Produktion: Basis im Temp-Ordner, Dateiliste in die eigene Ablage.
+    fn produktion() -> DateiAblage {
+        #[cfg(any(windows, target_os = "macos"))]
+        let ablegen: Arc<dyn Fn(Vec<std::path::PathBuf>) -> bool + Send + Sync> =
+            Arc::new(|p: Vec<std::path::PathBuf>| clipboard::set_dateien(&p));
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let ablegen: Arc<dyn Fn(Vec<std::path::PathBuf>) -> bool + Send + Sync> = Arc::new(|_| false);
+        DateiAblage { basis: dateien::ablage_basis(), ablegen }
+    }
+}
+
+/// Eine laufende Sendung Client -> Host: ihr Griff und der Eingabekanal, an
+/// den sie gebunden ist. Fallen lassen bricht sie ab (Griff::drop).
+struct DateiSendung {
+    griff: dateien::Griff,
+    /// Nummer des Eingabekanals (InputLink::kanal_nr), auf dem ihr erstes
+    /// Paket hinausging; 0, solange keins hinaus ist. datei_weg setzt sie,
+    /// datei_kanal_pruefen vergleicht sie mit dem stehenden Kanal.
+    kanal: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DateiSendung {
+    fn kennung(&self) -> u32 {
+        self.griff.kennung()
+    }
+
+    /// Nutzlast einer DATEI_QUITTUNG vom Host; kehrt sofort zurueck.
+    fn quittung(&self, nutzlast: &[u8]) {
+        self.griff.quittung(nutzlast);
+    }
+
+    /// Der Eingabekanal, an den sie gebunden ist (None: noch keiner).
+    fn gebunden(&self) -> Option<u64> {
+        Some(self.kanal.load(std::sync::atomic::Ordering::SeqCst)).filter(|&k| k != 0)
+    }
+}
+
+/// So lange bleibt die Zeile nach dem Ergebnis einer Uebertragung stehen.
+const DATEI_NACHLAUF: Duration = Duration::from_secs(6);
+
+/// Eine Richtung der Dateiuebertragung fuer die Anzeige: der letzte Stand
+/// und, sobald er ein Ergebnis traegt, seit wann.
+#[derive(Clone, Debug)]
+struct DateiAnzeige {
+    stand: dateien::Stand,
+    ergebnis_seit: Option<Instant>,
+}
+
+/// Die Zeilen ueber dem Bild: je Richtung eine, weil Senden und Empfangen
+/// zugleich laufen duerfen (Spezifikation 2.7 Schritt 6).
+#[derive(Clone, Debug, Default)]
+struct DateiStaende {
+    senden: Option<DateiAnzeige>,
+    empfangen: Option<DateiAnzeige>,
+}
+
+impl DateiStaende {
+    /// Einen Stand uebernehmen, zugeordnet nach der Kennung: Kennungen
+    /// steigen je Sender (Spezifikation 2.3). Der Stand einer aelteren
+    /// Uebertragung - etwa das "abgebrochen" eines Senders, den ein neuer
+    /// abgeloest hat und der sich erst meldet, wenn der neue schon laeuft -
+    /// ueberschreibt den neueren nicht. Kennung 0 (FilesPeerOld) gilt immer.
+    fn setzen(&mut self, st: dateien::Stand) {
+        let platz = match st.richtung {
+            dateien::Richtung::Senden => &mut self.senden,
+            dateien::Richtung::Empfangen => &mut self.empfangen,
+        };
+        if let Some(alt) = platz.as_ref() {
+            if st.kennung != 0 && alt.stand.kennung != 0 && st.kennung < alt.stand.kennung {
+                return;
+            }
+        }
+        let ergebnis_seit = if st.laeuft() { None } else { Some(Instant::now()) };
+        *platz = Some(DateiAnzeige { stand: st, ergebnis_seit });
+    }
+
+    /// Was jetzt zu sehen ist: laufende Uebertragungen und Ergebnisse der
+    /// letzten DATEI_NACHLAUF, Empfangen vor Senden.
+    fn sichtbare(&self, jetzt: Instant) -> Vec<&dateien::Stand> {
+        [&self.empfangen, &self.senden]
+            .into_iter()
+            .flatten()
+            .filter(|a| a.ergebnis_seit.is_none_or(|t| jetzt.saturating_duration_since(t) < DATEI_NACHLAUF))
+            .map(|a| &a.stand)
+            .collect()
+    }
+
+    fn sichtbar(&self, jetzt: Instant) -> bool {
+        !self.sichtbare(jetzt).is_empty()
+    }
+}
+
+/// Text und Farbe der Zeile fuer einen Stand. Groessen in MB (10^6) mit
+/// einer Nachkommastelle, wie die Zahlen der Statistik.
+fn datei_zeile(st: &dateien::Stand, lang: &strings::Lang) -> (String, u32) {
+    use dateien::{Ergebnis, Richtung};
+    use strings::Key::*;
+    let mb = |b: u64| format!("{:.1}", b as f64 / 1e6);
+    let senden = st.richtung == Richtung::Senden;
+    let (m, farbe) = match &st.ergebnis {
+        Ergebnis::Laeuft => (
+            Meldung::neu(if senden { FilesSending } else { FilesReceiving }, "")
+                .mit("{n}", mb(st.bytes))
+                .mit("{m}", format!("{} MB", mb(st.gesamt))),
+            ui::TEXT,
+        ),
+        Ergebnis::Fertig => (
+            Meldung::neu(if senden { FilesSent } else { FilesReady }, "").mit("{n}", st.oberste.to_string()),
+            ui::CYAN,
+        ),
+        Ergebnis::Abgebrochen(a) => (Meldung::neu(FilesAborted, "").mit("{n}", a.text()), ui::AMBER),
+        Ergebnis::ZuGross => (Meldung::neu(FilesTooLarge, ""), ui::AMBER),
+        Ergebnis::GegenseiteZuAlt => (Meldung::neu(FilesPeerOld, ""), ui::AMBER),
+    };
+    (m.text(lang), farbe)
+}
+
+/// Die schmalen Zeilen zu Dateiuebertragungen unten mittig ueber dem Bild,
+/// je sichtbarer Richtung eine. Derselbe Aufruf fuer Prozessor- und
+/// Grafikweg (oberflaeche_zeichnen) und fuer --shot.
+fn datei_zeilen_zeichnen(u: &mut ui::Ui, c: &mut ui::Canvas, ww: u32, wh: u32, zeilen: &[(String, u32)]) {
+    const GROESSE: u32 = 13;
+    const HOEHE: i32 = 26;
+    const ABSTAND: i32 = 6;
+    let n = zeilen.len() as i32;
+    let mut y = wh as i32 - 22 - n * HOEHE - (n - 1).max(0) * ABSTAND;
+    let breite = (ww as i32 - 80).max(120);
+    for (t, farbe) in zeilen {
+        let t = kuerzen(u, t, breite - 32, GROESSE, 1);
+        let tw = u.text.width(&t, GROESSE, 1);
+        c.fill(ww as i32 / 2 - tw / 2 - 16, y, tw + 32, HOEHE, ui::BG, 200);
+        u.text.draw_centered(c, ww as i32 / 2, y + 18, &t, GROESSE, *farbe, 1);
+        y += HOEHE + ABSTAND;
+    }
 }
 
 impl Shared {
@@ -854,7 +1017,7 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
         if let Err(e) = ergebnis {
             fehler_verbuchen(&mut shared.lock().unwrap(), &addr, e, &mut gemeldet);
         }
-        {
+        let datei = {
             let mut s = shared.lock().unwrap();
             s.abbruch = None;
             s.link = None;
@@ -865,7 +1028,12 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             s.connected = false;
             s.codec_wechsel = None;
             s.codec_idx = None;
-        }
+            // Dateien: Sender ab, Faehigkeit zurueck (das tat schon das Ende
+            // von run_session; der Empfaenger fiel mit ihr weg).
+            s.host_dateien = false;
+            s.datei_senden.take()
+        };
+        drop(datei);
         std::thread::sleep(Duration::from_secs(2));
     }
 }
@@ -1715,7 +1883,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // Erster Kontakt: der Schluessel kommt erst nach dem Handschlag in die Liste.
     let first = pin.eintragen(&sock.peer)?;
     let fp = sock.peer_fingerprint();
-    {
+    // Dateien: je Sitzung eine Nummer, gegen die Sender und Empfaenger ihren
+    // Stand melden; die Faehigkeit des Hosts gilt erst mit MSG_FAEHIGKEITEN
+    // dieser Sitzung.
+    let (sitzung, alt) = {
         let mut s = shared.lock().unwrap();
         s.connected = true;
         s.error = None;
@@ -1729,7 +1900,19 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.codecs.clear();
         s.codec_idx = None;
         s.codec_wechsel = None;
-    }
+        s.sitzung_nr += 1;
+        s.host_dateien = false;
+        s.host_zu_alt_gemeldet = false;
+        s.datei_stand = DateiStaende::default();
+        (s.sitzung_nr, s.datei_senden.take())
+    };
+    drop(alt);
+    // Ab hier raeumt jedes Ende der Sitzung die Dateiuebertragung ab.
+    let _ende = SitzungsEnde(shared);
+    let hh = sock.handshake_hash.clone();
+    // Der Empfaenger fuer Dateien vom Host, erst beim ersten Angebot angelegt;
+    // faellt er mit dieser Funktion weg, bricht er ab und loescht, was halb da ist.
+    let mut empfaenger: Option<dateien::Empfaenger> = None;
 
     // Weist der Host das Geraet ab, macht er die Leitung gleich nach dem
     // Handschlag zu. Das ist kein Netzfehler, sondern eine Aussage - also
@@ -1875,6 +2058,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
             }
         }
+        // Ist der Eingabekanal der laufenden Datei-Sendung verloren, bricht
+        // sie hier ab - je Nachricht geprueft, und der Host schickt laufend
+        // welche (Bilder, auch wiederholte, und Ton).
+        datei_kanal_pruefen(shared, input);
         // Regelmaessig nachfragen: Uhren laufen auseinander, und beim ersten
         // Versuch steht der Eingabekanal oft noch gar nicht.
         let faellig = if lat.versatz_us == 0 { 1 } else { 5 };
@@ -2375,6 +2562,42 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     ablage_setzen(text.to_owned());
                 }
             }
+            MSG_FAEHIGKEITEN => {
+                // Ein aelterer Client uebergeht Typ 11; hier gilt er fuer
+                // diese Sitzung (Spezifikation 2.2).
+                if let Some(bits) = dateien::faehigkeiten_lesen(&payload) {
+                    let kann = dateien::kann_dateien(bits);
+                    shared.lock().unwrap().host_dateien = kann;
+                    protokoll::zeile(format!(
+                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}",
+                        if kann { "ja" } else { "nein" }
+                    ));
+                }
+            }
+            DATEI_ANGEBOT | DATEI_STUECK | DATEI_ENDE => {
+                // Nur einreihen: geschrieben wird im Faden des Empfaengers,
+                // nie hier (die Hosts werfen einen Zuschauer hinaus, der 2 s
+                // nichts abnimmt). Der Puffer `payload` bleibt hier, der
+                // Empfaenger bekommt eine Kopie.
+                let e = empfaenger.get_or_insert_with(|| {
+                    let ablage = shared.lock().unwrap().datei_ablage.clone().unwrap_or_else(DateiAblage::produktion);
+                    let ablegen = ablage.ablegen;
+                    dateien::Empfaenger::neu(
+                        ablage.basis,
+                        quittungs_weg(input, hh.clone()),
+                        move |pfade| ablegen(pfade),
+                        datei_melder(shared, sitzung),
+                    )
+                });
+                e.nachricht(msg_type, payload.to_vec());
+            }
+            DATEI_QUITTUNG => {
+                // An die laufende Sendung; Griff::quittung kehrt sofort
+                // zurueck und uebergeht fremde Kennungen.
+                if let Some(d) = shared.lock().unwrap().datei_senden.as_ref() {
+                    d.quittung(&payload);
+                }
+            }
             MSG_CURSOR => {
                 if len >= 12 {
                     let w = u16::from_le_bytes([payload[0], payload[1]]);
@@ -2424,6 +2647,207 @@ fn ablage_setzen(text: String) {
         tx
     });
     let _ = tx.send(text);
+}
+
+// ------------------------------------------------------ Dateien (Spezifikation 3.4)
+
+/// Raeumt am Ende von run_session auf, auf jedem Weg hinaus (Fehler,
+/// Trennen, Abloesung, Zielwechsel): eine laufende Datei-Sendung bricht ab,
+/// die Faehigkeit des Hosts gilt nicht mehr. Der Empfaenger ist eine lokale
+/// Variable von run_session und bricht mit ihr ab (Drop).
+struct SitzungsEnde<'a>(&'a Arc<Mutex<Shared>>);
+
+impl Drop for SitzungsEnde<'_> {
+    fn drop(&mut self) {
+        let griff = match self.0.lock() {
+            Ok(mut s) => {
+                s.host_dateien = false;
+                s.datei_senden.take()
+            }
+            Err(_) => None,
+        };
+        // Ausserhalb der Sperre: Griff::drop bricht ab und kehrt sofort zurueck.
+        drop(griff);
+    }
+}
+
+/// Meldungen von Sender und Empfaenger einer Sitzung: die Zeile ins
+/// Protokoll, der Stand in die Anzeige - nur, solange die Sitzung gilt.
+/// Laeuft in deren Faeden, nie unter einer ihrer Sperren.
+fn datei_melder(shared: &Arc<Mutex<Shared>>, sitzung: u64) -> impl Fn(dateien::Ereignis) + Send + 'static {
+    let shared = shared.clone();
+    move |e: dateien::Ereignis| {
+        if let Some(z) = e.zeile {
+            protokoll::zeile(z);
+        }
+        if let Some(st) = e.stand {
+            if let Ok(mut s) = shared.lock() {
+                if s.sitzung_nr == sitzung {
+                    s.datei_stand.setzen(st);
+                }
+            }
+        }
+    }
+}
+
+/// Weg der Quittungen des Empfaengers (Host -> Client): DATEI_QUITTUNG ueber
+/// das normale send des Eingabekanals, also mit Vorrang vor Dateien. Er
+/// nimmt nur die Sperre des Eingabekanals, kurz, im Faden des Empfaengers -
+/// nie `shared` darunter, nie im Empfangsfaden. Voll, solange der Kanal fuer
+/// DIESE Sitzung nicht steht (Aufbau, Neuaufbau nach einem Fehler): der
+/// Empfaenger versucht es nach VOLL_WARTEN mit dem neuesten Stand wieder.
+fn quittungs_weg(input: &Arc<Mutex<InputLink>>, sitzung: Vec<u8>) -> Arc<dyn dateien::Weg> {
+    let input = input.clone();
+    Arc::new(move |typ: u8, n: &[u8]| {
+        let Ok(mut l) = input.lock() else { return dateien::Gesendet::Weg };
+        if l.sitzung() != Some(sitzung.as_slice()) {
+            return dateien::Gesendet::Voll;
+        }
+        if l.einreihen(typ, n) {
+            dateien::Gesendet::Ja
+        } else {
+            dateien::Gesendet::Voll
+        }
+    })
+}
+
+/// Weg des Senders Client -> Host: der Eingabekanal mit Nachrang
+/// (InputLink::datei_senden). Gebunden an die Sitzung und an den Kanal, auf
+/// dem das erste Paket hinausging (`kanal`, siehe DateiSendung): wechselt
+/// eins davon, gilt Weg - auf einem neuen Kanal kaeme der Rest ohne sein
+/// Angebot an (Spezifikation 2.7 Schritt 5, Verlust des Eingabekanals).
+/// Ausgenommen ist das Ende eines Abbruchs (Grund ungleich 0): es geht auch
+/// auf den neuen Kanal derselben Sitzung, damit der Empfaenger des Hosts
+/// gleich verwirft, statt STILLSTAND abzuwarten ("sofern die Leitung
+/// steht"); kennt er die Kennung nicht mehr, uebergeht er es. Steht gerade
+/// kein Kanal (Neuaufbau), gilt fuer dieses Ende Voll - der Sender versucht
+/// es hoechstens ENDE_FRIST lang, und jeder Versuch treibt den Aufbau.
+fn datei_weg(
+    input: &Arc<Mutex<InputLink>>,
+    sitzung: Vec<u8>,
+    kanal: Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<dyn dateien::Weg> {
+    use std::sync::atomic::Ordering;
+    let input = input.clone();
+    Arc::new(move |typ: u8, n: &[u8]| {
+        let Ok(mut l) = input.lock() else { return dateien::Gesendet::Weg };
+        if l.sitzung() != Some(sitzung.as_slice()) {
+            return dateien::Gesendet::Weg;
+        }
+        l.ensure();
+        let gebunden = kanal.load(Ordering::SeqCst);
+        let abbruch_ende =
+            typ == DATEI_ENDE && dateien::Ende::lesen(n).is_some_and(|e| e.grund != dateien::GRUND_VOLLSTAENDIG);
+        match l.kanal_nr() {
+            Some(nr) if gebunden == 0 || gebunden == nr => {
+                let r = l.datei_senden(typ, n);
+                if r == dateien::Gesendet::Ja {
+                    kanal.store(nr, Ordering::SeqCst);
+                }
+                r
+            }
+            Some(_) if abbruch_ende => l.datei_senden(typ, n),
+            None if abbruch_ende => dateien::Gesendet::Voll,
+            _ => dateien::Gesendet::Weg,
+        }
+    })
+}
+
+/// Verlust des Eingabekanals (Spezifikation 2.7 Schritt 5; Pflicht der Rolle
+/// laut dateien.rs): steht der Kanal nicht mehr, auf dem die laufende
+/// Sendung ihr erstes Paket schickte (Schreibfehler, Trennen, neuer Kanal),
+/// bricht sie sofort ab. Ihr Sender merkte es sonst erst beim naechsten
+/// Paket - und wartet er gerade auf Quittungen, die ueber den toten Kanal
+/// nie kommen, erst nach STILLSTAND (30 s). Sein Ende 1 geht auf dem neuen
+/// Kanal hinaus, sobald der steht (datei_weg). Die Sperren nacheinander,
+/// nie verschachtelt; `input` nur mit try_lock (Aufruf je Nachricht in
+/// run_session) - ist sie belegt, prueft der naechste Aufruf.
+fn datei_kanal_pruefen(shared: &Mutex<Shared>, input: &Mutex<InputLink>) {
+    let Some((kennung, gebunden)) = shared
+        .lock()
+        .ok()
+        .and_then(|s| s.datei_senden.as_ref().and_then(|d| Some((d.kennung(), d.gebunden()?))))
+    else {
+        return;
+    };
+    let jetzt = match input.try_lock() {
+        Ok(l) => l.kanal_nr(),
+        Err(_) => return,
+    };
+    if jetzt == Some(gebunden) {
+        return;
+    }
+    let alt = shared.lock().ok().and_then(|mut s| {
+        if s.datei_senden.as_ref().is_some_and(|d| d.kennung() == kennung) {
+            s.datei_senden.take()
+        } else {
+            None
+        }
+    });
+    if alt.is_some() {
+        protokoll::zeile(format!("Dateien: Eingabekanal {gebunden} verloren - Sendung {kennung} abgebrochen"));
+    }
+    // Ausserhalb der Sperre: Griff::drop bricht ab und kehrt sofort zurueck.
+    drop(alt);
+}
+
+/// Kopierter Text (Waechter): eine laufende Datei-Sendung bricht ab (neuer
+/// Inhalt, Spezifikation 2.7 Schritt 5), der Text geht wie bisher als IN_CLIP.
+fn text_senden(text: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+    let alt = shared.lock().ok().and_then(|mut s| s.datei_senden.take());
+    drop(alt);
+    if let Ok(mut l) = input.lock() {
+        l.send(IN_CLIP, text.as_bytes());
+    }
+}
+
+/// Kopierte Dateien (Waechter, Spezifikation 2.7 und 3.4). Stammen sie aus
+/// einem Empfang, geht nichts hinaus und nichts bricht ab (Widerhall). Sonst
+/// endet eine laufende Sendung; kann der Host Dateien, startet eine neue,
+/// sonst steht einmal je Sitzung FilesPeerOld da. Laeuft im Faden der
+/// Weiterleitung, nie im Faden des Waechters; Sender::starten kehrt sofort
+/// zurueck, Auflisten und Lesen laufen in dessen eigenem Faden. Der Griff
+/// liegt in `shared`, bevor die Sperre faellt - eine Quittung des Hosts, die
+/// run_session gleich danach bekommt, findet ihn also schon. Unter `shared`
+/// wird keine andere Sperre genommen.
+fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+    let basis = shared
+        .lock()
+        .ok()
+        .and_then(|s| s.datei_ablage.as_ref().map(|a| a.basis.clone()))
+        .unwrap_or_else(dateien::ablage_basis);
+    if dateien::aus_eigener_ablage(&pfade, &basis) {
+        protokoll::zeile("Dateien: nicht gesendet, sie stammen aus einem Empfang".into());
+        return;
+    }
+    let Ok(mut s) = shared.lock() else { return };
+    let alt = s.datei_senden.take();
+    let mut zu_alt = false;
+    match (s.link.as_ref().map(|(hh, _)| hh.clone()), s.host_dateien) {
+        (Some(hh), true) => {
+            let spielmodus = s.settings.is_some_and(|x| x.2);
+            let melden = datei_melder(shared, s.sitzung_nr);
+            let kanal = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let weg = datei_weg(input, hh, kanal.clone());
+            let griff = dateien::Sender::starten(pfade, weg, dateien::fenster(spielmodus), melden);
+            s.datei_senden = Some(DateiSendung { griff, kanal });
+        }
+        // Der Host hat in dieser Sitzung keine Dateien gemeldet (aelterer
+        // Stand): nichts senden - er trennte sonst den Eingabekanal -, und
+        // einmal je Sitzung sagen, warum.
+        (Some(_), false) if !s.host_zu_alt_gemeldet => {
+            s.host_zu_alt_gemeldet = true;
+            s.datei_stand.setzen(dateien::Stand::gegenseite_zu_alt(dateien::Richtung::Senden));
+            zu_alt = true;
+        }
+        _ => {}
+    }
+    drop(s);
+    // Die vorige Sendung bricht ab (ausserhalb der Sperre; kehrt sofort zurueck).
+    drop(alt);
+    if zu_alt {
+        protokoll::zeile(dateien::ZEILE_HOST_ZU_ALT.into());
+    }
 }
 
 /// Ein Paket in den Decoder und alle fertigen Bilder heraus. Gibt den
@@ -2745,6 +3169,11 @@ struct InputLink {
     nachreichen: Vec<Vec<u8>>,
     /// Frist fuer den Schreibfaden, siehe SCHREIBFRIST (Tests kuerzen sie).
     schreibfrist: Duration,
+    /// Laufende Nummer des stehenden Kanals, je neuem Kanal eins mehr. Der
+    /// Datei-Sender bindet sich daran: auf einem neuen Kanal ginge der Rest
+    /// einer Uebertragung ohne ihr Angebot hinaus (Spezifikation 2.7 Schritt
+    /// 5, Verlust des Eingabekanals).
+    kanal_nr: u64,
 }
 
 /// Ergebnis eines Aufbaus: die Leitung oder der Fehler, dazu der
@@ -2752,17 +3181,110 @@ struct InputLink {
 type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
 
 /// Nachrichten, die einen Zustand setzen statt ein Ereignis zu melden:
-/// Einstellungen, Codec, Testbild, Zwischenablage. Steht der Kanal gerade
-/// nicht (Aufbau im Hintergrund, Schreibfaden gescheitert), wird je Art die
-/// letzte gemerkt und nachgereicht, sobald er steht - frueher baute das
-/// naechste `send` den Kanal selbst auf und lieferte sie so aus. Maus,
-/// Tasten und Zeitfragen nicht: eine alte Lage oder Frage ist wertlos
-/// (Latenz vor Bandbreite), und gedrueckte Tasten und Maustasten gibt jeder
-/// Host selbst frei, wenn ein Eingabekanal endet oder ersetzt wird
-/// (host/main.m alle_tasten_loslassen, host/netz.rs eingabe_binden und
+/// Faehigkeiten, Einstellungen, Codec, Testbild, Zwischenablage. Steht der
+/// Kanal gerade nicht (Aufbau im Hintergrund, Schreibfaden gescheitert),
+/// wird je Art die letzte gemerkt und nachgereicht, sobald er steht -
+/// frueher baute das naechste `send` den Kanal selbst auf und lieferte sie
+/// so aus. Maus, Tasten und Zeitfragen nicht: eine alte Lage oder Frage ist
+/// wertlos (Latenz vor Bandbreite), und gedrueckte Tasten und Maustasten
+/// gibt jeder Host selbst frei, wenn ein Eingabekanal endet oder ersetzt
+/// wird (host/main.m alle_tasten_loslassen, host/netz.rs eingabe_binden und
 /// Ende der Eingabeschleife) - ein verlorenes Loslassen laesst also nichts
-/// haengen.
-const NACHREICHEN: [u8; 4] = [IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP];
+/// haengen. IN_FAEHIGKEITEN geht ohnehin als erste Nachricht auf jedem neu
+/// stehenden Kanal hinaus (siehe ensure); gemerkt wird sie trotzdem, falls
+/// sie jemand ohne Kanal sendet.
+const NACHREICHEN: [u8; 5] = [IN_FAEHIGKEITEN, IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP];
+
+/// Was dieser Client kann (Spezifikation 2.2), als erste Nachricht auf
+/// jedem Eingabekanal: Dateien Fassung 1. Ein aelterer Host uebergeht sie
+/// (hoechstens 256 Byte); ein neuerer schickt DATEI_* nur an einen
+/// Eingabekanal, der sie gemeldet hat.
+fn faehigkeiten_rahmen() -> Vec<u8> {
+    eingabe_rahmen(IN_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN))
+}
+
+/// Sendepuffer des Eingabekanals im Kernel. Klein, damit dort hoechstens
+/// 64 KiB Dateidaten vor einer Taste liegen (Nachrang, Spezifikation 3.4);
+/// fuer Tasten und Maus reicht er um Groessenordnungen.
+const EINGABE_SNDBUF: i32 = 64 * 1024;
+
+#[cfg(windows)]
+fn eingabe_sendepuffer(s: &std::net::TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET, SO_SNDBUF};
+    let wert = EINGABE_SNDBUF.to_ne_bytes();
+    // SAFETY: gueltiger Socket (lebt mit `s`), der Wert ist ein i32 wie verlangt.
+    unsafe {
+        setsockopt(SOCKET(s.as_raw_socket() as usize), SOL_SOCKET, SO_SNDBUF, Some(&wert));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn eingabe_sendepuffer(s: &std::net::TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn setsockopt(
+            fd: std::os::raw::c_int,
+            ebene: std::os::raw::c_int,
+            name: std::os::raw::c_int,
+            wert: *const std::os::raw::c_void,
+            laenge: u32,
+        ) -> std::os::raw::c_int;
+    }
+    // sys/socket.h (macOS): SOL_SOCKET 0xffff, SO_SNDBUF 0x1001
+    const SOL_SOCKET: std::os::raw::c_int = 0xffff;
+    const SO_SNDBUF: std::os::raw::c_int = 0x1001;
+    let wert: std::os::raw::c_int = EINGABE_SNDBUF;
+    // SAFETY: gueltiger Deskriptor (lebt mit `s`), Zeiger und Laenge eines c_int.
+    unsafe {
+        setsockopt(
+            s.as_raw_fd(),
+            SOL_SOCKET,
+            SO_SNDBUF,
+            &wert as *const std::os::raw::c_int as *const std::os::raw::c_void,
+            std::mem::size_of::<std::os::raw::c_int>() as u32,
+        );
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn eingabe_sendepuffer(_s: &std::net::TcpStream) {}
+
+/// SO_SNDBUF eines Sockets zuruecklesen (nur fuer den Test).
+#[cfg(all(test, windows))]
+fn sendepuffer_lesen(s: &std::net::TcpStream) -> Option<i32> {
+    use std::os::windows::io::AsRawSocket;
+    use windows::core::PSTR;
+    use windows::Win32::Networking::WinSock::{getsockopt, SOCKET, SOL_SOCKET, SO_SNDBUF};
+    let mut wert = [0u8; 4];
+    let mut laenge = 4i32;
+    // SAFETY: gueltiger Socket, Puffer und Laenge passen zueinander.
+    let r = unsafe {
+        getsockopt(SOCKET(s.as_raw_socket() as usize), SOL_SOCKET, SO_SNDBUF, PSTR(wert.as_mut_ptr()), &mut laenge)
+    };
+    (r == 0).then(|| i32::from_ne_bytes(wert))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn sendepuffer_lesen(s: &std::net::TcpStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn getsockopt(
+            fd: std::os::raw::c_int,
+            ebene: std::os::raw::c_int,
+            name: std::os::raw::c_int,
+            wert: *mut std::os::raw::c_void,
+            laenge: *mut u32,
+        ) -> std::os::raw::c_int;
+    }
+    let mut wert: std::os::raw::c_int = 0;
+    let mut laenge = std::mem::size_of::<std::os::raw::c_int>() as u32;
+    // SAFETY: gueltiger Deskriptor, Zeiger und Laenge eines c_int.
+    let r = unsafe {
+        getsockopt(s.as_raw_fd(), 0xffff, 0x1001, &mut wert as *mut std::os::raw::c_int as *mut std::os::raw::c_void, &mut laenge)
+    };
+    (r == 0).then_some(wert)
+}
 
 /// So lange darf ein Schreibaufruf des Eingabekanals ohne Fortschritt
 /// haengen, dann gilt der Kanal als kaputt und wird neu aufgebaut. Ohne
@@ -2806,9 +3328,21 @@ fn bewegungen_zusammenfassen(stapel: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     aus
 }
 
+/// Was der Schreibfaden eines Eingabekanals abzuarbeiten hat: Eingaben der
+/// Reihe nach, dazu hoechstens EIN Datei-Paket mit Nachrang.
+#[derive(Default)]
+struct Warteschlange {
+    eingaben: std::collections::VecDeque<Vec<u8>>,
+    /// Das wartende Datei-Paket (DATEI_*, fertig gerahmt). Ist der Platz
+    /// belegt, gilt fuer das naechste Gesendet::Voll.
+    datei: Option<Vec<u8>>,
+    /// Der Schreiber ist verworfen: der Faden endet.
+    zu: bool,
+}
+
 /// Schreibseite eines stehenden Eingabekanals.
 struct Schreiber {
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    q: Arc<(Mutex<Warteschlange>, std::sync::Condvar)>,
     /// Gesetzt, sobald der Schreibfaden an der Leitung gescheitert ist.
     kaputt: Arc<std::sync::atomic::AtomicBool>,
     /// Zweiter Griff an der Leitung: beim Verwerfen wird sie hierueber
@@ -2818,48 +3352,89 @@ struct Schreiber {
 
 impl Schreiber {
     /// Uebernimmt die Leitung und startet ihren Schreibfaden. Er nimmt, was
-    /// eingereiht ist, fasst Mausbewegungen zusammen und schreibt es in
-    /// Stuecken mit `frist` (siehe SCHREIBFRIST). Er endet, wenn das Schreiben
-    /// scheitert oder der Schreiber verworfen ist; was dann noch eingereiht
-    /// ist, faellt weg - der Host gibt beim Ende des Kanals ohnehin alle
-    /// Tasten frei.
+    /// an Eingaben eingereiht ist, fasst Mausbewegungen zusammen und schreibt
+    /// es in Stuecken mit `frist` (siehe SCHREIBFRIST). Erst wenn keine
+    /// Eingabe mehr wartet, schreibt er hoechstens ein Datei-Paket und sieht
+    /// danach wieder nach Eingaben: eine Taste wartet so hoechstens auf das
+    /// eine Paket, das gerade hinausgeht (bis 48 KiB), und auf das, was davon
+    /// im Sendepuffer des Kernels liegt (EINGABE_SNDBUF). Er endet, wenn das
+    /// Schreiben scheitert oder der Schreiber verworfen ist; was dann noch
+    /// eingereiht ist, faellt weg - der Host gibt beim Ende des Kanals ohnehin
+    /// alle Tasten frei.
     fn neu(mut sock: secure::Secure, frist: Duration) -> Schreiber {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let q: Arc<(Mutex<Warteschlange>, std::sync::Condvar)> = Arc::default();
         let kaputt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let k = kaputt.clone();
+        let (k, q2) = (kaputt.clone(), q.clone());
         sock.socket().set_write_timeout(Some(frist)).ok();
+        eingabe_sendepuffer(sock.socket());
         let griff = sock.abbruchgriff();
-        std::thread::spawn(move || {
-            while let Ok(erste) = rx.recv() {
-                let mut stapel = vec![erste];
-                while stapel.len() < STAPEL_MAX {
-                    match rx.try_recv() {
-                        Ok(b) => stapel.push(b),
-                        Err(_) => break,
-                    }
+        std::thread::spawn(move || loop {
+            let (stapel, datei) = {
+                let (m, cv) = &*q2;
+                let mut w = m.lock().unwrap_or_else(|e| e.into_inner());
+                while !w.zu && w.eingaben.is_empty() && w.datei.is_none() {
+                    w = cv.wait(w).unwrap_or_else(|e| e.into_inner());
                 }
-                for b in bewegungen_zusammenfassen(stapel) {
-                    // Je Stueck ein Datensatz, wie write_all am Stueck ihn
-                    // bilden wuerde: auf der Leitung dieselben Bytes.
-                    for stueck in b.chunks(secure::CHUNK_MAX) {
-                        if sock.write_all(stueck).is_err() {
-                            k.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // Gleich zu, nicht erst mit dem naechsten ensure:
-                            // der zweite Griff hielte die Leitung sonst offen,
-                            // und der Host saehe das Ende (und gaebe die
-                            // Tasten frei) erst spaeter.
-                            let _ = sock.socket().shutdown(std::net::Shutdown::Both);
-                            return;
-                        }
+                if w.zu {
+                    return;
+                }
+                if w.eingaben.is_empty() {
+                    (Vec::new(), w.datei.take())
+                } else {
+                    let n = w.eingaben.len().min(STAPEL_MAX);
+                    (w.eingaben.drain(..n).collect::<Vec<_>>(), None)
+                }
+            };
+            for b in bewegungen_zusammenfassen(stapel).iter().chain(datei.iter()) {
+                // Je Stueck ein Datensatz, wie write_all am Stueck ihn
+                // bilden wuerde: auf der Leitung dieselben Bytes.
+                for stueck in b.chunks(secure::CHUNK_MAX) {
+                    if sock.write_all(stueck).is_err() {
+                        k.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Gleich zu, nicht erst mit dem naechsten ensure:
+                        // der zweite Griff hielte die Leitung sonst offen,
+                        // und der Host saehe das Ende (und gaebe die
+                        // Tasten frei) erst spaeter.
+                        let _ = sock.socket().shutdown(std::net::Shutdown::Both);
+                        return;
                     }
                 }
             }
         });
-        Schreiber { tx, kaputt, griff }
+        Schreiber { q, kaputt, griff }
     }
 
     fn steht(&self) -> bool {
         !self.kaputt.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Eine fertig gerahmte Eingabe einreihen; zurueck kommt sie, wenn der
+    /// Faden nicht mehr schreibt.
+    fn einreihen(&self, b: Vec<u8>) -> Result<(), Vec<u8>> {
+        let (m, cv) = &*self.q;
+        let mut w = m.lock().unwrap_or_else(|e| e.into_inner());
+        if w.zu || !self.steht() {
+            return Err(b);
+        }
+        w.eingaben.push_back(b);
+        cv.notify_one();
+        Ok(())
+    }
+
+    /// Ein fertig gerahmtes Datei-Paket auf den einen Platz: Ja, oder Voll,
+    /// solange dort noch eines wartet; Weg, wenn der Faden nicht mehr schreibt.
+    fn datei_einreihen(&self, b: Vec<u8>) -> dateien::Gesendet {
+        let (m, cv) = &*self.q;
+        let mut w = m.lock().unwrap_or_else(|e| e.into_inner());
+        if w.zu || !self.steht() {
+            return dateien::Gesendet::Weg;
+        }
+        if w.datei.is_some() {
+            return dateien::Gesendet::Voll;
+        }
+        w.datei = Some(b);
+        cv.notify_one();
+        dateien::Gesendet::Ja
     }
 }
 
@@ -2870,6 +3445,14 @@ impl Drop for Schreiber {
     /// Warteschlange weiterzuleben; der Host sieht das Ende des Kanals und
     /// gibt die Tasten frei.
     fn drop(&mut self) {
+        {
+            let (m, cv) = &*self.q;
+            let mut w = m.lock().unwrap_or_else(|e| e.into_inner());
+            w.zu = true;
+            w.eingaben.clear();
+            w.datei = None;
+            cv.notify_all();
+        }
         if let Some(g) = self.griff.take() {
             let _ = g.shutdown(std::net::Shutdown::Both);
         }
@@ -2890,6 +3473,7 @@ impl InputLink {
             aufbau: None,
             nachreichen: Vec::new(),
             schreibfrist: SCHREIBFRIST,
+            kanal_nr: 0,
         }
     }
 
@@ -2948,13 +3532,19 @@ impl InputLink {
             match ergebnis {
                 Ok(s) => {
                     let k = Schreiber::neu(s, self.schreibfrist);
-                    // Was ohne Kanal kam und einen Zustand setzt, zuerst.
-                    for b in std::mem::take(&mut self.nachreichen) {
-                        if k.tx.send(b).is_ok() {
+                    // Zuerst, was dieser Client kann - auf jedem neuen Kanal,
+                    // der Host merkt es sich je Eingabekanal -, dann, was
+                    // ohne Kanal kam und einen Zustand setzt.
+                    let nachzureichen = std::mem::take(&mut self.nachreichen);
+                    let vorab = std::iter::once(faehigkeiten_rahmen())
+                        .chain(nachzureichen.into_iter().filter(|b| b.first() != Some(&IN_FAEHIGKEITEN)));
+                    for b in vorab {
+                        if k.einreihen(b).is_ok() {
                             self.sent += 1;
                         }
                     }
                     self.kanal = Some(k);
+                    self.kanal_nr += 1;
                     self.letzter_versuch = None;
                 }
                 Err(_) => {
@@ -3011,15 +3601,21 @@ impl InputLink {
     /// auf Zustandsnachrichten: die kommen nach, sobald er steht (siehe
     /// NACHREICHEN).
     fn send(&mut self, t: u8, payload: &[u8]) {
+        self.einreihen(t, payload);
+    }
+
+    /// Wie `send`; liefert, ob die Nachricht beim stehenden Kanal eingereiht
+    /// ist (sonst gemerkt, falls NACHREICHEN, oder weg).
+    fn einreihen(&mut self, t: u8, payload: &[u8]) -> bool {
         self.ensure();
         let mut buf = eingabe_rahmen(t, payload);
         if let Some(k) = self.kanal.as_ref().filter(|k| k.steht()) {
-            match k.tx.send(buf) {
+            match k.einreihen(buf) {
                 Ok(()) => {
                     self.sent += 1;
-                    return;
+                    return true;
                 }
-                Err(std::sync::mpsc::SendError(b)) => {
+                Err(b) => {
                     buf = b;
                     self.kanal = None;
                 }
@@ -3029,6 +3625,35 @@ impl InputLink {
             self.nachreichen.retain(|b| b.first() != Some(&t));
             self.nachreichen.push(buf);
         }
+        false
+    }
+
+    /// Ein Datei-Paket (DATEI_ANGEBOT, _STUECK, _ENDE) mit Nachrang: Ja =
+    /// auf dem einen Platz des Schreibfadens, der erst alle wartenden
+    /// Eingaben schreibt; Voll = dort wartet noch eines, spaeter noch einmal;
+    /// Weg = kein stehender Kanal (die Uebertragung bricht ab). Wartet nie.
+    fn datei_senden(&mut self, typ: u8, nutzlast: &[u8]) -> dateien::Gesendet {
+        self.ensure();
+        match self.kanal.as_ref().filter(|k| k.steht()) {
+            Some(k) => {
+                let r = k.datei_einreihen(eingabe_rahmen(typ, nutzlast));
+                if r == dateien::Gesendet::Ja {
+                    self.sent += 1;
+                }
+                r
+            }
+            None => dateien::Gesendet::Weg,
+        }
+    }
+
+    /// Nummer des stehenden Kanals, None ohne.
+    fn kanal_nr(&self) -> Option<u64> {
+        self.steht().then_some(self.kanal_nr)
+    }
+
+    /// Pruefsumme des Bildkanals, an den dieser Eingabekanal gebunden ist.
+    fn sitzung(&self) -> Option<&[u8]> {
+        self.link.as_ref().map(|(hh, _)| hh.as_slice())
     }
 
     /// Frage zum Zeitabgleich. Die Antwort kommt ueber den Bildkanal zurueck.
@@ -4561,9 +5186,15 @@ impl ApplicationHandler<Benutzer> for App {
         // mit 30 Bildern je Sekunde aus. Vorher lief die Schleife ohne Pause
         // und schrieb dasselbe Bild 150-mal je Sekunde ins Fenster - auf dem
         // Laptop ein gutes Viertel der gesamten Prozessorlast des Clients.
+        // Die Zeile zu Dateien zaehlt wie die Lagemeldung: solange sie
+        // sichtbar ist, wird neu gezeichnet (Fortschritt, dann 6 s Ergebnis).
         let (neues_bild, lage, wechsel) = {
             let s = self.shared.lock().unwrap();
-            (s.frame.is_some(), s.error_key.is_some(), s.wechsel_laeuft())
+            (
+                s.frame.is_some(),
+                s.error_key.is_some() || s.datei_stand.sichtbar(Instant::now()),
+                s.wechsel_laeuft(),
+            )
         };
         // Ein ausgelassenes Present (DXGI war noch nicht bereit) wird beim
         // naechsten Takt nachgeholt; der Codecwechsel-Hinweis muss auch ohne
@@ -4755,11 +5386,15 @@ impl App {
         // Ein laufender Benchmark endet mit der Verbindung; wiederherstellen
         // gibt es nichts mehr, nur das Testbild geht noch aus.
         self.benchmark_abbrechen(false);
-        let griff = {
+        let (griff, datei) = {
             let mut s = self.shared.lock().unwrap();
             s.target = None;
-            s.abbruch.take()
+            // Eine laufende Datei-Sendung sofort ab (der Empfaenger bricht
+            // mit dem Ende von run_session ab).
+            s.host_dateien = false;
+            (s.abbruch.take(), s.datei_senden.take())
         };
+        drop(datei);
         {
             let mut l = self.input.lock().unwrap();
             l.alle_loslassen();
@@ -4894,7 +5529,8 @@ impl App {
 
     /// Liegt gerade etwas ueber dem Bild, das sich bewegt und deshalb alle
     /// 33 ms neu gezeichnet werden will? Startbildschirm, Wartebild, Menue,
-    /// Statistik, ESC-Balken, Lagemeldung, Banner, Codecwechsel-Hinweis.
+    /// Statistik, ESC-Balken, Lagemeldung bzw. Zeile zu Dateien, Banner,
+    /// Codecwechsel-Hinweis.
     /// `lage` und `wechsel` kommen aus `Shared`, damit der Aufrufer die
     /// Sperre nur einmal nimmt.
     fn oberflaeche_sichtbar(&self, lage: bool, wechsel: bool) -> bool {
@@ -5133,7 +5769,7 @@ impl App {
         // Oberflaeche wird nicht mehr je Videobild neu gezeichnet.
         let (lage, wechsel) = {
             let s = self.shared.lock().unwrap();
-            (s.error_key.is_some(), s.wechsel_laeuft())
+            (s.error_key.is_some() || s.datei_stand.sichtbar(jetzt), s.wechsel_laeuft())
         };
         let sichtbar = self.oberflaeche_sichtbar(lage, wechsel);
         let mut nach = None;
@@ -5338,8 +5974,8 @@ impl App {
     }
 
     /// Alles, was ueber dem Bild liegt: Startbildschirm, Wartebildschirm,
-    /// Lagemeldung, Statistik, Erstkontakt-Banner, Menue, Codecwechsel-
-    /// Hinweis, ESC-Balken. Zeichnet nur; was ein Klick bewirkt, kommt als
+    /// Lagemeldung, Statistik, Erstkontakt-Banner, Zeile zu Dateien, Menue,
+    /// Codecwechsel-Hinweis, ESC-Balken. Zeichnet nur; was ein Klick bewirkt, kommt als
     /// Nachwirkung zurueck und wird NACH dem Praesentieren ausgefuehrt.
     fn oberflaeche_zeichnen(&mut self, c: &mut ui::Canvas, ww: u32, wh: u32) -> Nachwirkung {
         let mut n = Nachwirkung { act: Action::None, hud: None, abbrechen: false };
@@ -5438,6 +6074,15 @@ impl App {
                         }
                         self.ui.text.draw_centered(c, bx + bw / 2, ty + 24, &sas, 30, ui::AMBER, 6);
                     }
+                }
+                // Dateien: schmale Zeile unten mittig, solange eine
+                // Uebertragung laeuft und 6 s nach ihrem Ergebnis.
+                let zeilen: Vec<(String, u32)> = {
+                    let s = self.shared.lock().unwrap();
+                    s.datei_stand.sichtbare(Instant::now()).into_iter().map(|st| datei_zeile(st, self.lang)).collect()
+                };
+                if !zeilen.is_empty() {
+                    datei_zeilen_zeichnen(&mut self.ui, c, ww, wh, &zeilen);
                 }
                 // Nerd-Modus. Liegt ueber allem, deshalb zuletzt gezeichnet.
                 if self.hud_offen {
@@ -6422,6 +7067,37 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     u.tick = 40;
     u.mouse = (-1, -1);
 
+    // Ansicht "dateien": die Zeile zu Dateiuebertragungen unten mittig ueber
+    // einem angedeuteten Bild - ein Empfang laeuft, eine Sendung ist gerade
+    // fertig (beide Richtungen zugleich, wie es vorkommen kann).
+    if view == "dateien" {
+        for y in 0..h {
+            for x in 0..w {
+                let a = (x * 255 / w) as u32;
+                let b = (y * 160 / h) as u32;
+                buf[y * w + x] = ((a / 3) << 16) | ((b / 2) << 8) | (40 + a / 5);
+            }
+        }
+        use dateien::{Ergebnis, Richtung, Stand};
+        let staende = [
+            Stand {
+                richtung: Richtung::Empfangen, kennung: 7, bytes: 3_100_000, gesamt: 12_400_000,
+                eintraege: 5, dateien: 4, oberste: 2, ergebnis: Ergebnis::Laeuft,
+            },
+            Stand {
+                richtung: Richtung::Senden, kennung: 3, bytes: 2_600_000, gesamt: 2_600_000,
+                eintraege: 3, dateien: 3, oberste: 3, ergebnis: Ergebnis::Fertig,
+            },
+        ];
+        let zeilen: Vec<(String, u32)> = staende.iter().map(|s| datei_zeile(s, lang)).collect();
+        {
+            let mut c = ui::Canvas::neu(&mut buf, w, h);
+            datei_zeilen_zeichnen(&mut u, &mut c, w as u32, h as u32, &zeilen);
+        }
+        write_bmp(path, w, h, &buf, lang);
+        return;
+    }
+
     // Ansicht "sitzung": so sieht es waehrend der Uebertragung aus - ein
     // angedeutetes Bild, darauf die Zahlen und die Einstellungstafel. Ohne
     // Bildschirm ist das die einzige Moeglichkeit, die Oberflaeche zu pruefen.
@@ -6885,7 +7561,11 @@ fn main() {
         let path = args.get(i + 1).cloned().unwrap_or_else(|| "ui.bmp".into());
         let code = args.get(i + 2).cloned().unwrap_or_else(|| "de".into());
         let view = args.get(i + 3).cloned().unwrap_or_else(|| "start".into());
-        let (w, h) = if view == "sitzung" || view == "nerd" || view.starts_with("hud") { (1280, 720) } else { (900, 700) };
+        let (w, h) = if view == "sitzung" || view == "nerd" || view == "dateien" || view.starts_with("hud") {
+            (1280, 720)
+        } else {
+            (900, 700)
+        };
         screenshot(&path, w, h, strings::pick(&code), &view);
         return;
     }
@@ -6924,29 +7604,6 @@ fn main() {
     let start_addr = addr.clone();
     let input = Arc::new(Mutex::new(InputLink::new(input_addr)));
 
-    // Zwischenablage: Was hier kopiert wird, geht zum Host. Die Uebergabe
-    // aus der Fensterschleife heraus ist bewusst nicht blockierend. Kopierte
-    // Dateien meldet der Waechter schon, uebertragen werden sie noch nicht.
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        let link = input.clone();
-        std::thread::spawn(move || {
-            while let Ok(text) = rx.recv() {
-                if let Ok(mut l) = link.lock() {
-                    l.send(IN_CLIP, text.as_bytes());
-                }
-            }
-        });
-        clipboard::watch(move |inhalt| match inhalt {
-            clipboard::Inhalt::Text(text) => { let _ = tx.send(text); }
-            clipboard::Inhalt::Dateien(pfade) => protokoll::zeile(format!(
-                "Zwischenablage: {} Dateien kopiert - Uebertragung noch nicht angebunden",
-                pfade.len()
-            )),
-        });
-    }
-
     // Gespeicherte Einstellungen. Sie bestimmen unter anderem, ob wir im
     // Vollbild starten - das ist die Voreinstellung. Schon hier geladen,
     // weil der Empfangsfaden den Decoderwunsch vom ersten Bild an kennen soll.
@@ -6977,6 +7634,39 @@ fn main() {
 
     // Ton ist an, bis jemand ihn abschaltet - Default waere "aus".
     let shared = Arc::new(Mutex::new(Shared { decoder_wunsch, ton: true, ..Shared::default() }));
+    // Empfangene Dateien von frueher: was aelter als 24 h ist, geht - in einem
+    // eigenen Faden, damit bis zu 4 GB bzw. 10 000 Eintraege je Verzeichnis
+    // den Start nicht aufhalten. Neue Uebertragungen stoert das nicht: ihr
+    // Verzeichnis ist juenger als 24 h.
+    let _ = std::thread::Builder::new().name("qc-dateien-aufraeumen".into()).spawn(|| {
+        let weg = dateien::aufraeumen_beim_start();
+        if weg > 0 {
+            protokoll::zeile(format!("Dateien: {weg} alte Uebertragungsverzeichnisse beim Start geloescht"));
+        }
+    });
+
+    // Zwischenablage: Was hier kopiert wird, geht zum Host - Text als
+    // IN_CLIP, Dateien ueber den Sender (dateien.rs), nur mit Gegenueber
+    // (der Waechter liest ohne Sitzung nicht). Der Waechter reicht nur
+    // weiter (unter Windows laeuft er im Faden seines Fensters); Sperren und
+    // Senden stehen im eigenen Faden der Weiterleitung, der Reihe nach.
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (tx, rx) = std::sync::mpsc::channel::<clipboard::Inhalt>();
+        let (link, sh) = (input.clone(), shared.clone());
+        std::thread::spawn(move || {
+            while let Ok(inhalt) = rx.recv() {
+                match inhalt {
+                    clipboard::Inhalt::Text(text) => text_senden(&text, &sh, &link),
+                    clipboard::Inhalt::Dateien(pfade) => dateien_senden(pfade, &sh, &link),
+                }
+            }
+        });
+        clipboard::watch(move |inhalt| {
+            let _ = tx.send(inhalt);
+        });
+    }
+
     {
         let shared = shared.clone();
         let inp = input.clone();
@@ -8415,7 +9105,8 @@ mod tests {
         }
         l.mouse_move(0.1, 0.2);
         assert!(t.elapsed() < Duration::from_millis(1000), "send wartete {:?}", t.elapsed());
-        assert_eq!(l.sent, 7);
+        // 1 (IN_FAEHIGKEITEN als erste auf dem Kanal) + 6 + 1
+        assert_eq!(l.sent, 8);
         let _ = fertig_tx.send(());
         host.join().unwrap();
     }
@@ -8582,7 +9273,8 @@ mod tests {
         assert_eq!(l.sent, 0);
         eingabe_abwarten(&mut l);
         assert!(l.steht());
-        assert_eq!(l.sent, 3);
+        // Die Faehigkeiten vorweg, dann die drei gemerkten Zustaende.
+        assert_eq!(l.sent, 4);
         l.key(9, true, 0);
         let _ = los.send(());
         let (gelesen, _) = host.join().unwrap();
@@ -8591,7 +9283,16 @@ mod tests {
         einst.extend_from_slice(&[1, 1, 0]);
         let mut taste = 9u16.to_le_bytes().to_vec();
         taste.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
-        assert_eq!(gelesen, vec![(IN_TESTBILD, vec![1]), (IN_CODEC, vec![2]), (IN_SETTINGS, einst), (IN_KEY, taste)]);
+        assert_eq!(
+            gelesen,
+            vec![
+                (IN_FAEHIGKEITEN, vec![1, 0, 0, 0]),
+                (IN_TESTBILD, vec![1]),
+                (IN_CODEC, vec![2]),
+                (IN_SETTINGS, einst),
+                (IN_KEY, taste)
+            ]
+        );
 
         // Neue Bindung: nichts von der alten wird nachgereicht.
         let mut l = InputLink::new("127.0.0.1:1".into());
@@ -8941,6 +9642,7 @@ mod tests {
             SessionTakenOver, HostKeyChanged, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
             StorageUnavailable, ErrorAddress, ErrorNoConnection, ErrorHandshake, ErrorFfmpegStart, ErrorSound,
             ErrorGpuDisplay, ErrorGpuLost, ErrorPixelFormat, DecoderFallback,
+            FilesSending, FilesReceiving, FilesReady, FilesSent, FilesAborted, FilesTooLarge, FilesPeerOld,
         ] {
             assert!(strings::EN.table.iter().any(|(x, _)| *x == k), "{k:?} fehlt englisch");
             assert!(strings::DE.table.iter().any(|(x, _)| *x == k), "{k:?} fehlt deutsch");
@@ -9167,6 +9869,923 @@ mod tests {
                         assert_eq!((k.y, k.h), (zeile.y, zeile.h));
                     }
                     None => assert!(!MIT_VERKNUEPFUNG),
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------ Dateien (Spezifikation 3.4)
+
+    /// Bis die Bedingung gilt, hoechstens `frist`.
+    fn warten_bis(frist: Duration, f: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < frist {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f()
+    }
+
+    /// Liest eine Nachricht (Kopf und Nutzlast) von einer Leitung.
+    fn nachricht_lesen(h: &mut secure::Secure) -> Option<(u8, Vec<u8>)> {
+        let mut kopf = [0u8; 8];
+        h.read_exact(&mut kopf).ok()?;
+        let mut p = vec![0u8; u32::from_le_bytes(kopf[4..8].try_into().unwrap()) as usize];
+        h.read_exact(&mut p).ok()?;
+        Some((kopf[0], p))
+    }
+
+    /// Eigener leerer Ordner je Test unter temp_dir, mit der Kennung des Laufs.
+    fn test_ordner(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("{}-{name}", secure::test_lauf()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Nachrang im Schreiber (Spezifikation 3.4): Datei-Pakete stauen sich,
+    /// solange der Host nicht liest, bis der eine Platz belegt bleibt (Voll).
+    /// Eine Taste und eine Quittung, die DANACH eingereiht werden, gehen vor
+    /// dem wartenden Datei-Paket hinaus - vor ihnen liegt nur das eine Paket,
+    /// das der Schreibfaden gerade schrieb. Ohne stehenden Kanal gilt Weg.
+    #[test]
+    fn datei_pakete_haben_nachrang() {
+        secure::test_identitaet();
+        let hh = vec![0x76; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let mut ohne = InputLink::new(String::new());
+        assert_eq!(ohne.datei_senden(DATEI_STUECK, &[0; 20]), dateien::Gesendet::Weg);
+
+        // Der Host liest erst auf das Zeichen, dann bis zur Taste und bis
+        // alle `erwartet` Datei-Pakete da sind.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (los, los_rx) = std::sync::mpsc::channel::<usize>();
+        let (hh2, k) = (hh.clone(), host_priv);
+        let host = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut h = secure::Secure::accept(s, &noise::prologue_input(&hh2), &k).unwrap();
+            let erwartet = los_rx.recv().unwrap();
+            let (mut gelesen, mut taste, mut pakete) = (Vec::new(), false, 0usize);
+            while !(taste && pakete >= erwartet) {
+                let Some((a, p)) = nachricht_lesen(&mut h) else { break };
+                taste |= a == IN_KEY;
+                pakete += (a == DATEI_STUECK) as usize;
+                gelesen.push((a, p));
+            }
+            gelesen
+        });
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        let paket = |i: u32| {
+            let mut p = vec![0u8; dateien::STUECK_KOPF + dateien::STUECK_MAX];
+            p[..4].copy_from_slice(&i.to_le_bytes());
+            p
+        };
+        let (mut n, mut voll_seit, t0) = (0u32, None::<Instant>, Instant::now());
+        loop {
+            match l.datei_senden(DATEI_STUECK, &paket(n)) {
+                dateien::Gesendet::Ja => {
+                    n += 1;
+                    voll_seit = None;
+                }
+                dateien::Gesendet::Voll => {
+                    if voll_seit.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(300) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                dateien::Gesendet::Weg => panic!("Kanal weg nach {n} Paketen"),
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30) && n < 20_000, "kein Stau nach {n} Paketen");
+        }
+        // Der Platz haelt Paket n-1, der Schreibfaden haengt in n-2.
+        assert!(n >= 2);
+        assert_eq!(l.datei_senden(DATEI_STUECK, &paket(n)), dateien::Gesendet::Voll);
+        l.key(9, true, 0);
+        l.send(DATEI_QUITTUNG, &dateien::Quittung { kennung: 5, zustand: 0, empfangen: 7 }.kodieren());
+        los.send(n as usize).unwrap();
+        let gelesen = host.join().unwrap();
+        assert_eq!(gelesen[0], (IN_FAEHIGKEITEN, vec![1, 0, 0, 0]));
+        let nummer = |p: &Vec<u8>| u32::from_le_bytes(p[..4].try_into().unwrap());
+        let alle: Vec<u32> = gelesen.iter().filter(|(a, _)| *a == DATEI_STUECK).map(|(_, p)| nummer(p)).collect();
+        assert_eq!(alle, (0..n).collect::<Vec<_>>(), "Datei-Pakete fehlen oder ausser der Reihe");
+        let arten: Vec<u8> = gelesen.iter().map(|(a, _)| *a).collect();
+        let taste = arten.iter().position(|a| *a == IN_KEY).expect("Taste fehlt");
+        assert_eq!(arten.get(taste + 1), Some(&DATEI_QUITTUNG), "Quittung nicht gleich hinter der Taste");
+        let danach: Vec<u32> =
+            gelesen[taste..].iter().filter(|(a, _)| *a == DATEI_STUECK).map(|(_, p)| nummer(p)).collect();
+        assert_eq!(danach, vec![n - 1], "hinter der Taste noch {} Datei-Pakete", danach.len());
+    }
+
+    /// IN_FAEHIGKEITEN geht als erste Nachricht auf JEDEM neu stehenden
+    /// Kanal hinaus, vor allem Nachgereichten - auch auf dem, der nach einem
+    /// Abriss neu steht. Ohne Kanal gesendet, wird sie gemerkt (NACHREICHEN),
+    /// geht aber nie doppelt.
+    #[test]
+    fn faehigkeiten_zuerst_auf_jedem_kanal() {
+        use std::net::TcpListener;
+        secure::test_identitaet();
+        let hh = vec![0x77; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let lauscher = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = lauscher.local_addr().unwrap().to_string();
+        let (hh2, k) = (hh.clone(), host_priv);
+        let host = std::thread::spawn(move || {
+            // Erst nach 300 ms annehmen: so lange steht der Kanal sicher nicht.
+            std::thread::sleep(Duration::from_millis(300));
+            let mut runden = Vec::new();
+            for runde in 0..2 {
+                let (s, _) = lauscher.accept().unwrap();
+                let mut h = secure::Secure::accept(s, &noise::prologue_input(&hh2), &k).unwrap();
+                // Runde 1 bis zu den Einstellungen, Runde 2 nur die erste
+                // Nachricht; danach ist die Leitung zu.
+                let mut gelesen = Vec::new();
+                while let Some((a, p)) = nachricht_lesen(&mut h) {
+                    gelesen.push((a, p));
+                    if runde == 1 || a == IN_SETTINGS {
+                        break;
+                    }
+                }
+                runden.push(gelesen);
+            }
+            runden
+        });
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        l.send(IN_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN));
+        l.settings(10, 60, false, false, true);
+        assert!(!l.steht());
+        assert_eq!(l.nachreichen.len(), 2);
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        assert_eq!(l.kanal_nr(), Some(1));
+        // Der Host schliesst nach den Einstellungen: ein Schreibversuch
+        // scheitert, und ein neuer Kanal steht.
+        let t0 = Instant::now();
+        while l.kanal_nr < 2 && t0.elapsed() < Duration::from_secs(10) {
+            l.mouse_move(0.5, 0.5);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(l.kanal_nr, 2);
+        let runden = host.join().unwrap();
+        let faehig = (IN_FAEHIGKEITEN, vec![1, 0, 0, 0]);
+        assert_eq!(runden[0], vec![faehig.clone(), (IN_SETTINGS, vec![10, 0, 0, 0, 60, 0, 0, 0, 1])]);
+        assert_eq!(runden[1], vec![faehig]);
+    }
+
+    /// Der Socket des Eingabekanals hat einen Sendepuffer von 64 KiB: so
+    /// liegen im Kernel hoechstens 64 KiB Dateidaten vor einer Taste.
+    #[test]
+    fn eingabekanal_sendepuffer_64_kib() {
+        secure::test_identitaet();
+        let hh = vec![0x79; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_KEY);
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        let griff = l.kanal.as_ref().and_then(|k| k.griff.as_ref()).expect("kein Griff");
+        assert_eq!(sendepuffer_lesen(griff), Some(EINGABE_SNDBUF));
+        l.key(1, true, 0);
+        let _ = los.send(());
+        let _ = host.join();
+    }
+
+    /// Die Wege der Dateiuebertragung sind an die Sitzung gebunden, der des
+    /// Senders auch an den Eingabekanal seines ersten Pakets: nach einem
+    /// neuen Kanal oder in einer anderen Sitzung gilt Weg (der Rest einer
+    /// Uebertragung kaeme sonst ohne Angebot an) - nur das Ende eines
+    /// Abbruchs darf noch auf den neuen Kanal, und ohne stehenden Kanal
+    /// wartet es (Voll). Quittungen warten (Voll), solange der Kanal dieser
+    /// Sitzung nicht steht, und gehen dann ueber das normale send.
+    #[test]
+    fn datei_wege_binden_an_sitzung_und_kanal() {
+        secure::test_identitaet();
+        let hh = vec![0x7a; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, DATEI_ENDE);
+        let input = Arc::new(Mutex::new(InputLink::new(addr)));
+        let quittungen = quittungs_weg(&input, hh.clone());
+        let q = dateien::Quittung { kennung: 3, zustand: 0, empfangen: 0 }.kodieren();
+        assert_eq!(quittungen.senden(DATEI_QUITTUNG, &q), dateien::Gesendet::Voll, "ohne Bindung");
+        {
+            let mut l = input.lock().unwrap();
+            l.set_link(Some((hh.clone(), host_pub.clone())));
+            eingabe_abwarten(&mut l);
+            assert!(l.steht());
+        }
+        assert_eq!(quittungen.senden(DATEI_QUITTUNG, &q), dateien::Gesendet::Ja);
+        assert_eq!(quittungs_weg(&input, vec![1; 32]).senden(DATEI_QUITTUNG, &q), dateien::Gesendet::Voll, "fremde Sitzung");
+        let fremd = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fremder_weg = datei_weg(&input, vec![1; 32], fremd);
+        assert_eq!(fremder_weg.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Weg, "fremde Sitzung");
+
+        let kanal = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let weg = datei_weg(&input, hh.clone(), kanal.clone());
+        assert_eq!(weg.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Ja);
+        assert_eq!(kanal.load(std::sync::atomic::Ordering::SeqCst), 1, "nicht an Kanal 1 gebunden");
+        assert!(warten_bis(Duration::from_secs(3), || weg.senden(DATEI_STUECK, &[2]) == dateien::Gesendet::Ja));
+        let ende = |grund: u8| dateien::Ende { kennung: 9, grund }.kodieren();
+        // Ein neuer Kanal (hier nur seine Nummer): Angebot, Stueck und ein
+        // vollstaendiges Ende sind Weg, das Ende eines Abbruchs geht hinaus.
+        input.lock().unwrap().kanal_nr += 1;
+        assert_eq!(weg.senden(DATEI_STUECK, &[3]), dateien::Gesendet::Weg);
+        assert_eq!(weg.senden(DATEI_ANGEBOT, &[5]), dateien::Gesendet::Weg);
+        assert_eq!(weg.senden(DATEI_ENDE, &ende(dateien::GRUND_VOLLSTAENDIG)), dateien::Gesendet::Weg);
+        assert!(warten_bis(Duration::from_secs(3), || {
+            weg.senden(DATEI_ENDE, &ende(dateien::GRUND_ABGEBROCHEN)) == dateien::Gesendet::Ja
+        }));
+        assert_eq!(kanal.load(std::sync::atomic::Ordering::SeqCst), 1, "Bindung gewechselt");
+        let _ = los.send(());
+        let (gelesen, _) = host.join().unwrap();
+        assert_eq!(
+            gelesen,
+            vec![
+                (IN_FAEHIGKEITEN, vec![1, 0, 0, 0]),
+                (DATEI_QUITTUNG, q),
+                (DATEI_ANGEBOT, vec![1]),
+                (DATEI_STUECK, vec![2]),
+                (DATEI_ENDE, ende(dateien::GRUND_ABGEBROCHEN)),
+            ]
+        );
+        // Ohne stehenden Kanal: das Ende eines Abbruchs wartet, alles andere ist Weg.
+        input.lock().unwrap().trennen();
+        assert_eq!(weg.senden(DATEI_ENDE, &ende(dateien::GRUND_ABGEBROCHEN)), dateien::Gesendet::Voll);
+        assert_eq!(weg.senden(DATEI_STUECK, &[6]), dateien::Gesendet::Weg);
+        assert_eq!(weg.senden(DATEI_ENDE, &ende(dateien::GRUND_VOLLSTAENDIG)), dateien::Gesendet::Weg);
+    }
+
+    /// Verlust des Eingabekanals, die Regel allein: datei_kanal_pruefen laesst
+    /// eine Sendung stehen, solange ihr Kanal steht oder sie noch an keinen
+    /// gebunden ist, und bricht sie ab, sobald ein anderer Kanal steht oder
+    /// keiner. Ist die Sperre des Eingabekanals belegt, entscheidet sie nichts.
+    #[test]
+    fn kanalverlust_nach_kanalnummer() {
+        use std::sync::atomic::AtomicU64;
+        secure::test_identitaet();
+        let hh = vec![0x7d; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_KEY);
+        let input = Mutex::new(InputLink::new(addr));
+        {
+            let mut l = input.lock().unwrap();
+            l.set_link(Some((hh, host_pub)));
+            eingabe_abwarten(&mut l);
+            assert_eq!(l.kanal_nr(), Some(1));
+        }
+        // Ein Griff, dessen Faden gleich endet (nichts zu senden): die Regel
+        // sieht nur Griff und Bindung.
+        let sendung = |k: u64| {
+            let voll = Arc::new(|_: u8, _: &[u8]| dateien::Gesendet::Voll);
+            let griff = dateien::Sender::starten(Vec::new(), voll, dateien::FENSTER, |_| {});
+            DateiSendung { griff, kanal: Arc::new(AtomicU64::new(k)) }
+        };
+        let shared = Mutex::new(Shared::default());
+        let kennung = |s: &Mutex<Shared>| s.lock().unwrap().datei_senden.as_ref().map(|d| d.kennung());
+
+        // Gebunden an den stehenden Kanal, und noch ungebunden: bleibt.
+        for k in [1, 0] {
+            let d = sendung(k);
+            let nr = d.kennung();
+            shared.lock().unwrap().datei_senden = Some(d);
+            datei_kanal_pruefen(&shared, &input);
+            assert_eq!(kennung(&shared), Some(nr), "Bindung {k}");
+        }
+        // Ein neuer Kanal steht (hier nur seine Nummer): ab.
+        shared.lock().unwrap().datei_senden = Some(sendung(1));
+        input.lock().unwrap().kanal_nr = 2;
+        datei_kanal_pruefen(&shared, &input);
+        assert_eq!(kennung(&shared), None, "neuer Kanal");
+        // Schon an den neuen gebunden: bleibt.
+        let d = sendung(2);
+        let nr = d.kennung();
+        shared.lock().unwrap().datei_senden = Some(d);
+        datei_kanal_pruefen(&shared, &input);
+        assert_eq!(kennung(&shared), Some(nr));
+        // Kein Kanal steht: ab; eine ungebundene bleibt.
+        input.lock().unwrap().trennen();
+        datei_kanal_pruefen(&shared, &input);
+        assert_eq!(kennung(&shared), None, "ohne Kanal");
+        let d = sendung(0);
+        let nr = d.kennung();
+        shared.lock().unwrap().datei_senden = Some(d);
+        datei_kanal_pruefen(&shared, &input);
+        assert_eq!(kennung(&shared), Some(nr));
+        // Ist input belegt, wird nichts entschieden (try_lock).
+        shared.lock().unwrap().datei_senden = Some(sendung(1));
+        {
+            let _belegt = input.lock().unwrap();
+            datei_kanal_pruefen(&shared, &input);
+            assert!(kennung(&shared).is_some(), "unter belegter Sperre entschieden");
+        }
+        datei_kanal_pruefen(&shared, &input);
+        assert_eq!(kennung(&shared), None);
+        let _ = los.send(());
+        let _ = host.join();
+    }
+
+    /// Sender und Empfaenger melden ihren Stand nur, solange ihre Sitzung
+    /// gilt: ein spaetes Ergebnis der vorigen Sitzung gehoert nicht in die
+    /// Anzeige der neuen.
+    #[test]
+    fn datei_melder_nur_fuer_die_eigene_sitzung() {
+        use dateien::{Ereignis, Ergebnis, Richtung, Stand};
+        let shared = Arc::new(Mutex::new(Shared { sitzung_nr: 4, ..Shared::default() }));
+        let alt = datei_melder(&shared, 4);
+        let stand = |kennung: u32| Ereignis {
+            stand: Some(Stand {
+                richtung: Richtung::Empfangen,
+                kennung,
+                bytes: 5,
+                gesamt: 5,
+                eintraege: 1,
+                dateien: 1,
+                oberste: 1,
+                ergebnis: Ergebnis::Fertig,
+            }),
+            zeile: None,
+        };
+        alt(stand(11));
+        assert_eq!(shared.lock().unwrap().datei_stand.empfangen.as_ref().map(|d| d.stand.kennung), Some(11));
+        // Neue Sitzung: die Anzeige beginnt leer, der alte Melder schweigt.
+        {
+            let mut s = shared.lock().unwrap();
+            s.sitzung_nr = 5;
+            s.datei_stand = DateiStaende::default();
+        }
+        alt(stand(12));
+        assert!(shared.lock().unwrap().datei_stand.empfangen.is_none(), "Stand der vorigen Sitzung angezeigt");
+        datei_melder(&shared, 5)(stand(13));
+        assert_eq!(shared.lock().unwrap().datei_stand.empfangen.as_ref().map(|d| d.stand.kennung), Some(13));
+    }
+
+    /// Kopierte Dateien, waehrend der Host in dieser Sitzung keine
+    /// Faehigkeit "Dateien" gemeldet hat: nichts geht hinaus (ein aelterer
+    /// Host trennte sonst den Eingabekanal), einmal je Sitzung FilesPeerOld.
+    /// Mit der Faehigkeit geht das Angebot hinaus.
+    #[test]
+    fn ohne_host_dateien_wird_nichts_gesendet() {
+        secure::test_identitaet();
+        let hh = vec![0x78; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, DATEI_ANGEBOT);
+        let _ = los.send(());
+        let input = Arc::new(Mutex::new(InputLink::new(addr)));
+        let shared = Arc::new(Mutex::new(Shared { link: Some((hh.clone(), host_pub.clone())), ..Shared::default() }));
+        {
+            let mut l = input.lock().unwrap();
+            l.set_link(Some((hh, host_pub)));
+            eingabe_abwarten(&mut l);
+            assert!(l.steht());
+        }
+        let quelle = test_ordner("ohne-faehigkeit");
+        let datei = quelle.join("a.txt");
+        std::fs::write(&datei, b"hallo").unwrap();
+
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        let erst = {
+            let s = shared.lock().unwrap();
+            assert!(s.datei_senden.is_none(), "Sender gestartet");
+            assert!(s.host_zu_alt_gemeldet);
+            let a = s.datei_stand.senden.clone().expect("keine Meldung");
+            assert_eq!(a.stand.ergebnis, dateien::Ergebnis::GegenseiteZuAlt);
+            a.ergebnis_seit
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        assert_eq!(shared.lock().unwrap().datei_stand.senden.as_ref().unwrap().ergebnis_seit, erst, "zweimal gemeldet");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(input.lock().unwrap().sent, 1, "ausser den Faehigkeiten ging etwas hinaus");
+
+        shared.lock().unwrap().host_dateien = true;
+        dateien_senden(vec![datei], &shared, &input);
+        let (gelesen, _) = host.join().unwrap();
+        let arten: Vec<u8> = gelesen.iter().map(|(a, _)| *a).collect();
+        assert_eq!(arten, vec![IN_FAEHIGKEITEN, DATEI_ANGEBOT]);
+        let a = dateien::Angebot::lesen(&gelesen[1].1).unwrap();
+        assert_eq!((a.eintraege.len(), a.gesamt), (1, 5));
+        assert!(shared.lock().unwrap().datei_senden.is_some());
+        let _ = std::fs::remove_dir_all(&quelle);
+    }
+
+    /// Neuer Inhalt bricht eine laufende Sendung ab (Spezifikation 2.7
+    /// Schritt 5): neue Dateien starten eine neue (die alte schickt Ende 1),
+    /// neuer Text beendet sie und geht als IN_CLIP hinaus. Die Anzeige bleibt
+    /// bei der neuesten Kennung. Dateien aus der eigenen Ablage (Widerhall)
+    /// brechen nichts ab.
+    #[test]
+    fn neuer_inhalt_bricht_die_sendung_ab() {
+        secure::test_identitaet();
+        let hh = vec![0x7b; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_CLIP);
+        let _ = los.send(());
+        let input = Arc::new(Mutex::new(InputLink::new(addr)));
+        let quelle = test_ordner("neuer-inhalt");
+        let basis = quelle.join("ablage");
+        let shared = Arc::new(Mutex::new(Shared {
+            link: Some((hh.clone(), host_pub.clone())),
+            host_dateien: true,
+            datei_ablage: Some(DateiAblage { basis: basis.clone(), ablegen: Arc::new(|_| true) }),
+            ..Shared::default()
+        }));
+        {
+            let mut l = input.lock().unwrap();
+            l.set_link(Some((hh, host_pub)));
+            eingabe_abwarten(&mut l);
+            assert!(l.steht());
+        }
+        // 1 MB: ohne Quittung bleibt die Sendung nach dem ersten Fenster stehen.
+        let a = quelle.join("a.bin");
+        std::fs::write(&a, vec![7u8; 1_000_000]).unwrap();
+        let kennung = || shared.lock().unwrap().datei_senden.as_ref().map(|g| g.kennung());
+        dateien_senden(vec![a.clone()], &shared, &input);
+        let k1 = kennung().expect("keine Sendung");
+        assert!(warten_bis(Duration::from_secs(5), || {
+            shared.lock().unwrap().datei_stand.senden.as_ref().is_some_and(|d| d.stand.kennung == k1)
+        }));
+        dateien_senden(vec![a.clone()], &shared, &input);
+        let k2 = kennung().expect("keine neue Sendung");
+        assert!(k2 > k1);
+        // Widerhall: eine Liste aus der eigenen Ablage laesst die Sendung stehen.
+        let eigen = basis.join("1-1").join("x.txt");
+        std::fs::create_dir_all(eigen.parent().unwrap()).unwrap();
+        std::fs::write(&eigen, b"x").unwrap();
+        dateien_senden(vec![eigen], &shared, &input);
+        assert_eq!(kennung(), Some(k2));
+        // Das spaete "abgebrochen" von k1 verdraengt k2 nicht aus der Anzeige.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(shared.lock().unwrap().datei_stand.senden.as_ref().map(|d| d.stand.kennung), Some(k2));
+        text_senden("neuer Text", &shared, &input);
+        assert_eq!(kennung(), None, "Text hat die Sendung nicht abgebrochen");
+        let (gelesen, _) = host.join().unwrap();
+        assert_eq!(gelesen.last(), Some(&(IN_CLIP, b"neuer Text".to_vec())));
+        let enden: Vec<dateien::Ende> =
+            gelesen.iter().filter(|(t, _)| *t == DATEI_ENDE).filter_map(|(_, p)| dateien::Ende::lesen(p)).collect();
+        assert!(enden.contains(&dateien::Ende { kennung: k1, grund: dateien::GRUND_ABGEBROCHEN }), "{enden:?}");
+        assert!(warten_bis(Duration::from_secs(5), || {
+            shared.lock().unwrap().datei_stand.senden.as_ref().is_some_and(|d| {
+                d.stand.kennung == k2 && d.stand.ergebnis == dateien::Ergebnis::Abgebrochen(dateien::Abbruch::Hier)
+            })
+        }));
+        let _ = std::fs::remove_dir_all(&quelle);
+    }
+
+    /// run_session mit Scheinhost, Dateien in beide Richtungen:
+    /// MSG_FAEHIGKEITEN setzt host_dateien, IN_FAEHIGKEITEN kommt als erste
+    /// Nachricht auf dem Eingabekanal. Host -> Client: Angebot und Stuecke
+    /// kommen an, werden quittiert (0, dann 1) und liegen danach im
+    /// Ablageverzeichnis; die Ablage bekommt die obersten Eintraege. Client ->
+    /// Host: Angebot, Stuecke und Ende gehen ueber den Eingabekanal, die
+    /// Quittungen kommen ueber den Bildkanal. Dann das Sitzungsende mitten in
+    /// zwei Uebertragungen: der Empfaenger loescht, was halb da ist, der
+    /// Sender bricht ab, host_dateien ist wieder aus.
+    #[test]
+    fn dateien_ueber_die_sitzung() {
+        use dateien::{Angebot, Eintrag, EintragArt, Ende, Ergebnis, Quittung, Stueck};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        secure::test_identitaet();
+        ffmpeg::init().unwrap();
+        let (host_priv, _) = test_host();
+        let bild_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let eingabe_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bild_addr = bild_l.local_addr().unwrap().to_string();
+        let eingabe_addr = eingabe_l.local_addr().unwrap().to_string();
+
+        // Bildkanal des Scheinhosts: Gruss und Faehigkeiten, dann was der
+        // Test schickt; endet der Kanal des Tests, ist die Leitung zu.
+        let (hh_tx, hh_rx) = mpsc::channel::<Vec<u8>>();
+        let (bild_tx, bild_rx) = mpsc::channel::<Vec<u8>>();
+        let k = host_priv.clone();
+        std::thread::spawn(move || {
+            let (s, _) = bild_l.accept().unwrap();
+            let mut h = secure::Secure::accept(s, &noise::prologue_video(), &k).unwrap();
+            hh_tx.send(h.handshake_hash.clone()).unwrap();
+            let mut m = MAGIC.to_vec();
+            m.extend_from_slice(&eingabe_rahmen(MSG_FAEHIGKEITEN, &[1, 0, 0, 0]));
+            if h.write_all(&m).is_err() {
+                return;
+            }
+            while let Ok(r) = bild_rx.recv() {
+                if h.write_all(&r).is_err() {
+                    return;
+                }
+            }
+        });
+        // Eingabekanal des Scheinhosts: alles Gelesene an den Test.
+        let (ein_tx, ein_rx) = mpsc::channel::<(u8, Vec<u8>)>();
+        let k = host_priv.clone();
+        std::thread::spawn(move || {
+            let hh = hh_rx.recv().unwrap();
+            let (s, _) = eingabe_l.accept().unwrap();
+            let mut h = secure::Secure::accept(s, &noise::prologue_input(&hh), &k).unwrap();
+            while let Some(n) = nachricht_lesen(&mut h) {
+                if ein_tx.send(n).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let basis = test_ordner("dateien-sitzung").join("ablage");
+        let abgelegt: Arc<Mutex<Vec<Vec<std::path::PathBuf>>>> = Arc::default();
+        let a2 = abgelegt.clone();
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(bild_addr.clone()),
+            datei_ablage: Some(DateiAblage {
+                basis: basis.clone(),
+                ablegen: Arc::new(move |p| {
+                    a2.lock().unwrap().push(p);
+                    true
+                }),
+            }),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(eingabe_addr)));
+        // Wie der Fensterfaden: die Bindung des Eingabekanals nachfuehren.
+        let halt = Arc::new(AtomicBool::new(false));
+        {
+            let (s, i, h) = (shared.clone(), input.clone(), halt.clone());
+            std::thread::spawn(move || {
+                while !h.load(Ordering::SeqCst) {
+                    let link = s.lock().unwrap().link.clone();
+                    {
+                        let mut l = i.lock().unwrap();
+                        l.set_link(link);
+                        l.ensure();
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        }
+        let (ende_tx, ende_rx) = mpsc::channel();
+        {
+            let (s, i, a) = (shared.clone(), input.clone(), bild_addr.clone());
+            std::thread::spawn(move || {
+                let _ = ende_tx.send(run_session(&a, &s, &i));
+            });
+        }
+        let frist = Duration::from_secs(10);
+        let empfangen = || ein_rx.recv_timeout(frist).expect("nichts auf dem Eingabekanal");
+        // Die naechste Nachricht dieser Art (Zeitfragen dazwischen uebergehen).
+        let naechste = |art: u8| loop {
+            let (a, p) = empfangen();
+            if a == art {
+                return p;
+            }
+        };
+        let quittung_hin = |q: Quittung| eingabe_rahmen(DATEI_QUITTUNG, &q.kodieren());
+
+        // Faehigkeiten in beide Richtungen.
+        assert!(warten_bis(frist, || shared.lock().unwrap().host_dateien), "MSG_FAEHIGKEITEN kam nicht an");
+        assert_eq!(empfangen(), (IN_FAEHIGKEITEN, vec![1, 0, 0, 0]));
+
+        // Host -> Client: ein Ordner mit einer Datei ueber drei Stuecke, eine kleine Datei.
+        let inhalt_a: Vec<u8> = (0..100_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let angebot = Angebot {
+            kennung: 41,
+            gesamt: 100_005,
+            eintraege: vec![
+                Eintrag { art: EintragArt::Ordner, pfad: "ordner".into(), groesse: 0 },
+                Eintrag { art: EintragArt::Datei, pfad: "ordner/a.bin".into(), groesse: 100_000 },
+                Eintrag { art: EintragArt::Datei, pfad: "b.txt".into(), groesse: 5 },
+            ],
+        };
+        bild_tx.send(eingabe_rahmen(DATEI_ANGEBOT, &angebot.kodieren())).unwrap();
+        let q = Quittung::lesen(&naechste(DATEI_QUITTUNG)).unwrap();
+        assert_eq!(q, Quittung { kennung: 41, zustand: 0, empfangen: 0 });
+        let mut versatz = 0u64;
+        for teil in inhalt_a.chunks(dateien::STUECK_MAX) {
+            let s = Stueck { kennung: 41, eintrag: 1, versatz, daten: teil };
+            bild_tx.send(eingabe_rahmen(DATEI_STUECK, &s.kodieren())).unwrap();
+            versatz += teil.len() as u64;
+        }
+        let s = Stueck { kennung: 41, eintrag: 2, versatz: 0, daten: b"hallo" };
+        bild_tx.send(eingabe_rahmen(DATEI_STUECK, &s.kodieren())).unwrap();
+        bild_tx.send(eingabe_rahmen(DATEI_ENDE, &Ende { kennung: 41, grund: 0 }.kodieren())).unwrap();
+        let schluss = loop {
+            let q = Quittung::lesen(&naechste(DATEI_QUITTUNG)).unwrap();
+            if q.zustand != 0 {
+                break q;
+            }
+        };
+        assert_eq!(schluss, Quittung { kennung: 41, zustand: 1, empfangen: 100_005 });
+        let pfade = abgelegt.lock().unwrap().last().cloned().expect("nicht abgelegt");
+        assert_eq!(pfade.len(), 2);
+        assert!(pfade.iter().all(|p| p.starts_with(&basis)), "{pfade:?}");
+        assert_eq!(std::fs::read(pfade[0].join("a.bin")).unwrap(), inhalt_a);
+        assert_eq!(std::fs::read(&pfade[1]).unwrap(), b"hallo");
+        let stand = |f: fn(&DateiStaende) -> Option<&DateiAnzeige>| {
+            f(&shared.lock().unwrap().datei_stand).map(|a| a.stand.clone())
+        };
+        assert!(warten_bis(frist, || stand(|d| d.empfangen.as_ref())
+            .is_some_and(|s| s.ergebnis == Ergebnis::Fertig && s.oberste == 2)));
+
+        // Client -> Host: eine Datei von 70 000 Byte.
+        let quelle = test_ordner("dateien-sitzung-quelle");
+        let inhalt_c: Vec<u8> = (0..70_000u32).map(|i| (i * 13 % 241) as u8).collect();
+        let c = quelle.join("c.bin");
+        std::fs::write(&c, &inhalt_c).unwrap();
+        dateien_senden(vec![c.clone()], &shared, &input);
+        let an = Angebot::lesen(&naechste(DATEI_ANGEBOT)).unwrap();
+        assert_eq!((an.gesamt, an.eintraege.len(), an.eintraege[0].pfad.as_str()), (70_000, 1, "c.bin"));
+        bild_tx.send(quittung_hin(Quittung { kennung: an.kennung, zustand: 0, empfangen: 0 })).unwrap();
+        let mut daten = Vec::new();
+        loop {
+            let (a, p) = empfangen();
+            match a {
+                DATEI_STUECK => {
+                    let s = Stueck::lesen(&p).unwrap();
+                    assert_eq!((s.kennung, s.eintrag, s.versatz), (an.kennung, 0, daten.len() as u64));
+                    daten.extend_from_slice(s.daten);
+                }
+                DATEI_ENDE => {
+                    assert_eq!(Ende::lesen(&p).unwrap(), Ende { kennung: an.kennung, grund: 0 });
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(daten, inhalt_c);
+        bild_tx.send(quittung_hin(Quittung { kennung: an.kennung, zustand: 1, empfangen: 70_000 })).unwrap();
+        assert!(warten_bis(frist, || stand(|d| d.senden.as_ref())
+            .is_some_and(|s| s.ergebnis == Ergebnis::Fertig && s.kennung == an.kennung)));
+
+        // Zwei halbe Uebertragungen, dann schliesst der Host den Bildkanal.
+        let halb = Angebot {
+            kennung: 42,
+            gesamt: 100_000,
+            eintraege: vec![Eintrag { art: EintragArt::Datei, pfad: "d.bin".into(), groesse: 100_000 }],
+        };
+        bild_tx.send(eingabe_rahmen(DATEI_ANGEBOT, &halb.kodieren())).unwrap();
+        assert_eq!(Quittung::lesen(&naechste(DATEI_QUITTUNG)).unwrap().kennung, 42);
+        let s = Stueck { kennung: 42, eintrag: 0, versatz: 0, daten: &inhalt_a[..dateien::STUECK_MAX] };
+        bild_tx.send(eingabe_rahmen(DATEI_STUECK, &s.kodieren())).unwrap();
+        let verzeichnisse = |endung: &str| -> Vec<String> {
+            std::fs::read_dir(&basis)
+                .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|n| n.ends_with(endung))
+                .collect()
+        };
+        assert!(warten_bis(frist, || verzeichnisse("-42").iter().any(|v| {
+            std::fs::metadata(basis.join(v).join("d.bin")).map(|m| m.len()).unwrap_or(0) == dateien::STUECK_MAX as u64
+        })));
+        dateien_senden(vec![c], &shared, &input);
+        let an2 = Angebot::lesen(&naechste(DATEI_ANGEBOT)).unwrap();
+        assert!(shared.lock().unwrap().datei_senden.is_some());
+        drop(bild_tx);
+        let r = ende_rx.recv_timeout(frist).expect("run_session endet nicht");
+        assert!(r.is_err(), "{r:?}");
+        {
+            let s = shared.lock().unwrap();
+            assert!(!s.host_dateien, "host_dateien blieb");
+            assert!(s.datei_senden.is_none(), "Sender lief weiter");
+        }
+        assert!(warten_bis(frist, || verzeichnisse("-42").is_empty() && verzeichnisse("-42.laeuft").is_empty()),
+            "halbes Verzeichnis blieb: {:?}", verzeichnisse(""));
+        assert_eq!(verzeichnisse("-41").len(), 1, "das fertige ging mit");
+        assert!(warten_bis(frist, || stand(|d| d.senden.as_ref())
+            .is_some_and(|s| s.kennung == an2.kennung && matches!(s.ergebnis, Ergebnis::Abgebrochen(_)))));
+        assert!(warten_bis(frist, || stand(|d| d.empfangen.as_ref())
+            .is_some_and(|s| s.kennung == 42 && matches!(s.ergebnis, Ergebnis::Abgebrochen(_)))));
+        halt.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(basis.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&quelle);
+    }
+
+    /// Verlust des Eingabekanals mitten in einer Sendung (Spezifikation 2.7
+    /// Schritt 5), ueber run_session mit Scheinhost: Kanal 1 liest ein fast
+    /// volles Fenster Datei-Daten, quittiert nichts und schliesst. Der Sender
+    /// wartet dann auf Quittungen, die nie kommen, und ruft seinen Weg nicht
+    /// mehr auf - trotzdem ist die Sendung ab, kurz nachdem der Client den
+    /// Verlust bemerkt (hier an Mausbewegungen wie im Fensterfaden), nicht
+    /// erst nach STILLSTAND (30 s). Auf dem neuen Kanal geht nach
+    /// IN_FAEHIGKEITEN von ihr nur noch das Ende 1 hinaus, kein Stueck.
+    #[test]
+    fn kanalverlust_bricht_die_sendung_ab() {
+        use dateien::{Ende, Ergebnis};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        secure::test_identitaet();
+        ffmpeg::init().unwrap();
+        let (host_priv, _) = test_host();
+        let bild_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let eingabe_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bild_addr = bild_l.local_addr().unwrap().to_string();
+        let eingabe_addr = eingabe_l.local_addr().unwrap().to_string();
+        let halt = Arc::new(AtomicBool::new(false));
+
+        // Bildkanal: Gruss und Faehigkeiten, dann alle 10 ms eine Nachricht,
+        // die run_session uebergeht (wie die Bilder, die ein Host wiederholt).
+        let (hh_tx, hh_rx) = mpsc::channel::<Vec<u8>>();
+        {
+            let (k, h) = (host_priv.clone(), halt.clone());
+            std::thread::spawn(move || {
+                let (s, _) = bild_l.accept().unwrap();
+                let mut c = secure::Secure::accept(s, &noise::prologue_video(), &k).unwrap();
+                hh_tx.send(c.handshake_hash.clone()).unwrap();
+                let mut m = MAGIC.to_vec();
+                m.extend_from_slice(&eingabe_rahmen(MSG_FAEHIGKEITEN, &[1, 0, 0, 0]));
+                if c.write_all(&m).is_err() {
+                    return;
+                }
+                while !h.load(Ordering::SeqCst) {
+                    if c.write_all(&eingabe_rahmen(0xee, &[])).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
+        // Eingabekanal: Kanal 1 liest Datei-Daten bis kurz vor das Fenster
+        // und schliesst ohne Quittung; Kanal 2 reicht alles an den Test.
+        let (ein_tx, ein_rx) = mpsc::channel::<(u8, Vec<u8>)>();
+        let (zu_tx, zu_rx) = mpsc::channel::<Instant>();
+        {
+            let k = host_priv.clone();
+            std::thread::spawn(move || {
+                let hh = hh_rx.recv().unwrap();
+                let (s, _) = eingabe_l.accept().unwrap();
+                let mut c = secure::Secure::accept(s, &noise::prologue_input(&hh), &k).unwrap();
+                let mut daten = 0usize;
+                while let Some((a, p)) = nachricht_lesen(&mut c) {
+                    if a == DATEI_STUECK {
+                        daten += p.len() - dateien::STUECK_KOPF;
+                        if daten >= 250_000 {
+                            break;
+                        }
+                    }
+                }
+                let _ = c.socket().shutdown(std::net::Shutdown::Both);
+                drop(c);
+                let _ = zu_tx.send(Instant::now());
+                let (s, _) = eingabe_l.accept().unwrap();
+                let mut c = secure::Secure::accept(s, &noise::prologue_input(&hh), &k).unwrap();
+                while let Some(n) = nachricht_lesen(&mut c) {
+                    if ein_tx.send(n).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(bild_addr.clone()),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(eingabe_addr)));
+        // Wie der Fensterfaden: Bindung nachfuehren, Aufbau treiben, dazu alle
+        // 50 ms eine Mausbewegung - erst ein Schreibversuch zeigt, dass eine
+        // Leitung tot ist.
+        {
+            let (s, i, h) = (shared.clone(), input.clone(), halt.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                while !h.load(Ordering::SeqCst) {
+                    let link = s.lock().unwrap().link.clone();
+                    {
+                        let mut l = i.lock().unwrap();
+                        l.set_link(link);
+                        l.ensure();
+                        if n % 10 == 0 {
+                            l.mouse_move(0.5, 0.5);
+                        }
+                    }
+                    n += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        }
+        let (ende_tx, ende_rx) = mpsc::channel();
+        {
+            let (s, i, a) = (shared.clone(), input.clone(), bild_addr.clone());
+            std::thread::spawn(move || {
+                let _ = ende_tx.send(run_session(&a, &s, &i));
+            });
+        }
+        let frist = Duration::from_secs(10);
+        assert!(warten_bis(frist, || shared.lock().unwrap().host_dateien), "MSG_FAEHIGKEITEN kam nicht an");
+        assert!(warten_bis(frist, || input.lock().unwrap().steht()), "Eingabekanal steht nicht");
+
+        // 1 MB: nach dem ersten Fenster wartet der Sender auf Quittungen.
+        let quelle = test_ordner("kanalverlust");
+        let a = quelle.join("a.bin");
+        std::fs::write(&a, vec![5u8; 1_000_000]).unwrap();
+        dateien_senden(vec![a], &shared, &input);
+        let kennung = shared.lock().unwrap().datei_senden.as_ref().map(|g| g.kennung()).expect("keine Sendung");
+        let zu = zu_rx.recv_timeout(frist).expect("Kanal 1 kam nicht bis kurz vor das Fenster");
+
+        let abgebrochen = || {
+            shared.lock().unwrap().datei_stand.senden.as_ref().is_some_and(|d| {
+                d.stand.kennung == kennung && matches!(d.stand.ergebnis, Ergebnis::Abgebrochen(_))
+            })
+        };
+        assert!(
+            warten_bis(Duration::from_secs(5), abgebrochen),
+            "Sendung {:?} nach dem Verlust des Eingabekanals noch nicht abgebrochen",
+            zu.elapsed()
+        );
+        assert!(shared.lock().unwrap().datei_senden.is_none(), "Griff blieb stehen");
+
+        // Kanal 2: zuerst die Faehigkeiten, von der Sendung nur ihr Ende 1.
+        // Eine Frist fuer alles: die Mausbewegungen kommen laufend.
+        let bis = Instant::now() + Duration::from_secs(5);
+        let mut gelesen: Vec<(u8, Vec<u8>)> = Vec::new();
+        while !gelesen.iter().any(|(a, _)| *a == DATEI_ENDE) {
+            match ein_rx.recv_timeout(bis.saturating_duration_since(Instant::now())) {
+                Ok(n) => gelesen.push(n),
+                Err(_) => panic!(
+                    "kein Ende auf dem neuen Kanal, dort kam: {:?}",
+                    gelesen.iter().map(|(a, _)| *a).collect::<std::collections::BTreeSet<u8>>()
+                ),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(n) = ein_rx.try_recv() {
+            gelesen.push(n);
+        }
+        assert_eq!(gelesen[0], (IN_FAEHIGKEITEN, vec![1, 0, 0, 0]));
+        let datei: Vec<&(u8, Vec<u8>)> =
+            gelesen.iter().filter(|(a, _)| (DATEI_ANGEBOT..=DATEI_QUITTUNG).contains(a)).collect();
+        assert_eq!(datei.len(), 1, "auf dem neuen Kanal: {:?}", datei.iter().map(|(a, _)| *a).collect::<Vec<_>>());
+        assert_eq!(Ende::lesen(&datei[0].1), Some(Ende { kennung, grund: dateien::GRUND_ABGEBROCHEN }));
+
+        halt.store(true, Ordering::SeqCst);
+        let r = ende_rx.recv_timeout(frist).expect("run_session endet nicht");
+        assert!(r.is_err(), "{r:?}");
+        let _ = std::fs::remove_dir_all(&quelle);
+    }
+
+    /// Die Anzeige: Staende nach der Kennung (ein spaetes "abgebrochen" des
+    /// abgeloesten Senders ueberschreibt den neuen nicht), laufend immer,
+    /// Ergebnisse 6 s sichtbar; die Texte in jeder Sprache ohne offenen
+    /// Platzhalter, Groessen in MB mit einer Nachkommastelle.
+    #[test]
+    fn datei_zeile_nach_kennung_und_nachlauf() {
+        use dateien::{Abbruch, Ergebnis, Richtung, Stand};
+        let st = |richtung, kennung, ergebnis| Stand {
+            richtung,
+            kennung,
+            bytes: 1_260_000,
+            gesamt: 12_400_000,
+            eintraege: 4,
+            dateien: 3,
+            oberste: 2,
+            ergebnis,
+        };
+        let mut d = DateiStaende::default();
+        let jetzt = Instant::now();
+        assert!(!d.sichtbar(jetzt));
+        d.setzen(st(Richtung::Senden, 5, Ergebnis::Laeuft));
+        d.setzen(st(Richtung::Senden, 4, Ergebnis::Abgebrochen(Abbruch::Hier)));
+        assert_eq!(d.senden.as_ref().map(|a| (a.stand.kennung, a.stand.laeuft())), Some((5, true)));
+        assert!(d.sichtbar(jetzt + Duration::from_secs(600)), "laufend verschwindet");
+        d.setzen(st(Richtung::Senden, 5, Ergebnis::Fertig));
+        let t = d.senden.as_ref().unwrap().ergebnis_seit.unwrap();
+        assert!(d.sichtbar(t + Duration::from_millis(5900)));
+        assert!(!d.sichtbar(t + Duration::from_millis(6100)));
+        // FilesPeerOld (Kennung 0) gilt immer, danach wieder jede Sendung.
+        d.setzen(Stand::gegenseite_zu_alt(Richtung::Senden));
+        assert_eq!(d.senden.as_ref().unwrap().stand.ergebnis, Ergebnis::GegenseiteZuAlt);
+        d.setzen(st(Richtung::Senden, 6, Ergebnis::Laeuft));
+        assert_eq!(d.senden.as_ref().unwrap().stand.kennung, 6);
+        // Beide Richtungen zugleich: zwei Zeilen, Empfangen zuerst.
+        d.setzen(st(Richtung::Empfangen, 9, Ergebnis::Laeuft));
+        let jetzt = Instant::now();
+        assert_eq!(d.sichtbare(jetzt).iter().map(|s| s.richtung).collect::<Vec<_>>(), vec![Richtung::Empfangen, Richtung::Senden]);
+
+        let de = strings::pick("de");
+        let en = strings::pick("en");
+        assert_eq!(datei_zeile(&st(Richtung::Senden, 1, Ergebnis::Laeuft), de).0, "Dateien werden gesendet: 1.3 von 12.4 MB");
+        assert_eq!(datei_zeile(&st(Richtung::Empfangen, 1, Ergebnis::Laeuft), en).0, "Receiving files: 1.3 of 12.4 MB");
+        assert_eq!(datei_zeile(&st(Richtung::Empfangen, 1, Ergebnis::Fertig), de), ("Dateien bereit zum Einfügen: 2".to_string(), ui::CYAN));
+        assert_eq!(datei_zeile(&st(Richtung::Senden, 1, Ergebnis::Fertig), de).0, "Dateien übertragen: 2");
+        let (t, f) = datei_zeile(&st(Richtung::Senden, 1, Ergebnis::Abgebrochen(Abbruch::Quittung(3))), de);
+        assert_eq!((t.as_str(), f), ("Dateiübertragung abgebrochen: Gegenseite: zu wenig Platz", ui::AMBER));
+        let alle = [
+            Ergebnis::Laeuft,
+            Ergebnis::Fertig,
+            Ergebnis::Abgebrochen(Abbruch::Zeitueberschreitung),
+            Ergebnis::ZuGross,
+            Ergebnis::GegenseiteZuAlt,
+        ];
+        for lang in strings::all() {
+            for e in &alle {
+                for r in [Richtung::Senden, Richtung::Empfangen] {
+                    let (t, _) = datei_zeile(&st(r, 1, e.clone()), lang);
+                    assert!(!t.is_empty() && !t.contains('{'), "{} {e:?}: {t}", lang.code);
                 }
             }
         }

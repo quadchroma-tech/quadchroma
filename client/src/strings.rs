@@ -239,6 +239,21 @@ pub enum Key {
     DesktopShortcutFailed,
     /// Kommentar der Verknuepfung im Explorer: {n} Name, {m} Adresse.
     DesktopShortcutDescription,
+    // Dateien ueber die Zwischenablage (Zeile unten mittig ueber dem Bild)
+    /// Senden laeuft: {n} quittierte MB, {m} Gesamtgroesse samt "MB".
+    FilesSending,
+    /// Empfangen laeuft: {n} geschriebene MB, {m} Gesamtgroesse samt "MB".
+    FilesReceiving,
+    /// Empfangen und in die Ablage gelegt: {n} Zahl der obersten Eintraege.
+    FilesReady,
+    /// Gesendet und quittiert: {n} Zahl der obersten Eintraege.
+    FilesSent,
+    /// Abgebrochen: {n} der Grund (technischer Text wie im Protokoll).
+    FilesAborted,
+    /// Ueber den Grenzen (2.6), nichts uebertragen.
+    FilesTooLarge,
+    /// Die Gegenseite hat keine Faehigkeit "Dateien" gemeldet.
+    FilesPeerOld,
 }
 
 pub struct Lang {
@@ -426,6 +441,13 @@ pub static EN: Lang = Lang {
         (DesktopShortcutCreated, "Shortcut created on the desktop: {n}"),
         (DesktopShortcutFailed, "Shortcut not created: {n}"),
         (DesktopShortcutDescription, "QuadChroma: connect to {n} ({m})"),
+        (FilesSending, "Sending files: {n} of {m}"),
+        (FilesReceiving, "Receiving files: {n} of {m}"),
+        (FilesReady, "Files ready to paste: {n}"),
+        (FilesSent, "Files transferred: {n}"),
+        (FilesAborted, "File transfer aborted: {n}"),
+        (FilesTooLarge, "Files not transferred: more than 4 GB or 10,000 items"),
+        (FilesPeerOld, "The other side cannot receive files yet."),
     ],
 };
 
@@ -590,6 +612,13 @@ pub static DE: Lang = Lang {
         (DesktopShortcutCreated, "Verknüpfung auf dem Desktop angelegt: {n}"),
         (DesktopShortcutFailed, "Verknüpfung nicht angelegt: {n}"),
         (DesktopShortcutDescription, "QuadChroma: mit {n} verbinden ({m})"),
+        (FilesSending, "Dateien werden gesendet: {n} von {m}"),
+        (FilesReceiving, "Dateien werden empfangen: {n} von {m}"),
+        (FilesReady, "Dateien bereit zum Einfügen: {n}"),
+        (FilesSent, "Dateien übertragen: {n}"),
+        (FilesAborted, "Dateiübertragung abgebrochen: {n}"),
+        (FilesTooLarge, "Dateien nicht übertragen: mehr als 4 GB oder 10 000 Einträge"),
+        (FilesPeerOld, "Die Gegenseite kann noch keine Dateien empfangen."),
     ],
 };
 
@@ -635,7 +664,31 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > DesktopShortcutDescription as usize);
+        assert!(n > FilesPeerOld as usize);
+    }
+
+    /// Die Zeile zu Dateiuebertragungen: Platzhalter in jeder Sprache
+    /// vorhanden, wo sie gebraucht werden, sonst keiner; eigene Worte je
+    /// Sprache (EN/DE verschieden).
+    #[test]
+    fn datei_texte() {
+        for l in all() {
+            for k in [FilesSending, FilesReceiving] {
+                let t = l.get(k);
+                assert!(t.contains("{n}") && t.contains("{m}"), "{} {k:?}: {t}", l.code);
+            }
+            for k in [FilesReady, FilesSent, FilesAborted] {
+                let t = l.get(k);
+                assert!(t.contains("{n}") && !t.contains("{m}"), "{} {k:?}: {t}", l.code);
+            }
+            for k in [FilesTooLarge, FilesPeerOld] {
+                assert!(!l.get(k).contains('{'), "{} {k:?}", l.code);
+            }
+            assert!(l.get(FilesTooLarge).contains('4'), "{}", l.code);
+        }
+        for k in [FilesSending, FilesReceiving, FilesReady, FilesSent, FilesAborted, FilesTooLarge, FilesPeerOld] {
+            assert_ne!(EN.get(k), DE.get(k), "{k:?}");
+        }
     }
 
     /// Die Texte der Desktop-Verknuepfung: in jeder Sprache eigene Worte

@@ -164,6 +164,13 @@ pub static SV: Lang = Lang {
         (DesktopShortcutCreated, "Genväg skapad på skrivbordet: {n}"),
         (DesktopShortcutFailed, "Genvägen skapades inte: {n}"),
         (DesktopShortcutDescription, "QuadChroma: anslut till {n} ({m})"),
+        (FilesSending, "Skickar filer: {n} av {m}"),
+        (FilesReceiving, "Tar emot filer: {n} av {m}"),
+        (FilesReady, "Filer redo att klistra in: {n}"),
+        (FilesSent, "Filer överförda: {n}"),
+        (FilesAborted, "Filöverföringen avbröts: {n}"),
+        (FilesTooLarge, "Filerna överfördes inte: mer än 4 GB eller 10 000 objekt"),
+        (FilesPeerOld, "Den andra sidan kan inte ta emot filer ännu."),
     ],
 };
 
@@ -328,6 +335,13 @@ pub static DA: Lang = Lang {
         (DesktopShortcutCreated, "Genvej oprettet på skrivebordet: {n}"),
         (DesktopShortcutFailed, "Genvejen blev ikke oprettet: {n}"),
         (DesktopShortcutDescription, "QuadChroma: opret forbindelse til {n} ({m})"),
+        (FilesSending, "Sender filer: {n} af {m}"),
+        (FilesReceiving, "Modtager filer: {n} af {m}"),
+        (FilesReady, "Filer klar til indsættelse: {n}"),
+        (FilesSent, "Filer overført: {n}"),
+        (FilesAborted, "Filoverførslen blev afbrudt: {n}"),
+        (FilesTooLarge, "Filerne blev ikke overført: mere end 4 GB eller 10.000 elementer"),
+        (FilesPeerOld, "Den anden side kan endnu ikke modtage filer."),
     ],
 };
 
@@ -492,6 +506,13 @@ pub static NB: Lang = Lang {
         (DesktopShortcutCreated, "Snarvei opprettet på skrivebordet: {n}"),
         (DesktopShortcutFailed, "Snarveien ble ikke opprettet: {n}"),
         (DesktopShortcutDescription, "QuadChroma: koble til {n} ({m})"),
+        (FilesSending, "Sender filer: {n} av {m}"),
+        (FilesReceiving, "Mottar filer: {n} av {m}"),
+        (FilesReady, "Filer klare til å lime inn: {n}"),
+        (FilesSent, "Filer overført: {n}"),
+        (FilesAborted, "Filoverføringen ble avbrutt: {n}"),
+        (FilesTooLarge, "Filene ble ikke overført: mer enn 4 GB eller 10 000 elementer"),
+        (FilesPeerOld, "Den andre siden kan ikke motta filer ennå."),
     ],
 };
 
@@ -656,6 +677,13 @@ pub static FI: Lang = Lang {
         (DesktopShortcutCreated, "Pikakuvake luotu työpöydälle: {n}"),
         (DesktopShortcutFailed, "Pikakuvaketta ei luotu: {n}"),
         (DesktopShortcutDescription, "QuadChroma: yhdistä kohteeseen {n} ({m})"),
+        (FilesSending, "Lähetetään tiedostoja: {n} / {m}"),
+        (FilesReceiving, "Vastaanotetaan tiedostoja: {n} / {m}"),
+        (FilesReady, "Tiedostot valmiina liitettäviksi: {n}"),
+        (FilesSent, "Tiedostot siirretty: {n}"),
+        (FilesAborted, "Tiedostonsiirto keskeytyi: {n}"),
+        (FilesTooLarge, "Tiedostoja ei siirretty: yli 4 GB tai 10 000 kohdetta"),
+        (FilesPeerOld, "Vastapuoli ei vielä voi vastaanottaa tiedostoja."),
     ],
 };
 
@@ -820,5 +848,12 @@ pub static IS: Lang = Lang {
         (DesktopShortcutCreated, "Flýtileið búin til á skjáborðinu: {n}"),
         (DesktopShortcutFailed, "Flýtileið var ekki búin til: {n}"),
         (DesktopShortcutDescription, "QuadChroma: tengjast {n} ({m})"),
+        (FilesSending, "Sendir skrár: {n} af {m}"),
+        (FilesReceiving, "Tekur við skrám: {n} af {m}"),
+        (FilesReady, "Skrár tilbúnar til að líma: {n}"),
+        (FilesSent, "Skrár fluttar: {n}"),
+        (FilesAborted, "Hætt var við skráaflutning: {n}"),
+        (FilesTooLarge, "Skrár ekki fluttar: meira en 4 GB eða 10.000 atriði"),
+        (FilesPeerOld, "Hin hliðin getur ekki enn tekið við skrám."),
     ],
 };

@@ -54,10 +54,6 @@ use std::time::Duration;
 /// wird stillschweigend verworfen statt abgeschnitten.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// Mehr Dateiverweise liest der Waechter nicht - wie DATEIEN_MAX in
-/// clipboard.rs: mehr als EINTRAEGE_MAX (10000, Spezifikation 2.6) koennen
-/// ohnehin nicht hinaus, einer darueber reicht dem Sender fuer "zu viele".
-const DATEIEN_MAX: usize = 10_000;
 
 /// Abstand zwischen zwei Blicken auf den changeCount.
 const TAKT: Duration = Duration::from_millis(300);
@@ -329,7 +325,10 @@ fn lesen(b: Id) -> Option<Inhalt> {
             }
             if hat_typ(item, NSPasteboardTypeFileURL) {
                 dateiverweise += 1;
-                if pfade.len() <= DATEIEN_MAX {
+                // Mehr Dateiverweise liest der Waechter nicht: mehr als
+                // EINTRAEGE_MAX (Spezifikation 2.6) koennen ohnehin nicht
+                // hinaus, einer darueber reicht dem Sender fuer "zu viele".
+                if pfade.len() <= crate::dateien::EINTRAEGE_MAX as usize {
                     match dateiverweis(item) {
                         Some(p) => pfade.push(p),
                         None => unaufloesbar = true,
@@ -481,10 +480,8 @@ fn ablegen(b: Id, text: &str) -> Option<(isize, isize)> {
 /// `pfade` sind vollstaendige Pfade der obersten Eintraege; die Dateien
 /// selbst werden hier nicht gelesen. true, wenn die Liste auf dem Brett
 /// liegt; false bei leerer oder ungueltiger Liste (dann bleibt das Brett,
-/// wie es ist) oder wenn das Schreiben scheitert.
-// Aufrufer ist der Empfaenger der Dateiuebertragung (dateien.rs), der mit
-// einem eigenen Paket dazukommt.
-#[allow(dead_code)]
+/// wie es ist) oder wenn das Schreiben scheitert. Aufrufer ist der
+/// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden.
 pub fn set_dateien(pfade: &[PathBuf]) -> bool {
     let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
     let b = brett();

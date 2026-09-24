@@ -167,6 +167,13 @@ pub static RU: Lang = Lang {
         (DesktopShortcutCreated, "Ярлык создан на рабочем столе: {n}"),
         (DesktopShortcutFailed, "Ярлык не создан: {n}"),
         (DesktopShortcutDescription, "QuadChroma: подключиться к {n} ({m})"),
+        (FilesSending, "Отправка файлов: {n} из {m}"),
+        (FilesReceiving, "Получение файлов: {n} из {m}"),
+        (FilesReady, "Файлы готовы к вставке: {n}"),
+        (FilesSent, "Файлы переданы: {n}"),
+        (FilesAborted, "Передача файлов прервана: {n}"),
+        (FilesTooLarge, "Файлы не переданы: более 4 GB или 10 000 элементов"),
+        (FilesPeerOld, "Другая сторона пока не может принимать файлы."),
     ],
 };
 
@@ -333,6 +340,13 @@ pub static ZH: Lang = Lang {
         (DesktopShortcutCreated, "已在桌面上创建快捷方式：{n}"),
         (DesktopShortcutFailed, "未能创建快捷方式：{n}"),
         (DesktopShortcutDescription, "QuadChroma：连接到 {n}（{m}）"),
+        (FilesSending, "正在发送文件：{n} / {m}"),
+        (FilesReceiving, "正在接收文件：{n} / {m}"),
+        (FilesReady, "文件已可粘贴：{n}"),
+        (FilesSent, "文件已传输：{n}"),
+        (FilesAborted, "文件传输已中止：{n}"),
+        (FilesTooLarge, "文件未传输：超过 4 GB 或 10,000 个项目"),
+        (FilesPeerOld, "对方暂时无法接收文件。"),
     ],
 };
 
@@ -499,6 +513,13 @@ pub static JA: Lang = Lang {
         (DesktopShortcutCreated, "デスクトップにショートカットを作成しました: {n}"),
         (DesktopShortcutFailed, "ショートカットを作成できませんでした: {n}"),
         (DesktopShortcutDescription, "QuadChroma: {n} に接続 ({m})"),
+        (FilesSending, "ファイルを送信中: {n} / {m}"),
+        (FilesReceiving, "ファイルを受信中: {n} / {m}"),
+        (FilesReady, "貼り付けできるファイル: {n}"),
+        (FilesSent, "ファイルを転送しました: {n}"),
+        (FilesAborted, "ファイル転送を中止しました: {n}"),
+        (FilesTooLarge, "ファイルは転送されません: 4 GB または 10,000 項目を超えています"),
+        (FilesPeerOld, "相手側はまだファイルを受信できません。"),
     ],
 };
 
@@ -663,5 +684,12 @@ pub static TR: Lang = Lang {
         (DesktopShortcutCreated, "Masaüstünde kısayol oluşturuldu: {n}"),
         (DesktopShortcutFailed, "Kısayol oluşturulamadı: {n}"),
         (DesktopShortcutDescription, "QuadChroma: {n} ile bağlan ({m})"),
+        (FilesSending, "Dosyalar gönderiliyor: {n} / {m}"),
+        (FilesReceiving, "Dosyalar alınıyor: {n} / {m}"),
+        (FilesReady, "Yapıştırmaya hazır dosyalar: {n}"),
+        (FilesSent, "Dosyalar aktarıldı: {n}"),
+        (FilesAborted, "Dosya aktarımı iptal edildi: {n}"),
+        (FilesTooLarge, "Dosyalar aktarılmadı: 4 GB'tan veya 10.000 öğeden fazla"),
+        (FilesPeerOld, "Karşı taraf henüz dosya alamıyor."),
     ],
 };

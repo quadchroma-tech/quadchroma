@@ -164,6 +164,13 @@ pub static PL: Lang = Lang {
         (DesktopShortcutCreated, "Utworzono skrót na pulpicie: {n}"),
         (DesktopShortcutFailed, "Nie utworzono skrótu: {n}"),
         (DesktopShortcutDescription, "QuadChroma: połącz z {n} ({m})"),
+        (FilesSending, "Wysyłanie plików: {n} z {m}"),
+        (FilesReceiving, "Odbieranie plików: {n} z {m}"),
+        (FilesReady, "Pliki gotowe do wklejenia: {n}"),
+        (FilesSent, "Pliki przesłane: {n}"),
+        (FilesAborted, "Przesyłanie plików przerwane: {n}"),
+        (FilesTooLarge, "Pliki nie zostały przesłane: ponad 4 GB lub 10 000 elementów"),
+        (FilesPeerOld, "Druga strona nie może jeszcze odbierać plików."),
     ],
 };
 
@@ -328,6 +335,13 @@ pub static CS: Lang = Lang {
         (DesktopShortcutCreated, "Zástupce vytvořen na ploše: {n}"),
         (DesktopShortcutFailed, "Zástupce nebyl vytvořen: {n}"),
         (DesktopShortcutDescription, "QuadChroma: připojit k {n} ({m})"),
+        (FilesSending, "Odesílání souborů: {n} z {m}"),
+        (FilesReceiving, "Přijímání souborů: {n} z {m}"),
+        (FilesReady, "Soubory připravené k vložení: {n}"),
+        (FilesSent, "Soubory přeneseny: {n}"),
+        (FilesAborted, "Přenos souborů přerušen: {n}"),
+        (FilesTooLarge, "Soubory nebyly přeneseny: více než 4 GB nebo 10 000 položek"),
+        (FilesPeerOld, "Druhá strana zatím nemůže přijímat soubory."),
     ],
 };
 
@@ -492,6 +506,13 @@ pub static SK: Lang = Lang {
         (DesktopShortcutCreated, "Odkaz vytvorený na pracovnej ploche: {n}"),
         (DesktopShortcutFailed, "Odkaz sa nevytvoril: {n}"),
         (DesktopShortcutDescription, "QuadChroma: pripojiť k {n} ({m})"),
+        (FilesSending, "Odosielanie súborov: {n} z {m}"),
+        (FilesReceiving, "Prijímanie súborov: {n} z {m}"),
+        (FilesReady, "Súbory pripravené na vloženie: {n}"),
+        (FilesSent, "Súbory prenesené: {n}"),
+        (FilesAborted, "Prenos súborov prerušený: {n}"),
+        (FilesTooLarge, "Súbory neboli prenesené: viac ako 4 GB alebo 10 000 položiek"),
+        (FilesPeerOld, "Druhá strana zatiaľ nemôže prijímať súbory."),
     ],
 };
 
@@ -656,6 +677,13 @@ pub static HU: Lang = Lang {
         (DesktopShortcutCreated, "Parancsikon létrehozva az asztalon: {n}"),
         (DesktopShortcutFailed, "A parancsikon nem jött létre: {n}"),
         (DesktopShortcutDescription, "QuadChroma: csatlakozás ehhez: {n} ({m})"),
+        (FilesSending, "Fájlok küldése: {n} / {m}"),
+        (FilesReceiving, "Fájlok fogadása: {n} / {m}"),
+        (FilesReady, "Beillesztésre kész fájlok: {n}"),
+        (FilesSent, "Átvitt fájlok: {n}"),
+        (FilesAborted, "A fájlátvitel megszakadt: {n}"),
+        (FilesTooLarge, "A fájlok átvitele elmaradt: több mint 4 GB vagy 10 000 elem"),
+        (FilesPeerOld, "A másik oldal még nem tud fájlokat fogadni."),
     ],
 };
 
@@ -820,6 +848,13 @@ pub static RO: Lang = Lang {
         (DesktopShortcutCreated, "Comandă rapidă creată pe desktop: {n}"),
         (DesktopShortcutFailed, "Comanda rapidă nu a fost creată: {n}"),
         (DesktopShortcutDescription, "QuadChroma: conectare la {n} ({m})"),
+        (FilesSending, "Se trimit fișierele: {n} din {m}"),
+        (FilesReceiving, "Se primesc fișierele: {n} din {m}"),
+        (FilesReady, "Fișiere gata de lipit: {n}"),
+        (FilesSent, "Fișiere transferate: {n}"),
+        (FilesAborted, "Transferul de fișiere a fost întrerupt: {n}"),
+        (FilesTooLarge, "Fișierele nu au fost transferate: peste 4 GB sau 10.000 de elemente"),
+        (FilesPeerOld, "Cealaltă parte nu poate primi încă fișiere."),
     ],
 };
 
@@ -984,6 +1019,13 @@ pub static BG: Lang = Lang {
         (DesktopShortcutCreated, "Прекият път е създаден на работния плот: {n}"),
         (DesktopShortcutFailed, "Прекият път не е създаден: {n}"),
         (DesktopShortcutDescription, "QuadChroma: свързване с {n} ({m})"),
+        (FilesSending, "Изпращане на файлове: {n} от {m}"),
+        (FilesReceiving, "Получаване на файлове: {n} от {m}"),
+        (FilesReady, "Файлове, готови за поставяне: {n}"),
+        (FilesSent, "Прехвърлени файлове: {n}"),
+        (FilesAborted, "Прехвърлянето на файлове е прекъснато: {n}"),
+        (FilesTooLarge, "Файловете не са прехвърлени: над 4 GB или 10 000 елемента"),
+        (FilesPeerOld, "Другата страна все още не може да получава файлове."),
     ],
 };
 
@@ -1148,5 +1190,12 @@ pub static EL: Lang = Lang {
         (DesktopShortcutCreated, "Η συντόμευση δημιουργήθηκε στην επιφάνεια εργασίας: {n}"),
         (DesktopShortcutFailed, "Η συντόμευση δεν δημιουργήθηκε: {n}"),
         (DesktopShortcutDescription, "QuadChroma: σύνδεση με {n} ({m})"),
+        (FilesSending, "Αποστολή αρχείων: {n} από {m}"),
+        (FilesReceiving, "Λήψη αρχείων: {n} από {m}"),
+        (FilesReady, "Αρχεία έτοιμα για επικόλληση: {n}"),
+        (FilesSent, "Τα αρχεία μεταφέρθηκαν: {n}"),
+        (FilesAborted, "Η μεταφορά αρχείων διακόπηκε: {n}"),
+        (FilesTooLarge, "Τα αρχεία δεν μεταφέρθηκαν: πάνω από 4 GB ή 10.000 στοιχεία"),
+        (FilesPeerOld, "Η άλλη πλευρά δεν μπορεί ακόμη να λάβει αρχεία."),
     ],
 };
