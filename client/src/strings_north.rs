@@ -171,6 +171,11 @@ pub static SV: Lang = Lang {
         (FilesAborted, "Filöverföringen avbröts: {n}"),
         (FilesTooLarge, "Filerna överfördes inte: mer än 4 GB eller 10 000 objekt"),
         (FilesPeerOld, "Den andra sidan kan inte ta emot filer ännu."),
+        (TrayOpen, "Öppna"),
+        (TrayConnect, "Anslut: {n}"),
+        (TrayQuit, "Avsluta"),
+        (TrayStillRunning, "QuadChroma körs vidare i meddelandefältet."),
+        (TrayStillRunningMac, "QuadChroma körs vidare i menyraden."),
     ],
 };
 
@@ -342,6 +347,11 @@ pub static DA: Lang = Lang {
         (FilesAborted, "Filoverførslen blev afbrudt: {n}"),
         (FilesTooLarge, "Filerne blev ikke overført: mere end 4 GB eller 10.000 elementer"),
         (FilesPeerOld, "Den anden side kan endnu ikke modtage filer."),
+        (TrayOpen, "Åbn"),
+        (TrayConnect, "Forbind: {n}"),
+        (TrayQuit, "Afslut"),
+        (TrayStillRunning, "QuadChroma kører videre i meddelelsesområdet."),
+        (TrayStillRunningMac, "QuadChroma kører videre i menulinjen."),
     ],
 };
 
@@ -513,6 +523,11 @@ pub static NB: Lang = Lang {
         (FilesAborted, "Filoverføringen ble avbrutt: {n}"),
         (FilesTooLarge, "Filene ble ikke overført: mer enn 4 GB eller 10 000 elementer"),
         (FilesPeerOld, "Den andre siden kan ikke motta filer ennå."),
+        (TrayOpen, "Åpne"),
+        (TrayConnect, "Koble til: {n}"),
+        (TrayQuit, "Avslutt"),
+        (TrayStillRunning, "QuadChroma kjører videre i systemstatusfeltet."),
+        (TrayStillRunningMac, "QuadChroma kjører videre i menylinjen."),
     ],
 };
 
@@ -684,6 +699,11 @@ pub static FI: Lang = Lang {
         (FilesAborted, "Tiedostonsiirto keskeytyi: {n}"),
         (FilesTooLarge, "Tiedostoja ei siirretty: yli 4 GB tai 10 000 kohdetta"),
         (FilesPeerOld, "Vastapuoli ei vielä voi vastaanottaa tiedostoja."),
+        (TrayOpen, "Avaa"),
+        (TrayConnect, "Yhdistä: {n}"),
+        (TrayQuit, "Lopeta"),
+        (TrayStillRunning, "QuadChroma toimii edelleen ilmaisinalueella."),
+        (TrayStillRunningMac, "QuadChroma toimii edelleen valikkorivillä."),
     ],
 };
 
@@ -855,5 +875,10 @@ pub static IS: Lang = Lang {
         (FilesAborted, "Hætt var við skráaflutning: {n}"),
         (FilesTooLarge, "Skrár ekki fluttar: meira en 4 GB eða 10.000 atriði"),
         (FilesPeerOld, "Hin hliðin getur ekki enn tekið við skrám."),
+        (TrayOpen, "Opna"),
+        (TrayConnect, "Tengjast: {n}"),
+        (TrayQuit, "Hætta"),
+        (TrayStillRunning, "QuadChroma keyrir áfram á tilkynningasvæðinu."),
+        (TrayStillRunningMac, "QuadChroma keyrir áfram á valmyndastikunni."),
     ],
 };

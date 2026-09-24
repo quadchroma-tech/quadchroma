@@ -254,6 +254,17 @@ pub enum Key {
     FilesTooLarge,
     /// Die Gegenseite hat keine Faehigkeit "Dateien" gemeldet.
     FilesPeerOld,
+    // Symbol im Infobereich (Windows) bzw. in der Menueleiste (macOS)
+    /// Menuepunkt: Fenster zeigen.
+    TrayOpen,
+    /// Menuepunkt je gefundenem Host: {n} ist sein Name bzw. seine Adresse.
+    TrayConnect,
+    /// Menuepunkt: Programm beenden.
+    TrayQuit,
+    /// Einmalige Sprechblase beim ersten Ablegen (Windows).
+    TrayStillRunning,
+    /// Dasselbe fuer die Menueleiste (macOS).
+    TrayStillRunningMac,
 }
 
 pub struct Lang {
@@ -448,6 +459,11 @@ pub static EN: Lang = Lang {
         (FilesAborted, "File transfer aborted: {n}"),
         (FilesTooLarge, "Files not transferred: more than 4 GB or 10,000 items"),
         (FilesPeerOld, "The other side cannot receive files yet."),
+        (TrayOpen, "Open"),
+        (TrayConnect, "Connect: {n}"),
+        (TrayQuit, "Quit"),
+        (TrayStillRunning, "QuadChroma is still running in the notification area."),
+        (TrayStillRunningMac, "QuadChroma is still running in the menu bar."),
     ],
 };
 
@@ -619,6 +635,11 @@ pub static DE: Lang = Lang {
         (FilesAborted, "Dateiübertragung abgebrochen: {n}"),
         (FilesTooLarge, "Dateien nicht übertragen: mehr als 4 GB oder 10 000 Einträge"),
         (FilesPeerOld, "Die Gegenseite kann noch keine Dateien empfangen."),
+        (TrayOpen, "Öffnen"),
+        (TrayConnect, "Verbinden: {n}"),
+        (TrayQuit, "Beenden"),
+        (TrayStillRunning, "QuadChroma läuft im Infobereich weiter."),
+        (TrayStillRunningMac, "QuadChroma läuft in der Menüleiste weiter."),
     ],
 };
 
@@ -664,7 +685,7 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > FilesPeerOld as usize);
+        assert!(n > TrayStillRunningMac as usize);
     }
 
     /// Die Zeile zu Dateiuebertragungen: Platzhalter in jeder Sprache
@@ -689,6 +710,28 @@ mod tests {
         for k in [FilesSending, FilesReceiving, FilesReady, FilesSent, FilesAborted, FilesTooLarge, FilesPeerOld] {
             assert_ne!(EN.get(k), DE.get(k), "{k:?}");
         }
+    }
+
+    /// Die Texte am Symbol im Infobereich bzw. in der Menueleiste: in jeder
+    /// Sprache vorhanden, der Hostname hat seinen Platzhalter, Windows und
+    /// Mac nennen verschiedene Orte.
+    #[test]
+    fn tray_texte() {
+        for l in all() {
+            assert!(l.get(TrayConnect).contains("{n}"), "{}", l.code);
+            for k in [TrayOpen, TrayQuit, TrayStillRunning, TrayStillRunningMac] {
+                assert!(!l.get(k).contains('{'), "{}: {k:?}", l.code);
+            }
+            assert_ne!(l.get(TrayStillRunning), l.get(TrayStillRunningMac), "{}", l.code);
+            // Beenden heisst am Symbol wie auf dem Startbildschirm.
+            assert_eq!(l.get(TrayQuit), l.get(Quit), "{}", l.code);
+        }
+        for k in [TrayOpen, TrayConnect, TrayQuit, TrayStillRunning, TrayStillRunningMac] {
+            assert_ne!(EN.get(k), DE.get(k), "{k:?}");
+        }
+        assert_eq!(DE.get(TrayStillRunning), "QuadChroma läuft im Infobereich weiter.");
+        assert_eq!(DE.get(TrayStillRunningMac), "QuadChroma läuft in der Menüleiste weiter.");
+        assert_eq!(DE.get(TrayConnect), "Verbinden: {n}");
     }
 
     /// Die Texte der Desktop-Verknuepfung: in jeder Sprache eigene Worte

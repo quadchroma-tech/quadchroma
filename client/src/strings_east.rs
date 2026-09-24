@@ -171,6 +171,11 @@ pub static PL: Lang = Lang {
         (FilesAborted, "Przesyłanie plików przerwane: {n}"),
         (FilesTooLarge, "Pliki nie zostały przesłane: ponad 4 GB lub 10 000 elementów"),
         (FilesPeerOld, "Druga strona nie może jeszcze odbierać plików."),
+        (TrayOpen, "Otwórz"),
+        (TrayConnect, "Połącz: {n}"),
+        (TrayQuit, "Zakończ"),
+        (TrayStillRunning, "QuadChroma nadal działa w obszarze powiadomień."),
+        (TrayStillRunningMac, "QuadChroma nadal działa na pasku menu."),
     ],
 };
 
@@ -342,6 +347,11 @@ pub static CS: Lang = Lang {
         (FilesAborted, "Přenos souborů přerušen: {n}"),
         (FilesTooLarge, "Soubory nebyly přeneseny: více než 4 GB nebo 10 000 položek"),
         (FilesPeerOld, "Druhá strana zatím nemůže přijímat soubory."),
+        (TrayOpen, "Otevřít"),
+        (TrayConnect, "Připojit: {n}"),
+        (TrayQuit, "Ukončit"),
+        (TrayStillRunning, "QuadChroma dál běží v oznamovací oblasti."),
+        (TrayStillRunningMac, "QuadChroma dál běží na řádku nabídek."),
     ],
 };
 
@@ -513,6 +523,11 @@ pub static SK: Lang = Lang {
         (FilesAborted, "Prenos súborov prerušený: {n}"),
         (FilesTooLarge, "Súbory neboli prenesené: viac ako 4 GB alebo 10 000 položiek"),
         (FilesPeerOld, "Druhá strana zatiaľ nemôže prijímať súbory."),
+        (TrayOpen, "Otvoriť"),
+        (TrayConnect, "Pripojiť: {n}"),
+        (TrayQuit, "Ukončiť"),
+        (TrayStillRunning, "QuadChroma naďalej beží v oblasti oznámení."),
+        (TrayStillRunningMac, "QuadChroma naďalej beží na lište ponúk."),
     ],
 };
 
@@ -684,6 +699,11 @@ pub static HU: Lang = Lang {
         (FilesAborted, "A fájlátvitel megszakadt: {n}"),
         (FilesTooLarge, "A fájlok átvitele elmaradt: több mint 4 GB vagy 10 000 elem"),
         (FilesPeerOld, "A másik oldal még nem tud fájlokat fogadni."),
+        (TrayOpen, "Megnyitás"),
+        (TrayConnect, "Csatlakozás: {n}"),
+        (TrayQuit, "Kilépés"),
+        (TrayStillRunning, "A QuadChroma tovább fut az értesítési területen."),
+        (TrayStillRunningMac, "A QuadChroma tovább fut a menüsorban."),
     ],
 };
 
@@ -855,6 +875,11 @@ pub static RO: Lang = Lang {
         (FilesAborted, "Transferul de fișiere a fost întrerupt: {n}"),
         (FilesTooLarge, "Fișierele nu au fost transferate: peste 4 GB sau 10.000 de elemente"),
         (FilesPeerOld, "Cealaltă parte nu poate primi încă fișiere."),
+        (TrayOpen, "Deschide"),
+        (TrayConnect, "Conectare: {n}"),
+        (TrayQuit, "Ieșire"),
+        (TrayStillRunning, "QuadChroma rulează în continuare în zona de notificare."),
+        (TrayStillRunningMac, "QuadChroma rulează în continuare în bara de meniu."),
     ],
 };
 
@@ -1026,6 +1051,11 @@ pub static BG: Lang = Lang {
         (FilesAborted, "Прехвърлянето на файлове е прекъснато: {n}"),
         (FilesTooLarge, "Файловете не са прехвърлени: над 4 GB или 10 000 елемента"),
         (FilesPeerOld, "Другата страна все още не може да получава файлове."),
+        (TrayOpen, "Отвори"),
+        (TrayConnect, "Свързване: {n}"),
+        (TrayQuit, "Изход"),
+        (TrayStillRunning, "QuadChroma продължава да работи в областта за уведомяване."),
+        (TrayStillRunningMac, "QuadChroma продължава да работи в лентата с менюта."),
     ],
 };
 
@@ -1197,5 +1227,10 @@ pub static EL: Lang = Lang {
         (FilesAborted, "Η μεταφορά αρχείων διακόπηκε: {n}"),
         (FilesTooLarge, "Τα αρχεία δεν μεταφέρθηκαν: πάνω από 4 GB ή 10.000 στοιχεία"),
         (FilesPeerOld, "Η άλλη πλευρά δεν μπορεί ακόμη να λάβει αρχεία."),
+        (TrayOpen, "Άνοιγμα"),
+        (TrayConnect, "Σύνδεση: {n}"),
+        (TrayQuit, "Έξοδος"),
+        (TrayStillRunning, "Το QuadChroma συνεχίζει να εκτελείται στην περιοχή ειδοποιήσεων."),
+        (TrayStillRunningMac, "Το QuadChroma συνεχίζει να εκτελείται στη γραμμή μενού."),
     ],
 };

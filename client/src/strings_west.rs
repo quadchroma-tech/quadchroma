@@ -173,6 +173,11 @@ pub static FR: Lang = Lang {
         (FilesAborted, "Transfert de fichiers interrompu : {n}"),
         (FilesTooLarge, "Fichiers non transférés : plus de 4 GB ou de 10 000 éléments"),
         (FilesPeerOld, "L'autre côté ne peut pas encore recevoir de fichiers."),
+        (TrayOpen, "Ouvrir"),
+        (TrayConnect, "Se connecter : {n}"),
+        (TrayQuit, "Quitter"),
+        (TrayStillRunning, "QuadChroma continue de fonctionner dans la zone de notification."),
+        (TrayStillRunningMac, "QuadChroma continue de fonctionner dans la barre des menus."),
     ],
 };
 
@@ -344,6 +349,11 @@ pub static ES: Lang = Lang {
         (FilesAborted, "Transferencia de archivos cancelada: {n}"),
         (FilesTooLarge, "Archivos no transferidos: más de 4 GB o 10 000 elementos"),
         (FilesPeerOld, "El otro lado todavía no puede recibir archivos."),
+        (TrayOpen, "Abrir"),
+        (TrayConnect, "Conectar: {n}"),
+        (TrayQuit, "Salir"),
+        (TrayStillRunning, "QuadChroma sigue ejecutándose en el área de notificación."),
+        (TrayStillRunningMac, "QuadChroma sigue ejecutándose en la barra de menús."),
     ],
 };
 
@@ -515,6 +525,11 @@ pub static IT: Lang = Lang {
         (FilesAborted, "Trasferimento dei file interrotto: {n}"),
         (FilesTooLarge, "File non trasferiti: più di 4 GB o 10.000 elementi"),
         (FilesPeerOld, "L'altro lato non può ancora ricevere file."),
+        (TrayOpen, "Apri"),
+        (TrayConnect, "Connetti: {n}"),
+        (TrayQuit, "Esci"),
+        (TrayStillRunning, "QuadChroma continua a funzionare nell'area di notifica."),
+        (TrayStillRunningMac, "QuadChroma continua a funzionare nella barra dei menu."),
     ],
 };
 
@@ -686,6 +701,11 @@ pub static PT: Lang = Lang {
         (FilesAborted, "Transferência de ficheiros interrompida: {n}"),
         (FilesTooLarge, "Ficheiros não transferidos: mais de 4 GB ou 10 000 elementos"),
         (FilesPeerOld, "O outro lado ainda não pode receber ficheiros."),
+        (TrayOpen, "Abrir"),
+        (TrayConnect, "Ligar: {n}"),
+        (TrayQuit, "Sair"),
+        (TrayStillRunning, "O QuadChroma continua em execução na área de notificação."),
+        (TrayStillRunningMac, "O QuadChroma continua em execução na barra de menus."),
     ],
 };
 
@@ -857,5 +877,10 @@ pub static NL: Lang = Lang {
         (FilesAborted, "Bestandsoverdracht afgebroken: {n}"),
         (FilesTooLarge, "Bestanden niet overgedragen: meer dan 4 GB of 10.000 items"),
         (FilesPeerOld, "De andere kant kan nog geen bestanden ontvangen."),
+        (TrayOpen, "Openen"),
+        (TrayConnect, "Verbinden: {n}"),
+        (TrayQuit, "Afsluiten"),
+        (TrayStillRunning, "QuadChroma blijft actief in het systeemvak."),
+        (TrayStillRunningMac, "QuadChroma blijft actief in de menubalk."),
     ],
 };

@@ -174,6 +174,11 @@ pub static RU: Lang = Lang {
         (FilesAborted, "Передача файлов прервана: {n}"),
         (FilesTooLarge, "Файлы не переданы: более 4 GB или 10 000 элементов"),
         (FilesPeerOld, "Другая сторона пока не может принимать файлы."),
+        (TrayOpen, "Открыть"),
+        (TrayConnect, "Подключиться: {n}"),
+        (TrayQuit, "Выход"),
+        (TrayStillRunning, "QuadChroma продолжает работать в области уведомлений."),
+        (TrayStillRunningMac, "QuadChroma продолжает работать в строке меню."),
     ],
 };
 
@@ -347,6 +352,11 @@ pub static ZH: Lang = Lang {
         (FilesAborted, "文件传输已中止：{n}"),
         (FilesTooLarge, "文件未传输：超过 4 GB 或 10,000 个项目"),
         (FilesPeerOld, "对方暂时无法接收文件。"),
+        (TrayOpen, "打开"),
+        (TrayConnect, "连接：{n}"),
+        (TrayQuit, "退出"),
+        (TrayStillRunning, "QuadChroma 仍在通知区域中运行。"),
+        (TrayStillRunningMac, "QuadChroma 仍在菜单栏中运行。"),
     ],
 };
 
@@ -520,6 +530,11 @@ pub static JA: Lang = Lang {
         (FilesAborted, "ファイル転送を中止しました: {n}"),
         (FilesTooLarge, "ファイルは転送されません: 4 GB または 10,000 項目を超えています"),
         (FilesPeerOld, "相手側はまだファイルを受信できません。"),
+        (TrayOpen, "開く"),
+        (TrayConnect, "接続: {n}"),
+        (TrayQuit, "終了"),
+        (TrayStillRunning, "QuadChroma は通知領域で引き続き動作しています。"),
+        (TrayStillRunningMac, "QuadChroma はメニューバーで引き続き動作しています。"),
     ],
 };
 
@@ -691,5 +706,10 @@ pub static TR: Lang = Lang {
         (FilesAborted, "Dosya aktarımı iptal edildi: {n}"),
         (FilesTooLarge, "Dosyalar aktarılmadı: 4 GB'tan veya 10.000 öğeden fazla"),
         (FilesPeerOld, "Karşı taraf henüz dosya alamıyor."),
+        (TrayOpen, "Aç"),
+        (TrayConnect, "Bağlan: {n}"),
+        (TrayQuit, "Çıkış"),
+        (TrayStillRunning, "QuadChroma bildirim alanında çalışmaya devam ediyor."),
+        (TrayStillRunningMac, "QuadChroma menü çubuğunda çalışmaya devam ediyor."),
     ],
 };
