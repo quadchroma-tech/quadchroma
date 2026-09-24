@@ -159,6 +159,11 @@ pub static ET: Lang = Lang {
         (TipBenchDuration, "Mõõteaeg sammu kohta. Pikem on stabiilsem; 5 s on enamasti küllalt."),
         (TipBenchHint, "Samm läbib, kui kohale jõuab vähemalt 95 % sihtkaadrisagedusest, vahele jääb alla 1 % kaadritest ja kogu ahel püsib 30 ms sees – kaadrisagedusest sõltumata. Hosti kooderi aega näidatakse, kuid ei hinnata. Soovitus: parim värvikvaliteet, mis läbib kõrgeimal kaadrisagedusel, kõrgeima bitikiirusega."),
         (TipBenchTestPattern, "Jooksu ajaks näitab host ekraani asemel kindlat liikuvat mustrit – iga samm mõõdab sama sisu."),
+        (DesktopShortcut, "Otsetee"),
+        (TipDesktopShortcut, "Loob töölauale otsetee selle hostini. Topeltklõps loob kohe ühenduse."),
+        (DesktopShortcutCreated, "Otsetee loodud töölauale: {n}"),
+        (DesktopShortcutFailed, "Otseteed ei loodud: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: ühenda hostiga {n} ({m})"),
     ],
 };
 
@@ -318,6 +323,11 @@ pub static LV: Lang = Lang {
         (TipBenchDuration, "Mērīšanas laiks vienam solim. Ilgāks ir stabilāks; 5 s parasti pietiek."),
         (TipBenchHint, "Solis iztur, ja pienāk vismaz 95 % no mērķa kadru ātruma, izlaisti ir mazāk nekā 1 % kadru un visa ķēde iekļaujas 30 ms – neatkarīgi no kadru ātruma. Hosta kodētāja laiks tiek rādīts, bet netiek vērtēts. Ieteicams: labākā krāsu kvalitāte, kas iztur pie augstākā kadru ātruma, ar augstāko bitu ātrumu."),
         (TipBenchTestPattern, "Testa laikā hosts ekrāna vietā rāda fiksētu kustīgu rakstu – katrs solis mēra vienu un to pašu saturu."),
+        (DesktopShortcut, "Saīsne"),
+        (TipDesktopShortcut, "Izveido darbvirsmā saīsni uz šo hostu. Dubultklikšķis uzreiz izveido savienojumu."),
+        (DesktopShortcutCreated, "Saīsne izveidota darbvirsmā: {n}"),
+        (DesktopShortcutFailed, "Saīsne netika izveidota: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: savienoties ar {n} ({m})"),
     ],
 };
 
@@ -477,6 +487,11 @@ pub static LT: Lang = Lang {
         (TipBenchDuration, "Matavimo laikas vienam žingsniui. Ilgesnis stabilesnis; 5 s paprastai pakanka."),
         (TipBenchHint, "Žingsnis praeina, kai atkeliauja bent 95 % tikslinio kadrų dažnio, praleidžiama mažiau nei 1 % kadrų ir visa grandinė telpa į 30 ms – nepriklausomai nuo kadrų dažnio. Hosto koderio laikas rodomas, bet nevertinamas. Rekomenduojama: geriausia spalvų kokybė, kuri praeina esant didžiausiam kadrų dažniui, su didžiausia bitų sparta."),
         (TipBenchTestPattern, "Testo metu hostas vietoj ekrano rodo fiksuotą judantį raštą – kiekvienas žingsnis matuoja tą patį turinį."),
+        (DesktopShortcut, "Nuoroda"),
+        (TipDesktopShortcut, "Sukuria darbalaukyje nuorodą į šį hostą. Dukart spustelėjus iš karto prisijungiama."),
+        (DesktopShortcutCreated, "Nuoroda sukurta darbalaukyje: {n}"),
+        (DesktopShortcutFailed, "Nuoroda nesukurta: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: prisijungti prie {n} ({m})"),
     ],
 };
 
@@ -636,6 +651,11 @@ pub static SL: Lang = Lang {
         (TipBenchDuration, "Čas merjenja na korak. Daljši je mirnejši; 5 s običajno zadostuje."),
         (TipBenchHint, "Korak uspe, če prispe vsaj 95 % ciljne hitrosti sličic, izpuščenih je manj kot 1 % sličic in celotna veriga ostane znotraj 30 ms – ne glede na hitrost sličic. Čas kodirnika gostitelja je prikazan, a se ne ocenjuje. Priporočeno: najboljša barvna kakovost, ki uspe pri najvišji hitrosti sličic, z najvišjo bitno hitrostjo."),
         (TipBenchTestPattern, "Med izvajanjem gostitelj namesto zaslona kaže stalen gibljiv vzorec – vsak korak meri isto vsebino."),
+        (DesktopShortcut, "Ustvari bližnjico"),
+        (TipDesktopShortcut, "Na namizju ustvari bližnjico do tega gostitelja. Dvoklik takoj vzpostavi povezavo."),
+        (DesktopShortcutCreated, "Bližnjica ustvarjena na namizju: {n}"),
+        (DesktopShortcutFailed, "Bližnjica ni bila ustvarjena: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: poveži se z {n} ({m})"),
     ],
 };
 
@@ -795,6 +815,11 @@ pub static HR: Lang = Lang {
         (TipBenchDuration, "Vrijeme mjerenja po koraku. Dulje je stabilnije; 5 s obično je dovoljno."),
         (TipBenchHint, "Korak prolazi ako stigne barem 95 % ciljnog broja sličica, ispušteno je manje od 1 % sličica i cijeli lanac ostane unutar 30 ms – neovisno o broju sličica. Vrijeme enkodera hosta se prikazuje, ali ne ocjenjuje. Preporučeno: najbolja kvaliteta boje koja prolazi pri najvećem broju sličica, s najvećom brzinom prijenosa."),
         (TipBenchTestPattern, "Za vrijeme izvođenja host umjesto zaslona prikazuje fiksni pokretni uzorak – svaki korak mjeri isti sadržaj."),
+        (DesktopShortcut, "Stvori prečac"),
+        (TipDesktopShortcut, "Stvara na radnoj površini prečac do ovog hosta. Dvostrukim klikom odmah se povezuje."),
+        (DesktopShortcutCreated, "Prečac stvoren na radnoj površini: {n}"),
+        (DesktopShortcutFailed, "Prečac nije stvoren: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: poveži se s {n} ({m})"),
     ],
 };
 
@@ -954,5 +979,10 @@ pub static UK: Lang = Lang {
         (TipBenchDuration, "Час вимірювання на крок. Довше – стабільніше; 5 с зазвичай достатньо."),
         (TipBenchHint, "Крок проходить, якщо надходить щонайменше 95 % цільової частоти кадрів, пропущено менше ніж 1 % кадрів і весь ланцюжок вкладається в 30 ms – незалежно від частоти кадрів. Час кодера хоста показується, але не оцінюється. Рекомендується: найкраща якість кольору, яка проходить на найвищій частоті кадрів, із найвищим бітрейтом."),
         (TipBenchTestPattern, "На час вимірювання хост показує замість екрана фіксований рухомий візерунок – кожен крок вимірює той самий вміст."),
+        (DesktopShortcut, "Ярлик"),
+        (TipDesktopShortcut, "Створює на робочому столі ярлик до цього хоста. Подвійне клацання одразу підключає."),
+        (DesktopShortcutCreated, "Ярлик створено на робочому столі: {n}"),
+        (DesktopShortcutFailed, "Ярлик не створено: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: підключитися до {n} ({m})"),
     ],
 };

@@ -161,6 +161,11 @@ pub static FR: Lang = Lang {
         (TipBenchDuration, "Temps de mesure par étape. Plus long est plus stable ; 5 s suffisent en général."),
         (TipBenchHint, "Une étape réussit si au moins 95 % de la fréquence d'images cible arrivent, si moins de 1 % des images sont perdues et si toute la chaîne reste sous 30 ms – quelle que soit la fréquence d'images. Le temps d'encodage de l'hôte est affiché mais pas évalué. Recommandé : la meilleure qualité de couleur qui réussit à la fréquence d'images la plus élevée, au débit le plus élevé."),
         (TipBenchTestPattern, "Pendant toute la durée du test, l'hôte affiche un motif animé fixe à la place de l'écran – chaque étape mesure le même contenu."),
+        (DesktopShortcut, "Raccourci bureau"),
+        (TipDesktopShortcut, "Crée sur le bureau un raccourci vers cet hôte. Un double-clic dessus établit aussitôt la connexion."),
+        (DesktopShortcutCreated, "Raccourci créé sur le bureau : {n}"),
+        (DesktopShortcutFailed, "Raccourci non créé : {n}"),
+        (DesktopShortcutDescription, "QuadChroma : se connecter à {n} ({m})"),
     ],
 };
 
@@ -320,6 +325,11 @@ pub static ES: Lang = Lang {
         (TipBenchDuration, "Tiempo de medición por paso. Más largo es más estable; 5 s suelen bastar."),
         (TipBenchHint, "Un paso pasa si llega al menos el 95 % de la tasa de fotogramas objetivo, se pierde menos del 1 % de los fotogramas y toda la cadena se mantiene dentro de 30 ms, sea cual sea la tasa de fotogramas. El tiempo del codificador del host se muestra, pero no se evalúa. Recomendado: la mejor calidad de color que pasa a la tasa de fotogramas más alta, con la tasa de bits más alta."),
         (TipBenchTestPattern, "Durante la prueba, el host muestra un patrón fijo en movimiento en lugar de la pantalla: cada paso mide el mismo contenido."),
+        (DesktopShortcut, "Acceso directo"),
+        (TipDesktopShortcut, "Crea en el escritorio un acceso directo a este host. Con un doble clic se conecta al instante."),
+        (DesktopShortcutCreated, "Acceso directo creado en el escritorio: {n}"),
+        (DesktopShortcutFailed, "No se creó el acceso directo: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: conectar con {n} ({m})"),
     ],
 };
 
@@ -479,6 +489,11 @@ pub static IT: Lang = Lang {
         (TipBenchDuration, "Tempo di misura per passo. Più lungo è più stabile; 5 s di solito bastano."),
         (TipBenchHint, "Un passo è superato se arriva almeno il 95 % della frequenza fotogrammi obiettivo, meno dell'1 % dei fotogrammi viene perso e l'intera catena resta entro 30 ms, indipendentemente dalla frequenza fotogrammi. Il tempo dell'encoder dell'host viene mostrato ma non valutato. Consigliata: la migliore qualità colore che supera alla frequenza fotogrammi più alta, con il bitrate più alto."),
         (TipBenchTestPattern, "Per la durata del test l'host mostra un motivo fisso in movimento al posto dello schermo: ogni passo misura lo stesso contenuto."),
+        (DesktopShortcut, "Collegamento"),
+        (TipDesktopShortcut, "Crea sul desktop un collegamento a questo host. Con un doppio clic si connette subito."),
+        (DesktopShortcutCreated, "Collegamento creato sul desktop: {n}"),
+        (DesktopShortcutFailed, "Collegamento non creato: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: connettersi a {n} ({m})"),
     ],
 };
 
@@ -638,6 +653,11 @@ pub static PT: Lang = Lang {
         (TipBenchDuration, "Tempo de medição por passo. Mais longo é mais estável; 5 s costumam chegar."),
         (TipBenchHint, "Um passo passa se chegarem pelo menos 95 % da taxa de imagens alvo, se se perder menos de 1 % das imagens e se toda a cadeia se mantiver dentro de 30 ms, independentemente da taxa de imagens. O tempo do codificador do host é mostrado, mas não avaliado. Recomendado: a melhor qualidade de cor que passa à taxa de imagens mais alta, com a taxa de bits mais alta."),
         (TipBenchTestPattern, "Durante o teste, o host mostra um padrão fixo em movimento em vez do ecrã: cada passo mede o mesmo conteúdo."),
+        (DesktopShortcut, "Criar atalho"),
+        (TipDesktopShortcut, "Cria no ambiente de trabalho um atalho para este host. Um duplo clique liga de imediato."),
+        (DesktopShortcutCreated, "Atalho criado no ambiente de trabalho: {n}"),
+        (DesktopShortcutFailed, "Atalho não criado: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: ligar a {n} ({m})"),
     ],
 };
 
@@ -797,5 +817,10 @@ pub static NL: Lang = Lang {
         (TipBenchDuration, "Meettijd per stap. Langer is rustiger; 5 s is meestal genoeg."),
         (TipBenchHint, "Een stap slaagt als minstens 95 % van de doelframerate aankomt, minder dan 1 % van de beelden verloren gaat en de hele keten binnen 30 ms blijft – ongeacht de framerate. De encodertijd van de host wordt getoond maar niet beoordeeld. Aanbevolen: de beste kleurkwaliteit die slaagt bij de hoogste framerate, met de hoogste bitrate."),
         (TipBenchTestPattern, "Voor de duur van de run toont de host een vast bewegend patroon in plaats van het scherm – elke stap meet dezelfde inhoud."),
+        (DesktopShortcut, "Snelkoppeling"),
+        (TipDesktopShortcut, "Maakt op het bureaublad een snelkoppeling naar deze host. Dubbelklikken maakt meteen verbinding."),
+        (DesktopShortcutCreated, "Snelkoppeling op het bureaublad gemaakt: {n}"),
+        (DesktopShortcutFailed, "Snelkoppeling niet gemaakt: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: verbinden met {n} ({m})"),
     ],
 };
