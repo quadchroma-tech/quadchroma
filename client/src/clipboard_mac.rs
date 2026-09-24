@@ -1,8 +1,10 @@
 // Zwischenablage auf der Mac-Seite des Clients.
 //
 // Dieselbe Schnittstelle wie clipboard.rs (Windows): watch() meldet, was der
-// Benutzer hier kopiert hat, set() legt Text ab, ohne die eigene Ueberwachung
-// auszuloesen. Nur Text, wie bisher.
+// Benutzer hier kopiert hat (Text oder eine Dateiliste, siehe Inhalt), set()
+// legt Text ab und set_dateien() eine Dateiliste, beide ohne die eigene
+// Ueberwachung auszuloesen. Hier werden nur Pfade gelesen bzw. abgelegt, nie
+// Dateien; die uebertraegt ein eigener Teil (dateien.rs).
 //
 // NSPasteboard schickt keine Nachricht bei Aenderungen; es gibt nur den
 // changeCount. Deshalb fragt ein Faden alle 300 ms nach und liest, sobald die
@@ -11,9 +13,12 @@
 // Benutzers zurueckgemeldet wird. Waechter und set() laufen unter EINER
 // Sperre, damit der Waechter nie zwischen clearContents und setString liest.
 //
-// Gelesen wird nach derselben Regel wie auf dem Mac-Host (read_first_text in
-// host/clipboard.m): nur der erste Eintrag, und verdeckte Eintraege
-// (Passwoerter) sowie Dateien bleiben auf diesem Rechner.
+// Gelesen wird nach derselben Regel wie auf dem Mac-Host (host/clipboard.m):
+// verdeckte Eintraege (Passwoerter) bleiben auf diesem Rechner. Tragen
+// Eintraege Dateiverweise (public.file-url, Finder legt je Datei einen
+// Eintrag an), wird die Dateiliste gemeldet und kein Text - auch nicht der
+// Name, den Finder zusaetzlich als Text ablegt. Sonst zaehlt der Text des
+// ersten Eintrags.
 //
 // Gelesen wird nur waehrend einer Sitzung (`sitzung`). Ohne sie zaehlt der
 // Waechter nur den changeCount mit: ab macOS 15.4 kann jedes Lesen des
@@ -38,7 +43,9 @@
 // NSPasteboard und die Konstanten NSPasteboardTypeString und
 // NSPasteboardTypeFileURL) und libobjc.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -46,6 +53,11 @@ use std::time::Duration;
 /// Obergrenze fuer einen Uebertragungsvorgang - wie auf Windows. Groesseres
 /// wird stillschweigend verworfen statt abgeschnitten.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Mehr Dateiverweise liest der Waechter nicht - wie DATEIEN_MAX in
+/// clipboard.rs: mehr als EINTRAEGE_MAX (10000, Spezifikation 2.6) koennen
+/// ohnehin nicht hinaus, einer darueber reicht dem Sender fuer "zu viele".
+const DATEIEN_MAX: usize = 10_000;
 
 /// Abstand zwischen zwei Blicken auf den changeCount.
 const TAKT: Duration = Duration::from_millis(300);
@@ -115,10 +127,28 @@ unsafe fn msg_int(obj: Id, s: Sel) -> isize {
     f(obj, s)
 }
 
+/// [obj sel] -> BOOL
+unsafe fn msg_bool(obj: Id, s: Sel) -> bool {
+    let f: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(objc_msgSend as *const c_void);
+    f(obj, s) != 0
+}
+
 /// [obj sel:arg] -> id
 unsafe fn msg_id_1(obj: Id, s: Sel, a: Id) -> Id {
     let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc_msgSend as *const c_void);
     f(obj, s, a)
+}
+
+/// [obj sel:NSUInteger] -> id (objectAtIndex:)
+unsafe fn msg_id_u(obj: Id, s: Sel, a: usize) -> Id {
+    let f: unsafe extern "C" fn(Id, Sel, usize) -> Id = std::mem::transmute(objc_msgSend as *const c_void);
+    f(obj, s, a)
+}
+
+/// [obj sel:arg] -> BOOL (writeObjects:)
+unsafe fn msg_bool_1(obj: Id, s: Sel, a: Id) -> bool {
+    let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc_msgSend as *const c_void);
+    f(obj, s, a) != 0
 }
 
 /// [obj sel:arg] -> NSUInteger
@@ -146,6 +176,16 @@ unsafe fn msg_init_bytes(obj: Id, s: Sel, bytes: *const c_void, len: usize, enc:
     f(obj, s, bytes, len, enc)
 }
 
+/// [NSArray arrayWithObjects:count:] -> id (autoreleased)
+unsafe fn ns_liste(objekte: &[Id]) -> Id {
+    let k = klasse(c"NSArray");
+    if k.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: unsafe extern "C" fn(Id, Sel, *const Id, usize) -> Id = std::mem::transmute(objc_msgSend as *const c_void);
+    f(k, sel(c"arrayWithObjects:count:"), objekte.as_ptr(), objekte.len())
+}
+
 /// NSString aus einer C-Zeichenkette. Autoreleased: braucht einen Pool.
 unsafe fn ns_text(s: &CStr) -> Id {
     let k = klasse(c"NSString");
@@ -153,6 +193,18 @@ unsafe fn ns_text(s: &CStr) -> Id {
         return std::ptr::null_mut();
     }
     msg_id_1(k, sel(c"stringWithUTF8String:"), s.as_ptr() as Id)
+}
+
+/// NSString aus UTF-8-Bytes, ohne Abschneiden an einem NUL. Eigene
+/// Zaehlung: der Aufrufer gibt ihn mit release frei. Null bei ungueltigem
+/// UTF-8.
+unsafe fn ns_text_bytes(bytes: &[u8]) -> Id {
+    let k = klasse(c"NSString");
+    if k.is_null() {
+        return std::ptr::null_mut();
+    }
+    let roh = msg_id(k, sel(c"alloc"));
+    msg_init_bytes(roh, sel(c"initWithBytes:length:encoding:"), bytes.as_ptr() as *const c_void, bytes.len(), NS_UTF8)
 }
 
 /// Traegt der Eintrag diesen Typ? [item availableTypeFromArray:@[typ]]
@@ -184,14 +236,34 @@ impl Drop for Pool {
 
 /// changeCount nach dem eigenen Schreiben: einmal nach clearContents, einmal
 /// nach setString - je nachdem, wann der Waechter hinschaut, muss einer
-/// von beiden passen.
+/// von beiden passen. Gilt fuer Text und Dateilisten.
 static EIGEN: Mutex<(isize, isize)> = Mutex::new((-1, -1));
 
-/// Serialisiert set() gegen den Waechter (siehe Kopf).
+/// Serialisiert set() und set_dateien() gegen den Waechter (siehe Kopf).
 static SPERRE: Mutex<()> = Mutex::new(());
 
 /// Laeuft eine Sitzung? Nur dann liest der Waechter den Inhalt.
 static SITZUNG: AtomicBool = AtomicBool::new(false);
+
+/// Was der Benutzer kopiert hat. Dieselbe Art steht in clipboard.rs, damit
+/// die Aufrufer ohne Plattformweiche auskommen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inhalt {
+    /// Text des ersten Eintrags.
+    Text(String),
+    /// Dateiverweise aller Eintraege als Pfade, wie Finder sie ablegt: die
+    /// obersten Eintraege, Ordner nicht aufgeloest.
+    Dateien(Vec<PathBuf>),
+}
+
+impl Inhalt {
+    fn leer(&self) -> bool {
+        match self {
+            Inhalt::Text(t) => t.is_empty(),
+            Inhalt::Dateien(p) => p.is_empty(),
+        }
+    }
+}
 
 /// Sitzung beginnt (true, der Host hat angenommen) oder endet (false).
 pub fn sitzung(an: bool) {
@@ -214,26 +286,27 @@ fn change_count(b: Id) -> isize {
 
 // ------------------------------------------------------------------- Lesen
 
-/// Text des ERSTEN Eintrags auf dem Brett. Bewusst ueber pasteboardItems
-/// und nicht ueber [b stringForType:]: der bequeme Weg auf Brettebene haengt
-/// bei mehreren Eintraegen deren Text aneinander. None, wenn der Eintrag
-/// verdeckt ist, eine Datei ist, nichts Textartiges traegt oder die
+/// Was auf dem Brett liegt: eine Dateiliste, wenn Eintraege Dateiverweise
+/// (public.file-url) tragen, sonst der Text des ERSTEN Eintrags. Bewusst
+/// ueber pasteboardItems und nicht ueber [b stringForType:]: der bequeme Weg
+/// auf Brettebene haengt bei mehreren Eintraegen deren Text aneinander.
+///
+/// Betrachtet werden alle Eintraege: Finder legt je Datei einen an, und ein
+/// verdeckter Eintrag irgendwo haelt alles zurueck. None, wenn etwas
+/// verdeckt ist, ein Dateiverweis sich nicht aufloesen laesst (lieber keine
+/// Liste als eine halbe), nichts Textartiges anliegt oder der Text die
 /// Obergrenze reisst. Laeuft im eigenen Pool: die Rueckgaben sind
 /// autoreleased.
-fn lesen(b: Id) -> Option<String> {
+fn lesen(b: Id) -> Option<Inhalt> {
     let _pool = Pool::neu();
     unsafe {
         let eintraege = msg_id(b, sel(c"pasteboardItems"));
         if eintraege.is_null() {
             return None;
         }
-        let item = msg_id(eintraege, sel(c"firstObject"));
-        if item.is_null() {
-            return None;
-        }
         let anzahl = msg_int(eintraege, sel(c"count"));
-        if anzahl > 1 {
-            crate::protokoll::zeile(format!("Zwischenablage: {anzahl} Eintraege, nur der erste wird uebertragen"));
+        if anzahl <= 0 {
+            return None;
         }
         // Verdeckte Inhalte (Passwoerter) bleiben auf diesem Rechner. Laesst
         // sich das Kennzeichen nicht einmal anlegen, wird nichts gelesen -
@@ -242,13 +315,41 @@ fn lesen(b: Id) -> Option<String> {
         if verdeckt.is_null() {
             return None;
         }
-        if hat_typ(item, verdeckt) {
-            crate::protokoll::zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen".into());
-            return None;
+        let mut pfade = Vec::new();
+        let mut dateiverweise = 0usize;
+        let mut unaufloesbar = false;
+        for i in 0..anzahl as usize {
+            let item = msg_id_u(eintraege, sel(c"objectAtIndex:"), i);
+            if item.is_null() {
+                continue;
+            }
+            if hat_typ(item, verdeckt) {
+                crate::protokoll::zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen".into());
+                return None;
+            }
+            if hat_typ(item, NSPasteboardTypeFileURL) {
+                dateiverweise += 1;
+                if pfade.len() <= DATEIEN_MAX {
+                    match dateiverweis(item) {
+                        Some(p) => pfade.push(p),
+                        None => unaufloesbar = true,
+                    }
+                }
+            }
         }
-        // Dateien und Ordner uebertragen wir nicht - nur der Name oder Pfad
-        // waere sinnlos, weil er auf der anderen Seite nichts bedeutet.
-        if hat_typ(item, NSPasteboardTypeFileURL) {
+        if dateiverweise > 0 {
+            if unaufloesbar {
+                crate::protokoll::zeile("Zwischenablage: Dateiverweis nicht aufloesbar, nichts uebertragen".into());
+                return None;
+            }
+            return Some(Inhalt::Dateien(pfade));
+        }
+
+        if anzahl > 1 {
+            crate::protokoll::zeile(format!("Zwischenablage: {anzahl} Eintraege, nur der erste wird uebertragen"));
+        }
+        let item = msg_id(eintraege, sel(c"firstObject"));
+        if item.is_null() {
             return None;
         }
         let s = msg_id_1(item, sel(c"stringForType:"), NSPasteboardTypeString);
@@ -264,8 +365,59 @@ fn lesen(b: Id) -> Option<String> {
             return None;
         }
         let bytes = std::slice::from_raw_parts(p, len);
-        Some(String::from_utf8_lossy(bytes).into_owned())
+        Some(Inhalt::Text(String::from_utf8_lossy(bytes).into_owned()))
     }
+}
+
+/// Der Pfad hinter dem Dateiverweis (public.file-url) eines Eintrags, ueber
+/// datei_url. Der Pfad kommt aus `path`, also in der Schreibweise des
+/// Verweises. Die kann Umlaute zerlegt (NFD) tragen - fileURLWithPath: legt
+/// sie so an -, auch wenn der Name auf der Platte zusammengesetzt steht; auf
+/// APFS meinen beide Schreibweisen dieselbe Datei. Nur innerhalb eines Pools
+/// aufrufen.
+unsafe fn dateiverweis(item: Id) -> Option<PathBuf> {
+    let s = msg_id_1(item, sel(c"stringForType:"), NSPasteboardTypeFileURL);
+    let url = datei_url(s)?;
+    let pfad = msg_id(url, sel(c"path"));
+    if pfad.is_null() {
+        return None;
+    }
+    let p = msg_id(pfad, sel(c"UTF8String")) as *const c_char;
+    if p.is_null() {
+        return None;
+    }
+    let bytes = CStr::from_ptr(p).to_bytes();
+    if !bytes.starts_with(b"/") {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+/// Aus dem Text eines Dateiverweises ein Pfad-URL. Finder legt oft
+/// Datei-Referenz-URLs ab (file:///.file/id=...); die werden ueber
+/// filePathURL aufgeloest - das braucht die Datei, ein geloeschter Verweis
+/// ergibt also None. Gewoehnliche Pfad-URLs werden nur umgeformt, ohne das
+/// Dateisystem zu fragen. None auch, wenn es kein Datei-URL ist. Nur
+/// innerhalb eines Pools aufrufen (autoreleased).
+unsafe fn datei_url(text: Id) -> Option<Id> {
+    let url_klasse = klasse(c"NSURL");
+    if text.is_null() || url_klasse.is_null() {
+        return None;
+    }
+    let mut url = msg_id_1(url_klasse, sel(c"URLWithString:"), text);
+    if url.is_null() {
+        return None;
+    }
+    if msg_bool(url, sel(c"isFileReferenceURL")) {
+        url = msg_id(url, sel(c"filePathURL"));
+        if url.is_null() {
+            return None;
+        }
+    }
+    if !msg_bool(url, sel(c"isFileURL")) {
+        return None;
+    }
+    Some(url)
 }
 
 // ----------------------------------------------------------------- Schreiben
@@ -296,20 +448,9 @@ pub fn set(text: &str) {
 fn ablegen(b: Id, text: &str) -> Option<(isize, isize)> {
     let _pool = Pool::neu();
     unsafe {
-        let ns_klasse = klasse(c"NSString");
-        if ns_klasse.is_null() {
-            return None;
-        }
         // initWithBytes statt stringWithUTF8String: kein Abschneiden an
         // einem NUL im Text, und die Laenge steht fest.
-        let roh = msg_id(ns_klasse, sel(c"alloc"));
-        let s = msg_init_bytes(
-            roh,
-            sel(c"initWithBytes:length:encoding:"),
-            text.as_ptr() as *const c_void,
-            text.len(),
-            NS_UTF8,
-        );
+        let s = ns_text_bytes(text.as_bytes());
         if s.is_null() {
             return None;
         }
@@ -333,6 +474,125 @@ fn ablegen(b: Id, text: &str) -> Option<(isize, isize)> {
     }
 }
 
+/// Legt eine Dateiliste auf das allgemeine Brett, so dass "Einsetzen" im
+/// Finder die Dateien kopiert - ohne die eigene Ueberwachung auszuloesen
+/// (Zaehlung wie bei set()). Je Pfad ein Eintrag mit public.file-url, als
+/// fluechtig und programmerzeugt gekennzeichnet, nur fuer diesen Mac.
+/// `pfade` sind vollstaendige Pfade der obersten Eintraege; die Dateien
+/// selbst werden hier nicht gelesen. true, wenn die Liste auf dem Brett
+/// liegt; false bei leerer oder ungueltiger Liste (dann bleibt das Brett,
+/// wie es ist) oder wenn das Schreiben scheitert.
+// Aufrufer ist der Empfaenger der Dateiuebertragung (dateien.rs), der mit
+// einem eigenen Paket dazukommt.
+#[allow(dead_code)]
+pub fn set_dateien(pfade: &[PathBuf]) -> bool {
+    let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
+    let b = brett();
+    if b.is_null() {
+        return false;
+    }
+    dateien_setzen(b, pfade)
+}
+
+/// set_dateien auf dem Brett `b`, mit der Zaehlung fuer den Widerhall.
+fn dateien_setzen(b: Id, pfade: &[PathBuf]) -> bool {
+    match dateien_ablegen(b, pfade) {
+        Some((zaehler, ok)) => {
+            if let Ok(mut e) = EIGEN.lock() {
+                *e = zaehler;
+            }
+            ok
+        }
+        None => false,
+    }
+}
+
+/// Legt je Pfad einen NSPasteboardItem mit public.file-url (absoluteString
+/// von fileURLWithPath:) und den Kennzeichen FLUECHTIG und AUTOGEN auf `b`,
+/// vorher prepareForNewContentsWithOptions: "nur dieser Mac". Gibt die
+/// Zaehler wie `ablegen` zurueck und ob writeObjects: gelang. None, wenn
+/// schon das Bauen der Eintraege scheitert (leere Liste, relativer Pfad,
+/// NUL, kein UTF-8) - dann ist das Brett unberuehrt.
+fn dateien_ablegen(b: Id, pfade: &[PathBuf]) -> Option<((isize, isize), bool)> {
+    if pfade.is_empty() {
+        return None;
+    }
+    let _pool = Pool::neu();
+    unsafe {
+        let mut items: Vec<Id> = Vec::with_capacity(pfade.len());
+        for p in pfade {
+            match datei_eintrag(p) {
+                Some(item) => items.push(item),
+                None => {
+                    for i in items {
+                        let _ = msg_id(i, sel(c"release"));
+                    }
+                    return None;
+                }
+            }
+        }
+        let liste = ns_liste(&items);
+        let geschrieben = if liste.is_null() {
+            None
+        } else {
+            let nach_leeren = msg_int_1(b, sel(c"prepareForNewContentsWithOptions:"), NUR_DIESER_MAC);
+            let ok = msg_bool_1(b, sel(c"writeObjects:"), liste);
+            let nach_setzen = if ok { change_count(b) } else { nach_leeren };
+            Some(((nach_leeren, nach_setzen), ok))
+        };
+        for i in items {
+            let _ = msg_id(i, sel(c"release"));
+        }
+        geschrieben
+    }
+}
+
+/// Ein Eintrag fuer `pfad`: public.file-url plus FLUECHTIG und AUTOGEN.
+/// Eigene Zaehlung (alloc/init), der Aufrufer gibt ihn frei. Nur innerhalb
+/// eines Pools aufrufen.
+unsafe fn datei_eintrag(pfad: &PathBuf) -> Option<Id> {
+    let bytes = pfad.as_os_str().as_bytes();
+    if !pfad.is_absolute() || bytes.contains(&0) {
+        return None;
+    }
+    let url_klasse = klasse(c"NSURL");
+    let item_klasse = klasse(c"NSPasteboardItem");
+    let leer = ns_text(c"");
+    let fluechtig = ns_text(FLUECHTIG);
+    let autogen = ns_text(AUTOGEN);
+    if url_klasse.is_null() || item_klasse.is_null() || leer.is_null() || fluechtig.is_null() || autogen.is_null() {
+        return None;
+    }
+    let s = ns_text_bytes(bytes);
+    if s.is_null() {
+        return None;
+    }
+    // fileURLWithPath: fragt das Dateisystem, ob es ein Ordner ist, und
+    // haengt dann den Schraegstrich an - so erkennt Finder Ordner.
+    let url = msg_id_1(url_klasse, sel(c"fileURLWithPath:"), s);
+    let _ = msg_id(s, sel(c"release"));
+    if url.is_null() {
+        return None;
+    }
+    let text = msg_id(url, sel(c"absoluteString"));
+    if text.is_null() {
+        return None;
+    }
+    let item = msg_id(msg_id(item_klasse, sel(c"alloc")), sel(c"init"));
+    if item.is_null() {
+        return None;
+    }
+    let setzen = sel(c"setString:forType:");
+    if !msg_bool_2(item, setzen, text, NSPasteboardTypeFileURL)
+        || !msg_bool_2(item, setzen, leer, fluechtig)
+        || !msg_bool_2(item, setzen, leer, autogen)
+    {
+        let _ = msg_id(item, sel(c"release"));
+        return None;
+    }
+    Some(item)
+}
+
 /// Stammt dieser changeCount von unserem eigenen set()?
 fn eigener_vorgang(count: isize) -> bool {
     EIGEN
@@ -347,7 +607,7 @@ fn eigener_vorgang(count: isize) -> bool {
 /// bewegt, und stammt die Aenderung nicht von uns, wird gelesen - aber nur
 /// mit laufender Sitzung. Ohne sie wird nur mitgezaehlt; eine Aenderung von
 /// vorher holt auch der Sitzungsbeginn nicht nach.
-fn nachsehen(b: Id, zuletzt: &mut isize, sitzung: bool, lesen: impl FnOnce(Id) -> Option<String>) -> Option<String> {
+fn nachsehen(b: Id, zuletzt: &mut isize, sitzung: bool, lesen: impl FnOnce(Id) -> Option<Inhalt>) -> Option<Inhalt> {
     let jetzt = change_count(b);
     if jetzt == *zuletzt {
         return None;
@@ -359,12 +619,14 @@ fn nachsehen(b: Id, zuletzt: &mut isize, sitzung: bool, lesen: impl FnOnce(Id) -
     lesen(b)
 }
 
-/// Startet die Ueberwachung in einem eigenen Faden. `cb` bekommt jeden Text,
-/// den der Benutzer auf dem Mac waehrend einer Sitzung kopiert hat; eigene
-/// Schreibvorgaenge aus `set` sind bereits herausgefiltert. Was beim Start
-/// oder ohne Sitzung auf das Brett kam, wird nicht gemeldet - wie auf
-/// Windows, wo erst die naechste Aenderung in einer Sitzung zaehlt.
-pub fn watch(cb: impl Fn(String) + Send + 'static) {
+/// Startet die Ueberwachung in einem eigenen Faden. `cb` bekommt jeden Text
+/// und jede Dateiliste, die der Benutzer auf dem Mac waehrend einer Sitzung
+/// kopiert hat; eigene Schreibvorgaenge aus `set` und `set_dateien` sind
+/// bereits herausgefiltert. Was beim Start oder ohne Sitzung auf das Brett
+/// kam, wird nicht gemeldet - wie auf Windows, wo erst die naechste
+/// Aenderung in einer Sitzung zaehlt. `cb` laeuft ausserhalb der Sperre im
+/// Faden des Waechters.
+pub fn watch(cb: impl Fn(Inhalt) + Send + 'static) {
     std::thread::spawn(move || {
         let b = brett();
         if b.is_null() {
@@ -374,13 +636,13 @@ pub fn watch(cb: impl Fn(String) + Send + 'static) {
         let mut zuletzt = change_count(b);
         loop {
             std::thread::sleep(TAKT);
-            let text = {
+            let inhalt = {
                 let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
                 nachsehen(b, &mut zuletzt, SITZUNG.load(Ordering::Relaxed), lesen)
             };
-            if let Some(t) = text {
-                if !t.is_empty() {
-                    cb(t);
+            if let Some(i) = inhalt {
+                if !i.leer() {
+                    cb(i);
                 }
             }
         }
@@ -393,14 +655,95 @@ pub fn watch(cb: impl Fn(String) + Send + 'static) {
 mod tests {
     use super::*;
 
+    /// Ein eigenes, namenloses Brett - nie das allgemeine. Am Ende des Tests
+    /// mit releaseGlobally wieder freigeben.
+    unsafe fn eigenes_brett() -> Id {
+        let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
+        assert!(!b.is_null(), "kein eigenes Brett");
+        b
+    }
+
+    /// Spielt den Benutzer: legt je Eintrag die Paare (Typ, Wert) in EINEM
+    /// writeObjects: auf `b`, an set()/set_dateien() und ihrer Zaehlung
+    /// vorbei.
+    unsafe fn nutzer_kopiert(b: Id, eintraege: &[Vec<(Id, Id)>]) {
+        let mut items: Vec<Id> = Vec::new();
+        for paare in eintraege {
+            let item = msg_id(msg_id(klasse(c"NSPasteboardItem"), sel(c"alloc")), sel(c"init"));
+            for (typ, wert) in paare {
+                assert!(msg_bool_2(item, sel(c"setString:forType:"), *wert, *typ));
+            }
+            items.push(item);
+        }
+        let liste = ns_liste(&items);
+        let _ = msg_int(b, sel(c"clearContents"));
+        assert!(msg_bool_1(b, sel(c"writeObjects:"), liste), "writeObjects: scheitert");
+        for i in items {
+            let _ = msg_id(i, sel(c"release"));
+        }
+    }
+
+    /// NSString aus einem &str (autoreleased ueber den Pool des Tests).
+    unsafe fn ns(s: &str) -> Id {
+        let t = ns_text_bytes(s.as_bytes());
+        assert!(!t.is_null());
+        msg_id(t, sel(c"autorelease"))
+    }
+
+    /// absoluteString von fileURLWithPath: - so legt set_dateien ab und so
+    /// sieht ein gewoehnlicher Finder-Verweis aus.
+    unsafe fn url_text(p: &PathBuf) -> Id {
+        let url = msg_id_1(klasse(c"NSURL"), sel(c"fileURLWithPath:"), ns(p.to_str().unwrap()));
+        assert!(!url.is_null());
+        msg_id(url, sel(c"absoluteString"))
+    }
+
+    /// Meldet `inhalt` dieselben Dateien wie `pfade`, in derselben
+    /// Reihenfolge? Verglichen ueber Geraet und Inode: fileURLWithPath: legt
+    /// Umlaute zerlegt (NFD) ab, die Testdateien stehen zusammengesetzt auf
+    /// der Platte - auf APFS dieselbe Datei.
+    fn gleiche_dateien(inhalt: &Option<Inhalt>, pfade: &[PathBuf]) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Some(Inhalt::Dateien(gelesen)) = inhalt else {
+            return false;
+        };
+        let kennung = |p: &PathBuf| std::fs::symlink_metadata(p).map(|m| (m.dev(), m.ino())).ok();
+        gelesen.len() == pfade.len()
+            && gelesen.iter().zip(pfade).all(|(g, p)| kennung(g).is_some() && kennung(g) == kennung(p))
+    }
+
+    unsafe fn rust_text(s: Id) -> String {
+        assert!(!s.is_null());
+        CStr::from_ptr(msg_id(s, sel(c"UTF8String")) as *const c_char).to_string_lossy().into_owned()
+    }
+
+    /// Echte Testdateien unter temp_dir ($TMPDIR), eigener Ordner je Lauf
+    /// und Test: eine Datei, ein Ordner mit Leerzeichen, eine Datei mit
+    /// Umlauten.
+    fn testdateien(name: &str) -> (PathBuf, Vec<PathBuf>) {
+        let ordner = std::env::temp_dir().join(format!("qc-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        let unter = ordner.join("Unterordner mit Leerzeichen");
+        std::fs::create_dir_all(&unter).expect("Testordner");
+        let a = ordner.join("a.txt");
+        std::fs::write(&a, b"hallo").expect("Testdatei");
+        let b = ordner.join("\u{e4}\u{f6}\u{fc} \u{20ac}.bin");
+        std::fs::write(&b, [0u8, 1, 2]).expect("Testdatei");
+        (ordner, vec![a, unter, b])
+    }
+
     /// Setzen laesst den changeCount steigen, Lesen liefert denselben Text,
     /// und der neue Zaehler gilt als eigener Vorgang. Der vorherige Inhalt
-    /// des Bretts wird danach zurueckgelegt.
+    /// des Bretts wird danach zurueckgelegt. ACHTUNG: arbeitet auf dem
+    /// allgemeinen Brett und faellt deshalb unter --skip clipboard.
     #[test]
     fn setzen_zaehlen_lesen() {
         let b = brett();
         assert!(!b.is_null(), "NSPasteboard fehlt");
-        let vorher = lesen(b);
+        let vorher = match lesen(b) {
+            Some(Inhalt::Text(t)) => Some(t),
+            _ => None,
+        };
         let c0 = change_count(b);
 
         let probe = "QuadChroma Probe: Zwischenablage \u{e4}\u{f6}\u{fc} \u{1F600}\nzweite Zeile";
@@ -408,7 +751,7 @@ mod tests {
         let c1 = change_count(b);
         assert!(c1 > c0, "changeCount steigt nicht: {c0} -> {c1}");
         assert!(eigener_vorgang(c1), "eigener Vorgang nicht erkannt");
-        assert_eq!(lesen(b).as_deref(), Some(probe));
+        assert_eq!(lesen(b), Some(Inhalt::Text(probe.into())));
 
         // Zweites Setzen: wieder ein Schritt weiter, alte Zahl gilt nicht mehr.
         set("zweite Probe");
@@ -416,7 +759,7 @@ mod tests {
         assert!(c2 > c1);
         assert!(eigener_vorgang(c2));
         assert!(!eigener_vorgang(c1));
-        assert_eq!(lesen(b).as_deref(), Some("zweite Probe"));
+        assert_eq!(lesen(b), Some(Inhalt::Text("zweite Probe".into())));
 
         if let Some(v) = vorher {
             set(&v);
@@ -424,54 +767,35 @@ mod tests {
     }
 
     /// Dieselbe Leseregel wie auf dem Mac-Host: ein verdeckter Eintrag geht
-    /// nicht hinaus, eine Datei auch nicht, und von mehreren Eintraegen
-    /// zaehlt nur der erste. Geschrieben wird auf ein eigenes, namenloses
-    /// Brett - die allgemeine Zwischenablage (und damit ein laufender Host)
-    /// bekommt davon nichts mit.
+    /// nicht hinaus, von mehreren Texteintraegen zaehlt nur der erste, und
+    /// ein Eintrag mit Dateiverweis geht als Dateiliste, nicht als Text.
+    /// Geschrieben wird auf ein eigenes, namenloses Brett - die allgemeine
+    /// Zwischenablage (und damit ein laufender Host) bekommt davon nichts mit.
     #[test]
     fn verdeckt_bleibt_hier() {
         let _pool = Pool::neu();
         unsafe {
-            let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
-            assert!(!b.is_null(), "kein eigenes Brett");
-            let text_typ = NSPasteboardTypeString;
+            let b = eigenes_brett();
+            let text = NSPasteboardTypeString;
             let verdeckt = ns_text(VERDECKT);
             let datei = NSPasteboardTypeFileURL;
 
-            // Je Eintrag ein Text und wahlweise ein zweiter Typ dazu; alle
-            // Eintraege gehen in EINEM writeObjects: aufs Brett.
-            let schreiben = |eintraege: &[(&CStr, Option<(Id, &CStr)>)]| {
-                let mut items: Vec<Id> = Vec::new();
-                for (text, zusatz) in eintraege {
-                    let item = msg_id(msg_id(klasse(c"NSPasteboardItem"), sel(c"alloc")), sel(c"init"));
-                    assert!(msg_bool_2(item, sel(c"setString:forType:"), ns_text(text), text_typ));
-                    if let Some((typ, wert)) = zusatz {
-                        assert!(msg_bool_2(item, sel(c"setString:forType:"), ns_text(wert), *typ));
-                    }
-                    items.push(item);
-                }
-                let liste: unsafe extern "C" fn(Id, Sel, *const Id, usize) -> Id =
-                    std::mem::transmute(objc_msgSend as *const c_void);
-                let liste = liste(klasse(c"NSArray"), sel(c"arrayWithObjects:count:"), items.as_ptr(), items.len());
-                let _ = msg_int(b, sel(c"clearContents"));
-                let schreib: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc_msgSend as *const c_void);
-                assert!(schreib(b, sel(c"writeObjects:"), liste) != 0, "writeObjects: scheitert");
-                for i in items {
-                    let _ = msg_id(i, sel(c"release"));
-                }
-            };
-
-            schreiben(&[(c"geheim123", Some((verdeckt, c"")))]);
+            nutzer_kopiert(b, &[vec![(text, ns("geheim123")), (verdeckt, ns(""))]]);
             assert_eq!(lesen(b), None, "verdeckter Eintrag wurde gelesen");
 
-            schreiben(&[(c"offen", None)]);
-            assert_eq!(lesen(b).as_deref(), Some("offen"));
+            nutzer_kopiert(b, &[vec![(text, ns("offen"))]]);
+            assert_eq!(lesen(b), Some(Inhalt::Text("offen".into())));
 
-            schreiben(&[(c"eins", None), (c"zwei", None)]);
-            assert_eq!(lesen(b).as_deref(), Some("eins"));
+            nutzer_kopiert(b, &[vec![(text, ns("eins"))], vec![(text, ns("zwei"))]]);
+            assert_eq!(lesen(b), Some(Inhalt::Text("eins".into())));
 
-            schreiben(&[(c"probe.txt", Some((datei, c"file:///tmp/probe.txt")))]);
-            assert_eq!(lesen(b), None, "Datei wurde als Text gelesen");
+            // Nur der Verweis wird umgeformt, die Datei nicht angefasst.
+            nutzer_kopiert(b, &[vec![(text, ns("probe.txt")), (datei, ns("file:///tmp/probe.txt"))]]);
+            assert_eq!(
+                lesen(b),
+                Some(Inhalt::Dateien(vec![PathBuf::from("/tmp/probe.txt")])),
+                "Datei als Text gelesen"
+            );
 
             let _ = msg_id(b, sel(c"releaseGlobally"));
         }
@@ -484,8 +808,7 @@ mod tests {
     fn ohne_sitzung_wird_nicht_gelesen() {
         let _pool = Pool::neu();
         unsafe {
-            let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
-            assert!(!b.is_null(), "kein eigenes Brett");
+            let b = eigenes_brett();
             let mut zuletzt = change_count(b);
             let gelesen = std::cell::Cell::new(0);
             let zaehlend = |b: Id| {
@@ -503,7 +826,10 @@ mod tests {
             assert_eq!(gelesen.get(), 0, "alte Kopie beim Sitzungsbeginn gelesen");
 
             assert!(ablegen(b, "kopiert in der Sitzung").is_some());
-            assert_eq!(nachsehen(b, &mut zuletzt, true, zaehlend).as_deref(), Some("kopiert in der Sitzung"));
+            assert_eq!(
+                nachsehen(b, &mut zuletzt, true, zaehlend),
+                Some(Inhalt::Text("kopiert in der Sitzung".into()))
+            );
             assert_eq!(gelesen.get(), 1);
 
             let _ = msg_id(b, sel(c"releaseGlobally"));
@@ -520,8 +846,7 @@ mod tests {
     fn vom_host_fluechtig() {
         let _pool = Pool::neu();
         unsafe {
-            let b = msg_id(klasse(c"NSPasteboard"), sel(c"pasteboardWithUniqueName"));
-            assert!(!b.is_null(), "kein eigenes Brett");
+            let b = eigenes_brett();
             let (nach_leeren, nach_setzen) = ablegen(b, "von drueben").expect("ablegen");
             assert_eq!(nach_setzen, change_count(b));
             assert!(nach_setzen >= nach_leeren);
@@ -531,7 +856,189 @@ mod tests {
             assert!(hat_typ(item, ns_text(FLUECHTIG)), "Kennzeichen fehlt");
             assert!(hat_typ(item, ns_text(AUTOGEN)), "Kennzeichen AUTOGEN fehlt");
             assert!(hat_typ(item, NSPasteboardTypeString));
-            assert_eq!(lesen(b).as_deref(), Some("von drueben"));
+            assert_eq!(lesen(b), Some(Inhalt::Text("von drueben".into())));
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+    }
+
+    /// set_dateien auf einem eigenen Brett: je Pfad ein Eintrag mit
+    /// public.file-url (absoluteString von fileURLWithPath:) und beiden
+    /// Kennzeichen, der Zaehler steht nach dem letzten Schreiben, und lesen()
+    /// liefert genau die Pfade zurueck. Nur Dateien unter $TMPDIR.
+    #[test]
+    fn dateien_vom_host_ablegen() {
+        let _pool = Pool::neu();
+        let (ordner, pfade) = testdateien("dateien_vom_host_ablegen");
+        unsafe {
+            let b = eigenes_brett();
+            let ((nach_leeren, nach_setzen), ok) = dateien_ablegen(b, &pfade).expect("dateien_ablegen");
+            assert!(ok, "writeObjects: scheitert");
+            assert_eq!(nach_setzen, change_count(b));
+            assert!(nach_setzen >= nach_leeren);
+
+            let eintraege = msg_id(b, sel(c"pasteboardItems"));
+            assert_eq!(msg_int(eintraege, sel(c"count")), pfade.len() as isize, "ein Eintrag je Pfad");
+            for (i, p) in pfade.iter().enumerate() {
+                let item = msg_id_u(eintraege, sel(c"objectAtIndex:"), i);
+                let wert = msg_id_1(item, sel(c"stringForType:"), NSPasteboardTypeFileURL);
+                assert_eq!(rust_text(wert), rust_text(url_text(p)), "Verweis {i}");
+                assert!(hat_typ(item, ns_text(FLUECHTIG)), "FLUECHTIG fehlt an Eintrag {i}");
+                assert!(hat_typ(item, ns_text(AUTOGEN)), "AUTOGEN fehlt an Eintrag {i}");
+            }
+            // Der Ordner traegt den Schraegstrich, so erkennt Finder ihn.
+            assert!(rust_text(url_text(&pfade[1])).ends_with('/'));
+            let gelesen = lesen(b);
+            assert!(gleiche_dateien(&gelesen, &pfade), "andere Dateien gelesen: {gelesen:?}");
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+        let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Was set_dateien ablegt, meldet der Waechter nicht zurueck (Zaehlung
+    /// wie bei Text); eine Kopie des Benutzers danach schon.
+    #[test]
+    fn dateien_ohne_widerhall() {
+        let _pool = Pool::neu();
+        let (ordner, pfade) = testdateien("dateien_ohne_widerhall");
+        unsafe {
+            let b = eigenes_brett();
+            let mut zuletzt = change_count(b);
+            let gelesen = std::cell::Cell::new(0);
+            let zaehlend = |b: Id| {
+                gelesen.set(gelesen.get() + 1);
+                lesen(b)
+            };
+
+            assert!(dateien_setzen(b, &pfade), "dateien_setzen scheitert");
+            assert_eq!(nachsehen(b, &mut zuletzt, true, zaehlend), None, "eigene Dateiliste zurueckgemeldet");
+            assert_eq!(gelesen.get(), 0, "eigene Dateiliste gelesen");
+
+            nutzer_kopiert(b, &[vec![(NSPasteboardTypeFileURL, url_text(&pfade[0]))]]);
+            assert_eq!(nachsehen(b, &mut zuletzt, true, zaehlend), Some(Inhalt::Dateien(vec![pfade[0].clone()])));
+            assert_eq!(gelesen.get(), 1);
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+        let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Wie Finder: mehrere Dateien, je Datei ein Eintrag mit Namen als Text
+    /// und dem Verweis. Gemeldet werden alle Pfade und kein Text.
+    #[test]
+    fn dateien_alle_eintraege() {
+        let _pool = Pool::neu();
+        let (ordner, pfade) = testdateien("dateien_alle_eintraege");
+        unsafe {
+            let b = eigenes_brett();
+            let eintraege: Vec<Vec<(Id, Id)>> = pfade
+                .iter()
+                .map(|p| {
+                    let name = p.file_name().unwrap().to_str().unwrap();
+                    vec![(NSPasteboardTypeString, ns(name)), (NSPasteboardTypeFileURL, url_text(p))]
+                })
+                .collect();
+            nutzer_kopiert(b, &eintraege);
+            let gelesen = lesen(b);
+            assert!(gleiche_dateien(&gelesen, &pfade), "andere Dateien gelesen: {gelesen:?}");
+
+            // Ein Texteintrag vorn aendert nichts: Dateien gehen vor.
+            let mut gemischt = vec![vec![(NSPasteboardTypeString, ns("nur Text"))]];
+            gemischt.extend(eintraege);
+            nutzer_kopiert(b, &gemischt);
+            let gelesen = lesen(b);
+            assert!(gleiche_dateien(&gelesen, &pfade), "andere Dateien gelesen: {gelesen:?}");
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+        let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Finder legt oft Datei-Referenz-URLs ab (file:///.file/id=...): die
+    /// werden ueber filePathURL zum Pfad aufgeloest.
+    #[test]
+    fn dateien_referenz_aufgeloest() {
+        let _pool = Pool::neu();
+        let (ordner, pfade) = testdateien("dateien_referenz_aufgeloest");
+        unsafe {
+            let b = eigenes_brett();
+            let url = msg_id_1(klasse(c"NSURL"), sel(c"fileURLWithPath:"), ns(pfade[0].to_str().unwrap()));
+            let referenz = msg_id(url, sel(c"fileReferenceURL"));
+            assert!(!referenz.is_null(), "keine Referenz-URL");
+            let referenz = msg_id(referenz, sel(c"absoluteString"));
+            assert!(rust_text(referenz).starts_with("file:///.file/id="), "{}", rust_text(referenz));
+            nutzer_kopiert(b, &[vec![(NSPasteboardTypeFileURL, referenz)]]);
+
+            // Auch der unaufgeloeste Verweis (/.file/id=...) oeffnet dieselbe
+            // Datei - als Pfad taugt er trotzdem nicht: sein Name waere
+            // "id=...", und der geht als Dateiname hinaus. Also auch den
+            // Namen pruefen.
+            let gelesen = lesen(b);
+            assert!(gleiche_dateien(&gelesen, &pfade[..1]), "Referenz falsch aufgeloest: {gelesen:?}");
+            let Some(Inhalt::Dateien(liste)) = &gelesen else { unreachable!() };
+            assert!(!liste[0].starts_with("/.file"), "Referenz nicht aufgeloest: {:?}", liste[0]);
+            assert_eq!(liste[0].file_name(), pfade[0].file_name(), "Name nicht aus dem Pfad");
+            // `path` loest eine Referenz zwar selbst auf; datei_url liefert
+            // aber schon den Pfad-URL (filePathURL), wie ihn jeder weitere
+            // Schritt erwartet.
+            let aufgeloest = datei_url(referenz).expect("Referenz nicht aufloesbar");
+            let aufgeloest = rust_text(msg_id(aufgeloest, sel(c"absoluteString")));
+            assert!(
+                aufgeloest.starts_with("file:///") && !aufgeloest.starts_with("file:///.file/"),
+                "kein Pfad-URL: {aufgeloest}"
+            );
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+        let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Ein verdecktes Kennzeichen an irgendeinem Eintrag haelt die ganze
+    /// Dateiliste zurueck - auch am zweiten.
+    #[test]
+    fn dateien_verdeckt_bleibt_hier() {
+        let _pool = Pool::neu();
+        let (ordner, pfade) = testdateien("dateien_verdeckt_bleibt_hier");
+        unsafe {
+            let b = eigenes_brett();
+            let verdeckt = ns_text(VERDECKT);
+            let datei = NSPasteboardTypeFileURL;
+
+            nutzer_kopiert(b, &[vec![(datei, url_text(&pfade[0])), (verdeckt, ns(""))]]);
+            assert_eq!(lesen(b), None, "verdeckte Datei (erster Eintrag) gelesen");
+
+            nutzer_kopiert(
+                b,
+                &[vec![(datei, url_text(&pfade[0]))], vec![(datei, url_text(&pfade[2])), (verdeckt, ns(""))]],
+            );
+            assert_eq!(lesen(b), None, "verdeckte Datei (zweiter Eintrag) gelesen");
+
+            let _ = msg_id(b, sel(c"releaseGlobally"));
+        }
+        let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Ungueltiges: eine leere oder relative Liste laesst das Brett, wie es
+    /// ist; ein Verweis, der sich nicht aufloesen laesst oder keine Datei
+    /// meint, ergibt nichts - weder Dateien noch Text.
+    #[test]
+    fn dateien_ungueltig() {
+        let _pool = Pool::neu();
+        unsafe {
+            let b = eigenes_brett();
+            nutzer_kopiert(b, &[vec![(NSPasteboardTypeString, ns("bleibt"))]]);
+            let vorher = change_count(b);
+            assert!(!dateien_setzen(b, &[]));
+            assert!(!dateien_setzen(b, &[PathBuf::from("relativ/a.txt")]));
+            assert!(!dateien_setzen(b, &[PathBuf::from("/tmp/a\u{0}b")]));
+            assert_eq!(change_count(b), vorher, "ungueltige Liste hat das Brett angefasst");
+            assert_eq!(lesen(b), Some(Inhalt::Text("bleibt".into())));
+
+            for verweis in ["file:///.file/id=1.1", "https://example.org/a.txt"] {
+                nutzer_kopiert(b, &[vec![(NSPasteboardTypeString, ns("a.txt")), (NSPasteboardTypeFileURL, ns(verweis))]]);
+                assert_eq!(lesen(b), None, "Verweis {verweis} ergab etwas");
+            }
+
             let _ = msg_id(b, sel(c"releaseGlobally"));
         }
     }

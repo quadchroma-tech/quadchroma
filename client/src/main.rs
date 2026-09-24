@@ -6596,7 +6596,8 @@ fn main() {
     let input = Arc::new(Mutex::new(InputLink::new(input_addr)));
 
     // Zwischenablage: Was hier kopiert wird, geht zum Host. Die Uebergabe
-    // aus der Fensterschleife heraus ist bewusst nicht blockierend.
+    // aus der Fensterschleife heraus ist bewusst nicht blockierend. Kopierte
+    // Dateien meldet der Waechter schon, uebertragen werden sie noch nicht.
     #[cfg(any(windows, target_os = "macos"))]
     {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -6608,7 +6609,13 @@ fn main() {
                 }
             }
         });
-        clipboard::watch(move |text| { let _ = tx.send(text); });
+        clipboard::watch(move |inhalt| match inhalt {
+            clipboard::Inhalt::Text(text) => { let _ = tx.send(text); }
+            clipboard::Inhalt::Dateien(pfade) => protokoll::zeile(format!(
+                "Zwischenablage: {} Dateien kopiert - Uebertragung noch nicht angebunden",
+                pfade.len()
+            )),
+        });
     }
 
     // Gespeicherte Einstellungen. Sie bestimmen unter anderem, ob wir im
