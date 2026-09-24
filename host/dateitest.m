@@ -1,8 +1,11 @@
 // Pruefprogramm fuer host/dateien.m: Pruefvektoren (Spezifikation 2.4),
 // Kodieren und Lesen, Pfadregeln samt Bereinigung fuer macOS, Empfaenger und
-// Sender (auch gegeneinander im Speicher), Fenster, Drossel ueber den
-// Sendepuffer, Stillstand, Abbruch, Aufraeumen des Ablageverzeichnisses,
-// Loeschen tiefer Uebertragungen (absolut ueber PATH_MAX).
+// Sender (auch gegeneinander im Speicher), Sitzungsbindung, wann quittiert
+// wird, Warteschlange nach Datenbytes, Fenster, Drossel ueber den
+// Sendepuffer, Stillstand, Abbruch, Tausch gegen FIFO oder Verknuepfung,
+// Aufraeumen des Ablageverzeichnisses (auch mit einer Basis, die eine
+// Verknuepfung ist, und nach einem Uhrsprung), Loeschen tiefer Uebertragungen
+// (absolut ueber PATH_MAX).
 //
 //   clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
 //         -framework Foundation host/dateitest.m host/dateien.m -o /tmp/dateitest
@@ -145,6 +148,12 @@ static NSArray<NSArray<NSNumber *> *> *quittungen(void) {
         if (qc_datei_quittung_lesen(q.bytes, q.length, &k, &z, &e) == 0) [a addObject:@[ @(z), @(e) ]];
     }
     return a;
+}
+
+static NSString *quittungen_text(NSArray<NSArray<NSNumber *> *> *q) {
+    NSMutableArray<NSString *> *t = [NSMutableArray array];
+    for (NSArray *x in q) [t addObject:[NSString stringWithFormat:@"%@/%@", x[0], x[1]]];
+    return [t componentsJoinedByString:@" "];
 }
 
 static int letzter_zustand(void) {
@@ -392,6 +401,14 @@ static void pfade_pruefen(void) {
     [lang appendBytes:"x" length:1];
     pruefe(angebot_rc(lang, &grund, NULL) == QC_QUITT_UNGUELTIG, "Bytes nach dem letzten Eintrag: abgelehnt");
     pruefe(angebot_rc(qc_datei_angebot_kodieren(0, @[ E(0, 0, @"a") ]), &grund, NULL) == QC_QUITT_UNGUELTIG, "Kennung 0: abgelehnt");
+    // Wie im Rust-Kern: ueber 1 MiB ist "zu gross" (2), genau 1 MiB nicht
+    // (dort scheitert es hier an den Bytes nach dem letzten Eintrag: 4).
+    NSMutableData *mib = [gut mutableCopy];
+    mib.length = QC_DATEI_ANGEBOT_MAX;
+    int rc_mib = angebot_rc(mib, &grund, NULL);
+    mib.length = QC_DATEI_ANGEBOT_MAX + 1;
+    pruefe(rc_mib == QC_QUITT_UNGUELTIG && angebot_rc(mib, &grund, NULL) == QC_QUITT_ZU_GROSS,
+           "Angebot ueber 1 MiB: zu gross (2); genau 1 MiB mit Rest: ungueltig (4)");
 
     printf("\n-- Bereinigung fuer macOS\n");
     NSArray<QCDateiEintrag *> *aus = nil;
@@ -431,6 +448,12 @@ static void alle_stuecke(uint32_t kennung, NSArray *inhalte) {
             stueck(kennung, (uint32_t)i, o, [d subdataWithRange:NSMakeRange(o, n)]);
         }
     }
+}
+
+// Die Bytes [von, bis) von d als Stuecke fuer einen Eintrag, je hoechstens STUECK_MAX.
+static void bereich_senden(uint32_t kennung, uint32_t eintrag, NSData *d, NSUInteger von, NSUInteger bis) {
+    for (NSUInteger o = von; o < bis; o += QC_DATEI_STUECK_MAX)
+        stueck(kennung, eintrag, o, [d subdataWithRange:NSMakeRange(o, MIN((NSUInteger)QC_DATEI_STUECK_MAX, bis - o))]);
 }
 
 static void empfaenger_pruefen(void) {
@@ -510,10 +533,14 @@ static void empfaenger_pruefen(void) {
     qc_dateien_abwarten();
     pruefe(letzter_zustand() == QC_QUITT_UNGUELTIG && verzeichnisse_mit(30) == 0, "Ende vor dem letzten Stueck: Quittung 4, geloescht");
 
+    // Angehalten, damit alles zugleich wartet: nach dem Stueck wartet noch
+    // das Ende, also keine Zwischenquittung.
     neu_aufzeichnen();
+    qc_empfang_anhalten(1);
     empfang(QC_DATEI_ANGEBOT, beispiel(31, &inhalte));
     stueck(31, 1, 0, inhalte[1]);
     ende(31, QC_ENDE_ABGEBROCHEN);
+    qc_empfang_anhalten(0);
     qc_dateien_abwarten();
     pruefe(quittungen().count == 1 && verzeichnisse_mit(31) == 0 && zeilen_mit(@"abgebrochen (Gegenseite: abgebrochen)") >= 1,
            "Ende mit Grund 1: Verzeichnis geloescht, keine weitere Quittung");
@@ -530,18 +557,56 @@ static void empfaenger_pruefen(void) {
     qc_dateien_abwarten();
     pruefe(letzter_zustand() == QC_QUITT_FERTIG, "die neue laeuft danach vollstaendig durch");
 
+    // Stueck und Ende aus einer anderen Sitzung (Nachzuegler einer
+    // verworfenen Uebertragung mit zufaellig gleicher Kennung): Das Stueck
+    // passt genau an die erwartete Stelle (Eintrag 3, Versatz 0) - ohne die
+    // Pruefung der Sitzung landete sein Byte in der Datei, und das echte
+    // Stueck danach waere "ausser der Reihe". Darum laeuft die Uebertragung
+    // hier bis zum Ende weiter, und die Bytes werden verglichen.
     neu_aufzeichnen();
+    NSUInteger f34 = fertig_anzahl();
     empfang(QC_DATEI_ANGEBOT, beispiel(34, &inhalte));
     stueck(34, 1, 0, inhalte[1]);
     qc_dateien_abwarten();
+    NSString *o34 = qc_empfang_ordner();
     qc_empfang_nachricht(SITZUNG + 1, 1, QC_DATEI_STUECK, qc_datei_stueck_kodieren(34, 3, 0, "x", 1));
+    qc_empfang_nachricht(SITZUNG + 1, 1, QC_DATEI_ENDE, qc_datei_ende_kodieren(34, QC_ENDE_ABGEBROCHEN));
     qc_dateien_abwarten();
-    BOOL fremd_still = quittungen().count == 1 && verzeichnisse_mit(34) == 1;
+    for (NSUInteger i = 3; i < inhalte.count; i++) {
+        if (inhalte[i] == [NSNull null]) continue;
+        NSData *d = inhalte[i];
+        for (NSUInteger o = 0; o < d.length; o += QC_DATEI_STUECK_MAX)
+            stueck(34, (uint32_t)i, o, [d subdataWithRange:NSMakeRange(o, MIN((NSUInteger)QC_DATEI_STUECK_MAX, d.length - o))]);
+    }
+    ende(34, QC_ENDE_VOLLSTAENDIG);
+    qc_dateien_abwarten();
+    BOOL bytes34 = o34 && [[NSData dataWithContentsOfFile:[o34 stringByAppendingPathComponent:@"gross.bin"]] isEqualToData:inhalte[3]] &&
+                   [[NSData dataWithContentsOfFile:[o34 stringByAppendingPathComponent:@"Bilder/sub/c.txt"]] isEqualToData:inhalte[5]];
+    pruefe(letzter_zustand() == QC_QUITT_FERTIG && fertig_anzahl() == f34 + 1 && bytes34,
+           "Stueck und Ende aus einer anderen Sitzung: still uebergangen - die Uebertragung laeuft danach vollstaendig durch, "
+           "die Bytes stimmen");
+
+    neu_aufzeichnen();
+    empfang(QC_DATEI_ANGEBOT, beispiel(41, &inhalte));
+    stueck(41, 1, 0, inhalte[1]);
+    qc_dateien_abwarten();
+    NSUInteger q41 = quittungen().count;
+    BOOL laeuft41 = verzeichnisse_mit(41) == 1;
     qc_dateien_sitzung_vorbei(SITZUNG + 1);
     qc_dateien_abwarten();
-    pruefe(fremd_still, "Stueck aus einer anderen Sitzung: still uebergangen");
-    pruefe(verzeichnisse_mit(34) == 0 && qc_empfang_ordner() == nil && quittungen().count == 1,
+    pruefe(laeuft41 && verzeichnisse_mit(41) == 0 && qc_empfang_ordner() == nil && quittungen().count == q41,
            "Sitzung vorbei (Zuschauerwechsel): verworfen und geloescht, ohne Quittung");
+
+    // Ein Angebot, das der Eingabefaden noch vor dem Wechsel las, gehoert zu
+    // einer Sitzung, die es nicht mehr gibt: nichts anlegen.
+    neu_aufzeichnen();
+    atomic_store(&g_sitzung_gilt, 0);
+    empfang(QC_DATEI_ANGEBOT, beispiel(42, &inhalte));
+    qc_dateien_abwarten();
+    BOOL nichts42 = verzeichnisse_mit(42) == 0 && qc_empfang_ordner() == nil;
+    atomic_store(&g_sitzung_gilt, 1);
+    if (!nichts42) { ende(42, QC_ENDE_ABGEBROCHEN); qc_dateien_abwarten(); }
+    pruefe(nichts42, "Angebot einer vergangenen Sitzung: nichts angelegt, nichts gestartet");
 
     neu_aufzeichnen();
     empfang(QC_DATEI_ANGEBOT, beispiel(35, &inhalte));
@@ -553,24 +618,138 @@ static void empfaenger_pruefen(void) {
     qc_dateien_abwarten();
     pruefe(bleibt && verzeichnisse_mit(35) == 0, "Eingabekanal der Uebertragung getrennt: geloescht (ein fremder Kanal nicht)");
 
+    // Endet der Kanal gleich nach dem letzten Ende, waehrend davor noch alles
+    // wartet: "Kanal weg" ueberholt die Nachrichten nicht, die vor ihm kamen.
+    neu_aufzeichnen();
+    NSUInteger f46 = fertig_anzahl();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, beispiel(46, &inhalte));
+    alle_stuecke(46, inhalte);
+    ende(46, QC_ENDE_VOLLSTAENDIG);
+    qc_empfang_kanal_weg(SITZUNG, 1);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    pruefe(letzter_zustand() == QC_QUITT_FERTIG && fertig_anzahl() == f46 + 1 && verzeichnisse_mit(46) == 1,
+           "Eingabekanal weg direkt nach dem Ende: ueberholt nichts, die Uebertragung ist vollstaendig in der Ablage");
+
     printf("\n-- Empfaenger: quittiert, sobald mehr als 16 KiB offen sind\n");
     // Ein Sender, der nur ganze Stuecke ins Fenster setzt, hat im Spielmodus
     // (64 KiB) hoechstens ein Stueck (48 KiB) unterwegs - darauf muss eine
     // Quittung kommen, sonst haengen beide bis zum Stillstand.
+    // Angehalten, bis alles wartet: so quittiert er nur nach der Menge, nicht
+    // weil gerade nichts mehr wartet (das kommt erst beim letzten Stueck).
     neu_aufzeichnen();
+    qc_empfang_anhalten(1);
     empfang(QC_DATEI_ANGEBOT, beispiel(40, &inhalte));
     stueck(40, 1, 0, inhalte[1]);                                            // 5
     stueck(40, 3, 0, [inhalte[3] subdataWithRange:NSMakeRange(0, 16379)]);  // 16384 offen
-    qc_dateien_abwarten();
-    NSUInteger bei_16384 = quittungen().count;
     stueck(40, 3, 16379, [inhalte[3] subdataWithRange:NSMakeRange(16379, 1)]);          // 16385
     stueck(40, 3, 16380, [inhalte[3] subdataWithRange:NSMakeRange(16380, QC_DATEI_STUECK_MAX)]);
+    qc_empfang_anhalten(0);
     qc_dateien_abwarten();
     q = quittungen();
-    pruefe(bei_16384 == 1 && [q isEqualToArray:(@[ @[ @0, @0 ], @[ @0, @16385 ], @[ @0, @(16385 + QC_DATEI_STUECK_MAX) ] ])],
+    printf("         (Quittungen Zustand/empfangen: %s)\n", quittungen_text(q).UTF8String);
+    pruefe([q isEqualToArray:(@[ @[ @0, @0 ], @[ @0, @16385 ], @[ @0, @(16385 + QC_DATEI_STUECK_MAX) ] ])],
            "16384 Byte offen: noch keine Quittung; ab 16385 sofort - auch ein ganzes Stueck (48 KiB) wird quittiert");
     ende(40, QC_ENDE_ABGEBROCHEN);
     qc_dateien_abwarten();
+
+    printf("\n-- Empfaenger: quittiert, sobald nichts mehr wartet (wie der Rust-Kern)\n");
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, beispiel(43, &inhalte));
+    stueck(43, 1, 0, inhalte[1]);                                            // 5, danach wartet noch eines
+    stueck(43, 3, 0, [inhalte[3] subdataWithRange:NSMakeRange(0, 100)]);    // 105, danach nichts mehr
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    q = quittungen();
+    printf("         (Quittungen Zustand/empfangen: %s)\n", quittungen_text(q).UTF8String);
+    pruefe([q isEqualToArray:(@[ @[ @0, @0 ], @[ @0, @105 ] ])],
+           "Warteschlange leer: sofort quittiert, was offen ist (105 Byte); solange noch ein Stueck wartet, nicht (5 Byte)");
+    ende(43, QC_ENDE_ABGEBROCHEN);
+    qc_dateien_abwarten();
+
+    printf("\n-- Empfaenger: Warteschlange nach Datenbytes (FENSTER + STUECK_MAX), nicht nach Nachrichten\n");
+    // Alles wartet zugleich (angehalten): so viel, wie ein Sender, der sein
+    // Fenster einhaelt, hoechstens unquittiert unterwegs hat.
+    size_t budget = (size_t)QC_DATEI_FENSTER + QC_DATEI_STUECK_MAX;      // 311296
+    NSData *zwei = zufall(2 * QC_DATEI_FENSTER);
+    int ueber0 = zeilen_mit(@"mehr als das Fenster unquittiert");
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, qc_datei_angebot_kodieren(70, @[ E(0, 2 * QC_DATEI_FENSTER, @"gross.bin") ]));
+    bereich_senden(70, 0, zwei, 0, budget);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    BOOL passt = letzter_zustand() == QC_QUITT_LAEUFT && qc_empfang_ordner() != nil &&
+                 zeilen_mit(@"mehr als das Fenster unquittiert") == ueber0;
+    ende(70, QC_ENDE_ABGEBROCHEN);
+    qc_dateien_abwarten();
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, qc_datei_angebot_kodieren(71, @[ E(0, 2 * QC_DATEI_FENSTER, @"gross.bin") ]));
+    bereich_senden(71, 0, zwei, 0, budget + 1);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    pruefe(passt && letzter_zustand() == QC_QUITT_UNGUELTIG && verzeichnisse_mit(71) == 0 &&
+           zeilen_mit(@"mehr als das Fenster unquittiert") == ueber0 + 1,
+           "genau FENSTER + STUECK_MAX Datenbytes warten: angenommen; ein Byte mehr: Quittung 4, Verzeichnis geloescht");
+
+    // Viele kleine Stuecke: die Zahl der Nachrichten zaehlt nicht.
+    NSData *klein = zufall(20000);
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, qc_datei_angebot_kodieren(72, @[ E(0, klein.length, @"klein.bin") ]));
+    for (NSUInteger o = 0; o < klein.length; o++) stueck(72, 0, o, [klein subdataWithRange:NSMakeRange(o, 1)]);
+    ende(72, QC_ENDE_VOLLSTAENDIG);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    NSString *p72 = nil;
+    @synchronized (g_fertig_listen) { p72 = [g_fertig_listen.lastObject firstObject]; }
+    pruefe(letzter_zustand() == QC_QUITT_FERTIG && [p72 hasSuffix:@"-72/klein.bin"] &&
+           [[NSData dataWithContentsOfFile:p72] isEqualToData:klein],
+           "20000 Stuecke zu 1 Byte warten zugleich (mehr Nachrichten als EINTRAEGE_MAX): angenommen, die Bytes stimmen");
+
+    // Enden: hoechstens 8 warten (hier mit fremder Kennung, die laufende
+    // Uebertragung uebergeht sie).
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, beispiel(73, &inhalte));
+    for (int i = 0; i < 8; i++) ende(1073, QC_ENDE_VOLLSTAENDIG);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    BOOL acht = letzter_zustand() == QC_QUITT_LAEUFT && verzeichnisse_mit(73) == 1;
+    ende(73, QC_ENDE_ABGEBROCHEN);
+    qc_dateien_abwarten();
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, beispiel(74, &inhalte));
+    for (int i = 0; i < 9; i++) ende(1074, QC_ENDE_VOLLSTAENDIG);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    pruefe(acht && letzter_zustand() == QC_QUITT_UNGUELTIG && verzeichnisse_mit(74) == 0 && zeilen_mit(@"zu viele Enden") == 1,
+           "8 wartende Enden: angenommen; das neunte: Quittung 4");
+
+    // Ein neues Angebot leert die Warteschlange: der Sender hat alles davor
+    // aufgegeben, und ein volles Fenster davor zaehlt nicht mehr mit.
+    neu_aufzeichnen();
+    qc_empfang_anhalten(1);
+    empfang(QC_DATEI_ANGEBOT, qc_datei_angebot_kodieren(75, @[ E(0, 2 * QC_DATEI_FENSTER, @"gross.bin") ]));
+    bereich_senden(75, 0, zwei, 0, budget);
+    ende(75, QC_ENDE_ABGEBROCHEN);
+    empfang(QC_DATEI_ANGEBOT, qc_datei_angebot_kodieren(76, @[ E(0, 2 * QC_DATEI_FENSTER, @"gross.bin") ]));
+    bereich_senden(76, 0, zwei, 0, budget);
+    qc_empfang_anhalten(0);
+    qc_dateien_abwarten();
+    bereich_senden(76, 0, zwei, budget, zwei.length);
+    ende(76, QC_ENDE_VOLLSTAENDIG);
+    qc_dateien_abwarten();
+    NSString *p76 = nil;
+    @synchronized (g_fertig_listen) { p76 = [g_fertig_listen.lastObject firstObject]; }
+    pruefe(zeilen_mit(@"mehr als das Fenster unquittiert") == ueber0 + 1 && verzeichnisse_mit(75) == 0 &&
+           letzter_zustand() == QC_QUITT_FERTIG && [p76 hasSuffix:@"-76/gross.bin"] &&
+           [[NSData dataWithContentsOfFile:p76] isEqualToData:zwei],
+           "ein neues Angebot leert die Warteschlange: das alte faellt weg, das neue laeuft mit vollem Fenster durch");
 
     printf("\n-- Empfaenger: Stillstand (Frist hier 300 ms)\n");
     qc_dateien_stillstand_setzen(300);
@@ -608,6 +787,26 @@ static void empfaenger_pruefen(void) {
     NSArray *drin = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:ziel error:nil];
     pruefe(letzter_zustand() == QC_QUITT_SCHREIBFEHLER && drin.count == 0,
            "Basis ist eine Verknuepfung: abgelehnt (Quittung 5), ihr Ziel bleibt unberuehrt");
+    // Wird die Basis waehrend einer Uebertragung gegen eine Verknuepfung
+    // getauscht, loescht der Abbruch nicht in deren Ziel.
+    NSString *tausch = [g_wurzel stringByAppendingPathComponent:@"tausch"];
+    NSString *tausch_echt = [g_wurzel stringByAppendingPathComponent:@"tausch-echt"];
+    qc_dateien_basis_setzen(tausch);
+    neu_aufzeichnen();
+    empfang(QC_DATEI_ANGEBOT, beispiel(44, &inhalte));
+    qc_dateien_abwarten();
+    NSString *o44 = qc_empfang_ordner();
+    int nicht_ganz = zeilen_mit(@"liess sich nicht ganz loeschen");
+    BOOL getauscht = o44 && rename(tausch.fileSystemRepresentation, tausch_echt.fileSystemRepresentation) == 0 &&
+                     symlink(tausch_echt.fileSystemRepresentation, tausch.fileSystemRepresentation) == 0;
+    ende(44, QC_ENDE_ABGEBROCHEN);
+    qc_dateien_abwarten();
+    qc_dateien_basis_setzen(alt);
+    BOOL bleibt44 = existiert([tausch_echt stringByAppendingPathComponent:o44.lastPathComponent]);
+    unlink(tausch.fileSystemRepresentation);
+    [[NSFileManager defaultManager] removeItemAtPath:tausch_echt error:nil];
+    pruefe(getauscht && bleibt44 && qc_empfang_ordner() == nil && zeilen_mit(@"liess sich nicht ganz loeschen") == nicht_ganz + 1,
+           "Basis waehrend der Uebertragung gegen eine Verknuepfung getauscht: der Abbruch loescht nicht in ihrem Ziel");
     NSData *boese = qc_datei_angebot_kodieren(39, @[ E(0, 1, @"../ausbruch.txt") ]);
     neu_aufzeichnen();
     empfang(QC_DATEI_ANGEBOT, boese);
@@ -800,6 +999,32 @@ static void sender_pruefen(void) {
     pruefe(!haengt && letztes_ende() == QC_ENDE_LESEFEHLER && zeilen_mit(@"keine Datei mehr") == 1,
            "Datei nach dem Auflisten gegen eine FIFO getauscht: kein Haengen, ENDE mit Grund 2");
 
+    // Ebenso gegen eine Verknuepfung: deren Ziel geht nicht hinaus (O_NOFOLLOW).
+    schreiben(@"wird-link", [@"harmlos" dataUsingEncoding:NSUTF8StringEncoding]);
+    schreiben(@"geheim.txt", [@"GEHEIM!" dataUsingEncoding:NSUTF8StringEncoding]);
+    int lesefehler0 = zeilen_mit(@"Lesefehler bei");
+    neu_aufzeichnen();
+    senden(@[ @"vorne.bin", @"wird-link" ]);
+    for (int i = 0; i < 100 && stueck_summe() < QC_DATEI_FENSTER; i++) schlafen(0.01);   // steht am Fenster
+    NSString *wl = quelle(@"wird-link");
+    unlink(wl.fileSystemRepresentation);
+    symlink(quelle(@"geheim.txt").fileSystemRepresentation, wl.fileSystemRepresentation);
+    angebot_pfade(&k);
+    for (int i = 0; i < 200 && letztes_ende() == -1; i++) {
+        NSData *weiter = qc_datei_quittung_kodieren(k, 0, stueck_summe());
+        qc_senden_quittung(SITZUNG, weiter.bytes, weiter.length);
+        schlafen(0.01);
+    }
+    qc_senden_abbrechen();
+    qc_dateien_abwarten();
+    BOOL geheim_raus = NO;
+    NSData *geheim = [@"GEHEIM" dataUsingEncoding:NSUTF8StringEncoding];
+    for (NSData *st in nachrichten(QC_DATEI_STUECK))
+        if ([st rangeOfData:geheim options:0 range:NSMakeRange(0, st.length)].location != NSNotFound) geheim_raus = YES;
+    unlink(wl.fileSystemRepresentation);
+    pruefe(letztes_ende() == QC_ENDE_LESEFEHLER && !geheim_raus && zeilen_mit(@"Lesefehler bei") == lesefehler0 + 1,
+           "Datei nach dem Auflisten gegen eine Verknuepfung getauscht: ihr Ziel geht nicht hinaus, ENDE mit Grund 2");
+
     // Eine Quittung ungleich 0 beendet ohne ENDE; eine fremde Kennung zaehlt nicht.
     neu_aufzeichnen();
     senden(@[ @"eine.mb" ]);
@@ -929,7 +1154,61 @@ static void aufraeumen_pruefen(void) {
     qc_dateien_abwarten();
     pruefe(!existiert(vorgestern) && existiert(vorhin) && existiert([b stringByAppendingPathComponent:@"fremd"]),
            "beim Start: aelter als 24 h geloescht, juengere bleiben");
+
+    // Die Basis selbst ist eine Verknuepfung: nichts wird angefasst, auch
+    // nicht in ihrem Ziel - weder nach Anzahl noch nach Alter noch beim Start.
+    NSString *ziel = [g_wurzel stringByAppendingPathComponent:@"verkn-ziel"];
+    NSString *vb = [g_wurzel stringByAppendingPathComponent:@"verkn-basis"];
+    mkdir(ziel.fileSystemRepresentation, 0700);
+    for (int i = 1; i <= 5; i++) mkdir([ziel stringByAppendingFormat:@"/%d00-%d", i, i].fileSystemRepresentation, 0700);
+    mkdir([ziel stringByAppendingPathComponent:@"100-1/inhalt"].fileSystemRepresentation, 0700);
+    [[@"bleibt" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[ziel stringByAppendingPathComponent:@"100-1/inhalt/datei"]
+                                                         atomically:NO];
+    symlink(ziel.fileSystemRepresentation, vb.fileSystemRepresentation);
+    qc_dateien_basis_setzen(vb);
+    int ausgelassen = zeilen_mit(@"Aufraeumen ausgelassen");
+    qc_dateien_aufraeumen(3, 0);
+    qc_dateien_aufraeumen(0, 1);
+    qc_dateien_aufraeumen_beim_start();
+    qc_dateien_abwarten();
+    NSArray *im_ziel = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:ziel error:nil];
+    pruefe(im_ziel.count == 5 && existiert([ziel stringByAppendingPathComponent:@"100-1/inhalt/datei"]) &&
+           zeilen_mit(@"Aufraeumen ausgelassen") == ausgelassen + 3,
+           "Basis ist eine Verknuepfung: Aufraeumen laesst ihr Ziel unberuehrt (nach Anzahl, nach Alter, beim Start)");
+    unlink(vb.fileSystemRepresentation);
+
+    // Die Uhr ist zurueckgesprungen: drei Verzeichnisse tragen eine Zeit aus
+    // der Zukunft. Das eben abgelegte bleibt trotzdem - es zaehlt als eines
+    // der drei -, und das aelteste der uebrigen geht.
+    NSString *uhr = [g_wurzel stringByAppendingPathComponent:@"uhr"];
+    mkdir(uhr.fileSystemRepresentation, 0700);
+    uint64_t spaeter = (uint64_t)([NSDate date].timeIntervalSince1970 * 1000) + 3600ull * 1000;
+    NSArray<NSString *> *zukunft = @[ [NSString stringWithFormat:@"%llu-91", spaeter],
+                                      [NSString stringWithFormat:@"%llu-92", spaeter + 1],
+                                      [NSString stringWithFormat:@"%llu-93", spaeter + 2] ];
+    for (NSString *z in zukunft) mkdir([uhr stringByAppendingPathComponent:z].fileSystemRepresentation, 0700);
+    qc_dateien_basis_setzen(uhr);
+    atomic_store(&g_schleife, 0);
+    neu_aufzeichnen();
+    NSArray *inhalte;
+    empfang(QC_DATEI_ANGEBOT, beispiel(45, &inhalte));
+    alle_stuecke(45, inhalte);
+    ende(45, QC_ENDE_VOLLSTAENDIG);
+    qc_dateien_abwarten();
+    NSString *eben = nil;
+    @synchronized (g_fertig_listen) { eben = [[g_fertig_listen.lastObject firstObject] stringByDeletingLastPathComponent]; }
+    NSArray *uhr_rest = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:uhr error:nil];
+    printf("         (danach: %s)\n", [[uhr_rest sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "].UTF8String);
+    pruefe(letzter_zustand() == QC_QUITT_FERTIG && [eben hasSuffix:@"-45"] && existiert(eben) && uhr_rest.count == 3 &&
+           [uhr_rest containsObject:zukunft[1]] && [uhr_rest containsObject:zukunft[2]] && ![uhr_rest containsObject:zukunft[0]],
+           "Uhr zurueckgesprungen: das eben abgelegte Verzeichnis bleibt (als eines der drei), das aelteste der uebrigen geht");
+
+    // Die Vorgabe der Basis ist eine eigene, nicht die des Mac-Clients.
+    qc_dateien_basis_setzen(nil);
+    NSString *vorgabe = qc_dateien_basis();
     qc_dateien_basis_setzen(alt);
+    pruefe([vorgabe isEqualToString:[NSTemporaryDirectory() stringByAppendingPathComponent:@"QuadChroma-Host-Ablage"]],
+           "Vorgabe der Basis: NSTemporaryDirectory()/QuadChroma-Host-Ablage (der Mac-Client nimmt QuadChroma-Ablage)");
 }
 
 // ------------------------------------------------------------- Tiefe Pfade

@@ -153,8 +153,14 @@ void qc_dateien_einrichten(const qc_dateien_wege *wege);
 // qc_clip_set_dateien, der Pruefstand einen Rekorder. NULL = nur Protokoll.
 void qc_dateien_fertig_setzen(void (*fertig)(NSArray<NSString *> *pfade));
 
-// Ablagebasis: NSTemporaryDirectory()/QuadChroma-Ablage, Rechte 0700. Der
-// Pruefstand setzt einen eigenen Ordner unter $TMPDIR (nil = wieder die Vorgabe).
+// Ablagebasis: NSTemporaryDirectory()/QuadChroma-Host-Ablage, Rechte 0700.
+// ABWEICHUNG von 2.9 (dort .../QuadChroma-Ablage): der Mac-Client (Rust)
+// nimmt $TMPDIR/QuadChroma-Ablage, und das ist unter macOS derselbe Ordner.
+// Laufen Client und Host unter demselben Nutzer, raeumten sie einander sonst
+// Uebertragungen weg (der Rust-Kern kennt die Marke .laeuft, dieser Host
+// nicht). Mit eigener Basis raeumt keiner dem anderen etwas auf.
+// Der Pruefstand setzt einen eigenen Ordner unter $TMPDIR (nil = wieder die Vorgabe).
+#define QC_DATEI_BASIS_NAME "QuadChroma-Host-Ablage"
 void qc_dateien_basis_setzen(NSString *basis);
 NSString *qc_dateien_basis(void);
 
@@ -164,27 +170,43 @@ void qc_dateien_platzreserve_setzen(uint64_t bytes);
 
 // Aufraeumen (2.9) in der Basis: die `behalten` neuesten Uebertragungen bleiben
 // (0 = keine Obergrenze), aelter als hoechstalter_ms (0 = egal) wird geloescht.
-// Nur Unterverzeichnisse "<unix-ms>-<kennung>", nie einer Verknuepfung folgend.
-// Laeuft im Faden des Aufrufers.
+// Nur Unterverzeichnisse "<unix-ms>-<kennung>", nie einer Verknuepfung folgend:
+// Die Basis selbst wird mit O_NOFOLLOW geoeffnet und alles relativ zu ihrem
+// Deskriptor geloescht - ist sie eine Verknuepfung, bleibt alles unberuehrt.
+// Nach einem vollstaendigen Empfang bleibt das eben abgelegte Verzeichnis auf
+// jeden Fall (es zaehlt als eines der drei), auch wenn die Uhr zurueck-
+// gesprungen ist. Laeuft im Faden des Aufrufers.
 void qc_dateien_aufraeumen(NSUInteger behalten, uint64_t hoechstalter_ms);
 // Beim Programmstart: aelter als 24 h loeschen, auf "dateien-empfang".
 void qc_dateien_aufraeumen_beim_start(void);
 
 // Sitzung vorbei (Zuschauerwechsel, Zuschauer weg): laufende Uebertragungen
 // dieser und aelterer Sitzungen werden verworfen, ihr Verzeichnis geloescht.
-// neue_sitzung ist der Stand danach. Blockiert nie - darf unter g_send_mtx.
+// neue_sitzung ist der Stand danach. Blockiert nie - darf unter g_send_mtx
+// (nimmt nur kurz die Sperre des Eingangs, unter der nichts anderes laeuft).
+// Verarbeitet wird hinter allem, was vorher eingereiht wurde.
 void qc_dateien_sitzung_vorbei(uint64_t neue_sitzung);
 
 // --- Empfaenger (Client -> Host)
 // Eine Nachricht 50, 51 oder 52 vom Eingabekanal `kanal` der Sitzung
-// `sitzung`. Reiht nur ein und kehrt sofort zurueck.
+// `sitzung`. Reiht nur ein und kehrt sofort zurueck. Die Warteschlange ist
+// wie im Rust-Kern begrenzt: Datenbytes der Stuecke (je Stueck mindestens 1)
+// bis FENSTER + STUECK_MAX, hoechstens 8 Enden, ein neues Angebot leert sie;
+// darueber Quittung 4. Quittiert wird nach der Annahme (0/0), sobald mehr als
+// 16 KiB offen sind, sobald nichts mehr wartet und am Ende. Quittungen gehen
+// ueber wege.senden, das blockiert, bis sie hinaus sind - bei Stau geht also
+// keine verloren; nur mit dem Ende der Sitzung faellt sie weg.
 void qc_empfang_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSData *nutzlast);
-// Der Eingabekanal ist weg: eine Uebertragung, die ueber ihn kam, endet.
+// Der Eingabekanal ist weg: eine Uebertragung, die ueber ihn kam, endet -
+// aber erst hinter allem, was vorher von ihm kam (ein Ende davor zaehlt).
 void qc_empfang_kanal_weg(uint64_t sitzung, uint64_t kanal);
 
 // --- Sender (Host -> Client)
 // Beginnt eine Sendung an den Zuschauer der Sitzung `sitzung` (an: Adresse
 // fuers Protokoll) und bricht eine laufende ab. Kehrt sofort zurueck.
+// Gelesen wird jede Datei mit O_NOFOLLOW|O_NONBLOCK und erst nach fstat
+// (S_ISREG) blockierend: wurde sie seit dem Auflisten gegen eine
+// Verknuepfung oder eine FIFO getauscht, gibt es ENDE mit Grund 2.
 void qc_senden_starten(uint64_t sitzung, NSArray<NSString *> *pfade, NSString *an);
 // Eine Quittung (53) vom Eingabekanal. Blockiert nicht.
 void qc_senden_quittung(uint64_t sitzung, const uint8_t *p, size_t n);
@@ -192,8 +214,12 @@ void qc_senden_quittung(uint64_t sitzung, const uint8_t *p, size_t n);
 void qc_senden_abbrechen(void);
 
 // --- Pruefstaende
-void qc_dateien_abwarten(void);             // beide Warteschlangen einmal leer
+void qc_dateien_abwarten(void);             // beide Warteschlangen und der Eingang leer
 NSString *qc_empfang_ordner(void);          // Verzeichnis der laufenden Uebertragung, sonst nil
 int qc_senden_laeuft(void);                 // 1 = eine Sendung ist unterwegs
+// 1 = "dateien-empfang" anhalten (erst nach qc_dateien_abwarten), 0 = weiter.
+// Was derweil kommt, wartet im Eingang - so laesst sich pruefen, wann der
+// Empfaenger quittiert. Vor qc_dateien_abwarten wieder freigeben.
+void qc_empfang_anhalten(int an);
 
 #endif // QUADCHROMA_DATEIEN_H

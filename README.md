@@ -252,18 +252,25 @@ Rückgabe ist die Zahl der Fehler.
   Stauregel samt Ton im Stau, Ansage des Tonformats und AV1 in der Könnensliste,
   dazu Dateien über die Zwischenablage über die echten Kanäle: Fähigkeiten
   (Nachrichten 11 und 69), Client → Host mit Quittungen auf dem Bildkanal, Host →
-  Client mit Fenster, Zuschauerwechsel mitten in der Übertragung, Zuschauer ohne
-  Eingabekanal, älterer Client ohne Fähigkeiten, Obergrenzen auf dem Eingabekanal. Statt in die Ablage gehen
+  Client mit Fenster, Namen mit Umlauten im Protokoll, Zuschauerwechsel mitten
+  in der Übertragung samt Sitzungsbindung des Sendewegs, Zuschauer ohne
+  Eingabekanal, älterer Client ohne Fähigkeiten, Fähigkeit nur für den
+  Eingabekanal, der sie gemeldet hat, Obergrenzen auf dem Eingabekanal. Statt in die Ablage gehen
   empfangene Dateien an einen Rekorder, die Ablagebasis liegt im eigenen `HOME`.
   Loopback ab Port 19100 und 19400/19450, eigenes
-  `HOME` unter `$TMPDIR`, rund 80 s. Nutzt kurz einen echten kleinen
+  `HOME` unter `$TMPDIR` (nach einem bestandenen Lauf wieder entfernt), rund 80 s. Nutzt kurz einen echten kleinen
   HEVC-Encoder (640×360) — nicht während eines Streams starten.
 - `host/dateitest.m`: das Dateiprotokoll aus `host/dateien.m` ohne Netz und ohne
   Ablage — Prüfvektoren, Pfadregeln samt Bereinigung für macOS, Empfänger und
-  Sender gegeneinander im Speicher, Fenster, Drossel über den Sendepuffer,
-  Stillstand, Abbrüche, Aufräumen, auch von Übertragungen, deren Pfade absolut
-  über `PATH_MAX` liegen. Alle Dateien in einem frischen Ordner unter
-  `$TMPDIR`, rund 6 s.
+  Sender gegeneinander im Speicher, Nachzügler aus einer anderen Sitzung, wann
+  der Empfänger quittiert (ab 16 KiB offen und sobald nichts mehr wartet), seine
+  Warteschlange nach Datenbytes (Fenster plus ein Stück, höchstens 8 Enden, ein
+  neues Angebot leert sie), Fenster, Drossel über den Sendepuffer, Stillstand,
+  Abbrüche, eine Quelldatei, die nach dem Auflisten gegen eine FIFO oder eine
+  Verknüpfung getauscht wird, Aufräumen — auch mit einer Basis, die eine
+  Verknüpfung ist, nach einem Rücksprung der Uhr und von Übertragungen, deren
+  Pfade absolut über `PATH_MAX` liegen. Alle Dateien in einem frischen Ordner
+  unter `$TMPDIR`, rund 6 s.
 - `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, die Regel „nur mit
   Zuschauer lesen" und Dateiverweise (`public.file-url`) lesen und schreiben,
   auf einer eigenen benannten Ablage statt der allgemeinen; die Dateien dafür
