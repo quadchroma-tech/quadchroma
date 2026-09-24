@@ -61,4 +61,7 @@ windows = { version = "0.62", features = [
     # Host-Rolle: einen haengenden write an einen abgeloesten Zuschauer
     # abbrechen (CancelIoEx, siehe host/netz.rs)
     "Win32_System_IO",
+    # Desktop-Verknuepfung: IShellLinkW::GetPath beim Zuruecklesen im Test
+    # (verknuepfung.rs)
+    "Win32_Storage_FileSystem",
 ] }

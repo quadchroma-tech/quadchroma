@@ -26,6 +26,10 @@ use rayon::prelude::*;
 
 mod discovery;
 mod einstellungen;
+/// Einzelinstanz: ein zweiter Start reicht seine Adresse an den ersten weiter.
+mod einzel;
+/// Das Programmsymbol, im Programm gezeichnet, und seine .ico-Datei.
+mod logo;
 mod noise;
 mod protokoll_konst;
 mod secure;
@@ -38,6 +42,8 @@ mod strings_more;
 mod strings_north;
 mod strings_west;
 mod ui;
+/// Desktop-Verknuepfung je Host (anlegen nur unter Windows).
+mod verknuepfung;
 
 /// Ton und Zwischenablage: je Plattform eine Datei mit derselben
 /// Schnittstelle; der Ringpuffer des Tons ist geteilt (audio_ring.rs). Auf
@@ -1832,7 +1838,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         // gerade noch fleissig sendet.
         let wunsch_neu = {
             let mut s = shared.lock().unwrap();
-            if s.target.is_none() {
+            // Auch ein anderes Ziel beendet diese Sitzung: ein zweiter Start
+            // mit anderer Adresse (einzel.rs) trennt und verbindet sofort
+            // neu - fiel das Trennen in den Handschlag, bevor der
+            // Abbruchgriff stand, liefe die alte Sitzung sonst weiter.
+            if s.target.as_deref() != Some(addr) {
                 return Ok(());
             }
             if s.decoder_wunsch_neu {
@@ -3837,6 +3847,54 @@ fn cpu_eigen_messen(zeiten: &mut (u64, Instant)) -> Option<f32> {
 #[derive(PartialEq)]
 enum Screen { Start, Session }
 
+/// Ereignisse von ausserhalb des Fensterfadens an die Ereignisschleife
+/// (winit-Benutzerereignisse ueber einen EventLoopProxy). Spaetere Teile
+/// haengen hier ihre Faelle an, etwa das Symbol im Infobereich.
+#[derive(Debug)]
+pub enum Benutzer {
+    /// Ein zweiter Start hat seine Adresse weitergereicht (leer = nur nach
+    /// vorn holen), siehe einzel.rs.
+    Einzel(String),
+}
+
+/// Was ein weitergereichter Start bewirkt (siehe `einzel_folge`).
+#[derive(Debug, PartialEq)]
+enum EinzelFolge {
+    /// Ohne Adresse: nur das Fenster nach vorn.
+    NachVorn,
+    /// Die Sitzung laeuft schon zu dieser Adresse: bestehen lassen.
+    Bleibt(String),
+    /// Keine Sitzung: verbinden.
+    Verbinden(String),
+    /// Sitzung zu einem anderen Host: trennen, dann verbinden.
+    Wechseln(String),
+}
+
+/// Entscheidung fuer einen weitergereichten Start. `sitzung` ist die
+/// Adresse der laufenden (oder im Aufbau befindlichen) Sitzung, None auf
+/// dem Startbildschirm. Verglichen wird mit ergaenztem Port und ohne
+/// Ruecksicht auf die Schreibweise des Namens.
+fn einzel_folge(sitzung: Option<&str>, adresse: &str) -> EinzelFolge {
+    let adresse = adresse.trim();
+    if adresse.is_empty() {
+        return EinzelFolge::NachVorn;
+    }
+    let neu = adresse_vollstaendig(adresse);
+    match sitzung {
+        None => EinzelFolge::Verbinden(neu),
+        Some(alt) if adresse_vollstaendig(alt).eq_ignore_ascii_case(&neu) => EinzelFolge::Bleibt(neu),
+        Some(_) => EinzelFolge::Wechseln(neu),
+    }
+}
+
+/// Knoepfe fuer die Desktop-Verknuepfung gibt es nur unter Windows. Als
+/// Konstante statt cfg, damit derselbe Code auf beiden Plattformen gebaut
+/// (und geprueft) wird.
+const MIT_VERKNUEPFUNG: bool = cfg!(windows);
+
+/// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
+const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
+
 /// Wer ins Fenster zeichnet: die Karte ueber eine Flip-Swapchain, oder
 /// softbuffer (GDI) - nie beides am selben Fenster, das ist von DXGI nicht
 /// gedeckt. Entschieden wird beim Start; `Keine` bleibt nach einem
@@ -4004,6 +4062,9 @@ struct App {
     bench_scroll: usize,
     bench_folgt: bool,
     bench_lief: bool,
+    /// Ergebnis der letzten Desktop-Verknuepfung und seit wann es steht -
+    /// 6 s im Meldungsbereich des Startbildschirms bzw. im Reiter.
+    verknuepfung_meldung: Option<(Meldung, Instant)>,
 }
 
 /// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
@@ -4041,17 +4102,27 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Benutzer> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         // Vollbild ist die Voreinstellung; F11 schaltet um und merkt sich das.
-        let attrs = Window::default_attributes()
+        // Das Symbol zeichnet logo.rs; die Titelleiste nimmt 32 px (Windows
+        // rechnet herunter), die Taskleiste 48 px. Auf dem Mac setzt winit
+        // kein Fenstersymbol - dort bleibt es beim Symbol des Programms.
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
             .with_title("QuadChroma")
+            .with_window_icon(logo::fenster_symbol(32))
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_fullscreen(if self.fullscreen {
                 Some(winit::window::Fullscreen::Borderless(None))
             } else {
                 None
             });
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(logo::fenster_symbol(48));
+        }
         let window = Arc::new(el.create_window(attrs).expect("Fenster"));
         // Wer zeichnet: die Karte, wenn sie gewuenscht ist und geht - sonst
         // softbuffer. Nie beides am selben Fenster: erst wenn feststeht, dass
@@ -4111,6 +4182,13 @@ impl ApplicationHandler for App {
             protokoll::zeile("Anzeige: Software".into());
         }
         self.window = Some(window);
+    }
+
+    /// Benutzerereignisse (siehe `Benutzer`).
+    fn user_event(&mut self, _el: &ActiveEventLoop, ereignis: Benutzer) {
+        match ereignis {
+            Benutzer::Einzel(adresse) => self.einzel_empfangen(&adresse),
+        }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -4704,6 +4782,107 @@ impl App {
         self.angewandt_fuer = None;
     }
 
+    /// Mit einer Adresse verbinden: Port ergaenzen, Eingabekanal und Ziel
+    /// setzen, alte Meldungen weg, in die Sitzung. Derselbe Weg fuer den
+    /// Klick auf dem Startbildschirm und die Weitergabe eines zweiten Starts.
+    fn verbinden(&mut self, addr: &str) {
+        let addr = adresse_vollstaendig(addr);
+        self.addr_input = addr.clone();
+        let input_addr = bump_port(&addr, 1);
+        self.input.lock().unwrap().set_addr(input_addr);
+        let mut s = self.shared.lock().unwrap();
+        s.target = Some(addr);
+        s.error = None;
+        s.error_key = None;
+        drop(s);
+        self.screen = Screen::Session;
+    }
+
+    /// Ein zweiter Start hat sich gemeldet (einzel.rs): Fenster sichtbar und
+    /// nach vorn; mit Adresse verbinden wie ein Klick auf "Verbinden". Eine
+    /// Sitzung zu einem anderen Host wird vorher getrennt, eine zum selben
+    /// bleibt bestehen - der Doppelklick auf die Verknuepfung soll sie nicht
+    /// abloesen.
+    fn einzel_empfangen(&mut self, adresse: &str) {
+        if let Some(w) = &self.window {
+            w.set_visible(true);
+            w.set_minimized(false);
+            w.focus_window();
+        }
+        let sitzung = (self.screen == Screen::Session).then_some(self.addr_input.as_str());
+        match einzel_folge(sitzung, adresse) {
+            EinzelFolge::NachVorn => {
+                protokoll::zeile("Einzelinstanz: zweiter Start ohne Adresse - Fenster nach vorn".into());
+            }
+            EinzelFolge::Bleibt(a) => {
+                protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {a} - Sitzung dorthin laeuft schon"));
+            }
+            EinzelFolge::Verbinden(a) => {
+                protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {a} - verbinde"));
+                self.verbinden(&a);
+            }
+            EinzelFolge::Wechseln(a) => {
+                protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {a} - trenne {} und verbinde neu", self.addr_input));
+                self.verbindung_trennen();
+                self.verbinden(&a);
+            }
+        }
+    }
+
+    /// Desktop-Verknuepfung fuer einen Host anlegen; das Ergebnis steht 6 s
+    /// im Meldungsbereich bzw. im Reiter. Laeuft im Fensterfaden: dort hat
+    /// winit COM (STA) schon eingerichtet.
+    fn verknuepfung_anlegen(&mut self, adresse: &str, name: &str) {
+        use strings::Key::*;
+        let adresse = adresse_vollstaendig(adresse);
+        #[cfg(windows)]
+        let ergebnis = verknuepfung::verknuepfung_anlegen(None, &adresse, name, self.lang);
+        #[cfg(not(windows))]
+        let ergebnis: Result<std::path::PathBuf, String> = {
+            let _ = name;
+            Err("nur unter Windows".into())
+        };
+        let m = match ergebnis {
+            Ok(p) => {
+                let zeile = format!("Verknuepfung angelegt: {}", p.display());
+                protokoll::zeile(zeile.clone());
+                let datei = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                Meldung::neu(DesktopShortcutCreated, zeile).mit("{n}", datei)
+            }
+            Err(e) => {
+                let zeile = format!("Verknuepfung fuer {adresse} nicht angelegt: {e}");
+                protokoll::zeile(zeile.clone());
+                Meldung::neu(DesktopShortcutFailed, zeile).mit("{n}", e)
+            }
+        };
+        self.verknuepfung_meldung = Some((m, Instant::now()));
+    }
+
+    /// Das Ergebnis der letzten Verknuepfung als Text und Farbe, solange es
+    /// stehen soll: angelegt in Cyan, gescheitert in Amber.
+    fn verknuepfung_hinweis(&self) -> Option<(String, u32)> {
+        let (m, seit) = self.verknuepfung_meldung.as_ref()?;
+        if seit.elapsed() >= VERKNUEPFUNG_ANZEIGE {
+            return None;
+        }
+        let farbe = if m.key == strings::Key::DesktopShortcutFailed { ui::AMBER } else { ui::CYAN };
+        Some((m.text(self.lang), farbe))
+    }
+
+    /// Der Name, unter dem sich ein Host mit dieser Adresse gerade meldet -
+    /// sonst leer (dann steht die Adresse im Dateinamen).
+    fn host_name(&self, adresse: &str) -> String {
+        let a = adresse_vollstaendig(adresse);
+        self.hosts
+            .lock()
+            .map(|h| h.list())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|h| h.addr.to_string().eq_ignore_ascii_case(&a))
+            .map(|h| h.name)
+            .unwrap_or_default()
+    }
+
     /// Steht ein Bild im Fenster? Solange nicht, zeigt die Sitzung den
     /// Wartebildschirm, und Maus und Tastatur bleiben beim Client.
     fn bild_vorhanden(&self) -> bool {
@@ -5175,7 +5354,11 @@ impl App {
                         None => s.error.as_ref().map(|m| m.text(self.lang)),
                     }
                 };
-                n.act = start_screen(&mut self.ui, c, self.lang, &hosts, &self.addr_input, err.as_deref());
+                let hinweis = self.verknuepfung_hinweis();
+                n.act = start_screen(
+                    &mut self.ui, c, self.lang, &hosts, &self.addr_input, err.as_deref(),
+                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)),
+                );
             }
             Screen::Session => {
                 // Noch kein Bild da: Wartebildschirm zeichnen statt gar nichts.
@@ -5298,6 +5481,7 @@ impl App {
                         // Ergebnisse - nur, wenn der Reiter offen ist.
                         bench: if reiter == 4 { self.benchmark.as_ref().map(|b| b.stand()) } else { None },
                         bench_scroll,
+                        verknuepfung: self.verknuepfung_hinweis(),
                     };
                     n.hud = Some(hud(
                         &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
@@ -5350,18 +5534,8 @@ impl App {
     /// Sprache, Projektseite, Trennen und alles aus dem Menue.
     fn nachwirkung(&mut self, n: Nachwirkung) {
         match n.act {
-            Action::Connect(addr) => {
-                let addr = adresse_vollstaendig(&addr);
-                self.addr_input = addr.clone();
-                let input_addr = bump_port(&addr, 1);
-                self.input.lock().unwrap().set_addr(input_addr);
-                let mut s = self.shared.lock().unwrap();
-                s.target = Some(addr);
-                s.error = None;
-                s.error_key = None;
-                drop(s);
-                self.screen = Screen::Session;
-            }
+            Action::Connect(addr) => self.verbinden(&addr),
+            Action::Verknuepfung { adresse, name } => self.verknuepfung_anlegen(&adresse, &name),
             Action::Quit => self.quit = true,
             Action::NextLang => {
                 let all = strings::all();
@@ -5411,6 +5585,13 @@ impl App {
                 self.cfg.sichern();
             }
             HudAktion::Trennen => self.verbindung_trennen(),
+            HudAktion::Verknuepfung => {
+                // Name aus der Bekanntgabe, falls die Adresse passt, sonst
+                // steht die Adresse im Dateinamen.
+                let adresse = self.addr_input.clone();
+                let name = self.host_name(&adresse);
+                self.verknuepfung_anlegen(&adresse, &name);
+            }
             HudAktion::Stellen(m, f, g, fx, ton) => self.stellen(m, f, g, fx, ton),
             HudAktion::Codec(idx) => self.codec_wuenschen(idx),
             // --- Benchmark: Konfiguration nur, solange keiner laeuft -----
@@ -5558,6 +5739,8 @@ fn warte_screen(
 enum Action {
     None,
     Connect(String),
+    /// Desktop-Verknuepfung fuer diesen Host anlegen (nur Windows).
+    Verknuepfung { adresse: String, name: String },
     Quit,
     NextLang,
     Website,
@@ -5694,7 +5877,41 @@ fn mische(a: u32, b: u32, c: u32, d: u32, wx: u32, wy: u32) -> u32 {
     (kanal(16) << 16) | (kanal(8) << 8) | kanal(0)
 }
 
-/// Startbildschirm: Titel, gefundene Hosts, Adresse, Knoepfe.
+/// Hoehe der Hostliste auf dem Startbildschirm (vier Zeilen und Kopf).
+const START_LISTE_H: i32 = 34 * 4 + 52;
+
+/// Lage der Hostliste auf dem Startbildschirm: (links, Breite, oben der
+/// Tafel). Alles als Block mittig, damit unten kein totes Feld bleibt.
+fn start_rahmen(w: i32, h: i32) -> (i32, i32, i32) {
+    let cx = w / 2;
+    let panel_w = 560.min(w - 60);
+    let block_h = 150 + START_LISTE_H + 40 + 66 + 44;
+    let top = ((h - block_h) / 2).max(24);
+    (cx - panel_w / 2, panel_w, top + 130)
+}
+
+/// Schriftgroesse und Laufweite des kleinen Knopfs in der Hostzeile.
+const ZEILENKNOPF_SCHRIFT: (u32, i32) = (12, 1);
+
+/// Zeile `i` der Hostliste und - unter Windows - ihr Knopf fuer die
+/// Desktop-Verknuepfung rechts daneben. Die Zeile wird um den Knopf
+/// schmaler, damit ein Klick auf ihn nicht zugleich verbindet. Auch fuer
+/// `--shot starttip`, das die Maus auf den Knopf der ersten Zeile stellt.
+fn start_zeile(u: &mut ui::Ui, w: i32, h: i32, lang: &'static strings::Lang, i: usize) -> (ui::Rect, Option<ui::Rect>) {
+    let (px, panel_w, py) = start_rahmen(w, h);
+    let zeile = ui::Rect { x: px + 12, y: py + 44 + i as i32 * 34, w: panel_w - 24, h: 30 };
+    if !MIT_VERKNUEPFUNG {
+        return (zeile, None);
+    }
+    let (g, lw) = ZEILENKNOPF_SCHRIFT;
+    let kw = (u.text.width(lang.get(strings::Key::DesktopShortcut), g, lw) + 28).clamp(84, 150);
+    let knopf = ui::Rect { x: zeile.x + zeile.w - kw, y: zeile.y, w: kw, h: zeile.h };
+    (ui::Rect { w: zeile.w - kw - 8, ..zeile }, Some(knopf))
+}
+
+/// Startbildschirm: Titel, gefundene Hosts, Adresse, Knoepfe. `hinweis` ist
+/// das Ergebnis einer Desktop-Verknuepfung (Text, Farbe); es steht, solange
+/// es gilt, im Meldungsbereich statt einer Fehlermeldung.
 fn start_screen(
     u: &mut ui::Ui,
     c: &mut ui::Canvas,
@@ -5702,18 +5919,19 @@ fn start_screen(
     hosts: &[discovery::Host],
     addr: &str,
     error: Option<&str>,
+    hinweis: Option<(&str, u32)>,
 ) -> Action {
     use strings::Key::*;
     c.backdrop(u.tick);
 
     let cx = c.w as i32 / 2;
-    let panel_w = 560.min(c.w as i32 - 60);
-    let px = cx - panel_w / 2;
-
-    // Alles als Block mittig setzen, damit unten kein totes Feld bleibt.
-    let list_h = 34 * 4 + 52;
-    let block_h = 150 + list_h + 40 + 66 + 44;
-    let top = ((c.h as i32 - block_h) / 2).max(24);
+    let (px, panel_w, py) = start_rahmen(c.w as i32, c.h as i32);
+    let list_h = START_LISTE_H;
+    let top = py - 130;
+    // Tooltip wie im Menue: gemerkt, wenn die Maus darueber steht, gezeichnet
+    // ganz am Ende ueber allem.
+    let maus = u.mouse;
+    let mut tip: Option<strings::Key> = None;
 
     // Kopf
     u.text.draw_centered(c, cx, top + 52, "QUADCHROMA", 46, ui::CYAN, 10);
@@ -5721,7 +5939,6 @@ fn start_screen(
     u.text.draw_centered(c, cx, top + 88, lang.get(AppSubtitle), 13, ui::DIM, 2);
 
     // Hostliste
-    let py = top + 130;
     c.panel(px, py, panel_w, list_h, ui::CYAN);
     let title = if hosts.is_empty() { lang.get(SearchingHosts) } else { lang.get(FoundHosts) };
     u.text.draw(c, px + 18, py + 28, title, 13, ui::DIM, 3);
@@ -5735,10 +5952,25 @@ fn start_screen(
 
     let mut action = Action::None;
     for (i, h) in hosts.iter().take(4).enumerate() {
-        let r = ui::Rect { x: px + 12, y: py + 44 + i as i32 * 34, w: panel_w - 24, h: 30 };
+        let (r, knopf) = start_zeile(u, c.w as i32, c.h as i32, lang, i);
         let sel = addr == h.addr.to_string();
-        if u.row(c, r, &h.name, &h.addr.to_string(), sel) {
+        // Die Zeile ist um den Knopf schmaler: ein langer Name wird gekuerzt,
+        // statt in die Adresse zu laufen (Masse wie in Ui::row).
+        let rechts = h.addr.to_string();
+        let platz = r.w - 14 - 12 - u.text.width(&rechts, 13, 1) - 12;
+        let name = kuerzen(u, &h.name, platz, 15, 1);
+        if u.row(c, r, &name, &rechts, sel) {
             action = Action::Connect(h.addr.to_string());
+        }
+        if let Some(k) = knopf {
+            let (g, lw) = ZEILENKNOPF_SCHRIFT;
+            let t = kuerzen(u, lang.get(DesktopShortcut), k.w - 16, g, lw);
+            if k.hit(maus.0, maus.1) {
+                tip = Some(TipDesktopShortcut);
+            }
+            if u.button_mit(c, k, &t, ui::CYAN, g, lw) {
+                action = Action::Verknuepfung { adresse: h.addr.to_string(), name: h.name.clone() };
+            }
         }
     }
 
@@ -5757,10 +5989,16 @@ fn start_screen(
     }
 
     // Meldungen mit Pfad oder Fingerabdruck sind laenger als eine Zeile -
-    // umbrechen statt am Fensterrand abschneiden.
-    if let Some(e) = error {
+    // umbrechen statt am Fensterrand abschneiden. Das Ergebnis einer
+    // Verknuepfung ist neuer als jede stehende Meldung und hat 6 s Vorrang.
+    let meldung = match (hinweis, error) {
+        (Some((t, f)), _) => Some((t, f)),
+        (None, Some(e)) => Some((e, ui::AMBER)),
+        (None, None) => None,
+    };
+    if let Some((e, farbe)) = meldung {
         for (i, z) in umbruch(u, e, c.w as i32 - 60, 13).iter().enumerate() {
-            u.text.draw_centered(c, cx, by + 76 + i as i32 * 18, z, 13, ui::AMBER, 1);
+            u.text.draw_centered(c, cx, by + 76 + i as i32 * 18, z, 13, farbe, 1);
         }
     }
 
@@ -5800,6 +6038,9 @@ fn start_screen(
     if hot {
         c.hline(lr.x, lr.y + lr.h, lr.w, ui::CYAN, 160);
         if u.click { action = Action::NextLang; }
+    }
+    if let Some(k) = tip {
+        tooltip(u, c, lang.get(k), maus, c.w as i32, c.h as i32, 11, 1);
     }
     action
 }
@@ -6322,6 +6563,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             bench,
             // 30 Zeilen, rund 16 passen: 7 ist die Mitte des Rollwegs.
             bench_scroll: if view == "hud5" { 7 } else { 0 },
+            verknuepfung: None,
         };
         let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, "hud5" => 4, _ => 0 };
         // "hud2tip": die Maus steht ueber dem Knopf "Grafikkarte" der
@@ -6366,9 +6608,16 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         ),
         _ => None,
     };
+    // "starttip": die Maus steht ueber dem Knopf "Verknuepfung" der ersten
+    // Zeile, damit sein Tooltip im Bild ist (nur unter Windows gibt es ihn).
+    if view == "starttip" {
+        if let (_, Some(k)) = start_zeile(&mut u, w as i32, h as i32, lang, 0) {
+            u.mouse = (k.x + k.w / 2, k.y + k.h / 2);
+        }
+    }
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
-        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", meldung.as_deref());
+        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", meldung.as_deref(), None);
     }
 
     write_bmp(path, w, h, &buf, lang);
@@ -6403,45 +6652,24 @@ fn write_bmp(path: &str, w: usize, h: usize, buf: &[u32], lang: &'static strings
     println!("geschrieben: {path} ({w}x{h}, Sprache {})", lang.name);
 }
 
-fn main() {
-    // An die Konsole des Aufrufers anhaengen, falls es eine gibt. Beim
-    // Doppelklick gibt es keine, dann passiert hier einfach nichts.
-    #[cfg(windows)]
-    unsafe {
-        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
+/// Schalter mit Werten: ihre Werte sind nie die Adresse. Ohne diese Liste
+/// wurde aus `--anzeige cpu` die Adresse "cpu:9001" - und die echte Adresse
+/// dahinter ignoriert.
+const WERTIG: &[(&str, usize)] = &[
+    ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1),
+    ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
+    ("--benchmark-auswahl", 1), ("--mitschnitt", 1),
+    // Desktop-Verknuepfung: --verknuepfung <adresse> [--name <name>]
+    // [--ordner <verzeichnis>] legt nur an und verbindet nie.
+    ("--verknuepfung", 1), ("--name", 1), ("--ordner", 1),
+    // Host-Rolle (host/mod.rs liest sie selbst; hier nur, damit ihre
+    // Werte nie fuer eine Adresse gehalten werden)
+    ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1), ("--encoderweg", 1),
+];
 
-    // Erstes Argument, das kein Schalter und kein Wert eines Schalters ist,
-    // ist die Adresse. Ohne die zweite Haelfte wurde aus `--anzeige cpu` die
-    // Adresse "cpu:9001" - und die echte Adresse dahinter ignoriert.
-    const WERTIG: &[(&str, usize)] = &[
-        ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1),
-        ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
-        ("--benchmark-auswahl", 1), ("--mitschnitt", 1),
-        // Host-Rolle (host/mod.rs liest sie selbst; hier nur, damit ihre
-        // Werte nie fuer eine Adresse gehalten werden)
-        ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1), ("--encoderweg", 1),
-    ];
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Windows als Host: --host [port], --list, --messen - ohne Fenster,
-    // Abzweig VOR allem, was ein Fenster oder einen Client braucht.
-    #[cfg(windows)]
-    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
-        let code = host::main_host(&args);
-        std::process::exit(code);
-    }
-    // Auf dem Mac gibt es die Host-Rolle nicht (dort ist QuadChroma.app der
-    // Host). Ohne diesen Zweig wuerde "--list" zur Adresse und ein Fenster
-    // aufgehen, das auf eine Verbindung wartet.
-    #[cfg(not(windows))]
-    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
-        eprintln!("Die Host-Rolle (--host, --list, --messen) gibt es nur auf Windows.");
-        std::process::exit(2);
-    }
-
-    let mut addr = String::new();
+/// Erstes Argument, das kein Schalter und kein Wert eines Schalters ist:
+/// die Adresse, mit Port ergaenzt; sonst leer.
+fn adresse_aus_argumenten(args: &[String]) -> String {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -6462,9 +6690,84 @@ fn main() {
             i += 1;
             continue;
         }
-        addr = adresse_vollstaendig(a);
-        break;
+        return adresse_vollstaendig(a);
     }
+    String::new()
+}
+
+/// `--verknuepfung`: anlegen, Pfad bzw. Fehler ausgeben, Rueckgabewert 0/1;
+/// auf dem Mac gibt es das nicht (2). Laeuft vor allem anderen und ohne
+/// Protokolldatei - eine laufende App behaelt ihr protokoll.txt.
+fn verknuepfung_befehlszeile(a: Result<verknuepfung::Aufruf, String>) -> i32 {
+    #[cfg(not(windows))]
+    {
+        let _ = a;
+        eprintln!("Die Desktop-Verknuepfung (--verknuepfung) gibt es nur unter Windows.");
+        2
+    }
+    #[cfg(windows)]
+    {
+        let a = match a {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("Verknuepfung nicht angelegt: {e}");
+                return 1;
+            }
+        };
+        // Der Kommentar der Verknuepfung in der Sprache, die auch das
+        // Fenster naehme.
+        let cfg = einstellungen::Einstellungen::laden();
+        let lang = match &cfg.sprache {
+            Some(c) => strings::pick(c),
+            None => strings::pick(&system_language()),
+        };
+        // COM (STA) richtet verknuepfung_anlegen selbst ein.
+        match verknuepfung::verknuepfung_anlegen(a.ordner.as_deref(), &adresse_vollstaendig(&a.adresse), &a.name, lang) {
+            Ok(p) => {
+                println!("{}", p.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("Verknuepfung nicht angelegt: {e}");
+                1
+            }
+        }
+    }
+}
+
+fn main() {
+    // An die Konsole des Aufrufers anhaengen, falls es eine gibt. Beim
+    // Doppelklick gibt es keine, dann passiert hier einfach nichts.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Windows als Host: --host [port], --list, --messen - ohne Fenster,
+    // Abzweig VOR allem, was ein Fenster oder einen Client braucht.
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
+        let code = host::main_host(&args);
+        std::process::exit(code);
+    }
+    // Auf dem Mac gibt es die Host-Rolle nicht (dort ist QuadChroma.app der
+    // Host). Ohne diesen Zweig wuerde "--list" zur Adresse und ein Fenster
+    // aufgehen, das auf eine Verbindung wartet.
+    #[cfg(not(windows))]
+    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
+        eprintln!("Die Host-Rolle (--host, --list, --messen) gibt es nur auf Windows.");
+        std::process::exit(2);
+    }
+
+    // Desktop-Verknuepfung ohne Fenster und ohne Verbindung.
+    if let Some(a) = verknuepfung::aufruf(&args) {
+        std::process::exit(verknuepfung_befehlszeile(a));
+    }
+
+    let addr = adresse_aus_argumenten(&args);
 
     let headless = std::env::args().any(|a| a == "--headless");
 
@@ -6582,6 +6885,32 @@ fn main() {
         let (w, h) = if view == "sitzung" || view == "nerd" || view.starts_with("hud") { (1280, 720) } else { (900, 700) };
         screenshot(&path, w, h, strings::pick(&code), &view);
         return;
+    }
+
+    // Einzelinstanz: hoechstens ein Client mit Fenster je Nutzersitzung.
+    // Ein zweiter Start reicht seine Adresse an den ersten weiter und endet -
+    // vor allem anderen: vor Ablagewaechter, Bekanntgabe-Port und
+    // protokoll.txt (das der erste Schreiber leert). Der Pruefmodus
+    // (--headless) und alle Wege ohne Fenster oben sind ausgenommen.
+    let mut einzel_waechter = None;
+    let mut einzel_eingang = None;
+    let mut einzel_ohne = None;
+    if !headless {
+        match einzel::beanspruchen(&addr) {
+            einzel::Start::Erste { waechter, eingang } => {
+                einzel_waechter = Some(waechter);
+                einzel_eingang = Some(eingang);
+            }
+            einzel::Start::Weitergereicht => {
+                println!("QuadChroma laeuft schon - {} weitergereicht.", if addr.is_empty() { "nach vorn geholt" } else { addr.as_str() });
+                std::process::exit(0);
+            }
+            einzel::Start::Unerreichbar(g) => {
+                eprintln!("QuadChroma laeuft schon, antwortet aber nicht ({g}).");
+                std::process::exit(1);
+            }
+            einzel::Start::Ohne(g) => einzel_ohne = Some(g),
+        }
     }
 
     // Ohne Adresse auf der Befehlszeile faengt das Programm beim Startbildschirm
@@ -6903,7 +7232,22 @@ fn main() {
         }
     }
 
-    let el = EventLoop::new().expect("Ereignisschleife");
+    if let Some(g) = einzel_ohne {
+        protokoll::zeile(format!("Einzelinstanz: nicht moeglich ({g}) - weiter ohne"));
+    }
+    let el = EventLoop::<Benutzer>::with_user_event().build().expect("Ereignisschleife");
+    // Weitergereichte Adressen eines zweiten Starts als Benutzerereignis in
+    // die Schleife. Was vor ihrem Anlauf kam, wartet im Kanal.
+    if let Some(eingang) = einzel_eingang {
+        let proxy = el.create_proxy();
+        std::thread::spawn(move || {
+            while let Ok(a) = eingang.recv() {
+                if proxy.send_event(Benutzer::Einzel(a)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let mut app = App {
         shared,
         input: input.clone(),
@@ -6962,12 +7306,15 @@ fn main() {
         bench_scroll: 0,
         bench_folgt: true,
         bench_lief: false,
+        verknuepfung_meldung: None,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
         cfg,
     };
     el.run_app(&mut app).expect("Fenster");
+    // Erst jetzt: bis hierher ist dies die erste Instanz.
+    drop(einzel_waechter);
 }
 
 // --------------------------------------------------------------------- Menue
@@ -6982,6 +7329,8 @@ pub enum HudAktion {
     Nichts,
     Reiter(u8),
     Trennen,
+    /// Desktop-Verknuepfung fuer den verbundenen Host (nur Windows).
+    Verknuepfung,
     /// Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton.
     Stellen(u32, u16, bool, bool, bool),
     Schalter(u8),
@@ -7057,6 +7406,9 @@ pub struct HudStand {
     /// Erste sichtbare Zeile der Ergebnistabelle (der Stand lebt in der
     /// App; hier nur der Wert fuer diese Zeichnung).
     pub bench_scroll: usize,
+    /// Ergebnis der letzten Desktop-Verknuepfung (Text, Farbe), solange es
+    /// stehen soll - im Reiter Verschluesselung unter den Knoepfen.
+    pub verknuepfung: Option<(String, u32)>,
 }
 
 /// Ein Rollen-Knopf im Menue - fuer Anzeige und Decoder derselbe Satz,
@@ -7793,6 +8145,22 @@ fn hud(
             if r_trennen.hit(maus.0, maus.1) { tip = Some(TipDisconnect); }
             if u.button(c, r_trennen, lang.get(Disconnect), ui::MAGENTA) {
                 aktion = HudAktion::Trennen;
+            }
+            // Daneben: Desktop-Verknuepfung fuer diesen Host (nur Windows).
+            // Das Ergebnis steht 6 s darunter.
+            if MIT_VERKNUEPFUNG {
+                let t = lang.get(DesktopShortcut);
+                let bw = p(220).max(u.text.width(t, 15, 2) + p(40));
+                let r_verkn = ui::Rect { x: ix + p(220) + p(16), y: r_trennen.y, w: bw, h: p(38) };
+                if r_verkn.hit(maus.0, maus.1) { tip = Some(TipDesktopShortcut); }
+                if u.button(c, r_verkn, t, ui::CYAN) {
+                    aktion = HudAktion::Verknuepfung;
+                }
+                if let Some((text, farbe)) = &stand.verknuepfung {
+                    for (i, z) in umbruch(u, text, iw, sz(12)).iter().enumerate() {
+                        u.text.draw(c, ix, r_trennen.y + r_trennen.h + p(34) + i as i32 * p(18), z, sz(12), *farbe, p(1));
+                    }
+                }
             }
         }
     }
@@ -8671,6 +9039,126 @@ mod tests {
             bytes[4..].copy_from_slice(&high.to_le_bytes());
             let dxgi = ((high as i64) << 32) | low as i64;
             assert_eq!(luid_aus_bytes(bytes), dxgi);
+        }
+    }
+
+    fn argumente(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// --verknuepfung und seine Werte sind nie die Verbindungsadresse - und
+    /// die uebrige Auswertung bleibt, wie sie war.
+    #[test]
+    fn verknuepfung_nie_als_adresse() {
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--verknuepfung", "10.0.0.5"])), "");
+        assert_eq!(
+            adresse_aus_argumenten(&argumente(&["--verknuepfung", "10.0.0.5:9001", "--name", "Test Host.local", "--ordner", "C:\\qc\\desk"])),
+            ""
+        );
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--ordner", "d", "--name", "n", "--verknuepfung", "h"])), "");
+        // Wie bisher: die erste freie Angabe, Port ergaenzt; Werte anderer
+        // Schalter und --benchmark mit Zahl zaehlen nicht.
+        assert_eq!(adresse_aus_argumenten(&argumente(&["10.0.0.5"])), "10.0.0.5:9001");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--anzeige", "cpu", "h:9101"])), "h:9101");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--benchmark", "5", "--headless", "h"])), "h:9001");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--benchmark", "h"])), "h:9001");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--shot", "a.bmp", "de", "start"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&[])), "");
+    }
+
+    /// Ein anderes Ziel beendet die laufende Sitzung sofort - auch wenn der
+    /// Host weiter sendet und das Trennen den Abbruchgriff verpasst hat
+    /// (ein zweiter Start mit anderer Adresse trennt und verbindet in einem
+    /// Zug). Frueher endete die Sitzung nur ohne Ziel.
+    #[test]
+    fn zielwechsel_beendet_die_sitzung() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        secure::test_identitaet();
+        ffmpeg::init().unwrap();
+        let (host_priv, _) = test_host();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let halt = Arc::new(AtomicBool::new(false));
+        let h = halt.clone();
+        std::thread::spawn(move || {
+            let Ok((s, _)) = l.accept() else { return };
+            let Ok(mut sock) = secure::Secure::accept(s, &noise::prologue_video(), &host_priv) else { return };
+            if sock.write_all(MAGIC).is_err() {
+                return;
+            }
+            // Weiter senden, was der Client uebergeht (Typ 0xEE ist frei),
+            // damit seine Schleife laeuft.
+            while !h.load(Ordering::SeqCst) {
+                if sock.write_all(&[0xEE, 0, 0, 0, 0, 0, 0, 0]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr.clone()),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (s, i, a) = (shared.clone(), input.clone(), addr.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(run_session(&a, &s, &i));
+            });
+        }
+        let t0 = Instant::now();
+        while !shared.lock().unwrap().connected && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(shared.lock().unwrap().connected, "keine Sitzung");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rx.try_recv().is_err(), "Sitzung endete zu frueh");
+        // Anderes Ziel, der Abbruchgriff bleibt unberuehrt.
+        shared.lock().unwrap().target = Some("127.0.0.1:1".into());
+        let r = rx.recv_timeout(Duration::from_secs(3));
+        halt.store(true, Ordering::SeqCst);
+        assert!(matches!(r, Ok(Ok(()))), "Sitzung lief nach dem Zielwechsel weiter: {r:?}");
+    }
+
+    /// Weitergereichter Start: ohne Adresse nur nach vorn; zum selben Host
+    /// (Port ergaenzt, Schreibweise egal) bleibt die Sitzung; zu einem
+    /// anderen trennen und neu; ohne Sitzung verbinden.
+    #[test]
+    fn einzel_folge_entscheidet() {
+        use EinzelFolge::*;
+        assert_eq!(einzel_folge(None, ""), NachVorn);
+        assert_eq!(einzel_folge(Some("h:9001"), "  "), NachVorn);
+        assert_eq!(einzel_folge(None, "10.0.0.5"), Verbinden("10.0.0.5:9001".into()));
+        assert_eq!(einzel_folge(Some("10.0.0.5"), "10.0.0.5:9001"), Bleibt("10.0.0.5:9001".into()));
+        assert_eq!(einzel_folge(Some("Studio.local:9001"), "studio.LOCAL"), Bleibt("studio.LOCAL:9001".into()));
+        assert_eq!(einzel_folge(Some("10.0.0.5:9001"), "10.0.0.6:9001"), Wechseln("10.0.0.6:9001".into()));
+        assert_eq!(einzel_folge(Some("10.0.0.5:9001"), "10.0.0.5:9101"), Wechseln("10.0.0.5:9101".into()));
+    }
+
+    /// Die Hostzeile wird um den Knopf schmaler (unter Windows): ein Klick
+    /// auf den Knopf trifft die Zeile nicht, und beide liegen in der Tafel.
+    #[test]
+    fn hostzeile_und_knopf_ueberlappen_nicht() {
+        let mut u = ui::Ui::new();
+        for lang in strings::all() {
+            for i in 0..4 {
+                let (zeile, knopf) = start_zeile(&mut u, 900, 700, lang, i);
+                let (px, panel_w, _) = start_rahmen(900, 700);
+                assert!(zeile.x >= px && zeile.x + zeile.w <= px + panel_w);
+                match knopf {
+                    Some(k) => {
+                        assert!(MIT_VERKNUEPFUNG);
+                        assert!(zeile.x + zeile.w < k.x, "{}: Zeile reicht in den Knopf", lang.code);
+                        assert!(k.x + k.w <= px + panel_w - 12);
+                        assert!(!zeile.hit(k.x + k.w / 2, k.y + k.h / 2));
+                        assert_eq!((k.y, k.h), (zeile.y, zeile.h));
+                    }
+                    None => assert!(!MIT_VERKNUEPFUNG),
+                }
+            }
         }
     }
 }

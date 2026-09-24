@@ -162,6 +162,11 @@ pub static RU: Lang = Lang {
         (TipBenchDuration, "Время измерения на шаг. Дольше – стабильнее; 5 с обычно достаточно."),
         (TipBenchHint, "Шаг проходит, если приходит не менее 95 % целевой частоты кадров, потеряно менее 1 % кадров и вся цепочка укладывается в 30 ms – независимо от частоты кадров. Время кодера хоста показывается, но не оценивается. Рекомендуется: лучшее качество цвета, которое проходит на самой высокой частоте кадров, с самым высоким битрейтом."),
         (TipBenchTestPattern, "На время измерения хост показывает вместо экрана фиксированный движущийся узор – каждый шаг измеряет одно и то же содержимое."),
+        (DesktopShortcut, "Ярлык"),
+        (TipDesktopShortcut, "Создаёт на рабочем столе ярлык для этого хоста. Двойной щелчок сразу подключает."),
+        (DesktopShortcutCreated, "Ярлык создан на рабочем столе: {n}"),
+        (DesktopShortcutFailed, "Ярлык не создан: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: подключиться к {n} ({m})"),
     ],
 };
 
@@ -323,6 +328,11 @@ pub static ZH: Lang = Lang {
         (TipBenchDuration, "每步的测量时间。更长更稳定；通常 5 秒足够。"),
         (TipBenchHint, "一步通过的条件：至少达到目标帧率的 95 %，丢帧少于 1 %，且整条链路保持在 30 ms 以内——与帧率无关。主机的编码器耗时仅显示，不作评判。推荐：在最高帧率下通过的最佳色彩质量，取最高码率。"),
         (TipBenchTestPattern, "测试期间主机显示固定的运动图案而非屏幕内容，每一步测量的都是相同内容。"),
+        (DesktopShortcut, "快捷方式"),
+        (TipDesktopShortcut, "在桌面上创建此主机的快捷方式。双击即可立即连接。"),
+        (DesktopShortcutCreated, "已在桌面上创建快捷方式：{n}"),
+        (DesktopShortcutFailed, "未能创建快捷方式：{n}"),
+        (DesktopShortcutDescription, "QuadChroma：连接到 {n}（{m}）"),
     ],
 };
 
@@ -484,6 +494,11 @@ pub static JA: Lang = Lang {
         (TipBenchDuration, "1ステップあたりの計測時間。長いほど安定します。通常は 5 秒で十分です。"),
         (TipBenchHint, "目標フレームレートの 95 % 以上が届き、ドロップが 1 % 未満で、経路全体が 30 ms 以内に収まればステップは合格です（フレームレートにかかわらず）。ホストのエンコーダー時間は表示されますが、判定には使われません。おすすめ：最高フレームレートで合格する最良の色品質を、最高のビットレートで。"),
         (TipBenchTestPattern, "計測中、ホストは画面の代わりに固定の動くパターンを表示します。どのステップも同じ内容を計測します。"),
+        (DesktopShortcut, "デスクトップに追加"),
+        (TipDesktopShortcut, "このホストへのショートカットをデスクトップに作成します。ダブルクリックするとすぐに接続します。"),
+        (DesktopShortcutCreated, "デスクトップにショートカットを作成しました: {n}"),
+        (DesktopShortcutFailed, "ショートカットを作成できませんでした: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: {n} に接続 ({m})"),
     ],
 };
 
@@ -643,5 +658,10 @@ pub static TR: Lang = Lang {
         (TipBenchDuration, "Adım başına ölçüm süresi. Daha uzun daha kararlıdır; genelde 5 s yeter."),
         (TipBenchHint, "Hedef kare hızının en az % 95'i ulaşır, karelerin % 1'inden azı atlanır ve tüm zincir 30 ms içinde kalırsa adım geçer – kare hızından bağımsız olarak. Host'un kodlayıcı süresi gösterilir ama değerlendirilmez. Önerilen: en yüksek kare hızında geçen en iyi renk kalitesi, en yüksek bit hızıyla."),
         (TipBenchTestPattern, "Çalıştırma boyunca host ekran yerine sabit, hareketli bir desen gösterir – her adım aynı içeriği ölçer."),
+        (DesktopShortcut, "Masaüstü kısayolu"),
+        (TipDesktopShortcut, "Masaüstünde bu host için bir kısayol oluşturur. Çift tıklayınca hemen bağlanır."),
+        (DesktopShortcutCreated, "Masaüstünde kısayol oluşturuldu: {n}"),
+        (DesktopShortcutFailed, "Kısayol oluşturulamadı: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: {n} ile bağlan ({m})"),
     ],
 };

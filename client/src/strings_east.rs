@@ -159,6 +159,11 @@ pub static PL: Lang = Lang {
         (TipBenchDuration, "Czas pomiaru na krok. Dłużej jest stabilniej; 5 s zwykle wystarcza."),
         (TipBenchHint, "Krok przechodzi, gdy dociera co najmniej 95 % docelowej liczby klatek, pominięte jest mniej niż 1 % klatek, a cały łańcuch mieści się w 30 ms – niezależnie od liczby klatek. Czas enkodera hosta jest pokazywany, ale nie oceniany. Zalecana: najlepsza jakość kolorów, która przechodzi przy najwyższej liczbie klatek, z najwyższym bitrate'em."),
         (TipBenchTestPattern, "Na czas pomiaru host pokazuje zamiast ekranu stały ruchomy wzór – każdy krok mierzy tę samą treść."),
+        (DesktopShortcut, "Utwórz skrót"),
+        (TipDesktopShortcut, "Tworzy na pulpicie skrót do tego hosta. Dwukrotne kliknięcie od razu nawiązuje połączenie."),
+        (DesktopShortcutCreated, "Utworzono skrót na pulpicie: {n}"),
+        (DesktopShortcutFailed, "Nie utworzono skrótu: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: połącz z {n} ({m})"),
     ],
 };
 
@@ -318,6 +323,11 @@ pub static CS: Lang = Lang {
         (TipBenchDuration, "Doba měření na krok. Delší je stabilnější; 5 s většinou stačí."),
         (TipBenchHint, "Krok projde, když dorazí alespoň 95 % cílové snímkové frekvence, zahozeno je méně než 1 % snímků a celý řetězec se vejde do 30 ms – bez ohledu na snímkovou frekvenci. Čas enkodéru hostitele se zobrazuje, ale nehodnotí. Doporučeno: nejlepší barevná kvalita, která projde při nejvyšší snímkové frekvenci, s nejvyšším bitrate."),
         (TipBenchTestPattern, "Po dobu měření hostitel místo obrazovky zobrazuje pevný pohyblivý vzor – každý krok měří stejný obsah."),
+        (DesktopShortcut, "Zástupce"),
+        (TipDesktopShortcut, "Vytvoří na ploše zástupce tohoto hostitele. Poklepáním se hned připojíte."),
+        (DesktopShortcutCreated, "Zástupce vytvořen na ploše: {n}"),
+        (DesktopShortcutFailed, "Zástupce nebyl vytvořen: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: připojit k {n} ({m})"),
     ],
 };
 
@@ -477,6 +487,11 @@ pub static SK: Lang = Lang {
         (TipBenchDuration, "Čas merania na krok. Dlhší je stabilnejší; 5 s väčšinou stačí."),
         (TipBenchHint, "Krok prejde, keď dorazí aspoň 95 % cieľovej snímkovej frekvencie, zahodené je menej ako 1 % snímok a celý reťazec sa zmestí do 30 ms – bez ohľadu na snímkovú frekvenciu. Čas enkodéra hostiteľa sa zobrazuje, ale nehodnotí. Odporúčané: najlepšia farebná kvalita, ktorá prejde pri najvyššej snímkovej frekvencii, s najvyšším bitrate."),
         (TipBenchTestPattern, "Počas merania hostiteľ namiesto obrazovky zobrazuje pevný pohyblivý vzor – každý krok meria rovnaký obsah."),
+        (DesktopShortcut, "Odkaz"),
+        (TipDesktopShortcut, "Vytvorí na pracovnej ploche odkaz na tohto hostiteľa. Dvojklikom sa hneď pripojíte."),
+        (DesktopShortcutCreated, "Odkaz vytvorený na pracovnej ploche: {n}"),
+        (DesktopShortcutFailed, "Odkaz sa nevytvoril: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: pripojiť k {n} ({m})"),
     ],
 };
 
@@ -636,6 +651,11 @@ pub static HU: Lang = Lang {
         (TipBenchDuration, "Mérési idő lépésenként. A hosszabb egyenletesebb; 5 s általában elég."),
         (TipBenchHint, "Egy lépés átmegy, ha a célképkockaszám legalább 95 %-a megérkezik, a képkockák kevesebb mint 1 %-a esik ki, és a teljes lánc 30 ms-on belül marad – a képkockaszámtól függetlenül. A gazdagép kódolási ideje megjelenik, de nem számít az értékelésbe. Ajánlott: a legjobb színminőség, amely a legmagasabb képkockaszámnál átmegy, a legmagasabb bitrátával."),
         (TipBenchTestPattern, "A futás idejére a gazdagép a képernyő helyett rögzített, mozgó mintát mutat – minden lépés ugyanazt a tartalmat méri."),
+        (DesktopShortcut, "Parancsikon"),
+        (TipDesktopShortcut, "Parancsikont hoz létre az asztalon ehhez a gazdagéphez. Dupla kattintással azonnal csatlakozik."),
+        (DesktopShortcutCreated, "Parancsikon létrehozva az asztalon: {n}"),
+        (DesktopShortcutFailed, "A parancsikon nem jött létre: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: csatlakozás ehhez: {n} ({m})"),
     ],
 };
 
@@ -795,6 +815,11 @@ pub static RO: Lang = Lang {
         (TipBenchDuration, "Timp de măsurare per pas. Mai lung e mai stabil; 5 s ajung de obicei."),
         (TipBenchHint, "Un pas trece dacă sosesc cel puțin 95 % din rata de cadre țintă, se pierd sub 1 % din cadre și întregul lanț rămâne sub 30 ms – indiferent de rata de cadre. Timpul encoderului gazdei este afișat, dar nu evaluat. Recomandat: cea mai bună calitate a culorii care trece la cea mai mare rată de cadre, cu cel mai mare bitrate."),
         (TipBenchTestPattern, "Pe durata rulării, gazda arată în locul ecranului un model fix în mișcare – fiecare pas măsoară același conținut."),
+        (DesktopShortcut, "Comandă rapidă"),
+        (TipDesktopShortcut, "Creează pe desktop o comandă rapidă către această gazdă. Un dublu clic se conectează imediat."),
+        (DesktopShortcutCreated, "Comandă rapidă creată pe desktop: {n}"),
+        (DesktopShortcutFailed, "Comanda rapidă nu a fost creată: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: conectare la {n} ({m})"),
     ],
 };
 
@@ -954,6 +979,11 @@ pub static BG: Lang = Lang {
         (TipBenchDuration, "Време за измерване на стъпка. По-дълго е по-стабилно; 5 s обикновено стигат."),
         (TipBenchHint, "Стъпка преминава, когато пристигат поне 95 % от целевата честота на кадрите, пропуснати са под 1 % от кадрите и цялата верига се побира в 30 ms – независимо от честотата на кадрите. Времето на енкодера на хоста се показва, но не се оценява. Препоръка: най-доброто цветово качество, което преминава при най-високата честота на кадрите, с най-високия битрейт."),
         (TipBenchTestPattern, "За времето на измерването хостът показва вместо екрана фиксиран движещ се шаблон – всяка стъпка измерва едно и също съдържание."),
+        (DesktopShortcut, "Пряк път"),
+        (TipDesktopShortcut, "Създава на работния плот пряк път към този хост. С двойно щракване се свързва веднага."),
+        (DesktopShortcutCreated, "Прекият път е създаден на работния плот: {n}"),
+        (DesktopShortcutFailed, "Прекият път не е създаден: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: свързване с {n} ({m})"),
     ],
 };
 
@@ -1113,5 +1143,10 @@ pub static EL: Lang = Lang {
         (TipBenchDuration, "Χρόνος μέτρησης ανά βήμα. Μεγαλύτερος είναι σταθερότερος· 5 s συνήθως αρκούν."),
         (TipBenchHint, "Ένα βήμα περνά όταν φτάνει τουλάχιστον το 95 % του ρυθμού καρέ-στόχου, χάνεται λιγότερο από το 1 % των καρέ και ολόκληρη η αλυσίδα μένει μέσα σε 30 ms – ανεξάρτητα από τον ρυθμό καρέ. Ο χρόνος του encoder του host εμφανίζεται αλλά δεν αξιολογείται. Προτείνεται: η καλύτερη ποιότητα χρώματος που περνά στον υψηλότερο ρυθμό καρέ, με το υψηλότερο bitrate."),
         (TipBenchTestPattern, "Για όσο διαρκεί η εκτέλεση ο host δείχνει αντί για την οθόνη ένα σταθερό κινούμενο μοτίβο – κάθε βήμα μετρά το ίδιο περιεχόμενο."),
+        (DesktopShortcut, "Νέα συντόμευση"),
+        (TipDesktopShortcut, "Δημιουργεί στην επιφάνεια εργασίας μια συντόμευση προς αυτόν τον host. Με διπλό κλικ συνδέεται αμέσως."),
+        (DesktopShortcutCreated, "Η συντόμευση δημιουργήθηκε στην επιφάνεια εργασίας: {n}"),
+        (DesktopShortcutFailed, "Η συντόμευση δεν δημιουργήθηκε: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: σύνδεση με {n} ({m})"),
     ],
 };

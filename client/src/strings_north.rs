@@ -159,6 +159,11 @@ pub static SV: Lang = Lang {
         (TipBenchDuration, "Mättid per steg. Längre är stabilare; 5 s räcker oftast."),
         (TipBenchHint, "Ett steg klarar sig när minst 95 % av målbildfrekvensen kommer fram, under 1 % av bilderna tappas och hela kedjan håller sig inom 30 ms – oavsett bildfrekvens. Värdens kodartid visas men bedöms inte. Rekommenderas: bästa färgkvalitet som klarar sig vid högsta bildfrekvens, med högsta bitrate."),
         (TipBenchTestPattern, "Under körningen visar värden ett fast rörligt mönster i stället för skärmen – varje steg mäter samma innehåll."),
+        (DesktopShortcut, "Genväg"),
+        (TipDesktopShortcut, "Skapar en genväg till den här värden på skrivbordet. Ett dubbelklick ansluter direkt."),
+        (DesktopShortcutCreated, "Genväg skapad på skrivbordet: {n}"),
+        (DesktopShortcutFailed, "Genvägen skapades inte: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: anslut till {n} ({m})"),
     ],
 };
 
@@ -318,6 +323,11 @@ pub static DA: Lang = Lang {
         (TipBenchDuration, "Måletid pr. trin. Længere er mere stabilt; 5 s er som regel nok."),
         (TipBenchHint, "Et trin består, når mindst 95 % af målbilledfrekvensen når frem, under 1 % af billederne tabes, og hele kæden holder sig inden for 30 ms – uanset billedfrekvens. Værtens encodertid vises, men bedømmes ikke. Anbefalet: den bedste farvekvalitet, der består ved den højeste billedfrekvens, med den højeste bitrate."),
         (TipBenchTestPattern, "Under kørslen viser værten et fast bevægeligt mønster i stedet for skærmen – hvert trin måler det samme indhold."),
+        (DesktopShortcut, "Opret genvej"),
+        (TipDesktopShortcut, "Opretter en genvej til denne vært på skrivebordet. Et dobbeltklik opretter straks forbindelse."),
+        (DesktopShortcutCreated, "Genvej oprettet på skrivebordet: {n}"),
+        (DesktopShortcutFailed, "Genvejen blev ikke oprettet: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: opret forbindelse til {n} ({m})"),
     ],
 };
 
@@ -477,6 +487,11 @@ pub static NB: Lang = Lang {
         (TipBenchDuration, "Måletid per trinn. Lengre er jevnere; 5 s holder som regel."),
         (TipBenchHint, "Et trinn består når minst 95 % av målbildefrekvensen kommer fram, under 1 % av bildene tapes og hele kjeden holder seg innenfor 30 ms – uansett bildefrekvens. Vertens enkodertid vises, men bedømmes ikke. Anbefalt: beste fargekvalitet som består ved høyeste bildefrekvens, med høyeste bitrate."),
         (TipBenchTestPattern, "Under kjøringen viser verten et fast mønster i bevegelse i stedet for skjermen – hvert trinn måler samme innhold."),
+        (DesktopShortcut, "Lag snarvei"),
+        (TipDesktopShortcut, "Lager en snarvei til denne verten på skrivebordet. Et dobbeltklikk kobler til med en gang."),
+        (DesktopShortcutCreated, "Snarvei opprettet på skrivebordet: {n}"),
+        (DesktopShortcutFailed, "Snarveien ble ikke opprettet: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: koble til {n} ({m})"),
     ],
 };
 
@@ -636,6 +651,11 @@ pub static FI: Lang = Lang {
         (TipBenchDuration, "Mittausaika vaihetta kohti. Pidempi on vakaampi; 5 s riittää yleensä."),
         (TipBenchHint, "Vaihe läpäisee, kun vähintään 95 % tavoitekuvataajuudesta saapuu, alle 1 % kuvista putoaa ja koko ketju pysyy 30 ms:n sisällä – kuvataajuudesta riippumatta. Isäntäkoneen enkooderiaika näytetään, mutta sitä ei arvioida. Suositus: paras värilaatu, joka läpäisee suurimmalla kuvataajuudella, suurimmalla bitratella."),
         (TipBenchTestPattern, "Ajon ajan isäntäkone näyttää näytön sijaan kiinteän liikkuvan kuvion – jokainen vaihe mittaa saman sisällön."),
+        (DesktopShortcut, "Pikakuvake"),
+        (TipDesktopShortcut, "Luo työpöydälle pikakuvakkeen tähän isäntäkoneeseen. Kaksoisnapsautus muodostaa yhteyden heti."),
+        (DesktopShortcutCreated, "Pikakuvake luotu työpöydälle: {n}"),
+        (DesktopShortcutFailed, "Pikakuvaketta ei luotu: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: yhdistä kohteeseen {n} ({m})"),
     ],
 };
 
@@ -795,5 +815,10 @@ pub static IS: Lang = Lang {
         (TipBenchDuration, "Mælitími á skref. Lengri er stöðugri; 5 s duga yfirleitt."),
         (TipBenchHint, "Skref stenst ef að minnsta kosti 95 % af markrammatíðninni berast, undir 1 % rammanna týnast og öll keðjan helst innan 30 ms – óháð rammatíðni. Kóðaratími hýsilsins er sýndur en ekki metinn. Ráðlagt: bestu litgæðin sem standast við hæstu rammatíðni, með hæsta bitrate."),
         (TipBenchTestPattern, "Meðan á keyrslunni stendur sýnir hýsillinn fast hreyfimynstur í stað skjásins – hvert skref mælir sama efni."),
+        (DesktopShortcut, "Flýtileið"),
+        (TipDesktopShortcut, "Býr til flýtileið að þessum hýsli á skjáborðinu. Tvísmellur tengist strax."),
+        (DesktopShortcutCreated, "Flýtileið búin til á skjáborðinu: {n}"),
+        (DesktopShortcutFailed, "Flýtileið var ekki búin til: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: tengjast {n} ({m})"),
     ],
 };

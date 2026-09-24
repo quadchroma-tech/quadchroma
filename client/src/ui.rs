@@ -377,6 +377,12 @@ impl Ui {
 
     /// Knopf mit Eckklammern. Gibt true zurueck, wenn er in diesem Bild geklickt wurde.
     pub fn button(&mut self, c: &mut Canvas, r: Rect, label: &str, accent: u32) -> bool {
+        self.button_mit(c, r, label, accent, 15, 2)
+    }
+
+    /// Derselbe Knopf mit eigener Schriftgroesse und Laufweite - etwa der
+    /// kleine Knopf in einer Hostzeile. Mit 15/2 ist er bitgleich zu `button`.
+    pub fn button_mit(&mut self, c: &mut Canvas, r: Rect, label: &str, accent: u32, size: u32, spacing: i32) -> bool {
         let hot = r.hit(self.mouse.0, self.mouse.1);
         let a = if hot { 34 } else { 10 };
         c.rect(r.x, r.y, r.w, r.h, accent, a);
@@ -396,8 +402,10 @@ impl Ui {
             c.hline(r.x + cut, r.y, r.w - 2 * cut, accent, 120);
             c.hline(r.x + cut, r.y + r.h - 1, r.w - 2 * cut, accent, 120);
         }
-        let ty = r.y + r.h / 2 + 5;
-        self.text.draw_centered(c, r.x + r.w / 2, ty, label, 15, if hot { 0xffffff } else { TEXT }, 2);
+        // Grundlinie etwa ein Drittel der Schrifthoehe unter der Mitte
+        // (bei 15 genau die bisherigen 5 Bildpunkte).
+        let ty = r.y + r.h / 2 + size as i32 / 3;
+        self.text.draw_centered(c, r.x + r.w / 2, ty, label, size, if hot { 0xffffff } else { TEXT }, spacing);
         hot && self.click
     }
 

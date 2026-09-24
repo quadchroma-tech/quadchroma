@@ -226,6 +226,19 @@ pub enum Key {
     /// Tooltip auf dem Hinweis: die Regel, nach der ein Schritt besteht.
     TipBenchHint,
     TipBenchTestPattern,
+    // Desktop-Verknuepfung (nur Windows-Client)
+    /// Knopf je Hostzeile auf dem Startbildschirm und im Reiter
+    /// Verschluesselung. Nicht zu verwechseln mit TabShortcuts/Shortcut*
+    /// (Tastenkombinationen).
+    DesktopShortcut,
+    /// Tooltip zum Knopf.
+    TipDesktopShortcut,
+    /// Ergebnis: {n} ist der Dateiname der Verknuepfung.
+    DesktopShortcutCreated,
+    /// Fehlschlag: {n} ist der Grund.
+    DesktopShortcutFailed,
+    /// Kommentar der Verknuepfung im Explorer: {n} Name, {m} Adresse.
+    DesktopShortcutDescription,
 }
 
 pub struct Lang {
@@ -408,6 +421,11 @@ pub static EN: Lang = Lang {
         (TipBenchDuration, "Measuring time per step. Longer is steadier; 5 s is usually enough."),
         (TipBenchHint, "A step passes when at least 95 % of the target frame rate arrives, under 1 % of the frames are dropped and the whole chain stays within 30 ms – regardless of the frame rate. The host's encoder time is shown but not judged. Recommended: the best colour quality that passes at the highest frame rate, at the highest bitrate."),
         (TipBenchTestPattern, "For the duration of the run the host shows a fixed moving pattern instead of the screen – every step measures the same content."),
+        (DesktopShortcut, "Desktop shortcut"),
+        (TipDesktopShortcut, "Creates a shortcut to this host on the desktop. Double-clicking it connects right away."),
+        (DesktopShortcutCreated, "Shortcut created on the desktop: {n}"),
+        (DesktopShortcutFailed, "Shortcut not created: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: connect to {n} ({m})"),
     ],
 };
 
@@ -567,6 +585,11 @@ pub static DE: Lang = Lang {
         (TipBenchDuration, "Messzeit je Schritt. Länger ist ruhiger; 5 s reichen meist."),
         (TipBenchHint, "Ein Schritt besteht, wenn mindestens 95 % der Zielbildrate ankommen, unter 1 % der Bilder verworfen werden und die ganze Kette höchstens 30 ms lang ist – unabhängig von der Bildrate. Die Encoderzeit des Hosts wird nur angezeigt, nicht bewertet. Empfohlen: die beste Farbqualität, die bei der höchsten Bildrate besteht, mit der höchsten Datenrate."),
         (TipBenchTestPattern, "Der Host zeigt für die Dauer des Laufs ein festes, bewegtes Muster statt des Bildschirms – jeder Schritt misst denselben Inhalt."),
+        (DesktopShortcut, "Verknüpfung"),
+        (TipDesktopShortcut, "Legt auf dem Desktop eine Verknüpfung zu diesem Host an. Ein Doppelklick darauf verbindet sofort."),
+        (DesktopShortcutCreated, "Verknüpfung auf dem Desktop angelegt: {n}"),
+        (DesktopShortcutFailed, "Verknüpfung nicht angelegt: {n}"),
+        (DesktopShortcutDescription, "QuadChroma: mit {n} verbinden ({m})"),
     ],
 };
 
@@ -591,4 +614,50 @@ pub fn pick(system: &str) -> &'static Lang {
         }
     }
     &EN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Jede der 29 Tabellen fuehrt jeden Schluessel genau einmal, in der
+    /// Reihenfolge des Enums (der i-te Eintrag ist der i-te Schluessel), und
+    /// alle gleich viele - bisher nur Konvention, jetzt geprueft.
+    #[test]
+    fn alle_tabellen_in_enum_reihenfolge() {
+        let n = EN.table.len();
+        assert_eq!(all().len(), 29);
+        for l in all() {
+            assert_eq!(l.table.len(), n, "{}: Zahl der Eintraege", l.code);
+            for (i, (k, t)) in l.table.iter().enumerate() {
+                assert_eq!(*k as usize, i, "{}: Eintrag {i} ist {k:?}", l.code);
+                assert!(!t.is_empty(), "{}: {k:?} leer", l.code);
+            }
+        }
+        // Der letzte Schluessel des Enums steht auch in der Tabelle.
+        assert!(n > DesktopShortcutDescription as usize);
+    }
+
+    /// Die Texte der Desktop-Verknuepfung: in jeder Sprache eigene Worte
+    /// (ausser dort, wo das Wort gleich bleibt), Platzhalter vorhanden.
+    #[test]
+    fn verknuepfung_texte() {
+        for l in all() {
+            assert!(l.get(DesktopShortcutCreated).contains("{n}"), "{}", l.code);
+            assert!(l.get(DesktopShortcutFailed).contains("{n}"), "{}", l.code);
+            let d = l.get(DesktopShortcutDescription);
+            assert!(d.contains("{n}") && d.contains("{m}"), "{}", l.code);
+            assert!(!l.get(TipDesktopShortcut).contains('{'), "{}", l.code);
+        }
+        for k in [DesktopShortcut, TipDesktopShortcut, DesktopShortcutCreated, DesktopShortcutFailed, DesktopShortcutDescription] {
+            assert_ne!(EN.get(k), DE.get(k), "{k:?}");
+        }
+        // Nicht mit den Tastenkombinationen verwechseln: im Reiter
+        // Verschluesselung stehen beide Woerter auf einem Bild. Keines darf
+        // das andere sein oder mit ihm beginnen ("Shortcut"/"Shortcuts").
+        for l in all() {
+            let (k, t) = (l.get(DesktopShortcut).to_lowercase(), l.get(TabShortcuts).to_lowercase());
+            assert!(!k.starts_with(&t) && !t.starts_with(&k), "{}: {k} / {t}", l.code);
+        }
+    }
 }
