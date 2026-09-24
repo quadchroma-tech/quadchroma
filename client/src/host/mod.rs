@@ -525,8 +525,15 @@ pub fn main_host(args: &[String]) -> i32 {
         return 9;
     }
     // Zwischenablage: was hier kopiert wird, geht zum Zuschauer (48 auf dem
-    // Bildkanal); was von dort kommt, legt der Eingabefaden ab.
-    crate::clipboard::watch(|text| netz::send_small(MSG_CLIP, text.as_bytes()));
+    // Bildkanal); was von dort kommt, legt der Eingabefaden ab. Kopierte
+    // Dateien meldet der Waechter schon, uebertragen werden sie noch nicht.
+    crate::clipboard::watch(|inhalt| match inhalt {
+        crate::clipboard::Inhalt::Text(text) => netz::send_small(MSG_CLIP, text.as_bytes()),
+        crate::clipboard::Inhalt::Dateien(pfade) => log(format!(
+            "Zwischenablage: {} Dateien kopiert - Uebertragung noch nicht angebunden",
+            pfade.len()
+        )),
+    });
     eingabe::start();
     // Ton: Abgriff nur mit Zuschauer; ohne Tongeraet steht der Grund einmal da.
     ton::start();
