@@ -1497,6 +1497,26 @@ static void sender_pruefen(void) {
            "Namen erst nach der Windows-Bereinigung doppelt (a./a_, \"b \"/b_, x:y/x_y, con.txt/_con.txt, q?/q_, oben t./t_): "
            "nur der erste, mit Protokollzeile");
 
+    // Ein uebersprungener Eintrag verbraucht den Schluessel nicht: Ist der
+    // erste eines Paars eine Verknuepfung bzw. eine FIFO, geht der zweite
+    // (gewoehnliche Datei) trotzdem hinaus - auch oben ("u." Verknuepfung,
+    // "u_" Datei).
+    mkdir(quelle(@"sk").fileSystemRepresentation, 0700);
+    symlink("/etc/hosts", quelle(@"sk/a.").fileSystemRepresentation);
+    schreiben(@"sk/a_", [@"A" dataUsingEncoding:NSUTF8StringEncoding]);
+    mkfifo(quelle(@"sk/x:y").fileSystemRepresentation, 0600);
+    schreiben(@"sk/x_y", [@"X" dataUsingEncoding:NSUTF8StringEncoding]);
+    symlink("/etc/hosts", quelle(@"u.").fileSystemRepresentation);
+    schreiben(@"u_", [@"U" dataUsingEncoding:NSUTF8StringEncoding]);
+    neu_aufzeichnen();
+    senden(@[ @"sk", @"u.", @"u_" ]);
+    qc_dateien_abwarten();
+    NSArray<NSString *> *skp = angebot_pfade(NULL);
+    printf("         (Angebot: %s)\n", [skp componentsJoinedByString:@" | "].UTF8String ?: "abgelehnt");
+    pruefe([skp isEqualToArray:(@[ @"sk", @"sk/a_", @"sk/x_y", @"u_" ])] && letzter_zustand() == QC_QUITT_FERTIG,
+           "uebersprungene Eintraege (Verknuepfung a., FIFO x:y, oben Verknuepfung u.) verbrauchen den Schluessel nicht: "
+           "a_, x_y und u_ kommen an");
+
     // Ein '\' vor einem kombinierenden Zeichen ist auch einer: der Name geht
     // nicht hinaus (die Gegenseite lehnte sonst das ganze Angebot ab), der
     // Rest kommt an.

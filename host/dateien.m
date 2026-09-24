@@ -1521,16 +1521,21 @@ static int auflisten(uint64_t gen, int dfd, NSString *oben, NSArray<NSData *> *k
         // Auf einem Volume mit Gross- und Kleinschreibung koennen "A" und "a"
         // nebeneinander liegen, ebenso "a." und "a_" oder "a\x01" und "a_";
         // die Gegenseite lehnte dann alles ab.
+        // Der Schluessel zaehlt erst, wenn der Eintrag wirklich in die Liste
+        // kam: Ein uebersprungener (Verknuepfung, besondere Datei, ungueltiger
+        // Name) verbraucht ihn nicht, sonst ginge ein spaeterer gewoehnlicher
+        // Name mit demselben Schluessel ("a." Verknuepfung, "a_" Datei) auch
+        // nicht hinaus.
         NSString *ks = sende_schluessel(kname);
-        if (![gesehen containsObject:ks]) {
-            [gesehen addObject:ks];
-        } else {
+        if ([gesehen containsObject:ks]) {
             zeile(@"Dateien: uebersprungen (Name nach Bereinigung oder bis auf Gross- und Kleinschreibung doppelt): %@",
                   [quelle stringByAppendingPathComponent:k]);
             continue;
         }
+        NSUInteger vorher = liste.count;
         r = auflisten(gen, fd, oben, [kette arrayByAddingObject:kind[1]], [quelle stringByAppendingPathComponent:k],
                       [rel stringByAppendingFormat:@"/%@", kname], kname, tiefe + 1, liste, gesamt);
+        if (liste.count > vorher) [gesehen addObject:ks];
         if (r <= 0) break;
     }
     close(fd);
@@ -1740,13 +1745,16 @@ static void senden_lauf(uint64_t gen, uint64_t sitzung, NSArray<NSString *> *pfa
         }
         // Dateien aus mehreren Ordnern koennen gleich heissen, auch erst nach
         // der Windows-Bereinigung ("t." und "t_"): nur die erste.
+        // Wie bei den Kindern: der Schluessel zaehlt erst, wenn der Eintrag
+        // wirklich in die Liste kam.
         NSString *ks = sende_schluessel(name);
         if ([oben containsObject:ks]) {
             zeile(@"Dateien: doppelter Name %@ - nur der erste wird gesendet", name);
             continue;
         }
-        [oben addObject:ks];
+        NSUInteger vorher = liste.count;
         r = auflisten(gen, -1, p, @[], p, name, name, 1, liste, &gesamt);
+        if (liste.count > vorher) [oben addObject:ks];
         if (r <= 0) break;
     }
     if (r < 0) return;
