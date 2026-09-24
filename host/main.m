@@ -36,6 +36,7 @@
 #include <time.h>
 #import "audio.h"
 #import "clipboard.h"
+#import "dateien.h"
 #import "zeiger.h"
 #import "testbild.h"
 #include "qc_secure.h"
@@ -311,6 +312,14 @@ static uint64_t g_stau_seit = 0;
 static int g_stau_rueckstand = 0;
 static uint64_t g_stau_gesendet = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
+static uint64_t g_in_kanal = 0;             // seine Nummer; unter g_send_mtx
+// Dateien (dateien.m): was der aktuelle Eingabekanal an Faehigkeiten gemeldet
+// hat (IN_FAEHIGKEITEN). Gilt nur fuer diese Sitzung und diesen Kanal - ein
+// neuer Zuschauer oder ein neuer Eingabekanal muss sie neu melden. Unter
+// g_send_mtx.
+static uint64_t g_faehig_sitzung = 0, g_faehig_kanal = 0;
+static uint32_t g_faehig_bits = 0;
+static char g_vid_ip[INET_ADDRSTRLEN] = {0};  // Adresse des Zuschauers, fuers Protokoll; unter g_send_mtx
 // Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
 // nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
 // Kopplungsfenster schluepfen.
@@ -544,6 +553,9 @@ static void eingabe_abbrechen(void) {
     g_sitzung++;
     int alt = atomic_exchange(&g_in_fd, -1);
     if (alt >= 0) shutdown(alt, SHUT_RDWR);
+    // Laufende Dateiuebertragungen gehoeren zur alten Sitzung: verwerfen.
+    // Reiht nur ein, blockiert nie.
+    qc_dateien_sitzung_vorbei(g_sitzung);
 }
 
 static int backlog_bytes(int fd) {
@@ -572,6 +584,25 @@ static int ton_verwerfen(int fd) {
     return jetzt - g_ton_stau_seit >= QC_STAU_FRIST_US;
 }
 
+// Eine kleine Nachricht an den eingetragenen Zuschauer fd. Nur unter
+// g_send_mtx. 0 = gesendet; sonst ist er jetzt ausgetragen.
+static int klein_senden_gesperrt(int fd, uint8_t type, const void *data, size_t len) {
+    qc_hdr h = { .type = type, .flags = 0, .reserved = 0, .len = (uint32_t)len };
+    struct iovec iov[2];
+    iov[0].iov_base = &h;   iov[0].iov_len = sizeof h;
+    iov[1].iov_base = (void *)data; iov[1].iov_len = len;
+    if (qc_chan_send(g_vid, iov, len ? 2 : 1) == 0) return 0;
+    logf_(@"Zuschauer weg: Senden gescheitert (%s)", strerror(errno));
+    atomic_store(&g_vid_ready, 0);
+    atomic_store(&g_client_fd, -1);
+    close(fd);
+    eingabe_abbrechen();
+    qc_chan_free(g_vid);
+    g_vid = NULL;
+    stream_herunterfahren_anstossen();
+    return -1;
+}
+
 // Kleine Nachricht ueber die Bildverbindung. Umgeht bewusst die Vollbild-Sperre
 // und die Stauregel: Ton und Zwischenablage sind winzig und duerfen nicht warten.
 // ton: Ton, der im Dauerstau wegfaellt (ton_verwerfen). Rueckgabe 1 = deshalb
@@ -583,20 +614,7 @@ static int send_small_bis(uint8_t type, const void *data, size_t len, int ton) {
     if (fd >= 0 && atomic_load(&g_vid_ready) && ton && ton_verwerfen(fd)) {
         verworfen = 1;
     } else if (fd >= 0 && atomic_load(&g_vid_ready)) {
-        qc_hdr h = { .type = type, .flags = 0, .reserved = 0, .len = (uint32_t)len };
-        struct iovec iov[2];
-        iov[0].iov_base = &h;   iov[0].iov_len = sizeof h;
-        iov[1].iov_base = (void *)data; iov[1].iov_len = len;
-        if (qc_chan_send(g_vid, iov, len ? 2 : 1) != 0) {
-            logf_(@"Zuschauer weg: Senden gescheitert (%s)", strerror(errno));
-            atomic_store(&g_vid_ready, 0);
-            atomic_store(&g_client_fd, -1);
-            close(fd);
-            eingabe_abbrechen();
-            qc_chan_free(g_vid);
-            g_vid = NULL;
-            stream_herunterfahren_anstossen();
-        }
+        (void)klein_senden_gesperrt(fd, type, data, len);
     }
     pthread_mutex_unlock(&g_send_mtx);
     return verworfen;
@@ -604,6 +622,33 @@ static int send_small_bis(uint8_t type, const void *data, size_t len, int ton) {
 
 static void send_small(uint8_t type, const void *data, size_t len) {
     (void)send_small_bis(type, data, len, 0);
+}
+
+// Wie send_small, aber an eine Sitzung gebunden: nach einem Zuschauerwechsel
+// geht nichts mehr hinaus - Quittungen und Dateistuecke gehoeren nur zu dem
+// Zuschauer, mit dem die Uebertragung begann. Jeder Aufruf haelt g_send_mtx
+// nur fuer diese eine Nachricht (ein Dateistueck: hoechstens 48 KiB).
+// 1 = gesendet, 0 = die Sitzung ist vorbei.
+static int send_small_sitzung(uint64_t sitzung, uint8_t type, const void *data, size_t len) {
+    int gesendet = 0;
+    pthread_mutex_lock(&g_send_mtx);
+    int fd = atomic_load(&g_client_fd);
+    if (sitzung == g_sitzung && fd >= 0 && atomic_load(&g_vid_ready) && g_vid)
+        gesendet = klein_senden_gesperrt(fd, type, data, len) == 0;
+    pthread_mutex_unlock(&g_send_mtx);
+    return gesendet;
+}
+
+// Ungesendete Bytes im Sendepuffer des Zuschauers dieser Sitzung; -1 = die
+// Sitzung ist vorbei. Der Dateisender drosselt sich damit selbst: Dateidaten
+// zaehlen in SO_NWRITE mit und loesten sonst die Stauregel fuer Bilder aus.
+static int rueckstand_sitzung(uint64_t sitzung) {
+    int r = -1;
+    pthread_mutex_lock(&g_send_mtx);
+    int fd = atomic_load(&g_client_fd);
+    if (sitzung == g_sitzung && fd >= 0 && atomic_load(&g_vid_ready)) r = backlog_bytes(fd);
+    pthread_mutex_unlock(&g_send_mtx);
+    return r;
 }
 
 #define QC_MSG_SETTINGS   3    // Host -> Client: was gerade gilt
@@ -674,7 +719,86 @@ static void audio_cb(const float *pcm, size_t frames, uint32_t rate, uint8_t cha
 }
 
 static void clip_cb(const char *utf8, size_t len) {
+    // Neuer Inhalt in der Ablage: eine laufende Dateisendung ist ueberholt.
+    qc_senden_abbrechen();
     send_small(QC_MSG_CLIP, utf8, len);
+}
+
+// ----------------------------------------------------------------- Dateien
+// Dateien ueber die Zwischenablage (dateien.m). Hier nur die Bindung an
+// Sitzung und Leitung.
+
+// Hat der aktuelle Eingabekanal dieser Sitzung FAEHIG_DATEIEN gemeldet?
+// Nur unter g_send_mtx.
+static int dateien_faehig_gesperrt(void) {
+    return (g_faehig_bits & QC_FAEHIG_DATEIEN) && g_faehig_sitzung == g_sitzung &&
+           g_faehig_kanal == g_in_kanal && atomic_load(&g_in_fd) >= 0;
+}
+
+static int dateien_spielmodus(void) { return atomic_load(&g_cur_gaming); }
+
+static void dateien_log(const char *zeile) { logf_(@"%s", zeile); }
+
+static void dateien_einrichten(void) {
+    static const qc_dateien_wege wege = { send_small_sitzung, rueckstand_sitzung, dateien_spielmodus, dateien_log };
+    qc_dateien_einrichten(&wege);
+}
+
+// Fuer welche Sitzung "aelterer Client" schon im Protokoll steht (einmal je
+// Sitzung). Nur auf der Warteschlange der Ablage.
+static uint64_t g_dateien_alt_gemeldet = UINT64_MAX;
+
+// Der Nutzer hat am Mac Dateien kopiert (Warteschlange der Ablage, nur mit
+// Zuschauer gelesen). Gesendet wird nur an einen Zuschauer, dessen aktueller
+// Eingabekanal Dateien kann - ein aelterer Client wuerde sonst Nachrichten
+// bekommen, die er nicht kennt, und ohne Quittungen liefe nichts.
+static void clip_dateien_cb(NSArray<NSString *> *pfade) {
+    char ip[INET_ADDRSTRLEN];
+    pthread_mutex_lock(&g_send_mtx);
+    uint64_t sitzung = g_sitzung;
+    int da = atomic_load(&g_client_fd) >= 0 && atomic_load(&g_vid_ready);
+    int faehig = da && dateien_faehig_gesperrt();
+    memcpy(ip, g_vid_ip, sizeof ip);
+    pthread_mutex_unlock(&g_send_mtx);
+    if (!faehig) {
+        // Neuer Inhalt: eine laufende Sendung ist auch dann ueberholt.
+        qc_senden_abbrechen();
+        if (da && g_dateien_alt_gemeldet != sitzung) {
+            g_dateien_alt_gemeldet = sitzung;
+            logf_(@"Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)");
+        }
+        return;
+    }
+    qc_senden_starten(sitzung, pfade, @(ip));
+}
+
+// Eine Nachricht 50-53 oder 69 vom Eingabekanal `kanal` der Sitzung
+// `sitzung`, schon ganz gelesen. Hier geschieht keine Plattenarbeit: der
+// Empfaenger reiht nur ein, die Quittung setzt nur Zahlen.
+static void dateien_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSData *nutzlast) {
+    switch (typ) {
+        case QC_IN_FAEHIGKEITEN: {
+            uint32_t bits = 0;
+            if (qc_datei_faehigkeiten_lesen(nutzlast.bytes, nutzlast.length, &bits) != 0) break;
+            pthread_mutex_lock(&g_send_mtx);
+            int gilt = sitzung == g_sitzung && kanal == g_in_kanal;
+            if (gilt) {
+                g_faehig_sitzung = sitzung;
+                g_faehig_kanal = kanal;
+                g_faehig_bits = bits;
+            }
+            pthread_mutex_unlock(&g_send_mtx);
+            if (gilt) logf_(@"Eingabekanal: Client meldet Faehigkeiten %08x%s", bits,
+                            (bits & QC_FAEHIG_DATEIEN) ? " (Dateien)" : "");
+            break;
+        }
+        case QC_DATEI_QUITTUNG:
+            qc_senden_quittung(sitzung, nutzlast.bytes, nutzlast.length);
+            break;
+        default:
+            qc_empfang_nachricht(sitzung, kanal, typ, nutzlast);
+            break;
+    }
 }
 
 // Zeigerform: Kopf und Bild in einem Stueck, damit send_small sie unter einem
@@ -910,6 +1034,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         // der Neue faengt mit dem Bildschirm an. Den Schalter schon hier, damit
         // der Takt ihm keinen Balken mehr schickt; Aufraeumen auf g_capq unten.
         testbild_aus = atomic_exchange(&g_testbild, 0);
+        strlcpy(g_vid_ip, ip, sizeof g_vid_ip);
         atomic_store(&g_client_fd, fd);
         atomic_store(&g_vid_ready, 1);
     } else {
@@ -950,6 +1075,11 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         send_small(QC_MSG_SETTINGS, cur, sizeof cur);
     }
     codecs_senden();
+    // Was dieser Host kann: Dateien (Fassung 1). Aeltere Clients uebergehen Typ 11.
+    {
+        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN);
+        send_small(QC_MSG_FAEHIGKEITEN, f.bytes, f.length);
+    }
     logf_(@"Zuschauer verbunden: %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
           ip, ntohs(peer.sin_port), fp, sas);
 }
@@ -1038,6 +1168,7 @@ static void start_beacon(int port) {
 //   16 MAUS_BEWEGUNG : f32 x, f32 y            (0..1, Anteil der Bildbreite/-hoehe)
 //   17 MAUS_TASTE    : u8 taste, u8 gedrueckt, u16 frei, f32 x, f32 y
 //   18 RAD           : f32 dx, f32 dy          (Pixel)
+//   50-53, 69        : Dateien und Faehigkeiten (dateien.h), eigene Obergrenzen
 #define QC_IN_MOVE    16
 #define QC_IN_BUTTON  17
 #define QC_IN_SCROLL  18
@@ -1345,6 +1476,7 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
     BOOL aktuell = sitzung == g_sitzung && atomic_load(&g_vid_ready);
     if (aktuell) {
         kanal = ++kanaele;
+        g_in_kanal = kanal;             // seine Faehigkeiten meldet er gleich selbst
         int alt = atomic_exchange(&g_in_fd, fd);
         if (alt >= 0) shutdown(alt, SHUT_RDWR);
     }
@@ -1371,6 +1503,30 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
             // Die Ablage kann Geheimes tragen: nichts davon bleibt im Speicher liegen.
             if (big) { qc_wipe(big, h.len + 1); free(big); }
             if (!ok) break;
+            continue;
+        }
+        size_t grenze = qc_datei_grenze(h.type);
+        if (grenze) {
+            // Dateien und Faehigkeiten (50-53, 69): eigene Obergrenzen, vor
+            // der 256-Byte-Regel - wer darueber liegt, verliert den Kanal wie
+            // bisher. Gelesen wird hier, ausserhalb aller Sperren; auf die
+            // Platte schreibt die Warteschlange "dateien-empfang", nie dieser
+            // Faden, damit Maus und Tastatur nicht auf die Platte warten.
+            if (h.len > grenze) break;
+            uint8_t *d = malloc(h.len ? h.len : 1);
+            BOOL ok = d && (!h.len || qc_chan_read(in, d, h.len) == 0);
+            // Abgeloest: gehoert nicht mehr zu dieser Sitzung.
+            if (ok && atomic_load(&g_in_fd) != fd) ok = NO;
+            if (!ok) {
+                if (d) { qc_wipe(d, h.len); free(d); }
+                break;
+            }
+            @autoreleasepool {
+                // Dateiinhalte bleiben so wenig im Speicher liegen wie die Ablage.
+                NSData *nutzlast = [[NSData alloc] initWithBytesNoCopy:d length:h.len
+                                                           deallocator:^(void *b, NSUInteger l) { qc_wipe(b, l); free(b); }];
+                dateien_nachricht(sitzung, kanal, h.type, nutzlast);
+            }
             continue;
         }
         if (h.len > sizeof payload) break;
@@ -1450,6 +1606,8 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
         }
     }
     logf_(@"Eingabekanal getrennt");
+    // Eine Uebertragung, die ueber diesen Kanal kam, bekommt keine Stuecke mehr.
+    qc_empfang_kanal_weg(sitzung, kanal);
     // Austragen und schliessen unter derselben Sperre wie das Abbrechen:
     // so kann eingabe_abbrechen nie eine schon neu vergebene Nummer treffen.
     pthread_mutex_lock(&g_send_mtx);
@@ -2927,6 +3085,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     if (srvIdx != NSNotFound) {
         // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
+        // Dateien: empfangene gehen als Dateiliste in die Ablage; Reste
+        // frueherer Laeufe, aelter als 24 h, raeumt die Empfangswarteschlange weg.
+        dateien_einrichten();
+        qc_dateien_fertig_setzen(qc_clip_set_dateien);
+        qc_dateien_aufraeumen_beim_start();
+        qc_clip_dateien(clip_dateien_cb);
         qc_clip_bedingung(zeiger_aktiv);   // Inhalt nur mit Zuschauer lesen
         qc_clip_start(clip_cb);
         qc_zeiger_start(zeiger_cb, zeiger_aktiv, zeiger_log);

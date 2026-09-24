@@ -6,15 +6,18 @@
 // wiederholt gestempelt, im Stau ohne Taktversuche), Abschluss eines
 // Codecwechsels ohne Zuschauer, Codecwechsel mit anderem Aufnahmeformat bei
 // stillem Bildschirm (Umrechnung des letzten Bildes), --fest beim Start,
-// Stauregel samt Ton im Stau, Ansage des Tonformats, Koennensliste (AV1).
+// Stauregel samt Ton im Stau, Ansage des Tonformats, Koennensliste (AV1),
+// Dateien ueber die Zwischenablage (Faehigkeiten, beide Richtungen ueber echte
+// Kanaele, Fenster, Zuschauerwechsel mitten in der Uebertragung, aelterer
+// Client ohne IN_FAEHIGKEITEN).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
 //         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
 //         -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
 //         host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
-//         host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c \
-//         -o /tmp/hosttest
+//         host/dateien.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+//         host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 //   /tmp/hosttest
 //
 // main.m wird hier eingebunden; sein main heisst dann host_main und laeuft
@@ -32,6 +35,9 @@
 // Hosts, nur der Encoder ist nachgebildet (liefert sofort, nichts im Flug).
 // Nachreichen und Codecwechsel nehmen einen echten, kleinen Encoder (HEVC
 // 4:2:0, 640x360, wenige Bilder); die Aufnahme ist dort eine Attrappe.
+// Dateien: die Ablagebasis liegt im eigenen HOME, und statt
+// qc_clip_set_dateien bekommt ein Rekorder die fertigen Pfade - die
+// Zwischenablage des Nutzers bleibt unberuehrt.
 // Dauer rund 80 s. Rueckgabe: Zahl der Fehler.
 
 #define main host_main
@@ -1654,6 +1660,425 @@ static void fest_pruefen(void) {
     pruefe(mit && mit2, "mit --fest oder --fixed ist sie an");
 }
 
+
+// ------------------------------------------- Dateien ueber die Zwischenablage
+
+// Statt qc_clip_set_dateien: was in die Ablage gelegt wuerde.
+static NSMutableArray<NSArray<NSString *> *> *g_rekorder;
+
+static void rekorder(NSArray<NSString *> *pfade) {
+    @synchronized (g_rekorder) { [g_rekorder addObject:pfade]; }
+}
+
+static NSUInteger rekorder_anzahl(void) {
+    @synchronized (g_rekorder) { return g_rekorder.count; }
+}
+
+// Eingabekanal wie der Client: Handschlag mit dem Prologue des Eingabekanals
+// und der Pruefsumme des Bildkanals. tx bekommt den Sendeschluessel.
+static int eingabe_verbinden(int port, const uint8_t priv[32], const uint8_t hh[QC_HASHLEN], qc_cipher *tx) {
+    int c = verbinden(port);
+    if (c < 0) return -1;
+    uint8_t pro[256];
+    size_t pl = strlen(QC_PRO_INPUT);
+    memcpy(pro, QC_PRO_INPUT, pl);
+    memcpy(pro + pl, hh, QC_HASHLEN);
+    pl += QC_HASHLEN;
+    qc_handshake hs;
+    qc_handshake_init(&hs, 1, priv, pro, pl);
+    uint8_t msg[8192], nutz[8192];
+    size_t ml = 0, nl = 0;
+    if (qc_handshake_write(&hs, NULL, 0, msg, &ml) || rahmen_schreiben(c, msg, ml) ||
+        rahmen_lesen(c, msg, sizeof msg, &ml) || qc_handshake_read(&hs, msg, ml, nutz, &nl) ||
+        qc_handshake_write(&hs, NULL, 0, msg, &ml) || rahmen_schreiben(c, msg, ml)) {
+        close(c);
+        return -1;
+    }
+    qc_cipher empfang;
+    qc_handshake_split(&hs, tx, &empfang);
+    return c;
+}
+
+// Eine Nachricht auf dem Eingabekanal, verschluesselt in Datensaetzen wie qc_chan_send.
+static int ein_senden(int fd, qc_cipher *tx, uint8_t typ, const void *p, size_t n) {
+    size_t gesamt = sizeof(qc_hdr) + n;
+    uint8_t *klar = malloc(gesamt);
+    qc_hdr h = { .type = typ, .flags = 0, .reserved = 0, .len = (uint32_t)n };
+    memcpy(klar, &h, sizeof h);
+    if (n) memcpy(klar + sizeof h, p, n);
+    static uint8_t ct[QC_CHUNK_MAX + QC_TAGLEN];
+    int r = 0;
+    for (size_t o = 0; o < gesamt && !r;) {
+        size_t w = gesamt - o < QC_CHUNK_MAX ? gesamt - o : QC_CHUNK_MAX;
+        size_t cl = 0;
+        r = qc_encrypt(tx, klar + o, w, ct, &cl) ? -1 : rahmen_schreiben(fd, ct, cl);
+        o += w;
+    }
+    free(klar);
+    return r;
+}
+
+static int ein_daten(int fd, qc_cipher *tx, uint8_t typ, NSData *d) { return ein_senden(fd, tx, typ, d.bytes, d.length); }
+
+// Wie nachricht, aber mit der ganzen Nutzlast.
+static int nachricht_ganz(leser *l, qc_hdr *h, NSData **nutzlast, int frist_ms) {
+    for (;;) {
+        if (l->len >= sizeof *h) {
+            memcpy(h, l->buf, sizeof *h);
+            if (l->len >= sizeof *h + h->len) {
+                *nutzlast = [NSData dataWithBytes:l->buf + sizeof *h length:h->len];
+                size_t weg = sizeof *h + h->len;
+                memmove(l->buf, l->buf + weg, l->len - weg);
+                l->len -= weg;
+                return 1;
+            }
+        }
+        int r = datensatz(l, frist_ms);
+        if (r != 1) return r;
+    }
+}
+
+// Liest bis zur naechsten Quittung (andere Nachrichten werden uebergangen).
+// 1 = gelesen, sonst wie nachricht.
+static int quittung_lesen(leser *l, uint8_t *zustand, uint64_t *empfangen, int frist_ms) {
+    qc_hdr h;
+    NSData *d = nil;
+    int r;
+    while ((r = nachricht_ganz(l, &h, &d, frist_ms)) == 1) {
+        uint32_t k;
+        if (h.type == QC_DATEI_QUITTUNG && qc_datei_quittung_lesen(d.bytes, d.length, &k, zustand, empfangen) == 0) return 1;
+    }
+    return r;
+}
+
+static int faehig_jetzt(void) {
+    pthread_mutex_lock(&g_send_mtx);
+    int f = dateien_faehig_gesperrt();
+    pthread_mutex_unlock(&g_send_mtx);
+    return f;
+}
+
+static int warten_bis(int (*bedingung)(void), double sekunden) {
+    double t0 = sek();
+    while (!bedingung() && sek() - t0 < sekunden) usleep(10 * 1000);
+    return bedingung();
+}
+
+static int eingabe_steht(void) { return atomic_load(&g_in_fd) >= 0; }
+static int empfang_ruht(void) { return qc_empfang_ordner() == nil; }
+static int sender_ruht(void) { return !qc_senden_laeuft(); }
+
+// Ein Zuschauer mit Bild- und Eingabekanal ueber die echte Annahme.
+typedef struct { int bild, ein; leser l; qc_cipher tx; uint8_t hh[QC_HASHLEN]; char folge[64]; } schein;
+
+static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_t priv[32]) {
+    memset(s, 0, sizeof *s);
+    strom_attrappe_setzen();
+    qc_cipher rx;
+    s->bild = client_verbinden(bild_port, priv, &rx, s->hh);
+    s->ein = -1;
+    if (s->bild < 0) return -1;
+    leser_init(&s->l, s->bild, 0);
+    s->l.rx = rx;
+    char magic[4];
+    if (klartext(&s->l, magic, 4, 2000) != 1) return -1;
+    // Was nach der Begruessung kommt, bis einschliesslich der Faehigkeiten.
+    qc_hdr h;
+    NSData *d = nil;
+    size_t n = 0;
+    while (nachricht_ganz(&s->l, &h, &d, 1000) == 1 && n + 4 < sizeof s->folge) {
+        n += (size_t)snprintf(s->folge + n, sizeof s->folge - n, "%s%d", n ? " " : "", h.type);
+        if (h.type == QC_MSG_FAEHIGKEITEN) {
+            uint32_t bits = 0;
+            if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 || bits != 1) return -1;
+            break;
+        }
+    }
+    s->ein = eingabe_verbinden(ein_port, priv, s->hh, &s->tx);
+    if (s->ein < 0 || !warten_bis(eingabe_steht, 2)) return -1;
+    return 0;
+}
+
+static void schein_schliessen(schein *s) {
+    if (s->ein >= 0) close(s->ein);
+    if (s->bild >= 0) close(s->bild);
+    free(s->l.buf);
+    memset(s, 0, sizeof *s);
+}
+
+static NSData *zufall(size_t n) {
+    NSMutableData *d = [NSMutableData dataWithLength:n];
+    arc4random_buf(d.mutableBytes, n);
+    return d;
+}
+
+// Client -> Host: Angebot wie in dateitest, mit Ordnern, einer leeren Datei
+// und einer Datei ueber mehrere Stuecke.
+static NSArray *g_inhalte;
+static NSData *beispiel_angebot(uint32_t kennung) {
+    g_inhalte = @[ [NSNull null], [@"hallo" dataUsingEncoding:NSUTF8StringEncoding], [NSData data], zufall(150000),
+                   [NSNull null], [@"abc" dataUsingEncoding:NSUTF8StringEncoding] ];
+    return qc_datei_angebot_kodieren(kennung, @[ [QCDateiEintrag art:1 groesse:0 pfad:@"Bilder"],
+                                                 [QCDateiEintrag art:0 groesse:5 pfad:@"Bilder/a.txt"],
+                                                 [QCDateiEintrag art:0 groesse:0 pfad:@"b.bin"],
+                                                 [QCDateiEintrag art:0 groesse:150000 pfad:@"gross.bin"],
+                                                 [QCDateiEintrag art:1 groesse:0 pfad:@"Bilder/sub"],
+                                                 [QCDateiEintrag art:0 groesse:3 pfad:@"Bilder/sub/c.txt"] ]);
+}
+
+// Die Stuecke des Beispiels, hoechstens `bis` Stueck (0 = alle).
+static int beispiel_stuecke(schein *s, uint32_t kennung, int bis) {
+    int n = 0;
+    for (NSUInteger i = 0; i < g_inhalte.count; i++) {
+        if (g_inhalte[i] == [NSNull null]) continue;
+        NSData *d = g_inhalte[i];
+        for (NSUInteger o = 0; o < d.length; o += QC_DATEI_STUECK_MAX) {
+            if (bis && n >= bis) return 0;
+            NSUInteger m = d.length - o < QC_DATEI_STUECK_MAX ? d.length - o : QC_DATEI_STUECK_MAX;
+            NSData *st = qc_datei_stueck_kodieren(kennung, (uint32_t)i, o, (const uint8_t *)d.bytes + o, m);
+            if (ein_daten(s->ein, &s->tx, QC_DATEI_STUECK, st)) return -1;
+            n++;
+        }
+    }
+    return 0;
+}
+
+// Host -> Client, wie ein Client mit Empfaenger: liest Angebot und Stuecke,
+// quittiert je 64 KiB, am Ende mit 1. zurueckhalten: die ersten Stuecke erst
+// quittieren, wenn 300 ms nichts mehr kommt (so zeigt sich das Fenster).
+// *stoss = so viel kam vor der ersten Quittung; *unterwegs = hoechstens
+// unquittiert. Rueckgabe: Inhalte je Eintrag (nil bei Fehler), *ende = Grund.
+static NSMutableDictionary<NSNumber *, NSMutableData *> *client_empfangen(schein *s, BOOL zurueckhalten, uint64_t *stoss,
+                                                                          uint64_t *unterwegs, int *ende, NSArray **pfade) {
+    NSMutableDictionary<NSNumber *, NSMutableData *> *inhalt = [NSMutableDictionary dictionary];
+    uint32_t kennung = 0;
+    uint64_t erhalten = 0, quittiert = 0;
+    BOOL erste = zurueckhalten;
+    *stoss = 0; *unterwegs = 0; *ende = -1;
+    for (;;) {
+        qc_hdr h;
+        NSData *d = nil;
+        int r = nachricht_ganz(&s->l, &h, &d, erste && kennung ? 300 : 3000);
+        if (r != 1) {
+            if (!(erste && kennung)) return nil;
+            // Nichts mehr ohne Quittung: das Fenster ist ausgeschoepft.
+            erste = NO;
+            *stoss = erhalten;
+            quittiert = erhalten;
+            ein_daten(s->ein, &s->tx, QC_DATEI_QUITTUNG, qc_datei_quittung_kodieren(kennung, 0, erhalten));
+            continue;
+        }
+        if (h.type == QC_DATEI_ANGEBOT) {
+            NSArray<QCDateiEintrag *> *e = nil;
+            uint64_t g;
+            if (qc_datei_angebot_lesen(d.bytes, d.length, &kennung, &g, &e, NULL) != 0) return nil;
+            NSMutableArray *p = [NSMutableArray array];
+            for (QCDateiEintrag *x in e) [p addObject:[x.teile componentsJoinedByString:@"/"]];
+            if (pfade) *pfade = p;
+            if (!erste) ein_daten(s->ein, &s->tx, QC_DATEI_QUITTUNG, qc_datei_quittung_kodieren(kennung, 0, 0));
+        } else if (h.type == QC_DATEI_STUECK) {
+            uint32_t k, e; uint64_t v; const uint8_t *p; size_t n;
+            if (qc_datei_stueck_lesen(d.bytes, d.length, &k, &e, &v, &p, &n) != 0 || k != kennung) return nil;
+            NSMutableData *m = inhalt[@(e)] ?: (inhalt[@(e)] = [NSMutableData data]);
+            if (m.length != v) return nil;
+            [m appendBytes:p length:n];
+            erhalten += n;
+            if (erhalten - quittiert > *unterwegs) *unterwegs = erhalten - quittiert;
+            if (!erste && erhalten - quittiert >= QC_DATEI_QUITTUNG_ALLE) {
+                quittiert = erhalten;
+                ein_daten(s->ein, &s->tx, QC_DATEI_QUITTUNG, qc_datei_quittung_kodieren(kennung, 0, erhalten));
+            }
+        } else if (h.type == QC_DATEI_ENDE) {
+            uint32_t k; uint8_t g;
+            if (qc_datei_ende_lesen(d.bytes, d.length, &k, &g) != 0 || k != kennung) return nil;
+            *ende = g;
+            if (g == 0) ein_daten(s->ein, &s->tx, QC_DATEI_QUITTUNG, qc_datei_quittung_kodieren(kennung, 1, erhalten));
+            return inhalt;
+        }
+    }
+}
+
+// Alle Nachrichten der naechsten frist_ms: wie viele davon Dateien (50-52).
+static int datei_nachrichten(schein *s, int frist_ms) {
+    int n = 0;
+    qc_hdr h;
+    NSData *d;
+    while (nachricht_ganz(&s->l, &h, &d, frist_ms) == 1)
+        if (h.type == QC_DATEI_ANGEBOT || h.type == QC_DATEI_STUECK || h.type == QC_DATEI_ENDE) n++;
+    return n;
+}
+
+static void dateien_pruefen(int bild_port, int ein_port) {
+    printf("\n-- Dateien: Faehigkeiten\n");
+    static char pfad[1100];                 // g_log_pfad zeigt danach noch hierher
+    snprintf(pfad, sizeof pfad, "%s/dateien.log", g_home);
+    g_log_pfad = pfad;
+    pthread_mutex_lock(&g_log_mtx);
+    log_oeffnen("w");
+    pthread_mutex_unlock(&g_log_mtx);
+    g_rekorder = [NSMutableArray array];
+    dateien_einrichten();
+    NSString *home = @(g_home);
+    qc_dateien_basis_setzen([home stringByAppendingPathComponent:@"ablage"]);
+    qc_dateien_fertig_setzen(rekorder);
+    atomic_store(&g_cur_gaming, 0);
+
+    uint8_t f_priv[32], f_pub[32], g_priv[32], g_pub[32];
+    qc_keypair(f_priv, f_pub);
+    qc_keypair(g_priv, g_pub);
+    qc_authorize(f_pub, "hosttest F");
+    qc_authorize(g_pub, "hosttest G");
+    schein F, G;
+    stdout_stumm(1);
+    int ok = schein_verbinden(&F, bild_port, ein_port, f_priv) == 0;
+    int vorher = faehig_jetzt();
+    NSData *eins = qc_datei_faehigkeiten_kodieren(1);
+    ein_daten(F.ein, &F.tx, QC_IN_FAEHIGKEITEN, eins);
+    int nachher = warten_bis(faehig_jetzt, 1);
+    stdout_stumm(0);
+    printf("         (nach der Begruessung: %s)\n", F.folge);
+    pruefe(ok && strstr(F.folge, "3 8 11"), "MSG_FAEHIGKEITEN (11) mit Bit 0 kommt nach Einstellungen und Codecliste");
+    pruefe(!vorher && nachher, "IN_FAEHIGKEITEN wird fuer diese Sitzung und diesen Eingabekanal gemerkt");
+
+    printf("\n-- Dateien: Client -> Host ueber die echten Kanaele\n");
+    stdout_stumm(1);
+    ein_daten(F.ein, &F.tx, QC_DATEI_ANGEBOT, beispiel_angebot(77));
+    uint8_t z = 9; uint64_t em = 9;
+    int q0 = quittung_lesen(&F.l, &z, &em, 2000) == 1 && z == 0 && em == 0;
+    NSMutableString *folge = [NSMutableString string];
+    beispiel_stuecke(&F, 77, 0);
+    ein_daten(F.ein, &F.tx, QC_DATEI_ENDE, qc_datei_ende_kodieren(77, 0));
+    while (quittung_lesen(&F.l, &z, &em, 3000) == 1) {
+        [folge appendFormat:@"%s%u/%llu", folge.length ? " " : "", z, em];
+        if (z) break;
+    }
+    qc_dateien_abwarten();                  // die Protokollzeile des Empfaengers ist geschrieben
+    stdout_stumm(0);
+    printf("         (Quittungen auf dem Bildkanal nach 0/0: %s)\n", folge.UTF8String);
+    pruefe(q0 && [folge isEqualToString:@"0/98309 1/150008"],
+           "Quittungen kommen auf dem Bildkanal: sofort 0/0, je 64 KiB, am Ende 1 mit allen Bytes");
+    NSArray<NSString *> *liste = nil;
+    @synchronized (g_rekorder) { liste = g_rekorder.lastObject; }
+    NSString *wurzel = liste.firstObject.stringByDeletingLastPathComponent;
+    BOOL bytes = liste.count == 3 && [liste[0].lastPathComponent isEqualToString:@"Bilder"] &&
+                 [liste[1].lastPathComponent isEqualToString:@"b.bin"] && [liste[2].lastPathComponent isEqualToString:@"gross.bin"] &&
+                 [[NSData dataWithContentsOfFile:[wurzel stringByAppendingPathComponent:@"Bilder/a.txt"]] isEqualToData:g_inhalte[1]] &&
+                 [[NSData dataWithContentsOfFile:[wurzel stringByAppendingPathComponent:@"gross.bin"]] isEqualToData:g_inhalte[3]] &&
+                 [[NSData dataWithContentsOfFile:[wurzel stringByAppendingPathComponent:@"Bilder/sub/c.txt"]] isEqualToData:g_inhalte[5]];
+    pruefe(rekorder_anzahl() == 1 && bytes && [wurzel hasPrefix:[home stringByAppendingPathComponent:@"ablage/"]],
+           "der Rekorder (statt der Ablage) bekommt die obersten Pfade, die Bytes stimmen");
+    pruefe(zeilen_mit(pfad, "Dateien: empfangen 6 Eintraege, 0,2 MB - in die Ablage gelegt") == 1, "Protokollzeile im Host-Protokoll");
+
+    // Ein Stueck ausser der Reihe: Quittung 4, der Kanal bleibt (Zeitabgleich geht).
+    stdout_stumm(1);
+    ein_daten(F.ein, &F.tx, QC_DATEI_ANGEBOT, beispiel_angebot(78));
+    int q78 = quittung_lesen(&F.l, &z, &em, 2000) == 1 && z == 0;
+    ein_daten(F.ein, &F.tx, QC_DATEI_STUECK, qc_datei_stueck_kodieren(78, 3, 0, "xyz", 3));
+    int q4 = quittung_lesen(&F.l, &z, &em, 2000) == 1 && z == QC_QUITT_UNGUELTIG;
+    uint64_t t_client = 4242;
+    ein_senden(F.ein, &F.tx, QC_IN_TIME, &t_client, 8);
+    qc_hdr h;
+    NSData *d = nil;
+    int zeit = 0;
+    while (!zeit && nachricht_ganz(&F.l, &h, &d, 2000) == 1) zeit = h.type == QC_MSG_TIME;
+    stdout_stumm(0);
+    pruefe(q78 && q4 && zeit && warten_bis(empfang_ruht, 1), "Stueck ausser der Reihe: Quittung 4, der Eingabekanal bleibt bestehen");
+
+    printf("\n-- Dateien: Host -> Client (Fenster)\n");
+    NSString *q = [home stringByAppendingPathComponent:@"quelle"];
+    NSData *x_bin = zufall(600000), *y_bin = zufall(200000);
+    [[NSFileManager defaultManager] createDirectoryAtPath:[q stringByAppendingPathComponent:@"Q"] withIntermediateDirectories:YES
+                                               attributes:nil error:nil];
+    [x_bin writeToFile:[q stringByAppendingPathComponent:@"Q/x.bin"] atomically:NO];
+    [[NSData data] writeToFile:[q stringByAppendingPathComponent:@"Q/leer.txt"] atomically:NO];
+    [[@"12345" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[q stringByAppendingPathComponent:@"einzeln.txt"] atomically:NO];
+    [y_bin writeToFile:[q stringByAppendingPathComponent:@"y.bin"] atomically:NO];
+    uint64_t stoss = 0, unterwegs = 0;
+    int ende = -1;
+    NSArray *pfade = nil;
+    stdout_stumm(1);
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"Q"], [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
+    NSDictionary<NSNumber *, NSData *> *inhalt = client_empfangen(&F, YES, &stoss, &unterwegs, &ende, &pfade);
+    qc_dateien_abwarten();
+    stdout_stumm(0);
+    printf("         (Angebot: %s; vor der ersten Quittung %llu Byte, hoechstens %llu unquittiert)\n",
+           [pfade componentsJoinedByString:@", "].UTF8String, stoss, unterwegs);
+    pruefe([pfade isEqualToArray:(@[ @"Q", @"Q/leer.txt", @"Q/x.bin", @"einzeln.txt" ])] && ende == 0 &&
+           [inhalt[@2] isEqualToData:x_bin] && [inhalt[@3] isEqualToData:[@"12345" dataUsingEncoding:NSUTF8StringEncoding]] &&
+           !inhalt[@1],
+           "Dateiliste in den Sender: Angebot, Stuecke und ENDE kommen beim Scheinclient an, die Bytes stimmen");
+    pruefe(stoss == QC_DATEI_FENSTER && unterwegs <= QC_DATEI_FENSTER, "das Fenster wird eingehalten (256 KiB ohne Quittung, nie mehr)");
+    pruefe(zeilen_mit(pfad, "Dateien: sende 4 Eintraege, 0,6 MB an 127.0.0.1") == 1 &&
+           zeilen_mit(pfad, "Dateien: gesendet und quittiert (0,6 MB in ") == 1, "Protokollzeilen wie beim Windows-Host");
+    atomic_store(&g_cur_gaming, 1);
+    stdout_stumm(1);
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"y.bin"] ]);
+    inhalt = client_empfangen(&F, YES, &stoss, &unterwegs, &ende, &pfade);
+    qc_dateien_abwarten();
+    stdout_stumm(0);
+    atomic_store(&g_cur_gaming, 0);
+    pruefe(stoss == QC_DATEI_FENSTER_SPIEL && ende == 0 && [inhalt[@0] isEqualToData:y_bin], "im Spielmodus 64 KiB");
+
+    printf("\n-- Dateien: Zuschauerwechsel mitten in der Uebertragung\n");
+    NSData *gross = zufall(2000000);
+    [gross writeToFile:[q stringByAppendingPathComponent:@"gross.bin"] atomically:NO];
+    stdout_stumm(1);
+    // Beide Richtungen laufen, der Client quittiert nichts mehr.
+    ein_daten(F.ein, &F.tx, QC_DATEI_ANGEBOT, beispiel_angebot(79));
+    beispiel_stuecke(&F, 79, 2);
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"gross.bin"] ]);
+    usleep(300 * 1000);
+    NSString *laufend = qc_empfang_ordner();
+    int sendet = qc_senden_laeuft();
+    NSUInteger rek0 = rekorder_anzahl();
+    ok = schein_verbinden(&G, bild_port, ein_port, g_priv) == 0;     // G loest F ab
+    int empfang_weg = warten_bis(empfang_ruht, 2), sender_weg = warten_bis(sender_ruht, 2);
+    int bei_g = datei_nachrichten(&G, 300);
+    stdout_stumm(0);
+    printf("         (vorher: Empfang in %s, Sender %s)\n", laufend.lastPathComponent.UTF8String ?: "-", sendet ? "laeuft" : "ruht");
+    pruefe(ok && laufend && empfang_weg && ![[NSFileManager defaultManager] fileExistsAtPath:laufend] && rekorder_anzahl() == rek0,
+           "Client -> Host: der Neue loest ab, die Uebertragung wird verworfen und ihr Verzeichnis geloescht");
+    pruefe(sendet && sender_weg && bei_g == 0, "Host -> Client: der Sender bricht ab, beim Neuen kommt nichts davon an");
+    pruefe(zeilen_mit(pfad, "Dateien: abgebrochen (Zuschauer gewechselt oder weg)") == 2,
+           "beide Abbrueche stehen im Protokoll");
+
+    printf("\n-- Dateien: aelterer Client (ohne IN_FAEHIGKEITEN)\n");
+    stdout_stumm(1);
+    int g_faehig = faehig_jetzt();
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
+    bei_g = datei_nachrichten(&G, 400);
+    qc_dateien_abwarten();
+    stdout_stumm(0);
+    pruefe(!g_faehig && bei_g == 0 && !qc_senden_laeuft(), "ohne IN_FAEHIGKEITEN geht nichts hinaus");
+    pruefe(zeilen_mit(pfad, "Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)") == 1,
+           "die Protokollzeile kommt einmal je Sitzung");
+
+    printf("\n-- Dateien: Obergrenzen auf dem Eingabekanal\n");
+    stdout_stumm(1);
+    ein_daten(G.ein, &G.tx, QC_IN_FAEHIGKEITEN, eins);
+    int g_jetzt = warten_bis(faehig_jetzt, 1);
+    // Ein Stueck, eins groesser als 16 + 49152: der Kanal endet.
+    NSMutableData *zu_gross = [NSMutableData dataWithLength:QC_DATEI_STUECK_KOPF + QC_DATEI_STUECK_MAX + 1];
+    ein_daten(G.ein, &G.tx, QC_DATEI_STUECK, zu_gross);
+    uint8_t b1;
+    struct pollfd pf = { .fd = G.ein, .events = POLLIN, .revents = 0 };
+    int zu = poll(&pf, 1, 2000) == 1 && recv(G.ein, &b1, 1, 0) == 0;
+    int weg = !faehig_jetzt();
+    stdout_stumm(0);
+    pruefe(g_jetzt && zu, "ein Stueck ueber 16 + 49152 Byte beendet den Eingabekanal");
+    pruefe(weg, "mit dem Kanal ist auch seine Faehigkeit weg");
+
+    zuschauer_weg();
+    schein_schliessen(&F);
+    schein_schliessen(&G);
+    qc_dateien_abwarten();
+    pthread_mutex_lock(&g_log_mtx);
+    fclose(g_log);
+    g_log = NULL;
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -1699,6 +2124,7 @@ int main(void) {
         codec_abschluss_pruefen();
         formatwechsel_pruefen(bild_port);
         fest_pruefen();
+        dateien_pruefen(bild_port, ein_port);
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();

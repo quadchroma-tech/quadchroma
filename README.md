@@ -249,11 +249,24 @@ Rückgabe ist die Zahl der Fehler.
   Obergrenze des Protokolls, Zuschauerwechsel (Nachricht 10) samt Testbild-Rest,
   Abbau zwischen Hochfahren und Eintragen, Nachreichen bei stillem Bildschirm,
   Codecwechsel ohne Zuschauer und mit Formatwechsel (echte VT-Encoder), `--fest`,
-  Stauregel samt Ton im Stau, Ansage des Tonformats und AV1 in der Könnensliste. Loopback ab Port 19100 und 19400/19450, eigenes
+  Stauregel samt Ton im Stau, Ansage des Tonformats und AV1 in der Könnensliste,
+  dazu Dateien über die Zwischenablage über die echten Kanäle: Fähigkeiten
+  (Nachrichten 11 und 69), Client → Host mit Quittungen auf dem Bildkanal, Host →
+  Client mit Fenster, Zuschauerwechsel mitten in der Übertragung, älterer Client
+  ohne Fähigkeiten, Obergrenzen auf dem Eingabekanal. Statt in die Ablage gehen
+  empfangene Dateien an einen Rekorder, die Ablagebasis liegt im eigenen `HOME`.
+  Loopback ab Port 19100 und 19400/19450, eigenes
   `HOME` unter `$TMPDIR`, rund 80 s. Nutzt kurz einen echten kleinen
   HEVC-Encoder (640×360) — nicht während eines Streams starten.
-- `host/ablagetest.m`: Kennzeichnung des empfangenen Texts und die Regel „nur mit
-  Zuschauer lesen", auf einer eigenen benannten Ablage statt der allgemeinen.
+- `host/dateitest.m`: das Dateiprotokoll aus `host/dateien.m` ohne Netz und ohne
+  Ablage — Prüfvektoren, Pfadregeln samt Bereinigung für macOS, Empfänger und
+  Sender gegeneinander im Speicher, Fenster, Drossel über den Sendepuffer,
+  Stillstand, Abbrüche, Aufräumen. Alle Dateien in einem frischen Ordner unter
+  `$TMPDIR`, rund 6 s.
+- `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, die Regel „nur mit
+  Zuschauer lesen" und Dateiverweise (`public.file-url`) lesen und schreiben,
+  auf einer eigenen benannten Ablage statt der allgemeinen; die Dateien dafür
+  liegen unter `$TMPDIR`.
 
 ```
 clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \
@@ -264,8 +277,14 @@ clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-decla
       -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
       -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
       host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
-      host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c \
-      -o /tmp/hosttest
+      host/dateien.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+      host/vendor/monocypher/monocypher.c -o /tmp/hosttest
+
+clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
+      -framework Foundation host/dateitest.m host/dateien.m -o /tmp/dateitest
+
+clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 -framework Foundation \
+      -framework AppKit host/ablagetest.m -o /tmp/ablagetest
 
 clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c \
       host/vendor/monocypher/monocypher.c -o /tmp/noisetest
