@@ -2436,7 +2436,11 @@ impl SenderInnen {
         let angebot = Angebot { kennung: self.kennung, gesamt: liste.gesamt, eintraege: liste.eintraege };
         let mut stand = Stand::aus_angebot(Richtung::Senden, &angebot);
         let t0 = Instant::now();
-        let mut hinaus = false;
+        // Zeitpunkt, zu dem das Angebot hinaus war (None: noch nicht). Die
+        // Dauer in der Schlusszeile zaehlt ab da, nicht ab dem Start des
+        // Senders - sonst stuende das Warten auf einen Eingabekanal im Aufbau
+        // mit darin.
+        let mut hinaus: Option<Instant> = None;
         match self.uebertragen(&angebot, (&liste.quellen, &liste.orte), weg, fenster, melden, v, &mut stand, &mut hinaus) {
             Ok(()) => {
                 stand.bytes = stand.gesamt;
@@ -2444,7 +2448,7 @@ impl SenderInnen {
                 let z = format!(
                     "Dateien: gesendet und quittiert ({} MB in {} s)",
                     mb_text(stand.gesamt),
-                    sekunden_text(t0.elapsed())
+                    sekunden_text(hinaus.unwrap_or(t0).elapsed())
                 );
                 melden(Ereignis::beides(stand, z));
             }
@@ -2459,7 +2463,7 @@ impl SenderInnen {
                 };
                 // Ende nur, wenn das Angebot hinaus ist und der Empfaenger
                 // nicht selbst schon beendet hat.
-                if let (true, Some(g)) = (hinaus, ende) {
+                if let (true, Some(g)) = (hinaus.is_some(), ende) {
                     self.ende_senden(weg, g, v);
                 }
                 // "abgelehnt" nur, solange das Angebot nicht angenommen war;
@@ -2492,11 +2496,11 @@ impl SenderInnen {
         melden: &dyn Fn(Ereignis),
         v: &Vorgaben,
         stand: &mut Stand,
-        hinaus: &mut bool,
+        hinaus: &mut Option<Instant>,
     ) -> Result<(), Aus> {
         self.frist_neu();
         self.senden(weg, DATEI_ANGEBOT, &angebot.kodieren(), v)?;
-        *hinaus = true;
+        *hinaus = Some(Instant::now());
         self.frist_neu();
         melden(Ereignis::beides(
             stand.clone(),
