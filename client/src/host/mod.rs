@@ -12,10 +12,11 @@
 // Client darf den Host nicht erkennen.
 //
 // Stand: Zuschauerplatz (Noise-Responder, Kopplung, Bekanntgabe), Eingaben,
-// Zwischenablage, Aufnahme (Desktop Duplication) mit Schrittmacher und
-// Encoder im Betrieb (nvenc, ohne NVIDIA h264_mf in Software), Codecwechsel,
-// Testbild, Ton (WASAPI-Loopback), Zeigerform, Last, Wachhalten; die
-// Konserve bleibt als Bildquelle waehlbar (--konserve); die Messung (--messen).
+// Zwischenablage (Text und Dateien, netz.rs mit dateien.rs), Aufnahme
+// (Desktop Duplication) mit Schrittmacher und Encoder im Betrieb (nvenc,
+// ohne NVIDIA h264_mf in Software), Codecwechsel, Testbild, Ton
+// (WASAPI-Loopback), Zeigerform, Last, Wachhalten; die Konserve bleibt als
+// Bildquelle waehlbar (--konserve); die Messung (--messen).
 
 pub mod aufnahme;
 pub mod eingabe;
@@ -519,20 +520,33 @@ pub fn main_host(args: &[String]) -> i32 {
         None => encoder::Weg::Auto,
     };
 
+    // Empfangene Dateien frueherer Laeufe: aelter als 24 h weg (2.9). Die
+    // Host-Rolle hat ihre eigene Basis (netz::host_ablage_basis).
+    let alt = netz::host_ablage_aufraeumen();
+    if alt > 0 {
+        log(format!(
+            "Dateien: {alt} Uebertragungen aelter als 24 h geloescht ({})",
+            netz::host_ablage_basis().display()
+        ));
+    }
+
     // Zuschauerplatz: Bild, Eingabe, Bekanntgabe.
     if let Err(e) = netz::start(port, priv_key) {
         log(format!("{e}"));
         return 9;
     }
-    // Zwischenablage: was hier kopiert wird, geht zum Zuschauer (48 auf dem
-    // Bildkanal); was von dort kommt, legt der Eingabefaden ab. Kopierte
-    // Dateien meldet der Waechter schon, uebertragen werden sie noch nicht.
+    // Zwischenablage: was hier kopiert wird, geht zum Zuschauer - Text als
+    // 48, eine Dateiliste ueber den Sender (50-52), beides auf dem
+    // Bildkanal; neuer Inhalt bricht eine laufende Datei-Sendung ab. Was von
+    // dort kommt, legt der Eingabefaden (Text) bzw. der Empfaenger der
+    // Dateien ab (netz.rs). Der Waechter wartet dabei nie: das Senden der
+    // Dateien laeuft in eigenen Faeden.
     crate::clipboard::watch(|inhalt| match inhalt {
-        crate::clipboard::Inhalt::Text(text) => netz::send_small(MSG_CLIP, text.as_bytes()),
-        crate::clipboard::Inhalt::Dateien(pfade) => log(format!(
-            "Zwischenablage: {} Dateien kopiert - Uebertragung noch nicht angebunden",
-            pfade.len()
-        )),
+        crate::clipboard::Inhalt::Text(text) => {
+            netz::datei_sendung_abbrechen();
+            netz::send_small(MSG_CLIP, text.as_bytes());
+        }
+        crate::clipboard::Inhalt::Dateien(pfade) => netz::dateien_senden(pfade),
     });
     eingabe::start();
     // Ton: Abgriff nur mit Zuschauer; ohne Tongeraet steht der Grund einmal da.
