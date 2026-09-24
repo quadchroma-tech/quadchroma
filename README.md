@@ -7,7 +7,7 @@ Windows, der Mac zieht unsichtbar mit. Deshalb fühlt sich die Maus lokal an —
 damit er trotzdem aussieht wie auf dem Mac, schickt der Host nur die *Form* des
 Zeigers (Pfeil, Hand, Ziehpfeile, Textcursor, Wartekugel), sobald sie sich ändert.
 
-Stand: 23.09.2026. Läuft, ist aber noch ein Gerüst, keine fertige Anwendung.
+Stand: 24.09.2026. Läuft, ist aber noch ein Gerüst, keine fertige Anwendung.
 
 ## Warum 4:4:4
 
@@ -71,18 +71,19 @@ Visual-C++-Laufzeit braucht es nicht.
 ### Mac als Client (im Aufbau)
 
 Derselbe Client baut auch auf dem Mac (arm64), mit Ton über AudioToolbox und
-Zwischenablage über NSPasteboard; die Anzeige läuft dort noch über die CPU
-(softbuffer), Metal kommt später. Bauen mit Rust und dem FFmpeg aus Homebrew:
+Zwischenablage über NSPasteboard (Text und Dateien); die Anzeige läuft dort noch
+über die CPU (softbuffer), Metal kommt später. Schließen legt ihn in die
+Menüleiste. Bauen mit Rust und dem FFmpeg aus Homebrew:
 
     cd client
     FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
 
 Ablage unter `~/Library/Application Support/QuadChroma` (client.key, known_hosts.txt,
-einstellungen.txt, protokoll.txt, benchmark.txt — neben host.key und authorized.txt
-des Hosts, getrennte Dateien). Lizenzhinweis: das Homebrew-FFmpeg ist ein GPL-Build
-(libx264, libx265); für den Eigengebrauch in Ordnung, zur Weitergabe des Mac-Clients
-braucht es einen LGPL-Build ohne GPL-Teile.
+einstellungen.txt, protokoll.txt, benchmark.txt, einzel.sock — neben host.key und
+authorized.txt des Hosts, getrennte Dateien). Lizenzhinweis: das Homebrew-FFmpeg
+ist ein GPL-Build (libx264, libx265); für den Eigengebrauch in Ordnung, zur
+Weitergabe des Mac-Clients braucht es einen LGPL-Build ohne GPL-Teile.
 
 ## Bedienung im Client
 
@@ -115,6 +116,56 @@ Automatik, Grafikkarte, Integriert und Prozessor. Der Client erkennt die Karten 
 Start (gemeinsamer Speicher heißt integriert), zeigt nur Knöpfe, zu denen es eine Karte
 gibt, und nennt die erkannte Karte im Tooltip. Der Decoder wechselt sofort, die
 Anzeige ab dem nächsten Start.
+
+## Dateien über die Zwischenablage
+
+Dateien und Ordner kopiert man im Explorer bzw. Finder und fügt sie auf der anderen
+Seite ein – in beide Richtungen, zwischen dem Client (Windows oder Mac) und jedem
+Host (Mac oder Windows-Host-Rolle). Anders als bei RDP beginnt die Übertragung
+sofort beim Kopieren, nicht erst beim Einfügen: Die Gegenseite schreibt die Dateien
+in ein eigenes Verzeichnis im Temp-Ordner (`QuadChroma-Ablage`, bei den Hosts
+`QuadChroma-Host-Ablage`) und legt sie als Dateiliste in ihre Zwischenablage, sobald
+alles da ist. Dort bleiben die drei neuesten Übertragungen; beim Start geht, was
+älter als 24 h ist oder ein beendeter Lauf halb empfangen liegen ließ. Im Client
+zeigt eine schmale Zeile unten im Bild den Fortschritt.
+
+- Grenzen: 4 GB und 10 000 Einträge je Kopie, die Liste der Einträge bis 1 MiB.
+- Nachrang vor Bild, Ton und Eingaben: höchstens 256 KiB unquittiert unterwegs (im
+  Spielmodus und in der Windows-Host-Rolle 64 KiB), am Eingabekanal wartet höchstens
+  ein Datei-Paket hinter den Tasten, die Fäden laufen mit niedrigerer Priorität.
+- Neuer Inhalt in der Ablage, Sitzungsende und 30 s ohne Fortschritt brechen ab,
+  halb Empfangenes wird gelöscht.
+- Der Empfänger prüft Pfade, Längen und Reihenfolge, als wären sie feindlich, und
+  bereinigt Namen, die sein System nicht kennt. Verknüpfungen werden weder
+  gesendet noch angelegt.
+- Ältere Gegenstellen bekommen nichts: Ob die andere Seite Dateien kann, meldet sie
+  beim Verbinden (Fähigkeiten, Nachrichten 11 und 69).
+- Gemessen im Integrationstest: rund 30 MB/s auf der VM, 28 MB/s im LAN vom
+  Windows-Client zum Mac-Host, bei unveränderten 114 Bildern/s.
+
+Auf dem Mac kann macOS beim ersten Kopieren aus Schreibtisch, Dokumente oder
+Downloads nach dem Zugriff fragen, ab macOS 15.4 auch beim Lesen der
+Zwischenablage. Anzeige, Protokollzeilen und die Nachrichten 50–53 im Einzelnen
+stehen in `BENUTZUNG.txt`.
+
+## Schließen, Einzelinstanz, Desktop-Verknüpfung
+
+Schließen trennt eine laufende Sitzung und legt den Client ab: unter Windows als
+Symbol im Infobereich, auf dem Mac in der Menüleiste. Das Symbol holt das Fenster
+zurück, verbindet über sein Menü mit gefundenen Hosts oder beendet das Programm;
+`tray=aus` in `einstellungen.txt` stellt das alte Verhalten wieder her. Es läuft nur
+eine App mit Fenster: Ein zweiter Start reicht seine Adresse an die laufende weiter
+und endet.
+
+Darauf baut die Desktop-Verknüpfung (nur Windows): Der Knopf „Verknüpfung“ in jeder
+Hostzeile des Startbildschirms oder im Reiter Verschlüsselung legt
+`QuadChroma - <Name>.lnk` mit dem Programmsymbol auf den Desktop. Ein Doppelklick
+verbindet sofort, auch wenn die App schon im Infobereich liegt. Ohne Fenster:
+
+    quadchroma.exe --verknuepfung <adresse> [--name <name>] [--ordner <verzeichnis>]
+
+Die Verknüpfung trägt den vollen Pfad der exe und die Adresse des Hosts, nicht
+seinen Namen: Nach einem Umzug der exe oder einer neuen Adresse legt man sie neu an.
 
 ## Gemessen auf einem Mac mini M1
 
@@ -154,10 +205,10 @@ hinein. Damit kann niemand die Tastatur des Macs übernehmen, ohne vorher den
 Bildkanal legitim aufgebaut zu haben. Die Prüfsumme weist nur die Sitzung aus,
 nicht den Host; deshalb vergleicht der Client am Eingabekanal zusätzlich den
 Schlüssel der Gegenstelle mit dem des Bildkanals, noch im Handschlag und bevor
-er sich selbst ausweist, und Tasten und Zwischenablage gehen nur an denselben
-Host. Der Host bindet den Eingabekanal an genau einen Zuschauer: Löst ein neuer
-ihn ab oder reißt sein Bild ab, kappt er ihn und lässt dessen gedrückte Tasten
-und Maustasten los.
+er sich selbst ausweist, und Tasten, Zwischenablage und Dateien gehen nur an
+denselben Host. Der Host bindet den Eingabekanal an genau einen Zuschauer: Löst
+ein neuer ihn ab oder reißt sein Bild ab, kappt er ihn und lässt dessen gedrückte
+Tasten und Maustasten los.
 
 Freigabe: Solange der Host noch keine Freigabeliste hat, nimmt er die erste
 Gegenstelle von selbst auf (der Mac-Host auch bei einer leeren Datei mit 0 Byte),
@@ -206,7 +257,19 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Freigabeliste;
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
-  Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern
+  Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern.
+  Von den Dateien, der Verknüpfung und dem Infobereich (belegt auf der VM mit
+  Windows-Host-Rolle und Client, Client → Mac-Host im LAN, dazu `dateitest`,
+  `ablagetest` und die Dateiabschnitte von `hosttest`) noch offen: Kopieren mit
+  Strg+C und Einfügen im Explorer von Hand am Laptop (auf der VM kopierte ein Skript
+  über .NET, eingefügt wurde per Shell-Befehl), Einfügen im Finder am Mac, Dateien
+  vom Mac-Host zum Client im laufenden Betrieb, der Mac-Client mit Dateien,
+  Infobereich und Menüleiste in echter Bedienung (Klicks, Menü, Sprechblase bzw.
+  Blase, das Fenster wirklich im Vordergrund nach einem Doppelklick auf die
+  Verknüpfung), die Verknüpfung über den Knopf auf dem echten, auch auf OneDrive
+  umgeleiteten Desktop, und Durchsatz und Verzögerung nach den letzten
+  Nachbesserungen (Fenster der Windows-Host-Rolle 64 KiB, Fäden mit niedrigerer
+  Priorität)
 - Veröffentlichung: ein Lizenzpaket für die Binärdateien (GPL- und LGPL-Text, Hinweise
   der Rust-Abhängigkeiten, der zu den DLLs passende FFmpeg-Quellstand samt
   Bauangaben) und eine Lizenz für das Projekt selbst; Developer-ID-Signatur und
@@ -216,16 +279,22 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   bekanntem Namen ein anderes Gerät von einer neuen Adresse, gilt es als Erstkontakt;
   dann schützt nur der Vergleichscode.
 - Die Zwischenablage geht während einer Sitzung auch dann hinüber, wenn das Fenster
-  des Clients keinen Fokus hat. Gelesen wird sie auf allen Seiten nur mit Gegenüber;
+  des Clients keinen Fokus hat – kopierte Dateien sofort und bis 4 GB, auch wenn
+  drüben nie eingefügt wird. Gelesen wird sie auf allen Seiten nur mit Gegenüber;
   der Mac-Host zählt ohne Zuschauer nur mit, dass sich etwas geändert hat.
+- Dateien erst beim Einfügen übertragen (wie RDP) statt sofort beim Kopieren; die
+  Liste der Einträge in Teilen statt am Stück (bis 1 MiB, dahinter warten Tasten
+  bzw. Bilder kurz)
+- Desktop-Verknüpfung auf dem Mac-Client; ein Symbol im Infobereich bzw. in der
+  Menüleiste für die Hosts (die haben kein Fenster)
 - Kopplungsdialog in der Oberfläche statt Kommandozeilenschalter
 - Rollenwahl (Windows als Host): `--host` ist da (Zuschauerplatz, Kopplung, Bekanntgabe,
-  Eingaben, Zwischenablage, Desktop Duplication, Encoder über NVENC bzw. ohne NVIDIA
-  H.264 in Software, Schrittmacher, Codecwechsel, Testbild, Ton, Zeigerform, Last,
-  Wachhalten), dazu `--list`, `--messen` und die Konserve als Prüfweg. Es fehlen
-  AMF/QSV, HDR-Ausgänge, Skalieren und Drehen auf der Karte (beides läuft heute über
-  den Prozessor), die Bildschirmwahl im Menü und ein Menüeintrag "Diesen Rechner
-  freigeben". Beschreibung in `BENUTZUNG.txt`.
+  Eingaben, Zwischenablage samt Dateien, Desktop Duplication, Encoder über NVENC bzw.
+  ohne NVIDIA H.264 in Software, Schrittmacher, Codecwechsel, Testbild, Ton,
+  Zeigerform, Last, Wachhalten), dazu `--list`, `--messen` und die Konserve als
+  Prüfweg. Es fehlen AMF/QSV, HDR-Ausgänge, Skalieren und Drehen auf der Karte
+  (beides läuft heute über den Prozessor), die Bildschirmwahl im Menü und ein
+  Menüeintrag "Diesen Rechner freigeben". Beschreibung in `BENUTZUNG.txt`.
 - AV1: Kein Host bietet ihn an, bis Protokoll und Client ihn kennen
 - Tonkomprimierung als Wahlmöglichkeit; unkomprimiert braucht mehr Bandbreite als das Bild
 - Virtuelles Mikrofon auf dem Host, damit Programme dort den Client hören
@@ -252,15 +321,15 @@ Rückgabe ist die Zahl der Fehler.
   Stauregel samt Ton im Stau, Ansage des Tonformats und AV1 in der Könnensliste,
   dazu Dateien über die Zwischenablage über die echten Kanäle: Fähigkeiten
   (Nachrichten 11 und 69), Client → Host mit Quittungen auf dem Bildkanal und den
-  Zeilen „empfange …“ und „empfangen …“ im Host-Protokoll, Host →
-  Client mit Fenster, Namen mit Umlauten im Protokoll, Zuschauerwechsel mitten
-  in der Übertragung samt Sitzungsbindung des Sendewegs, Zuschauer ohne
-  Eingabekanal, älterer Client ohne Fähigkeiten, Fähigkeit nur für den
-  Eingabekanal, der sie gemeldet hat, Obergrenzen auf dem Eingabekanal. Statt in die Ablage gehen
+  Zeilen „empfange …“ und „empfangen …“ im Host-Protokoll, Host → Client mit
+  Fenster, Namen mit Umlauten im Protokoll, Zuschauerwechsel mitten in der
+  Übertragung samt Sitzungsbindung des Sendewegs, Zuschauer ohne Eingabekanal,
+  älterer Client ohne Fähigkeiten, Fähigkeit nur für den Eingabekanal, der sie
+  gemeldet hat, Obergrenzen auf dem Eingabekanal. Statt in die Ablage gehen
   empfangene Dateien an einen Rekorder, die Ablagebasis liegt im eigenen `HOME`.
-  Loopback ab Port 19100 und 19400/19450, eigenes
-  `HOME` unter `$TMPDIR` (nach einem bestandenen Lauf wieder entfernt), rund 80 s. Nutzt kurz einen echten kleinen
-  HEVC-Encoder (640×360) — nicht während eines Streams starten.
+  Loopback ab Port 19100 und 19400/19450, eigenes `HOME` unter `$TMPDIR` (nach
+  einem bestandenen Lauf wieder entfernt), rund 80 s. Nutzt kurz einen echten
+  kleinen HEVC-Encoder (640×360) — nicht während eines Streams starten.
 - `host/dateitest.m`: das Dateiprotokoll aus `host/dateien.m` ohne Netz und ohne
   Ablage — Prüfvektoren, Pfadregeln samt Bereinigung für macOS und (für den
   Schlüssel des Senders gegen Doppelte) für Windows, Empfänger und
@@ -289,7 +358,7 @@ Rückgabe ist die Zahl der Fehler.
   `QOS_CLASS_UTILITY`). Alle Dateien in einem frischen Ordner unter `$TMPDIR`,
   rund 8 s.
 - `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, die Regel „nur mit
-  Zuschauer lesen" und Dateiverweise (`public.file-url`) lesen und schreiben,
+  Zuschauer lesen“ und Dateiverweise (`public.file-url`) lesen und schreiben,
   auf einer eigenen benannten Ablage statt der allgemeinen; die Dateien dafür
   liegen unter `$TMPDIR`.
 
@@ -323,14 +392,25 @@ Gegentest der Rust-Seite (`quadchroma --noisetest adresse:port`).
 Die Rust-Seite prüft sich mit `cargo test --release` in `client\` bzw. `client/`;
 mehrere Tests brauchen Loopback (TCP über 127.0.0.1). Auf Windows gehört der
 `bin`-Ordner von FFmpeg in den `PATH`, und `APPDATA` sollte auf einen eigenen Ordner
-zeigen: Ein Test beschreibt die Zwischenablage der Sitzung und schreibt ins
-Protokoll. Auf dem Mac mit `-- --skip clipboard`, sonst lesen und beschreiben Tests
-die echte Zwischenablage.
+zeigen: Die Ablagetests beschreiben die Zwischenablage der Sitzung, nacheinander
+hinter dem benannten Mutex `Global\QuadChromaAblageTest`, und schreiben ins
+Protokoll. Auf dem Mac mit `-- --skip clipboard`, sonst liest und beschreibt
+`setzen_zaehlen_lesen` die echte Zwischenablage; die übrigen Ablagetests des
+Mac-Clients arbeiten auf eigenen Brettern und laufen einzeln per Namen
+(`-- --exact clipboard_mac::tests::<name>`). Empfangene Dateien schreiben die Tests
+in einen eigenen Ordner je Lauf im Temp-Ordner (`qc-test-<pid>-ablage` bzw.
+`qc-test-<pid>-host-ablage`), nie in `QuadChroma-Ablage`.
+
+Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Netz:
+`quadchroma.exe --tray-selbsttest` (braucht eine Sitzung mit Explorer) bzw.
+`quadchroma --menueleiste-selbsttest` auf dem Mac, Rückgabe 0 oder 1.
 
 ## Aufbau
 
-    host/        Mac: Aufnahme, Encoder, Netz, Eingaben, Ton, Zwischenablage, Zeigerform
+    host/        Mac: Aufnahme, Encoder, Netz, Eingaben, Ton, Zwischenablage, Dateien (dateien.m), Zeigerform
     client/      Windows: Empfang, Decodieren, Anzeige (anzeige.rs: Direct3D 11), Eingaben, Ton, Zwischenablage;
+                 Dateien (dateien.rs, gemeinsam mit der Host-Rolle), Infobereich bzw. Menüleiste (tray*.rs),
+                 Einzelinstanz (einzel.rs), Desktop-Verknüpfung (verknuepfung.rs), Programmsymbol (logo.rs);
                  dazu die Host-Rolle (client/src/host/: Aufnahme, Encoder, Netz, Eingaben, Ton, Zeigerform)
     Makefile     baut und signiert das App-Bündel
 

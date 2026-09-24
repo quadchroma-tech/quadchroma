@@ -16,6 +16,12 @@ und Zwischenablage vom Client, 9003 die Bekanntgabe im Netz. Beim ersten
 Start fragt die Windows-Firewall, ob das Programm ins Netz darf - das muss
 erlaubt werden, sonst bleibt die Liste leer.
 
+Schliessen beendet QuadChroma nicht, es legt die App im Infobereich ab
+(auf dem Mac in der Menueleiste). Es laeuft nur eine App mit Fenster: ein
+zweiter Start reicht seine Adresse an sie weiter. Darauf baut die
+Desktop-Verknuepfung je Host. Alles drei steht weiter unten, ebenso das
+Kopieren von Dateien zwischen Client und Host.
+
 Verschluesselung und Kopplung
 -----------------------------
 
@@ -76,9 +82,11 @@ prueft der Client noch im Handschlag, dass derselbe Host antwortet wie auf
 dem Bildkanal; sonst geht keine Taste hinaus (Protokoll: "Eingabekanal:
 Gegenstelle <Fingerabdruck> ist nicht der Host des Bildkanals - vor
 Nachricht 3 abgebrochen", hoechstens alle 10 s). Der Eingabekanal baut
-sich im Hintergrund auf; Einstellungen, Codec, Testbild und Zwischenablage,
-die davor kommen, reicht der Client nach (je Art die letzte), Mausbewegungen
-und Tasten nicht. Die gespeicherten Werte eines Hosts (siehe "Das Menue")
+sich im Hintergrund auf; seine erste Nachricht sagt immer, was der Client
+kann (Faehigkeiten, siehe "Dateien ueber die Zwischenablage").
+Einstellungen, Codec, Testbild und Zwischenablage, die davor kommen,
+reicht der Client nach (je Art die letzte), Mausbewegungen und Tasten
+nicht. Die gespeicherten Werte eines Hosts (siehe "Das Menue")
 gelten schon ab dem Bildkanal - ein gespeichertes "Ton aus" also sofort -;
 zum Host schickt der Client sie, sobald der Eingabekanal steht.
 
@@ -178,20 +186,22 @@ Mac als Client (im Aufbau)
 --------------------------
 
 Derselbe Client baut auch auf dem Mac (arm64): Ton ueber AudioToolbox,
-Zwischenablage ueber NSPasteboard, Anzeige vorerst ueber die CPU (kein
-Metal, keine Grafikkarten im Reiter Anzeige). Bauen mit Rust und dem FFmpeg
-aus Homebrew:
+Zwischenablage ueber NSPasteboard (Text und Dateien), Anzeige vorerst ueber
+die CPU (kein Metal, keine Grafikkarten im Reiter Anzeige). Schliessen legt
+ihn in die Menueleiste; eine Desktop-Verknuepfung gibt es auf dem Mac
+nicht. Bauen mit Rust und dem FFmpeg aus Homebrew:
 
     cd client
     FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
 
 Ablage: ~/Library/Application Support/QuadChroma/ (client.key,
-known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt) - derselbe
-Ordner wie beim Host, getrennte Dateien. Einen neuen Ordner legt der Client
-nur fuer den Eigentuemer an (0700), neue Schluessel und Listen mit 0600;
-Vorhandenes behaelt seine Rechte. Die Kopplung laeuft wie bei jedem
-Client: der Host muss einmal mit --pair gestartet werden.
+known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, dazu
+einzel.sock und einzel.lock der Einzelinstanz) - derselbe Ordner wie beim
+Host, getrennte Dateien. Einen neuen Ordner legt der Client nur fuer den
+Eigentuemer an (0700), neue Schluessel und Listen mit 0600; Vorhandenes
+behaelt seine Rechte. Die Kopplung laeuft wie bei jedem Client: der Host
+muss einmal mit --pair gestartet werden.
 
 Lizenzhinweis: das FFmpeg aus Homebrew ist ein GPL-Build (libx264, libx265).
 Fuer den Eigengebrauch in Ordnung; zur Weitergabe des Mac-Clients braucht es
@@ -208,6 +218,172 @@ Tasten:
 Jede Tastenfunktion ist auch im Menue ein Schalter; die Tasten muss sich
 niemand merken.
 
+Fenster schliessen: Infobereich und Menueleiste
+-----------------------------------------------
+
+Schliessen (das X oder Alt+F4, auf dem Mac der rote Knopf oder Cmd+W auf
+dem Startbildschirm) beendet den Client nicht, es legt ihn ab: unter
+Windows als Symbol im Infobereich neben der Uhr, auf dem Mac als Symbol
+oben in der Menueleiste (das Programmsymbol einfarbig; geht das nicht,
+steht dort "QC"). Eine laufende Sitzung wird dabei getrennt wie mit
+"Trennen" - der Host hoert auf zu arbeiten. Abgelegt zeichnet und
+decodiert der Client nichts; die Suche nach Hosts und die Einzelinstanz
+(siehe unten) laufen weiter. Auf dem Mac verlaesst das Fenster vorher das
+Vollbild und kehrt beim Oeffnen dorthin zurueck; abgelegt hat die App
+dort kein Dock-Symbol und steht nicht im Programmumschalter.
+
+Das Symbol ist ab dem Start da, nicht erst nach dem Schliessen (ausser
+mit tray=aus, siehe unten):
+
+    Windows   Linksklick, Doppelklick oder Eingabetaste zeigen das
+              Fenster, Rechtsklick oeffnet das Menue.
+    Mac       Ein Klick oeffnet das Menue.
+
+Im Menue stehen "Oeffnen" (unter Windows fett), bis zu vier gefundene
+Hosts als "Verbinden: <Name>" und "Beenden". "Verbinden" wirkt wie ein
+Klick auf die Hostzeile: eine Sitzung zum selben Host bleibt, eine zu
+einem anderen wird vorher getrennt. Der Tooltip heisst "QuadChroma", in
+einer Sitzung "QuadChroma - <Name bzw. Adresse>". Beim ersten Ablegen
+kommt einmal der Hinweis "QuadChroma laeuft im Infobereich weiter."
+(Windows, Sprechblase) bzw. "QuadChroma laeuft in der Menueleiste
+weiter." (Mac, Blase unter dem Symbol, 6 s). Vermerkt wird das in
+einstellungen.txt als tray_hinweis=1, aber erst, wenn der Hinweis
+wirklich zu sehen war; mit tray_hinweis=0 kommt er noch einmal.
+
+Beenden: "Beenden" im Menue des Symbols, der Knopf "Beenden" oder ESC auf
+dem Startbildschirm, auf dem Mac auch Cmd+Q. Ein WM_CLOSE an das Fenster
+legt die App nur ab wie das X; ein Skript beendet sie mit taskkill /F
+bzw. Stop-Process -Id.
+
+tray=aus in einstellungen.txt schaltet das Ablegen ab: kein Symbol, und
+Schliessen beendet das Programm wie frueher. Dasselbe gilt ohne Symbol -
+laesst es sich nicht anlegen (etwa ohne Explorer), ist es noch nicht
+angemeldet oder zeigt macOS es nicht an (volle Menueleiste, "In der
+Menueleiste erlauben" aus), beendet Schliessen das Programm. Die App wird
+also nie unsichtbar ohne Weg zurueck. Startet Explorer neu, meldet sich
+das Symbol von selbst wieder an.
+
+Im Protokoll (protokoll.txt) steht, was geschah; auf dem Mac beginnen
+die Zeilen mit "Menueleiste:" statt "Infobereich:":
+
+    "Infobereich: Symbol angelegt"
+    "Infobereich: kein Symbol (<Grund>) - Schliessen beendet das Programm"
+    "Infobereich: Symbol (noch) nicht angemeldet (<Grund>) - Schliessen
+     beendet, bis es steht"
+    "Infobereich: Fenster geschlossen - trenne <Adresse>"
+    "Infobereich: Fenster abgelegt, QuadChroma laeuft weiter"
+    "Infobereich: Hinweis nicht gezeigt - kommt beim naechsten Ablegen
+     noch einmal"
+    "Infobereich: Fenster wieder sichtbar"
+    "Infobereich: verbinde mit <Adresse>" bzw. "Infobereich: trenne
+     <Adresse> und verbinde mit <Adresse>"
+    "Infobereich: Beenden"
+
+Selbsttest des Symbols, ohne Verbindung, ohne Bekanntgabe und ohne
+protokoll.txt:
+
+    quadchroma.exe --tray-selbsttest                       (Windows)
+    ./target/release/quadchroma --menueleiste-selbsttest   (Mac)
+
+Er legt das Symbol an, aendert den Tooltip und entfernt es wieder;
+Rueckgabe 0 heisst bestanden, 1 gescheitert (unter Windows etwa in einer
+Sitzung ohne Explorer, wie ueber ssh). Der Mac-Test prueft dazu Bild,
+Menue samt seinen Befehlen und die Blase, zeigt das Symbol nur kurz und
+nennt am Ende die Dauer. Der Schalter der jeweils anderen Plattform
+endet mit 2.
+
+Nur eine App (Einzelinstanz)
+----------------------------
+
+Je Nutzersitzung laeuft hoechstens ein Client mit Fenster. Startet man
+ihn ein zweites Mal - von Hand, mit einer Adresse oder per Doppelklick
+auf eine Desktop-Verknuepfung -, reicht der zweite Start seine Adresse
+an den ersten weiter und endet mit 0 ("QuadChroma laeuft schon -
+<Adresse> weitergereicht." bzw. ohne Adresse "QuadChroma laeuft schon -
+nach vorn geholt."). Der erste holt sein Fenster nach vorn, auch aus dem
+Infobereich bzw. der Menueleiste, und verbindet wie ein Klick auf
+"Verbinden": eine Sitzung zum selben Host bleibt bestehen, eine zu einem
+anderen wird vorher getrennt. In seinem Protokoll steht "Einzelinstanz:
+zweiter Start mit <Adresse> - verbinde" (bzw. "... - Sitzung dorthin
+laeuft schon", "... - trenne <Adresse> und verbinde neu") oder
+"Einzelinstanz: zweiter Start ohne Adresse - Fenster nach vorn".
+
+Ausgenommen sind alle Wege ohne Fenster: der Pruefmodus (--headless),
+die Host-Rolle (--host, --list, --messen), --verknuepfung, --shot und die
+Selbsttests (--tray-selbsttest, --menueleiste-selbsttest, --decodertest,
+--anzeigetest, --noisetest).
+
+Grenzen: Eine Adresse ueber 508 Byte oder mit Steuerzeichen reicht der
+zweite Start nicht weiter; er holt die App nur nach vorn und endet mit 1
+("QuadChroma laeuft schon - nach vorn geholt, Adresse nicht
+weitergereicht (<Grund>)."). Antwortet die laufende App 5 s lang nicht,
+endet er ebenfalls mit 1 ("QuadChroma laeuft schon, antwortet aber nicht
+(<Grund>)."). Endet die laufende App gerade, wird der zweite Start selbst
+zur App und verbindet. Geht die Einzelinstanz gar nicht, laeuft die App
+ohne sie ("Einzelinstanz: nicht moeglich (<Grund>) - weiter ohne").
+
+Unter Windows erkennt ein Mutex (Local\QuadChroma-Client) die erste
+Instanz; weitergereicht wird per WM_COPYDATA an ein unsichtbares Fenster
+der Klasse QuadChromaEinzel, und der zweite Start gibt sein Recht auf den
+Vordergrund an den ersten weiter. Auf dem Mac ist es ein Unix-Socket
+einzel.sock mit der Sperre einzel.lock im Ablageordner.
+
+Desktop-Verknuepfung (nur Windows)
+----------------------------------
+
+Fuer jeden Host laesst sich eine Verknuepfung auf den Desktop legen. Ein
+Doppelklick darauf verbindet sofort - auch wenn QuadChroma schon laeuft
+oder im Infobereich liegt, dann ueber die Einzelinstanz. Angelegt wird
+sie
+
+    - auf dem Startbildschirm mit dem Knopf "Verknuepfung" rechts in der
+      Zeile jedes gefundenen Hosts,
+    - im Menue, Reiter "Verschluesselung", mit dem Knopf "Verknuepfung"
+      neben "Trennen", fuer den verbundenen Host (Name aus der
+      Bekanntgabe, wenn die Adresse passt, sonst die Adresse).
+
+Das Ergebnis steht 6 s im Meldungsbereich bzw. unter dem Knopf:
+"Verknuepfung auf dem Desktop angelegt: <Datei>", sonst in Amber
+"Verknuepfung nicht angelegt: <Grund>". Im Protokoll steht
+"Verknuepfung angelegt: <Pfad>" bzw. "Verknuepfung fuer <Adresse> nicht
+angelegt: <Grund>".
+
+Die Datei heisst "QuadChroma - <Name>.lnk" und liegt auf dem Desktop des
+Nutzers, auch wenn der auf OneDrive umgeleitet ist. Vom Namen faellt ein
+".local" am Ende weg; Zeichen, die Windows in Dateinamen nicht erlaubt,
+werden zu "_", Punkte und Leerzeichen am Ende fallen weg, hoechstens 64
+Zeichen. Ohne Namen steht die Adresse da, mit "_" statt ":"
+("QuadChroma - 192.168.178.194_9001.lnk"). Eine vorhandene Datei gleichen
+Namens wird ueberschrieben - es ist derselbe Host. Die Verknuepfung ruft
+
+    <Ordner der exe>\quadchroma.exe "192.168.178.194:9001"
+
+auf (Arbeitsordner ist der Ordner der exe) - derselbe Weg wie eine
+Adresse beim Start. Ihr Symbol ist das Programmsymbol (vier farbige
+Quadrate) aus %APPDATA%\QuadChroma\quadchroma.ico; die Datei wird bei
+jedem Anlegen geschrieben bzw. erneuert, denn die exe selbst traegt kein
+Symbol. Als Kommentar zeigt Windows "QuadChroma: mit <Name> verbinden
+(<Adresse>)" in der Sprache der Oberflaeche.
+
+Grenzen: Die Verknuepfung zeigt mit vollem Pfad auf die exe, mit der sie
+angelegt wurde - wer die exe verschiebt, legt sie neu an. Und sie traegt
+die Adresse, nicht den Namen: bekommt der Host eine neue Adresse, geht
+der Doppelklick ins Leere, und unter der neuen Adresse ist der Host fuer
+den Client ohnehin ein Erstkontakt (siehe "Verschluesselung und
+Kopplung").
+
+Ohne Fenster und ohne Verbindung:
+
+    quadchroma.exe --verknuepfung <adresse> [--name <name>]
+                   [--ordner <verzeichnis>]
+
+legt sie an (ohne --ordner auf dem Desktop; ohne Port gilt 9001), gibt
+den Pfad aus und endet mit 0; sonst "Verknuepfung nicht angelegt:
+<Grund>" und Rueckgabe 1 (etwa ohne Adresse, bei einem Schalter ohne
+Wert oder wenn der Ordner fehlt). protokoll.txt bleibt dabei unberuehrt.
+Auf dem Mac endet der Schalter mit 2 ("Die Desktop-Verknuepfung
+(--verknuepfung) gibt es nur unter Windows.").
+
 Das Menue
 ---------
 
@@ -219,7 +395,8 @@ F10. Fuenf Reiter:
     Anzeige         Vollbild, pixelgenau, Statistik, Nerd-Modus, welche
                     Statistikzeilen, Karte fuer Anzeige und Decoder
                     (Automatik, Grafikkarte, Integriert, Prozessor)
-    Verschluesselung  Verfahren, Vergleichscode, Fingerabdruck, Trennen
+    Verschluesselung  Verfahren, Vergleichscode, Fingerabdruck, Trennen,
+                    Desktop-Verknuepfung (Windows)
     Tastenkombinationen  alle Tasten, die der Client selbst abfaengt
     Benchmark       misst Codecs, Bildraten und Datenraten der Reihe nach
                     (siehe unten)
@@ -452,17 +629,21 @@ Zwischenablage
 --------------
 
 Kopierter Text geht in beide Richtungen, vom Client zum Host ueber den
-Eingabekanal (9002), zurueck ueber den Bildkanal (9001); nur Text, bis
-4 MB. Auf jeder Seite - Mac oder Windows, Host oder Client - gilt
-dieselbe Regel: was ein Programm als vertraulich markiert, bleibt auf dem
-Rechner, auf dem es kopiert wurde. Auf dem Mac ist das die Markierung
-org.nspasteboard.ConcealedType (Passwortverwalter wie 1Password oder
-KeePassXC), auf Windows ExcludeClipboardContentFromMonitorProcessing oder
-"Clipboard Viewer Ignore" (etwa KeePass). Im Protokoll steht dann
-"Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen". Ein
-Passwort laesst sich also nicht hinueberkopieren - das ist Absicht. Dateien
-werden nicht uebertragen, und auf dem Mac von mehreren Eintraegen nur der
-erste.
+Eingabekanal (9002), zurueck ueber den Bildkanal (9001); Text bis 4 MB.
+Kopierte Dateien und Ordner gehen auf denselben Kanaelen hinueber, siehe
+den naechsten Abschnitt. Auf jeder Seite - Mac oder Windows, Host oder
+Client - gilt dieselbe Regel: was ein Programm als vertraulich markiert,
+bleibt auf dem Rechner, auf dem es kopiert wurde. Auf dem Mac ist das die
+Markierung org.nspasteboard.ConcealedType (Passwortverwalter wie
+1Password oder KeePassXC), auf Windows
+ExcludeClipboardContentFromMonitorProcessing oder "Clipboard Viewer
+Ignore" (etwa KeePass). Im Protokoll steht dann "Zwischenablage: Eintrag
+ist als verdeckt markiert, nicht uebertragen". Ein Passwort laesst sich
+also nicht hinueberkopieren - das ist Absicht, und es gilt ebenso fuer
+Dateien; auf dem Mac haelt schon ein einziger verdeckter Eintrag alles
+zurueck. Von mehreren Texteintraegen geht auf dem Mac nur der erste
+hinueber. Liegt eine Dateiliste in der Ablage, geht auf keiner Seite Text
+hinaus - auch nicht der Dateiname, den Finder zusaetzlich als Text ablegt.
 
 Gesendet wird nur, was waehrend einer Sitzung kopiert wird; was vorher
 kopiert wurde, geht auch beim Verbinden nicht hinueber. Ohne Gegenueber
@@ -477,7 +658,363 @@ den Verlauf (Win+V) noch in die Cloud-Zwischenablage, und Ablageverwalter
 uebergehen es. Auf dem Mac - Host wie Client - traegt es
 org.nspasteboard.TransientType und AutoGeneratedType, die Kennungen, an
 denen Ablageverwalter Fluechtiges erkennen, und es liegt nur auf diesem
-Mac, nicht in der Universellen Zwischenablage fuer iPhone und iPad.
+Mac, nicht in der Universellen Zwischenablage fuer iPhone und iPad. Das
+gilt fuer Text wie fuer empfangene Dateilisten.
+
+Dateien ueber die Zwischenablage
+--------------------------------
+
+Dateien und Ordner kopiert man wie gewohnt - im Explorer bzw. im Finder
+"Kopieren" - und fuegt sie auf der anderen Seite ein. Das geht in beide
+Richtungen, zwischen dem Client (Windows oder Mac) und jedem Host (Mac
+oder Windows-Host-Rolle), ueber die bestehende, verschluesselte
+Verbindung, also nur zwischen gekoppelten Geraeten. Anders als bei RDP
+beginnt die Uebertragung sofort beim Kopieren, nicht erst beim
+Einfuegen: die Gegenseite schreibt die Dateien in ein eigenes
+Verzeichnis (siehe "Ablageverzeichnis") und legt sie, sobald alles da
+ist, als Dateiliste in ihre Zwischenablage - das ersetzt, was dort
+gerade liegt. "Einfuegen" im Explorer bzw. Finder kopiert sie von dort an
+die gewuenschte Stelle. Ausschneiden wirkt wie Kopieren: die Quelle
+bleibt, wo sie ist. Ist die Ablage unter Windows beim Ablegen belegt,
+wird es rund 2 s lang wiederholt; scheitert es, bricht die Uebertragung
+ab (im Client "Zwischenablage nicht verfuegbar").
+
+Wie beim Text wird nur waehrend einer Sitzung gelesen; was vorher kopiert
+wurde, geht beim Verbinden nicht hinueber. Eine Kopie loest oft mehrere
+Meldungen der Ablage aus. Unter Windows (Client und Host-Rolle) und im
+Mac-Client wird deshalb erst gelesen, wenn die Ablage 150 ms ruhig war,
+und dieselbe Dateiliste geht innerhalb von 2 s nur einmal hinaus
+("Zwischenablage: dieselbe Dateiliste noch einmal gemeldet -
+uebergangen"). Neuer Inhalt - Text oder andere Dateien - bricht eine
+laufende Sendung dieser Seite ab. Kopiert man empfangene Dateien noch
+einmal, gehen sie nicht zurueck ("Dateien: nicht gesendet, sie stammen
+aus einem Empfang", beim Mac-Host "Dateien: nicht gesendet (stammen aus
+einem Empfang dieses Hosts)").
+
+Direkt nach dem Verbinden weiss der Client oft noch nicht, ob der Host
+Dateien kann, und der Eingabekanal steht vielleicht noch nicht. Eine
+Kopie wartet dann bis zu 5 s ("Dateien: N Eintraege vorgemerkt - die
+Faehigkeiten des Hosts stehen noch aus (hoechstens 5 s)") und geht
+hinaus, sobald die Meldung da ist. Ebenso haelt die Windows-Host-Rolle
+eine Kopie bis zu 5 s zurueck, bis der Eingabekanal des Zuschauers
+gemeldet hat, was er kann ("Dateien: Zuschauer meldet Dateien - die
+vorgemerkte Liste geht hinaus"). Der Mac-Host merkt nichts vor; ohne
+Eingabekanal schreibt er "Dateien: nicht gesendet (Zuschauer ohne
+Eingabekanal)".
+
+Anzeige (nur im Client, die Hosts schreiben alles ins Protokoll): eine
+schmale Zeile unten mittig ueber dem Bild, je Richtung eine, solange die
+Uebertragung laeuft und 6 s danach:
+
+    "Dateien werden gesendet: 3.1 von 12.4 MB"
+    "Dateien werden empfangen: 3.1 von 12.4 MB"
+    "Dateien uebertragen: 2"               gesendet und quittiert
+    "Dateien bereit zum Einfuegen: 2"      empfangen und in der Ablage
+    "Dateiuebertragung abgebrochen: <Grund>"
+    "Dateien nicht uebertragen: mehr als 4 GB oder 10 000 Eintraege"
+    "Die Gegenseite kann noch keine Dateien empfangen."
+
+Die Zahl ist die der obersten Eintraege, also dessen, was beim Kopieren
+markiert war. Der Grund heisst "von diesem Geraet", "von der
+Gegenseite", "Verbindung unterbrochen", "Zeitueberschreitung, kein
+Fortschritt", "zu wenig Speicherplatz", "ungueltige Daten", "Lesefehler",
+"Schreibfehler" oder "Zwischenablage nicht verfuegbar"; Einzelheiten
+stehen in protokoll.txt. Ergebnisse stehen in Cyan, Abbrueche, Grenzen
+und "Die Gegenseite kann ..." (einmal je Sitzung) in Amber.
+
+Grenzen: hoechstens 4 GiB (4295 MB) und 10 000 Eintraege - Dateien und
+Ordner - je Kopie, und die Liste der Eintraege darf hoechstens 1 MiB
+lang sein. Darueber geht nichts hinaus ("Dateien: nicht gesendet, zu
+gross (5368,7 MB, hoechstens 4295,0 MB)" bzw. "(mehr als 10000
+Eintraege)" oder "(Dateiliste ueber 1048576 Byte)"; beim Mac-Host
+"Dateien: abgelehnt (mehr als 4 GB oder 10000 Eintraege) - nichts
+gesendet"). Ein Pfad darf hoechstens 1024 Byte lang und 32 Stufen tief
+sein, ein Name 255 Byte. Der Empfaenger nimmt nur an, wenn danach noch
+1 GiB frei bleibt (Windows und Mac-Host); der Mac-Client prueft das
+nicht vorab und bricht bei einem Schreibfehler sauber ab.
+
+Was der Sender auslaesst, steht je mit einer Zeile "Dateien:
+uebersprungen (<was>): <Pfad>" im Protokoll: Verknuepfungen (symbolische,
+unter Windows auch Junctions - sie werden nie verfolgt), besondere
+Dateien wie FIFOs, Namen, die die Gegenseite ablehnen muesste ("\", nicht
+in UTF-8, zu lang, zu tief), und Namen, die ein Empfaenger gleich saehe:
+nach der strengsten Bereinigung (der von Windows, siehe unten), in NFC
+und ohne Ruecksicht auf die Schreibweise. Von solchen Doppelten geht nur
+der erste hinaus; das trifft auch gleichnamige Dateien aus verschiedenen
+Ordnern (dafuer schreibt der Mac-Host "Dateien: doppelter Name <Name> -
+nur der erste wird gesendet"). Namen gehen in NFC hinaus, Finder liefert
+sie oft zerlegt. Eine Datei geht nur hinaus, wenn sie beim Oeffnen noch
+dieselbe ist wie beim Auflisten (Unix: Geraet und Inode, Windows: der
+endgueltige Pfad); sonst, und wenn sie kuerzer ist als angekuendigt,
+bricht die Sendung mit einem Lesefehler ab. Ist sie laenger geworden,
+geht nur die angekuendigte Groesse hinaus.
+
+Nachrang ("Latenz vor Bandbreite"): Bild, Ton und Eingaben gehen vor.
+
+    Fenster       Hoechstens 256 KiB sind unquittiert unterwegs, im
+                  Spielmodus 64 KiB; ein Wechsel des Spielmodus wirkt
+                  sofort auf eine laufende Sendung. Die Windows-Host-Rolle
+                  sendet immer mit hoechstens 64 KiB: Windows kann nicht
+                  messen, was im Sendepuffer des Kernels (256 KiB) liegt,
+                  das kleine Fenster ersetzt das. Es kostet Durchsatz,
+                  hoechstens 64 KiB je Umlaufzeit - bei 20 ms Umlaufzeit
+                  also rund 3,3 MB/s.
+    Client        Der Schreibfaden des Eingabekanals schreibt erst alle
+                  wartenden Eingaben (Tasten, Maus, Einstellungen), dann
+                  hoechstens ein Datei-Paket; mehr als eines wartet nie.
+                  Der Sendepuffer des Eingabekanals ist 64 KiB klein: vor
+                  einer Taste liegen im Kernel hoechstens 64 KiB
+                  Dateidaten. Quittungen gehen ohne Nachrang hinaus.
+    Windows-      Ein Datei-Paket kommt nur in die Warteschlange des
+    Host-Rolle    Bildkanals, wenn dort kein anderes wartet und hoechstens
+                  128 KiB liegen; Quittungen gehen als kleine
+                  Steuernachricht vorbei.
+    Mac-Host      Dateien, auch die Liste der Eintraege, warten, solange
+                  mehr als 128 KiB im Sendepuffer des Bildkanals liegen;
+                  der Sender sieht alle 2 ms nach.
+    Faeden        Senden und Empfangen laufen in eigenen Faeden mit
+                  niedrigerer Prioritaet: Windows "unter normal", macOS
+                  QoS "utility". Der Mac-Host sendet mit "default" und
+                  relativer Prioritaet -15, weil macOS unter "utility"
+                  aus 2 ms Warten rund 10 ms machte.
+
+Die Liste der Eintraege (bis 1 MiB) geht als ein Paket hinaus: davor
+wartet sie wie jedes Datei-Paket, teilen laesst sie sich aber nicht. Auf
+einer duennen Leitung warten Tasten bzw. Bilder dahinter also kurz.
+
+Abbruch: Eine Sendung endet, wenn auf ihrer Seite neuer Inhalt kopiert
+wird (Text oder andere Dateien); ihr Ende geht vor dem neuen Angebot
+hinaus, Client und Windows-Host-Rolle warten darauf hoechstens rund
+1,5 s. Jede Uebertragung endet, wenn die Sitzung endet oder ein anderer
+Zuschauer uebernimmt, und wenn 30 s lang kein Fortschritt kommt (der
+Sender bekommt keine neue Quittung, der Empfaenger kein Stueck).
+Verliert der Client waehrend einer Sendung zum Host den Eingabekanal,
+bricht er sofort ab statt erst nach 30 s ("Dateien: Eingabekanal N
+verloren - Sendung K abgebrochen"); sein Ende geht auf dem neuen
+Eingabekanal hinaus, damit der Host das halbe Verzeichnis gleich
+verwirft (der Mac-Host verwirft ohnehin, was ueber den verlorenen Kanal
+kam). Halb Empfangenes wird geloescht; abgebrochene Dateien kopiert man
+neu. Eine verlorene Quittung haelt nichts auf: der Empfaenger in Client
+und Windows-Host-Rolle wiederholt seinen Stand im Leerlauf jede Sekunde.
+
+Ablageverzeichnis: Empfangene Dateien liegen im Temp-Ordner des Nutzers,
+nie im Schreibtisch, in Dokumente oder Downloads:
+
+    Windows-Client       %TEMP%\QuadChroma-Ablage
+    Mac-Client           $TMPDIR/QuadChroma-Ablage
+    Windows-Host-Rolle   %TEMP%\QuadChroma-Host-Ablage
+    Mac-Host             $TMPDIR/QuadChroma-Host-Ablage
+
+Client und Host haben getrennte Ordner, damit keiner dem anderen etwas
+wegraeumt, wenn beide unter demselben Nutzer laufen. Unter macOS hat die
+Basis die Rechte 0700. Je Uebertragung gibt es ein Unterverzeichnis
+<unix-ms>-<kennung>; solange sie laeuft, liegt daneben die Marke
+<unix-ms>-<kennung>.laeuft. Nach jedem vollstaendigen Empfang bleiben
+die drei neuesten Uebertragungen (die eben abgelegte immer, auch wenn die
+Uhr zurueckgesprungen ist), aeltere werden geloescht. Beim Start geht,
+was aelter als 24 h ist, und was ein frueherer Lauf halb empfangen
+liegen liess: Client und Windows-Host-Rolle schreiben Prozesskennung und
+Startzeit in die Marke und raeumen eine Uebertragung weg, deren Prozess
+nicht mehr lebt (auch bei jedem Aufraeumen danach); der Mac-Host loescht
+beim Start jede Uebertragung mit Marke. Laufende Uebertragungen werden
+weder gezaehlt noch geloescht, Verknuepfungen nie verfolgt, und
+geloescht wird nur in der eigenen Basis. Im Protokoll steht "Dateien: N
+alte Uebertragungsverzeichnisse beim Start geloescht" (Client),
+"Dateien: N Uebertragungen geloescht, aelter als 24 h oder verwaist
+(<Basis>)" (Windows-Host-Rolle) bzw. "Dateien: N unfertige
+Uebertragung(en) eines frueheren Laufs geloescht" (Mac-Host). Ist die
+Basis des Mac-Hosts eine Verknuepfung oder gehoert sie einem anderen
+Nutzer, raeumt er nichts auf ("Dateien: Aufraeumen ausgelassen - ...").
+
+Namen beim Empfaenger: Er prueft alles, was ankommt, als waere es
+feindlich. Das ganze Angebot wird abgelehnt (Quittung 4, es bleibt
+nichts liegen) bei einem leeren Pfad, "/" am Anfang, einem leeren
+Bestandteil, "." oder "..", NUL oder "\" im Pfad, zu langen oder zu
+tiefen Pfaden, falscher Reihenfolge (ein Ordner nach seinem Inhalt),
+ungueltigem UTF-8, falscher Summe und bei Namen, die nach der
+Bereinigung doppelt sind. Mehr als 10000 Eintraege, mehr als 4 GiB oder
+ein Angebot ueber 1 MiB ergeben Quittung 2, zu wenig Platz Quittung 3.
+Bereinigt wird, was nur auf diesem System kein gueltiger Name ist:
+
+    Windows   < > : " | ? * und Steuerzeichen werden zu "_", Punkte und
+              Leerzeichen am Ende ebenso; Geraetenamen (CON, PRN, AUX,
+              NUL, CONIN$, CONOUT$, COM0-9, LPT0-9), auch mit Endung wie
+              con.txt und in jeder Schreibweise, bekommen ein "_" davor.
+              Doppelt heisst: gleich bis auf Gross- und Kleinschreibung.
+    Mac       Nur Steuerzeichen werden zu "_", ":" bleibt. Doppelt
+              heisst: gleich nach NFC und ohne Ruecksicht auf die
+              Schreibweise, auch ss und scharfes s - wie APFS es sieht.
+              Der Mac-Host legt die Namen in NFC an.
+
+Geschrieben wird nur in das frische Uebertragungsverzeichnis; jede Datei
+wird neu angelegt, Verknuepfungen werden nie angelegt oder verfolgt.
+
+Aeltere Gegenstellen: Ob die andere Seite Dateien kann, sagt sie beim
+Verbinden (Faehigkeiten, Nachrichten 11 und 69, siehe unten). Ein
+aelterer Stand sagt nichts; dann geht nichts hinaus - ein aelterer Host
+trennte sonst den Eingabekanal, er nimmt dort ausser Text nur 256 Byte
+je Nachricht -, und es gibt eine Meldung:
+
+    Client               einmal je Sitzung "Die Gegenseite kann noch
+                         keine Dateien empfangen.", im Protokoll
+                         "Dateien: Host kann keine Dateien empfangen
+                         (aelterer Host)"
+    Windows-Host-Rolle   einmal je Zuschauer, nach 5 s: "Dateien: nicht
+                         gesendet, der Eingabekanal des Zuschauers hat in
+                         5,0 s keine Faehigkeiten gemeldet" (ohne
+                         Eingabekanal "... stand nach 5,0 s noch nicht");
+                         meldet er Faehigkeiten ohne Dateien, "Dateien:
+                         Zuschauer kann keine Dateien empfangen (aelterer
+                         Client)"
+    Mac-Host             einmal je Sitzung "Dateien: Zuschauer kann keine
+                         Dateien empfangen (aelterer Client)"
+
+Ein aelterer Client uebergeht die Nachricht 11 einfach.
+
+Auf dem Mac: Kopiert man dort - am Host wie am Client - Dateien aus
+Schreibtisch, Dokumente oder Downloads, liest QuadChroma sie von dort, und
+macOS kann einmal fragen, ob QuadChroma auf diesen Ordner zugreifen
+darf. Ohne Erlaubnis scheitert das Lesen; das Protokoll nennt den Grund.
+Ab macOS 15.4 kann schon das Lesen der Zwischenablage eine Rueckfrage des
+Systems ausloesen (Einfuegen aus einem anderen Programm), fuer
+Dateiverweise wie fuer Text. Empfangene Dateien liegen dagegen nie in
+diesen Ordnern, sondern im Temp-Ordner; Finder kopiert sie beim
+Einfuegen von dort.
+
+Gemessen (Integrationstest vom 24.09.2026, am Stand vor den letzten
+Nachbesserungen): Auf der VM ohne Grafikkarte, Windows-Host-Rolle und
+Client auf derselben Maschine, ging 1 GiB in 30 bis 35 s hinueber, rund
+30 MB/s in beide Richtungen und bitgleich; der Host meldete dabei keinen
+Stau und kein verworfenes Bild. Der Software-Encoder der VM brauchte
+waehrenddessen mehr Zeit: 25 bis 75 ms mehr Verzoegerung und etwa ein
+Bild je Sekunde weniger. Seitdem laufen die Datei-Faeden mit
+niedrigerer Prioritaet, und die Host-Rolle sendet mit 64 statt 256 KiB
+Fenster - neu gemessen ist das noch nicht. Im LAN vom Windows-Client zum
+Mac-Host (M1): 209,7 MB in 7,4 s, also 28 MB/s, bei unveraenderten 114
+Bildern je Sekunde und rund 35 ms Verzoegerung.
+
+Protokollzeilen: im Client in protokoll.txt, in der Windows-Host-Rolle in
+host-protokoll.txt, im Mac-Host in /tmp/quadchroma-m1.log. Diese lauten
+auf allen Seiten gleich, nur die Gruende in Klammern unterscheiden sich:
+
+    "Dateien: sende 3 Eintraege, 12,4 MB"    (Hosts: "... an <IP>")
+    "Dateien: gesendet und quittiert (12,4 MB in 1,8 s)"
+    "Dateien: empfange 3 Eintraege, 12,4 MB"
+    "Dateien: empfangen 3 Eintraege, 12,4 MB - in die Ablage gelegt"
+    "Dateien: abgelehnt (<Grund>)"      vor der Annahme; beim Sender
+                                        etwa "(Gegenseite: zu wenig
+                                        Platz)"
+    "Dateien: abgebrochen (<Grund>)"    danach, im Client etwa "(hier
+                                        abgebrochen)", "(Verbindung
+                                        weg)", "(Gegenseite: abgebrochen)"
+                                        oder "(Zeitueberschreitung, kein
+                                        Fortschritt)"
+    "Dateien: uebersprungen (<was>): <Pfad>"
+    "Dateien: nichts zu senden"
+
+Dazu im Client und in der Windows-Host-Rolle:
+
+    "Dateien: nicht gesendet, zu gross (<Grund>)"
+    "Dateien: nicht gesendet, sie stammen aus einem Empfang"
+    "Dateien: Quittung N nicht gesendet, der Weg blieb voll (<Zustand>)"
+    "Zwischenablage: dieselbe Dateiliste noch einmal gemeldet -
+     uebergangen"
+    "Zwischenablage: Dateiliste nicht lesbar, nichts uebertragen"
+                                        (Windows)
+    "Zwischenablage: Dateiliste nicht abgelegt (Ablage belegt oder
+     Schreiben gescheitert, 40 Versuche in 1950 ms)"      (Windows)
+
+nur im Client:
+
+    "Host meldet Faehigkeiten 0x1: Dateien ja"
+    "Dateien: N Eintraege vorgemerkt - die Faehigkeiten des Hosts stehen
+     noch aus (hoechstens 5 s)"
+    "Dateien: Host kann keine Dateien empfangen (aelterer Host)"
+    "Dateien: Eingabekanal N verloren - Sendung K abgebrochen"
+    "Dateien: N alte Uebertragungsverzeichnisse beim Start geloescht"
+    "Zwischenablage: Dateiverweis nicht aufloesbar, nichts uebertragen"
+                                        (Mac-Client)
+
+nur in der Windows-Host-Rolle:
+
+    "Eingabekanal: Faehigkeiten 0x1 (Dateien)"
+    "Eingabekanal: Nachricht T mit N Byte ueber der Grenze von G Byte -
+     Kanal beendet"
+    "Dateien: Zuschauer meldet Dateien - die vorgemerkte Liste geht
+     hinaus"
+    "Dateien: nicht gesendet, der Eingabekanal des Zuschauers hat in
+     5,0 s keine Faehigkeiten gemeldet" (bzw. "... stand nach 5,0 s noch
+     nicht")
+    "Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)"
+    "Dateien: N Uebertragungen geloescht, aelter als 24 h oder verwaist
+     (<Basis>)"
+
+nur im Mac-Host:
+
+    "Eingabekanal: Client meldet Faehigkeiten 00000001 (Dateien)"
+    "Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)"
+    "Dateien: nicht gesendet (Zuschauer ohne Eingabekanal)"
+    "Dateien: nicht gesendet (stammen aus einem Empfang dieses Hosts)"
+    "Dateien: abgelehnt (mehr als 4 GB oder 10000 Eintraege) - nichts
+     gesendet"
+    "Dateien: doppelter Name <Name> - nur der erste wird gesendet"
+    "Dateien: N unfertige Uebertragung(en) eines frueheren Laufs
+     geloescht"
+    "Zwischenablage: N Dateiverweis(e) vom Mac erkannt"
+    "Zwischenablage: N Dateiverweis(e) vom Client abgelegt"
+
+Nachrichten der Leitung (Kopf wie ueberall: u8 Typ, u8 Flags, u16 frei,
+u32 Laenge; alle Zahlen little endian):
+
+    11  Faehigkeiten  Host -> Client, Bildkanal: u32 Bits (mindestens
+                      4 Byte, weitere werden uebergangen), Bit 0 heisst
+                      "Dateien Fassung 1". Geht an jeden neuen Zuschauer
+                      nach Begruessung, Einstellungen und Codecliste.
+    69  Faehigkeiten  Client -> Host, Eingabekanal, dasselbe Format; die
+                      erste Nachricht jedes Eingabekanals. Sie gilt nur
+                      fuer den Kanal, der sie geschickt hat.
+    50  Angebot       u32 Kennung (nicht 0), u32 Anzahl (1 bis 10000),
+                      u64 Gesamt (Summe der Dateigroessen, genau), dann je
+                      Eintrag u8 Art (0 Datei, 1 Ordner), u8 0,
+                      u16 Pfadlaenge (1 bis 1024), u64 Groesse (Ordner 0),
+                      Pfad (UTF-8, relativ, Trenner "/"). Vorfahr vor
+                      Nachfahr; hoechstens 1 MiB.
+    51  Stueck        u32 Kennung, u32 Eintrag, u64 Versatz, 1 bis 49152
+                      Byte Daten; streng der Reihe nach, Ordner und leere
+                      Dateien uebersprungen.
+    52  Ende          u32 Kennung, u8 Grund (0 vollstaendig, 1 abgebrochen,
+                      2 Lesefehler, 3 Zeitueberschreitung); mindestens
+                      5 Byte.
+    53  Quittung      genau 16 Byte: u32 Kennung, u8 Zustand, u8 0, u16 0,
+                      u64 empfangen (geschriebene Datenbytes). Zustand
+                      0 laeuft, 1 fertig und in der Ablage, 2 zu gross
+                      oder zu viele Eintraege, 3 zu wenig Platz,
+                      4 ungueltig, 5 Schreibfehler, 6 beim Empfaenger
+                      abgebrochen. Alles ausser 0 beendet die
+                      Uebertragung auf beiden Seiten.
+
+50 bis 52 gehen vom Sender zum Empfaenger - Host -> Client auf dem
+Bildkanal, Client -> Host auf dem Eingabekanal -, 53 in der
+Gegenrichtung. Gesendet wird nur an eine Gegenseite, die in dieser
+Sitzung Bit 0 gemeldet hat; ein Host verlangt die Meldung vom aktuellen
+Eingabekanal des Zuschauers. Beim Zuschauerwechsel und am Sitzungsende
+gilt sie nicht mehr. Quittiert wird gleich nach der Annahme (Zustand 0,
+empfangen 0), spaetestens je 64 KiB geschriebener Daten, wenn nichts
+mehr wartet, und am Ende; der Mac-Host auch, sobald mehr als 16 KiB
+offen sind. Der Empfaenger nimmt hoechstens ein Fenster plus ein Stueck
+an ungeschriebenen Daten und 8 Enden an. Jede Abweichung im Ablauf ist
+ein Protokollfehler (Quittung 4); der Kanal bleibt bestehen. Auf dem
+Eingabekanal der Hosts gelten je Nachricht diese Obergrenzen, darueber
+endet der Kanal wie bisher:
+
+    50 Angebot            1 MiB
+    51 Stueck             16 + 49152 Byte
+    52, 53, 69            256 Byte
+    48 Text               4 MiB
+    alle anderen          256 Byte
+
+Auf dem Bildkanal des Clients gilt weiter die allgemeine Grenze von
+64 MiB je Nachricht.
 
 Benchmark
 ---------
@@ -740,6 +1277,18 @@ mit h264_mf schiebt er nach, bis es heraus ist, siehe oben).
 Ohne Nachricht 10 verbindet sich der alte Client, sobald er wieder
 laeuft, von selbst neu und loest den neuen ab - wie ein aelterer Client.
 
+Dateien ueber die Zwischenablage gehen auch mit der Host-Rolle in beide
+Richtungen (siehe dort): Kopieren im Explorer des Hosts schickt sie an
+den Zuschauer, sofern sein Client Dateien kann; was vom Zuschauer kommt,
+liegt danach als Dateiliste in der Ablage der Sitzung, in der die
+Host-Rolle laeuft, und Einfuegen im Explorer kopiert es aus
+%TEMP%\QuadChroma-Host-Ablage. Die Host-Rolle sendet mit einem festen
+Fenster von 64 KiB, haelt eine Kopie gleich nach dem Verbinden bis zu
+5 s zurueck, bis der Zuschauer seine Faehigkeiten gemeldet hat, und
+raeumt beim Start ihren Ablageordner auf. Ein Symbol im Infobereich hat
+sie nicht, auch keine Einzelinstanz - beides gehoert zum Client mit
+Fenster.
+
 Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
 privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,
 Fingerabdruck, Name) - getrennt von client.key und known_hosts.txt.
@@ -763,4 +1312,4 @@ Voraussetzung ist Windows 10 oder 11, 64 Bit. Eine Visual-C++-Laufzeit
 braucht es nicht: die C-Laufzeit steckt in der exe, und die FFmpeg-Dateien
 nutzen nur die Universal C Runtime, die zu Windows 10 und 11 gehoert.
 
-Stand: 23.09.2026
+Stand: 24.09.2026
