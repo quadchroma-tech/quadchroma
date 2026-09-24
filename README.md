@@ -45,10 +45,10 @@ Auf Windows einfach starten:
 
 Der Host ruft sich alle zwei Sekunden im lokalen Netz aus, erscheint also von selbst
 im Startbildschirm. Drei Kanäle: 9001 Bild und Ton (und alles vom Host zum Client),
-9002 Eingaben und Zwischenablage vom Client, 9003 die Bekanntgabe. Was der Client
-entscheidet (Decoder, Anzeige, Zeigerform) und was FFmpeg dazu sagt, steht in
-`%APPDATA%\QuadChroma\protokoll.txt`; die Bedienung im Einzelnen beschreibt
-`BENUTZUNG.txt`.
+9002 Eingaben und Zwischenablage samt Dateien (alles vom Client zum Host), 9003 die
+Bekanntgabe. Was der Client entscheidet (Decoder, Anzeige, Zeigerform) und was
+FFmpeg dazu sagt, steht in `%APPDATA%\QuadChroma\protokoll.txt`; die Bedienung im
+Einzelnen beschreibt `BENUTZUNG.txt`.
 
 ### Windows-Client bauen
 
@@ -80,10 +80,10 @@ Menüleiste. Bauen mit Rust und dem FFmpeg aus Homebrew:
     ./target/release/quadchroma 192.168.178.194:9001
 
 Ablage unter `~/Library/Application Support/QuadChroma` (client.key, known_hosts.txt,
-einstellungen.txt, protokoll.txt, benchmark.txt, einzel.sock — neben host.key und
-authorized.txt des Hosts, getrennte Dateien). Lizenzhinweis: das Homebrew-FFmpeg
-ist ein GPL-Build (libx264, libx265); für den Eigengebrauch in Ordnung, zur
-Weitergabe des Mac-Clients braucht es einen LGPL-Build ohne GPL-Teile.
+einstellungen.txt, protokoll.txt, benchmark.txt, einzel.sock, einzel.lock — neben
+host.key und authorized.txt des Hosts, getrennte Dateien). Lizenzhinweis: das
+Homebrew-FFmpeg ist ein GPL-Build (libx264, libx265); für den Eigengebrauch in
+Ordnung, zur Weitergabe des Mac-Clients braucht es einen LGPL-Build ohne GPL-Teile.
 
 ## Bedienung im Client
 
@@ -140,8 +140,11 @@ zeigt eine schmale Zeile unten im Bild den Fortschritt.
   gesendet noch angelegt.
 - Ältere Gegenstellen bekommen nichts: Ob die andere Seite Dateien kann, meldet sie
   beim Verbinden (Fähigkeiten, Nachrichten 11 und 69).
-- Gemessen im Integrationstest: rund 30 MB/s auf der VM, 28 MB/s im LAN vom
-  Windows-Client zum Mac-Host, bei unveränderten 114 Bildern/s.
+- Gemessen im Integrationstest (Stand 574cd3e, vor dem 64-KiB-Fenster der
+  Host-Rolle und den Fäden mit Nachrang): auf der VM rund 30 MB/s in beide
+  Richtungen, dort mit etwa 1 Bild/s weniger und 25–75 ms mehr Verzögerung im
+  Software-Encoder; im LAN vom Windows-Client zum Mac-Host 28 MB/s bei
+  unveränderten 114 Bildern/s.
 
 Auf dem Mac kann macOS beim ersten Kopieren aus Schreibtisch, Dokumente oder
 Downloads nach dem Zugriff fragen, ab macOS 15.4 auch beim Lesen der
@@ -166,6 +169,10 @@ verbindet sofort, auch wenn die App schon im Infobereich liegt. Ohne Fenster:
 
 Die Verknüpfung trägt den vollen Pfad der exe und die Adresse des Hosts, nicht
 seinen Namen: Nach einem Umzug der exe oder einer neuen Adresse legt man sie neu an.
+
+Das Programmsymbol, vier farbige Quadrate, zeichnet der Client selbst: unter Windows
+für Titelleiste, Taskleiste, Infobereich und Verknüpfung (die exe trägt keines), auf
+dem Mac einfarbig für die Menüleiste.
 
 ## Gemessen auf einem Mac mini M1
 
@@ -258,9 +265,15 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
   Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern.
-  Von den Dateien, der Verknüpfung und dem Infobereich (belegt auf der VM mit
-  Windows-Host-Rolle und Client, Client → Mac-Host im LAN, dazu `dateitest`,
-  `ablagetest` und die Dateiabschnitte von `hosttest`) noch offen: Kopieren mit
+  Von den Dateien, der Verknüpfung und dem Infobereich (belegt im Integrationstest
+  am Stand 574cd3e auf der VM mit Windows-Host-Rolle und Client und Client →
+  Mac-Host im LAN, dazu `dateitest`, `ablagetest` und die Dateiabschnitte von
+  `hosttest`) noch offen: die Nachbesserungen nach 574cd3e, die bisher nur
+  Prüfstände und Unit-Tests belegen (Entprellen und Entdoppeln der Ablage,
+  Vormerken einer Kopie direkt nach dem Verbinden, Aufräumen verwaister
+  Übertragungen, am Mac-Host Namen in NFC und die Zeile „empfange …“, die
+  Einzelinstanz, wenn die erste App gerade endet, und das Beenden, wenn macOS das
+  Symbol der Menüleiste nicht zeigt), dazu Kopieren mit
   Strg+C und Einfügen im Explorer von Hand am Laptop (auf der VM kopierte ein Skript
   über .NET, eingefügt wurde per Shell-Befehl), Einfügen im Finder am Mac, Dateien
   vom Mac-Host zum Client im laufenden Betrieb, der Mac-Client mit Dateien,
@@ -269,7 +282,8 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Verknüpfung), die Verknüpfung über den Knopf auf dem echten, auch auf OneDrive
   umgeleiteten Desktop, und Durchsatz und Verzögerung nach den letzten
   Nachbesserungen (Fenster der Windows-Host-Rolle 64 KiB, Fäden mit niedrigerer
-  Priorität)
+  Priorität; der Mac-Client sendet unter der Dienstklasse „utility“, die Fristen
+  und Schlaf deutlich dehnt – im Modell des Codes 20 MB in 4,1 statt 1,1 s)
 - Veröffentlichung: ein Lizenzpaket für die Binärdateien (GPL- und LGPL-Text, Hinweise
   der Rust-Abhängigkeiten, der zu den DLLs passende FFmpeg-Quellstand samt
   Bauangaben) und eine Lizenz für das Projekt selbst; Developer-ID-Signatur und
@@ -391,15 +405,18 @@ Gegentest der Rust-Seite (`quadchroma --noisetest adresse:port`).
 
 Die Rust-Seite prüft sich mit `cargo test --release` in `client\` bzw. `client/`;
 mehrere Tests brauchen Loopback (TCP über 127.0.0.1). Auf Windows gehört der
-`bin`-Ordner von FFmpeg in den `PATH`, und `APPDATA` sollte auf einen eigenen Ordner
-zeigen: Die Ablagetests beschreiben die Zwischenablage der Sitzung, nacheinander
-hinter dem benannten Mutex `Global\QuadChromaAblageTest`, und schreiben ins
-Protokoll. Auf dem Mac mit `-- --skip clipboard`, sonst liest und beschreibt
-`setzen_zaehlen_lesen` die echte Zwischenablage; die übrigen Ablagetests des
-Mac-Clients arbeiten auf eigenen Brettern und laufen einzeln per Namen
-(`-- --exact clipboard_mac::tests::<name>`). Empfangene Dateien schreiben die Tests
-in einen eigenen Ordner je Lauf im Temp-Ordner (`qc-test-<pid>-ablage` bzw.
-`qc-test-<pid>-host-ablage`), nie in `QuadChroma-Ablage`.
+`bin`-Ordner von FFmpeg in den `PATH`. Die Ablagetests beschreiben dort die echte
+Zwischenablage der Sitzung, nacheinander hinter dem benannten Mutex
+`Global\QuadChromaAblageTest`, und in einer Sitzung mit Explorer erscheint kurz ein
+echtes Symbol im Infobereich (ohne Sprechblase). Auf dem Mac mit
+`-- --skip clipboard`, sonst liest und beschreibt `setzen_zaehlen_lesen` die echte
+Zwischenablage; die übrigen Ablagetests des Mac-Clients arbeiten auf eigenen Brettern
+und laufen einzeln per Namen (`-- --exact clipboard_mac::tests::<name>`). Den
+Ablageordner fassen die Tests nie an: Schlüssel, Einstellungen, `protokoll.txt` und
+`quadchroma.ico` liegen je Lauf in `qc-test-<pid>-<ms>/QuadChroma` im Temp-Ordner,
+`APPDATA` muss also nicht umgelenkt werden. Empfangene Dateien schreiben die Tests
+in `qc-test-<pid>-ablage` bzw. `qc-test-<pid>-host-ablage`, ebenfalls im
+Temp-Ordner, nie in `QuadChroma-Ablage`.
 
 Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Netz:
 `quadchroma.exe --tray-selbsttest` (braucht eine Sitzung mit Explorer) bzw.

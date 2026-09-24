@@ -12,9 +12,10 @@ Wer die Adresse kennt, kann sie auch eintippen oder gleich mitgeben:
     quadchroma.exe 192.168.178.194:9001
 
 Port 9001 ist Bild und Ton (und alles vom Host zum Client), 9002 Eingaben
-und Zwischenablage vom Client, 9003 die Bekanntgabe im Netz. Beim ersten
-Start fragt die Windows-Firewall, ob das Programm ins Netz darf - das muss
-erlaubt werden, sonst bleibt die Liste leer.
+und Zwischenablage samt Dateien (alles vom Client zum Host), 9003 die
+Bekanntgabe im Netz. Beim ersten Start fragt die Windows-Firewall, ob das
+Programm ins Netz darf - das muss erlaubt werden, sonst bleibt die Liste
+leer.
 
 Schliessen beendet QuadChroma nicht, es legt die App im Infobereich ab
 (auf dem Mac in der Menueleiste). Es laeuft nur eine App mit Fenster: ein
@@ -243,7 +244,9 @@ Im Menue stehen "Oeffnen" (unter Windows fett), bis zu vier gefundene
 Hosts als "Verbinden: <Name>" und "Beenden". "Verbinden" wirkt wie ein
 Klick auf die Hostzeile: eine Sitzung zum selben Host bleibt, eine zu
 einem anderen wird vorher getrennt. Der Tooltip heisst "QuadChroma", in
-einer Sitzung "QuadChroma - <Name bzw. Adresse>". Beim ersten Ablegen
+einer Sitzung "QuadChroma - <Name bzw. Adresse>" (im Programm mit
+Gedankenstrich statt "-"). Namen stehen im Menue und im Tooltip mit
+hoechstens 40 Zeichen, laengere enden auf "...". Beim ersten Ablegen
 kommt einmal der Hinweis "QuadChroma laeuft im Infobereich weiter."
 (Windows, Sprechblase) bzw. "QuadChroma laeuft in der Menueleiste
 weiter." (Mac, Blase unter dem Symbol, 6 s). Vermerkt wird das in
@@ -253,7 +256,13 @@ wirklich zu sehen war; mit tray_hinweis=0 kommt er noch einmal.
 Beenden: "Beenden" im Menue des Symbols, der Knopf "Beenden" oder ESC auf
 dem Startbildschirm, auf dem Mac auch Cmd+Q. Ein WM_CLOSE an das Fenster
 legt die App nur ab wie das X; ein Skript beendet sie mit taskkill /F
-bzw. Stop-Process -Id.
+bzw. Stop-Process -Id. taskkill ohne /F wirkt wie das X und hat eine
+Nebenwirkung: es schickt WM_CLOSE an alle Fenster oberster Ebene des
+Prozesses, auch an das unsichtbare der Einzelinstanz (siehe unten), und
+das schliesst sich dabei. Laeuft die App danach im Infobereich weiter,
+findet ein zweiter Start oder ein Doppelklick auf eine Verknuepfung sie
+nicht mehr und endet nach 5 s mit 1 ("QuadChroma laeuft schon, antwortet
+aber nicht (<Grund>)."), bis die App beendet ist.
 
 tray=aus in einstellungen.txt schaltet das Ablegen ab: kein Symbol, und
 Schliessen beendet das Programm wie frueher. Dasselbe gilt ohne Symbol -
@@ -262,6 +271,14 @@ angemeldet oder zeigt macOS es nicht an (volle Menueleiste, "In der
 Menueleiste erlauben" aus), beendet Schliessen das Programm. Die App wird
 also nie unsichtbar ohne Weg zurueck. Startet Explorer neu, meldet sich
 das Symbol von selbst wieder an.
+
+Zum Umstellen die vorhandene Zeile tray=an in tray=aus aendern (auch 0,
+nein oder off), und zwar bei beendeter App: gelesen wird die Datei nur
+beim Start, und eine laufende App schreibt sie beim naechsten Sichern
+(etwa beim ersten Ablegen, mit F9 oder bei einer Aenderung im Menue) mit
+ihren Werten zurueck. tray= und tray_hinweis= gelten nur vor der ersten
+Zeile "host ..."; darunter gehoeren sie zu diesem Host und werden
+uebergangen.
 
 Im Protokoll (protokoll.txt) steht, was geschah; auf dem Mac beginnen
 die Zeilen mit "Menueleiste:" statt "Infobereich:":
@@ -326,7 +343,8 @@ Unter Windows erkennt ein Mutex (Local\QuadChroma-Client) die erste
 Instanz; weitergereicht wird per WM_COPYDATA an ein unsichtbares Fenster
 der Klasse QuadChromaEinzel, und der zweite Start gibt sein Recht auf den
 Vordergrund an den ersten weiter. Auf dem Mac ist es ein Unix-Socket
-einzel.sock mit der Sperre einzel.lock im Ablageordner.
+einzel.sock mit der Sperre einzel.lock, beide in
+~/Library/Application Support/QuadChroma.
 
 Desktop-Verknuepfung (nur Windows)
 ----------------------------------
@@ -362,8 +380,11 @@ auf (Arbeitsordner ist der Ordner der exe) - derselbe Weg wie eine
 Adresse beim Start. Ihr Symbol ist das Programmsymbol (vier farbige
 Quadrate) aus %APPDATA%\QuadChroma\quadchroma.ico; die Datei wird bei
 jedem Anlegen geschrieben bzw. erneuert, denn die exe selbst traegt kein
-Symbol. Als Kommentar zeigt Windows "QuadChroma: mit <Name> verbinden
-(<Adresse>)" in der Sprache der Oberflaeche.
+Symbol. Dasselbe Symbol zeichnet der Client beim Start selbst fuer sein
+Fenster, in Titelleiste und Taskleiste, und fuer den Infobereich (auf
+dem Mac nur fuer die Menueleiste, einfarbig). Als Kommentar zeigt
+Windows "QuadChroma: mit <Name> verbinden (<Adresse>)" in der Sprache der
+Oberflaeche.
 
 Grenzen: Die Verknuepfung zeigt mit vollem Pfad auf die exe, mit der sie
 angelegt wurde - wer die exe verschiebt, legt sie neu an. Und sie traegt
@@ -720,7 +741,10 @@ Gegenseite", "Verbindung unterbrochen", "Zeitueberschreitung, kein
 Fortschritt", "zu wenig Speicherplatz", "ungueltige Daten", "Lesefehler",
 "Schreibfehler" oder "Zwischenablage nicht verfuegbar"; Einzelheiten
 stehen in protokoll.txt. Ergebnisse stehen in Cyan, Abbrueche, Grenzen
-und "Die Gegenseite kann ..." (einmal je Sitzung) in Amber.
+und "Die Gegenseite kann ..." (einmal je Sitzung) in Amber. "Dateien
+nicht uebertragen: ..." steht fuer jede der Grenzen unten, auch wenn nur
+die Liste der Eintraege ueber 1 MiB laege, und ebenso, wenn ein Angebot
+mit Quittung 2 abgelehnt wird - in beiden Richtungen.
 
 Grenzen: hoechstens 4 GiB (4295 MB) und 10 000 Eintraege - Dateien und
 Ordner - je Kopie, und die Liste der Eintraege darf hoechstens 1 MiB
@@ -728,10 +752,11 @@ lang sein. Darueber geht nichts hinaus ("Dateien: nicht gesendet, zu
 gross (5368,7 MB, hoechstens 4295,0 MB)" bzw. "(mehr als 10000
 Eintraege)" oder "(Dateiliste ueber 1048576 Byte)"; beim Mac-Host
 "Dateien: abgelehnt (mehr als 4 GB oder 10000 Eintraege) - nichts
-gesendet"). Ein Pfad darf hoechstens 1024 Byte lang und 32 Stufen tief
-sein, ein Name 255 Byte. Der Empfaenger nimmt nur an, wenn danach noch
-1 GiB frei bleibt (Windows und Mac-Host); der Mac-Client prueft das
-nicht vorab und bricht bei einem Schreibfehler sauber ab.
+gesendet" bzw. "Dateien: abgelehnt (Liste der Eintraege ueber 1 MiB) -
+nichts gesendet"). Ein Pfad darf hoechstens 1024 Byte lang und 32
+Stufen tief sein, ein Name 255 Byte. Der Empfaenger nimmt nur an, wenn
+danach noch 1 GiB frei bleibt (Windows und Mac-Host); der Mac-Client
+prueft das nicht vorab und bricht bei einem Schreibfehler sauber ab.
 
 Was der Sender auslaesst, steht je mit einer Zeile "Dateien:
 uebersprungen (<was>): <Pfad>" im Protokoll: Verknuepfungen (symbolische,
@@ -776,7 +801,11 @@ Nachrang ("Latenz vor Bandbreite"): Bild, Ton und Eingaben gehen vor.
                   niedrigerer Prioritaet: Windows "unter normal", macOS
                   QoS "utility". Der Mac-Host sendet mit "default" und
                   relativer Prioritaet -15, weil macOS unter "utility"
-                  aus 2 ms Warten rund 10 ms machte.
+                  aus 2 ms Warten rund 10 ms machte. Der Mac-Client
+                  sendet unter "utility"; macOS dehnt dort Fristen und
+                  Schlaf deutlich (im Modell des Codes 20 MB in 4,1
+                  statt 1,1 s). Wie schnell er wirklich sendet, ist noch
+                  nicht gemessen.
 
 Die Liste der Eintraege (bis 1 MiB) geht als ein Paket hinaus: davor
 wartet sie wie jedes Datei-Paket, teilen laesst sie sich aber nicht. Auf
@@ -832,9 +861,12 @@ nichts liegen) bei einem leeren Pfad, "/" am Anfang, einem leeren
 Bestandteil, "." oder "..", NUL oder "\" im Pfad, zu langen oder zu
 tiefen Pfaden, falscher Reihenfolge (ein Ordner nach seinem Inhalt),
 ungueltigem UTF-8, falscher Summe und bei Namen, die nach der
-Bereinigung doppelt sind. Mehr als 10000 Eintraege, mehr als 4 GiB oder
-ein Angebot ueber 1 MiB ergeben Quittung 2, zu wenig Platz Quittung 3.
-Bereinigt wird, was nur auf diesem System kein gueltiger Name ist:
+Bereinigung doppelt sind. Mehr als 10000 Eintraege oder mehr als 4 GiB
+ergeben Quittung 2, ein Angebot ueber 1 MiB ebenso beim Client; bei den
+Hosts kommt ein solches nie an, ihr Eingabekanal endet darueber ohne
+Quittung (siehe die Obergrenzen unten). Zu wenig Platz ergibt Quittung 3
+(nicht beim Mac-Client, er prueft den Platz nicht vorab). Bereinigt
+wird, was nur auf diesem System kein gueltiger Name ist:
 
     Windows   < > : " | ? * und Steuerzeichen werden zu "_", Punkte und
               Leerzeichen am Ende ebenso; Geraetenamen (CON, PRN, AUX,
@@ -924,6 +956,11 @@ Dazu im Client und in der Windows-Host-Rolle:
     "Zwischenablage: Dateiliste nicht abgelegt (Ablage belegt oder
      Schreiben gescheitert, 40 Versuche in 1950 ms)"      (Windows)
 
+Die "Zwischenablage: ..."-Zeilen schreibt die Windows-Host-Rolle wie der
+Client zuerst in protokoll.txt (siehe "Windows als Host") und erst im
+Fuenf-Sekunden-Takt in host-protokoll.txt. Dort stehen sie also bis zu
+5 s spaeter als die "Dateien: ..."-Zeilen, zu denen sie gehoeren.
+
 nur im Client:
 
     "Host meldet Faehigkeiten 0x1: Dateien ja"
@@ -957,11 +994,14 @@ nur im Mac-Host:
     "Dateien: nicht gesendet (stammen aus einem Empfang dieses Hosts)"
     "Dateien: abgelehnt (mehr als 4 GB oder 10000 Eintraege) - nichts
      gesendet"
+    "Dateien: abgelehnt (Liste der Eintraege ueber 1 MiB) - nichts
+     gesendet"
     "Dateien: doppelter Name <Name> - nur der erste wird gesendet"
     "Dateien: N unfertige Uebertragung(en) eines frueheren Laufs
      geloescht"
     "Zwischenablage: N Dateiverweis(e) vom Mac erkannt"
     "Zwischenablage: N Dateiverweis(e) vom Client abgelegt"
+    "Zwischenablage: Schreiben der Dateiverweise abgelehnt"
 
 Nachrichten der Leitung (Kopf wie ueberall: u8 Typ, u8 Flags, u16 frei,
 u32 Laenge; alle Zahlen little endian):
@@ -1015,6 +1055,14 @@ endet der Kanal wie bisher:
 
 Auf dem Bildkanal des Clients gilt weiter die allgemeine Grenze von
 64 MiB je Nachricht.
+
+Quittung 1 heisst bei Client und Windows-Host-Rolle: die Dateiliste
+liegt in der Ablage; scheitert das Ablegen, kommt 5. Der Mac-Host
+quittiert 1 und schreibt "... - in die Ablage gelegt", sobald alles
+geschrieben ist, und legt die Liste erst gleich danach auf seinem
+Hauptfaden in die Ablage. Scheitert das, steht nur "Zwischenablage:
+Schreiben der Dateiverweise abgelehnt" in seinem Protokoll, und der
+Client zeigt trotzdem "Dateien uebertragen".
 
 Benchmark
 ---------
@@ -1102,6 +1150,18 @@ erzwingt die Karte und sagt, was sie dazu meint;
 zaehlt die Karten auf und probiert jede Decoderwahl mit HEVC 4:4:4, 4:2:0
 und H.264 durch, ohne Verbindung.
 
+    quadchroma.exe --shot datei.bmp [sprache] [ansicht]
+
+schreibt ein Bild der Oberflaeche als BMP, ohne Fenster und ohne
+Verbindung, und endet (Vorgabe ui.bmp, de, start; Sprache als Kuerzel
+wie en). Ansichten: start, starttip (Tooltip des Knopfs "Verknuepfung"),
+abgeloest und fingerabdruck (Startbildschirm mit der jeweiligen
+Meldung), sitzung und nerd (Statistik ueber einem angedeuteten Bild),
+hud, hud2 bis hud5 und hud2tip (das Menue, je ein Reiter), dateien und
+dateienfehler (die Zeilen der Dateiuebertragung, laufend und fertig bzw.
+mit Abbruchgruenden). Die Startbildschirme sind 900x700 gross, alle
+anderen 1280x720.
+
     quadchroma.exe 192.168.178.194:9001 --ohne-aud
 
 laesst den Zugriffseinheiten-Begrenzer (AUD) weg, den der Client sonst
@@ -1129,6 +1189,14 @@ kein Wachhalten (Leerlauf unter 1 % eines Kerns). Alles laeuft ohne
 Fenster ueber die Befehlszeile; jede Zeile steht auch in
 %APPDATA%\QuadChroma\host-protokoll.txt (Drossel und Obergrenze: siehe
 "Protokoll der Hosts" oben).
+
+Die Host-Rolle schreibt ausserdem in protokoll.txt - ihre Kartenzeilen
+beim Start, die Meldungen von FFmpeg und die Zeilen "Zwischenablage:
+..." - und beginnt die Datei dabei neu wie der Client. Laufen Client und
+Host-Rolle unter demselben Nutzer, schreiben also beide in dieselbe
+protokoll.txt, und wer zuletzt startet, leert sie. In host-protokoll.txt
+stehen diese Zeilen ebenfalls, im Betrieb aber erst im
+Fuenf-Sekunden-Takt.
 
     quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
                    [--pair] [--forget] [--konserve datei.hevc]
