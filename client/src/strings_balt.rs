@@ -164,6 +164,13 @@ pub static ET: Lang = Lang {
         (DesktopShortcutCreated, "Otsetee loodud töölauale: {n}"),
         (DesktopShortcutFailed, "Otseteed ei loodud: {n}"),
         (DesktopShortcutDescription, "QuadChroma: ühenda hostiga {n} ({m})"),
+        (FilesSending, "Failide saatmine: {n} / {m}"),
+        (FilesReceiving, "Failide vastuvõtmine: {n} / {m}"),
+        (FilesReady, "Failid on kleepimiseks valmis: {n}"),
+        (FilesSent, "Failid edastatud: {n}"),
+        (FilesAborted, "Failide edastamine katkestati: {n}"),
+        (FilesTooLarge, "Faile ei edastatud: üle 4 GB või 10 000 kirje"),
+        (FilesPeerOld, "Teine pool ei saa veel faile vastu võtta."),
     ],
 };
 
@@ -328,6 +335,13 @@ pub static LV: Lang = Lang {
         (DesktopShortcutCreated, "Saīsne izveidota darbvirsmā: {n}"),
         (DesktopShortcutFailed, "Saīsne netika izveidota: {n}"),
         (DesktopShortcutDescription, "QuadChroma: savienoties ar {n} ({m})"),
+        (FilesSending, "Failu sūtīšana: {n} no {m}"),
+        (FilesReceiving, "Failu saņemšana: {n} no {m}"),
+        (FilesReady, "Faili gatavi ielīmēšanai: {n}"),
+        (FilesSent, "Faili pārsūtīti: {n}"),
+        (FilesAborted, "Failu pārsūtīšana pārtraukta: {n}"),
+        (FilesTooLarge, "Faili netika pārsūtīti: vairāk nekā 4 GB vai 10 000 vienumu"),
+        (FilesPeerOld, "Otra puse vēl nevar saņemt failus."),
     ],
 };
 
@@ -492,6 +506,13 @@ pub static LT: Lang = Lang {
         (DesktopShortcutCreated, "Nuoroda sukurta darbalaukyje: {n}"),
         (DesktopShortcutFailed, "Nuoroda nesukurta: {n}"),
         (DesktopShortcutDescription, "QuadChroma: prisijungti prie {n} ({m})"),
+        (FilesSending, "Siunčiami failai: {n} iš {m}"),
+        (FilesReceiving, "Gaunami failai: {n} iš {m}"),
+        (FilesReady, "Failai paruošti įklijuoti: {n}"),
+        (FilesSent, "Failai perduoti: {n}"),
+        (FilesAborted, "Failų perdavimas nutrauktas: {n}"),
+        (FilesTooLarge, "Failai neperduoti: daugiau nei 4 GB arba 10 000 elementų"),
+        (FilesPeerOld, "Kita pusė dar negali priimti failų."),
     ],
 };
 
@@ -656,6 +677,13 @@ pub static SL: Lang = Lang {
         (DesktopShortcutCreated, "Bližnjica ustvarjena na namizju: {n}"),
         (DesktopShortcutFailed, "Bližnjica ni bila ustvarjena: {n}"),
         (DesktopShortcutDescription, "QuadChroma: poveži se z {n} ({m})"),
+        (FilesSending, "Pošiljanje datotek: {n} od {m}"),
+        (FilesReceiving, "Prejemanje datotek: {n} od {m}"),
+        (FilesReady, "Datoteke, pripravljene za lepljenje: {n}"),
+        (FilesSent, "Datoteke prenesene: {n}"),
+        (FilesAborted, "Prenos datotek je bil prekinjen: {n}"),
+        (FilesTooLarge, "Datoteke niso bile prenesene: več kot 4 GB ali 10.000 elementov"),
+        (FilesPeerOld, "Druga stran še ne more prejemati datotek."),
     ],
 };
 
@@ -820,6 +848,13 @@ pub static HR: Lang = Lang {
         (DesktopShortcutCreated, "Prečac stvoren na radnoj površini: {n}"),
         (DesktopShortcutFailed, "Prečac nije stvoren: {n}"),
         (DesktopShortcutDescription, "QuadChroma: poveži se s {n} ({m})"),
+        (FilesSending, "Slanje datoteka: {n} od {m}"),
+        (FilesReceiving, "Primanje datoteka: {n} od {m}"),
+        (FilesReady, "Datoteke spremne za lijepljenje: {n}"),
+        (FilesSent, "Datoteke prenesene: {n}"),
+        (FilesAborted, "Prijenos datoteka prekinut: {n}"),
+        (FilesTooLarge, "Datoteke nisu prenesene: više od 4 GB ili 10.000 stavki"),
+        (FilesPeerOld, "Druga strana još ne može primati datoteke."),
     ],
 };
 
@@ -984,5 +1019,12 @@ pub static UK: Lang = Lang {
         (DesktopShortcutCreated, "Ярлик створено на робочому столі: {n}"),
         (DesktopShortcutFailed, "Ярлик не створено: {n}"),
         (DesktopShortcutDescription, "QuadChroma: підключитися до {n} ({m})"),
+        (FilesSending, "Надсилання файлів: {n} з {m}"),
+        (FilesReceiving, "Отримання файлів: {n} з {m}"),
+        (FilesReady, "Файли готові до вставлення: {n}"),
+        (FilesSent, "Файли передано: {n}"),
+        (FilesAborted, "Передавання файлів перервано: {n}"),
+        (FilesTooLarge, "Файли не передано: понад 4 GB або 10 000 елементів"),
+        (FilesPeerOld, "Інша сторона ще не може отримувати файли."),
     ],
 };

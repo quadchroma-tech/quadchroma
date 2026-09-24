@@ -79,12 +79,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Gilt auch fuer den Block einer abgelegten Dateiliste.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// Mehr oberste Eintraege einer Dateiliste liest der Waechter nicht. Mehr als
-/// EINTRAEGE_MAX (10000, Spezifikation 2.6) koennen ohnehin nicht hinaus;
-/// einer darueber reicht, damit der Sender "zu viele" erkennt und meldet,
-/// statt still nur einen Teil zu schicken. Haelt ausserdem die Zeit bei
-/// offener Ablage kurz.
-const DATEIEN_MAX: usize = 10_000;
 
 /// Groesse des Kopfes DROPFILES (packed(1)): pFiles, pt.x, pt.y, fNC, fWide.
 const DROPFILES_GROESSE: usize = 20;
@@ -345,9 +339,11 @@ fn lesen() -> Option<Inhalt> {
 /// aufrufen: das Handle gehoert der Ablage und gilt nur, solange sie offen
 /// ist. Deshalb auch nie DragFinish darauf - das gaebe einen Block frei, der
 /// dem System gehoert. Gelesen werden nur die Pfade, keine Datei, damit die
-/// Ablage so kurz wie moeglich offen bleibt. Hoechstens DATEIEN_MAX + 1
-/// Eintraege. None, wenn einer der Pfade nicht zu lesen ist - lieber keine
-/// Liste als eine halbe.
+/// Ablage so kurz wie moeglich offen bleibt. Hoechstens EINTRAEGE_MAX + 1
+/// Eintraege: mehr als EINTRAEGE_MAX (Spezifikation 2.6) koennen ohnehin
+/// nicht hinaus, einer darueber reicht, damit der Sender "zu viele" erkennt
+/// und meldet, statt still nur einen Teil zu schicken. None, wenn einer der
+/// Pfade nicht zu lesen ist - lieber keine Liste als eine halbe.
 fn hdrop_pfade() -> Option<Vec<PathBuf>> {
     let handle = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.ok()?;
     if handle.0.is_null() {
@@ -358,7 +354,7 @@ fn hdrop_pfade() -> Option<Vec<PathBuf>> {
     // 0xFFFFFFFF fragt nach der Anzahl, ein Index ohne Puffer nach der Laenge
     // (in Zeichen, ohne NUL).
     let anzahl = unsafe { DragQueryFileW(hdrop, u32::MAX, None) } as usize;
-    let anzahl = anzahl.min(DATEIEN_MAX + 1);
+    let anzahl = anzahl.min(crate::dateien::EINTRAEGE_MAX as usize + 1);
     let mut pfade = Vec::with_capacity(anzahl);
     for i in 0..anzahl as u32 {
         let laenge = unsafe { DragQueryFileW(hdrop, i, None) } as usize;
@@ -483,10 +479,8 @@ pub fn set(text: &str) {
 /// `pfade` sind vollstaendige Pfade der obersten Eintraege; die Dateien
 /// selbst werden hier nicht angefasst. true, wenn die Liste in der Ablage
 /// liegt; false bei leerer oder ungueltiger Liste (dann bleibt die Ablage,
-/// wie sie ist) oder wenn die Ablage nicht zu bekommen war.
-// Aufrufer ist der Empfaenger der Dateiuebertragung (dateien.rs), der mit
-// einem eigenen Paket dazukommt; bis dahin nur die Tests.
-#[allow(dead_code)]
+/// wie sie ist) oder wenn die Ablage nicht zu bekommen war. Aufrufer ist der
+/// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden.
 pub fn set_dateien(pfade: &[PathBuf]) -> bool {
     let Some(block) = dropfiles_bauen(pfade) else {
         return false;

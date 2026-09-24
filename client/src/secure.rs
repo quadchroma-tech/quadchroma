@@ -375,7 +375,25 @@ pub fn config_dir() -> Result<PathBuf, String> {
 /// Schluessel des laufenden Hosts, und protokoll.txt wuerde geleert.
 #[cfg(test)]
 fn basis_ordner() -> Result<PathBuf, String> {
-    Ok(std::env::temp_dir().join(format!("qc-test-{}", std::process::id())))
+    Ok(std::env::temp_dir().join(test_lauf()))
+}
+
+/// Name des Testordners dieses Laufs: "qc-test-<pid>-<Startzeit in ms>".
+/// Nur die pid reichte nicht: die Ordner bleiben liegen, Windows vergibt
+/// pids neu, und ein neuer Lauf mit derselben pid fand dann eine alte
+/// known_hosts.txt mit einem anderen Schluessel fuer 127.0.0.1 - die
+/// Loopback-Tests scheiterten am Pin. Einmal je Prozess bestimmt, damit alle
+/// Tests eines Laufs denselben Ordner teilen (Testschluessel, known_hosts).
+#[cfg(test)]
+pub fn test_lauf() -> &'static str {
+    static LAUF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LAUF.get_or_init(|| {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("qc-test-{}-{ms}", std::process::id())
+    })
 }
 
 #[cfg(all(not(test), target_os = "macos"))]
@@ -845,9 +863,11 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
-    /// Eigener leerer Ordner je Test - die Tests laufen nebeneinander.
+    /// Eigener leerer Ordner je Test - die Tests laufen nebeneinander. Mit
+    /// der Kennung des Laufs (test_lauf), damit ein Ordner eines frueheren
+    /// Laufs mit derselben pid nicht hineinspielt.
     fn ordner(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("qc-test-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("{}-{name}", test_lauf()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -856,6 +876,28 @@ mod tests {
     const A: [u8; 32] = [0xaa; 32];
     const B: [u8; 32] = [0xbb; 32];
     const C: [u8; 32] = [0xcc; 32];
+
+    /// Die Ablage der Tests ist je Prozess frisch: nicht der Ordner, den ein
+    /// frueherer Lauf mit derselben pid hinterliess (samt known_hosts.txt
+    /// mit einem anderen Schluessel fuer 127.0.0.1), aber innerhalb eines
+    /// Laufs immer derselbe - auch fuer ordner(name).
+    #[test]
+    fn testablage_je_lauf_frisch() {
+        let pid_ordner = std::env::temp_dir().join(format!("qc-test-{}", std::process::id()));
+        let b = basis_ordner().unwrap();
+        assert_ne!(b, pid_ordner);
+        assert_eq!(b, basis_ordner().unwrap());
+        let name = b.file_name().unwrap().to_str().unwrap().to_string();
+        let praefix = format!("qc-test-{}-", std::process::id());
+        let ms: u128 = name.strip_prefix(&praefix).and_then(|z| z.parse().ok()).expect(&name);
+        let jetzt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        assert!(ms <= jetzt && jetzt - ms < 24 * 3_600_000, "{name}");
+        assert!(config_dir().unwrap().starts_with(&b));
+        assert!(!config_dir().unwrap().starts_with(&pid_ordner));
+        let o = ordner("lauf");
+        assert_eq!(o.file_name().unwrap().to_str().unwrap(), format!("{name}-lauf"));
+        let _ = std::fs::remove_dir_all(&o);
+    }
 
     #[test]
     fn known_hosts_unlesbar_ist_kein_erstkontakt() {

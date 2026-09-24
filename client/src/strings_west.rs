@@ -166,6 +166,13 @@ pub static FR: Lang = Lang {
         (DesktopShortcutCreated, "Raccourci créé sur le bureau : {n}"),
         (DesktopShortcutFailed, "Raccourci non créé : {n}"),
         (DesktopShortcutDescription, "QuadChroma : se connecter à {n} ({m})"),
+        (FilesSending, "Envoi des fichiers : {n} sur {m}"),
+        (FilesReceiving, "Réception des fichiers : {n} sur {m}"),
+        (FilesReady, "Fichiers prêts à coller : {n}"),
+        (FilesSent, "Fichiers transférés : {n}"),
+        (FilesAborted, "Transfert de fichiers interrompu : {n}"),
+        (FilesTooLarge, "Fichiers non transférés : plus de 4 GB ou de 10 000 éléments"),
+        (FilesPeerOld, "L'autre côté ne peut pas encore recevoir de fichiers."),
     ],
 };
 
@@ -330,6 +337,13 @@ pub static ES: Lang = Lang {
         (DesktopShortcutCreated, "Acceso directo creado en el escritorio: {n}"),
         (DesktopShortcutFailed, "No se creó el acceso directo: {n}"),
         (DesktopShortcutDescription, "QuadChroma: conectar con {n} ({m})"),
+        (FilesSending, "Enviando archivos: {n} de {m}"),
+        (FilesReceiving, "Recibiendo archivos: {n} de {m}"),
+        (FilesReady, "Archivos listos para pegar: {n}"),
+        (FilesSent, "Archivos transferidos: {n}"),
+        (FilesAborted, "Transferencia de archivos cancelada: {n}"),
+        (FilesTooLarge, "Archivos no transferidos: más de 4 GB o 10 000 elementos"),
+        (FilesPeerOld, "El otro lado todavía no puede recibir archivos."),
     ],
 };
 
@@ -494,6 +508,13 @@ pub static IT: Lang = Lang {
         (DesktopShortcutCreated, "Collegamento creato sul desktop: {n}"),
         (DesktopShortcutFailed, "Collegamento non creato: {n}"),
         (DesktopShortcutDescription, "QuadChroma: connettersi a {n} ({m})"),
+        (FilesSending, "Invio dei file: {n} di {m}"),
+        (FilesReceiving, "Ricezione dei file: {n} di {m}"),
+        (FilesReady, "File pronti da incollare: {n}"),
+        (FilesSent, "File trasferiti: {n}"),
+        (FilesAborted, "Trasferimento dei file interrotto: {n}"),
+        (FilesTooLarge, "File non trasferiti: più di 4 GB o 10.000 elementi"),
+        (FilesPeerOld, "L'altro lato non può ancora ricevere file."),
     ],
 };
 
@@ -658,6 +679,13 @@ pub static PT: Lang = Lang {
         (DesktopShortcutCreated, "Atalho criado no ambiente de trabalho: {n}"),
         (DesktopShortcutFailed, "Atalho não criado: {n}"),
         (DesktopShortcutDescription, "QuadChroma: ligar a {n} ({m})"),
+        (FilesSending, "A enviar ficheiros: {n} de {m}"),
+        (FilesReceiving, "A receber ficheiros: {n} de {m}"),
+        (FilesReady, "Ficheiros prontos a colar: {n}"),
+        (FilesSent, "Ficheiros transferidos: {n}"),
+        (FilesAborted, "Transferência de ficheiros interrompida: {n}"),
+        (FilesTooLarge, "Ficheiros não transferidos: mais de 4 GB ou 10 000 elementos"),
+        (FilesPeerOld, "O outro lado ainda não pode receber ficheiros."),
     ],
 };
 
@@ -822,5 +850,12 @@ pub static NL: Lang = Lang {
         (DesktopShortcutCreated, "Snelkoppeling op het bureaublad gemaakt: {n}"),
         (DesktopShortcutFailed, "Snelkoppeling niet gemaakt: {n}"),
         (DesktopShortcutDescription, "QuadChroma: verbinden met {n} ({m})"),
+        (FilesSending, "Bestanden worden verzonden: {n} van {m}"),
+        (FilesReceiving, "Bestanden worden ontvangen: {n} van {m}"),
+        (FilesReady, "Bestanden klaar om te plakken: {n}"),
+        (FilesSent, "Bestanden overgedragen: {n}"),
+        (FilesAborted, "Bestandsoverdracht afgebroken: {n}"),
+        (FilesTooLarge, "Bestanden niet overgedragen: meer dan 4 GB of 10.000 items"),
+        (FilesPeerOld, "De andere kant kan nog geen bestanden ontvangen."),
     ],
 };

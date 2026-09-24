@@ -11,8 +11,10 @@
 // Eingaben: nie mehr als FENSTER Byte unquittiert, und eine volle oertliche
 // Warteschlange (Gesendet::Voll) wird abgewartet statt ueberfuellt.
 //
-// Plattformunabhaengig mit std. Weichen gibt es nur fuer die Pfadbereinigung
-// (EIGENE_REGELN) und den freien Platz (freier_platz).
+// Plattformunabhaengig mit std. Weichen gibt es fuer die Pfadbereinigung
+// (EIGENE_REGELN), den freien Platz (freier_platz) und die Sicherheit beim
+// Anlegen und Oeffnen (Unix-Rechte 0700, O_NOFOLLOW/O_NONBLOCK bzw.
+// FILE_FLAG_OPEN_REPARSE_POINT, ':' in sicher_anhaengen).
 //
 // ============================================================ PROTOKOLL
 //
@@ -242,7 +244,10 @@
 //     schickt. Dieser Empfaenger quittiert zusaetzlich bei leerer
 //     Warteschlange und haengt deshalb mit keinem Sender.
 
-#![allow(dead_code)] // Das Modul steht; die Rollen binden es in eigenen Paketen an.
+// Der Client bindet das Modul an (main.rs); manches braucht nur die
+// Windows-Host-Rolle (Eingangsgrenzen, Zeile fuer aeltere Zuschauer) und
+// liegt auf dem Mac brach.
+#![allow(dead_code)]
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -1030,7 +1035,7 @@ fn name_lesen(name: &str) -> Option<(u64, u32)> {
 /// remove_dir_all folgt ihnen nicht). Liefert die Zahl der geloeschten
 /// Verzeichnisse.
 pub fn aufraeumen(basis: &Path, behalten: usize, hoechstalter: Option<Duration>) -> usize {
-    aufraeumen_zu(basis, behalten, hoechstalter, unix_ms())
+    aufraeumen_zu(basis, behalten, hoechstalter, unix_ms(), None)
 }
 
 /// Beim Programmstart: alles in der Basis, was aelter als 24 h ist.
@@ -1038,7 +1043,25 @@ pub fn aufraeumen_beim_start() -> usize {
     aufraeumen(&ablage_basis(), usize::MAX, Some(HOECHSTALTER))
 }
 
-fn aufraeumen_zu(basis: &Path, behalten: usize, hoechstalter: Option<Duration>, jetzt_ms: u64) -> usize {
+/// Nach einem vollstaendigen Empfang: wie aufraeumen(basis, BEHALTEN, None),
+/// aber das eben abgelegte Verzeichnis `frisch` bleibt immer und zaehlt als
+/// eines der BEHALTEN. Sortiert wird nach der Uhrzeit im Namen; sprang die
+/// Uhr zurueck, saehe das frische Verzeichnis sonst wie das aelteste aus, und
+/// die Ablage zeigte gleich nach dem Ablegen auf geloeschte Dateien.
+fn aufraeumen_nach_empfang(basis: &Path, frisch: &Path) -> usize {
+    let name = frisch.file_name().and_then(|n| n.to_str());
+    aufraeumen_zu(basis, BEHALTEN, None, unix_ms(), name)
+}
+
+/// `ausser`: Name eines Verzeichnisses in der Basis, das bleibt (und als
+/// eines der `behalten` zaehlt, falls es fertig ist).
+fn aufraeumen_zu(
+    basis: &Path,
+    behalten: usize,
+    hoechstalter: Option<Duration>,
+    jetzt_ms: u64,
+    ausser: Option<&str>,
+) -> usize {
     match fs::symlink_metadata(basis) {
         Ok(md) if md.is_dir() => {}
         _ => return 0,
@@ -1066,8 +1089,11 @@ fn aufraeumen_zu(basis: &Path, behalten: usize, hoechstalter: Option<Duration>, 
         marken.iter().filter(|m| !alt(m.0)).map(|m| m.2.as_str()).collect();
     let mut geloescht = 0;
     let mut fertige = Vec::new();
+    let mut ausnahme_fertig = false;
     for o in &ordner {
-        if alt(o.0) {
+        if ausser == Some(o.3.as_str()) {
+            ausnahme_fertig = !laufend.contains(o.3.as_str());
+        } else if alt(o.0) {
             if fs::remove_dir_all(&o.2).is_ok() {
                 geloescht += 1;
             }
@@ -1081,6 +1107,7 @@ fn aufraeumen_zu(basis: &Path, behalten: usize, hoechstalter: Option<Duration>, 
         }
     }
     fertige.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+    let behalten = if ausnahme_fertig { behalten.saturating_sub(1) } else { behalten };
     for o in fertige.iter().skip(behalten) {
         if fs::remove_dir_all(&o.2).is_ok() {
             geloescht += 1;
@@ -1156,6 +1183,62 @@ fn zum_schreiben_oeffnen(p: &Path) -> io::Result<File> {
         return Err(io::Error::other("keine gewoehnliche Datei"));
     }
     Ok(f)
+}
+
+/// Oeffnet eine aufgelistete Quelle zum Lesen (Sender). Zwischen Auflisten
+/// und Oeffnen kann ein anderer Prozess die Datei ersetzen: durch eine
+/// Verknuepfung (dann ginge deren Ziel hinaus) oder durch eine FIFO (dann
+/// hinge der Faden, und Griff::abbrechen hoelfe nicht). Deshalb ohne einer
+/// Verknuepfung zu folgen (macOS O_NOFOLLOW, Windows
+/// FILE_FLAG_OPEN_REPARSE_POINT), ohne an einer FIFO zu warten (O_NONBLOCK;
+/// bei einer gewoehnlichen Datei wirkt es nicht), und genommen wird nur, was
+/// nach den Metadaten des offenen Griffs eine gewoehnliche Datei ist.
+fn zum_lesen_oeffnen(p: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.read(true);
+    // O_NOFOLLOW 0x0100, O_NONBLOCK 0x0004 (sys/fcntl.h)
+    #[cfg(target_os = "macos")]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, 0x0100 | 0x0004);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(&mut o, 0x0020_0000);
+    let f = o.open(p)?;
+    let md = f.metadata()?;
+    if !md.is_file() || md.file_type().is_symlink() {
+        return Err(io::Error::other("keine gewoehnliche Datei"));
+    }
+    #[cfg(windows)]
+    {
+        // Ein Analysepunkt, der keine Verknuepfung ist (etwa eine
+        // OneDrive-Datei "nur online"): mit FILE_FLAG_OPEN_REPARSE_POINT
+        // laese man den Platzhalter statt des Inhalts. Dann regulaer oeffnen,
+        // damit der Filter des Dienstes den Inhalt liefert - aber nur, wenn
+        // der zweite Griff dieselbe Datei trifft (Datentraeger und
+        // Dateinummer); wurde sie inzwischen durch eine Verknuepfung ersetzt,
+        // zeigte er woandershin.
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let zweit = File::open(p)?;
+            return match (datei_nummer(&f), datei_nummer(&zweit)) {
+                (Some(a), Some(b)) if a == b => Ok(zweit),
+                _ => Err(io::Error::other("Datei wurde beim Oeffnen ersetzt")),
+            };
+        }
+    }
+    Ok(f)
+}
+
+/// Datentraeger und Dateinummer eines offenen Griffs (Windows).
+#[cfg(windows)]
+fn datei_nummer(f: &File) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut i = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: der Griff gehoert `f` und lebt bis nach dem Aufruf; `i` ist
+    // eine gueltige Struktur zum Beschreiben.
+    unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut i) }.ok()?;
+    Some((i.dwVolumeSerialNumber, ((i.nFileIndexHigh as u64) << 32) | i.nFileIndexLow as u64))
 }
 
 /// Freier Platz fuer den Aufrufer am Ort `pfad` (einem vorhandenen Ordner).
@@ -1802,7 +1885,7 @@ impl SenderInnen {
                 continue;
             }
             let quelle = &quellen[i];
-            let mut f = File::open(quelle)
+            let mut f = zum_lesen_oeffnen(quelle)
                 .map_err(|err| Aus::Lesefehler(format!("{}: {err}", quelle.display())))?;
             let mut versatz = 0u64;
             while versatz < e.groesse {
@@ -2493,7 +2576,7 @@ impl Schreiber {
             return self.abgebrochen_melden(st, h, Abbruch::Ablage);
         }
         self.schluss_quittung(Quittung { kennung: u.kennung, zustand: ZUSTAND_FERTIG, empfangen: u.empfangen });
-        aufraeumen(&self.basis, BEHALTEN, None);
+        aufraeumen_nach_empfang(&self.basis, &u.verzeichnis);
         let mut st = u.stand.clone();
         st.bytes = u.empfangen;
         st.ergebnis = Ergebnis::Fertig;
@@ -3905,6 +3988,92 @@ mod tests {
         assert!(matches!(letztes(&ev), Some(Ergebnis::Abgebrochen(Abbruch::Lesefehler(t))) if t.contains("kuerzer")));
     }
 
+    /// Wird eine aufgelistete Quelle vor dem Oeffnen durch eine Verknuepfung
+    /// ersetzt, geht das Ziel nicht hinaus: Ende 2, kein Datenbyte.
+    #[test]
+    fn quelle_durch_verknuepfung_ersetzt_geht_nicht_hinaus() {
+        let o = Ordner::neu("quelle-verknuepfung");
+        let draussen = o.p().join("draussen.txt");
+        datei(&draussen, b"geheim geheim");
+        let p = quelle_datei(&o, "a.bin", 13);
+        let weg = Rekorder::neu();
+        weg.voll.store(true, Ordering::SeqCst);
+        let (ev, melden) = sammler();
+        let g = Sender::starten_mit(vec![p.clone()], weg.clone(), FENSTER, melden, vorgaben(5000));
+        let angelegt = std::cell::Cell::new(true);
+        nach_dem_auflisten(&p, &weg, |p| {
+            fs::remove_file(p).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&draussen, p).unwrap();
+            // Braucht unter Windows Administratorrechte oder den Entwicklermodus.
+            #[cfg(windows)]
+            if let Err(e) = std::os::windows::fs::symlink_file(&draussen, p) {
+                eprintln!("quelle_durch_verknuepfung_ersetzt_geht_nicht_hinaus: uebersprungen ({e})");
+                angelegt.set(false);
+            }
+        });
+        assert!(g.abwarten(Duration::from_secs(3)), "Sender haengt");
+        if !angelegt.get() {
+            return;
+        }
+        assert_eq!(weg.datenbytes(), 0, "das Ziel der Verknuepfung ging hinaus");
+        assert_eq!(weg.enden(), vec![Ende { kennung: g.kennung(), grund: GRUND_LESEFEHLER }]);
+        assert!(matches!(letztes(&ev), Some(Ergebnis::Abgebrochen(Abbruch::Lesefehler(_)))), "{:?}", ergebnisse(&ev));
+    }
+
+    /// Wird eine aufgelistete Quelle vor dem Oeffnen durch eine FIFO
+    /// ersetzt, haengt der Sender nicht (ohne Schreiber blockierte das
+    /// Oeffnen fuer immer): Ende 2, und er endet.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quelle_durch_fifo_ersetzt_haengt_nicht() {
+        use std::os::unix::fs::OpenOptionsExt;
+        extern "C" {
+            // mode_t ist unter macOS u16 (sys/_types/_mode_t.h).
+            fn mkfifo(pfad: *const std::os::raw::c_char, modus: u16) -> std::os::raw::c_int;
+        }
+        let o = Ordner::neu("quelle-fifo");
+        let p = quelle_datei(&o, "a.bin", 100);
+        let weg = Rekorder::neu();
+        weg.voll.store(true, Ordering::SeqCst);
+        let (ev, melden) = sammler();
+        let g = Sender::starten_mit(vec![p.clone()], weg.clone(), FENSTER, melden, vorgaben(5000));
+        nach_dem_auflisten(&p, &weg, |p| {
+            fs::remove_file(p).unwrap();
+            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: c ist ein mit NUL abgeschlossener Pfad.
+            assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        });
+        let fertig = g.abwarten(Duration::from_secs(3));
+        if !fertig {
+            // Den haengenden Faden loesen, damit der Testlauf endet.
+            let _ = OpenOptions::new().write(true).custom_flags(0x0004).open(&p);
+        }
+        assert!(fertig, "Sender haengt an der FIFO");
+        assert_eq!(weg.datenbytes(), 0);
+        assert_eq!(weg.enden(), vec![Ende { kennung: g.kennung(), grund: GRUND_LESEFEHLER }]);
+        assert!(matches!(letztes(&ev), Some(Ergebnis::Abgebrochen(Abbruch::Lesefehler(t))) if t.contains("keine gewoehnliche")));
+    }
+
+    /// Das Oeffnen zum Lesen fuer sich: gewoehnliche Datei ja, Ordner und
+    /// Verknuepfung nein.
+    #[test]
+    fn zum_lesen_nur_gewoehnliche_dateien() {
+        let o = Ordner::neu("lesen-oeffnen");
+        let p = quelle_datei(&o, "a.bin", 10);
+        let mut f = zum_lesen_oeffnen(&p).unwrap();
+        let mut v = Vec::new();
+        f.read_to_end(&mut v).unwrap();
+        assert_eq!(v.len(), 10);
+        assert!(zum_lesen_oeffnen(o.p()).is_err());
+        #[cfg(unix)]
+        {
+            let l = o.p().join("link");
+            std::os::unix::fs::symlink(&p, &l).unwrap();
+            assert!(zum_lesen_oeffnen(&l).is_err());
+        }
+    }
+
     #[test]
     fn datei_laenger_geworden_nur_die_angekuendigte_groesse() {
         let o = Ordner::neu("laenger");
@@ -4139,17 +4308,68 @@ mod tests {
         datei(&b.join(format!("{jung}-4{MARKE_ENDUNG}")), b"");
         // Nach einem Empfang (ohne Alter), behalten 1: die laufende bleibt
         // und zaehlt nicht mit.
-        let n = aufraeumen_zu(b, 1, None, jetzt);
+        let n = aufraeumen_zu(b, 1, None, jetzt, None);
         assert_eq!(n, 2, "{:?}", inhalt(b));
         let mut e = vec![format!("{alt}-3"), format!("{alt}-3{MARKE_ENDUNG}"), format!("{jung}-4"), format!("{jung}-4{MARKE_ENDUNG}"), format!("{jung}-5")];
         e.sort();
         assert_eq!(inhalt(b), e);
         // Beim Start: aelter als 24 h geht, auch mit Marke.
-        let n = aufraeumen_zu(b, usize::MAX, Some(HOECHSTALTER), jetzt);
+        let n = aufraeumen_zu(b, usize::MAX, Some(HOECHSTALTER), jetzt, None);
         assert_eq!(n, 1);
         let mut e = vec![format!("{jung}-4"), format!("{jung}-4{MARKE_ENDUNG}"), format!("{jung}-5")];
         e.sort();
         assert_eq!(inhalt(b), e);
+    }
+
+    /// Uhrsprung: Die Uhr ging zurueck, die fertigen Verzeichnisse tragen
+    /// spaetere Zeiten im Namen als das eben abgelegte. Das Aufraeumen nach
+    /// dem Empfang nimmt das eben abgelegte aus (es zaehlt als eines der
+    /// drei); geloescht wird das aelteste der uebrigen.
+    #[test]
+    fn aufraeumen_nimmt_das_eben_abgelegte_aus() {
+        let o = Ordner::neu("uhrsprung");
+        let b = o.p();
+        let jetzt = unix_ms();
+        let spaeter = jetzt + 3_600_000;
+        for k in 1..=3u64 {
+            fs::create_dir_all(b.join(format!("{}-{k}", spaeter + k))).unwrap();
+        }
+        let frisch = format!("{jetzt}-9");
+        fs::create_dir_all(b.join(&frisch)).unwrap();
+        let n = aufraeumen_zu(b, BEHALTEN, None, jetzt, Some(&frisch));
+        assert_eq!(n, 1);
+        let mut e = vec![frisch.clone(), format!("{}-2", spaeter + 2), format!("{}-3", spaeter + 3)];
+        e.sort();
+        assert_eq!(inhalt(b), e);
+        // Ohne Ausnahme ginge das eben abgelegte als aeltestes.
+        let n = aufraeumen_zu(b, 2, None, jetzt, None);
+        assert_eq!(n, 1);
+        assert!(!inhalt(b).contains(&frisch));
+    }
+
+    /// Dasselbe im ganzen Empfang: Nach der Quittung 1 liegen die Dateien,
+    /// auf die die Ablage zeigt, noch da - auch wenn in der Basis schon drei
+    /// fertige Verzeichnisse mit spaeterer Zeit stehen.
+    #[test]
+    fn nach_uhrsprung_bleibt_das_eben_abgelegte() {
+        let b = Ordner::neu("uhrsprung-empfang");
+        let spaeter = unix_ms() + 3_600_000;
+        for k in 1..=3u64 {
+            fs::create_dir_all(b.p().join(format!("{}-{k}", spaeter + k))).unwrap();
+        }
+        let t = testempfang(b.p(), vorgaben(5000));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 100]));
+        t.e.nachricht(DATEI_STUECK, stueck(2, 0, &[2; 50]));
+        t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+        assert!(bis(Duration::from_secs(3), || t.weg.hat_quittung(ZUSTAND_FERTIG)));
+        assert!(bis(Duration::from_secs(3), || letztes(&t.ev) == Some(Ergebnis::Fertig)));
+        let pfade = sperre(&t.fertig).clone().unwrap();
+        assert_eq!(fs::read(pfade[0].join("x")).unwrap(), vec![1; 100]);
+        assert_eq!(fs::read(&pfade[1]).unwrap(), vec![2; 50]);
+        assert_eq!(inhalt(b.p()).len(), BEHALTEN, "{:?}", inhalt(b.p()));
+        assert!(!b.p().join(format!("{}-1", spaeter + 1)).exists());
     }
 
     #[test]
