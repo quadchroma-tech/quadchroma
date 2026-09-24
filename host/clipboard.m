@@ -73,6 +73,7 @@ static void clip_log(NSString *fmt, ...) {
 // bis auf g_cb_queue und g_started, die nur beim Start gesetzt werden.
 
 static void (*g_on_change)(const char *utf8, size_t len) = NULL;
+static void (*g_on_dateien)(NSArray<NSString *> *pfade) = NULL;   // vor dem Start gesetzt
 static int (*g_aktiv)(void) = NULL;          // NULL = immer lesen
 static dispatch_queue_t g_cb_queue = nil;    // liefert den Rueckruf aus
 static dispatch_source_t g_timer = nil;
@@ -80,30 +81,52 @@ static BOOL g_started = NO;
 
 static NSInteger g_seen = -1;          // zuletzt gesehener changeCount, -1 = noch nie abgefragt
 static NSInteger g_self_change = -1;   // changeCount, den unser eigenes Schreiben erzeugt hat
-static NSString *g_last = nil;         // Text, den wir zuletzt gelesen oder geschrieben haben
+static NSString *g_last = nil;         // Text, den wir zuletzt gelesen oder geschrieben haben;
+                                       // nil, sobald Dateien erkannt oder geschrieben wurden
 
 // ------------------------------------------------------------------- Lesen
 
-// Liest den Text des ERSTEN Eintrags. Bewusst ueber pasteboardItems und nicht
-// ueber [pb stringForType:]: der bequeme Weg auf Brettebene haengt bei mehreren
-// Eintraegen deren Text aneinander, und genau das will hier niemand.
-static NSString *read_first_text(NSPasteboard *pb) {
+// Liest, was in der Ablage liegt. Dateiverweise haben Vorrang und werden ueber
+// ALLE Eintraege gesucht - Finder legt je Datei einen eigenen ab. Gibt es
+// welche, steht in *dateien die Liste der Pfade (leer, wenn sich keiner
+// aufloesen liess), und es gibt keinen Text: auch nicht den Dateinamen, den
+// Finder zusaetzlich als Text ablegt. Sonst der Text des ERSTEN Eintrags,
+// bewusst ueber pasteboardItems und nicht ueber [pb stringForType:]: der
+// bequeme Weg auf Brettebene haengt bei mehreren Eintraegen deren Text
+// aneinander, und genau das will hier niemand.
+static NSString *ablage_lesen(NSPasteboard *pb, NSArray<NSString *> **dateien) {
+    *dateien = nil;
     NSArray<NSPasteboardItem *> *items = pb.pasteboardItems;
+    if (!items.count) return nil;
+
+    // Verdeckte Inhalte (Passwoerter) bleiben auf diesem Rechner. Traegt auch
+    // nur ein Eintrag die Kennung, wird gar nichts gelesen.
+    for (NSPasteboardItem *item in items) {
+        if ([item availableTypeFromArray:@[kConcealedType]]) {
+            clip_log(@"Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen");
+            return nil;
+        }
+    }
+
+    NSMutableArray<NSString *> *pfade = nil;
+    for (NSPasteboardItem *item in items) {
+        if (![item availableTypeFromArray:@[NSPasteboardTypeFileURL]]) continue;
+        if (!pfade) pfade = [NSMutableArray array];
+        NSString *s = [item stringForType:NSPasteboardTypeFileURL];
+        NSURL *u = s ? [NSURL URLWithString:s] : nil;
+        // Datei-Referenz-URLs (file:///.file/id=...) auf den Pfad aufloesen.
+        if (u.isFileReferenceURL) u = u.filePathURL;
+        if (u.isFileURL && u.path.length) [pfade addObject:u.path];
+    }
+    if (pfade) {
+        *dateien = pfade;
+        return nil;
+    }
+
     NSPasteboardItem *item = items.firstObject;
-    if (!item) return nil;
     if (items.count > 1)
         clip_log(@"Zwischenablage: %lu Eintraege, nur der erste wird uebertragen",
                  (unsigned long)items.count);
-
-    // Verdeckte Inhalte (Passwoerter) bleiben auf diesem Rechner.
-    if ([item availableTypeFromArray:@[kConcealedType]]) {
-        clip_log(@"Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen");
-        return nil;
-    }
-    // Dateien und Ordner uebertragen wir nicht - nur der Text waere sinnlos,
-    // weil der Pfad auf der Windows-Seite nichts bedeutet.
-    if ([item availableTypeFromArray:@[NSPasteboardTypeFileURL]]) return nil;
-
     // Bilder und alles andere ohne Textdarstellung fallen hier von selbst raus.
     return [item stringForType:NSPasteboardTypeString];
 }
@@ -128,7 +151,21 @@ static void clip_poll(void) {
     int (*aktiv)(void) = g_aktiv;
     if (aktiv && !aktiv()) { g_last = nil; return; }
 
-    NSString *text = read_first_text(pb);
+    NSArray<NSString *> *dateien = nil;
+    NSString *text = ablage_lesen(pb, &dateien);
+    if (dateien) {
+        // Dateien statt Text: der zuletzt gesehene Text gilt nicht mehr -
+        // sonst fiele eine spaetere Kopie desselben Textes als "unveraendert" weg.
+        g_last = nil;
+        if (!dateien.count) {
+            clip_log(@"Zwischenablage: Dateiverweise erkannt (%ld), aber keiner laesst sich aufloesen", (long)now);
+            return;
+        }
+        clip_log(@"Zwischenablage: %lu Dateiverweis(e) vom Mac erkannt", (unsigned long)dateien.count);
+        void (*dcb)(NSArray<NSString *> *) = g_on_dateien;
+        if (dcb) dispatch_async(g_cb_queue, ^{ dcb(dateien); });
+        return;
+    }
     if (text.length == 0) {
         // Seit macOS 15.4 kann genau hier die Systemabfrage zum Einsetzen
         // dazwischenfunken und nil liefern, ohne dass ein Fenster sichtbar wird.
@@ -213,7 +250,65 @@ static void clip_write(NSString *text) {
     g_last = text;
 }
 
+// Eine Dateiliste vom Client: je Pfad ein Eintrag mit public.file-url, dazu
+// dieselben Kennungen wie beim Text (nicht in den Verlauf, von einem Programm
+// abgelegt) und nur fuer diesen Mac. urls sind die fertigen file://-URLs.
+static void clip_write_dateien(NSArray<NSString *> *urls) {
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+
+    NSMutableArray<NSPasteboardItem *> *items = [NSMutableArray arrayWithCapacity:urls.count];
+    for (NSString *u in urls) {
+        NSPasteboardItem *item = [[NSPasteboardItem alloc] init];
+        if (![item setString:u forType:NSPasteboardTypeFileURL] ||
+            ![item setData:[NSData data] forType:kTransientType] ||
+            ![item setData:[NSData data] forType:kAutoGeneratedType]) {
+            clip_log(@"Zwischenablage: Dateiverweis liess sich nicht befuellen");
+            return;
+        }
+        [items addObject:item];
+    }
+    // Wie beim Text: erst leeren (nur fuer diesen Mac), dann alle Eintraege in
+    // einem Zug - nie declareTypes dazwischen.
+    [pb prepareForNewContentsWithOptions:NSPasteboardContentsCurrentHostOnly];
+    if (![pb writeObjects:items]) {
+        clip_log(@"Zwischenablage: Schreiben der Dateiverweise abgelehnt");
+        return;
+    }
+
+    // Widerhall: wie beim Text den eigenen Stand merken. Einen Text gibt es
+    // jetzt nicht mehr, also auch keinen zuletzt gesehenen.
+    NSInteger now = pb.changeCount;
+    g_self_change = now;
+    g_seen = now;
+    g_last = nil;
+    clip_log(@"Zwischenablage: %lu Dateiverweis(e) vom Client abgelegt", (unsigned long)urls.count);
+}
+
 // -------------------------------------------------------------- Schnittstelle
+
+void qc_clip_dateien(void (*on_dateien)(NSArray<NSString *> *pfade)) {
+    // Wie qc_clip_bedingung: vor qc_clip_start gesetzt.
+    g_on_dateien = on_dateien;
+}
+
+void qc_clip_set_dateien(NSArray<NSString *> *pfade) {
+    if (!pfade.count) return;
+    // Die URLs noch im Faden des Aufrufers: fileURLWithPath: fragt das
+    // Dateisystem, ob ein Ordner dahintersteht - das gehoert nicht auf den
+    // Hauptfaden.
+    NSMutableArray<NSString *> *urls = [NSMutableArray arrayWithCapacity:pfade.count];
+    for (NSString *p in pfade) {
+        NSString *u = [NSURL fileURLWithPath:p].absoluteString;
+        if (!u.length) {
+            clip_log(@"Zwischenablage: %@ laesst sich nicht als Dateiverweis ablegen", p);
+            return;
+        }
+        [urls addObject:u];
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool { clip_write_dateien(urls); }
+    });
+}
 
 void qc_clip_bedingung(int (*aktiv)(void)) {
     // Gesetzt wird vor qc_clip_start auf dem Hauptfaden; clip_poll liest es

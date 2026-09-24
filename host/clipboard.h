@@ -1,17 +1,25 @@
 // QuadChroma Host: Abgleich der Zwischenablage, Mac-Seite.
 //
-// Zwei Richtungen, beide ueber die Eingabeverbindung (Port 9002), Nachrichtentyp
-// 48, Nutzlast reiner UTF-8-Text ohne Abschluss-Null:
+// Zwei Richtungen, Nachrichtentyp 48, Nutzlast reiner UTF-8-Text ohne
+// Abschluss-Null:
 //   Mac -> Client : qc_clip_start() meldet ueber den Rueckruf, was der Benutzer
-//                   am Mac kopiert hat.
-//   Client -> Mac : qc_clip_set() legt den Text des Clients in die Ablage.
+//                   am Mac kopiert hat; main.m schickt es ueber den Bildkanal
+//                   (Port 9001).
+//   Client -> Mac : kommt ueber den Eingabekanal (Port 9002); qc_clip_set()
+//                   legt den Text des Clients in die Ablage.
 //
-// Nur Text. Bilder und Dateien werden bewusst ausgelassen; mehr als 4 MB
-// ebenfalls, mit einer Zeile im Protokoll.
+// Dazu Dateiverweise (public.file-url): qc_clip_dateien() meldet eine
+// Dateiliste, die der Nutzer am Mac kopiert hat, qc_clip_set_dateien() legt
+// eine empfangene in die Ablage. Uebertragen werden die Dateien selbst von
+// dateien.m. Bilder werden bewusst ausgelassen, Text ueber 4 MB ebenfalls,
+// mit einer Zeile im Protokoll.
 #ifndef QUADCHROMA_CLIPBOARD_H
 #define QUADCHROMA_CLIPBOARD_H
 
 #include <stddef.h>
+#ifdef __OBJC__
+#import <Foundation/Foundation.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +50,24 @@ void qc_clip_bedingung(int (*aktiv)(void));
 // Loest den Rueckruf von qc_clip_start() nicht aus. Ungueltiges UTF-8 und
 // Nutzlasten ueber 4 MB werden verworfen und protokolliert.
 void qc_clip_set(const char *utf8, size_t len);
+
+#ifdef __OBJC__
+// Rueckruf fuer Dateiverweise; vor qc_clip_start() setzen. Enthaelt die Ablage
+// Dateiverweise (public.file-url, gesucht ueber alle Eintraege,
+// Datei-Referenz-URLs aufgeloest), kommt statt des Textes die Liste der Pfade
+// - der Text geht dann nicht hinaus, auch nicht der Dateiname, den Finder
+// zusaetzlich als Text ablegt. Traegt auch nur ein Eintrag die Kennung
+// "verdeckt", wird gar nichts gelesen. Gelesen wird wie beim Text nur mit
+// Zuschauer (qc_clip_bedingung). Der Rueckruf laeuft auf derselben seriellen
+// Warteschlange wie der fuer Text und darf blockieren.
+void qc_clip_dateien(void (*on_dateien)(NSArray<NSString *> *pfade));
+
+// Legt eine Dateiliste in die Ablage: je Pfad ein Eintrag mit public.file-url,
+// gekennzeichnet als voruebergehend und automatisch erzeugt, nur fuer diesen
+// Mac. Darf aus jedem Faden aufgerufen werden und kehrt sofort zurueck;
+// geschrieben wird versetzt auf dem Hauptfaden. Loest keinen Rueckruf aus.
+void qc_clip_set_dateien(NSArray<NSString *> *pfade);
+#endif
 
 #ifdef __cplusplus
 }
