@@ -3336,11 +3336,16 @@ mod tests {
             assert!(l.eingabe_binden(1, h.abbruchgriff().unwrap()));
             let (l2, u2) = (l.clone(), u.clone());
             let leser = std::thread::spawn(move || eingabe_lesen(&mut h, &l2, 1, &u2));
+            // Mit Frist: liest die Schleife nicht mehr, haengt das Schreiben
+            // sonst (die Leitung haelt den Kanal noch offen).
+            c.socket().set_write_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut m = kopf(typ, 0, 0, grenze).to_vec();
             m.resize(8 + grenze, 0);
-            c.write_all(&m).unwrap();
+            let r = c.write_all(&m);
+            assert!(r.is_ok(), "Typ {typ}: Nachricht mit {grenze} Byte nicht gelesen: {r:?}");
             // Der Kanal lebt: die Meldung danach kommt an.
-            faehigkeiten_melden(&mut c).unwrap();
+            let r = faehigkeiten_melden(&mut c);
+            assert!(r.is_ok(), "Typ {typ}: Kanal nach einer Nachricht mit {grenze} Byte beendet: {r:?}");
             let bis = Instant::now() + Duration::from_secs(5);
             while !l.kann_dateien() && Instant::now() < bis {
                 std::thread::sleep(Duration::from_millis(2));
@@ -3419,6 +3424,7 @@ mod tests {
         let (l3, u3) = (l.clone(), u.clone());
         let leseschleife = std::thread::spawn(move || eingabe_lesen(&mut h_ein, &l3, 1, &u3));
         // Der Scheinclient schreibt auf den Eingabekanal ...
+        c_ein.socket().set_write_timeout(Some(Duration::from_secs(20))).unwrap();
         let c_ein = Arc::new(Mutex::new(c_ein));
         let c = c_ein.clone();
         let weg_c: Arc<dyn dateien::Weg> = Arc::new(move |typ: u8, n: &[u8]| {
