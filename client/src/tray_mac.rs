@@ -18,6 +18,13 @@
 // dem Symbol, das nach sechs Sekunden wieder zugeht. Eine Mitteilung ueber
 // die Mitteilungszentrale ginge nur mit Rueckfrage des Systems.
 //
+// Ein angelegtes Statusobjekt heisst nicht, dass es zu sehen ist: bei voller
+// Menueleiste (Kameraaussparung) oder wenn "In der Menueleiste erlauben" aus
+// ist, verdraengt das System es - sein Fenster hat dann keinen Bildschirm.
+// steht() und hinweis() pruefen deshalb, ob das Fenster des Knopfes einen
+// Bildschirm hat (angezeigt); sonst beendet Schliessen das Programm, statt
+// es ohne Weg zurueck abzulegen (Spezifikation 3.9, Durchsicht [12]).
+//
 // Die Aktivierungsart (`aktivierung`): verborgen Accessory (kein
 // Dock-Symbol, nicht im Programmumschalter), sichtbar Regular.
 
@@ -335,13 +342,25 @@ impl Symbol {
         }
     }
 
-    /// Steht das Symbol? Auf dem Mac, sobald es angelegt ist.
+    /// Steht das Symbol wirklich sichtbar in der Menueleiste? Angelegt und
+    /// vom System angezeigt (siehe angezeigt).
     pub fn steht(&self) -> bool {
-        !self.item.is_null()
+        !self.item.is_null() && self.angezeigt()
+    }
+
+    /// Hat das Fenster des Knopfes einen Bildschirm? Ein verdraengtes
+    /// Statusobjekt hat Knopf und Fenster, aber keinen Bildschirm (es liegt
+    /// ausserhalb, etwa bei y = -30) - isVisible sagt dort trotzdem ja.
+    fn angezeigt(&self) -> bool {
+        let _pool = Pool::neu();
+        unsafe {
+            let fenster = msg_id(msg_id(self.item, c"button"), c"window");
+            !fenster.is_null() && !msg_id(fenster, c"screen").is_null()
+        }
     }
 
     pub fn grund(&self) -> Option<String> {
-        None
+        (!self.steht()).then(|| "vom System (noch) nicht in der Menueleiste angezeigt (voll oder nicht erlaubt?)".into())
     }
 
     /// Menue und Tooltip erneuern, wenn sich etwas geaendert hat.
@@ -396,19 +415,24 @@ impl Symbol {
 
     /// Die Hinweisblase unter dem Symbol (NSPopover), sechs Sekunden lang.
     /// Steht das Symbol nicht auf dem Bildschirm (etwa hinter der Kamera-
-    /// aussparung verdraengt), bleibt sie aus.
-    pub fn hinweis(&mut self, titel: &str, text: &str) {
+    /// aussparung verdraengt), bleibt sie aus - sie erschiene sonst lose am
+    /// Bildschirmrand. true nur, wenn sie unter dem sichtbaren Symbol
+    /// gezeigt wurde; nur dann vermerkt main.rs tray_hinweis=1.
+    pub fn hinweis(&mut self, titel: &str, text: &str) -> bool {
         let _ = titel; // Der Text nennt QuadChroma schon.
         let _pool = Pool::neu();
         self.hinweis_schliessen();
+        if !self.steht() {
+            return false;
+        }
         unsafe {
             let knopf = msg_id(self.item, c"button");
-            if knopf.is_null() || msg_id(knopf, c"window").is_null() {
-                return;
+            if knopf.is_null() {
+                return false;
             }
             let pop = msg_id(msg_id(klasse(c"NSPopover"), c"alloc"), c"init");
             if pop.is_null() {
-                return;
+                return false;
             }
             msg_void_int(pop, c"setBehavior:", TRANSIENT);
             let zeile = msg_id_1(klasse(c"NSTextField"), c"labelWithString:", ns_text(text));
@@ -416,7 +440,7 @@ impl Symbol {
             if zeile.is_null() || vc.is_null() {
                 msg_id(vc, c"release");
                 msg_id(pop, c"release");
-                return;
+                return false;
             }
             let g = senden!(zeile, sel(c"fittingSize"); -> NSSize);
             let rahmen = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { w: g.w + 28.0, h: g.h + 20.0 } };
@@ -424,7 +448,7 @@ impl Symbol {
             if ansicht.is_null() {
                 msg_id(vc, c"release");
                 msg_id(pop, c"release");
-                return;
+                return false;
             }
             senden!(zeile, sel(c"setFrameOrigin:"), NSPoint { x: 14.0, y: 10.0 } => NSPoint; -> ());
             msg_void_1(ansicht, c"addSubview:", zeile);
@@ -439,6 +463,7 @@ impl Symbol {
             self.popover = pop;
             self.popover_seit = Some(Instant::now());
         }
+        true
     }
 
     fn hinweis_schliessen(&mut self) {
@@ -569,13 +594,12 @@ pub fn selbsttest() -> i32 {
         if !stand.menue.iter().any(|p| p.befehl() == Some(Befehl::Verbinden("127.0.0.1:9".into()))) {
             fehler.push("kein Punkt fuer den Host".into());
         }
-        // Kurz laufen lassen, damit AppKit das Symbol zeichnet.
+        // Kurz laufen lassen, damit AppKit das Symbol zeichnet. Sichtbar
+        // heisst dasselbe wie fuer steht(): das Fenster hat einen Bildschirm.
         laufen(0.3);
-        let fenster = msg_id(knopf, c"window");
-        let sichtbar = !fenster.is_null() && msg_bool(fenster, c"isVisible");
         println!(
             "Menueleisten-Selbsttest: Statusobjekt angelegt, {}",
-            if sichtbar { "sichtbar in der Menueleiste" } else { "vom System nicht angezeigt (Menueleiste voll?)" }
+            if s.steht() { "sichtbar in der Menueleiste" } else { "vom System nicht angezeigt (Menueleiste voll?)" }
         );
     }
     // Aendern: Stand einer Sitzung ohne gefundene Hosts.
@@ -590,18 +614,24 @@ pub fn selbsttest() -> i32 {
             fehler.push("Tooltip nach dem Aendern".into());
         }
     }
-    // Die Hinweisblase einmal kurz.
-    s.hinweis("QuadChroma", lang.get(tray::HINWEIS));
-    if !s.popover.is_null() {
+    // Die Hinweisblase einmal kurz - nur, wenn das Symbol sichtbar steht
+    // (dasselbe Merkmal wie beim echten Ablegen).
+    let steht = s.steht();
+    let gezeigt = s.hinweis("QuadChroma", lang.get(tray::HINWEIS));
+    if gezeigt != steht {
+        fehler.push(format!("Hinweisblase: gezeigt {gezeigt}, Symbol sichtbar {steht}"));
+    }
+    if gezeigt {
         unsafe {
+            let sofort = msg_bool(s.popover, c"isShown");
             laufen(0.2);
             println!(
-                "Menueleisten-Selbsttest: Hinweisblase {}",
-                if msg_bool(s.popover, c"isShown") { "gezeigt" } else { "nicht gezeigt" }
+                "Menueleisten-Selbsttest: Hinweisblase gezeigt (isShown sofort {sofort}, nach 0,2 s {})",
+                msg_bool(s.popover, c"isShown")
             );
         }
     } else {
-        println!("Menueleisten-Selbsttest: Hinweisblase ausgelassen (Symbol ohne Fenster)");
+        println!("Menueleisten-Selbsttest: Hinweisblase ausgelassen (Symbol nicht angezeigt)");
     }
     drop(s);
     let dauer = start.elapsed();

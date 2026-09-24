@@ -248,7 +248,8 @@ pub enum Key {
     FilesReady,
     /// Gesendet und quittiert: {n} Zahl der obersten Eintraege.
     FilesSent,
-    /// Abgebrochen: {n} der Grund (technischer Text wie im Protokoll).
+    /// Abgebrochen: {n} der Grund, einer der Texte FilesAbort* (Einzelheiten
+    /// wie Pfade und Systemtexte stehen nur im Protokoll).
     FilesAborted,
     /// Ueber den Grenzen (2.6), nichts uebertragen.
     FilesTooLarge,
@@ -265,6 +266,26 @@ pub enum Key {
     TrayStillRunning,
     /// Dasselbe fuer die Menueleiste (macOS).
     TrayStillRunningMac,
+    // Abbruchgruende fuer FilesAborted ({n}), zugeordnet in main.rs
+    // (abbruch_schluessel) aus dateien::Abbruch
+    /// Auf diesem Geraet abgebrochen: neuer Inhalt, Trennen, Kanal weg.
+    FilesAbortLocal,
+    /// Die Gegenseite hat abgebrochen (Ende 1, Quittung 6).
+    FilesAbortPeer,
+    /// Die Verbindung ist weg.
+    FilesAbortConnection,
+    /// 30 s ohne Fortschritt (Ende 3, Quittung 6 beim Empfaenger).
+    FilesAbortTimeout,
+    /// Zu wenig Platz (Quittung 3).
+    FilesAbortNoSpace,
+    /// Ungueltige Daten (Quittung 4, Protokollfehler).
+    FilesAbortInvalid,
+    /// Lesefehler beim Sender (Ende 2).
+    FilesAbortRead,
+    /// Schreibfehler beim Empfaenger (Quittung 5).
+    FilesAbortWrite,
+    /// Die Ablage liess sich nicht setzen.
+    FilesAbortClipboard,
 }
 
 pub struct Lang {
@@ -464,6 +485,15 @@ pub static EN: Lang = Lang {
         (TrayQuit, "Quit"),
         (TrayStillRunning, "QuadChroma is still running in the notification area."),
         (TrayStillRunningMac, "QuadChroma is still running in the menu bar."),
+        (FilesAbortLocal, "by this device"),
+        (FilesAbortPeer, "by the other side"),
+        (FilesAbortConnection, "connection interrupted"),
+        (FilesAbortTimeout, "timeout, no progress"),
+        (FilesAbortNoSpace, "not enough disk space"),
+        (FilesAbortInvalid, "invalid data"),
+        (FilesAbortRead, "read error"),
+        (FilesAbortWrite, "write error"),
+        (FilesAbortClipboard, "clipboard not available"),
     ],
 };
 
@@ -640,6 +670,15 @@ pub static DE: Lang = Lang {
         (TrayQuit, "Beenden"),
         (TrayStillRunning, "QuadChroma läuft im Infobereich weiter."),
         (TrayStillRunningMac, "QuadChroma läuft in der Menüleiste weiter."),
+        (FilesAbortLocal, "von diesem Gerät"),
+        (FilesAbortPeer, "von der Gegenseite"),
+        (FilesAbortConnection, "Verbindung unterbrochen"),
+        (FilesAbortTimeout, "Zeitüberschreitung, kein Fortschritt"),
+        (FilesAbortNoSpace, "zu wenig Speicherplatz"),
+        (FilesAbortInvalid, "ungültige Daten"),
+        (FilesAbortRead, "Lesefehler"),
+        (FilesAbortWrite, "Schreibfehler"),
+        (FilesAbortClipboard, "Zwischenablage nicht verfügbar"),
     ],
 };
 
@@ -685,7 +724,39 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > TrayStillRunningMac as usize);
+        assert!(n > FilesAbortClipboard as usize);
+        assert_eq!(n, FilesAbortClipboard as usize + 1, "Tabellen laenger als das Enum");
+    }
+
+    /// Die Abbruchgruende der Datei-Zeile: in jeder Sprache vorhanden, ohne
+    /// Platzhalter, je Sprache verschieden voneinander, und eigene Worte je
+    /// Sprache (EN/DE verschieden).
+    #[test]
+    fn abbruchgruende() {
+        let gruende = [
+            FilesAbortLocal,
+            FilesAbortPeer,
+            FilesAbortConnection,
+            FilesAbortTimeout,
+            FilesAbortNoSpace,
+            FilesAbortInvalid,
+            FilesAbortRead,
+            FilesAbortWrite,
+            FilesAbortClipboard,
+        ];
+        for l in all() {
+            let mut texte = std::collections::HashSet::new();
+            for k in gruende {
+                let t = l.get(k);
+                assert!(!t.is_empty() && !t.contains('{'), "{} {k:?}: {t}", l.code);
+                assert!(texte.insert(t), "{} {k:?}: doppelt ({t})", l.code);
+            }
+        }
+        for k in gruende {
+            assert_ne!(EN.get(k), DE.get(k), "{k:?}");
+        }
+        assert_eq!(DE.get(FilesAbortNoSpace), "zu wenig Speicherplatz");
+        assert_eq!(EN.get(FilesAbortTimeout), "timeout, no progress");
     }
 
     /// Die Zeile zu Dateiuebertragungen: Platzhalter in jeder Sprache

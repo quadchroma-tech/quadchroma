@@ -30,7 +30,10 @@ const NAME_MAX: usize = 64;
 /// fallen weg (Windows schnitte sie still ab); die Laenge ist begrenzt. Ohne
 /// verwertbaren Namen steht die Adresse da, mit "_" statt ":".
 pub fn dateiname(name: &str, adresse: &str) -> String {
-    let mut n = name.trim();
+    // Punkte und Leerzeichen am Ende zuerst: ein voll qualifizierter Name
+    // ("studio.local.") verloere sein ".local" sonst nicht (Integrationstest
+    // 574cd3e, Befund 7).
+    let mut n = name.trim().trim_end_matches(['.', ' ']);
     // `get` statt Schnitt: die letzten sechs Byte koennen mitten in einem
     // Mehrbyte-Zeichen beginnen.
     if let Some(i) = n.len().checked_sub(6) {
@@ -182,8 +185,9 @@ pub fn verknuepfung_anlegen(
     let pfad = ziel_ordner.join(dateiname(name, adresse));
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
     let arbeitsordner = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    // Laesst sich die Symboldatei nicht schreiben, zeigt die Verknuepfung
-    // eben das Standardsymbol der exe - kein Grund, sie nicht anzulegen.
+    // Laesst sich die Symboldatei nicht erneuern, nimmt ico_schreiben die
+    // vorhandene; gibt es keine, zeigt die Verknuepfung eben das
+    // Standardsymbol der exe - kein Grund, sie nicht anzulegen.
     // Bewusst ohne Protokollzeile: der Befehlszeilenweg liefe sonst in
     // protokoll.txt und leerte das Protokoll einer laufenden App.
     let symbol = match crate::logo::ico_schreiben() {
@@ -261,6 +265,10 @@ mod tests {
     fn dateiname_bereinigt() {
         assert_eq!(dateiname("Mac-mini-von-Robert.local", "192.168.178.194:9001"), "QuadChroma - Mac-mini-von-Robert.lnk");
         assert_eq!(dateiname("studio.LOCAL", "x"), "QuadChroma - studio.lnk");
+        // Auch mit Punkt (und Leerzeichen) am Ende, wie ein voll qualifizierter Name.
+        assert_eq!(dateiname("x.local.", "y"), "QuadChroma - x.lnk");
+        assert_eq!(dateiname("studio.local. . ", "y"), "QuadChroma - studio.lnk");
+        assert_eq!(dateiname("x.local..", "y"), "QuadChroma - x.lnk");
         // Nur ein angehaengtes .local faellt weg.
         assert_eq!(dateiname("local.host", "x"), "QuadChroma - local.host.lnk");
         // Verbotene Zeichen und Steuerzeichen werden zu "_".
