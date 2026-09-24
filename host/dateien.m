@@ -24,10 +24,17 @@
 #include <time.h>
 #include <unistd.h>
 
-// Was hoechstens auf der Empfangswarteschlange warten darf. Ein Sender, der
-// sich an das Fenster haelt, hat nie mehr als 256 KiB unquittiert unterwegs;
-// dazu kommt hoechstens ein Angebot. Wer mehr schickt, haelt sich nicht daran.
-#define QC_EMPFANG_WARTEND_MAX (8u * 1024u * 1024u)
+// Was hoechstens auf der Empfangswarteschlange warten darf, wie im Rust-Kern
+// (client/src/dateien.rs, WARTEND_DATEN_MAX und WARTEND_ENDEN_MAX): die
+// Datenbytes der Stuecke (je Stueck mindestens 1) bis FENSTER + STUECK_MAX -
+// so viel hat ein Sender, der sein Fenster einhaelt, hoechstens unquittiert
+// unterwegs, gleich in wie vielen Stuecken, auch einer, der nur VOR dem
+// Stueck prueft und dann ein ganzes schickt. Die Zahl der Stuecke ist bewusst
+// nicht eigens begrenzt (viele kleine Dateien sind erlaubt). Dazu hoechstens
+// 8 Enden; ein neues Angebot leert die Warteschlange, es wartet also
+// hoechstens eines. Darueber ist es ein Protokollfehler (Quittung 4).
+#define QC_EMPFANG_DATEN_MAX  ((size_t)QC_DATEI_FENSTER + QC_DATEI_STUECK_MAX)
+#define QC_EMPFANG_ENDEN_MAX  8u
 
 // --------------------------------------------------------------- Helfer
 
@@ -393,7 +400,7 @@ NSString *qc_dateien_basis(void) {
     pthread_mutex_lock(&g_basis_mtx);
     NSString *b = g_basis;
     pthread_mutex_unlock(&g_basis_mtx);
-    return b ?: [NSTemporaryDirectory() stringByAppendingPathComponent:@"QuadChroma-Ablage"];
+    return b ?: [NSTemporaryDirectory() stringByAppendingPathComponent:@QC_DATEI_BASIS_NAME];
 }
 
 void qc_dateien_stillstand_setzen(uint32_t ms) { atomic_store(&g_stillstand_ms, ms ? ms : QC_DATEI_STILLSTAND_MS); }
@@ -493,11 +500,13 @@ static int eintrag_loeschen(int dfd, const char *name, dev_t geraet, int tiefe) 
 }
 
 // Einen Baum loeschen, ohne je einer Verknuepfung zu folgen. Auch die Wurzel
-// wird nur geloescht, nicht verfolgt. 0 = alles weg.
+// wird nur geloescht, nicht verfolgt, und ihr Elternordner (die Basis) wird
+// nur geoeffnet, wenn er selbst keine Verknuepfung ist (O_NOFOLLOW) - ist die
+// Basis inzwischen eine, bleibt ihr Ziel unberuehrt. 0 = alles weg.
 static int baum_loeschen(NSString *pfad) {
     NSString *eltern = pfad.stringByDeletingLastPathComponent, *name = pfad.lastPathComponent;
     if (!eltern.length || !name.length || [name isEqualToString:@"/"]) return -1;
-    int dfd = open(eltern.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int dfd = open(eltern.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (dfd < 0) return -1;
     struct stat st;
     int r = fstat(dfd, &st) == 0 ? eintrag_loeschen(dfd, name.fileSystemRepresentation, st.st_dev, 0) : errno;
@@ -522,11 +531,41 @@ static BOOL uebertragung_name(const char *n, uint64_t *ms) {
     return YES;
 }
 
-void qc_dateien_aufraeumen(NSUInteger behalten, uint64_t hoechstalter_ms) {
+// Aufraeumen (2.9). ausser: Name eines Uebertragungsverzeichnisses, das auf
+// keinen Fall geloescht wird - das eben in die Ablage gelegte. Es zaehlt als
+// eines der `behalten`: Sortiert wird nach der Wanduhr im Namen, und springt
+// die Uhr zurueck, staende das eben fertige sonst als aeltestes da und
+// verschwaende, waehrend die Ablage noch darauf zeigt.
+// Die Basis wird ohne Verknuepfung geoeffnet (O_NOFOLLOW), und alles darunter
+// wird relativ zu ihrem Deskriptor gelesen und geloescht: Ist die Basis eine
+// Verknuepfung, wird nichts angefasst, auch nicht in ihrem Ziel.
+static void aufraeumen_ausser(NSUInteger behalten, uint64_t hoechstalter_ms, NSString *ausser) {
     if (!behalten && !hoechstalter_ms) return;
     NSString *basis = qc_dateien_basis();
-    DIR *d = opendir(basis.fileSystemRepresentation);
-    if (!d) return;
+    int bfd = open(basis.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (bfd < 0) {
+        // Noch keine Basis: nichts zu tun. Sonst eine Verknuepfung (ELOOP),
+        // etwas anderes als ein Ordner (ENOTDIR) oder nicht lesbar.
+        if (errno != ENOENT)
+            zeile(@"Dateien: Aufraeumen ausgelassen - %@ ist kein Ordner, eine Verknuepfung oder nicht lesbar (%s)",
+                  basis, strerror(errno));
+        return;
+    }
+    struct stat bst;
+    if (fstat(bfd, &bst) != 0 || bst.st_uid != getuid()) {
+        zeile(@"Dateien: Aufraeumen ausgelassen - %@ gehoert einem anderen Nutzer", basis);
+        close(bfd);
+        return;
+    }
+    int kopie = dup(bfd);
+    DIR *d = kopie >= 0 ? fdopendir(kopie) : NULL;
+    if (!d) {
+        if (kopie >= 0) close(kopie);
+        close(bfd);
+        return;
+    }
+    const char *ausser_c = ausser.UTF8String;
+    BOOL ausser_da = NO;
     NSMutableArray<NSArray *> *funde = [NSMutableArray array];
     struct dirent *e;
     while ((e = readdir(d))) {
@@ -534,22 +573,32 @@ void qc_dateien_aufraeumen(NSUInteger behalten, uint64_t hoechstalter_ms) {
         if (!uebertragung_name(e->d_name, &ms)) continue;
         struct stat st;
         // Nur echte Ordner; eine Verknuepfung mit passendem Namen bleibt liegen.
-        if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (fstatat(bfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (ausser_c && !strcmp(e->d_name, ausser_c)) { ausser_da = YES; continue; }
         [funde addObject:@[ @(ms), @(e->d_name) ]];
     }
-    closedir(d);
+    closedir(d);                                      // schliesst die Kopie, bfd bleibt
     [funde sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
         NSComparisonResult r = [b[0] compare:a[0]];              // neueste zuerst
         return r != NSOrderedSame ? r : [b[1] compare:a[1]];
     }];
+    // So viele der uebrigen bleiben; 0 bei `behalten` heisst: keine Obergrenze.
+    NSUInteger andere = !behalten ? NSUIntegerMax : behalten - (ausser_da ? 1 : 0);
     uint64_t jetzt = unix_ms();
     for (NSUInteger i = 0; i < funde.count; i++) {
         uint64_t ms = [funde[i][0] unsignedLongLongValue];
-        BOOL weg = (behalten && i >= behalten) || (hoechstalter_ms && ms + hoechstalter_ms < jetzt);
+        BOOL weg = i >= andere || (hoechstalter_ms && ms + hoechstalter_ms < jetzt);
         if (!weg) continue;
-        NSString *p = [basis stringByAppendingPathComponent:funde[i][1]];
-        if (baum_loeschen(p) != 0) zeile(@"Dateien: Aufraeumen - %@ liess sich nicht ganz loeschen", p);
+        NSString *name = funde[i][1];
+        int r = eintrag_loeschen(bfd, name.UTF8String, bst.st_dev, 0);
+        if (r) zeile(@"Dateien: Aufraeumen - %@ liess sich nicht ganz loeschen (%s)",
+                     [basis stringByAppendingPathComponent:name], strerror(r));
     }
+    close(bfd);
+}
+
+void qc_dateien_aufraeumen(NSUInteger behalten, uint64_t hoechstalter_ms) {
+    aufraeumen_ausser(behalten, hoechstalter_ms, nil);
 }
 
 void qc_dateien_aufraeumen_beim_start(void) {
@@ -580,8 +629,55 @@ void qc_dateien_aufraeumen_beim_start(void) {
 
 // Die laufende Uebertragung. Nur auf g_empfang_q.
 static QCEmpfang *g_empfang = nil;
-static _Atomic uint64_t g_empfang_wartend = 0;
-static _Atomic int g_empfang_ueberlauf = 0;
+
+// Eingang des Empfaengers: eine eigene Warteschlange (FIFO) vor g_empfang_q,
+// damit sie sich nach Datenbytes begrenzen und von einem neuen Angebot leeren
+// laesst - auf g_empfang_q eingereihte Bloecke liessen sich nicht mehr
+// zurueckholen. Abgeholt wird je Block genau ein Eintrag, der naechste Block
+// kommt danach wieder hinten an; so laufen Wache und Pruefstandsaufrufe
+// dazwischen. Auch "Eingabekanal weg" und "Sitzung vorbei" laufen hier
+// durch, damit sie Nachrichten, die vor ihnen kamen, nicht ueberholen.
+enum {
+    EINGANG_UEBERLAUF = 0,      // Warteschlange uebergelaufen: Quittung 4
+    EINGANG_KANAL_WEG = 1,
+    EINGANG_VORBEI    = 2,      // sitzung = die neue Sitzung
+    // sonst QC_DATEI_ANGEBOT, QC_DATEI_STUECK, QC_DATEI_ENDE
+};
+@interface QCEingang : NSObject {
+@public
+    uint8_t art;
+    uint64_t sitzung, kanal;
+}
+@property (nonatomic, strong) NSData *nutzlast;
+@property (nonatomic, copy) NSString *grund;          // nur beim Ueberlauf
+@end
+@implementation QCEingang
+@end
+
+static pthread_mutex_t g_eingang_mtx = PTHREAD_MUTEX_INITIALIZER;
+// Alles unter g_eingang_mtx; darunter wird nichts anderes gerufen.
+static NSMutableArray<QCEingang *> *g_eingang = nil;
+static size_t g_eingang_daten = 0;          // Datenbytes wartender Stuecke (je Stueck mindestens 1)
+static unsigned g_eingang_enden = 0;        // wartende Enden
+static int g_eingang_ueberlauf = 0;         // bis zum naechsten Angebot wird nichts angenommen
+static int g_eingang_geplant = 0;           // ein Abholer steht auf g_empfang_q
+static int g_empfang_angehalten = 0;        // nur Pruefstaende: g_empfang_q angehalten
+
+// Was ein wartendes Stueck zaehlt: seine Daten, mindestens 1 (auch ein
+// kaputtes ohne Daten).
+static size_t stueck_daten(NSData *d) {
+    return d.length > QC_DATEI_STUECK_KOPF + 1 ? d.length - QC_DATEI_STUECK_KOPF : 1;
+}
+
+// Wartet nichts mehr im Eingang? Der Empfaenger quittiert dann sofort, was
+// offen ist - so bleibt kein Sender mit kleinem Fenster haengen, gleich wie
+// er seine Stuecke schneidet (wie im Rust-Kern).
+static BOOL eingang_leer(void) {
+    pthread_mutex_lock(&g_eingang_mtx);
+    BOOL leer = g_eingang.count == 0;
+    pthread_mutex_unlock(&g_eingang_mtx);
+    return leer;
+}
 
 static void quittung_an(uint64_t sitzung, uint32_t kennung, uint8_t zustand, uint64_t empfangen) {
     NSData *q = qc_datei_quittung_kodieren(kennung, zustand, empfangen);
@@ -653,6 +749,9 @@ static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
         zeile(@"Dateien: abgebrochen (neues Angebot vor dem Ende der laufenden Uebertragung)");
         empfang_beenden(YES);
     }
+    // Ein Nachzuegler einer Sitzung, die es nicht mehr gibt (der Eingabefaden
+    // las ihn noch vor dem Wechsel): nichts anlegen, niemandem antworten.
+    if (g_wege.rueckstand && g_wege.rueckstand(sitzung) < 0) return;
     uint32_t kennung = 0;
     uint64_t gesamt = 0;
     NSArray<QCDateiEintrag *> *eintraege = nil;
@@ -787,8 +886,14 @@ static void empfang_stueck(uint64_t sitzung, NSData *d) {
     // offen sind - "spaetestens je 64 KiB" (2.6) ist damit erfuellt. Grund:
     // Ein Sender, der nur ganze Stuecke ins Fenster setzt, steht im
     // Spielmodus schon mit einem Stueck (48 KiB) unterwegs; wartete der
-    // Empfaenger auf 64 KiB, hingen beide bis zum Stillstand.
-    if (E->empfangen - E->quittiert > QC_DATEI_FENSTER_SPIEL - QC_DATEI_STUECK_MAX) {
+    // Empfaenger auf 64 KiB, hingen beide bis zum Stillstand. Zusaetzlich,
+    // wie im Rust-Kern, sobald im Eingang nichts mehr wartet: dann steht der
+    // Sender womoeglich am Fenster, gleich wie er seine Stuecke schneidet.
+    // Quittungen gehen hier nie wegen eines Staus verloren: der Weg (main.m,
+    // send_small_sitzung) blockiert, bis sie im Sendepuffer liegen, und
+    // scheitert nur, wenn die Sitzung vorbei ist.
+    uint64_t offen = E->empfangen - E->quittiert;
+    if (offen > QC_DATEI_FENSTER_SPIEL - QC_DATEI_STUECK_MAX || (offen && eingang_leer())) {
         E->quittiert = E->empfangen;
         quittung_an(E->sitzung, E->kennung, QC_QUITT_LAEUFT, E->empfangen);
     }
@@ -824,53 +929,161 @@ static void empfang_ende(uint64_t sitzung, NSData *d) {
     quittung_an(E->sitzung, E->kennung, QC_QUITT_FERTIG, E->empfangen);
     NSUInteger anzahl = E.eintraege.count;
     uint64_t bytes = E->empfangen;
+    NSString *eben = E.ordner.lastPathComponent;
     empfang_beenden(NO);                  // das Verzeichnis bleibt: daraus wird eingefuegt
-    qc_dateien_aufraeumen(3, 0);
+    aufraeumen_ausser(3, 0, eben);        // das eben abgelegte bleibt auf jeden Fall
     zeile(@"Dateien: empfangen %lu Eintraege, %@ - in die Ablage gelegt", (unsigned long)anzahl, mb_text(bytes));
+}
+
+// Einen Eintrag verarbeiten. Nur auf g_empfang_q.
+static void eingang_verarbeiten(QCEingang *e) {
+    switch (e->art) {
+        case QC_DATEI_ANGEBOT: empfang_angebot(e->sitzung, e->kanal, e.nutzlast); break;
+        case QC_DATEI_STUECK:  empfang_stueck(e->sitzung, e.nutzlast); break;
+        case QC_DATEI_ENDE:    empfang_ende(e->sitzung, e.nutzlast); break;
+        case EINGANG_UEBERLAUF:
+            // Die Gegenseite schickt mehr, als ihr Fenster erlaubt. Beendet
+            // wird die laufende Uebertragung dieser Sitzung, gleich welche
+            // Kennung das Stueck trug - sonst stuende sie still, bis der
+            // Stillstand greift, denn bis zum naechsten Angebot wird nichts
+            // mehr angenommen.
+            if (g_empfang && g_empfang->sitzung == e->sitzung) protokollfehler(g_empfang, e.grund);
+            break;
+        case EINGANG_KANAL_WEG:
+            if (g_empfang && g_empfang->sitzung == e->sitzung && g_empfang->kanal == e->kanal) {
+                zeile(@"Dateien: abgebrochen (Eingabekanal getrennt)");
+                empfang_beenden(YES);
+            }
+            break;
+        case EINGANG_VORBEI:
+            if (g_empfang && g_empfang->sitzung != e->sitzung) {
+                zeile(@"Dateien: abgebrochen (Zuschauer gewechselt oder weg)");
+                empfang_beenden(YES);
+            }
+            break;
+        default: break;
+    }
+}
+
+static void eingang_abholen(void);
+
+static void abholer_planen(void) {
+    dispatch_async(g_empfang_q, ^{ @autoreleasepool { eingang_abholen(); } });
+}
+
+// Den aeltesten Eintrag holen und verarbeiten; wartet danach noch mehr, kommt
+// der naechste Abholer hinten an g_empfang_q. g_eingang_geplant faellt erst
+// nach der Verarbeitung: solange es gesetzt ist, ist noch etwas zu tun
+// (darauf wartet qc_dateien_abwarten).
+static void eingang_abholen(void) {
+    QCEingang *e = nil;
+    pthread_mutex_lock(&g_eingang_mtx);
+    if (g_eingang.count) {
+        e = g_eingang[0];
+        [g_eingang removeObjectAtIndex:0];
+        if (e->art == QC_DATEI_STUECK) g_eingang_daten -= stueck_daten(e.nutzlast);
+        else if (e->art == QC_DATEI_ENDE) g_eingang_enden--;
+    }
+    pthread_mutex_unlock(&g_eingang_mtx);
+    if (e) eingang_verarbeiten(e);
+    pthread_mutex_lock(&g_eingang_mtx);
+    BOOL weiter = g_eingang.count > 0;
+    if (!weiter) g_eingang_geplant = 0;
+    pthread_mutex_unlock(&g_eingang_mtx);
+    if (weiter) abholer_planen();
+}
+
+// Hinten anhaengen; 1 = es muss ein Abholer geplant werden. Unter g_eingang_mtx.
+static int einreihen_gesperrt(QCEingang *e) {
+    if (!g_eingang) g_eingang = [NSMutableArray array];
+    [g_eingang addObject:e];
+    if (g_eingang_geplant) return 0;
+    g_eingang_geplant = 1;
+    return 1;
+}
+
+static QCEingang *eingang_neu(uint8_t art, uint64_t sitzung, uint64_t kanal) {
+    QCEingang *e = [[QCEingang alloc] init];
+    e->art = art;
+    e->sitzung = sitzung;
+    e->kanal = kanal;
+    return e;
 }
 
 void qc_empfang_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSData *nutzlast) {
     if (!g_empfang_q || !nutzlast) return;
-    uint64_t n = nutzlast.length;
-    if (atomic_fetch_add(&g_empfang_wartend, n) + n > QC_EMPFANG_WARTEND_MAX) {
-        // Die Gegenseite schickt weit mehr, als ihr Fenster erlaubt: nicht
-        // weiter einreihen (der Speicher waere sonst ihr ausgeliefert),
-        // sondern die Uebertragung als ungueltig beenden.
-        atomic_fetch_sub(&g_empfang_wartend, n);
-        if (!atomic_exchange(&g_empfang_ueberlauf, 1)) {
-            dispatch_async(g_empfang_q, ^{
-                @autoreleasepool {
-                    atomic_store(&g_empfang_ueberlauf, 0);
-                    if (g_empfang && g_empfang->sitzung == sitzung)
-                        protokollfehler(g_empfang, @"Gegenseite haelt das Fenster nicht ein");
-                }
-            });
-        }
-        return;
-    }
-    dispatch_async(g_empfang_q, ^{
-        @autoreleasepool {
-            switch (typ) {
-                case QC_DATEI_ANGEBOT: empfang_angebot(sitzung, kanal, nutzlast); break;
-                case QC_DATEI_STUECK:  empfang_stueck(sitzung, nutzlast); break;
-                case QC_DATEI_ENDE:    empfang_ende(sitzung, nutzlast); break;
-                default: break;
+    if (typ != QC_DATEI_ANGEBOT && typ != QC_DATEI_STUECK && typ != QC_DATEI_ENDE) return;
+    QCEingang *e = eingang_neu(typ, sitzung, kanal);
+    e.nutzlast = nutzlast;
+    // Was ein Angebot verwirft, wird erst nach der Sperre freigegeben.
+    NS_VALID_UNTIL_END_OF_SCOPE NSMutableArray<QCEingang *> *alt = nil;
+    int planen = 0;
+    pthread_mutex_lock(&g_eingang_mtx);
+    switch (typ) {
+        case QC_DATEI_ANGEBOT:
+            // Der Sender hat alles davor aufgegeben: was noch an Angeboten,
+            // Stuecken und Enden wartet, faellt weg. Kanal- und
+            // Sitzungsereignisse bleiben in ihrer Reihenfolge.
+            alt = g_eingang;
+            g_eingang = [NSMutableArray array];
+            for (QCEingang *x in alt)
+                if (x->art == EINGANG_KANAL_WEG || x->art == EINGANG_VORBEI) [g_eingang addObject:x];
+            g_eingang_daten = 0;
+            g_eingang_enden = 0;
+            g_eingang_ueberlauf = 0;
+            planen = einreihen_gesperrt(e);
+            break;
+        case QC_DATEI_STUECK: {
+            if (g_eingang_ueberlauf) break;
+            size_t d = stueck_daten(nutzlast);
+            if (g_eingang_daten + d > QC_EMPFANG_DATEN_MAX) {
+                // Nicht weiter einreihen (der Speicher waere sonst der
+                // Gegenseite ausgeliefert), sondern die Uebertragung als
+                // ungueltig beenden; bis zum naechsten Angebot wird nichts
+                // mehr angenommen.
+                g_eingang_ueberlauf = 1;
+                QCEingang *u = eingang_neu(EINGANG_UEBERLAUF, sitzung, kanal);
+                u.grund = @"mehr als das Fenster unquittiert";
+                planen = einreihen_gesperrt(u);
+            } else {
+                g_eingang_daten += d;
+                planen = einreihen_gesperrt(e);
             }
+            break;
         }
-        atomic_fetch_sub(&g_empfang_wartend, n);
-    });
+        case QC_DATEI_ENDE:
+            if (g_eingang_ueberlauf) break;
+            if (g_eingang_enden >= QC_EMPFANG_ENDEN_MAX) {
+                g_eingang_ueberlauf = 1;
+                QCEingang *u = eingang_neu(EINGANG_UEBERLAUF, sitzung, kanal);
+                u.grund = @"zu viele Enden";
+                planen = einreihen_gesperrt(u);
+            } else {
+                g_eingang_enden++;
+                planen = einreihen_gesperrt(e);
+            }
+            break;
+    }
+    pthread_mutex_unlock(&g_eingang_mtx);
+    alt = nil;
+    if (planen) abholer_planen();
 }
 
 void qc_empfang_kanal_weg(uint64_t sitzung, uint64_t kanal) {
     if (!g_empfang_q) return;
-    dispatch_async(g_empfang_q, ^{
-        @autoreleasepool {
-            if (g_empfang && g_empfang->sitzung == sitzung && g_empfang->kanal == kanal) {
-                zeile(@"Dateien: abgebrochen (Eingabekanal getrennt)");
-                empfang_beenden(YES);
-            }
-        }
-    });
+    pthread_mutex_lock(&g_eingang_mtx);
+    int planen = einreihen_gesperrt(eingang_neu(EINGANG_KANAL_WEG, sitzung, kanal));
+    pthread_mutex_unlock(&g_eingang_mtx);
+    if (planen) abholer_planen();
+}
+
+void qc_empfang_anhalten(int an) {
+    if (!g_empfang_q) return;
+    pthread_mutex_lock(&g_eingang_mtx);
+    if (an && !g_empfang_angehalten) dispatch_suspend(g_empfang_q);
+    if (!an && g_empfang_angehalten) dispatch_resume(g_empfang_q);
+    g_empfang_angehalten = an ? 1 : 0;
+    pthread_mutex_unlock(&g_eingang_mtx);
 }
 
 NSString *qc_empfang_ordner(void) {
@@ -1280,18 +1493,25 @@ void qc_dateien_sitzung_vorbei(uint64_t neue_sitzung) {
     // ist, und muss dafuer nicht erst eine Quittung abwarten.
     pthread_cond_broadcast(&g_s_cv);
     if (!g_empfang_q) return;
-    dispatch_async(g_empfang_q, ^{
-        @autoreleasepool {
-            if (g_empfang && g_empfang->sitzung != neue_sitzung) {
-                zeile(@"Dateien: abgebrochen (Zuschauer gewechselt oder weg)");
-                empfang_beenden(YES);
-            }
-        }
-    });
+    // Hinter allem, was noch von der alten Sitzung wartet (das laeuft ins
+    // Leere oder in die Uebertragung, die hier gleich endet). Nur ein Griff an
+    // g_eingang_mtx, kein Freigeben unter g_send_mtx.
+    pthread_mutex_lock(&g_eingang_mtx);
+    int planen = einreihen_gesperrt(eingang_neu(EINGANG_VORBEI, neue_sitzung, 0));
+    pthread_mutex_unlock(&g_eingang_mtx);
+    if (planen) abholer_planen();
 }
 
 void qc_dateien_abwarten(void) {
-    if (g_empfang_q) dispatch_sync(g_empfang_q, ^{});
-    if (g_senden_q) dispatch_sync(g_senden_q, ^{});
-    if (g_empfang_q) dispatch_sync(g_empfang_q, ^{});
+    for (;;) {
+        if (g_empfang_q) dispatch_sync(g_empfang_q, ^{});
+        if (g_senden_q) dispatch_sync(g_senden_q, ^{});
+        if (g_empfang_q) dispatch_sync(g_empfang_q, ^{});
+        // Abgeholt wird ein Eintrag je Block: erst fertig, wenn kein
+        // Abholer mehr ansteht.
+        pthread_mutex_lock(&g_eingang_mtx);
+        int ruhig = !g_eingang_geplant;
+        pthread_mutex_unlock(&g_eingang_mtx);
+        if (ruhig) return;
+    }
 }

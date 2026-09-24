@@ -737,7 +737,13 @@ static int dateien_faehig_gesperrt(void) {
 
 static int dateien_spielmodus(void) { return atomic_load(&g_cur_gaming); }
 
-static void dateien_log(const char *zeile) { logf_(@"%s", zeile); }
+// Die Zeile ist UTF-8 (Pfade mit Umlauten). Nicht ueber "%s": das liest
+// NSString in der Standardkodierung (hier MacRoman), aus jedem Umlaut
+// wuerden zwei falsche Zeichen.
+static void dateien_log(const char *zeile) {
+    NSString *s = [NSString stringWithUTF8String:zeile];
+    logf_(@"%@", s ?: @"Dateien: (Protokollzeile nicht in UTF-8)");
+}
 
 static void dateien_einrichten(void) {
     static const qc_dateien_wege wege = { send_small_sitzung, rueckstand_sitzung, dateien_spielmodus, dateien_log };

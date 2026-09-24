@@ -8,8 +8,10 @@
 // stillem Bildschirm (Umrechnung des letzten Bildes), --fest beim Start,
 // Stauregel samt Ton im Stau, Ansage des Tonformats, Koennensliste (AV1),
 // Dateien ueber die Zwischenablage (Faehigkeiten, beide Richtungen ueber echte
-// Kanaele, Fenster, Zuschauerwechsel mitten in der Uebertragung, Zuschauer
-// ohne Eingabekanal, aelterer Client ohne IN_FAEHIGKEITEN).
+// Kanaele, Fenster, Umlaute im Protokoll, Zuschauerwechsel mitten in der
+// Uebertragung, Sitzungsbindung des Wegs, Zuschauer ohne Eingabekanal,
+// aelterer Client ohne IN_FAEHIGKEITEN, Faehigkeit nur fuer den Eingabekanal,
+// der sie gemeldet hat).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -1909,6 +1911,23 @@ static int datei_nachrichten(schein *s, int frist_ms) {
     return n;
 }
 
+// Alle Nachrichten der naechsten frist_ms: wie viele davon vom Typ typ.
+static int nachrichten_vom_typ(schein *s, uint8_t typ, int frist_ms) {
+    int n = 0;
+    qc_hdr h;
+    NSData *d;
+    while (nachricht_ganz(&s->l, &h, &d, frist_ms) == 1)
+        if (h.type == typ) n++;
+    return n;
+}
+
+static uint64_t sitzung_jetzt(void) {
+    pthread_mutex_lock(&g_send_mtx);
+    uint64_t s = g_sitzung;
+    pthread_mutex_unlock(&g_send_mtx);
+    return s;
+}
+
 static void dateien_pruefen(int bild_port, int ein_port) {
     printf("\n-- Dateien: Faehigkeiten\n");
     static char pfad[1100];                 // g_log_pfad zeigt danach noch hierher
@@ -1949,15 +1968,28 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     NSMutableString *folge = [NSMutableString string];
     beispiel_stuecke(&F, 77, 0);
     ein_daten(F.ein, &F.tx, QC_DATEI_ENDE, qc_datei_ende_kodieren(77, 0));
+    // Wie viele Zwischenquittungen kommen, haengt davon ab, wann der Eingang
+    // leer ist (dann quittiert der Empfaenger sofort); fest steht: steigend,
+    // spaetestens je 64 KiB (der Empfaenger quittiert ab 16 KiB offen, ein
+    // Stueck hat hoechstens 48 KiB), am Ende 1 mit allen Bytes.
+    BOOL folge_ok = YES;
+    uint64_t vorige = 0;
+    int zwischen = 0;
+    z = 9;
     while (quittung_lesen(&F.l, &z, &em, 3000) == 1) {
         [folge appendFormat:@"%s%u/%llu", folge.length ? " " : "", z, em];
+        // Zwischenquittungen steigen echt; die letzte darf den Stand der
+        // vorigen wiederholen (war der Eingang nach dem letzten Stueck leer).
+        if (em < vorige || (em == vorige && !z) || em - vorige > QC_DATEI_QUITTUNG_ALLE) folge_ok = NO;
+        vorige = em;
         if (z) break;
+        zwischen++;
     }
     qc_dateien_abwarten();                  // die Protokollzeile des Empfaengers ist geschrieben
     stdout_stumm(0);
     printf("         (Quittungen auf dem Bildkanal nach 0/0: %s)\n", folge.UTF8String);
-    pruefe(q0 && [folge isEqualToString:@"0/49157 0/98309 0/147461 1/150008"],
-           "Quittungen kommen auf dem Bildkanal: sofort 0/0, sobald mehr als 16 KiB offen sind, am Ende 1 mit allen Bytes");
+    pruefe(q0 && folge_ok && zwischen >= 2 && z == QC_QUITT_FERTIG && em == 150008,
+           "Quittungen kommen auf dem Bildkanal: sofort 0/0, dann steigend und spaetestens je 64 KiB, am Ende 1 mit allen Bytes");
     NSArray<NSString *> *liste = nil;
     @synchronized (g_rekorder) { liste = g_rekorder.lastObject; }
     NSString *wurzel = liste.firstObject.stringByDeletingLastPathComponent;
@@ -1994,6 +2026,12 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     [[NSData data] writeToFile:[q stringByAppendingPathComponent:@"Q/leer.txt"] atomically:NO];
     [[@"12345" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[q stringByAppendingPathComponent:@"einzeln.txt"] atomically:NO];
     [y_bin writeToFile:[q stringByAppendingPathComponent:@"y.bin"] atomically:NO];
+    // Eine Verknuepfung mit Umlauten im Namen: sie wird uebersprungen, und die
+    // Zeile dazu muss den Namen unverfaelscht in UTF-8 tragen (nicht als
+    // MacRoman gelesen). Name in NFC, als Bytes.
+    char verkn[1200];
+    snprintf(verkn, sizeof verkn, "%s/Q/Verkn\xc3\xbcpfung \xc3\xa4", q.fileSystemRepresentation);
+    int verkn_da = symlink("x.bin", verkn) == 0;
     uint64_t stoss = 0, unterwegs = 0;
     int ende = -1;
     NSArray *pfade = nil;
@@ -2011,6 +2049,12 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     pruefe(stoss == QC_DATEI_FENSTER && unterwegs <= QC_DATEI_FENSTER, "das Fenster wird eingehalten (256 KiB ohne Quittung, nie mehr)");
     pruefe(zeilen_mit(pfad, "Dateien: sende 4 Eintraege, 0,6 MB an 127.0.0.1") == 1 &&
            zeilen_mit(pfad, "Dateien: gesendet und quittiert (0,6 MB in ") == 1, "Protokollzeilen wie beim Windows-Host");
+    // NFC wie angelegt oder NFD, falls das Dateisystem den Namen so meldet;
+    // falsch gelesen stuende dort statt jedes Umlauts eine Zeichenfolge wie
+    // E2 88 9A C2 BA.
+    int umlaut = zeilen_mit(pfad, "uebersprungen (symbolische Verknuepfung): ") == 1 &&
+                 zeilen_mit(pfad, "/Q/Verkn\xc3\xbcpfung \xc3\xa4") + zeilen_mit(pfad, "/Q/Verknu\xcc\x88pfung a\xcc\x88") == 1;
+    pruefe(verkn_da && umlaut, "Host-Protokoll: Namen mit Umlauten stehen unverfaelscht (UTF-8) in der Zeile");
     atomic_store(&g_cur_gaming, 1);
     stdout_stumm(1);
     clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"y.bin"] ]);
@@ -2032,9 +2076,19 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     NSString *laufend = qc_empfang_ordner();
     int sendet = qc_senden_laeuft();
     NSUInteger rek0 = rekorder_anzahl();
+    uint64_t s_f = sitzung_jetzt();
     ok = schein_verbinden(&G, bild_port, ein_port, g_priv) == 0;     // G loest F ab
+    uint64_t s_g = sitzung_jetzt();
     int empfang_weg = warten_bis(empfang_ruht, 2), sender_weg = warten_bis(sender_ruht, 2);
     int bei_g = datei_nachrichten(&G, 300);
+    // Die Sitzungsbindung des Wegs fuer sich: mit der Sitzung des Vorgaengers
+    // geht nichts hinaus (so auch keine Quittung eines Empfaengers, der den
+    // Wechsel noch nicht bemerkt hat), mit der des Neuen genau das eine.
+    NSData *qt = qc_datei_quittung_kodieren(4711, 0, 1);
+    int alt_raus = send_small_sitzung(s_f, QC_DATEI_QUITTUNG, qt.bytes, qt.length);
+    int alt_rueckstand = rueckstand_sitzung(s_f);
+    int neu_raus = send_small_sitzung(s_g, QC_DATEI_QUITTUNG, qt.bytes, qt.length);
+    int quittungen_bei_g = nachrichten_vom_typ(&G, QC_DATEI_QUITTUNG, 300);
     stdout_stumm(0);
     printf("         (vorher: Empfang in %s, Sender %s)\n", laufend.lastPathComponent.UTF8String ?: "-", sendet ? "laeuft" : "ruht");
     pruefe(ok && laufend && empfang_weg && ![[NSFileManager defaultManager] fileExistsAtPath:laufend] && rekorder_anzahl() == rek0,
@@ -2042,6 +2096,8 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     pruefe(sendet && sender_weg && bei_g == 0, "Host -> Client: der Sender bricht ab, beim Neuen kommt nichts davon an");
     pruefe(zeilen_mit(pfad, "Dateien: abgebrochen (Zuschauer gewechselt oder weg)") == 2,
            "beide Abbrueche stehen im Protokoll");
+    pruefe(s_f != s_g && !alt_raus && alt_rueckstand == -1 && neu_raus && quittungen_bei_g == 1,
+           "send_small_sitzung mit der Sitzung des Vorgaengers: nichts geht hinaus, Rueckstand -1; mit der des Neuen genau eine Nachricht");
 
     printf("\n-- Dateien: ohne Eingabekanal, dann aelterer Client (ohne IN_FAEHIGKEITEN)\n");
     stdout_stumm(1);
@@ -2081,6 +2137,26 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     stdout_stumm(0);
     pruefe(g_jetzt && zu, "ein Stueck ueber 16 + 49152 Byte beendet den Eingabekanal");
     pruefe(weg, "mit dem Kanal ist auch seine Faehigkeit weg");
+
+    printf("\n-- Dateien: die Faehigkeit gilt nur fuer den Eingabekanal, der sie gemeldet hat\n");
+    // Derselbe Zuschauer (dieselbe Sitzung) verbindet einen neuen
+    // Eingabekanal, meldet darauf aber nichts: die Meldung des alten Kanals
+    // gilt nicht mehr - er koennte etwa ein aelterer Client sein.
+    stdout_stumm(1);
+    close(G.ein);
+    G.ein = eingabe_verbinden(ein_port, g_priv, G.hh, &G.tx);
+    int neuer_kanal = G.ein >= 0 && warten_bis(eingabe_steht, 2);
+    int faehig_neu = faehig_jetzt();
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
+    int bei_g2 = datei_nachrichten(&G, 400);
+    qc_dateien_abwarten();
+    int sendet2 = qc_senden_laeuft();
+    ein_daten(G.ein, &G.tx, QC_IN_FAEHIGKEITEN, eins);
+    int selbst_gemeldet = warten_bis(faehig_jetzt, 1);
+    stdout_stumm(0);
+    pruefe(neuer_kanal && !faehig_neu && bei_g2 == 0 && !sendet2,
+           "neuer Eingabekanal derselben Sitzung ohne IN_FAEHIGKEITEN: die Meldung des alten gilt nicht, nichts geht hinaus");
+    pruefe(selbst_gemeldet, "meldet der neue Kanal die Faehigkeit selbst, gilt sie wieder");
 
     zuschauer_weg();
     schein_schliessen(&F);
@@ -2141,6 +2217,8 @@ int main(void) {
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();
+        // Das eigene HOME bleibt nur liegen, wenn etwas fehlschlug (zum Nachsehen).
+        if (!g_fehler) [[NSFileManager defaultManager] removeItemAtPath:@(g_home) error:nil];
         printf("\n%s: %d Fehler\n", g_fehler ? "NICHT BESTANDEN" : "bestanden", g_fehler);
         return g_fehler;
     }
