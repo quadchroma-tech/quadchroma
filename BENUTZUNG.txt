@@ -913,17 +913,19 @@ Dateiverweise wie fuer Text. Empfangene Dateien liegen dagegen nie in
 diesen Ordnern, sondern im Temp-Ordner; Finder kopiert sie beim
 Einfuegen von dort.
 
-Gemessen (Integrationstest vom 24.09.2026, am Stand vor den letzten
-Nachbesserungen): Auf der VM ohne Grafikkarte, Windows-Host-Rolle und
-Client auf derselben Maschine, ging 1 GiB in 30 bis 35 s hinueber, rund
-30 MB/s in beide Richtungen und bitgleich; der Host meldete dabei keinen
-Stau und kein verworfenes Bild. Der Software-Encoder der VM brauchte
-waehrenddessen mehr Zeit: 25 bis 75 ms mehr Verzoegerung und etwa ein
-Bild je Sekunde weniger. Seitdem laufen die Datei-Faeden mit
-niedrigerer Prioritaet, und die Host-Rolle sendet mit 64 statt 256 KiB
-Fenster - neu gemessen ist das noch nicht. Im LAN vom Windows-Client zum
-Mac-Host (M1): 209,7 MB in 7,4 s, also 28 MB/s, bei unveraenderten 114
-Bildern je Sekunde und rund 35 ms Verzoegerung.
+Gemessen im Integrationstest des Endstands (24.09.2026) auf der VM ohne
+Grafikkarte, mit Windows-Host-Rolle und Client auf derselben Maschine, je
+1 GiB bitgleich:
+- Client -> Host: rund 30 MB/s. Der Software-Encoder der VM brauchte
+  dabei mehr Zeit, etwa 60 ms mehr Verzoegerung und 2 Bilder je Sekunde
+  weniger. Die Ursache ist nicht geklaert; an der Prozessorlast liegt es
+  nicht.
+- Host -> Client: 69 bis 93 MB/s, ohne messbare Wirkung auf Bild und
+  Verzoegerung.
+In beiden Richtungen meldete der Host keinen Stau und kein verworfenes
+Bild. Im LAN vom Windows-Client zum Mac-Host: 209,7 MB in 7,4 s, also
+28 MB/s, bei unveraenderten rund 114 Bildern je Sekunde und 30 bis 37 ms
+Verzoegerung.
 
 Protokollzeilen: im Client in protokoll.txt, in der Windows-Host-Rolle in
 host-protokoll.txt, im Mac-Host in /tmp/quadchroma-m1.log. Diese lauten

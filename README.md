@@ -140,11 +140,14 @@ zeigt eine schmale Zeile unten im Bild den Fortschritt.
   gesendet noch angelegt.
 - Ältere Gegenstellen bekommen nichts: Ob die andere Seite Dateien kann, meldet sie
   beim Verbinden (Fähigkeiten, Nachrichten 11 und 69).
-- Gemessen im Integrationstest (Stand 574cd3e, vor dem 64-KiB-Fenster der
-  Host-Rolle und den Fäden mit Nachrang): auf der VM rund 30 MB/s in beide
-  Richtungen, dort mit etwa 1 Bild/s weniger und 25–75 ms mehr Verzögerung im
-  Software-Encoder; im LAN vom Windows-Client zum Mac-Host 28 MB/s bei
-  unveränderten 114 Bildern/s.
+- Gemessen im Integrationstest des Endstands (e134fc6):
+  - Auf der VM (Software-Encoder, ohne Grafikkarte): Client → Host rund 30 MB/s,
+    dabei etwa 2 Bilder/s weniger und rund 60 ms mehr Verzögerung im Encoder.
+    Die Ursache ist nicht geklärt, die Prozessorlast ist es nicht.
+  - Host → Client auf der VM 69–93 MB/s, ohne messbare Wirkung auf Bild und
+    Verzögerung.
+  - Im LAN vom Windows-Client zum Mac-Host: 28 MB/s bei unveränderten rund
+    114 Bildern/s und 30–37 ms Verzögerung.
 
 Auf dem Mac kann macOS beim ersten Kopieren aus Schreibtisch, Dokumente oder
 Downloads nach dem Zugriff fragen, ab macOS 15.4 auch beim Lesen der
@@ -265,15 +268,12 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
   Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern.
-  Von den Dateien, der Verknüpfung und dem Infobereich (belegt im Integrationstest
-  am Stand 574cd3e auf der VM mit Windows-Host-Rolle und Client und Client →
-  Mac-Host im LAN, dazu `dateitest`, `ablagetest` und die Dateiabschnitte von
-  `hosttest`) noch offen: die Nachbesserungen nach 574cd3e, die bisher nur
-  Prüfstände und Unit-Tests belegen (Entprellen und Entdoppeln der Ablage,
-  Vormerken einer Kopie direkt nach dem Verbinden, Aufräumen verwaister
-  Übertragungen, am Mac-Host Namen in NFC und die Zeile „empfange …“, die
-  Einzelinstanz, wenn die erste App gerade endet, und das Beenden, wenn macOS das
-  Symbol der Menüleiste nicht zeigt), dazu Kopieren mit
+  Die Dateien, die Verknüpfung und der Infobereich sind in zwei Integrationstests
+  belegt: auf der VM mit Windows-Host-Rolle und Client, und Client → Mac-Host
+  im LAN, zuletzt am Stand e134fc6. Dazu kommen `dateitest`, `ablagetest` und
+  die Dateiabschnitte von `hosttest`. Nur in Prüfständen und Unit-Tests belegt
+  sind die Einzelinstanz, wenn die erste App gerade endet, und das Beenden,
+  wenn macOS das Symbol der Menüleiste nicht zeigt. Noch offen ist Kopieren mit
   Strg+C und Einfügen im Explorer von Hand am Laptop (auf der VM kopierte ein Skript
   über .NET, eingefügt wurde per Shell-Befehl), Einfügen im Finder am Mac, Dateien
   vom Mac-Host zum Client im laufenden Betrieb, der Mac-Client mit Dateien,
