@@ -11,7 +11,8 @@
 //   symbol.steht() -> bool          Symbol wirklich sichtbar angemeldet?
 //   symbol.grund() -> Option<String> warum nicht (Protokoll, Selbsttest)
 //   symbol.stand_setzen(&stand)     Menue und Tooltip erneuern
-//   symbol.hinweis(titel, text)     einmalige Sprechblase bzw. Hinweisblase
+//   symbol.hinweis(titel, text) -> bool  einmalige Sprechblase bzw. Hinweisblase;
+//                                   true nur, wenn sie wirklich gezeigt wurde
 //   symbol.takt()                   aus der Ereignisschleife, etwa 2 je Sekunde
 //   drop(symbol)                    Symbol entfernen
 //
@@ -201,7 +202,9 @@ impl Symbol {
         None
     }
     pub fn stand_setzen(&mut self, _stand: &Stand) {}
-    pub fn hinweis(&mut self, _titel: &str, _text: &str) {}
+    pub fn hinweis(&mut self, _titel: &str, _text: &str) -> bool {
+        false
+    }
     pub fn takt(&mut self) {}
 }
 

@@ -61,6 +61,9 @@ mod tray_mac;
 /// damit die Aufrufstellen ohne Weiche auskommen.
 #[cfg(any(windows, target_os = "macos"))]
 mod audio_ring;
+/// Entprellen und Entdoppeln der Ablage-Meldungen, fuer beide Waechter.
+#[cfg(any(windows, target_os = "macos"))]
+mod ablage_ruhe;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
@@ -729,6 +732,15 @@ struct Shared {
     /// Der Host kann Dateien: MSG_FAEHIGKEITEN mit FAEHIG_DATEIEN in DIESER
     /// Sitzung (Spezifikation 2.2). Zurueck bei jedem Sitzungsende.
     host_dateien: bool,
+    /// MSG_FAEHIGKEITEN kam in dieser Sitzung an (mit oder ohne Dateien).
+    /// Solange nicht, und hoechstens DATEI_ANLAUF nach dem Sitzungsbeginn,
+    /// wird eine Kopie vorgemerkt statt FilesPeerOld gemeldet.
+    faehigkeiten_da: bool,
+    /// Beginn dieser Sitzung (Handschlag steht), fuer DATEI_ANLAUF.
+    sitzung_seit: Option<Instant>,
+    /// Eine Kopie, die auf MSG_FAEHIGKEITEN wartet (Integrationstest 574cd3e,
+    /// Befund 3); hoechstens eine, die neueste gilt.
+    datei_vorgemerkt: Option<DateiVormerkung>,
     /// FilesPeerOld stand in dieser Sitzung schon da (einmal je Sitzung).
     host_zu_alt_gemeldet: bool,
     /// Die laufende Datei-Sendung Client -> Host, hoechstens eine. Fallen
@@ -787,6 +799,23 @@ impl DateiSendung {
         Some(self.kanal.load(std::sync::atomic::Ordering::SeqCst)).filter(|&k| k != 0)
     }
 }
+
+/// Eine Kopie, die auf die Faehigkeiten des Hosts wartet: die Pfade, bis
+/// wann sie wartet, und die Sitzung, in der sie entstand.
+#[derive(Debug)]
+struct DateiVormerkung {
+    pfade: Vec<std::path::PathBuf>,
+    bis: Instant,
+    sitzung: u64,
+}
+
+/// Anlauf einer Sitzung fuer Dateien (Integrationstest 574cd3e, Befund 3):
+/// so lange wartet eine Kopie direkt nach dem Verbinden auf MSG_FAEHIGKEITEN
+/// (vorgemerkt statt FilesPeerOld), und so lange wartet eine neue Sendung auf
+/// einen Eingabekanal, der noch im Aufbau ist (Voll statt Weg). Der Host
+/// schickt die Faehigkeiten gleich nach Gruss und Strominfo; wer sie nach
+/// DATEI_ANLAUF nicht hat, ist ein aelterer Host.
+const DATEI_ANLAUF: Duration = Duration::from_secs(5);
 
 /// So lange bleibt die Zeile nach dem Ergebnis einer Uebertragung stehen.
 const DATEI_NACHLAUF: Duration = Duration::from_secs(6);
@@ -861,11 +890,48 @@ fn datei_zeile(st: &dateien::Stand, lang: &strings::Lang) -> (String, u32) {
             Meldung::neu(if senden { FilesSent } else { FilesReady }, "").mit("{n}", st.oberste.to_string()),
             ui::CYAN,
         ),
-        Ergebnis::Abgebrochen(a) => (Meldung::neu(FilesAborted, "").mit("{n}", a.text()), ui::AMBER),
+        Ergebnis::Abgebrochen(a) => {
+            (Meldung::neu(FilesAborted, a.text()).mit("{n}", lang.get(abbruch_schluessel(a))), ui::AMBER)
+        }
         Ergebnis::ZuGross => (Meldung::neu(FilesTooLarge, ""), ui::AMBER),
         Ergebnis::GegenseiteZuAlt => (Meldung::neu(FilesPeerOld, ""), ui::AMBER),
     };
     (m.text(lang), farbe)
+}
+
+/// Der Abbruchgrund in Worten der Oberflaeche (Durchsicht [13]): ein
+/// Schluessel je haeufigem Grund. Einzelheiten - Pfade, Systemtexte, der
+/// genaue Zustand - stehen nur im Protokoll (Abbruch::text, die Zeile des
+/// Kerns). Die Gruende gelten in beide Richtungen: "zu wenig Speicherplatz"
+/// meldet beim Senden die Gegenseite (Quittung 3), beim Empfangen lehnt diese
+/// Seite selbst ab.
+fn abbruch_schluessel(a: &dateien::Abbruch) -> strings::Key {
+    use dateien::Abbruch as A;
+    use strings::Key::*;
+    match a {
+        A::Hier => FilesAbortLocal,
+        A::Verbindung => FilesAbortConnection,
+        A::Lesefehler(_) => FilesAbortRead,
+        A::Zeitueberschreitung => FilesAbortTimeout,
+        A::Quittung(z) => match *z {
+            dateien::ZUSTAND_KEIN_PLATZ => FilesAbortNoSpace,
+            dateien::ZUSTAND_SCHREIBFEHLER => FilesAbortWrite,
+            // Quittung 6: der Empfaenger hat aufgegeben (Stillstand u. ae.).
+            dateien::ZUSTAND_ABGEBROCHEN => FilesAbortPeer,
+            // 4 (ungueltig), 1 zu frueh oder ein unbekannter Zustand.
+            _ => FilesAbortInvalid,
+        },
+        A::Ende(g) => match *g {
+            dateien::GRUND_ABGEBROCHEN => FilesAbortPeer,
+            dateien::GRUND_LESEFEHLER => FilesAbortRead,
+            dateien::GRUND_ZEIT => FilesAbortTimeout,
+            _ => FilesAbortInvalid,
+        },
+        A::Abgelehnt(z, _) if *z == dateien::ZUSTAND_KEIN_PLATZ => FilesAbortNoSpace,
+        A::Abgelehnt(..) | A::Ungueltig(_) => FilesAbortInvalid,
+        A::Schreibfehler(_) => FilesAbortWrite,
+        A::Ablage => FilesAbortClipboard,
+    }
 }
 
 /// Die schmalen Zeilen zu Dateiuebertragungen unten mittig ueber dem Bild,
@@ -888,6 +954,23 @@ fn datei_zeilen_zeichnen(u: &mut ui::Ui, c: &mut ui::Canvas, ww: u32, wh: u32, z
 }
 
 impl Shared {
+    /// Sitzungsende fuer Dateien: die Faehigkeit des Hosts gilt nicht mehr,
+    /// eine vorgemerkte Kopie faellt weg, die laufende Sendung kommt heraus -
+    /// fallen lassen (ausserhalb der Sperre) bricht sie ab.
+    fn dateien_zuruecksetzen(&mut self) -> Option<DateiSendung> {
+        self.host_dateien = false;
+        self.faehigkeiten_da = false;
+        self.datei_vorgemerkt = None;
+        self.datei_senden.take()
+    }
+
+    /// Stehen die Faehigkeiten des Hosts noch aus, obwohl sie bald kommen
+    /// muessten (Sitzung juenger als DATEI_ANLAUF)? Dann wird eine Kopie
+    /// vorgemerkt statt FilesPeerOld gemeldet.
+    fn faehigkeiten_offen(&self) -> bool {
+        self.link.is_some() && !self.faehigkeiten_da && self.sitzung_seit.is_some_and(|t| t.elapsed() < DATEI_ANLAUF)
+    }
+
     /// Laeuft gerade ein Codecwechsel, den man dem Nutzer erklaeren sollte?
     fn wechsel_laeuft(&self) -> bool {
         self.codec_wechsel.map(|t| t.elapsed() < CODEC_WECHSEL_FRIST).unwrap_or(false)
@@ -1037,8 +1120,7 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             s.codec_idx = None;
             // Dateien: Sender ab, Faehigkeit zurueck (das tat schon das Ende
             // von run_session; der Empfaenger fiel mit ihr weg).
-            s.host_dateien = false;
-            s.datei_senden.take()
+            s.dateien_zuruecksetzen()
         };
         drop(datei);
         std::thread::sleep(Duration::from_secs(2));
@@ -1908,10 +1990,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.codec_idx = None;
         s.codec_wechsel = None;
         s.sitzung_nr += 1;
-        s.host_dateien = false;
+        s.sitzung_seit = Some(Instant::now());
         s.host_zu_alt_gemeldet = false;
         s.datei_stand = DateiStaende::default();
-        (s.sitzung_nr, s.datei_senden.take())
+        (s.sitzung_nr, s.dateien_zuruecksetzen())
     };
     drop(alt);
     // Ab hier raeumt jedes Ende der Sitzung die Dateiuebertragung ab.
@@ -2572,9 +2654,16 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             MSG_FAEHIGKEITEN => {
                 // Ein aelterer Client uebergeht Typ 11; hier gilt er fuer
                 // diese Sitzung (Spezifikation 2.2).
+                // Eine vorgemerkte Kopie holt die Weiterleitung der Ablage ab
+                // (vorgemerkte_dateien) - nicht hier: dateien_senden fragt
+                // das Dateisystem, und der Empfangsfaden darf nicht warten.
                 if let Some(bits) = dateien::faehigkeiten_lesen(&payload) {
                     let kann = dateien::kann_dateien(bits);
-                    shared.lock().unwrap().host_dateien = kann;
+                    {
+                        let mut s = shared.lock().unwrap();
+                        s.host_dateien = kann;
+                        s.faehigkeiten_da = true;
+                    }
                     protokoll::zeile(format!(
                         "Host meldet Faehigkeiten {bits:#x}: Dateien {}",
                         if kann { "ja" } else { "nein" }
@@ -2667,10 +2756,7 @@ struct SitzungsEnde<'a>(&'a Arc<Mutex<Shared>>);
 impl Drop for SitzungsEnde<'_> {
     fn drop(&mut self) {
         let griff = match self.0.lock() {
-            Ok(mut s) => {
-                s.host_dateien = false;
-                s.datei_senden.take()
-            }
+            Ok(mut s) => s.dateien_zuruecksetzen(),
             Err(_) => None,
         };
         // Ausserhalb der Sperre: Griff::drop bricht ab und kehrt sofort zurueck.
@@ -2729,20 +2815,40 @@ fn quittungs_weg(input: &Arc<Mutex<InputLink>>, sitzung: Vec<u8>) -> Arc<dyn dat
 /// steht"); kennt er die Kennung nicht mehr, uebergeht er es. Steht gerade
 /// kein Kanal (Neuaufbau), gilt fuer dieses Ende Voll - der Sender versucht
 /// es hoechstens ENDE_FRIST lang, und jeder Versuch treibt den Aufbau.
+///
+/// Anlauf (Integrationstest 574cd3e, Befund 3): Solange noch kein Paket
+/// hinaus ist und die Sendung juenger als DATEI_ANLAUF ist, heisst ein
+/// Eingabekanal, der noch nicht steht (im Aufbau, oder im Pruefmodus noch
+/// nicht an diese Sitzung gebunden), Voll statt Weg - direkt nach dem
+/// Verbinden brach eine Kopie sonst mit "Verbindung weg" ab. Jeder Versuch
+/// treibt den Aufbau.
 fn datei_weg(
     input: &Arc<Mutex<InputLink>>,
     sitzung: Vec<u8>,
     kanal: Arc<std::sync::atomic::AtomicU64>,
 ) -> Arc<dyn dateien::Weg> {
+    datei_weg_bis(input, sitzung, kanal, Instant::now() + DATEI_ANLAUF)
+}
+
+/// datei_weg mit dem Ende des Anlaufs (die Tests setzen es selbst).
+fn datei_weg_bis(
+    input: &Arc<Mutex<InputLink>>,
+    sitzung: Vec<u8>,
+    kanal: Arc<std::sync::atomic::AtomicU64>,
+    anlauf_bis: Instant,
+) -> Arc<dyn dateien::Weg> {
     use std::sync::atomic::Ordering;
     let input = input.clone();
     Arc::new(move |typ: u8, n: &[u8]| {
         let Ok(mut l) = input.lock() else { return dateien::Gesendet::Weg };
-        if l.sitzung() != Some(sitzung.as_slice()) {
-            return dateien::Gesendet::Weg;
+        let gebunden = kanal.load(Ordering::SeqCst);
+        let im_anlauf = gebunden == 0 && Instant::now() < anlauf_bis;
+        match l.sitzung() {
+            Some(s) if s == sitzung.as_slice() => {}
+            None if im_anlauf => return dateien::Gesendet::Voll,
+            _ => return dateien::Gesendet::Weg,
         }
         l.ensure();
-        let gebunden = kanal.load(Ordering::SeqCst);
         let abbruch_ende =
             typ == DATEI_ENDE && dateien::Ende::lesen(n).is_some_and(|e| e.grund != dateien::GRUND_VOLLSTAENDIG);
         match l.kanal_nr() {
@@ -2754,7 +2860,7 @@ fn datei_weg(
                 r
             }
             Some(_) if abbruch_ende => l.datei_senden(typ, n),
-            None if abbruch_ende => dateien::Gesendet::Voll,
+            None if abbruch_ende || im_anlauf => dateien::Gesendet::Voll,
             _ => dateien::Gesendet::Weg,
         }
     })
@@ -2768,13 +2874,14 @@ fn datei_weg(
 /// nie kommen, erst nach STILLSTAND (30 s). Sein Ende 1 geht auf dem neuen
 /// Kanal hinaus, sobald der steht (datei_weg). Die Sperren nacheinander,
 /// nie verschachtelt; `input` nur mit try_lock (Aufruf je Nachricht in
-/// run_session) - ist sie belegt, prueft der naechste Aufruf.
+/// run_session) - ist sie belegt, prueft der naechste Aufruf. Eine Sendung,
+/// deren Faden schon zu Ende ist (quittiert oder abgebrochen), bleibt
+/// unberuehrt: sie ist nicht mehr abzubrechen, und eine Protokollzeile
+/// "abgebrochen" fuer eine gelungene Uebertragung fuehrte in die Irre.
 fn datei_kanal_pruefen(shared: &Mutex<Shared>, input: &Mutex<InputLink>) {
-    let Some((kennung, gebunden)) = shared
-        .lock()
-        .ok()
-        .and_then(|s| s.datei_senden.as_ref().and_then(|d| Some((d.kennung(), d.gebunden()?))))
-    else {
+    let Some((kennung, gebunden)) = shared.lock().ok().and_then(|s| {
+        s.datei_senden.as_ref().filter(|d| d.griff.laeuft()).and_then(|d| Some((d.kennung(), d.gebunden()?)))
+    }) else {
         return;
     };
     let jetzt = match input.try_lock() {
@@ -2799,9 +2906,13 @@ fn datei_kanal_pruefen(shared: &Mutex<Shared>, input: &Mutex<InputLink>) {
 }
 
 /// Kopierter Text (Waechter): eine laufende Datei-Sendung bricht ab (neuer
-/// Inhalt, Spezifikation 2.7 Schritt 5), der Text geht wie bisher als IN_CLIP.
+/// Inhalt, Spezifikation 2.7 Schritt 5), eine vorgemerkte Kopie faellt weg,
+/// der Text geht wie bisher als IN_CLIP.
 fn text_senden(text: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
-    let alt = shared.lock().ok().and_then(|mut s| s.datei_senden.take());
+    let alt = shared.lock().ok().and_then(|mut s| {
+        s.datei_vorgemerkt = None;
+        s.datei_senden.take()
+    });
     drop(alt);
     if let Ok(mut l) = input.lock() {
         l.send(IN_CLIP, text.as_bytes());
@@ -2811,12 +2922,15 @@ fn text_senden(text: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
 /// Kopierte Dateien (Waechter, Spezifikation 2.7 und 3.4). Stammen sie aus
 /// einem Empfang, geht nichts hinaus und nichts bricht ab (Widerhall). Sonst
 /// endet eine laufende Sendung; kann der Host Dateien, startet eine neue,
-/// sonst steht einmal je Sitzung FilesPeerOld da. Laeuft im Faden der
-/// Weiterleitung, nie im Faden des Waechters; Sender::starten kehrt sofort
-/// zurueck, Auflisten und Lesen laufen in dessen eigenem Faden. Der Griff
-/// liegt in `shared`, bevor die Sperre faellt - eine Quittung des Hosts, die
-/// run_session gleich danach bekommt, findet ihn also schon. Unter `shared`
-/// wird keine andere Sperre genommen.
+/// sonst steht einmal je Sitzung FilesPeerOld da. Direkt nach dem Verbinden,
+/// solange MSG_FAEHIGKEITEN noch aussteht (Shared::faehigkeiten_offen), wird
+/// die Liste vorgemerkt; vorgemerkte_dateien schickt sie los, sobald die
+/// Faehigkeiten da sind, oder meldet nach DATEI_ANLAUF FilesPeerOld. Laeuft
+/// im Faden der Weiterleitung, nie im Faden des Waechters; Sender::starten
+/// kehrt sofort zurueck, Auflisten und Lesen laufen in dessen eigenem Faden.
+/// Der Griff liegt in `shared`, bevor die Sperre faellt - eine Quittung des
+/// Hosts, die run_session gleich danach bekommt, findet ihn also schon. Unter
+/// `shared` wird keine andere Sperre genommen.
 fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
     let basis = shared
         .lock()
@@ -2828,6 +2942,21 @@ fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, i
         return;
     }
     let Ok(mut s) = shared.lock() else { return };
+    // Neuer Inhalt: eine vorgemerkte Kopie gilt nicht mehr.
+    s.datei_vorgemerkt = None;
+    if s.faehigkeiten_offen() {
+        let alt = s.datei_senden.take();
+        let n = pfade.len();
+        let sitzung = s.sitzung_nr;
+        s.datei_vorgemerkt = Some(DateiVormerkung { pfade, bis: Instant::now() + DATEI_ANLAUF, sitzung });
+        drop(s);
+        drop(alt);
+        protokoll::zeile(format!(
+            "Dateien: {n} Eintraege vorgemerkt - die Faehigkeiten des Hosts stehen noch aus (hoechstens {} s)",
+            DATEI_ANLAUF.as_secs()
+        ));
+        return;
+    }
     let alt = s.datei_senden.take();
     let mut zu_alt = false;
     match (s.link.as_ref().map(|(hh, _)| hh.clone()), s.host_dateien) {
@@ -2855,6 +2984,39 @@ fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, i
     if zu_alt {
         protokoll::zeile(dateien::ZEILE_HOST_ZU_ALT.into());
     }
+}
+
+/// Eine vorgemerkte Kopie (dateien_senden) weiterreichen: sind die
+/// Faehigkeiten des Hosts da oder ist DATEI_ANLAUF um, geht sie wieder durch
+/// dateien_senden - dann startet der Sender bzw. steht FilesPeerOld da (nach
+/// dem Anlauf gilt der Host als aelter). Gehoert sie zu einer vergangenen
+/// Sitzung, faellt sie weg. Laeuft im Faden der Weiterleitung, im kurzen Takt,
+/// solange etwas vorgemerkt ist (VORMERK_TAKT).
+fn vorgemerkte_dateien(shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
+    let pfade = {
+        let Ok(mut s) = shared.lock() else { return };
+        let Some(v) = s.datei_vorgemerkt.as_ref() else { return };
+        if v.sitzung != s.sitzung_nr || s.link.is_none() {
+            s.datei_vorgemerkt = None;
+            return;
+        }
+        if !s.faehigkeiten_da && Instant::now() < v.bis {
+            return;
+        }
+        s.datei_vorgemerkt.take().map(|v| v.pfade)
+    };
+    if let Some(p) = pfade {
+        dateien_senden(p, shared, input);
+    }
+}
+
+/// So oft sieht die Weiterleitung nach einer vorgemerkten Kopie.
+const VORMERK_TAKT: Duration = Duration::from_millis(20);
+
+/// Liegt eine Kopie vorgemerkt? Dann wartet die Weiterleitung nur
+/// VORMERK_TAKT auf den naechsten Inhalt.
+fn vormerk_takt(shared: &Mutex<Shared>) -> Option<Duration> {
+    shared.lock().ok().and_then(|s| s.datei_vorgemerkt.as_ref().map(|_| VORMERK_TAKT))
 }
 
 /// Ein Paket in den Decoder und alle fertigen Bilder heraus. Gibt den
@@ -3215,11 +3377,15 @@ fn faehigkeiten_rahmen() -> Vec<u8> {
 /// fuer Tasten und Maus reicht er um Groessenordnungen.
 const EINGABE_SNDBUF: i32 = 64 * 1024;
 
-#[cfg(windows)]
 fn eingabe_sendepuffer(s: &std::net::TcpStream) {
+    sendepuffer_setzen(s, EINGABE_SNDBUF);
+}
+
+#[cfg(windows)]
+fn sendepuffer_setzen(s: &std::net::TcpStream, groesse: i32) {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET, SO_SNDBUF};
-    let wert = EINGABE_SNDBUF.to_ne_bytes();
+    let wert = groesse.to_ne_bytes();
     // SAFETY: gueltiger Socket (lebt mit `s`), der Wert ist ein i32 wie verlangt.
     unsafe {
         setsockopt(SOCKET(s.as_raw_socket() as usize), SOL_SOCKET, SO_SNDBUF, Some(&wert));
@@ -3227,7 +3393,7 @@ fn eingabe_sendepuffer(s: &std::net::TcpStream) {
 }
 
 #[cfg(target_os = "macos")]
-fn eingabe_sendepuffer(s: &std::net::TcpStream) {
+fn sendepuffer_setzen(s: &std::net::TcpStream, groesse: i32) {
     use std::os::unix::io::AsRawFd;
     extern "C" {
         fn setsockopt(
@@ -3241,7 +3407,7 @@ fn eingabe_sendepuffer(s: &std::net::TcpStream) {
     // sys/socket.h (macOS): SOL_SOCKET 0xffff, SO_SNDBUF 0x1001
     const SOL_SOCKET: std::os::raw::c_int = 0xffff;
     const SO_SNDBUF: std::os::raw::c_int = 0x1001;
-    let wert: std::os::raw::c_int = EINGABE_SNDBUF;
+    let wert: std::os::raw::c_int = groesse;
     // SAFETY: gueltiger Deskriptor (lebt mit `s`), Zeiger und Laenge eines c_int.
     unsafe {
         setsockopt(
@@ -3255,7 +3421,7 @@ fn eingabe_sendepuffer(s: &std::net::TcpStream) {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn eingabe_sendepuffer(_s: &std::net::TcpStream) {}
+fn sendepuffer_setzen(_s: &std::net::TcpStream, _groesse: i32) {}
 
 /// SO_SNDBUF eines Sockets zuruecklesen (nur fuer den Test).
 #[cfg(all(test, windows))]
@@ -3347,6 +3513,25 @@ struct Warteschlange {
     zu: bool,
 }
 
+impl Warteschlange {
+    /// Ein Datei-Paket auf den einen Platz: Ja, oder Voll, solange dort noch
+    /// eines wartet; Weg, wenn der Schreiber verworfen ist. Der Rahmen
+    /// entsteht erst, wenn der Platz frei ist (`bauen`): der Sender versucht
+    /// es bei Voll alle 2 ms wieder, und je Versuch 48 KiB zu kopieren und
+    /// wegzuwerfen hiesse Arbeit unter der Sperre `input`, die der
+    /// Fensterfaden fuer jede Taste braucht (Durchsicht [10]).
+    fn datei_platz(&mut self, bauen: impl FnOnce() -> Vec<u8>) -> dateien::Gesendet {
+        if self.zu {
+            return dateien::Gesendet::Weg;
+        }
+        if self.datei.is_some() {
+            return dateien::Gesendet::Voll;
+        }
+        self.datei = Some(bauen());
+        dateien::Gesendet::Ja
+    }
+}
+
 /// Schreibseite eines stehenden Eingabekanals.
 struct Schreiber {
     q: Arc<(Mutex<Warteschlange>, std::sync::Condvar)>,
@@ -3428,20 +3613,21 @@ impl Schreiber {
         Ok(())
     }
 
-    /// Ein fertig gerahmtes Datei-Paket auf den einen Platz: Ja, oder Voll,
-    /// solange dort noch eines wartet; Weg, wenn der Faden nicht mehr schreibt.
-    fn datei_einreihen(&self, b: Vec<u8>) -> dateien::Gesendet {
+    /// Ein Datei-Paket auf den einen Platz: Ja, oder Voll, solange dort noch
+    /// eines wartet; Weg, wenn der Faden nicht mehr schreibt. Gerahmt wird
+    /// erst, wenn es hineinkommt (Warteschlange::datei_platz) - die eine
+    /// Kopie je Paket liegt unter der kurzen Sperre der Warteschlange.
+    fn datei_einreihen(&self, typ: u8, nutzlast: &[u8]) -> dateien::Gesendet {
         let (m, cv) = &*self.q;
         let mut w = m.lock().unwrap_or_else(|e| e.into_inner());
-        if w.zu || !self.steht() {
+        if !self.steht() {
             return dateien::Gesendet::Weg;
         }
-        if w.datei.is_some() {
-            return dateien::Gesendet::Voll;
+        let r = w.datei_platz(|| eingabe_rahmen(typ, nutzlast));
+        if r == dateien::Gesendet::Ja {
+            cv.notify_one();
         }
-        w.datei = Some(b);
-        cv.notify_one();
-        dateien::Gesendet::Ja
+        r
     }
 }
 
@@ -3643,7 +3829,7 @@ impl InputLink {
         self.ensure();
         match self.kanal.as_ref().filter(|k| k.steht()) {
             Some(k) => {
-                let r = k.datei_einreihen(eingabe_rahmen(typ, nutzlast));
+                let r = k.datei_einreihen(typ, nutzlast);
                 if r == dateien::Gesendet::Ja {
                     self.sent += 1;
                 }
@@ -4487,8 +4673,9 @@ enum Screen { Start, Session }
 #[derive(Debug)]
 pub enum Benutzer {
     /// Ein zweiter Start hat seine Adresse weitergereicht (leer = nur nach
-    /// vorn holen), siehe einzel.rs.
-    Einzel(String),
+    /// vorn holen), siehe einzel.rs. Die Schleife bestaetigt die Uebernahme;
+    /// erst dann endet der zweite Start mit "weitergereicht".
+    Einzel(einzel::Weitergabe),
     /// Wahl am Symbol im Infobereich bzw. in der Menueleiste (tray.rs).
     Tray(tray::Befehl),
 }
@@ -4670,6 +4857,9 @@ struct App {
     /// Wann zuletzt gezeichnet wurde - Oberflaechen ohne neues Bild werden
     /// nur alle 33 ms neu gezeichnet.
     letzte_zeichnung: Instant,
+    /// Lag beim letzten Takt Oberflaeche ueber dem Bild? Verschwindet sie,
+    /// wird einmal neu gezeichnet (siehe neu_zeichnen).
+    oberflaeche_vorher: bool,
     /// Seit wann ESC gehalten wird, und ob der Druck schon verbraucht ist.
     /// Ein kurzer Druck geht an den Host, ein langer oeffnet das Menue - und
     /// dann darf der Host ihn gerade NICHT sehen.
@@ -4854,10 +5044,19 @@ impl ApplicationHandler<Benutzer> for App {
         }
     }
 
-    /// Benutzerereignisse (siehe `Benutzer`).
+    /// Benutzerereignisse (siehe `Benutzer`). Eine Weitergabe, die kommt,
+    /// waehrend das Programm schon endet, bleibt unbestaetigt: der zweite
+    /// Start bekommt 0 und wird selbst erste Instanz, sobald diese weg ist
+    /// (einzel.rs) - die Adresse geht nicht verloren.
     fn user_event(&mut self, _el: &ActiveEventLoop, ereignis: Benutzer) {
         match ereignis {
-            Benutzer::Einzel(adresse) => self.einzel_empfangen(&adresse),
+            Benutzer::Einzel(w) if self.quit => {
+                protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {:?} waehrend des Beendens - nicht uebernommen", w.adresse));
+            }
+            Benutzer::Einzel(w) => {
+                self.einzel_empfangen(&w.adresse);
+                w.bestaetigen();
+            }
             Benutzer::Tray(befehl) => self.tray_befehl(befehl),
         }
     }
@@ -5277,12 +5476,24 @@ impl ApplicationHandler<Benutzer> for App {
         // naechsten Takt nachgeholt; der Codecwechsel-Hinweis muss auch ohne
         // neue Bilder erscheinen und wieder verschwinden.
         let oberflaeche = self.oberflaeche_sichtbar(lage, wechsel);
-        if neues_bild || self.praesentation_ausstehend || (oberflaeche && self.letzte_zeichnung.elapsed() >= Duration::from_millis(33)) {
+        let vorher = std::mem::replace(&mut self.oberflaeche_vorher, oberflaeche);
+        if neu_zeichnen(neues_bild, self.praesentation_ausstehend, oberflaeche, vorher, self.letzte_zeichnung.elapsed()) {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
     }
+}
+
+/// Ist ein Neuzeichnen faellig? Bei einem neuen Bild und einem
+/// ausgelassenen Present immer; solange Oberflaeche ueber dem Bild liegt,
+/// alle 33 ms; und einmal in dem Takt, in dem sie verschwindet (`vorher`
+/// sichtbar, jetzt nicht) - sonst bliebe etwa die Zeile zu Dateien nach ihren
+/// 6 s stehen, bis der Host das naechste Bild schickt, und bei stillem
+/// Bildschirm tut er das nicht (Durchsicht [11]). Dasselbe gilt fuer Banner
+/// und Codecwechsel-Hinweis.
+fn neu_zeichnen(neues_bild: bool, ausstehend: bool, oberflaeche: bool, vorher: bool, seit_letzter: Duration) -> bool {
+    neues_bild || ausstehend || (vorher && !oberflaeche) || (oberflaeche && seit_letzter >= Duration::from_millis(33))
 }
 
 impl App {
@@ -5468,8 +5679,7 @@ impl App {
             s.target = None;
             // Eine laufende Datei-Sendung sofort ab (der Empfaenger bricht
             // mit dem Ende von run_session ab).
-            s.host_dateien = false;
-            (s.abbruch.take(), s.datei_senden.take())
+            (s.abbruch.take(), s.dateien_zuruecksetzen())
         };
         drop(datei);
         {
@@ -5597,7 +5807,11 @@ impl App {
         let steht = self.symbol.as_ref().map(|s| s.steht()).unwrap_or(false);
         let sitzung = self.screen == Screen::Session;
         match tray::beim_schliessen(self.cfg.tray, steht, sitzung, self.cfg.tray_hinweis) {
-            tray::Schliessen::Beenden => el.exit(),
+            tray::Schliessen::Beenden => {
+                // Ab hier uebernimmt die Schleife keine Weitergabe mehr (user_event).
+                self.quit = true;
+                el.exit();
+            }
             tray::Schliessen::Ablegen { trennen, hinweis } => {
                 if trennen {
                     protokoll::zeile(format!("{}: Fenster geschlossen - trenne {}", tray::ORT, self.addr_input));
@@ -5605,12 +5819,16 @@ impl App {
                 }
                 self.fenster_verbergen();
                 protokoll::zeile(format!("{}: Fenster abgelegt, QuadChroma laeuft weiter", tray::ORT));
+                // Vermerkt wird der Hinweis nur, wenn er wirklich zu sehen
+                // war - sonst kommt er beim naechsten Ablegen noch einmal.
                 if hinweis {
-                    if let Some(s) = self.symbol.as_mut() {
-                        s.hinweis("QuadChroma", self.lang.get(tray::HINWEIS));
+                    let gezeigt = self.symbol.as_mut().is_some_and(|s| s.hinweis("QuadChroma", self.lang.get(tray::HINWEIS)));
+                    if gezeigt {
+                        self.cfg.tray_hinweis = true;
+                        self.cfg.sichern();
+                    } else {
+                        protokoll::zeile(format!("{}: Hinweis nicht gezeigt - kommt beim naechsten Ablegen noch einmal", tray::ORT));
                     }
-                    self.cfg.tray_hinweis = true;
-                    self.cfg.sichern();
                 }
             }
         }
@@ -7298,8 +7516,10 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
 
     // Ansicht "dateien": die Zeile zu Dateiuebertragungen unten mittig ueber
     // einem angedeuteten Bild - ein Empfang laeuft, eine Sendung ist gerade
-    // fertig (beide Richtungen zugleich, wie es vorkommen kann).
-    if view == "dateien" {
+    // fertig (beide Richtungen zugleich, wie es vorkommen kann). Ansicht
+    // "dateienfehler": dieselben Zeilen mit uebersetzten Abbruchgruenden
+    // (Empfang: Zeitueberschreitung, Sendung: Gegenseite ohne Platz).
+    if view == "dateien" || view == "dateienfehler" {
         for y in 0..h {
             for x in 0..w {
                 let a = (x * 255 / w) as u32;
@@ -7307,15 +7527,22 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                 buf[y * w + x] = ((a / 3) << 16) | ((b / 2) << 8) | (40 + a / 5);
             }
         }
-        use dateien::{Ergebnis, Richtung, Stand};
+        use dateien::{Abbruch, Ergebnis, Richtung, Stand};
+        let fehler = view == "dateienfehler";
         let staende = [
             Stand {
                 richtung: Richtung::Empfangen, kennung: 7, bytes: 3_100_000, gesamt: 12_400_000,
-                eintraege: 5, dateien: 4, oberste: 2, ergebnis: Ergebnis::Laeuft,
+                eintraege: 5, dateien: 4, oberste: 2,
+                ergebnis: if fehler { Ergebnis::Abgebrochen(Abbruch::Zeitueberschreitung) } else { Ergebnis::Laeuft },
             },
             Stand {
                 richtung: Richtung::Senden, kennung: 3, bytes: 2_600_000, gesamt: 2_600_000,
-                eintraege: 3, dateien: 3, oberste: 3, ergebnis: Ergebnis::Fertig,
+                eintraege: 3, dateien: 3, oberste: 3,
+                ergebnis: if fehler {
+                    Ergebnis::Abgebrochen(Abbruch::Quittung(dateien::ZUSTAND_KEIN_PLATZ))
+                } else {
+                    Ergebnis::Fertig
+                },
             },
         ];
         let zeilen: Vec<(String, u32)> = staende.iter().map(|s| datei_zeile(s, lang)).collect();
@@ -7815,7 +8042,7 @@ fn main() {
         let path = args.get(i + 1).cloned().unwrap_or_else(|| "ui.bmp".into());
         let code = args.get(i + 2).cloned().unwrap_or_else(|| "de".into());
         let view = args.get(i + 3).cloned().unwrap_or_else(|| "start".into());
-        let (w, h) = if view == "sitzung" || view == "nerd" || view == "dateien" || view.starts_with("hud") {
+        let (w, h) = if view == "sitzung" || view == "nerd" || view.starts_with("dateien") || view.starts_with("hud") {
             (1280, 720)
         } else {
             (900, 700)
@@ -7838,9 +8065,19 @@ fn main() {
                 einzel_waechter = Some(waechter);
                 einzel_eingang = Some(eingang);
             }
-            einzel::Start::Weitergereicht => {
-                println!("QuadChroma laeuft schon - {} weitergereicht.", if addr.is_empty() { "nach vorn geholt" } else { addr.as_str() });
+            einzel::Start::Weitergereicht(None) => {
+                if addr.is_empty() {
+                    println!("QuadChroma laeuft schon - nach vorn geholt.");
+                } else {
+                    println!("QuadChroma laeuft schon - {addr} weitergereicht.");
+                }
                 std::process::exit(0);
+            }
+            // Die Adresse kaeme so nicht an (zu lang, Steuerzeichen): die
+            // laufende App ist nur nach vorn geholt, die Adresse verworfen.
+            einzel::Start::Weitergereicht(Some(g)) => {
+                eprintln!("QuadChroma laeuft schon - nach vorn geholt, Adresse nicht weitergereicht ({g}).");
+                std::process::exit(1);
             }
             einzel::Start::Unerreichbar(g) => {
                 eprintln!("QuadChroma laeuft schon, antwortet aber nicht ({g}).");
@@ -7904,17 +8141,31 @@ fn main() {
     // (der Waechter liest ohne Sitzung nicht). Der Waechter reicht nur
     // weiter (unter Windows laeuft er im Faden seines Fensters); Sperren und
     // Senden stehen im eigenen Faden der Weiterleitung, der Reihe nach.
+    // Liegt eine Kopie vorgemerkt (Faehigkeiten des Hosts stehen noch aus),
+    // sieht die Weiterleitung im kurzen Takt nach ihr.
     #[cfg(any(windows, target_os = "macos"))]
     {
+        use std::sync::mpsc::RecvTimeoutError;
         let (tx, rx) = std::sync::mpsc::channel::<clipboard::Inhalt>();
         let (link, sh) = (input.clone(), shared.clone());
-        std::thread::spawn(move || {
-            while let Ok(inhalt) = rx.recv() {
-                match inhalt {
-                    clipboard::Inhalt::Text(text) => text_senden(&text, &sh, &link),
-                    clipboard::Inhalt::Dateien(pfade) => dateien_senden(pfade, &sh, &link),
-                }
+        std::thread::spawn(move || loop {
+            let inhalt = match vormerk_takt(&sh) {
+                None => match rx.recv() {
+                    Ok(i) => Some(i),
+                    Err(_) => break,
+                },
+                Some(takt) => match rx.recv_timeout(takt) {
+                    Ok(i) => Some(i),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                },
+            };
+            match inhalt {
+                Some(clipboard::Inhalt::Text(text)) => text_senden(&text, &sh, &link),
+                Some(clipboard::Inhalt::Dateien(pfade)) => dateien_senden(pfade, &sh, &link),
+                None => {}
             }
+            vorgemerkte_dateien(&sh, &link);
         });
         clipboard::watch(move |inhalt| {
             let _ = tx.send(inhalt);
@@ -8191,12 +8442,14 @@ fn main() {
     }
     let el = EventLoop::<Benutzer>::with_user_event().build().expect("Ereignisschleife");
     // Weitergereichte Adressen eines zweiten Starts als Benutzerereignis in
-    // die Schleife. Was vor ihrem Anlauf kam, wartet im Kanal.
+    // die Schleife. Was vor ihrem Anlauf kam, wartet im Kanal. Ist die
+    // Schleife zu, faellt die Weitergabe unbestaetigt weg (der zweite Start
+    // bekommt 0), und dieser Faden endet.
     if let Some(eingang) = einzel_eingang {
         let proxy = el.create_proxy();
         std::thread::spawn(move || {
-            while let Ok(a) = eingang.recv() {
-                if proxy.send_event(Benutzer::Einzel(a)).is_err() {
+            while let Ok(w) = eingang.recv() {
+                if proxy.send_event(Benutzer::Einzel(w)).is_err() {
                     break;
                 }
             }
@@ -8240,6 +8493,7 @@ fn main() {
         banner_until: None,
         angewandt_fuer: None,
         letzte_zeichnung: Instant::now(),
+        oberflaeche_vorher: false,
         esc_seit: None,
         esc_verbraucht: false,
         esc_mods: 0,
@@ -10314,20 +10568,32 @@ mod tests {
     }
 
     /// Der Socket des Eingabekanals hat einen Sendepuffer von 64 KiB: so
-    /// liegen im Kernel hoechstens 64 KiB Dateidaten vor einer Taste.
+    /// liegen im Kernel hoechstens 64 KiB Dateidaten vor einer Taste. Der
+    /// Socket steht vorher auf 8 KiB, damit der Test auch dort etwas prueft,
+    /// wo 64 KiB schon die Vorgabe des Systems ist (Windows; Phase-B-Hinweis
+    /// f-client): erst Schreiber::neu setzt die 64 KiB.
     #[test]
     fn eingabekanal_sendepuffer_64_kib() {
         secure::test_identitaet();
         let hh = vec![0x79; 32];
-        let (host_priv, host_pub) = noise::keypair().unwrap();
-        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_KEY);
-        let mut l = InputLink::new(addr);
-        l.set_link(Some((hh, host_pub)));
-        eingabe_abwarten(&mut l);
-        assert!(l.steht());
-        let griff = l.kanal.as_ref().and_then(|k| k.griff.as_ref()).expect("kein Griff");
+        let (host_priv, _) = noise::keypair().unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (los, los_rx) = std::sync::mpsc::channel::<()>();
+        let hh2 = hh.clone();
+        let host = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let h = secure::Secure::accept(s, &noise::prologue_input(&hh2), &host_priv).unwrap();
+            let _ = los_rx.recv();
+            drop(h);
+        });
+        let sock = secure::Secure::connect_pruefend(&addr, &noise::prologue_input(&hh), |_| Ok(())).expect("Eingabekanal");
+        sendepuffer_setzen(sock.socket(), 8 * 1024);
+        assert_eq!(sendepuffer_lesen(sock.socket()), Some(8 * 1024), "8 KiB nicht gesetzt");
+        let k = Schreiber::neu(sock, SCHREIBFRIST);
+        let griff = k.griff.as_ref().expect("kein Griff");
         assert_eq!(sendepuffer_lesen(griff), Some(EINGABE_SNDBUF));
-        l.key(1, true, 0);
+        drop(k);
         let _ = los.send(());
         let _ = host.join();
     }
@@ -10414,13 +10680,22 @@ mod tests {
             eingabe_abwarten(&mut l);
             assert_eq!(l.kanal_nr(), Some(1));
         }
-        // Ein Griff, dessen Faden gleich endet (nichts zu senden): die Regel
-        // sieht nur Griff und Bindung.
-        let sendung = |k: u64| {
+        // Ein Griff, dessen Faden laeuft (sein Angebot bekommt immer Voll) -
+        // oder, mit `laeuft` false, gleich endet (nichts zu senden): die
+        // Regel sieht nur Griff und Bindung.
+        let quelle = test_ordner("kanalverlust-nummer");
+        let datei = quelle.join("a.txt");
+        std::fs::write(&datei, b"hallo").unwrap();
+        let sendung_mit = |k: u64, laeuft: bool| {
             let voll = Arc::new(|_: u8, _: &[u8]| dateien::Gesendet::Voll);
-            let griff = dateien::Sender::starten(Vec::new(), voll, dateien::FENSTER, |_| {});
+            let pfade = if laeuft { vec![datei.clone()] } else { Vec::new() };
+            let griff = dateien::Sender::starten(pfade, voll, dateien::FENSTER, |_| {});
+            if !laeuft {
+                assert!(griff.abwarten(Duration::from_secs(5)), "Sender ohne Pfade endet nicht");
+            }
             DateiSendung { griff, kanal: Arc::new(AtomicU64::new(k)) }
         };
+        let sendung = |k: u64| sendung_mit(k, true);
         let shared = Mutex::new(Shared::default());
         let kennung = |s: &Mutex<Shared>| s.lock().unwrap().datei_senden.as_ref().map(|d| d.kennung());
 
@@ -10437,6 +10712,13 @@ mod tests {
         input.lock().unwrap().kanal_nr = 2;
         datei_kanal_pruefen(&shared, &input);
         assert_eq!(kennung(&shared), None, "neuer Kanal");
+        // Eine Sendung, deren Faden schon zu Ende ist, bleibt unberuehrt -
+        // sie ist nicht mehr abzubrechen (Phase-B-Hinweis f-client).
+        let fertig = sendung_mit(1, false);
+        let nr = fertig.kennung();
+        shared.lock().unwrap().datei_senden = Some(fertig);
+        datei_kanal_pruefen(&shared, &input);
+        assert_eq!(kennung(&shared), Some(nr), "beendete Sendung als abgebrochen entnommen");
         // Schon an den neuen gebunden: bleibt.
         let d = sendung(2);
         let nr = d.kennung();
@@ -10463,6 +10745,7 @@ mod tests {
         assert_eq!(kennung(&shared), None);
         let _ = los.send(());
         let _ = host.join();
+        let _ = std::fs::remove_dir_all(&quelle);
     }
 
     /// Sender und Empfaenger melden ihren Stand nur, solange ihre Sitzung
@@ -11048,11 +11331,13 @@ mod tests {
         assert_eq!(datei_zeile(&st(Richtung::Empfangen, 1, Ergebnis::Fertig), de), ("Dateien bereit zum Einfügen: 2".to_string(), ui::CYAN));
         assert_eq!(datei_zeile(&st(Richtung::Senden, 1, Ergebnis::Fertig), de).0, "Dateien übertragen: 2");
         let (t, f) = datei_zeile(&st(Richtung::Senden, 1, Ergebnis::Abgebrochen(Abbruch::Quittung(3))), de);
-        assert_eq!((t.as_str(), f), ("Dateiübertragung abgebrochen: Gegenseite: zu wenig Platz", ui::AMBER));
+        assert_eq!((t.as_str(), f), ("Dateiübertragung abgebrochen: zu wenig Speicherplatz", ui::AMBER));
         let alle = [
             Ergebnis::Laeuft,
             Ergebnis::Fertig,
             Ergebnis::Abgebrochen(Abbruch::Zeitueberschreitung),
+            Ergebnis::Abgebrochen(Abbruch::Hier),
+            Ergebnis::Abgebrochen(Abbruch::Quittung(3)),
             Ergebnis::ZuGross,
             Ergebnis::GegenseiteZuAlt,
         ];
@@ -11064,5 +11349,280 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Abbruchgruende in der Datei-Zeile (Durchsicht [13]): jeder Grund des
+    /// Kerns kommt als uebersetzter Schluessel, in jeder Sprache ohne
+    /// Platzhalter; Einzelheiten (Pfade, Systemtexte, der deutsche
+    /// Protokolltext) erscheinen nie - auf Englisch steht kein deutsches Wort.
+    #[test]
+    fn abbruchgruende_uebersetzt() {
+        use dateien::{Abbruch, Ergebnis, Richtung, Stand};
+        use strings::Key::*;
+        let geheim = "/Users/geheim/Datei.bin: No such file".to_string();
+        let faelle = [
+            (Abbruch::Hier, FilesAbortLocal),
+            (Abbruch::Verbindung, FilesAbortConnection),
+            (Abbruch::Lesefehler(geheim.clone()), FilesAbortRead),
+            (Abbruch::Zeitueberschreitung, FilesAbortTimeout),
+            (Abbruch::Quittung(dateien::ZUSTAND_FERTIG), FilesAbortInvalid),
+            (Abbruch::Quittung(dateien::ZUSTAND_KEIN_PLATZ), FilesAbortNoSpace),
+            (Abbruch::Quittung(dateien::ZUSTAND_UNGUELTIG), FilesAbortInvalid),
+            (Abbruch::Quittung(dateien::ZUSTAND_SCHREIBFEHLER), FilesAbortWrite),
+            (Abbruch::Quittung(dateien::ZUSTAND_ABGEBROCHEN), FilesAbortPeer),
+            (Abbruch::Quittung(99), FilesAbortInvalid),
+            (Abbruch::Ende(dateien::GRUND_ABGEBROCHEN), FilesAbortPeer),
+            (Abbruch::Ende(dateien::GRUND_LESEFEHLER), FilesAbortRead),
+            (Abbruch::Ende(dateien::GRUND_ZEIT), FilesAbortTimeout),
+            (Abbruch::Ende(99), FilesAbortInvalid),
+            (Abbruch::Abgelehnt(dateien::ZUSTAND_KEIN_PLATZ, geheim.clone()), FilesAbortNoSpace),
+            (Abbruch::Abgelehnt(dateien::ZUSTAND_UNGUELTIG, geheim.clone()), FilesAbortInvalid),
+            (Abbruch::Ungueltig(geheim.clone()), FilesAbortInvalid),
+            (Abbruch::Schreibfehler(geheim.clone()), FilesAbortWrite),
+            (Abbruch::Ablage, FilesAbortClipboard),
+        ];
+        for (a, k) in &faelle {
+            assert_eq!(abbruch_schluessel(a), *k, "{a:?}");
+            for r in [Richtung::Senden, Richtung::Empfangen] {
+                let st = Stand {
+                    richtung: r,
+                    kennung: 1,
+                    bytes: 0,
+                    gesamt: 0,
+                    eintraege: 1,
+                    dateien: 1,
+                    oberste: 1,
+                    ergebnis: Ergebnis::Abgebrochen(a.clone()),
+                };
+                for lang in strings::all() {
+                    let (t, farbe) = datei_zeile(&st, lang);
+                    assert_eq!(farbe, ui::AMBER);
+                    assert_eq!(t, lang.get(FilesAborted).replace("{n}", lang.get(*k)), "{} {a:?}", lang.code);
+                    assert!(!t.contains("geheim") && !t.contains(&a.text()), "{} {a:?}: {t}", lang.code);
+                }
+                let en = datei_zeile(&st, strings::pick("en")).0;
+                for wort in ["Gegenseite", "abgebrochen", "Zeitueberschreitung", "Verbindung", "Lesefehler", "Schreibfehler", "Ablage"] {
+                    assert!(!en.contains(wort), "{a:?}: {en}");
+                }
+            }
+        }
+        assert_eq!(
+            datei_zeile(
+                &Stand {
+                    richtung: Richtung::Senden,
+                    kennung: 1,
+                    bytes: 0,
+                    gesamt: 0,
+                    eintraege: 1,
+                    dateien: 1,
+                    oberste: 1,
+                    ergebnis: Ergebnis::Abgebrochen(Abbruch::Zeitueberschreitung)
+                },
+                strings::pick("en")
+            )
+            .0,
+            "File transfer aborted: timeout, no progress"
+        );
+    }
+
+    /// Neu gezeichnet wird bei einem neuen Bild, einem ausgelassenen Present,
+    /// alle 33 ms, solange Oberflaeche sichtbar ist - und genau einmal, wenn
+    /// sie verschwindet (Durchsicht [11]: sonst bliebe die Datei-Zeile bei
+    /// stillem Bildschirm stehen).
+    #[test]
+    fn neu_zeichnen_beim_verschwinden() {
+        let ms = Duration::from_millis;
+        // Nichts los: nicht zeichnen.
+        assert!(!neu_zeichnen(false, false, false, false, ms(1000)));
+        assert!(neu_zeichnen(true, false, false, false, ms(0)));
+        assert!(neu_zeichnen(false, true, false, false, ms(0)));
+        // Sichtbar: im 33-ms-Takt.
+        assert!(!neu_zeichnen(false, false, true, true, ms(10)));
+        assert!(neu_zeichnen(false, false, true, true, ms(33)));
+        // Der Takt, in dem sie verschwindet: einmal, sofort.
+        assert!(neu_zeichnen(false, false, false, true, ms(1)));
+        // Danach wieder nichts. So, wie about_to_wait `vorher` fuehrt:
+        let mut vorher = false;
+        let mut zeichnungen = 0;
+        for sichtbar in [true, true, true, false, false, false] {
+            let v = std::mem::replace(&mut vorher, sichtbar);
+            zeichnungen += neu_zeichnen(false, false, sichtbar, v, ms(40)) as u32;
+        }
+        assert_eq!(zeichnungen, 4, "drei im Takt und eine beim Verschwinden");
+    }
+
+    /// Der Datei-Platz des Schreibers (Durchsicht [10]): gerahmt wird nur,
+    /// was hineinkommt - bei Voll entsteht kein Rahmen, und das wartende
+    /// Paket bleibt unberuehrt. Ein verworfener Schreiber meldet Weg.
+    #[test]
+    fn datei_rahmen_erst_bei_freiem_platz() {
+        let mut w = Warteschlange::default();
+        let gebaut = std::cell::Cell::new(0u32);
+        let bauen = |n: u8| {
+            gebaut.set(gebaut.get() + 1);
+            eingabe_rahmen(DATEI_STUECK, &[n; 64])
+        };
+        assert_eq!(w.datei_platz(|| bauen(1)), dateien::Gesendet::Ja);
+        for _ in 0..100 {
+            assert_eq!(w.datei_platz(|| bauen(2)), dateien::Gesendet::Voll);
+        }
+        assert_eq!(gebaut.get(), 1, "Rahmen bei Voll gebaut");
+        assert_eq!(w.datei.as_deref(), Some(eingabe_rahmen(DATEI_STUECK, &[1; 64]).as_slice()));
+        w.datei = None;
+        assert_eq!(w.datei_platz(|| bauen(3)), dateien::Gesendet::Ja);
+        assert_eq!(gebaut.get(), 2);
+        w.zu = true;
+        w.datei = None;
+        assert_eq!(w.datei_platz(|| bauen(4)), dateien::Gesendet::Weg);
+        assert_eq!(gebaut.get(), 2);
+    }
+
+    /// Kopie direkt nach dem Verbinden (Integrationstest 574cd3e, Befund 3):
+    /// solange MSG_FAEHIGKEITEN noch aussteht, wird vorgemerkt statt
+    /// FilesPeerOld gemeldet; mit den Faehigkeiten geht das Angebot hinaus.
+    /// Kommen sie binnen DATEI_ANLAUF nicht, steht FilesPeerOld da (der Host
+    /// ist aelter); ist die Sitzung schon aelter, sofort. Neuer Text und eine
+    /// neue Sitzung verwerfen die vorgemerkte Kopie.
+    #[test]
+    fn kopie_vor_den_faehigkeiten_wird_vorgemerkt() {
+        secure::test_identitaet();
+        let hh = vec![0x7e; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, DATEI_ANGEBOT);
+        let _ = los.send(());
+        let input = Arc::new(Mutex::new(InputLink::new(addr)));
+        {
+            let mut l = input.lock().unwrap();
+            l.set_link(Some((hh.clone(), host_pub.clone())));
+            eingabe_abwarten(&mut l);
+            assert!(l.steht());
+        }
+        let quelle = test_ordner("vorgemerkt");
+        let datei = quelle.join("a.txt");
+        std::fs::write(&datei, b"hallo").unwrap();
+        let neu = || Shared {
+            link: Some((hh.clone(), host_pub.clone())),
+            sitzung_nr: 3,
+            sitzung_seit: Some(Instant::now()),
+            ..Shared::default()
+        };
+        let shared = Arc::new(Mutex::new(neu()));
+
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.datei_senden.is_none(), "Sender vor den Faehigkeiten gestartet");
+            assert!(s.datei_stand.senden.is_none(), "FilesPeerOld vor Ablauf des Anlaufs");
+            assert!(!s.host_zu_alt_gemeldet);
+            assert_eq!(s.datei_vorgemerkt.as_ref().map(|v| v.pfade.clone()), Some(vec![datei.clone()]));
+        }
+        assert_eq!(vormerk_takt(&shared), Some(VORMERK_TAKT));
+        // Noch keine Faehigkeiten, Anlauf nicht um: bleibt vorgemerkt.
+        vorgemerkte_dateien(&shared, &input);
+        assert!(shared.lock().unwrap().datei_vorgemerkt.is_some());
+        // Die Faehigkeiten kommen: das Angebot geht hinaus.
+        {
+            let mut s = shared.lock().unwrap();
+            s.faehigkeiten_da = true;
+            s.host_dateien = true;
+        }
+        vorgemerkte_dateien(&shared, &input);
+        assert!(shared.lock().unwrap().datei_vorgemerkt.is_none());
+        assert!(shared.lock().unwrap().datei_senden.is_some(), "vorgemerkte Kopie nicht gesendet");
+        assert_eq!(vormerk_takt(&shared), None);
+        let (gelesen, _) = host.join().unwrap();
+        let arten: Vec<u8> = gelesen.iter().map(|(a, _)| *a).collect();
+        assert_eq!(arten, vec![IN_FAEHIGKEITEN, DATEI_ANGEBOT]);
+
+        // Die Faehigkeiten bleiben aus: nach dem Anlauf FilesPeerOld, einmal.
+        let shared = Arc::new(Mutex::new(neu()));
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        assert!(shared.lock().unwrap().datei_vorgemerkt.is_some());
+        {
+            // Die Zeit vorstellen: Sitzung und Vormerkung sind DATEI_ANLAUF alt.
+            let mut s = shared.lock().unwrap();
+            s.sitzung_seit = Some(Instant::now() - DATEI_ANLAUF - Duration::from_millis(1));
+            s.datei_vorgemerkt.as_mut().unwrap().bis = Instant::now();
+        }
+        vorgemerkte_dateien(&shared, &input);
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.datei_vorgemerkt.is_none());
+            assert!(s.datei_senden.is_none());
+            assert!(s.host_zu_alt_gemeldet);
+            assert_eq!(s.datei_stand.senden.as_ref().map(|a| a.stand.ergebnis.clone()), Some(dateien::Ergebnis::GegenseiteZuAlt));
+        }
+        // Eine aeltere Sitzung ohne Faehigkeiten: sofort FilesPeerOld.
+        let shared = Arc::new(Mutex::new(Shared {
+            sitzung_seit: Some(Instant::now() - DATEI_ANLAUF - Duration::from_millis(1)),
+            ..neu()
+        }));
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        assert!(shared.lock().unwrap().datei_vorgemerkt.is_none());
+        assert!(shared.lock().unwrap().host_zu_alt_gemeldet, "aelterer Host nicht sofort gemeldet");
+        // Neuer Text bzw. eine neue Sitzung verwerfen die Vormerkung.
+        let shared = Arc::new(Mutex::new(neu()));
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        text_senden("neu", &shared, &input);
+        assert!(shared.lock().unwrap().datei_vorgemerkt.is_none(), "Text hat die Vormerkung nicht verworfen");
+        dateien_senden(vec![datei.clone()], &shared, &input);
+        {
+            let mut s = shared.lock().unwrap();
+            s.sitzung_nr += 1;
+            s.faehigkeiten_da = true;
+            s.host_dateien = true;
+        }
+        vorgemerkte_dateien(&shared, &input);
+        let s = shared.lock().unwrap();
+        assert!(s.datei_vorgemerkt.is_none() && s.datei_senden.is_none(), "Vormerkung der vorigen Sitzung gesendet");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&quelle);
+    }
+
+    /// Eine neue Sendung, waehrend der Eingabekanal noch im Aufbau ist
+    /// (Integrationstest 574cd3e, Befund 3): Voll statt Weg - auch, solange
+    /// er im Pruefmodus noch gar nicht an die Sitzung gebunden ist -, bis
+    /// er steht; dann geht das Angebot hinaus. Nach dem Anlauf gilt Weg wie
+    /// bisher, und ebenso, sobald ein Paket hinaus ist (Verlust des Kanals).
+    #[test]
+    fn datei_weg_wartet_auf_den_aufbau() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        secure::test_identitaet();
+        let hh = vec![0x7f; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        // Der Host nimmt erst nach 600 ms an: so lange steht der Kanal nicht.
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::from_millis(600), DATEI_ANGEBOT);
+        let input = Arc::new(Mutex::new(InputLink::new(addr)));
+        let kanal = Arc::new(AtomicU64::new(0));
+        let weg = datei_weg(&input, hh.clone(), kanal.clone());
+        // Noch nicht an die Sitzung gebunden (Pruefmodus: alle 3 s).
+        assert_eq!(weg.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Voll, "ohne Bindung");
+        input.lock().unwrap().set_link(Some((hh.clone(), host_pub.clone())));
+        // Im Aufbau: Voll, nie Weg, bis der Kanal steht.
+        let t0 = Instant::now();
+        let mut voll = 0;
+        loop {
+            match weg.senden(DATEI_ANGEBOT, &[1]) {
+                dateien::Gesendet::Ja => break,
+                dateien::Gesendet::Voll => voll += 1,
+                dateien::Gesendet::Weg => panic!("Weg im Aufbau nach {:?}", t0.elapsed()),
+            }
+            assert!(t0.elapsed() < Duration::from_secs(4), "Kanal steht nicht");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(voll > 0, "der Kanal stand sofort - der Test prueft nichts");
+        assert_eq!(kanal.load(Ordering::SeqCst), 1);
+        let _ = los.send(());
+        let (gelesen, _) = host.join().unwrap();
+        assert_eq!(gelesen.iter().map(|(a, _)| *a).collect::<Vec<_>>(), vec![IN_FAEHIGKEITEN, DATEI_ANGEBOT]);
+        // Gebunden und der Kanal weg: Weg (Verlust des Eingabekanals).
+        input.lock().unwrap().trennen();
+        assert_eq!(weg.senden(DATEI_STUECK, &[2]), dateien::Gesendet::Weg);
+        // Nach dem Anlauf: ohne Bindung bzw. ohne Kanal Weg wie bisher.
+        let ohne = Arc::new(Mutex::new(InputLink::new("127.0.0.1:1".into())));
+        let abgelaufen = datei_weg_bis(&ohne, hh.clone(), Arc::new(AtomicU64::new(0)), Instant::now());
+        assert_eq!(abgelaufen.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Weg);
+        ohne.lock().unwrap().set_link(Some((hh, host_pub)));
+        assert_eq!(abgelaufen.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Weg);
     }
 }

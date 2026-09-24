@@ -21,6 +21,15 @@
 // Nachrichtenfenster; Windows schickt dann WM_CLIPBOARDUPDATE. Kein Abfragen im
 // Takt, kein SetClipboardViewer (dessen Kette bricht, sobald ein Glied abstuerzt).
 //
+// Gelesen wird nicht bei WM_CLIPBOARDUPDATE selbst, sondern erst, wenn die
+// Ablage ablage_ruhe::RUHE lang ruhig war (SetTimer im Faden des Waechters,
+// jede weitere Meldung schiebt ihn hinaus): eine Kopie loest oft mehrere
+// Meldungen aus, und wer bei der ersten schon oeffnet, haelt die Ablage fest,
+// waehrend die Quelle noch in OleFlushClipboard steckt - andere Programme
+// scheitern dann kurz. Dieselbe Dateiliste geht innerhalb von
+// ablage_ruhe::DOPPEL_FRIST nur einmal hinaus (Integrationstest, Befunde 1
+// und 2).
+//
 // Gelesen wird nur mit Gegenueber ("kein Zuschauer, keine Arbeit"), wie auf
 // dem Mac (clipboard_mac.rs): im Client waehrend einer Sitzung (`sitzung`),
 // in der Host-Rolle, solange ein Zuschauer da ist. Ohne Gegenueber wird die
@@ -50,8 +59,10 @@ use std::ffi::{c_void, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::ablage_ruhe::{Entdoppler, Entpreller, DOPPEL_FRIST, RUHE};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -69,8 +80,8 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY};
 use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, RegisterClassW,
-    TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer, RegisterClassW,
+    SetTimer, TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WM_TIMER,
     WNDCLASSW,
 };
 
@@ -79,6 +90,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Gilt auch fuer den Block einer abgelegten Dateiliste.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// Versuche, die Ablage zu bekommen: fuer Text und das Lesen des Waechters
+/// kurz (ein verlorener Text ist billig, und der Waechter soll nicht haengen),
+/// fuer eine empfangene Dateiliste lang - scheitert sie, verwirft der
+/// Empfaenger eine vollstaendig uebertragene Sendung (bis 4 GB). Das Warten
+/// blockiert dort nur den Schreibfaden des Empfaengers (Durchsicht [15]).
+#[derive(Clone, Copy, Debug)]
+struct Versuche {
+    anzahl: u32,
+    abstand: Duration,
+}
+
+/// Text ablegen und lesen: zehn Versuche im Abstand von 10 ms.
+const VERSUCHE_KURZ: Versuche = Versuche { anzahl: 10, abstand: Duration::from_millis(10) };
+/// Dateiliste ablegen: vierzig Versuche im Abstand von 50 ms, rund 2 s.
+const VERSUCHE_DATEIEN: Versuche = Versuche { anzahl: 40, abstand: Duration::from_millis(50) };
+
+/// Kennung des Zeitgebers, mit dem der Waechter auf Ruhe wartet.
+const ZEITGEBER_RUHE: usize = 1;
 
 /// Groesse des Kopfes DROPFILES (packed(1)): pFiles, pt.x, pt.y, fNC, fWide.
 const DROPFILES_GROESSE: usize = 20;
@@ -113,6 +142,10 @@ static OWNER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 /// Laeuft eine Sitzung des Clients? Setzt der Empfangsfaden (main.rs).
 static SITZUNG: AtomicBool = AtomicBool::new(false);
 
+/// Zaehlt jeden Sitzungswechsel des Clients: dieselbe Dateiliste in einer
+/// neuen Sitzung ist eine neue Kopie (Entdoppler).
+static SITZUNGS_WECHSEL: AtomicU64 = AtomicU64::new(0);
+
 /// Was der Benutzer kopiert hat. Dieselbe Art steht in clipboard_mac.rs,
 /// damit die Aufrufer ohne Plattformweiche auskommen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,13 +168,21 @@ impl Inhalt {
 
 /// Sitzung des Clients beginnt (true, der Host hat angenommen) oder endet.
 pub fn sitzung(an: bool) {
-    SITZUNG.store(an, Ordering::Relaxed);
+    if SITZUNG.swap(an, Ordering::Relaxed) != an {
+        SITZUNGS_WECHSEL.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Darf der Waechter jetzt lesen? Im Client mit Sitzung, in der Host-Rolle
 /// mit Zuschauer. Die Host-Rolle setzt `sitzung` nicht; ihren Zuschauer
 /// kennt das Netzteil (netz::zuschauer_da), und im Client ist dort nie einer.
 fn darf_lesen() -> bool {
+    // Tests des Waechterfadens geben das Gegenueber je Faden vor, statt die
+    // Sitzung aller Tests zu kippen.
+    #[cfg(test)]
+    if let Some(d) = tests::GEGENUEBER.with(|g| g.get()) {
+        return d;
+    }
     SITZUNG.load(Ordering::Relaxed) || crate::host::netz::zuschauer_da()
 }
 
@@ -149,6 +190,10 @@ thread_local! {
     /// Empfaenger des Ueberwachungsfadens. Liegt im Faden selbst, weil die
     /// Fensterprozedur genau dort und nur dort aufgerufen wird.
     static SINK: RefCell<Option<Box<dyn Fn(Inhalt)>>> = RefCell::new(None);
+    /// Entprellen und Entdoppeln der Meldungen (ablage_ruhe.rs), ebenso nur
+    /// im Faden des Waechters.
+    static RUHE_STAND: RefCell<(Entpreller, Entdoppler)> =
+        RefCell::new((Entpreller::neu(RUHE), Entdoppler::neu(DOPPEL_FRIST)));
 }
 
 // ------------------------------------------------------------ Hilfsmittel
@@ -172,18 +217,18 @@ impl Drop for ClipboardGuard {
 }
 
 /// Die Zwischenablage haelt immer nur ein Prozess zugleich; ein Fehlschlag ist
-/// der Normalfall, kein Grund zur Aufregung. Zehn Versuche im Abstand von 10 ms,
-/// danach geben wir leise auf.
+/// der Normalfall, kein Grund zur Aufregung. `versuche.anzahl` Versuche im
+/// Abstand von `versuche.abstand` (siehe Versuche), danach geben wir leise auf.
 ///
 /// `owner` darf zum reinen Lesen None sein. Zum Schreiben muss ein Fenster
 /// angegeben werden, siehe OWNER.
-fn open_clipboard(owner: Option<HWND>) -> Option<ClipboardGuard> {
-    for versuch in 0..10 {
+fn open_clipboard(owner: Option<HWND>, versuche: Versuche) -> Option<ClipboardGuard> {
+    for versuch in 0..versuche.anzahl {
         if unsafe { OpenClipboard(owner) }.is_ok() {
             return Some(ClipboardGuard);
         }
-        if versuch < 9 {
-            std::thread::sleep(Duration::from_millis(10));
+        if versuch + 1 < versuche.anzahl {
+            std::thread::sleep(versuche.abstand);
         }
     }
     None
@@ -312,10 +357,16 @@ fn format_vorhanden(name: &str) -> bool {
 /// einmal nicht greift.
 ///
 /// Die Ablage ist nur fuer die Dauer dieses Aufrufs offen; gemeldet wird
-/// erst danach (on_clipboard_update).
+/// erst danach (on_clipboard_update). Liegt weder eine Dateiliste noch Text
+/// an (etwa ein Bild), wird sie gar nicht erst geoeffnet - fragen, ob ein
+/// Format anliegt, geht ohne.
 fn lesen() -> Option<Inhalt> {
+    let da = |f: u32| unsafe { IsClipboardFormatAvailable(f) }.is_ok();
+    if !da(CF_HDROP.0 as u32) && !da(CF_UNICODETEXT.0 as u32) {
+        return None;
+    }
     // Zum Lesen braucht es kein Besitzerfenster.
-    let _guard = open_clipboard(None)?;
+    let _guard = open_clipboard(None, VERSUCHE_KURZ)?;
 
     // Bei offener Ablage fragen, damit Kennzeichen und Inhalt zum selben
     // Eintrag gehoeren.
@@ -469,7 +520,7 @@ pub fn set(text: &str) {
     }
     units.push(0);
     let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
-    let _ = block_ablegen(&bytes, CF_UNICODETEXT.0 as u32, &[]);
+    let _ = block_ablegen(&bytes, CF_UNICODETEXT.0 as u32, &[], VERSUCHE_KURZ);
 }
 
 /// Legt eine Dateiliste in die Zwischenablage (CF_HDROP), so dass "Einfuegen"
@@ -481,17 +532,36 @@ pub fn set(text: &str) {
 /// liegt; false bei leerer oder ungueltiger Liste (dann bleibt die Ablage,
 /// wie sie ist) oder wenn die Ablage nicht zu bekommen war. Aufrufer ist der
 /// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden.
+///
+/// Haelt ein anderes Programm (oder der eigene Waechter) die Ablage gerade
+/// fest, wird laenger und mit Abstand wiederholt als bei Text
+/// (VERSUCHE_DATEIEN, rund 2 s): ein Fehlschlag hiesse Quittung 5, und die
+/// vollstaendig empfangene Uebertragung waere verworfen.
 pub fn set_dateien(pfade: &[PathBuf]) -> bool {
+    dateien_ablegen_mit(pfade, VERSUCHE_DATEIEN)
+}
+
+/// set_dateien mit gegebenen Versuchen (die Tests pruefen damit auch die
+/// kurze Wiederholung).
+fn dateien_ablegen_mit(pfade: &[PathBuf], versuche: Versuche) -> bool {
     let Some(block) = dropfiles_bauen(pfade) else {
         return false;
     };
-    block_ablegen(&block, CF_HDROP.0 as u32, &[(BEVORZUGTE_WIRKUNG, DROPEFFECT_COPY.0)])
+    let ok = block_ablegen(&block, CF_HDROP.0 as u32, &[(BEVORZUGTE_WIRKUNG, DROPEFFECT_COPY.0)], versuche);
+    if !ok {
+        crate::protokoll::zeile(format!(
+            "Zwischenablage: Dateiliste nicht abgelegt (Ablage belegt oder Schreiben gescheitert, {} Versuche in {} ms)",
+            versuche.anzahl,
+            (versuche.abstand * versuche.anzahl.saturating_sub(1)).as_millis()
+        ));
+    }
+    ok
 }
 
 /// Legt `daten` als Format `format` ab, dazu die DWORD-Formate `zusatz`.
 /// Gemeinsamer Weg von set() und set_dateien(). true, wenn der Inhalt in der
 /// Ablage liegt.
-fn block_ablegen(daten: &[u8], format: u32, zusatz: &[(&str, u32)]) -> bool {
+fn block_ablegen(daten: &[u8], format: u32, zusatz: &[(&str, u32)], versuche: Versuche) -> bool {
     // Erst der Speicher, dann die Ablage oeffnen: die Zuteilung kann dauern und
     // solange soll kein anderes Programm ausgesperrt sein.
     let Ok(hmem) = (unsafe { GlobalAlloc(GMEM_MOVEABLE, daten.len()) }) else {
@@ -526,7 +596,7 @@ fn block_ablegen(daten: &[u8], format: u32, zusatz: &[(&str, u32)]) -> bool {
     // Ab hier ueber einen Umweg, damit das Notfenster in jedem Fall wieder weg
     // ist. DestroyWindow gehoert in den Faden, der das Fenster angelegt hat -
     // das ist hier derselbe.
-    let ok = write_locked(hmem, format, owner, zusatz);
+    let ok = write_locked(hmem, format, owner, zusatz, versuche);
 
     if eigenes_fenster {
         let _ = unsafe { DestroyWindow(owner) };
@@ -538,8 +608,8 @@ fn block_ablegen(daten: &[u8], format: u32, zusatz: &[(&str, u32)]) -> bool {
 /// `format`, dazu `zusatz` und die Kennzeichen, dann die eigene Laufnummer.
 /// Getrennt, damit der Aufrufer das Notfenster auf jedem Rueckweg wieder
 /// abraeumen kann.
-fn write_locked(hmem: HGLOBAL, format: u32, owner: HWND, zusatz: &[(&str, u32)]) -> bool {
-    let Some(guard) = open_clipboard(Some(owner)) else {
+fn write_locked(hmem: HGLOBAL, format: u32, owner: HWND, zusatz: &[(&str, u32)], versuche: Versuche) -> bool {
+    let Some(guard) = open_clipboard(Some(owner), versuche) else {
         let _ = unsafe { GlobalFree(Some(hmem)) };
         return false;
     };
@@ -571,15 +641,89 @@ fn write_locked(hmem: HGLOBAL, format: u32, owner: HWND, zusatz: &[(&str, u32)])
 
 // -------------------------------------------------------------- Ueberwachung
 
-/// Wird aus der Fensterprozedur gerufen. Darf unter keinen Umstaenden in Panik
-/// geraten, sonst reisst es den Faden und die Ueberwachung ist bis zum Neustart
-/// des Clients tot. Keine Dateiarbeit hier: gelesen werden nur Pfade, und
-/// die Ablage ist schon wieder zu, wenn `cb` sie bekommt.
+/// WM_CLIPBOARDUPDATE: noch nicht lesen, nur den Zeitgeber (neu) stellen -
+/// gelesen wird, wenn die Ablage RUHE lang ruhig war (ruhe_abgelaufen).
+/// SetTimer mit derselben Kennung ersetzt den laufenden Zeitgeber. Ohne
+/// Gegenueber wird nichts vorgemerkt, und ein anstehendes Lesen faellt weg:
+/// dieser Inhalt hat den vorigen ueberschrieben und wird nie gelesen - auch
+/// nicht, wenn die Sitzung waehrend der Ruhe beginnt.
+fn ablage_geaendert(hwnd: HWND) {
+    let darf = darf_lesen();
+    let _ = RUHE_STAND.try_with(|r| {
+        if let Ok(mut r) = r.try_borrow_mut() {
+            if darf {
+                r.0.aenderung(Instant::now());
+            } else {
+                r.0.verwerfen();
+            }
+        }
+    });
+    unsafe {
+        if darf {
+            let _ = SetTimer(Some(hwnd), ZEITGEBER_RUHE, RUHE.as_millis() as u32, None);
+        } else {
+            let _ = KillTimer(Some(hwnd), ZEITGEBER_RUHE);
+        }
+    }
+}
+
+/// WM_TIMER des Ruhe-Zeitgebers: ist die Ruhe um, einmal lesen und melden;
+/// sonst (der Zeitgeber kann um einen Takt der Systemuhr frueh kommen) fuer
+/// den Rest neu stellen.
+fn ruhe_abgelaufen(hwnd: HWND) {
+    let jetzt = Instant::now();
+    let (faellig, rest) = RUHE_STAND
+        .try_with(|r| match r.try_borrow_mut() {
+            Ok(mut r) => {
+                let faellig = r.0.faellig(jetzt);
+                (faellig, r.0.wartet().then(|| r.0.schlaf(jetzt, RUHE)))
+            }
+            Err(_) => (false, None),
+        })
+        .unwrap_or((false, None));
+    match rest {
+        Some(d) => unsafe {
+            let _ = SetTimer(Some(hwnd), ZEITGEBER_RUHE, d.as_millis() as u32 + 1, None);
+        },
+        None => unsafe {
+            let _ = KillTimer(Some(hwnd), ZEITGEBER_RUHE);
+        },
+    }
+    if faellig {
+        on_clipboard_update();
+    }
+}
+
+/// Wird aus der Fensterprozedur gerufen, wenn die Ablage ruhig ist. Darf
+/// unter keinen Umstaenden in Panik geraten, sonst reisst es den Faden und
+/// die Ueberwachung ist bis zum Neustart des Clients tot. Keine Dateiarbeit
+/// hier: gelesen werden nur Pfade, und die Ablage ist schon wieder zu, wenn
+/// `cb` sie bekommt.
 fn on_clipboard_update() {
+    #[cfg(test)]
+    tests::NACHGESEHEN.with(|n| n.set(n.get() + 1));
     let Some(inhalt) = nachsehen(darf_lesen(), unsafe { GetClipboardSequenceNumber() }, lesen) else {
         return;
     };
     if inhalt.leer() {
+        return;
+    }
+    // Dieselbe Dateiliste gerade eben schon gemeldet: dieselbe Kopie.
+    let sitzung = SITZUNGS_WECHSEL.load(Ordering::Relaxed);
+    let neu = RUHE_STAND
+        .try_with(|r| match r.try_borrow_mut() {
+            Ok(mut r) => match &inhalt {
+                Inhalt::Dateien(p) => r.1.dateien(p, Instant::now(), sitzung),
+                Inhalt::Text(_) => {
+                    r.1.text();
+                    true
+                }
+            },
+            Err(_) => true,
+        })
+        .unwrap_or(true);
+    if !neu {
+        crate::protokoll::zeile("Zwischenablage: dieselbe Dateiliste noch einmal gemeldet - uebergangen".into());
         return;
     }
 
@@ -615,7 +759,11 @@ fn nachsehen(darf: bool, seq: u32, lesen: impl FnOnce() -> Option<Inhalt>) -> Op
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
-        on_clipboard_update();
+        ablage_geaendert(hwnd);
+        return LRESULT(0);
+    }
+    if msg == WM_TIMER && wp.0 == ZEITGEBER_RUHE {
+        ruhe_abgelaufen(hwnd);
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -676,6 +824,14 @@ mod tests {
     use super::*;
     use windows::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+    use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PostMessageW, PM_REMOVE};
+
+    thread_local! {
+        /// Wie oft on_clipboard_update in diesem Faden nachsah (Entprellen).
+        pub(super) static NACHGESEHEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Vorgabe fuer darf_lesen in diesem Faden (None: wie im Betrieb).
+        pub(super) static GEGENUEBER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
 
     /// Sperre fuer alle Tests an der echten Ablage der Sitzung. Benannt und
     /// systemweit, weil auf der Bau-VM mehrere Testlaeufe (auch aus anderen
@@ -740,7 +896,7 @@ mod tests {
     /// die Kennzeichen `marken` in EINEM Vorgang ab, an set()/set_dateien()
     /// vorbei.
     fn nutzer_kopiert(fenster: HWND, formate: &[(u32, Vec<u8>)], marken: &[&str]) {
-        let _guard = open_clipboard(Some(fenster)).expect("Ablage nicht zu oeffnen");
+        let _guard = open_clipboard(Some(fenster), VERSUCHE_KURZ).expect("Ablage nicht zu oeffnen");
         unsafe { EmptyClipboard() }.expect("EmptyClipboard");
         for (format, daten) in formate {
             let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, daten.len()) }.expect("GlobalAlloc");
@@ -757,7 +913,7 @@ mod tests {
 
     /// Ablage leeren und das Testfenster abbauen.
     fn aufraeumen(fenster: HWND) {
-        if let Some(_guard) = open_clipboard(Some(fenster)) {
+        if let Some(_guard) = open_clipboard(Some(fenster), VERSUCHE_KURZ) {
             let _ = unsafe { EmptyClipboard() };
         }
         let _ = unsafe { DestroyWindow(fenster) };
@@ -960,7 +1116,7 @@ mod tests {
         assert!(set_dateien(&pfade), "set_dateien() meldet Fehlschlag");
         assert_ne!(unsafe { GetClipboardSequenceNumber() }, vorher, "set_dateien() hat nichts geschrieben");
         {
-            let _guard = open_clipboard(Some(fenster)).expect("Ablage nicht zu oeffnen");
+            let _guard = open_clipboard(Some(fenster), VERSUCHE_KURZ).expect("Ablage nicht zu oeffnen");
             let wirkung = wide(BEVORZUGTE_WIRKUNG);
             let wirkung = unsafe { RegisterClipboardFormatW(PCWSTR(wirkung.as_ptr())) };
             let wert = roh_lesen(wirkung).expect("Preferred DropEffect fehlt");
@@ -1006,5 +1162,120 @@ mod tests {
 
         aufraeumen(fenster);
         let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Haelt die Ablage in einem eigenen Faden (mit eigenem Fenster) fuer
+    /// `dauer` offen; kehrt zurueck, sobald sie offen ist. Der Griff wartet
+    /// auf das Ende des Fadens.
+    fn ablage_halten(dauer: Duration) -> std::thread::JoinHandle<()> {
+        let (offen_tx, offen_rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let fenster = create_message_window().expect("Nachrichtenfenster");
+            let guard = open_clipboard(Some(fenster), VERSUCHE_DATEIEN).expect("Ablage nicht zu halten");
+            offen_tx.send(()).unwrap();
+            std::thread::sleep(dauer);
+            drop(guard);
+            let _ = unsafe { DestroyWindow(fenster) };
+        });
+        offen_rx.recv_timeout(Duration::from_secs(5)).expect("Ablage nicht geoeffnet");
+        h
+    }
+
+    /// Am echten Windows (Durchsicht [15]): haelt ein anderer die Ablage
+    /// 300 ms fest, scheitert die kurze Wiederholung des Textes - die
+    /// Dateiliste aber wartet (bis rund 2 s) und liegt danach in der Ablage.
+    #[test]
+    fn set_dateien_wartet_auf_belegte_ablage() {
+        let _sperre = AblageSperre::nehmen();
+        let (ordner, pfade) = testdateien("set_dateien_wartet");
+        let fenster = create_message_window().expect("Nachrichtenfenster");
+
+        let halter = ablage_halten(Duration::from_millis(400));
+        let t0 = Instant::now();
+        assert!(!dateien_ablegen_mit(&pfade, VERSUCHE_KURZ), "kurze Wiederholung trotz belegter Ablage gelungen");
+        assert!(t0.elapsed() < Duration::from_millis(350), "kurze Wiederholung dauerte {:?}", t0.elapsed());
+        halter.join().unwrap();
+
+        let halter = ablage_halten(Duration::from_millis(300));
+        let t0 = Instant::now();
+        assert!(set_dateien(&pfade), "Dateiliste trotz 300 ms belegter Ablage verworfen");
+        let dauer = t0.elapsed();
+        halter.join().unwrap();
+        assert!(dauer >= Duration::from_millis(200), "nicht gewartet ({dauer:?}) - war die Ablage belegt?");
+        {
+            let _guard = open_clipboard(Some(fenster), VERSUCHE_KURZ).expect("Ablage nicht zu oeffnen");
+            assert_eq!(hdrop_pfade(), Some(pfade.clone()), "andere Pfade in der Ablage");
+        }
+
+        aufraeumen(fenster);
+        let _ = std::fs::remove_dir_all(ordner);
+    }
+
+    /// Die Nachrichten dieses Fadens abarbeiten, `dauer` lang.
+    fn pumpen(dauer: Duration) {
+        let bis = Instant::now() + dauer;
+        let mut msg = MSG::default();
+        while Instant::now() < bis {
+            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Im Faden des Waechters (Integrationstest Befunde 1 und 2): drei
+    /// Meldungen dicht hintereinander ergeben EIN Nachsehen, und zwar erst,
+    /// wenn die Ablage RUHE lang ruhig war - nicht bei der ersten Meldung.
+    /// Ohne Gegenueber wird nichts vorgemerkt, und eine Meldung ohne
+    /// Gegenueber verwirft ein anstehendes Nachsehen. Die Meldungen kommen
+    /// von Hand (PostMessageW), das Gegenueber gibt der Test vor; die Sperre,
+    /// weil nachsehen() dann die echte Ablage liest.
+    #[test]
+    fn waechter_entprellt_im_fensterfaden() {
+        let _sperre = AblageSperre::nehmen();
+        let fenster = create_message_window().expect("Nachrichtenfenster");
+        NACHGESEHEN.with(|n| n.set(0));
+        let gegenueber = |an: bool| GEGENUEBER.with(|g| g.set(Some(an)));
+        let melden = || unsafe {
+            PostMessageW(Some(fenster), WM_CLIPBOARDUPDATE, WPARAM(0), LPARAM(0)).expect("PostMessageW");
+        };
+        let nachgesehen = || NACHGESEHEN.with(|n| n.get());
+        gegenueber(true);
+        melden();
+        pumpen(Duration::from_millis(40));
+        melden();
+        pumpen(Duration::from_millis(40));
+        melden();
+        pumpen(Duration::from_millis(60));
+        assert_eq!(nachgesehen(), 0, "vor der Ruhe nachgesehen");
+        pumpen(RUHE + Duration::from_millis(250));
+        assert_eq!(nachgesehen(), 1, "nicht genau einmal nachgesehen");
+        pumpen(Duration::from_millis(300));
+        assert_eq!(nachgesehen(), 1, "ohne neue Meldung noch einmal nachgesehen");
+        // Die naechste Kopie: wieder genau einmal.
+        melden();
+        pumpen(RUHE + Duration::from_millis(250));
+        assert_eq!(nachgesehen(), 2);
+        // Ohne Gegenueber: nichts, auch nicht, wenn es waehrend der Ruhe kommt.
+        gegenueber(false);
+        melden();
+        pumpen(Duration::from_millis(50));
+        gegenueber(true);
+        pumpen(RUHE + Duration::from_millis(250));
+        assert_eq!(nachgesehen(), 2, "Kopie ohne Gegenueber nachgesehen");
+        // Eine Kopie ohne Gegenueber ueberschreibt eine anstehende.
+        melden();
+        pumpen(Duration::from_millis(50));
+        gegenueber(false);
+        melden();
+        pumpen(Duration::from_millis(50));
+        gegenueber(true);
+        pumpen(RUHE + Duration::from_millis(250));
+        assert_eq!(nachgesehen(), 2, "ueberschriebene Kopie nachgesehen");
+        GEGENUEBER.with(|g| g.set(None));
+        let _ = unsafe { DestroyWindow(fenster) };
     }
 }

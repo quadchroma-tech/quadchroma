@@ -308,18 +308,36 @@ pub fn ico(groessen: &[u32]) -> Vec<u8> {
 }
 
 /// Die .ico-Datei im Ablageordner des Clients schreiben bzw. erneuern und
-/// ihren Pfad liefern. Erst in eine Nachbardatei, dann umbenennen: eine
-/// Verknuepfung, die gerade gezeichnet wird, sieht nie eine halbe Datei.
+/// ihren Pfad liefern (ico_schreiben_nach).
 pub fn ico_schreiben() -> Result<std::path::PathBuf, String> {
     let ziel = crate::einstellungen::datei_pfad("quadchroma.ico")
         .ok_or_else(|| "kein Ablageordner fuer das Symbol".to_string())?;
-    let neu = ziel.with_extension("ico.neu");
-    std::fs::write(&neu, ico(&ICO_GROESSEN)).map_err(|e| format!("{}: {e}", neu.display()))?;
-    std::fs::rename(&neu, &ziel).map_err(|e| {
-        let _ = std::fs::remove_file(&neu);
-        format!("{}: {e}", ziel.display())
-    })?;
-    Ok(ziel)
+    ico_schreiben_nach(&ziel)
+}
+
+/// Die .ico-Datei nach `ziel` schreiben bzw. erneuern. Erst in eine
+/// Nachbardatei (je Prozess ein eigener Name: Fenster und Befehlszeile
+/// koennen gleichzeitig anlegen), dann umbenennen: eine Verknuepfung, die
+/// gerade gezeichnet wird, sieht nie eine halbe Datei. Scheitert das
+/// Erneuern (etwa weil Explorer die Datei gerade liest), taugt die
+/// vorhandene weiter - sie ist dasselbe Logo -, statt dass die Verknuepfung
+/// das Standardsymbol zeigt. Err nur, wenn es danach keine Datei gibt.
+pub fn ico_schreiben_nach(ziel: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let neu = ziel.with_extension(format!("ico.{}.neu", std::process::id()));
+    let erneuert = std::fs::write(&neu, ico(&ICO_GROESSEN))
+        .map_err(|e| format!("{}: {e}", neu.display()))
+        .and_then(|()| std::fs::rename(&neu, ziel).map_err(|e| format!("{}: {e}", ziel.display())));
+    match erneuert {
+        Ok(()) => Ok(ziel.to_path_buf()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&neu);
+            if std::fs::symlink_metadata(ziel).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                Ok(ziel.to_path_buf())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Fenstersymbol in einer Groesse (winit rechnet es fuer die Titelleiste um).
@@ -531,5 +549,46 @@ mod tests {
         // Als PNG laesst sie sich wie das Logo schreiben (fuer NSImage).
         let p = png(36, 36, &vorlage(36));
         assert_eq!(&p[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    }
+
+    /// Die .ico schreiben und erneuern; scheitert das Erneuern, gilt die
+    /// vorhandene weiter (Phase-B-Hinweis f-oberflaeche) - ohne vorhandene
+    /// ist es ein Fehler. Keine Nachbardatei bleibt liegen. Nur unter temp_dir.
+    #[test]
+    fn ico_erneuern_oder_vorhandene_nehmen() {
+        let ordner = std::env::temp_dir().join(format!("qc-test-{}-ico", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let ziel = ordner.join("quadchroma.ico");
+        assert_eq!(ico_schreiben_nach(&ziel).unwrap(), ziel);
+        assert_eq!(std::fs::read(&ziel).unwrap(), ico(&ICO_GROESSEN));
+        std::fs::write(&ziel, b"alt").unwrap();
+        // Erneuern scheitert: unter Unix ist der Ordner schreibgeschuetzt,
+        // unter Windows haelt ein Leser die Datei ohne Freigabe offen.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ordner, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        #[cfg(windows)]
+        let sperre = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(&ziel).unwrap()
+        };
+        let r = ico_schreiben_nach(&ziel);
+        #[cfg(windows)]
+        drop(sperre);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ordner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(r.unwrap(), ziel, "vorhandene .ico nicht genommen");
+        assert_eq!(std::fs::read(&ziel).unwrap(), b"alt");
+        let namen: Vec<_> = std::fs::read_dir(&ordner).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(namen, vec![std::ffi::OsString::from("quadchroma.ico")], "Nachbardatei liegen geblieben");
+        // Ohne vorhandene Datei (und ohne Ordner) ist es ein Fehler.
+        assert!(ico_schreiben_nach(&ordner.join("fehlt").join("quadchroma.ico")).is_err());
+        let _ = std::fs::remove_dir_all(&ordner);
     }
 }

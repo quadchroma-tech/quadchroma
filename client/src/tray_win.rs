@@ -10,8 +10,12 @@
 // PostMessageW/SendMessageTimeoutW an dessen Fenster und ueber einen
 // geteilten Stand; zurueck geht es ueber den Rueckruf `befehl`, den main.rs
 // mit einem EventLoopProxy belegt. Keiner wartet je auf den anderen, ausser
-// beim Anlegen und Entfernen (je hoechstens WARTEN) und beim Selbsttest
-// (bewusst synchron).
+// beim Anlegen (auf das Fenster ohne Frist - es haengt nicht am Explorer -,
+// auf die Anmeldung hoechstens WARTEN), beim Entfernen (hoechstens WARTEN),
+// bei der Sprechblase (hoechstens FRAGEN_HINWEIS) und beim Selbsttest
+// (bewusst synchron). Beendet wird der Faden nur ueber WM_BEENDEN, nie ueber
+// WM_CLOSE: das koennte auch von aussen kommen und liesse die abgelegte App
+// ohne Symbol zurueck.
 //
 // Bedienung (NOTIFYICON_VERSION_4):
 //   - Linksklick (NIN_SELECT), Eingabe/Leertaste (NIN_KEYSELECT) und
@@ -21,7 +25,8 @@
 //     sonst schliesst das Menue nicht beim Klick daneben; danach WM_NULL
 //     (bekannte Eigenheit von TrackPopupMenu).
 //   - Tooltip ueber NIF_TIP mit NIF_SHOWTIP (Fassung 4 blendet ihn sonst aus).
-//   - Die einmalige Sprechblase ueber NIF_INFO.
+//   - Die einmalige Sprechblase ueber NIF_INFO, ebenfalls mit NIF_SHOWTIP
+//     (jedes NIM_MODIFY ohne das Kennzeichen blendet den Tooltip aus).
 
 use crate::tray::{self, Befehl, Punkt, Stand};
 use std::cell::RefCell;
@@ -40,7 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetMessageW, GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage,
-    HICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON, SM_MENUDROPALIGNMENT,
+    HICON, HMENU, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON, SM_MENUDROPALIGNMENT,
     TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
     WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -55,6 +60,9 @@ const WM_TOOLTIP: u32 = WM_APP + 2;
 const WM_HINWEIS: u32 = WM_APP + 3;
 /// Symbol entfernen (Selbsttest); Antwort 1 = entfernt.
 const WM_ENTFERNEN: u32 = WM_APP + 4;
+/// Symbol entfernen und den Faden beenden (Drop). Eigene Nachricht statt
+/// WM_CLOSE, das auch von aussen kommen kann (siehe Kopf).
+const WM_BEENDEN: u32 = WM_APP + 5;
 /// Eingabe- oder Leertaste auf dem Symbol (NIN_SELECT | NINF_KEY).
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 /// Kennung des Symbols an unserem Fenster.
@@ -66,6 +74,12 @@ const ID_HOST: u32 = 100;
 /// So lange wartet der Fensterfaden hoechstens auf die erste Anmeldung
 /// bzw. auf das Ende des Fadens.
 const WARTEN: Duration = Duration::from_secs(2);
+/// So lange wartet hinweis() hoechstens auf die Antwort des Symbolfadens
+/// (Shell_NotifyIconW kann haengen, wenn Explorer haengt). Das Fenster ist
+/// dann schon verborgen, der Nutzer merkt davon nichts.
+const FRAGEN_HINWEIS: u32 = 1000;
+/// Frist fuer die synchronen Fragen des Selbsttests.
+const FRAGEN_SELBSTTEST: u32 = 3000;
 
 /// Was beide Faeden teilen.
 struct Geteilt {
@@ -114,7 +128,10 @@ impl Symbol {
     /// Faden und Fenster anlegen und das Symbol anmelden. Err nur, wenn es
     /// weder Faden noch Fenster gibt; scheitert nur die Anmeldung (kein
     /// Explorer), steht `steht()` auf false und `grund()` sagt warum - der
-    /// Faden wartet dann auf "TaskbarCreated".
+    /// Faden wartet dann auf "TaskbarCreated". Auf das Fenster wird ohne Frist
+    /// gewartet: sein Anlegen haengt nicht am Explorer, und mit einer Frist
+    /// liefe bei Ueberlast ein Faden ohne Besitzer weiter, dessen Symbol nie
+    /// mehr entfernt wuerde (Durchsicht [4]).
     pub fn neu(befehl: Box<dyn Fn(Befehl) + Send>, stand: &Stand) -> Result<Symbol, String> {
         let geteilt = Arc::new(Geteilt {
             stand: Mutex::new(stand.clone()),
@@ -136,10 +153,10 @@ impl Symbol {
         // Das Fenster meldet der Faden sofort; die Anmeldung beim Explorer
         // kann dauern, wenn er haengt. Darauf wird hoechstens WARTEN lang
         // gewartet - danach steht das Symbol eben erst spaeter (steht()).
-        let fenster = match bereit_rx.recv_timeout(WARTEN) {
+        let fenster = match bereit_rx.recv() {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err("Symbolfaden meldet sich nicht".into()),
+            Err(_) => return Err("Symbolfaden endete ohne Fenster".into()),
         };
         let bis = std::time::Instant::now() + WARTEN;
         while !geteilt.versucht.load(Ordering::SeqCst) && std::time::Instant::now() < bis {
@@ -177,12 +194,17 @@ impl Symbol {
         }
     }
 
-    /// Die Sprechblase (NIF_INFO) einmal zeigen.
-    pub fn hinweis(&mut self, titel: &str, text: &str) {
+    /// Die Sprechblase (NIF_INFO) einmal zeigen. true nur, wenn das Symbol
+    /// steht und der Infobereich sie angenommen hat (NIM_MODIFY gelungen) -
+    /// nur dann vermerkt main.rs tray_hinweis=1.
+    pub fn hinweis(&mut self, titel: &str, text: &str) -> bool {
+        if !self.steht() {
+            return false;
+        }
         if let Ok(mut h) = self.geteilt.hinweis.lock() {
             *h = (titel.to_string(), text.to_string());
         }
-        self.posten(WM_HINWEIS);
+        self.fragen(WM_HINWEIS, FRAGEN_HINWEIS)
     }
 
     /// Unter Windows gibt es nichts nachzufuehren (die Sprechblase schliesst
@@ -195,11 +217,11 @@ impl Symbol {
         }
     }
 
-    /// Synchron an den Faden (Selbsttest): Antwort 1 = gelungen.
-    fn fragen(&self, msg: u32) -> bool {
+    /// Synchron an den Faden, hoechstens `frist_ms`: Antwort 1 = gelungen.
+    fn fragen(&self, msg: u32, frist_ms: u32) -> bool {
         let mut antwort = 0usize;
         let r = unsafe {
-            SendMessageTimeoutW(HWND(self.fenster as *mut _), msg, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 3000, Some(&mut antwort))
+            SendMessageTimeoutW(HWND(self.fenster as *mut _), msg, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, frist_ms, Some(&mut antwort))
         };
         r.0 != 0 && antwort == 1
     }
@@ -207,10 +229,10 @@ impl Symbol {
 
 impl Drop for Symbol {
     fn drop(&mut self) {
-        // WM_CLOSE entfernt das Symbol und schliesst das Fenster; der Faden
+        // WM_BEENDEN entfernt das Symbol und schliesst das Fenster; der Faden
         // endet mit seiner Schleife. Nicht ewig warten: steht gerade ein
         // Kontextmenue offen, endet es erst mit dem Fenster.
-        self.posten(WM_CLOSE);
+        self.posten(WM_BEENDEN);
         let _ = self.ende.recv_timeout(WARTEN);
     }
 }
@@ -288,7 +310,11 @@ fn tooltip_anwenden(hwnd: HWND, f: &Faden) -> bool {
 fn hinweis_zeigen(hwnd: HWND, f: &Faden) -> bool {
     let (titel, text) = f.geteilt.hinweis.lock().map(|h| h.clone()).unwrap_or_default();
     let mut d = daten(hwnd);
-    d.uFlags = NIF_INFO;
+    // NIF_SHOWTIP bei jedem NIM_MODIFY (Fassung 4), dazu der geltende
+    // Tooltip - sonst bleibt er nach der Sprechblase aus, bis er sich aendert.
+    d.uFlags = NIF_INFO | NIF_TIP | NIF_SHOWTIP;
+    let tooltip = f.geteilt.stand.lock().map(|s| s.tooltip.clone()).unwrap_or_default();
+    feld_setzen(&mut d.szTip, &tooltip);
     feld_setzen(&mut d.szInfoTitle, &titel);
     feld_setzen(&mut d.szInfo, &text);
     d.dwInfoFlags = NIIF_INFO;
@@ -300,35 +326,65 @@ fn menuetext(t: &str) -> HSTRING {
     HSTRING::from(t.replace('&', "&&"))
 }
 
+/// Befehlsnummer des Menuepunkts an Stelle `i` (None: Trenner). Hosts
+/// tragen ID_HOST plus ihre Stelle im Menue; befehl_zu loest genau so auf.
+fn menue_nummer(i: usize, p: &Punkt) -> Option<u32> {
+    match p {
+        Punkt::Oeffnen(_) => Some(ID_OEFFNEN),
+        Punkt::Trenner => None,
+        Punkt::Verbinden { .. } => Some(ID_HOST + i as u32),
+        Punkt::Beenden(_) => Some(ID_BEENDEN),
+    }
+}
+
+/// Der Befehl zur gewaehlten Nummer (TrackPopupMenu mit TPM_RETURNCMD),
+/// aufgeloest gegen genau die Liste, aus der das Menue gebaut war. 0 (nichts
+/// gewaehlt) und fremde Nummern ergeben nichts.
+fn befehl_zu(punkte: &[Punkt], gewaehlt: u32) -> Option<Befehl> {
+    match gewaehlt {
+        0 => None,
+        ID_OEFFNEN => Some(Befehl::Oeffnen),
+        ID_BEENDEN => Some(Befehl::Beenden),
+        n if n >= ID_HOST => punkte
+            .get((n - ID_HOST) as usize)
+            .filter(|p| matches!(p, Punkt::Verbinden { .. }))
+            .and_then(|p| p.befehl()),
+        _ => None,
+    }
+}
+
+/// Das Kontextmenue aus den Punkten bauen: Nummern nach menue_nummer,
+/// "Oeffnen" fett (die Vorgabe, die auch der Doppelklick ausloest). Der
+/// Aufrufer gibt es mit DestroyMenu frei.
+fn menue_bauen(punkte: &[Punkt]) -> Option<HMENU> {
+    unsafe {
+        let menue = CreatePopupMenu().ok()?;
+        for (i, p) in punkte.iter().enumerate() {
+            let nummer = menue_nummer(i, p).unwrap_or(0) as usize;
+            let _ = match p {
+                Punkt::Oeffnen(t) | Punkt::Beenden(t) => AppendMenuW(menue, MF_STRING, nummer, &menuetext(t)),
+                Punkt::Verbinden { text, .. } => AppendMenuW(menue, MF_STRING, nummer, &menuetext(text)),
+                Punkt::Trenner => AppendMenuW(menue, MF_SEPARATOR, 0, PCWSTR::null()),
+            };
+        }
+        let _ = SetMenuDefaultItem(menue, ID_OEFFNEN, 0);
+        Some(menue)
+    }
+}
+
 /// Das Kontextmenue an der Stelle (x, y) zeigen und den gewaehlten Befehl
 /// liefern. Gebaut aus dem Stand dieses Augenblicks; die Wahl wird gegen
 /// genau diese Liste aufgeloest.
 fn menue_zeigen(hwnd: HWND, f: &Faden, x: i32, y: i32) -> Option<Befehl> {
     let punkte = f.geteilt.stand.lock().map(|s| s.menue.clone()).unwrap_or_default();
     unsafe {
-        let menue = CreatePopupMenu().ok()?;
-        for (i, p) in punkte.iter().enumerate() {
-            let _ = match p {
-                Punkt::Oeffnen(t) => AppendMenuW(menue, MF_STRING, ID_OEFFNEN as usize, &menuetext(t)),
-                Punkt::Trenner => AppendMenuW(menue, MF_SEPARATOR, 0, PCWSTR::null()),
-                Punkt::Verbinden { text, .. } => AppendMenuW(menue, MF_STRING, ID_HOST as usize + i, &menuetext(text)),
-                Punkt::Beenden(t) => AppendMenuW(menue, MF_STRING, ID_BEENDEN as usize, &menuetext(t)),
-            };
-        }
-        // "Oeffnen" fett: die Vorgabe, die auch der Doppelklick ausloest.
-        let _ = SetMenuDefaultItem(menue, ID_OEFFNEN, 0);
+        let menue = menue_bauen(&punkte)?;
         let ausrichtung = if GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
         let _ = SetForegroundWindow(hwnd);
         let gewaehlt = TrackPopupMenu(menue, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY | ausrichtung, x, y, None, hwnd, None).0 as u32;
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menue);
-        match gewaehlt {
-            0 => None,
-            ID_OEFFNEN => Some(Befehl::Oeffnen),
-            ID_BEENDEN => Some(Befehl::Beenden),
-            n if n >= ID_HOST => punkte.get((n - ID_HOST) as usize).and_then(|p| p.befehl()),
-            _ => None,
-        }
+        befehl_zu(&punkte, gewaehlt)
     }
 }
 
@@ -360,7 +416,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TOOLTIP => LRESULT(tooltip_anwenden(hwnd, &f) as isize),
         WM_HINWEIS => LRESULT(hinweis_zeigen(hwnd, &f) as isize),
         WM_ENTFERNEN => LRESULT(abmelden(hwnd, &f) as isize),
-        WM_CLOSE => {
+        WM_BEENDEN => {
             if f.geteilt.steht.load(Ordering::SeqCst) {
                 abmelden(hwnd, &f);
             }
@@ -369,6 +425,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        // Von aussen (etwa taskkill ohne /F an ein sichtbares Fenster):
+        // uebergehen - das Symbol ist der Weg zurueck zur abgelegten App.
+        WM_CLOSE => LRESULT(0),
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -464,12 +523,12 @@ pub fn selbsttest() -> i32 {
         *st = neu.clone();
     }
     s.zuletzt = neu;
-    if !s.fragen(WM_TOOLTIP) {
+    if !s.fragen(WM_TOOLTIP, FRAGEN_SELBSTTEST) {
         eprintln!("Infobereich-Selbsttest: Tooltip nicht geaendert (NIM_MODIFY gescheitert)");
         return 1;
     }
     println!("Infobereich-Selbsttest: Tooltip geaendert");
-    if !s.fragen(WM_ENTFERNEN) {
+    if !s.fragen(WM_ENTFERNEN, FRAGEN_SELBSTTEST) {
         eprintln!("Infobereich-Selbsttest: Symbol nicht entfernt (NIM_DELETE gescheitert)");
         return 1;
     }
@@ -479,4 +538,85 @@ pub fn selbsttest() -> i32 {
     }
     println!("Infobereich-Selbsttest: Symbol entfernt - bestanden");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID, GET_MENU_DEFAULT_ITEM_FLAGS};
+
+    fn host(name: &str, addr: &str) -> crate::discovery::Host {
+        crate::discovery::Host { name: name.into(), addr: addr.parse().unwrap(), seen: std::time::Instant::now() }
+    }
+
+    /// Menuenummer -> Befehl als reine Logik: jeder waehlbare Punkt liefert
+    /// genau seinen Befehl - bei mehreren Hosts der richtige Host.
+    #[test]
+    fn menuenummer_fuehrt_zum_befehl() {
+        let hosts = [host("A", "10.0.0.1:9001"), host("B", "10.0.0.2:9001"), host("C", "10.0.0.3:9101")];
+        for n in 0..=hosts.len() {
+            let punkte = tray::menue(crate::strings::pick("de"), &hosts[..n]);
+            let mut waehlbar = 0;
+            for (i, p) in punkte.iter().enumerate() {
+                match menue_nummer(i, p) {
+                    Some(nr) => {
+                        waehlbar += 1;
+                        assert_eq!(befehl_zu(&punkte, nr), p.befehl(), "{n} Hosts, Punkt {i}: {p:?}");
+                    }
+                    None => assert_eq!(*p, Punkt::Trenner),
+                }
+            }
+            assert_eq!(waehlbar, n + 2);
+            // Nichts gewaehlt, fremde Nummern, ein Trenner: nichts.
+            assert_eq!(befehl_zu(&punkte, 0), None);
+            assert_eq!(befehl_zu(&punkte, 99), None);
+            assert_eq!(befehl_zu(&punkte, ID_HOST + punkte.len() as u32), None);
+            assert_eq!(befehl_zu(&punkte, ID_HOST + 1), None, "Trenner als Host aufgeloest");
+        }
+    }
+
+    /// Der Symbolfaden endet nur ueber WM_BEENDEN (Drop), nicht ueber ein
+    /// WM_CLOSE von aussen - die abgelegte App behielte sonst kein Symbol.
+    /// Ohne Infobereich (Sitzung 0 ueber ssh) gilt die Sprechblase nicht als
+    /// gezeigt, tray_hinweis bliebe also offen. Mit Infobereich (Sitzung mit
+    /// Explorer) erscheint das Symbol kurz, die Sprechblase wird ausgelassen.
+    #[test]
+    fn symbolfaden_endet_nur_ueber_beenden() {
+        let stand = tray::stand(crate::strings::pick("de"), &[], None);
+        let mut s = Symbol::neu(Box::new(|_| {}), &stand).expect("Symbolfenster");
+        unsafe {
+            let _ = PostMessageW(Some(HWND(s.fenster as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        assert!(
+            s.ende.recv_timeout(Duration::from_millis(300)).is_err(),
+            "WM_CLOSE von aussen hat den Symbolfaden beendet"
+        );
+        if !s.steht() {
+            assert!(!s.hinweis("QuadChroma", "Test"), "Sprechblase ohne Symbol als gezeigt gemeldet");
+        }
+        s.posten(WM_BEENDEN);
+        assert!(s.ende.recv_timeout(WARTEN).is_ok(), "WM_BEENDEN hat den Symbolfaden nicht beendet");
+    }
+
+    /// Das echte Menue (CreatePopupMenu, ohne Shell - geht auch in Sitzung 0):
+    /// jede Stelle traegt die Nummer, die zu ihrem Befehl fuehrt; "Oeffnen"
+    /// ist die Vorgabe.
+    #[test]
+    fn echtes_menue_nummern() {
+        let hosts = [host("A", "10.0.0.1:9001"), host("B", "10.0.0.2:9001"), host("C", "10.0.0.3:9101"), host("D", "10.0.0.4:9001")];
+        let punkte = tray::menue(crate::strings::pick("de"), &hosts);
+        let menue = menue_bauen(&punkte).expect("Menue");
+        unsafe {
+            assert_eq!(GetMenuItemCount(Some(menue)), punkte.len() as i32);
+            for (i, p) in punkte.iter().enumerate() {
+                let id = GetMenuItemID(menue, i as i32);
+                match p {
+                    Punkt::Trenner => assert_eq!(id, 0, "Stelle {i}"),
+                    _ => assert_eq!(befehl_zu(&punkte, id), p.befehl(), "Stelle {i}: {p:?}"),
+                }
+            }
+            assert_eq!(GetMenuDefaultItem(menue, 0, GET_MENU_DEFAULT_ITEM_FLAGS(0)), ID_OEFFNEN);
+            let _ = DestroyMenu(menue);
+        }
+    }
 }
