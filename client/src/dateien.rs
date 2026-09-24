@@ -73,28 +73,53 @@
 //
 // Sender (Faden "qc-dateien-senden")
 //
-//   Sender::starten(pfade: Vec<PathBuf>, weg: Arc<dyn Weg>, fenster: u64,
-//                   melden: impl Fn(Ereignis) + Send + 'static) -> Griff
-//   Sender::starten_mit(..., vorgaben: Vorgaben) -> Griff
+//   Sender::starten_nach(vorgaenger: Option<Griff>, pfade: Vec<PathBuf>,
+//                        weg: Arc<dyn Weg>,
+//                        fenster: impl Fn() -> u64 + Send + 'static,
+//                        melden: impl Fn(Ereignis) + Send + 'static,
+//                        vorgaben: Vorgaben) -> Griff
+//   Sender::starten(pfade, weg, fenster: u64, melden) -> Griff
+//   Sender::starten_mit(pfade, weg, fenster: u64, melden, vorgaben) -> Griff
+//       (beide wie starten_nach ohne Vorgaenger, mit festem Fenster)
 //
-//   Vorgaben { stillstand, voll_warten, ende_frist, freier_platz, grenzen }
+//   Vorgaben { stillstand, voll_warten, ende_frist, nachquittieren,
+//              freier_platz, grenzen, eigene_basis }
 //   mit Vorgaben::default() fuer die Produktion (STILLSTAND, VOLL_WARTEN,
-//   ENDE_FRIST, freier_platz(), Grenzen::default()); Tests verkuerzen die
-//   Fristen, setzen einen Platz vor oder setzen die Grenzen des Auflistens
-//   herab (Grenzen { eintraege, gesamt, angebot }).
+//   ENDE_FRIST, NACHQUITTIEREN, freier_platz(), Grenzen::default(),
+//   ablage_basis); Tests verkuerzen die Fristen, setzen einen Platz vor oder
+//   setzen die Grenzen des Auflistens herab (Grenzen { eintraege, gesamt,
+//   angebot }). eigene_basis ist die Ablagebasis DER ROLLE (Client
+//   ablage_basis, Windows-Host-Rolle host::netz::host_ablage_basis): gegen
+//   sie prueft der Sender den Widerhall.
 //
-//   starten() kehrt sofort zurueck; Auflisten, Lesen und Senden laufen im
-//   eigenen Faden, nie im Ablagewaechter. fenster = fenster(spielmodus):
-//   FENSTER bzw. FENSTER_SPIEL. Ablauf: eigene Ablage? (dann nichts) ->
-//   auflisten() -> Angebot -> Stuecke (hoechstens fenster Byte unquittiert,
-//   ein Stueck wird dafuer notfalls kuerzer geschnitten) -> Ende 0 -> warten
-//   auf Quittung 1, hoechstens STILLSTAND. Ohne neue Quittung ueber
-//   STILLSTAND: Ende 3. Datei kuerzer als angekuendigt oder unlesbar: Ende 2.
-//   Laenger geworden: nur die angekuendigte Groesse geht hinaus.
+//   starten*() kehren sofort zurueck; Auflisten, Lesen und Senden laufen im
+//   eigenen Faden, nie im Ablagewaechter. Der Faden laeuft mit Nachrang
+//   (Windows THREAD_PRIORITY_BELOW_NORMAL, macOS QOS_CLASS_UTILITY), damit er
+//   auf knapper CPU Aufnahme, Encoder und Ton nicht verdraengt. `fenster`
+//   liefert das Fenster; der Sender fragt es vor jedem Stueck neu (nie unter
+//   einer Sperre dieses Moduls), so wirkt ein Wechsel in den Spielmodus
+//   waehrend der Uebertragung. Die Rolle gibt `fenster(spielmodus)` zurueck,
+//   also FENSTER bzw. FENSTER_SPIEL (die Windows-Host-Rolle kappt bei
+//   64 KiB, siehe host/netz.rs). `vorgaenger`: die Sendung, die dieser ersetzt
+//   (neuer Inhalt). starten_nach bricht sie sofort ab; der neue Faden wartet
+//   hoechstens ende_frist + VORGAENGER_RAND auf ihr Ende, bevor er etwas
+//   tut - sonst stritten ihr Ende 1 und das neue Angebot um denselben Platz
+//   der Rolle, und das Ende koennte verhungern. Ablauf: Vorgaenger abwarten
+//   -> eigene Ablage? (dann nichts) -> auflisten() -> Angebot -> Stuecke
+//   (hoechstens fenster Byte unquittiert, ein Stueck wird dafuer notfalls
+//   kuerzer geschnitten) -> Ende 0 -> warten auf Quittung 1, hoechstens
+//   STILLSTAND. Ohne neue Quittung ueber STILLSTAND: Ende 3. Datei kuerzer
+//   als angekuendigt, unlesbar oder seit dem Auflisten ersetzt (Geraet und
+//   Inode bzw. endgueltiger Pfad stimmen nicht): Ende 2. Laenger geworden:
+//   nur die angekuendigte Groesse geht hinaus. Das Angebot geht als EIN
+//   Paket hinaus (bis ANGEBOT_MAX): vor ihm wartet der Nachrang der Rolle,
+//   aber es selbst laesst sich nicht teilen - bewusst so gelassen (ein
+//   geteiltes Angebot waere eine neue Fassung des Protokolls).
 //
 //   Griff::kennung() -> u32
 //   Griff::quittung(&self, nutzlast: &[u8])  Nutzlast von DATEI_QUITTUNG, wie
-//       sie ankommt; fremde Kennungen werden uebergangen. Kehrt sofort zurueck,
+//       sie ankommt; fremde Kennungen werden uebergangen, `empfangen` wird
+//       bei der gesendeten Menge gekappt. Kehrt sofort zurueck,
 //       keine Plattenarbeit: darf im Lesefaden eines Kanals laufen.
 //   Griff::abbrechen(&self)  kehrt sofort zurueck (wartet NICHT auf den
 //       Faden - sonst drohte eine Verklemmung, wenn der Aufrufer die Sperre
@@ -135,12 +160,21 @@
 //   meldet, ob die Ablage gesetzt wurde; Quittung 1 heisst "in die Ablage
 //   gelegt" und soll das nicht behaupten, wenn es nicht stimmt.
 //
-//   Geschrieben wird nur im eigenen Schreibfaden, nie im Lesefaden. Quittung
+//   Geschrieben wird nur im eigenen Schreibfaden, nie im Lesefaden; er laeuft
+//   mit Nachrang wie der Sender. Quittung
 //   0 nach der Annahme (empfangen 0), dann spaetestens je QUITTUNG_ALLE Byte
 //   und zusaetzlich immer dann, wenn die Warteschlange leer ist und noch
 //   Unquittiertes vorliegt (so kann kein Sender mit kleinem Fenster haengen
 //   bleiben). Ueber STILLSTAND ohne Stueck: Quittung 6, Verzeichnis weg.
-//   Quittungen gehen nicht verloren: Jeder Versuch ist einer; bei Voll gilt
+//   Gesendet::Ja heisst nur "eingereiht": ein Weg kann eine Quittung danach
+//   noch verlieren (etwa der Eingabekanal des Clients, der mitten in einer
+//   Sitzung neu aufgebaut wird). Deshalb wiederholt der Schreibfaden im
+//   Leerlauf - alles quittiert, kein Stueck - den Stand alle nachquittieren
+//   (NACHQUITTIEREN, 1 s); ein Sender, der am Fenster auf eine verlorene
+//   Quittung wartet, laeuft damit nach spaetestens einer Sekunde weiter
+//   statt nach STILLSTAND abzubrechen. Das kostet 16 Byte je Sekunde, nur
+//   solange eine Uebertragung ohne Stueck steht; der Sender wertet eine
+//   Wiederholung ohne Fortschritt nicht als Lebenszeichen. Bei Voll gilt
 //   der Stand als unquittiert, und der Schreibfaden versucht es nach
 //   VOLL_WARTEN wieder (mit dem dann neuesten Stand), ohne dafuer das
 //   Schreiben anzuhalten. Eine Schlussquittung (1 bis 6) wird ebenso
@@ -184,15 +218,24 @@
 //       ein eigener Ordner je Lauf). Nie Schreibtisch, Dokumente, Downloads.
 //   basis_anlegen(&Path)        Unix 0700; eine Verknuepfung als Basis gilt nicht.
 //   aufraeumen(basis, behalten, hoechstalter: Option<Duration>) -> usize
-//   aufraeumen_beim_start() -> usize   beim Programmstart: aelter als 24 h weg.
+//   aufraeumen_beim_start() -> usize   beim Programmstart: aelter als 24 h
+//       und verwaiste weg.
 //   aus_eigener_ablage(pfade, basis) -> bool   Widerhallschutz (2.7 Schritt 2);
-//       der Sender prueft es selbst noch einmal.
+//       der Sender prueft es selbst noch einmal, gegen Vorgaben::eigene_basis.
 //   Je Uebertragung <basis>/<unix-ms>-<kennung>; waehrend sie laeuft, liegt
-//   daneben die leere Marke <unix-ms>-<kennung>.laeuft. aufraeumen() zaehlt
-//   und loescht nur Verzeichnisse ohne Marke (ausser nach 24 h): Client und
-//   Host-Rolle teilen unter Windows dieselbe Basis (%TEMP%), und das Aufraeumen
-//   des einen darf dem anderen keine laufende Uebertragung wegloeschen. Das
+//   daneben die Marke <unix-ms>-<kennung>.laeuft mit "<pid> <start>" des
+//   empfangenden Prozesses (start: Windows Erstellzeit laut GetProcessTimes,
+//   macOS Startzeit laut proc_pidinfo, in us). aufraeumen() zaehlt und
+//   loescht nur Verzeichnisse ohne Marke (ausser nach 24 h): das Aufraeumen
+//   darf keiner laufenden Uebertragung ihr Verzeichnis wegloeschen. Das
 //   ergaenzt 2.9 ("die drei neuesten bleiben") um laufende Uebertragungen.
+//   Eine Marke, deren Prozess nicht mehr lebt (Windows OpenProcess und
+//   GetExitCodeProcess, Unix kill(pid, 0)) oder deren Kennung inzwischen
+//   ein anderer Prozess traegt (Startzeit weicht ab), gilt als verwaist:
+//   Verzeichnis und Marke gehen beim Start und bei jedem Aufraeumen, ohne 24
+//   h abzuwarten (Integrationstest Befund 4: ein beendeter Empfaenger liess
+//   bis zu 4 GiB liegen). Eine Marke ohne lesbaren Inhalt (aeltere Staende)
+//   gilt wie bisher als laufend.
 //   Geloescht wird nur innerhalb der Basis; Verknuepfungen werden nie verfolgt.
 //
 // Kodierer, Leser, Pfade
@@ -207,8 +250,12 @@
 //   pfad_pruefen(pfad), pfad_bereinigen(pfad, regeln),
 //   bestandteil_bereinigen(teil, regeln), Regeln { Windows, Mac }, EIGENE_REGELN
 //   auflisten(pfade) -> Liste   (Senderseite, 2.7 Schritt 3; auflisten_mit
-//       mit eigenen Grenzen). Liste { eintraege, quellen, gesamt, hinweise,
-//       zu_gross: Option<String> }
+//       mit eigenen Grenzen). Liste { eintraege, quellen, orte, gesamt,
+//       hinweise, zu_gross: Option<String> }; Ort { kennung, pfad }: was das
+//       Auflisten von der Quelle sah (Unix Geraet und Inode, Windows der
+//       erwartete endgueltige Pfad), gegen den offenen Griff geprueft.
+//   nfc(name) -> String   zusammengesetzte Normalform (macOS CoreFoundation,
+//       Windows NormalizeString); vergleichsschluessel(name) fuer Doppelte.
 //   freier_platz(pfad) -> Option<u64>   Windows GetDiskFreeSpaceExW, sonst None
 //   mb_text(bytes) -> "12,4"
 //
@@ -218,12 +265,20 @@
 //     im Angebot Quittung 4.
 //   - Ein neues Angebot verwirft alles, was von frueheren Uebertragungen noch
 //     in der Warteschlange steht; Stuecke und Enden mit fremder Kennung werden
-//     still uebergangen (etwa der Rest eines abgelehnten Angebots).
+//     still uebergangen (etwa der Rest eines abgelehnten Angebots). Laeuft
+//     die Warteschlange ueber, endet die laufende Uebertragung sofort mit
+//     Quittung 4, gleich welche Kennung das Stueck trug (wie beim Mac-Host) -
+//     die Warteschlange nimmt danach bis zum naechsten Angebot nichts mehr an.
 //   - Der Sender ueberspringt beim Auflisten ausser Verknuepfungen auch
 //     Namen, die die Gegenseite ablehnen muesste ('\', nicht UTF-8, zu lang,
-//     zu tief) und Namen, die nach der strengsten (Windows-)Bereinigung ohne
-//     Ruecksicht auf die Schreibweise doppelt waeren - auf jeder Stufe, nicht
-//     nur oben. Jeweils mit Protokollzeile.
+//     zu tief) und Namen, die nach der strengsten (Windows-)Bereinigung, in
+//     NFC und ohne Ruecksicht auf die Schreibweise (volle Gross- und
+//     Kleinschreibung: ss = U+00DF) doppelt waeren - auf jeder Stufe, nicht nur
+//     oben. Jeweils mit Protokollzeile. Die Namen gehen in NFC hinaus, wie
+//     beim Mac-Host (Finder liefert oft die zerlegte Form).
+//   - Der Empfaenger prueft Doppelte unter macOS ebenso (NFC, volle
+//     Schreibweise - APFS saehe die Namen gleich), unter Windows nach der
+//     einfachen Kleinschreibung (NTFS unterscheidet ss und U+00DF, NFC und NFD).
 //
 // Pflichten der Rollen (Integrationspakete):
 //   - Eingang: 50/51/52 -> Empfaenger::nachricht, 53 -> Griff::quittung. Keine
@@ -231,6 +286,13 @@
 //   - Neuer Ablageinhalt (Text oder Dateien, aber nicht aus_eigener_ablage),
 //     Sitzungsende, Zuschauerwechsel, Verlust des Eingabekanals: Griff
 //     abbrechen bzw. fallen lassen. Je Richtung hoechstens ein Griff.
+//   - Neue Dateien: den bisherigen Griff als Vorgaenger an
+//     Sender::starten_nach geben, statt ihn selbst abzubrechen - auch einen,
+//     den eben neuer Text abgebrochen hat, solange keine neue Sendung lief.
+//     Sonst streiten sein Ende 1 und das neue Angebot um den Platz der Rolle.
+//   - Das Fenster als Lieferant mit dem Spielmodus von jetzt (nie
+//     blockierend: der Lieferant laeuft im Faden des Senders), und
+//     Vorgaben::eigene_basis auf die eigene Ablagebasis setzen.
 //   - Sitzungsende/Zuschauerwechsel: Empfaenger::abbrechen.
 //   - Programmstart: aufraeumen_beim_start().
 //   - Staende nach der Kennung zuordnen (Stand.kennung, Griff::kennung):
@@ -303,6 +365,13 @@ pub const PLATZRESERVE: u64 = 1024 * 1024 * 1024;
 pub const VOLL_WARTEN: Duration = Duration::from_millis(2);
 /// Ende bzw. Quittung nach einem Abbruch: so lange Voll abwarten, dann aufgeben.
 pub const ENDE_FRIST: Duration = Duration::from_secs(1);
+/// Ein neuer Sender wartet hoechstens ende_frist plus so viel auf das Ende
+/// seines Vorgaengers (dessen Ende 1 bei Voll bis zu ende_frist braucht).
+pub const VORGAENGER_RAND: Duration = Duration::from_millis(500);
+/// Im Leerlauf (alles quittiert, kein Stueck) wiederholt der Empfaenger
+/// seinen Stand so oft - eine Quittung, die der Weg mit Ja nahm, kann danach
+/// noch verloren gehen (Modulkopf).
+pub const NACHQUITTIEREN: Duration = Duration::from_secs(1);
 /// Nach einem vollstaendigen Empfang bleiben so viele Verzeichnisse.
 pub const BEHALTEN: usize = 3;
 /// Beim Start werden Verzeichnisse geloescht, die aelter sind.
@@ -518,12 +587,18 @@ pub struct Vorgaben {
     pub voll_warten: Duration,
     /// Das Ende nach einem Abbruch (Sender) bei Voll hoechstens so lange
     /// versuchen. Quittungen des Empfaengers gelten nicht: sie werden
-    /// wiederholt, bis sie hinaus sind (siehe Modulkopf).
+    /// wiederholt, bis sie hinaus sind (siehe Modulkopf). Ein neuer Sender
+    /// wartet hoechstens so lange plus VORGAENGER_RAND auf seinen Vorgaenger.
     pub ende_frist: Duration,
+    /// Empfaenger: im Leerlauf den Stand nach so langer Zeit wiederholen.
+    pub nachquittieren: Duration,
     /// Freier Platz am Ort der Basis; None = nicht vorab pruefen.
     pub freier_platz: fn(&Path) -> Option<u64>,
     /// Grenzen beim Auflisten (Sender).
     pub grenzen: Grenzen,
+    /// Die Ablagebasis der Rolle, gegen die der Sender den Widerhall prueft
+    /// (2.7 Schritt 2): Client ablage_basis, Windows-Host-Rolle ihre eigene.
+    pub eigene_basis: fn() -> PathBuf,
 }
 
 impl Default for Vorgaben {
@@ -532,8 +607,10 @@ impl Default for Vorgaben {
             stillstand: STILLSTAND,
             voll_warten: VOLL_WARTEN,
             ende_frist: ENDE_FRIST,
+            nachquittieren: NACHQUITTIEREN,
             freier_platz,
             grenzen: Grenzen::default(),
+            eigene_basis: ablage_basis,
         }
     }
 }
@@ -745,7 +822,15 @@ impl Angebot {
                 ordner.insert(&e.pfad);
             }
             let b = teile.iter().map(|t| bestandteil_bereinigen(t, regeln)).collect::<Vec<_>>().join("/");
-            if !gesehen.insert(b.to_lowercase()) {
+            // macOS (APFS) sieht NFC und NFD sowie ss und U+00DF als denselben
+            // Namen - ohne diese Pruefung scheiterte das Anlegen mit "File
+            // exists"; NTFS unterscheidet beides, dort genuegt die einfache
+            // Kleinschreibung (2.3).
+            let schluessel = match regeln {
+                Regeln::Mac => vergleichsschluessel(&b),
+                Regeln::Windows => b.to_lowercase(),
+            };
+            if !gesehen.insert(schluessel) {
                 return Err(Ablehnung::Ungueltig(format!("Eintrag {i}: {b:?} doppelt")));
             }
             bereinigt.push(b);
@@ -948,6 +1033,121 @@ fn geraetename(name: &str) -> bool {
     false
 }
 
+/// Schluessel fuer Doppelte ohne Ruecksicht auf Normalform und Schreibweise:
+/// NFC, dann die vollen Gross- und Kleinbuchstaben der std (U+00DF -> SS
+/// -> ss, die Ligatur U+FB01 -> FI -> fi) - so, wie APFS und der Mac-Host (NFC plus
+/// NSCaseInsensitiveSearch) Namen gleichsetzen.
+pub fn vergleichsschluessel(name: &str) -> String {
+    nfc(name).to_uppercase().to_lowercase()
+}
+
+/// Der Name in der zusammengesetzten Normalform (NFC). Finder liefert Namen
+/// oft zerlegt (NFD, "u" + U+0308); der Mac-Host sendet NFC, der Rust-Sender
+/// ebenso. Scheitert die Umwandlung, bleibt der Name, wie er ist.
+#[cfg(target_os = "macos")]
+pub fn nfc(name: &str) -> String {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct CfBereich {
+        anfang: isize,
+        laenge: isize,
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithBytes(a: *const c_void, b: *const u8, n: isize, kodierung: u32, extern_: u8) -> *const c_void;
+        fn CFStringCreateMutableCopy(a: *const c_void, hoechstens: isize, s: *const c_void) -> *mut c_void;
+        fn CFStringNormalize(s: *mut c_void, form: isize);
+        fn CFStringGetLength(s: *const c_void) -> isize;
+        fn CFStringGetBytes(
+            s: *const c_void,
+            bereich: CfBereich,
+            kodierung: u32,
+            ersatz: u8,
+            extern_: u8,
+            puffer: *mut u8,
+            hoechstens: isize,
+            benutzt: *mut isize,
+        ) -> isize;
+        fn CFRelease(p: *const c_void);
+    }
+    // kCFStringEncodingUTF8, kCFStringNormalizationFormC
+    const UTF8: u32 = 0x0800_0100;
+    const FORM_C: isize = 2;
+    if name.is_ascii() {
+        return name.to_string();
+    }
+    // SAFETY: CoreFoundation mit gueltigen Zeigern und Laengen; jedes
+    // angelegte Objekt wird genau einmal freigegeben, bevor die Funktion
+    // endet, und kein Zeiger lebt darueber hinaus.
+    unsafe {
+        let s = CFStringCreateWithBytes(std::ptr::null(), name.as_ptr(), name.len() as isize, UTF8, 0);
+        if s.is_null() {
+            return name.to_string();
+        }
+        let m = CFStringCreateMutableCopy(std::ptr::null(), 0, s);
+        CFRelease(s);
+        if m.is_null() {
+            return name.to_string();
+        }
+        CFStringNormalize(m, FORM_C);
+        let laenge = CFStringGetLength(m);
+        let mut noetig: isize = 0;
+        CFStringGetBytes(m, CfBereich { anfang: 0, laenge }, UTF8, 0, 0, std::ptr::null_mut(), 0, &mut noetig);
+        let mut puffer = vec![0u8; noetig.max(0) as usize];
+        let mut benutzt: isize = 0;
+        let zeichen = CFStringGetBytes(
+            m,
+            CfBereich { anfang: 0, laenge },
+            UTF8,
+            0,
+            0,
+            puffer.as_mut_ptr(),
+            puffer.len() as isize,
+            &mut benutzt,
+        );
+        CFRelease(m);
+        if zeichen != laenge || benutzt < 0 {
+            return name.to_string();
+        }
+        puffer.truncate(benutzt as usize);
+        String::from_utf8(puffer).unwrap_or_else(|_| name.to_string())
+    }
+}
+
+/// Wie oben, unter Windows ueber NormalizeString.
+#[cfg(windows)]
+pub fn nfc(name: &str) -> String {
+    use windows::Win32::Globalization::{NormalizationC, NormalizeString};
+    if name.is_ascii() {
+        return name.to_string();
+    }
+    let w: Vec<u16> = name.encode_utf16().collect();
+    // SAFETY: Quelle und Ziel sind gueltige Slices; die Laengen reicht die
+    // windows-Crate aus den Slices weiter.
+    let mut schaetzung = unsafe { NormalizeString(NormalizationC, &w, None) };
+    for _ in 0..4 {
+        if schaetzung <= 0 {
+            return name.to_string();
+        }
+        let mut ziel = vec![0u16; schaetzung as usize];
+        // SAFETY: wie oben.
+        let n = unsafe { NormalizeString(NormalizationC, &w, Some(&mut ziel)) };
+        if n > 0 {
+            ziel.truncate(n as usize);
+            return String::from_utf16(&ziel).unwrap_or_else(|_| name.to_string());
+        }
+        // Zu klein: der Betrag ist die neue Schaetzung.
+        schaetzung = -n;
+    }
+    name.to_string()
+}
+
+/// Andere Systeme: unveraendert.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn nfc(name: &str) -> String {
+    name.to_string()
+}
+
 /// Haengt einen bereinigten relativen Pfad an; None, wenn ein Bestandteil
 /// fuer das eigene System kein schlichter Name ist (Laufwerk, Wurzel, "..",
 /// unter Windows auch jedes ':', sonst kaeme "a:b" als alternativer
@@ -1085,24 +1285,33 @@ fn aufraeumen_zu(
         }
     }
     let alt = |ms: u64| hoechstalter.is_some_and(|h| jetzt_ms.saturating_sub(ms) > h.as_millis() as u64);
+    // Verwaist: der Prozess der Marke lebt nicht mehr (Modulkopf). Solche
+    // Verzeichnisse gehen wie alte, ohne gezaehlt zu werden.
+    let waisen: HashSet<&str> =
+        marken.iter().filter(|m| !alt(m.0) && marke_verwaist(&m.1)).map(|m| m.2.as_str()).collect();
     let laufend: HashSet<&str> =
-        marken.iter().filter(|m| !alt(m.0)).map(|m| m.2.as_str()).collect();
+        marken.iter().filter(|m| !alt(m.0) && !waisen.contains(m.2.as_str())).map(|m| m.2.as_str()).collect();
     let mut geloescht = 0;
     let mut fertige = Vec::new();
     let mut ausnahme_fertig = false;
+    // Verwaiste Marken, deren Verzeichnis sich nicht loeschen liess: sie
+    // bleiben, sonst gaelte der Rest danach als fertige Uebertragung.
+    let mut bleibt: HashSet<&str> = HashSet::new();
     for o in &ordner {
         if ausser == Some(o.3.as_str()) {
             ausnahme_fertig = !laufend.contains(o.3.as_str());
-        } else if alt(o.0) {
+        } else if alt(o.0) || waisen.contains(o.3.as_str()) {
             if fs::remove_dir_all(&o.2).is_ok() {
                 geloescht += 1;
+            } else {
+                bleibt.insert(o.3.as_str());
             }
         } else if !laufend.contains(o.3.as_str()) {
             fertige.push(o);
         }
     }
     for m in &marken {
-        if alt(m.0) {
+        if (alt(m.0) || waisen.contains(m.2.as_str())) && !bleibt.contains(m.2.as_str()) {
             let _ = fs::remove_file(&m.1);
         }
     }
@@ -1114,6 +1323,142 @@ fn aufraeumen_zu(
         }
     }
     geloescht
+}
+
+// ------------------------------------------------ Marke und Prozess
+
+/// Inhalt der Marke: "<pid> <start>\n" des empfangenden Prozesses.
+fn marke_inhalt() -> String {
+    format!("{} {}\n", std::process::id(), eigener_start())
+}
+
+/// "<pid> <start>" aus einer Marke; None bei leerem oder fremdem Inhalt.
+fn marke_lesen(inhalt: &str) -> Option<(u32, u64)> {
+    let mut t = inhalt.split_whitespace();
+    let (pid, start) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?);
+    t.next().is_none().then_some((pid, start))
+}
+
+/// Ist die Uebertragung dieser Marke verwaist? Nur, wenn es sicher ist:
+/// eigene Prozesskennung mit anderer Startzeit (ein frueherer Prozess mit
+/// derselben Kennung), ein Prozess, der nicht mehr lebt, oder einer, der
+/// inzwischen spaeter gestartet ist. Unlesbar, leer (aeltere Staende) oder
+/// nicht zu entscheiden (fremder Nutzer, keine Rechte): nicht verwaist.
+fn marke_verwaist(marke: &Path) -> bool {
+    // Wie eine Quelle oeffnen: keiner Verknuepfung folgen, an keiner FIFO
+    // haengen; mehr als 64 Byte hat keine Marke.
+    let Ok(f) = zum_lesen_oeffnen(marke, &Ort::default()) else { return false };
+    let mut inhalt = String::new();
+    if f.take(64).read_to_string(&mut inhalt).is_err() {
+        return false;
+    }
+    let Some((pid, start)) = marke_lesen(&inhalt) else { return false };
+    prozess_verwaist(pid, start)
+}
+
+fn prozess_verwaist(pid: u32, start: u64) -> bool {
+    if pid == std::process::id() {
+        return start != eigener_start();
+    }
+    match prozess_lebt(pid) {
+        Some(false) => true,
+        _ => prozess_start(pid).is_some_and(|s| s != start),
+    }
+}
+
+/// Startzeit dieses Prozesses (siehe prozess_start), einmal ermittelt.
+fn eigener_start() -> u64 {
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *START.get_or_init(|| prozess_start(std::process::id()).unwrap_or(0))
+}
+
+/// Lebt der Prozess? None: nicht zu entscheiden (dann gilt er als lebend).
+#[cfg(windows)]
+fn prozess_lebt(pid: u32) -> Option<bool> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: OpenProcess liefert einen eigenen Griff, der hier genau einmal
+    // geschlossen wird; code ist ein gueltiger Zeiger auf ein u32.
+    unsafe {
+        let h = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            // Keine solche Prozesskennung.
+            Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => return Some(false),
+            // Etwa Zugriff verweigert: es gibt ihn, er gehoert jemand anderem.
+            Err(_) => return None,
+        };
+        let mut code = 0u32;
+        let r = GetExitCodeProcess(h, &mut code);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some(code == STILL_ACTIVE.0 as u32)
+    }
+}
+
+/// Unix: kill(pid, 0) - ESRCH heisst weg, EPERM heisst: es gibt ihn.
+#[cfg(unix)]
+fn prozess_lebt(pid: u32) -> Option<bool> {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // Nie 0 oder negativ: kill(0, ..) bzw. kill(-1, ..) meinten Gruppen.
+    let pid = i32::try_from(pid).ok().filter(|&p| p > 0)?;
+    // SAFETY: Signal 0 prueft nur, es wird nichts zugestellt.
+    if unsafe { kill(pid, 0) } == 0 {
+        return Some(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(3) => Some(false), // ESRCH
+        _ => None,
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn prozess_lebt(_pid: u32) -> Option<bool> {
+    None
+}
+
+/// Startzeit eines Prozesses, eindeutig genug gegen wiederverwendete
+/// Kennungen: Windows die Erstellzeit (100 ns seit 1601), macOS Sekunden und
+/// Mikrosekunden des Starts. None: nicht zu ermitteln.
+#[cfg(windows)]
+fn prozess_start(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: wie in prozess_lebt; die FILETIME-Zeiger zeigen auf lokale
+    // Variablen.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut erstellt, mut ende, mut kern, mut nutzer) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let r = GetProcessTimes(h, &mut erstellt, &mut ende, &mut kern, &mut nutzer);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some(((erstellt.dwHighDateTime as u64) << 32) | erstellt.dwLowDateTime as u64)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn prozess_start(pid: u32) -> Option<u64> {
+    extern "C" {
+        fn proc_pidinfo(pid: i32, art: i32, arg: u64, puffer: *mut std::ffi::c_void, groesse: i32) -> i32;
+    }
+    // struct proc_bsdinfo (sys/proc_info.h): 136 Byte, pbi_start_tvsec bei
+    // 120, pbi_start_tvusec bei 128; PROC_PIDTBSDINFO = 3.
+    const GROESSE: usize = 136;
+    let pid = i32::try_from(pid).ok().filter(|&p| p > 0)?;
+    let mut info = [0u64; GROESSE / 8];
+    // SAFETY: der Puffer ist GROESSE Byte gross und 8-Byte-ausgerichtet.
+    let n = unsafe { proc_pidinfo(pid, 3, 0, info.as_mut_ptr().cast(), GROESSE as i32) };
+    if n != GROESSE as i32 {
+        return None;
+    }
+    Some(info[120 / 8].wrapping_mul(1_000_000).wrapping_add(info[128 / 8]))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn prozess_start(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Das Uebertragungsverzeichnis, frisch (nicht rekursiv); unter Unix 0700
@@ -1135,7 +1480,12 @@ fn verzeichnis_anlegen(basis: &Path, kennung: u32) -> io::Result<(PathBuf, PathB
         let name = format!("{}-{kennung}", ms + versuch);
         let marke = basis.join(format!("{name}{MARKE_ENDUNG}"));
         match OpenOptions::new().write(true).create_new(true).open(&marke) {
-            Ok(_) => {}
+            // Wer empfaengt: daran erkennt ein spaeteres Aufraeumen, ob die
+            // Uebertragung verwaist ist. Scheitert das Schreiben, bleibt die
+            // Marke leer und gilt wie bisher bis 24 h als laufend.
+            Ok(mut f) => {
+                let _ = f.write_all(marke_inhalt().as_bytes());
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -1193,7 +1543,14 @@ fn zum_schreiben_oeffnen(p: &Path) -> io::Result<File> {
 /// FILE_FLAG_OPEN_REPARSE_POINT), ohne an einer FIFO zu warten (O_NONBLOCK;
 /// bei einer gewoehnlichen Datei wirkt es nicht), und genommen wird nur, was
 /// nach den Metadaten des offenen Griffs eine gewoehnliche Datei ist.
-fn zum_lesen_oeffnen(p: &Path) -> io::Result<File> {
+///
+/// O_NOFOLLOW bzw. FILE_FLAG_OPEN_REPARSE_POINT wirken nur auf den letzten
+/// Bestandteil. Legt ein anderer Prozess nach dem Auflisten einen
+/// Zwischenordner als Verknuepfung auf einen fremden Ordner an, oeffnete der
+/// Pfad eine fremde Datei (Gesamtdurchsicht [0]). Deshalb muss der offene
+/// Griff die Datei sein, die das Auflisten gesehen hat (`ort`, ort_pruefen);
+/// sonst Fehler, beim Sender Ende 2.
+fn zum_lesen_oeffnen(p: &Path, ort: &Ort) -> io::Result<File> {
     let mut o = OpenOptions::new();
     o.read(true);
     // O_NOFOLLOW 0x0100, O_NONBLOCK 0x0004 (sys/fcntl.h)
@@ -1220,12 +1577,95 @@ fn zum_lesen_oeffnen(p: &Path) -> io::Result<File> {
         if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             let zweit = File::open(p)?;
             return match (datei_nummer(&f), datei_nummer(&zweit)) {
-                (Some(a), Some(b)) if a == b => Ok(zweit),
+                (Some(a), Some(b)) if a == b => {
+                    ort_pruefen(&zweit, ort)?;
+                    Ok(zweit)
+                }
                 _ => Err(io::Error::other("Datei wurde beim Oeffnen ersetzt")),
             };
         }
     }
+    ort_pruefen(&f, ort)?;
     Ok(f)
+}
+
+/// Was das Auflisten von einer Quelle gesehen hat. Beim Oeffnen (Datei) und
+/// nach dem Lesen eines Ordners wird geprueft, dass unter dem Pfad noch
+/// dasselbe liegt: unter Unix Geraet und Inode (lstat beim Auflisten gegen
+/// fstat des offenen Griffs), unter Windows der endgueltige Pfad des Griffs
+/// (GetFinalPathNameByHandleW) gegen den erwarteten - kanonischer Ordner
+/// ueber dem obersten Eintrag plus relativer Pfad. Leer (Default): nichts zu
+/// pruefen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ort {
+    /// Unix: (st_dev, st_ino).
+    pub kennung: Option<(u64, u64)>,
+    /// Windows: der erwartete endgueltige Pfad (Form \\?\C:\...).
+    pub pfad: Option<PathBuf>,
+}
+
+fn verlegt() -> io::Error {
+    io::Error::other("seit dem Auflisten ersetzt oder verlegt")
+}
+
+/// Geraet und Inode (Unix).
+#[cfg(unix)]
+fn kennung_von(md: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn kennung_von(_md: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Ist der offene Griff die Quelle, die das Auflisten gesehen hat?
+fn ort_pruefen(f: &File, ort: &Ort) -> io::Result<()> {
+    if let Some(k) = ort.kennung {
+        if kennung_von(&f.metadata()?) != Some(k) {
+            return Err(verlegt());
+        }
+    }
+    #[cfg(windows)]
+    if let Some(erwartet) = &ort.pfad {
+        // Laesst sich der Pfad nicht ermitteln (manche Dateisysteme), bleibt
+        // es bei den uebrigen Pruefungen.
+        if let Some(echt) = endgueltiger_pfad(f) {
+            if !echt.as_os_str().eq_ignore_ascii_case(erwartet.as_os_str()) {
+                return Err(verlegt());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Der endgueltige Pfad eines offenen Griffs, alle Verknuepfungen aufgeloest,
+/// in derselben Form wie fs::canonicalize (\\?\C:\...).
+#[cfg(windows)]
+fn endgueltiger_pfad(f: &File) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS};
+    let mut puffer = vec![0u16; 512];
+    for _ in 0..3 {
+        // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS = 0, wie fs::canonicalize.
+        // SAFETY: der Griff gehoert `f` und lebt bis nach dem Aufruf; die
+        // Laenge des Puffers reicht die windows-Crate aus dem Slice weiter.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(HANDLE(f.as_raw_handle()), &mut puffer, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
+        } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < puffer.len() {
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&puffer[..n])));
+        }
+        // Zu klein: n ist die noetige Laenge samt NUL.
+        puffer = vec![0u16; n + 1];
+    }
+    None
 }
 
 /// Datentraeger und Dateinummer eines offenen Griffs (Windows).
@@ -1271,6 +1711,9 @@ pub struct Liste {
     pub eintraege: Vec<Eintrag>,
     /// Je Eintrag die Quelle auf der Platte.
     pub quellen: Vec<PathBuf>,
+    /// Je Eintrag, was das Auflisten von der Quelle sah (siehe Ort); der
+    /// Sender prueft den offenen Griff dagegen.
+    pub orte: Vec<Ort>,
     pub gesamt: u64,
     /// Protokollzeilen fuer Uebersprungenes.
     pub hinweise: Vec<String>,
@@ -1281,7 +1724,7 @@ pub struct Liste {
 struct Auflister {
     liste: Liste,
     g: Grenzen,
-    /// Schon vergebene Pfade, streng bereinigt und klein geschrieben.
+    /// Schon vergebene Pfade: streng bereinigt, als vergleichsschluessel.
     gesehen: HashSet<String>,
     /// Laenge des Angebots bis hier.
     laenge: usize,
@@ -1289,8 +1732,9 @@ struct Auflister {
 
 /// Listet die kopierten Pfade rekursiv auf. Verknuepfungen (auch Junctions),
 /// besondere Dateien und fuer die Gegenseite ungueltige oder doppelte Namen
-/// werden uebersprungen, jeweils mit Hinweis. Ueber EINTRAEGE_MAX,
-/// GESAMT_MAX oder ANGEBOT_MAX: zu_gross, und die Suche endet.
+/// werden uebersprungen, jeweils mit Hinweis. Die Namen im Angebot stehen in
+/// NFC. Ueber EINTRAEGE_MAX, GESAMT_MAX oder ANGEBOT_MAX: zu_gross, und die
+/// Suche endet.
 pub fn auflisten(pfade: &[PathBuf]) -> Liste {
     auflisten_mit(pfade, Grenzen::default())
 }
@@ -1310,9 +1754,92 @@ pub fn auflisten_mit(pfade: &[PathBuf], g: Grenzen) -> Liste {
             a.hinweis("Name nicht in UTF-8", p);
             continue;
         };
-        a.eintrag(p, name.to_string(), 1);
+        a.eintrag(p, nfc(name), 1, fs::symlink_metadata(p), erwarteter_pfad_oben(p));
     }
     a.liste
+}
+
+/// Windows: wo ein oberster Eintrag endgueltig liegen muss - im kanonischen
+/// Ordner darueber (dort darf der Nutzer Verknuepfungen haben, das ist sein
+/// Weg zur Quelle), unter seinem eigenen Namen. Ab da darf nichts mehr
+/// umleiten. Den Namen liefert das Dateisystem selbst (ein Kurzname wie
+/// LANGER~1.TXT waere sonst nie gleich dem endgueltigen Pfad), aber nur,
+/// wenn er dabei im selben Ordner bleibt.
+#[cfg(windows)]
+fn erwarteter_pfad_oben(p: &Path) -> Option<PathBuf> {
+    let eltern = match p.parent() {
+        Some(e) if !e.as_os_str().is_empty() => e,
+        _ => Path::new("."),
+    };
+    let eltern = fs::canonicalize(eltern).ok()?;
+    match fs::canonicalize(p) {
+        Ok(echt) if echt.parent().is_some_and(|e| e.as_os_str().eq_ignore_ascii_case(eltern.as_os_str())) => Some(echt),
+        _ => Some(eltern.join(p.file_name()?)),
+    }
+}
+
+#[cfg(not(windows))]
+fn erwarteter_pfad_oben(_p: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Ein Kind eines Ordners: Name (wie auf der Platte), Pfad, Metadaten (lstat).
+type Kind = (String, PathBuf, io::Result<fs::Metadata>);
+
+/// Liest einen Ordner, den das Auflisten als `ort` gesehen hat: Namen und je
+/// Kind die Metadaten, ohne Verknuepfungen zu folgen. read_dir folgte aber
+/// einer Verknuepfung, die ein anderer Prozess eben an die Stelle des
+/// Ordners gelegt hat - dann stammten Namen und Metadaten aus einem fremden
+/// Ordner. Deshalb wird danach geprueft, dass unter dem Pfad noch derselbe
+/// Ordner liegt (ordner_unveraendert); sonst Err und kein Kind. Liefert die
+/// Kinder und Hinweise (Pfad, was).
+fn ordner_lesen(p: &Path, ort: &Ort) -> Result<(Vec<Kind>, Vec<(PathBuf, String)>), String> {
+    let rd = fs::read_dir(p).map_err(|e| format!("Ordner nicht lesbar: {e}"))?;
+    let mut kinder = Vec::new();
+    let mut hinweise = Vec::new();
+    for e in rd {
+        match e {
+            Ok(e) => {
+                let pfad = e.path();
+                match e.file_name().into_string() {
+                    Ok(n) => {
+                        let md = fs::symlink_metadata(&pfad);
+                        kinder.push((n, pfad, md));
+                    }
+                    Err(_) => hinweise.push((pfad, "Name nicht in UTF-8".to_string())),
+                }
+            }
+            Err(err) => hinweise.push((p.to_path_buf(), format!("Ordner nicht ganz lesbar: {err}"))),
+        }
+    }
+    if !ordner_unveraendert(p, ort) {
+        return Err("Ordner wurde beim Auflisten ersetzt".into());
+    }
+    Ok((kinder, hinweise))
+}
+
+/// Liegt unter `p` noch der Ordner, den das Auflisten gesehen hat - ein
+/// Ordner, keine Verknuepfung, mit derselben Kennung bzw. demselben
+/// endgueltigen Pfad?
+fn ordner_unveraendert(p: &Path, ort: &Ort) -> bool {
+    let Ok(md) = fs::symlink_metadata(p) else { return false };
+    if !md.is_dir() || md.file_type().is_symlink() {
+        return false;
+    }
+    if let Some(k) = ort.kennung {
+        if kennung_von(&md) != Some(k) {
+            return false;
+        }
+    }
+    #[cfg(windows)]
+    if let Some(erwartet) = &ort.pfad {
+        if let Ok(echt) = fs::canonicalize(p) {
+            if !echt.as_os_str().eq_ignore_ascii_case(erwartet.as_os_str()) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl Auflister {
@@ -1320,8 +1847,17 @@ impl Auflister {
         self.liste.hinweise.push(format!("Dateien: uebersprungen ({was}): {}", p.display()));
     }
 
-    fn eintrag(&mut self, quelle: &Path, rel: String, tiefe: usize) {
-        let md = match fs::symlink_metadata(quelle) {
+    /// `rel`: der Pfad im Angebot (Namen in NFC); `md`: lstat der Quelle;
+    /// `erwartet`: Windows, siehe Ort.
+    fn eintrag(
+        &mut self,
+        quelle: &Path,
+        rel: String,
+        tiefe: usize,
+        md: io::Result<fs::Metadata>,
+        erwartet: Option<PathBuf>,
+    ) {
+        let md = match md {
             Ok(m) => m,
             Err(e) => return self.hinweis(&format!("nicht lesbar: {e}"), quelle),
         };
@@ -1339,21 +1875,20 @@ impl Auflister {
         if rel.len() > PFAD_MAX || tiefe > TIEFE_MAX {
             return self.hinweis("Pfad zu lang oder zu tief", quelle);
         }
-        let schluessel = rel
-            .split('/')
-            .map(|t| bestandteil_bereinigen(t, Regeln::Windows))
-            .collect::<Vec<_>>()
-            .join("/")
-            .to_lowercase();
-        if !self.gesehen.insert(schluessel) {
+        // Die strengste Bereinigung (Windows), NFC und volle Schreibweise:
+        // was irgendein Empfaenger gleich saehe, geht nur einmal hinaus.
+        let bereinigt = rel.split('/').map(|t| bestandteil_bereinigen(t, Regeln::Windows)).collect::<Vec<_>>().join("/");
+        if !self.gesehen.insert(vergleichsschluessel(&bereinigt)) {
             return self.hinweis("doppelter Name, nur der erste geht hinaus", quelle);
         }
         let (art, groesse) =
             if art.is_dir() { (EintragArt::Ordner, 0) } else { (EintragArt::Datei, md.len()) };
+        let ort = Ort { kennung: kennung_von(&md), pfad: erwartet };
         self.laenge += EINTRAG_KOPF + rel.len();
         self.liste.gesamt = self.liste.gesamt.saturating_add(groesse);
         self.liste.eintraege.push(Eintrag { art, pfad: rel.clone(), groesse });
         self.liste.quellen.push(quelle.to_path_buf());
+        self.liste.orte.push(ort.clone());
         if self.liste.eintraege.len() > self.g.eintraege as usize {
             self.liste.zu_gross = Some(format!("mehr als {} Eintraege", self.g.eintraege));
         } else if self.liste.gesamt > self.g.gesamt {
@@ -1365,27 +1900,20 @@ impl Auflister {
         if self.liste.zu_gross.is_some() || art != EintragArt::Ordner {
             return;
         }
-        let mut kinder: Vec<(String, PathBuf)> = Vec::new();
-        match fs::read_dir(quelle) {
-            Ok(rd) => {
-                for e in rd {
-                    match e {
-                        Ok(e) => match e.file_name().into_string() {
-                            Ok(n) => kinder.push((n, e.path())),
-                            Err(_) => self.hinweis("Name nicht in UTF-8", &e.path()),
-                        },
-                        Err(err) => self.hinweis(&format!("Ordner nicht ganz lesbar: {err}"), quelle),
-                    }
-                }
-            }
-            Err(e) => return self.hinweis(&format!("Ordner nicht lesbar: {e}"), quelle),
+        let (mut kinder, hinweise) = match ordner_lesen(quelle, &ort) {
+            Ok(x) => x,
+            Err(t) => return self.hinweis(&t, quelle),
+        };
+        for (p, was) in hinweise {
+            self.hinweis(&was, &p);
         }
         kinder.sort_by(|a, b| a.0.cmp(&b.0));
-        for (n, p) in kinder {
+        for (n, p, md) in kinder {
             if self.liste.zu_gross.is_some() {
                 return;
             }
-            self.eintrag(&p, format!("{rel}/{n}"), tiefe + 1);
+            let erwartet = ort.pfad.as_ref().map(|e| e.join(&n));
+            self.eintrag(&p, format!("{rel}/{}", nfc(&n)), tiefe + 1, md, erwartet);
         }
     }
 }
@@ -1544,6 +2072,9 @@ struct SenderZustand {
     abbruch: bool,
     angenommen: bool,
     quittiert: u64,
+    /// Datenbytes, die hinaus sind oder eben hinausgehen: bis hierhin darf
+    /// eine Quittung reichen (Griff::quittung kappt).
+    gesendet: u64,
     /// Letzter Fortschritt (Angebot hinaus, erste Quittung, mehr quittiert).
     letzte: Option<Instant>,
     /// Quittung mit Zustand ungleich 0.
@@ -1571,6 +2102,7 @@ impl Drop for SenderEndet<'_> {
 }
 
 impl Sender {
+    /// Ohne Vorgaenger, festes Fenster, Vorgaben::default().
     pub fn starten(
         pfade: Vec<PathBuf>,
         weg: Arc<dyn Weg>,
@@ -1580,6 +2112,7 @@ impl Sender {
         Sender::starten_mit(pfade, weg, fenster, melden, Vorgaben::default())
     }
 
+    /// Ohne Vorgaenger, festes Fenster.
     pub fn starten_mit(
         pfade: Vec<PathBuf>,
         weg: Arc<dyn Weg>,
@@ -1587,22 +2120,82 @@ impl Sender {
         melden: impl Fn(Ereignis) + Send + 'static,
         vorgaben: Vorgaben,
     ) -> Griff {
+        Sender::starten_nach(None, pfade, weg, move || fenster, melden, vorgaben)
+    }
+
+    /// Startet eine Sendung, die `vorgaenger` ersetzt (neuer Inhalt; siehe
+    /// Modulkopf): der Vorgaenger bricht sofort ab, der neue Faden wartet
+    /// hoechstens ende_frist + VORGAENGER_RAND auf sein Ende, bevor er etwas
+    /// tut. Das Warten laesst sich nicht abbrechen (es ist begrenzt): so
+    /// deckt es auch eine Kette ab - wird dieser Sender waehrenddessen selbst
+    /// ersetzt, wartet sein Nachfolger auf ihn und damit auch auf dessen
+    /// Vorgaenger. `fenster` wird vor jedem Stueck gefragt, nie unter einer
+    /// Sperre dieses Moduls (es darf also etwa mit try_lock nach dem
+    /// Spielmodus sehen). Kehrt sofort zurueck.
+    pub fn starten_nach(
+        vorgaenger: Option<Griff>,
+        pfade: Vec<PathBuf>,
+        weg: Arc<dyn Weg>,
+        fenster: impl Fn() -> u64 + Send + 'static,
+        melden: impl Fn(Ereignis) + Send + 'static,
+        vorgaben: Vorgaben,
+    ) -> Griff {
+        if let Some(v) = &vorgaenger {
+            v.abbrechen();
+        }
         let innen = Arc::new(SenderInnen {
             kennung: neue_kennung(),
             z: Mutex::new(SenderZustand::default()),
             cv: Condvar::new(),
         });
         let faden = innen.clone();
-        let fenster = fenster.max(1);
         let gestartet = std::thread::Builder::new().name("qc-dateien-senden".into()).spawn(move || {
             let _endet = SenderEndet(&faden);
-            faden.lauf(&pfade, &*weg, fenster, &melden, &vorgaben);
+            if let Err(e) = faden_nachrang() {
+                melden(Ereignis::zeile(format!("Dateien: Sender ohne Nachrang ({e})")));
+            }
+            if let Some(v) = vorgaenger {
+                v.abwarten(vorgaben.ende_frist + VORGAENGER_RAND);
+            }
+            faden.lauf(&pfade, &*weg, &fenster, &melden, &vorgaben);
         });
         if gestartet.is_err() {
             sperre(&innen.z).beendet = true;
         }
         Griff { innen }
     }
+}
+
+/// Faeden dieses Moduls laufen mit Nachrang ("Latenz vor Bandbreite", auch
+/// auf knapper CPU: der Integrationstest sah mit einem Encoder in Software
+/// 25 bis 75 ms mehr Verzoegerung, solange eine Datei lief). Windows:
+/// THREAD_PRIORITY_BELOW_NORMAL; macOS: QOS_CLASS_UTILITY (der Planer gibt
+/// dem Faden weniger Rechenzeit und die langsameren Kerne).
+#[cfg(windows)]
+fn faden_nachrang() -> Result<(), String> {
+    use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: GetCurrentThread liefert einen Pseudogriff auf den eigenen
+    // Faden, der nicht geschlossen werden muss.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) }.map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn faden_nachrang() -> Result<(), String> {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(klasse: u32, relativ: i32) -> i32;
+    }
+    // QOS_CLASS_UTILITY (sys/qos.h)
+    const QOS_CLASS_UTILITY: u32 = 0x11;
+    // SAFETY: betrifft nur den aufrufenden Faden.
+    match unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) } {
+        0 => Ok(()),
+        r => Err(format!("pthread_set_qos_class_self_np: {r}")),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn faden_nachrang() -> Result<(), String> {
+    Ok(())
 }
 
 impl Griff {
@@ -1621,11 +2214,19 @@ impl Griff {
             return;
         }
         if q.zustand == ZUSTAND_LAEUFT {
+            // Hoechstens bis zur gesendeten Menge (wie der Mac-Host): eine
+            // Quittung darueber hinaus oeffnete sonst das Fenster ganz und
+            // liesse die Stillstandsuhr stehen, weil danach keine echte
+            // Quittung mehr als Fortschritt gaelte. Das schuetzt vor einer
+            // einzelnen falschen Quittung; eine Gegenseite, die immer wieder
+            // zu viel quittiert, bremst es nicht - das trifft nur ihre eigene
+            // Strecke.
+            let empfangen = q.empfangen.min(z.gesendet);
             // Nur Fortschritt zaehlt als neue Quittung; eine Wiederholung
             // desselben Standes haelt den Sender nicht am Leben.
-            if !z.angenommen || q.empfangen > z.quittiert {
+            if !z.angenommen || empfangen > z.quittiert {
                 z.angenommen = true;
-                z.quittiert = z.quittiert.max(q.empfangen);
+                z.quittiert = z.quittiert.max(empfangen);
                 z.letzte = Some(Instant::now());
             }
         } else {
@@ -1728,9 +2329,13 @@ impl SenderInnen {
     }
 
     /// Wartet, bis unter dem Fenster Platz ist; liefert den freien Platz.
-    fn fenster_abwarten(&self, gesendet: u64, fenster: u64, v: &Vorgaben) -> Result<u64, Aus> {
-        let mut z = sperre(&self.z);
+    /// Das Fenster wird in jeder Runde neu gefragt, und zwar vor der Sperre:
+    /// der Lieferant der Rolle darf eine eigene Sperre versuchen, die ein
+    /// anderer Faden haelt, waehrend er Griff::quittung ruft.
+    fn fenster_abwarten(&self, gesendet: u64, fenster: &dyn Fn() -> u64, v: &Vorgaben) -> Result<u64, Aus> {
         loop {
+            let fenster = fenster().max(1);
+            let z = sperre(&self.z);
             SenderInnen::pruefen(&z)?;
             let unterwegs = gesendet.saturating_sub(z.quittiert);
             if unterwegs < fenster {
@@ -1741,7 +2346,7 @@ impl SenderInnen {
             if jetzt >= frist {
                 return Err(Aus::Stillstand);
             }
-            z = warten(&self.cv, z, frist - jetzt);
+            drop(warten(&self.cv, z, frist - jetzt));
         }
     }
 
@@ -1781,8 +2386,11 @@ impl SenderInnen {
         }
     }
 
-    fn lauf(&self, pfade: &[PathBuf], weg: &dyn Weg, fenster: u64, melden: &dyn Fn(Ereignis), v: &Vorgaben) {
-        if aus_eigener_ablage(pfade, &ablage_basis()) {
+    fn lauf(&self, pfade: &[PathBuf], weg: &dyn Weg, fenster: &dyn Fn() -> u64, melden: &dyn Fn(Ereignis), v: &Vorgaben) {
+        if sperre(&self.z).abbruch {
+            return;
+        }
+        if aus_eigener_ablage(pfade, &(v.eigene_basis)()) {
             melden(Ereignis::zeile("Dateien: nicht gesendet, sie stammen aus einem Empfang".into()));
             return;
         }
@@ -1811,7 +2419,7 @@ impl SenderInnen {
         let mut stand = Stand::aus_angebot(Richtung::Senden, &angebot);
         let t0 = Instant::now();
         let mut hinaus = false;
-        match self.uebertragen(&angebot, &liste.quellen, weg, fenster, melden, v, &mut stand, &mut hinaus) {
+        match self.uebertragen(&angebot, (&liste.quellen, &liste.orte), weg, fenster, melden, v, &mut stand, &mut hinaus) {
             Ok(()) => {
                 stand.bytes = stand.gesamt;
                 stand.ergebnis = Ergebnis::Fertig;
@@ -1860,9 +2468,9 @@ impl SenderInnen {
     fn uebertragen(
         &self,
         angebot: &Angebot,
-        quellen: &[PathBuf],
+        (quellen, orte): (&[PathBuf], &[Ort]),
         weg: &dyn Weg,
-        fenster: u64,
+        fenster: &dyn Fn() -> u64,
         melden: &dyn Fn(Ereignis),
         v: &Vorgaben,
         stand: &mut Stand,
@@ -1885,7 +2493,7 @@ impl SenderInnen {
                 continue;
             }
             let quelle = &quellen[i];
-            let mut f = zum_lesen_oeffnen(quelle)
+            let mut f = zum_lesen_oeffnen(quelle, &orte[i])
                 .map_err(|err| Aus::Lesefehler(format!("{}: {err}", quelle.display())))?;
             let mut versatz = 0u64;
             while versatz < e.groesse {
@@ -1907,6 +2515,9 @@ impl SenderInnen {
                 }
                 Stueck { kennung: self.kennung, eintrag: i as u32, versatz, daten: &puffer[..n] }
                     .kodieren_in(&mut rahmen);
+                // Vor dem Senden: ein schneller Empfaenger quittiert sonst,
+                // bevor die Kappe in Griff::quittung das Stueck kennt.
+                sperre(&self.z).gesendet = gesendet + n as u64;
                 self.senden(weg, DATEI_STUECK, &rahmen, v)?;
                 gesendet += n as u64;
                 versatz += n as u64;
@@ -1951,9 +2562,12 @@ enum Eingang {
     Angebot(Vec<u8>),
     Stueck(Vec<u8>),
     Ende(Vec<u8>),
-    /// Die Warteschlange lief ueber; die Kennung der verworfenen Nachricht
-    /// und der Grund fuer das Protokoll.
-    Ueberlauf(Option<u32>, &'static str),
+    /// Die Warteschlange lief ueber; der Grund fuer das Protokoll. Die
+    /// laufende Uebertragung endet mit Quittung 4, gleich welche Kennung die
+    /// verworfene Nachricht trug - sonst laege sie still, bis STILLSTAND
+    /// vergangen ist (die Warteschlange nimmt bis zum naechsten Angebot
+    /// nichts mehr an).
+    Ueberlauf(&'static str),
 }
 
 /// Was ein wartendes Stueck gegen WARTEND_DATEN_MAX zaehlt: seine Daten,
@@ -1992,6 +2606,9 @@ impl Empfaenger {
         let faden = innen.clone();
         let gestartet = std::thread::Builder::new().name("qc-dateien-empfang".into()).spawn(move || {
             let _endet = EmpfEndet(&faden);
+            if let Err(e) = faden_nachrang() {
+                melden(Ereignis::zeile(format!("Dateien: Empfaenger ohne Nachrang ({e})")));
+            }
             let mut s = Schreiber {
                 basis,
                 weg,
@@ -2035,8 +2652,7 @@ impl Empfaenger {
                 let d = stueck_daten(&nutzlast);
                 if q.daten + d > WARTEND_DATEN_MAX {
                     q.ueberlauf = true;
-                    let k = kennung_lesen(&nutzlast);
-                    q.eingang.push_back(Eingang::Ueberlauf(k, "mehr als das Fenster unquittiert"));
+                    q.eingang.push_back(Eingang::Ueberlauf("mehr als das Fenster unquittiert"));
                 } else {
                     q.daten += d;
                     q.eingang.push_back(Eingang::Stueck(nutzlast));
@@ -2048,8 +2664,7 @@ impl Empfaenger {
                 }
                 if q.enden >= WARTEND_ENDEN_MAX {
                     q.ueberlauf = true;
-                    let k = kennung_lesen(&nutzlast);
-                    q.eingang.push_back(Eingang::Ueberlauf(k, "zu viele Enden"));
+                    q.eingang.push_back(Eingang::Ueberlauf("zu viele Enden"));
                 } else {
                     q.enden += 1;
                     // Mehr als ENDE_MIN Byte liest niemand; ein langes Ende
@@ -2117,6 +2732,9 @@ struct Uebertragung {
     /// Stand der letzten Quittung, die der Weg genommen hat (Gesendet::Ja);
     /// None, solange nicht einmal die Quittung 0 hinaus ist.
     quittiert: Option<u64>,
+    /// Wann der Weg zuletzt eine Quittung nahm (fuer das Nachquittieren im
+    /// Leerlauf).
+    quittiert_um: Instant,
     /// Nach Voll erst ab dann wieder quittieren.
     nochmal: Option<Instant>,
     datei: Option<File>,
@@ -2277,6 +2895,21 @@ impl Schreiber {
                             if let Some(t) = u.nochmal {
                                 wecken = Some(wecken.map_or(t, |w| w.min(t)));
                             }
+                        } else {
+                            // Leerlauf: alles quittiert, kein Stueck. Den
+                            // Stand nach nachquittieren wiederholen - Ja hiess
+                            // nur "eingereiht", und wartet der Sender am
+                            // Fenster auf eine Quittung, die danach verloren
+                            // ging, kaeme sonst keins mehr (Modulkopf). Nach
+                            // Voll erst nach voll_warten.
+                            let mut nach = u.quittiert_um.max(u.letzte) + self.v.nachquittieren;
+                            if let Some(t) = u.nochmal {
+                                nach = nach.max(t);
+                            }
+                            if jetzt >= nach {
+                                break Holen::Quittieren;
+                            }
+                            frist = Some(st.min(nach));
                         }
                     }
                     match (wecken, frist) {
@@ -2308,10 +2941,8 @@ impl Schreiber {
                 Holen::Nachricht(Eingang::Angebot(n)) => self.angebot(&n),
                 Holen::Nachricht(Eingang::Stueck(n)) => self.stueck(&n),
                 Holen::Nachricht(Eingang::Ende(n)) => self.ende(&n),
-                Holen::Nachricht(Eingang::Ueberlauf(k, grund)) => {
-                    if self.aktiv(k) {
-                        self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(grund.to_string()));
-                    }
+                Holen::Nachricht(Eingang::Ueberlauf(grund)) => {
+                    self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(grund.to_string()));
                 }
             }
         }
@@ -2342,15 +2973,17 @@ impl Schreiber {
     /// Zwischenquittung (Zustand 0) mit dem neuesten Stand; ein Versuch.
     /// Nur Gesendet::Ja zaehlt als quittiert. Bei Voll bleibt der Stand offen,
     /// und lauf() versucht es nach voll_warten wieder (mit dem dann neuesten
-    /// Stand), ohne das Schreiben aufzuhalten; so geht keine Quittung
-    /// verloren, und ein Sender am Fenster bleibt nicht haengen. Weg: die
-    /// Sitzung ist vorbei, die Uebertragung wird verworfen.
+    /// Stand), ohne das Schreiben aufzuhalten; ein Sender am Fenster bleibt
+    /// so nicht haengen. Im Leerlauf ruft lauf() es auch fuer einen schon
+    /// quittierten Stand (Wiederholung, siehe Modulkopf). Weg: die Sitzung
+    /// ist vorbei, die Uebertragung wird verworfen.
     fn quittieren(&mut self) {
         let Some(u) = self.ue.as_mut() else { return };
         let q = Quittung { kennung: u.kennung, zustand: ZUSTAND_LAEUFT, empfangen: u.empfangen };
         match self.weg.senden(DATEI_QUITTUNG, &q.kodieren()) {
             Gesendet::Ja => {
                 u.quittiert = Some(q.empfangen);
+                u.quittiert_um = Instant::now();
                 u.nochmal = None;
             }
             Gesendet::Voll => u.nochmal = Some(Instant::now() + self.v.voll_warten),
@@ -2489,6 +3122,7 @@ impl Schreiber {
             im_eintrag: 0,
             empfangen: 0,
             quittiert: None,
+            quittiert_um: jetzt,
             nochmal: None,
             datei: None,
             letzte: jetzt,
@@ -2627,8 +3261,10 @@ mod tests {
             stillstand: Duration::from_millis(stillstand_ms),
             voll_warten: VOLL_WARTEN,
             ende_frist: Duration::from_millis(200),
+            nachquittieren: NACHQUITTIEREN,
             freier_platz: |_| None,
             grenzen: Grenzen::default(),
+            eigene_basis: ablage_basis,
         }
     }
 
@@ -4061,16 +4697,16 @@ mod tests {
     fn zum_lesen_nur_gewoehnliche_dateien() {
         let o = Ordner::neu("lesen-oeffnen");
         let p = quelle_datei(&o, "a.bin", 10);
-        let mut f = zum_lesen_oeffnen(&p).unwrap();
+        let mut f = zum_lesen_oeffnen(&p, &Ort::default()).unwrap();
         let mut v = Vec::new();
         f.read_to_end(&mut v).unwrap();
         assert_eq!(v.len(), 10);
-        assert!(zum_lesen_oeffnen(o.p()).is_err());
+        assert!(zum_lesen_oeffnen(o.p(), &Ort::default()).is_err());
         #[cfg(unix)]
         {
             let l = o.p().join("link");
             std::os::unix::fs::symlink(&p, &l).unwrap();
-            assert!(zum_lesen_oeffnen(&l).is_err());
+            assert!(zum_lesen_oeffnen(&l, &Ort::default()).is_err());
         }
     }
 
@@ -4107,7 +4743,9 @@ mod tests {
         assert!(g.abwarten(Duration::from_secs(3)));
         assert_eq!(weg.versuche.load(Ordering::SeqCst), 0);
         assert!(zeilen(&ev).iter().any(|z| z.contains("aus einem Empfang")));
-        let _ = fs::remove_dir_all(&basis);
+        // Nur den eigenen Ordner: andere Tests legen ebenfalls unter der
+        // Basis dieses Prozesses an.
+        let _ = fs::remove_dir_all(basis.join("12-34"));
     }
 
     /// Der Widerhallschutz greift auch, wenn Basis und Pfad der Ablage
@@ -4610,5 +5248,649 @@ mod tests {
         assert_eq!(letztes(&ev_s), Some(Ergebnis::Abgebrochen(Abbruch::Hier)));
         assert!(bis(Duration::from_secs(3), || inhalt(z.p()).is_empty()), "{:?}", inhalt(z.p()));
         assert!(bis(Duration::from_secs(1), || letztes(&ev_e) == Some(Ergebnis::Abgebrochen(Abbruch::Ende(GRUND_ABGEBROCHEN)))));
+    }
+
+    // ------------------------------------------------------ Nachbesserung n-kern
+
+    /// Ein Weg, der wie der eine Datei-Platz einer Rolle der Reihe nach
+    /// mitschreibt, was hinausgeht: (Typ, Kennung, Grund bzw. Zustand).
+    /// `halten`: Kennung, deren erstes Stueck im Weg so lange haengt (wie ein
+    /// langsamer Schreibfaden); `haengt` wird gesetzt, sobald es haengt.
+    struct Reihe {
+        n: Mutex<Vec<(u8, u32, u8)>>,
+        halten: Mutex<Option<(u32, Duration)>>,
+        haengt: std::sync::atomic::AtomicBool,
+    }
+
+    impl Reihe {
+        fn neu() -> Arc<Reihe> {
+            Arc::new(Reihe { n: Mutex::new(Vec::new()), halten: Mutex::new(None), haengt: Default::default() })
+        }
+        fn stelle(&self, typ: u8, kennung: u32) -> Option<usize> {
+            sperre(&self.n).iter().position(|x| x.0 == typ && x.1 == kennung)
+        }
+    }
+
+    impl Weg for Reihe {
+        fn senden(&self, typ: u8, n: &[u8]) -> Gesendet {
+            let k = kennung_lesen(n).unwrap_or(0);
+            if typ == DATEI_STUECK {
+                let halt = sperre(&self.halten).take_if(|h| h.0 == k);
+                if let Some((_, d)) = halt {
+                    self.haengt.store(true, Ordering::SeqCst);
+                    thread::sleep(d);
+                }
+            }
+            let z = match typ {
+                DATEI_ENDE => Ende::lesen(n).map_or(0, |e| e.grund),
+                _ => 0,
+            };
+            sperre(&self.n).push((typ, k, z));
+            Gesendet::Ja
+        }
+    }
+
+    /// Wettlauf beim neuen Kopieren (Pruefstand der Host-Rolle): der neue
+    /// Sender schickt sein Angebot erst, wenn der abgebrochene Vorgaenger sein
+    /// Ende 1 hinaus hat - auch wenn der gerade in einem langsamen Weg steckt.
+    /// Ohne das Warten ginge das neue Angebot waehrend der 300 ms hinaus.
+    #[test]
+    fn neuer_sender_wartet_auf_das_ende_des_vorgaengers() {
+        let o = Ordner::neu("vorgaenger");
+        let pa = quelle_datei(&o, "a.bin", 300_000);
+        let pb = quelle_datei(&o, "b.bin", 1000);
+        let weg = Reihe::neu();
+        let (ev_a, melden_a) = sammler();
+        let a = Sender::starten_mit(vec![pa], weg.clone(), FENSTER, melden_a, vorgaben(5000));
+        let ka = a.kennung();
+        *sperre(&weg.halten) = Some((ka, Duration::from_millis(300)));
+        assert!(bis(Duration::from_secs(3), || weg.haengt.load(Ordering::SeqCst)), "A kam nicht in den Weg");
+        let (ev_b, melden_b) = sammler();
+        let b = Sender::starten_nach(Some(a), vec![pb], weg.clone(), || FENSTER, melden_b, vorgaben(5000));
+        let kb = b.kennung();
+        assert!(bis(Duration::from_secs(3), || weg.stelle(DATEI_ANGEBOT, kb).is_some()), "B schickt kein Angebot");
+        let ende_a = weg.stelle(DATEI_ENDE, ka);
+        let angebot_b = weg.stelle(DATEI_ANGEBOT, kb);
+        assert!(
+            matches!((ende_a, angebot_b), (Some(e), Some(an)) if e < an),
+            "Ende(A) {ende_a:?} nicht vor Angebot(B) {angebot_b:?}: {:?}",
+            sperre(&weg.n)
+        );
+        assert_eq!(sperre(&weg.n)[ende_a.unwrap()].2, GRUND_ABGEBROCHEN);
+        assert_eq!(letztes(&ev_a), Some(Ergebnis::Abgebrochen(Abbruch::Hier)));
+        b.quittung(&Quittung { kennung: kb, zustand: ZUSTAND_FERTIG, empfangen: 1000 }.kodieren());
+        assert!(b.abwarten(Duration::from_secs(3)));
+        assert_eq!(letztes(&ev_b), Some(Ergebnis::Fertig));
+    }
+
+    /// Das Warten auf den Vorgaenger ist begrenzt: haengt er, geht das neue
+    /// Angebot nach ende_frist + VORGAENGER_RAND trotzdem hinaus.
+    #[test]
+    fn warten_auf_den_vorgaenger_ist_begrenzt() {
+        let o = Ordner::neu("vorgaenger-haengt");
+        let pa = quelle_datei(&o, "a.bin", 300_000);
+        let pb = quelle_datei(&o, "b.bin", 1000);
+        let weg = Reihe::neu();
+        let (_ev_a, melden_a) = sammler();
+        let a = Sender::starten_mit(vec![pa], weg.clone(), FENSTER, melden_a, vorgaben(5000));
+        *sperre(&weg.halten) = Some((a.kennung(), Duration::from_secs(3)));
+        assert!(bis(Duration::from_secs(3), || weg.haengt.load(Ordering::SeqCst)));
+        let t0 = Instant::now();
+        let (_ev_b, melden_b) = sammler();
+        let b = Sender::starten_nach(Some(a), vec![pb], weg.clone(), || FENSTER, melden_b, vorgaben(5000));
+        let kb = b.kennung();
+        assert!(bis(Duration::from_secs(3), || weg.stelle(DATEI_ANGEBOT, kb).is_some()));
+        let d = t0.elapsed();
+        let frist = vorgaben(5000).ende_frist + VORGAENGER_RAND;
+        assert!(d >= frist - Duration::from_millis(50) && d < frist + Duration::from_millis(1500), "{d:?}");
+    }
+
+    /// Gesamtdurchsicht [1]: eine Quittung ueber die gesendete Menge hinaus
+    /// wird gekappt. Ohne Kappe oeffnete sie das Fenster ganz (alles ginge
+    /// hinaus), und danach gaelte keine echte Quittung mehr als Fortschritt:
+    /// die Sendung braeche nach STILLSTAND ab.
+    #[test]
+    fn quittung_ueber_die_gesendete_menge_wird_gekappt() {
+        let o = Ordner::neu("kappe");
+        let p = quelle_datei(&o, "a.bin", 3_000_000);
+        let weg = Rekorder::neu();
+        // Ein langsamer Weg: 8 ms je Stueck, 62 Stuecke dauern ueber 400 ms.
+        let langsam: Arc<dyn Weg> = {
+            let w = weg.clone();
+            Arc::new(move |t: u8, n: &[u8]| {
+                if t == DATEI_STUECK {
+                    thread::sleep(Duration::from_millis(8));
+                }
+                w.senden(t, n)
+            })
+        };
+        let (ev, melden) = sammler();
+        let g = Arc::new(Sender::starten_mit(vec![p], langsam, FENSTER_SPIEL, melden, vorgaben(400)));
+        let k = g.kennung();
+        assert!(bis(Duration::from_secs(3), || weg.datenbytes() == FENSTER_SPIEL));
+        g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: 0 }.kodieren());
+        g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: u64::MAX }.kodieren());
+        thread::sleep(Duration::from_millis(150));
+        // Die falsche Quittung zaehlt nur bis zur gesendeten Menge: ein
+        // Fenster mehr, nicht alles.
+        assert_eq!(weg.datenbytes(), 2 * FENSTER_SPIEL, "Fenster durch die falsche Quittung geoeffnet");
+        // Danach quittiert ein ordentlicher Empfaenger, was ankommt; das ist
+        // Fortschritt, die Sendung laeuft durch.
+        let (g2, w2) = (g.clone(), weg.clone());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let quittierer = thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                g2.quittung(&Quittung { kennung: k, zustand: 0, empfangen: w2.datenbytes() }.kodieren());
+                thread::sleep(Duration::from_millis(3));
+            }
+        });
+        let alles = bis(Duration::from_secs(5), || !weg.enden().is_empty());
+        stop.store(true, Ordering::SeqCst);
+        quittierer.join().unwrap();
+        assert!(alles, "kein Ende");
+        assert_eq!(weg.enden()[0].grund, GRUND_VOLLSTAENDIG, "{:?}", zeilen(&ev));
+        g.quittung(&Quittung { kennung: k, zustand: ZUSTAND_FERTIG, empfangen: 3_000_000 }.kodieren());
+        assert!(g.abwarten(Duration::from_secs(3)));
+        assert_eq!(letztes(&ev), Some(Ergebnis::Fertig), "{:?}", zeilen(&ev));
+    }
+
+    /// Gesamtdurchsicht [2]: im Leerlauf wiederholt der Empfaenger seinen
+    /// Stand nach nachquittieren.
+    #[test]
+    fn empfaenger_wiederholt_den_stand_im_leerlauf() {
+        let b = Ordner::neu("nachquittieren");
+        let mut v = vorgaben(5000);
+        v.nachquittieren = Duration::from_millis(100);
+        let t = testempfang(b.p(), v);
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 10]));
+        let zehn = || t.weg.quittungen().iter().filter(|q| **q == Quittung { kennung: 7, zustand: 0, empfangen: 10 }).count();
+        assert!(bis(Duration::from_secs(3), || zehn() >= 1));
+        thread::sleep(Duration::from_millis(450));
+        assert!(zehn() >= 3, "{} Wiederholungen in 450 ms", zehn());
+        // Nicht mehr als etwa alle 100 ms.
+        assert!(zehn() <= 8, "{} Wiederholungen in 450 ms", zehn());
+    }
+
+    /// Gesamtdurchsicht [2] im ganzen Lauf: der Quittungsweg nimmt ab 500 KB
+    /// 50 ms lang Quittungen mit Ja an, stellt sie aber nicht zu (Eingabekanal
+    /// neu aufgebaut). Der Sender steht dann am Fenster; ohne Wiederholung
+    /// kaeme nie wieder eine Quittung, und beide braechen nach STILLSTAND ab.
+    #[test]
+    fn verlorene_zwischenquittung_haelt_nicht_bis_stillstand() {
+        let q = Ordner::neu("verloren-quelle");
+        let z = Ordner::neu("verloren-ziel");
+        let p = quelle_datei(&q, "a.bin", 1_500_000);
+        let mut v = vorgaben(3000);
+        v.nachquittieren = Duration::from_millis(100);
+        let (qtx, qrx) = mpsc::channel::<Vec<u8>>();
+        let qtx = Mutex::new(qtx);
+        let beginn: Mutex<Option<Instant>> = Mutex::new(None);
+        let verloren = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let v2 = verloren.clone();
+        let fertig: Fertig = Arc::new(Mutex::new(None));
+        let f2 = fertig.clone();
+        let (ev_e, me) = sammler();
+        let empf = Arc::new(Empfaenger::neu_mit(
+            z.p().to_path_buf(),
+            Arc::new(move |_t: u8, n: &[u8]| {
+                let qu = Quittung::lesen(n).unwrap();
+                if qu.zustand == ZUSTAND_LAEUFT && qu.empfangen >= 500_000 {
+                    let seit = *sperre(&beginn).get_or_insert_with(Instant::now);
+                    if seit.elapsed() < Duration::from_millis(50) {
+                        v2.fetch_add(1, Ordering::SeqCst);
+                        return Gesendet::Ja;
+                    }
+                }
+                let _ = sperre(&qtx).send(n.to_vec());
+                Gesendet::Ja
+            }),
+            move |pf| {
+                *sperre(&f2) = Some(pf);
+                true
+            },
+            me,
+            v,
+        ));
+        let e2 = empf.clone();
+        let (ev_s, ms) = sammler();
+        let t0 = Instant::now();
+        let griff = Arc::new(Sender::starten_mit(
+            vec![p.clone()],
+            Arc::new(move |t: u8, n: &[u8]| {
+                e2.nachricht(t, n.to_vec());
+                Gesendet::Ja
+            }),
+            FENSTER_SPIEL,
+            ms,
+            v,
+        ));
+        let g2 = griff.clone();
+        thread::spawn(move || {
+            while let Ok(q) = qrx.recv() {
+                g2.quittung(&q);
+            }
+        });
+        assert!(griff.abwarten(Duration::from_secs(10)), "Sender haengt");
+        let dauer = t0.elapsed();
+        assert!(verloren.load(Ordering::SeqCst) > 0, "keine Quittung verloren - Probe ohne Wert");
+        assert_eq!(letztes(&ev_s), Some(Ergebnis::Fertig), "{:?} nach {dauer:?}", zeilen(&ev_s));
+        assert!(dauer < Duration::from_millis(2500), "erst nach {dauer:?}");
+        assert!(bis(Duration::from_secs(3), || letztes(&ev_e) == Some(Ergebnis::Fertig)));
+        gleich(&p, &sperre(&fertig).clone().unwrap()[0]);
+    }
+
+    /// Gesamtdurchsicht [9]: das Fenster wird vor jedem Stueck neu gefragt.
+    /// Ein Wechsel in den Spielmodus waehrend der Uebertragung wirkt also:
+    /// danach gehen neue Daten nur, solange weniger als FENSTER_SPIEL
+    /// unquittiert ist.
+    #[test]
+    fn fenster_folgt_dem_lieferanten() {
+        let o = Ordner::neu("fenster-lieferant");
+        let p = quelle_datei(&o, "gross.bin", 1_000_000);
+        let weg = Rekorder::neu();
+        let (_ev, melden) = sammler();
+        let f = Arc::new(std::sync::atomic::AtomicU64::new(FENSTER));
+        let f2 = f.clone();
+        let g = Sender::starten_nach(None, vec![p], weg.clone(), move || f2.load(Ordering::SeqCst), melden, vorgaben(10_000));
+        let k = g.kennung();
+        assert!(bis(Duration::from_secs(3), || weg.datenbytes() == FENSTER));
+        f.store(FENSTER_SPIEL, Ordering::SeqCst);
+        // 100000 quittiert: 162144 sind noch unterwegs, mehr als das neue
+        // Fenster - nichts Neues.
+        g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: 100_000 }.kodieren());
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(weg.datenbytes(), FENSTER, "nach dem Wechsel ging mehr als das neue Fenster hinaus");
+        // Alles quittiert: genau ein neues Fenster.
+        g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: FENSTER }.kodieren());
+        assert!(bis(Duration::from_secs(3), || weg.datenbytes() == FENSTER + FENSTER_SPIEL));
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(weg.datenbytes(), FENSTER + FENSTER_SPIEL);
+        // Und zurueck: wieder das grosse Fenster.
+        f.store(FENSTER, Ordering::SeqCst);
+        g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: FENSTER + FENSTER_SPIEL }.kodieren());
+        assert!(bis(Duration::from_secs(3), || weg.datenbytes() == 2 * FENSTER + FENSTER_SPIEL));
+    }
+
+    /// Hinweis aus Phase B (f-kern): laeuft die Warteschlange mit Stuecken
+    /// einer FREMDEN Kennung ueber, endet die laufende Uebertragung sofort
+    /// mit Quittung 4 (wie beim Mac-Host) - statt still zu stehen, bis
+    /// STILLSTAND vergangen ist.
+    #[test]
+    fn ueberlauf_mit_fremder_kennung_beendet_die_laufende() {
+        let b = Ordner::neu("ueberlauf-fremd");
+        let t = testempfang(b.p(), vorgaben(5000));
+        let tor = sperre(&t.weg.tor);
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        let daten = vec![1u8; STUECK_MAX];
+        for i in 0..8u64 {
+            let s = Stueck { kennung: 8, eintrag: 0, versatz: i * STUECK_MAX as u64, daten: &daten }.kodieren();
+            t.e.nachricht(DATEI_STUECK, s);
+        }
+        assert!(sperre(&t.e.innen.q).ueberlauf);
+        drop(tor);
+        let t0 = Instant::now();
+        assert!(bis(Duration::from_secs(3), || t.weg.hat_quittung(ZUSTAND_UNGUELTIG)), "keine Quittung 4");
+        assert!(t0.elapsed() < Duration::from_secs(2), "erst nach {:?}", t0.elapsed());
+        assert_eq!(t.weg.quittungen().last().map(|q| (q.kennung, q.zustand)), Some((7, ZUSTAND_UNGUELTIG)));
+        assert!(bis(Duration::from_secs(3), || inhalt(b.p()).is_empty()));
+        let z = zeilen(&t.ev).join("\n");
+        assert!(z.contains("Dateien: abgebrochen (mehr als das Fenster unquittiert)"), "{z}");
+    }
+
+    /// Integrationstest Befund 4: die Marke nennt den empfangenden Prozess;
+    /// eine Marke, deren Prozess nicht mehr lebt oder deren Kennung jetzt ein
+    /// anderer Prozess traegt, ist verwaist - Verzeichnis und Marke gehen
+    /// beim Aufraeumen, ohne 24 h abzuwarten. Laufende (eigener Prozess) und
+    /// Marken ohne Inhalt (aeltere Staende) bleiben.
+    #[test]
+    fn verwaiste_uebertragungen_gehen_beim_aufraeumen() {
+        let eigen = std::process::id();
+        let start = eigener_start();
+        assert!(prozess_lebt(eigen) != Some(false));
+        assert_eq!(prozess_lebt(2_000_000_000), Some(false), "erfundene Prozesskennung lebt");
+        assert!(!prozess_verwaist(eigen, start));
+        assert!(prozess_verwaist(eigen, start.wrapping_add(1)));
+        assert!(prozess_verwaist(2_000_000_000, 5));
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(start != 0, "Startzeit des eigenen Prozesses unbekannt");
+            assert_eq!(prozess_start(eigen), Some(start));
+        }
+        let o = Ordner::neu("waisen");
+        let b = o.p();
+        let jetzt = unix_ms();
+        let jung = jetzt - 3_600_000;
+        let marke = |k: u32, inhalt: &str| {
+            fs::create_dir_all(b.join(format!("{jung}-{k}")).join("innen")).unwrap();
+            datei(&b.join(format!("{jung}-{k}")).join("innen").join("f"), b"f");
+            datei(&b.join(format!("{jung}-{k}{MARKE_ENDUNG}")), inhalt.as_bytes());
+        };
+        marke(1, &format!("{eigen} {start}\n"));
+        marke(2, "2000000000 5\n");
+        marke(3, &format!("{eigen} {}\n", start.wrapping_add(1)));
+        marke(4, "");
+        marke(5, "kaputt");
+        fs::create_dir_all(b.join(format!("{jung}-6"))).unwrap();
+        let n = aufraeumen_zu(b, usize::MAX, None, jetzt, None);
+        assert_eq!(n, 2, "{:?}", inhalt(b));
+        let mut e = vec![
+            format!("{jung}-1"),
+            format!("{jung}-1{MARKE_ENDUNG}"),
+            format!("{jung}-4"),
+            format!("{jung}-4{MARKE_ENDUNG}"),
+            format!("{jung}-5"),
+            format!("{jung}-5{MARKE_ENDUNG}"),
+            format!("{jung}-6"),
+        ];
+        e.sort();
+        assert_eq!(inhalt(b), e);
+        // Beim Start (mit Hoechstalter) ebenso.
+        marke(7, "2000000000 5\n");
+        assert_eq!(aufraeumen_zu(b, usize::MAX, Some(HOECHSTALTER), jetzt, None), 1);
+        assert_eq!(inhalt(b), e);
+    }
+
+    /// Die Marke eines laufenden Empfangs traegt Prozesskennung und
+    /// Startzeit dieses Prozesses.
+    #[test]
+    fn marke_nennt_den_empfangenden_prozess() {
+        let b = Ordner::neu("marke-inhalt");
+        let t = testempfang(b.p(), vorgaben(5000));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        let m = inhalt(b.p()).into_iter().find(|n| n.ends_with(MARKE_ENDUNG)).unwrap();
+        let text = fs::read_to_string(b.p().join(&m)).unwrap();
+        assert_eq!(marke_lesen(&text), Some((std::process::id(), eigener_start())), "{text:?}");
+        assert!(!marke_verwaist(&b.p().join(&m)));
+        assert_eq!(marke_lesen(""), None);
+        assert_eq!(marke_lesen("1 2 3"), None);
+        assert_eq!(marke_lesen("x 2"), None);
+    }
+
+    /// Die Prioritaet des aufrufenden Fadens: Windows GetThreadPriority,
+    /// macOS die QoS-Klasse.
+    #[cfg(windows)]
+    fn prioritaet_jetzt() -> i64 {
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: Pseudogriff auf den eigenen Faden.
+        unsafe { GetThreadPriority(GetCurrentThread()) as i64 }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prioritaet_jetzt() -> i64 {
+        extern "C" {
+            fn qos_class_self() -> u32;
+        }
+        // SAFETY: liest nur die Klasse des eigenen Fadens.
+        unsafe { qos_class_self() as i64 }
+    }
+
+    /// Latenz vor Bandbreite (Integrationstest V4): Sender- und
+    /// Empfaengerfaden laufen mit Nachrang. melden laeuft im jeweiligen
+    /// Faden und sieht dessen Prioritaet.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn faeden_laufen_mit_nachrang() {
+        let erwartet: i64 = if cfg!(windows) { -1 } else { 0x11 };
+        assert_ne!(prioritaet_jetzt(), erwartet, "schon der Testfaden hat Nachrang - Probe ohne Wert");
+        let o = Ordner::neu("nachrang");
+        let p = quelle_datei(&o, "a.bin", 100);
+        let gesehen = Arc::new(Mutex::new(Vec::<(&str, i64)>::new()));
+        let g2 = gesehen.clone();
+        let s = Sender::starten_mit(
+            vec![p],
+            Rekorder::neu(),
+            FENSTER,
+            move |_e| sperre(&g2).push(("Sender", prioritaet_jetzt())),
+            vorgaben(5000),
+        );
+        let g3 = gesehen.clone();
+        let e = Empfaenger::neu_mit(
+            o.p().join("basis"),
+            Rekorder::neu(),
+            |_| true,
+            move |_e| sperre(&g3).push(("Empfaenger", prioritaet_jetzt())),
+            vorgaben(5000),
+        );
+        e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        let beide = || {
+            let g = sperre(&gesehen);
+            g.iter().any(|x| x.0 == "Sender") && g.iter().any(|x| x.0 == "Empfaenger")
+        };
+        assert!(bis(Duration::from_secs(3), beide), "{:?}", sperre(&gesehen));
+        for (wer, prio) in sperre(&gesehen).iter() {
+            assert_eq!(*prio, erwartet, "{wer} ohne Nachrang");
+        }
+        s.abbrechen();
+        e.abbrechen();
+    }
+
+    /// Gesamtdurchsicht [0]: legt ein anderer Prozess nach dem Auflisten
+    /// einen Zwischenordner als Verknuepfung auf einen fremden Ordner an,
+    /// geht dessen Datei nicht hinaus (gleicher Name, gleiche Groesse): der
+    /// offene Griff ist nicht die Datei, die das Auflisten sah. Ende 2, kein
+    /// Datenbyte.
+    #[test]
+    fn getauschter_zwischenordner_geht_nicht_hinaus() {
+        let o = Ordner::neu("zwischenordner");
+        let draussen = o.p().join("draussen");
+        fs::create_dir_all(&draussen).unwrap();
+        datei(&draussen.join("f.txt"), b"geheim geheim");
+        let proj = o.p().join("proj");
+        fs::create_dir_all(proj.join("sub")).unwrap();
+        datei(&proj.join("sub").join("f.txt"), b"harmlos harml");
+        let weg = Rekorder::neu();
+        weg.voll.store(true, Ordering::SeqCst);
+        let (ev, melden) = sammler();
+        let g = Sender::starten_mit(vec![proj.clone()], weg.clone(), FENSTER, melden, vorgaben(5000));
+        let angelegt = std::cell::Cell::new(true);
+        nach_dem_auflisten(&proj, &weg, |p| {
+            fs::rename(p.join("sub"), p.join("sub-alt")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&draussen, p.join("sub")).unwrap();
+            // Braucht unter Windows Administratorrechte oder den Entwicklermodus.
+            #[cfg(windows)]
+            if let Err(e) = std::os::windows::fs::symlink_dir(&draussen, p.join("sub")) {
+                eprintln!("getauschter_zwischenordner_geht_nicht_hinaus: uebersprungen ({e})");
+                angelegt.set(false);
+            }
+        });
+        assert!(g.abwarten(Duration::from_secs(3)), "Sender haengt");
+        if !angelegt.get() {
+            return;
+        }
+        let alle = weg.alle();
+        assert!(!alle.iter().any(|(t, n)| *t == DATEI_STUECK && n.ends_with(b"geheim geheim")), "fremde Datei ging hinaus");
+        assert_eq!(weg.datenbytes(), 0);
+        assert_eq!(weg.enden(), vec![Ende { kennung: g.kennung(), grund: GRUND_LESEFEHLER }]);
+        assert!(
+            matches!(letztes(&ev), Some(Ergebnis::Abgebrochen(Abbruch::Lesefehler(t))) if t.contains("ersetzt")),
+            "{:?}",
+            ergebnisse(&ev)
+        );
+    }
+
+    /// Ort fuer sich: der offene Griff muss die gesehene Datei sein; ein
+    /// Ordner, unter dessen Pfad inzwischen etwas anderes liegt, wird nicht
+    /// gelesen (ordner_lesen).
+    #[test]
+    fn ort_und_ordner_werden_geprueft() {
+        let o = Ordner::neu("ort");
+        let a = quelle_datei(&o, "a.bin", 10);
+        let b = quelle_datei(&o, "b.bin", 10);
+        let d = o.p().join("d");
+        fs::create_dir_all(&d).unwrap();
+        datei(&d.join("x"), b"x");
+        let l = auflisten(&[a.clone(), d.clone()]);
+        assert_eq!(l.orte.len(), l.eintraege.len());
+        let ort_a = l.orte[0].clone();
+        let ort_d = l.orte[1].clone();
+        if cfg!(unix) {
+            assert!(ort_a.kennung.is_some() && ort_a.pfad.is_none(), "{ort_a:?}");
+        } else {
+            assert!(ort_a.kennung.is_none() && ort_a.pfad.is_some(), "{ort_a:?}");
+        }
+        assert!(zum_lesen_oeffnen(&a, &ort_a).is_ok());
+        // Eine andere Datei unter dem Ort von a: nein.
+        let e = zum_lesen_oeffnen(&b, &ort_a).unwrap_err();
+        assert!(e.to_string().contains("ersetzt"), "{e}");
+        // Der Ordner wie gesehen: seine Kinder; unter dem Ort eines anderen: nichts.
+        let (kinder, _) = ordner_lesen(&d, &ort_d).unwrap();
+        assert_eq!(kinder.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(), vec!["x"]);
+        let anderer = o.p().join("anderer");
+        fs::create_dir_all(&anderer).unwrap();
+        let fremd =
+            Ort { kennung: kennung_von(&fs::symlink_metadata(&anderer).unwrap()), pfad: erwarteter_pfad_oben(&anderer) };
+        assert!(ordner_lesen(&d, &fremd).unwrap_err().contains("ersetzt"));
+        // Eine Verknuepfung auf den Ordner gilt nie als der Ordner.
+        #[cfg(unix)]
+        {
+            let link = o.p().join("link");
+            std::os::unix::fs::symlink(&d, &link).unwrap();
+            assert!(ordner_lesen(&link, &ort_d).is_err());
+        }
+    }
+
+    /// Windows: kommt ein oberster Pfad als Kurzname (LANGER~1.TXT), gilt
+    /// sein langer Name als erwarteter Ort - die Datei ist lesbar, und ein
+    /// Ordner darunter ebenso. Ohne 8.3-Namen auf dem Datentraeger
+    /// uebersprungen.
+    #[cfg(windows)]
+    #[test]
+    fn kurzname_oben_ist_kein_ersetzter_ort() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let o = Ordner::neu("kurzname");
+        let lang = o.p().join("ein recht langer Dateiname.txt");
+        datei(&lang, b"inhalt");
+        let d = o.p().join("ein recht langer Ordnername");
+        fs::create_dir_all(&d).unwrap();
+        datei(&d.join("x.txt"), b"x");
+        let kurz = |p: &Path| -> PathBuf {
+            let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let mut puffer = vec![0u16; 1024];
+            // SAFETY: w ist mit NUL abgeschlossen, der Puffer ein gueltiger Slice.
+            let n = unsafe { GetShortPathNameW(PCWSTR(w.as_ptr()), Some(&mut puffer)) } as usize;
+            assert!(n > 0 && n < puffer.len());
+            PathBuf::from(std::ffi::OsString::from_wide(&puffer[..n]))
+        };
+        let (k_datei, k_ordner) = (kurz(&lang), kurz(&d));
+        if k_datei.file_name() == lang.file_name() {
+            eprintln!("kurzname_oben_ist_kein_ersetzter_ort: uebersprungen (keine 8.3-Namen)");
+            return;
+        }
+        let l = auflisten(&[k_datei.clone(), k_ordner.clone()]);
+        assert_eq!(l.eintraege.len(), 3, "{:?}", l.hinweise);
+        for (i, q) in l.quellen.iter().enumerate() {
+            if l.eintraege[i].art == EintragArt::Datei {
+                assert!(zum_lesen_oeffnen(q, &l.orte[i]).is_ok(), "{} / {:?}", q.display(), l.orte[i]);
+            }
+        }
+    }
+
+    /// [6]/[17]: NFC und volle Schreibweise.
+    #[test]
+    fn nfc_und_vergleichsschluessel() {
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(nfc("Gru\u{308}sse"), "Gr\u{fc}sse");
+            assert_eq!(nfc("A\u{30a}ngstro\u{308}m"), "\u{c5}ngstr\u{f6}m");
+        }
+        assert_eq!(nfc("Gr\u{fc}sse"), "Gr\u{fc}sse");
+        assert_eq!(nfc("abc.txt"), "abc.txt");
+        let k = vergleichsschluessel;
+        assert_eq!(k("Ma\u{df}e.xlsx"), k("MASSE.XLSX"));
+        assert_eq!(k("\u{fb01}le"), k("FILE"));
+        assert_eq!(k("Gru\u{308}sse"), k("GR\u{dc}SSE"));
+        assert_ne!(k("a_b"), k("a:b"));
+    }
+
+    /// [6]: Doppelte nach NFC und voller Schreibweise gehen nur einmal
+    /// hinaus (der Mac-Host und APFS saehen sie gleich und lehnten das ganze
+    /// Angebot ab); [17]: die Namen gehen in NFC hinaus, auch zerlegte Namen
+    /// von der Platte.
+    #[test]
+    fn auflisten_in_nfc_ohne_doppelte() {
+        let o = Ordner::neu("nfc");
+        let (a, b, c) = (o.p().join("a"), o.p().join("b"), o.p().join("c"));
+        for d in [&a, &b, &c] {
+            fs::create_dir_all(d).unwrap();
+        }
+        datei(&a.join("Ma\u{df}e.xlsx"), b"1");
+        datei(&b.join("Masse.xlsx"), b"2");
+        datei(&a.join("Gr\u{fc}sse"), b"3");
+        datei(&b.join("Gru\u{308}sse"), b"4");
+        let unter = c.join("Ordne\u{301}r");
+        fs::create_dir_all(&unter).unwrap();
+        datei(&unter.join("Gru\u{308}sse.txt"), b"5");
+        let l = auflisten(&[
+            a.join("Ma\u{df}e.xlsx"),
+            b.join("Masse.xlsx"),
+            a.join("Gr\u{fc}sse"),
+            b.join("Gru\u{308}sse"),
+            unter.clone(),
+        ]);
+        let pfade: Vec<&str> = l.eintraege.iter().map(|e| e.pfad.as_str()).collect();
+        let erwartet = vec!["Ma\u{df}e.xlsx", "Gr\u{fc}sse", "Ordn\u{e9}r", "Ordn\u{e9}r/Gr\u{fc}sse.txt"];
+        assert_eq!(pfade, erwartet, "{:?}", l.hinweise);
+        let doppelt = l.hinweise.iter().filter(|h| h.contains("doppelter Name")).count();
+        assert_eq!(doppelt, 2, "{:?}", l.hinweise);
+        // Die Quellen bleiben, wie sie auf der Platte heissen.
+        assert_eq!(l.quellen[3], unter.join("Gru\u{308}sse.txt"));
+        let an = Angebot { kennung: 1, gesamt: l.gesamt, eintraege: l.eintraege };
+        assert!(an.pruefen(Regeln::Mac).is_ok() && an.pruefen(Regeln::Windows).is_ok());
+    }
+
+    /// Der Empfaenger unter macOS lehnt, was APFS gleich saehe, als doppelt
+    /// ab (statt am Anlegen mit "File exists" zu scheitern); unter Windows
+    /// unterscheidet NTFS ss und U+00DF, NFC und NFD.
+    #[test]
+    fn empfaenger_doppelt_nach_nfc_und_voller_schreibweise() {
+        let ss = eintraege(&[(O, "O", 0), (D, "O/Masse.xlsx", 1), (D, "O/Ma\u{df}e.xlsx", 1)]);
+        let e = ss.pruefen(Regeln::Mac).unwrap_err();
+        assert!(e.text().contains("doppelt") && e.zustand() == ZUSTAND_UNGUELTIG, "{e:?}");
+        assert!(ss.pruefen(Regeln::Windows).is_ok());
+        let nfd = eintraege(&[(D, "Gr\u{fc}sse", 1), (D, "Gru\u{308}sse", 1)]);
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(nfd.pruefen(Regeln::Mac).unwrap_err().text().contains("doppelt"));
+        }
+        assert!(nfd.pruefen(Regeln::Windows).is_ok());
+    }
+
+    fn andere_basis() -> PathBuf {
+        std::env::temp_dir().join(format!("qc-test-{}-andere-basis", std::process::id()))
+    }
+
+    /// [16]: der Sender prueft den Widerhall gegen die Basis DER ROLLE
+    /// (Vorgaben::eigene_basis), nicht fest gegen die des Clients: eine Datei
+    /// aus der Client-Ablage geht von einer anderen Rolle aus hinaus, eine aus
+    /// ihrer eigenen nicht.
+    #[test]
+    fn widerhall_gegen_die_basis_der_rolle() {
+        let mut v = vorgaben(5000);
+        v.eigene_basis = andere_basis;
+        // Ordner, die kein Aufraeumen anfasst (kein <ms>-<kennung>).
+        let client = ablage_basis().join("n-kern-widerhall").join("x.txt");
+        let eigen = andere_basis().join("n-kern-widerhall").join("y.txt");
+        for p in [&client, &eigen] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            datei(p, b"x");
+        }
+        let weg = Rekorder::neu();
+        let (ev, melden) = sammler();
+        let g = Sender::starten_mit(vec![client.clone()], weg.clone(), FENSTER, melden, v);
+        assert!(bis(Duration::from_secs(3), || !weg.enden().is_empty()), "{:?}", zeilen(&ev));
+        assert_eq!(weg.alle()[0].0, DATEI_ANGEBOT);
+        drop(g);
+        let weg = Rekorder::neu();
+        let (ev, melden) = sammler();
+        let g = Sender::starten_mit(vec![eigen], weg.clone(), FENSTER, melden, v);
+        assert!(g.abwarten(Duration::from_secs(3)));
+        assert_eq!(weg.versuche.load(Ordering::SeqCst), 0);
+        assert!(zeilen(&ev).iter().any(|z| z.contains("aus einem Empfang")));
+        let _ = fs::remove_dir_all(client.parent().unwrap());
+        let _ = fs::remove_dir_all(andere_basis());
     }
 }
