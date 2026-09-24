@@ -43,6 +43,10 @@ pub const MSG_HOSTSTATUS: u8 = 9;
 /// sonst loesten zwei Clients einander endlos ab. Ein aelterer Client
 /// uebergeht sie wie jeden unbekannten Typ.
 pub const MSG_ABGELOEST: u8 = 10;
+/// Faehigkeiten des Hosts: u32 Bits (FAEHIG_*), mindestens 4 Byte, weitere
+/// Bytes werden uebergangen. Geht an jeden neuen Zuschauer, zusammen mit
+/// Einstellungen und Codecliste. Ein aelterer Client uebergeht Typ 11.
+pub const MSG_FAEHIGKEITEN: u8 = 11;
 /// Tonformat: u32 Rate, u8 Kanaele, u8 1 = float32 verschachtelt, 2 frei.
 pub const MSG_AUDIO_INFO: u8 = 32;
 /// Ton: float32 LE verschachtelt.
@@ -53,6 +57,29 @@ pub const MSG_CLIP: u8 = 48;
 /// u16 Hotspot y, u8 sichtbar, u8 Massstab, u16 frei), dann RGBA mit gerader
 /// Deckkraft. Kommt nur, wenn sich die Form aendert.
 pub const MSG_CURSOR: u8 = 49;
+
+// ------------------------------------ Dateien (beide Richtungen, dateien.rs)
+//
+// Wie MSG_CLIP gelten sie in beide Richtungen unter derselben Nummer:
+// Host -> Client auf dem Bildkanal, Client -> Host auf dem Eingabekanal; die
+// Quittung laeuft jeweils in der Gegenrichtung. Formate, Grenzen und Ablauf
+// stehen im Kopf von dateien.rs. Gesendet wird nur an eine Gegenseite, die in
+// DIESER Sitzung FAEHIG_DATEIEN gemeldet hat - ein aelterer Host trennte
+// sonst den Eingabekanal (alles ueber 256 Byte ausser IN_CLIP).
+
+/// Angebot: u32 Kennung, u32 Anzahl, u64 Gesamt, dann die Eintraege.
+pub const DATEI_ANGEBOT: u8 = 50;
+/// Stueck: u32 Kennung, u32 Eintrag, u64 Versatz, 1 ..= 49152 Datenbytes.
+pub const DATEI_STUECK: u8 = 51;
+/// Ende: u32 Kennung, u8 Grund (mindestens 5 Byte).
+pub const DATEI_ENDE: u8 = 52;
+/// Quittung (genau 16 Byte): u32 Kennung, u8 Zustand, u8 frei, u16 frei,
+/// u64 empfangen - vom Empfaenger zum Sender.
+pub const DATEI_QUITTUNG: u8 = 53;
+
+/// Bit 0 in MSG_FAEHIGKEITEN / IN_FAEHIGKEITEN: "Dateien Fassung 1".
+pub const FAEHIG_DATEIEN: u32 = 1;
+
 /// Flag Bit 0 im Bildkopf: Vollbild.
 pub const FLAG_KEY: u8 = 0x01;
 
@@ -78,6 +105,10 @@ pub const IN_CODEC: u8 = 66;
 /// Bildschirms, 0 = wieder der Bildschirm. Fuer den Benchmark, damit jeder
 /// Schritt denselben Inhalt misst.
 pub const IN_TESTBILD: u8 = 68;
+/// Faehigkeiten des Clients: u32 Bits (FAEHIG_*), wie MSG_FAEHIGKEITEN. Die
+/// erste Nachricht auf JEDEM neu stehenden Eingabekanal (gehoert zu
+/// NACHREICHEN). Ein aelterer Host uebergeht sie, weil sie unter 256 Byte hat.
+pub const IN_FAEHIGKEITEN: u8 = 69;
 
 // Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
 pub const MOD_SHIFT: u32 = 1;

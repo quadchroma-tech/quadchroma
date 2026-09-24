@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+/// Dateien ueber die Zwischenablage: Protokoll, Sender, Empfaenger und
+/// Ablageverzeichnis, gemeinsam fuer Client und Windows-Host-Rolle.
+mod dateien;
 mod discovery;
 mod einstellungen;
 mod noise;
