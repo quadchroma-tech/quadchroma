@@ -12,7 +12,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fts.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -242,6 +241,14 @@ static NSString *schluessel(NSString *pfad) {
     return [[pfad precomposedStringWithCanonicalMapping] stringByFoldingWithOptions:NSCaseInsensitiveSearch locale:nil];
 }
 
+// Derselbe Schluessel beim Sender, fuer einen einzelnen Namen: erst so
+// bereinigt, wie es jeder Empfaenger mindestens tut (Steuerzeichen zu '_'),
+// sonst gingen "a\x01" und "a_" beide hinaus, und die Gegenseite lehnte das
+// ganze Angebot als doppelt ab.
+static NSString *sende_schluessel(NSString *name) {
+    return schluessel(qc_datei_bereinigen(name));
+}
+
 static int angebot_pruefen(const uint8_t *p, size_t n, uint32_t *kennung_aus, uint64_t *gesamt_aus,
                            NSArray<QCDateiEintrag *> **aus, NSString **grund) {
 #define ABLEHNEN(z, ...) do { *grund = [NSString stringWithFormat:__VA_ARGS__]; return (z); } while (0)
@@ -411,36 +418,91 @@ static NSString *basis_bereit(NSString *basis) {
     return nil;
 }
 
-// Einen Baum loeschen, ohne je einer Verknuepfung zu folgen (FTS_PHYSICAL):
-// eine Verknuepfung darin verschwindet selbst, ihr Ziel bleibt. Auch die
-// Wurzel wird nur geloescht, nicht verfolgt. 0 = alles weg.
-static int baum_loeschen(NSString *pfad) {
-    char *wurzel[2] = { (char *)pfad.fileSystemRepresentation, NULL };
-    FTS *f = fts_open(wurzel, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, NULL);
-    if (!f) return -1;
-    int fehler = 0;
-    FTSENT *e;
-    while ((e = fts_read(f))) {
-        switch (e->fts_info) {
-            case FTS_D:
-                break;                                    // vor dem Inhalt: noch nichts
-            case FTS_DP:
-                if (rmdir(e->fts_accpath) != 0) fehler = errno;
-                break;
-            case FTS_DNR:
-                if (rmdir(e->fts_accpath) != 0) fehler = e->fts_errno ? e->fts_errno : errno;
-                break;
-            case FTS_ERR:
-            case FTS_NS:
-                fehler = e->fts_errno;
-                break;
-            default:                                      // Datei, Verknuepfung, Besonderes
-                if (unlink(e->fts_accpath) != 0) fehler = errno;
-                break;
-        }
+// So tief steigt das Loeschen hoechstens unter die Wurzel hinab. Eine
+// Uebertragung hat hoechstens TIEFE_MAX Stufen unter ihrem Verzeichnis; je
+// Stufe bleibt beim Loeschen ein Deskriptor offen.
+#define QC_LOESCHEN_TIEFE_MAX ((int)(2 * QC_DATEI_TIEFE_MAX))
+
+static int eintrag_loeschen(int dfd, const char *name, dev_t geraet, int tiefe);
+
+// Den Inhalt des offenen Ordners fd loeschen. Erst alle Namen lesen, dann
+// loeschen: Loeschen waehrend readdir kann Eintraege ueberspringen. 0 = alles
+// weg, sonst der erste errno.
+static int inhalt_loeschen(int fd, dev_t geraet, int tiefe) {
+    int kopie = dup(fd);
+    DIR *d = kopie >= 0 ? fdopendir(kopie) : NULL;
+    if (!d) {
+        int err = errno;
+        if (kopie >= 0) close(kopie);
+        return err;
     }
-    fts_close(f);
-    return fehler ? -1 : 0;
+    char **namen = NULL;
+    size_t anzahl = 0, platz = 0;
+    int fehler = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (anzahl == platz) {
+            size_t neu = platz ? platz * 2 : 64;
+            char **n = realloc(namen, neu * sizeof *namen);
+            if (!n) { fehler = ENOMEM; break; }
+            namen = n;
+            platz = neu;
+        }
+        if (!(namen[anzahl] = strdup(e->d_name))) { fehler = ENOMEM; break; }
+        anzahl++;
+    }
+    closedir(d);                                      // schliesst die Kopie, fd bleibt
+    for (size_t i = 0; i < anzahl; i++) {
+        int r = eintrag_loeschen(fd, namen[i], geraet, tiefe);
+        if (r && !fehler) fehler = r;
+        free(namen[i]);
+    }
+    free(namen);
+    return fehler;
+}
+
+// Den Eintrag `name` im Ordner dfd loeschen, einen Ordner samt Inhalt. Alles
+// relativ ueber Deskriptoren (openat, unlinkat): so gibt es keine Grenze fuer
+// die Laenge des ganzen Pfads - ein Uebertragungsverzeichnis mit einem
+// erlaubten relativen Pfad von 1024 Byte liegt absolut ueber PATH_MAX, und
+// dort scheitern unlink/rmdir/opendir mit vollem Pfad. Kein chdir (der Host
+// hat viele Faeden). Eine Verknuepfung verschwindet selbst, ihr Ziel bleibt;
+// in einen Ordner auf einem anderen Geraet wird nicht abgestiegen.
+// 0 = weg (oder schon weg), sonst errno.
+static int eintrag_loeschen(int dfd, const char *name, dev_t geraet, int tiefe) {
+    struct stat st;
+    if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) return errno == ENOENT ? 0 : errno;
+    if (!S_ISDIR(st.st_mode)) return unlinkat(dfd, name, 0) == 0 || errno == ENOENT ? 0 : errno;
+    if (st.st_dev != geraet) return EXDEV;
+    if (tiefe >= QC_LOESCHEN_TIEFE_MAX) return ELOOP;
+    int fehler = 0;
+    int fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd >= 0) {
+        fehler = inhalt_loeschen(fd, geraet, tiefe + 1);
+        close(fd);
+    } else if (errno == ELOOP || errno == ENOTDIR) {
+        // Zwischen fstatat und openat gegen etwas anderes getauscht: es
+        // selbst loeschen, nie hineinfolgen.
+        return unlinkat(dfd, name, 0) == 0 || errno == ENOENT ? 0 : errno;
+    } else {
+        fehler = errno;                               // nicht lesbar: vielleicht leer
+    }
+    if (unlinkat(dfd, name, AT_REMOVEDIR) == 0 || errno == ENOENT) return 0;
+    return fehler ? fehler : errno;
+}
+
+// Einen Baum loeschen, ohne je einer Verknuepfung zu folgen. Auch die Wurzel
+// wird nur geloescht, nicht verfolgt. 0 = alles weg.
+static int baum_loeschen(NSString *pfad) {
+    NSString *eltern = pfad.stringByDeletingLastPathComponent, *name = pfad.lastPathComponent;
+    if (!eltern.length || !name.length || [name isEqualToString:@"/"]) return -1;
+    int dfd = open(eltern.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -1;
+    struct stat st;
+    int r = fstat(dfd, &st) == 0 ? eintrag_loeschen(dfd, name.fileSystemRepresentation, st.st_dev, 0) : errno;
+    close(dfd);
+    return r ? -1 : 0;
 }
 
 // "<unix-ms>-<kennung>": nur so heissen Uebertragungen. *ms = der Zeitpunkt.
@@ -721,7 +783,12 @@ static void empfang_stueck(uint64_t sitzung, NSData *d) {
         E->versatz = 0;
         naechste_datei(E);
     }
-    if (E->empfangen - E->quittiert >= QC_DATEI_QUITTUNG_ALLE) {
+    // Quittiert wird, sobald mehr als FENSTER_SPIEL - STUECK_MAX (16 KiB)
+    // offen sind - "spaetestens je 64 KiB" (2.6) ist damit erfuellt. Grund:
+    // Ein Sender, der nur ganze Stuecke ins Fenster setzt, steht im
+    // Spielmodus schon mit einem Stueck (48 KiB) unterwegs; wartete der
+    // Empfaenger auf 64 KiB, hingen beide bis zum Stillstand.
+    if (E->empfangen - E->quittiert > QC_DATEI_FENSTER_SPIEL - QC_DATEI_STUECK_MAX) {
         E->quittiert = E->empfangen;
         quittung_an(E->sitzung, E->kennung, QC_QUITT_LAEUFT, E->empfangen);
     }
@@ -971,11 +1038,13 @@ static int auflisten(uint64_t gen, NSString *quelle, NSString *rel, NSString *na
     for (NSString *k in kinder) {
         NSString *kname = [k precomposedStringWithCanonicalMapping];
         // Auf einem Volume mit Gross- und Kleinschreibung koennen "A" und "a"
-        // nebeneinander liegen; die Gegenseite lehnte dann alles ab.
-        if (![gesehen containsObject:schluessel(kname)]) {
-            [gesehen addObject:schluessel(kname)];
+        // nebeneinander liegen, ebenso "a\x01" und "a_"; die Gegenseite
+        // lehnte dann alles ab.
+        NSString *ks = sende_schluessel(kname);
+        if (![gesehen containsObject:ks]) {
+            [gesehen addObject:ks];
         } else {
-            zeile(@"Dateien: uebersprungen (Name nur in Gross- und Kleinschreibung verschieden): %@",
+            zeile(@"Dateien: uebersprungen (Name nach Bereinigung oder bis auf Gross- und Kleinschreibung doppelt): %@",
                   [quelle stringByAppendingPathComponent:k]);
             continue;
         }
@@ -988,7 +1057,31 @@ static int auflisten(uint64_t gen, NSString *quelle, NSString *rel, NSString *na
 
 static int senden_daten(uint64_t gen, uint64_t sitzung, uint32_t kennung, NSArray<QCDateiEintrag *> *liste,
                         NSData *angebot) {
-    if (!g_wege.senden || !g_wege.senden(sitzung, QC_DATEI_ANGEBOT, angebot.bytes, angebot.length)) {
+    if (!g_wege.senden) return 0;
+    // Auch das Angebot (bis 1 MiB am Stueck) hat Nachrang: erst wenn im
+    // Sendepuffer hoechstens 128 KiB liegen. Es ist noch nichts unterwegs,
+    // also gibt es kein ENDE, wenn es hier endet.
+    {
+        uint64_t frei = 0;
+        int z = 0;
+        switch (platz_abwarten(gen, sitzung, 0, &frei, &z)) {
+            case WARTEN_OK: break;
+            case WARTEN_UEBERHOLT:
+                zeile(@"Dateien: abgebrochen (neuer Inhalt in der Ablage)");
+                return 0;
+            case WARTEN_ZEIT:
+                zeile(@"Dateien: abgebrochen (seit %@ Sendepuffer ueber 128 KiB)",
+                      sek_text(atomic_load(&g_stillstand_ms) / 1000.0));
+                return 0;
+            case WARTEN_ZUSTAND:
+                zeile(@"Dateien: abgebrochen (Gegenseite: %@)", zustand_text(z));
+                return 0;
+            default:
+                zeile(@"Dateien: abgebrochen (Zuschauer gewechselt oder weg)");
+                return 0;
+        }
+    }
+    if (!g_wege.senden(sitzung, QC_DATEI_ANGEBOT, angebot.bytes, angebot.length)) {
         zeile(@"Dateien: abgebrochen (Zuschauer gewechselt oder weg)");
         return 0;
     }
@@ -1002,9 +1095,13 @@ static int senden_daten(uint64_t gen, uint64_t sitzung, uint32_t kennung, NSArra
     for (NSUInteger i = 0; i < liste.count && !warum; i++) {
         QCDateiEintrag *e = liste[i];
         if (e.art != 0 || e.groesse == 0) continue;
-        int fd = open(e.quelle.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        // O_NONBLOCK: Wurde die Datei seit dem Auflisten gegen eine FIFO
+        // getauscht, blockierte open sonst die Warteschlange auf Dauer. Erst
+        // nach der Pruefung auf eine gewoehnliche Datei wieder blockierend.
+        int fd = open(e.quelle.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
         struct stat st;
-        if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) != 0) {
             warum = [NSString stringWithFormat:@"Lesefehler bei %@: %s", e.quelle, fd < 0 ? strerror(errno) : "keine Datei mehr"];
             grund = QC_ENDE_LESEFEHLER;
             if (fd >= 0) close(fd);
@@ -1113,11 +1210,12 @@ static void senden_lauf(uint64_t gen, uint64_t sitzung, NSArray<NSString *> *pfa
             continue;
         }
         // Dateien aus mehreren Ordnern koennen gleich heissen: nur die erste.
-        if ([oben containsObject:schluessel(name)]) {
+        NSString *ks = sende_schluessel(name);
+        if ([oben containsObject:ks]) {
             zeile(@"Dateien: doppelter Name %@ - nur der erste wird gesendet", name);
             continue;
         }
-        [oben addObject:schluessel(name)];
+        [oben addObject:ks];
         r = auflisten(gen, p, name, name, 1, liste, &gesamt);
         if (r <= 0) break;
     }

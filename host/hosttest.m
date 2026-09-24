@@ -8,8 +8,8 @@
 // stillem Bildschirm (Umrechnung des letzten Bildes), --fest beim Start,
 // Stauregel samt Ton im Stau, Ansage des Tonformats, Koennensliste (AV1),
 // Dateien ueber die Zwischenablage (Faehigkeiten, beide Richtungen ueber echte
-// Kanaele, Fenster, Zuschauerwechsel mitten in der Uebertragung, aelterer
-// Client ohne IN_FAEHIGKEITEN).
+// Kanaele, Fenster, Zuschauerwechsel mitten in der Uebertragung, Zuschauer
+// ohne Eingabekanal, aelterer Client ohne IN_FAEHIGKEITEN).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -1765,6 +1765,7 @@ static int warten_bis(int (*bedingung)(void), double sekunden) {
 }
 
 static int eingabe_steht(void) { return atomic_load(&g_in_fd) >= 0; }
+static int eingabe_weg(void) { return atomic_load(&g_in_fd) < 0; }
 static int empfang_ruht(void) { return qc_empfang_ordner() == nil; }
 static int sender_ruht(void) { return !qc_senden_laeuft(); }
 
@@ -1955,8 +1956,8 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     qc_dateien_abwarten();                  // die Protokollzeile des Empfaengers ist geschrieben
     stdout_stumm(0);
     printf("         (Quittungen auf dem Bildkanal nach 0/0: %s)\n", folge.UTF8String);
-    pruefe(q0 && [folge isEqualToString:@"0/98309 1/150008"],
-           "Quittungen kommen auf dem Bildkanal: sofort 0/0, je 64 KiB, am Ende 1 mit allen Bytes");
+    pruefe(q0 && [folge isEqualToString:@"0/49157 0/98309 0/147461 1/150008"],
+           "Quittungen kommen auf dem Bildkanal: sofort 0/0, sobald mehr als 16 KiB offen sind, am Ende 1 mit allen Bytes");
     NSArray<NSString *> *liste = nil;
     @synchronized (g_rekorder) { liste = g_rekorder.lastObject; }
     NSString *wurzel = liste.firstObject.stringByDeletingLastPathComponent;
@@ -2042,14 +2043,26 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     pruefe(zeilen_mit(pfad, "Dateien: abgebrochen (Zuschauer gewechselt oder weg)") == 2,
            "beide Abbrueche stehen im Protokoll");
 
-    printf("\n-- Dateien: aelterer Client (ohne IN_FAEHIGKEITEN)\n");
+    printf("\n-- Dateien: ohne Eingabekanal, dann aelterer Client (ohne IN_FAEHIGKEITEN)\n");
     stdout_stumm(1);
+    // Erst ohne Eingabekanal: das ist kein aelterer Client, der Hinweis
+    // dafuer bleibt unverbraucht.
+    close(G.ein);
+    G.ein = -1;
+    int ohne = warten_bis(eingabe_weg, 2);
+    clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
+    int ohne_zeilen = zeilen_mit(pfad, "Dateien: nicht gesendet (Zuschauer ohne Eingabekanal)") == 1 &&
+                      zeilen_mit(pfad, "aelterer Client") == 0;
+    G.ein = eingabe_verbinden(ein_port, g_priv, G.hh, &G.tx);
+    int wieder = G.ein >= 0 && warten_bis(eingabe_steht, 2);
     int g_faehig = faehig_jetzt();
     clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
     clip_dateien_cb(@[ [q stringByAppendingPathComponent:@"einzeln.txt"] ]);
     bei_g = datei_nachrichten(&G, 400);
     qc_dateien_abwarten();
     stdout_stumm(0);
+    pruefe(ohne && ohne_zeilen && wieder,
+           "Zuschauer ohne Eingabekanal: eigene Zeile statt \"aelterer Client\", der Hinweis bleibt unverbraucht");
     pruefe(!g_faehig && bei_g == 0 && !qc_senden_laeuft(), "ohne IN_FAEHIGKEITEN geht nichts hinaus");
     pruefe(zeilen_mit(pfad, "Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)") == 1,
            "die Protokollzeile kommt einmal je Sitzung");

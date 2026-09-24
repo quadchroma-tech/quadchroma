@@ -757,13 +757,19 @@ static void clip_dateien_cb(NSArray<NSString *> *pfade) {
     pthread_mutex_lock(&g_send_mtx);
     uint64_t sitzung = g_sitzung;
     int da = atomic_load(&g_client_fd) >= 0 && atomic_load(&g_vid_ready);
+    int kanal = atomic_load(&g_in_fd) >= 0;
     int faehig = da && dateien_faehig_gesperrt();
     memcpy(ip, g_vid_ip, sizeof ip);
     pthread_mutex_unlock(&g_send_mtx);
     if (!faehig) {
         // Neuer Inhalt: eine laufende Sendung ist auch dann ueberholt.
         qc_senden_abbrechen();
-        if (da && g_dateien_alt_gemeldet != sitzung) {
+        if (da && !kanal) {
+            // Ohne Eingabekanal weiss niemand, was der Client kann (und es
+            // kaemen keine Quittungen). Das ist kein aelterer Client - der
+            // Hinweis dafuer bleibt fuer diese Sitzung unverbraucht.
+            logf_(@"Dateien: nicht gesendet (Zuschauer ohne Eingabekanal)");
+        } else if (da && g_dateien_alt_gemeldet != sitzung) {
             g_dateien_alt_gemeldet = sitzung;
             logf_(@"Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)");
         }
