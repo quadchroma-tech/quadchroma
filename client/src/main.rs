@@ -2869,7 +2869,10 @@ fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, i
         _ => {}
     }
     drop(s);
-    // Die vorige Sendung bricht ab (ausserhalb der Sperre; kehrt sofort zurueck).
+    // In den anderen Zweigen bricht die vorige Sendung hier ab (ausserhalb der
+    // Sperre; kehrt sofort zurueck). Im ersten hat starten_nach sie schon
+    // unter `shared` abgebrochen - unschaedlich, Griff::abbrechen nimmt nur
+    // die Blattsperre des Griffs.
     drop(alt);
     if zu_alt {
         protokoll::zeile(dateien::ZEILE_HOST_ZU_ALT.into());

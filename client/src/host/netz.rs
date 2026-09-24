@@ -152,9 +152,10 @@ const DATEI_RUECKSTAND: usize = 128 * 1024;
 /// 256 KiB fuellte ihn vor jedem Bild mit Dateidaten (Gesamtdurchsicht [8]:
 /// im Modell 329 ms statt 131 ms beim Mac-Host). Das Fenster zaehlt, was in
 /// Warteschlange, Kernel und Leitung unquittiert unterwegs ist; 64 KiB
-/// ersetzen so, was SO_NWRITE auf dem Mac leistet. Durchsatz kostet das erst
-/// weit ueber 100 Mbit/s. Der Empfaenger prueft nur die Obergrenze; das
-/// Protokoll bleibt vertraeglich.
+/// ersetzen so, was SO_NWRITE auf dem Mac leistet. Das kostet Durchsatz je
+/// nach Umlaufzeit: hoechstens 64 KiB je Umlauf, im LAN (um 1 ms) also ueber
+/// 60 MB/s, bei 20 ms Umlaufzeit aber nur rund 3,3 MB/s. Der Empfaenger
+/// prueft nur die Obergrenze; das Protokoll bleibt vertraeglich.
 const DATEI_FENSTER_HOST: u64 = dateien::FENSTER_SPIEL;
 /// So lange wartet eine kopierte Dateiliste auf die Faehigkeiten des
 /// aktuellen Eingabekanals (Integrationstest Befund 3: gleich nach dem
@@ -1402,6 +1403,11 @@ fn dateien_senden_mit(u: &DateiUmgebung, pfade: Vec<PathBuf>) -> Start {
             let nr = d.vormerk_nr;
             d.vorgemerkt = Some(Vorgemerkt { pfade, nr });
             drop(d);
+            // Kam IN_FAEHIGKEITEN zwischen lage() oben und dem Vormerken,
+            // fand eingabe_lesen noch nichts vor; ohne diese Nachschau ginge
+            // die Liste erst mit dem Zeitgeber hinaus, bis zu VORMERKEN
+            // spaeter (Hinweis der Gegenpruefung).
+            l.vorgemerkte_pruefen(u, None);
             // Der Zeitgeber haelt die Leitung nicht fest.
             let (leitung, u2) = (Arc::downgrade(&l), u.clone());
             let zeitgeber = std::thread::Builder::new().name("qc-dateien-vormerken".into()).spawn(move || {
@@ -4076,6 +4082,52 @@ mod tests {
         assert!(sperre(&e.dateien).vorgemerkt.is_none());
         assert_eq!(z.zahl(|t| t == dateien::ZEILE_ZUSCHAUER_ZU_ALT), 1, "{:?}", z.alle());
         e.schliessen();
+        let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Hinweis der Gegenpruefung: kommt IN_FAEHIGKEITEN, nachdem
+    /// dateien_senden_mit die Lage (noch ohne Meldung) gelesen, die Liste
+    /// aber noch nicht vorgemerkt hat, findet die Leseschleife nichts vor.
+    /// Die Nachschau nach dem Vormerken schickt die Liste trotzdem sofort,
+    /// nicht erst mit dem Zeitgeber (hier 5 s). Der Test haelt dafuer die
+    /// Dateisperre, bis die Meldung eingetragen ist; die Leseschleife
+    /// (vorgemerkte_pruefen nach IN_FAEHIGKEITEN) kaeme in diesem Fenster zu
+    /// frueh und wird deshalb gar nicht gerufen.
+    #[test]
+    fn meldung_zwischen_lage_und_vormerken_geht_sofort_hinaus() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s, z) = (Rekorder::default(), Staende::default(), Zeilen::default());
+        let mut u = umgebung_mit_zeilen(&PLATZ, &ZAEHLER, "vormerken-nachschau", &r, &s, &z);
+        u.vormerken = Duration::from_secs(5);
+        let u = Arc::new(u);
+        let quelle = test_ordner("vormerken-nachschau-quelle").join("a.bin");
+        std::fs::write(&quelle, vec![3u8; 1000]).unwrap();
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.1".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        let (h, _c) = tcp_paar();
+        assert!(a.eingabe_binden(1, h.try_clone().unwrap()));
+        assert_eq!(a.lage(), Lage::Offen { kanal: true });
+        let dateisperre = sperre(&a.dateien);
+        let (u2, q2) = (u.clone(), quelle.clone());
+        let kopieren = std::thread::spawn(move || dateien_senden_mit(&u2, vec![q2]));
+        // dateien_senden_mit liest die Lage (Offen) und wartet dann auf die
+        // Dateisperre.
+        std::thread::sleep(Duration::from_millis(200));
+        a.faehigkeiten_setzen(1, FAEHIG_DATEIEN);
+        let t0 = Instant::now();
+        drop(dateisperre);
+        assert_eq!(
+            kopieren.join().unwrap(),
+            Start::Vorgemerkt,
+            "die Lage wurde erst nach der Meldung gelesen - Probe ohne Wert"
+        );
+        let v = abholen_bis(&a, Duration::from_secs(10), |p| p.1 == DATEI_ANGEBOT);
+        assert!(t0.elapsed() < Duration::from_secs(2), "Angebot erst nach {:?} (Zeitgeber)", t0.elapsed());
+        assert!(v.iter().all(|p| p.0 == Art::Datei));
+        assert_eq!(z.zahl(|t| t.contains("vorgemerkte Liste geht hinaus")), 1, "{:?}", z.alle());
+        a.schliessen();
         let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
         let _ = std::fs::remove_dir_all(&u.basis);
     }

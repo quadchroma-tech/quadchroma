@@ -1344,6 +1344,8 @@ fn marke_lesen(inhalt: &str) -> Option<(u32, u64)> {
 /// derselben Kennung), ein Prozess, der nicht mehr lebt, oder einer, der
 /// inzwischen spaeter gestartet ist. Unlesbar, leer (aeltere Staende) oder
 /// nicht zu entscheiden (fremder Nutzer, keine Rechte): nicht verwaist.
+/// Startzeit 0 heisst: der schreibende Prozess kannte seine eigene nicht -
+/// dann zaehlt nur, ob der Prozess noch lebt.
 fn marke_verwaist(marke: &Path) -> bool {
     // Wie eine Quelle oeffnen: keiner Verknuepfung folgen, an keiner FIFO
     // haengen; mehr als 64 Byte hat keine Marke.
@@ -1357,11 +1359,18 @@ fn marke_verwaist(marke: &Path) -> bool {
 }
 
 fn prozess_verwaist(pid: u32, start: u64) -> bool {
+    // Eigene Kennung: dieser Prozess schreibt immer eigener_start() (einmal
+    // ermittelt), eine andere Zahl stammt also von einem frueheren Prozess -
+    // auch 0, wenn dieser seine Startzeit kennt.
     if pid == std::process::id() {
         return start != eigener_start();
     }
     match prozess_lebt(pid) {
         Some(false) => true,
+        // Ein lebender Prozess mit unbekannter Startzeit in der Marke
+        // (Hinweis der Gegenpruefung): nicht verwaist - sonst loeschte ein
+        // anderer Prozess die laufende Uebertragung.
+        _ if start == 0 => false,
         _ => prozess_start(pid).is_some_and(|s| s != start),
     }
 }
@@ -2171,6 +2180,15 @@ impl Sender {
 /// 25 bis 75 ms mehr Verzoegerung, solange eine Datei lief). Windows:
 /// THREAD_PRIORITY_BELOW_NORMAL; macOS: QOS_CLASS_UTILITY (der Planer gibt
 /// dem Faden weniger Rechenzeit und die langsameren Kerne).
+/// Gemessen auf dem M1 (Gegenpruefung n-kern): gegen 8 volle Faeden bekommt
+/// ein UTILITY-Faden rund ein Siebtel der Rechenzeit eines normalen (mit
+/// QOS_CLASS_DEFAULT und relativer Prioritaet -15 rund die Haelfte). Dafuer
+/// dehnt UTILITY Fristen und Schlaf in diesen Faeden deutlich: eine Frist
+/// von 100 ms endet nach rund 250 ms, und ein Sender, der bei Voll je
+/// VOLL_WARTEN schlaeft, schafft im Modell (ein Platz, der je 1 ms frei
+/// wird) 20 MB in 4,1 s statt 1,1 s. Tests duerfen deshalb keine genauen
+/// Fristen annehmen; ob der Durchsatz des Mac-Clients so reicht, misst die
+/// Integrationsphase.
 #[cfg(windows)]
 fn faden_nachrang() -> Result<(), String> {
     use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
@@ -5318,6 +5336,12 @@ mod tests {
         );
         assert_eq!(sperre(&weg.n)[ende_a.unwrap()].2, GRUND_ABGEBROCHEN);
         assert_eq!(letztes(&ev_a), Some(Ergebnis::Abgebrochen(Abbruch::Hier)));
+        // Quittung 1 wie ein echter Empfaenger erst nach dem Ende 0 von B.
+        // Kaeme sie vorher (Stueck und Ende noch nicht hinaus), waere sie ein
+        // Protokollfehler, und B braeche zu Recht mit Abgebrochen(Quittung(1))
+        // ab - so flackerte der Test frueher (Gegenpruefung: 1 von 40 auf dem
+        // Mac).
+        assert!(bis(Duration::from_secs(3), || weg.stelle(DATEI_ENDE, kb).is_some()), "B schickt kein Ende");
         b.quittung(&Quittung { kennung: kb, zustand: ZUSTAND_FERTIG, empfangen: 1000 }.kodieren());
         assert!(b.abwarten(Duration::from_secs(3)));
         assert_eq!(letztes(&ev_b), Some(Ergebnis::Fertig));
@@ -5348,70 +5372,113 @@ mod tests {
     /// Gesamtdurchsicht [1]: eine Quittung ueber die gesendete Menge hinaus
     /// wird gekappt. Ohne Kappe oeffnete sie das Fenster ganz (alles ginge
     /// hinaus), und danach gaelte keine echte Quittung mehr als Fortschritt:
-    /// die Sendung braeche nach STILLSTAND ab.
+    /// eine Sendung, die laenger dauert als STILLSTAND, braeche ab.
+    /// Keine Annahme ueber die Geschwindigkeit: unter macOS dehnt der
+    /// Nachrang (QOS_CLASS_UTILITY) jeden Schlaf im Faden des Senders, hier
+    /// die 8 ms des Wegs, gemessen auf das Mehrfache. Geprueft wird deshalb
+    /// "genau ein Fenster mehr" erst, wenn es hinaus ist, und das Ende mit
+    /// weiter Frist.
     #[test]
     fn quittung_ueber_die_gesendete_menge_wird_gekappt() {
         let o = Ordner::neu("kappe");
-        let p = quelle_datei(&o, "a.bin", 3_000_000);
+        let p = quelle_datei(&o, "a.bin", 1_000_000);
         let weg = Rekorder::neu();
-        // Ein langsamer Weg: 8 ms je Stueck, 62 Stuecke dauern ueber 400 ms.
+        // Datenbytes, die der Weg genommen hat - mitgezaehlt, damit der
+        // Quittierer unten nicht alle 3 ms die ganze Aufzeichnung kopiert (und
+        // so die Sperre haelt, die der Faden des Senders braucht).
+        let daten = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Ein langsamer Weg: 8 ms je Stueck.
         let langsam: Arc<dyn Weg> = {
-            let w = weg.clone();
+            let (w, d) = (weg.clone(), daten.clone());
             Arc::new(move |t: u8, n: &[u8]| {
                 if t == DATEI_STUECK {
                     thread::sleep(Duration::from_millis(8));
                 }
-                w.senden(t, n)
+                let r = w.senden(t, n);
+                if t == DATEI_STUECK && r == Gesendet::Ja {
+                    d.fetch_add((n.len() - STUECK_KOPF) as u64, Ordering::SeqCst);
+                }
+                r
             })
         };
+        let gezaehlt = || daten.load(Ordering::SeqCst);
         let (ev, melden) = sammler();
-        let g = Arc::new(Sender::starten_mit(vec![p], langsam, FENSTER_SPIEL, melden, vorgaben(400)));
+        let g = Arc::new(Sender::starten_mit(vec![p], langsam, FENSTER_SPIEL, melden, vorgaben(1000)));
         let k = g.kennung();
-        assert!(bis(Duration::from_secs(3), || weg.datenbytes() == FENSTER_SPIEL));
+        assert!(bis(Duration::from_secs(5), || gezaehlt() == FENSTER_SPIEL), "{}", gezaehlt());
         g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: 0 }.kodieren());
         g.quittung(&Quittung { kennung: k, zustand: 0, empfangen: u64::MAX }.kodieren());
+        // Die falsche Quittung zaehlt nur bis zur gesendeten Menge: genau ein
+        // Fenster mehr, nicht alles. Ohne Kappe ginge in den 150 ms danach
+        // mindestens ein weiteres Stueck hinaus.
+        assert!(bis(Duration::from_secs(5), || gezaehlt() >= 2 * FENSTER_SPIEL), "{}", gezaehlt());
         thread::sleep(Duration::from_millis(150));
-        // Die falsche Quittung zaehlt nur bis zur gesendeten Menge: ein
-        // Fenster mehr, nicht alles.
         assert_eq!(weg.datenbytes(), 2 * FENSTER_SPIEL, "Fenster durch die falsche Quittung geoeffnet");
         // Danach quittiert ein ordentlicher Empfaenger, was ankommt; das ist
         // Fortschritt, die Sendung laeuft durch.
-        let (g2, w2) = (g.clone(), weg.clone());
+        let g2 = g.clone();
+        let d2 = daten.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop2 = stop.clone();
         let quittierer = thread::spawn(move || {
             while !stop2.load(Ordering::SeqCst) {
-                g2.quittung(&Quittung { kennung: k, zustand: 0, empfangen: w2.datenbytes() }.kodieren());
+                g2.quittung(&Quittung { kennung: k, zustand: 0, empfangen: d2.load(Ordering::SeqCst) }.kodieren());
                 thread::sleep(Duration::from_millis(3));
             }
         });
-        let alles = bis(Duration::from_secs(5), || !weg.enden().is_empty());
+        let alles = bis(Duration::from_secs(30), || !weg.enden().is_empty());
         stop.store(true, Ordering::SeqCst);
         quittierer.join().unwrap();
         assert!(alles, "kein Ende");
         assert_eq!(weg.enden()[0].grund, GRUND_VOLLSTAENDIG, "{:?}", zeilen(&ev));
-        g.quittung(&Quittung { kennung: k, zustand: ZUSTAND_FERTIG, empfangen: 3_000_000 }.kodieren());
+        g.quittung(&Quittung { kennung: k, zustand: ZUSTAND_FERTIG, empfangen: 1_000_000 }.kodieren());
         assert!(g.abwarten(Duration::from_secs(3)));
         assert_eq!(letztes(&ev), Some(Ergebnis::Fertig), "{:?}", zeilen(&ev));
     }
 
     /// Gesamtdurchsicht [2]: im Leerlauf wiederholt der Empfaenger seinen
-    /// Stand nach nachquittieren.
+    /// Stand nach nachquittieren - und nie oefter. Keine Annahme ueber die
+    /// Genauigkeit der Fristen: unter macOS dehnt der Nachrang
+    /// (QOS_CLASS_UTILITY) sie im Faden des Empfaengers, gemessen 100 ms auf
+    /// rund 250 ms (Gegenpruefung). Deshalb zaehlt nur, dass die
+    /// Wiederholungen kommen, und der Abstand zwischen zweien.
     #[test]
     fn empfaenger_wiederholt_den_stand_im_leerlauf() {
         let b = Ordner::neu("nachquittieren");
-        let mut v = vorgaben(5000);
+        let mut v = vorgaben(30_000);
         v.nachquittieren = Duration::from_millis(100);
-        let t = testempfang(b.p(), v);
-        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
-        assert!(angenommen(&t));
-        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 10]));
-        let zehn = || t.weg.quittungen().iter().filter(|q| **q == Quittung { kennung: 7, zustand: 0, empfangen: 10 }).count();
-        assert!(bis(Duration::from_secs(3), || zehn() >= 1));
-        thread::sleep(Duration::from_millis(450));
-        assert!(zehn() >= 3, "{} Wiederholungen in 450 ms", zehn());
-        // Nicht mehr als etwa alle 100 ms.
-        assert!(zehn() <= 8, "{} Wiederholungen in 450 ms", zehn());
+        // Der Weg schreibt die Zeitpunkte der Quittungen "10 empfangen" mit.
+        let zehn: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let angenommen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (z2, a2) = (zehn.clone(), angenommen.clone());
+        let e = Empfaenger::neu_mit(
+            b.p().to_path_buf(),
+            Arc::new(move |_t: u8, n: &[u8]| {
+                match Quittung::lesen(n) {
+                    Some(Quittung { kennung: 7, zustand: 0, empfangen: 0 }) => a2.store(true, Ordering::SeqCst),
+                    Some(Quittung { kennung: 7, zustand: 0, empfangen: 10 }) => sperre(&z2).push(Instant::now()),
+                    q => panic!("unerwartete Quittung {q:?}"),
+                }
+                Gesendet::Ja
+            }),
+            |_| true,
+            |_| {},
+            v,
+        );
+        e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(bis(Duration::from_secs(5), || angenommen.load(Ordering::SeqCst)));
+        e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 10]));
+        // Die Quittung nach dem Stueck und mindestens drei Wiederholungen.
+        let zahl = || sperre(&zehn).len();
+        assert!(bis(Duration::from_secs(10), || zahl() >= 4), "{} Quittungen", zahl());
+        // Nie oefter als alle nachquittieren (der Weg stempelt, bevor der
+        // Empfaenger quittiert_um setzt; die naechste kommt fruehestens 100 ms
+        // danach).
+        let z = sperre(&zehn).clone();
+        for w in z.windows(2) {
+            assert!(w[1] - w[0] >= Duration::from_millis(95), "Wiederholung schon nach {:?}", w[1] - w[0]);
+        }
+        e.abbrechen();
     }
 
     /// Gesamtdurchsicht [2] im ganzen Lauf: der Quittungsweg nimmt ab 500 KB
@@ -5607,6 +5674,46 @@ mod tests {
         assert_eq!(marke_lesen(""), None);
         assert_eq!(marke_lesen("1 2 3"), None);
         assert_eq!(marke_lesen("x 2"), None);
+    }
+
+    /// Hinweis der Gegenpruefung: kannte der empfangende Prozess seine
+    /// Startzeit nicht (Marke "<pid> 0"), ist seine Uebertragung nur verwaist,
+    /// wenn er nicht mehr lebt - ein anderer Prozess hielte sie sonst wegen
+    /// der abweichenden Startzeit fuer verwaist und loeschte sie mitten im
+    /// Empfang. Als lebender fremder Prozess dient ein Kind, das nur wartet.
+    #[test]
+    fn marke_ohne_startzeit_verwaist_nur_mit_totem_prozess() {
+        use std::process::{Command, Stdio};
+        let mut kind = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        }
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+        let pid = kind.id();
+        assert_eq!(prozess_lebt(pid), Some(true));
+        assert!(!prozess_verwaist(pid, 0), "lebender Prozess mit unbekannter Startzeit gilt als verwaist");
+        if cfg!(any(windows, target_os = "macos")) {
+            // Ohne die Ausnahme fuer 0 schluege gerade dieser Vergleich an.
+            let start = prozess_start(pid).expect("Startzeit des Kindes");
+            assert_ne!(start, 0);
+            assert!(!prozess_verwaist(pid, start));
+            assert!(prozess_verwaist(pid, start.wrapping_add(1)), "wiederverwendete Kennung nicht erkannt");
+        }
+        kind.kill().unwrap();
+        kind.wait().unwrap();
+        assert!(prozess_verwaist(pid, 0), "toter Prozess mit unbekannter Startzeit gilt nicht als verwaist");
+        // Die eigene Kennung mit 0: von einem frueheren Prozess, wenn dieser
+        // seine Startzeit kennt.
+        assert_eq!(prozess_verwaist(std::process::id(), 0), eigener_start() != 0);
     }
 
     /// Die Prioritaet des aufrufenden Fadens: Windows GetThreadPriority,
