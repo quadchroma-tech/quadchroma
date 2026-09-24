@@ -57,9 +57,10 @@
 //
 //   Ja   = eingereiht. Voll = oertliche Warteschlange voll, spaeter noch einmal
 //   (der Kern schlaeft dann VOLL_WARTEN = 2 ms - thread::sleep, das auch unter
-//   Windows so kurz schlaeft - und ruft erneut mit DENSELBEN Bytes; ein
-//   Abbruch wirkt nach hoechstens einem Schlaf). Weg = Sitzung vorbei,
-//   abbrechen.
+//   Windows so kurz schlaeft - und ruft erneut; ein Abbruch wirkt nach
+//   hoechstens einem Schlaf). Der Sender wiederholt mit DENSELBEN Bytes, der
+//   Empfaenger eine Zwischenquittung mit dem dann neuesten Stand. Nichts, was
+//   Voll bekam, gilt als gesendet. Weg = Sitzung vorbei, abbrechen.
 //   senden() darf nie lange blockieren. Es wird nur aus den Faeden dieses
 //   Moduls gerufen, nie unter einer Sperre dieses Moduls. Fuer Closures gibt
 //   es eine Umsetzung: `Arc::new(|typ: u8, n: &[u8]| ... )`.
@@ -113,6 +114,10 @@
 //   Empfaenger::nachricht(&self, typ: u8, nutzlast: Vec<u8>)  legt 50/51/52
 //       nur in die Warteschlange und kehrt sofort zurueck (darf im Lesefaden
 //       eines Kanals und unter EINSPEISEN laufen). Andere Typen: uebergangen.
+//       Die Warteschlange fasst FENSTER + STUECK_MAX Datenbytes (soviel hat
+//       ein Sender, der das Fenster einhaelt, hoechstens unquittiert
+//       unterwegs, gleich in wie vielen Stuecken) und 8 Enden; darueber
+//       Quittung 4. Ein neues Angebot leert sie.
 //   Empfaenger::abbrechen(&self)  Sitzungsende/Zuschauerwechsel: die laufende
 //       Uebertragung wird verworfen, ihr Verzeichnis geloescht, der Faden
 //       endet; weitere Nachrichten werden uebergangen. Kehrt sofort zurueck.
@@ -133,6 +138,14 @@
 //   und zusaetzlich immer dann, wenn die Warteschlange leer ist und noch
 //   Unquittiertes vorliegt (so kann kein Sender mit kleinem Fenster haengen
 //   bleiben). Ueber STILLSTAND ohne Stueck: Quittung 6, Verzeichnis weg.
+//   Quittungen gehen nicht verloren: Jeder Versuch ist einer; bei Voll gilt
+//   der Stand als unquittiert, und der Schreibfaden versucht es nach
+//   VOLL_WARTEN wieder (mit dem dann neuesten Stand), ohne dafuer das
+//   Schreiben anzuhalten. Eine Schlussquittung (1 bis 6) wird ebenso
+//   wiederholt, bis der Weg sie nimmt oder Weg meldet, ein neues Angebot sie
+//   ueberholt, die Sitzung endet oder STILLSTAND vergangen ist (dann hat der
+//   Sender ohnehin aufgegeben; es gibt eine Protokollzeile "Dateien: Quittung
+//   N nicht gesendet, ..."). fertig() laeuft dabei nur einmal.
 //
 // Stand und Ereignis (fuer Oberflaeche und Protokoll)
 //
@@ -218,6 +231,10 @@
 //     abbrechen bzw. fallen lassen. Je Richtung hoechstens ein Griff.
 //   - Sitzungsende/Zuschauerwechsel: Empfaenger::abbrechen.
 //   - Programmstart: aufraeumen_beim_start().
+//   - Staende nach der Kennung zuordnen (Stand.kennung, Griff::kennung):
+//     Nach Griff::abbrechen meldet der alte Faden sein Abgebrochen(Hier) unter
+//     Umstaenden erst, wenn schon ein neuer Sender laeuft; ohne Zuordnung
+//     zeigte die Oberflaeche fuer die neue Uebertragung "abgebrochen".
 //   - Der Sender schneidet ein Stueck notfalls kuerzer, damit nie mehr als das
 //     Fenster unterwegs ist. Das muss auch ein anderer Sender (Mac-Host) tun:
 //     Bei FENSTER_SPIEL = 64 KiB und Stuecken zu 48 KiB wartete er sonst auf
@@ -288,10 +305,21 @@ pub const HOECHSTALTER: Duration = Duration::from_secs(24 * 3600);
 
 /// Fortschritt an die Oberflaeche hoechstens so oft.
 const FORTSCHRITT_TAKT: Duration = Duration::from_millis(100);
-/// So viel darf beim Empfaenger ungeschrieben warten (Stuecke und Enden,
-/// je Nachricht 64 Byte Aufschlag). Ein Sender, der sein Fenster einhaelt,
-/// kommt nie ueber FENSTER; darueber ist es ein Protokollfehler (Quittung 4).
-const WARTESCHLANGE_MAX: usize = 4 * FENSTER as usize;
+/// So viele Datenbytes duerfen beim Empfaenger ungeschrieben warten (jedes
+/// Stueck zaehlt mit seinen Daten, mindestens 1). Das ist, was ein Sender,
+/// der sein Fenster einhaelt, hoechstens unquittiert unterwegs hat - auch
+/// einer, der wie in 2.7 Schritt 4 nur VOR dem Stueck prueft
+/// (gesendet - quittiert < FENSTER) und dann ein volles Stueck schickt. Die
+/// Zahl der Nachrichten ist bewusst nicht eigens begrenzt: viele kleine
+/// Dateien (bis zu EINTRAEGE_MAX Stuecke) oder kurz geschnittene Stuecke
+/// sind erlaubt, und jedes Stueck traegt mindestens 1 Byte. Im unguenstigsten
+/// Fall (lauter 1-Byte-Stuecke) belegt die Warteschlange rund 20 MB, im
+/// ueblichen um 300 KB. Darueber ist es ein Protokollfehler (Quittung 4).
+const WARTEND_DATEN_MAX: usize = FENSTER as usize + STUECK_MAX;
+/// So viele Enden duerfen warten. Ein Sender schickt je Uebertragung
+/// hoechstens zwei (Ende 0 und danach Ende 1 bzw. 3), ein neues Angebot
+/// leert die Warteschlange.
+const WARTEND_ENDEN_MAX: usize = 8;
 /// Endung der Marke einer laufenden Uebertragung.
 const MARKE_ENDUNG: &str = ".laeuft";
 
@@ -483,8 +511,9 @@ pub struct Vorgaben {
     pub stillstand: Duration,
     /// Bei Gesendet::Voll so lange warten.
     pub voll_warten: Duration,
-    /// Ende nach einem Abbruch bzw. eine Quittung bei Voll hoechstens so lange
-    /// versuchen.
+    /// Das Ende nach einem Abbruch (Sender) bei Voll hoechstens so lange
+    /// versuchen. Quittungen des Empfaengers gelten nicht: sie werden
+    /// wiederholt, bis sie hinaus sind (siehe Modulkopf).
     pub ende_frist: Duration,
     /// Freier Platz am Ort der Basis; None = nicht vorab pruefen.
     pub freier_platz: fn(&Path) -> Option<u64>,
@@ -915,11 +944,17 @@ fn geraetename(name: &str) -> bool {
 }
 
 /// Haengt einen bereinigten relativen Pfad an; None, wenn ein Bestandteil
-/// fuer das eigene System kein schlichter Name ist (Laufwerk, Wurzel, "..").
-/// Das ist die letzte Wache vor dem Dateisystem.
+/// fuer das eigene System kein schlichter Name ist (Laufwerk, Wurzel, "..",
+/// unter Windows auch jedes ':', sonst kaeme "a:b" als alternativer
+/// Datenstrom von "a" durch - Path sieht darin einen schlichten Namen). Das
+/// ist die letzte Wache vor dem Dateisystem, zusaetzlich zu pfad_pruefen und
+/// der Bereinigung.
 fn sicher_anhaengen(basis: &Path, rel: &str) -> Option<PathBuf> {
     let mut p = basis.to_path_buf();
     for t in rel.split('/') {
+        if cfg!(windows) && t.contains(':') {
+            return None;
+        }
         let mut c = Path::new(t).components();
         match (c.next(), c.next()) {
             (Some(Component::Normal(x)), None) if x == std::ffi::OsStr::new(t) => p.push(x),
@@ -1054,7 +1089,10 @@ fn aufraeumen_zu(basis: &Path, behalten: usize, hoechstalter: Option<Duration>, 
     geloescht
 }
 
-/// Ein Ordner, frisch (nicht rekursiv); unter Unix 0700.
+/// Das Uebertragungsverzeichnis, frisch (nicht rekursiv); unter Unix 0700
+/// wie die Basis. Die empfangenen Ordner darin bekommen dagegen die
+/// ueblichen Rechte (create_dir, umask): Finder uebernimmt sie beim Einfuegen,
+/// und die Basis mit 0700 schuetzt ohnehin alles darunter.
 fn ordner_anlegen(p: &Path) -> io::Result<()> {
     #[cfg(unix)]
     return std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(p);
@@ -1715,10 +1753,13 @@ impl SenderInnen {
                 if let (true, Some(g)) = (hinaus, ende) {
                     self.ende_senden(weg, g, v);
                 }
+                // "abgelehnt" nur, solange das Angebot nicht angenommen war;
+                // eine Quittung 4 danach (Protokollfehler) bricht ab.
+                let angenommen = sperre(&self.z).angenommen;
                 let zeile = match &ergebnis {
                     Ergebnis::ZuGross => "Dateien: abgelehnt (Gegenseite: zu gross oder zu viele Eintraege)".to_string(),
                     Ergebnis::Abgebrochen(Abbruch::Quittung(z))
-                        if matches!(*z, ZUSTAND_KEIN_PLATZ | ZUSTAND_UNGUELTIG) =>
+                        if !angenommen && matches!(*z, ZUSTAND_KEIN_PLATZ | ZUSTAND_UNGUELTIG) =>
                     {
                         format!("Dateien: abgelehnt (Gegenseite: {})", zustand_text(*z))
                     }
@@ -1813,8 +1854,11 @@ struct EmpfInnen {
 #[derive(Default)]
 struct EmpfQ {
     eingang: VecDeque<Eingang>,
-    /// Wartende Bytes (Stuecke und Enden, mit Aufschlag).
-    bytes: usize,
+    /// Wartende Datenbytes der Stuecke (je Stueck mindestens 1), hoechstens
+    /// WARTEND_DATEN_MAX.
+    daten: usize,
+    /// Wartende Enden, hoechstens WARTEND_ENDEN_MAX.
+    enden: usize,
     ueberlauf: bool,
     abbruch: bool,
     beendet: bool,
@@ -1824,12 +1868,16 @@ enum Eingang {
     Angebot(Vec<u8>),
     Stueck(Vec<u8>),
     Ende(Vec<u8>),
-    /// Die Warteschlange lief ueber; die Kennung des verworfenen Stuecks.
-    Ueberlauf(Option<u32>),
+    /// Die Warteschlange lief ueber; die Kennung der verworfenen Nachricht
+    /// und der Grund fuer das Protokoll.
+    Ueberlauf(Option<u32>, &'static str),
 }
 
-/// Aufschlag je wartender Nachricht, damit auch viele kleine begrenzt sind.
-const AUFSCHLAG: usize = 64;
+/// Was ein wartendes Stueck gegen WARTEND_DATEN_MAX zaehlt: seine Daten,
+/// mindestens 1 (auch ein kaputtes ohne Daten).
+fn stueck_daten(nutzlast: &[u8]) -> usize {
+    nutzlast.len().saturating_sub(STUECK_KOPF).max(1)
+}
 
 struct EmpfEndet<'a>(&'a EmpfInnen);
 
@@ -1868,6 +1916,7 @@ impl Empfaenger {
                 melden: Box::new(melden),
                 v: vorgaben,
                 ue: None,
+                ausstehend: None,
             };
             s.lauf(&faden);
         });
@@ -1879,7 +1928,10 @@ impl Empfaenger {
 
     /// Legt eine Nachricht (50, 51, 52) in die Warteschlange und kehrt sofort
     /// zurueck. Ein neues Angebot verwirft alles, was davor noch wartet: der
-    /// Sender hat die fruehere Uebertragung damit aufgegeben.
+    /// Sender hat die fruehere Uebertragung damit aufgegeben. Stuecke ueber
+    /// WARTEND_DATEN_MAX bzw. Enden ueber WARTEND_ENDEN_MAX sind ein
+    /// Protokollfehler (Quittung 4); bis zum naechsten Angebot wird dann
+    /// nichts mehr angenommen.
     pub fn nachricht(&self, typ: u8, nutzlast: Vec<u8>) {
         let mut q = sperre(&self.innen.q);
         if q.abbruch || q.beendet {
@@ -1888,26 +1940,39 @@ impl Empfaenger {
         match typ {
             DATEI_ANGEBOT => {
                 q.eingang.clear();
-                q.bytes = 0;
+                q.daten = 0;
+                q.enden = 0;
                 q.ueberlauf = false;
                 q.eingang.push_back(Eingang::Angebot(nutzlast));
             }
-            DATEI_STUECK | DATEI_ENDE => {
+            DATEI_STUECK => {
                 if q.ueberlauf {
                     return;
                 }
-                let b = nutzlast.len() + AUFSCHLAG;
-                if q.bytes + b > WARTESCHLANGE_MAX {
+                let d = stueck_daten(&nutzlast);
+                if q.daten + d > WARTEND_DATEN_MAX {
                     q.ueberlauf = true;
                     let k = kennung_lesen(&nutzlast);
-                    q.eingang.push_back(Eingang::Ueberlauf(k));
+                    q.eingang.push_back(Eingang::Ueberlauf(k, "mehr als das Fenster unquittiert"));
                 } else {
-                    q.bytes += b;
-                    q.eingang.push_back(if typ == DATEI_STUECK {
-                        Eingang::Stueck(nutzlast)
-                    } else {
-                        Eingang::Ende(nutzlast)
-                    });
+                    q.daten += d;
+                    q.eingang.push_back(Eingang::Stueck(nutzlast));
+                }
+            }
+            DATEI_ENDE => {
+                if q.ueberlauf {
+                    return;
+                }
+                if q.enden >= WARTEND_ENDEN_MAX {
+                    q.ueberlauf = true;
+                    let k = kennung_lesen(&nutzlast);
+                    q.eingang.push_back(Eingang::Ueberlauf(k, "zu viele Enden"));
+                } else {
+                    q.enden += 1;
+                    // Mehr als ENDE_MIN Byte liest niemand; ein langes Ende
+                    // (auf dem Bildkanal bis 64 MiB) nicht aufheben.
+                    let n = if nutzlast.len() > ENDE_MIN { nutzlast[..ENDE_MIN].to_vec() } else { nutzlast };
+                    q.eingang.push_back(Eingang::Ende(n));
                 }
             }
             _ => return,
@@ -1922,7 +1987,8 @@ impl Empfaenger {
         let mut q = sperre(&self.innen.q);
         q.abbruch = true;
         q.eingang.clear();
-        q.bytes = 0;
+        q.daten = 0;
+        q.enden = 0;
         drop(q);
         self.innen.cv.notify_all();
     }
@@ -1965,7 +2031,11 @@ struct Uebertragung {
     /// Davon schon geschrieben.
     im_eintrag: u64,
     empfangen: u64,
-    quittiert: u64,
+    /// Stand der letzten Quittung, die der Weg genommen hat (Gesendet::Ja);
+    /// None, solange nicht einmal die Quittung 0 hinaus ist.
+    quittiert: Option<u64>,
+    /// Nach Voll erst ab dann wieder quittieren.
+    nochmal: Option<Instant>,
     datei: Option<File>,
     letzte: Instant,
     gemeldet: Instant,
@@ -1980,6 +2050,16 @@ fn naechste_datei(a: &Angebot, ab: usize) -> usize {
 }
 
 impl Uebertragung {
+    /// Liegt Unquittiertes vor (auch die Quittung 0 der Annahme)?
+    fn offen(&self) -> bool {
+        self.quittiert != Some(self.empfangen)
+    }
+
+    /// Darf jetzt quittiert werden? Nach Voll erst nach voll_warten.
+    fn faellig(&self, jetzt: Instant) -> bool {
+        self.nochmal.is_none_or(|t| jetzt >= t)
+    }
+
     /// Schliesst, loescht Verzeichnis und Marke; liefert den Stand und ggf.
     /// eine Zeile, falls das Loeschen scheiterte.
     fn verwerfen(mut self) -> (Stand, Option<String>) {
@@ -2038,9 +2118,23 @@ impl Uebertragung {
 
 enum Holen {
     Nachricht(Eingang),
+    /// Unquittiertes quittieren (Warteschlange leer).
     Quittieren,
+    /// Die ausstehende Schlussquittung noch einmal versuchen.
+    Nachreichen,
+    /// Die ausstehende Schlussquittung ist verfallen.
+    Aufgeben,
+    /// Nach Voll kurz warten, dann wieder nachsehen.
+    Schlafen(Duration),
     Stillstand,
     Schluss,
+}
+
+/// Eine Schlussquittung (1 bis 6), die der Weg noch nicht genommen hat.
+struct Ausstehend {
+    q: Quittung,
+    nochmal: Instant,
+    aufgeben: Instant,
 }
 
 /// Der Schreibfaden.
@@ -2051,6 +2145,7 @@ struct Schreiber {
     melden: Box<dyn Fn(Ereignis) + Send>,
     v: Vorgaben,
     ue: Option<Uebertragung>,
+    ausstehend: Option<Ausstehend>,
 }
 
 impl Schreiber {
@@ -2063,43 +2158,76 @@ impl Schreiber {
                         break Holen::Schluss;
                     }
                     if let Some(e) = q.eingang.pop_front() {
-                        let b = match &e {
-                            Eingang::Stueck(n) | Eingang::Ende(n) => n.len() + AUFSCHLAG,
-                            _ => 0,
-                        };
-                        q.bytes = q.bytes.saturating_sub(b);
+                        match &e {
+                            Eingang::Stueck(n) => q.daten = q.daten.saturating_sub(stueck_daten(n)),
+                            Eingang::Ende(_) => q.enden = q.enden.saturating_sub(1),
+                            _ => {}
+                        }
                         break Holen::Nachricht(e);
                     }
-                    match &self.ue {
-                        None => q = warten_ohne_frist(&innen.cv, q),
-                        Some(u) => {
-                            // Nichts wartet mehr: Unquittiertes jetzt quittieren.
-                            if u.empfangen > u.quittiert {
+                    // Nichts wartet mehr.
+                    let jetzt = Instant::now();
+                    // Naechster Versuch nach Voll bzw. Stillstand.
+                    let mut wecken: Option<Instant> = None;
+                    let mut frist: Option<Instant> = None;
+                    if let Some(a) = &self.ausstehend {
+                        if jetzt >= a.aufgeben {
+                            break Holen::Aufgeben;
+                        }
+                        if jetzt >= a.nochmal {
+                            break Holen::Nachreichen;
+                        }
+                        wecken = Some(a.nochmal);
+                    }
+                    if let Some(u) = &self.ue {
+                        let st = u.letzte + self.v.stillstand;
+                        if jetzt >= st {
+                            break Holen::Stillstand;
+                        }
+                        frist = Some(st);
+                        // Unquittiertes jetzt quittieren, nach Voll erst nach
+                        // voll_warten.
+                        if u.offen() {
+                            if u.faellig(jetzt) {
                                 break Holen::Quittieren;
                             }
-                            let frist = u.letzte + self.v.stillstand;
-                            let jetzt = Instant::now();
-                            if jetzt >= frist {
-                                break Holen::Stillstand;
+                            if let Some(t) = u.nochmal {
+                                wecken = Some(wecken.map_or(t, |w| w.min(t)));
                             }
-                            q = warten(&innen.cv, q, frist - jetzt);
                         }
+                    }
+                    match (wecken, frist) {
+                        // Schlafen statt Condvar mit kurzer Frist (unter
+                        // Windows dauerte die bis zur Timeraufloesung); was
+                        // derweil ankommt, wartet hoechstens voll_warten.
+                        (Some(w), _) => break Holen::Schlafen(w.saturating_duration_since(jetzt)),
+                        (None, Some(f)) => q = warten(&innen.cv, q, f - jetzt),
+                        (None, None) => q = warten_ohne_frist(&innen.cv, q),
                     }
                 }
             };
             match holen {
                 Holen::Schluss => break,
-                Holen::Quittieren => self.quittieren(innen),
-                Holen::Stillstand => {
-                    self.fehler(innen, ZUSTAND_ABGEBROCHEN, Abbruch::Zeitueberschreitung)
+                Holen::Schlafen(d) => std::thread::sleep(d),
+                Holen::Quittieren => self.quittieren(),
+                Holen::Nachreichen => self.nachreichen(),
+                Holen::Aufgeben => {
+                    if let Some(a) = self.ausstehend.take() {
+                        let z = format!(
+                            "Dateien: Quittung {} nicht gesendet, der Weg blieb voll ({})",
+                            a.q.zustand,
+                            zustand_text(a.q.zustand)
+                        );
+                        self.melden(Ereignis::zeile(z));
+                    }
                 }
-                Holen::Nachricht(Eingang::Angebot(n)) => self.angebot(&n, innen),
-                Holen::Nachricht(Eingang::Stueck(n)) => self.stueck(&n, innen),
-                Holen::Nachricht(Eingang::Ende(n)) => self.ende(&n, innen),
-                Holen::Nachricht(Eingang::Ueberlauf(k)) => {
+                Holen::Stillstand => self.fehler(ZUSTAND_ABGEBROCHEN, Abbruch::Zeitueberschreitung),
+                Holen::Nachricht(Eingang::Angebot(n)) => self.angebot(&n),
+                Holen::Nachricht(Eingang::Stueck(n)) => self.stueck(&n),
+                Holen::Nachricht(Eingang::Ende(n)) => self.ende(&n),
+                Holen::Nachricht(Eingang::Ueberlauf(k, grund)) => {
                     if self.aktiv(k) {
-                        let t = "mehr als das Fenster unquittiert".to_string();
-                        self.fehler(innen, ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
+                        self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(grund.to_string()));
                     }
                 }
             }
@@ -2128,50 +2256,65 @@ impl Schreiber {
         }
     }
 
-    /// Schickt eine Quittung; bei Voll hoechstens ende_frist lang (danach
-    /// traegt die naechste den Stand mit). false: Weg.
-    fn quittung_senden(&self, innen: &EmpfInnen, q: Quittung) -> bool {
-        let n = q.kodieren();
-        let bis = Instant::now() + self.v.ende_frist;
-        loop {
-            match self.weg.senden(DATEI_QUITTUNG, &n) {
-                Gesendet::Ja => return true,
-                Gesendet::Weg => return false,
-                Gesendet::Voll => {
-                    if Instant::now() >= bis || sperre(&innen.q).abbruch {
-                        return true;
-                    }
-                    std::thread::sleep(self.v.voll_warten);
+    /// Zwischenquittung (Zustand 0) mit dem neuesten Stand; ein Versuch.
+    /// Nur Gesendet::Ja zaehlt als quittiert. Bei Voll bleibt der Stand offen,
+    /// und lauf() versucht es nach voll_warten wieder (mit dem dann neuesten
+    /// Stand), ohne das Schreiben aufzuhalten; so geht keine Quittung
+    /// verloren, und ein Sender am Fenster bleibt nicht haengen. Weg: die
+    /// Sitzung ist vorbei, die Uebertragung wird verworfen.
+    fn quittieren(&mut self) {
+        let Some(u) = self.ue.as_mut() else { return };
+        let q = Quittung { kennung: u.kennung, zustand: ZUSTAND_LAEUFT, empfangen: u.empfangen };
+        match self.weg.senden(DATEI_QUITTUNG, &q.kodieren()) {
+            Gesendet::Ja => {
+                u.quittiert = Some(q.empfangen);
+                u.nochmal = None;
+            }
+            Gesendet::Voll => u.nochmal = Some(Instant::now() + self.v.voll_warten),
+            Gesendet::Weg => {
+                if let Some(u) = self.ue.take() {
+                    let (st, h) = u.verwerfen();
+                    self.abgebrochen_melden(st, h, Abbruch::Verbindung);
                 }
             }
         }
     }
 
-    fn quittieren(&mut self, innen: &EmpfInnen) {
-        let Some(u) = self.ue.as_mut() else { return };
-        u.quittiert = u.empfangen;
-        let q = Quittung { kennung: u.kennung, zustand: ZUSTAND_LAEUFT, empfangen: u.empfangen };
-        if !self.quittung_senden(innen, q) {
-            if let Some(u) = self.ue.take() {
-                let (st, h) = u.verwerfen();
-                self.abgebrochen_melden(st, h, Abbruch::Verbindung);
-            }
+    /// Schlussquittung (Zustand 1 bis 6); die Uebertragung ist hier schon zu
+    /// Ende. Nimmt der Weg sie nicht (Voll), wird sie aufgehoben und von
+    /// lauf() alle voll_warten erneut versucht, hoechstens STILLSTAND lang
+    /// (dann hat auch der Sender aufgegeben). Ein neues Angebot ueberholt sie,
+    /// das Sitzungsende verwirft sie. Weg: nichts mehr zu tun.
+    fn schluss_quittung(&mut self, q: Quittung) {
+        self.ausstehend = None;
+        if self.weg.senden(DATEI_QUITTUNG, &q.kodieren()) == Gesendet::Voll {
+            let jetzt = Instant::now();
+            self.ausstehend =
+                Some(Ausstehend { q, nochmal: jetzt + self.v.voll_warten, aufgeben: jetzt + self.v.stillstand });
+        }
+    }
+
+    fn nachreichen(&mut self) {
+        let Some(a) = self.ausstehend.as_mut() else { return };
+        match self.weg.senden(DATEI_QUITTUNG, &a.q.kodieren()) {
+            Gesendet::Voll => a.nochmal = Instant::now() + self.v.voll_warten,
+            Gesendet::Ja | Gesendet::Weg => self.ausstehend = None,
         }
     }
 
     /// Beendet die laufende Uebertragung mit einer Quittung ungleich 0 und
     /// loescht ihr Verzeichnis.
-    fn fehler(&mut self, innen: &EmpfInnen, zustand: u8, grund: Abbruch) {
+    fn fehler(&mut self, zustand: u8, grund: Abbruch) {
         let Some(u) = self.ue.take() else { return };
-        self.quittung_senden(innen, Quittung { kennung: u.kennung, zustand, empfangen: u.empfangen });
+        self.schluss_quittung(Quittung { kennung: u.kennung, zustand, empfangen: u.empfangen });
         let (st, h) = u.verwerfen();
         self.abgebrochen_melden(st, h, grund);
     }
 
     /// Ein Angebot nicht annehmen: Quittung und Meldung, sonst nichts.
-    fn ablehnen(&self, innen: &EmpfInnen, kennung: Option<u32>, zustand: u8, text: String) {
+    fn ablehnen(&mut self, kennung: Option<u32>, zustand: u8, text: String) {
         if let Some(k) = kennung {
-            self.quittung_senden(innen, Quittung { kennung: k, zustand, empfangen: 0 });
+            self.schluss_quittung(Quittung { kennung: k, zustand, empfangen: 0 });
         }
         let mut st = Stand::neu(Richtung::Empfangen, kennung.unwrap_or(0));
         let praefix = if zustand == ZUSTAND_SCHREIBFEHLER { "abgebrochen" } else { "abgelehnt" };
@@ -2188,7 +2331,10 @@ impl Schreiber {
         self.melden(Ereignis::beides(st, zeile));
     }
 
-    fn angebot(&mut self, n: &[u8], innen: &EmpfInnen) {
+    fn angebot(&mut self, n: &[u8]) {
+        // Der Sender hat die fruehere Uebertragung aufgegeben: ihre
+        // ausstehende Schlussquittung erreicht niemanden mehr.
+        self.ausstehend = None;
         if let Some(u) = self.ue.take() {
             let (st, h) = u.verwerfen();
             self.abgebrochen_melden(st, h, Abbruch::Ende(GRUND_ABGEBROCHEN));
@@ -2200,24 +2346,24 @@ impl Schreiber {
         });
         let (a, rel) = match geprueft {
             Ok(x) => x,
-            Err(abl) => return self.ablehnen(innen, kennung, abl.zustand(), abl.text().to_string()),
+            Err(abl) => return self.ablehnen(kennung, abl.zustand(), abl.text().to_string()),
         };
         if let Err(e) = basis_anlegen(&self.basis) {
             let t = format!("Ablage {}: {e}", self.basis.display());
-            return self.ablehnen(innen, kennung, ZUSTAND_SCHREIBFEHLER, t);
+            return self.ablehnen(kennung, ZUSTAND_SCHREIBFEHLER, t);
         }
         if let Some(frei) = (self.v.freier_platz)(&self.basis) {
             let noetig = a.gesamt.saturating_add(PLATZRESERVE);
             if frei < noetig {
                 let t = format!("zu wenig Platz: {} MB frei, {} MB noetig", mb_text(frei), mb_text(noetig));
-                return self.ablehnen(innen, kennung, ZUSTAND_KEIN_PLATZ, t);
+                return self.ablehnen(kennung, ZUSTAND_KEIN_PLATZ, t);
             }
         }
         let (verzeichnis, marke) = match verzeichnis_anlegen(&self.basis, a.kennung) {
             Ok(x) => x,
             Err(e) => {
                 let t = format!("Uebertragungsverzeichnis: {e}");
-                return self.ablehnen(innen, kennung, ZUSTAND_SCHREIBFEHLER, t);
+                return self.ablehnen(kennung, ZUSTAND_SCHREIBFEHLER, t);
             }
         };
         let mut ziele = Vec::with_capacity(a.eintraege.len());
@@ -2228,7 +2374,7 @@ impl Schreiber {
                 break;
             };
             let angelegt = match e.art {
-                EintragArt::Ordner => ordner_anlegen(&ziel),
+                EintragArt::Ordner => fs::create_dir(&ziel),
                 EintragArt::Datei => OpenOptions::new().write(true).create_new(true).open(&ziel).map(|_| ()),
             };
             if let Err(err) = angelegt {
@@ -2246,7 +2392,7 @@ impl Schreiber {
         if let Some((z, t)) = fehler {
             let _ = verzeichnis_loeschen(&verzeichnis);
             let _ = fs::remove_file(&marke);
-            return self.ablehnen(innen, kennung, z, t);
+            return self.ablehnen(kennung, z, t);
         }
         let jetzt = Instant::now();
         let u = Uebertragung {
@@ -2259,42 +2405,45 @@ impl Schreiber {
             marke,
             im_eintrag: 0,
             empfangen: 0,
-            quittiert: 0,
+            quittiert: None,
+            nochmal: None,
             datei: None,
             letzte: jetzt,
             gemeldet: jetzt,
         };
-        let q = Quittung { kennung: u.kennung, zustand: ZUSTAND_LAEUFT, empfangen: 0 };
-        if !self.quittung_senden(innen, q) {
-            let (st, h) = u.verwerfen();
-            return self.abgebrochen_melden(st, h, Abbruch::Verbindung);
-        }
         let zeile = format!(
             "Dateien: empfange {} Eintraege, {} MB",
             u.angebot.eintraege.len(),
             mb_text(u.angebot.gesamt)
         );
-        self.melden(Ereignis::beides(u.stand.clone(), zeile));
+        let stand = u.stand.clone();
         self.ue = Some(u);
+        // Quittung 0 mit empfangen 0; bei Voll holt lauf() sie nach.
+        self.quittieren();
+        if self.ue.is_some() {
+            self.melden(Ereignis::beides(stand, zeile));
+        }
     }
 
-    fn stueck(&mut self, n: &[u8], innen: &EmpfInnen) {
+    fn stueck(&mut self, n: &[u8]) {
         // Fremde Kennung: Rest einer verworfenen Uebertragung, still uebergehen.
         if !self.aktiv(kennung_lesen(n)) {
             return;
         }
         let Some(s) = Stueck::lesen(n) else {
             let t = "Stueck mit ungueltiger Laenge".to_string();
-            return self.fehler(innen, ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
+            return self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
         };
         let Some(u) = self.ue.as_mut() else { return };
         if let Err(t) = u.pruefen(&s) {
-            return self.fehler(innen, ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
+            return self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
         }
         if let Err(t) = u.schreiben(&s) {
-            return self.fehler(innen, ZUSTAND_SCHREIBFEHLER, Abbruch::Schreibfehler(t));
+            return self.fehler(ZUSTAND_SCHREIBFEHLER, Abbruch::Schreibfehler(t));
         }
-        let quittieren = u.empfangen - u.quittiert >= QUITTUNG_ALLE;
+        // Spaetestens je QUITTUNG_ALLE geschriebener Byte (nach Voll erst
+        // wieder nach voll_warten).
+        let quittieren = u.empfangen - u.quittiert.unwrap_or(0) >= QUITTUNG_ALLE && u.faellig(Instant::now());
         let fortschritt = if u.gemeldet.elapsed() >= FORTSCHRITT_TAKT {
             u.gemeldet = Instant::now();
             u.stand.bytes = u.empfangen;
@@ -2303,20 +2452,20 @@ impl Schreiber {
             None
         };
         if quittieren {
-            self.quittieren(innen);
+            self.quittieren();
         }
         if let Some(st) = fortschritt {
             self.melden(Ereignis::stand(st));
         }
     }
 
-    fn ende(&mut self, n: &[u8], innen: &EmpfInnen) {
+    fn ende(&mut self, n: &[u8]) {
         if !self.aktiv(kennung_lesen(n)) {
             return;
         }
         let Some(e) = Ende::lesen(n) else {
             let t = "Ende zu kurz".to_string();
-            return self.fehler(innen, ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
+            return self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
         };
         let Some(mut u) = self.ue.take() else { return };
         if e.grund != GRUND_VOLLSTAENDIG {
@@ -2326,7 +2475,7 @@ impl Schreiber {
         if u.naechster < u.angebot.eintraege.len() {
             self.ue = Some(u);
             let t = "Ende vor dem letzten Stueck".to_string();
-            return self.fehler(innen, ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
+            return self.fehler(ZUSTAND_UNGUELTIG, Abbruch::Ungueltig(t));
         }
         u.datei = None;
         let _ = fs::remove_file(&u.marke);
@@ -2339,14 +2488,11 @@ impl Schreiber {
             .map(|(_, z)| z.clone())
             .collect();
         if !(self.fertig)(oberste) {
-            self.quittung_senden(
-                innen,
-                Quittung { kennung: u.kennung, zustand: ZUSTAND_SCHREIBFEHLER, empfangen: u.empfangen },
-            );
+            self.schluss_quittung(Quittung { kennung: u.kennung, zustand: ZUSTAND_SCHREIBFEHLER, empfangen: u.empfangen });
             let (st, h) = u.verwerfen();
             return self.abgebrochen_melden(st, h, Abbruch::Ablage);
         }
-        self.quittung_senden(innen, Quittung { kennung: u.kennung, zustand: ZUSTAND_FERTIG, empfangen: u.empfangen });
+        self.schluss_quittung(Quittung { kennung: u.kennung, zustand: ZUSTAND_FERTIG, empfangen: u.empfangen });
         aufraeumen(&self.basis, BEHALTEN, None);
         let mut st = u.stand.clone();
         st.bytes = u.empfangen;
@@ -2436,17 +2582,22 @@ mod tests {
     }
 
     /// Ein Weg, der alles mitschreibt. `voll` antwortet Voll (ohne
-    /// Mitschreiben), `antworten` gibt die naechsten Antworten vor.
+    /// Mitschreiben), `antworten` gibt die naechsten Antworten vor. Haelt der
+    /// Test `tor`, bleibt senden() davor stehen (nur fuer Tests: so staut sich
+    /// beim Empfaenger alles in der Warteschlange, waehrend der Schreibfaden
+    /// in der Quittung 0 steckt).
     #[derive(Default)]
     struct Rekorder {
         n: Mutex<Vec<(u8, Vec<u8>)>>,
         antworten: Mutex<VecDeque<Gesendet>>,
         voll: std::sync::atomic::AtomicBool,
         versuche: std::sync::atomic::AtomicUsize,
+        tor: Mutex<()>,
     }
 
     impl Weg for Rekorder {
         fn senden(&self, typ: u8, nutzlast: &[u8]) -> Gesendet {
+            drop(sperre(&self.tor));
             self.versuche.fetch_add(1, Ordering::SeqCst);
             if self.voll.load(Ordering::SeqCst) {
                 return Gesendet::Voll;
@@ -2734,6 +2885,26 @@ mod tests {
         assert!(sicher_anhaengen(b, "C:").is_none());
         assert!(sicher_anhaengen(b, "..").is_none());
         assert!(sicher_anhaengen(b, "a/../b").is_none());
+    }
+
+    #[test]
+    fn sicher_anhaengen_laesst_nur_schlichte_namen_durch() {
+        let b = Path::new("basis");
+        assert_eq!(sicher_anhaengen(b, "a/b c"), Some(b.join("a").join("b c")));
+        for boese in ["..", ".", "", "a//b", "/x", "a/../b", "a/."] {
+            assert_eq!(sicher_anhaengen(b, boese), None, "{boese:?}");
+        }
+        // ':' ist unter Windows nie ein schlichter Name: "C:" waere ein
+        // Laufwerk, "ab:c" ein alternativer Datenstrom von "ab". Auf dem Mac
+        // ist ':' erlaubt (2.5).
+        for doppelpunkt in ["C:", "ab:c", "a/x:y"] {
+            let r = sicher_anhaengen(b, doppelpunkt);
+            if cfg!(windows) {
+                assert_eq!(r, None, "{doppelpunkt:?}");
+            } else {
+                assert!(r.is_some(), "{doppelpunkt:?}");
+            }
+        }
     }
 
     fn eintraege(v: &[(EintragArt, &str, u64)]) -> Angebot {
@@ -3025,19 +3196,17 @@ mod tests {
     #[test]
     fn empfaenger_quittiert_je_64_kib() {
         let b = Ordner::neu("quittung-je");
-        let mut v = vorgaben(5000);
-        v.ende_frist = Duration::from_secs(2);
-        let t = testempfang(b.p(), v);
+        let t = testempfang(b.p(), vorgaben(5000));
         let groesse = 3 * QUITTUNG_ALLE + 10;
         let a = Angebot {
             kennung: 7,
             gesamt: groesse,
             eintraege: vec![Eintrag { art: EintragArt::Datei, pfad: "g".into(), groesse }],
         };
-        // Der Schreibfaden haengt an Quittung 0, bis alles eingereiht ist; so
+        // Der Schreibfaden steckt in Quittung 0, bis alles eingereiht ist; so
         // laeuft die Warteschlange nie leer, und es wird nur nach
         // QUITTUNG_ALLE quittiert (und am Ende).
-        t.weg.voll.store(true, Ordering::SeqCst);
+        let tor = sperre(&t.weg.tor);
         t.e.nachricht(DATEI_ANGEBOT, a.kodieren());
         let daten = muster(groesse as usize, 5);
         let mut v = 0usize;
@@ -3047,7 +3216,7 @@ mod tests {
             v += n;
         }
         t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
-        t.weg.voll.store(false, Ordering::SeqCst);
+        drop(tor);
         assert!(bis(Duration::from_secs(3), || t.weg.hat_quittung(ZUSTAND_FERTIG)));
         let q = t.weg.quittungen();
         let laufend: Vec<u64> = q.iter().filter(|q| q.zustand == 0).map(|q| q.empfangen).collect();
@@ -3266,31 +3435,279 @@ mod tests {
         assert!(bis(Duration::from_secs(3), || letztes(&t.ev) == ablage));
     }
 
+    /// Eine Zwischenquittung, die Voll bekam, gilt nicht als gesendet: der
+    /// Schreibfaden holt sie nach, auch nach laenger als ende_frist
+    /// (vorgaben: 200 ms), und zwar ohne Busy-Loop.
+    #[test]
+    fn zwischenquittung_bei_voll_wird_nachgeholt() {
+        let b = Ordner::neu("zwischen-voll");
+        let t = testempfang(b.p(), vorgaben(5000));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        t.weg.voll.store(true, Ordering::SeqCst);
+        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 60]));
+        thread::sleep(Duration::from_millis(300));
+        let v0 = t.weg.versuche.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        let versuche = t.weg.versuche.load(Ordering::SeqCst) - v0;
+        assert!((1..=80).contains(&versuche), "{versuche} Versuche in 100 ms");
+        assert!(!t.weg.quittungen().iter().any(|q| q.empfangen == 60));
+        t.weg.voll.store(false, Ordering::SeqCst);
+        let da = || t.weg.quittungen().iter().any(|q| q == &Quittung { kennung: 7, zustand: 0, empfangen: 60 });
+        assert!(bis(Duration::from_secs(1), da), "Quittung verloren: {:?}", t.weg.quittungen());
+        // Danach laeuft die Uebertragung normal zu Ende.
+        t.e.nachricht(DATEI_STUECK, stueck(1, 60, &[1; 40]));
+        t.e.nachricht(DATEI_STUECK, stueck(2, 0, &[2; 50]));
+        t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+        assert!(bis(Duration::from_secs(3), || t.weg.hat_quittung(ZUSTAND_FERTIG)));
+    }
+
+    /// Ebenso die Schlussquittung 1; fertig() laeuft dabei nur einmal.
+    #[test]
+    fn schlussquittung_bei_voll_wird_nachgeholt() {
+        let b = Ordner::neu("schluss-voll");
+        let t = testempfang(b.p(), vorgaben(5000));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 100]));
+        t.e.nachricht(DATEI_STUECK, stueck(2, 0, &[2; 50]));
+        assert!(bis(Duration::from_secs(3), || t.weg.quittungen().iter().any(|q| q.empfangen == 150)));
+        t.weg.voll.store(true, Ordering::SeqCst);
+        t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+        assert!(bis(Duration::from_secs(3), || sperre(&t.fertig).is_some()));
+        thread::sleep(Duration::from_millis(300));
+        assert!(!t.weg.hat_quittung(ZUSTAND_FERTIG));
+        t.weg.voll.store(false, Ordering::SeqCst);
+        assert!(bis(Duration::from_secs(1), || t.weg.hat_quittung(ZUSTAND_FERTIG)), "Quittung 1 verloren");
+        thread::sleep(Duration::from_millis(50));
+        let q = t.weg.quittungen();
+        assert_eq!(q.iter().filter(|q| q.zustand == ZUSTAND_FERTIG).count(), 1);
+        assert_eq!(*q.last().unwrap(), Quittung { kennung: 7, zustand: ZUSTAND_FERTIG, empfangen: 150 });
+        assert_eq!(ergebnisse(&t.ev).iter().filter(|e| **e == Ergebnis::Fertig).count(), 1);
+    }
+
+    /// Bleibt der Weg voll, gibt der Empfaenger die Schlussquittung nach
+    /// STILLSTAND auf (mit Protokollzeile), versucht danach nichts mehr und
+    /// nimmt Neues an.
+    #[test]
+    fn schlussquittung_verfaellt_nach_stillstand() {
+        let b = Ordner::neu("schluss-verfaellt");
+        let t = testempfang(b.p(), vorgaben(300));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        t.weg.voll.store(true, Ordering::SeqCst);
+        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 100]));
+        t.e.nachricht(DATEI_STUECK, stueck(2, 0, &[2; 50]));
+        t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+        assert!(bis(Duration::from_secs(3), || sperre(&t.fertig).is_some()));
+        let t0 = Instant::now();
+        let aufgegeben = || zeilen(&t.ev).iter().any(|z| z == "Dateien: Quittung 1 nicht gesendet, der Weg blieb voll (fertig)");
+        assert!(bis(Duration::from_secs(3), aufgegeben), "{:?}", zeilen(&t.ev));
+        assert!(t0.elapsed() >= Duration::from_millis(200), "zu frueh: {:?}", t0.elapsed());
+        let v0 = t.weg.versuche.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(t.weg.versuche.load(Ordering::SeqCst), v0, "nach dem Aufgeben kein Versuch mehr");
+        t.weg.voll.store(false, Ordering::SeqCst);
+        let mut neu = kleines_angebot();
+        neu.kennung = 8;
+        t.e.nachricht(DATEI_ANGEBOT, neu.kodieren());
+        assert!(bis(Duration::from_secs(3), || t.weg.quittungen().iter().any(|q| q.kennung == 8 && q.zustand == 0)));
+        assert!(!t.weg.hat_quittung(ZUSTAND_FERTIG));
+    }
+
+    /// Ein neues Angebot ueberholt eine ausstehende Schlussquittung: der
+    /// Sender hat die fruehere Uebertragung aufgegeben.
+    #[test]
+    fn neues_angebot_ueberholt_die_ausstehende_schlussquittung() {
+        let b = Ordner::neu("schluss-ueberholt");
+        let t = testempfang(b.p(), vorgaben(5000));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        t.e.nachricht(DATEI_STUECK, stueck(1, 0, &[1; 100]));
+        t.e.nachricht(DATEI_STUECK, stueck(2, 0, &[2; 50]));
+        t.weg.voll.store(true, Ordering::SeqCst);
+        t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+        assert!(bis(Duration::from_secs(3), || sperre(&t.fertig).is_some()));
+        let mut neu = kleines_angebot();
+        neu.kennung = 8;
+        t.e.nachricht(DATEI_ANGEBOT, neu.kodieren());
+        thread::sleep(Duration::from_millis(50));
+        t.weg.voll.store(false, Ordering::SeqCst);
+        assert!(bis(Duration::from_secs(3), || t.weg.quittungen().iter().any(|q| q.kennung == 8)));
+        thread::sleep(Duration::from_millis(50));
+        assert!(!t.weg.hat_quittung(ZUSTAND_FERTIG), "{:?}", t.weg.quittungen());
+        assert_eq!(t.weg.quittungen().last().unwrap(), &Quittung { kennung: 8, zustand: 0, empfangen: 0 });
+    }
+
+    /// Ersetzt jemand eine angelegte Datei durch eine Verknuepfung, schreibt
+    /// der Empfaenger nicht hindurch (O_NOFOLLOW bzw.
+    /// FILE_FLAG_OPEN_REPARSE_POINT und die Pruefung auf eine gewoehnliche
+    /// Datei): Quittung 5, das Ziel draussen bleibt unberuehrt.
+    #[test]
+    fn verknuepfung_am_ziel_wird_nicht_beschrieben() {
+        let b = Ordner::neu("ziel-verknuepfung");
+        let basis = b.p().join("basis");
+        let draussen = b.p().join("draussen.txt");
+        datei(&draussen, b"bleibt");
+        let t = testempfang(&basis, vorgaben(5000));
+        let a = Angebot {
+            kennung: 7,
+            gesamt: 10,
+            eintraege: vec![Eintrag { art: EintragArt::Datei, pfad: "f".into(), groesse: 10 }],
+        };
+        t.e.nachricht(DATEI_ANGEBOT, a.kodieren());
+        assert!(angenommen(&t));
+        let verz = basis.join(inhalt(&basis).into_iter().find(|n| !n.ends_with(MARKE_ENDUNG)).unwrap());
+        fs::remove_file(verz.join("f")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&draussen, verz.join("f")).unwrap();
+        #[cfg(windows)]
+        {
+            // Braucht Administratorrechte oder den Entwicklermodus.
+            if let Err(e) = std::os::windows::fs::symlink_file(&draussen, verz.join("f")) {
+                eprintln!("verknuepfung_am_ziel_wird_nicht_beschrieben: uebersprungen ({e})");
+                return;
+            }
+        }
+        t.e.nachricht(DATEI_STUECK, stueck(0, 0, &[b'x'; 10]));
+        assert!(bis(Duration::from_secs(3), || t.weg.hat_quittung(ZUSTAND_SCHREIBFEHLER)), "{:?}", zeilen(&t.ev));
+        assert!(bis(Duration::from_secs(3), || inhalt(&basis).is_empty()), "{:?}", inhalt(&basis));
+        assert_eq!(fs::read(&draussen).unwrap(), b"bleibt");
+        assert!(fs::symlink_metadata(&draussen).unwrap().is_file());
+    }
+
+    /// Basis und Uebertragungsverzeichnis sind 0700, empfangene Ordner
+    /// bekommen die ueblichen Rechte (Finder uebernimmt sie beim Einfuegen).
+    #[cfg(unix)]
+    #[test]
+    fn empfangene_ordner_haben_die_ueblichen_rechte() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = Ordner::neu("rechte");
+        let basis = b.p().join("basis");
+        let t = testempfang(&basis, vorgaben(5000));
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        assert!(angenommen(&t));
+        let verz = basis.join(inhalt(&basis).into_iter().find(|n| !n.ends_with(MARKE_ENDUNG)).unwrap());
+        let modus = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let vergleich = b.p().join("vergleich");
+        fs::create_dir(&vergleich).unwrap();
+        assert_eq!(modus(&basis), 0o700);
+        assert_eq!(modus(&verz), 0o700);
+        assert_eq!(modus(&verz.join("d")), modus(&vergleich));
+    }
+
     #[test]
     fn warteschlange_laeuft_nicht_ueber() {
         let b = Ordner::neu("ueberlauf");
-        let mut v = vorgaben(5000);
-        v.ende_frist = Duration::from_secs(2);
-        let t = testempfang(b.p(), v);
+        let t = testempfang(b.p(), vorgaben(5000));
         let groesse = 64 * STUECK_MAX as u64;
         let a = Angebot {
             kennung: 7,
             gesamt: groesse,
             eintraege: vec![Eintrag { art: EintragArt::Datei, pfad: "g".into(), groesse }],
         };
-        // Der Schreibfaden haengt an der Quittung 0, bis `voll` wieder faellt;
-        // so staut sich alles in der Warteschlange.
-        t.weg.voll.store(true, Ordering::SeqCst);
+        // Der Schreibfaden steckt in der Quittung 0, bis das Tor aufgeht; so
+        // staut sich alles in der Warteschlange.
+        let tor = sperre(&t.weg.tor);
         t.e.nachricht(DATEI_ANGEBOT, a.kodieren());
         let daten = vec![7u8; STUECK_MAX];
         for i in 0..64u64 {
             t.e.nachricht(DATEI_STUECK, stueck(0, i * STUECK_MAX as u64, &daten));
         }
-        assert!(sperre(&t.e.innen.q).bytes <= WARTESCHLANGE_MAX);
+        assert!(sperre(&t.e.innen.q).daten <= WARTEND_DATEN_MAX);
         assert!(sperre(&t.e.innen.q).ueberlauf);
-        t.weg.voll.store(false, Ordering::SeqCst);
+        // Auch Enden sind begrenzt (hier ohnehin schon uebergelaufen).
+        for _ in 0..100 {
+            t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+        }
+        assert_eq!(sperre(&t.e.innen.q).enden, 0);
+        drop(tor);
         assert!(bis(Duration::from_secs(3), || t.weg.hat_quittung(ZUSTAND_UNGUELTIG)));
         assert!(bis(Duration::from_secs(3), || inhalt(b.p()).is_empty()));
+        let z = zeilen(&t.ev).join("\n");
+        assert!(z.contains("Dateien: abgebrochen (mehr als das Fenster unquittiert)"), "{z}");
+    }
+
+    /// Hoechstens WARTEND_ENDEN_MAX Enden warten, jedes auf ENDE_MIN Byte
+    /// gekuerzt (auf dem Bildkanal koennte eins bis 64 MiB lang sein).
+    #[test]
+    fn enden_sind_begrenzt_und_gekuerzt() {
+        let b = Ordner::neu("enden");
+        let t = testempfang(b.p(), vorgaben(5000));
+        let tor = sperre(&t.weg.tor);
+        t.e.nachricht(DATEI_ANGEBOT, kleines_angebot().kodieren());
+        let mut lang = Ende { kennung: 7, grund: GRUND_ABGEBROCHEN }.kodieren();
+        lang.resize(1000, 0xee);
+        for _ in 0..WARTEND_ENDEN_MAX {
+            t.e.nachricht(DATEI_ENDE, lang.clone());
+        }
+        {
+            let q = sperre(&t.e.innen.q);
+            assert!(!q.ueberlauf);
+            assert_eq!(q.enden, WARTEND_ENDEN_MAX);
+            assert!(q.eingang.iter().all(|e| !matches!(e, Eingang::Ende(n) if n.len() != ENDE_MIN)));
+        }
+        t.e.nachricht(DATEI_ENDE, lang);
+        assert!(sperre(&t.e.innen.q).ueberlauf);
+        drop(tor);
+        // Das erste Ende (Grund 1) verwirft die Uebertragung wie gewohnt.
+        assert!(bis(Duration::from_secs(3), || inhalt(b.p()).is_empty()));
+        let ende = Some(Ergebnis::Abgebrochen(Abbruch::Ende(GRUND_ABGEBROCHEN)));
+        assert!(bis(Duration::from_secs(3), || letztes(&t.ev) == ende), "{:?}", ergebnisse(&t.ev));
+    }
+
+    /// Ein volles Fenster in vielen kleinen Stuecken (hier 10000 zu 26 Byte
+    /// wie bei vielen kleinen Dateien, dazu der Rest bis FENSTER + STUECK_MAX)
+    /// passt in die Warteschlange und wird ganz geschrieben; ein Byte mehr
+    /// ist ein Protokollfehler.
+    #[test]
+    fn warteschlange_fasst_ein_fenster_in_kleinen_stuecken() {
+        // Aus 2.7 Schritt 4 abgeleitet, nicht aus der Konstanten: so viel hat
+        // ein Sender hoechstens unquittiert unterwegs.
+        let hoechstens = FENSTER as usize + STUECK_MAX;
+        for mehr in [0usize, 1] {
+            let b = Ordner::neu(&format!("fenster-klein-{mehr}"));
+            let t = testempfang(b.p(), vorgaben(10_000));
+            let groesse = (hoechstens + mehr) as u64;
+            let a = Angebot {
+                kennung: 7,
+                gesamt: groesse,
+                eintraege: vec![Eintrag { art: EintragArt::Datei, pfad: "g".into(), groesse }],
+            };
+            let daten = muster(groesse as usize, 9);
+            let mut teile: Vec<usize> = vec![26; 10_000];
+            let mut rest = groesse as usize - 260_000;
+            while rest > 0 {
+                let n = rest.min(STUECK_MAX);
+                teile.push(n);
+                rest -= n;
+            }
+            let tor = sperre(&t.weg.tor);
+            t.e.nachricht(DATEI_ANGEBOT, a.kodieren());
+            let mut v = 0usize;
+            for n in teile {
+                t.e.nachricht(DATEI_STUECK, stueck(0, v as u64, &daten[v..v + n]));
+                v += n;
+            }
+            t.e.nachricht(DATEI_ENDE, Ende { kennung: 7, grund: 0 }.kodieren());
+            let (ueberlauf, wartend) = {
+                let q = sperre(&t.e.innen.q);
+                (q.ueberlauf, q.daten)
+            };
+            drop(tor);
+            if mehr == 0 {
+                assert!(!ueberlauf, "10000 kleine Stuecke im Fenster sind erlaubt");
+                assert_eq!(wartend, hoechstens);
+                assert!(bis(Duration::from_secs(10), || t.weg.hat_quittung(ZUSTAND_FERTIG)), "{:?}", zeilen(&t.ev));
+                assert!(!t.weg.hat_quittung(ZUSTAND_UNGUELTIG));
+                let pfade = sperre(&t.fertig).clone().unwrap();
+                assert_eq!(fs::read(&pfade[0]).unwrap(), daten);
+            } else {
+                assert!(ueberlauf, "ein Byte ueber FENSTER + STUECK_MAX");
+                assert!(bis(Duration::from_secs(10), || t.weg.hat_quittung(ZUSTAND_UNGUELTIG)));
+                assert!(bis(Duration::from_secs(3), || inhalt(b.p()).is_empty()));
+            }
+        }
     }
 
     // ------------------------------------------------------ Sender
@@ -3390,6 +3807,30 @@ mod tests {
                 Ergebnis::Abgebrochen(Abbruch::Quittung(zustand))
             };
             assert_eq!(letztes(&ev), Some(erwartet));
+        }
+    }
+
+    /// Quittung 4 vor der Annahme heisst "abgelehnt", danach (Protokollfehler
+    /// mitten im Lauf) "abgebrochen".
+    #[test]
+    fn quittung_4_nach_der_annahme_heisst_abgebrochen() {
+        for (angenommen, erwartet) in [
+            (false, "Dateien: abgelehnt (Gegenseite: ungueltig)"),
+            (true, "Dateien: abgebrochen (Gegenseite: ungueltig)"),
+        ] {
+            let o = Ordner::neu(&format!("quittung-4-{angenommen}"));
+            let p = quelle_datei(&o, "a.bin", 500_000);
+            let weg = Rekorder::neu();
+            let (ev, melden) = sammler();
+            let g = Sender::starten_mit(vec![p], weg.clone(), FENSTER_SPIEL, melden, vorgaben(5000));
+            assert!(bis(Duration::from_secs(3), || weg.datenbytes() == FENSTER_SPIEL));
+            if angenommen {
+                g.quittung(&Quittung { kennung: g.kennung(), zustand: 0, empfangen: 0 }.kodieren());
+            }
+            g.quittung(&Quittung { kennung: g.kennung(), zustand: ZUSTAND_UNGUELTIG, empfangen: 0 }.kodieren());
+            assert!(g.abwarten(Duration::from_secs(3)));
+            assert!(zeilen(&ev).iter().any(|z| z == erwartet), "{:?}", zeilen(&ev));
+            assert_eq!(letztes(&ev), Some(Ergebnis::Abgebrochen(Abbruch::Quittung(ZUSTAND_UNGUELTIG))));
         }
     }
 
@@ -3498,6 +3939,30 @@ mod tests {
         assert_eq!(weg.versuche.load(Ordering::SeqCst), 0);
         assert!(zeilen(&ev).iter().any(|z| z.contains("aus einem Empfang")));
         let _ = fs::remove_dir_all(&basis);
+    }
+
+    /// Der Widerhallschutz greift auch, wenn Basis und Pfad der Ablage
+    /// verschieden geschrieben sind (macOS /var gegen /private/var, Windows
+    /// \\?\C:\ gegen C:\): dann vergleicht er nach canonicalize.
+    #[test]
+    fn eigene_ablage_auch_ueber_den_kanonischen_pfad() {
+        let o = Ordner::neu("kanonisch");
+        let echt = o.p().join("echt");
+        let x = echt.join("ablage").join("12-34").join("x.txt");
+        fs::create_dir_all(x.parent().unwrap()).unwrap();
+        datei(&x, b"x");
+        let draussen = o.p().join("draussen.txt");
+        datei(&draussen, b"d");
+        #[cfg(unix)]
+        let (basis, pfad) = {
+            std::os::unix::fs::symlink(&echt, o.p().join("link")).unwrap();
+            (o.p().join("link").join("ablage"), x.clone())
+        };
+        #[cfg(not(unix))]
+        let (basis, pfad) = (echt.join("ablage"), fs::canonicalize(&x).unwrap());
+        assert!(!pfad.starts_with(&basis), "der Vergleich wie gegeben darf hier nicht greifen");
+        assert!(aus_eigener_ablage(&[pfad], &basis));
+        assert!(!aus_eigener_ablage(&[draussen], &basis));
     }
 
     // ------------------------------------------------------ Auflisten
@@ -3722,6 +4187,17 @@ mod tests {
     /// Sender und Empfaenger ueber Wege im Speicher; die Quittungen laufen
     /// ueber einen eigenen Faden zurueck wie ueber den Bild- bzw. Eingabekanal.
     fn paar(pfade: Vec<PathBuf>, basis: &Path, fenster: u64, v: Vorgaben) -> Paar {
+        paar_mit(pfade, basis, fenster, v, |_| false)
+    }
+
+    /// Wie paar(); `voll(quittung)` laesst den Quittungsweg Voll melden.
+    fn paar_mit(
+        pfade: Vec<PathBuf>,
+        basis: &Path,
+        fenster: u64,
+        v: Vorgaben,
+        voll: impl Fn(&Quittung) -> bool + Send + Sync + 'static,
+    ) -> Paar {
         let (qtx, qrx) = mpsc::channel::<Vec<u8>>();
         let qtx = Mutex::new(qtx);
         let fertig: Fertig = Arc::new(Mutex::new(None));
@@ -3731,6 +4207,9 @@ mod tests {
             basis.to_path_buf(),
             Arc::new(move |t: u8, n: &[u8]| {
                 assert_eq!(t, DATEI_QUITTUNG);
+                if voll(&Quittung::lesen(n).unwrap()) {
+                    return Gesendet::Voll;
+                }
                 let _ = sperre(&qtx).send(n.to_vec());
                 Gesendet::Ja
             }),
@@ -3815,6 +4294,34 @@ mod tests {
         assert!(pa.empf.abwarten(Duration::from_secs(3)));
         // Nach dem Abbrechen bleibt eine FERTIGE Uebertragung liegen.
         assert_eq!(inhalt(z.p()).len(), 1);
+    }
+
+    /// Der Quittungsweg meldet laenger als ende_frist Voll: erst ab der
+    /// ersten Zwischenquittung mit Daten (der Sender steht dann am Fenster
+    /// des Spielmodus), dann ab der Quittung 1, je 300 ms. Beide Seiten kommen
+    /// danach zu Ende, vor STILLSTAND (1,5 s).
+    #[test]
+    fn lauf_uebersteht_voll_auf_dem_quittungsweg() {
+        let q = Ordner::neu("voll-lauf-quelle");
+        let z = Ordner::neu("voll-lauf-ziel");
+        let p = quelle_datei(&q, "a.bin", 300_000);
+        let mut v = vorgaben(1500);
+        v.ende_frist = Duration::from_millis(50);
+        let beginn: Mutex<[Option<Instant>; 2]> = Mutex::new([None, None]);
+        let voll = move |qu: &Quittung| {
+            let phase = match qu.zustand {
+                ZUSTAND_LAEUFT if qu.empfangen > 0 => 0,
+                ZUSTAND_FERTIG => 1,
+                _ => return false,
+            };
+            sperre(&beginn)[phase].get_or_insert_with(Instant::now).elapsed() < Duration::from_millis(300)
+        };
+        let pa = paar_mit(vec![p.clone()], z.p(), FENSTER_SPIEL, v, voll);
+        assert!(pa.griff.abwarten(Duration::from_secs(5)), "Sender haengt");
+        assert_eq!(letztes(&pa.ev_s), Some(Ergebnis::Fertig), "{:?}", zeilen(&pa.ev_s));
+        assert!(bis(Duration::from_secs(3), || letztes(&pa.ev_e) == Some(Ergebnis::Fertig)), "{:?}", zeilen(&pa.ev_e));
+        let pfade = sperre(&pa.fertig).clone().unwrap();
+        gleich(&p, &pfade[0]);
     }
 
     #[test]
