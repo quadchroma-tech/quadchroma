@@ -56,13 +56,24 @@
 // (klein_an) - nie hinter den einen Datei-Platz des eigenen Senders. Host
 // -> Client: der Sender reiht seine Pakete als Art::Datei ein (datei_an):
 // hoechstens eines wartet, und nur bei hoechstens DATEI_RUECKSTAND
-// Rueckstand - sonst Gesendet::Voll. So stehen vor einem Bild nie mehr als
-// ein Datei-Paket und 128 KiB, und Art::Datei zaehlt nicht gegen
-// KLEIN_GRENZE. Beide Wege sind an die Zuschauernummer gebunden (Muster
-// send_small_an): nach einem Wechsel melden sie Gesendet::Weg. Abloesen und
-// Schliessen brechen Sender und Empfaenger des Zuschauers ab. Die
-// Host-Rolle hat eine eigene Ablagebasis (host_ablage_basis), damit Client
-// und Host-Rolle auf einem Rechner einander nichts aufraeumen.
+// Rueckstand in der Warteschlange - sonst Gesendet::Voll. Art::Datei zaehlt
+// nicht gegen KLEIN_GRENZE. Was schon beim Kernel liegt (Sendepuffer bis
+// SNDBUF, 256 KiB), sieht diese Regel nicht; die Dateidaten dort, in der
+// Warteschlange und auf der Leitung zusammen begrenzt das Fenster, und das
+// ist fuer die Host-Rolle fest hoechstens DATEI_FENSTER_HOST (64 KiB) -
+// Windows kennt kein SO_NWRITE, mit dem der Mac-Host den Kernelpuffer
+// selbst misst. Vor einem Bild liegen also hoechstens 128 KiB Rueckstand
+// und ein Datei-Paket (ein Stueck bis 48 KiB; das Angebot einmal am Stueck,
+// bis 1 MiB - bewusst so gelassen, es ist ein Paket des Protokolls), dazu
+// im Kernel hoechstens 64 KiB Dateidaten. Beide Wege sind an die
+// Zuschauernummer gebunden (Muster send_small_an): nach einem Wechsel melden
+// sie Gesendet::Weg. Abloesen und Schliessen brechen Sender und Empfaenger
+// des Zuschauers ab. Kopiert der Nutzer Dateien, waehrend der aktuelle
+// Eingabekanal noch keine Faehigkeiten gemeldet hat (gleich nach dem
+// Verbinden), wird die Liste bis VORMERKEN (5 s) vorgemerkt und geht
+// hinaus, sobald IN_FAEHIGKEITEN kommt. Die Host-Rolle hat eine eigene
+// Ablagebasis (host_ablage_basis), damit Client und Host-Rolle auf einem
+// Rechner einander nichts aufraeumen.
 // Sperrreihenfolge: EINSPEISEN, AKTUELL, dann entweder Leitung.q oder
 // Leitung.dateien - diese beiden nie ineinander.
 
@@ -130,10 +141,32 @@ const ABLOESUNG_HOECHSTENS: Duration = Duration::from_secs(15);
 const KLEIN_GRENZE: usize = 2 * HARTE_GRENZE;
 /// Datei-Pakete (Art::Datei) nur, solange hoechstens so viel im Rueckstand
 /// liegt und kein anderes Datei-Paket mehr wartet (Spezifikation 3.3). Ein
-/// Bild wartet so hinter hoechstens 128 KiB und einem Stueck (48 KiB) -
-/// Dateien haben Nachrang, das Fenster des Kerns (256 KiB) fuellt sonst der
-/// Kernelpuffer.
+/// Bild wartet so in der Warteschlange hinter hoechstens 128 KiB und einem
+/// Datei-Paket (Stueck bis 48 KiB, Angebot einmal bis 1 MiB). Was davor
+/// schon beim Kernel liegt, sieht diese Regel nicht - dort begrenzt
+/// DATEI_FENSTER_HOST die Dateidaten.
 const DATEI_RUECKSTAND: usize = 128 * 1024;
+/// Fenster des Senders Host -> Client, fest hoechstens 64 KiB (auch ausser
+/// dem Spielmodus). ABWEICHUNG von 2.6 (FENSTER 256 KiB): die Voll-Regel
+/// oben sieht den Kernelpuffer (SNDBUF, 256 KiB) nicht, und ein Fenster von
+/// 256 KiB fuellte ihn vor jedem Bild mit Dateidaten (Gesamtdurchsicht [8]:
+/// im Modell 329 ms statt 131 ms beim Mac-Host). Das Fenster zaehlt, was in
+/// Warteschlange, Kernel und Leitung unquittiert unterwegs ist; 64 KiB
+/// ersetzen so, was SO_NWRITE auf dem Mac leistet. Das kostet Durchsatz je
+/// nach Umlaufzeit: hoechstens 64 KiB je Umlauf, im LAN (um 1 ms) also ueber
+/// 60 MB/s, bei 20 ms Umlaufzeit aber nur rund 3,3 MB/s. Der Empfaenger
+/// prueft nur die Obergrenze; das Protokoll bleibt vertraeglich.
+const DATEI_FENSTER_HOST: u64 = dateien::FENSTER_SPIEL;
+/// So lange wartet eine kopierte Dateiliste auf die Faehigkeiten des
+/// aktuellen Eingabekanals (Integrationstest Befund 3: gleich nach dem
+/// Verbinden steht er oft noch nicht, im --headless-Client bis zu 3 s).
+const VORMERKEN: Duration = Duration::from_secs(5);
+
+/// Das Fenster fuer den Sender der Host-Rolle: wie im Kern, aber nie ueber
+/// DATEI_FENSTER_HOST.
+fn fenster_host(spielmodus: bool) -> u64 {
+    dateien::fenster(spielmodus).min(DATEI_FENSTER_HOST)
+}
 
 /// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
 /// ist. Die Sperren hier schuetzen Abfolgen (EINSPEISEN, FREIGABE) oder Daten,
@@ -488,6 +521,38 @@ impl Warteschlange {
             _ => false,
         }
     }
+
+    /// Was der eingetragene Eingabekanal zu Dateien sagt (siehe Lage).
+    fn lage(&self) -> Lage {
+        if !self.offen {
+            return Lage::Zu;
+        }
+        match (&self.eingabe, self.faehig) {
+            (Some((n, _)), Some((m, bits))) if *n == m => {
+                if dateien::kann_dateien(bits) {
+                    Lage::Kann
+                } else {
+                    Lage::KannNicht
+                }
+            }
+            (kanal, _) => Lage::Offen { kanal: kanal.is_some() },
+        }
+    }
+}
+
+/// Was der aktuelle Eingabekanal eines Zuschauers zu Dateien gemeldet hat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lage {
+    /// Der Zuschauer ist abgeloest oder weg.
+    Zu,
+    /// IN_FAEHIGKEITEN mit FAEHIG_DATEIEN.
+    Kann,
+    /// IN_FAEHIGKEITEN ohne FAEHIG_DATEIEN.
+    KannNicht,
+    /// Noch nichts: kein Eingabekanal (`kanal` false), oder der eingetragene
+    /// hat noch keine Faehigkeiten gemeldet. Ein neuer Client meldet sie als
+    /// erste Nachricht; ein aelterer nie.
+    Offen { kanal: bool },
 }
 
 /// Dateiuebertragung eines Zuschauers. Eigene Sperre (Leitung::dateien),
@@ -499,10 +564,26 @@ struct DateiStand {
     empfaenger: Option<dateien::Empfaenger>,
     /// Host -> Client; hoechstens einer.
     sender: Option<dateien::Griff>,
-    /// ZEILE_ZUSCHAUER_ZU_ALT steht schon im Protokoll (einmal je Zuschauer).
-    zu_alt_gemeldet: bool,
+    /// Die zuletzt abgebrochene Sendung (neuer Text, vorgemerkte Liste),
+    /// solange noch keine neue lief: die naechste wartet in ihrem Faden auf
+    /// deren Ende 1, bevor ihr Angebot hinausgeht (Sender::starten_nach).
+    abgebrochen: Option<dateien::Griff>,
+    /// Eine kopierte Liste, die auf die Faehigkeiten des aktuellen
+    /// Eingabekanals wartet (hoechstens VORMERKEN).
+    vorgemerkt: Option<Vorgemerkt>,
+    /// Zaehlt die Vormerkungen: ein spaeter Zeitgeber trifft keine neuere.
+    vormerk_nr: u64,
+    /// Die Zeile "Zuschauer kann keine Dateien" bzw. "hat keine
+    /// Faehigkeiten gemeldet" steht schon im Protokoll (einmal je Zuschauer).
+    kann_nicht_gemeldet: bool,
     /// Zuschauer abgeloest oder weg: nichts Neues mehr anlegen.
     zu: bool,
+}
+
+/// Eine vorgemerkte Dateiliste (siehe DateiStand::vorgemerkt).
+struct Vorgemerkt {
+    pfade: Vec<PathBuf>,
+    nr: u64,
 }
 
 /// Ein verbundener Zuschauer: Warteschlange zum Sendefaden und die Kennung
@@ -588,6 +669,8 @@ impl Leitung {
         let (empfaenger, sender) = {
             let mut d = sperre(&self.dateien);
             d.zu = true;
+            d.vorgemerkt = None;
+            d.abgebrochen = None;
             (d.empfaenger.take(), d.sender.take())
         };
         if let Some(e) = empfaenger {
@@ -728,10 +811,15 @@ impl Leitung {
     }
 
     /// Darf DATEI_* an diesen Zuschauer? Nur, solange er da ist und sein
-    /// aktueller Eingabekanal FAEHIG_DATEIEN gemeldet hat.
+    /// aktueller Eingabekanal FAEHIG_DATEIEN gemeldet hat. Der Dienst fragt
+    /// lage(), die Tests diese Kurzform.
+    #[cfg(test)]
     fn kann_dateien(&self) -> bool {
-        let q = sperre(&self.q);
-        q.offen && q.faehig_aktuell()
+        self.lage() == Lage::Kann
+    }
+
+    fn lage(&self) -> Lage {
+        sperre(&self.q).lage()
     }
 
     /// Ein Paket des Datei-Senders einreihen (Art::Datei, 3.3): Weg, wenn der
@@ -796,12 +884,81 @@ impl Leitung {
         }
     }
 
-    /// Bricht die laufende Sendung ab (neuer Ablageinhalt); ihr Faden
-    /// schickt Ende 1.
+    /// Neuer Text in der Ablage: die laufende Sendung bricht ab (ihr Faden
+    /// schickt Ende 1), eine vorgemerkte Liste faellt weg. Der Griff bleibt
+    /// als Vorgaenger der naechsten Sendung liegen. Kehrt sofort zurueck.
     fn sender_abbrechen(&self) {
-        let alt = sperre(&self.dateien).sender.take();
-        if let Some(g) = alt {
+        let mut d = sperre(&self.dateien);
+        d.vorgemerkt = None;
+        Leitung::sendung_beenden(&mut d);
+    }
+
+    /// Die laufende Sendung bricht ab (neuer Inhalt); ihr Griff bleibt in
+    /// `abgebrochen`, bis eine neue Sendung auf ihr Ende wartet.
+    fn sendung_beenden(d: &mut DateiStand) {
+        if let Some(g) = d.sender.take() {
             g.abbrechen();
+            d.abgebrochen = Some(g);
+        }
+    }
+
+    /// Startet den Sender fuer diesen Zuschauer (unter seiner Dateisperre):
+    /// der Weg ist an seine Nummer gebunden, das Fenster ist fenster_host
+    /// (je Stueck gefragt, also mit dem Spielmodus von jetzt), und die
+    /// vorige Sendung ist der Vorgaenger. Liefert die Kennung.
+    fn sender_starten(&self, d: &mut DateiStand, u: &DateiUmgebung, pfade: Vec<PathBuf>) -> u32 {
+        let (platz, zaehler, nr) = (u.platz, u.zaehler, self.nr());
+        let weg: Arc<dyn dateien::Weg> = Arc::new(move |typ: u8, n: &[u8]| datei_an(platz, zaehler, nr, typ, n));
+        let vorgaenger = d.sender.take().or_else(|| d.abgebrochen.take());
+        let griff = dateien::Sender::starten_nach(
+            vorgaenger,
+            pfade,
+            weg,
+            || fenster_host(Z.gaming.load(Ordering::Relaxed)),
+            u.melden(Some(self.ip.clone())),
+            u.vorgaben,
+        );
+        let kennung = griff.kennung();
+        d.sender = Some(griff);
+        kennung
+    }
+
+    /// Eine vorgemerkte Liste pruefen (nach IN_FAEHIGKEITEN bzw. vom
+    /// Zeitgeber ihrer Vormerkung, `verfallen` = deren Nummer): kann der
+    /// aktuelle Eingabekanal Dateien, geht sie jetzt hinaus; kann er es
+    /// nicht, faellt sie weg (ZEILE_ZUSCHAUER_ZU_ALT); hat er noch nichts
+    /// gemeldet, wartet sie weiter - ausser ihre Frist ist um, dann faellt
+    /// sie mit einer zutreffenden Zeile weg (zeile_ohne_meldung). Die
+    /// Zeilen kommen einmal je Zuschauer.
+    fn vorgemerkte_pruefen(&self, u: &DateiUmgebung, verfallen: Option<u64>) {
+        let lage = self.lage();
+        let mut d = sperre(&self.dateien);
+        let Some(nr) = d.vorgemerkt.as_ref().map(|v| v.nr) else { return };
+        if verfallen.is_some_and(|n| n != nr) {
+            return;
+        }
+        let zeile = match lage {
+            Lage::Kann => {
+                let Some(v) = d.vorgemerkt.take() else { return };
+                self.sender_starten(&mut d, u, v.pfade);
+                drop(d);
+                (u.zeile)("Dateien: Zuschauer meldet Dateien - die vorgemerkte Liste geht hinaus".into());
+                return;
+            }
+            Lage::Offen { .. } if verfallen.is_none() => return,
+            Lage::Offen { kanal } => zeile_ohne_meldung(kanal, u.vormerken),
+            Lage::KannNicht => dateien::ZEILE_ZUSCHAUER_ZU_ALT.to_string(),
+            Lage::Zu => {
+                d.vorgemerkt = None;
+                return;
+            }
+        };
+        d.vorgemerkt = None;
+        let melden = !d.kann_nicht_gemeldet;
+        d.kann_nicht_gemeldet = true;
+        drop(d);
+        if melden {
+            (u.zeile)(zeile);
         }
     }
 
@@ -1067,9 +1224,11 @@ fn datei_an(platz: &Mutex<Option<Arc<Leitung>>>, zaehler: &AtomicU64, nr: u64, t
 
 /// Woran die Dateiuebertragung der Host-Rolle haengt: Platz und Zaehler der
 /// Zuschauer (fuer die nummerngebundenen Wege), die Ablagebasis, was mit
-/// fertig empfangenen Dateien geschieht, und die Vorgaben des Kerns. Der
-/// Dienst nimmt AKTUELL, NR, host_ablage_basis() und clipboard::set_dateien
-/// (DateiUmgebung::dienst); Tests eigene, mit einem Rekorder statt der Ablage.
+/// fertig empfangenen Dateien geschieht, wohin die Protokollzeilen gehen, wie
+/// lange eine Liste vorgemerkt bleibt, und die Vorgaben des Kerns. Der
+/// Dienst nimmt AKTUELL, NR, host_ablage_basis(), clipboard::set_dateien und
+/// host::log (DateiUmgebung::dienst); Tests eigene, mit Rekordern.
+#[derive(Clone)]
 struct DateiUmgebung {
     platz: &'static Mutex<Option<Arc<Leitung>>>,
     zaehler: &'static AtomicU64,
@@ -1079,6 +1238,11 @@ struct DateiUmgebung {
     /// uebergeht ihn (ihre Zeilen gehen ins Protokoll); Tests sehen daran
     /// das Ergebnis.
     stand: Arc<dyn Fn(&dateien::Stand) + Send + Sync>,
+    /// Protokollzeilen der Dateiuebertragung (Dienst: host::log).
+    zeile: Arc<dyn Fn(String) + Send + Sync>,
+    /// So lange wartet eine kopierte Liste auf die Faehigkeiten (VORMERKEN).
+    vormerken: Duration,
+    /// Vorgaben des Kerns; eigene_basis ist host_ablage_basis.
     vorgaben: dateien::Vorgaben,
 }
 
@@ -1090,7 +1254,9 @@ impl DateiUmgebung {
             basis: host_ablage_basis(),
             ablegen: Arc::new(ablage_setzen),
             stand: Arc::new(|_: &dateien::Stand| {}),
-            vorgaben: dateien::Vorgaben::default(),
+            zeile: Arc::new(|z: String| log(z)),
+            vormerken: VORMERKEN,
+            vorgaben: dateien::Vorgaben { eigene_basis: host_ablage_basis, ..dateien::Vorgaben::default() },
         }
     }
 
@@ -1098,12 +1264,13 @@ impl DateiUmgebung {
     /// ins Host-Protokoll - beim Sender mit dem Ziel `ip` (zeile_mit_ziel).
     fn melden(&self, ip: Option<String>) -> impl Fn(dateien::Ereignis) + Send + 'static {
         let stand = self.stand.clone();
+        let zeile = self.zeile.clone();
         move |e: dateien::Ereignis| {
             if let Some(s) = &e.stand {
                 stand(s);
             }
             if let Some(z) = e.zeile {
-                log(match &ip {
+                zeile(match &ip {
                     Some(ip) => zeile_mit_ziel(z, ip),
                     None => z,
                 });
@@ -1145,8 +1312,9 @@ pub fn host_ablage_basis() -> PathBuf {
     }
 }
 
-/// Beim Start der Host-Rolle: Uebertragungen aelter als 24 h loeschen (2.9).
-/// Liefert die Zahl der geloeschten Verzeichnisse.
+/// Beim Start der Host-Rolle: Uebertragungen aelter als 24 h loeschen (2.9)
+/// und verwaiste (ihr Prozess lebt nicht mehr, siehe dateien.rs). Liefert die
+/// Zahl der geloeschten Verzeichnisse.
 pub fn host_ablage_aufraeumen() -> usize {
     dateien::aufraeumen(&host_ablage_basis(), usize::MAX, Some(dateien::HOECHSTALTER))
 }
@@ -1160,11 +1328,26 @@ enum Start {
     EigeneAblage,
     /// Der Zuschauer ist eben gegangen.
     Zu,
-    /// Der aktuelle Eingabekanal kann keine Dateien; `gemeldet`: die Zeile
-    /// ZEILE_ZUSCHAUER_ZU_ALT ging eben hinaus (einmal je Zuschauer).
+    /// Der aktuelle Eingabekanal hat Faehigkeiten ohne FAEHIG_DATEIEN
+    /// gemeldet; `gemeldet`: die Zeile ZEILE_ZUSCHAUER_ZU_ALT ging eben
+    /// hinaus (einmal je Zuschauer).
     ZuAlt { gemeldet: bool },
+    /// Der aktuelle Eingabekanal hat noch nichts gemeldet (oder es gibt
+    /// keinen): die Liste wartet hoechstens VORMERKEN auf IN_FAEHIGKEITEN.
+    Vorgemerkt,
     /// Der Sender laeuft, mit dieser Kennung.
     Gestartet(u32),
+}
+
+/// Die Zeile, wenn eine vorgemerkte Liste verfaellt: was wirklich war, statt
+/// "aelterer Client" (Integrationstest Befund 3).
+fn zeile_ohne_meldung(kanal: bool, frist: Duration) -> String {
+    let s = format!("{:.1}", frist.as_secs_f64()).replace('.', ",");
+    if kanal {
+        format!("Dateien: nicht gesendet, der Eingabekanal des Zuschauers hat in {s} s keine Faehigkeiten gemeldet")
+    } else {
+        format!("Dateien: nicht gesendet, der Eingabekanal des Zuschauers stand nach {s} s noch nicht")
+    }
 }
 
 /// Die Sender-Zeile "Dateien: sende ..." nennt das Ziel (3.3).
@@ -1177,52 +1360,73 @@ fn zeile_mit_ziel(z: String, ip: &str) -> String {
 }
 
 /// Eine kopierte Dateiliste an den aktuellen Zuschauer: eine laufende
-/// Sendung bricht ab (neuer Inhalt), dann startet der Sender - nur, wenn der
-/// aktuelle Eingabekanal FAEHIG_DATEIEN gemeldet hat; sonst einmal je
-/// Zuschauer ZEILE_ZUSCHAUER_ZU_ALT. Der Sender liest und sendet in seinem
-/// eigenen Faden; sein Weg ist an die Nummer dieses Zuschauers gebunden.
+/// Sendung bricht ab (neuer Inhalt, sie wird der Vorgaenger der neuen),
+/// dann startet der Sender - wenn der aktuelle Eingabekanal FAEHIG_DATEIEN
+/// gemeldet hat. Hat er Faehigkeiten ohne das Bit gemeldet, einmal je
+/// Zuschauer ZEILE_ZUSCHAUER_ZU_ALT. Hat er noch nichts gemeldet (etwa gleich
+/// nach dem Verbinden) oder steht noch keiner, wird die Liste vorgemerkt:
+/// sie geht hinaus, sobald IN_FAEHIGKEITEN kommt (eingabe_lesen), sonst
+/// faellt sie nach u.vormerken mit einer zutreffenden Zeile weg. Der Sender
+/// liest und sendet in seinem eigenen Faden; sein Weg ist an die Nummer
+/// dieses Zuschauers gebunden.
 fn dateien_senden_mit(u: &DateiUmgebung, pfade: Vec<PathBuf>) -> Start {
     let Some(l) = sperre(u.platz).clone() else { return Start::KeinZuschauer };
     // Vor dem Abbrechen (Pflicht der Rollen im Kern): eine Liste aus dem
     // eigenen Empfang ist kein neuer Inhalt des Nutzers.
     if dateien::aus_eigener_ablage(&pfade, &u.basis) {
-        log("Dateien: nicht gesendet, sie stammen aus einem Empfang");
+        (u.zeile)("Dateien: nicht gesendet, sie stammen aus einem Empfang".into());
         return Start::EigeneAblage;
     }
     // Vor der Dateisperre: q und dateien liegen nie ineinander.
-    let kann = l.kann_dateien();
-    let nr = l.nr();
+    let lage = l.lage();
     let mut d = sperre(&l.dateien);
-    if d.zu {
+    if d.zu || lage == Lage::Zu {
         return Start::Zu;
     }
-    if let Some(alt) = d.sender.take() {
-        alt.abbrechen();
-    }
-    if !kann {
-        let gemeldet = !d.zu_alt_gemeldet;
-        d.zu_alt_gemeldet = true;
-        drop(d);
-        if gemeldet {
-            log(dateien::ZEILE_ZUSCHAUER_ZU_ALT);
+    // Neuer Inhalt ersetzt auch eine vorgemerkte Liste.
+    d.vorgemerkt = None;
+    match lage {
+        Lage::Kann => Start::Gestartet(l.sender_starten(&mut d, u, pfade)),
+        Lage::KannNicht | Lage::Zu => {
+            Leitung::sendung_beenden(&mut d);
+            let gemeldet = !d.kann_nicht_gemeldet;
+            d.kann_nicht_gemeldet = true;
+            drop(d);
+            if gemeldet {
+                (u.zeile)(dateien::ZEILE_ZUSCHAUER_ZU_ALT.into());
+            }
+            Start::ZuAlt { gemeldet }
         }
-        return Start::ZuAlt { gemeldet };
+        Lage::Offen { .. } => {
+            Leitung::sendung_beenden(&mut d);
+            d.vormerk_nr += 1;
+            let nr = d.vormerk_nr;
+            d.vorgemerkt = Some(Vorgemerkt { pfade, nr });
+            drop(d);
+            // Kam IN_FAEHIGKEITEN zwischen lage() oben und dem Vormerken,
+            // fand eingabe_lesen noch nichts vor; ohne diese Nachschau ginge
+            // die Liste erst mit dem Zeitgeber hinaus, bis zu VORMERKEN
+            // spaeter (Hinweis der Gegenpruefung).
+            l.vorgemerkte_pruefen(u, None);
+            // Der Zeitgeber haelt die Leitung nicht fest.
+            let (leitung, u2) = (Arc::downgrade(&l), u.clone());
+            let zeitgeber = std::thread::Builder::new().name("qc-dateien-vormerken".into()).spawn(move || {
+                std::thread::sleep(u2.vormerken);
+                if let Some(l) = leitung.upgrade() {
+                    l.vorgemerkte_pruefen(&u2, Some(nr));
+                }
+            });
+            if zeitgeber.is_err() {
+                // Ohne Zeitgeber nicht warten: gleich entscheiden.
+                l.vorgemerkte_pruefen(u, Some(nr));
+            }
+            Start::Vorgemerkt
+        }
     }
-    let (platz, zaehler) = (u.platz, u.zaehler);
-    let weg: Arc<dyn dateien::Weg> = Arc::new(move |typ: u8, n: &[u8]| datei_an(platz, zaehler, nr, typ, n));
-    let griff = dateien::Sender::starten_mit(
-        pfade,
-        weg,
-        dateien::fenster(Z.gaming.load(Ordering::Relaxed)),
-        u.melden(Some(l.ip.clone())),
-        u.vorgaben,
-    );
-    let kennung = griff.kennung();
-    d.sender = Some(griff);
-    Start::Gestartet(kennung)
 }
 
-/// Neuer Text in der Ablage: eine laufende Sendung bricht ab.
+/// Neuer Text in der Ablage: eine laufende Sendung bricht ab, eine
+/// vorgemerkte Liste faellt weg.
 fn sendung_abbrechen_mit(u: &DateiUmgebung) {
     let l = sperre(u.platz).clone();
     if let Some(l) = l {
@@ -1719,10 +1923,11 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
         }
         // Abgeloest? Dann nichts mehr einspeisen - auch nicht, was schon
         // entschluesselt im Puffer lag. Pruefen und Ausfuehren unter EINSPEISEN.
-        let _einspeisen = sperre(&EINSPEISEN);
+        let einspeisen = sperre(&EINSPEISEN);
         if !bild.gilt(nr) {
             return Kanalende::Abgeloest;
         }
+        let mut faehigkeiten = false;
         match typ {
             IN_MOVE | IN_BUTTON | IN_SCROLL | IN_KEY => eingabe::verarbeiten(typ, &payload),
             IN_CLIP => {
@@ -1774,6 +1979,7 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
             IN_FAEHIGKEITEN => {
                 if let Some(bits) = dateien::faehigkeiten_lesen(&payload) {
                     bild.faehigkeiten_setzen(nr, bits);
+                    faehigkeiten = true;
                     log(format!(
                         "Eingabekanal: Faehigkeiten {bits:#x}{}",
                         if dateien::kann_dateien(bits) { " (Dateien)" } else { "" }
@@ -1781,6 +1987,12 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
                 }
             }
             _ => {}
+        }
+        drop(einspeisen);
+        // Eine vorgemerkte Liste wartete auf genau diese Meldung. Ausserhalb
+        // von EINSPEISEN: das Starten des Senders ist ein Fadenstart.
+        if faehigkeiten {
+            bild.vorgemerkte_pruefen(u, None);
         }
     }
 }
@@ -3009,8 +3221,34 @@ mod tests {
         }
     }
 
+    /// Wie im Dienst die eigene Basis der Host-Rolle, nur mit laengerer
+    /// Stillstandsfrist.
     fn test_vorgaben() -> dateien::Vorgaben {
-        dateien::Vorgaben { stillstand: Duration::from_secs(10), ..dateien::Vorgaben::default() }
+        dateien::Vorgaben {
+            stillstand: Duration::from_secs(10),
+            eigene_basis: host_ablage_basis,
+            ..dateien::Vorgaben::default()
+        }
+    }
+
+    /// Protokollzeilen der Dateiuebertragung (DateiUmgebung::zeile).
+    #[derive(Clone, Default)]
+    struct Zeilen(Arc<Mutex<Vec<String>>>);
+
+    impl Zeilen {
+        fn hook(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+            let z = self.0.clone();
+            Arc::new(move |t: String| {
+                println!("{t}");
+                sperre(&z).push(t)
+            })
+        }
+        fn alle(&self) -> Vec<String> {
+            sperre(&self.0).clone()
+        }
+        fn zahl(&self, f: impl Fn(&str) -> bool) -> usize {
+            sperre(&self.0).iter().filter(|z| f(z)).count()
+        }
     }
 
     fn umgebung_test(
@@ -3020,7 +3258,27 @@ mod tests {
         r: &Rekorder,
         s: &Staende,
     ) -> DateiUmgebung {
-        DateiUmgebung { platz, zaehler, basis: test_ordner(name), ablegen: r.ablegen(), stand: s.hook(), vorgaben: test_vorgaben() }
+        umgebung_mit_zeilen(platz, zaehler, name, r, s, &Zeilen::default())
+    }
+
+    fn umgebung_mit_zeilen(
+        platz: &'static Mutex<Option<Arc<Leitung>>>,
+        zaehler: &'static AtomicU64,
+        name: &str,
+        r: &Rekorder,
+        s: &Staende,
+        z: &Zeilen,
+    ) -> DateiUmgebung {
+        DateiUmgebung {
+            platz,
+            zaehler,
+            basis: test_ordner(name),
+            ablegen: r.ablegen(),
+            stand: s.hook(),
+            zeile: z.hook(),
+            vormerken: VORMERKEN,
+            vorgaben: test_vorgaben(),
+        }
     }
 
     /// Traegt `l` als neuen Zuschauer in `platz` ein, wie bild_annehmen
@@ -3548,35 +3806,57 @@ mod tests {
         }
     }
 
+    /// Bindet Eingabekanal `einr` an `l` und laesst ihn Faehigkeiten OHNE
+    /// Dateien melden (ein Client, der das Bit nicht setzt).
+    fn unfaehig_machen(l: &Leitung, einr: u64) -> (TcpStream, TcpStream) {
+        let (h, c) = tcp_paar();
+        assert!(l.eingabe_binden(einr, h.try_clone().unwrap()));
+        l.faehigkeiten_setzen(einr, 0);
+        assert_eq!(l.lage(), Lage::KannNicht);
+        (h, c)
+    }
+
     /// Der Waechter: eine kopierte Dateiliste geht nur an einen Zuschauer,
-    /// der Dateien gemeldet hat - sonst einmal je Zuschauer die Zeile
-    /// ZEILE_ZUSCHAUER_ZU_ALT. Neuer Inhalt (Dateien oder Text) bricht eine
-    /// laufende Sendung ab, die dann Ende 1 schickt; eine Liste aus der
-    /// eigenen Ablage nicht. Die Sender-Zeile nennt das Ziel.
+    /// der Dateien gemeldet hat - hat er Faehigkeiten ohne Dateien gemeldet,
+    /// einmal je Zuschauer die Zeile ZEILE_ZUSCHAUER_ZU_ALT. Neuer Inhalt
+    /// (Dateien oder Text) bricht eine laufende Sendung ab, die dann Ende 1
+    /// schickt - und zwar VOR dem Angebot der neuen (der neue Sender wartet
+    /// in seinem Faden auf seinen Vorgaenger; ohne das stritten beide um den
+    /// einen Datei-Platz, und das Ende konnte verhungern). Eine Liste aus der
+    /// eigenen Ablage bricht nichts ab. Die Sender-Zeile nennt das Ziel.
     #[test]
     fn kopierte_dateien_nur_an_faehige_zuschauer_und_neuer_inhalt_bricht_ab() {
         static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
         static ZAEHLER: AtomicU64 = AtomicU64::new(0);
-        let (r, s) = (Rekorder::default(), Staende::default());
-        let u = umgebung_test(&PLATZ, &ZAEHLER, "waechter", &r, &s);
+        let (r, s, z) = (Rekorder::default(), Staende::default(), Zeilen::default());
+        let u = umgebung_mit_zeilen(&PLATZ, &ZAEHLER, "waechter", &r, &s, &z);
         let quelle = test_ordner("waechter-quelle").join("a.bin");
         std::fs::write(&quelle, vec![3u8; 200_000]).unwrap();
         assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::KeinZuschauer);
         let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.1".into()));
         zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
-        // Ohne IN_FAEHIGKEITEN: nichts gesendet, die Zeile nur einmal.
+        // Faehigkeiten ohne Dateien: nichts gesendet, die Zeile nur einmal.
+        let _e1 = unfaehig_machen(&a, 1);
         assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::ZuAlt { gemeldet: true });
         assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::ZuAlt { gemeldet: false });
+        assert_eq!(z.zahl(|t| t == dateien::ZEILE_ZUSCHAUER_ZU_ALT), 1);
         std::thread::sleep(Duration::from_millis(100));
         assert!(sperre(&a.q).pakete.is_empty());
-        let _e = faehig_machen(&a, 1);
+        let _e2 = faehig_machen(&a, 2);
         let Start::Gestartet(k1) = dateien_senden_mit(&u, vec![quelle.clone()]) else { panic!("nicht gestartet") };
         let v = abholen_bis(&a, Duration::from_secs(5), |p| p.1 == DATEI_ANGEBOT);
         assert!(v.iter().all(|p| p.0 == Art::Datei));
-        // Neue Dateien: der erste Sender bricht ab und schickt Ende 1.
+        // Neue Dateien: der erste Sender bricht ab, sein Ende 1 geht vor dem
+        // Angebot des zweiten hinaus.
         let Start::Gestartet(k2) = dateien_senden_mit(&u, vec![quelle.clone()]) else { panic!("nicht gestartet") };
         assert_ne!(k1, k2);
-        abholen_bis(&a, Duration::from_secs(5), |p| ist_ende(p, k1, dateien::GRUND_ABGEBROCHEN));
+        let v = abholen_bis(&a, Duration::from_secs(5), |p| p.1 == DATEI_ANGEBOT && dateien::kennung_lesen(&p.2) == Some(k2));
+        let ende_k1 = v.iter().position(|p| ist_ende(p, k1, dateien::GRUND_ABGEBROCHEN));
+        let angebot_k2 = v.iter().position(|p| p.1 == DATEI_ANGEBOT);
+        assert!(
+            matches!((ende_k1, angebot_k2), (Some(e), Some(an)) if e < an),
+            "Ende(k1) {ende_k1:?} nicht vor Angebot(k2) {angebot_k2:?}"
+        );
         // Neuer Text: auch der zweite.
         sendung_abbrechen_mit(&u);
         assert!(sperre(&a.dateien).sender.is_none());
@@ -3593,6 +3873,7 @@ mod tests {
         let b = Arc::new(Leitung::neu(None, vec![2], vec![2], "10.0.0.2".into()));
         zuschauer_eintragen(&PLATZ, &ZAEHLER, b.clone());
         assert!(sperre(&a.dateien).sender.is_none());
+        let _e3 = unfaehig_machen(&b, 3);
         assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::ZuAlt { gemeldet: true });
         assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::ZuAlt { gemeldet: false });
         b.schliessen();
@@ -3607,6 +3888,357 @@ mod tests {
             "Dateien: gesendet und quittiert (12,4 MB in 1,8 s)"
         );
         let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Hinweis Phase B (M4): die Zeile des Senders im Protokoll der
+    /// Host-Rolle nennt das Ziel, " an <ip>" - an der echten Anbindung
+    /// (DateiUmgebung::melden aus sender_starten), nicht nur zeile_mit_ziel.
+    #[test]
+    fn senderzeile_nennt_das_ziel() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s, z) = (Rekorder::default(), Staende::default(), Zeilen::default());
+        let u = umgebung_mit_zeilen(&PLATZ, &ZAEHLER, "senderzeile", &r, &s, &z);
+        let quelle = test_ordner("senderzeile-quelle").join("a.bin");
+        std::fs::write(&quelle, vec![3u8; 1000]).unwrap();
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.9".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        let _e = faehig_machen(&a, 1);
+        assert!(matches!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::Gestartet(_)));
+        abholen_bis(&a, Duration::from_secs(5), |p| p.1 == DATEI_ANGEBOT);
+        let bis = Instant::now() + Duration::from_secs(5);
+        while z.zahl(|t| t.starts_with("Dateien: sende ")) == 0 && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let zeilen = z.alle();
+        assert!(zeilen.iter().any(|t| t == "Dateien: sende 1 Eintraege, 0,0 MB an 10.0.0.9"), "{zeilen:?}");
+        a.schliessen();
+        let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Gesamtdurchsicht [8]: das Fenster Host -> Client ist fest hoechstens
+    /// 64 KiB, auch ausser dem Spielmodus - ohne Quittung liegen nie mehr
+    /// Dateidaten in Warteschlange, Kernel und Leitung.
+    #[test]
+    fn fenster_der_host_rolle_hoechstens_64_kib() {
+        assert!(fenster_host(false) <= 65_536 && fenster_host(true) <= 65_536);
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s) = (Rekorder::default(), Staende::default());
+        let u = umgebung_test(&PLATZ, &ZAEHLER, "fenster-host", &r, &s);
+        let quelle = test_ordner("fenster-host-quelle").join("gross.bin");
+        std::fs::write(&quelle, vec![5u8; 1_000_000]).unwrap();
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.1".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        let _e = faehig_machen(&a, 1);
+        assert!(matches!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::Gestartet(_)));
+        // Wie ein Sendefaden, der alles sofort abnimmt; quittiert wird nicht.
+        let bis = Instant::now() + Duration::from_millis(500);
+        let mut daten = 0usize;
+        while Instant::now() < bis {
+            for p in abholen(&a) {
+                if p.1 == DATEI_STUECK {
+                    daten += p.2.len() - dateien::STUECK_KOPF;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(daten as u64, DATEI_FENSTER_HOST, "unquittiert hinaus: {daten}");
+        a.schliessen();
+        let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Gesamtdurchsicht [16]: der Sender der Host-Rolle prueft den Widerhall
+    /// gegen IHRE Basis (Vorgaben::eigene_basis), nicht gegen die des
+    /// Clients: eine Datei aus der Ablage des Clients auf demselben Rechner
+    /// geht hinaus.
+    #[test]
+    fn host_sender_prueft_die_eigene_basis() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s, z) = (Rekorder::default(), Staende::default(), Zeilen::default());
+        let u = umgebung_mit_zeilen(&PLATZ, &ZAEHLER, "eigene-basis", &r, &s, &z);
+        assert_eq!((u.vorgaben.eigene_basis)(), host_ablage_basis());
+        assert_eq!((DateiUmgebung::dienst().vorgaben.eigene_basis)(), host_ablage_basis());
+        // Unter der Basis des Clients (im Test je Prozess), in einem Ordner,
+        // den kein Aufraeumen anfasst.
+        let vom_client = dateien::ablage_basis().join("n-kern-16").join("bericht.pdf");
+        std::fs::create_dir_all(vom_client.parent().unwrap()).unwrap();
+        std::fs::write(&vom_client, b"pdf").unwrap();
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.1".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        let _e = faehig_machen(&a, 1);
+        assert!(matches!(dateien_senden_mit(&u, vec![vom_client.clone()]), Start::Gestartet(_)));
+        abholen_bis(&a, Duration::from_secs(5), |p| p.1 == DATEI_ANGEBOT);
+        assert_eq!(z.zahl(|t| t.contains("aus einem Empfang")), 0, "{:?}", z.alle());
+        // Ein Pfad unter der eigenen Basis (die Rolle prueft hier u.basis,
+        // also erst der Kern): nichts gesendet. Der Kern prueft vor jedem
+        // Zugriff auf die Platte, die Datei muss es dafuer nicht geben - so
+        // stoert der Test das Aufraeumen der Basis in anderen Tests nicht.
+        let eigen = host_ablage_basis().join("n-kern-16").join("x.txt");
+        assert!(matches!(dateien_senden_mit(&u, vec![eigen]), Start::Gestartet(_)));
+        let bis = Instant::now() + Duration::from_secs(5);
+        while z.zahl(|t| t.contains("aus einem Empfang")) == 0 && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(z.zahl(|t| t.contains("aus einem Empfang")), 1, "{:?}", z.alle());
+        a.schliessen();
+        let _ = std::fs::remove_dir_all(vom_client.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Integrationstest Befund 3 (Host-Seite): kopiert der Nutzer Dateien,
+    /// waehrend der aktuelle Eingabekanal noch keine Faehigkeiten gemeldet
+    /// hat, wird die Liste vorgemerkt und geht hinaus, sobald IN_FAEHIGKEITEN
+    /// ueber die echte Leseschleife kommt. Sonst faellt sie nach der Frist
+    /// mit einer zutreffenden Zeile weg (nicht "aelterer Client"); neuer
+    /// Text verwirft sie.
+    #[test]
+    fn vorgemerkte_liste_geht_nach_den_faehigkeiten_hinaus() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s, z) = (Rekorder::default(), Staende::default(), Zeilen::default());
+        let mut u = umgebung_mit_zeilen(&PLATZ, &ZAEHLER, "vormerken", &r, &s, &z);
+        u.vormerken = Duration::from_millis(400);
+        let u = Arc::new(u);
+        let quelle = test_ordner("vormerken-quelle").join("a.bin");
+        std::fs::write(&quelle, vec![3u8; 1000]).unwrap();
+        // 1. Eingabekanal steht, hat aber noch nichts gemeldet. Hier mit
+        // langer Frist: das Angebot muss auf die Meldung hin kommen, nicht
+        // erst mit dem Zeitgeber der Vormerkung.
+        let u_lang = Arc::new(DateiUmgebung { vormerken: Duration::from_secs(3), ..(*u).clone() });
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.1".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        let (mut h, mut c) = paar();
+        assert!(a.eingabe_binden(1, h.abbruchgriff().unwrap()));
+        let (l2, u2) = (a.clone(), u_lang.clone());
+        let leser = std::thread::spawn(move || eingabe_lesen(&mut h, &l2, 1, &u2));
+        assert_eq!(dateien_senden_mit(&u_lang, vec![quelle.clone()]), Start::Vorgemerkt);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(sperre(&a.q).pakete.is_empty());
+        faehigkeiten_melden(&mut c).unwrap();
+        let v = abholen_bis(&a, Duration::from_secs(1), |p| p.1 == DATEI_ANGEBOT);
+        assert!(v.iter().all(|p| p.0 == Art::Datei));
+        assert!(z.zahl(|t| t.contains("vorgemerkte Liste geht hinaus")) == 1, "{:?}", z.alle());
+        assert_eq!(z.zahl(|t| t.contains("aelterer Client")), 0, "{:?}", z.alle());
+        a.schliessen();
+        assert_eq!(endet_binnen(leser, Duration::from_secs(5)), Some(Kanalende::Leitung));
+
+        // 2. Neuer Text verwirft eine vorgemerkte Liste; ihr Zeitgeber
+        // trifft danach nichts mehr.
+        let b = Arc::new(Leitung::neu(None, vec![2], vec![2], "10.0.0.2".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, b.clone());
+        let (h2, _c2) = tcp_paar();
+        assert!(b.eingabe_binden(2, h2.try_clone().unwrap()));
+        assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::Vorgemerkt);
+        sendung_abbrechen_mit(&u);
+        b.faehigkeiten_setzen(2, FAEHIG_DATEIEN);
+        b.vorgemerkte_pruefen(&u, None);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(sperre(&b.q).pakete.is_empty(), "nach neuem Text ging die Liste doch hinaus");
+        assert!(sperre(&b.dateien).sender.is_none());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(z.zahl(|t| t.starts_with("Dateien: nicht gesendet")), 0, "{:?}", z.alle());
+
+        // 3. Keine Meldung binnen der Frist: die Zeile sagt, was war - hier
+        // steht der Eingabekanal, hat aber nichts gemeldet.
+        let c3 = Arc::new(Leitung::neu(None, vec![3], vec![3], "10.0.0.3".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, c3.clone());
+        let (h3, _c3) = tcp_paar();
+        assert!(c3.eingabe_binden(3, h3.try_clone().unwrap()));
+        assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::Vorgemerkt);
+        let ohne_meldung = "Dateien: nicht gesendet, der Eingabekanal des Zuschauers hat in 0,4 s keine Faehigkeiten gemeldet";
+        let bis = Instant::now() + Duration::from_secs(5);
+        while z.zahl(|t| t == ohne_meldung) == 0 && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(z.zahl(|t| t == ohne_meldung), 1, "{:?}", z.alle());
+        assert!(sperre(&c3.dateien).vorgemerkt.is_none());
+        assert!(sperre(&c3.q).pakete.is_empty());
+
+        // 4. Ohne Eingabekanal: "stand nach ... noch nicht".
+        let d = Arc::new(Leitung::neu(None, vec![4], vec![4], "10.0.0.4".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, d.clone());
+        assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::Vorgemerkt);
+        let kein_kanal = "Dateien: nicht gesendet, der Eingabekanal des Zuschauers stand nach 0,4 s noch nicht";
+        let bis = Instant::now() + Duration::from_secs(5);
+        while z.zahl(|t| t == kein_kanal) == 0 && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(z.zahl(|t| t == kein_kanal), 1, "{:?}", z.alle());
+
+        // 5. Meldet der Kanal Faehigkeiten ohne Dateien, faellt die Liste
+        // sofort weg, mit der Zeile fuer aeltere Clients.
+        let e = Arc::new(Leitung::neu(None, vec![5], vec![5], "10.0.0.5".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, e.clone());
+        let (h5, _c5) = tcp_paar();
+        assert!(e.eingabe_binden(5, h5.try_clone().unwrap()));
+        assert_eq!(dateien_senden_mit(&u, vec![quelle.clone()]), Start::Vorgemerkt);
+        e.faehigkeiten_setzen(5, 0);
+        e.vorgemerkte_pruefen(&u, None);
+        assert!(sperre(&e.dateien).vorgemerkt.is_none());
+        assert_eq!(z.zahl(|t| t == dateien::ZEILE_ZUSCHAUER_ZU_ALT), 1, "{:?}", z.alle());
+        e.schliessen();
+        let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Hinweis der Gegenpruefung: kommt IN_FAEHIGKEITEN, nachdem
+    /// dateien_senden_mit die Lage (noch ohne Meldung) gelesen, die Liste
+    /// aber noch nicht vorgemerkt hat, findet die Leseschleife nichts vor.
+    /// Die Nachschau nach dem Vormerken schickt die Liste trotzdem sofort,
+    /// nicht erst mit dem Zeitgeber (hier 5 s). Der Test haelt dafuer die
+    /// Dateisperre, bis die Meldung eingetragen ist; die Leseschleife
+    /// (vorgemerkte_pruefen nach IN_FAEHIGKEITEN) kaeme in diesem Fenster zu
+    /// frueh und wird deshalb gar nicht gerufen.
+    #[test]
+    fn meldung_zwischen_lage_und_vormerken_geht_sofort_hinaus() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s, z) = (Rekorder::default(), Staende::default(), Zeilen::default());
+        let mut u = umgebung_mit_zeilen(&PLATZ, &ZAEHLER, "vormerken-nachschau", &r, &s, &z);
+        u.vormerken = Duration::from_secs(5);
+        let u = Arc::new(u);
+        let quelle = test_ordner("vormerken-nachschau-quelle").join("a.bin");
+        std::fs::write(&quelle, vec![3u8; 1000]).unwrap();
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "10.0.0.1".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        let (h, _c) = tcp_paar();
+        assert!(a.eingabe_binden(1, h.try_clone().unwrap()));
+        assert_eq!(a.lage(), Lage::Offen { kanal: true });
+        let dateisperre = sperre(&a.dateien);
+        let (u2, q2) = (u.clone(), quelle.clone());
+        let kopieren = std::thread::spawn(move || dateien_senden_mit(&u2, vec![q2]));
+        // dateien_senden_mit liest die Lage (Offen) und wartet dann auf die
+        // Dateisperre.
+        std::thread::sleep(Duration::from_millis(200));
+        a.faehigkeiten_setzen(1, FAEHIG_DATEIEN);
+        let t0 = Instant::now();
+        drop(dateisperre);
+        assert_eq!(
+            kopieren.join().unwrap(),
+            Start::Vorgemerkt,
+            "die Lage wurde erst nach der Meldung gelesen - Probe ohne Wert"
+        );
+        let v = abholen_bis(&a, Duration::from_secs(10), |p| p.1 == DATEI_ANGEBOT);
+        assert!(t0.elapsed() < Duration::from_secs(2), "Angebot erst nach {:?} (Zeitgeber)", t0.elapsed());
+        assert!(v.iter().all(|p| p.0 == Art::Datei));
+        assert_eq!(z.zahl(|t| t.contains("vorgemerkte Liste geht hinaus")), 1, "{:?}", z.alle());
+        a.schliessen();
+        let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Hinweis Phase B (M3): Datei-Nachrichten eines ueberholten
+    /// Eingabekanals gehen nicht mehr an Empfaenger oder Sender. Der alte
+    /// Leser hat sein Angebot bzw. seine Quittung schon gelesen und wartet
+    /// auf EINSPEISEN, als ein neuer Kanal gebunden wird; danach endet er mit
+    /// Abgeloest, ohne weiterzugeben.
+    #[test]
+    fn ueberholter_eingabekanal_gibt_keine_datei_nachrichten_weiter() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s) = (Rekorder::default(), Staende::default());
+        let u = Arc::new(umgebung_test(&PLATZ, &ZAEHLER, "ueberholt", &r, &s));
+        let angebot = dateien::Angebot {
+            kennung: 7,
+            gesamt: 5,
+            eintraege: vec![dateien::Eintrag { art: dateien::EintragArt::Datei, pfad: "a.txt".into(), groesse: 5 }],
+        }
+        .kodieren();
+        let l = Arc::new(Leitung::neu(None, vec![1], vec![1], "C".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, l.clone());
+        // Ein laufender Sender Host -> Client, dessen Quittung gleich ueber
+        // den alten Kanal kommt.
+        let _e0 = faehig_machen(&l, 10);
+        let quelle = test_ordner("ueberholt-quelle").join("a.bin");
+        std::fs::write(&quelle, vec![3u8; 1000]).unwrap();
+        let Start::Gestartet(k) = dateien_senden_mit(&u, vec![quelle.clone()]) else { panic!("nicht gestartet") };
+        abholen_bis(&l, Duration::from_secs(5), |p| p.1 == DATEI_ENDE);
+        let abbruch = dateien::Quittung { kennung: k, zustand: dateien::ZUSTAND_ABGEBROCHEN, empfangen: 0 }.kodieren();
+        for (runde, nachricht) in [(1u64, (DATEI_ANGEBOT, angebot.clone())), (3, (DATEI_QUITTUNG, abbruch))] {
+            let (mut h, mut c) = paar();
+            assert!(l.eingabe_binden(runde, h.abbruchgriff().unwrap()));
+            let (l2, u2) = (l.clone(), u.clone());
+            let leser = std::thread::spawn(move || eingabe_lesen(&mut h, &l2, runde, &u2));
+            let einspeisen = sperre(&EINSPEISEN);
+            let mut m = kopf(nachricht.0, 0, 0, nachricht.1.len()).to_vec();
+            m.extend_from_slice(&nachricht.1);
+            c.write_all(&m).unwrap();
+            if nachricht.0 == DATEI_ANGEBOT {
+                // Das Angebot ist gelesen, sobald es den Empfaenger gibt (vor
+                // EINSPEISEN angelegt).
+                let bis = Instant::now() + Duration::from_secs(5);
+                while sperre(&l.dateien).empfaenger.is_none() && Instant::now() < bis {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert!(sperre(&l.dateien).empfaenger.is_some());
+            } else {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            // Ein neuer Kanal desselben Zuschauers ueberholt den alten.
+            let (h_neu, _c_neu) = tcp_paar();
+            assert!(l.eingabe_binden(runde + 1, h_neu.try_clone().unwrap()));
+            drop(einspeisen);
+            assert_eq!(endet_binnen(leser, Duration::from_secs(5)), Some(Kanalende::Abgeloest));
+            std::thread::sleep(Duration::from_millis(300));
+            let quittungen = sperre(&l.q).pakete.iter().filter(|(_, p)| p[0] == DATEI_QUITTUNG).count();
+            assert_eq!(quittungen, 0, "das Angebot des ueberholten Kanals wurde angenommen");
+            let laeuft = sperre(&l.dateien).sender.as_ref().is_some_and(|g| g.laeuft());
+            assert!(laeuft, "die Quittung des ueberholten Kanals beendete den Sender");
+        }
+        l.schliessen();
+        let _ = std::fs::remove_dir_all(quelle.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// Hinweis Phase B (M5): die Quittungen eines Empfaengers gehen nur an
+    /// SEINEN Zuschauer (nummerngebunden), auch im Wettlauffenster, in dem
+    /// schon ein neuer Zuschauer eingetragen, der alte aber noch nicht
+    /// abgeloest ist.
+    #[test]
+    fn quittungen_des_empfaengers_nur_an_seinen_zuschauer() {
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s) = (Rekorder::default(), Staende::default());
+        let u = umgebung_test(&PLATZ, &ZAEHLER, "quittung-nummer", &r, &s);
+        let a = Arc::new(Leitung::neu(None, vec![1], vec![1], "A".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, a.clone());
+        a.empfaenger_bereit(&u);
+        // B wird eingetragen, ohne dass A abgeloest ist.
+        let b = Arc::new(Leitung::neu(None, vec![2], vec![2], "B".into()));
+        {
+            let mut p = sperre(&PLATZ);
+            let nr = ZAEHLER.fetch_add(1, Ordering::Relaxed) + 1;
+            b.nr.store(nr, Ordering::Relaxed);
+            *p = Some(b.clone());
+        }
+        let angebot = dateien::Angebot {
+            kennung: 7,
+            gesamt: 5,
+            eintraege: vec![dateien::Eintrag { art: dateien::EintragArt::Datei, pfad: "a.txt".into(), groesse: 5 }],
+        };
+        a.datei_eingang(DATEI_ANGEBOT, angebot.kodieren());
+        // Der Empfaenger von A nimmt an und quittiert - sein Weg meldet Weg,
+        // er verwirft (Abbruch Verbindung). Bei B kommt nichts an.
+        let bis = Instant::now() + Duration::from_secs(5);
+        let verbindung = || {
+            sperre(&s.0).iter().any(|st| st.ergebnis == dateien::Ergebnis::Abgebrochen(dateien::Abbruch::Verbindung))
+        };
+        while !verbindung() && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(verbindung(), "{:?}", sperre(&s.0));
+        std::thread::sleep(Duration::from_millis(100));
+        for (wer, l) in [("A", &a), ("B", &b)] {
+            let n = sperre(&l.q).pakete.iter().filter(|(_, p)| p[0] == DATEI_QUITTUNG).count();
+            assert_eq!(n, 0, "Quittung bei {wer}");
+        }
+        a.schliessen();
+        b.schliessen();
         let _ = std::fs::remove_dir_all(&u.basis);
     }
 }

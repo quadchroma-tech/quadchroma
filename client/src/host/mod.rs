@@ -520,12 +520,14 @@ pub fn main_host(args: &[String]) -> i32 {
         None => encoder::Weg::Auto,
     };
 
-    // Empfangene Dateien frueherer Laeufe: aelter als 24 h weg (2.9). Die
-    // Host-Rolle hat ihre eigene Basis (netz::host_ablage_basis).
+    // Empfangene Dateien frueherer Laeufe: aelter als 24 h weg (2.9), dazu
+    // halb empfangene eines beendeten Prozesses (verwaiste Marke, siehe
+    // dateien.rs). Die Host-Rolle hat ihre eigene Basis
+    // (netz::host_ablage_basis).
     let alt = netz::host_ablage_aufraeumen();
     if alt > 0 {
         log(format!(
-            "Dateien: {alt} Uebertragungen aelter als 24 h geloescht ({})",
+            "Dateien: {alt} Uebertragungen geloescht, aelter als 24 h oder verwaist ({})",
             netz::host_ablage_basis().display()
         ));
     }

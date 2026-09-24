@@ -2828,15 +2828,34 @@ fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, i
         return;
     }
     let Ok(mut s) = shared.lock() else { return };
-    let alt = s.datei_senden.take();
+    let mut alt = s.datei_senden.take();
     let mut zu_alt = false;
     match (s.link.as_ref().map(|(hh, _)| hh.clone()), s.host_dateien) {
         (Some(hh), true) => {
-            let spielmodus = s.settings.is_some_and(|x| x.2);
             let melden = datei_melder(shared, s.sitzung_nr);
             let kanal = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let weg = datei_weg(input, hh, kanal.clone());
-            let griff = dateien::Sender::starten(pfade, weg, dateien::fenster(spielmodus), melden);
+            // Das Fenster fragt der Sender vor jedem Stueck, so wirkt ein
+            // Wechsel in den Spielmodus waehrend der Uebertragung. Nur
+            // try_lock: der Faden des Senders wartet nie auf `shared`
+            // (run_session haelt es, waehrend es Griff::quittung ruft); ist
+            // es belegt, gilt der zuletzt gesehene Stand.
+            let zuletzt = std::sync::atomic::AtomicU64::new(dateien::fenster(s.settings.is_some_and(|x| x.2)));
+            let spiel = Arc::downgrade(shared);
+            let fenster = move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                if let Some(m) = spiel.upgrade() {
+                    if let Ok(s) = m.try_lock() {
+                        zuletzt.store(dateien::fenster(s.settings.is_some_and(|x| x.2)), Relaxed);
+                    }
+                }
+                zuletzt.load(Relaxed)
+            };
+            // Die vorige Sendung bricht ab; die neue wartet in ihrem eigenen
+            // Faden auf deren Ende 1, bevor ihr Angebot hinausgeht.
+            let vorgaenger = alt.take().map(|d| d.griff);
+            let griff =
+                dateien::Sender::starten_nach(vorgaenger, pfade, weg, fenster, melden, dateien::Vorgaben::default());
             s.datei_senden = Some(DateiSendung { griff, kanal });
         }
         // Der Host hat in dieser Sitzung keine Dateien gemeldet (aelterer
@@ -2850,7 +2869,10 @@ fn dateien_senden(pfade: Vec<std::path::PathBuf>, shared: &Arc<Mutex<Shared>>, i
         _ => {}
     }
     drop(s);
-    // Die vorige Sendung bricht ab (ausserhalb der Sperre; kehrt sofort zurueck).
+    // In den anderen Zweigen bricht die vorige Sendung hier ab (ausserhalb der
+    // Sperre; kehrt sofort zurueck). Im ersten hat starten_nach sie schon
+    // unter `shared` abgebrochen - unschaedlich, Griff::abbrechen nimmt nur
+    // die Blattsperre des Griffs.
     drop(alt);
     if zu_alt {
         protokoll::zeile(dateien::ZEILE_HOST_ZU_ALT.into());
