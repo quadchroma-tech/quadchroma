@@ -268,19 +268,25 @@ Rückgabe ist die Zahl der Fehler.
   ein verspätetes Angebot mitten in einer laufenden Übertragung, wann
   der Empfänger quittiert (ab 16 KiB offen und sobald nichts mehr wartet), seine
   Warteschlange nach Datenbytes (Fenster plus ein Stück, höchstens 8 Enden, ein
-  neues Angebot leert sie), die Zeile „Dateien: empfange …“ beim Annehmen, Namen
-  in NFC auf der Platte (die rohen Bytes, auch wenn das Angebot NFD trägt),
-  Fenster, Drossel über den Sendepuffer, Stillstand (eine wiederholte Quittung
-  ohne Fortschritt hält den Sender nicht am Leben), Abbrüche, eine Quelldatei,
-  die nach dem Auflisten gegen eine FIFO oder eine Verknüpfung getauscht wird,
-  ebenso ein Ordner darüber (Vergleich von Gerät und Inode), ein Ordner, der
-  während des Auflistens fortlaufend gegen eine Verknüpfung getauscht wird
-  (1,5 s Dauerlauf), Namen, die erst nach der Windows-Bereinigung doppelt sind,
-  Aufräumen — auch mit einer Basis, die eine Verknüpfung ist, nach einem
-  Rücksprung der Uhr, von Übertragungen, deren Pfade absolut über `PATH_MAX`
-  liegen, mit der Marke `.laeuft` laufender Übertragungen und von Waisen
-  (unfertig beim Start) —, sowie die Dienstklasse der beiden Warteschlangen
-  (`QOS_CLASS_UTILITY`). Alle Dateien in einem frischen Ordner unter `$TMPDIR`,
+  neues Angebot leert sie), die Zeile „Dateien: empfange …“ beim Annehmen (nicht,
+  wenn schon die Quittung 0 nicht mehr hinausgeht), Namen in NFC auf der Platte
+  (die rohen Bytes, auch wenn das Angebot NFD trägt), ein `/` vor einem
+  kombinierenden Zeichen, Fenster, Drossel über den Sendepuffer samt Takt (alle
+  2–3 ms, nicht 10 ms), Stillstand (eine wiederholte Quittung ohne Fortschritt
+  hält den Sender nicht am Leben), Abbrüche, eine Quelldatei, die nach dem
+  Auflisten gegen eine FIFO oder eine Verknüpfung getauscht wird, ebenso ein
+  Ordner darüber (gegen eine Verknüpfung und gegen einen anderen echten Ordner,
+  dort hält der Vergleich von Gerät und Inode die fremde Datei zurück), ein
+  Ordner, der während des Auflistens fortlaufend gegen eine Verknüpfung
+  getauscht wird (1,5 s Dauerlauf), Namen, die erst nach der Windows-Bereinigung
+  doppelt sind, ein `\` vor einem kombinierenden Zeichen, Senden aus einer
+  Quelle, deren Pfad absolut über `PATH_MAX` liegt, Aufräumen — auch mit einer
+  Basis, die eine Verknüpfung ist, nach einem Rücksprung der Uhr, von
+  Übertragungen, deren Pfade absolut über `PATH_MAX` liegen, mit der Marke
+  `.laeuft` laufender Übertragungen und von Waisen (unfertig beim Start) —,
+  sowie die Dienstklasse der beiden Warteschlangen (`dateien-senden` mit
+  `QOS_CLASS_DEFAULT` und relativer Priorität −15, `dateien-empfang` mit
+  `QOS_CLASS_UTILITY`). Alle Dateien in einem frischen Ordner unter `$TMPDIR`,
   rund 8 s.
 - `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, die Regel „nur mit
   Zuschauer lesen" und Dateiverweise (`public.file-url`) lesen und schreiben,

@@ -23,8 +23,12 @@
 // Faeden: Der Empfaenger arbeitet auf der seriellen Warteschlange
 // "dateien-empfang", der Sender auf "dateien-senden" - nie im Lesefaden eines
 // Kanals, nie auf der Hauptwarteschlange und nie unter g_send_mtx. Beide
-// laufen mit QOS_CLASS_UTILITY ("Latenz vor Bandbreite"): Aufnahme, Encoder
-// und Ton gehen vor.
+// laufen mit niedriger Prioritaet ("Latenz vor Bandbreite"): Aufnahme,
+// Encoder und Ton gehen vor. "dateien-empfang" mit QOS_CLASS_UTILITY,
+// "dateien-senden" mit QOS_CLASS_DEFAULT und relativer Prioritaet -15
+// (Prioritaet 21, knapp ueber UTILITY) - unter UTILITY legte macOS die
+// Zeitgeber zusammen, und aus den 2 ms Warten bei vollem Sendepuffer
+// (QC_DATEI_WARTEN_US) wuerden rund 10 ms.
 #ifndef QUADCHROMA_DATEIEN_H
 #define QUADCHROMA_DATEIEN_H
 
@@ -92,7 +96,14 @@ size_t qc_datei_grenze(uint8_t typ);
 @property (nonatomic) uint64_t groesse;               // bei Ordnern 0
 @property (nonatomic, copy) NSData *pfad;             // wie auf der Leitung: UTF-8, relativ, Trenner '/'
 @property (nonatomic, copy) NSArray<NSString *> *teile;   // Empfaenger: Bestandteile nach der Bereinigung, in NFC
-@property (nonatomic, copy) NSString *quelle;         // Sender: absoluter Pfad auf diesem Mac
+@property (nonatomic, copy) NSString *quelle;         // Sender: absoluter Pfad auf diesem Mac (fuers Protokoll)
+// Sender: der Weg zur Datei, wie das Auflisten ihn ging - der oberste Pfad,
+// wie der Nutzer ihn kopiert hat, und darunter die rohen Namen (je mit NUL;
+// leer fuer einen obersten Eintrag). Gelesen wird Stufe fuer Stufe relativ
+// (openat, ohne Verknuepfung), nie ueber den ganzen Pfad: der kann ueber
+// PATH_MAX liegen.
+@property (nonatomic, copy) NSString *oben;
+@property (nonatomic, copy) NSArray<NSData *> *kette;
 // Sender: st_dev und st_ino, wie sie beim Auflisten gesehen wurden. Die
 // geoeffnete Datei muss genau diese sein (fstat), sonst ENDE mit Grund 2.
 @property (nonatomic) uint64_t geraet;
@@ -110,8 +121,8 @@ int qc_datei_faehigkeiten_lesen(const uint8_t *p, size_t n, uint32_t *bits);
 NSData *qc_datei_angebot_kodieren(uint32_t kennung, NSArray<QCDateiEintrag *> *eintraege);
 
 // Liest und prueft ein Angebot nach 2.3, 2.5 und 2.6, samt Bereinigung fuer
-// macOS; die Bestandteile (teile) sind danach in NFC, so werden sie auch
-// angelegt. Rueckgabe QC_QUITT_LAEUFT = in Ordnung, sonst der Zustand der
+// macOS; die Bestandteile (teile, zerlegt an den Bytes '/') sind danach in
+// NFC, so werden sie auch angelegt. Rueckgabe QC_QUITT_LAEUFT = in Ordnung, sonst der Zustand der
 // Ablehnung (QC_QUITT_ZU_GROSS oder QC_QUITT_UNGUELTIG). *kennung ist gesetzt,
 // sobald 4 Byte da sind; *grund beschreibt eine Ablehnung.
 int qc_datei_angebot_lesen(const uint8_t *p, size_t n, uint32_t *kennung, uint64_t *gesamt,
@@ -222,11 +233,14 @@ void qc_dateien_sitzung_vorbei(uint64_t neue_sitzung);
 // (nur, was aus seiner oder einer aelteren Sitzung wartet - ein verspaetetes
 // Angebot einer vergangenen Sitzung verwirft nichts aus der aktuellen);
 // darueber Quittung 4. Beim Annehmen eines Angebots steht im Protokoll
-// "Dateien: empfange N Eintraege, X MB". Namen werden in NFC angelegt, so
-// wie sie nach der Bereinigung sind (nicht zerlegt wie fileSystemRepresentation). Quittiert wird nach der Annahme (0/0), sobald mehr als
-// 16 KiB offen sind, sobald nichts mehr wartet und am Ende. Quittungen gehen
-// ueber wege.senden, das blockiert, bis sie hinaus sind - bei Stau geht also
-// keine verloren; nur mit dem Ende der Sitzung faellt sie weg.
+// "Dateien: empfange N Eintraege, X MB" (nur, wenn die Quittung 0
+// hinausging; sonst ist die Sitzung vorbei und die Uebertragung wird gleich
+// verworfen). Namen werden in NFC angelegt, so wie sie nach der Bereinigung
+// sind (nicht zerlegt wie fileSystemRepresentation). Quittiert wird nach der
+// Annahme (0/0), sobald mehr als 16 KiB offen sind, sobald nichts mehr
+// wartet und am Ende. Quittungen gehen ueber wege.senden, das blockiert, bis
+// sie hinaus sind - bei Stau geht also keine verloren; nur mit dem Ende der
+// Sitzung faellt sie weg.
 void qc_empfang_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSData *nutzlast);
 // Der Eingabekanal ist weg: eine Uebertragung, die ueber ihn kam, endet -
 // aber erst hinter allem, was vorher von ihm kam (ein Ende davor zaehlt).
@@ -240,11 +254,14 @@ void qc_empfang_kanal_weg(uint64_t sitzung, uint64_t kanal);
 // Protokollzeile. Ordner werden ueber einen Deskriptor gelesen, der
 // nachweislich (st_dev/st_ino) der eben per lstat gesehene Ordner ist, und
 // ihre Eintraege relativ dazu (fstatat) - ein waehrenddessen getauschter
-// Ordner geht leer hinaus. Gelesen wird jede Datei mit O_NOFOLLOW|O_NONBLOCK
-// und erst nach fstat blockierend: Ist sie keine gewoehnliche Datei mehr
-// (FIFO, Verknuepfung) oder nicht mehr die beim Auflisten gesehene (st_dev/
-// st_ino - etwa weil ein Ordner darueber gegen eine Verknuepfung getauscht
-// wurde, die O_NOFOLLOW nicht abfaengt), gibt es ENDE mit Grund 2.
+// Ordner geht leer hinaus. Gelesen wird jede Datei auf demselben Weg:
+// oberster Pfad, darunter Stufe fuer Stufe openat mit O_NOFOLLOW (so gilt
+// PATH_MAX nicht fuer den ganzen Pfad), die Datei mit O_NONBLOCK und erst
+// nach fstat blockierend. Ist sie keine gewoehnliche Datei mehr (FIFO,
+// Verknuepfung), liegt auf dem Weg eine Verknuepfung, oder ist sie nicht
+// mehr die beim Auflisten gesehene (st_dev/st_ino - etwa weil ein Ordner
+// darueber gegen einen anderen getauscht wurde), gibt es ENDE mit Grund 2.
+// Namen mit '\' (auch vor einem kombinierenden Zeichen) gehen nicht hinaus.
 void qc_senden_starten(uint64_t sitzung, NSArray<NSString *> *pfade, NSString *an);
 // Eine Quittung (53) vom Eingabekanal. Blockiert nicht. Nur Fortschritt
 // (mehr quittiert als bisher, oder die erste Quittung nach dem Angebot)

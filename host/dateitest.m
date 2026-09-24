@@ -3,13 +3,16 @@
 // (Schluessel des Senders), Empfaenger und Sender (auch gegeneinander im
 // Speicher), Sitzungsbindung (auch ein verspaetetes Angebot mitten in einer
 // Uebertragung), wann quittiert wird, Warteschlange nach Datenbytes, Namen in
-// NFC auf der Platte, Fenster, Drossel ueber den Sendepuffer, Stillstand (nur
-// Fortschritt erneuert ihn), Abbruch, Tausch gegen FIFO oder Verknuepfung -
-// der Datei selbst, eines Ordners darueber und waehrend des Auflistens -,
-// Doppelte nach der Windows-Bereinigung, Aufraeumen des Ablageverzeichnisses
-// (auch mit einer Basis, die eine Verknuepfung ist, nach einem Uhrsprung, mit
-// Marken laufender Uebertragungen und Waisen beim Start), Loeschen tiefer
-// Uebertragungen (absolut ueber PATH_MAX), Dienstklasse der Warteschlangen.
+// NFC auf der Platte, '/' vor einem kombinierenden Zeichen, Quittung 0 ohne
+// Sitzung, Fenster, Drossel ueber den Sendepuffer (samt Takt: alle 2-3 ms,
+// nicht 10 ms), Stillstand (nur Fortschritt erneuert ihn), Abbruch, Tausch
+// gegen FIFO, Verknuepfung oder einen anderen Ordner - der Datei selbst,
+// eines Ordners darueber und waehrend des Auflistens -, Doppelte nach der
+// Windows-Bereinigung, Aufraeumen des Ablageverzeichnisses (auch mit einer
+// Basis, die eine Verknuepfung ist, nach einem Uhrsprung, mit Marken
+// laufender Uebertragungen und Waisen beim Start), Loeschen tiefer
+// Uebertragungen und Senden aus einer Quelle absolut ueber PATH_MAX,
+// Dienstklasse der Warteschlangen.
 //
 //   clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
 //         -framework Foundation host/dateitest.m host/dateien.m -o /tmp/dateitest
@@ -24,6 +27,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -61,14 +65,36 @@ static _Atomic uint64_t g_vorbei_bis = SITZUNG - 1;
 // Fenstermessung: was der Sender an Datenbytes hinausgab und was ihm davon
 // quittiert zugestellt wurde. Unter @synchronized (g_gesendet).
 static uint64_t g_stueck_bytes = 0, g_zugestellt = 0, g_max_unterwegs = 0;
-// Dienstklasse des Fadens, der "Dateien: sende ..." bzw. "Dateien: empfange
-// ..." schrieb - also die der Warteschlangen "dateien-senden" und
-// "dateien-empfang" (-1 = noch keine solche Zeile).
-static _Atomic int g_qos_senden = -1, g_qos_empfang = -1;
+// Dienstklasse (und relative Prioritaet) des Fadens, der "Dateien: sende
+// ..." bzw. "Dateien: empfange ..." schrieb - also die der Warteschlangen
+// "dateien-senden" und "dateien-empfang" (-1 = noch keine solche Zeile).
+static _Atomic int g_qos_senden = -1, g_qos_empfang = -1, g_relprio_senden = 1;
 static _Atomic int g_stumm = 0;                     // 1: Protokoll weder zeigen noch merken (Dauerlauf)
+// Nachrang-Messung: Zeitpunkte (ms, monoton), zu denen "dateien-senden" nach
+// dem Sendepuffer sah, und die Prioritaet seines Fadens dabei (die hoechste).
+// nil = nicht messen. Unter @synchronized (g_gesendet).
+static NSMutableArray<NSNumber *> *g_blicke = nil;
+static int g_blick_prio = -1;
+// 1: Quittungen gehen nicht hinaus (senden liefert 0), der Rueckstand gilt
+// aber noch - die Sitzung endete eben erst.
+static _Atomic int g_quittung_weg = 0;
+// Lag beim letzten "fertig" die Marke des Verzeichnisses noch? -1 = noch keins.
+static _Atomic int g_marke_bei_fertig = -1;
+
+static double ms_jetzt(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
 
 static void protokoll(const char *z) {
-    if (!strncmp(z, "Dateien: sende ", 15)) atomic_store(&g_qos_senden, (int)qos_class_self());
+    if (!strncmp(z, "Dateien: sende ", 15)) {
+        qos_class_t k = QOS_CLASS_UNSPECIFIED;
+        int rel = 1;
+        pthread_get_qos_class_np(pthread_self(), &k, &rel);
+        atomic_store(&g_qos_senden, (int)k);
+        atomic_store(&g_relprio_senden, rel);
+    }
     if (!strncmp(z, "Dateien: empfange ", 18)) atomic_store(&g_qos_empfang, (int)qos_class_self());
     if (atomic_load(&g_stumm)) return;
     @synchronized (g_zeilen) { [g_zeilen addObject:@(z)]; }
@@ -99,6 +125,7 @@ static void zustellen(uint64_t sitzung, NSData *q) {
 
 static int weg_senden(uint64_t sitzung, uint8_t typ, const void *d, size_t n) {
     if (!atomic_load(&g_sitzung_gilt) || sitzung <= atomic_load(&g_vorbei_bis)) return 0;
+    if (typ == QC_DATEI_QUITTUNG && atomic_load(&g_quittung_weg)) return 0;
     NSData *data = [NSData dataWithBytes:d length:n];
     @synchronized (g_gesendet) {
         [g_gesendet addObject:@[ @(typ), data ]];
@@ -122,12 +149,30 @@ static int weg_senden(uint64_t sitzung, uint8_t typ, const void *d, size_t n) {
 }
 
 static int weg_rueckstand(uint64_t sitzung) {
+    const char *q = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+    if (q && !strcmp(q, "tech.quadchroma.dateien-senden")) {
+        @synchronized (g_gesendet) {
+            if (g_blicke) {
+                [g_blicke addObject:@(ms_jetzt())];
+                struct thread_extended_info inf;
+                mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT;
+                mach_port_t t = mach_thread_self();
+                if (thread_info(t, THREAD_EXTENDED_INFO, (thread_info_t)&inf, &n) == KERN_SUCCESS && inf.pth_priority > g_blick_prio)
+                    g_blick_prio = inf.pth_priority;
+                mach_port_deallocate(mach_task_self(), t);
+            }
+        }
+    }
     return atomic_load(&g_sitzung_gilt) && sitzung > atomic_load(&g_vorbei_bis) ? atomic_load(&g_rueckstand) : -1;
 }
 
 static int weg_spiel(void) { return atomic_load(&g_spiel); }
 
 static void fertig(NSArray<NSString *> *pfade) {
+    NSString *o = pfade.firstObject.stringByDeletingLastPathComponent;
+    struct stat st;
+    atomic_store(&g_marke_bei_fertig,
+                 o && lstat([o stringByAppendingString:@QC_DATEI_MARKE_ENDUNG].fileSystemRepresentation, &st) == 0 ? 1 : 0);
     @synchronized (g_fertig_listen) { [g_fertig_listen addObject:pfade]; }
 }
 
@@ -229,6 +274,9 @@ static int angebot_rc(NSData *d, NSString **grund, NSArray<QCDateiEintrag *> **a
 static int liste_rc(NSArray<QCDateiEintrag *> *e, NSString **grund) {
     return angebot_rc(qc_datei_angebot_kodieren(7, e), grund, NULL);
 }
+
+// Setzt fuer das %C im Muster ein kombinierendes Zeichen ein (U+0301, Akut).
+#define AKUT(muster) [NSString stringWithFormat:(muster), (unichar)0x0301]
 
 static NSString *wiederholt(char c, NSUInteger n) {
     return [@"" stringByPaddingToLength:n withString:[NSString stringWithFormat:@"%c", c] startingAtIndex:0];
@@ -460,6 +508,9 @@ static void pfade_pruefen(void) {
         @[ @"lpt9.txt", @"_lpt9.txt" ], @[ @"LPT0", @"_LPT0" ], @[ @"COM¹", @"_COM¹" ], @[ @"lpt³.x", @"_lpt³.x" ],
         @[ @"COM10", @"COM10" ], @[ @"COM", @"COM" ], @[ @"conin$", @"_conin$" ], @[ @"CONOUT$.log", @"_CONOUT$.log" ],
         @[ @"nul.txt", @"_nul.txt" ], @[ @"prn", @"_prn" ], @[ @"console", @"console" ], @[ @"Ärger.txt", @"Ärger.txt" ],
+        // Ein Punkt vor einem kombinierenden Zeichen (U+0301) ist einer (der
+        // Rust-Kern trennt am Zeichen '.'): der Stamm ist COM1 bzw. aux.
+        @[ AKUT(@"COM1.%C"), AKUT(@"_COM1.%C") ], @[ AKUT(@"aux.%Ctxt"), AKUT(@"_aux.%Ctxt") ],
     ];
     NSMutableArray<NSString *> *falsch = [NSMutableArray array];
     for (NSArray<NSString *> *p in win) {
@@ -550,6 +601,9 @@ static void empfaenger_pruefen(void) {
                  [[NSData dataWithContentsOfFile:[ordner stringByAppendingPathComponent:@"b.bin"]] length] == 0;
     pruefe(bytes && qc_empfang_ordner() == nil && existiert(ordner), "Bytes stimmen; das Verzeichnis bleibt zum Einfuegen");
     pruefe(marke_da && !existiert(marke), "nach dem vollstaendigen Empfang ist die Marke weg (das Verzeichnis bleibt)");
+    pruefe(atomic_load(&g_marke_bei_fertig) == 0,
+           "die Marke ist schon weg, wenn die Dateien in die Ablage gehen (endet der Host dazwischen, loescht der naechste "
+           "Start kein Verzeichnis, auf das die Ablage zeigt)");
     pruefe(zeilen_mit(@"Dateien: empfangen 6 Eintraege, 0,2 MB - in die Ablage gelegt") == 1, "Protokollzeile wie beim Windows-Host");
 
     printf("\n-- Empfaenger: Namen in NFC auf der Platte, auch wenn sie zerlegt (NFD) kommen\n");
@@ -586,6 +640,42 @@ static void empfaenger_pruefen(void) {
     printf("         (angelegt: %s)\n", [[hex_namen sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@" "].UTF8String);
     pruefe(letzter_zustand() == QC_QUITT_FERTIG && fertig_anzahl() == f_nfc + 1 && [roh isEqualToSet:soll_roh],
            "angelegt in NFC (C3 84 fuer Ae), ob das Angebot NFC oder NFD trug - auch Ordner und Namen darin");
+
+    printf("\n-- Empfaenger: '/' vor einem kombinierenden Zeichen trennt\n");
+    // "k/" U+0301 "b.txt": zerlegt wird an den Bytes '/' (wie im Rust-Kern).
+    // Mit componentsSeparatedByString: bliebe es ein Bestandteil, der Eintrag
+    // gaelte als oberster und landete als eigener Pfad in der Ablage.
+    NSArray<QCDateiEintrag *> *kombi = nil;
+    NSData *a90 = qc_datei_angebot_kodieren(90, @[ E(1, 0, @"k"), E(0, 3, AKUT(@"k/%Cb.txt")) ]);
+    int rc90 = angebot_rc(a90, NULL, &kombi);
+    NSUInteger f90 = fertig_anzahl();
+    neu_aufzeichnen();
+    empfang(QC_DATEI_ANGEBOT, a90);
+    stueck(90, 1, 0, [@"abc" dataUsingEncoding:NSUTF8StringEncoding]);
+    ende(90, QC_ENDE_VOLLSTAENDIG);
+    qc_dateien_abwarten();
+    NSArray<NSString *> *l90 = nil;
+    @synchronized (g_fertig_listen) { l90 = g_fertig_listen.lastObject; }
+    NSString *o90 = l90.firstObject.stringByDeletingLastPathComponent;
+    BOOL b90 = [[NSData dataWithContentsOfFile:[o90 stringByAppendingPathComponent:AKUT(@"k/%Cb.txt")]]
+                   isEqualToData:[@"abc" dataUsingEncoding:NSUTF8StringEncoding]];
+    printf("         (Bestandteile: %s)\n", rc90 == 0 ? [kombi[1].teile componentsJoinedByString:@" | "].UTF8String : "abgelehnt");
+    pruefe(rc90 == 0 && [kombi[1].teile isEqualToArray:(@[ @"k", AKUT(@"%Cb.txt") ])] && letzter_zustand() == QC_QUITT_FERTIG &&
+           fertig_anzahl() == f90 + 1 && l90.count == 1 && [l90[0].lastPathComponent isEqualToString:@"k"] && b90,
+           "\"k/\\u0301b.txt\" hat zwei Bestandteile; in der Ablage steht nur der oberste Ordner k, die Datei liegt darin");
+
+    printf("\n-- Empfaenger: Quittung 0 geht nicht mehr hinaus\n");
+    // Die Sitzung endete eben (senden liefert 0, der Rueckstand gilt noch):
+    // gleich verwerfen, ohne die Zeile "empfange" (wie im Rust-Kern).
+    int empfange91 = zeilen_mit(@"Dateien: empfange "), weg91 = zeilen_mit(@"abgebrochen (Zuschauer gewechselt oder weg)");
+    neu_aufzeichnen();
+    atomic_store(&g_quittung_weg, 1);
+    empfang(QC_DATEI_ANGEBOT, beispiel(91, &inhalte));
+    qc_dateien_abwarten();
+    atomic_store(&g_quittung_weg, 0);
+    pruefe(zeilen_mit(@"Dateien: empfange ") == empfange91 && zeilen_mit(@"abgebrochen (Zuschauer gewechselt oder weg)") == weg91 + 1 &&
+           qc_empfang_ordner() == nil && verzeichnisse_mit(91) == 0 && marken_mit(91) == 0,
+           "ohne Quittung 0: keine Zeile \"empfange\", Verzeichnis und Marke gleich wieder weg");
 
     printf("\n-- Empfaenger: Stuecke ausser der Reihe, mit Luecke, doppelt, ueber die Groesse\n");
     struct { const char *name; uint32_t eintrag; uint64_t versatz; size_t n; int vorher; } faelle[] = {
@@ -1110,14 +1200,31 @@ static void sender_pruefen(void) {
     atomic_store(&g_schleife, 1);
     atomic_store(&g_rueckstand, 200 * 1024);
     neu_aufzeichnen();
+    @synchronized (g_gesendet) { g_blicke = [NSMutableArray array]; g_blick_prio = -1; }
     senden(@[ @"einzeln.bin" ]);
     schlafen(0.3);
+    NSArray<NSNumber *> *blicke = nil;
+    int blick_prio;
+    @synchronized (g_gesendet) { blicke = g_blicke; g_blicke = nil; blick_prio = g_blick_prio; }
     NSUInteger waehrend = nachrichten(QC_DATEI_STUECK).count, angebote = nachrichten(QC_DATEI_ANGEBOT).count;
     atomic_store(&g_rueckstand, 100 * 1024);
     qc_dateien_abwarten();
     atomic_store(&g_rueckstand, 0);
     pruefe(angebote == 0 && waehrend == 0 && nachrichten(QC_DATEI_ANGEBOT).count == 1 && letzter_zustand() == QC_QUITT_FERTIG,
            "solange mehr als 128 KiB im Sendepuffer liegen, geht weder das Angebot noch ein Stueck hinaus; danach laeuft es durch");
+    // Wie oft sieht der Sender dabei nach? Spezifikation 3.6: alle 2 ms. Mit
+    // QOS_CLASS_UTILITY legte macOS die Zeitgeber zusammen, und aus 2 ms
+    // wuerden rund 10-12 ms - der Durchsatz fiele im LAN auf ein Drittel.
+    NSMutableArray<NSNumber *> *abstand = [NSMutableArray array];
+    for (NSUInteger i = 1; i < blicke.count; i++) [abstand addObject:@(blicke[i].doubleValue - blicke[i - 1].doubleValue)];
+    [abstand sortUsingSelector:@selector(compare:)];
+    double median = abstand.count ? abstand[abstand.count / 2].doubleValue : 1e9;
+    printf("         (%lu Blicke in 0,3 s, Abstand im Median %.2f ms, hoechstens %.2f ms; Prioritaet des Fadens %d)\n",
+           (unsigned long)blicke.count, median, abstand.count ? abstand.lastObject.doubleValue : 0.0, blick_prio);
+    pruefe(abstand.count >= 40 && median >= 2.0 && median < 6.0,
+           "bei vollem Sendepuffer sieht der Sender alle 2 bis 3 ms wieder nach, nicht erst nach 10 ms (Zeitgeber nicht zusammengelegt)");
+    pruefe(blick_prio > 0 && blick_prio < 31,
+           "dabei laeuft er unter der Prioritaet gewoehnlicher Arbeit (DEFAULT = 31): Latenz vor Bandbreite");
 
     printf("\n-- Abbrueche beim Sender\n");
     // Der Empfaenger bekommt alles, seine Quittungen erreichen den Sender
@@ -1217,18 +1324,46 @@ static void sender_pruefen(void) {
 
     // Nicht die Datei, sondern ein Ordner darueber wird getauscht: proj/sub
     // wird umbenannt und als Verknuepfung auf einen fremden Ordner neu
-    // angelegt, der eine gleich grosse f.txt enthaelt. O_NOFOLLOW wirkt nur
-    // auf den letzten Bestandteil - erst der Vergleich von st_dev/st_ino mit
-    // dem Auflisten haelt die fremden Bytes zurueck.
+    // angelegt, der eine gleich grosse f.txt enthaelt. Gelesen wird Stufe
+    // fuer Stufe ohne Verknuepfung (wie beim Auflisten): Schon das Oeffnen
+    // scheitert, die fremden Bytes gehen nicht hinaus.
     schreiben(@"proj/a.bin", zufall(300000));
     schreiben(@"proj/sub/f.txt", [@"harmlos" dataUsingEncoding:NSUTF8StringEncoding]);
     schreiben(@"fremd/f.txt", [@"FREMD!!" dataUsingEncoding:NSUTF8StringEncoding]);
+    int lesefehler1 = zeilen_mit(@"Lesefehler bei");
+    neu_aufzeichnen();
+    senden(@[ @"proj" ]);
+    for (int i = 0; i < 100 && stueck_summe() < QC_DATEI_FENSTER; i++) schlafen(0.01);   // steht am Fenster (a.bin)
+    BOOL verkn = rename(quelle(@"proj/sub").fileSystemRepresentation, quelle(@"proj/sub-alt").fileSystemRepresentation) == 0 &&
+                 symlink(quelle(@"fremd").fileSystemRepresentation, quelle(@"proj/sub").fileSystemRepresentation) == 0;
+    angebot_pfade(&k);
+    for (int i = 0; i < 200 && letztes_ende() == -1; i++) {
+        NSData *weiter = qc_datei_quittung_kodieren(k, 0, stueck_summe());
+        qc_senden_quittung(SITZUNG, weiter.bytes, weiter.length);
+        schlafen(0.01);
+    }
+    qc_senden_abbrechen();
+    qc_dateien_abwarten();
+    BOOL fremd_verkn = NO;
+    NSData *fremd_bytes = [@"FREMD" dataUsingEncoding:NSUTF8StringEncoding];
+    for (NSData *st in nachrichten(QC_DATEI_STUECK))
+        if ([st rangeOfData:fremd_bytes options:0 range:NSMakeRange(0, st.length)].location != NSNotFound) fremd_verkn = YES;
+    unlink(quelle(@"proj/sub").fileSystemRepresentation);
+    rename(quelle(@"proj/sub-alt").fileSystemRepresentation, quelle(@"proj/sub").fileSystemRepresentation);
+    pruefe(verkn && letztes_ende() == QC_ENDE_LESEFEHLER && !fremd_verkn && zeilen_mit(@"Lesefehler bei") == lesefehler1 + 1,
+           "Ordner ueber der Datei nach dem Auflisten gegen eine Verknuepfung getauscht: die fremde Datei geht nicht hinaus, "
+           "ENDE mit Grund 2");
+
+    // Derselbe Tausch gegen einen echten Ordner (fremd wird an die Stelle von
+    // proj/sub umbenannt): Der Weg fuehrt jetzt ohne Verknuepfung zu einer
+    // f.txt gleicher Groesse - erst der Vergleich von st_dev/st_ino mit dem
+    // Auflisten haelt ihre Bytes zurueck.
     int verlegt0 = zeilen_mit(@"nicht mehr die aufgelistete Datei");
     neu_aufzeichnen();
     senden(@[ @"proj" ]);
     for (int i = 0; i < 100 && stueck_summe() < QC_DATEI_FENSTER; i++) schlafen(0.01);   // steht am Fenster (a.bin)
     BOOL zwischen = rename(quelle(@"proj/sub").fileSystemRepresentation, quelle(@"proj/sub-alt").fileSystemRepresentation) == 0 &&
-                    symlink(quelle(@"fremd").fileSystemRepresentation, quelle(@"proj/sub").fileSystemRepresentation) == 0;
+                    rename(quelle(@"fremd").fileSystemRepresentation, quelle(@"proj/sub").fileSystemRepresentation) == 0;
     angebot_pfade(&k);
     for (int i = 0; i < 200 && letztes_ende() == -1; i++) {
         NSData *weiter = qc_datei_quittung_kodieren(k, 0, stueck_summe());
@@ -1238,15 +1373,14 @@ static void sender_pruefen(void) {
     qc_senden_abbrechen();
     qc_dateien_abwarten();
     BOOL fremd_raus = NO;
-    NSData *fremd_bytes = [@"FREMD" dataUsingEncoding:NSUTF8StringEncoding];
     for (NSData *st in nachrichten(QC_DATEI_STUECK))
         if ([st rangeOfData:fremd_bytes options:0 range:NSMakeRange(0, st.length)].location != NSNotFound) fremd_raus = YES;
-    unlink(quelle(@"proj/sub").fileSystemRepresentation);
+    rename(quelle(@"proj/sub").fileSystemRepresentation, quelle(@"fremd").fileSystemRepresentation);
     rename(quelle(@"proj/sub-alt").fileSystemRepresentation, quelle(@"proj/sub").fileSystemRepresentation);
     pruefe(zwischen && letztes_ende() == QC_ENDE_LESEFEHLER && !fremd_raus &&
            zeilen_mit(@"nicht mehr die aufgelistete Datei") == verlegt0 + 1,
-           "Ordner ueber der Datei nach dem Auflisten gegen eine Verknuepfung getauscht: die fremde Datei geht nicht hinaus, "
-           "ENDE mit Grund 2");
+           "Ordner ueber der Datei nach dem Auflisten gegen einen anderen echten Ordner getauscht: die fremde Datei gleichen "
+           "Namens geht nicht hinaus, ENDE mit Grund 2 (\"nicht mehr die aufgelistete Datei\")");
 
     // Und waehrend des Auflistens selbst: Ein Faden tauscht rennen/sub
     // fortlaufend und atomar (RENAME_SWAP) mit einer Verknuepfung auf einen
@@ -1362,6 +1496,21 @@ static void sender_pruefen(void) {
            zeilen_mit(@"doppelter Name t_") == 1 && letzter_zustand() == QC_QUITT_FERTIG,
            "Namen erst nach der Windows-Bereinigung doppelt (a./a_, \"b \"/b_, x:y/x_y, con.txt/_con.txt, q?/q_, oben t./t_): "
            "nur der erste, mit Protokollzeile");
+
+    // Ein '\' vor einem kombinierenden Zeichen ist auch einer: der Name geht
+    // nicht hinaus (die Gegenseite lehnte sonst das ganze Angebot ab), der
+    // Rest kommt an.
+    schreiben(AKUT(@"bs/a\\%C"), [@"1" dataUsingEncoding:NSUTF8StringEncoding]);
+    schreiben(@"bs/ok.txt", [@"2" dataUsingEncoding:NSUTF8StringEncoding]);
+    int ungueltig0 = zeilen_mit(@"Name oder Pfad fuer die Gegenseite ungueltig");
+    neu_aufzeichnen();
+    senden(@[ @"bs" ]);
+    qc_dateien_abwarten();
+    NSArray<NSString *> *bs = angebot_pfade(NULL);
+    printf("         (Angebot: %s)\n", [bs componentsJoinedByString:@" | "].UTF8String ?: "abgelehnt");
+    pruefe([bs isEqualToArray:(@[ @"bs", @"bs/ok.txt" ])] && letzter_zustand() == QC_QUITT_FERTIG &&
+           zeilen_mit(@"Name oder Pfad fuer die Gegenseite ungueltig") == ungueltig0 + 1,
+           "Name mit '\\' vor einem kombinierenden Zeichen: uebersprungen, mit Protokollzeile; der Rest kommt an");
 
     // Was aus einem Empfang stammt (liegt in der eigenen Basis), geht nicht zurueck.
     NSString *empfangen = nil;
@@ -1571,6 +1720,27 @@ static void aufraeumen_pruefen(void) {
     pruefe(gesperrt51 && rest51 && !existiert(o51) && !existiert(m51) &&
            zeilen_mit(@"1 unfertige Uebertragung(en) eines frueheren Laufs geloescht") == waisen51 + 1,
            "Rest eines Abbruchs, der sich nicht ganz loeschen liess: behaelt seine Marke, der naechste Start raeumt ihn weg");
+
+    // Laesst sich die Marke am Ende eines vollstaendigen Empfangs nicht
+    // loeschen (hier: die Basis ohne Schreibrecht), steht das im Protokoll -
+    // mit Marke raeumte der naechste Start das Verzeichnis als Waise weg.
+    NSString *mb92 = [g_wurzel stringByAppendingPathComponent:@"marke-bleibt"];
+    qc_dateien_basis_setzen(mb92);
+    neu_aufzeichnen();
+    empfang(QC_DATEI_ANGEBOT, beispiel(92, &inhalte));
+    alle_stuecke(92, inhalte);
+    qc_dateien_abwarten();
+    NSString *o92 = qc_empfang_ordner();
+    int marke92 = zeilen_mit(@"liess sich nicht loeschen - der naechste Start raeumt das Verzeichnis daneben weg");
+    BOOL zu92 = chmod(mb92.fileSystemRepresentation, 0500) == 0;
+    ende(92, QC_ENDE_VOLLSTAENDIG);
+    qc_dateien_abwarten();
+    BOOL bleibt92 = o92 && existiert([o92 stringByAppendingString:@QC_DATEI_MARKE_ENDUNG]);
+    chmod(mb92.fileSystemRepresentation, 0700);
+    pruefe(zu92 && letzter_zustand() == QC_QUITT_FERTIG && bleibt92 &&
+           zeilen_mit(@"liess sich nicht loeschen - der naechste Start raeumt das Verzeichnis daneben weg") == marke92 + 1,
+           "Marke am Ende nicht loeschbar: Protokollzeile (der naechste Start raeumte das Verzeichnis sonst still weg)");
+    [[NSFileManager defaultManager] removeItemAtPath:mb92 error:nil];
     [[NSFileManager defaultManager] removeItemAtPath:wb error:nil];
     [[NSFileManager defaultManager] removeItemAtPath:mb error:nil];
 
@@ -1610,6 +1780,71 @@ static BOOL tief_anlegen(NSString *ordner, NSArray<NSString *> *teile) {
     }
     BOOL ok = fd >= 0 && close(fd) == 0;
     return ok;
+}
+
+// Oeffnet ordner/teile (ohne das letzte) Bestandteil fuer Bestandteil; -1 = nicht da.
+static int tief_eltern(NSString *ordner, NSArray<NSString *> *teile) {
+    int fd = open(ordner.fileSystemRepresentation, O_RDONLY | O_DIRECTORY);
+    for (NSUInteger i = 0; fd >= 0 && i + 1 < teile.count; i++) {
+        int n = openat(fd, teile[i].UTF8String, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        close(fd);
+        fd = n;
+    }
+    return fd;
+}
+
+// Schreibt bzw. liest die Datei ordner/teile ueber openat (der ganze Pfad
+// darf ueber PATH_MAX liegen).
+static BOOL tief_schreiben(NSString *ordner, NSArray<NSString *> *teile, NSData *d) {
+    int fd = tief_eltern(ordner, teile);
+    int f = fd >= 0 ? openat(fd, teile.lastObject.UTF8String, O_WRONLY | O_CREAT | O_EXCL, 0600) : -1;
+    BOOL ok = f >= 0 && write(f, d.bytes, d.length) == (ssize_t)d.length;
+    if (f >= 0) close(f);
+    if (fd >= 0) close(fd);
+    return ok;
+}
+
+static NSData *tief_lesen(NSString *ordner, NSArray<NSString *> *teile) {
+    int fd = tief_eltern(ordner, teile);
+    int f = fd >= 0 ? openat(fd, teile.lastObject.UTF8String, O_RDONLY | O_NOFOLLOW) : -1;
+    NSMutableData *d = f >= 0 ? [NSMutableData data] : nil;
+    char b[4096];
+    ssize_t r;
+    while (f >= 0 && (r = read(f, b, sizeof b)) > 0) [d appendBytes:b length:(NSUInteger)r];
+    if (f >= 0) close(f);
+    if (fd >= 0) close(fd);
+    return d;
+}
+
+// Loescht den Eintrag name im Ordner dfd samt Inhalt, relativ ueber
+// Deskriptoren - removeItemAtPath: scheitert, wo der ganze Pfad ueber
+// PATH_MAX liegt.
+static void weg_at(int dfd, const char *name) {
+    struct stat st;
+    if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) return;
+    if (!S_ISDIR(st.st_mode)) { unlinkat(dfd, name, 0); return; }
+    int fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd >= 0) {
+        NSMutableArray<NSData *> *namen = [NSMutableArray array];
+        int kopie = dup(fd);
+        DIR *d = kopie >= 0 ? fdopendir(kopie) : NULL;
+        struct dirent *e;
+        while (d && (e = readdir(d)))
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, ".."))
+                [namen addObject:[NSData dataWithBytes:e->d_name length:strlen(e->d_name) + 1]];
+        if (d) closedir(d);
+        else if (kopie >= 0) close(kopie);
+        for (NSData *n in namen) weg_at(fd, n.bytes);
+        close(fd);
+    }
+    unlinkat(dfd, name, AT_REMOVEDIR);
+}
+
+static void tief_weg(NSString *pfad) {
+    int dfd = open(pfad.stringByDeletingLastPathComponent.fileSystemRepresentation, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return;
+    weg_at(dfd, pfad.lastPathComponent.fileSystemRepresentation);
+    close(dfd);
 }
 
 // Wie viele "liess sich nicht ganz loeschen" seit dem letzten Aufruf - so
@@ -1701,6 +1936,40 @@ static void tiefe_pfade_pruefen(void) {
     pruefe(loeschfehler_neu() == 0 && rest_da && !existiert(rest) && verzeichnisse_mit(65) == 1,
            "beim Start: ein alter Rest mit ueber 1500 Byte Tiefe wird ganz geloescht, die juengeren bleiben");
 
+    // Sender: eine Quelle, deren relativer Pfad erlaubt ist (t/a../b../c../f.txt,
+    // 760 Byte), deren absoluter aber ueber PATH_MAX liegt. Gelesen wird
+    // Stufe fuer Stufe wie beim Auflisten; ueber den ganzen Pfad scheiterte
+    // das Oeffnen (ENAMETOOLONG), und die ganze Sendung endete mit Grund 2 -
+    // auch kurz.txt kaeme nicht an.
+    NSString *lq = [g_wurzel stringByAppendingPathComponent:wiederholt('p', 250)];
+    NSString *lt = [lq stringByAppendingPathComponent:@"t"];
+    NSArray<NSString *> *abc = @[ wiederholt('a', 250), wiederholt('b', 250), wiederholt('c', 250) ];
+    NSArray<NSString *> *abcf = [abc arrayByAddingObject:@"f.txt"];
+    NSData *tief_inhalt = zufall(70000);                 // zwei Stuecke
+    BOOL quelle_da = mkdir(lq.fileSystemRepresentation, 0700) == 0 && tief_anlegen(lt, abc) &&
+                     tief_schreiben(lt, abcf, tief_inhalt) &&
+                     [[@"kurz" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[lt stringByAppendingPathComponent:@"kurz.txt"] atomically:NO];
+    NSUInteger labs = [[lt stringByAppendingPathComponent:[abcf componentsJoinedByString:@"/"]] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    atomic_store(&g_schleife, 1);
+    neu_aufzeichnen();
+    NSUInteger flang = fertig_anzahl();
+    qc_senden_starten(SITZUNG, @[ lt ], @"192.0.2.9");
+    qc_dateien_abwarten();
+    atomic_store(&g_schleife, 0);
+    NSArray<NSString *> *lp = angebot_pfade(NULL);
+    NSString *lang_an = nil;
+    @synchronized (g_fertig_listen) { lang_an = [g_fertig_listen.lastObject firstObject]; }
+    BOOL lang_bytes = fertig_anzahl() == flang + 1 && [tief_lesen(lang_an, abcf) isEqualToData:tief_inhalt] &&
+                      [[NSData dataWithContentsOfFile:[lang_an stringByAppendingPathComponent:@"kurz.txt"]]
+                          isEqualToData:[@"kurz" dataUsingEncoding:NSUTF8StringEncoding]];
+    printf("         (Quelle absolut %lu Byte; Angebot %lu Eintraege, Ende mit Grund %d)\n", (unsigned long)labs,
+           (unsigned long)lp.count, letztes_ende());
+    pruefe(quelle_da && labs > PATH_MAX && lp.count == 6 && letztes_ende() == QC_ENDE_VOLLSTAENDIG &&
+           letzter_zustand() == QC_QUITT_FERTIG && lang_bytes,
+           "Sender: Quelle absolut ueber PATH_MAX (relativ 760 Byte) - alles kommt an, Byte fuer Byte");
+    tief_weg(lq);
+    pruefe(!existiert(lq), "die tiefe Quelle ist wieder weg");
+
     // Zum Schluss alles weg (auch damit unter $TMPDIR nichts liegen bleibt).
     schlafen(0.005);
     qc_dateien_aufraeumen(0, 1);
@@ -1739,11 +2008,14 @@ int main(void) {
         tiefe_pfade_pruefen();
         qc_dateien_abwarten();
         printf("\n-- Nachrang: Dienstklasse der Warteschlangen\n");
-        printf("         (dateien-senden 0x%x, dateien-empfang 0x%x, Hauptfaden 0x%x; UTILITY = 0x%x)\n",
-               atomic_load(&g_qos_senden), atomic_load(&g_qos_empfang), (int)qos_class_self(), (int)QOS_CLASS_UTILITY);
-        pruefe(atomic_load(&g_qos_senden) == QOS_CLASS_UTILITY && atomic_load(&g_qos_empfang) == QOS_CLASS_UTILITY,
-               "\"dateien-senden\" und \"dateien-empfang\" laufen mit QOS_CLASS_UTILITY (Latenz vor Bandbreite)");
-        [[NSFileManager defaultManager] removeItemAtPath:g_wurzel error:nil];
+        printf("         (dateien-senden 0x%x relativ %d, dateien-empfang 0x%x, Hauptfaden 0x%x; DEFAULT = 0x%x, UTILITY = 0x%x)\n",
+               atomic_load(&g_qos_senden), atomic_load(&g_relprio_senden), atomic_load(&g_qos_empfang), (int)qos_class_self(),
+               (int)QOS_CLASS_DEFAULT, (int)QOS_CLASS_UTILITY);
+        pruefe(atomic_load(&g_qos_senden) == QOS_CLASS_DEFAULT && atomic_load(&g_relprio_senden) == QOS_MIN_RELATIVE_PRIORITY &&
+               atomic_load(&g_qos_empfang) == QOS_CLASS_UTILITY,
+               "\"dateien-senden\" laeuft mit QOS_CLASS_DEFAULT und relativer Prioritaet -15, \"dateien-empfang\" mit "
+               "QOS_CLASS_UTILITY (Latenz vor Bandbreite)");
+        tief_weg(g_wurzel);
         printf("\n%s: %d Fehler\n", g_fehler ? "NICHT BESTANDEN" : "bestanden", g_fehler);
         return g_fehler;
     }
