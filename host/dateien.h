@@ -22,7 +22,13 @@
 //
 // Faeden: Der Empfaenger arbeitet auf der seriellen Warteschlange
 // "dateien-empfang", der Sender auf "dateien-senden" - nie im Lesefaden eines
-// Kanals, nie auf der Hauptwarteschlange und nie unter g_send_mtx.
+// Kanals, nie auf der Hauptwarteschlange und nie unter g_send_mtx. Beide
+// laufen mit niedriger Prioritaet ("Latenz vor Bandbreite"): Aufnahme,
+// Encoder und Ton gehen vor. "dateien-empfang" mit QOS_CLASS_UTILITY,
+// "dateien-senden" mit QOS_CLASS_DEFAULT und relativer Prioritaet -15
+// (Prioritaet 21, knapp ueber UTILITY) - unter UTILITY legte macOS die
+// Zeitgeber zusammen, und aus den 2 ms Warten bei vollem Sendepuffer
+// (QC_DATEI_WARTEN_US) wuerden rund 10 ms.
 #ifndef QUADCHROMA_DATEIEN_H
 #define QUADCHROMA_DATEIEN_H
 
@@ -89,8 +95,19 @@ size_t qc_datei_grenze(uint8_t typ);
 @property (nonatomic) uint8_t art;                    // 0 = Datei, 1 = Ordner
 @property (nonatomic) uint64_t groesse;               // bei Ordnern 0
 @property (nonatomic, copy) NSData *pfad;             // wie auf der Leitung: UTF-8, relativ, Trenner '/'
-@property (nonatomic, copy) NSArray<NSString *> *teile;   // Empfaenger: Bestandteile nach der Bereinigung
-@property (nonatomic, copy) NSString *quelle;         // Sender: absoluter Pfad auf diesem Mac
+@property (nonatomic, copy) NSArray<NSString *> *teile;   // Empfaenger: Bestandteile nach der Bereinigung, in NFC
+@property (nonatomic, copy) NSString *quelle;         // Sender: absoluter Pfad auf diesem Mac (fuers Protokoll)
+// Sender: der Weg zur Datei, wie das Auflisten ihn ging - der oberste Pfad,
+// wie der Nutzer ihn kopiert hat, und darunter die rohen Namen (je mit NUL;
+// leer fuer einen obersten Eintrag). Gelesen wird Stufe fuer Stufe relativ
+// (openat, ohne Verknuepfung), nie ueber den ganzen Pfad: der kann ueber
+// PATH_MAX liegen.
+@property (nonatomic, copy) NSString *oben;
+@property (nonatomic, copy) NSArray<NSData *> *kette;
+// Sender: st_dev und st_ino, wie sie beim Auflisten gesehen wurden. Die
+// geoeffnete Datei muss genau diese sein (fstat), sonst ENDE mit Grund 2.
+@property (nonatomic) uint64_t geraet;
+@property (nonatomic) uint64_t knoten;
 + (instancetype)art:(uint8_t)art groesse:(uint64_t)groesse pfad:(NSString *)pfad;
 @end
 
@@ -104,7 +121,8 @@ int qc_datei_faehigkeiten_lesen(const uint8_t *p, size_t n, uint32_t *bits);
 NSData *qc_datei_angebot_kodieren(uint32_t kennung, NSArray<QCDateiEintrag *> *eintraege);
 
 // Liest und prueft ein Angebot nach 2.3, 2.5 und 2.6, samt Bereinigung fuer
-// macOS. Rueckgabe QC_QUITT_LAEUFT = in Ordnung, sonst der Zustand der
+// macOS; die Bestandteile (teile, zerlegt an den Bytes '/') sind danach in
+// NFC, so werden sie auch angelegt. Rueckgabe QC_QUITT_LAEUFT = in Ordnung, sonst der Zustand der
 // Ablehnung (QC_QUITT_ZU_GROSS oder QC_QUITT_UNGUELTIG). *kennung ist gesetzt,
 // sobald 4 Byte da sind; *grund beschreibt eine Ablehnung.
 int qc_datei_angebot_lesen(const uint8_t *p, size_t n, uint32_t *kennung, uint64_t *gesamt,
@@ -128,6 +146,16 @@ int qc_datei_quittung_lesen(const uint8_t *p, size_t n, uint32_t *kennung, uint8
 // Bereinigung eines Bestandteils fuer macOS (2.5): Steuerzeichen U+0000 bis
 // U+001F werden zu '_'. ':' bleibt.
 NSString *qc_datei_bereinigen(NSString *bestandteil);
+
+// Bereinigung eines Bestandteils fuer Windows (2.5), wie
+// bestandteil_bereinigen(.., Regeln::Windows) im Rust-Kern: < > : " | ? * und
+// U+0000 bis U+001F werden zu '_', Punkte und Leerzeichen am Ende je zu '_',
+// Geraetenamen (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM0-9, LPT0-9, COM/LPT
+// mit hochgestellter 1-3; auch mit Endung, in jeder Schreibweise) bekommen
+// ein '_' davor. Der Sender nimmt sie fuer seinen Schluessel gegen Doppelte:
+// Er kennt das System der Gegenseite nicht und muss so streng sein wie der
+// strengste Empfaenger. Schliesst die macOS-Bereinigung ein.
+NSString *qc_datei_bereinigen_windows(NSString *bestandteil);
 
 // ---------------------------------------------------------------- Betrieb
 
@@ -157,10 +185,14 @@ void qc_dateien_fertig_setzen(void (*fertig)(NSArray<NSString *> *pfade));
 // ABWEICHUNG von 2.9 (dort .../QuadChroma-Ablage): der Mac-Client (Rust)
 // nimmt $TMPDIR/QuadChroma-Ablage, und das ist unter macOS derselbe Ordner.
 // Laufen Client und Host unter demselben Nutzer, raeumten sie einander sonst
-// Uebertragungen weg (der Rust-Kern kennt die Marke .laeuft, dieser Host
-// nicht). Mit eigener Basis raeumt keiner dem anderen etwas auf.
+// Uebertragungen weg. Mit eigener Basis raeumt keiner dem anderen etwas auf.
+// Je Uebertragung <basis>/<unix-ms>-<kennung>; solange sie laeuft, liegt
+// daneben die leere Marke <unix-ms>-<kennung>.laeuft (wie im Rust-Kern). Sie
+// verschwindet mit dem Ende der Uebertragung, bei einem vollstaendigen
+// Empfang ebenso wie bei einem Abbruch.
 // Der Pruefstand setzt einen eigenen Ordner unter $TMPDIR (nil = wieder die Vorgabe).
 #define QC_DATEI_BASIS_NAME "QuadChroma-Host-Ablage"
+#define QC_DATEI_MARKE_ENDUNG ".laeuft"
 void qc_dateien_basis_setzen(NSString *basis);
 NSString *qc_dateien_basis(void);
 
@@ -170,14 +202,20 @@ void qc_dateien_platzreserve_setzen(uint64_t bytes);
 
 // Aufraeumen (2.9) in der Basis: die `behalten` neuesten Uebertragungen bleiben
 // (0 = keine Obergrenze), aelter als hoechstalter_ms (0 = egal) wird geloescht.
-// Nur Unterverzeichnisse "<unix-ms>-<kennung>", nie einer Verknuepfung folgend:
-// Die Basis selbst wird mit O_NOFOLLOW geoeffnet und alles relativ zu ihrem
-// Deskriptor geloescht - ist sie eine Verknuepfung, bleibt alles unberuehrt.
-// Nach einem vollstaendigen Empfang bleibt das eben abgelegte Verzeichnis auf
-// jeden Fall (es zaehlt als eines der drei), auch wenn die Uhr zurueck-
-// gesprungen ist. Laeuft im Faden des Aufrufers.
+// Nur Unterverzeichnisse "<unix-ms>-<kennung>" (und ihre Marken), nie einer
+// Verknuepfung folgend: Die Basis selbst wird mit O_NOFOLLOW geoeffnet und
+// alles relativ zu ihrem Deskriptor geloescht - ist sie eine Verknuepfung,
+// bleibt alles unberuehrt. Laufende (mit Marke) werden weder gezaehlt noch
+// geloescht, ausser nach hoechstalter_ms. Nach einem vollstaendigen Empfang
+// bleibt das eben abgelegte Verzeichnis auf jeden Fall (es zaehlt als eines
+// der drei), auch wenn die Uhr zurueckgesprungen ist. Laeuft im Faden des
+// Aufrufers.
 void qc_dateien_aufraeumen(NSUInteger behalten, uint64_t hoechstalter_ms);
-// Beim Programmstart: aelter als 24 h loeschen, auf "dateien-empfang".
+// Beim Programmstart, auf "dateien-empfang": aelter als 24 h loeschen und
+// dazu jede unfertige Uebertragung (mit Marke) gleich welchen Alters samt
+// Marke - beim Start des Dienstes laeuft noch keine (ein Host je Nutzer, mit
+// eigener Basis), eine Marke stammt also aus einem Lauf, der mitten im
+// Empfang endete. Nur die Uebertragung, die gerade hier laeuft, bleibt.
 void qc_dateien_aufraeumen_beim_start(void);
 
 // Sitzung vorbei (Zuschauerwechsel, Zuschauer weg): laufende Uebertragungen
@@ -191,11 +229,18 @@ void qc_dateien_sitzung_vorbei(uint64_t neue_sitzung);
 // Eine Nachricht 50, 51 oder 52 vom Eingabekanal `kanal` der Sitzung
 // `sitzung`. Reiht nur ein und kehrt sofort zurueck. Die Warteschlange ist
 // wie im Rust-Kern begrenzt: Datenbytes der Stuecke (je Stueck mindestens 1)
-// bis FENSTER + STUECK_MAX, hoechstens 8 Enden, ein neues Angebot leert sie;
-// darueber Quittung 4. Quittiert wird nach der Annahme (0/0), sobald mehr als
-// 16 KiB offen sind, sobald nichts mehr wartet und am Ende. Quittungen gehen
-// ueber wege.senden, das blockiert, bis sie hinaus sind - bei Stau geht also
-// keine verloren; nur mit dem Ende der Sitzung faellt sie weg.
+// bis FENSTER + STUECK_MAX, hoechstens 8 Enden, ein neues Angebot leert sie
+// (nur, was aus seiner oder einer aelteren Sitzung wartet - ein verspaetetes
+// Angebot einer vergangenen Sitzung verwirft nichts aus der aktuellen);
+// darueber Quittung 4. Beim Annehmen eines Angebots steht im Protokoll
+// "Dateien: empfange N Eintraege, X MB" (nur, wenn die Quittung 0
+// hinausging; sonst ist die Sitzung vorbei und die Uebertragung wird gleich
+// verworfen). Namen werden in NFC angelegt, so wie sie nach der Bereinigung
+// sind (nicht zerlegt wie fileSystemRepresentation). Quittiert wird nach der
+// Annahme (0/0), sobald mehr als 16 KiB offen sind, sobald nichts mehr
+// wartet und am Ende. Quittungen gehen ueber wege.senden, das blockiert, bis
+// sie hinaus sind - bei Stau geht also keine verloren; nur mit dem Ende der
+// Sitzung faellt sie weg.
 void qc_empfang_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSData *nutzlast);
 // Der Eingabekanal ist weg: eine Uebertragung, die ueber ihn kam, endet -
 // aber erst hinter allem, was vorher von ihm kam (ein Ende davor zaehlt).
@@ -204,11 +249,24 @@ void qc_empfang_kanal_weg(uint64_t sitzung, uint64_t kanal);
 // --- Sender (Host -> Client)
 // Beginnt eine Sendung an den Zuschauer der Sitzung `sitzung` (an: Adresse
 // fuers Protokoll) und bricht eine laufende ab. Kehrt sofort zurueck.
-// Gelesen wird jede Datei mit O_NOFOLLOW|O_NONBLOCK und erst nach fstat
-// (S_ISREG) blockierend: wurde sie seit dem Auflisten gegen eine
-// Verknuepfung oder eine FIFO getauscht, gibt es ENDE mit Grund 2.
+// Doppelte Namen (nach der Windows-Bereinigung, ohne Ruecksicht auf Gross-
+// und Kleinschreibung und Normalform) gehen nur einmal hinaus, mit
+// Protokollzeile. Ordner werden ueber einen Deskriptor gelesen, der
+// nachweislich (st_dev/st_ino) der eben per lstat gesehene Ordner ist, und
+// ihre Eintraege relativ dazu (fstatat) - ein waehrenddessen getauschter
+// Ordner geht leer hinaus. Gelesen wird jede Datei auf demselben Weg:
+// oberster Pfad, darunter Stufe fuer Stufe openat mit O_NOFOLLOW (so gilt
+// PATH_MAX nicht fuer den ganzen Pfad), die Datei mit O_NONBLOCK und erst
+// nach fstat blockierend. Ist sie keine gewoehnliche Datei mehr (FIFO,
+// Verknuepfung), liegt auf dem Weg eine Verknuepfung, oder ist sie nicht
+// mehr die beim Auflisten gesehene (st_dev/st_ino - etwa weil ein Ordner
+// darueber gegen einen anderen getauscht wurde), gibt es ENDE mit Grund 2.
+// Namen mit '\' (auch vor einem kombinierenden Zeichen) gehen nicht hinaus.
 void qc_senden_starten(uint64_t sitzung, NSArray<NSString *> *pfade, NSString *an);
-// Eine Quittung (53) vom Eingabekanal. Blockiert nicht.
+// Eine Quittung (53) vom Eingabekanal. Blockiert nicht. Nur Fortschritt
+// (mehr quittiert als bisher, oder die erste Quittung nach dem Angebot)
+// erneuert die Stillstandsfrist - wie im Rust-Sender; eine Wiederholung
+// desselben Standes haelt den Sender nicht am Leben.
 void qc_senden_quittung(uint64_t sitzung, const uint8_t *p, size_t n);
 // Neuer Inhalt in der Ablage: eine laufende Sendung endet (ENDE mit Grund 1).
 void qc_senden_abbrechen(void);

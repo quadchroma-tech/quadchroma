@@ -2000,7 +2000,9 @@ static void dateien_pruefen(int bild_port, int ein_port) {
                  [[NSData dataWithContentsOfFile:[wurzel stringByAppendingPathComponent:@"Bilder/sub/c.txt"]] isEqualToData:g_inhalte[5]];
     pruefe(rekorder_anzahl() == 1 && bytes && [wurzel hasPrefix:[home stringByAppendingPathComponent:@"ablage/"]],
            "der Rekorder (statt der Ablage) bekommt die obersten Pfade, die Bytes stimmen");
-    pruefe(zeilen_mit(pfad, "Dateien: empfangen 6 Eintraege, 0,2 MB - in die Ablage gelegt") == 1, "Protokollzeile im Host-Protokoll");
+    pruefe(zeilen_mit(pfad, "Dateien: empfangen 6 Eintraege, 0,2 MB - in die Ablage gelegt") == 1 &&
+           zeilen_mit(pfad, "Dateien: empfange 6 Eintraege, 0,2 MB") == 1,
+           "Protokollzeilen im Host-Protokoll (beim Annehmen und am Ende, wie beim Windows-Host)");
 
     // Ein Stueck ausser der Reihe: Quittung 4, der Kanal bleibt (Zeitabgleich geht).
     stdout_stumm(1);
