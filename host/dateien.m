@@ -239,6 +239,49 @@ NSString *qc_datei_bereinigen(NSString *t) {
     return m ? [m copy] : t;
 }
 
+// Ist der Stamm (vor dem ersten '.', ohne Leerzeichen am Ende) ein
+// Geraetename unter Windows? Wie geraetename() im Rust-Kern: ohne Ruecksicht
+// auf die ASCII-Schreibweise; COM/LPT mit einer Ziffer 0-9 oder einer
+// hochgestellten 1-3.
+static BOOL windows_geraetename(NSString *name) {
+    NSUInteger punkt = [name rangeOfString:@"."].location;
+    NSString *stamm = punkt == NSNotFound ? name : [name substringToIndex:punkt];
+    NSUInteger l = stamm.length;
+    while (l && [stamm characterAtIndex:l - 1] == ' ') l--;
+    stamm = [stamm substringToIndex:l];
+    // Nur ASCII gross (wie to_ascii_uppercase); alles andere bleibt, wie es ist.
+    unichar b[8];
+    if (stamm.length > 7) return NO;
+    [stamm getCharacters:b range:NSMakeRange(0, stamm.length)];
+    for (NSUInteger i = 0; i < stamm.length; i++)
+        if (b[i] >= 'a' && b[i] <= 'z') b[i] = (unichar)(b[i] - 'a' + 'A');
+    NSString *gross = [NSString stringWithCharacters:b length:stamm.length];
+    for (NSString *g in @[ @"CON", @"PRN", @"AUX", @"NUL", @"CONIN$", @"CONOUT$" ])
+        if ([gross isEqualToString:g]) return YES;
+    if (gross.length == 4 && ([gross hasPrefix:@"COM"] || [gross hasPrefix:@"LPT"])) {
+        unichar z = b[3];
+        return (z >= '0' && z <= '9') || z == 0x00B9 || z == 0x00B2 || z == 0x00B3;
+    }
+    return NO;
+}
+
+NSString *qc_datei_bereinigen_windows(NSString *t) {
+    NSMutableString *m = [t mutableCopy];
+    for (NSUInteger i = 0; i < m.length; i++) {
+        unichar c = [m characterAtIndex:i];
+        if (c < 0x20 || (c < 0x80 && strchr("<>:\"|?*", (int)c)))
+            [m replaceCharactersInRange:NSMakeRange(i, 1) withString:@"_"];
+    }
+    // Punkte und Leerzeichen am Ende: je Zeichen ein '_'.
+    for (NSUInteger i = m.length; i > 0; i--) {
+        unichar c = [m characterAtIndex:i - 1];
+        if (c != '.' && c != ' ') break;
+        [m replaceCharactersInRange:NSMakeRange(i - 1, 1) withString:@"_"];
+    }
+    if (windows_geraetename(m)) [m insertString:@"_" atIndex:0];
+    return [m copy];
+}
+
 // Vergleichsschluessel fuer Doppelte: ohne Ruecksicht auf Gross- und
 // Kleinschreibung - und auf die Unicode-Normalform, denn APFS unterscheidet
 // ein e mit Akzent als ein Zeichen und als e plus kombinierenden Akzent
@@ -248,12 +291,15 @@ static NSString *schluessel(NSString *pfad) {
     return [[pfad precomposedStringWithCanonicalMapping] stringByFoldingWithOptions:NSCaseInsensitiveSearch locale:nil];
 }
 
-// Derselbe Schluessel beim Sender, fuer einen einzelnen Namen: erst so
-// bereinigt, wie es jeder Empfaenger mindestens tut (Steuerzeichen zu '_'),
-// sonst gingen "a\x01" und "a_" beide hinaus, und die Gegenseite lehnte das
-// ganze Angebot als doppelt ab.
+// Derselbe Schluessel beim Sender, fuer einen einzelnen Namen. Der Sender
+// kennt das System der Gegenseite nicht (die Faehigkeiten tragen nur Bit 0),
+// muss also so streng sein wie der strengste Empfaenger: erst nach der
+// Windows-Bereinigung vergleichen, die die macOS-Bereinigung einschliesst.
+// Sonst gingen etwa "a." und "a_", "x:y" und "x_y" oder "a\x01" und "a_"
+// beide hinaus, und ein Windows-Empfaenger lehnte das ganze Angebot als
+// doppelt ab.
 static NSString *sende_schluessel(NSString *name) {
-    return schluessel(qc_datei_bereinigen(name));
+    return schluessel(qc_datei_bereinigen_windows(name));
 }
 
 static int angebot_pruefen(const uint8_t *p, size_t n, uint32_t *kennung_aus, uint64_t *gesamt_aus,
@@ -299,8 +345,12 @@ static int angebot_pruefen(const uint8_t *p, size_t n, uint32_t *kennung_aus, ui
         if (art == 1) [ordner addObject:roh];
         NSString *text = [[NSString alloc] initWithBytes:s length:pl encoding:NSUTF8StringEncoding];
         if (!text) ABLEHNEN(QC_QUITT_UNGUELTIG, @"Eintrag %u: kein gueltiges UTF-8", i);
+        // Die Bestandteile in NFC: so werden sie angelegt (siehe
+        // eltern_oeffnen), und so gehen sie bei einer Ruecksendung wieder
+        // hinaus.
         NSMutableArray<NSString *> *teile = [NSMutableArray array];
-        for (NSString *t in [text componentsSeparatedByString:@"/"]) [teile addObject:qc_datei_bereinigen(t)];
+        for (NSString *t in [text componentsSeparatedByString:@"/"])
+            [teile addObject:[qc_datei_bereinigen(t) precomposedStringWithCanonicalMapping]];
         // Erst nach der Bereinigung auf Doppelte pruefen.
         NSString *k = schluessel([teile componentsJoinedByString:@"/"]);
         if ([namen containsObject:k]) ABLEHNEN(QC_QUITT_UNGUELTIG, @"Eintrag %u: doppelt", i);
@@ -539,8 +589,15 @@ static BOOL uebertragung_name(const char *n, uint64_t *ms) {
 // Die Basis wird ohne Verknuepfung geoeffnet (O_NOFOLLOW), und alles darunter
 // wird relativ zu ihrem Deskriptor gelesen und geloescht: Ist die Basis eine
 // Verknuepfung, wird nichts angefasst, auch nicht in ihrem Ziel.
-static void aufraeumen_ausser(NSUInteger behalten, uint64_t hoechstalter_ms, NSString *ausser) {
-    if (!behalten && !hoechstalter_ms) return;
+// Marken (<name>.laeuft, eine gewoehnliche Datei): Ein Verzeichnis mit Marke
+// laeuft noch und wird weder gezaehlt noch geloescht (wie im Rust-Kern) -
+// ausser nach hoechstalter_ms oder mit `unfertige` (beim Start: dann ist es
+// eine Waise). Eine Marke geht mit ihrem Verzeichnis, nach hoechstalter_ms
+// und mit `unfertige` auch allein.
+static NSString *laufender_name(void);
+
+static void aufraeumen_ausser(NSUInteger behalten, uint64_t hoechstalter_ms, NSString *ausser, BOOL unfertige) {
+    if (!behalten && !hoechstalter_ms && !unfertige) return;
     NSString *basis = qc_dateien_basis();
     int bfd = open(basis.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (bfd < 0) {
@@ -564,32 +621,76 @@ static void aufraeumen_ausser(NSUInteger behalten, uint64_t hoechstalter_ms, NSS
         close(bfd);
         return;
     }
-    const char *ausser_c = ausser.UTF8String;
+    uint64_t jetzt = unix_ms();
+    BOOL (^alt)(uint64_t) = ^BOOL(uint64_t ms) { return hoechstalter_ms && ms + hoechstalter_ms < jetzt; };
+    const size_t endung = strlen(QC_DATEI_MARKE_ENDUNG);
     BOOL ausser_da = NO;
-    NSMutableArray<NSArray *> *funde = [NSMutableArray array];
+    NSMutableArray<NSArray *> *funde = [NSMutableArray array];      // @[ms, Name] der Verzeichnisse
+    NSMutableDictionary<NSString *, NSNumber *> *marken = [NSMutableDictionary dictionary];   // Stamm -> ms
     struct dirent *e;
     while ((e = readdir(d))) {
         uint64_t ms;
-        if (!uebertragung_name(e->d_name, &ms)) continue;
         struct stat st;
+        size_t l = strlen(e->d_name);
+        if (l > endung && !strcmp(e->d_name + l - endung, QC_DATEI_MARKE_ENDUNG)) {
+            // "<unix-ms>-<kennung>" hat hoechstens 19 + 1 + 10 Zeichen.
+            char stamm[32];
+            if (l - endung >= sizeof stamm) continue;
+            memcpy(stamm, e->d_name, l - endung);
+            stamm[l - endung] = 0;
+            // Nur eine gewoehnliche Datei ist eine Marke.
+            if (uebertragung_name(stamm, &ms) && fstatat(bfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISREG(st.st_mode))
+                marken[@(stamm)] = @(ms);
+            continue;
+        }
+        if (!uebertragung_name(e->d_name, &ms)) continue;
         // Nur echte Ordner; eine Verknuepfung mit passendem Namen bleibt liegen.
         if (fstatat(bfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode)) continue;
-        if (ausser_c && !strcmp(e->d_name, ausser_c)) { ausser_da = YES; continue; }
         [funde addObject:@[ @(ms), @(e->d_name) ]];
     }
     closedir(d);                                      // schliesst die Kopie, bfd bleibt
-    [funde sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+    NSMutableArray<NSArray *> *fertige = [NSMutableArray array];
+    NSUInteger waisen = 0;
+    for (NSArray *f in funde) {
+        NSString *name = f[1];
+        BOOL markiert = marken[name] != nil;
+        if (ausser && [name isEqualToString:ausser]) {
+            ausser_da = !markiert;                    // zaehlt nur fertig als eines der `behalten`
+            continue;
+        }
+        if (!markiert) { [fertige addObject:f]; continue; }
+        // Laeuft (noch): nur als Waise beim Start oder nach dem Hoechstalter.
+        if (!unfertige && !alt([f[0] unsignedLongLongValue])) continue;
+        int r = eintrag_loeschen(bfd, name.UTF8String, bst.st_dev, 0);
+        if (r) zeile(@"Dateien: Aufraeumen - %@ liess sich nicht ganz loeschen (%s)",
+                     [basis stringByAppendingPathComponent:name], strerror(r));
+        else if (unfertige) waisen++;
+    }
+    // Marken: die der eben geloeschten Waisen und alte; die der Ausnahme nie.
+    for (NSString *stamm in marken) {
+        if (ausser && [stamm isEqualToString:ausser]) continue;
+        if (!unfertige && !alt([marken[stamm] unsignedLongLongValue])) continue;
+        NSString *m = [stamm stringByAppendingString:@QC_DATEI_MARKE_ENDUNG];
+        // Liess sich das Verzeichnis nicht ganz loeschen, bleibt die Marke:
+        // sonst zaehlte der Rest beim naechsten Aufraeumen als fertig.
+        struct stat st;
+        if (fstatat(bfd, stamm.UTF8String, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode)) continue;
+        eintrag_loeschen(bfd, m.UTF8String, bst.st_dev, 0);
+    }
+    if (waisen)
+        zeile(@"Dateien: %lu unfertige Uebertragung(en) eines frueheren Laufs geloescht", (unsigned long)waisen);
+    [fertige sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
         NSComparisonResult r = [b[0] compare:a[0]];              // neueste zuerst
         return r != NSOrderedSame ? r : [b[1] compare:a[1]];
     }];
     // So viele der uebrigen bleiben; 0 bei `behalten` heisst: keine Obergrenze.
     NSUInteger andere = !behalten ? NSUIntegerMax : behalten - (ausser_da ? 1 : 0);
-    uint64_t jetzt = unix_ms();
-    for (NSUInteger i = 0; i < funde.count; i++) {
-        uint64_t ms = [funde[i][0] unsignedLongLongValue];
-        BOOL weg = i >= andere || (hoechstalter_ms && ms + hoechstalter_ms < jetzt);
+    for (NSUInteger i = 0; i < fertige.count; i++) {
+        uint64_t ms = [fertige[i][0] unsignedLongLongValue];
+        BOOL weg = i >= andere || alt(ms);
         if (!weg) continue;
-        NSString *name = funde[i][1];
+        NSString *name = fertige[i][1];
         int r = eintrag_loeschen(bfd, name.UTF8String, bst.st_dev, 0);
         if (r) zeile(@"Dateien: Aufraeumen - %@ liess sich nicht ganz loeschen (%s)",
                      [basis stringByAppendingPathComponent:name], strerror(r));
@@ -598,13 +699,17 @@ static void aufraeumen_ausser(NSUInteger behalten, uint64_t hoechstalter_ms, NSS
 }
 
 void qc_dateien_aufraeumen(NSUInteger behalten, uint64_t hoechstalter_ms) {
-    aufraeumen_ausser(behalten, hoechstalter_ms, nil);
+    aufraeumen_ausser(behalten, hoechstalter_ms, nil, NO);
 }
 
 void qc_dateien_aufraeumen_beim_start(void) {
     if (!g_empfang_q) return;
     dispatch_async(g_empfang_q, ^{
-        @autoreleasepool { qc_dateien_aufraeumen(0, 24ull * 3600 * 1000); }
+        @autoreleasepool {
+            // Auf g_empfang_q: laeuft hier schon eine Uebertragung (der
+            // Aufruf kam spaet), bleibt sie samt Marke.
+            aufraeumen_ausser(0, 24ull * 3600 * 1000, laufender_name(), YES);
+        }
     });
 }
 
@@ -622,6 +727,7 @@ void qc_dateien_aufraeumen_beim_start(void) {
 }
 @property (nonatomic, strong) NSArray<QCDateiEintrag *> *eintraege;
 @property (nonatomic, copy) NSString *ordner;
+@property (nonatomic, copy) NSString *marke;          // <ordner>.laeuft, solange sie laeuft
 @property (nonatomic, strong) dispatch_source_t wache;
 @end
 @implementation QCEmpfang
@@ -629,6 +735,9 @@ void qc_dateien_aufraeumen_beim_start(void) {
 
 // Die laufende Uebertragung. Nur auf g_empfang_q.
 static QCEmpfang *g_empfang = nil;
+
+// Name ihres Verzeichnisses in der Basis, sonst nil. Nur auf g_empfang_q.
+static NSString *laufender_name(void) { return g_empfang.ordner.lastPathComponent; }
 
 // Eingang des Empfaengers: eine eigene Warteschlange (FIFO) vor g_empfang_q,
 // damit sie sich nach Datenbytes begrenzen und von einem neuen Angebot leeren
@@ -684,15 +793,25 @@ static void quittung_an(uint64_t sitzung, uint32_t kennung, uint8_t zustand, uin
     if (g_wege.senden) g_wege.senden(sitzung, QC_DATEI_QUITTUNG, q.bytes, q.length);
 }
 
-// Die laufende Uebertragung beenden; loeschen = ihr Verzeichnis mit.
+// Die laufende Uebertragung beenden; loeschen = ihr Verzeichnis mit. Die
+// Marke geht mit: fertig oder verworfen, sie laeuft nicht mehr. Nur wenn
+// vom Verzeichnis etwas uebrig blieb, bleibt auch die Marke - dann zaehlt der
+// Rest nicht als fertige Uebertragung, und der naechste Start raeumt ihn als
+// Waise weg.
 static void empfang_beenden(BOOL loeschen) {
     QCEmpfang *E = g_empfang;
     if (!E) return;
     g_empfang = nil;
     if (E->fd >= 0) { close(E->fd); E->fd = -1; }
     if (E.wache) { dispatch_source_cancel(E.wache); E.wache = nil; }
-    if (loeschen && baum_loeschen(E.ordner) != 0)
+    BOOL rest = NO;
+    if (loeschen && baum_loeschen(E.ordner) != 0) {
         zeile(@"Dateien: %@ liess sich nicht ganz loeschen", E.ordner);
+        rest = YES;
+    }
+    // Wie das Verzeichnis nur relativ zur Basis, ohne ihr zu folgen, falls
+    // sie inzwischen eine Verknuepfung ist.
+    if (E.marke && !rest) baum_loeschen(E.marke);
 }
 
 static void naechste_datei(QCEmpfang *E) {
@@ -703,10 +822,16 @@ static void naechste_datei(QCEmpfang *E) {
 
 // Den Elternordner eines Eintrags im Uebertragungsverzeichnis oeffnen,
 // Bestandteil fuer Bestandteil und ohne je einer Verknuepfung zu folgen.
+// Namen im Uebertragungsverzeichnis (hier und beim Anlegen und Oeffnen der
+// Dateien): die Bestandteile, wie angebot_pruefen sie liefert (bereinigt,
+// NFC), als UTF-8 - nicht ueber fileSystemRepresentation, das zerlegt (NFD).
+// APFS legt die Bytes so an, wie sie kommen; ein zerlegter Name ginge bei
+// einer Ruecksendung (Mac -> Windows) zerlegt hinaus und staende dort neben
+// dem gleich aussehenden.
 static int eltern_oeffnen(NSString *ordner, NSArray<NSString *> *teile) {
     int fd = open(ordner.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     for (NSUInteger i = 0; fd >= 0 && i + 1 < teile.count; i++) {
-        int n = openat(fd, teile[i].fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int n = openat(fd, teile[i].UTF8String, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         int err = errno;
         close(fd);
         errno = err;
@@ -715,10 +840,15 @@ static int eltern_oeffnen(NSString *ordner, NSArray<NSString *> *teile) {
     return fd;
 }
 
-static void protokollfehler(QCEmpfang *E, NSString *warum) {
-    zeile(@"Dateien: abgebrochen (ungueltig: %@)", warum);
+// Quittung 4 und verwerfen; `text` steht so in der Protokollzeile.
+static void ungueltig_beenden(QCEmpfang *E, NSString *text) {
+    zeile(@"Dateien: abgebrochen (%@)", text);
     quittung_an(E->sitzung, E->kennung, QC_QUITT_UNGUELTIG, E->empfangen);
     empfang_beenden(YES);
+}
+
+static void protokollfehler(QCEmpfang *E, NSString *warum) {
+    ungueltig_beenden(E, [@"ungueltig: " stringByAppendingString:warum]);
 }
 
 static void schreibfehler(QCEmpfang *E, QCDateiEintrag *e, int err) {
@@ -745,13 +875,15 @@ static void empfang_wache(QCEmpfang *E) {
 }
 
 static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
+    // Ein Nachzuegler einer Sitzung, die es nicht mehr gibt (der Eingabefaden
+    // las ihn noch vor dem Wechsel): nichts anlegen, niemandem antworten -
+    // und vor allem die laufende Uebertragung der aktuellen Sitzung nicht
+    // verwerfen, deren Sender sonst ohne Quittung bis zum Stillstand wartete.
+    if (g_wege.rueckstand && g_wege.rueckstand(sitzung) < 0) return;
     if (g_empfang) {
         zeile(@"Dateien: abgebrochen (neues Angebot vor dem Ende der laufenden Uebertragung)");
         empfang_beenden(YES);
     }
-    // Ein Nachzuegler einer Sitzung, die es nicht mehr gibt (der Eingabefaden
-    // las ihn noch vor dem Wechsel): nichts anlegen, niemandem antworten.
-    if (g_wege.rueckstand && g_wege.rueckstand(sitzung) < 0) return;
     uint32_t kennung = 0;
     uint64_t gesamt = 0;
     NSArray<QCDateiEintrag *> *eintraege = nil;
@@ -779,11 +911,22 @@ static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
         return;
     }
     // Frisches Verzeichnis je Uebertragung; darin alle Ordner und leeren
-    // Dateien, jede exklusiv angelegt.
-    NSString *ordner = [basis stringByAppendingPathComponent:
-                        [NSString stringWithFormat:@"%llu-%u", unix_ms(), kennung]];
+    // Dateien, jede exklusiv angelegt. Zuerst die Marke daneben: Endet der
+    // Host mitten im Empfang, erkennt der naechste Start daran die Waise
+    // (qc_dateien_aufraeumen_beim_start) - ohne Marke laege sie 24 h.
+    NSString *name_u = [NSString stringWithFormat:@"%llu-%u", unix_ms(), kennung];
+    NSString *ordner = [basis stringByAppendingPathComponent:name_u];
+    NSString *marke = [ordner stringByAppendingString:@QC_DATEI_MARKE_ENDUNG];
+    int mfd = open(marke.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (mfd < 0) {
+        zeile(@"Dateien: abgelehnt (Marke %@ nicht anlegbar: %s)", marke, strerror(errno));
+        quittung_an(sitzung, kennung, QC_QUITT_SCHREIBFEHLER, 0);
+        return;
+    }
+    close(mfd);
     if (mkdir(ordner.fileSystemRepresentation, 0700) != 0) {
         zeile(@"Dateien: abgelehnt (Verzeichnis %@ nicht anlegbar: %s)", ordner, strerror(errno));
+        baum_loeschen(marke);
         quittung_an(sitzung, kennung, QC_QUITT_SCHREIBFEHLER, 0);
         return;
     }
@@ -791,7 +934,7 @@ static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
         int ok = -1, err = 0;
         int pfd = eltern_oeffnen(ordner, e.teile);
         if (pfd >= 0) {
-            const char *name = e.teile.lastObject.fileSystemRepresentation;
+            const char *name = e.teile.lastObject.UTF8String;
             if (e.art == 1) {
                 ok = mkdirat(pfd, name, 0755);
             } else {
@@ -803,6 +946,7 @@ static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
         if (pfd >= 0) close(pfd);
         if (ok != 0) {
             baum_loeschen(ordner);
+            baum_loeschen(marke);
             zeile(@"Dateien: abgelehnt (Schreibfehler bei %@: %s)", [e.teile componentsJoinedByString:@"/"], strerror(err));
             quittung_an(sitzung, kennung, QC_QUITT_SCHREIBFEHLER, 0);
             return;
@@ -817,6 +961,7 @@ static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
     E->letzte_ms = jetzt_ms();
     E.eintraege = eintraege;
     E.ordner = ordner;
+    E.marke = marke;
     naechste_datei(E);
     // Stillstand: im Takt nachsehen, ob noch Stuecke kommen.
     uint64_t takt = atomic_load(&g_stillstand_ms) / 4;
@@ -833,6 +978,8 @@ static void empfang_angebot(uint64_t sitzung, uint64_t kanal, NSData *d) {
     }
     g_empfang = E;
     quittung_an(sitzung, kennung, QC_QUITT_LAEUFT, 0);
+    // Wie im Rust-Kern (und damit wie beim Windows-Host) nach der Quittung 0.
+    zeile(@"Dateien: empfange %lu Eintraege, %@", (unsigned long)eintraege.count, mb_text(gesamt));
 }
 
 static void empfang_stueck(uint64_t sitzung, NSData *d) {
@@ -859,7 +1006,7 @@ static void empfang_stueck(uint64_t sitzung, NSData *d) {
     }
     if (E->fd < 0) {
         int pfd = eltern_oeffnen(E.ordner, e.teile);
-        E->fd = pfd >= 0 ? openat(pfd, e.teile.lastObject.fileSystemRepresentation, O_WRONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
+        E->fd = pfd >= 0 ? openat(pfd, e.teile.lastObject.UTF8String, O_WRONLY | O_NOFOLLOW | O_CLOEXEC) : -1;
         int err = errno;
         if (pfd >= 0) close(pfd);
         if (E->fd < 0) { schreibfehler(E, e, err); return; }
@@ -931,7 +1078,7 @@ static void empfang_ende(uint64_t sitzung, NSData *d) {
     uint64_t bytes = E->empfangen;
     NSString *eben = E.ordner.lastPathComponent;
     empfang_beenden(NO);                  // das Verzeichnis bleibt: daraus wird eingefuegt
-    aufraeumen_ausser(3, 0, eben);        // das eben abgelegte bleibt auf jeden Fall
+    aufraeumen_ausser(3, 0, eben, NO);    // das eben abgelegte bleibt auf jeden Fall
     zeile(@"Dateien: empfangen %lu Eintraege, %@ - in die Ablage gelegt", (unsigned long)anzahl, mb_text(bytes));
 }
 
@@ -946,8 +1093,9 @@ static void eingang_verarbeiten(QCEingang *e) {
             // wird die laufende Uebertragung dieser Sitzung, gleich welche
             // Kennung das Stueck trug - sonst stuende sie still, bis der
             // Stillstand greift, denn bis zum naechsten Angebot wird nichts
-            // mehr angenommen.
-            if (g_empfang && g_empfang->sitzung == e->sitzung) protokollfehler(g_empfang, e.grund);
+            // mehr angenommen. Die Zeile lautet wie im Rust-Kern
+            // ("Dateien: abgebrochen (mehr als das Fenster unquittiert)").
+            if (g_empfang && g_empfang->sitzung == e->sitzung) ungueltig_beenden(g_empfang, e.grund);
             break;
         case EINGANG_KANAL_WEG:
             if (g_empfang && g_empfang->sitzung == e->sitzung && g_empfang->kanal == e->kanal) {
@@ -1021,15 +1169,29 @@ void qc_empfang_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSData 
     pthread_mutex_lock(&g_eingang_mtx);
     switch (typ) {
         case QC_DATEI_ANGEBOT:
-            // Der Sender hat alles davor aufgegeben: was noch an Angeboten,
-            // Stuecken und Enden wartet, faellt weg. Kanal- und
-            // Sitzungsereignisse bleiben in ihrer Reihenfolge.
+            // Der Sender hat alles davor aufgegeben: was aus seiner Sitzung
+            // (oder einer aelteren) noch an Angeboten, Stuecken, Enden und
+            // Ueberlaeufen wartet, faellt weg. Was aus einer neueren Sitzung
+            // wartet, bleibt: Ein verspaetetes Angebot einer vergangenen
+            // Sitzung (der Eingabefaden las es noch vor dem Wechsel) nimmt der
+            // aktuellen nichts - empfang_angebot uebergeht es dann. Kanal-
+            // und Sitzungsereignisse bleiben in ihrer Reihenfolge. Die Zaehler
+            // gelten danach fuer das, was bleibt. Die Sperre nach einem
+            // Ueberlauf faellt mit jedem Angebot; danach begrenzt wieder die
+            // Menge (ein wartender Ueberlauf einer neueren Sitzung bleibt und
+            // beendet deren Uebertragung trotzdem).
             alt = g_eingang;
             g_eingang = [NSMutableArray array];
-            for (QCEingang *x in alt)
-                if (x->art == EINGANG_KANAL_WEG || x->art == EINGANG_VORBEI) [g_eingang addObject:x];
             g_eingang_daten = 0;
             g_eingang_enden = 0;
+            for (QCEingang *x in alt) {
+                BOOL datei = x->art == QC_DATEI_ANGEBOT || x->art == QC_DATEI_STUECK || x->art == QC_DATEI_ENDE ||
+                             x->art == EINGANG_UEBERLAUF;
+                if (datei && x->sitzung <= sitzung) continue;
+                [g_eingang addObject:x];
+                if (x->art == QC_DATEI_STUECK) g_eingang_daten += stueck_daten(x.nutzlast);
+                else if (x->art == QC_DATEI_ENDE) g_eingang_enden++;
+            }
             g_eingang_ueberlauf = 0;
             planen = einreihen_gesperrt(e);
             break;
@@ -1108,7 +1270,8 @@ static uint32_t g_s_kennung = 0;            // 0 = keine
 static uint64_t g_s_gesendet = 0;           // Datenbytes, die hinausgingen (oder gerade gehen)
 static uint64_t g_s_quittiert = 0;
 static int g_s_zustand = 0;                 // erster Zustand ungleich 0
-static uint64_t g_s_quittung_ms = 0;        // letzte Quittung, monoton
+static int g_s_angenommen = 0;              // die erste Quittung (0/0 nach dem Angebot) ist da
+static uint64_t g_s_quittung_ms = 0;        // letzter Fortschritt (Start, erste Quittung, mehr quittiert), monoton
 
 enum { WARTEN_OK, WARTEN_UEBERHOLT, WARTEN_WEG, WARTEN_ZEIT, WARTEN_ZUSTAND };
 
@@ -1129,9 +1292,16 @@ void qc_senden_quittung(uint64_t sitzung, const uint8_t *p, size_t n) {
         // Nie mehr als quittiert werten, als hinausging - sonst oeffnete eine
         // falsche Quittung das Fenster beliebig weit.
         if (empfangen > g_s_gesendet) empfangen = g_s_gesendet;
-        if (empfangen > g_s_quittiert) g_s_quittiert = empfangen;
+        // Nur Fortschritt erneuert die Stillstandsfrist (wie im Rust-Sender,
+        // Griff::quittung): die erste Quittung nach dem Angebot oder mehr
+        // quittiert als bisher. Eine Wiederholung desselben Standes haelt den
+        // Sender nicht am Leben.
+        if (!g_s_angenommen || empfangen > g_s_quittiert) {
+            g_s_angenommen = 1;
+            if (empfangen > g_s_quittiert) g_s_quittiert = empfangen;
+            g_s_quittung_ms = jetzt_ms();
+        }
         if (zustand != QC_QUITT_LAEUFT && !g_s_zustand) g_s_zustand = zustand;
-        g_s_quittung_ms = jetzt_ms();
         pthread_cond_broadcast(&g_s_cv);
     }
     pthread_mutex_unlock(&g_s_mtx);
@@ -1205,10 +1375,46 @@ static BOOL aus_eigenem_empfang(NSArray<NSString *> *pfade) {
     return NO;
 }
 
+// Die Namen im offenen Ordner fd, nach Namen sortiert (wie bisher mit
+// compare:), je @[NSString, NSData mit den rohen Bytes samt NUL]. fd bleibt
+// offen. nil = nicht lesbar (errno gesetzt).
+static NSArray<NSArray *> *ordner_namen(int fd) {
+    int kopie = dup(fd);
+    DIR *d = kopie >= 0 ? fdopendir(kopie) : NULL;
+    if (!d) {
+        int err = errno;
+        if (kopie >= 0) close(kopie);
+        errno = err;
+        return nil;
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSArray *> *kinder = [NSMutableArray array];
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        size_t l = strlen(de->d_name);
+        NSString *k = [fm stringWithFileSystemRepresentation:de->d_name length:l];
+        if (!k) continue;
+        [kinder addObject:@[ k, [NSData dataWithBytes:de->d_name length:l + 1] ]];
+    }
+    closedir(d);                                      // schliesst die Kopie, fd bleibt
+    [kinder sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) { return [a[0] compare:b[0]]; }];
+    return kinder;
+}
+
 // Ein Eintrag samt Inhalt (Ordner rekursiv, nach Namen sortiert).
+// dfd >= 0: der Eintrag heisst `roh` im schon geoeffneten Elternordner dfd
+// und wird relativ dazu angesehen (fstatat, openat, beides ohne einer
+// Verknuepfung zu folgen). dfd < 0 nur fuer die obersten Pfade: die kommen
+// per lstat ueber den ganzen Pfad, so wie der Nutzer sie kopiert hat.
+// So stammt alles unter einem obersten Ordner nachweislich aus diesem Baum:
+// Ein Ordner wird ueber einen Deskriptor gelesen, dessen st_dev/st_ino die
+// eben gesehenen sind; wurde er dazwischen getauscht (etwa gegen eine
+// Verknuepfung auf einen fremden Ordner), geht er leer hinaus. st_dev/st_ino
+// jeder Datei merkt sich der Eintrag fuer die Pruefung beim Lesen.
 // 1 = weiter, 0 = ueber EINTRAEGE_MAX oder GESAMT_MAX, -1 = ueberholt.
-static int auflisten(uint64_t gen, NSString *quelle, NSString *rel, NSString *name, NSUInteger tiefe,
-                     NSMutableArray<QCDateiEintrag *> *liste, uint64_t *gesamt) {
+static int auflisten(uint64_t gen, int dfd, const char *roh, NSString *quelle, NSString *rel, NSString *name,
+                     NSUInteger tiefe, NSMutableArray<QCDateiEintrag *> *liste, uint64_t *gesamt) {
     if (ueberholt(gen)) return -1;
     NSData *pfad = [rel dataUsingEncoding:NSUTF8StringEncoding];
     if (!pfad || pfad.length > QC_DATEI_PFAD_MAX || tiefe > QC_DATEI_TIEFE_MAX ||
@@ -1219,7 +1425,8 @@ static int auflisten(uint64_t gen, NSString *quelle, NSString *rel, NSString *na
         return 1;
     }
     struct stat st;
-    if (lstat(quelle.fileSystemRepresentation, &st) != 0) {
+    int rc = dfd >= 0 ? fstatat(dfd, roh, &st, AT_SYMLINK_NOFOLLOW) : lstat(quelle.fileSystemRepresentation, &st);
+    if (rc != 0) {
         zeile(@"Dateien: uebersprungen (nicht lesbar: %s): %@", strerror(errno), quelle);
         return 1;
     }
@@ -1236,23 +1443,35 @@ static int auflisten(uint64_t gen, NSString *quelle, NSString *rel, NSString *na
     e.groesse = e.art ? 0 : (uint64_t)st.st_size;
     e.pfad = pfad;
     e.quelle = quelle;
+    e.geraet = (uint64_t)st.st_dev;
+    e.knoten = (uint64_t)st.st_ino;
     [liste addObject:e];
     *gesamt += e.groesse;
     if (liste.count > QC_DATEI_EINTRAEGE_MAX || *gesamt > QC_DATEI_GESAMT_MAX) return 0;
     if (!e.art) return 1;
-    NSError *fehler = nil;
-    NSArray<NSString *> *kinder = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:quelle error:&fehler];
+    int fd = dfd >= 0 ? openat(dfd, roh, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                      : open(quelle.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat ost;
+    NSArray<NSArray *> *kinder = nil;
+    BOOL getauscht = NO;
+    int err = 0;
+    if (fd < 0 || fstat(fd, &ost) != 0) err = errno;
+    else if (ost.st_dev != st.st_dev || ost.st_ino != st.st_ino) getauscht = YES;
+    else if (!(kinder = ordner_namen(fd))) err = errno;
     if (!kinder) {
-        zeile(@"Dateien: Ordner nicht lesbar (%@), er geht leer hinaus: %@", fehler.localizedDescription, quelle);
+        zeile(@"Dateien: Ordner nicht lesbar (%s), er geht leer hinaus: %@",
+              getauscht ? "seit dem Ansehen getauscht" : strerror(err), quelle);
+        if (fd >= 0) close(fd);
         return 1;
     }
-    kinder = [kinder sortedArrayUsingSelector:@selector(compare:)];
     NSMutableSet<NSString *> *gesehen = [NSMutableSet set];
-    for (NSString *k in kinder) {
+    int r = 1;
+    for (NSArray *kind in kinder) {
+        NSString *k = kind[0];
         NSString *kname = [k precomposedStringWithCanonicalMapping];
         // Auf einem Volume mit Gross- und Kleinschreibung koennen "A" und "a"
-        // nebeneinander liegen, ebenso "a\x01" und "a_"; die Gegenseite
-        // lehnte dann alles ab.
+        // nebeneinander liegen, ebenso "a." und "a_" oder "a\x01" und "a_";
+        // die Gegenseite lehnte dann alles ab.
         NSString *ks = sende_schluessel(kname);
         if (![gesehen containsObject:ks]) {
             [gesehen addObject:ks];
@@ -1261,11 +1480,12 @@ static int auflisten(uint64_t gen, NSString *quelle, NSString *rel, NSString *na
                   [quelle stringByAppendingPathComponent:k]);
             continue;
         }
-        int r = auflisten(gen, [quelle stringByAppendingPathComponent:k], [rel stringByAppendingFormat:@"/%@", kname],
-                          kname, tiefe + 1, liste, gesamt);
-        if (r <= 0) return r;
+        r = auflisten(gen, fd, [kind[1] bytes], [quelle stringByAppendingPathComponent:k],
+                      [rel stringByAppendingFormat:@"/%@", kname], kname, tiefe + 1, liste, gesamt);
+        if (r <= 0) break;
     }
-    return 1;
+    close(fd);
+    return r;
 }
 
 static int senden_daten(uint64_t gen, uint64_t sitzung, uint32_t kennung, NSArray<QCDateiEintrag *> *liste,
@@ -1311,11 +1531,24 @@ static int senden_daten(uint64_t gen, uint64_t sitzung, uint32_t kennung, NSArra
         // O_NONBLOCK: Wurde die Datei seit dem Auflisten gegen eine FIFO
         // getauscht, blockierte open sonst die Warteschlange auf Dauer. Erst
         // nach der Pruefung auf eine gewoehnliche Datei wieder blockierend.
+        // O_NOFOLLOW wirkt nur auf den letzten Bestandteil: Wurde ein Ordner
+        // darueber gegen eine Verknuepfung getauscht, oeffnete der Kernel
+        // eine fremde Datei gleichen Namens. Deshalb muss die offene Datei
+        // die beim Auflisten gesehene sein (st_dev/st_ino), sonst Grund 2 -
+        // von einer anderen geht kein Byte hinaus.
         int fd = open(e.quelle.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
         struct stat st;
-        if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) != 0) {
-            warum = [NSString stringWithFormat:@"Lesefehler bei %@: %s", e.quelle, fd < 0 ? strerror(errno) : "keine Datei mehr"];
+        NSString *fehler = nil;
+        if (fd < 0)
+            fehler = @(strerror(errno));
+        else if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+            fehler = @"keine Datei mehr";
+        else if ((uint64_t)st.st_dev != e.geraet || (uint64_t)st.st_ino != e.knoten)
+            fehler = @"nicht mehr die aufgelistete Datei (seit dem Auflisten verlegt oder getauscht)";
+        else if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK) != 0)
+            fehler = @(strerror(errno));
+        if (fehler) {
+            warum = [NSString stringWithFormat:@"Lesefehler bei %@: %@", e.quelle, fehler];
             grund = QC_ENDE_LESEFEHLER;
             if (fd >= 0) close(fd);
             break;
@@ -1422,14 +1655,15 @@ static void senden_lauf(uint64_t gen, uint64_t sitzung, NSArray<NSString *> *pfa
             zeile(@"Dateien: uebersprungen (kein Name): %@", p);
             continue;
         }
-        // Dateien aus mehreren Ordnern koennen gleich heissen: nur die erste.
+        // Dateien aus mehreren Ordnern koennen gleich heissen, auch erst nach
+        // der Windows-Bereinigung ("t." und "t_"): nur die erste.
         NSString *ks = sende_schluessel(name);
         if ([oben containsObject:ks]) {
             zeile(@"Dateien: doppelter Name %@ - nur der erste wird gesendet", name);
             continue;
         }
         [oben addObject:ks];
-        r = auflisten(gen, p, name, name, 1, liste, &gesamt);
+        r = auflisten(gen, -1, NULL, p, name, name, 1, liste, &gesamt);
         if (r <= 0) break;
     }
     if (r < 0) return;
@@ -1454,6 +1688,7 @@ static void senden_lauf(uint64_t gen, uint64_t sitzung, NSArray<NSString *> *pfa
     g_s_gesendet = 0;
     g_s_quittiert = 0;
     g_s_zustand = 0;
+    g_s_angenommen = 0;
     g_s_quittung_ms = jetzt_ms();
     pthread_mutex_unlock(&g_s_mtx);
     atomic_store(&g_s_laeuft, 1);
@@ -1484,8 +1719,14 @@ void qc_senden_starten(uint64_t sitzung, NSArray<NSString *> *pfade, NSString *a
 
 void qc_dateien_einrichten(const qc_dateien_wege *wege) {
     if (wege) g_wege = *wege;
-    if (!g_empfang_q) g_empfang_q = dispatch_queue_create("tech.quadchroma.dateien-empfang", DISPATCH_QUEUE_SERIAL);
-    if (!g_senden_q) g_senden_q = dispatch_queue_create("tech.quadchroma.dateien-senden", DISPATCH_QUEUE_SERIAL);
+    // Latenz vor Bandbreite: Plattenarbeit und Stuecke laufen mit
+    // QOS_CLASS_UTILITY, damit sie Aufnahme, Encoder und Ton nicht
+    // verdraengen. Ohne eigene Klasse erbten die Bloecke die des Aufrufers
+    // (Eingabefaden, Warteschlange der Ablage).
+    dispatch_queue_attr_t nachrang =
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+    if (!g_empfang_q) g_empfang_q = dispatch_queue_create("tech.quadchroma.dateien-empfang", nachrang);
+    if (!g_senden_q) g_senden_q = dispatch_queue_create("tech.quadchroma.dateien-senden", nachrang);
 }
 
 void qc_dateien_sitzung_vorbei(uint64_t neue_sitzung) {

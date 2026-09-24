@@ -3098,7 +3098,10 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     if (srvIdx != NSNotFound) {
         // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
         // Dateien: empfangene gehen als Dateiliste in die Ablage; Reste
-        // frueherer Laeufe, aelter als 24 h, raeumt die Empfangswarteschlange weg.
+        // frueherer Laeufe, aelter als 24 h, und jede unfertige Uebertragung
+        // (Marke .laeuft, der vorige Lauf endete mitten im Empfang) raeumt die
+        // Empfangswarteschlange weg - vor der Annahme unten, also bevor ein
+        // Empfang beginnen kann.
         dateien_einrichten();
         qc_dateien_fertig_setzen(qc_clip_set_dateien);
         qc_dateien_aufraeumen_beim_start();

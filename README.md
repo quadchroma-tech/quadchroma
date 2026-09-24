@@ -251,7 +251,8 @@ Rückgabe ist die Zahl der Fehler.
   Codecwechsel ohne Zuschauer und mit Formatwechsel (echte VT-Encoder), `--fest`,
   Stauregel samt Ton im Stau, Ansage des Tonformats und AV1 in der Könnensliste,
   dazu Dateien über die Zwischenablage über die echten Kanäle: Fähigkeiten
-  (Nachrichten 11 und 69), Client → Host mit Quittungen auf dem Bildkanal, Host →
+  (Nachrichten 11 und 69), Client → Host mit Quittungen auf dem Bildkanal und den
+  Zeilen „empfange …“ und „empfangen …“ im Host-Protokoll, Host →
   Client mit Fenster, Namen mit Umlauten im Protokoll, Zuschauerwechsel mitten
   in der Übertragung samt Sitzungsbindung des Sendewegs, Zuschauer ohne
   Eingabekanal, älterer Client ohne Fähigkeiten, Fähigkeit nur für den
@@ -261,16 +262,26 @@ Rückgabe ist die Zahl der Fehler.
   `HOME` unter `$TMPDIR` (nach einem bestandenen Lauf wieder entfernt), rund 80 s. Nutzt kurz einen echten kleinen
   HEVC-Encoder (640×360) — nicht während eines Streams starten.
 - `host/dateitest.m`: das Dateiprotokoll aus `host/dateien.m` ohne Netz und ohne
-  Ablage — Prüfvektoren, Pfadregeln samt Bereinigung für macOS, Empfänger und
-  Sender gegeneinander im Speicher, Nachzügler aus einer anderen Sitzung, wann
+  Ablage — Prüfvektoren, Pfadregeln samt Bereinigung für macOS und (für den
+  Schlüssel des Senders gegen Doppelte) für Windows, Empfänger und
+  Sender gegeneinander im Speicher, Nachzügler aus einer anderen Sitzung, auch
+  ein verspätetes Angebot mitten in einer laufenden Übertragung, wann
   der Empfänger quittiert (ab 16 KiB offen und sobald nichts mehr wartet), seine
   Warteschlange nach Datenbytes (Fenster plus ein Stück, höchstens 8 Enden, ein
-  neues Angebot leert sie), Fenster, Drossel über den Sendepuffer, Stillstand,
-  Abbrüche, eine Quelldatei, die nach dem Auflisten gegen eine FIFO oder eine
-  Verknüpfung getauscht wird, Aufräumen — auch mit einer Basis, die eine
-  Verknüpfung ist, nach einem Rücksprung der Uhr und von Übertragungen, deren
-  Pfade absolut über `PATH_MAX` liegen. Alle Dateien in einem frischen Ordner
-  unter `$TMPDIR`, rund 6 s.
+  neues Angebot leert sie), die Zeile „Dateien: empfange …“ beim Annehmen, Namen
+  in NFC auf der Platte (die rohen Bytes, auch wenn das Angebot NFD trägt),
+  Fenster, Drossel über den Sendepuffer, Stillstand (eine wiederholte Quittung
+  ohne Fortschritt hält den Sender nicht am Leben), Abbrüche, eine Quelldatei,
+  die nach dem Auflisten gegen eine FIFO oder eine Verknüpfung getauscht wird,
+  ebenso ein Ordner darüber (Vergleich von Gerät und Inode), ein Ordner, der
+  während des Auflistens fortlaufend gegen eine Verknüpfung getauscht wird
+  (1,5 s Dauerlauf), Namen, die erst nach der Windows-Bereinigung doppelt sind,
+  Aufräumen — auch mit einer Basis, die eine Verknüpfung ist, nach einem
+  Rücksprung der Uhr, von Übertragungen, deren Pfade absolut über `PATH_MAX`
+  liegen, mit der Marke `.laeuft` laufender Übertragungen und von Waisen
+  (unfertig beim Start) —, sowie die Dienstklasse der beiden Warteschlangen
+  (`QOS_CLASS_UTILITY`). Alle Dateien in einem frischen Ordner unter `$TMPDIR`,
+  rund 8 s.
 - `host/ablagetest.m`: Kennzeichnung des empfangenen Texts, die Regel „nur mit
   Zuschauer lesen" und Dateiverweise (`public.file-url`) lesen und schreiben,
   auf einer eigenen benannten Ablage statt der allgemeinen; die Dateien dafür
