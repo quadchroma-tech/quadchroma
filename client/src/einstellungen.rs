@@ -170,6 +170,13 @@ pub struct Einstellungen {
     pub decoder: DecoderWunsch,
     /// Gewuenschte Anzeige (Datei: anzeige=auto|gpu|gpu2|integriert|cpu|warp).
     pub anzeige: AnzeigeWunsch,
+    /// Schliessen legt die App in den Infobereich bzw. in die Menueleiste
+    /// (Datei: tray=an|aus). Mit tray=aus beendet Schliessen das Programm
+    /// wie frueher, und es gibt kein Symbol.
+    pub tray: bool,
+    /// Die einmalige Sprechblase beim ersten Ablegen ist gezeigt worden
+    /// (Datei: tray_hinweis=1).
+    pub tray_hinweis: bool,
     /// Fingerabdruck des Hosts -> seine Werte.
     pub hosts: HashMap<String, HostWerte>,
 }
@@ -185,6 +192,8 @@ impl Default for Einstellungen {
             stats: StatWahl::default(),
             decoder: DecoderWunsch::Automatik,
             anzeige: AnzeigeWunsch::Automatik,
+            tray: true,
+            tray_hinweis: false,
             hosts: HashMap::new(),
         }
     }
@@ -205,10 +214,15 @@ fn pfad() -> Option<PathBuf> {
 
 impl Einstellungen {
     pub fn laden() -> Einstellungen {
-        let mut e = Einstellungen::default();
-        let Some(p) = pfad() else { return e };
-        let Ok(text) = std::fs::read_to_string(&p) else { return e };
+        let Some(p) = pfad() else { return Einstellungen::default() };
+        let Ok(text) = std::fs::read_to_string(&p) else { return Einstellungen::default() };
+        Einstellungen::aus_text(&text)
+    }
 
+    /// Der Inhalt von einstellungen.txt als Einstellungen (ohne Datei, damit
+    /// es sich pruefen laesst).
+    pub fn aus_text(text: &str) -> Einstellungen {
+        let mut e = Einstellungen::default();
         // Ein fehlerhafter Eintrag darf nie den ganzen Start verhindern:
         // alles, was nicht gelesen werden kann, bleibt auf der Voreinstellung.
         let mut aktueller_host: Option<String> = None;
@@ -245,6 +259,8 @@ impl Einstellungen {
                 (None, "stat_code") => e.stats.code = v == "1",
                 (None, "decoder") => e.decoder = DecoderWunsch::aus(v).unwrap_or(e.decoder),
                 (None, "anzeige") => e.anzeige = AnzeigeWunsch::aus(v).unwrap_or(e.anzeige),
+                (None, "tray") => e.tray = schalter(v).unwrap_or(e.tray),
+                (None, "tray_hinweis") => e.tray_hinweis = v == "1",
                 (Some(fp), _) => {
                     if let Some(h) = e.hosts.get_mut(fp) {
                         match k {
@@ -265,6 +281,11 @@ impl Einstellungen {
 
     pub fn sichern(&self) {
         let Some(p) = pfad() else { return };
+        std::fs::write(p, self.als_text()).ok();
+    }
+
+    /// Die Einstellungen als Inhalt von einstellungen.txt.
+    pub fn als_text(&self) -> String {
         let mut t = String::from("# QuadChroma, gespeicherte Einstellungen\n");
         t.push_str(&format!("vollbild={}\n", self.vollbild as u8));
         t.push_str(&format!("pixelgenau={}\n", self.pixelgenau as u8));
@@ -281,6 +302,8 @@ impl Einstellungen {
         ));
         t.push_str(&format!("decoder={}\n", self.decoder.schluessel()));
         t.push_str(&format!("anzeige={}\n", self.anzeige.schluessel()));
+        t.push_str(&format!("tray={}\n", if self.tray { "an" } else { "aus" }));
+        t.push_str(&format!("tray_hinweis={}\n", self.tray_hinweis as u8));
         // Sortiert schreiben, damit die Datei zwischen zwei Laeufen gleich
         // aussieht und man Aenderungen erkennt.
         let mut fps: Vec<&String> = self.hosts.keys().collect();
@@ -292,7 +315,7 @@ impl Einstellungen {
                 h.mbit, h.fps, h.gaming as u8, h.fest as u8, h.ton as u8
             ));
         }
-        std::fs::write(p, t).ok();
+        t
     }
 
     pub fn fuer_host(&self, fingerabdruck: &str) -> Option<HostWerte> {
@@ -304,5 +327,62 @@ impl Einstellungen {
         if alt != Some(w) {
             self.sichern();
         }
+    }
+}
+
+/// Ein Schalter in der Datei: an/aus, dazu 1/0, ja/nein und on/off. Anderes
+/// ergibt None, dann bleibt die Voreinstellung.
+fn schalter(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "an" | "1" | "ja" | "on" | "true" => Some(true),
+        "aus" | "0" | "nein" | "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// tray und tray_hinweis: Voreinstellung, lesen, schreiben, und was
+    /// nicht gelesen werden kann, laesst die Voreinstellung stehen.
+    #[test]
+    fn tray_lesen_und_schreiben() {
+        let e = Einstellungen::default();
+        assert!(e.tray);
+        assert!(!e.tray_hinweis);
+        // Eine alte Datei ohne die Zeilen: Ablegen an, Hinweis noch offen.
+        let alt = Einstellungen::aus_text("vollbild=1\nsprache=de\n");
+        assert!(alt.tray && !alt.tray_hinweis);
+        assert_eq!(alt.sprache.as_deref(), Some("de"));
+
+        let aus = Einstellungen::aus_text("tray=aus\ntray_hinweis=1\n");
+        assert!(!aus.tray);
+        assert!(aus.tray_hinweis);
+        for (v, soll) in [("an", true), ("AUS", false), ("0", false), ("1", true), (" nein ", false), ("off", false), ("quatsch", true)] {
+            assert_eq!(Einstellungen::aus_text(&format!("tray={v}\n")).tray, soll, "tray={v}");
+        }
+        assert!(!Einstellungen::aus_text("tray_hinweis=0\n").tray_hinweis);
+        // Unter einem Host-Block gehoeren die Zeilen dem Host, nicht dem
+        // Programm.
+        let h = Einstellungen::aus_text("host AAAA-BBBB-CCCC-DDDD\ntray=aus\ntray_hinweis=1\n");
+        assert!(h.tray && !h.tray_hinweis);
+
+        // Schreiben und wieder lesen.
+        let mut e = Einstellungen::default();
+        let t = e.als_text();
+        assert!(t.contains("\ntray=an\n"), "{t}");
+        assert!(t.contains("\ntray_hinweis=0\n"), "{t}");
+        e.tray = false;
+        e.tray_hinweis = true;
+        e.hosts.insert("AAAA-BBBB-CCCC-DDDD".into(), HostWerte { mbit: 80, fps: 60, gaming: true, fest: false, ton: true });
+        let t = e.als_text();
+        assert!(t.contains("\ntray=aus\n"), "{t}");
+        assert!(t.contains("\ntray_hinweis=1\n"), "{t}");
+        // Die Programmwerte stehen vor dem ersten Host-Block.
+        assert!(t.find("tray=").unwrap() < t.find("host ").unwrap());
+        let zurueck = Einstellungen::aus_text(&t);
+        assert!(!zurueck.tray && zurueck.tray_hinweis);
+        assert_eq!(zurueck.fuer_host("AAAA-BBBB-CCCC-DDDD"), e.fuer_host("AAAA-BBBB-CCCC-DDDD"));
     }
 }

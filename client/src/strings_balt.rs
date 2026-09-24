@@ -164,6 +164,11 @@ pub static ET: Lang = Lang {
         (DesktopShortcutCreated, "Otsetee loodud töölauale: {n}"),
         (DesktopShortcutFailed, "Otseteed ei loodud: {n}"),
         (DesktopShortcutDescription, "QuadChroma: ühenda hostiga {n} ({m})"),
+        (TrayOpen, "Ava"),
+        (TrayConnect, "Ühenda: {n}"),
+        (TrayQuit, "Välju"),
+        (TrayStillRunning, "QuadChroma töötab edasi teavitusalal."),
+        (TrayStillRunningMac, "QuadChroma töötab edasi menüüribal."),
     ],
 };
 
@@ -328,6 +333,11 @@ pub static LV: Lang = Lang {
         (DesktopShortcutCreated, "Saīsne izveidota darbvirsmā: {n}"),
         (DesktopShortcutFailed, "Saīsne netika izveidota: {n}"),
         (DesktopShortcutDescription, "QuadChroma: savienoties ar {n} ({m})"),
+        (TrayOpen, "Atvērt"),
+        (TrayConnect, "Savienot: {n}"),
+        (TrayQuit, "Iziet"),
+        (TrayStillRunning, "QuadChroma turpina darboties paziņojumu apgabalā."),
+        (TrayStillRunningMac, "QuadChroma turpina darboties izvēļņu joslā."),
     ],
 };
 
@@ -492,6 +502,11 @@ pub static LT: Lang = Lang {
         (DesktopShortcutCreated, "Nuoroda sukurta darbalaukyje: {n}"),
         (DesktopShortcutFailed, "Nuoroda nesukurta: {n}"),
         (DesktopShortcutDescription, "QuadChroma: prisijungti prie {n} ({m})"),
+        (TrayOpen, "Atidaryti"),
+        (TrayConnect, "Prisijungti: {n}"),
+        (TrayQuit, "Išeiti"),
+        (TrayStillRunning, "QuadChroma toliau veikia pranešimų srityje."),
+        (TrayStillRunningMac, "QuadChroma toliau veikia meniu juostoje."),
     ],
 };
 
@@ -656,6 +671,11 @@ pub static SL: Lang = Lang {
         (DesktopShortcutCreated, "Bližnjica ustvarjena na namizju: {n}"),
         (DesktopShortcutFailed, "Bližnjica ni bila ustvarjena: {n}"),
         (DesktopShortcutDescription, "QuadChroma: poveži se z {n} ({m})"),
+        (TrayOpen, "Odpri"),
+        (TrayConnect, "Poveži: {n}"),
+        (TrayQuit, "Končaj"),
+        (TrayStillRunning, "QuadChroma še naprej teče v območju za obvestila."),
+        (TrayStillRunningMac, "QuadChroma še naprej teče v menijski vrstici."),
     ],
 };
 
@@ -820,6 +840,11 @@ pub static HR: Lang = Lang {
         (DesktopShortcutCreated, "Prečac stvoren na radnoj površini: {n}"),
         (DesktopShortcutFailed, "Prečac nije stvoren: {n}"),
         (DesktopShortcutDescription, "QuadChroma: poveži se s {n} ({m})"),
+        (TrayOpen, "Otvori"),
+        (TrayConnect, "Poveži: {n}"),
+        (TrayQuit, "Izlaz"),
+        (TrayStillRunning, "QuadChroma i dalje radi u području obavijesti."),
+        (TrayStillRunningMac, "QuadChroma i dalje radi u traci izbornika."),
     ],
 };
 
@@ -984,5 +1009,10 @@ pub static UK: Lang = Lang {
         (DesktopShortcutCreated, "Ярлик створено на робочому столі: {n}"),
         (DesktopShortcutFailed, "Ярлик не створено: {n}"),
         (DesktopShortcutDescription, "QuadChroma: підключитися до {n} ({m})"),
+        (TrayOpen, "Відкрити"),
+        (TrayConnect, "Підключитися: {n}"),
+        (TrayQuit, "Вийти"),
+        (TrayStillRunning, "QuadChroma і далі працює в області сповіщень."),
+        (TrayStillRunningMac, "QuadChroma і далі працює в рядку меню."),
     ],
 };

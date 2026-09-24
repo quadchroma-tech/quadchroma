@@ -166,6 +166,11 @@ pub static FR: Lang = Lang {
         (DesktopShortcutCreated, "Raccourci créé sur le bureau : {n}"),
         (DesktopShortcutFailed, "Raccourci non créé : {n}"),
         (DesktopShortcutDescription, "QuadChroma : se connecter à {n} ({m})"),
+        (TrayOpen, "Ouvrir"),
+        (TrayConnect, "Se connecter : {n}"),
+        (TrayQuit, "Quitter"),
+        (TrayStillRunning, "QuadChroma continue de fonctionner dans la zone de notification."),
+        (TrayStillRunningMac, "QuadChroma continue de fonctionner dans la barre des menus."),
     ],
 };
 
@@ -330,6 +335,11 @@ pub static ES: Lang = Lang {
         (DesktopShortcutCreated, "Acceso directo creado en el escritorio: {n}"),
         (DesktopShortcutFailed, "No se creó el acceso directo: {n}"),
         (DesktopShortcutDescription, "QuadChroma: conectar con {n} ({m})"),
+        (TrayOpen, "Abrir"),
+        (TrayConnect, "Conectar: {n}"),
+        (TrayQuit, "Salir"),
+        (TrayStillRunning, "QuadChroma sigue ejecutándose en el área de notificación."),
+        (TrayStillRunningMac, "QuadChroma sigue ejecutándose en la barra de menús."),
     ],
 };
 
@@ -494,6 +504,11 @@ pub static IT: Lang = Lang {
         (DesktopShortcutCreated, "Collegamento creato sul desktop: {n}"),
         (DesktopShortcutFailed, "Collegamento non creato: {n}"),
         (DesktopShortcutDescription, "QuadChroma: connettersi a {n} ({m})"),
+        (TrayOpen, "Apri"),
+        (TrayConnect, "Connetti: {n}"),
+        (TrayQuit, "Esci"),
+        (TrayStillRunning, "QuadChroma continua a funzionare nell'area di notifica."),
+        (TrayStillRunningMac, "QuadChroma continua a funzionare nella barra dei menu."),
     ],
 };
 
@@ -658,6 +673,11 @@ pub static PT: Lang = Lang {
         (DesktopShortcutCreated, "Atalho criado no ambiente de trabalho: {n}"),
         (DesktopShortcutFailed, "Atalho não criado: {n}"),
         (DesktopShortcutDescription, "QuadChroma: ligar a {n} ({m})"),
+        (TrayOpen, "Abrir"),
+        (TrayConnect, "Ligar: {n}"),
+        (TrayQuit, "Sair"),
+        (TrayStillRunning, "O QuadChroma continua em execução na área de notificação."),
+        (TrayStillRunningMac, "O QuadChroma continua em execução na barra de menus."),
     ],
 };
 
@@ -822,5 +842,10 @@ pub static NL: Lang = Lang {
         (DesktopShortcutCreated, "Snelkoppeling op het bureaublad gemaakt: {n}"),
         (DesktopShortcutFailed, "Snelkoppeling niet gemaakt: {n}"),
         (DesktopShortcutDescription, "QuadChroma: verbinden met {n} ({m})"),
+        (TrayOpen, "Openen"),
+        (TrayConnect, "Verbinden: {n}"),
+        (TrayQuit, "Afsluiten"),
+        (TrayStillRunning, "QuadChroma blijft actief in het systeemvak."),
+        (TrayStillRunningMac, "QuadChroma blijft actief in de menubalk."),
     ],
 };

@@ -47,6 +47,13 @@ mod strings_west;
 mod ui;
 /// Desktop-Verknuepfung je Host (anlegen nur unter Windows).
 mod verknuepfung;
+/// Schliessen legt die App ab: Symbol im Infobereich (Windows, tray_win.rs)
+/// bzw. in der Menueleiste (macOS, tray_mac.rs); gemeinsame Logik in tray.rs.
+mod tray;
+#[cfg(windows)]
+mod tray_win;
+#[cfg(target_os = "macos")]
+mod tray_mac;
 
 /// Ton und Zwischenablage: je Plattform eine Datei mit derselben
 /// Schnittstelle; der Ringpuffer des Tons ist geteilt (audio_ring.rs). Auf
@@ -3851,13 +3858,14 @@ fn cpu_eigen_messen(zeiten: &mut (u64, Instant)) -> Option<f32> {
 enum Screen { Start, Session }
 
 /// Ereignisse von ausserhalb des Fensterfadens an die Ereignisschleife
-/// (winit-Benutzerereignisse ueber einen EventLoopProxy). Spaetere Teile
-/// haengen hier ihre Faelle an, etwa das Symbol im Infobereich.
+/// (winit-Benutzerereignisse ueber einen EventLoopProxy).
 #[derive(Debug)]
 pub enum Benutzer {
     /// Ein zweiter Start hat seine Adresse weitergereicht (leer = nur nach
     /// vorn holen), siehe einzel.rs.
     Einzel(String),
+    /// Wahl am Symbol im Infobereich bzw. in der Menueleiste (tray.rs).
+    Tray(tray::Befehl),
 }
 
 /// Was ein weitergereichter Start bewirkt (siehe `einzel_folge`).
@@ -3897,6 +3905,21 @@ const MIT_VERKNUEPFUNG: bool = cfg!(windows);
 
 /// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
 const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
+
+/// So oft wird der Stand des Symbols (Menue, Tooltip) neu berechnet.
+const TRAY_TAKT: Duration = Duration::from_millis(500);
+
+/// Takt der Ereignisschleife, solange das Fenster abgelegt ist: nichts zu
+/// zeichnen, nur Symbol und Benutzerereignisse ("kein Zuschauer, keine
+/// Arbeit").
+const VERBORGEN_TAKT: Duration = Duration::from_millis(250);
+
+/// macOS: so lange nach dem Verlassen des Vollbilds wird das Fenster
+/// verborgen. Das Vollbild ist dort ein eigener Space; ein verborgenes
+/// Fenster darin liesse einen leeren schwarzen Space zurueck. Der Uebergang
+/// dauert etwa eine halbe Sekunde.
+#[cfg(target_os = "macos")]
+const VOLLBILD_VERLASSEN: Duration = Duration::from_millis(1200);
 
 /// Wer ins Fenster zeichnet: die Karte ueber eine Flip-Swapchain, oder
 /// softbuffer (GDI) - nie beides am selben Fenster, das ist von DXGI nicht
@@ -4068,6 +4091,18 @@ struct App {
     /// Ergebnis der letzten Desktop-Verknuepfung und seit wann es steht -
     /// 6 s im Meldungsbereich des Startbildschirms bzw. im Reiter.
     verknuepfung_meldung: Option<(Meldung, Instant)>,
+    /// Symbol im Infobereich bzw. in der Menueleiste. None bei tray=aus oder
+    /// wenn es sich nicht anlegen liess - dann beendet Schliessen.
+    symbol: Option<tray::Symbol>,
+    /// Weg der Befehle des Symbols in die Ereignisschleife.
+    proxy: winit::event_loop::EventLoopProxy<Benutzer>,
+    /// Das Fenster ist abgelegt (unsichtbar): nichts zeichnen, langsamer Takt.
+    verborgen: bool,
+    /// Wann der Stand des Symbols zuletzt berechnet wurde.
+    tray_takt: Instant,
+    /// macOS: wann das Fenster nach dem Verlassen des Vollbilds verborgen wird.
+    #[cfg(target_os = "macos")]
+    verbergen_faellig: Option<Instant>,
 }
 
 /// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
@@ -4185,19 +4220,34 @@ impl ApplicationHandler<Benutzer> for App {
             protokoll::zeile("Anzeige: Software".into());
         }
         self.window = Some(window);
+        // Das Symbol im Infobereich bzw. in der Menueleiste: von Anfang an,
+        // damit das Schliessen einen Weg zurueck hat (und der Tooltip die
+        // Sitzung zeigt). Auf dem Mac verlangt AppKit den Hauptfaden nach
+        // dem Start der Ereignisschleife - also hier.
+        if self.symbol.is_none() && self.cfg.tray {
+            self.symbol_anlegen();
+        }
     }
 
     /// Benutzerereignisse (siehe `Benutzer`).
     fn user_event(&mut self, _el: &ActiveEventLoop, ereignis: Benutzer) {
         match ereignis {
             Benutzer::Einzel(adresse) => self.einzel_empfangen(&adresse),
+            Benutzer::Tray(befehl) => self.tray_befehl(befehl),
         }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::RedrawRequested => self.draw(),
+            // Schliessen legt die App ab (Infobereich bzw. Menueleiste);
+            // ohne Symbol oder mit tray=aus beendet es wie bisher.
+            WindowEvent::CloseRequested => self.schliessen(el),
+            // Abgelegt wird nichts gezeichnet.
+            WindowEvent::RedrawRequested => {
+                if !self.verborgen {
+                    self.draw();
+                }
+            }
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as i32, position.y as i32);
@@ -4284,6 +4334,12 @@ impl ApplicationHandler<Benutzer> for App {
                                 return;
                             }
                             KC::Escape => { self.quit = true; return; }
+                            // Cmd+W schliesst auf dem Startbildschirm wie das
+                            // rote Knoepfchen (winit legt dafuer keinen
+                            // Menuepunkt an). In der Sitzung gehoert Cmd+W
+                            // dem Mac drueben.
+                            #[cfg(target_os = "macos")]
+                            KC::KeyW if self.mods & MOD_CMD != 0 => { self.schliessen(el); return; }
                             _ => {}
                         }
                     }
@@ -4470,6 +4526,27 @@ impl ApplicationHandler<Benutzer> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if self.quit { el.exit(); return; }
+        // Symbol: Menue (gefundene Hosts, Sprache) und Tooltip (Sitzung).
+        self.symbol_nachfuehren();
+        #[cfg(target_os = "macos")]
+        if let Some(t) = self.verbergen_faellig {
+            if Instant::now() >= t {
+                self.verbergen_faellig = None;
+                if self.verborgen {
+                    if let Some(w) = &self.window {
+                        w.set_visible(false);
+                    }
+                    tray_mac::aktivierung(false);
+                }
+            }
+        }
+        // Abgelegt: nichts zeichnen, nichts nachsehen - nur langsam auf
+        // Benutzerereignisse (Symbol, Einzelinstanz) warten. Eine Sitzung
+        // gibt es dann nicht (Schliessen hat getrennt).
+        if self.verborgen {
+            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + VERBORGEN_TAKT));
+            return;
+        }
         // Nicht mehr in Dauerschleife: alle zwei Millisekunden nachsehen (das
         // reicht fuer den ESC-Balken und fuer Bilder mit 240 je Sekunde) und
         // nur zeichnen, wenn es etwas zu zeichnen gibt - siehe unten.
@@ -4807,11 +4884,7 @@ impl App {
     /// bleibt bestehen - der Doppelklick auf die Verknuepfung soll sie nicht
     /// abloesen.
     fn einzel_empfangen(&mut self, adresse: &str) {
-        if let Some(w) = &self.window {
-            w.set_visible(true);
-            w.set_minimized(false);
-            w.focus_window();
-        }
+        self.fenster_zeigen();
         let sitzung = (self.screen == Screen::Session).then_some(self.addr_input.as_str());
         match einzel_folge(sitzung, adresse) {
             EinzelFolge::NachVorn => {
@@ -4829,6 +4902,162 @@ impl App {
                 self.verbindung_trennen();
                 self.verbinden(&a);
             }
+        }
+    }
+
+    /// Das Fenster sichtbar und nach vorn - auch aus dem Infobereich bzw.
+    /// der Menueleiste. Derselbe Weg fuer Einzelinstanz und Symbol.
+    fn fenster_zeigen(&mut self) {
+        let war_verborgen = self.verborgen;
+        self.verborgen = false;
+        #[cfg(target_os = "macos")]
+        {
+            self.verbergen_faellig = None;
+            // Erst wieder ein normales Programm (Dock, Menueleiste), dann
+            // das Fenster - sonst bekaeme es keinen Fokus.
+            tray_mac::aktivierung(true);
+        }
+        if let Some(w) = &self.window {
+            w.set_visible(true);
+            w.set_minimized(false);
+            // macOS: das Vollbild wurde beim Ablegen verlassen (siehe
+            // fenster_verbergen) - wieder hinein, wenn es gewuenscht ist.
+            #[cfg(target_os = "macos")]
+            if war_verborgen && self.fullscreen && w.fullscreen().is_none() {
+                w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
+            w.focus_window();
+        }
+        if war_verborgen {
+            // Die Oberflaeche ganz neu zeichnen, nicht nur den Kasten.
+            self.ui_kasten_alt = None;
+            protokoll::zeile(format!("{}: Fenster wieder sichtbar", tray::ORT));
+        }
+    }
+
+    /// Das Fenster ablegen: unsichtbar, die App laeuft beim Symbol weiter.
+    fn fenster_verbergen(&mut self) {
+        self.verborgen = true;
+        self.hud_offen = false;
+        self.esc_seit = None;
+        self.esc_verbraucht = false;
+        let Some(w) = self.window.clone() else { return };
+        // macOS: aus dem Vollbild (eigener Space) erst heraus, verborgen wird
+        // danach in about_to_wait.
+        #[cfg(target_os = "macos")]
+        if w.fullscreen().is_some() {
+            w.set_fullscreen(None);
+            self.verbergen_faellig = Some(Instant::now() + VOLLBILD_VERLASSEN);
+            return;
+        }
+        w.set_visible(false);
+        #[cfg(target_os = "macos")]
+        tray_mac::aktivierung(false);
+    }
+
+    /// Schliessen des Fensters (X, Alt+F4, Cmd+W): ablegen statt beenden,
+    /// siehe tray::beim_schliessen. Eine laufende Sitzung wird getrennt wie
+    /// mit "Trennen" - kein Zuschauer, keine Arbeit.
+    fn schliessen(&mut self, el: &ActiveEventLoop) {
+        let steht = self.symbol.as_ref().map(|s| s.steht()).unwrap_or(false);
+        let sitzung = self.screen == Screen::Session;
+        match tray::beim_schliessen(self.cfg.tray, steht, sitzung, self.cfg.tray_hinweis) {
+            tray::Schliessen::Beenden => el.exit(),
+            tray::Schliessen::Ablegen { trennen, hinweis } => {
+                if trennen {
+                    protokoll::zeile(format!("{}: Fenster geschlossen - trenne {}", tray::ORT, self.addr_input));
+                    self.verbindung_trennen();
+                }
+                self.fenster_verbergen();
+                protokoll::zeile(format!("{}: Fenster abgelegt, QuadChroma laeuft weiter", tray::ORT));
+                if hinweis {
+                    if let Some(s) = self.symbol.as_mut() {
+                        s.hinweis("QuadChroma", self.lang.get(tray::HINWEIS));
+                    }
+                    self.cfg.tray_hinweis = true;
+                    self.cfg.sichern();
+                }
+            }
+        }
+    }
+
+    /// Eine Wahl am Symbol.
+    fn tray_befehl(&mut self, befehl: tray::Befehl) {
+        match befehl {
+            tray::Befehl::Oeffnen => self.fenster_zeigen(),
+            tray::Befehl::Verbinden(adresse) => {
+                // Wie ein Klick auf die Hostzeile: eine Sitzung zum selben
+                // Host bleibt, eine zu einem anderen wird vorher getrennt.
+                self.fenster_zeigen();
+                let sitzung = (self.screen == Screen::Session).then_some(self.addr_input.as_str());
+                match einzel_folge(sitzung, &adresse) {
+                    EinzelFolge::NachVorn => {}
+                    EinzelFolge::Bleibt(a) => {
+                        protokoll::zeile(format!("{}: Verbinden mit {a} - Sitzung dorthin laeuft schon", tray::ORT));
+                    }
+                    EinzelFolge::Verbinden(a) => {
+                        protokoll::zeile(format!("{}: verbinde mit {a}", tray::ORT));
+                        self.verbinden(&a);
+                    }
+                    EinzelFolge::Wechseln(a) => {
+                        protokoll::zeile(format!("{}: trenne {} und verbinde mit {a}", tray::ORT, self.addr_input));
+                        self.verbindung_trennen();
+                        self.verbinden(&a);
+                    }
+                }
+            }
+            tray::Befehl::Beenden => {
+                protokoll::zeile(format!("{}: Beenden", tray::ORT));
+                self.quit = true;
+            }
+        }
+    }
+
+    /// Stand des Symbols jetzt: Menue aus den gefundenen Hosts, Tooltip mit
+    /// Name bzw. Adresse der Sitzung.
+    fn tray_stand(&self) -> tray::Stand {
+        let hosts = self.hosts.lock().map(|h| h.list()).unwrap_or_default();
+        let sitzung = (self.screen == Screen::Session).then(|| {
+            let name = self.host_name(&self.addr_input);
+            if name.is_empty() { self.addr_input.clone() } else { name }
+        });
+        tray::stand(self.lang, &hosts, sitzung.as_deref())
+    }
+
+    /// Das Symbol anlegen; seine Befehle kommen als Benutzerereignisse.
+    fn symbol_anlegen(&mut self) {
+        let proxy = self.proxy.clone();
+        let befehl: Box<dyn Fn(tray::Befehl) + Send> = Box::new(move |b| {
+            let _ = proxy.send_event(Benutzer::Tray(b));
+        });
+        match tray::Symbol::neu(befehl, &self.tray_stand()) {
+            Ok(s) => {
+                if s.steht() {
+                    protokoll::zeile(format!("{}: Symbol angelegt", tray::ORT));
+                } else {
+                    protokoll::zeile(format!(
+                        "{}: Symbol (noch) nicht angemeldet ({}) - Schliessen beendet, bis es steht",
+                        tray::ORT,
+                        s.grund().unwrap_or_default()
+                    ));
+                }
+                self.symbol = Some(s);
+            }
+            Err(e) => protokoll::zeile(format!("{}: kein Symbol ({e}) - Schliessen beendet das Programm", tray::ORT)),
+        }
+    }
+
+    /// Etwa zweimal je Sekunde: Stand des Symbols erneuern (nur Aenderungen
+    /// gehen hinaus) und dem Symbol seinen Takt geben.
+    fn symbol_nachfuehren(&mut self) {
+        if self.symbol.is_none() || self.tray_takt.elapsed() < TRAY_TAKT {
+            return;
+        }
+        self.tray_takt = Instant::now();
+        let stand = self.tray_stand();
+        if let Some(s) = self.symbol.as_mut() {
+            s.stand_setzen(&stand);
+            s.takt();
         }
     }
 
@@ -6770,6 +6999,31 @@ fn main() {
         std::process::exit(verknuepfung_befehlszeile(a));
     }
 
+    // Selbsttest des Symbols: anlegen, aendern, entfernen, Ende - vor
+    // Einzelinstanz, Ablagewaechter, Bekanntgabe, Protokolldatei und jedem
+    // Netz (auch vor --noisetest). Unter Windows der Infobereich, auf dem Mac
+    // die Menueleiste; den jeweils anderen Schalter gibt es auf dieser
+    // Plattform nicht (Rueckgabe 2). Beide haben keinen Wert und stehen
+    // deshalb nicht in WERTIG; als Adresse gelten sie nie (beginnen mit --).
+    if args.iter().any(|a| a == "--tray-selbsttest") {
+        #[cfg(windows)]
+        std::process::exit(tray_win::selbsttest());
+        #[cfg(not(windows))]
+        {
+            eprintln!("Den Infobereich-Selbsttest (--tray-selbsttest) gibt es nur unter Windows.");
+            std::process::exit(2);
+        }
+    }
+    if args.iter().any(|a| a == "--menueleiste-selbsttest") {
+        #[cfg(target_os = "macos")]
+        std::process::exit(tray_mac::selbsttest());
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("Den Menueleisten-Selbsttest (--menueleiste-selbsttest) gibt es nur unter macOS.");
+            std::process::exit(2);
+        }
+    }
+
     let addr = adresse_aus_argumenten(&args);
 
     let headless = std::env::args().any(|a| a == "--headless");
@@ -7258,6 +7512,7 @@ fn main() {
             }
         });
     }
+    let proxy = el.create_proxy();
     let mut app = App {
         shared,
         input: input.clone(),
@@ -7317,12 +7572,21 @@ fn main() {
         bench_folgt: true,
         bench_lief: false,
         verknuepfung_meldung: None,
+        symbol: None,
+        proxy,
+        verborgen: false,
+        tray_takt: Instant::now(),
+        #[cfg(target_os = "macos")]
+        verbergen_faellig: None,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
         cfg,
     };
     el.run_app(&mut app).expect("Fenster");
+    // Das Symbol vor dem Prozessende entfernen (sonst bliebe es unter
+    // Windows bis zur naechsten Mausbewegung darueber stehen).
+    drop(app);
     // Erst jetzt: bis hierher ist dies die erste Instanz.
     drop(einzel_waechter);
 }
@@ -9074,6 +9338,17 @@ mod tests {
         assert_eq!(adresse_aus_argumenten(&argumente(&["--benchmark", "h"])), "h:9001");
         assert_eq!(adresse_aus_argumenten(&argumente(&["--shot", "a.bmp", "de", "start"])), "");
         assert_eq!(adresse_aus_argumenten(&argumente(&[])), "");
+    }
+
+    /// Die Selbsttests des Symbols (--tray-selbsttest, --menueleiste-
+    /// selbsttest) haben keinen Wert: nie eine Adresse, und eine Angabe
+    /// dahinter gehoert nicht zu ihnen.
+    #[test]
+    fn symbol_selbsttest_nie_als_adresse() {
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--tray-selbsttest"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--menueleiste-selbsttest"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--tray-selbsttest", "h"])), "h:9001");
+        assert!(!WERTIG.iter().any(|(s, _)| s.contains("selbsttest")));
     }
 
     /// Ein anderes Ziel beendet die laufende Sitzung sofort - auch wenn der

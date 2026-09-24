@@ -7,7 +7,9 @@
 //   - als .ico-Datei im Ablageordner des Clients, auf die jede
 //     Desktop-Verknuepfung zeigt (SetIconLocation) - die exe selbst hat kein
 //     eingebettetes Symbol, sonst zeigte die Verknuepfung das Standardsymbol,
-//   - spaeter als Symbol im Infobereich.
+//   - als Symbol im Infobereich (Windows, tray_win.rs) und - einfarbig als
+//     Vorlagenbild, siehe `vorlage` - in der Menueleiste des Macs
+//     (tray_mac.rs).
 //
 // Das ICO-Format wird hier von Hand geschrieben: kleine Groessen als
 // 32-Bit-BMP (so liest sie jede Windows-Fassung), 256 px als PNG. Das PNG
@@ -92,6 +94,48 @@ pub fn rgba(groesse: u32) -> Vec<u8> {
                 out[o + 2] = (sb / sa) as u8;
                 out[o + 3] = ((sa * 255) / (STUFEN * STUFEN) as u32) as u8;
             }
+        }
+    }
+    out
+}
+
+/// Das Logo als einfarbige Vorlage fuer die Menueleiste des Macs: nur die
+/// vier Felder, schwarz mit Deckung, ohne Kachel und ohne Farben. macOS
+/// faerbt ein Vorlagenbild (setTemplate:YES) selbst passend zu hellem und
+/// dunklem Hintergrund und wertet nur die Deckung aus. Der Rand ist
+/// schmaler als bei `rgba`, weil keine Kachel das Motiv umgibt. Geglaettet
+/// wie `rgba` (4x4 Abtastungen je Bildpunkt).
+/// Nur auf dem Mac gebraucht (und in den Tests beider Plattformen).
+#[cfg(any(target_os = "macos", test))]
+pub fn vorlage(groesse: u32) -> Vec<u8> {
+    let g = groesse.max(1);
+    let n = g as i64;
+    let rand = (n / 12).max(1);
+    let mut luecke = (n / 9).max(1).min(n);
+    if (n - 2 * rand - luecke) % 2 != 0 {
+        luecke += 1;
+    }
+    let feld = ((n - 2 * rand - luecke) / 2).max(1);
+    let r_feld = g as f32 * 0.06;
+    let links = [rand, rand + feld + luecke];
+
+    let mut out = vec![0u8; (g * g * 4) as usize];
+    const STUFEN: u32 = 4;
+    for y in 0..g {
+        for x in 0..g {
+            let mut treffer = 0u32;
+            for sy in 0..STUFEN {
+                for sx in 0..STUFEN {
+                    let px = x as f32 + (sx as f32 + 0.5) / STUFEN as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / STUFEN as f32;
+                    let drin = links.iter().any(|&fy| {
+                        links.iter().any(|&fx| in_rundem_rechteck(px, py, fx as f32, fy as f32, feld as f32, feld as f32, r_feld))
+                    });
+                    treffer += drin as u32;
+                }
+            }
+            // Farbe bleibt schwarz (0, 0, 0); nur die Deckung zaehlt.
+            out[((y * g + x) * 4 + 3) as usize] = ((treffer * 255) / (STUFEN * STUFEN)) as u8;
         }
     }
     out
@@ -461,5 +505,31 @@ mod tests {
             // Zwischen den Feldern: die Kachel.
             assert_eq!(farbe(g / 2, g / 2), (KACHEL, 255), "Mitte bei {g}");
         }
+    }
+
+    /// Die Vorlage fuer die Menueleiste: nur Deckung, schwarz; die vier
+    /// Felder deckend, Ecken, Rand und das Kreuz dazwischen durchsichtig.
+    #[test]
+    fn vorlage_einfarbig_vier_felder() {
+        for g in [18u32, 36, 54] {
+            let b = vorlage(g);
+            assert_eq!(b.len(), (g * g * 4) as usize);
+            assert!(b.chunks(4).all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0), "nur schwarz bei {g}");
+            let deckung = |x: u32, y: u32| b[((y * g + x) * 4 + 3) as usize];
+            assert_eq!(deckung(0, 0), 0, "Ecke bei {g}");
+            assert_eq!(deckung(g - 1, g - 1), 0, "Ecke bei {g}");
+            let v = g / 4;
+            let d = g - 1 - g / 4;
+            for (x, y) in [(v, v), (d, v), (d, d), (v, d)] {
+                assert_eq!(deckung(x, y), 255, "Feld bei {x},{y} ({g})");
+            }
+            // Die Luecke zwischen den Feldern bleibt frei: waagrecht und
+            // senkrecht durch die Mitte.
+            assert_eq!(deckung(g / 2, v), 0, "senkrechte Luecke bei {g}");
+            assert_eq!(deckung(v, g / 2), 0, "waagrechte Luecke bei {g}");
+        }
+        // Als PNG laesst sie sich wie das Logo schreiben (fuer NSImage).
+        let p = png(36, 36, &vorlage(36));
+        assert_eq!(&p[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
     }
 }

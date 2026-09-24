@@ -164,6 +164,11 @@ pub static PL: Lang = Lang {
         (DesktopShortcutCreated, "Utworzono skrót na pulpicie: {n}"),
         (DesktopShortcutFailed, "Nie utworzono skrótu: {n}"),
         (DesktopShortcutDescription, "QuadChroma: połącz z {n} ({m})"),
+        (TrayOpen, "Otwórz"),
+        (TrayConnect, "Połącz: {n}"),
+        (TrayQuit, "Zakończ"),
+        (TrayStillRunning, "QuadChroma nadal działa w obszarze powiadomień."),
+        (TrayStillRunningMac, "QuadChroma nadal działa na pasku menu."),
     ],
 };
 
@@ -328,6 +333,11 @@ pub static CS: Lang = Lang {
         (DesktopShortcutCreated, "Zástupce vytvořen na ploše: {n}"),
         (DesktopShortcutFailed, "Zástupce nebyl vytvořen: {n}"),
         (DesktopShortcutDescription, "QuadChroma: připojit k {n} ({m})"),
+        (TrayOpen, "Otevřít"),
+        (TrayConnect, "Připojit: {n}"),
+        (TrayQuit, "Ukončit"),
+        (TrayStillRunning, "QuadChroma dál běží v oznamovací oblasti."),
+        (TrayStillRunningMac, "QuadChroma dál běží na řádku nabídek."),
     ],
 };
 
@@ -492,6 +502,11 @@ pub static SK: Lang = Lang {
         (DesktopShortcutCreated, "Odkaz vytvorený na pracovnej ploche: {n}"),
         (DesktopShortcutFailed, "Odkaz sa nevytvoril: {n}"),
         (DesktopShortcutDescription, "QuadChroma: pripojiť k {n} ({m})"),
+        (TrayOpen, "Otvoriť"),
+        (TrayConnect, "Pripojiť: {n}"),
+        (TrayQuit, "Ukončiť"),
+        (TrayStillRunning, "QuadChroma naďalej beží v oblasti oznámení."),
+        (TrayStillRunningMac, "QuadChroma naďalej beží na lište ponúk."),
     ],
 };
 
@@ -656,6 +671,11 @@ pub static HU: Lang = Lang {
         (DesktopShortcutCreated, "Parancsikon létrehozva az asztalon: {n}"),
         (DesktopShortcutFailed, "A parancsikon nem jött létre: {n}"),
         (DesktopShortcutDescription, "QuadChroma: csatlakozás ehhez: {n} ({m})"),
+        (TrayOpen, "Megnyitás"),
+        (TrayConnect, "Csatlakozás: {n}"),
+        (TrayQuit, "Kilépés"),
+        (TrayStillRunning, "A QuadChroma tovább fut az értesítési területen."),
+        (TrayStillRunningMac, "A QuadChroma tovább fut a menüsorban."),
     ],
 };
 
@@ -820,6 +840,11 @@ pub static RO: Lang = Lang {
         (DesktopShortcutCreated, "Comandă rapidă creată pe desktop: {n}"),
         (DesktopShortcutFailed, "Comanda rapidă nu a fost creată: {n}"),
         (DesktopShortcutDescription, "QuadChroma: conectare la {n} ({m})"),
+        (TrayOpen, "Deschide"),
+        (TrayConnect, "Conectare: {n}"),
+        (TrayQuit, "Ieșire"),
+        (TrayStillRunning, "QuadChroma rulează în continuare în zona de notificare."),
+        (TrayStillRunningMac, "QuadChroma rulează în continuare în bara de meniu."),
     ],
 };
 
@@ -984,6 +1009,11 @@ pub static BG: Lang = Lang {
         (DesktopShortcutCreated, "Прекият път е създаден на работния плот: {n}"),
         (DesktopShortcutFailed, "Прекият път не е създаден: {n}"),
         (DesktopShortcutDescription, "QuadChroma: свързване с {n} ({m})"),
+        (TrayOpen, "Отвори"),
+        (TrayConnect, "Свързване: {n}"),
+        (TrayQuit, "Изход"),
+        (TrayStillRunning, "QuadChroma продължава да работи в областта за уведомяване."),
+        (TrayStillRunningMac, "QuadChroma продължава да работи в лентата с менюта."),
     ],
 };
 
@@ -1148,5 +1178,10 @@ pub static EL: Lang = Lang {
         (DesktopShortcutCreated, "Η συντόμευση δημιουργήθηκε στην επιφάνεια εργασίας: {n}"),
         (DesktopShortcutFailed, "Η συντόμευση δεν δημιουργήθηκε: {n}"),
         (DesktopShortcutDescription, "QuadChroma: σύνδεση με {n} ({m})"),
+        (TrayOpen, "Άνοιγμα"),
+        (TrayConnect, "Σύνδεση: {n}"),
+        (TrayQuit, "Έξοδος"),
+        (TrayStillRunning, "Το QuadChroma συνεχίζει να εκτελείται στην περιοχή ειδοποιήσεων."),
+        (TrayStillRunningMac, "Το QuadChroma συνεχίζει να εκτελείται στη γραμμή μενού."),
     ],
 };

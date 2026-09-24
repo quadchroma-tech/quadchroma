@@ -167,6 +167,11 @@ pub static RU: Lang = Lang {
         (DesktopShortcutCreated, "Ярлык создан на рабочем столе: {n}"),
         (DesktopShortcutFailed, "Ярлык не создан: {n}"),
         (DesktopShortcutDescription, "QuadChroma: подключиться к {n} ({m})"),
+        (TrayOpen, "Открыть"),
+        (TrayConnect, "Подключиться: {n}"),
+        (TrayQuit, "Выход"),
+        (TrayStillRunning, "QuadChroma продолжает работать в области уведомлений."),
+        (TrayStillRunningMac, "QuadChroma продолжает работать в строке меню."),
     ],
 };
 
@@ -333,6 +338,11 @@ pub static ZH: Lang = Lang {
         (DesktopShortcutCreated, "已在桌面上创建快捷方式：{n}"),
         (DesktopShortcutFailed, "未能创建快捷方式：{n}"),
         (DesktopShortcutDescription, "QuadChroma：连接到 {n}（{m}）"),
+        (TrayOpen, "打开"),
+        (TrayConnect, "连接：{n}"),
+        (TrayQuit, "退出"),
+        (TrayStillRunning, "QuadChroma 仍在通知区域中运行。"),
+        (TrayStillRunningMac, "QuadChroma 仍在菜单栏中运行。"),
     ],
 };
 
@@ -499,6 +509,11 @@ pub static JA: Lang = Lang {
         (DesktopShortcutCreated, "デスクトップにショートカットを作成しました: {n}"),
         (DesktopShortcutFailed, "ショートカットを作成できませんでした: {n}"),
         (DesktopShortcutDescription, "QuadChroma: {n} に接続 ({m})"),
+        (TrayOpen, "開く"),
+        (TrayConnect, "接続: {n}"),
+        (TrayQuit, "終了"),
+        (TrayStillRunning, "QuadChroma は通知領域で引き続き動作しています。"),
+        (TrayStillRunningMac, "QuadChroma はメニューバーで引き続き動作しています。"),
     ],
 };
 
@@ -663,5 +678,10 @@ pub static TR: Lang = Lang {
         (DesktopShortcutCreated, "Masaüstünde kısayol oluşturuldu: {n}"),
         (DesktopShortcutFailed, "Kısayol oluşturulamadı: {n}"),
         (DesktopShortcutDescription, "QuadChroma: {n} ile bağlan ({m})"),
+        (TrayOpen, "Aç"),
+        (TrayConnect, "Bağlan: {n}"),
+        (TrayQuit, "Çıkış"),
+        (TrayStillRunning, "QuadChroma bildirim alanında çalışmaya devam ediyor."),
+        (TrayStillRunningMac, "QuadChroma menü çubuğunda çalışmaya devam ediyor."),
     ],
 };

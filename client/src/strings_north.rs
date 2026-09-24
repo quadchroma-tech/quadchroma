@@ -164,6 +164,11 @@ pub static SV: Lang = Lang {
         (DesktopShortcutCreated, "Genväg skapad på skrivbordet: {n}"),
         (DesktopShortcutFailed, "Genvägen skapades inte: {n}"),
         (DesktopShortcutDescription, "QuadChroma: anslut till {n} ({m})"),
+        (TrayOpen, "Öppna"),
+        (TrayConnect, "Anslut: {n}"),
+        (TrayQuit, "Avsluta"),
+        (TrayStillRunning, "QuadChroma körs vidare i meddelandefältet."),
+        (TrayStillRunningMac, "QuadChroma körs vidare i menyraden."),
     ],
 };
 
@@ -328,6 +333,11 @@ pub static DA: Lang = Lang {
         (DesktopShortcutCreated, "Genvej oprettet på skrivebordet: {n}"),
         (DesktopShortcutFailed, "Genvejen blev ikke oprettet: {n}"),
         (DesktopShortcutDescription, "QuadChroma: opret forbindelse til {n} ({m})"),
+        (TrayOpen, "Åbn"),
+        (TrayConnect, "Forbind: {n}"),
+        (TrayQuit, "Afslut"),
+        (TrayStillRunning, "QuadChroma kører videre i meddelelsesområdet."),
+        (TrayStillRunningMac, "QuadChroma kører videre i menulinjen."),
     ],
 };
 
@@ -492,6 +502,11 @@ pub static NB: Lang = Lang {
         (DesktopShortcutCreated, "Snarvei opprettet på skrivebordet: {n}"),
         (DesktopShortcutFailed, "Snarveien ble ikke opprettet: {n}"),
         (DesktopShortcutDescription, "QuadChroma: koble til {n} ({m})"),
+        (TrayOpen, "Åpne"),
+        (TrayConnect, "Koble til: {n}"),
+        (TrayQuit, "Avslutt"),
+        (TrayStillRunning, "QuadChroma kjører videre i systemstatusfeltet."),
+        (TrayStillRunningMac, "QuadChroma kjører videre i menylinjen."),
     ],
 };
 
@@ -656,6 +671,11 @@ pub static FI: Lang = Lang {
         (DesktopShortcutCreated, "Pikakuvake luotu työpöydälle: {n}"),
         (DesktopShortcutFailed, "Pikakuvaketta ei luotu: {n}"),
         (DesktopShortcutDescription, "QuadChroma: yhdistä kohteeseen {n} ({m})"),
+        (TrayOpen, "Avaa"),
+        (TrayConnect, "Yhdistä: {n}"),
+        (TrayQuit, "Lopeta"),
+        (TrayStillRunning, "QuadChroma toimii edelleen ilmaisinalueella."),
+        (TrayStillRunningMac, "QuadChroma toimii edelleen valikkorivillä."),
     ],
 };
 
@@ -820,5 +840,10 @@ pub static IS: Lang = Lang {
         (DesktopShortcutCreated, "Flýtileið búin til á skjáborðinu: {n}"),
         (DesktopShortcutFailed, "Flýtileið var ekki búin til: {n}"),
         (DesktopShortcutDescription, "QuadChroma: tengjast {n} ({m})"),
+        (TrayOpen, "Opna"),
+        (TrayConnect, "Tengjast: {n}"),
+        (TrayQuit, "Hætta"),
+        (TrayStillRunning, "QuadChroma keyrir áfram á tilkynningasvæðinu."),
+        (TrayStillRunningMac, "QuadChroma keyrir áfram á valmyndastikunni."),
     ],
 };
