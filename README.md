@@ -180,8 +180,9 @@ sobald es ein anderer Bildschirm ist; der Mac schreibt dazu keine Zeile
 `Bildschirmwechsel`, sondern `Aufnahme wiederhergestellt`.
 
 Bei einem Wechsel steht im Protokoll beider Hosts `Bildschirmwechsel: <alt> -> <neu>
-(<Grund>)` mit `Wunsch des Zuschauers`, `Hauptbildschirm gewechselt`, `Ausweichplatz`
-oder `zurueck zum gewuenschten Bildschirm`. Alle Zeilen, die Nachrichten 12 und 70 im
+(<Grund>)` mit `Wunsch des Zuschauers`, `Wunsch des Zuschauers: Automatik`,
+`Hauptbildschirm gewechselt`, `Ausweichplatz` oder `zurueck zum gewuenschten
+Bildschirm`. Alle Zeilen, die Nachrichten 12 und 70 im
 Einzelnen und der Prüfmodus (`--bildschirm <Kennung|auto>`, Feld „Strom“ in der
 Statuszeile) stehen in `BENUTZUNG.txt`.
 
@@ -338,7 +339,9 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   echte Ausgänge, die VM hat einen, belegt sind die reinen Teile in Unit-Tests —,
   dort auch Kennung, Name und Bildrate aus echten Monitoren; beim Mac-Host der
   Hauptbildschirmwechsel live samt Namen aus AppKit, den `hosttest` mit Attrappen
-  für Liste und Strom belegt;
+  für Liste und Strom belegt (am Gerät belegt am 26.09.2026: Wunsch auf den zweiten
+  Bildschirm des Mac-Hosts mit Wechsel, Maus per `--eingabeprobe` auf dem
+  gewünschten Bildschirm, zurück mit `auto`);
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
   Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern.

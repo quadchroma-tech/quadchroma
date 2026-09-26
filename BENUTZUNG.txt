@@ -494,9 +494,10 @@ Die Nummer ist der Eintrag in der Liste des Hosts (0 = HEVC 4:4:4 10 Bit,
 Ebenfalls im Pruefmodus prueft --eingabeprobe den Eingabeweg: Sobald der
 Eingabekanal steht, schickt der Client zwei Mausbewegungen (Bildmitte,
 dann rechts unten, im Abstand von einer Sekunde) und endet eine Sekunde
-spaeter. Ob sie ankamen, zeigt die Zeigerposition auf dem Host. Auf einen
-Bildschirmwechsel wartet die Probe nicht: zusammen mit --bildschirm landet
-sie auf dem Bildschirm vor dem Wechsel (siehe "Bildschirm des Hosts").
+spaeter. Ob sie ankamen, zeigt die Zeigerposition auf dem Host. Zusammen
+mit --bildschirm wartet die Probe, bis der Wunsch hinaus ist und der Host
+ihn beantwortet hat (hoechstens 5 s): die Maus landet auf dem
+gewuenschten Bildschirm (siehe "Bildschirm des Hosts").
 
 Bildrate: der Host schickt nie mehr Bilder als eingestellt. ScreenCaptureKit
 liefert auf einem 120-Hz-Bildschirm gern 148 echte Bilder je Sekunde - jedes
@@ -820,12 +821,12 @@ den Pin und wird gespeichert. Ein Platz ausser Bereich ergibt eine
 Zeile, dann gilt die Datei bzw. Automatik. --list zeigt je Bildschirm
 Kennung, Name, Groesse, Bildrate und den Hauptbildschirm.
 
-Pruefmodus: --bildschirm <Kennung|auto> schickt den Wunsch einmal, mit
-dem naechsten Statustakt (alle 3 s), sobald der Eingabekanal steht und
-der Host die Wahl gemeldet hat ("Bildschirmwunsch gesendet:
-<Kennung|auto>"; bei einem Host ohne Bit 1 "Bildschirmwunsch nicht
-gesendet: der Host kennt keine Bildschirmwahl"). Jede Liste des Hosts
-ergibt eine Zeile, im Fensterbetrieb in protokoll.txt:
+Pruefmodus: --bildschirm <Kennung|auto> schickt den Wunsch einmal, sobald
+der Eingabekanal steht und der Host die Wahl gemeldet hat
+("Bildschirmwunsch gesendet: <Kennung|auto>"; bei einem Host ohne Bit 1
+"Bildschirmwunsch nicht gesendet: der Host kennt keine Bildschirmwahl").
+Jede Liste des Hosts ergibt eine Zeile, im Fensterbetrieb in
+protokoll.txt:
 
     "Bildschirme des Hosts (Wunsch <Kennung|Automatik>): <Name>
      <Kennung> <B>x<H> <Hz> Hz [Haupt] [gestreamt]; ..."
@@ -835,11 +836,10 @@ Die Statuszeile alle drei Sekunden traegt hinter dem Codec das Feld
 "| Strom <B>x<H>@<fps>" ("?" ohne Strominfo - auch gleich nach dem
 Verbinden, die Masse eines vorigen Hosts bleiben nicht stehen), damit
 ein Wechsel auch bei gleichem Codec zu sehen ist. --eingabeprobe wartet
-nicht auf den Wechsel: die Probe geht hinaus, sobald der Eingabekanal
-steht, und beendet den Client rund 2 s spaeter; der Wunsch aus
---bildschirm geht erst mit dem Statustakt hinaus, womoeglich erst nach
-dem Ende der Probe. Die Maus landet also auf dem Bildschirm vor dem
-Wechsel (siehe "Das Menue").
+auf den Wechsel: die Probe geht erst hinaus, wenn der Wunsch gesendet
+und vom Host beantwortet ist (Liste mit dem Wunsch; ohne Antwort nach
+5 s), und beendet den Client rund 2 s spaeter. Die Maus landet also auf
+dem gewuenschten Bildschirm (siehe "Das Menue").
 
     quadchroma.exe 192.168.178.194:9001 --headless --bildschirm v0-m0-s0
     quadchroma.exe 192.168.178.194:9001 --headless --bildschirm auto
@@ -867,10 +867,10 @@ Protokollzeilen des Mac-Hosts (/tmp/quadchroma-m1.log); <Text> ist
     "Bildschirmwunsch <Kennung|Automatik> verworfen: Aufnahme laeuft
      noch nicht"
     "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" mit den Gruenden
-     "Wunsch des Zuschauers", "Hauptbildschirm gewechselt",
-     "Ausweichplatz" und "zurueck zum gewuenschten Bildschirm" (ein
-     Wunsch auf Automatik, der den Bildschirm wechselt, steht als
-     "Hauptbildschirm gewechselt")
+     "Wunsch des Zuschauers", "Wunsch des Zuschauers: Automatik"
+     (der Zuschauer hat auf Automatik gestellt), "Hauptbildschirm
+     gewechselt", "Ausweichplatz" und "zurueck zum gewuenschten
+     Bildschirm"
     "Bildschirmwechsel: <alt> -> <neu> (<Grund>) nicht vollzogen"
      (dazu " - Ausweichweg wie beim Bildschirmverlust", wenn ein
      Zuschauer da ist; ohne Zuschauer bleibt nur das Ziel)
@@ -916,9 +916,8 @@ Protokollzeilen der Windows-Host-Rolle (host-protokoll.txt); <Text> ist
      moeglich"          (ohne Aufnahme: Konserve, kein DXGI-Ausgang,
                          kein Encoder; die Antwort ist die alte Liste)
     "Bildschirmwunsch: ungueltig (<n> Byte) - uebergangen"
-    "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" mit denselben vier
-     Gruenden (ein Wunsch auf Automatik steht hier als "Wunsch des
-     Zuschauers"); solange keine Duplication steht - kein Zuschauer
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" mit denselben fuenf
+     Gruenden; solange keine Duplication steht - kein Zuschauer
      oder gerade ein Verlust -, mit dem Zusatz " - ohne laufenden
      Strom nur das Ziel, gilt ab dem naechsten Aufbau". Nur zwischen
      zwei Bildschirmen: ist die Liste leer oder wird sie es, gibt es
@@ -982,7 +981,11 @@ durch, die Tests der Windows-Host-Rolle die Wahl, die Kennungen,
 bildschirm.txt, den Wunsch ueber den echten Eingabekanal und die
 Begruessung mit 3 und 12.
 
-Noch nicht am Geraet belegt, nur in Pruefstaenden und am Code: bei der
+Am Geraet belegt (26.09.2026, Windows-Client gegen den Mac-Host mit
+zwei Bildschirmen): Wunsch auf den zweiten Bildschirm mit Wechsel,
+Liste und Strom, die Maus per --eingabeprobe auf dem gewuenschten
+Bildschirm, zurueck mit "auto", bildschirm.txt. Noch nicht am Geraet
+belegt, nur in Pruefstaenden und am Code: bei der
 Windows-Host-Rolle der Wechsel selbst (Duplication neu, Switch, Info,
 Vollbild, Liste danach; bei gleicher Groesse bleibt der Encoder auf dem
 Prozessorweg stehen) - er braucht zwei echte Ausgaenge, die VM hat

@@ -356,11 +356,13 @@ pub fn ziel_waehlen(liste: &[Ausgang], wunsch: Option<&str>) -> Option<(Ausgang,
 }
 
 /// Der Grund eines Bildschirmwechsels fuers Protokoll (1.4 Schritt 7):
-/// nach einem neuen Wunsch "Wunsch des Zuschauers"; ohne neuen Wunsch je
-/// nachdem, wie das neue Ziel zustande kam.
+/// nach einem neuen Wunsch "Wunsch des Zuschauers" (auf Automatik gestellt:
+/// "Wunsch des Zuschauers: Automatik" - dieselben Worte wie beim Mac-Host);
+/// ohne neuen Wunsch je nachdem, wie das neue Ziel zustande kam.
 pub fn wechsel_grund(neu: Wahl, wunsch_neu: bool) -> &'static str {
     match neu {
         Wahl::Ausweich => "Ausweichplatz",
+        Wahl::Automatik if wunsch_neu => "Wunsch des Zuschauers: Automatik",
         _ if wunsch_neu => "Wunsch des Zuschauers",
         Wahl::Wunsch => "zurueck zum gewuenschten Bildschirm",
         Wahl::Automatik => "Hauptbildschirm gewechselt",
@@ -2108,7 +2110,7 @@ mod tests {
     #[test]
     fn wechsel_grund_alle_faelle() {
         assert_eq!(wechsel_grund(Wahl::Wunsch, true), "Wunsch des Zuschauers");
-        assert_eq!(wechsel_grund(Wahl::Automatik, true), "Wunsch des Zuschauers");
+        assert_eq!(wechsel_grund(Wahl::Automatik, true), "Wunsch des Zuschauers: Automatik");
         assert_eq!(wechsel_grund(Wahl::Ausweich, true), "Ausweichplatz");
         assert_eq!(wechsel_grund(Wahl::Ausweich, false), "Ausweichplatz");
         assert_eq!(wechsel_grund(Wahl::Wunsch, false), "zurueck zum gewuenschten Bildschirm");
