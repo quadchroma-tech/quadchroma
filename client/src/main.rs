@@ -8238,6 +8238,14 @@ fn main() {
             std::env::args().nth(i + 1).and_then(|v| v.parse().ok()).unwrap_or(5)
         });
         let ohne_testbild = std::env::args().any(|a| a == "--ohne-testbild");
+        // --eingabeprobe: Diagnose ohne Fenster. Sobald der Eingabekanal
+        // steht, gehen zwei Mausbewegungen hinaus (Bildmitte, dann rechts
+        // unten, im Abstand von einer Sekunde), danach endet das Programm.
+        // Ob sie ankamen, zeigt die Zeigerposition auf dem Host.
+        let eingabeprobe = std::env::args().any(|a| a == "--eingabeprobe");
+        const PROBEN: [(f32, f32); 2] = [(0.5, 0.5), (0.75, 0.75)];
+        let mut probe_stand = 0usize;
+        let mut probe_zeit: Option<Instant> = None;
         // --benchmark-auswahl codecs:mbit:fps grenzt den Lauf ein (siehe
         // BenchKonfig::einschraenken).
         let benchmark_auswahl: Option<String> = std::env::args()
@@ -8267,6 +8275,23 @@ fn main() {
             let takt_ende = Instant::now() + Duration::from_secs(3);
             while Instant::now() < takt_ende {
                 std::thread::sleep(Duration::from_millis(50));
+                if eingabeprobe && probe_stand < PROBEN.len() {
+                    let faellig = probe_zeit.map_or(true, |t| t.elapsed() >= Duration::from_secs(1));
+                    let mut l = input.lock().unwrap();
+                    if faellig && l.steht() {
+                        let (nx, ny) = PROBEN[probe_stand];
+                        l.mouse_move(nx, ny);
+                        drop(l);
+                        println!("Eingabeprobe: Mausbewegung nach ({nx}, {ny}) eingereiht");
+                        probe_stand += 1;
+                        probe_zeit = Some(Instant::now());
+                        if probe_stand == PROBEN.len() {
+                            std::thread::sleep(Duration::from_secs(1));
+                            println!("Eingabeprobe beendet");
+                            std::process::exit(0);
+                        }
+                    }
+                }
                 let Some(dauer) = benchmark_dauer else { continue };
                 match bench.as_mut() {
                     None => {

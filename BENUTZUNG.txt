@@ -491,6 +491,11 @@ Im Pruefmodus laesst sich der Wechsel anstossen:
 Die Nummer ist der Eintrag in der Liste des Hosts (0 = HEVC 4:4:4 10 Bit,
 3 = HEVC 4:2:0 8 Bit, 4 = H.264). Die Adresse darf an jeder Stelle stehen.
 
+Ebenfalls im Pruefmodus prueft --eingabeprobe den Eingabeweg: Sobald der
+Eingabekanal steht, schickt der Client zwei Mausbewegungen (Bildmitte,
+dann rechts unten, im Abstand von einer Sekunde) und endet. Ob sie ankamen,
+zeigt die Zeigerposition auf dem Host.
+
 Bildrate: der Host schickt nie mehr Bilder als eingestellt. ScreenCaptureKit
 liefert auf einem 120-Hz-Bildschirm gern 148 echte Bilder je Sekunde - jedes
 ging durch Encoder, Leitung und Decoder. Jetzt bekommt ein Bild den naechsten
