@@ -297,6 +297,126 @@ pub enum Key {
     ScreenSwitching,
     /// {n} = gewuenschte Kennung, {m} = der Bildschirm, der stattdessen laeuft.
     ScreenFallback,
+    // Zugang (Spezifikation Pairing v1, Abschnitt 14). EN und DE wie dort;
+    // die uebrigen 27 Tabellen tragen vorerst den englischen Text - Paket P6
+    // uebersetzt sie (gleiche Uebersetzung wie in host/texte.m des Mac-Hosts).
+    // Platzhalter: {n} Name, {i} ID "ddd ddd ddd", {c} Code "628 306",
+    // {s} Sekunden, {p} Passwort bzw. Port, {d} Datum.
+    // Client: Zugangsdialog und Meldungen
+    /// Zugangsdialog, Titel: {n} Name des Hosts.
+    AccessTitle,
+    /// Zugangsdialog, Erklaerung: {n} Name des Hosts (zweimal).
+    AccessText,
+    /// Zugangsdialog, nur wenn der Host "Zulassen" anbietet (Bit 1): {n} Name des Hosts.
+    AccessOrAllow,
+    /// Zugangsdialog: Vergleichscode, {c} = "628 306".
+    AccessCode,
+    /// Zugangsdialog: Beschriftung des Passwortfelds.
+    AccessPassword,
+    /// Zugangsdialog: Knopf, der das Passwort lesbar zeigt.
+    AccessShow,
+    /// Zugangsdialog: Knopf Abbrechen (sendet ZUGANG_ABBRUCH).
+    AccessCancel,
+    /// Zugangsdialog: Beweis ist unterwegs, Knopf deaktiviert.
+    AccessChecking,
+    /// Zugangsdialog: Ergebnis 2, Passwort falsch.
+    AccessWrong,
+    /// Zugangsdialog: Drossel, {s} Sekunden bis zum naechsten Versuch.
+    AccessWait,
+    /// Zugangsdialog (8.3): anderer Schluessel unter bekannter Adresse, {i} neue ID.
+    AccessNewIdentity,
+    /// Meldung: Ergebnis 3, am Host abgelehnt; {n} Name des Hosts.
+    MsgRefused,
+    /// Meldung: keine Antwort (Frist); {n} Name des Hosts.
+    MsgNoAnswer,
+    /// Meldung: Ergebnis 4, zu viele Versuche.
+    MsgTooManyAttempts,
+    /// Meldung: Host antwortet weder QCH1 noch QCA1; {n} Name des Hosts.
+    MsgHostOutdated,
+    /// Meldung: host_proof falsch (moeglicher Angriff); {n} Name des Hosts.
+    MsgHostProofBad,
+    /// Meldung (8.2): der Schluessel passt nicht zur gewaehlten ID.
+    MsgOtherDevice,
+    /// Meldung (9.2): {i} die gesuchte ID.
+    MsgIdNotFound,
+    // Client: Startbildschirm
+    /// Hostzeile rechts: {i} ID "ddd ddd ddd".
+    StartId,
+    /// Knopf (Windows): Host-Rolle starten.
+    StartShare,
+    /// Derselbe Knopf, wenn die Host-Rolle schon laeuft (deaktiviert).
+    StartSharing,
+    // Host: Windows-Host-Rolle (Mac-Host: dieselben Texte in host/texte.m;
+    // die mit (Mac) markierten braucht nur er - sie stehen hier, damit beide
+    // Dateien dieselben Schluessel und Uebersetzungen fuehren)
+    /// Host-Menue, Kopfzeile: niemand verbunden.
+    HostReady,
+    /// Host-Menue, Kopfzeile: {n} Name des Zuschauers.
+    HostConnected,
+    /// Host-Menue: eigene ID, {i} "ddd ddd ddd".
+    HostDeviceId,
+    /// Host-Menue: {p} das Zugangspasswort.
+    HostPassword,
+    /// Host: Hinweis nach dem Kopieren von ID oder Passwort.
+    HostCopied,
+    /// Host-Menue: Fenster zum Aendern des Passworts oeffnen.
+    HostChangePassword,
+    /// Host-Menue: neues Zufallspasswort erzeugen.
+    HostRandomPassword,
+    /// Passwortfenster: erstes Feld.
+    HostNewPassword,
+    /// Passwortfenster: zweites Feld.
+    HostRepeatPassword,
+    /// Passwortfenster: die Felder sind verschieden.
+    HostPasswordsDiffer,
+    /// Passwortfenster: norm(pw) kuerzer als 8 Byte.
+    HostPasswordShort,
+    /// Passwortfenster: gespeichert.
+    HostPasswordSaved,
+    /// Host-Menue: host-password.txt unlesbar.
+    HostPasswordUnreadable,
+    /// Host-Menue: Untermenue der erlaubten Geraete.
+    HostDevices,
+    /// Host-Menue: die Liste ist leer.
+    HostNoDevices,
+    /// Host-Menue, je Geraet: {n} Name, {i} ID, {d} Datum.
+    HostDeviceLine,
+    /// Host-Menue, je Geraet: entfernen.
+    HostRemove,
+    /// Host-Menue: alle Geraete entfernen (mit Rueckfrage).
+    HostRemoveAll,
+    /// Rueckfrage zu "Alle entfernen".
+    HostRemoveAllAsk,
+    /// Host-Menue: host-devices.txt beschaedigt.
+    HostListDamaged,
+    /// Host-Menue: beschaedigte Liste neu anlegen (alte bleibt als .defekt-<zeit>).
+    HostListReset,
+    /// Zulassen-Fenster: {n} Name des Clients, {i} seine ID.
+    HostRequest,
+    /// Zulassen-Fenster: Knopf Zulassen (Standard).
+    HostAllow,
+    /// Zulassen-Fenster: Knopf Ablehnen.
+    HostDeny,
+    /// Host-Menue (Mac): beim Anmelden starten.
+    HostStartLogin,
+    /// Host-Menue (Windows): mit Windows starten.
+    HostStartWindows,
+    /// Host-Menue (Mac): App liegt nicht in /Applications.
+    HostMoveToApps,
+    /// Host-Menue (Mac): Bildschirmaufnahme fehlt.
+    HostScreenMissing,
+    /// Host-Menue (Mac): Bedienungshilfen fehlen.
+    HostAccessMissing,
+    /// Host-Menue: {p} der belegte Port.
+    HostPortBusy,
+    /// Host-Menue (Mac): beenden.
+    HostQuit,
+    /// Host-Menue (Windows): Host-Rolle beenden.
+    HostStopSharing,
+    /// Infobereich (Windows): Tooltip, {i} die eigene ID.
+    HostTooltip,
+    /// Host-Fenster: Knopf OK.
+    HostOk,
 }
 
 pub struct Lang {
@@ -510,6 +630,62 @@ pub static EN: Lang = Lang {
         (TipScreen, "Which of the host's screens you see. Automatic follows the main screen; a fixed screen stays until you choose something else."),
         (ScreenSwitching, "Switching screen …"),
         (ScreenFallback, "{n} not connected – fallback: {m}"),
+        // Zugang (Spezifikation Pairing v1, Abschnitt 14)
+        (AccessTitle, "Password for {n}"),
+        (AccessText, "{n} does not know this device yet. Enter the password shown in the QuadChroma menu on {n}."),
+        (AccessOrAllow, "Or ask someone at {n} to click \"Allow\"."),
+        (AccessCode, "Code: {c}"),
+        (AccessPassword, "Password"),
+        (AccessShow, "Show"),
+        (AccessCancel, "Cancel"),
+        (AccessChecking, "Checking ..."),
+        (AccessWrong, "Wrong password."),
+        (AccessWait, "Too many attempts. Try again in {s} s."),
+        (AccessNewIdentity, "The device at this address has a new identity (ID {i})."),
+        (MsgRefused, "{n} refused the connection."),
+        (MsgNoAnswer, "No answer from {n}. Please try again."),
+        (MsgTooManyAttempts, "Too many attempts. Please wait a moment and try again."),
+        (MsgHostOutdated, "{n} uses an older QuadChroma version. Please update it there."),
+        (MsgHostProofBad, "{n} could not confirm the password. The connection was stopped for safety."),
+        (MsgOtherDevice, "A different device answers at this address."),
+        (MsgIdNotFound, "No device with ID {i} found in the network."),
+        (StartId, "ID {i}"),
+        (StartShare, "Share this PC"),
+        (StartSharing, "Sharing is on"),
+        (HostReady, "Ready for connections"),
+        (HostConnected, "Connected: {n}"),
+        (HostDeviceId, "Device ID: {i}"),
+        (HostPassword, "Password: {p}"),
+        (HostCopied, "Copied"),
+        (HostChangePassword, "Change password ..."),
+        (HostRandomPassword, "New random password"),
+        (HostNewPassword, "New password (at least 8 characters)"),
+        (HostRepeatPassword, "Repeat password"),
+        (HostPasswordsDiffer, "The passwords do not match."),
+        (HostPasswordShort, "At least 8 characters, please."),
+        (HostPasswordSaved, "Password saved."),
+        (HostPasswordUnreadable, "Password file unreadable - new devices only via \"Allow\"."),
+        (HostDevices, "Allowed devices"),
+        (HostNoDevices, "No devices yet"),
+        (HostDeviceLine, "{n} - ID {i} - since {d}"),
+        (HostRemove, "Remove"),
+        (HostRemoveAll, "Remove all devices ..."),
+        (HostRemoveAllAsk, "Remove all allowed devices? They will need the password again."),
+        (HostListDamaged, "Device list damaged"),
+        (HostListReset, "Reset device list"),
+        (HostRequest, "{n} (ID {i}) wants to control this computer."),
+        (HostAllow, "Allow"),
+        (HostDeny, "Deny"),
+        (HostStartLogin, "Start at login"),
+        (HostStartWindows, "Start with Windows"),
+        (HostMoveToApps, "Move QuadChroma to Applications first"),
+        (HostScreenMissing, "Screen Recording not allowed - open System Settings ..."),
+        (HostAccessMissing, "Accessibility not allowed - open System Settings ..."),
+        (HostPortBusy, "Port {p} is used by another program"),
+        (HostQuit, "Quit QuadChroma"),
+        (HostStopSharing, "Stop sharing"),
+        (HostTooltip, "QuadChroma - sharing this PC (ID {i})"),
+        (HostOk, "OK"),
     ],
 };
 
@@ -700,6 +876,62 @@ pub static DE: Lang = Lang {
         (TipScreen, "Welchen Bildschirm des Hosts du siehst. Automatisch folgt dem Hauptbildschirm; ein fester Bildschirm gilt, bis du etwas anderes wählst."),
         (ScreenSwitching, "Bildschirm wird gewechselt …"),
         (ScreenFallback, "{n} nicht angeschlossen – Ausweichplatz: {m}"),
+        // Zugang (Spezifikation Pairing v1, Abschnitt 14)
+        (AccessTitle, "Passwort für {n}"),
+        (AccessText, "{n} kennt dieses Gerät noch nicht. Gib das Passwort ein, das im QuadChroma-Menü auf {n} steht."),
+        (AccessOrAllow, "Oder bitte jemanden an {n}, auf „Zulassen“ zu klicken."),
+        (AccessCode, "Code: {c}"),
+        (AccessPassword, "Passwort"),
+        (AccessShow, "Anzeigen"),
+        (AccessCancel, "Abbrechen"),
+        (AccessChecking, "Wird geprüft …"),
+        (AccessWrong, "Falsches Passwort."),
+        (AccessWait, "Zu viele Versuche. Erneut in {s} s."),
+        (AccessNewIdentity, "Das Gerät unter dieser Adresse hat eine neue Identität (ID {i})."),
+        (MsgRefused, "{n} hat die Verbindung abgelehnt."),
+        (MsgNoAnswer, "Keine Antwort von {n}. Bitte erneut versuchen."),
+        (MsgTooManyAttempts, "Zu viele Versuche. Bitte kurz warten und erneut versuchen."),
+        (MsgHostOutdated, "{n} verwendet eine ältere QuadChroma-Version. Bitte dort aktualisieren."),
+        (MsgHostProofBad, "{n} konnte das Passwort nicht bestätigen. Die Verbindung wurde sicherheitshalber beendet."),
+        (MsgOtherDevice, "An dieser Adresse antwortet ein anderes Gerät."),
+        (MsgIdNotFound, "Kein Gerät mit der ID {i} im Netz gefunden."),
+        (StartId, "ID {i}"),
+        (StartShare, "Diesen PC freigeben"),
+        (StartSharing, "Freigabe läuft"),
+        (HostReady, "Bereit für Verbindungen"),
+        (HostConnected, "Verbunden: {n}"),
+        (HostDeviceId, "Geräte-ID: {i}"),
+        (HostPassword, "Passwort: {p}"),
+        (HostCopied, "Kopiert"),
+        (HostChangePassword, "Passwort ändern …"),
+        (HostRandomPassword, "Neues Zufallspasswort"),
+        (HostNewPassword, "Neues Passwort (mindestens 8 Zeichen)"),
+        (HostRepeatPassword, "Passwort wiederholen"),
+        (HostPasswordsDiffer, "Die Passwörter stimmen nicht überein."),
+        (HostPasswordShort, "Bitte mindestens 8 Zeichen."),
+        (HostPasswordSaved, "Passwort gespeichert."),
+        (HostPasswordUnreadable, "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“."),
+        (HostDevices, "Erlaubte Geräte"),
+        (HostNoDevices, "Noch keine Geräte"),
+        (HostDeviceLine, "{n} – ID {i} – seit {d}"),
+        (HostRemove, "Entfernen"),
+        (HostRemoveAll, "Alle Geräte entfernen …"),
+        (HostRemoveAllAsk, "Alle erlaubten Geräte entfernen? Sie brauchen dann wieder das Passwort."),
+        (HostListDamaged, "Geräteliste beschädigt"),
+        (HostListReset, "Geräteliste zurücksetzen"),
+        (HostRequest, "{n} (ID {i}) möchte diesen Computer steuern."),
+        (HostAllow, "Zulassen"),
+        (HostDeny, "Ablehnen"),
+        (HostStartLogin, "Beim Anmelden starten"),
+        (HostStartWindows, "Mit Windows starten"),
+        (HostMoveToApps, "QuadChroma zuerst in den Ordner Programme bewegen"),
+        (HostScreenMissing, "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen …"),
+        (HostAccessMissing, "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen …"),
+        (HostPortBusy, "Port {p} ist von einem anderen Programm belegt"),
+        (HostQuit, "QuadChroma beenden"),
+        (HostStopSharing, "Freigabe beenden"),
+        (HostTooltip, "QuadChroma – Freigabe läuft (ID {i})"),
+        (HostOk, "OK"),
     ],
 };
 
@@ -745,8 +977,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > ScreenFallback as usize);
-        assert_eq!(n, ScreenFallback as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > HostOk as usize);
+        assert_eq!(n, HostOk as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Abbruchgruende der Datei-Zeile: in jeder Sprache vorhanden, ohne
@@ -879,6 +1111,149 @@ mod tests {
         for l in all() {
             let (k, t) = (l.get(DesktopShortcut).to_lowercase(), l.get(TabShortcuts).to_lowercase());
             assert!(!k.starts_with(&t) && !t.starts_with(&k), "{}: {k} / {t}", l.code);
+        }
+    }
+
+    /// Die Zugangstexte (Spezifikation Pairing v1, Abschnitt 14): am Ende des
+    /// Enums hinter der Bildschirmwahl, in jeder Tabelle, mit genau den
+    /// Platzhaltern, die der Aufrufer ersetzt, und keinem weiteren. EN und DE
+    /// wie vorgegeben, DE mit Umlauten und typografischen Zeichen. Die 27
+    /// weiteren Tabellen tragen bis Paket P6 den englischen Text.
+    #[test]
+    fn zugang_texte() {
+        let n: &[&str] = &["{n}"];
+        let i: &[&str] = &["{i}"];
+        let keiner: &[&str] = &[];
+        let alle: [(Key, &[&str]); 55] = [
+            (AccessTitle, n),
+            (AccessText, n),
+            (AccessOrAllow, n),
+            (AccessCode, &["{c}"]),
+            (AccessPassword, keiner),
+            (AccessShow, keiner),
+            (AccessCancel, keiner),
+            (AccessChecking, keiner),
+            (AccessWrong, keiner),
+            (AccessWait, &["{s}"]),
+            (AccessNewIdentity, i),
+            (MsgRefused, n),
+            (MsgNoAnswer, n),
+            (MsgTooManyAttempts, keiner),
+            (MsgHostOutdated, n),
+            (MsgHostProofBad, n),
+            (MsgOtherDevice, keiner),
+            (MsgIdNotFound, i),
+            (StartId, i),
+            (StartShare, keiner),
+            (StartSharing, keiner),
+            (HostReady, keiner),
+            (HostConnected, n),
+            (HostDeviceId, i),
+            (HostPassword, &["{p}"]),
+            (HostCopied, keiner),
+            (HostChangePassword, keiner),
+            (HostRandomPassword, keiner),
+            (HostNewPassword, keiner),
+            (HostRepeatPassword, keiner),
+            (HostPasswordsDiffer, keiner),
+            (HostPasswordShort, keiner),
+            (HostPasswordSaved, keiner),
+            (HostPasswordUnreadable, keiner),
+            (HostDevices, keiner),
+            (HostNoDevices, keiner),
+            (HostDeviceLine, &["{n}", "{i}", "{d}"]),
+            (HostRemove, keiner),
+            (HostRemoveAll, keiner),
+            (HostRemoveAllAsk, keiner),
+            (HostListDamaged, keiner),
+            (HostListReset, keiner),
+            (HostRequest, &["{n}", "{i}"]),
+            (HostAllow, keiner),
+            (HostDeny, keiner),
+            (HostStartLogin, keiner),
+            (HostStartWindows, keiner),
+            (HostMoveToApps, keiner),
+            (HostScreenMissing, keiner),
+            (HostAccessMissing, keiner),
+            (HostPortBusy, &["{p}"]),
+            (HostQuit, keiner),
+            (HostStopSharing, keiner),
+            (HostTooltip, i),
+            (HostOk, keiner),
+        ];
+        // Lueckenlos am Ende: so bleiben alle 29 Tabellen davor unveraendert.
+        assert_eq!(AccessTitle as usize, ScreenFallback as usize + 1);
+        for (nr, (k, _)) in alle.iter().enumerate() {
+            assert_eq!(*k as usize, AccessTitle as usize + nr, "{k:?}");
+        }
+        assert_eq!(HostOk as usize + 1, EN.table.len());
+        let bekannt = ["{n}", "{m}", "{i}", "{c}", "{s}", "{p}", "{d}"];
+        for l in all() {
+            for (k, soll) in &alle {
+                let t = l.get(*k);
+                assert!(!t.is_empty(), "{} {k:?}", l.code);
+                for p in bekannt {
+                    assert_eq!(t.contains(p), soll.contains(&p), "{} {k:?}: {p} in {t}", l.code);
+                }
+                // Keine Klammer ausser den erwarteten Platzhaltern.
+                let erwartet: usize = soll.iter().map(|p| t.matches(p).count()).sum();
+                assert_eq!(t.matches('{').count(), erwartet, "{} {k:?}: {t}", l.code);
+                assert_eq!(t.matches('}').count(), erwartet, "{} {k:?}: {t}", l.code);
+            }
+        }
+        // Eigene Worte je Sprache - ausser Code, ID und OK, die im Deutschen
+        // genauso heissen.
+        let gleich = [AccessCode, StartId, HostOk];
+        for (k, _) in &alle {
+            if gleich.contains(k) {
+                assert_eq!(EN.get(*k), DE.get(*k), "{k:?}");
+            } else {
+                assert_ne!(EN.get(*k), DE.get(*k), "{k:?}");
+            }
+        }
+        // Deutsch typografisch wie der Bestand: keine geraden Anfuehrungs-
+        // zeichen, kein " - " statt Gedankenstrich, kein "..." statt "…",
+        // keine Umschreibung von Umlauten.
+        for (k, _) in &alle {
+            let t = DE.get(*k);
+            assert!(!t.contains('"') && !t.contains(" - ") && !t.contains("..."), "{k:?}: {t}");
+            let umschrieben = [
+                "Geraet",
+                "fuer",
+                "Menue",
+                "geprueft",
+                "aender",
+                "oeffnen",
+                "ueber",
+                "laeuft",
+                "moechte",
+                "schaedigt",
+                "zurueck",
+                "aeltere",
+                "staetigen",
+                "Passwoerter",
+                "Identitaet",
+            ];
+            for w in umschrieben {
+                assert!(!t.contains(w), "{k:?}: {t}");
+            }
+        }
+        assert_eq!(EN.get(AccessOrAllow), "Or ask someone at {n} to click \"Allow\".");
+        assert_eq!(DE.get(AccessOrAllow), "Oder bitte jemanden an {n}, auf „Zulassen“ zu klicken.");
+        assert_eq!(
+            DE.get(AccessText),
+            "{n} kennt dieses Gerät noch nicht. Gib das Passwort ein, das im QuadChroma-Menü auf {n} steht."
+        );
+        assert_eq!(DE.get(HostDeviceLine), "{n} – ID {i} – seit {d}");
+        assert_eq!(DE.get(HostPasswordUnreadable), "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“.");
+        assert_eq!(DE.get(StartShare), "Diesen PC freigeben");
+        assert_eq!(EN.get(HostTooltip), "QuadChroma - sharing this PC (ID {i})");
+        // Bis P6: die uebrigen 27 Sprachen tragen den englischen Text (P6
+        // ersetzt diese Pruefung, sobald die Uebersetzungen stehen).
+        for l in all().iter().skip(2) {
+            for (k, _) in &alle {
+                assert_eq!(l.get(*k), EN.get(*k), "{} {k:?}", l.code);
+            }
         }
     }
 }
