@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"
+          xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <!-- quadchroma.manifest: Anwendungsmanifest der Windows-exe. Vorlage;
+       client/build.rs setzt @VERSION@ (aus Cargo.toml) und @ARCH@ (Ziel) ein
+       und bindet die Datei ueber res/quadchroma.rc als RT_MANIFEST 1 ein. -->
+  <assemblyIdentity type="win32" name="tech.quadchroma.quadchroma" version="@VERSION@" processorArchitecture="@ARCH@"/>
+  <description>QuadChroma</description>
+  <!-- Keine Rechteerhoehung; laeuft mit den Rechten des Aufrufers. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <!-- Fuer Windows 10 und 11 gebaut (eine GUID fuer beide). -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <!-- Per-Monitor-DPI v2 vom Start an; dasselbe, was winit (Client) und
+           host/mod.rs (dpi_bewusst) sonst per Aufruf setzen. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- Pfade laenger als 260 Zeichen, wenn das System sie freigibt. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!-- Prozess-Codepage UTF-8 (ab Windows 10 1903): die FFmpeg-DLLs und
+           ihre C-Laufzeit sehen dann UTF-8 in schmalen Zeichenketten. -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

@@ -256,6 +256,11 @@ mod protokoll {
 const COPYRIGHT: &str = "© 2026 Robert Brandt";
 /// Projektseite. Steht anklickbar neben der Urheberzeile.
 const WEBSITE: &str = "quadchroma.tech";
+/// FFmpeg-Hinweis (LGPL 2.1 Abschnitt 6 und Checkliste auf ffmpeg.org/legal):
+/// zeigt das Programm im Betrieb Urheberhinweise, gehoert der von FFmpeg
+/// dazu, samt Verweis auf den Lizenztext - THIRD_PARTY_NOTICES.md liegt
+/// jeder Weitergabe bei. Wie COPYRIGHT ein Rechtshinweis, nicht uebersetzt.
+const FFMPEG_HINWEIS: &str = "Uses libraries from the FFmpeg project under the LGPLv2.1 · THIRD_PARTY_NOTICES.md";
 
 /// Die Projektseite im Standardbrowser oeffnen. Wir starten nichts selbst,
 /// sondern reichen die Adresse an das System weiter - das ist der einzige Weg,
@@ -7321,19 +7326,26 @@ fn start_screen(
         }
     }
 
-    // Fussleiste: zwei Zeilen. Oben die Urheberzeile, darunter Version,
-    // Tastenhinweise und die Sprache zum Durchschalten.
+    // Fussleiste: Oben die Urheberzeile mit Projektseite und FFmpeg-Hinweis,
+    // darunter Version, Tastenhinweise und die Sprache zum Durchschalten.
+    // Passt die Urheberzeile nicht in eine Zeile, steht der FFmpeg-Hinweis
+    // in einer eigenen Zeile darunter, und die Trennlinie rueckt nach oben.
     let fy2 = c.h as i32 - 22;
-    c.hline(0, fy2 - 38, c.w as i32, ui::CYAN, 30);
-    // Urheberzeile und Projektseite nebeneinander, als Block mittig. Nur die
-    // Adresse ist anklickbar; sie oeffnet den Browser des Systems.
     {
         let cw = u.text.width(COPYRIGHT, 11, 2);
         let ww_ = u.text.width(WEBSITE, 11, 2);
+        let fw = u.text.width(FFMPEG_HINWEIS, 11, 2);
         let luecke = 22;
-        let gesamt = cw + luecke + ww_;
+        let einzeilig = cw + luecke + ww_ + luecke + fw <= c.w as i32 - 40;
+        let gesamt = cw + luecke + ww_ + if einzeilig { luecke + fw } else { 0 };
         let x0 = cx - gesamt / 2;
-        let wy = fy2 - 16;
+        let wy = if einzeilig { fy2 - 16 } else { fy2 - 31 };
+        c.hline(0, wy - 22, c.w as i32, ui::CYAN, 30);
+        if einzeilig {
+            u.text.draw(c, x0 + cw + luecke + ww_ + luecke, wy, FFMPEG_HINWEIS, 11, ui::DIM, 2);
+        } else {
+            u.text.draw_centered(c, cx, fy2 - 16, FFMPEG_HINWEIS, 11, ui::DIM, 2);
+        }
         u.text.draw(c, x0, wy, COPYRIGHT, 11, ui::DIM, 2);
         let wx = x0 + cw + luecke;
         let r = ui::Rect { x: wx - 6, y: wy - 12, w: ww_ + 12, h: 18 };

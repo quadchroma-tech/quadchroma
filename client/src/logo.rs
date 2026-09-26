@@ -1,12 +1,15 @@
-// Das Programmsymbol: im Programm gezeichnet, ohne Ressourcendatei und
-// ohne build.rs.
+// Das Programmsymbol: im Programm gezeichnet, ohne Bilddatei im Quelltext.
 //
 // Motiv: vier farbige Quadrate auf einer dunklen Kachel - "Quad Chroma",
 // vier Felder in den Farben der Oberflaeche (ui.rs). Gebraucht wird es
 //   - als Fenstersymbol (winit, Icon::from_rgba),
 //   - als .ico-Datei im Ablageordner des Clients, auf die jede
-//     Desktop-Verknuepfung zeigt (SetIconLocation) - die exe selbst hat kein
-//     eingebettetes Symbol, sonst zeigte die Verknuepfung das Standardsymbol,
+//     Desktop-Verknuepfung zeigt (SetIconLocation),
+//   - als eingebettetes Symbol der Windows-exe: res/quadchroma.ico im
+//     Repository sind dieselben Bytes (der Test ico_schreiben_res erzeugt die
+//     Datei, ico_res_gleich_logo wacht darueber), client/build.rs bindet sie
+//     ueber res/quadchroma.rc ein. Die Verknuepfung zeigt weiter auf die
+//     .ico im Ablageordner - das geht unabhaengig vom Symbol in der exe,
 //   - als Symbol im Infobereich (Windows, tray_win.rs) und - einfarbig als
 //     Vorlagenbild, siehe `vorlage` - in der Menueleiste des Macs
 //     (tray_mac.rs).
@@ -590,5 +593,41 @@ mod tests {
         // Ohne vorhandene Datei (und ohne Ordner) ist es ein Fehler.
         assert!(ico_schreiben_nach(&ordner.join("fehlt").join("quadchroma.ico")).is_err());
         let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// res/quadchroma.ico - das Symbol, das build.rs in die Windows-exe
+    /// einbettet - sind genau die Bytes, die das Programm zur Laufzeit als
+    /// .ico schreibt. Laufen beide auseinander, zeigen exe und Verknuepfung
+    /// verschiedene Symbole; dann ico_schreiben_res ausfuehren.
+    #[test]
+    fn ico_res_gleich_logo() {
+        let repo = include_bytes!("../res/quadchroma.ico");
+        let jetzt = ico(&ICO_GROESSEN);
+        // Kein assert_eq!: bei einer Abweichung gaebe es 280 KB Bytes aus.
+        assert!(
+            repo.as_slice() == jetzt.as_slice(),
+            "res/quadchroma.ico ({} Byte) weicht vom Logo ({} Byte) ab - neu erzeugen: \
+             QC_ICO_PFAD=res/quadchroma.ico cargo test --release ico_schreiben_res -- --ignored",
+            repo.len(),
+            jetzt.len()
+        );
+    }
+
+    /// res/quadchroma.ico neu erzeugen. Absichtlich uebersprungen (#[ignore]):
+    /// laeuft nur auf Wunsch und nur dann noetig, wenn sich Motiv, Farben
+    /// (ui.rs) oder ICO_GROESSEN geaendert haben - ico_res_gleich_logo meldet
+    /// das. Aufruf im Ordner client/ (Zielpfad relativ dazu oder absolut):
+    ///   PowerShell: $env:QC_ICO_PFAD = "res\quadchroma.ico"; cargo test --release ico_schreiben_res -- --ignored
+    ///   sh:         QC_ICO_PFAD=res/quadchroma.ico cargo test --release ico_schreiben_res -- --ignored
+    /// Die Datei danach mit ins Repository nehmen.
+    #[test]
+    #[ignore = "schreibt die .ico nach QC_ICO_PFAD; nur ausdruecklich aufrufen"]
+    fn ico_schreiben_res() {
+        let pfad = std::path::PathBuf::from(
+            std::env::var_os("QC_ICO_PFAD").expect("QC_ICO_PFAD (Zielpfad der .ico) ist nicht gesetzt"),
+        );
+        let daten = ico(&ICO_GROESSEN);
+        std::fs::write(&pfad, &daten).unwrap_or_else(|e| panic!("{}: {e}", pfad.display()));
+        println!("{} Byte -> {}", daten.len(), pfad.display());
     }
 }

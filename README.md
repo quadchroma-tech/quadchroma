@@ -53,9 +53,18 @@ Einzelnen beschreibt `BENUTZUNG.txt`.
 
 ### Windows-Client bauen
 
-Rust (MSVC), LLVM für bindgen und ein FFmpeg-9-Build unter LGPL als DLLs:
+Rust (MSVC), LLVM für bindgen und die FFmpeg-Bibliotheken aus
+`scripts/build-ffmpeg-windows.sh`: ein schlanker LGPL-Bau von FFmpeg 9.0.2 ohne jede
+Fremdbibliothek, per MinGW-w64 auf dem Mac (Homebrew: `mingw-w64`, `nasm`, `pkgconf`)
+oder unter Linux übersetzt. Das Skript lädt die FFmpeg-Quellen und die NVIDIA-Header,
+prüft ihre SHA-256 und legt DLLs, Header und Importbibliotheken in den angegebenen
+Ordner:
 
-    set FFMPEG_DIR=C:\pfad\zu\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0
+    scripts/build-ffmpeg-windows.sh ffmpeg-windows
+
+Den Ordner auf den Windows-Rechner kopieren, dann:
+
+    set FFMPEG_DIR=C:\pfad\zu\ffmpeg-windows
     set LIBCLANG_PATH=C:\Program Files\LLVM\bin
     cd client
     cargo build --release
@@ -65,9 +74,10 @@ C-Laufzeit statisch in die exe bindet — sonst bräuchte sie `VCRUNTIME140.dll`
 aus dem Visual C++ Redistributable. Eine gesetzte Umgebungsvariable `RUSTFLAGS`
 ersetzt diese Einstellung. Fehlt so die statische Laufzeit, bricht der Bau mit
 einem Hinweis ab.
-Neben die exe gehören `avcodec-63.dll`, `avformat-63.dll`, `avutil-61.dll` und
-`swresample-7.dll`; Voraussetzung ist Windows 10 oder 11 (64 Bit), eine
-Visual-C++-Laufzeit braucht es nicht.
+Neben die exe gehören `avcodec-63.dll` und `avutil-61.dll` (aus `ffmpeg-windows\bin`);
+Voraussetzung ist Windows 10 oder 11 (64 Bit), eine Visual-C++-Laufzeit braucht es
+nicht. Fertige FFmpeg-Builds aus dem Netz taugen nicht für die Weitergabe: die meisten
+binden Fremdbibliotheken ein, manche davon unter der GPL.
 
 ### Mac als Client (im Aufbau)
 
@@ -361,10 +371,11 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Nachbesserungen (Fenster der Windows-Host-Rolle 64 KiB, Fäden mit niedrigerer
   Priorität; der Mac-Client sendet unter der Dienstklasse „utility“, die Fristen
   und Schlaf deutlich dehnt – im Modell des Codes 20 MB in 4,1 statt 1,1 s)
-- Veröffentlichung: ein Lizenzpaket für die Binärdateien (GPL- und LGPL-Text, Hinweise
-  der Rust-Abhängigkeiten, der zu den DLLs passende FFmpeg-Quellstand samt
-  Bauangaben) und eine Lizenz für das Projekt selbst; Developer-ID-Signatur und
-  Notarisierung für den Mac-Host (heute ein lokales Zertifikat), eine Signatur der exe
+- Veröffentlichung: Lizenz, Hinweisdatei, Beitragsregeln und die Release-Abläufe liegen
+  bereit (Abschnitt „Lizenz und Veröffentlichung“). Es fehlen die Zertifikate
+  (Developer ID von Apple für Signatur und Notarisierung des Mac-Hosts, heute ein
+  lokales Zertifikat; eine Codesignatur für die exe), die GitHub-Organisation und der
+  erste Release; was dafür einmalig zu tun ist, steht in `RELEASING.md`
 - Die Kopplung hängt an der Adresse: `known_hosts.txt` merkt sich den Schlüssel je
   Adresse, und die Bekanntgabe im Netz ist nicht ausgewiesen. Meldet sich unter
   bekanntem Namen ein anderes Gerät von einer neuen Adresse, gilt es als Erstkontakt;
@@ -518,6 +529,40 @@ Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Net
 `quadchroma.exe --tray-selbsttest` (braucht eine Sitzung mit Explorer) bzw.
 `quadchroma --menueleiste-selbsttest` auf dem Mac, Rückgabe 0 oder 1.
 
+## Lizenz und Veröffentlichung
+
+Alle Rechtstexte und die Dateien für GitHub sind englisch:
+
+- `LICENSE.md` – PolyForm Strict License 1.0.0 im Wortlaut, dazu die Zusatzbedingungen
+  des Lizenzgebers: nur persönliche, nichtkommerzielle Nutzung (jede Nutzung in oder für
+  Unternehmen, Behörden und andere Organisationen ist kommerziell, auch intern), kein
+  Einbetten in andere Produkte, Geräte oder Dienste, keine Weitergabe, keine
+  Bearbeitung. Kommerzielle Lizenzen auf Anfrage an hello@quadchroma.tech.
+- `THIRD_PARTY_NOTICES.md` – alle Fremdanteile der verteilten Programme mit ihren
+  Lizenztexten: FFmpeg (LGPL 2.1, eigener Bau, Quellen und schriftliches Angebot),
+  die NVIDIA-Header, die Compiler-Laufzeit, die Rust-Crates je Ziel, Monocypher.
+- `CLA.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
+  `.github/` (Vorlagen für Issues und Pull Requests) – Beiträge nur mit der
+  Beitragsvereinbarung; sie räumt je Beitrag die Rechte ein, die eine spätere
+  Doppel-Lizenzierung braucht.
+- `README.en.md` – englische Übersicht für GitHub; dieses README und `BENUTZUNG.txt`
+  bleiben die vollständige deutsche Dokumentation.
+- `RELEASING.md` – Signieren und Veröffentlichen: was einmalig nötig ist (Apple
+  Developer Program und Developer-ID-Zertifikat; für Windows Azure Artifact Signing
+  oder ein Codesignatur-Zertifikat; die Secrets für GitHub), und wie ein Release lokal
+  (`make sign notarize staple dmg`, `scripts/sign-windows.ps1`) oder über
+  `.github/workflows/release.yml` läuft (Tag `vX.Y.Z` → Entwurf mit allen Paketen,
+  SHA256SUMS und den FFmpeg-Quellen).
+
+FFmpeg: Der Windows-Client nutzt Bibliotheken des FFmpeg-Projekts unter der LGPLv2.1,
+als eigene DLLs neben der exe. Sie entstehen mit `scripts/build-ffmpeg-windows.sh`
+aus dem unveränderten FFmpeg 9.0.2 ohne Fremdbibliotheken (vorher: ein fertiger Build,
+der über chromaprint GPL-Code enthielt und sich deshalb nicht weitergeben ließ).
+Der Startbildschirm nennt FFmpeg in der Fußzeile, wie es die LGPL verlangt, sobald ein
+Programm Urheberhinweise zeigt. Die exe trägt Versionsangaben, Symbol und Manifest
+(`client/build.rs`, `client/res/`), der Mac-Host die Bundle-Kennung
+`tech.quadchroma.host`.
+
 ## Aufbau
 
     host/        Mac: Aufnahme, Encoder, Netz, Eingaben, Ton, Zwischenablage, Dateien (dateien.m),
@@ -528,6 +573,8 @@ Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Net
                  Desktop-Verknüpfung (verknuepfung.rs), Programmsymbol (logo.rs);
                  dazu die Host-Rolle (client/src/host/: Aufnahme mit Bildschirmwahl, Encoder, Netz, Eingaben,
                  Ton, Zeigerform)
-    Makefile     baut und signiert das App-Bündel
+    Makefile     baut und signiert das App-Bündel; sign, notarize, staple, zip, dmg für die Weitergabe
+    scripts/     build-ffmpeg-windows.sh (FFmpeg für Windows), sign-windows.ps1 (Codesignatur der exe)
+    .github/     CI und Release (workflows/), Vorlagen für Issues und Pull Requests
 
 Der Host ist in C und Objective-C geschrieben, der Client in Rust.

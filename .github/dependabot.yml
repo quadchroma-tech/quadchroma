@@ -1,0 +1,13 @@
+# Dependabot: haelt die per Commit-SHA gepinnten GitHub Actions in
+# .github/workflows/*.yml aktuell (SHA und Tag-Kommentar in einem Pull Request).
+#
+# Absichtlich NUR github-actions: die Rust-Abhaengigkeiten (client/Cargo.lock)
+# werden von Hand gepflegt - keine neuen Crates, keine ungefragten Updates.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "ci"

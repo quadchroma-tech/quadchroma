@@ -1,0 +1,18 @@
+# Zeilenenden und Binaerdateien.
+#
+# Textdateien liegen im Repository mit LF; beim Auschecken bekommt jede Plattform
+# ihre eigenen Zeilenenden (text=auto). PowerShell- und Batch-Dateien werden
+# ueberall mit CRLF ausgecheckt, damit sie auf der Bau-VM so aussehen, wie
+# Windows sie erwartet. Bilder, Symbole und Mitschnitte sind binaer - keine
+# Umwandlung, kein Diff.
+* text=auto
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.ico binary
+*.icns binary
+*.bmp binary
+*.hevc binary

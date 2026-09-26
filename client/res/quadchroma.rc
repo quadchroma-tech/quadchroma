@@ -1,0 +1,59 @@
+// quadchroma.rc - Versionsinfo, Programmsymbol und Anwendungsmanifest der
+// Windows-exe. client/build.rs uebersetzt die Datei mit rc.exe (Windows SDK)
+// oder llvm-rc; die Zahlen und der Manifest-Pfad stehen in
+// quadchroma_version.h, das build.rs aus Cargo.toml nach OUT_DIR schreibt
+// (eingebunden ueber /I).
+#pragma code_page(65001)
+#include "quadchroma_version.h"
+
+// Konstanten aus winver.h/winresrc.h, hier selbst definiert: so braucht die
+// Datei keinen SDK-Include-Pfad (INCLUDE) und geht auch mit llvm-rc.
+#define VS_VERSION_INFO                    1
+#define VS_FFI_FILEFLAGSMASK               0x3F
+#define VOS_NT_WINDOWS32                   0x40004
+#define VFT_APP                            0x1
+#define VFT2_UNKNOWN                       0x0
+#define RT_MANIFEST                        24
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+
+// Das Programmsymbol: der Explorer zeigt die ICON-Ressource mit der
+// kleinsten ID. Dieselbe .ico, die logo.rs zur Laufzeit schreibt
+// (logo::ico(&ICO_GROESSEN)); res/quadchroma.ico ist daraus erzeugt.
+1 ICON "quadchroma.ico"
+
+// Anwendungsmanifest (asInvoker, Per-Monitor-DPI v2, lange Pfade, UTF-8,
+// Windows 10/11); build.rs fuellt die Vorlage res/quadchroma.manifest.
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST QC_MANIFEST_PFAD
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     QC_VERSION_ZAHLEN
+PRODUCTVERSION  QC_VERSION_ZAHLEN
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0x0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = Englisch (USA), 04B0 = Unicode (1200)
+        BLOCK "040904B0"
+        BEGIN
+            // FileDescription ist der Name, den Task-Manager, Firewall- und
+            // SmartScreen-Dialoge zeigen - deshalb kurz.
+            VALUE "CompanyName",      "Robert Brandt"
+            VALUE "FileDescription",  "QuadChroma"
+            VALUE "FileVersion",      QC_VERSION_TEXT
+            VALUE "InternalName",     "quadchroma"
+            VALUE "LegalCopyright",   "© 2026 Robert Brandt"
+            VALUE "OriginalFilename", "quadchroma.exe"
+            VALUE "ProductName",      "QuadChroma"
+            VALUE "ProductVersion",   QC_VERSION_TEXT
+            VALUE "Comments",         "QuadChroma remote desktop (HEVC 4:4:4) - https://quadchroma.tech"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
