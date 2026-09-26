@@ -11,14 +11,21 @@
 // Kanaele, Fenster, Umlaute im Protokoll, Zuschauerwechsel mitten in der
 // Uebertragung, Sitzungsbindung des Wegs, Zuschauer ohne Eingabekanal,
 // aelterer Client ohne IN_FAEHIGKEITEN, Faehigkeit nur fuer den Eingabekanal,
-// der sie gemeldet hat).
+// der sie gemeldet hat), Bildschirmwahl (Pruefvektoren der Nachrichten 12 und
+// 70, Kuerzen, reine Wahl, Stromgroesse, bildschirm.txt, --display als Pin,
+// Begruessung mit Faehigkeiten 3 und Liste, Automatik folgt dem
+// Hauptbildschirm entprellt, Wunsch ueber den echten Eingabekanal, fehlender
+// Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
+// Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
+// 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
+// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
 //         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
 //         -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
 //         host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
-//         host/dateien.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+//         host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
 //         host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 //   /tmp/hosttest
 //
@@ -40,7 +47,7 @@
 // Dateien: die Ablagebasis liegt im eigenen HOME, und statt
 // qc_clip_set_dateien bekommt ein Rekorder die fertigen Pfade - die
 // Zwischenablage des Nutzers bleibt unberuehrt.
-// Dauer rund 80 s. Rueckgabe: Zahl der Fehler.
+// Dauer rund 100 s. Rueckgabe: Zahl der Fehler.
 
 #define main host_main
 #include "main.m"
@@ -923,10 +930,11 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
 // --------------------------------------------- Zuschauerwechsel, Abbau
 
 // Attrappe fuer einen laufenden Strom: ScreenCaptureKit gehoert nicht in den
-// Pruefstand. Anhalten und Umstellen melden sofort Erfolg.
+// Pruefstand. Starten, Anhalten und Umstellen melden sofort Erfolg.
 @interface FakeStrom : SCStream
 @end
 @implementation FakeStrom
+- (void)startCaptureWithCompletionHandler:(void (^)(NSError *))h { if (h) h(nil); }
 - (void)stopCaptureWithCompletionHandler:(void (^)(NSError *))h { if (h) h(nil); }
 - (void)updateConfiguration:(SCStreamConfiguration *)c completionHandler:(void (^)(NSError *))h { if (h) h(nil); }
 @end
@@ -1771,12 +1779,21 @@ static int eingabe_weg(void) { return atomic_load(&g_in_fd) < 0; }
 static int empfang_ruht(void) { return qc_empfang_ordner() == nil; }
 static int sender_ruht(void) { return !qc_senden_laeuft(); }
 
-// Ein Zuschauer mit Bild- und Eingabekanal ueber die echte Annahme.
-typedef struct { int bild, ein; leser l; qc_cipher tx; uint8_t hh[QC_HASHLEN]; char folge[64]; } schein;
+// Ein Zuschauer mit Bild- und Eingabekanal ueber die echte Annahme. liste:
+// die Bildschirmliste (12) aus der Begruessung.
+typedef struct {
+    int bild, ein; leser l; qc_cipher tx; uint8_t hh[QC_HASHLEN]; char folge[64];
+    uint8_t liste[QC_BILDSCHIRM_LISTE_MAX]; size_t liste_n;
+} schein;
+
+// Vor dem Verbinden einen Strom vortaeuschen (dann laeuft stream_hochfahren_sync
+// nicht) - der Abschnitt Bildschirm schaltet das ab und laesst den echten
+// Aufnahmestart mit seinen Attrappen laufen.
+static int g_schein_attrappe = 1;
 
 static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_t priv[32]) {
     memset(s, 0, sizeof *s);
-    strom_attrappe_setzen();
+    if (g_schein_attrappe) strom_attrappe_setzen();
     qc_cipher rx;
     s->bild = client_verbinden(bild_port, priv, &rx, s->hh);
     s->ein = -1;
@@ -1785,7 +1802,8 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
     s->l.rx = rx;
     char magic[4];
     if (klartext(&s->l, magic, 4, 2000) != 1) return -1;
-    // Was nach der Begruessung kommt, bis einschliesslich der Faehigkeiten.
+    // Was nach der Begruessung kommt, bis einschliesslich der Bildschirmliste;
+    // die Faehigkeiten davor muessen genau 3 sein (Dateien und Bildschirmwahl).
     qc_hdr h;
     NSData *d = nil;
     size_t n = 0;
@@ -1793,10 +1811,16 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
         n += (size_t)snprintf(s->folge + n, sizeof s->folge - n, "%s%d", n ? " " : "", h.type);
         if (h.type == QC_MSG_FAEHIGKEITEN) {
             uint32_t bits = 0;
-            if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 || bits != 1) return -1;
+            if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 || bits != 3) return -1;
+        }
+        if (h.type == QC_MSG_BILDSCHIRME) {
+            if (d.length > sizeof s->liste) return -1;
+            memcpy(s->liste, d.bytes, d.length);
+            s->liste_n = d.length;
             break;
         }
     }
+    if (!s->liste_n) return -1;
     s->ein = eingabe_verbinden(ein_port, priv, s->hh, &s->tx);
     if (s->ein < 0 || !warten_bis(eingabe_steht, 2)) return -1;
     return 0;
@@ -1957,7 +1981,7 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     int nachher = warten_bis(faehig_jetzt, 1);
     stdout_stumm(0);
     printf("         (nach der Begruessung: %s)\n", F.folge);
-    pruefe(ok && strstr(F.folge, "3 8 11"), "MSG_FAEHIGKEITEN (11) mit Bit 0 kommt nach Einstellungen und Codecliste");
+    pruefe(ok && strstr(F.folge, "3 8 11 12"), "MSG_FAEHIGKEITEN (11) mit Bit 0 und 1 kommt nach Einstellungen und Codecliste, dann die Bildschirmliste (12)");
     pruefe(!vorher && nachher, "IN_FAEHIGKEITEN wird fuer diese Sitzung und diesen Eingabekanal gemerkt");
 
     printf("\n-- Dateien: Client -> Host ueber die echten Kanaele\n");
@@ -2170,6 +2194,749 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     pthread_mutex_unlock(&g_log_mtx);
 }
 
+// --------------------------------------------------------------- Bildschirm
+//
+// Bildschirmwahl und Umschalten (Spezifikation 3.2). Die Liste kommt aus einer
+// Attrappe statt von ScreenCaptureKit, der Strom aus einer Fabrik, die eine
+// FakeStrom liefert; Encoder, Annahme, Begruessung, Eingabekanal und der Weg
+// ueber g_lifeq/g_capq sind die des Hosts. Bilder kommen wie beim
+// Codecwechsel ueber den Grabber.
+
+static NSArray<QCBildschirm *> *g_test_liste = nil;
+static NSArray<QCBildschirm *> *test_liste(void) { return g_test_liste ?: @[]; }
+
+static _Atomic int g_fabrik_aufrufe = 0;
+static _Atomic CGDirectDisplayID g_fabrik_zuletzt = 0;
+static _Atomic long g_fabrik_cfg_w = 0, g_fabrik_cfg_h = 0;
+static SCStream *test_fabrik(QCBildschirm *b, SCStreamConfiguration *cfg, id grab, dispatch_queue_t q, NSString **fehler) {
+    (void)grab; (void)q; (void)fehler;
+    atomic_fetch_add(&g_fabrik_aufrufe, 1);
+    atomic_store(&g_fabrik_zuletzt, b.displayID);
+    atomic_store(&g_fabrik_cfg_w, (long)cfg.width);
+    atomic_store(&g_fabrik_cfg_h, (long)cfg.height);
+    FakeStrom *fs = [FakeStrom alloc];
+    [g_attrappen addObject:fs];
+    return fs;
+}
+
+static QCBildschirm *bs(NSString *k, NSString *n, CGDirectDisplayID id_, size_t w, size_t h, double hz, BOOL haupt) {
+    return [QCBildschirm kennung:k name:n displayID:id_ w:w h:h hz:hz haupt:haupt];
+}
+
+// Die Liste der Attrappe tauschen, auf g_lifeq - dort liest sie der Lieferant.
+static void liste_setzen(NSArray<QCBildschirm *> *l) {
+    dispatch_sync(g_lifeq, ^{ g_test_liste = l; });
+}
+
+static NSData *hex(const char *s) {
+    NSMutableData *d = [NSMutableData data];
+    for (const char *p = s; *p;) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        unsigned v = 0;
+        sscanf(p, "%2x", &v);
+        uint8_t b = (uint8_t)v;
+        [d appendBytes:&b length:1];
+        p += 2;
+    }
+    return d;
+}
+
+static NSString *zeichen_mal(NSString *s, int n) {
+    return [@"" stringByPaddingToLength:(NSUInteger)n * s.length withString:s startingAtIndex:0];
+}
+
+// Ein Eintrag der Liste (12), wie der Client ihn liest.
+typedef struct { char kennung[65]; char name[49]; uint16_t w, h, hz; uint8_t flags; } eintrag;
+
+// Liest die Liste: Wunsch nach *wunsch, Eintrag idx nach *e. Rueckgabe: die
+// Zahl der Eintraege, -1 = kaputt.
+static int liste_lesen(const uint8_t *p, size_t n, char *wunsch, int idx, eintrag *e) {
+    if (n < 4 || p[0] != QC_BILDSCHIRM_FASSUNG) return -1;
+    size_t anzahl = p[1], wl = p[2], o = 4;
+    if (o + wl > n) return -1;
+    if (wunsch) { memcpy(wunsch, p + o, wl); wunsch[wl] = 0; }
+    o += wl;
+    for (size_t i = 0; i < anzahl; i++) {
+        if (o + 10 > n) return -1;
+        size_t kl = p[o], nl = p[o + 1];
+        if (o + 10 + kl + nl > n || kl > 64 || nl > 48) return -1;
+        if ((int)i == idx && e) {
+            memcpy(&e->w, p + o + 2, 2); memcpy(&e->h, p + o + 4, 2); memcpy(&e->hz, p + o + 6, 2);
+            e->flags = p[o + 8];
+            memcpy(e->kennung, p + o + 10, kl); e->kennung[kl] = 0;
+            memcpy(e->name, p + o + 10 + kl, nl); e->name[nl] = 0;
+        }
+        o += 10 + kl + nl;
+    }
+    return o == n ? (int)anzahl : -1;
+}
+
+// Alles, was in frist_ms beim Zuschauer ankommt: Typfolge (ohne Stempel),
+// die letzte Liste, die letzte Strominfo, Wechselansagen, Bilder, Hoststatus.
+typedef struct {
+    char folge[256]; uint8_t liste[QC_BILDSCHIRM_LISTE_MAX]; size_t liste_n; uint8_t info[8]; int infos;
+    int wechsel; uint8_t wechsel_codec; int bilder, voll, erstes_voll; int status, statusse;
+} gelesen;
+
+static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
+    memset(g, 0, sizeof *g);
+    g->erstes_voll = -1;
+    g->status = -1;
+    qc_hdr h;
+    NSData *d = nil;
+    size_t n = 0;
+    while (nachricht_ganz(&s->l, &h, &d, frist_ms) == 1) {
+        if (h.type != QC_MSG_STAMP && n + 6 < sizeof g->folge)
+            n += (size_t)snprintf(g->folge + n, sizeof g->folge - n, "%s%d", n ? " " : "", h.type);
+        switch (h.type) {
+            case QC_MSG_BILDSCHIRME:
+                g->liste_n = d.length < sizeof g->liste ? d.length : sizeof g->liste;
+                memcpy(g->liste, d.bytes, g->liste_n);
+                break;
+            case QC_MSG_INFO: if (d.length >= 8) memcpy(g->info, d.bytes, 8); g->infos++; break;
+            case QC_MSG_SWITCH: g->wechsel++; if (d.length) g->wechsel_codec = ((const uint8_t *)d.bytes)[0]; break;
+            case QC_MSG_VIDEO: {
+                int key = (h.flags & QC_FLAG_KEY) ? 1 : 0;
+                if (g->bilder == 0) g->erstes_voll = key;
+                g->bilder++;
+                g->voll += key;
+                break;
+            }
+            case QC_MSG_HOSTSTATUS: if (d.length) g->status = ((const uint8_t *)d.bytes)[0]; g->statusse++; break;
+            default: break;
+        }
+    }
+}
+
+static uint16_t info_w(const gelesen *g) { uint16_t v; memcpy(&v, g->info, 2); return v; }
+static uint16_t info_h(const gelesen *g) { uint16_t v; memcpy(&v, g->info + 2, 2); return v; }
+
+// Wie oft der Typ in der Folge steht (die Folge sind Zahlen mit Leerzeichen).
+static int typen_zaehlen(const char *folge, int typ) {
+    int n = 0;
+    for (const char *p = folge; *p;) {
+        char *ende = NULL;
+        long t = strtol(p, &ende, 10);
+        if (ende == p) break;
+        if (t == typ) n++;
+        p = ende;
+        while (*p == ' ') p++;
+    }
+    return n;
+}
+
+static uint64_t wartet_seit_jetzt(void) {
+    __block uint64_t seit = 0;
+    dispatch_sync(g_lifeq, ^{ seit = g_bildschirm_wartet_seit; });
+    return seit;
+}
+
+// Ein Bild der Aufnahme in den Grabber des Hosts, wie ScreenCaptureKit.
+static void bild_einspeisen(CVPixelBufferRef pb) {
+    CMSampleBufferRef sb = aufnahme_bild(pb, uhr());
+    SCStream *fs = strom_jetzt();
+    dispatch_sync(g_capq, ^{ [g_grab stream:fs didOutputSampleBuffer:sb ofType:SCStreamOutputTypeScreen]; });
+    CFRelease(sb);
+}
+
+static CGDirectDisplayID display_jetzt(void) {
+    __block CGDirectDisplayID d = 0;
+    dispatch_sync(g_lifeq, ^{ d = g_display_id; });
+    return d;
+}
+
+static NSString *wunsch_jetzt(void) {
+    __block NSString *w = nil;
+    dispatch_sync(g_lifeq, ^{ w = g_display_wunsch; });
+    return w;
+}
+
+static VTCompressionSessionRef session_jetzt(void) {
+    __block VTCompressionSessionRef s = NULL;
+    dispatch_sync(g_capq, ^{ s = g_session; });
+    return s;
+}
+
+static int letztes_bild_da(void) {
+    __block int da = 0;
+    dispatch_sync(g_capq, ^{ da = g_last_pb != NULL; });
+    return da;
+}
+
+// Der Stand fuer die Ausgabe: Fabrikaufrufe, zuletzt gebauter Bildschirm,
+// gestreamter Bildschirm, Maus, Stromgroesse.
+static void stand_zeile(const char *was) {
+    printf("         (%s: Fabrik %d Aufruf(e), zuletzt Kennung %u, gestreamt Kennung %u, Maus auf %u, Strom %dx%d, g_cfg %ldx%ld)\n",
+           was, atomic_load(&g_fabrik_aufrufe), atomic_load(&g_fabrik_zuletzt), display_jetzt(), atomic_load(&g_input_display),
+           g_info_w, g_info_h, atomic_load(&g_fabrik_cfg_w), atomic_load(&g_fabrik_cfg_h));
+}
+
+static NSString *datei_inhalt(const char *pfad) {
+    NSData *d = [NSData dataWithContentsOfFile:@(pfad)];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"(kein UTF-8)" : nil;
+}
+
+static void datei_schreiben(const char *pfad, const void *p, size_t n) {
+    FILE *f = fopen(pfad, "wb");
+    if (!f) return;
+    fwrite(p, 1, n, f);
+    fclose(f);
+}
+
+static void bildschirm_pruefen(int bild_port, int ein_port) {
+    printf("\n-- Bildschirm: Pruefvektoren (2.4), Kuerzen, Wahl, Stromgroesse\n");
+    QCBildschirm *A = bs(@"v1138-m1234-s0", @"X27 X1", 2, 1920, 1080, 120, YES);
+    QCBildschirm *B = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 1920, 1080, 240, NO);
+    NSArray *zwei = @[ A, B ];
+    NSData *soll = hex("01 02 00 00 "
+                       "0e 06 80 07 38 04 78 00 03 00 76 31 31 33 38 2d 6d 31 32 33 34 2d 73 30 58 32 37 20 58 31 "
+                       "08 0d 80 07 38 04 f0 00 00 00 76 30 2d 6d 30 2d 73 30 56 69 72 74 75 65 6c 6c 20 31 36 3a 39");
+    pruefe([qc_bildschirme_kodieren(zwei, nil, 2) isEqualToData:soll],
+           "Liste mit Automatik, X27 X1 (Haupt, gestreamt) und Virtuell 16:9: die Bytes der Spezifikation");
+    pruefe([qc_bildschirm_wunsch_kodieren(@"v0-m0-s0") isEqualToData:hex("08 76 30 2d 6d 30 2d 73 30")] &&
+           [qc_bildschirm_wunsch_kodieren(nil) isEqualToData:hex("00")],
+           "Wunsch v0-m0-s0 und Automatik: die Bytes der Spezifikation");
+    NSString *k = @"x";
+    uint8_t w1[] = { 8, 'v', '0', '-', 'm', '0', '-', 's', '0' };
+    uint8_t w0[] = { 0 };
+    int r1 = qc_bildschirm_wunsch_lesen(w1, sizeof w1, &k);
+    int ok1 = r1 == 0 && [k isEqualToString:@"v0-m0-s0"];
+    k = @"x";
+    int ok0 = qc_bildschirm_wunsch_lesen(w0, 1, &k) == 0 && k == nil;
+    // Ein Byte mehr als angesagt wird uebergangen (wie im Rust-Kern).
+    uint8_t w_mehr[] = { 2, 'a', 'b', 'c' };
+    int ok_mehr = qc_bildschirm_wunsch_lesen(w_mehr, sizeof w_mehr, &k) == 0 && [k isEqualToString:@"ab"];
+    pruefe(ok1 && ok0 && ok_mehr, "Wunsch lesen: v0-m0-s0, 00 = Automatik, Nachlauf hinter der Laenge wird uebergangen");
+    uint8_t w_kurz[] = { 5, 'a' }, w_steuer[] = { 2, 'a', '\n' }, w_utf[] = { 2, 0xff, 0xfe }, w_c1[] = { 3, 'a', 0xc2, 0x85 };
+    uint8_t w_lang[66];
+    memset(w_lang, 'k', sizeof w_lang);
+    w_lang[0] = 65;
+    pruefe(qc_bildschirm_wunsch_lesen(w_kurz, sizeof w_kurz, &k) < 0 && qc_bildschirm_wunsch_lesen(w_steuer, sizeof w_steuer, &k) < 0 &&
+           qc_bildschirm_wunsch_lesen(w_utf, sizeof w_utf, &k) < 0 && qc_bildschirm_wunsch_lesen(w_c1, sizeof w_c1, &k) < 0 &&
+           qc_bildschirm_wunsch_lesen(w_lang, sizeof w_lang, &k) < 0 && qc_bildschirm_wunsch_lesen(NULL, 0, &k) < 0,
+           "Wunsch lesen: Laenge ueber dem Rest, Zeilenumbruch, kein UTF-8, U+0085, 65 Byte, leer -> ungueltig");
+
+    // Kuerzen an Zeichengrenzen, Steuerzeichen weg, leere Kennung "?", 16 Eintraege.
+    NSMutableArray *viele = [NSMutableArray array];
+    [viele addObject:bs(zeichen_mal(@"ä", 40), zeichen_mal(@"ü", 30), 2, 1920, 1080, 119.88, YES)];   // 80 bzw. 60 Byte
+    [viele addObject:bs(@"a\tb", @"Büro – Monitor ä", 6, 70000, 1080, 0, NO)];
+    for (int i = 0; i < 20; i++) [viele addObject:bs(@"\x01", @"x", (CGDirectDisplayID)(100 + i), 800, 600, 60, NO)];
+    NSData *lang = qc_bildschirme_kodieren(viele, zeichen_mal(@"x", 100), 6);
+    char wunsch[65] = {0};
+    eintrag e0, e1, e2;
+    int anzahl = liste_lesen(lang.bytes, lang.length, wunsch, 0, &e0);
+    liste_lesen(lang.bytes, lang.length, NULL, 1, &e1);
+    liste_lesen(lang.bytes, lang.length, NULL, 2, &e2);
+    printf("         (Liste mit 22 Eintraegen: %d kodiert, %zu Byte, Wunsch %zu Byte, Kennung 0 %zu Byte, Name 0 %zu Byte)\n",
+           anzahl, lang.length, strlen(wunsch), strlen(e0.kennung), strlen(e0.name));
+    pruefe(anzahl == 16 && strlen(wunsch) == 64 && lang.length <= QC_BILDSCHIRM_LISTE_MAX,
+           "hoechstens 16 Eintraege, der Wunsch auf 64 Byte gekuerzt, nie ueber der Hoechstlaenge");
+    pruefe([@(e0.kennung) isEqualToString:zeichen_mal(@"ä", 32)] && [@(e0.name) isEqualToString:zeichen_mal(@"ü", 24)] &&
+           e0.hz == 120 && e0.flags == QC_BILDSCHIRM_FLAG_HAUPT,
+           "Kennung auf 64 und Name auf 48 Byte an Zeichengrenzen gekuerzt (32 bzw. 24 Umlaute), 119,88 Hz -> 120");
+    pruefe(strcmp(e1.kennung, "ab") == 0 && [@(e1.name) isEqualToString:@"Büro – Monitor ä"] && e1.w == 65535 && e1.hz == 0 &&
+           e1.flags == QC_BILDSCHIRM_FLAG_GESTREAMT && strcmp(e2.kennung, "?") == 0,
+           "Steuerzeichen fallen weg, Umlaute bleiben, Breite gedeckelt, gestreamt an der displayID, leere Kennung wird \"?\"");
+    pruefe(liste_lesen(soll.bytes, soll.length - 1, NULL, -1, NULL) < 0 && liste_lesen(soll.bytes, 3, NULL, -1, NULL) < 0,
+           "Gegenprobe des Lesers: eine abgeschnittene Liste ist kaputt");
+
+    int grund = -1;
+    NSArray *ohne_haupt = @[ bs(@"a", @"A", 1, 800, 600, 60, NO), bs(@"b", @"B", 2, 800, 600, 60, NO) ];
+    pruefe(qc_bildschirm_wahl(zwei, nil, &grund) == A && grund == QC_WAHL_HAUPT, "Wahl: Automatik nimmt den Hauptbildschirm");
+    pruefe(qc_bildschirm_wahl(zwei, @"v0-m0-s0", &grund) == B && grund == QC_WAHL_WUNSCH, "Wahl: der Wunsch, wenn er da ist");
+    pruefe(qc_bildschirm_wahl(zwei, @"v9-m9-s9", &grund) == A && grund == QC_WAHL_HAUPT, "Wahl: Wunsch nicht da -> Hauptbildschirm als Ausweichplatz");
+    pruefe(qc_bildschirm_wahl(ohne_haupt, nil, &grund) == ohne_haupt[0] && grund == QC_WAHL_ERSTER, "Wahl: ohne Hauptbildschirm der erste");
+    pruefe(qc_bildschirm_wahl(@[], @"a", &grund) == nil && grund == QC_WAHL_KEINER, "Wahl: leere Liste -> keiner");
+    pruefe([qc_bildschirm_kennung(1138, 1234, 0) isEqualToString:@"v1138-m1234-s0"], "Kennung aus Vendor, Model, Serial");
+
+    int sw = 0, sh = 0;
+    g_out_fest_w = g_out_fest_h = 0;
+    stromgroesse_fuer(bs(@"k", @"4K", 1, 3840, 2160, 60, NO), &sw, &sh);
+    int ok_4k = sw == 1920 && sh == 1080;
+    stromgroesse_fuer(bs(@"k", @"breit", 1, 3840, 1080, 60, NO), &sw, &sh);
+    int ok_breit = sw == 1920 && sh == 1080;
+    stromgroesse_fuer(bs(@"k", @"ungerade", 1, 1921, 1081, 60, NO), &sw, &sh);
+    int ok_gerade = sw == 1920 && sh == 1080;
+    g_out_fest_w = 640; g_out_fest_h = 360;
+    stromgroesse_fuer(bs(@"k", @"4K", 1, 3840, 2160, 60, NO), &sw, &sh);
+    int ok_out = sw == 640 && sh == 360;
+    g_out_fest_w = g_out_fest_h = 0;
+    pruefe(ok_4k && ok_breit && ok_gerade && ok_out, "Stromgroesse: ab 3840 bzw. 2160 halbiert, gerade, --out hat Vorrang");
+
+    printf("\n-- Bildschirm: bildschirm.txt\n");
+    char pfad[1200];
+    qc_config_path("bildschirm.txt", pfad, sizeof pfad);
+    unlink(pfad);
+    NSString *w = @"x";
+    pruefe(qc_bildschirm_wunsch_laden(&w) == 1 && w == nil, "ohne Datei: Automatik (1)");
+    w = @"x";
+    pruefe(qc_bildschirm_wunsch_speichern(@"v0-m0-s0") == 0 && [datei_inhalt(pfad) isEqualToString:@"v0-m0-s0\n"] &&
+           qc_bildschirm_wunsch_laden(&w) == 0 && [w isEqualToString:@"v0-m0-s0"],
+           "Wunsch gespeichert (eine Zeile) und wieder gelesen");
+    w = @"x";
+    pruefe(qc_bildschirm_wunsch_speichern(nil) == 0 && [datei_inhalt(pfad) isEqualToString:@"auto\n"] &&
+           qc_bildschirm_wunsch_laden(&w) == 0 && w == nil, "Automatik als \"auto\"");
+    datei_schreiben(pfad, "v1-m2-s3\r\n", 10);
+    w = nil;
+    pruefe(qc_bildschirm_wunsch_laden(&w) == 0 && [w isEqualToString:@"v1-m2-s3"], "Zeilenende mit \\r\\n wird toleriert");
+    struct { const char *inhalt; size_t n; const char *was; } kaputt[] = {
+        { "", 0, "leer" },
+        { "ab\x01" "c\n", 5, "Steuerzeichen" },
+        { "a\nb\n", 4, "zwei Zeilen" },
+        { "\xff\xfe\n", 3, "kein UTF-8" },
+    };
+    int alle_kaputt = 1;
+    for (size_t i = 0; i < sizeof kaputt / sizeof kaputt[0]; i++) {
+        datei_schreiben(pfad, kaputt[i].inhalt, kaputt[i].n);
+        w = @"x";
+        int r = qc_bildschirm_wunsch_laden(&w);
+        NSData *danach = [NSData dataWithContentsOfFile:@(pfad)];
+        int unveraendert = danach.length == kaputt[i].n && memcmp(danach.bytes, kaputt[i].inhalt, kaputt[i].n) == 0;
+        if (r != -1 || w != nil || !unveraendert) { alle_kaputt = 0; printf("         (%s: Rueckgabe %d)\n", kaputt[i].was, r); }
+    }
+    char lang100[102];
+    memset(lang100, 'k', 100);
+    lang100[100] = '\n';
+    datei_schreiben(pfad, lang100, 101);
+    w = @"x";
+    int r_lang = qc_bildschirm_wunsch_laden(&w);
+    pruefe(alle_kaputt && r_lang == -1 && w == nil, "kaputte Datei (leer, Steuerzeichen, zwei Zeilen, kein UTF-8, 100 Byte): -1, Automatik, Datei bleibt");
+    unlink(pfad);
+
+    printf("\n-- Bildschirm: Aufnahmestart und Begruessung (Attrappen fuer Liste und Strom, echter Encoder 1920x1080)\n");
+    static char logpfad[1100];
+    snprintf(logpfad, sizeof logpfad, "%s/bildschirm.log", g_home);
+    g_log_pfad = logpfad;
+    pthread_mutex_lock(&g_log_mtx);
+    log_oeffnen("w");
+    pthread_mutex_unlock(&g_log_mtx);
+    qc_bildschirm_liste_setzen(test_liste);
+    qc_strom_fabrik_setzen(test_fabrik);
+    // Die Strom-Attrappe eines frueheren Abschnitts liegt womoeglich noch in
+    // g_stream - dann saehe die Bewertung einen laufenden Strom und wechselte.
+    stdout_stumm(1);
+    stream_herunterfahren_anstossen();
+    SCStream *rest = strom_jetzt();
+    stdout_stumm(0);
+    pruefe(rest == nil, "vorher: kein Strom (die Attrappe des vorigen Abschnitts ist abgebaut)");
+    liste_setzen(@[ A, B ]);
+    atomic_store(&g_codec_id, 3);
+    g_info_w = 0; g_info_h = 0; g_info_fps = 60;
+    atomic_store(&g_cur_fps, 60);
+    atomic_store(&g_cur_mbit, 10);
+    atomic_store(&g_cur_fixed, 0);
+    atomic_store(&g_fixed_gewollt, 0);
+    atomic_store(&g_cur_gaming, 0);
+    atomic_store(&g_testbild, 0);
+    g_cfg = [[SCStreamConfiguration alloc] init];
+    g_grab = [[Grabber alloc] init];
+    dispatch_sync(g_lifeq, ^{ g_display_wunsch = nil; g_display_id = 0; g_display_aktuell = nil; g_bildschirme = nil; g_display_pin = -1; });
+    atomic_store(&g_fabrik_aufrufe, 0);
+
+    // --display N: nach der ersten Wahl wird der Listenplatz zum Wunsch fuer
+    // diesen Lauf; bildschirm.txt bleibt unberuehrt. Ausser Bereich: Zeile, Automatik.
+    stdout_stumm(1);
+    dispatch_sync(g_lifeq, ^{ g_display_pin = 1; bildschirm_neu_bewerten(QC_ANLASS_START); });
+    NSString *pin_wunsch = wunsch_jetzt();
+    CGDirectDisplayID pin_ziel = display_jetzt();
+    dispatch_sync(g_lifeq, ^{ g_display_wunsch = nil; g_display_pin = 7; bildschirm_neu_bewerten(QC_ANLASS_START); });
+    NSString *pin7_wunsch = wunsch_jetzt();
+    CGDirectDisplayID pin7_ziel = display_jetzt();
+    stdout_stumm(0);
+    pruefe([pin_wunsch isEqualToString:@"v0-m0-s0"] && pin_ziel == 6 && access(pfad, F_OK) != 0 &&
+           zeilen_mit(logpfad, "Bildschirm --display 1: Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" gilt als Wunsch fuer diesen Lauf") == 1,
+           "--display 1 pinnt die Kennung des Listenplatzes 1 als Wunsch, ohne bildschirm.txt zu schreiben");
+    pruefe(pin7_wunsch == nil && pin7_ziel == 2 && zeilen_mit(logpfad, "Bildschirm 7 nicht verfuegbar (2 in der Liste) - Automatik") == 1,
+           "--display 7 ausser Bereich: Zeile, Automatik, Hauptbildschirm");
+
+    uint8_t h_priv[32], h_pub[32];
+    qc_keypair(h_priv, h_pub);
+    qc_authorize(h_pub, "hosttest H");
+    schein H;
+    g_schein_attrappe = 0;
+    stdout_stumm(1);
+    int ok = schein_verbinden(&H, bild_port, ein_port, h_priv) == 0;
+    stdout_stumm(0);
+    printf("         (nach der Begruessung: %s)\n", H.folge);
+    pruefe(ok && strstr(H.folge, "3 8 11 12"), "Begruessung: Faehigkeiten 3 (Dateien und Bildschirmwahl), danach die Bildschirmliste (12)");
+    pruefe(H.liste_n == soll.length && memcmp(H.liste, soll.bytes, soll.length) == 0,
+           "die Liste in der Begruessung ist der Pruefvektor: X27 X1 Haupt und gestreamt, Automatik");
+    VTCompressionSessionRef s_a = session_jetzt();
+    stand_zeile("nach dem Aufnahmestart");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 1 && atomic_load(&g_fabrik_zuletzt) == 2 && display_jetzt() == 2 &&
+           atomic_load(&g_input_display) == 2 && g_info_w == 1920 && g_info_h == 1080 &&
+           atomic_load(&g_fabrik_cfg_w) == 1920 && atomic_load(&g_fabrik_cfg_h) == 1080 && s_a != NULL,
+           "Aufnahmestart: Strom fuer den Hauptbildschirm, Encoder und g_cfg 1920x1080, die Maus folgt");
+    pruefe(zeilen_mit(logpfad, "Aufnahme gestartet: Bildschirm 1920x1080, 120 Hz, Kennung 2 (v1138-m1234-s0) \"X27 X1\" -> 1920x1080") == 1,
+           "Protokollzeile beim Aufnahmestart");
+    CVPixelBufferRef pb_gross = testpuffer(1920, 1080), pb_klein = testpuffer(1280, 720);
+    gelesen g;
+    stdout_stumm(1);
+    bild_einspeisen(pb_gross);
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g.bilder == 1 && g.erstes_voll == 1 && letztes_bild_da(), "der Zuschauer bekommt sein erstes Vollbild");
+
+    printf("\n-- Bildschirm: Automatik folgt dem Hauptbildschirm (entprellt)\n");
+    QCBildschirm *A2 = bs(@"v1138-m1234-s0", @"X27 X1", 2, 1920, 1080, 120, NO);
+    QCBildschirm *B2 = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 1920, 1080, 240, YES);
+    liste_setzen(@[ A2, B2 ]);
+    // CoreGraphics meldet eine Aenderung mehrmals kurz hintereinander: ein Wechsel.
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(50 * 1000);
+    bildschirm_konfiguration_geaendert();
+    usleep(50 * 1000);
+    bildschirm_konfiguration_geaendert();
+    usleep(150 * 1000);
+    int noch_nicht = atomic_load(&g_fabrik_aufrufe) == 1;
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    eintrag ea, eb;
+    liste_lesen(g.liste, g.liste_n, wunsch, 0, &ea);
+    liste_lesen(g.liste, g.liste_n, wunsch, 1, &eb);
+    printf("         (nach dem Wechsel: %s; Liste: Wunsch \"%s\", %s Flags %d, %s Flags %d)\n", g.folge, wunsch, ea.kennung, ea.flags, eb.kennung, eb.flags);
+    stand_zeile(noch_nicht ? "150 ms nach der dritten Meldung noch kein Wechsel; danach" : "150 ms nach der dritten Meldung SCHON gewechselt; danach");
+    pruefe(noch_nicht && atomic_load(&g_fabrik_aufrufe) == 2 && atomic_load(&g_fabrik_zuletzt) == 6 && display_jetzt() == 6 &&
+           atomic_load(&g_input_display) == 6,
+           "drei Meldungen binnen 100 ms ergeben nach 300 ms Ruhe genau einen Wechsel auf den neuen Hauptbildschirm, die Maus folgt");
+    pruefe(strstr(g.folge, "7 1 12") && g.wechsel == 1 && g.wechsel_codec == 3 && info_w(&g) == 1920 && info_h(&g) == 1080 &&
+           !wunsch[0] && eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) && ea.flags == 0 && session_jetzt() == s_a,
+           "SWITCH mit dem laufenden Codec, INFO (gleiche Masse, Encoder bleibt), dann die Liste mit dem neuen als Haupt und gestreamt");
+    pruefe(!letztes_bild_da() && g.bilder == 0,
+           "auch bei gleicher Groesse ist das letzte Bild des alten Bildschirms weg - es kaeme sonst als erstes Vollbild des neuen");
+    stdout_stumm(1);
+    bild_einspeisen(pb_gross);
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g.bilder == 1 && g.erstes_voll == 1, "das erste Bild vom neuen Bildschirm ist ein Vollbild");
+    pruefe(zeilen_mit(logpfad, "Bildschirmwechsel: Kennung 2 (v1138-m1234-s0) \"X27 X1\" -> Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" (Hauptbildschirm gewechselt)") == 1 &&
+           zeilen_mit(logpfad, "Bildschirm gewaehlt: Kennung 6 (v0-m0-s0) \"Virtuell 16:9\", 1920x1080 Pixel, 240 Hz (Hauptbildschirm)") == 1,
+           "Protokollzeilen: Bildschirm gewaehlt, Bildschirmwechsel mit Grund");
+
+    printf("\n-- Bildschirm: Wunsch ueber den Eingabekanal, fehlender Wunsch, Ausweichplatz, Rueckkehr\n");
+    // Wunsch auf einen Bildschirm, der nicht angeschlossen ist: kein Wechsel
+    // (der Hauptbildschirm laeuft schon), die Liste traegt den Wunsch, die
+    // Datei auch.
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v9-m9-s9"));
+    usleep(300 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n9 = liste_lesen(g.liste, g.liste_n, wunsch, 1, &eb);
+    printf("         (nach dem Wunsch v9-m9-s9: %s; Liste: Wunsch \"%s\", %d Eintraege, %s Flags %d)\n", g.folge, wunsch, n9, eb.kennung, eb.flags);
+    stand_zeile("danach");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 2 && g.wechsel == 0 && n9 == 2 && strcmp(wunsch, "v9-m9-s9") == 0 &&
+           eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) && [wunsch_jetzt() isEqualToString:@"v9-m9-s9"] &&
+           [datei_inhalt(pfad) isEqualToString:@"v9-m9-s9\n"],
+           "Wunsch v9-m9-s9 (nicht angeschlossen): kein Wechsel, Antwort ist die Liste mit dem Wunsch und unveraendertem gestreamt, bildschirm.txt geschrieben");
+    pruefe(zeilen_mit(logpfad, "Bildschirmwunsch: v9-m9-s9 - nicht angeschlossen, Ausweichplatz Kennung 6 (v0-m0-s0) \"Virtuell 16:9\"") == 1,
+           "Protokollzeile zum fehlenden Wunsch");
+    // Wunsch auf A (nicht Haupt): Wechsel.
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));
+    usleep(300 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    liste_lesen(g.liste, g.liste_n, wunsch, 0, &ea);
+    liste_lesen(g.liste, g.liste_n, NULL, 1, &eb);
+    printf("         (nach dem Wunsch: %s; Liste: Wunsch \"%s\", %s Flags %d, %s Flags %d)\n", g.folge, wunsch, ea.kennung, ea.flags, eb.kennung, eb.flags);
+    stand_zeile("danach");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 3 && atomic_load(&g_fabrik_zuletzt) == 2 && display_jetzt() == 2 && atomic_load(&g_input_display) == 2 &&
+           strstr(g.folge, "7 1 12") && g.wechsel == 1 && strcmp(wunsch, "v1138-m1234-s0") == 0 &&
+           ea.flags == QC_BILDSCHIRM_FLAG_GESTREAMT && eb.flags == QC_BILDSCHIRM_FLAG_HAUPT &&
+           [datei_inhalt(pfad) isEqualToString:@"v1138-m1234-s0\n"],
+           "Wunsch v1138-m1234-s0 ueber den echten Eingabekanal: Wechsel, Liste mit Wunsch (gestreamt, nicht Haupt), bildschirm.txt");
+    pruefe(zeilen_mit(logpfad, "-> Kennung 2 (v1138-m1234-s0) \"X27 X1\" (Wunsch des Zuschauers)") == 1, "Protokollzeile mit Grund \"Wunsch des Zuschauers\"");
+    // Der gewuenschte faellt weg: Ausweichplatz Hauptbildschirm, der Wunsch bleibt.
+    liste_setzen(@[ B2 ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_weg = liste_lesen(g.liste, g.liste_n, wunsch, 0, &eb);
+    stand_zeile("der gewuenschte Bildschirm ist weg");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 4 && atomic_load(&g_fabrik_zuletzt) == 6 && display_jetzt() == 6 && atomic_load(&g_input_display) == 6 &&
+           g.wechsel == 1 && n_weg == 1 && strcmp(wunsch, "v1138-m1234-s0") == 0 && eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) &&
+           [wunsch_jetzt() isEqualToString:@"v1138-m1234-s0"],
+           "der gewuenschte Bildschirm faellt weg: Wechsel auf den Hauptbildschirm, der Wunsch bleibt in der Liste");
+    pruefe(zeilen_mit(logpfad, "-> Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" (Ausweichplatz)") == 1 &&
+           zeilen_mit(logpfad, "1920x1080 Pixel, 240 Hz (Hauptbildschirm) - Ausweichplatz") == 1, "Protokollzeilen zum Ausweichplatz");
+    // Er kommt zurueck: von selbst wieder hin.
+    liste_setzen(@[ B2, A2 ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    liste_lesen(g.liste, g.liste_n, wunsch, 1, &ea);
+    stand_zeile("er ist zurueck");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 5 && atomic_load(&g_fabrik_zuletzt) == 2 && display_jetzt() == 2 && atomic_load(&g_input_display) == 2 &&
+           g.wechsel == 1 && ea.flags == QC_BILDSCHIRM_FLAG_GESTREAMT && strcmp(wunsch, "v1138-m1234-s0") == 0,
+           "der gewuenschte Bildschirm kommt zurueck: der Host wechselt von selbst zurueck");
+    pruefe(zeilen_mit(logpfad, "(zurueck zum gewuenschten Bildschirm)") == 1, "Protokollzeile mit Grund \"zurueck zum gewuenschten Bildschirm\"");
+
+    printf("\n-- Bildschirm: andere Groesse (Encoder neu, INFO, Vollbild, letztes Bild weg)\n");
+    QCBildschirm *C = bs(@"v7-m7-s7", @"Klein", 9, 1280, 720, 60, NO);
+    liste_setzen(@[ B2, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();          // nur die Liste aendert sich: keine Umschaltung, aber eine neue Liste
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_c = liste_lesen(g.liste, g.liste_n, wunsch, 2, &e2);
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 5 && g.wechsel == 0 && n_c == 3 && strcmp(e2.kennung, "v7-m7-s7") == 0 && e2.w == 1280,
+           "ein Bildschirm kommt dazu, der gewuenschte laeuft weiter: kein Wechsel, nur die neue Liste");
+    // Ein letztes Bild des alten Bildschirms liegt an (jeder Wechsel raeumt
+    // es weg, deshalb hier frisch einspeisen).
+    stdout_stumm(1);
+    bild_einspeisen(pb_gross);
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int bild_vorher = letztes_bild_da() && g.bilder == 1;
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    VTCompressionSessionRef s_c = session_jetzt();
+    printf("         (nach dem Wechsel auf 1280x720: %s; INFO %ux%u)\n", g.folge, info_w(&g), info_h(&g));
+    stand_zeile("danach");
+    pruefe(bild_vorher && atomic_load(&g_fabrik_aufrufe) == 6 && atomic_load(&g_fabrik_zuletzt) == 9 && display_jetzt() == 9 &&
+           atomic_load(&g_input_display) == 9 && strstr(g.folge, "7 1 12") && g.wechsel == 1 && info_w(&g) == 1280 && info_h(&g) == 720 &&
+           g_info_w == 1280 && g_info_h == 720 && s_c != NULL && atomic_load(&g_fabrik_cfg_w) == 1280 && atomic_load(&g_fabrik_cfg_h) == 720 &&
+           zeilen_mit(logpfad, "Encoder: Kandidat 3 HEVC 4:2:0 8 Bit, 1280x720") == 1,
+           "andere Groesse: Encoder neu (1280x720), g_cfg und INFO mit 1280x720, SWITCH davor, Liste danach, Maus folgt");
+    pruefe(!letztes_bild_da() && g.bilder == 0, "das liegengebliebene Bild des alten Bildschirms ist weg, ohne Bild geht nichts hinaus");
+    stdout_stumm(1);
+    bild_einspeisen(pb_klein);
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g.bilder == 1 && g.erstes_voll == 1, "das erste Bild in der neuen Groesse ist ein Vollbild");
+
+    printf("\n-- Bildschirm: Wunsch waehrend eines Codecwechsels wartet\n");
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 1; });
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));
+    usleep(700 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 200, &g);
+    stdout_stumm(0);
+    liste_lesen(g.liste, g.liste_n, wunsch, 2, &e2);
+    int wartet = atomic_load(&g_fabrik_aufrufe) == 6 && display_jetzt() == 9 && g.wechsel == 0 && g.liste_n > 0 &&
+                 strcmp(wunsch, "v1138-m1234-s0") == 0 && e2.flags == QC_BILDSCHIRM_FLAG_GESTREAMT;
+    int wartet_zeile = zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == 1;
+    stand_zeile("waehrend des Codecwechsels");
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 0; });
+    stdout_stumm(1);
+    usleep(700 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    stand_zeile("nach dem Codecwechsel");
+    pruefe(wartet && wartet_zeile, "solange der Codecwechsel laeuft: kein Bildschirmwechsel, die Antwort (Liste mit Wunsch) kommt trotzdem, eine Zeile");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == 7 && atomic_load(&g_fabrik_zuletzt) == 2 && display_jetzt() == 2 && g.wechsel == 1 &&
+           info_w(&g) == 1920 && zeilen_mit(logpfad, "(Wunsch des Zuschauers)") == 3 && zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == 1,
+           "danach folgt der Wechsel, mit dem Grund des Wunsches (der dritte Wunsch-Wechsel), ohne weitere Wartezeile");
+
+    printf("\n-- Bildschirm: der Wartezustand endet, sobald kein Wechsel mehr ansteht\n");
+    // Ausgang: Strom auf Kennung 2 (Wunsch v1138-m1234-s0), Liste [B2, A2, C],
+    // kein Codecwechsel. Ein Wunsch auf C muss auf den Codecwechsel warten;
+    // der naechste Wunsch, zurueck auf den gestreamten Bildschirm, macht den
+    // Wechsel hinfaellig. Jeder Wunsch bekommt seine Antwort (Spezifikation
+    // 2.2), der Wartezustand endet mit dem hinfaelligen Wechsel - sonst
+    // bliebe er stehen und unterdrueckte jede spaetere Antwort und Zeile
+    // (Befund der Gegenpruefung) und erzwaenge nach 5 s einen spaeteren
+    // Wechsel mitten im Codecwechsel.
+    int warte_vorher = zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel");
+    int fehlt_vorher = zeilen_mit(logpfad, "nicht angeschlossen, Ausweichplatz");
+    int gewaehlt_vorher = zeilen_mit(logpfad, "Bildschirm gewaehlt:");
+    int wunsch_vorher = zeilen_mit(logpfad, "(Wunsch des Zuschauers)");
+    int fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 1; });
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));          // muss warten
+    usleep(100 * 1000);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));   // zurueck auf den gestreamten
+    usleep(700 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int listen = typen_zaehlen(g.folge, QC_MSG_BILDSCHIRME);
+    liste_lesen(g.liste, g.liste_n, wunsch, 1, &ea);
+    uint64_t seit_hinfaellig = wartet_seit_jetzt();
+    printf("         (waehrend des Codecwechsels: Folge \"%s\", letzte Liste mit Wunsch \"%s\", %s Flags %d; Wartezeilen %d -> %d; wartet seit %llu)\n",
+           g.folge, wunsch, ea.kennung, ea.flags, warte_vorher, zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel"),
+           (unsigned long long)seit_hinfaellig);
+    pruefe(listen == 2 && strcmp(wunsch, "v1138-m1234-s0") == 0 && ea.flags == QC_BILDSCHIRM_FLAG_GESTREAMT && g.wechsel == 0 &&
+           atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && display_jetzt() == 2 &&
+           zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == warte_vorher + 1,
+           "zwei Wuensche waehrend des Codecwechsels (weg und zurueck): je eine Liste als Antwort, die letzte mit dem letzten Wunsch, kein Wechsel, eine Wartezeile");
+    pruefe(seit_hinfaellig == 0, "der Wartezustand endet, sobald kein Wechsel mehr ansteht (das Ziel ist wieder der gestreamte Bildschirm)");
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 0; });
+    stdout_stumm(1);
+    usleep(500 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 200, &g);
+    stdout_stumm(0);
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && display_jetzt() == 2 && [wunsch_jetzt() isEqualToString:@"v1138-m1234-s0"],
+           "nach dem Ende des Codecwechsels bleibt es beim gestreamten Bildschirm: kein Wechsel");
+    // Danach bekommt ein unerfuellbarer Wunsch wieder Antwort und Zeile (2.3).
+    // Der Strom laeuft auf A (nicht Haupt): der Ausweichplatz ist der
+    // Hauptbildschirm B, also ein Wechsel mit Grund "Ausweichplatz".
+    int ausweich_vorher = zeilen_mit(logpfad, "(Ausweichplatz)");
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v9-m9-s9"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_v9 = liste_lesen(g.liste, g.liste_n, wunsch, 0, &eb);
+    printf("         (nach dem Wunsch v9-m9-s9: Folge \"%s\", %d Eintraege, Wunsch \"%s\", %s Flags %d; Zeilen 'nicht angeschlossen' %d -> %d)\n",
+           g.folge, n_v9, wunsch, eb.kennung, eb.flags, fehlt_vorher, zeilen_mit(logpfad, "nicht angeschlossen, Ausweichplatz"));
+    pruefe(n_v9 == 3 && strcmp(wunsch, "v9-m9-s9") == 0 && eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) &&
+           strstr(g.folge, "7 1 12") && g.wechsel == 1 && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && display_jetzt() == 6 &&
+           zeilen_mit(logpfad, "nicht angeschlossen, Ausweichplatz Kennung 6 (v0-m0-s0) \"Virtuell 16:9\"") == fehlt_vorher + 1 &&
+           zeilen_mit(logpfad, "(Ausweichplatz)") == ausweich_vorher + 1,
+           "danach bekommt ein Wunsch auf einen nicht angeschlossenen Bildschirm wieder seine Zeile und die Liste mit dem Wunsch, hier mit Wechsel auf den Ausweichplatz");
+    // Ein neues Warten beginnt frisch: die 5-s-Frist zaehlt ab SEINEM Beginn.
+    // Zurueck auf A (ein Wechsel, kein Codecwechsel), dann Wunsch auf C bei
+    // laufendem Codecwechsel: er wartet, nichts wird erzwungen.
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    int zurueck_auf_a = atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 2 && g.wechsel == 1 && display_jetzt() == 2;
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 1; });
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));
+    usleep(100 * 1000);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));   // derselbe Wunsch noch einmal: auch er bekommt seine Antwort
+    usleep(700 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    uint64_t seit_neu = wartet_seit_jetzt();
+    printf("         (Wunsch v7-m7-s7 bei laufendem Codecwechsel: Folge \"%s\", Fabrik %d, gestreamt %u, Wartezeilen %d, 'trotzdem' %d, wartet seit %llu)\n",
+           g.folge, atomic_load(&g_fabrik_aufrufe), display_jetzt(), zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel"),
+           zeilen_mit(logpfad, "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem"), (unsigned long long)seit_neu);
+    pruefe(zurueck_auf_a && seit_neu != 0 && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 2 && g.wechsel == 0 && display_jetzt() == 2 &&
+           typen_zaehlen(g.folge, QC_MSG_BILDSCHIRME) == 2 && zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == warte_vorher + 2 &&
+           zeilen_mit(logpfad, "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem") == 0,
+           "ein neues Warten beginnt frisch: der Wechsel wartet mit einer Zeile, jeder Wunsch bekommt seine Antwort, nichts wird erzwungen");
+    // Die 5-s-Frist selbst: liegt der Beginn des Wartens laenger zurueck,
+    // kommt der Wechsel trotzdem, mit Zeile, und das Warten ist zu Ende.
+    stdout_stumm(1);
+    dispatch_sync(g_lifeq, ^{ g_bildschirm_wartet_seit -= 6ull * 1000000ull; });
+    usleep(500 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    stand_zeile("Codecwechsel nach 5 s nicht fertig");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 3 && atomic_load(&g_fabrik_zuletzt) == 9 && display_jetzt() == 9 &&
+           strstr(g.folge, "7 1 12") && g.wechsel == 1 && wartet_seit_jetzt() == 0 &&
+           zeilen_mit(logpfad, "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem") == 1 &&
+           zeilen_mit(logpfad, "(Wunsch des Zuschauers)") == wunsch_vorher + 2,
+           "nach 5 s kommt der Bildschirmwechsel trotzdem, mit dem Grund des Wunsches, und das Warten ist zu Ende");
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 0; });
+    // Zurueck auf A fuer die naechsten Abschnitte. Die Zeile "Bildschirm
+    // gewaehlt" kam je Ziel einmal (v7-m7-s7 beim Warten, Ausweichplatz,
+    // zurueck auf A, v7-m7-s7 beim zweiten Warten - nicht noch einmal fuer
+    // den wiederholten Wunsch -, jetzt), nie fuer die Wiederholungen des
+    // Wartens.
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    printf("         (Zeilen \"Bildschirm gewaehlt\": %d -> %d)\n", gewaehlt_vorher, zeilen_mit(logpfad, "Bildschirm gewaehlt:"));
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 4 && display_jetzt() == 2 && g.wechsel == 1 && info_w(&g) == 1920 &&
+           zeilen_mit(logpfad, "Bildschirm gewaehlt:") == gewaehlt_vorher + 5,
+           "zurueck auf den grossen Bildschirm: Wechsel, INFO 1920x1080, je Ziel eine Zeile \"Bildschirm gewaehlt\" (nie fuer die Wiederholungen des Wartens)");
+
+    printf("\n-- Bildschirm: leere Liste bei laufendem Strom\n");
+    // Meldet ScreenCaptureKit voruebergehend keinen Bildschirm, laeuft der
+    // Strom weiter: kein Ziel wechseln, kein Neuaufbau, wenn die Liste
+    // zurueckkommt - faellt der Bildschirm wirklich weg, endet der Strom
+    // (didStopWithError), und die Wiederherstellung bewertet neu.
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    liste_setzen(@[]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_leer = liste_lesen(g.liste, g.liste_n, wunsch, -1, NULL);
+    printf("         (leere Liste: Folge \"%s\", %d Eintraege, gestreamt %u)\n", g.folge, n_leer, display_jetzt());
+    pruefe(strom_jetzt() != nil && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && display_jetzt() == 2 &&
+           typen_zaehlen(g.folge, QC_MSG_BILDSCHIRME) == 1 && n_leer == 0,
+           "leere Liste bei laufendem Strom: der Strom und sein Bildschirm bleiben, die leere Liste geht hinaus");
+    liste_setzen(@[ B2, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_wieder = liste_lesen(g.liste, g.liste_n, wunsch, 1, &ea);
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && display_jetzt() == 2 && n_wieder == 3 &&
+           ea.flags == QC_BILDSCHIRM_FLAG_GESTREAMT,
+           "kommt die Liste zurueck, bleibt der Strom stehen: kein unnoetiger Neuaufbau, die Liste traegt den gestreamten Bildschirm");
+
+    printf("\n-- Bildschirm: Bildschirmverlust und Wiederherstellung (ohne Hauptwarteschlange)\n");
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    NSError *err = [NSError errorWithDomain:@"hosttest" code:-3801 userInfo:@{ NSLocalizedDescriptionKey: @"Bildschirm weg" }];
+    stdout_stumm(1);
+    [g_grab stream:strom_jetzt() didStopWithError:err];
+    usleep(300 * 1000);
+    SCStream *nach_verlust = strom_jetzt();
+    alles_lesen(&H, 200, &g);
+    int verlust = nach_verlust == nil && g.status == 1 && g.statusse == 1;
+    usleep(2300 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(verlust, "Bildschirmverlust: der Strom ist weg, der Zuschauer bekommt Hoststatus 1");
+    stand_zeile("nach der Wiederherstellung");
+    pruefe(strom_jetzt() != nil && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && atomic_load(&g_fabrik_zuletzt) == 2 && g.status == 0 && g.liste_n > 0 &&
+           zeilen_mit(logpfad, "Aufnahme wiederhergestellt: Bildschirm 1920x1080, 120 Hz, Kennung 2 (v1138-m1234-s0) \"X27 X1\"") == 1,
+           "nach 2 s ist die Aufnahme auf dem gewuenschten Bildschirm wieder da: Hoststatus 0, Liste, Zeile");
+
+    zuschauer_weg();
+    schein_schliessen(&H);
+    stdout_stumm(1);
+    stream_herunterfahren_anstossen();
+    SCStream *st = strom_jetzt();
+    stdout_stumm(0);
+    pruefe(st == nil && !session_jetzt() && !letztes_bild_da(), "ohne Zuschauer: Strom, Encoder und letztes Bild weg");
+    g_schein_attrappe = 1;
+    liste_setzen(@[]);
+    dispatch_sync(g_lifeq, ^{ g_display_wunsch = nil; g_display_id = 0; g_display_aktuell = nil; g_bildschirme = nil; g_display_pin = -1; });
+    unlink(pfad);
+    CVPixelBufferRelease(pb_gross);
+    CVPixelBufferRelease(pb_klein);
+    atomic_store(&g_bild_offen, 0);
+    atomic_store(&g_codec_id, 0);
+    g_cfg = nil;
+    g_grab = nil;
+    pthread_mutex_lock(&g_log_mtx);
+    fclose(g_log);
+    g_log = NULL;
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -2206,6 +2973,10 @@ int main(void) {
         g_stats.nal_len = 4;
         atomic_store(&g_cur_fps, 120);
         g_attrappen = [NSMutableArray array];
+        // Nie ScreenCaptureKit: die Bildschirmliste kommt aus der Attrappe
+        // (leer, bis der Abschnitt Bildschirm sie fuellt), der Strom aus der Fabrik.
+        qc_bildschirm_liste_setzen(test_liste);
+        qc_strom_fabrik_setzen(test_fabrik);
         protokoll_pruefen(bild_port, ein_port);
         abloesen_pruefen();
         wechsel_pruefen(bild_port);
@@ -2216,6 +2987,7 @@ int main(void) {
         formatwechsel_pruefen(bild_port);
         fest_pruefen();
         dateien_pruefen(bild_port, ein_port);
+        bildschirm_pruefen(bild_port, ein_port);
         ton_pruefen();
         stau_pruefen();
         codecs_pruefen_pruefen();

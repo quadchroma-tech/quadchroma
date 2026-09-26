@@ -341,9 +341,19 @@ Rückgabe ist die Zahl der Fehler.
   älterer Client ohne Fähigkeiten, Fähigkeit nur für den Eingabekanal, der sie
   gemeldet hat, Obergrenzen auf dem Eingabekanal. Statt in die Ablage gehen
   empfangene Dateien an einen Rekorder, die Ablagebasis liegt im eigenen `HOME`.
+  Dazu die Bildschirmwahl (`host/bildschirm.m`): Prüfvektoren der Nachrichten 12
+  und 70, Kürzen an Zeichengrenzen, die reine Wahl, Stromgröße, `bildschirm.txt`
+  (auch kaputt), `--display` als Pin für den Lauf, Begrüßung mit Fähigkeiten 3
+  und Liste, Automatik folgt dem Hauptbildschirm (entprellt), Wunsch über den
+  echten Eingabekanal, fehlender Wunsch mit Ausweichplatz und Rückkehr, andere
+  Größe mit neuem Encoder und Vollbild, Warten auf einen laufenden Codecwechsel
+  (jeder Wunsch bekommt seine Antwort; das Warten endet, sobald kein Wechsel
+  mehr ansteht; nach 5 s kommt der Wechsel trotzdem), leere Liste bei laufendem
+  Strom, Bildschirmverlust und Wiederherstellung — Liste und Strom kommen aus
+  Attrappen, die Encoder sind echt.
   Loopback ab Port 19100 und 19400/19450, eigenes `HOME` unter `$TMPDIR` (nach
-  einem bestandenen Lauf wieder entfernt), rund 80 s. Nutzt kurz einen echten
-  kleinen HEVC-Encoder (640×360) — nicht während eines Streams starten.
+  einem bestandenen Lauf wieder entfernt), rund 100 s. Nutzt kurz echte
+  HEVC-Encoder (640×360, 1920×1080, 1280×720) — nicht während eines Streams starten.
 - `host/dateitest.m`: das Dateiprotokoll aus `host/dateien.m` ohne Netz und ohne
   Ablage — Prüfvektoren, Pfadregeln samt Bereinigung für macOS und (für den
   Schlüssel des Senders gegen Doppelte) für Windows, Empfänger und
@@ -385,7 +395,7 @@ clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-decla
       -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
       -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
       host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
-      host/dateien.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+      host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
       host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 
 clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \

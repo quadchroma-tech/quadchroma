@@ -227,6 +227,10 @@ static int config_path(const char *file, char *out, size_t cap) {
     return 0;
 }
 
+int qc_config_path(const char *file, char *out, size_t cap) {
+    return config_path(file, out, cap);
+}
+
 // Gibt es die Datei wirklich nicht? Ein Verweis ins Leere meldet beim Oeffnen
 // ebenfalls ENOENT - dann ist sie aber nicht weg, sondern verbogen.
 static int fehlt(const char *path, int oeffnen_errno) {

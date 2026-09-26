@@ -11,6 +11,9 @@
 //
 // Der Codec laesst sich im Betrieb wechseln (Nachricht 66 vom Client); der
 // Start erfolgt immer mit Kandidat 0, HEVC 4:4:4 10 Bit.
+// Der Bildschirm ebenso (Nachricht 70, Liste als Nachricht 12): ohne Wunsch
+// folgt der Host dem Hauptbildschirm, mit Wunsch dem gewuenschten, siehe
+// bildschirm.h. --display N pinnt fuer diesen Lauf den Listenplatz N.
 //
 // Ueber "open -n QuadChroma.app --args ..." starten, damit die Freigaben am
 // Bundle haengen. Ausgaben zusaetzlich in /tmp/quadchroma-m1.log.
@@ -37,6 +40,7 @@
 #import "audio.h"
 #import "clipboard.h"
 #import "dateien.h"
+#import "bildschirm.h"
 #import "zeiger.h"
 #import "testbild.h"
 #include "qc_secure.h"
@@ -443,12 +447,12 @@ static _Atomic int g_codec_id = 0;
 // ueberleben: er wartet, bis wieder ein Bildschirm da ist, und baut die
 // Aufnahme dann selbst neu auf. Der Client erfaehrt derweil, woran es liegt.
 static id g_grab = nil;                       // der Empfaenger der Aufnahme, wird wiederverwendet
-static int g_display_idx = 0;
 static _Atomic int g_fixed_gewollt = 0;       // was der Benutzer will, unabhaengig vom Ausfall
 static int g_kein_bildschirm_gemeldet = 0;
 static IOPMAssertionID g_wach = kIOPMNullAssertionID;
 static void aufnahme_wiederherstellen(void);
 static void hoststatus_senden(uint8_t lage);
+static void bildschirme_senden(void);
 // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder leben nur, solange
 // jemand verbunden ist. Auf- und Abbau laufen streng nacheinander auf einer
 // eigenen Warteschlange, damit ein gehender und ein kommender Zuschauer sich
@@ -488,6 +492,9 @@ static int g_info_w = 0, g_info_h = 0, g_info_fps = 0;
 // Codecwechsel im Betrieb. Laeuft ausschliesslich auf der Aufnahmewarteschlange;
 // die Eingabe reicht den Wunsch nur dorthin weiter.
 static void codec_wechseln(int idx);
+// Bildschirmwunsch (Nachricht 70). Laeuft ausschliesslich auf der
+// Lebenslauf-Warteschlange; die Eingabe reicht ihn nur dorthin weiter.
+static void bildschirm_wunsch_setzen(NSString *kennung);
 
 // Alle Zeiten des Hosts kommen von derselben Uhr wie die Bildzeitstempel der
 // Aufnahme. Nur so lassen sich Aufnahme, Encoder und Versand vergleichen.
@@ -659,6 +666,8 @@ static int rueckstand_sitzung(uint64_t sitzung) {
 #define QC_MSG_CODECS     8    // Host -> Client: was dieser Mac codieren kann
 #define QC_IN_CODEC       66   // Client -> Host: Codecwunsch (u8 Index)
 #define QC_IN_TESTBILD    68   // Client -> Host: Testbild (u8: 1 an, 0 aus) fuer den Benchmark
+// 12 MSG_BILDSCHIRME (Host -> Client) und 70 IN_BILDSCHIRM (Client -> Host):
+// Bildschirmliste und -wunsch, siehe bildschirm.h.
 
 // Testbild statt Aufnahme: solange es an ist, verwirft die Aufnahme ihre
 // Bilder, und der Takt speist die vorgerenderte Schleife in Zielrate.
@@ -1087,11 +1096,14 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         send_small(QC_MSG_SETTINGS, cur, sizeof cur);
     }
     codecs_senden();
-    // Was dieser Host kann: Dateien (Fassung 1). Aeltere Clients uebergehen Typ 11.
+    // Was dieser Host kann: Dateien (Fassung 1) und Bildschirmwahl. Aeltere
+    // Clients uebergehen Typ 11 und 12; ein Client ohne Bit 1 schickt nie
+    // einen Bildschirmwunsch.
     {
-        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN);
+        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM);
         send_small(QC_MSG_FAEHIGKEITEN, f.bytes, f.length);
     }
+    bildschirme_senden();
     logf_(@"Zuschauer verbunden: %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
           ip, ntohs(peer.sin_port), fp, sas);
 }
@@ -1181,6 +1193,7 @@ static void start_beacon(int port) {
 //   17 MAUS_TASTE    : u8 taste, u8 gedrueckt, u16 frei, f32 x, f32 y
 //   18 RAD           : f32 dx, f32 dy          (Pixel)
 //   50-53, 69        : Dateien und Faehigkeiten (dateien.h), eigene Obergrenzen
+//   70 BILDSCHIRM    : Bildschirmwunsch (bildschirm.h), hoechstens 65 Byte
 #define QC_IN_MOVE    16
 #define QC_IN_BUTTON  17
 #define QC_IN_SCROLL  18
@@ -1198,11 +1211,14 @@ static uint64_t g_mods_kanal = 0;         // welcher Eingabekanal g_mods zuletzt
 static CGPoint g_pos = {0, 0};
 static int g_buttons = 0;                 // Bitmaske der gedrueckten Maustasten
 static uint64_t g_button_kanal[3] = {0};  // wer sie gedrueckt hat: links, rechts, Mitte
-static CGDirectDisplayID g_input_display = 0;
+// Der Bildschirm, auf dem die Maus laeuft: immer der gestreamte. Geschrieben
+// auf der Lebenslauf-Warteschlange bei jedem Aufnahmestart und Wechsel,
+// gelesen im Eingabefaden - deshalb atomar.
+static _Atomic CGDirectDisplayID g_input_display = 0;
 static _Atomic long g_input_events = 0;
 
 static CGPoint to_display_point(float nx, float ny) {
-    CGRect b = CGDisplayBounds(g_input_display);
+    CGRect b = CGDisplayBounds(atomic_load(&g_input_display));
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
     return CGPointMake(b.origin.x + nx * b.size.width, b.origin.y + ny * b.size.height);
@@ -1614,6 +1630,20 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                     else logf_(@"Codecwunsch %d verworfen: Aufnahme laeuft noch nicht", idx);
                 }
                 break;
+            case QC_IN_BILDSCHIRM: {
+                // Bildschirmwunsch. Ebenfalls nur weiterreichen, auf die
+                // Lebenslauf-Warteschlange, der der Strom gehoert. Keine
+                // Sitzungspruefung: der Wunsch gilt hostweit, der letzte
+                // gewinnt. Ungueltiges wird uebergangen, der Kanal bleibt.
+                NSString *kennung = nil;
+                if (qc_bildschirm_wunsch_lesen(payload, h.len, &kennung) != 0) {
+                    logf_(@"Bildschirmwunsch ungueltig (%u Byte) - uebergangen", h.len);
+                    break;
+                }
+                if (g_lifeq) dispatch_async(g_lifeq, ^{ bildschirm_wunsch_setzen(kennung); });
+                else logf_(@"Bildschirmwunsch %@ verworfen: Aufnahme laeuft noch nicht", kennung ?: @"Automatik");
+                break;
+            }
             default: break;
         }
     }
@@ -1633,7 +1663,7 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
 }
 
 static int start_input_server(int port, CGDirectDisplayID display) {
-    g_input_display = display;
+    atomic_store(&g_input_display, display);
     g_evsrc = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
     if (g_evsrc) CGEventSourceSetLocalEventsSuppressionInterval(g_evsrc, 0.0);
 
@@ -2579,8 +2609,10 @@ static void fixed_tick(void) {
         // aber schon hinter sich und braucht die Wiederherstellung.
         if (!zuschauer_braucht_strom()) return;
         hoststatus_senden(1);
-        // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch weg.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        // Nicht sofort: direkt nach dem Abriss ist der Bildschirm meist noch
+        // weg. Auf g_lifeq, nicht auf der Hauptwarteschlange: der Weg zum
+        // neuen Strom laeuft ganz dort (und der Pruefstand dreht keine Run-Loop).
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), g_lifeq, ^{
             aufnahme_wiederherstellen();
         });
     });
@@ -2589,175 +2621,473 @@ static void fixed_tick(void) {
 @end
 
 // ------------------------------------------------------------------- Helfer
+//
+// Bildschirmwahl (bildschirm.h). Der Host streamt genau einen Bildschirm: in
+// der Automatik den Hauptbildschirm, mit Wunsch (Nachricht 70, --display) den
+// gewuenschten - faellt der weg, den Hauptbildschirm als Ausweichplatz, bis er
+// zurueck ist. Neu bewertet wird beim Start, bei jedem Wunsch, bei jeder
+// Aenderung der Bildschirmkonfiguration (Rueckruf von CoreGraphics, entprellt)
+// und bei jedem Aufnahmestart. Zwei Monitore am Mac haben das noetig
+// gemacht: ScreenCaptureKit sortiert seine Liste nicht stabil, und die
+// displayID gilt nur je Sitzung - der Schluessel ist die stabile Kennung.
+// Alles hier gehoert der Lebenslauf-Warteschlange g_lifeq (in main vor den
+// Warteschlangen: dem Hauptfaden); Encoderarbeit laeuft per dispatch_sync auf
+// g_capq. Nichts davon laeuft auf der Hauptwarteschlange - der Pruefstand
+// dreht keine Run-Loop -, Wiederholungen gehen per dispatch_after auf g_lifeq.
 
-// Der gewaehlte Bildschirm, an seiner Kennung. Zwei Monitore am Mac haben
-// das noetig gemacht: ScreenCaptureKit sortiert seine Liste nicht stabil,
-// Listenplatz 0 war beim Start der eine Monitor und beim naechsten
-// Aufnahmestart der andere - das Bild kam vom 4K-Schirm, die Maus lief auf
-// dem 240-Hz-Schirm daneben, weil die Eingabe die Kennung vom Start behielt.
+// Der gewuenschte Bildschirm an seiner stabilen Kennung, nil = Automatik.
+static NSString *g_display_wunsch = nil;
+// --display N: nach der ersten Wahl wird die Kennung des Bildschirms am
+// Listenplatz N zum Wunsch fuer diesen Lauf (bildschirm.txt bleibt). -1 = keiner.
+static int g_display_pin = -1;
+// Der gestreamte Bildschirm; ohne Strom das Ziel des naechsten Starts. 0 = keiner.
 static CGDirectDisplayID g_display_id = 0;
-// Der Bildschirm, den der Host eigentlich will: der beim Start gewaehlte.
-// Schlaeft der ein oder wird abgezogen, laeuft die Aufnahme auf einem
-// anderen weiter - aber der Wunsch bleibt, und beim naechsten Aufnahmestart
-// gilt wieder er. Ohne diese Trennung wanderte der Host mit dem Hauptstatus:
-// schlief der 4K-Schirm, wurde der zweite Monitor Hauptbildschirm, der Host
-// merkte sich den und blieb dort, auch als der 4K-Schirm laengst zurueck war.
-static CGDirectDisplayID g_display_wunsch = 0;
-// Wurde der Listenplatz mit --display ausdruecklich verlangt?
-static int g_display_explizit = 0;
+static QCBildschirm *g_display_aktuell = nil;
+// Die zuletzt geholte Liste.
+static NSArray<QCBildschirm *> *g_bildschirme = nil;
+// --out BxH: feste Stromgroesse, hat Vorrang vor der Bildschirmgroesse.
+static int g_out_fest_w = 0, g_out_fest_h = 0;
+// Nachricht 12, fertig kodiert: geschrieben auf g_lifeq, gelesen von jedem,
+// der sie senden will (die Begruessung im Annahmefaden). Eigene kleine
+// Sperre, ein Blatt - darunter wird keine andere genommen.
+static pthread_mutex_t g_bildschirm_mtx = PTHREAD_MUTEX_INITIALIZER;
+static NSData *g_bildschirm_payload = nil;
+// Ein Bildschirmwechsel wartet auf einen laufenden Codecwechsel: seit wann
+// (Hostuhr in us, 0 = wartet nicht), auf welchen Bildschirm, aus welchem
+// Anlass (fuer den Grund in der Zeile), und ob die Wiederholung schon
+// eingereiht ist (genau eine, nicht eine je Wunsch). Nur auf g_lifeq. Das
+// Warten endet mit dem vollzogenen Wechsel - oder sobald eine Bewertung
+// keinen Wechsel mehr braucht (das Ziel ist wieder der gestreamte
+// Bildschirm, der Zuschauer ist weg): bliebe es stehen, bekaeme kein
+// spaeterer Wunsch mehr Antwort und Zeile, und ein spaeterer Wechsel wuerde
+// nach 5 s erzwungen, mitten in einem frischen Codecwechsel.
+static uint64_t g_bildschirm_wartet_seit = 0;
+static CGDirectDisplayID g_bildschirm_wartet_ziel = 0;
+static int g_bildschirm_wartet_anlass = 0;
+static BOOL g_bildschirm_wartet_eingereiht = NO;
 
-// Bildschirm waehlen. Reihenfolge: der zuletzt gewaehlte (an seiner Kennung,
-// damit ein Neustart der Aufnahme auf demselben Bildschirm landet), sonst der
-// mit --display verlangte Listenplatz, sonst der Hauptbildschirm - der mit der
-// Menueleiste, den man fernsteuern will -, sonst der erste der Liste. Die Wahl
-// gilt danach auch fuer die Maus: Zeiger und Bild gehoeren auf denselben Schirm.
-static SCDisplay *pick_display(int idx, size_t *pxW, size_t *pxH, double *hz) {
-    __block SCDisplay *display = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    CGDirectDisplayID gewollt = g_display_wunsch;
-    int explizit = g_display_explizit;
-    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *c, NSError *e) {
-        if (e) {
-            logf_(@"Bildschirme nicht abrufbar: %@", e.localizedDescription);
-        } else {
-            if (gewollt) {
-                for (SCDisplay *d in c.displays) if (d.displayID == gewollt) { display = d; break; }
-                if (!display) logf_(@"Bildschirm %u ist weg - Aufnahme weicht aus, bis er zurueck ist", gewollt);
-            }
-            if (!display && explizit) {
-                if (c.displays.count > (NSUInteger)idx) display = c.displays[idx];
-                else logf_(@"Bildschirm %d nicht verfuegbar (%lu in der Liste)", idx, (unsigned long)c.displays.count);
-            }
-            if (!display && !explizit) {
-                CGDirectDisplayID haupt = CGMainDisplayID();
-                for (SCDisplay *d in c.displays) if (d.displayID == haupt) { display = d; break; }
-                if (!display && c.displays.count) display = c.displays[0];
-            }
+// Anlass einer Neubewertung. WARTEN ist die Wiederholung eines wartenden
+// Wechsels: sie antwortet keinem Wunsch und schreibt keine Wahl-Zeile.
+enum { QC_ANLASS_START = 0, QC_ANLASS_KONFIG = 1, QC_ANLASS_WUNSCH = 2, QC_ANLASS_WARTEN = 3 };
+#define QC_BILDSCHIRM_ENTPRELLEN_MS 300
+#define QC_BILDSCHIRM_WARTEN_MS     200
+#define QC_BILDSCHIRM_WARTEN_MAX_US (5ull * 1000000ull)
+
+static QCBildschirm *bildschirm_neu_bewerten(int anlass);
+
+// Strombau, ersetzbar (Pruefstand: FakeStrom). Liefert den fertig
+// konfigurierten, noch nicht gestarteten Strom, sonst nil mit Fehlertext.
+typedef SCStream *(*qc_strom_fabrik)(QCBildschirm *b, SCStreamConfiguration *cfg, id grab,
+                                     dispatch_queue_t q, NSString **fehler);
+
+static SCStream *strom_bauen_sck(QCBildschirm *b, SCStreamConfiguration *cfg, id grab,
+                                 dispatch_queue_t q, NSString **fehler) {
+    if (!b.sc) { if (fehler) *fehler = @"kein SCDisplay zum Bildschirm"; return nil; }
+    SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:b.sc excludingWindows:@[]];
+    SCStream *st = [[SCStream alloc] initWithFilter:f configuration:cfg delegate:grab];
+    NSError *err = nil;
+    if (![st addStreamOutput:grab type:SCStreamOutputTypeScreen sampleHandlerQueue:q error:&err]) {
+        if (fehler) *fehler = [NSString stringWithFormat:@"Ausgabe nicht anmeldbar (%@)", err.localizedDescription];
+        return nil;
+    }
+    qc_audio_attach(st, audio_cb);
+    return st;
+}
+
+static qc_strom_fabrik g_strom_fabrik = strom_bauen_sck;
+// Nur der Pruefstand ruft das (er bindet main.m ein).
+__attribute__((unused)) static void qc_strom_fabrik_setzen(qc_strom_fabrik f) { g_strom_fabrik = f ?: strom_bauen_sck; }
+
+// Stromgroesse fuer einen Bildschirm, wie beim Start: --out hat Vorrang,
+// sonst die Pixelmasse, ab 3840 bzw. 2160 halbiert, immer gerade.
+static void stromgroesse_fuer(QCBildschirm *b, int *w, int *h) {
+    int ow = g_out_fest_w, oh = g_out_fest_h;
+    if (ow <= 0 || oh <= 0) {
+        ow = (int)(b.w >= 3840 ? b.w / 2 : b.w);
+        oh = (int)(b.h >= 2160 ? b.h / 2 : b.h);
+    }
+    *w = ow & ~1;
+    *h = oh & ~1;
+}
+
+static NSString *bildschirm_text(QCBildschirm *b) {
+    if (!b) return @"keiner";
+    return [NSString stringWithFormat:@"Kennung %u (%@) \"%@\"", b.displayID, b.kennung, b.name ?: @""];
+}
+
+// Nachricht 12 aus dem Stand neu kodieren. Auf g_lifeq (oder vor den Warteschlangen).
+static void bildschirm_zustand_nachfuehren(void) {
+    NSData *p = qc_bildschirme_kodieren(g_bildschirme, g_display_wunsch, g_display_id);
+    pthread_mutex_lock(&g_bildschirm_mtx);
+    g_bildschirm_payload = p;
+    pthread_mutex_unlock(&g_bildschirm_mtx);
+}
+
+// Die Liste an den Zuschauer. Aus jedem Faden, nie unter g_send_mtx.
+static void bildschirme_senden(void) {
+    pthread_mutex_lock(&g_bildschirm_mtx);
+    NSData *p = g_bildschirm_payload;
+    pthread_mutex_unlock(&g_bildschirm_mtx);
+    if (!p) p = qc_bildschirme_kodieren(nil, nil, 0);
+    send_small(QC_MSG_BILDSCHIRME, p.bytes, p.length);
+}
+
+// Strom fuer den Bildschirm ziel bauen und starten; kein Strom darf laufen
+// (g_stream nil). Auf g_lifeq. Die Stromgroesse folgt dem Bildschirm: aendert
+// sie sich (oder gibt es noch keinen Encoder), entsteht der Encoder neu, auf
+// g_capq wie beim Codecwechsel, und g_cfg bekommt die neuen Masse; ein
+// liegengebliebenes Bild in der alten Groesse ginge sonst ungeprueft in den
+// neuen Encoder. wechsel: der Zuschauer erfaehrt es in jedem Fall - SWITCH
+// mit dem laufenden Codec, damit er den Decoder neu baut, dann INFO mit den
+// Massen; danach kommt das erste Bild als Vollbild. Bei anderer Groesse mit
+// laufendem Encoder (Wiederherstellung auf einem anderen Bildschirm) ebenso.
+// Beides auf g_capq, damit zwischen SWITCH und dem Vollbild-Merker kein Bild
+// hinausgeht; CompleteFrames holt vorher die Bilder aus dem Encoder, deren
+// Rueckruf sonst hinter dem SWITCH landen koennte. Das letzte Bild des alten
+// Bildschirms faellt bei jedem Wechsel weg, auch bei gleicher Groesse: der
+// Takt reichte es sonst als erstes Vollbild des neuen nach, bevor
+// ScreenCaptureKit das erste echte liefert (ein Bild vom falschen Bildschirm).
+// YES = laeuft (g_stream gesetzt, Maus folgt); NO = nicht gestartet, mit Zeile.
+static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
+    int w = 0, h = 0;
+    stromgroesse_fuer(ziel, &w, &h);
+    __block BOOL enc = YES;
+    dispatch_sync(g_capq, ^{
+        int codec = atomic_load(&g_codec_id);
+        int fps = atomic_load(&g_cur_fps), mbit = atomic_load(&g_cur_mbit);
+        BOOL neue_groesse = (w != g_info_w || h != g_info_h);
+        BOOL ansagen = wechsel || (neue_groesse && g_session != NULL);
+        if (neue_groesse || wechsel) {
+            if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
+            g_behelf = 0;
+            atomic_store(&g_bild_offen, 0);
         }
+        if (neue_groesse || !g_session) {
+            if (g_session) {
+                VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
+                VTCompressionSessionRef s = g_session;
+                g_session = NULL;
+                VTCompressionSessionInvalidate(s);
+                CFRelease(s);
+            }
+            g_info_w = w;
+            g_info_h = h;
+            enc = encoder_start(codec, w, h, fps, mbit);
+            // Das Testbild folgt der Stromgroesse.
+            if (enc && atomic_load(&g_testbild)) qc_testbild_start(w, h, pixfmt_fuer(codec));
+        } else if (ansagen) {
+            VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
+        }
+        if (g_cfg) {
+            g_cfg.width = (size_t)w;
+            g_cfg.height = (size_t)h;
+            g_cfg.pixelFormat = pixfmt_fuer(codec);
+            if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
+        }
+        // Ohne Encoder keine Ansage: der Client baute sonst den Decoder um
+        // und bekaeme kein Bild, bis die Wiederherstellung greift.
+        if (ansagen && enc) {
+            switch_senden(codec);
+            strominfo_senden();
+        }
+        atomic_store(&g_wait_key, 1);
+        atomic_store(&g_force_key, 1);
+        g_stats.nal_len = 4;
+    });
+    if (!enc) { logf_(@"Encoder laesst sich nicht starten"); return NO; }
+
+    NSString *fehler = nil;
+    SCStream *st = g_strom_fabrik(ziel, g_cfg, g_grab, g_capq, &fehler);
+    if (!st) { logf_(@"Aufnahme: %@", fehler ?: @"Strom laesst sich nicht bauen"); return NO; }
+    // Auf den Start hier warten, auf der Lebenslauf-Warteschlange, statt den
+    // Strom im Rueckruf einzutragen: dort liefe es an Auf- und Abbau vorbei.
+    // Ein Abbau saehe keinen Strom und liesse ihn ohne Zuschauer laufen; ein
+    // neuer Zuschauer baute einen zweiten auf - zwei Stroeme am selben
+    // Tonabgriff, doppelter Ton.
+    __block BOOL gestartet = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [st startCaptureWithCompletionHandler:^(NSError *e) {
+        if (e) logf_(@"Aufnahme: Start misslungen (%@, Code %ld)", e.localizedDescription, (long)e.code);
+        else gestartet = YES;
         dispatch_semaphore_signal(sem);
     }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
-    if (!display) return nil;
-    if (display.displayID != g_display_id)
-        logf_(@"Bildschirm gewaehlt: Kennung %u, %ld x %ld Punkte%@%@", display.displayID,
-              (long)display.width, (long)display.height,
-              display.displayID == CGMainDisplayID() ? @" (Hauptbildschirm)" : @"",
-              (g_display_wunsch && display.displayID != g_display_wunsch) ? @" - Ausweichplatz" : @"");
-    g_display_id = display.displayID;
-    // Der erste gewaehlte Bildschirm ist der gewollte; ein Ausweichplatz
-    // aendert daran nichts.
-    if (!g_display_wunsch) g_display_wunsch = display.displayID;
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
+        // Kaeme der Start doch noch, liefe dieser Strom unbemerkt neben dem
+        // naechsten - mit Ton am selben Abgriff.
+        logf_(@"Aufnahme: Start meldet sich nicht");
+        [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
+        return NO;
+    }
+    if (!gestartet) return NO;               // nach dem Signal gelesen, also fertig geschrieben
+    // Waehrend des Starts gegangen: sein Abbau ist schon durch oder steht
+    // hinter uns an und kennt diesen Strom nicht - also selbst anhalten.
+    if (!zuschauer_braucht_strom()) {
+        dispatch_semaphore_t halt = dispatch_semaphore_create(0);
+        [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; dispatch_semaphore_signal(halt); }];
+        dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+        logf_(@"Aufnahme nicht gestartet: kein Zuschauer mehr");
+        return NO;
+    }
+    stream_setzen(st);
+    g_display_id = ziel.displayID;
+    g_display_aktuell = ziel;
     // Die Maus folgt dem Bild - immer, nicht nur beim Programmstart.
-    g_input_display = display.displayID;
-    CGDisplayModeRef m = CGDisplayCopyDisplayMode(display.displayID);
-    if (pxW) *pxW = m ? CGDisplayModeGetPixelWidth(m) : 0;
-    if (pxH) *pxH = m ? CGDisplayModeGetPixelHeight(m) : 0;
-    if (hz) *hz = m ? CGDisplayModeGetRefreshRate(m) : 0;
-    if (m) CGDisplayModeRelease(m);
-    return display;
+    atomic_store(&g_input_display, ziel.displayID);
+    atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
+    // Solange gestreamt wird, darf der Bildschirm nicht einschlafen.
+    if (g_wach == kIOPMNullAssertionID)
+        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+                                    CFSTR("QuadChroma streamt diesen Bildschirm"), &g_wach);
+    return YES;
+}
+
+// Das Warten ist zu Ende (Wechsel vollzogen oder hinfaellig). Auf g_lifeq.
+static void bildschirm_warten_beenden(void) {
+    g_bildschirm_wartet_seit = 0;
+    g_bildschirm_wartet_ziel = 0;
+    g_bildschirm_wartet_anlass = 0;
+}
+
+// Die Wiederholung eines wartenden Wechsels einreihen: nach
+// QC_BILDSCHIRM_WARTEN_MS auf g_lifeq neu bewerten - genau einmal, gleich
+// wie viele Wuensche waehrend des Wartens kommen. Auf g_lifeq.
+static void bildschirm_warten_einreihen(void) {
+    if (g_bildschirm_wartet_eingereiht) return;
+    g_bildschirm_wartet_eingereiht = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, QC_BILDSCHIRM_WARTEN_MS * NSEC_PER_MSEC), g_lifeq, ^{
+        g_bildschirm_wartet_eingereiht = NO;
+        bildschirm_neu_bewerten(QC_ANLASS_WARTEN);
+    });
+}
+
+// Der Wechsel im laufenden Betrieb (Spezifikation 1.4): alten Strom anhalten,
+// Groesse und Encoder nachziehen, SWITCH und INFO, neuer Strom, Maus, Liste,
+// Zeile. Auf g_lifeq. anlass: was die Bewertung ausgeloest hat; ein Wunsch
+// bekommt seine Antwort (die Liste) schon beim Warten, jeder Wunsch.
+static void bildschirm_wechseln(QCBildschirm *neu, NSString *grund, int anlass) {
+    // Laeuft ein Codecwechsel (auf g_capq), wartet der Bildschirmwechsel: nach
+    // QC_BILDSCHIRM_WARTEN_MS noch einmal bewerten, hoechstens 5 s ab dem
+    // Beginn dieses Wartens, dann trotzdem.
+    __block int codec_aktiv = 0;
+    dispatch_sync(g_capq, ^{ codec_aktiv = g_wechsel_aktiv; });
+    uint64_t jetzt = now_us();
+    if (codec_aktiv) {
+        if (!g_bildschirm_wartet_seit) g_bildschirm_wartet_seit = jetzt;
+        if (g_bildschirm_wartet_ziel != neu.displayID) {
+            // Ein neues Ziel: Zeile, und sein Anlass bestimmt den Grund. Hat
+            // die Wiederholung selbst ein anderes Ziel gefunden (die Liste
+            // hat sich waehrend des Wartens geaendert), gilt das wie eine
+            // Konfigurationsaenderung.
+            g_bildschirm_wartet_ziel = neu.displayID;
+            g_bildschirm_wartet_anlass = anlass == QC_ANLASS_WARTEN ? QC_ANLASS_KONFIG : anlass;
+            logf_(@"Bildschirmwechsel auf %@ wartet auf den laufenden Codecwechsel", bildschirm_text(neu));
+        }
+        // Die Antwort auf einen Wunsch geht gleich hinaus, mit dem noch
+        // gestreamten Bildschirm; nach dem Wechsel kommt die Liste erneut.
+        if (anlass == QC_ANLASS_WUNSCH) { bildschirm_zustand_nachfuehren(); bildschirme_senden(); }
+        if (jetzt - g_bildschirm_wartet_seit < QC_BILDSCHIRM_WARTEN_MAX_US) {
+            bildschirm_warten_einreihen();
+            return;
+        }
+        logf_(@"Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem");
+    }
+    bildschirm_warten_beenden();
+    QCBildschirm *alt = g_display_aktuell;
+    // 1. Alten Strom anhalten. Ab hier gibt es keinen Strom: ein Codecwunsch
+    //    wird abgelehnt, ein spaeter Bescheid des alten Stroms uebergangen.
+    SCStream *st = g_stream;
+    stream_setzen(nil);
+    if (st) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [st stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(sem); }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+    }
+    // 2. bis 5.: Groesse, Encoder, SWITCH, INFO, neuer Strom, Maus.
+    if (!strom_fuer_bildschirm_starten(neu, YES)) {
+        // Wie bei einem Bildschirmverlust: Hoststatus 1, Wiederholung. Das
+        // Ziel bleibt, die Liste meldet den Stand. Ohne Zuschauer bleibt es
+        // beim Ziel; der naechste Zuschauer baut den Strom neu.
+        BOOL zuschauer = zuschauer_braucht_strom();
+        logf_(@"Bildschirmwechsel: %@ -> %@ (%@) nicht vollzogen%@", bildschirm_text(alt), bildschirm_text(neu), grund,
+              zuschauer ? @" - Ausweichweg wie beim Bildschirmverlust" : @"");
+        g_display_id = neu.displayID;
+        g_display_aktuell = neu;
+        bildschirm_zustand_nachfuehren();
+        bildschirme_senden();
+        if (zuschauer) {
+            hoststatus_senden(1);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), g_lifeq, ^{ aufnahme_wiederherstellen(); });
+        }
+        return;
+    }
+    // 6. und 7.: Liste und Zeile.
+    bildschirm_zustand_nachfuehren();
+    bildschirme_senden();
+    logf_(@"Bildschirmwechsel: %@ -> %@ (%@)", bildschirm_text(alt), bildschirm_text(neu), grund);
+}
+
+// Neu bewerten (Spezifikation 1.2): Liste holen, Wahl (Wunsch, sonst
+// Hauptbildschirm, sonst der erste), bei Abweichung vom gestreamten
+// Bildschirm wechseln, sonst nur die Liste melden, wenn sie sich geaendert
+// hat oder ein Wunsch die Antwort verlangt. Ohne Strom werden nur Ziel und
+// Liste nachgefuehrt; der Strom laeuft erst mit dem naechsten Zuschauer. Auf
+// g_lifeq, oder in main vor den Warteschlangen. Rueckgabe: das Ziel, nil =
+// kein Bildschirm. Steht kein Wechsel (mehr) an, endet hier ein etwaiges
+// Warten auf den Codecwechsel.
+static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
+    BOOL wunsch = anlass == QC_ANLASS_WUNSCH;           // bekommt Antwort und Zeilen
+    BOOL wiederholung = anlass == QC_ANLASS_WARTEN;     // weder Antwort noch Wahl-Zeile
+    NSArray<QCBildschirm *> *liste = qc_bildschirme_holen();
+    if (!liste) {
+        logf_(@"Bildschirme nicht abrufbar - der Stand bleibt");
+        if (wunsch) bildschirme_senden();
+        if (wiederholung && g_bildschirm_wartet_seit) bildschirm_warten_einreihen();   // das Warten geht weiter
+        return g_stream ? g_display_aktuell : nil;
+    }
+    // --display N: einmal, nach der ersten Wahl. Der Wunsch fuer diesen Lauf
+    // ist dann die Kennung des Bildschirms an Platz N; bildschirm.txt bleibt.
+    if (g_display_pin >= 0) {
+        if ((NSUInteger)g_display_pin < liste.count) {
+            g_display_wunsch = liste[g_display_pin].kennung;
+            logf_(@"Bildschirm --display %d: %@ gilt als Wunsch fuer diesen Lauf",
+                  g_display_pin, bildschirm_text(liste[g_display_pin]));
+        } else {
+            logf_(@"Bildschirm %d nicht verfuegbar (%lu in der Liste) - %@", g_display_pin,
+                  (unsigned long)liste.count, g_display_wunsch ? @"der Wunsch aus bildschirm.txt gilt" : @"Automatik");
+        }
+        g_display_pin = -1;
+    }
+    int art = QC_WAHL_KEINER;
+    QCBildschirm *ziel = qc_bildschirm_wahl(liste, g_display_wunsch, &art);
+    BOOL liste_neu = ![liste isEqualToArray:g_bildschirme];
+    g_bildschirme = liste;
+    if (wunsch && g_display_wunsch && art != QC_WAHL_WUNSCH)
+        logf_(@"Bildschirmwunsch: %@ - nicht angeschlossen, Ausweichplatz %@", g_display_wunsch, bildschirm_text(ziel));
+    if (!ziel) {
+        bildschirm_warten_beenden();
+        if (g_stream) {
+            // ScreenCaptureKit meldet gerade keinen Bildschirm, der Strom
+            // laeuft aber: der Stand bleibt, sonst baute die naechste
+            // Bewertung mit gefuellter Liste den Strom auf demselben
+            // Bildschirm unnoetig neu. Faellt der Bildschirm wirklich weg,
+            // endet der Strom (didStopWithError), und die Wiederherstellung
+            // bewertet neu.
+            if (liste_neu) logf_(@"Kein Bildschirm in der Liste - der laufende Strom bleibt");
+            bildschirm_zustand_nachfuehren();
+            if (liste_neu || wunsch) bildschirme_senden();
+            return g_display_aktuell;
+        }
+        BOOL ziel_neu = g_display_id != 0;
+        g_display_id = 0;
+        g_display_aktuell = nil;
+        bildschirm_zustand_nachfuehren();
+        if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
+        return nil;
+    }
+    BOOL ziel_neu = ziel.displayID != g_display_id;
+    // Die Zeile je Ziel einmal: nicht fuer die Wiederholungen des Wartens und
+    // nicht erneut fuer ein Ziel, auf das der Wechsel schon wartet.
+    if (ziel_neu && !wiederholung && ziel.displayID != g_bildschirm_wartet_ziel)
+        logf_(@"Bildschirm gewaehlt: %@, %zux%zu Pixel, %.0f Hz%@%@", bildschirm_text(ziel), ziel.w, ziel.h, ziel.hz,
+              ziel.haupt ? @" (Hauptbildschirm)" : @"",
+              (g_display_wunsch && art != QC_WAHL_WUNSCH) ? @" - Ausweichplatz" : @"");
+    if (g_stream && ziel_neu) {
+        // Der Grund: bei der Wiederholung eines wartenden Wechsels der
+        // Anlass, aus dem er wartet.
+        int wirksam = wiederholung ? g_bildschirm_wartet_anlass : anlass;
+        NSString *grund;
+        if (art == QC_WAHL_WUNSCH)
+            grund = wirksam == QC_ANLASS_WUNSCH ? @"Wunsch des Zuschauers" : @"zurueck zum gewuenschten Bildschirm";
+        else
+            grund = g_display_wunsch ? @"Ausweichplatz" : @"Hauptbildschirm gewechselt";
+        bildschirm_wechseln(ziel, grund, anlass);
+        return ziel;
+    }
+    // Kein Wechsel (mehr) noetig - auch ein wartender ist damit hinfaellig.
+    bildschirm_warten_beenden();
+    if (!g_stream) g_display_id = ziel.displayID;       // Ziel des naechsten Starts
+    g_display_aktuell = ziel;
+    bildschirm_zustand_nachfuehren();
+    if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
+    return ziel;
+}
+
+// Ein Wunsch vom Eingabekanal (Nachricht 70). Auf g_lifeq. Gilt hostweit,
+// ueberschreibt --display und den gemerkten Wunsch, wird in bildschirm.txt
+// gemerkt; die Antwort ist die Liste - auch bei einem Bildschirm, der gerade
+// nicht angeschlossen ist (Ausweichplatz, bis er da ist).
+static void bildschirm_wunsch_setzen(NSString *kennung) {
+    g_display_wunsch = kennung;
+    g_display_pin = -1;
+    int r = qc_bildschirm_wunsch_speichern(kennung);
+    logf_(@"Bildschirmwunsch: %@%@", kennung ?: @"Automatik",
+          r == 0 ? @"" : @" - bildschirm.txt liess sich nicht schreiben");
+    bildschirm_neu_bewerten(QC_ANLASS_WUNSCH);
+}
+
+// Aenderung der Bildschirmkonfiguration (Monitor dazu oder weg, Hauptbildschirm
+// umgestellt): entprellt, dann auf g_lifeq neu bewerten. Aus jedem Faden.
+static _Atomic unsigned g_bildschirm_folge = 0;
+static void bildschirm_konfiguration_geaendert(void) {
+    unsigned f = atomic_fetch_add(&g_bildschirm_folge, 1) + 1;
+    if (!g_lifeq) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, QC_BILDSCHIRM_ENTPRELLEN_MS * NSEC_PER_MSEC), g_lifeq, ^{
+        if (atomic_load(&g_bildschirm_folge) != f) return;   // ein spaeterer Aufruf hat die Frist neu gesetzt
+        bildschirm_neu_bewerten(QC_ANLASS_KONFIG);
+    });
+}
+
+// Rueckruf von CoreGraphics, auf dem Hauptfaden (die Dienstschleife dreht
+// dort die Run-Loop). Er kommt vor und nach jeder Aenderung; gezaehlt wird
+// nur das Danach. Die Namen (AppKit) werden gleich hier aufgefrischt.
+static void bildschirm_rueckruf(CGDirectDisplayID d, CGDisplayChangeSummaryFlags flags, void *ctx) {
+    (void)d; (void)ctx;
+    if (flags & kCGDisplayBeginConfigurationFlag) return;
+    qc_bildschirm_namen_auffrischen();
+    bildschirm_konfiguration_geaendert();
 }
 
 static void list_displays(void) {
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *c, NSError *e) {
-        if (e) logf_(@"Inhalte nicht abrufbar: %@", e.localizedDescription);
-        int i = 0;
-        for (SCDisplay *d in c.displays) {
-            CGDisplayModeRef m = CGDisplayCopyDisplayMode(d.displayID);
-            size_t pw = m ? CGDisplayModeGetPixelWidth(m) : 0, ph = m ? CGDisplayModeGetPixelHeight(m) : 0;
-            double hz = m ? CGDisplayModeGetRefreshRate(m) : 0;
-            if (m) CGDisplayModeRelease(m);
-            logf_(@"Display %d: id=%u, %ld x %ld Punkte, %zu x %zu Pixel, %.0f Hz%@",
-                  i++, d.displayID, (long)d.width, (long)d.height, pw, ph, hz,
-                  d.displayID == CGMainDisplayID() ? @"  (Hauptbildschirm)" : @"");
-        }
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+    NSArray<QCBildschirm *> *liste = qc_bildschirme_holen();
+    if (!liste) { logf_(@"Inhalte nicht abrufbar"); return; }
+    int i = 0;
+    for (QCBildschirm *b in liste)
+        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %zu x %zu Pixel, %.0f Hz%@",
+              i++, b.displayID, b.kennung, b.name, b.w, b.h, b.hz, b.haupt ? @"  (Hauptbildschirm)" : @"");
+}
+
+// Aufnahme nach einem Bildschirmverlust neu aufbauen. Auf g_lifeq; kommt
+// verzoegert ueber dispatch_after aus didStopWithError, einem gescheiterten
+// Wechsel oder von hier (alle 3 s, solange kein Bildschirm da ist). Der
+// Zielbildschirm wird neu bewertet: ein Ausweichplatz kann eine andere
+// Groesse haben, dann bekommt der Zuschauer SWITCH und INFO.
+static void wiederherstellen_spaeter(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), g_lifeq, ^{ aufnahme_wiederherstellen(); });
 }
 
 static void aufnahme_wiederherstellen(void) {
+    if (g_stream) return;
     // Nur solange jemand zuschaut (oder gerade eingetragen wird). Geht der
     // Zuschauer waehrend des Wartens, endet die Kette hier.
     if (!zuschauer_braucht_strom()) return;
-    // Auf der Lebenslauf-Warteschlange: pick_display wartet blockierend auf
-    // ScreenCaptureKit, und das darf weder die Aufnahme- noch die Hauptschleife
-    // anhalten - und kein Abbau darf dazwischenfunken.
-    dispatch_async(g_lifeq ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (g_stream) return;
-        // Hier noch einmal: zwischen der Pruefung oben und diesem Block kann
-        // der Zuschauer gegangen und sein Abbau schon gelaufen sein.
-        if (!zuschauer_braucht_strom()) return;
-        size_t pw = 0, ph = 0; double hz = 0;
-        SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
-        if (!d) {
-            if (!g_kein_bildschirm_gemeldet) {
-                g_kein_bildschirm_gemeldet = 1;
-                logf_(@"Kein Bildschirm - warte auf seine Rueckkehr");
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                aufnahme_wiederherstellen();
-            });
-            return;
+    QCBildschirm *ziel = bildschirm_neu_bewerten(QC_ANLASS_START);
+    if (!ziel) {
+        if (!g_kein_bildschirm_gemeldet) {
+            g_kein_bildschirm_gemeldet = 1;
+            logf_(@"Kein Bildschirm - warte auf seine Rueckkehr");
         }
-        g_kein_bildschirm_gemeldet = 0;
-
-        SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
-        int fps = atomic_load(&g_cur_fps);
-        if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
-        SCStream *st = [[SCStream alloc] initWithFilter:f configuration:g_cfg delegate:g_grab];
-        NSError *err = nil;
-        if (![st addStreamOutput:g_grab type:SCStreamOutputTypeScreen sampleHandlerQueue:g_capq error:&err]) {
-            logf_(@"Aufnahme: Ausgabe nicht anmeldbar (%@), neuer Versuch", err.localizedDescription);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                aufnahme_wiederherstellen();
-            });
-            return;
-        }
-        qc_audio_attach(st, audio_cb);
-        // Auf den Start hier warten, auf der Lebenslauf-Warteschlange, statt
-        // den Strom im Rueckruf einzutragen: dort lief das an Auf- und Abbau
-        // vorbei. Ein Abbau saehe keinen Strom und liesse ihn ohne Zuschauer
-        // laufen; ein neuer Zuschauer baute einen zweiten auf - zwei Stroeme
-        // am selben Tonabgriff, doppelter Ton.
-        __block BOOL gestartet = NO;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [st startCaptureWithCompletionHandler:^(NSError *e) {
-            if (e) logf_(@"Aufnahme: Start misslungen (%@, Code %ld), neuer Versuch", e.localizedDescription, (long)e.code);
-            else gestartet = YES;
-            dispatch_semaphore_signal(sem);
-        }];
-        BOOL laeuft = NO;
-        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
-            // Kommt der Start doch noch, darf dieser Strom nicht neben dem
-            // naechsten Versuch weiterlaufen.
-            logf_(@"Aufnahme: Start meldet sich nicht, neuer Versuch");
-            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
-        } else {
-            laeuft = gestartet;          // nach dem Signal gelesen, also fertig geschrieben
-        }
-        if (!laeuft) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                aufnahme_wiederherstellen();
-            });
-            return;
-        }
-        // Waehrend des Starts gegangen: sein Abbau ist schon durch oder steht
-        // hinter uns an und kennt diesen Strom nicht - also selbst anhalten.
-        if (!zuschauer_braucht_strom()) {
-            dispatch_semaphore_t halt = dispatch_semaphore_create(0);
-            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; dispatch_semaphore_signal(halt); }];
-            dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
-            logf_(@"Aufnahme nicht wiederhergestellt: kein Zuschauer mehr");
-            return;
-        }
-        stream_setzen(st);
-        atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
-        atomic_store(&g_force_key, 1);
-        atomic_store(&g_wait_key, 1);
-        hoststatus_senden(0);
-        logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz", pw, ph, hz);
-    });
+        wiederherstellen_spaeter();
+        return;
+    }
+    g_kein_bildschirm_gemeldet = 0;
+    if (!strom_fuer_bildschirm_starten(ziel, NO)) {
+        if (zuschauer_braucht_strom()) { logf_(@"Aufnahme: neuer Versuch in 3 s"); wiederherstellen_spaeter(); }
+        return;
+    }
+    bildschirm_zustand_nachfuehren();
+    bildschirme_senden();
+    hoststatus_senden(0);
+    logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz, %@", ziel.w, ziel.h, ziel.hz, bildschirm_text(ziel));
 }
 
 // Aufnahme und Encoder fuer einen Zuschauer aufbauen. Wird vom Faden der
@@ -2768,56 +3098,12 @@ static BOOL stream_hochfahren_sync(void) {
     __block BOOL ok = NO;
     dispatch_sync(g_lifeq, ^{
         if (g_stream) { ok = YES; return; }
-        size_t pw = 0, ph = 0; double hz = 0;
-        SCDisplay *d = pick_display(g_display_idx, &pw, &ph, &hz);
-        if (!d) { logf_(@"Kein Bildschirm - Aufnahme kann nicht starten"); return; }
-
-        // Encoder zuerst, auf der Aufnahmewarteschlange - wie beim Codecwechsel.
-        __block BOOL enc = YES;
-        dispatch_sync(g_capq, ^{
-            if (!g_session)
-                enc = encoder_start(atomic_load(&g_codec_id), g_info_w, g_info_h,
-                                    atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit));
-        });
-        if (!enc) { logf_(@"Encoder laesst sich nicht starten"); return; }
-
-        int fps = atomic_load(&g_cur_fps);
-        if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
-        g_cfg.pixelFormat = pixfmt_fuer(atomic_load(&g_codec_id));
-        SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
-        SCStream *st = [[SCStream alloc] initWithFilter:f configuration:g_cfg delegate:g_grab];
-        NSError *err = nil;
-        if (![st addStreamOutput:g_grab type:SCStreamOutputTypeScreen sampleHandlerQueue:g_capq error:&err]) {
-            logf_(@"Aufnahme: Ausgabe nicht anmeldbar (%@)", err.localizedDescription);
-            return;
-        }
-        qc_audio_attach(st, audio_cb);
-        __block BOOL gestartet = NO;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [st startCaptureWithCompletionHandler:^(NSError *e) {
-            if (e) logf_(@"Aufnahme: Start misslungen (%@, Code %ld)", e.localizedDescription, (long)e.code);
-            else gestartet = YES;
-            dispatch_semaphore_signal(sem);
-        }];
-        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC)) != 0) {
-            // Kaeme der Start doch noch, liefe dieser Strom unbemerkt neben
-            // dem naechsten - mit Ton am selben Abgriff.
-            logf_(@"Aufnahme: Start meldet sich nicht");
-            [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
-            return;
-        }
-        if (!gestartet) return;
-
-        stream_setzen(st);
-        atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
-        atomic_store(&g_force_key, 1);
-        atomic_store(&g_wait_key, 1);
-        g_stats.nal_len = 4;
-        // Solange gestreamt wird, darf der Bildschirm nicht einschlafen.
-        if (g_wach == kIOPMNullAssertionID)
-            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
-                                        CFSTR("QuadChroma streamt diesen Bildschirm"), &g_wach);
-        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz, Kennung %u", pw, ph, hz, g_display_id);
+        QCBildschirm *ziel = bildschirm_neu_bewerten(QC_ANLASS_START);
+        if (!ziel) { logf_(@"Kein Bildschirm - Aufnahme kann nicht starten"); return; }
+        if (!strom_fuer_bildschirm_starten(ziel, NO)) return;
+        bildschirm_zustand_nachfuehren();
+        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz, %@ -> %dx%d",
+              ziel.w, ziel.h, ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h);
         ok = YES;
     });
     return ok;
@@ -2950,7 +3236,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     BOOL do_list = [args containsObject:@"--list"];
     if (!do_list && capIdx == NSNotFound && srvIdx == NSNotFound && ![args containsObject:@"--formattest"]) {
         logf_(@"Aufruf: --list | --capture <sekunden> <datei.hevc> | --serve [port]   "
-               "[--display N] [--out BxH] [--fps N] [--mbit N] [--fest] [--pair] [--forget]");
+               "[--display N (Listenplatz, nur fuer diesen Lauf)] [--out BxH] [--fps N] [--mbit N] [--fest] [--pair] [--forget]");
         return 2;
     }
 
@@ -2959,14 +3245,16 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         CGRequestScreenCaptureAccess();
         return 3;
     }
+    // Die Namen der Bildschirme kommen von AppKit, auf dem Hauptfaden.
+    qc_bildschirm_namen_auffrischen();
     if (do_list) { list_displays(); codecs_pruefen(); return 0; }
 
     // Pruefmodus: nimmt die Aufnahme einen Formatwechsel im Betrieb an?
     // Das ist nirgends dokumentiert und entscheidet, ob die Codecwahl ohne
     // Neustart des Stroms geht. Also messen statt annehmen.
     if ([args containsObject:@"--formattest"]) {
-        size_t pw = 0, ph = 0; double hz2 = 0;
-        SCDisplay *d = pick_display(0, &pw, &ph, &hz2);
+        QCBildschirm *b = qc_bildschirm_wahl(qc_bildschirme_holen(), nil, NULL);
+        SCDisplay *d = b.sc;
         if (!d) return 4;
         SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
         cfg.width = 1920; cfg.height = 1080;
@@ -3010,7 +3298,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     }
     codecs_pruefen();
 
-    int displayIdx = 0, fps = 120, mbit = 150, outW = 0, outH = 0, port = 9001;
+    int fps = 120, mbit = 150, outW = 0, outH = 0, port = 9001;
     double seconds = 0;
     NSString *outPath = nil;
     fest_einlesen(args);
@@ -3021,19 +3309,27 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     }
     if (srvIdx != NSNotFound && srvIdx + 1 < (NSInteger)args.count && ![args[srvIdx + 1] hasPrefix:@"--"])
         port = [args[srvIdx + 1] intValue];
-    if ((i = [args indexOfObject:@"--display"]) != NSNotFound) { displayIdx = [args[i + 1] intValue]; g_display_explizit = 1; }
+    if ((i = [args indexOfObject:@"--display"]) != NSNotFound && i + 1 < (NSInteger)args.count) g_display_pin = [args[i + 1] intValue];
     if ((i = [args indexOfObject:@"--fps"]) != NSNotFound) fps = [args[i + 1] intValue];
     if ((i = [args indexOfObject:@"--mbit"]) != NSNotFound) mbit = [args[i + 1] intValue];
     if ((i = [args indexOfObject:@"--out"]) != NSNotFound) sscanf(args[i + 1].UTF8String, "%dx%d", &outW, &outH);
+    if (outW > 0 && outH > 0) { g_out_fest_w = outW; g_out_fest_h = outH; }
 
-    size_t pxW = 0, pxH = 0; double hz = 0;
-    SCDisplay *display = pick_display(displayIdx, &pxW, &pxH, &hz);
-    if (!display) return 4;
-    if (outW <= 0 || outH <= 0) {
-        outW = (int)(pxW >= 3840 ? pxW / 2 : pxW);
-        outH = (int)(pxH >= 2160 ? pxH / 2 : pxH);
+    // Der gemerkte Wunsch (bildschirm.txt), dann die erste Wahl - hier auf
+    // dem Hauptfaden, vor den Warteschlangen. --display N ueberstimmt den
+    // gemerkten Wunsch fuer diesen Lauf, ohne die Datei zu aendern; eine
+    // kaputte Datei wird nie still ersetzt.
+    {
+        NSString *gemerkt = nil;
+        int r = qc_bildschirm_wunsch_laden(&gemerkt);
+        if (r < 0) logf_(@"Bildschirmwahl: bildschirm.txt unlesbar - Automatik");
+        else if (r == 0 && gemerkt) { g_display_wunsch = gemerkt; logf_(@"Bildschirmwahl: Wunsch %@ aus bildschirm.txt", gemerkt); }
     }
-    outW &= ~1; outH &= ~1;
+    QCBildschirm *display = bildschirm_neu_bewerten(QC_ANLASS_START);
+    if (!display) { logf_(@"Kein Bildschirm - Abbruch"); return 4; }
+    stromgroesse_fuer(display, &outW, &outH);
+    size_t pxW = display.w, pxH = display.h;
+    double hz = display.hz;
 
     // Start immer mit Kandidat 0 (HEVC 4:4:4 10 Bit); das Aufnahmeformat
     // gehoert zum Kandidaten, nicht zur Kommandozeile.
@@ -3050,8 +3346,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     // Im Dienstbetrieb startet die Annahme erst weiter unten, wenn alles steht.
     if (srvIdx == NSNotFound) {
-        logf_(@"\n=== Aufnahme %.1f s: Display %d (%zux%zu Pixel) -> %dx%d, %d fps ===",
-              seconds, displayIdx, pxW, pxH, outW, outH, fps);
+        logf_(@"\n=== Aufnahme %.1f s: %@ (%zux%zu Pixel) -> %dx%d, %d fps ===",
+              seconds, bildschirm_text(display), pxW, pxH, outW, outH, fps);
     }
 
     // Im Dienstbetrieb entsteht der Encoder erst mit dem ersten Zuschauer.
@@ -3075,7 +3371,6 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
 
     Grabber *grab = [[Grabber alloc] init];
     g_grab = grab;
-    g_display_idx = displayIdx;
     g_cfg = cfg;
     atomic_store(&g_cur_mbit, mbit);
     atomic_store(&g_cur_fps, fps);
@@ -3115,19 +3410,29 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         // Handschlag und Freigabe sein, bevor main weiter unten ankaeme.
         // bild_verbindung braucht dann g_lifeq und g_capq
         // (stream_hochfahren_sync; dispatch_sync auf eine NULL-Warteschlange
-        // endet mit SIGSEGV), g_cfg, g_grab, g_display_idx und die Werte
+        // endet mit SIGSEGV), g_cfg, g_grab, den Zielbildschirm und die Werte
         // g_cur_*; apply_settings aus dem Eingabekanal liest g_tick. Frueher
         // startete die Annahme vor all dem.
+        // Aenderungen der Bildschirmkonfiguration meldet CoreGraphics auf dem
+        // Hauptfaden (die Dienstschleife unten dreht die Run-Loop); der Host
+        // bewertet dann entprellt neu und folgt dem Hauptbildschirm bzw.
+        // kehrt zum gewuenschten zurueck - ohne Neustart, ohne neuen Zuschauer.
+        // Der Wunsch fuer die Zeile unten wird hier gelesen: sobald die
+        // Annahme laeuft, gehoert g_display_wunsch der Lebenslauf-Warteschlange.
+        NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
+                                                 : @" - Automatik (folgt dem Hauptbildschirm)";
+        CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
         if (start_server(port) < 0) return 9;
         start_input_server(port + 1, display.displayID);
         start_beacon(port);
         BOOL ax = AXIsProcessTrusted();
         logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-        logf_(@"Bildschirm Kennung %u (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps", display.displayID, pxW, pxH, hz, outW, outH, fps);
+        logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {
         // Aufnahme in eine Datei: sofort loslegen.
-        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+        if (!display.sc) { logf_(@"Kein SCDisplay zum Bildschirm"); return 7; }
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display.sc excludingWindows:@[]];
         SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:grab];
         g_stream = stream;
         NSError *err = nil;
@@ -3159,6 +3464,9 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         for (;;) {
             [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5.0]];
             drosseln_nachtragen();
+            // Namen der Bildschirme (AppKit, Hauptfaden) nachziehen: NSScreen
+            // kennt einen neuen Monitor womoeglich erst kurz nach dem Rueckruf.
+            qc_bildschirm_namen_auffrischen();
             if (atomic_load(&g_client_fd) >= 0) stau_frist_pruefen();
             long f = atomic_load(&g_sent_frames);
             long long b = atomic_load(&g_sent_bytes);

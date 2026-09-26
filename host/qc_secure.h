@@ -68,4 +68,9 @@ int qc_authorize(const uint8_t pub[32], const char *name);
 /// Liste gibt oder sie 0 Bytes hat. -1 = nicht lesbar oder beschaedigt.
 int qc_authorized_count(void);
 
+/// Pfad einer Datei im Ablageordner ~/Library/Application Support/QuadChroma
+/// (der Ordner wird angelegt). HOME aus der Umgebung, sonst aus getpwuid.
+/// 0 = out gefuellt, -1 = kein HOME.
+int qc_config_path(const char *file, char *out, size_t cap);
+
 #endif
