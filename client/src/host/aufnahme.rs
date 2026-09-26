@@ -16,9 +16,18 @@
 //
 // Ausfall: DXGI_ERROR_ACCESS_LOST (Modewechsel, UAC-Bildschirm, Vollbild-
 // exklusiv) -> Duplication abbauen, Nachricht 9 = 1, alle 2 s neu versuchen,
-// bei Erfolg 9 = 0 und Vollbild erzwingen. Gemerkt wird der Geraetename des
-// Ausgangs, nicht der Listenplatz: faellt er weg, wird ausgewichen, kommt er
-// zurueck, gilt er wieder.
+// bei Erfolg 9 = 0 und Vollbild erzwingen.
+//
+// Bildschirmwahl (Spezifikation Bildschirm, 1.1-1.5): der Host streamt in
+// der Automatik den Hauptbildschirm (MONITORINFOF_PRIMARY) und folgt ihm;
+// ein Wunsch des Zuschauers (Nachricht 70, Kennung aus der Liste 12) macht
+// einen Bildschirm fest - faellt er weg, gilt der Hauptbildschirm als
+// Ausweichplatz, kommt er zurueck, wechselt der Host von selbst zurueck.
+// Die Kennung ist die Geraete-ID des Monitors (ACR0501), nie der
+// Listenplatz; der Wunsch steht in bildschirm.txt. Der Aufnahmefaden zaehlt
+// die Ausgaenge alle 2 s neu auf und bewertet neu (ziel_waehlen); ein
+// Wechsel laeuft wie ein Codecwechsel zwischen zwei Bildern: Duplication
+// neu, Switch 7, Info 1, Vollbild, Nachricht 12 mit dem neuen Stand.
 //
 // Gedrehte Ausgaenge (Hochformat, 180 Grad, hochkantes Panel, das Windows
 // quer betreibt): die Oberflaeche kommt ungedreht, gedreht wird beim
@@ -26,30 +35,52 @@
 // Groesse des Desktops, die Maus bleibt beim Desktop (DesktopCoordinates).
 
 use std::ffi::c_void;
+use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
-use windows::core::{Interface, BOOL};
-use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::core::{Interface, BOOL, PCWSTR};
+use windows::Win32::Devices::Display::{
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+};
+use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ACTIVE,
+    ENUM_CURRENT_SETTINGS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 use super::encoder::{self, Betrieb, Bild, Quelle, Weg};
 use super::takt::{Schrittmacher, INFLIGHT_AUFNAHME, INFLIGHT_TAKT};
 use super::zeiger::Zeiger;
 use super::{log, netz, Z};
+use crate::bildschirm::{self, BildschirmEintrag, Bildschirme};
 use std::sync::atomic::Ordering;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Ausgang {
     /// Platz in der Liste (--output n).
     pub index: usize,
-    /// Geraetename (\\.\DISPLAYn) - das, was sich der Host merkt.
+    /// Geraetename (\\.\DISPLAYn) - der Schluessel zu DXGI und GDI.
     pub name: String,
+    /// Stabile Kennung (1.3): der zweite Teil der Geraete-ID des Monitors
+    /// (MONITOR\ACR0501\{...}\0001 -> ACR0501), bei Gleichheit in der Liste
+    /// mit -<Listenplatz>; ohne Geraete-ID der Geraetename. Das merkt sich
+    /// der Host (Wunsch, bildschirm.txt), nie den Listenplatz.
+    pub kennung: String,
+    /// Anzeigename fuer die Liste: der Monitorname aus QueryDisplayConfig,
+    /// sonst die DeviceString des Monitors, sonst der Geraetename.
+    pub anzeigename: String,
+    /// Bildwiederholrate des Anzeigemodus (0 = unbekannt).
+    pub hz: u16,
     pub links: i32,
     pub oben: i32,
     pub breite: i32,
@@ -58,12 +89,24 @@ pub struct Ausgang {
     pub karte: usize,
     pub karte_name: String,
     pub nvidia: bool,
+    /// Hauptbildschirm laut GDI (MONITORINFOF_PRIMARY), nicht die Lage (0,0).
     pub haupt: bool,
+}
+
+impl Ausgang {
+    /// Kennung und Name fuers Protokoll: ACR0501 (X27 X1).
+    pub fn bezeichnung(&self) -> String {
+        format!("{} ({})", self.kennung, self.anzeigename)
+    }
 }
 
 fn utf16_text(s: &[u16]) -> String {
     let n = s.iter().position(|&c| c == 0).unwrap_or(s.len());
     String::from_utf16_lossy(&s[..n])
+}
+
+fn utf16_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn fehler(was: &str, e: windows::core::Error) -> String {
@@ -86,6 +129,9 @@ pub fn ausgaenge() -> Result<Vec<Ausgang>, String> {
                     liste.push(Ausgang {
                         index: liste.len(),
                         name: utf16_text(&od.DeviceName),
+                        kennung: String::new(),
+                        anzeigename: String::new(),
+                        hz: 0,
                         links: r.left,
                         oben: r.top,
                         breite: r.right - r.left,
@@ -93,6 +139,7 @@ pub fn ausgaenge() -> Result<Vec<Ausgang>, String> {
                         karte: i as usize,
                         karte_name: karte_name.clone(),
                         nvidia: d.VendorId == 0x10de,
+                        // Nur der Rueckfall, falls GDI den Ausgang nicht kennt.
                         haupt: r.left == 0 && r.top == 0,
                     });
                 }
@@ -101,7 +148,152 @@ pub fn ausgaenge() -> Result<Vec<Ausgang>, String> {
         }
         i += 1;
     }
+    // Kennung, Name, Bildrate und Hauptbildschirm (1.3) - alles ueber den
+    // Geraetenamen verknuepft.
+    let gdi = gdi_monitore();
+    let namen = anzeigenamen();
+    for a in &mut liste {
+        if let Some(m) = gdi.iter().find(|m| m.0 == a.name) {
+            a.haupt = m.2;
+        }
+        let (geraete_id, geraete_string) = monitor_geraet(&a.name);
+        a.kennung = kennung_aus_geraete_id(geraete_id.as_deref().unwrap_or(""), &a.name);
+        let freundlich = namen.iter().find(|n| n.0 == a.name).map(|n| n.1.as_str());
+        a.anzeigename = name_waehlen(freundlich, geraete_string.as_deref(), &a.name);
+        a.hz = bildrate(&a.name);
+    }
+    kennungen_eindeutig(&mut liste);
     Ok(liste)
+}
+
+/// Geraete-ID und DeviceString des Monitors an einem Ausgang
+/// (EnumDisplayDevicesW mit dem Geraetenamen des Ausgangs): der erste
+/// aktive Monitor, sonst der erste. Leere Felder sind None.
+fn monitor_geraet(name: &str) -> (Option<String>, Option<String>) {
+    let wname = utf16_null(name);
+    let mut erster: Option<(Option<String>, Option<String>)> = None;
+    for i in 0..8u32 {
+        let mut dd = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+        if !unsafe { EnumDisplayDevicesW(PCWSTR(wname.as_ptr()), i, &mut dd, 0) }.as_bool() {
+            break;
+        }
+        let nicht_leer = |s: String| if s.trim().is_empty() { None } else { Some(s) };
+        let eintrag = (nicht_leer(utf16_text(&dd.DeviceID)), nicht_leer(utf16_text(&dd.DeviceString)));
+        if dd.StateFlags.0 & DISPLAY_DEVICE_ACTIVE.0 != 0 {
+            return eintrag;
+        }
+        erster.get_or_insert(eintrag);
+    }
+    erster.unwrap_or((None, None))
+}
+
+/// Die Monitornamen aus QueryDisplayConfig: je aktivem Pfad (Geraetename
+/// der Quelle, Anzeigename des Ziels). Leer, wenn Windows nichts liefert.
+fn anzeigenamen() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != ERROR_SUCCESS {
+            return out;
+        }
+        let mut pfade: Vec<DISPLAYCONFIG_PATH_INFO> = (0..np).map(|_| Default::default()).collect();
+        let mut modi: Vec<DISPLAYCONFIG_MODE_INFO> = (0..nm).map(|_| Default::default()).collect();
+        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, pfade.as_mut_ptr(), &mut nm, modi.as_mut_ptr(), None) != ERROR_SUCCESS {
+            return out;
+        }
+        pfade.truncate(np as usize);
+        for p in &pfade {
+            let mut quelle = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            quelle.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: p.sourceInfo.adapterId,
+                id: p.sourceInfo.id,
+            };
+            if DisplayConfigGetDeviceInfo(&mut quelle.header) != 0 {
+                continue;
+            }
+            let mut ziel = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+            ziel.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: p.targetInfo.adapterId,
+                id: p.targetInfo.id,
+            };
+            if DisplayConfigGetDeviceInfo(&mut ziel.header) != 0 {
+                continue;
+            }
+            out.push((utf16_text(&quelle.viewGdiDeviceName), utf16_text(&ziel.monitorFriendlyDeviceName)));
+        }
+    }
+    out
+}
+
+/// Bildwiederholrate des laufenden Anzeigemodus eines Ausgangs
+/// (EnumDisplaySettingsW, dmDisplayFrequency); 0 und 1 heissen dort
+/// "Vorgabe des Geraets" - hier unbekannt (0).
+fn bildrate(name: &str) -> u16 {
+    let wname = utf16_null(name);
+    let mut dm = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+    if !unsafe { EnumDisplaySettingsW(PCWSTR(wname.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm) }.as_bool() {
+        return 0;
+    }
+    match dm.dmDisplayFrequency {
+        0 | 1 => 0,
+        hz => hz.min(u16::MAX as u32) as u16,
+    }
+}
+
+/// Die Kennung (1.3) aus der Geraete-ID des Monitors: der zweite Teil von
+/// MONITOR\ACR0501\{4d36e96e-...}\0001 (ACR0501). Ohne brauchbare
+/// Geraete-ID gilt der Geraetename (\\.\DISPLAYn). Steuerzeichen fallen weg,
+/// hoechstens 64 Byte (bildschirm::kennung_bereinigen).
+pub fn kennung_aus_geraete_id(geraete_id: &str, name: &str) -> String {
+    let teil = geraete_id.split('\\').filter(|t| !t.trim().is_empty()).nth(1).unwrap_or("");
+    let k = bildschirm::kennung_bereinigen(teil.trim());
+    if k.is_empty() {
+        bildschirm::kennung_bereinigen(name)
+    } else {
+        k
+    }
+}
+
+/// Zwei Ausgaenge mit derselben Kennung (zwei gleiche Monitore) bekommen
+/// -<Listenplatz> angehaengt, beide - sonst hinge die Kennung am Zufall der
+/// Reihenfolge.
+pub fn kennungen_eindeutig(liste: &mut [Ausgang]) {
+    let doppelt: Vec<String> = liste
+        .iter()
+        .filter(|a| liste.iter().filter(|b| b.kennung == a.kennung).count() > 1)
+        .map(|a| a.kennung.clone())
+        .collect();
+    for a in liste.iter_mut() {
+        if doppelt.contains(&a.kennung) {
+            // Der Anhang muss in die 64 Byte passen (gekuerzt an einer
+            // Zeichengrenze), sonst blieben beide Kennungen gleich.
+            let anhang = format!("-{}", a.index);
+            let mut basis = a.kennung.clone();
+            while basis.len() + anhang.len() > bildschirm::KENNUNG_MAX {
+                basis.pop();
+            }
+            a.kennung = bildschirm::kennung_bereinigen(&format!("{basis}{anhang}"));
+        }
+    }
+}
+
+/// Der Anzeigename (1.3): der Monitorname aus QueryDisplayConfig, sonst die
+/// DeviceString des Monitors, sonst der Geraetename - der erste, der nach
+/// dem Bereinigen (bildschirm::name_bereinigen) nicht leer ist.
+pub fn name_waehlen(freundlich: Option<&str>, geraete_string: Option<&str>, name: &str) -> String {
+    for k in [freundlich, geraete_string, Some(name)] {
+        if let Some(k) = k {
+            let n = bildschirm::name_bereinigen(k.trim());
+            if !n.is_empty() {
+                return n;
+            }
+        }
+    }
+    String::new()
 }
 
 /// Karten und Ausgaenge ins Protokoll, Ausgaenge in `out`.
@@ -124,9 +316,10 @@ pub fn ausgaenge_melden(out: &mut Vec<Ausgang>) {
             }
             for a in &liste {
                 log(format!(
-                    "Ausgang {}: {} {}x{} bei ({},{})  an Karte {} ({}){}",
+                    "Ausgang {}: {} {}x{} bei ({},{})  an Karte {} ({}){}  Kennung {} ({}), {} Hz",
                     a.index, a.name, a.breite, a.hoehe, a.links, a.oben, a.karte, a.karte_name,
-                    if a.haupt { "  (Hauptbildschirm)" } else { "" }
+                    if a.haupt { "  (Hauptbildschirm)" } else { "" },
+                    a.kennung, a.anzeigename, a.hz
                 ));
             }
             *out = liste;
@@ -135,16 +328,403 @@ pub fn ausgaenge_melden(out: &mut Vec<Ausgang>) {
     }
 }
 
-/// --output n = Platz in der Liste; ohne Angabe der Hauptbildschirm, sonst
-/// der erste.
-pub fn ausgang_waehlen(liste: &[Ausgang], wunsch: Option<usize>) -> Option<Ausgang> {
-    if let Some(n) = wunsch {
-        match liste.get(n) {
-            Some(a) => return Some(a.clone()),
-            None => log(format!("Ausgang {n} nicht verfuegbar ({} in der Liste) - nehme den Hauptbildschirm", liste.len())),
+// ------------------------------------------------------------ Bildschirmwahl
+
+/// Wie das Ziel zustande kam (ziel_waehlen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wahl {
+    /// Der gewuenschte Bildschirm ist da und gilt.
+    Wunsch,
+    /// Es gibt einen Wunsch, aber der Bildschirm ist nicht angeschlossen:
+    /// Hauptbildschirm (sonst der erste) als Ausweichplatz.
+    Ausweich,
+    /// Kein Wunsch: der Hauptbildschirm, sonst der erste.
+    Automatik,
+}
+
+/// Das Ziel (1.2): der Wunsch, wenn er angeschlossen ist, sonst der
+/// Hauptbildschirm, sonst der erste in der Liste, sonst keiner. Rein - ohne
+/// DXGI pruefbar.
+pub fn ziel_waehlen(liste: &[Ausgang], wunsch: Option<&str>) -> Option<(Ausgang, Wahl)> {
+    if let Some(w) = wunsch {
+        if let Some(a) = liste.iter().find(|a| a.kennung == w) {
+            return Some((a.clone(), Wahl::Wunsch));
         }
     }
-    liste.iter().find(|a| a.haupt).or_else(|| liste.first()).cloned()
+    let a = liste.iter().find(|a| a.haupt).or_else(|| liste.first())?;
+    Some((a.clone(), if wunsch.is_some() { Wahl::Ausweich } else { Wahl::Automatik }))
+}
+
+/// Der Grund eines Bildschirmwechsels fuers Protokoll (1.4 Schritt 7):
+/// nach einem neuen Wunsch "Wunsch des Zuschauers"; ohne neuen Wunsch je
+/// nachdem, wie das neue Ziel zustande kam.
+pub fn wechsel_grund(neu: Wahl, wunsch_neu: bool) -> &'static str {
+    match neu {
+        Wahl::Ausweich => "Ausweichplatz",
+        _ if wunsch_neu => "Wunsch des Zuschauers",
+        Wahl::Wunsch => "zurueck zum gewuenschten Bildschirm",
+        Wahl::Automatik => "Hauptbildschirm gewechselt",
+    }
+}
+
+/// Die Liste fuer Nachricht 12 aus den Ausgaengen: Wunsch (None =
+/// Automatik) und je Ausgang Kennung, Name, Groesse, Hz, Hauptbildschirm;
+/// `gestreamt` traegt genau der Ausgang mit dieser Kennung.
+pub fn als_bildschirme(liste: &[Ausgang], wunsch: Option<&str>, gestreamt: Option<&str>) -> Bildschirme {
+    Bildschirme {
+        wunsch: wunsch.map(str::to_string),
+        eintraege: liste
+            .iter()
+            .map(|a| BildschirmEintrag {
+                kennung: a.kennung.clone(),
+                name: a.anzeigename.clone(),
+                breite: a.breite.clamp(0, u16::MAX as i32) as u16,
+                hoehe: a.hoehe.clamp(0, u16::MAX as i32) as u16,
+                hz: a.hz,
+                haupt: a.haupt,
+                gestreamt: gestreamt == Some(a.kennung.as_str()),
+            })
+            .collect(),
+    }
+}
+
+/// Die Liste in Z fuer die Begruessung eines Zuschauers (Nachricht 12 nach
+/// Nachricht 11) - der Aufnahmefaden haelt sie danach aktuell.
+pub fn bildschirme_setzen(liste: &[Ausgang], wunsch: Option<&str>, gestreamt: Option<&str>) {
+    *Z.bildschirme.lock().unwrap_or_else(|e| e.into_inner()) = als_bildschirme(liste, wunsch, gestreamt);
+}
+
+/// Der Bildschirmwunsch des Zuschauers (Nachricht 70), bis der
+/// Aufnahmefaden ihn zwischen zwei Bildern abholt - wie CODEC_WUNSCH.
+/// Aeusseres Some = ein neuer Wunsch liegt vor, inneres None = Automatik.
+/// Der letzte Wunsch gewinnt.
+static BILDSCHIRM_WUNSCH: Mutex<Option<Option<String>>> = Mutex::new(None);
+
+/// Warum kein Aufnahmefaden laeuft (Konserve als Bildquelle, kein
+/// DXGI-Ausgang, kein Encoder): dann holt niemand einen Wunsch aus dem
+/// Postfach, und der Eingabefaden beantwortet ihn selbst mit der
+/// unveraenderten Liste (2.3) - der Zuschauer wartet sonst 5 s auf einen
+/// Wechsel, der nie kommt.
+static OHNE_AUFNAHME: OnceLock<&'static str> = OnceLock::new();
+
+/// Vom Start (mod.rs), wenn kein Aufnahmefaden gestartet wird.
+pub fn ohne_aufnahme(grund: &'static str) {
+    let _ = OHNE_AUFNAHME.set(grund);
+}
+
+/// Ein Wunsch vom Eingabekanal (netz::eingabe_lesen): nur vormerken, der
+/// Wechsel selbst laeuft im Aufnahmefaden. Ohne Aufnahmefaden geht sofort
+/// die unveraenderte Liste zurueck, der Wunsch wird nicht gespeichert.
+pub fn bildschirm_wunsch(wunsch: Option<String>) {
+    if let Some(grund) = OHNE_AUFNAHME.get() {
+        log(format!("Bildschirmwunsch: {} - {grund}, kein Wechsel moeglich", wunsch.as_deref().unwrap_or("Automatik")));
+        netz::bildschirme_senden();
+        return;
+    }
+    *BILDSCHIRM_WUNSCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(wunsch);
+}
+
+/// Der Aufnahmefaden holt den vorgemerkten Wunsch ab.
+pub fn bildschirm_wunsch_abholen() -> Option<Option<String>> {
+    BILDSCHIRM_WUNSCH.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// Was in bildschirm.txt steht (1.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Gespeichert {
+    /// Keine Datei: Automatik, ohne Vermerk.
+    Fehlt,
+    Automatik,
+    Kennung(String),
+    /// Vorhanden, aber nicht genau eine Zeile "auto" oder eine gueltige
+    /// Kennung: Automatik, mit Vermerk - die Datei wird nie still ersetzt.
+    Unlesbar,
+}
+
+/// bildschirm.txt lesen: genau eine Zeile, "auto" oder die Kennung
+/// (Leerzeilen und Zeilenende am Rand sind erlaubt).
+pub fn wunsch_laden_aus(pfad: &Path) -> Gespeichert {
+    let bytes = match std::fs::read(pfad) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Gespeichert::Fehlt,
+        Err(_) => return Gespeichert::Unlesbar,
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else { return Gespeichert::Unlesbar };
+    let mut zeilen = text.lines().map(str::trim).filter(|z| !z.is_empty());
+    let Some(z) = zeilen.next() else { return Gespeichert::Unlesbar };
+    if zeilen.next().is_some() {
+        return Gespeichert::Unlesbar;
+    }
+    if z == "auto" {
+        return Gespeichert::Automatik;
+    }
+    if bildschirm::kennung_bereinigen(z) != z {
+        return Gespeichert::Unlesbar;
+    }
+    Gespeichert::Kennung(z.to_string())
+}
+
+/// bildschirm.txt schreiben: erst eine temporaere Datei daneben, dann
+/// umbenennen - nie eine halbe Zeile.
+pub fn wunsch_speichern_nach(pfad: &Path, wunsch: Option<&str>) -> Result<(), String> {
+    let zeile = format!("{}\n", wunsch.unwrap_or("auto"));
+    let tmp = pfad.with_extension(format!("{}.neu", std::process::id()));
+    std::fs::write(&tmp, zeile).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, pfad).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", pfad.display())
+    })
+}
+
+/// Eine temporaere Datei bildschirm.<pid>.neu, die ein abgestuerzter Lauf
+/// zwischen Schreiben und Umbenennen liegen liess, raeumt der naechste
+/// Start weg. Liefert, wie viele es waren.
+pub fn wunsch_reste_aufraeumen(pfad: &Path) -> usize {
+    let Some(dir) = pfad.parent() else { return 0 };
+    let Ok(eintraege) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for e in eintraege.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("bildschirm.") && name.ends_with(".neu") && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Der gespeicherte Wunsch beim Start (None = Automatik), mit Vermerk im
+/// Protokoll - auch fuer eine kaputte Datei, die dann liegen bleibt.
+pub fn wunsch_laden() -> Option<String> {
+    let Some(p) = crate::einstellungen::datei_pfad("bildschirm.txt") else { return None };
+    let reste = wunsch_reste_aufraeumen(&p);
+    if reste > 0 {
+        log(format!("Bildschirmwahl: {reste} liegengebliebene temporaere Datei(en) bildschirm.*.neu entfernt"));
+    }
+    match wunsch_laden_aus(&p) {
+        Gespeichert::Fehlt => None,
+        Gespeichert::Automatik => {
+            log("Bildschirmwahl: Automatik (bildschirm.txt)");
+            None
+        }
+        Gespeichert::Kennung(k) => {
+            log(format!("Bildschirmwahl: {k} (bildschirm.txt)"));
+            Some(k)
+        }
+        Gespeichert::Unlesbar => {
+            log("Bildschirmwahl: bildschirm.txt unlesbar - Automatik");
+            None
+        }
+    }
+}
+
+/// Den Wunsch speichern (bei jedem neuen Wunsch, 1.5); scheitert das, steht
+/// es im Protokoll, der Wunsch gilt trotzdem.
+fn wunsch_speichern(wunsch: Option<&str>) {
+    let Some(p) = crate::einstellungen::datei_pfad("bildschirm.txt") else {
+        log("Bildschirmwahl: kein Ablageordner - Wunsch nicht gespeichert");
+        return;
+    };
+    if let Err(e) = wunsch_speichern_nach(&p, wunsch) {
+        log(format!("Bildschirmwahl: Wunsch nicht gespeichert ({e})"));
+    }
+}
+
+/// Was eine Neubewertung ergab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Bewertung {
+    /// Das Ziel ist ein anderer Bildschirm als vorher (auch von oder nach
+    /// "keiner"): eine laufende Duplication faellt, der Aufbau nimmt das
+    /// neue Ziel.
+    gewechselt: bool,
+    /// Nachricht 12 ist faellig (Liste, Ziel oder Wunsch geaendert).
+    melden: bool,
+    /// Der Grund im Protokoll, wenn von einem Bildschirm auf einen anderen
+    /// gewechselt wurde.
+    grund: Option<&'static str>,
+}
+
+/// Was der Aufnahmefaden ueber die Bildschirme weiss - der Zustand der
+/// Betriebsart (1.1): Wunsch, letzte Liste, Ziel. Lebt ueber die Sitzungen
+/// hinweg im Aufnahmefaden; ohne Zuschauer wird er nur nachgefuehrt.
+pub struct Bildschirmstand {
+    /// Kennung des gewuenschten Bildschirms, None = Automatik.
+    wunsch: Option<String>,
+    /// Die zuletzt aufgezaehlten Ausgaenge.
+    liste: Vec<Ausgang>,
+    /// Das bestimmte Ziel - gestreamt, sobald seine Duplication steht.
+    ziel: Option<Ausgang>,
+    wahl: Option<Wahl>,
+    /// Wann die Ausgaenge das naechste Mal aufgezaehlt werden (alle 2 s).
+    naechste_pruefung: Instant,
+    /// Eingabeweg des Encoders von der Befehlszeile, und die Entscheidung
+    /// daraus (encoder::weg_entscheiden) fuer den Ausgang `weg_fuer` - ein
+    /// anderer Ausgang bekommt eine eigene.
+    weg_cli: Weg,
+    weg: Weg,
+    weg_fuer: Option<String>,
+    /// Nachricht 12 nach einem Wechsel bei laufendem Strom steht noch aus:
+    /// sie geht erst nach dem Aufbau des neuen Stroms hinaus (1.4 Schritt
+    /// 6), der Aufnahmefaden holt sie nach (meldung_nachholen).
+    meldung_offen: bool,
+    /// Der zuletzt gemeldete Fehler beim Aufzaehlen der Ausgaenge (einmal
+    /// im Protokoll, die letzte Liste gilt solange weiter); leer = keiner.
+    aufzaehl_fehler: String,
+}
+
+/// Abstand zweier Aufzaehlungen der Ausgaenge im Betrieb.
+const PRUEFTAKT: Duration = Duration::from_secs(2);
+
+impl Bildschirmstand {
+    /// Der Stand beim Start: Wunsch (bildschirm.txt bzw. --output), die
+    /// Liste vom Start und die Wegentscheidung fuer das erste Ziel.
+    pub fn neu(wunsch: Option<String>, liste: Vec<Ausgang>, weg_cli: Weg, weg: Weg) -> Bildschirmstand {
+        let (ziel, wahl) = match ziel_waehlen(&liste, wunsch.as_deref()) {
+            Some((a, w)) => (Some(a), Some(w)),
+            None => (None, None),
+        };
+        let weg_fuer = ziel.as_ref().map(|a| a.kennung.clone());
+        Bildschirmstand { wunsch, liste, ziel, wahl, naechste_pruefung: Instant::now() + PRUEFTAKT, weg_cli, weg, weg_fuer, meldung_offen: false, aufzaehl_fehler: String::new() }
+    }
+
+    /// Das Ziel, dessen Duplication der Aufnahmefaden aufbaut.
+    fn ziel(&self) -> Option<Ausgang> {
+        self.ziel.clone()
+    }
+
+    /// Die naechste Aufzaehlung sofort (nach einem Verlust, vor einem Aufbau).
+    fn pruefung_faellig(&mut self) {
+        self.naechste_pruefung = Instant::now();
+    }
+
+    /// Ein neuer Encoderweg, wenn `a` ein anderer Ausgang ist als der, fuer
+    /// den die Entscheidung fiel (der Weg hing sonst am Startausgang); fuer
+    /// denselben Ausgang None - die Sitzung behaelt ihren Weg, auch einen
+    /// abgesenkten.
+    fn weg_neu_fuer(&mut self, a: &Ausgang) -> Option<Weg> {
+        if self.weg_fuer.as_deref() == Some(a.kennung.as_str()) {
+            return None;
+        }
+        self.weg = encoder::weg_entscheiden(self.weg_cli, a.index);
+        self.weg_fuer = Some(a.kennung.clone());
+        Some(self.weg)
+    }
+
+    /// Wunsch abholen, alle 2 s (oder sofort nach pruefung_faellig) die
+    /// Ausgaenge neu aufzaehlen und bewerten; Nachricht 12 bei Aenderung -
+    /// nach einem Wechsel bei laufendem Strom (`strom_laeuft`: die
+    /// Duplication steht) erst nach dem Aufbau des neuen, wie 1.4 es reiht
+    /// (meldung_nachholen im Aufnahmefaden).
+    fn nachfuehren(&mut self, strom_laeuft: bool) -> Bewertung {
+        let wunsch_neu = bildschirm_wunsch_abholen();
+        if wunsch_neu.is_none() && Instant::now() < self.naechste_pruefung {
+            return Bewertung::default();
+        }
+        self.naechste_pruefung = Instant::now() + PRUEFTAKT;
+        if let Some(w) = wunsch_neu.as_ref() {
+            self.wunsch = w.clone();
+            wunsch_speichern(self.wunsch.as_deref());
+        }
+        let liste = self.liste_aufgezaehlt(ausgaenge());
+        let alt = self.ziel.as_ref().map(|a| a.bezeichnung());
+        let b = self.bewerten_mit(liste, wunsch_neu.is_some());
+        if let (Some(g), Some(alt), Some(neu)) = (b.grund, alt, self.ziel.as_ref()) {
+            log(format!(
+                "Bildschirmwechsel: {alt} -> {} ({g}){}",
+                neu.bezeichnung(),
+                if strom_laeuft { "" } else { " - ohne laufenden Strom nur das Ziel, gilt ab dem naechsten Aufbau" }
+            ));
+        }
+        if self.meldung_faellig(b, strom_laeuft) {
+            self.liste_melden();
+        }
+        b
+    }
+
+    /// Eine frische Aufzaehlung uebernehmen. Scheitert sie (DXGI-Factory,
+    /// Adapterbeschreibung), gilt die letzte Liste weiter: ein
+    /// voruebergehender Fehler ist kein leerer Bildschirmsatz und wirft
+    /// keinen gesunden Strom weg. Der Fehler steht einmal im Protokoll, die
+    /// naechste gute Liste vergisst ihn.
+    fn liste_aufgezaehlt(&mut self, ergebnis: Result<Vec<Ausgang>, String>) -> Vec<Ausgang> {
+        match ergebnis {
+            Ok(l) => {
+                if !self.aufzaehl_fehler.is_empty() {
+                    self.aufzaehl_fehler.clear();
+                    log("Ausgaenge: wieder aufzaehlbar");
+                }
+                l
+            }
+            Err(e) => {
+                if self.aufzaehl_fehler != e {
+                    log(format!("Ausgaenge: {e} - die letzte Liste gilt weiter"));
+                    self.aufzaehl_fehler = e;
+                }
+                self.liste.clone()
+            }
+        }
+    }
+
+    /// Geht Nachricht 12 jetzt hinaus? Nach einem Wechsel bei laufendem
+    /// Strom nicht: sie wartet auf den Aufbau des neuen (1.4 Schritt 6,
+    /// nach Switch 7 und Info 1), sonst bei jeder Aenderung - und holt
+    /// dabei eine noch offene mit nach.
+    fn meldung_faellig(&mut self, b: Bewertung, strom_laeuft: bool) -> bool {
+        if b.gewechselt && strom_laeuft {
+            self.meldung_offen = true;
+            return false;
+        }
+        b.melden || std::mem::take(&mut self.meldung_offen)
+    }
+
+    /// Die nach einem Wechsel zurueckgestellte Nachricht 12 - nach dem
+    /// Aufbau des neuen Stroms, auch einem gescheiterten (dann steht das
+    /// Ziel als gestreamt in der Liste, 2.2: "Ziel bestimmt").
+    fn meldung_nachholen(&mut self) {
+        if std::mem::take(&mut self.meldung_offen) {
+            self.liste_melden();
+        }
+    }
+
+    /// Neu bewerten (1.2) mit dieser Liste: Ziel = Wunsch, sonst
+    /// Hauptbildschirm, sonst der erste. Rein bis auf die Zeilen zum Wunsch -
+    /// so ohne DXGI pruefbar.
+    fn bewerten_mit(&mut self, liste: Vec<Ausgang>, wunsch_neu: bool) -> Bewertung {
+        let liste_geaendert = liste != self.liste;
+        let (ziel, wahl) = match ziel_waehlen(&liste, self.wunsch.as_deref()) {
+            Some((a, w)) => (Some(a), Some(w)),
+            None => (None, None),
+        };
+        let gewechselt = ziel.as_ref().map(|a| &a.kennung) != self.ziel.as_ref().map(|a| &a.kennung);
+        if wunsch_neu {
+            match (self.wunsch.as_deref(), wahl) {
+                (Some(w), Some(Wahl::Ausweich)) => log(format!(
+                    "Bildschirmwunsch: {w} - nicht angeschlossen, Ausweichplatz {}",
+                    ziel.as_ref().map(|a| a.bezeichnung()).unwrap_or_else(|| "keiner".into())
+                )),
+                (Some(w), _) => log(format!("Bildschirmwunsch: {w}{}", if gewechselt { "" } else { " (laeuft bereits)" })),
+                (None, _) => log(format!("Bildschirmwunsch: Automatik{}", if gewechselt { "" } else { " (laeuft bereits)" })),
+            }
+        }
+        // Der Grund gilt nur fuer einen Wechsel von einem Bildschirm auf
+        // einen anderen (nicht von oder nach "keiner"); die Zeile dazu
+        // schreibt nachfuehren.
+        let grund = match (gewechselt, self.ziel.is_some() && ziel.is_some(), wahl) {
+            (true, true, Some(w)) => Some(wechsel_grund(w, wunsch_neu)),
+            _ => None,
+        };
+        self.liste = liste;
+        self.ziel = ziel;
+        self.wahl = wahl;
+        Bewertung { gewechselt, melden: liste_geaendert || gewechselt || wunsch_neu, grund }
+    }
+
+    /// Den Stand nach Z (fuer die Begruessung) und als Nachricht 12 an den
+    /// Zuschauer.
+    fn liste_melden(&self) {
+        bildschirme_setzen(&self.liste, self.wunsch.as_deref(), self.ziel.as_ref().map(|a| a.kennung.as_str()));
+        netz::bildschirme_senden();
+    }
 }
 
 /// Groesse des Stroms aus der Bildgroesse (dw x dh): ab 3840 Breite wird
@@ -300,7 +880,7 @@ unsafe extern "system" fn monitor_cb(m: HMONITOR, _dc: HDC, _r: *mut RECT, lp: L
     let mut info = MONITORINFOEXW::default();
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     if GetMonitorInfoW(m, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO).as_bool() {
-        liste.push((utf16_text(&info.szDevice), info.monitorInfo.rcMonitor, (info.monitorInfo.dwFlags & 1) != 0));
+        liste.push((utf16_text(&info.szDevice), info.monitorInfo.rcMonitor, (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0));
     }
     BOOL(1)
 }
@@ -552,14 +1132,21 @@ pub fn geraet_roh(device: &ID3D11Device) -> *mut c_void {
 
 // --------------------------------------------------------------- Betrieb
 
-/// Der Aufnahmefaden. `wunsch` ist der beim Start gewaehlte Ausgang (sein
-/// Geraetename zaehlt), `weg` der Eingabeweg des Encoders.
-pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
+/// Der Aufnahmefaden. `wunsch` ist die Kennung des gewuenschten Bildschirms
+/// (None = Automatik), `liste` die Ausgaenge vom Start, `weg_cli` der
+/// Eingabeweg des Encoders von der Befehlszeile und `weg` die Entscheidung
+/// daraus fuer das erste Ziel.
+pub fn start(wunsch: Option<String>, liste: Vec<Ausgang>, weg_cli: Weg, weg: Weg) {
+    let mut stand = Bildschirmstand::neu(wunsch, liste, weg_cli, weg);
+    bildschirme_setzen(&stand.liste, stand.wunsch.as_deref(), stand.ziel.as_ref().map(|a| a.kennung.as_str()));
     std::thread::Builder::new()
         .name("quadchroma-aufnahme".into())
         .spawn(move || loop {
             while !netz::zuschauer_da() {
                 std::thread::sleep(Duration::from_millis(100));
+                // Ohne Zuschauer nur den Stand nachfuehren (Wunsch, Liste,
+                // Ziel); der Strom laeuft erst mit dem naechsten (1.2).
+                stand.nachfuehren(false);
             }
             // Der naechste Zuschauer ist einer mit anderer Nummer - auch wenn
             // er den jetzigen ohne Luecke abloest und zuschauer_da() dabei
@@ -567,7 +1154,7 @@ pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
             // der abgestuerzten Sitzung abgeloest hat, bekommt gleich einen
             // neuen Anlauf.
             let nr = netz::zuschauer_nr();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sitzung(wunsch.as_ref(), weg)));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sitzung(&mut stand)));
             if r.is_err() {
                 // Wachhalten und Timerperiode hat Drop schon abgebaut.
                 log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
@@ -591,29 +1178,6 @@ pub fn start(wunsch: Option<Ausgang>, weg: Weg) {
         .ok();
 }
 
-/// Den gewuenschten Ausgang in der aktuellen Liste finden; ist er weg, wird
-/// ausgewichen (Hauptbildschirm, sonst der erste), mit Vermerk.
-fn ausgang_finden(wunsch: Option<&Ausgang>, ausgewichen: &mut bool) -> Option<Ausgang> {
-    let liste = ausgaenge().unwrap_or_default();
-    if let Some(w) = wunsch {
-        if let Some(a) = liste.iter().find(|a| a.name == w.name) {
-            if *ausgewichen {
-                *ausgewichen = false;
-                log(format!("Ausgang {} ist wieder da - gilt wieder", w.name));
-            }
-            return Some(a.clone());
-        }
-    }
-    let ersatz = liste.iter().find(|a| a.haupt).or_else(|| liste.first()).cloned();
-    if let (Some(w), Some(e)) = (wunsch, ersatz.as_ref()) {
-        if !*ausgewichen {
-            *ausgewichen = true;
-            log(format!("Ausgang {} nicht da - weiche auf {} aus", w.name, e.name));
-        }
-    }
-    ersatz
-}
-
 /// Bild und Maus auf denselben Ausgang; die Stromgroesse kommt aus dem
 /// Anzeigemodus der Duplication (dw x dh) - das ist die Groesse der Bilder,
 /// die wirklich ankommen - und steht danach in Z. Liefert den Plan (Breite,
@@ -625,6 +1189,18 @@ fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32) -> ((i32, i32, bool), bool) {
     Z.info_w.store(w as u32, Ordering::Relaxed);
     Z.info_h.store(h as u32, Ordering::Relaxed);
     ((w, h, halb), alt != (w, h))
+}
+
+/// Bleibt der stehende Encoder ueber einen Aufbau der Duplication bei
+/// gleicher Stromgroesse hinweg? Nur einer auf dem Prozessorweg, und nur,
+/// wenn auch die neue Aufnahme den Prozessorweg nimmt. Ein Pool (Texturweg)
+/// gehoert zum Geraet der alten Duplication. Und nimmt die neue Aufnahme
+/// Texturen - fuer den neuen Ausgang wurde Null-Kopien entschieden (3.3) -,
+/// soll der Encoder gleich so laufen, nicht erst nach dem naechsten Codec-
+/// oder Einstellungswechsel (Schritt 4b stellte sonst die Quelle auf den
+/// stehenden Prozessorweg-Encoder um: kein toter Strom, aber der alte Weg).
+pub fn encoder_bleibt(enc_texturen: bool, aufnahme_texturen: bool) -> bool {
+    !enc_texturen && !aufnahme_texturen
 }
 
 /// Ist die Oberflaeche aus AcquireNextFrame so gross wie der Modus (und
@@ -841,8 +1417,10 @@ impl Drop for Wachhalten {
     }
 }
 
-/// Eine Aufnahmesitzung fuer die Dauer eines Zuschauers.
-fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
+/// Eine Aufnahmesitzung fuer die Dauer eines Zuschauers. `stand` ist die
+/// Bildschirmwahl des Hosts (Wunsch, Liste, Ziel), die ueber die Sitzung
+/// hinaus gilt.
+fn sitzung(stand: &mut Bildschirmstand) {
     // Solange gestreamt wird, darf der Bildschirm nicht einschlafen; die
     // Fristen des Takts brauchen die Millisekunde.
     let wach = Wachhalten::an();
@@ -856,14 +1434,17 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
     let mut testbild_an = false;
     let mut naechster_versuch = Instant::now();
     let mut naechster_enc_versuch = Instant::now();
-    let mut ausgewichen = false;
     let mut verloren = false;
     let mut kein_bildschirm_gemeldet = false;
     let mut dup_fehler_gemeldet = String::new();
     let mut enc_fehler_gemeldet = String::new();
     let mut zeiger_fehler_gemeldet = false;
     let mut verlustmeldung = Verlustmeldung::default();
-    let mut weg = weg_wunsch;
+    let mut weg = stand.weg;
+    // Kennung des Bildschirms, dessen Duplication in dieser Sitzung zuletzt
+    // stand: ein anderer beim naechsten Aufbau ist ein Bildschirmwechsel
+    // (1.4) - Switch 7, Info 1, Vollbild, auch bei gleicher Groesse.
+    let mut gestreamt: Option<String> = None;
     // Letztes echtes Bild: Aufnahmezeit, ob es codiert wurde (fuer die
     // Wiederholung ohne neue Umrechnung).
     let mut letztes: Option<(u64, bool)> = None;
@@ -898,10 +1479,32 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
             }
         }
 
-        // 1. Duplication aufbauen oder wiederherstellen, alle 2 s.
+        // 1. Bildschirm (1.2): den Wunsch des Zuschauers (Nachricht 70)
+        //    abholen, alle 2 s - und vor jedem Aufbau - die Ausgaenge neu
+        //    aufzaehlen und das Ziel bestimmen; Aenderungen gehen als
+        //    Nachricht 12 hinaus - nach einem Wechsel bei stehender
+        //    Duplication erst nach dem Aufbau des neuen Stroms (1b). Weicht
+        //    das Ziel vom laufenden ab, faellt die Duplication hier,
+        //    zwischen zwei Bildern; der Aufbau darunter nimmt das neue Ziel
+        //    (1.4).
+        let aufbau_faellig = auf.is_none() && Instant::now() >= naechster_versuch;
+        if aufbau_faellig {
+            stand.pruefung_faellig();
+        }
+        let bewertung = stand.nachfuehren(auf.is_some());
+        if bewertung.gewechselt && auf.is_some() {
+            // Der alte Strom haelt an; sein letztes Bild gehoert nicht zum
+            // neuen Bildschirm.
+            auf = None;
+            letztes = None;
+            naechster_versuch = Instant::now();
+        }
+
+        // 1b. Duplication aufbauen oder wiederherstellen, alle 2 s - auf dem
+        //     Ziel aus Schritt 1.
         if auf.is_none() && Instant::now() >= naechster_versuch {
             naechster_versuch = Instant::now() + Duration::from_secs(2);
-            match ausgang_finden(wunsch, &mut ausgewichen) {
+            match stand.ziel() {
                 None => {
                     if !kein_bildschirm_gemeldet {
                         kein_bildschirm_gemeldet = true;
@@ -913,75 +1516,110 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                 // Die Quelle (Textur oder STAGING) richtet sich nach dem, was
                 // der Encoder des laufenden Kandidaten nimmt, nicht nach dem
                 // Weg allein; der Null-Kopien-Weg kennt noch keine Skalierung
-                // und keine Drehung.
-                Some(a) => match duplication_aufbauen(&a).and_then(move |d| {
-                    let (gw, gh) = d.desktop_groesse();
-                    let (_, _, halb) = stromplan(gw as i32, gh as i32);
-                    let weg_hier = if weg == Weg::D3d11 && (halb || d.drehung != Drehung::Keine) { Weg::Bgra } else { weg };
-                    Aufnahme::neu(d, encoder::texturweg(Z.codec_id.load(Ordering::Relaxed) as usize, weg_hier), halb)
-                }) {
-                    Ok(neu) => {
-                        kein_bildschirm_gemeldet = false;
-                        dup_fehler_gemeldet.clear();
-                        let d = &neu.dup;
+                // und keine Drehung. Ein anderer Bildschirm als der zuletzt
+                // gestreamte ist ein Wechsel (1.4): der Encoderweg wird fuer
+                // ihn neu entschieden, und nach dem Aufbau gehen Switch 7
+                // (mit dem laufenden Codec - der Zuschauer baut den Decoder
+                // neu) und Info 1 hinaus, dann ein Vollbild.
+                Some(a) => {
+                    let wechsel = gestreamt.as_deref().is_some_and(|k| k != a.kennung);
+                    if let Some(neu) = stand.weg_neu_fuer(&a) {
+                        weg = neu;
+                    }
+                    let aufbau = duplication_aufbauen(&a).and_then(move |d| {
                         let (gw, gh) = d.desktop_groesse();
-                        let ((nw, nh, halb), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
-                        if geaendert || nw != w || nh != h {
-                            w = nw;
-                            h = nh;
+                        let (_, _, halb) = stromplan(gw as i32, gh as i32);
+                        let weg_hier = if weg == Weg::D3d11 && (halb || d.drehung != Drehung::Keine) { Weg::Bgra } else { weg };
+                        Aufnahme::neu(d, encoder::texturweg(Z.codec_id.load(Ordering::Relaxed) as usize, weg_hier), halb)
+                    });
+                    match aufbau {
+                        Ok(neu) => {
+                            kein_bildschirm_gemeldet = false;
+                            dup_fehler_gemeldet.clear();
+                            let d = &neu.dup;
+                            let (gw, gh) = d.desktop_groesse();
+                            let ((nw, nh, halb), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
+                            let groesse_neu = geaendert || nw != w || nh != h;
+                            if groesse_neu {
+                                w = nw;
+                                h = nh;
+                            }
+                            // Der stehende Encoder faellt bei anderer Groesse
+                            // und wenn er nicht zur neuen Aufnahme passt
+                            // (encoder_bleibt: sein Pool haengt am alten
+                            // Geraet, oder der fuer den neuen Ausgang
+                            // entschiedene Weg nimmt Texturen) - vor dem
+                            // Switch, damit seine letzten Pakete noch zum
+                            // alten Strom gehoeren. Ein Pool am alten Geraet
+                            // wird nicht mehr geleert.
                             if let Some(e) = enc.take() {
-                                e.schliessen();
+                                if !groesse_neu && encoder_bleibt(e.texturen(), neu.kopie.is_some()) {
+                                    enc = Some(e);
+                                } else if e.texturen() && !groesse_neu {
+                                    drop(e);
+                                } else {
+                                    e.schliessen();
+                                }
                             }
-                            netz::strominfo_senden();
-                        }
-                        if weg == Weg::D3d11 && halb {
-                            log("Null-Kopien-Weg: Ausgang ab 3840 Breite wird noch nicht auf der Karte skaliert - Prozessorweg (bgra)");
-                            weg = Weg::Bgra;
-                        } else if weg == Weg::D3d11 && d.drehung != Drehung::Keine {
-                            log("Null-Kopien-Weg: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg (bgra)");
-                            weg = Weg::Bgra;
-                        }
-                        if verlustmeldung.aufgebaut() {
-                            if (a.breite, a.hoehe) != (gw as i32, gh as i32) {
-                                log(format!("Ausgang {} meldet {}x{}, der Anzeigemodus ist {}x{} - der Strom folgt dem Anzeigemodus", a.name, a.breite, a.hoehe, gw, gh));
+                            if wechsel {
+                                // Erst der Switch, dann die Info - auch bei
+                                // gleicher Groesse; das Vollbild (unten) traegt
+                                // die Parametersaetze (kein GLOBAL_HEADER).
+                                encoder::switch_senden(Z.codec_id.load(Ordering::Relaxed) as usize);
                             }
-                            log(format!(
-                                "Aufnahme {}: {} {}x{}{} an Karte {} ({}), Format {}, Desktopbild im Systemspeicher: {}, Strom {}x{}{}, Quelle {}",
-                                if verloren { "wiederhergestellt" } else { "gestartet" },
-                                a.name, gw, gh,
-                                if d.drehung != Drehung::Keine { format!(" gedreht {} Grad (Oberflaeche {}x{}, gedreht wird auf dem Prozessor)", d.drehung.grad(), d.breite, d.hoehe) } else { String::new() },
-                                a.karte, a.karte_name, d.format.0,
-                                if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
-                                if halb { " (halbiert)" } else if (w, h) != (gw as i32, gh as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
-                                if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
-                            ));
+                            if wechsel || groesse_neu {
+                                netz::strominfo_senden();
+                            }
+                            gestreamt = Some(a.kennung.clone());
+                            if weg == Weg::D3d11 && halb {
+                                log("Null-Kopien-Weg: Ausgang ab 3840 Breite wird noch nicht auf der Karte skaliert - Prozessorweg (bgra)");
+                                weg = Weg::Bgra;
+                            } else if weg == Weg::D3d11 && d.drehung != Drehung::Keine {
+                                log("Null-Kopien-Weg: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg (bgra)");
+                                weg = Weg::Bgra;
+                            }
+                            if verlustmeldung.aufgebaut() {
+                                if (a.breite, a.hoehe) != (gw as i32, gh as i32) {
+                                    log(format!("Ausgang {} meldet {}x{}, der Anzeigemodus ist {}x{} - der Strom folgt dem Anzeigemodus", a.name, a.breite, a.hoehe, gw, gh));
+                                }
+                                log(format!(
+                                    "Aufnahme {}: {} {}x{}{} an Karte {} ({}), Format {}, Desktopbild im Systemspeicher: {}, Strom {}x{}{}, Quelle {}",
+                                    if verloren { "wiederhergestellt" } else { "gestartet" },
+                                    a.name, gw, gh,
+                                    if d.drehung != Drehung::Keine { format!(" gedreht {} Grad (Oberflaeche {}x{}, gedreht wird auf dem Prozessor)", d.drehung.grad(), d.breite, d.hoehe) } else { String::new() },
+                                    a.karte, a.karte_name, d.format.0,
+                                    if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
+                                    if halb { " (halbiert)" } else if (w, h) != (gw as i32, gh as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
+                                    if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
+                                ));
+                            }
+                            auf = Some(neu);
+                            letztes = None;
+                            if verloren {
+                                verloren = false;
+                                netz::hoststatus_senden(0);
+                            }
+                            Z.force_key.store(true, Ordering::Relaxed);
+                            Z.wait_key.store(true, Ordering::Relaxed);
                         }
-                        // Texturen gehoeren zum Geraet: mit ihm faellt auch der Pool.
-                        if enc.as_ref().map(|e| e.texturen()).unwrap_or(false) {
-                            enc = None;
+                        Err(e) => {
+                            if dup_fehler_gemeldet != e {
+                                dup_fehler_gemeldet = e.clone();
+                                log(format!("Aufnahme: {e} - neuer Versuch alle 2 s"));
+                            }
+                            if !verloren {
+                                verloren = true;
+                                netz::hoststatus_senden(1);
+                            }
                         }
-                        auf = Some(neu);
-                        letztes = None;
-                        if verloren {
-                            verloren = false;
-                            netz::hoststatus_senden(0);
-                        }
-                        Z.force_key.store(true, Ordering::Relaxed);
-                        Z.wait_key.store(true, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        if dup_fehler_gemeldet != e {
-                            dup_fehler_gemeldet = e.clone();
-                            log(format!("Aufnahme: {e} - neuer Versuch alle 2 s"));
-                        }
-                        if !verloren {
-                            verloren = true;
-                            netz::hoststatus_senden(1);
-                        }
-                    }
-                },
+                }
             }
         }
+
+        // 1c. Nachricht 12 nach einem Wechsel: jetzt, nach dem Aufbau des
+        //     neuen Stroms (1.4 Schritt 6) - auch nach einem gescheiterten.
+        stand.meldung_nachholen();
 
         // 2. Encoder oeffnen, sobald die Aufnahme steht.
         if auf.is_some() && enc.is_none() && Instant::now() >= naechster_enc_versuch {
@@ -1192,6 +1830,9 @@ fn sitzung(wunsch: Option<&Ausgang>, weg_wunsch: Weg) {
                 netz::hoststatus_senden(1);
             }
             naechster_versuch = Instant::now() + Duration::from_secs(2);
+            // Ein Verlust ist oft ein Topologiewechsel: gleich neu bewerten
+            // (Liste, Ziel), der Aufbau kommt in 2 s.
+            stand.pruefung_faellig();
         }
 
         // 7. Der Takt: Testbild als echte Bilder in Zielrate; feste Bildrate
@@ -1377,6 +2018,347 @@ fn codec_wechseln(idx: usize, enc: &mut Option<Betrieb>, auf: Option<&Aufnahme>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.split_whitespace().map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
+    }
+
+    /// Ein Ausgang fuer die Wahl-Tests: Kennung, Name, Lage, Hauptbildschirm.
+    fn ausgang(index: usize, kennung: &str, name: &str, links: i32, hz: u16, haupt: bool) -> Ausgang {
+        Ausgang {
+            index,
+            name: format!("\\\\.\\DISPLAY{}", index + 1),
+            kennung: kennung.into(),
+            anzeigename: name.into(),
+            hz,
+            links,
+            oben: 0,
+            breite: 1920,
+            hoehe: 1080,
+            karte: 0,
+            karte_name: "Karte".into(),
+            nvidia: false,
+            haupt,
+        }
+    }
+
+    /// Die zwei Bildschirme aus den Pruefvektoren (2.4): "X27 X1" Haupt,
+    /// "Virtuell 16:9" daneben.
+    fn zwei() -> Vec<Ausgang> {
+        vec![ausgang(0, "v1138-m1234-s0", "X27 X1", 0, 120, true), ausgang(1, "v0-m0-s0", "Virtuell 16:9", 1920, 240, false)]
+    }
+
+    /// Die Liste aus Ausgaengen ergibt byte-genau den Pruefvektor der
+    /// Spezifikation (2.4) - Automatik, der Hauptbildschirm gestreamt.
+    #[test]
+    fn pruefvektor_aus_ausgaengen() {
+        let liste = hex(
+            "01 02 00 00 \
+             0e 06 80 07 38 04 78 00 03 00 76 31 31 33 38 2d 6d 31 32 33 34 2d 73 30 58 32 37 20 58 31 \
+             08 0d 80 07 38 04 f0 00 00 00 76 30 2d 6d 30 2d 73 30 56 69 72 74 75 65 6c 6c 20 31 36 3a 39",
+        );
+        let b = als_bildschirme(&zwei(), None, Some("v1138-m1234-s0"));
+        assert_eq!(bildschirm::bildschirme_kodieren(&b), liste);
+        // Mit Wunsch auf den zweiten, der zweite gestreamt: Wunsch und Flags
+        // wandern mit; die Kennung kommt aus dem Wunsch-Pruefvektor.
+        let b = als_bildschirme(&zwei(), Some("v0-m0-s0"), Some("v0-m0-s0"));
+        let p = bildschirm::bildschirme_kodieren(&b);
+        assert_eq!(&p[..4], &[1, 2, 8, 0]);
+        assert_eq!(&p[4..12], &hex("76 30 2d 6d 30 2d 73 30")[..]);
+        let g = bildschirm::bildschirme_lesen(&p).unwrap();
+        assert_eq!(g.gestreamt().map(|e| e.name.as_str()), Some("Virtuell 16:9"));
+        assert_eq!(g.gewuenschter().map(|e| e.hz), Some(240));
+        assert!(g.eintraege[0].haupt && !g.eintraege[0].gestreamt);
+        // Ohne Ziel traegt keiner das Bit.
+        let b = als_bildschirme(&zwei(), None, None);
+        assert!(b.eintraege.iter().all(|e| !e.gestreamt));
+        // Groessen ueber u16 werden gekappt, nicht umgebrochen.
+        let mut riesig = zwei();
+        riesig[0].breite = 70_000;
+        assert_eq!(als_bildschirme(&riesig, None, None).eintraege[0].breite, u16::MAX);
+    }
+
+    /// ziel_waehlen (1.2), alle Faelle: Automatik folgt dem Hauptbildschirm,
+    /// ohne Hauptbildschirm der erste; ein Wunsch gilt, wenn er da ist;
+    /// fehlt er, der Hauptbildschirm als Ausweichplatz; leere Liste: keiner.
+    #[test]
+    fn ziel_waehlen_alle_faelle() {
+        let l = zwei();
+        assert_eq!(ziel_waehlen(&l, None), Some((l[0].clone(), Wahl::Automatik)));
+        assert_eq!(ziel_waehlen(&l, Some("v0-m0-s0")), Some((l[1].clone(), Wahl::Wunsch)));
+        assert_eq!(ziel_waehlen(&l, Some("v1138-m1234-s0")), Some((l[0].clone(), Wahl::Wunsch)));
+        assert_eq!(ziel_waehlen(&l, Some("DEL4321")), Some((l[0].clone(), Wahl::Ausweich)));
+        // Hauptbildschirm gewechselt: Automatik folgt.
+        let mut m = zwei();
+        m[0].haupt = false;
+        m[1].haupt = true;
+        assert_eq!(ziel_waehlen(&m, None), Some((m[1].clone(), Wahl::Automatik)));
+        assert_eq!(ziel_waehlen(&m, Some("DEL4321")).map(|(a, w)| (a.kennung, w)), Some(("v0-m0-s0".into(), Wahl::Ausweich)));
+        // Kein Hauptbildschirm gemeldet: der erste.
+        m[1].haupt = false;
+        assert_eq!(ziel_waehlen(&m, None).map(|(a, _)| a.index), Some(0));
+        assert_eq!(ziel_waehlen(&m, Some("x")).map(|(a, w)| (a.index, w)), Some((0, Wahl::Ausweich)));
+        // Nur der gewuenschte ist weg -> der Rest entscheidet; ganz leer -> keiner.
+        assert_eq!(ziel_waehlen(&l[..1], Some("v0-m0-s0")), Some((l[0].clone(), Wahl::Ausweich)));
+        assert_eq!(ziel_waehlen(&[], None), None);
+        assert_eq!(ziel_waehlen(&[], Some("v0-m0-s0")), None);
+    }
+
+    /// Die Gruende fuer die Protokollzeile (1.4 Schritt 7).
+    #[test]
+    fn wechsel_grund_alle_faelle() {
+        assert_eq!(wechsel_grund(Wahl::Wunsch, true), "Wunsch des Zuschauers");
+        assert_eq!(wechsel_grund(Wahl::Automatik, true), "Wunsch des Zuschauers");
+        assert_eq!(wechsel_grund(Wahl::Ausweich, true), "Ausweichplatz");
+        assert_eq!(wechsel_grund(Wahl::Ausweich, false), "Ausweichplatz");
+        assert_eq!(wechsel_grund(Wahl::Wunsch, false), "zurueck zum gewuenschten Bildschirm");
+        assert_eq!(wechsel_grund(Wahl::Automatik, false), "Hauptbildschirm gewechselt");
+    }
+
+    /// Kennung und Name aus den Strings der Geraete (1.3), rein.
+    #[test]
+    fn kennung_und_name_aus_geraete_id() {
+        let name = "\\\\.\\DISPLAY1";
+        assert_eq!(kennung_aus_geraete_id("MONITOR\\ACR0501\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0001", name), "ACR0501");
+        assert_eq!(kennung_aus_geraete_id("MONITOR\\DEL4321\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0002", name), "DEL4321");
+        // Ohne Geraete-ID, ohne zweiten Teil oder nur Steuerzeichen: der Geraetename.
+        assert_eq!(kennung_aus_geraete_id("", name), name);
+        assert_eq!(kennung_aus_geraete_id("MONITOR", name), name);
+        assert_eq!(kennung_aus_geraete_id("MONITOR\\\u{1}\\x", name), name);
+        // Steuerzeichen fallen weg, hoechstens 64 Byte.
+        assert_eq!(kennung_aus_geraete_id("MONITOR\\AB\tC\\x", name), "ABC");
+        let lang = format!("MONITOR\\{}\\x", "k".repeat(100));
+        assert_eq!(kennung_aus_geraete_id(&lang, name).len(), bildschirm::KENNUNG_MAX);
+
+        // Zwei gleiche Monitore: beide mit Listenplatz, ein dritter anderer nicht.
+        let mut l = vec![ausgang(0, "ACR0501", "a", 0, 60, true), ausgang(1, "DEL4321", "b", 1920, 60, false), ausgang(2, "ACR0501", "c", 3840, 60, false)];
+        kennungen_eindeutig(&mut l);
+        assert_eq!(l.iter().map(|a| a.kennung.as_str()).collect::<Vec<_>>(), ["ACR0501-0", "DEL4321", "ACR0501-2"]);
+        let mut eins = vec![ausgang(0, "ACR0501", "a", 0, 60, true)];
+        kennungen_eindeutig(&mut eins);
+        assert_eq!(eins[0].kennung, "ACR0501");
+        // Eine Kennung an der 64-Byte-Grenze doppelt: der Anhang passt
+        // trotzdem hinein (die Basis wird gekuerzt), beide bleiben
+        // verschieden und in der Grenze - auch mit mehrbytigen Zeichen.
+        for lang in ["k".repeat(bildschirm::KENNUNG_MAX), "\u{e4}".repeat(bildschirm::KENNUNG_MAX / 2)] {
+            let mut l = vec![ausgang(0, &lang, "a", 0, 60, true), ausgang(1, &lang, "b", 1920, 60, false)];
+            kennungen_eindeutig(&mut l);
+            assert_ne!(l[0].kennung, l[1].kennung, "{lang}");
+            assert!(l[0].kennung.ends_with("-0") && l[1].kennung.ends_with("-1"), "{:?}", l[1].kennung);
+            assert!(l.iter().all(|a| a.kennung.len() <= bildschirm::KENNUNG_MAX && a.kennung.len() > bildschirm::KENNUNG_MAX - 4), "{:?}", l[0].kennung);
+        }
+
+        // Name: Monitorname, sonst DeviceString, sonst Geraetename; leer und
+        // Leerraum zaehlen nicht, gekuerzt auf 48 Byte.
+        assert_eq!(name_waehlen(Some("X27 X1"), Some("PnP-Monitor (Standard)"), name), "X27 X1");
+        assert_eq!(name_waehlen(Some("  "), Some("PnP-Monitor (Standard)"), name), "PnP-Monitor (Standard)");
+        assert_eq!(name_waehlen(None, None, name), name);
+        assert_eq!(name_waehlen(Some(""), Some("\u{7}"), name), name);
+        assert_eq!(name_waehlen(Some(&"ä".repeat(40)), None, name), "ä".repeat(24));
+    }
+
+    /// Der Stand des Aufnahmefadens (bewerten_mit): Automatik folgt dem
+    /// Hauptbildschirm; ein Wunsch wechselt; fehlt der gewuenschte, gilt
+    /// der Hauptbildschirm als Ausweichplatz, mit dem Wunsch in der Liste;
+    /// kommt er zurueck, geht es von selbst zurueck; eine geaenderte Liste
+    /// ist zu melden, eine gleiche nicht.
+    #[test]
+    fn bewertung_folgt_haupt_wunsch_ausweich_rueckkehr() {
+        let mut st = Bildschirmstand::neu(None, zwei(), Weg::Auto, Weg::Bgra);
+        assert_eq!(st.ziel.as_ref().map(|a| a.kennung.as_str()), Some("v1138-m1234-s0"));
+        assert_eq!(st.wahl, Some(Wahl::Automatik));
+        // Dieselbe Liste: nichts zu tun, nichts zu melden.
+        assert_eq!(st.bewerten_mit(zwei(), false), Bewertung::default());
+        // Hauptbildschirm wandert: Automatik folgt.
+        let mut m = zwei();
+        m[0].haupt = false;
+        m[1].haupt = true;
+        let b = st.bewerten_mit(m.clone(), false);
+        assert_eq!(b, Bewertung { gewechselt: true, melden: true, grund: Some("Hauptbildschirm gewechselt") });
+        assert_eq!(st.ziel.as_ref().map(|a| a.index), Some(1));
+        // Nur die Bildrate aendert sich: melden, kein Wechsel.
+        m[0].hz = 144;
+        assert_eq!(st.bewerten_mit(m.clone(), false), Bewertung { gewechselt: false, melden: true, grund: None });
+        // Wunsch auf den ersten (Zuschauer): Wechsel mit Grund.
+        st.wunsch = Some("v1138-m1234-s0".into());
+        let b = st.bewerten_mit(m.clone(), true);
+        assert_eq!(b, Bewertung { gewechselt: true, melden: true, grund: Some("Wunsch des Zuschauers") });
+        assert_eq!(st.wahl, Some(Wahl::Wunsch));
+        // Derselbe Wunsch noch einmal: kein Wechsel, aber Antwort (melden).
+        assert_eq!(st.bewerten_mit(m.clone(), true), Bewertung { gewechselt: false, melden: true, grund: None });
+        // Der gewuenschte faellt weg: Ausweichplatz Hauptbildschirm, der
+        // Wunsch bleibt und steht in der Liste.
+        let nur_zweiter = vec![m[1].clone()];
+        let b = st.bewerten_mit(nur_zweiter.clone(), false);
+        assert_eq!(b, Bewertung { gewechselt: true, melden: true, grund: Some("Ausweichplatz") });
+        assert_eq!(st.wahl, Some(Wahl::Ausweich));
+        assert_eq!(st.wunsch.as_deref(), Some("v1138-m1234-s0"));
+        let liste = als_bildschirme(&st.liste, st.wunsch.as_deref(), st.ziel.as_ref().map(|a| a.kennung.as_str()));
+        assert_eq!(liste.wunsch.as_deref(), Some("v1138-m1234-s0"));
+        assert_eq!(liste.gestreamt().map(|e| e.kennung.as_str()), Some("v0-m0-s0"));
+        assert!(liste.gewuenschter().is_none());
+        // Er kommt zurueck: von selbst zurueck.
+        let b = st.bewerten_mit(m.clone(), false);
+        assert_eq!(b, Bewertung { gewechselt: true, melden: true, grund: Some("zurueck zum gewuenschten Bildschirm") });
+        assert_eq!(st.ziel.as_ref().map(|a| a.index), Some(0));
+        // Wunsch auf eine fremde Kennung: gespeichert, Ausweichplatz, kein
+        // Wechsel, wenn schon der Hauptbildschirm laeuft ... hier laeuft der
+        // erste (nicht Haupt), also Wechsel auf den Hauptbildschirm.
+        st.wunsch = Some("DEL4321".into());
+        let b = st.bewerten_mit(m.clone(), true);
+        assert_eq!(b, Bewertung { gewechselt: true, melden: true, grund: Some("Ausweichplatz") });
+        assert_eq!(st.ziel.as_ref().map(|a| a.index), Some(1));
+        // Zurueck auf Automatik: der Hauptbildschirm laeuft schon - kein Wechsel.
+        st.wunsch = None;
+        assert_eq!(st.bewerten_mit(m.clone(), true), Bewertung { gewechselt: false, melden: true, grund: None });
+        // Alles weg und wieder da: kein Grund (kein alter bzw. neuer
+        // Bildschirm), aber gewechselt.
+        assert_eq!(st.bewerten_mit(Vec::new(), false), Bewertung { gewechselt: true, melden: true, grund: None });
+        assert!(st.ziel.is_none() && st.wahl.is_none());
+        assert_eq!(st.bewerten_mit(m.clone(), false), Bewertung { gewechselt: true, melden: true, grund: None });
+        // Der Encoderweg haengt am Ausgang: fuer denselben bleibt die
+        // Entscheidung vom Start, fuer einen anderen faellt eine neue
+        // (Befehlszeile bgra -> bgra, ohne messung.txt).
+        let mut st = Bildschirmstand::neu(None, zwei(), Weg::Yuv444, Weg::Bgra);
+        assert_eq!(st.weg_neu_fuer(&zwei()[0]), None, "Startausgang: Entscheidung vom Start bleibt");
+        assert_eq!(st.weg_neu_fuer(&zwei()[1]), Some(Weg::Yuv444), "anderer Ausgang: neu entschieden");
+        assert_eq!(st.weg_neu_fuer(&zwei()[1]), None);
+        assert_eq!(st.weg_neu_fuer(&zwei()[0]), Some(Weg::Yuv444));
+    }
+
+    /// Nach einem Aufbau bei gleicher Stromgroesse bleibt nur ein Encoder
+    /// auf dem Prozessorweg, und nur, wenn auch die neue Aufnahme den
+    /// Prozessorweg nimmt: ein Pool haengt am alten Geraet, und nimmt die
+    /// neue Aufnahme Texturen (Null-Kopien fuer den neuen Ausgang
+    /// entschieden, 3.3), laeuft der Encoder gleich so - Texturen an einen
+    /// Encoder ohne Pool ("Textur ohne Pool") gibt es nie.
+    #[test]
+    fn encoder_bleibt_nur_prozessorweg_auf_prozessorweg() {
+        assert!(encoder_bleibt(false, false), "Prozessorweg -> Prozessorweg: bleibt");
+        assert!(!encoder_bleibt(false, true), "Prozessorweg-Encoder, neue Aufnahme mit Texturen: neu");
+        assert!(!encoder_bleibt(true, false), "Pool am alten Geraet: neu");
+        assert!(!encoder_bleibt(true, true), "Pool am alten Geraet: neu, auch fuer Texturen");
+    }
+
+    /// Scheitert das Aufzaehlen (DXGI-Factory), gilt die letzte Liste
+    /// weiter: kein Wechsel, nichts zu melden, kein gesunder Strom faellt;
+    /// der Fehler wird gemerkt (einmal ins Protokoll) und mit der naechsten
+    /// guten Liste vergessen.
+    #[test]
+    fn aufzaehlfehler_behaelt_die_letzte_liste() {
+        let mut st = Bildschirmstand::neu(None, zwei(), Weg::Auto, Weg::Bgra);
+        let l = st.liste_aufgezaehlt(Err("CreateDXGIFactory1: kaputt".into()));
+        assert_eq!(l, zwei());
+        assert_eq!(st.aufzaehl_fehler, "CreateDXGIFactory1: kaputt");
+        assert_eq!(st.bewerten_mit(l, false), Bewertung::default());
+        assert_eq!(st.ziel.as_ref().map(|a| a.index), Some(0));
+        // Derselbe Fehler noch einmal: dieselbe Liste, gemerkt bleibt er.
+        assert_eq!(st.liste_aufgezaehlt(Err("CreateDXGIFactory1: kaputt".into())), zwei());
+        assert_eq!(st.aufzaehl_fehler, "CreateDXGIFactory1: kaputt");
+        // Eine gute Liste: sie gilt, der Fehler ist vergessen.
+        let l = st.liste_aufgezaehlt(Ok(vec![zwei()[1].clone()]));
+        assert_eq!(l.len(), 1);
+        assert!(st.aufzaehl_fehler.is_empty());
+        assert_eq!(st.bewerten_mit(l, false).gewechselt, true);
+    }
+
+    /// Nachricht 12 nach einem Wechsel bei laufendem Strom erst nach dem
+    /// Aufbau des neuen (1.4 Schritt 6); ohne laufenden Strom, bei einer
+    /// blossen Listenaenderung und als Antwort auf einen Wunsch sofort. Eine
+    /// offene Meldung wird genau einmal nachgeholt.
+    #[test]
+    fn nachricht_12_nach_wechsel_erst_nach_dem_aufbau() {
+        let mut st = Bildschirmstand::neu(None, zwei(), Weg::Auto, Weg::Bgra);
+        let wechsel = Bewertung { gewechselt: true, melden: true, grund: Some("Wunsch des Zuschauers") };
+        let nur_liste = Bewertung { gewechselt: false, melden: true, grund: None };
+        // Ohne laufenden Strom: sofort.
+        assert!(st.meldung_faellig(wechsel, false));
+        assert!(!st.meldung_offen);
+        // Mit laufendem Strom: zurueckgestellt, bis der Aufbau sie nachholt.
+        assert!(!st.meldung_faellig(wechsel, true));
+        assert!(st.meldung_offen);
+        assert!(std::mem::take(&mut st.meldung_offen));
+        // Nichts zu melden: nichts. Nur die Liste: sofort, auch im Betrieb.
+        assert!(!st.meldung_faellig(Bewertung::default(), true));
+        assert!(st.meldung_faellig(nur_liste, true));
+        // Eine offene Meldung geht mit der naechsten faelligen Bewertung
+        // mit hinaus, auch ohne eigene Aenderung - und danach nicht mehr.
+        assert!(!st.meldung_faellig(wechsel, true));
+        assert!(st.meldung_faellig(Bewertung::default(), false));
+        assert!(!st.meldung_offen);
+        assert!(!st.meldung_faellig(Bewertung::default(), false));
+    }
+
+    /// bildschirm.txt (1.5): geschrieben und gelesen, "auto" fuer Automatik,
+    /// fehlt -> Fehlt, kaputt -> Unlesbar und unveraendert liegen gelassen.
+    #[test]
+    fn wunsch_datei_hin_und_zurueck() {
+        let ordner = std::env::temp_dir().join(format!("qc-bildschirm-{}", std::process::id()));
+        std::fs::create_dir_all(&ordner).unwrap();
+        let pfad = ordner.join("bildschirm.txt");
+        assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Fehlt);
+        wunsch_speichern_nach(&pfad, Some("ACR0501")).unwrap();
+        assert_eq!(std::fs::read_to_string(&pfad).unwrap(), "ACR0501\n");
+        assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Kennung("ACR0501".into()));
+        wunsch_speichern_nach(&pfad, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&pfad).unwrap(), "auto\n");
+        assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Automatik);
+        // Keine temporaere Datei bleibt liegen.
+        assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
+        // Ein bildschirm.<pid>.neu eines abgestuerzten Laufs raeumt der
+        // Start weg (wunsch_laden); anderes und die Datei selbst bleiben.
+        std::fs::write(ordner.join("bildschirm.4711.neu"), "ACR0501\n").unwrap();
+        std::fs::write(ordner.join("anderes.neu"), "x").unwrap();
+        assert_eq!(wunsch_reste_aufraeumen(&pfad), 1);
+        assert!(!ordner.join("bildschirm.4711.neu").exists());
+        assert!(ordner.join("anderes.neu").exists() && pfad.exists());
+        assert_eq!(wunsch_reste_aufraeumen(&pfad), 0);
+        std::fs::remove_file(ordner.join("anderes.neu")).unwrap();
+        assert_eq!(wunsch_reste_aufraeumen(&ordner.join("gibt-es-nicht").join("bildschirm.txt")), 0);
+        // Zeilenende in Windows-Art und Leerzeilen am Rand sind in Ordnung.
+        std::fs::write(&pfad, "\r\nv0-m0-s0\r\n\r\n").unwrap();
+        assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Kennung("v0-m0-s0".into()));
+        // Kaputt: leer, zwei Zeilen, kein UTF-8, Steuerzeichen, zu lang.
+        for kaputt in [b"".to_vec(), b"\n \n".to_vec(), b"a\nb\n".to_vec(), vec![0xff, 0xfe, b'a'], b"a\tb\n".to_vec(), vec![b'k'; 65]] {
+            std::fs::write(&pfad, &kaputt).unwrap();
+            assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Unlesbar, "{kaputt:?}");
+            assert_eq!(std::fs::read(&pfad).unwrap(), kaputt, "Datei still ersetzt");
+        }
+        // Ueber die Ablage: im Test der Temp-Ordner (secure::config_dir).
+        wunsch_speichern(Some("DEL4321"));
+        assert_eq!(wunsch_laden(), Some("DEL4321".into()));
+        wunsch_speichern(None);
+        assert_eq!(wunsch_laden(), None);
+        std::fs::remove_dir_all(&ordner).ok();
+    }
+
+    /// Die Win32-Wege der Liste (DXGI, GDI, EnumDisplayDevices,
+    /// QueryDisplayConfig, EnumDisplaySettings) laufen ohne Absturz, und
+    /// jeder Ausgang traegt eine Kennung und einen Namen in den Grenzen der
+    /// Leitung, hoechstens einer ist Hauptbildschirm, die Kennungen sind
+    /// eindeutig. Auf der Bau-VM (ssh, Sitzung 0) ist die DXGI-Liste leer -
+    /// dann prueft das nur die GDI-Seite.
+    #[test]
+    fn geraetewege_liefern_kennung_und_name() {
+        let liste = ausgaenge().unwrap_or_default();
+        for a in &liste {
+            println!("Ausgang {}: {} Kennung {} ({}) {} Hz{}", a.index, a.name, a.kennung, a.anzeigename, a.hz, if a.haupt { " Haupt" } else { "" });
+            assert!(!a.kennung.is_empty() && a.kennung.len() <= bildschirm::KENNUNG_MAX, "{a:?}");
+            assert!(a.anzeigename.len() <= bildschirm::NAME_MAX, "{a:?}");
+            assert_eq!(bildschirm::kennung_bereinigen(&a.kennung), a.kennung);
+        }
+        assert!(liste.iter().filter(|a| a.haupt).count() <= 1);
+        let mut kennungen: Vec<&str> = liste.iter().map(|a| a.kennung.as_str()).collect();
+        kennungen.sort();
+        kennungen.dedup();
+        assert_eq!(kennungen.len(), liste.len(), "Kennungen nicht eindeutig");
+        for (name, r, haupt) in gdi_monitore() {
+            let (id, s) = monitor_geraet(&name);
+            println!("GDI {name}: {}x{} Haupt {haupt}, Geraete-ID {id:?}, DeviceString {s:?}, {} Hz", r.right - r.left, r.bottom - r.top, bildrate(&name));
+            assert!(!kennung_aus_geraete_id(id.as_deref().unwrap_or(""), &name).is_empty());
+        }
+        let _ = anzeigenamen();
+    }
 
     #[test]
     fn stromplan_halbiert_nur_ab_3840() {

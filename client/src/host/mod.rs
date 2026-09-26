@@ -14,7 +14,8 @@
 // Stand: Zuschauerplatz (Noise-Responder, Kopplung, Bekanntgabe), Eingaben,
 // Zwischenablage (Text und Dateien, netz.rs mit dateien.rs), Aufnahme
 // (Desktop Duplication) mit Schrittmacher und Encoder im Betrieb (nvenc,
-// ohne NVIDIA h264_mf in Software), Codecwechsel, Testbild, Ton
+// ohne NVIDIA h264_mf in Software), Codecwechsel, Bildschirmwahl mit
+// Umschalten (aufnahme.rs, Nachrichten 12 und 70), Testbild, Ton
 // (WASAPI-Loopback), Zeigerform, Last, Wachhalten; die Konserve bleibt als
 // Bildquelle waehlbar (--konserve); die Messung (--messen).
 
@@ -83,6 +84,10 @@ pub struct Zustand {
     pub testbild: AtomicBool,
     /// Bildquelle ist eine Konserve (kein Encoder, kein Codecwechsel).
     pub konserve: AtomicBool,
+    /// Die Bildschirme des Hosts mit Wunsch und gestreamtem Eintrag
+    /// (Nachricht 12) - vom Aufnahmefaden gepflegt, vom Netzfaden fuer die
+    /// Begruessung gelesen.
+    pub bildschirme: Mutex<crate::bildschirm::Bildschirme>,
 }
 
 pub static Z: Zustand = Zustand {
@@ -113,6 +118,7 @@ pub static Z: Zustand = Zustand {
     enc_n: AtomicU64::new(0),
     testbild: AtomicBool::new(false),
     konserve: AtomicBool::new(false),
+    bildschirme: Mutex::new(crate::bildschirm::Bildschirme { wunsch: None, eintraege: Vec::new() }),
 };
 
 // ---------------------------------------------------------------- Protokoll
@@ -451,19 +457,41 @@ pub fn main_host(args: &[String]) -> i32 {
         Z.fest.store(true, Ordering::Relaxed);
     }
 
-    // Bildschirm: Liste der Ausgaenge, Wahl per --output n oder Hauptbildschirm.
-    // Gemerkt wird der Geraetename, nicht der Listenplatz. Ohne DXGI-Ausgang
-    // (WARP, RDP) kommt die Geometrie aus der GDI-Liste - fuer die Maus.
+    // Bildschirm (Spezifikation Bildschirm 1.1-1.5): die Ausgaenge mit
+    // Kennung und Name; der Wunsch aus bildschirm.txt, --output n pinnt fuer
+    // diesen Lauf den Bildschirm am Listenplatz n (die Datei bleibt); Ziel
+    // ist der Wunsch, sonst der Hauptbildschirm, sonst der erste. Gemerkt
+    // wird die Kennung, nie der Listenplatz. Ohne DXGI-Ausgang (WARP, RDP)
+    // kommt die Geometrie aus der GDI-Liste - fuer die Maus.
     let mut ausgaenge = Vec::new();
     aufnahme::ausgaenge_melden(&mut ausgaenge);
-    let wunsch = arg_zahl(args, "--output").map(|n| n as usize);
-    let ausgang = aufnahme::ausgang_waehlen(&ausgaenge, wunsch);
-    match &ausgang {
+    let gespeichert = aufnahme::wunsch_laden();
+    let pin = arg_zahl(args, "--output").and_then(|n| match ausgaenge.get(n as usize) {
         Some(a) => {
+            log(format!("--output {n}: Bildschirm {} gilt fuer diesen Lauf (bildschirm.txt bleibt)", a.bezeichnung()));
+            Some(a.kennung.clone())
+        }
+        None => {
+            log(format!("Ausgang {n} nicht verfuegbar ({} in der Liste) - kein Pin, es gilt bildschirm.txt bzw. der Hauptbildschirm", ausgaenge.len()));
+            None
+        }
+    });
+    let wunsch = pin.or(gespeichert);
+    let ziel = aufnahme::ziel_waehlen(&ausgaenge, wunsch.as_deref());
+    aufnahme::bildschirme_setzen(&ausgaenge, wunsch.as_deref(), ziel.as_ref().map(|(a, _)| a.kennung.as_str()));
+    let ausgang = ziel.as_ref().map(|(a, _)| a.clone());
+    match &ziel {
+        Some((a, wahl)) => {
             log(format!(
-                "Ausgang gewaehlt: {} {}x{} bei ({},{}) an Karte {}{}",
+                "Ausgang gewaehlt: {} {}x{} bei ({},{}) an Karte {}{}, Kennung {} ({}), {} Hz{}",
                 a.name, a.breite, a.hoehe, a.links, a.oben, a.karte,
-                if a.haupt { " (Hauptbildschirm)" } else { "" }
+                if a.haupt { " (Hauptbildschirm)" } else { "" },
+                a.kennung, a.anzeigename, a.hz,
+                match wahl {
+                    aufnahme::Wahl::Wunsch => " - gewuenschter Bildschirm".to_string(),
+                    aufnahme::Wahl::Ausweich => format!(" - Ausweichplatz, {} nicht angeschlossen", wunsch.as_deref().unwrap_or("?")),
+                    aufnahme::Wahl::Automatik => String::new(),
+                }
             ));
             eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
             let (w, h) = aufnahme::stromgroesse(a);
@@ -509,7 +537,7 @@ pub fn main_host(args: &[String]) -> i32 {
     };
 
     // Eingabeweg des Encoders: --encoderweg bgra|yuv444|d3d11|auto.
-    let weg = match arg_wert(args, "--encoderweg") {
+    let weg_cli = match arg_wert(args, "--encoderweg") {
         Some(t) => match encoder::Weg::aus_text(&t) {
             Some(w) => w,
             None => {
@@ -556,16 +584,26 @@ pub fn main_host(args: &[String]) -> i32 {
     // Bildquelle: die Konserve bestimmt die Eckdaten des Stroms - vor der
     // Zeile dazu. Sonst die Aufnahme des gewaehlten Ausgangs mit dem
     // Encoder aus der Kandidatentabelle - beides erst, wenn jemand zuschaut.
+    // Ohne Aufnahmefaden (Konserve, keine Bildquelle) beantwortet der
+    // Eingabefaden einen Bildschirmwunsch (70) selbst mit der unveraenderten
+    // Liste - niemand sonst holte ihn ab.
     if let Some(k) = konserve {
+        aufnahme::ohne_aufnahme("Konserve als Bildquelle");
         konserve::abspielen(k);
     } else {
         match (&ausgang, startkandidat) {
             (Some(a), Some(_)) => {
-                let weg = encoder::weg_entscheiden(weg, a.index);
-                aufnahme::start(Some(a.clone()), weg);
+                let weg = encoder::weg_entscheiden(weg_cli, a.index);
+                aufnahme::start(wunsch, ausgaenge, weg_cli, weg);
             }
-            (None, _) => log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus"),
-            (_, None) => log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus"),
+            (None, _) => {
+                aufnahme::ohne_aufnahme("kein DXGI-Ausgang");
+                log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus");
+            }
+            (_, None) => {
+                aufnahme::ohne_aufnahme("kein Encoder");
+                log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus");
+            }
         }
     }
     log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));

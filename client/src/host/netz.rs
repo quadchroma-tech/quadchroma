@@ -1497,6 +1497,17 @@ pub fn strominfo_senden() {
     send_small(MSG_INFO, &super::strominfo());
 }
 
+/// Nachricht 12: die Bildschirme des Hosts, wie sie in Z stehen.
+fn bildschirme_payload() -> Vec<u8> {
+    crate::bildschirm::bildschirme_kodieren(&sperre(&Z.bildschirme))
+}
+
+/// Die Bildschirmliste (12) an den aktuellen Zuschauer - nach einem
+/// Wechsel, einer geaenderten Liste oder als Antwort auf einen Wunsch.
+pub fn bildschirme_senden() {
+    send_small(MSG_BILDSCHIRME, &bildschirme_payload());
+}
+
 pub fn hoststatus_senden(lage: u8) {
     send_small(MSG_HOSTSTATUS, &[lage, 0]);
 }
@@ -1794,9 +1805,11 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     super::ton::info_zuruecksetzen();
     settings_senden();
     send_small(MSG_CODECS, &encoder::codecs_payload());
-    // Was dieser Host kann (2.2): Dateien Fassung 1 - nur an genau diesen
-    // Zuschauer. Ein aelterer Client uebergeht Typ 11.
-    send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN));
+    // Was dieser Host kann (2.2): Dateien Fassung 1 und die Bildschirmwahl -
+    // nur an genau diesen Zuschauer; danach die Bildschirme (12). Ein
+    // aelterer Client uebergeht Typ 11 und 12.
+    send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN | FAEHIG_BILDSCHIRM));
+    send_small_an(&AKTUELL, &NR, nr, MSG_BILDSCHIRME, &bildschirme_payload());
     log(format!("Zuschauer verbunden: {ip}:{port}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}"));
     // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten: solange
     // er abnimmt (Rest des laufenden Pakets, dann das Schlusswort), sonst
@@ -1969,6 +1982,15 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
             IN_CODEC => {
                 if len >= 1 {
                     encoder::codec_wunsch(payload[0] as usize);
+                }
+            }
+            IN_BILDSCHIRM => {
+                // Bildschirmwunsch: nur vormerken - der Wechsel selbst
+                // gehoert in den Aufnahmefaden. Ungueltiges (Laenge, UTF-8,
+                // Steuerzeichen) wird uebergangen, der Kanal bleibt.
+                match crate::bildschirm::wunsch_lesen(&payload) {
+                    Some(w) => super::aufnahme::bildschirm_wunsch(w),
+                    None => log(format!("Bildschirmwunsch: ungueltig ({len} Byte) - uebergangen")),
                 }
             }
             // Dateien Client -> Host: nur in die Warteschlange des
@@ -2394,6 +2416,29 @@ mod tests {
         s.write_all(&m)
     }
 
+    /// Die naechste Nachricht vom Bildkanal: (Typ, Nutzlast).
+    fn naechste(s: &mut secure::Secure) -> Result<(u8, Vec<u8>), String> {
+        let mut h = [0u8; 8];
+        s.read_exact(&mut h)?;
+        let len = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+        let mut p = vec![0u8; len];
+        s.read_exact(&mut p)?;
+        Ok((h[0], p))
+    }
+
+    /// Die Bildschirmliste, die der Host in der Begruessung schickt: die
+    /// zwei Eintraege der Pruefvektoren (bildschirm.rs), Automatik.
+    fn begruessungsliste() -> crate::bildschirm::Bildschirme {
+        use crate::bildschirm::{BildschirmEintrag, Bildschirme};
+        Bildschirme {
+            wunsch: None,
+            eintraege: vec![
+                BildschirmEintrag { kennung: "v1138-m1234-s0".into(), name: "X27 X1".into(), breite: 1920, hoehe: 1080, hz: 120, haupt: true, gestreamt: true },
+                BildschirmEintrag { kennung: "v0-m0-s0".into(), name: "Virtuell 16:9".into(), breite: 1920, hoehe: 1080, hz: 240, haupt: false, gestreamt: false },
+            ],
+        }
+    }
+
     /// Liest vom Bildkanal nach MAGIC bis MSG_FAEHIGKEITEN und gibt dessen
     /// Nutzlast zurueck. Die erste Nachricht muss die Begruessung (MSG_INFO)
     /// sein.
@@ -2457,13 +2502,20 @@ mod tests {
         std::thread::spawn(move || annahme_bild(bild_l));
         std::thread::spawn(move || annahme_eingabe(ein_l));
 
+        // Die Bildschirme, die der Aufnahmefaden in Z hinterlegt haette.
+        *sperre(&Z.bildschirme) = begruessungsliste();
+
         // Zuschauer A, waehrend eine stumme Verbindung am Bildport haengt.
         let stumm = TcpStream::connect(&bild_addr).unwrap();
         let mut a = bild_verbinden(&bild_addr);
         drop(stumm);
-        // Nach der Begruessung kommt MSG_FAEHIGKEITEN: Dateien Fassung 1.
+        // Nach der Begruessung kommt MSG_FAEHIGKEITEN: Dateien Fassung 1 und
+        // Bildschirmwahl (3), gleich danach die Bildschirme (12).
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(bis_faehigkeiten(&mut a), Ok(vec![1, 0, 0, 0]));
+        assert_eq!(bis_faehigkeiten(&mut a), Ok(vec![3, 0, 0, 0]));
+        let (typ, p) = naechste(&mut a).unwrap();
+        assert_eq!(typ, MSG_BILDSCHIRME, "nach 11 kommt 12");
+        assert_eq!(crate::bildschirm::bildschirme_lesen(&p), Some(begruessungsliste()));
         // Eingabekanal von A, ebenso an einer stummen Verbindung vorbei.
         let stumm = TcpStream::connect(&ein_addr).unwrap();
         let t0 = Instant::now();
@@ -2497,9 +2549,12 @@ mod tests {
         assert_eq!(zuschauer_nr(), nr_a + 1);
         assert!(!Z.testbild.load(Ordering::Relaxed), "Testbild von A ueberlebt die Abloesung");
         assert!(!aktuell().unwrap().kann_dateien(), "Faehigkeiten von A gelten fuer B");
-        // Auch B bekommt MSG_FAEHIGKEITEN.
+        // Auch B bekommt MSG_FAEHIGKEITEN und die Bildschirme.
         b.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(bis_faehigkeiten(&mut b), Ok(vec![1, 0, 0, 0]));
+        assert_eq!(bis_faehigkeiten(&mut b), Ok(vec![3, 0, 0, 0]));
+        let (typ, p) = naechste(&mut b).unwrap();
+        assert_eq!(typ, MSG_BILDSCHIRME);
+        assert_eq!(crate::bildschirm::bildschirme_lesen(&p), Some(begruessungsliste()));
         a_ein.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let t0 = Instant::now();
@@ -3567,6 +3622,82 @@ mod tests {
         assert_eq!(host_ablage_aufraeumen(), 1);
         assert!(!alt.exists() && frisch.exists());
         let _ = std::fs::remove_dir_all(&basis);
+    }
+
+    /// Der Bildschirmwunsch (70) geht ueber den echten Eingabekanal in die
+    /// Vormerkung des Aufnahmefadens (aufnahme::bildschirm_wunsch_abholen):
+    /// eine Kennung, Automatik, der letzte gewinnt; Ungueltiges (Laenge,
+    /// Steuerzeichen) wird uebergangen, ohne den Kanal zu beenden.
+    #[test]
+    fn bildschirmwunsch_kommt_ueber_den_eingabekanal() {
+        use super::super::aufnahme::bildschirm_wunsch_abholen;
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s) = (Rekorder::default(), Staende::default());
+        let u = Arc::new(umgebung_test(&PLATZ, &ZAEHLER, "bildschirmwunsch", &r, &s));
+        let (mut h, mut c) = paar();
+        let l = Arc::new(Leitung::neu(None, vec![1], vec![1], "C".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, l.clone());
+        assert!(l.eingabe_binden(1, h.abbruchgriff().unwrap()));
+        let (l2, u2) = (l.clone(), u.clone());
+        let leser = std::thread::spawn(move || eingabe_lesen(&mut h, &l2, 1, &u2));
+        let wunsch = |c: &mut secure::Secure, nutzlast: &[u8]| {
+            let mut m = kopf(IN_BILDSCHIRM, 0, 0, nutzlast.len()).to_vec();
+            m.extend_from_slice(nutzlast);
+            c.write_all(&m).unwrap();
+        };
+        let abholen = || {
+            let bis = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(w) = bildschirm_wunsch_abholen() {
+                    return w;
+                }
+                assert!(Instant::now() < bis, "kein Wunsch angekommen");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let _ = bildschirm_wunsch_abholen();
+        // Der Pruefvektor (2.4): Wunsch auf v0-m0-s0.
+        wunsch(&mut c, &[8, 0x76, 0x30, 0x2d, 0x6d, 0x30, 0x2d, 0x73, 0x30]);
+        assert_eq!(abholen(), Some("v0-m0-s0".into()));
+        // Automatik.
+        wunsch(&mut c, &[0]);
+        assert_eq!(abholen(), None);
+        // Zwei kurz nacheinander: der letzte gewinnt (kein Puffer).
+        wunsch(&mut c, b"\x03ABC");
+        wunsch(&mut c, b"\x03DEF");
+        faehigkeiten_melden(&mut c).unwrap();
+        let bis = Instant::now() + Duration::from_secs(5);
+        while !l.kann_dateien() && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(l.kann_dateien());
+        assert_eq!(bildschirm_wunsch_abholen(), Some(Some("DEF".into())));
+        // Ungueltig: Laenge ueber dem Rest, Steuerzeichen, leer - uebergangen,
+        // der Kanal lebt (die Faehigkeiten danach kommen an).
+        for kaputt in [&b"\x05ab"[..], &b"\x02a\n"[..], &b""[..]] {
+            wunsch(&mut c, kaputt);
+            let mut m = kopf(IN_FAEHIGKEITEN, 0, 0, 4).to_vec();
+            m.extend_from_slice(&dateien::faehigkeiten_kodieren(0));
+            c.write_all(&m).unwrap();
+            let bis = Instant::now() + Duration::from_secs(5);
+            while l.kann_dateien() && Instant::now() < bis {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!l.kann_dateien(), "Kanal nach {kaputt:?} nicht mehr am Leben");
+            assert_eq!(bildschirm_wunsch_abholen(), None, "{kaputt:?} durchgelassen");
+            faehigkeiten_melden(&mut c).unwrap();
+            let bis = Instant::now() + Duration::from_secs(5);
+            while !l.kann_dateien() && Instant::now() < bis {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(l.kann_dateien());
+        }
+        // Ueber 65 Byte ist der Wunsch nie; die Grenze des Typs bleibt 256.
+        assert_eq!(eingangsgrenze(IN_BILDSCHIRM), 256);
+        l.schliessen();
+        assert!(endet_binnen(leser, Duration::from_secs(5)).is_some());
+        let _ = std::fs::remove_dir_all(&u.basis);
     }
 
     /// Nimmt die Grenzen aus 2.6 fuer 50-53 und 69: genau an der Grenze
