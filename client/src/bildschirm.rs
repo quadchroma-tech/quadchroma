@@ -19,8 +19,12 @@
 // Windows: Geraete-ID des Monitors), nie ein Listenplatz. Gelesen wird
 // defensiv: jede Laenge gegen den Rest geprueft, ungueltiges UTF-8 ersetzt,
 // mehr als 16 Eintraege nur bis 16, eine fremde Fassung ergibt None.
+//
+// Kodieren der Liste und Lesen des Wunsches braucht nur die Windows-Host-
+// Rolle; auf dem Mac gibt es die nicht, dort waeren sie sonst "nie benutzt".
+// Unter Windows bleibt die Warnung scharf.
 
-#![allow(dead_code)]
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// Hoechstlaenge einer Kennung in Byte.
 pub const KENNUNG_MAX: usize = 64;
