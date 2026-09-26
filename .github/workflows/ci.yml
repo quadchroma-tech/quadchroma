@@ -184,6 +184,10 @@ jobs:
                 -framework Foundation host/dateitest.m host/dateien.m -o build/dateitest
           clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 -framework Foundation \
                 -framework AppKit host/ablagetest.m -o build/ablagetest
+          # menuetest: texts (29 tables) and the menu bar model, without showing anything.
+          clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
+                -framework Foundation -framework AppKit -framework ServiceManagement \
+                host/menuetest.m host/menue.m host/texte.m -o build/menuetest
           # hosttest needs Screen Recording (a TCC permission) at run time, which a runner
           # does not have - only compile it here; that catches compile errors.
           clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
@@ -194,7 +198,7 @@ jobs:
                 host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
                 host/vendor/monocypher/monocypher.c -o build/hosttest
 
-      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, dateitest, ablagetest)
+      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, dateitest, ablagetest, menuetest)
         run: |
           set -euo pipefail
           # noisetest prints two log lines and "OK" as the last line.
@@ -202,6 +206,7 @@ jobs:
           build/annahmetest
           build/dateitest
           build/ablagetest
+          build/menuetest
 
       - name: FFmpeg (Homebrew, GPL build - only for building and testing the Mac client)
         run: |

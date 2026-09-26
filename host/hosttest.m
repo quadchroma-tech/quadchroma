@@ -18,7 +18,9 @@
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
 // Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
-// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt).
+// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt), Dienst-Takt
+// ohne Run-Loop (Auslastung im Takt, Drosselzeilen nachgetragen) und Abschied
+// beim Beenden (Typ 10 als letzte Nachricht).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -30,7 +32,9 @@
 //   /tmp/hosttest
 //
 // main.m wird hier eingebunden; sein main heisst dann host_main und laeuft
-// nie. Es startet also kein Dienst, keine Aufnahme, und nichts schreibt in
+// nie. Die Oberflaeche (menue.m) bindet der Pruefstand nicht: main.m bringt
+// schwache Standardfassungen fuer ihre Einstiege mit. Es startet also kein
+// Dienst, keine Aufnahme, keine Oberflaeche, und nichts schreibt in
 // /tmp/quadchroma-m1.log: g_log bleibt leer, alles geht nach stdout - nur die
 // Protokollpruefung lenkt g_log fuer sich auf eine Datei im eigenen HOME. Die
 // Zuschauer sind echte TCP-Verbindungen ueber 127.0.0.1 ab Port 19100 mit
@@ -2961,6 +2965,58 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pthread_mutex_unlock(&g_log_mtx);
 }
 
+// ------------------------------------- Dienst-Takt und Abschied beim Beenden
+
+// Der Takt ersetzt die fruehere 5-s-Schleife in main (die [NSApp run]
+// weichen musste). Er laeuft auf eigener Warteschlange - hier ohne jede
+// Run-Loop, mit 0,2 s statt 5 s.
+static void takt_pruefen(void) {
+    printf("\n-- Dienst-Takt ohne Run-Loop, Abschied beim Beenden\n");
+    int h, c;
+    if (paar(&h, &c, 0)) { pruefe(0, "Verbindung"); return; }
+    zuschauer_setzen(h, kanal(h, 0x55));
+    // Eine zurueckgehaltene Drosselzeile, deren Frist schon um ist: der Takt
+    // muss sie nachtragen, wie frueher die Schleife.
+    logf_gedrosselt(&d_ein_fremd, "10.9.8.7", @"Takt-Probe von %s", "10.9.8.7");
+    logf_gedrosselt(&d_ein_fremd, "10.9.8.7", @"Takt-Probe von %s", "10.9.8.7");
+    pruefe(drossel_weitere(&d_ein_fremd) >= 1, "vorher: eine Zeile zurueckgehalten");
+    drossel_altern(&d_ein_fremd);
+
+    double t0 = sek();
+    dienst_takt_starten(0.2);
+    leser l;
+    leser_init(&l, c, 0x55);
+    qc_hdr m;
+    uint8_t anf[8];
+    int last = 0, fassung_gut = 1;
+    double erste = 0;
+    while (last < 3 && sek() - t0 < 4.0) {
+        if (nachricht(&l, &m, anf, 1500) != 1) break;
+        if (m.type != QC_MSG_LAST) continue;
+        if (!last) erste = sek() - t0;
+        if (m.len != 28 || anf[0] != 1) fassung_gut = 0;
+        last++;
+    }
+    double dauer = sek() - t0;
+    printf("         (%d Auslastungsmeldungen in %.2f s, die erste nach %.2f s)\n", last, dauer, erste);
+    pruefe(last == 3, "Auslastung (Typ 6) kommt im Takt, ohne dass jemand die Run-Loop dreht");
+    pruefe(fassung_gut, "Auslastung: 28 Byte, Fassung 1");
+    pruefe(erste >= 0.15 && erste < 1.0, "erste Runde nach einem vollen Takt");
+    pruefe(drossel_weitere(&d_ein_fremd) == 0, "zurueckgehaltene Drosselzeile nachgetragen");
+    dienst_takt_anhalten();
+
+    // Beenden: der Zuschauer bekommt Typ 10 als letzte Nachricht, dann ist zu.
+    host_abschied();
+    int e, letzte = -1, laenge = -1;
+    while ((e = nachricht(&l, &m, anf, 2000)) == 1) { letzte = m.type; laenge = (int)m.len; }
+    pruefe(letzte == QC_MSG_ABGELOEST && laenge == 0, "Abschied: Typ 10 mit Laenge 0 als letzte Nachricht");
+    pruefe(e == 0, "danach schliesst der Host den Bildkanal");
+    pruefe(atomic_load(&g_client_fd) == -1 && g_vid == NULL && !atomic_load(&g_vid_ready),
+           "Zuschauer ausgetragen");
+    close(c);
+    free(l.buf);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -3014,6 +3070,7 @@ int main(void) {
         bildschirm_pruefen(bild_port, ein_port);
         ton_pruefen();
         stau_pruefen();
+        takt_pruefen();
         codecs_pruefen_pruefen();
         // Das eigene HOME bleibt nur liegen, wenn etwas fehlschlug (zum Nachsehen).
         if (!g_fehler) [[NSFileManager defaultManager] removeItemAtPath:@(g_home) error:nil];

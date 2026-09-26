@@ -34,9 +34,11 @@
     <string>public.app-category.utilities</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Robert Brandt</string>
-    <!-- The host runs without a Dock icon and without windows; this does not
-         matter for the signature or Gatekeeper. -->
-    <key>LSBackgroundOnly</key>
+    <!-- The host runs without a Dock icon, as a menu bar app: status item,
+         menu and small windows (approval request, password). LSBackgroundOnly
+         would forbid them. Neither key matters for the signature, Gatekeeper
+         or the TCC permissions (they depend on identifier and certificate). -->
+    <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
