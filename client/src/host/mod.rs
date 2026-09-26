@@ -584,7 +584,11 @@ pub fn main_host(args: &[String]) -> i32 {
     // Bildquelle: die Konserve bestimmt die Eckdaten des Stroms - vor der
     // Zeile dazu. Sonst die Aufnahme des gewaehlten Ausgangs mit dem
     // Encoder aus der Kandidatentabelle - beides erst, wenn jemand zuschaut.
+    // Ohne Aufnahmefaden (Konserve, keine Bildquelle) beantwortet der
+    // Eingabefaden einen Bildschirmwunsch (70) selbst mit der unveraenderten
+    // Liste - niemand sonst holte ihn ab.
     if let Some(k) = konserve {
+        aufnahme::ohne_aufnahme("Konserve als Bildquelle");
         konserve::abspielen(k);
     } else {
         match (&ausgang, startkandidat) {
@@ -592,8 +596,14 @@ pub fn main_host(args: &[String]) -> i32 {
                 let weg = encoder::weg_entscheiden(weg_cli, a.index);
                 aufnahme::start(wunsch, ausgaenge, weg_cli, weg);
             }
-            (None, _) => log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus"),
-            (_, None) => log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus"),
+            (None, _) => {
+                aufnahme::ohne_aufnahme("kein DXGI-Ausgang");
+                log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus");
+            }
+            (_, None) => {
+                aufnahme::ohne_aufnahme("kein Encoder");
+                log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus");
+            }
         }
     }
     log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));

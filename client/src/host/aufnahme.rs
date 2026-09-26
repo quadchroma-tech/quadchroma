@@ -36,7 +36,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -269,7 +269,14 @@ pub fn kennungen_eindeutig(liste: &mut [Ausgang]) {
         .collect();
     for a in liste.iter_mut() {
         if doppelt.contains(&a.kennung) {
-            a.kennung = bildschirm::kennung_bereinigen(&format!("{}-{}", a.kennung, a.index));
+            // Der Anhang muss in die 64 Byte passen (gekuerzt an einer
+            // Zeichengrenze), sonst blieben beide Kennungen gleich.
+            let anhang = format!("-{}", a.index);
+            let mut basis = a.kennung.clone();
+            while basis.len() + anhang.len() > bildschirm::KENNUNG_MAX {
+                basis.pop();
+            }
+            a.kennung = bildschirm::kennung_bereinigen(&format!("{basis}{anhang}"));
         }
     }
 }
@@ -393,9 +400,27 @@ pub fn bildschirme_setzen(liste: &[Ausgang], wunsch: Option<&str>, gestreamt: Op
 /// Der letzte Wunsch gewinnt.
 static BILDSCHIRM_WUNSCH: Mutex<Option<Option<String>>> = Mutex::new(None);
 
+/// Warum kein Aufnahmefaden laeuft (Konserve als Bildquelle, kein
+/// DXGI-Ausgang, kein Encoder): dann holt niemand einen Wunsch aus dem
+/// Postfach, und der Eingabefaden beantwortet ihn selbst mit der
+/// unveraenderten Liste (2.3) - der Zuschauer wartet sonst 5 s auf einen
+/// Wechsel, der nie kommt.
+static OHNE_AUFNAHME: OnceLock<&'static str> = OnceLock::new();
+
+/// Vom Start (mod.rs), wenn kein Aufnahmefaden gestartet wird.
+pub fn ohne_aufnahme(grund: &'static str) {
+    let _ = OHNE_AUFNAHME.set(grund);
+}
+
 /// Ein Wunsch vom Eingabekanal (netz::eingabe_lesen): nur vormerken, der
-/// Wechsel selbst laeuft im Aufnahmefaden.
+/// Wechsel selbst laeuft im Aufnahmefaden. Ohne Aufnahmefaden geht sofort
+/// die unveraenderte Liste zurueck, der Wunsch wird nicht gespeichert.
 pub fn bildschirm_wunsch(wunsch: Option<String>) {
+    if let Some(grund) = OHNE_AUFNAHME.get() {
+        log(format!("Bildschirmwunsch: {} - {grund}, kein Wechsel moeglich", wunsch.as_deref().unwrap_or("Automatik")));
+        netz::bildschirme_senden();
+        return;
+    }
     *BILDSCHIRM_WUNSCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(wunsch);
 }
 
@@ -451,10 +476,31 @@ pub fn wunsch_speichern_nach(pfad: &Path, wunsch: Option<&str>) -> Result<(), St
     })
 }
 
+/// Eine temporaere Datei bildschirm.<pid>.neu, die ein abgestuerzter Lauf
+/// zwischen Schreiben und Umbenennen liegen liess, raeumt der naechste
+/// Start weg. Liefert, wie viele es waren.
+pub fn wunsch_reste_aufraeumen(pfad: &Path) -> usize {
+    let Some(dir) = pfad.parent() else { return 0 };
+    let Ok(eintraege) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for e in eintraege.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("bildschirm.") && name.ends_with(".neu") && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Der gespeicherte Wunsch beim Start (None = Automatik), mit Vermerk im
 /// Protokoll - auch fuer eine kaputte Datei, die dann liegen bleibt.
 pub fn wunsch_laden() -> Option<String> {
     let Some(p) = crate::einstellungen::datei_pfad("bildschirm.txt") else { return None };
+    let reste = wunsch_reste_aufraeumen(&p);
+    if reste > 0 {
+        log(format!("Bildschirmwahl: {reste} liegengebliebene temporaere Datei(en) bildschirm.*.neu entfernt"));
+    }
     match wunsch_laden_aus(&p) {
         Gespeichert::Fehlt => None,
         Gespeichert::Automatik => {
@@ -517,6 +563,13 @@ pub struct Bildschirmstand {
     weg_cli: Weg,
     weg: Weg,
     weg_fuer: Option<String>,
+    /// Nachricht 12 nach einem Wechsel bei laufendem Strom steht noch aus:
+    /// sie geht erst nach dem Aufbau des neuen Stroms hinaus (1.4 Schritt
+    /// 6), der Aufnahmefaden holt sie nach (meldung_nachholen).
+    meldung_offen: bool,
+    /// Der zuletzt gemeldete Fehler beim Aufzaehlen der Ausgaenge (einmal
+    /// im Protokoll, die letzte Liste gilt solange weiter); leer = keiner.
+    aufzaehl_fehler: String,
 }
 
 /// Abstand zweier Aufzaehlungen der Ausgaenge im Betrieb.
@@ -531,7 +584,7 @@ impl Bildschirmstand {
             None => (None, None),
         };
         let weg_fuer = ziel.as_ref().map(|a| a.kennung.clone());
-        Bildschirmstand { wunsch, liste, ziel, wahl, naechste_pruefung: Instant::now() + PRUEFTAKT, weg_cli, weg, weg_fuer }
+        Bildschirmstand { wunsch, liste, ziel, wahl, naechste_pruefung: Instant::now() + PRUEFTAKT, weg_cli, weg, weg_fuer, meldung_offen: false, aufzaehl_fehler: String::new() }
     }
 
     /// Das Ziel, dessen Duplication der Aufnahmefaden aufbaut.
@@ -558,8 +611,11 @@ impl Bildschirmstand {
     }
 
     /// Wunsch abholen, alle 2 s (oder sofort nach pruefung_faellig) die
-    /// Ausgaenge neu aufzaehlen und bewerten; Nachricht 12 bei Aenderung.
-    fn nachfuehren(&mut self) -> Bewertung {
+    /// Ausgaenge neu aufzaehlen und bewerten; Nachricht 12 bei Aenderung -
+    /// nach einem Wechsel bei laufendem Strom (`strom_laeuft`: die
+    /// Duplication steht) erst nach dem Aufbau des neuen, wie 1.4 es reiht
+    /// (meldung_nachholen im Aufnahmefaden).
+    fn nachfuehren(&mut self, strom_laeuft: bool) -> Bewertung {
         let wunsch_neu = bildschirm_wunsch_abholen();
         if wunsch_neu.is_none() && Instant::now() < self.naechste_pruefung {
             return Bewertung::default();
@@ -569,22 +625,65 @@ impl Bildschirmstand {
             self.wunsch = w.clone();
             wunsch_speichern(self.wunsch.as_deref());
         }
-        let liste = match ausgaenge() {
-            Ok(l) => l,
-            Err(e) => {
-                log(format!("Ausgaenge: {e}"));
-                Vec::new()
-            }
-        };
+        let liste = self.liste_aufgezaehlt(ausgaenge());
         let alt = self.ziel.as_ref().map(|a| a.bezeichnung());
         let b = self.bewerten_mit(liste, wunsch_neu.is_some());
         if let (Some(g), Some(alt), Some(neu)) = (b.grund, alt, self.ziel.as_ref()) {
-            log(format!("Bildschirmwechsel: {alt} -> {} ({g})", neu.bezeichnung()));
+            log(format!(
+                "Bildschirmwechsel: {alt} -> {} ({g}){}",
+                neu.bezeichnung(),
+                if strom_laeuft { "" } else { " - ohne laufenden Strom nur das Ziel, gilt ab dem naechsten Aufbau" }
+            ));
         }
-        if b.melden {
+        if self.meldung_faellig(b, strom_laeuft) {
             self.liste_melden();
         }
         b
+    }
+
+    /// Eine frische Aufzaehlung uebernehmen. Scheitert sie (DXGI-Factory,
+    /// Adapterbeschreibung), gilt die letzte Liste weiter: ein
+    /// voruebergehender Fehler ist kein leerer Bildschirmsatz und wirft
+    /// keinen gesunden Strom weg. Der Fehler steht einmal im Protokoll, die
+    /// naechste gute Liste vergisst ihn.
+    fn liste_aufgezaehlt(&mut self, ergebnis: Result<Vec<Ausgang>, String>) -> Vec<Ausgang> {
+        match ergebnis {
+            Ok(l) => {
+                if !self.aufzaehl_fehler.is_empty() {
+                    self.aufzaehl_fehler.clear();
+                    log("Ausgaenge: wieder aufzaehlbar");
+                }
+                l
+            }
+            Err(e) => {
+                if self.aufzaehl_fehler != e {
+                    log(format!("Ausgaenge: {e} - die letzte Liste gilt weiter"));
+                    self.aufzaehl_fehler = e;
+                }
+                self.liste.clone()
+            }
+        }
+    }
+
+    /// Geht Nachricht 12 jetzt hinaus? Nach einem Wechsel bei laufendem
+    /// Strom nicht: sie wartet auf den Aufbau des neuen (1.4 Schritt 6,
+    /// nach Switch 7 und Info 1), sonst bei jeder Aenderung - und holt
+    /// dabei eine noch offene mit nach.
+    fn meldung_faellig(&mut self, b: Bewertung, strom_laeuft: bool) -> bool {
+        if b.gewechselt && strom_laeuft {
+            self.meldung_offen = true;
+            return false;
+        }
+        b.melden || std::mem::take(&mut self.meldung_offen)
+    }
+
+    /// Die nach einem Wechsel zurueckgestellte Nachricht 12 - nach dem
+    /// Aufbau des neuen Stroms, auch einem gescheiterten (dann steht das
+    /// Ziel als gestreamt in der Liste, 2.2: "Ziel bestimmt").
+    fn meldung_nachholen(&mut self) {
+        if std::mem::take(&mut self.meldung_offen) {
+            self.liste_melden();
+        }
     }
 
     /// Neu bewerten (1.2) mit dieser Liste: Ziel = Wunsch, sonst
@@ -1047,7 +1146,7 @@ pub fn start(wunsch: Option<String>, liste: Vec<Ausgang>, weg_cli: Weg, weg: Weg
                 std::thread::sleep(Duration::from_millis(100));
                 // Ohne Zuschauer nur den Stand nachfuehren (Wunsch, Liste,
                 // Ziel); der Strom laeuft erst mit dem naechsten (1.2).
-                stand.nachfuehren();
+                stand.nachfuehren(false);
             }
             // Der naechste Zuschauer ist einer mit anderer Nummer - auch wenn
             // er den jetzigen ohne Luecke abloest und zuschauer_da() dabei
@@ -1090,6 +1189,18 @@ fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32) -> ((i32, i32, bool), bool) {
     Z.info_w.store(w as u32, Ordering::Relaxed);
     Z.info_h.store(h as u32, Ordering::Relaxed);
     ((w, h, halb), alt != (w, h))
+}
+
+/// Bleibt der stehende Encoder ueber einen Aufbau der Duplication bei
+/// gleicher Stromgroesse hinweg? Nur einer auf dem Prozessorweg, und nur,
+/// wenn auch die neue Aufnahme den Prozessorweg nimmt. Ein Pool (Texturweg)
+/// gehoert zum Geraet der alten Duplication. Und nimmt die neue Aufnahme
+/// Texturen - fuer den neuen Ausgang wurde Null-Kopien entschieden (3.3) -,
+/// soll der Encoder gleich so laufen, nicht erst nach dem naechsten Codec-
+/// oder Einstellungswechsel (Schritt 4b stellte sonst die Quelle auf den
+/// stehenden Prozessorweg-Encoder um: kein toter Strom, aber der alte Weg).
+pub fn encoder_bleibt(enc_texturen: bool, aufnahme_texturen: bool) -> bool {
+    !enc_texturen && !aufnahme_texturen
 }
 
 /// Ist die Oberflaeche aus AcquireNextFrame so gross wie der Modus (und
@@ -1371,14 +1482,16 @@ fn sitzung(stand: &mut Bildschirmstand) {
         // 1. Bildschirm (1.2): den Wunsch des Zuschauers (Nachricht 70)
         //    abholen, alle 2 s - und vor jedem Aufbau - die Ausgaenge neu
         //    aufzaehlen und das Ziel bestimmen; Aenderungen gehen als
-        //    Nachricht 12 hinaus. Weicht das Ziel vom laufenden ab, faellt
-        //    die Duplication hier, zwischen zwei Bildern; der Aufbau darunter
-        //    nimmt das neue Ziel (1.4).
+        //    Nachricht 12 hinaus - nach einem Wechsel bei stehender
+        //    Duplication erst nach dem Aufbau des neuen Stroms (1b). Weicht
+        //    das Ziel vom laufenden ab, faellt die Duplication hier,
+        //    zwischen zwei Bildern; der Aufbau darunter nimmt das neue Ziel
+        //    (1.4).
         let aufbau_faellig = auf.is_none() && Instant::now() >= naechster_versuch;
         if aufbau_faellig {
             stand.pruefung_faellig();
         }
-        let bewertung = stand.nachfuehren();
+        let bewertung = stand.nachfuehren(auf.is_some());
         if bewertung.gewechselt && auf.is_some() {
             // Der alte Strom haelt an; sein letztes Bild gehoert nicht zum
             // neuen Bildschirm.
@@ -1430,7 +1543,21 @@ fn sitzung(stand: &mut Bildschirmstand) {
                             if groesse_neu {
                                 w = nw;
                                 h = nh;
-                                if let Some(e) = enc.take() {
+                            }
+                            // Der stehende Encoder faellt bei anderer Groesse
+                            // und wenn er nicht zur neuen Aufnahme passt
+                            // (encoder_bleibt: sein Pool haengt am alten
+                            // Geraet, oder der fuer den neuen Ausgang
+                            // entschiedene Weg nimmt Texturen) - vor dem
+                            // Switch, damit seine letzten Pakete noch zum
+                            // alten Strom gehoeren. Ein Pool am alten Geraet
+                            // wird nicht mehr geleert.
+                            if let Some(e) = enc.take() {
+                                if !groesse_neu && encoder_bleibt(e.texturen(), neu.kopie.is_some()) {
+                                    enc = Some(e);
+                                } else if e.texturen() && !groesse_neu {
+                                    drop(e);
+                                } else {
                                     e.schliessen();
                                 }
                             }
@@ -1466,10 +1593,6 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                                 ));
                             }
-                            // Texturen gehoeren zum Geraet: mit ihm faellt auch der Pool.
-                            if enc.as_ref().map(|e| e.texturen()).unwrap_or(false) {
-                                enc = None;
-                            }
                             auf = Some(neu);
                             letztes = None;
                             if verloren {
@@ -1493,6 +1616,10 @@ fn sitzung(stand: &mut Bildschirmstand) {
                 }
             }
         }
+
+        // 1c. Nachricht 12 nach einem Wechsel: jetzt, nach dem Aufbau des
+        //     neuen Stroms (1.4 Schritt 6) - auch nach einem gescheiterten.
+        stand.meldung_nachholen();
 
         // 2. Encoder oeffnen, sobald die Aufnahme steht.
         if auf.is_some() && enc.is_none() && Instant::now() >= naechster_enc_versuch {
@@ -2010,6 +2137,16 @@ mod tests {
         let mut eins = vec![ausgang(0, "ACR0501", "a", 0, 60, true)];
         kennungen_eindeutig(&mut eins);
         assert_eq!(eins[0].kennung, "ACR0501");
+        // Eine Kennung an der 64-Byte-Grenze doppelt: der Anhang passt
+        // trotzdem hinein (die Basis wird gekuerzt), beide bleiben
+        // verschieden und in der Grenze - auch mit mehrbytigen Zeichen.
+        for lang in ["k".repeat(bildschirm::KENNUNG_MAX), "\u{e4}".repeat(bildschirm::KENNUNG_MAX / 2)] {
+            let mut l = vec![ausgang(0, &lang, "a", 0, 60, true), ausgang(1, &lang, "b", 1920, 60, false)];
+            kennungen_eindeutig(&mut l);
+            assert_ne!(l[0].kennung, l[1].kennung, "{lang}");
+            assert!(l[0].kennung.ends_with("-0") && l[1].kennung.ends_with("-1"), "{:?}", l[1].kennung);
+            assert!(l.iter().all(|a| a.kennung.len() <= bildschirm::KENNUNG_MAX && a.kennung.len() > bildschirm::KENNUNG_MAX - 4), "{:?}", l[0].kennung);
+        }
 
         // Name: Monitorname, sonst DeviceString, sonst Geraetename; leer und
         // Leerraum zaehlen nicht, gekuerzt auf 48 Byte.
@@ -2089,6 +2226,69 @@ mod tests {
         assert_eq!(st.weg_neu_fuer(&zwei()[0]), Some(Weg::Yuv444));
     }
 
+    /// Nach einem Aufbau bei gleicher Stromgroesse bleibt nur ein Encoder
+    /// auf dem Prozessorweg, und nur, wenn auch die neue Aufnahme den
+    /// Prozessorweg nimmt: ein Pool haengt am alten Geraet, und nimmt die
+    /// neue Aufnahme Texturen (Null-Kopien fuer den neuen Ausgang
+    /// entschieden, 3.3), laeuft der Encoder gleich so - Texturen an einen
+    /// Encoder ohne Pool ("Textur ohne Pool") gibt es nie.
+    #[test]
+    fn encoder_bleibt_nur_prozessorweg_auf_prozessorweg() {
+        assert!(encoder_bleibt(false, false), "Prozessorweg -> Prozessorweg: bleibt");
+        assert!(!encoder_bleibt(false, true), "Prozessorweg-Encoder, neue Aufnahme mit Texturen: neu");
+        assert!(!encoder_bleibt(true, false), "Pool am alten Geraet: neu");
+        assert!(!encoder_bleibt(true, true), "Pool am alten Geraet: neu, auch fuer Texturen");
+    }
+
+    /// Scheitert das Aufzaehlen (DXGI-Factory), gilt die letzte Liste
+    /// weiter: kein Wechsel, nichts zu melden, kein gesunder Strom faellt;
+    /// der Fehler wird gemerkt (einmal ins Protokoll) und mit der naechsten
+    /// guten Liste vergessen.
+    #[test]
+    fn aufzaehlfehler_behaelt_die_letzte_liste() {
+        let mut st = Bildschirmstand::neu(None, zwei(), Weg::Auto, Weg::Bgra);
+        let l = st.liste_aufgezaehlt(Err("CreateDXGIFactory1: kaputt".into()));
+        assert_eq!(l, zwei());
+        assert_eq!(st.aufzaehl_fehler, "CreateDXGIFactory1: kaputt");
+        assert_eq!(st.bewerten_mit(l, false), Bewertung::default());
+        assert_eq!(st.ziel.as_ref().map(|a| a.index), Some(0));
+        // Derselbe Fehler noch einmal: dieselbe Liste, gemerkt bleibt er.
+        assert_eq!(st.liste_aufgezaehlt(Err("CreateDXGIFactory1: kaputt".into())), zwei());
+        assert_eq!(st.aufzaehl_fehler, "CreateDXGIFactory1: kaputt");
+        // Eine gute Liste: sie gilt, der Fehler ist vergessen.
+        let l = st.liste_aufgezaehlt(Ok(vec![zwei()[1].clone()]));
+        assert_eq!(l.len(), 1);
+        assert!(st.aufzaehl_fehler.is_empty());
+        assert_eq!(st.bewerten_mit(l, false).gewechselt, true);
+    }
+
+    /// Nachricht 12 nach einem Wechsel bei laufendem Strom erst nach dem
+    /// Aufbau des neuen (1.4 Schritt 6); ohne laufenden Strom, bei einer
+    /// blossen Listenaenderung und als Antwort auf einen Wunsch sofort. Eine
+    /// offene Meldung wird genau einmal nachgeholt.
+    #[test]
+    fn nachricht_12_nach_wechsel_erst_nach_dem_aufbau() {
+        let mut st = Bildschirmstand::neu(None, zwei(), Weg::Auto, Weg::Bgra);
+        let wechsel = Bewertung { gewechselt: true, melden: true, grund: Some("Wunsch des Zuschauers") };
+        let nur_liste = Bewertung { gewechselt: false, melden: true, grund: None };
+        // Ohne laufenden Strom: sofort.
+        assert!(st.meldung_faellig(wechsel, false));
+        assert!(!st.meldung_offen);
+        // Mit laufendem Strom: zurueckgestellt, bis der Aufbau sie nachholt.
+        assert!(!st.meldung_faellig(wechsel, true));
+        assert!(st.meldung_offen);
+        assert!(std::mem::take(&mut st.meldung_offen));
+        // Nichts zu melden: nichts. Nur die Liste: sofort, auch im Betrieb.
+        assert!(!st.meldung_faellig(Bewertung::default(), true));
+        assert!(st.meldung_faellig(nur_liste, true));
+        // Eine offene Meldung geht mit der naechsten faelligen Bewertung
+        // mit hinaus, auch ohne eigene Aenderung - und danach nicht mehr.
+        assert!(!st.meldung_faellig(wechsel, true));
+        assert!(st.meldung_faellig(Bewertung::default(), false));
+        assert!(!st.meldung_offen);
+        assert!(!st.meldung_faellig(Bewertung::default(), false));
+    }
+
     /// bildschirm.txt (1.5): geschrieben und gelesen, "auto" fuer Automatik,
     /// fehlt -> Fehlt, kaputt -> Unlesbar und unveraendert liegen gelassen.
     #[test]
@@ -2105,6 +2305,16 @@ mod tests {
         assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Automatik);
         // Keine temporaere Datei bleibt liegen.
         assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
+        // Ein bildschirm.<pid>.neu eines abgestuerzten Laufs raeumt der
+        // Start weg (wunsch_laden); anderes und die Datei selbst bleiben.
+        std::fs::write(ordner.join("bildschirm.4711.neu"), "ACR0501\n").unwrap();
+        std::fs::write(ordner.join("anderes.neu"), "x").unwrap();
+        assert_eq!(wunsch_reste_aufraeumen(&pfad), 1);
+        assert!(!ordner.join("bildschirm.4711.neu").exists());
+        assert!(ordner.join("anderes.neu").exists() && pfad.exists());
+        assert_eq!(wunsch_reste_aufraeumen(&pfad), 0);
+        std::fs::remove_file(ordner.join("anderes.neu")).unwrap();
+        assert_eq!(wunsch_reste_aufraeumen(&ordner.join("gibt-es-nicht").join("bildschirm.txt")), 0);
         // Zeilenende in Windows-Art und Leerzeilen am Rand sind in Ordnung.
         std::fs::write(&pfad, "\r\nv0-m0-s0\r\n\r\n").unwrap();
         assert_eq!(wunsch_laden_aus(&pfad), Gespeichert::Kennung("v0-m0-s0".into()));
