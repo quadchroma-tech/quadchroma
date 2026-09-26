@@ -494,11 +494,11 @@ u16 0, u32 length; numbers little endian unless noted):
     Handshake message 3 (client -> host) carries "QCN1", u8 n, n bytes
     of UTF-8, the client's name (1 to 40 bytes), and u8 flags. Bit 0:
     the client does not know the host's key (it is not in hosts.txt) -
-    "prove yourself"; bits 1 to 7 are 0. Older clients send "client" or
-    "QCN1" without the flags byte (flags 0); then, and for a broken
-    payload, the host shows the client's IP address. Hosts ignore
-    further bytes. The client decides on bit 0 after message 2, when it
-    has the host's key.
+    "prove yourself"; bits 1 to 7 are 0. Older clients send "QCN1"
+    without the flags byte, which counts as flags 0, or just "client";
+    for "client" and for a broken payload the host shows the client's
+    IP address instead of a name. Hosts ignore further bytes. The
+    client decides on bit 0 after message 2, when it has the host's key.
 
     After the handshake the host sends 4 bytes on the video channel:
     "QCH1" - the device is known, the session starts as before - or
