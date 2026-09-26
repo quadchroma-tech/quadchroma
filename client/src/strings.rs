@@ -102,7 +102,6 @@ pub enum Key {
     PairingOk,
     SecuredWith,
     HostFingerprint,
-    NotPaired,
     FirstContact,
     // Fehler
     ErrorConnectRefused,
@@ -542,7 +541,6 @@ pub static EN: Lang = Lang {
         (PairingOk, "Paired"),
         (SecuredWith, "Secured · comparison code"),
         (HostFingerprint, "Host fingerprint"),
-        (NotPaired, "This host does not know your device yet. Start the host with --pair and connect again."),
         (FirstContact, "First contact with this host. Compare the code with the one on the host."),
         (ErrorConnectRefused, "Host refused the connection"),
         (ErrorTimeout, "Host did not answer"),
@@ -794,7 +792,6 @@ pub static DE: Lang = Lang {
         (PairingOk, "Gekoppelt"),
         (SecuredWith, "Gesichert · Vergleichscode"),
         (HostFingerprint, "Fingerabdruck des Hosts"),
-        (NotPaired, "Dieser Host kennt dein Gerät noch nicht. Host mit --pair starten und erneut verbinden."),
         (FirstContact, "Erstkontakt mit diesem Host. Code mit dem auf dem Host vergleichen."),
         (ErrorConnectRefused, "Host hat die Verbindung abgelehnt"),
         (ErrorTimeout, "Host antwortet nicht"),
