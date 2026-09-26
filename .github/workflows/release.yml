@@ -624,31 +624,9 @@ jobs:
           ls -l
           sha256sum -- * > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          win=$(ls quadchroma-*-windows-x64*.zip)
-          mac=$(ls QuadChroma-*-macos-arm64*.dmg)
-          {
-            echo "QuadChroma $VERSION"
-            echo
-            echo "Files:"
-            for f in *; do echo "- $f"; done
-            echo
-            case "$win" in
-              *-unsigned*) echo "Windows: quadchroma.exe is NOT code-signed (unsigned build; see RELEASING.md). SmartScreen will warn: More info > Run anyway.";;
-              *)           echo "Windows: quadchroma.exe is Authenticode-signed (Azure Artifact Signing, SHA-256, RFC 3161 timestamp).";;
-            esac
-            case "$mac" in
-              *-unsigned*)    echo "macOS: QuadChroma.app is ad-hoc signed only, not notarized. Gatekeeper will refuse it: System Settings > Privacy & Security > Open Anyway.";;
-              *-selfsigned*)  echo "macOS: QuadChroma.app is signed with the project's own free certificate \"QuadChroma Release\" (not issued by Apple, not notarized). Gatekeeper refuses the first start: System Settings > Privacy & Security > Open Anyway (see README.txt). Screen Recording and Accessibility stay granted across updates.";;
-              *-unnotarized*) echo "macOS: QuadChroma.app is Developer ID signed but NOT notarized.";;
-              *)              echo "macOS: QuadChroma.app is Developer ID signed, notarized and stapled (ZIP and DMG).";;
-            esac
-            echo
-            # FFmpeg checklist (ffmpeg.org/legal.html): this sentence on every page that offers a download.
-            quellen="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/ffmpeg-9.0.2.tar.xz"
-            echo "This software uses code of [FFmpeg](https://ffmpeg.org) licensed under the [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html) and its source can be downloaded [here]($quellen). The complete corresponding source of the FFmpeg DLLs is attached to this release: \`ffmpeg-9.0.2.tar.xz\`, \`nv-codec-headers-*.tar.gz\` and \`build-ffmpeg-windows.sh\` (see THIRD_PARTY_NOTICES.txt, section 2)."
-            echo
-            echo "Verify downloads: sha256sum -c SHA256SUMS.txt (Windows: Get-FileHash -Algorithm SHA256 <file>)."
-          } > ../notes.md
+          # Release page: which single file to download for each computer, first start,
+          # FFmpeg notice (ffmpeg.org/legal.html) - see scripts/release-notes.sh.
+          bash ../scripts/release-notes.sh . "$VERSION" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > ../notes.md
           cat ../notes.md
 
       - name: Create the draft (gh release create --draft)
