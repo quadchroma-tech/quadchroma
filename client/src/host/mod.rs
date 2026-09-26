@@ -858,7 +858,11 @@ pub fn main_host(args: &[String]) -> i32 {
             }
         }
     }
-    log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
+    if netz_laeuft {
+        log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
+    } else {
+        log(format!("\n=== Dienst wartet auf Port {port} (Bild), {} (Eingabe) ===", port + 1));
+    }
     log(format!(
         "Strom: {}x{}, {} fps, {} Mbit/s, feste Bildrate {}",
         Z.info_w.load(Ordering::Relaxed),
