@@ -54,15 +54,16 @@ static const qc_sprache QC_EN = { "en", "English", {
     [QCTextHostPasswordNotSaved]   = "The password could not be saved.",
 }};
 
-// Deutsch: echte Umlaute, typografische Anfuehrungszeichen und Gedankenstrich
-// wie die deutschen Texte in client/src/strings.rs.
+// Deutsch: echte Umlaute, typografische Anfuehrungszeichen, Gedankenstrich und
+// Auslassungszeichen (U+2026) - zeichengleich mit den Host-Schluesseln in
+// client/src/strings.rs (Englisch dort wie hier mit "...").
 static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostReady]              = "Bereit für Verbindungen",
     [QCTextHostConnected]          = "Verbunden: {n}",
     [QCTextHostDeviceId]           = "Geräte-ID: {i}",
     [QCTextHostPassword]           = "Passwort: {p}",
     [QCTextHostCopied]             = "Kopiert",
-    [QCTextHostChangePassword]     = "Passwort ändern ...",
+    [QCTextHostChangePassword]     = "Passwort ändern …",
     [QCTextHostRandomPassword]     = "Neues Zufallspasswort",
     [QCTextHostNewPassword]        = "Neues Passwort (mindestens 8 Zeichen)",
     [QCTextHostRepeatPassword]     = "Passwort wiederholen",
@@ -74,7 +75,7 @@ static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostNoDevices]          = "Noch keine Geräte",
     [QCTextHostDeviceLine]         = "{n} – ID {i} – seit {d}",
     [QCTextHostRemove]             = "Entfernen",
-    [QCTextHostRemoveAll]          = "Alle Geräte entfernen ...",
+    [QCTextHostRemoveAll]          = "Alle Geräte entfernen …",
     [QCTextHostRemoveAllAsk]       = "Alle erlaubten Geräte entfernen? Sie brauchen dann wieder das Passwort.",
     [QCTextHostListDamaged]        = "Geräteliste beschädigt",
     [QCTextHostListReset]          = "Geräteliste zurücksetzen",
@@ -84,8 +85,8 @@ static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostStartLogin]         = "Beim Anmelden starten",
     [QCTextHostStartWindows]       = "Mit Windows starten",
     [QCTextHostMoveToApps]         = "QuadChroma zuerst in den Ordner Programme bewegen",
-    [QCTextHostScreenMissing]      = "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen ...",
-    [QCTextHostAccessMissing]      = "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen ...",
+    [QCTextHostScreenMissing]      = "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen …",
+    [QCTextHostAccessMissing]      = "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen …",
     [QCTextHostPortBusy]           = "Port {p} ist von einem anderen Programm belegt",
     [QCTextHostQuit]               = "QuadChroma beenden",
     [QCTextHostStopSharing]        = "Freigabe beenden",

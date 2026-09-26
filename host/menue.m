@@ -90,11 +90,17 @@ NSString *qc_datum_text(NSString *iso) {
 int qc_passwort_pruefen(NSString *pw, NSString *wiederholt) {
     // norm aus Abschnitt 3.4, nur gezaehlt: Leerzeichen, Tab, LF, CR und '-'
     // fallen weg, alle anderen Bytes zaehlen (UTF-8, keine Normalisierung).
-    // Der Kern prueft selbst noch einmal (qc_zugang_passwort_setzen -1).
-    size_t n = 0;
-    for (const unsigned char *p = (const unsigned char *)(pw.UTF8String ?: ""); *p; p++)
+    // Dazu die Grenzen des Kerns: hoechstens QC_ZUGANG_PW_MAX Byte wie
+    // eingegeben, eine Zeile (eingefuegter Text kann Umbrueche tragen). Der
+    // Kern prueft selbst noch einmal (qc_zugang_passwort_setzen -1).
+    size_t n = 0, roh = 0;
+    int umbruch = 0;
+    for (const unsigned char *p = (const unsigned char *)(pw.UTF8String ?: ""); *p; p++, roh++) {
+        if (*p == 0x0A || *p == 0x0D) umbruch = 1;
         if (*p != 0x20 && *p != 0x09 && *p != 0x0A && *p != 0x0D && *p != '-') n++;
+    }
     if (n < 8) return 2;
+    if (roh > QC_ZUGANG_PW_MAX || umbruch) return 3;
     if (![pw isEqualToString:wiederholt ?: @""]) return 1;
     return 0;
 }
@@ -148,15 +154,19 @@ static NSArray<QCMenuePunkt *> *geraete_untermenue(QCMenueZustand *z) {
 NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z) {
     NSMutableArray<QCMenuePunkt *> *m = [NSMutableArray array];
 
-    // Kopf: Name und Zustand, dazu ein belegter Port.
+    // Kopf: Name und Zustand. Belegt ein anderes Programm den Bildport, kann
+    // niemand verbinden - dann steht das statt "Bereit" da.
     QCMenuePunkt *kopf = punkt(@"QuadChroma", QCAktionKeine, NO);
     kopf.kopf = YES;
     [m addObject:kopf];
-    [m addObject:punkt(z.zuschauer ? qc_text_mit(QCTextHostConnected, @{ @"n": z.zuschauer })
-                                   : qc_text(QCTextHostReady), QCAktionKeine, NO)];
-    if (z.portBelegt > 0)
-        [m addObject:punkt(qc_text_mit(QCTextHostPortBusy, @{ @"p": [NSString stringWithFormat:@"%d", z.portBelegt] }),
-                           QCAktionKeine, NO)];
+    NSString *zustand;
+    if (z.zuschauer)
+        zustand = qc_text_mit(QCTextHostConnected, @{ @"n": z.zuschauer });
+    else if (z.portBelegt > 0)
+        zustand = qc_text_mit(QCTextHostPortBusy, @{ @"p": [NSString stringWithFormat:@"%d", z.portBelegt] });
+    else
+        zustand = qc_text(QCTextHostReady);
+    [m addObject:punkt(zustand, QCAktionKeine, NO)];
     [m addObject:trennlinie()];
 
     // Wer dieser Mac ist und wie man hineinkommt.
@@ -293,7 +303,6 @@ NSImage *qc_menue_symbol(BOOL verbunden) {
 
 static qc_oberflaeche_cfg g_cfg;
 static _Atomic int g_ui_da = 0;            // qc_oberflaeche_starten ist gelaufen
-static _Atomic int g_port_belegt = 0;
 static _Atomic int g_auffrischen_steht_an = 0;
 
 static QCAnmelden anmelden_lesen(void) {
@@ -311,7 +320,7 @@ QCMenueZustand *qc_menue_zustand_lesen(void) {
     QCMenueZustand *z = [[QCMenueZustand alloc] init];
     z.eigeneId = qc_zugang_eigene_id();
 
-    char pw[256];
+    char pw[QC_ZUGANG_PW_MAX + 1];
     if (qc_zugang_passwort(pw, sizeof pw) == 0) {
         pw[sizeof pw - 1] = 0;
         z.passwort = [NSString stringWithUTF8String:pw];   // kaputtes UTF-8 -> nil, gilt als unlesbar
@@ -331,13 +340,14 @@ QCMenueZustand *qc_menue_zustand_lesen(void) {
     z.bildschirm = qc_zustand_bildschirmfreigabe() != 0;
     z.bedienung = qc_zustand_bedienungshilfen() != 0;
     z.anmelden = anmelden_lesen();
-    z.portBelegt = atomic_load(&g_port_belegt);
+    z.portBelegt = qc_zustand_port_belegt();
     return z;
 }
 
 // ======================================================= Laufende Oberflaeche
 // Ab hier: nur im Host (main.m ruft qc_oberflaeche_starten). Der Pruefstand
-// menuetest und hosttest binden die Datei ein, starten sie aber nie.
+// menuetest bindet die Datei ein, startet sie aber nie; hosttest bindet sie
+// gar nicht (main.m bringt schwache Standardfassungen ihrer Einstiege mit).
 
 static void ui_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void ui_log(NSString *fmt, ...) {
@@ -372,6 +382,7 @@ static id<NSObject> g_aktivitaet;
 static dispatch_source_t g_signale[2];
 static int g_kopiert_nr;
 static int g_beenden;                       // 0 laeuft, 1 Abschied unterwegs, 2 fertig
+static int g_signal_beenden;                // ein Signal hat terminate: schon angestellt
 // Was das Menue zuletzt zeigte: bleibt es gleich, wird nicht neu gebaut -
 // sonst flackerte ein offenes Menue (das Oeffnen liest selbst neu).
 static NSArray<NSString *> *g_titel_zuletzt;
@@ -403,6 +414,26 @@ static void im_kern(dispatch_block_t b) {
     });
 }
 
+static void hinweis_zeigen(QCText t, double sekunden);
+
+// Wie im_kern fuer Kernfunktionen mit Rueckgabe (0 = gelungen). Ein Fehler
+// kommt ins Protokoll (was: deutsch, ohne Geheimnisse); mit einem Text
+// (fehlertext != QCTextAnzahl) steht er zusaetzlich kurz neben dem Symbol.
+// Das neu gelesene Menue zeigt ohnehin den wahren Stand (etwa das alte
+// Passwort oder das nicht entfernte Geraet).
+static void im_kern_pruefen(NSString *was, QCText fehlertext, int (^b)(void)) {
+    dispatch_async(ui_q(), ^{
+        int r;
+        @autoreleasepool { r = b(); }
+        if (r != 0) {
+            ui_log(@"Oberflaeche: %@ gescheitert (%d)", was, r);
+            if (fehlertext != QCTextAnzahl)
+                dispatch_async(dispatch_get_main_queue(), ^{ hinweis_zeigen(fehlertext, 4.0); });
+        }
+        zustand_auffrischen();
+    });
+}
+
 static void ablage_setzen(NSString *text, BOOL verdeckt) {
     NSPasteboardItem *it = [[NSPasteboardItem alloc] init];
     [it setString:text forType:NSPasteboardTypeString];
@@ -412,15 +443,18 @@ static void ablage_setzen(NSString *text, BOOL verdeckt) {
     [pb writeObjects:@[it]];
 }
 
-// Kurz "Kopiert" neben dem Symbol - das Menue ist nach dem Klick schon zu.
-static void kopiert_zeigen(void) {
+// Kurz ein Hinweis neben dem Symbol ("Kopiert", oder dass etwas nicht
+// gelang) - das Menue ist nach dem Klick schon zu. Nur auf dem Hauptfaden.
+static void hinweis_zeigen(QCText t, double sekunden) {
     if (!g_item) return;
-    g_item.button.title = qc_text(QCTextHostCopied);
+    g_item.button.title = qc_text(t);
     int nr = ++g_kopiert_nr;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sekunden * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (nr == g_kopiert_nr) g_item.button.title = @"";
     });
 }
+
+static void kopiert_zeigen(void) { hinweis_zeigen(QCTextHostCopied, 1.5); }
 
 static void einstellungen_oeffnen(NSString *anker) {
     NSString *s = [@"x-apple.systempreferences:com.apple.preference.security?" stringByAppendingString:anker];
@@ -658,6 +692,7 @@ static void anfrage_abgleichen(void) {
     NSString *pw = self.eins.stringValue;
     int r = qc_passwort_pruefen(pw, self.zwei.stringValue);
     if (r == 2) { [self hinweis:QCTextHostPasswordShort fehler:YES]; return; }
+    if (r == 3) { [self hinweis:QCTextHostPasswordNotSaved fehler:YES]; return; }
     if (r == 1) { [self hinweis:QCTextHostPasswordsDiffer fehler:YES]; return; }
     self.eins.enabled = self.zwei.enabled = self.ok.enabled = NO;
     self.hinweis.stringValue = @"";
@@ -666,6 +701,7 @@ static void anfrage_abgleichen(void) {
     dispatch_async(ui_q(), ^{
         int e = kopie ? qc_zugang_passwort_setzen(kopie) : -2;
         if (kopie) { memset_s(kopie, strlen(kopie), 0, strlen(kopie)); free(kopie); }
+        if (e != 0) ui_log(@"Oberflaeche: Passwort aendern gescheitert (%d)", e);
         zustand_auffrischen();
         dispatch_async(dispatch_get_main_queue(), ^{
             QCPasswortFenster *f = schwach;
@@ -677,7 +713,9 @@ static void anfrage_abgleichen(void) {
                 });
                 return;
             }
-            [f hinweis:e == -1 ? QCTextHostPasswordShort : QCTextHostPasswordNotSaved fehler:YES];
+            // Die Laenge hat das Fenster schon geprueft: ein -1 des Kerns
+            // heisst hier "so nicht annehmbar", nicht "zu kurz".
+            [f hinweis:QCTextHostPasswordNotSaved fehler:YES];
             f.eins.enabled = f.zwei.enabled = f.ok.enabled = YES;
         });
     });
@@ -700,7 +738,7 @@ static void alle_entfernen_fragen(void) {
     if (!g_frage_fenster) g_frage_fenster = [[QCFrage alloc] init];
     [g_frage_fenster zeigenText:qc_text(QCTextHostRemoveAllAsk) zusatz:nil ja:qc_text(QCTextHostRemove)
                            nein:qc_text(QCTextAccessCancel) jaStandard:NO antwort:^(BOOL ja) {
-        if (ja) im_kern(^{ (void)qc_zugang_alle_entfernen(); });
+        if (ja) im_kern_pruefen(@"Alle Geraete entfernen", QCTextAnzahl, ^{ return qc_zugang_alle_entfernen(); });
     }];
 }
 
@@ -789,15 +827,15 @@ static void beenden_antworten(void) {
 }
 
 // Jeder Weg zum Beenden (Menue, Cmd+Q, SIGTERM/SIGINT, Abmelden) kommt hier
-// vorbei: erst bekommt der Zuschauer seine letzte Nachricht, dann endet der
-// Prozess. Der Abschied laeuft nicht auf der Main Queue; haengt er, beendet
-// die Frist trotzdem.
+// vorbei: erst schliesst der Kern die Verbindung zum Zuschauer (Abschied),
+// dann endet der Prozess. Der Abschied laeuft nicht auf der Main Queue;
+// haengt er, beendet die Frist trotzdem.
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     (void)app;
     if (g_beenden == 2) return NSTerminateNow;
     if (g_beenden == 0) {
         g_beenden = 1;
-        ui_log(@"Oberflaeche: Beenden - Zuschauer wird verabschiedet");
+        ui_log(@"Oberflaeche: Beenden - Verbindung zum Zuschauer wird geschlossen");
         [g_anfrage_fenster schliessen];
         [g_frage_fenster schliessen];
         [g_passwort_fenster.panel close];
@@ -837,22 +875,21 @@ static void beenden_antworten(void) {
             [g_passwort_fenster zeigen];
             break;
         case QCAktionPasswortZufall:
-            im_kern(^{
-                int r = qc_zugang_passwort_zufall();
-                if (r != 0) ui_log(@"Oberflaeche: neues Zufallspasswort gescheitert (%d)", r);
-            });
+            // Scheitert das Schreiben, gilt das alte Passwort weiter (das
+            // Menue zeigt es) - der Hinweis sagt, warum sich nichts aendert.
+            im_kern_pruefen(@"Neues Zufallspasswort", QCTextHostPasswordNotSaved, ^{ return qc_zugang_passwort_zufall(); });
             break;
         case QCAktionGeraetEntfernen: {
             NSData *pub = m.representedObject;
             if ([pub isKindOfClass:[NSData class]] && pub.length == 32)
-                im_kern(^{ (void)qc_zugang_geraet_entfernen(pub.bytes); });
+                im_kern_pruefen(@"Geraet entfernen", QCTextAnzahl, ^{ return qc_zugang_geraet_entfernen(pub.bytes); });
             break;
         }
         case QCAktionAlleEntfernen:
             alle_entfernen_fragen();
             break;
         case QCAktionListeZuruecksetzen:
-            im_kern(^{ (void)qc_zugang_liste_zuruecksetzen(); });
+            im_kern_pruefen(@"Geraeteliste zuruecksetzen", QCTextAnzahl, ^{ return qc_zugang_liste_zuruecksetzen(); });
             break;
         case QCAktionAnmelden:
             anmelden_umschalten(z.anmelden);
@@ -905,6 +942,15 @@ static void menue_anwenden(void) {
 
 // ------------------------------------------------------------ Start
 
+// SIGTERM/SIGINT beenden wie der Menuepunkt, mit Abschied und Frist. Die
+// Quelle meldet sich in einem Block der Main Queue - dort darf terminate:
+// NICHT laufen: es dreht bei NSTerminateLater eine eigene Run-Loop, und die
+// bedient die Main Queue nicht, solange sie selbst in einem Main-Queue-Block
+// steckt. Weder die Antwort nach dem Abschied noch die Frist kaemen an, der
+// Host hinge fuer immer (die Signale stehen auf SIG_IGN). Deshalb stellt der
+// Block terminate: nur als Block der Run-Loop selbst an - in allen ueblichen
+// Modi, also auch bei offenem Menue. Ein zweites Signal, waehrend der
+// Abschied laeuft, wartet nicht mehr auf ihn.
 static void signale_einrichten(void) {
     int nummern[2] = { SIGTERM, SIGINT };
     for (int i = 0; i < 2; i++) {
@@ -914,8 +960,18 @@ static void signale_einrichten(void) {
         if (!q) continue;
         int nr = nummern[i];
         dispatch_source_set_event_handler(q, ^{
-            ui_log(@"Oberflaeche: Signal %s - beende", nr == SIGTERM ? "SIGTERM" : "SIGINT");
-            [NSApp terminate:nil];
+            const char *name = nr == SIGTERM ? "SIGTERM" : "SIGINT";
+            if (g_beenden == 1) {
+                ui_log(@"Oberflaeche: Signal %s waehrend des Abschieds - beende sofort", name);
+                beenden_antworten();
+                return;
+            }
+            if (g_beenden || g_signal_beenden) return;
+            g_signal_beenden = 1;
+            ui_log(@"Oberflaeche: Signal %s - beende", name);
+            CFRunLoopRef haupt = CFRunLoopGetMain();
+            CFRunLoopPerformBlock(haupt, kCFRunLoopCommonModes, ^{ [NSApp terminate:nil]; });
+            CFRunLoopWakeUp(haupt);
         });
         dispatch_resume(q);
         g_signale[i] = q;
@@ -931,11 +987,6 @@ void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) {
     // Ab hier kann jemand am Mac "Zulassen" klicken: Anfragen, die vor
     // [NSApp run] kommen, warten auf der Main Queue und erscheinen danach.
     atomic_store(&g_ui_da, 1);
-}
-
-void qc_oberflaeche_port_belegt(int port) {
-    atomic_store(&g_port_belegt, port > 0 ? port : 0);
-    zustand_auffrischen();
 }
 
 // ------------------------------------------------ Rueckrufe aus dem Kern

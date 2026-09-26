@@ -20,7 +20,7 @@
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
 // Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt), Dienst-Takt
 // ohne Run-Loop (Auslastung im Takt, Drosselzeilen nachgetragen) und Abschied
-// beim Beenden (Typ 10 als letzte Nachricht).
+// beim Beenden (Verbindung zu, ohne Typ 10).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -3005,12 +3005,14 @@ static void takt_pruefen(void) {
     pruefe(drossel_weitere(&d_ein_fremd) == 0, "zurueckgehaltene Drosselzeile nachgetragen");
     dienst_takt_anhalten();
 
-    // Beenden: der Zuschauer bekommt Typ 10 als letzte Nachricht, dann ist zu.
+    // Beenden: der Host schliesst den Bildkanal - ohne Typ 10, den der Client
+    // als "ein anderes Geraet hat uebernommen" anzeigen wuerde.
     host_abschied();
-    int e, letzte = -1, laenge = -1;
-    while ((e = nachricht(&l, &m, anf, 2000)) == 1) { letzte = m.type; laenge = (int)m.len; }
-    pruefe(letzte == QC_MSG_ABGELOEST && laenge == 0, "Abschied: Typ 10 mit Laenge 0 als letzte Nachricht");
-    pruefe(e == 0, "danach schliesst der Host den Bildkanal");
+    int e, typ10 = 0;
+    double t_ab = sek();
+    while ((e = nachricht(&l, &m, anf, 2000)) == 1) if (m.type == QC_MSG_ABGELOEST) typ10 = 1;
+    pruefe(!typ10, "Abschied: kein Typ 10 (der hiesse beim Client \"anderes Geraet hat uebernommen\")");
+    pruefe(e == 0 && sek() - t_ab < 1.0, "der Host schliesst den Bildkanal sofort");
     pruefe(atomic_load(&g_client_fd) == -1 && g_vid == NULL && !atomic_load(&g_vid_ready),
            "Zuschauer ausgetragen");
     close(c);

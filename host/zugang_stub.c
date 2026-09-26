@@ -98,6 +98,7 @@ int qc_zustand_zuschauer(char *name, size_t groesse) {
 
 int qc_zustand_bildschirmfreigabe(void) { return 1; }
 int qc_zustand_bedienungshilfen(void) { return 1; }
+int qc_zustand_port_belegt(void) { return 0; }
 
 // Schwache Standardfassungen der Oberflaechen-Rueckrufe wie bei P2: ohne
 // menue.m gilt "keine Oberflaeche".

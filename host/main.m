@@ -1404,6 +1404,18 @@ static void apply_settings(int mbit, int fps, int gaming, int fixed, int ton) {
           mbit, fps, gaming ? @"an" : @"aus", fixed ? @"an" : @"aus", ton ? @"an" : @"aus");
 }
 
+// Einstellungen des Zuschauers der Reihe nach, aber nicht auf der Main Queue:
+// apply_settings endet mit send_small (g_send_mtx; wer das Senden haelt, kann
+// bis zu 2 s haengen), und die Main Queue gehoert der Menueleiste - Menue und
+// Zulassen-Fenster stuenden so lange. apply_settings fasst nichts an, was den
+// Hauptfaden braucht (Encoder und Aufnahme ueber g_capq, der Rest atomar).
+static dispatch_queue_t einstellungen_q(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{ q = dispatch_queue_create("tech.quadchroma.einstellungen", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+
 // Alles loslassen, was dieser Eingabekanal noch als gedrueckt hinterlassen
 // hat: Tasten und Maustasten. Was ein neuerer Kanal inzwischen drueckt,
 // bleibt gedrueckt.
@@ -1595,7 +1607,7 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                     int fx = payload[7] ? 1 : 0;
                     // Ein Client ohne das neunte Byte will Ton.
                     int ton = h.len >= 9 ? (payload[8] ? 1 : 0) : 1;
-                    dispatch_async(dispatch_get_main_queue(), ^{
+                    dispatch_async(einstellungen_q(), ^{
                         apply_settings((int)m, (int)f, g, fx, ton);
                     });
                 }
@@ -3197,50 +3209,10 @@ static CFAbsoluteTime g_takt_t0 = 0;
 static long g_takt_bilder = 0, g_takt_bilder2 = 0;   // Bezugspunkte fuer Zeile bzw. gemeldete Bildrate
 static long long g_takt_bytes = 0;
 
-// Bildport, Eingabeport und Bekanntgabe. Belegt ein anderes Programm den
-// Bildport, endet der Host nicht mehr (frueher Code 9): das Menue zeigt es,
-// und der Takt versucht es jede Runde erneut - erst ein Blick, ob der Port
-// frei ist, damit nicht jede Runde "bind fehlgeschlagen" ins Protokoll geht.
-// Eingabeport und Bekanntgabe folgen erst, wenn der Bildport steht; sonst
-// riefe die Bekanntgabe Clients zu einem fremden Dienst.
-static _Atomic int g_port_wartet = 0;         // belegter Bildport; 0 = die Annahme laeuft
-static CGDirectDisplayID g_dienst_display = 0;
-
-static int dienst_ports_oeffnen(int port) {
-    if (start_server(port) < 0) return -1;
-    start_input_server(port + 1, g_dienst_display);
-    start_beacon(port);
-    return 0;
-}
-
-static int port_frei(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a = {0};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = htons((uint16_t)port);
-    int frei = bind(fd, (struct sockaddr *)&a, sizeof a) == 0;
-    close(fd);
-    return frei;
-}
-
-// Auf g_taktq.
-static void dienst_ports_nachversuchen(void) {
-    int port = atomic_load(&g_port_wartet);
-    if (!port || !port_frei(port) || dienst_ports_oeffnen(port) != 0) return;
-    atomic_store(&g_port_wartet, 0);
-    qc_oberflaeche_port_belegt(0);
-    logf_(@"Bildport %d ist frei geworden - Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d",
-          port, port, port + 1, port + 2);
-}
-
-// Eine Runde des Takts, auf g_taktq.
+// Eine Runde des Takts, auf g_taktq. (Einen belegten Bildport meldet und
+// versucht der Kern selbst, ueber qc_zustand_port_belegt - nicht dieser Takt.)
 static void dienst_takt_schritt(void) {
     drosseln_nachtragen();
-    if (atomic_load(&g_port_wartet)) dienst_ports_nachversuchen();
     if (atomic_load(&g_client_fd) >= 0) stau_frist_pruefen();
     long f = atomic_load(&g_sent_frames);
     long long b = atomic_load(&g_sent_bytes);
@@ -3321,16 +3293,29 @@ __attribute__((unused)) static void dienst_takt_anhalten(void) {
 }
 
 // Beenden (Menue, Cmd+Q, SIGTERM/SIGINT, Abmelden; menue.m ruft es ausserhalb
-// der Main Queue): der Zuschauer bekommt als letzte Nachricht Typ 10 wie beim
-// Abloesen - sein Client verbindet sich dann nicht alle zwei Sekunden neu mit
-// einem Host, den es nicht mehr gibt. Danach sind Bild- und Eingabekanal zu.
+// der Main Queue): Bild- und Eingabekanal des Zuschauers werden geschlossen,
+// sein Client sieht sofort das Ende der Verbindung - wie heute, wenn der Host
+// endet. Bewusst OHNE Typ 10: den deutet der Client als "ein anderes Geraet
+// hat die Sitzung uebernommen" und zeigte eine falsche, beunruhigende
+// Meldung. Eine eigene Abschiedsnachricht kennt das Protokoll nicht; der
+// Client versucht es also wie bisher von selbst erneut, bis der Host wieder
+// laeuft.
 static void host_abschied(void) {
     char fp[24] = {0};
     pthread_mutex_lock(&g_send_mtx);
-    int r = zuschauer_abloesen(-1, fp);
+    int alt = atomic_exchange(&g_client_fd, -1);
+    atomic_store(&g_vid_ready, 0);
+    if (alt >= 0) {
+        if (g_vid) qc_fingerprint(g_vid_peer, fp);
+        // shutdown weckt auch einen Faden, der gerade auf diesem Socket liest.
+        shutdown(alt, SHUT_RDWR);
+        close(alt);
+    }
+    eingabe_abbrechen();
+    qc_chan_free(g_vid);
+    g_vid = NULL;
     pthread_mutex_unlock(&g_send_mtx);
-    if (r >= 0)
-        logf_(@"Beenden: Zuschauer %s verabschiedet%s", fp, r ? "" : " - die letzte Nachricht kam nicht an");
+    if (alt >= 0) logf_(@"Beenden: Verbindung zum Zuschauer %s geschlossen", fp);
     logf_(@"Host beendet");
 }
 
@@ -3338,11 +3323,10 @@ static void ui_protokoll(NSString *zeile) {
     logf_(@"%@", zeile);
 }
 
-// Schwache Standardfassungen der Oberflaeche (wie die qc_ui_*-Rueckrufe in
-// zugang.h): der Host bindet menue.m und bekommt deren Fassungen; Pruefstaende,
+// Schwache Standardfassung der Oberflaeche (wie die qc_ui_*-Rueckrufe in
+// zugang.h): der Host bindet menue.m und bekommt deren Fassung; Pruefstaende,
 // die main.m ohne menue.m einbinden (hosttest), bauen auch so.
 __attribute__((weak)) void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) { (void)cfg; }
-__attribute__((weak)) void qc_oberflaeche_port_belegt(int port) { (void)port; }
 
 int main(int argc, const char *argv[]) { @autoreleasepool {
     pthread_mutex_lock(&g_log_mtx);
@@ -3606,16 +3590,11 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
                                                  : @" - Automatik (folgt dem Hauptbildschirm)";
         CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
-        g_dienst_display = display.displayID;
-        if (dienst_ports_oeffnen(port) != 0) {
-            atomic_store(&g_port_wartet, port);
-            qc_oberflaeche_port_belegt(port);
-            logf_(@"\n=== Bildport %d belegt oder nicht nutzbar - der Host laeuft weiter, das Menue zeigt es; "
-                   "neuer Versuch alle %.0f s ===", port, QC_TAKT_S);
-        } else {
-            logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-        }
+        if (start_server(port) < 0) return 9;
+        start_input_server(port + 1, display.displayID);
+        start_beacon(port);
         BOOL ax = AXIsProcessTrusted();
+        logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
         logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {
@@ -3650,8 +3629,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         // Stau-Frist) laeuft auf eigener Warteschlange, der Hauptfaden gehoert
         // AppKit - Menueleiste, Zulassen-Fenster, Zeigerform, Zwischenablage,
         // Bildschirmrueckrufe. [NSApp run] kehrt nicht zurueck: Beenden laeuft
-        // ueber [NSApp terminate:] (menue.m), erst mit dem Abschied an den
-        // Zuschauer.
+        // ueber [NSApp terminate:] (menue.m), erst nach dem Abschied
+        // (host_abschied schliesst die Verbindung zum Zuschauer).
         dienst_takt_starten(QC_TAKT_S);
         qc_oberflaeche_cfg ui = { .abschied = host_abschied, .protokoll = ui_protokoll };
         qc_oberflaeche_starten(&ui);

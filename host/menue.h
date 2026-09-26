@@ -1,6 +1,6 @@
 // Oberflaeche des Mac-Hosts (Spezifikation Pairing 7.1-7.6): Symbol in der
 // Menueleiste mit Menue, Zulassen-Fenster, Passwort-Fenster, Rueckfrage
-// "Alle Geraete entfernen", Beenden samt Abschied an den Zuschauer.
+// "Alle Geraete entfernen", Beenden (Verbindung zum Zuschauer vorher zu).
 //
 // Faeden: alles, was AppKit anfasst, laeuft auf dem Hauptfaden. Kernfunktionen
 // (zugang.h) ruft die Oberflaeche nur auf ihrer eigenen seriellen
@@ -15,8 +15,8 @@
 #include "zugang.h"
 
 typedef struct {
-    // Vor dem Beenden: der Zuschauer bekommt seine letzte Nachricht. Laeuft
-    // nie auf der Main Queue (nimmt g_send_mtx); darf kurz blockieren.
+    // Vor dem Beenden: Bild- und Eingabekanal des Zuschauers schliessen.
+    // Laeuft nie auf der Main Queue (nimmt g_send_mtx); darf kurz blockieren.
     void (*abschied)(void);
     // Eine Protokollzeile (deutsch, ASCII-Umschrift wie das uebrige Protokoll).
     void (*protokoll)(NSString *zeile);
@@ -26,10 +26,6 @@ typedef struct {
 // (SIGTERM/SIGINT beenden sauber), Warteschlange. Symbol und Menue entstehen
 // in applicationDidFinishLaunching.
 void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg);
-
-// Der Bildport ist von einem anderen Programm belegt (port) oder wieder frei
-// (0). Aus jedem Faden.
-void qc_oberflaeche_port_belegt(int port);
 
 // ------------------------------------------------------------------ Modell
 // Das Menue entsteht in zwei Schritten: ein Zustand (vom Kern gelesen), daraus
@@ -98,7 +94,9 @@ NSString *qc_code_text(uint32_t code);
 // unlesbar -> unveraendert.
 NSString *qc_datum_text(NSString *iso);
 // Pruefung im Passwort-Fenster: 0 gut, 1 ungleich, 2 zu kurz (norm(pw)
-// unter 8 Byte, norm wie Abschnitt 3.4: ohne Leerzeichen, Tab, CR, LF, '-').
+// unter 8 Byte, norm wie Abschnitt 3.4: ohne Leerzeichen, Tab, CR, LF, '-'),
+// 3 unzulaessig (ueber QC_ZUGANG_PW_MAX Byte UTF-8 oder mit Zeilenumbruch -
+// so nimmt der Kern es nicht an).
 int qc_passwort_pruefen(NSString *pw, NSString *wiederholt);
 // Vorlagenbild fuer die Menueleiste, 18 pt: die vier Felder des Logos, das
 // vierte hohl (unterscheidet den Host vom Mac-Client), mit Punkt, solange

@@ -35,6 +35,7 @@ static qc_geraet f_geraete[4];
 static int f_verbunden = 0;
 static char f_zuschauer[64] = "";
 static int f_bildschirm = 1, f_bedienung = 1;
+static int f_port = 0;                  // belegter Bildport, 0 = frei
 
 uint32_t qc_zugang_eigene_id(void) { return f_id; }
 int qc_zugang_passwort(char *puffer, size_t groesse) {
@@ -61,6 +62,7 @@ int qc_zustand_zuschauer(char *name, size_t groesse) {
 }
 int qc_zustand_bildschirmfreigabe(void) { return f_bildschirm; }
 int qc_zustand_bedienungshilfen(void) { return f_bedienung; }
+int qc_zustand_port_belegt(void) { return f_port; }
 
 static qc_geraet geraet(uint8_t schluessel, uint32_t id, const char *name, const char *datum) {
     qc_geraet g;
@@ -75,7 +77,9 @@ static qc_geraet geraet(uint8_t schluessel, uint32_t id, const char *name, const
 // ------------------------------------------------------------ Texte
 
 // Wortgleich mit der Spezifikation (Pairing, Abschnitt 14) und den drei
-// Mac-eigenen Schluesseln; Deutsch mit Umlauten, „…“ und Gedankenstrich.
+// Mac-eigenen Schluesseln; Deutsch mit Umlauten, „…“, Gedankenstrich und
+// Auslassungszeichen "…" wie die Host-Schluessel in client/src/strings.rs
+// (Englisch dort mit "...").
 static const char *const SOLL_EN[QCTextAnzahl] = {
     [QCTextHostReady] = "Ready for connections",
     [QCTextHostConnected] = "Connected: {n}",
@@ -122,7 +126,7 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostDeviceId] = "Geräte-ID: {i}",
     [QCTextHostPassword] = "Passwort: {p}",
     [QCTextHostCopied] = "Kopiert",
-    [QCTextHostChangePassword] = "Passwort ändern ...",
+    [QCTextHostChangePassword] = "Passwort ändern …",
     [QCTextHostRandomPassword] = "Neues Zufallspasswort",
     [QCTextHostNewPassword] = "Neues Passwort (mindestens 8 Zeichen)",
     [QCTextHostRepeatPassword] = "Passwort wiederholen",
@@ -134,7 +138,7 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostNoDevices] = "Noch keine Geräte",
     [QCTextHostDeviceLine] = "{n} – ID {i} – seit {d}",
     [QCTextHostRemove] = "Entfernen",
-    [QCTextHostRemoveAll] = "Alle Geräte entfernen ...",
+    [QCTextHostRemoveAll] = "Alle Geräte entfernen …",
     [QCTextHostRemoveAllAsk] = "Alle erlaubten Geräte entfernen? Sie brauchen dann wieder das Passwort.",
     [QCTextHostListDamaged] = "Geräteliste beschädigt",
     [QCTextHostListReset] = "Geräteliste zurücksetzen",
@@ -144,8 +148,8 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostStartLogin] = "Beim Anmelden starten",
     [QCTextHostStartWindows] = "Mit Windows starten",
     [QCTextHostMoveToApps] = "QuadChroma zuerst in den Ordner Programme bewegen",
-    [QCTextHostScreenMissing] = "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen ...",
-    [QCTextHostAccessMissing] = "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen ...",
+    [QCTextHostScreenMissing] = "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen …",
+    [QCTextHostAccessMissing] = "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen …",
     [QCTextHostPortBusy] = "Port {p} ist von einem anderen Programm belegt",
     [QCTextHostQuit] = "QuadChroma beenden",
     [QCTextHostStopSharing] = "Freigabe beenden",
@@ -287,6 +291,17 @@ static void hilfen_pruefen(void) {
     pruefe(qc_passwort_pruefen(@"langes-passwort", @"langes-passwurt") == 1, "ungleich");
     pruefe(qc_passwort_pruefen(@"kurz", @"anders") == 2, "zu kurz geht vor ungleich");
     pruefe(qc_passwort_pruefen(@"langes passwort", nil) == 1, "zweites Feld fehlt: ungleich");
+    NSString *p256 = [@"" stringByPaddingToLength:256 withString:@"a" startingAtIndex:0];
+    NSString *p257 = [p256 stringByAppendingString:@"a"];
+    pruefe(qc_passwort_pruefen(p256, p256) == 0, "256 Byte: gut (QC_ZUGANG_PW_MAX)");
+    pruefe(qc_passwort_pruefen(p257, p257) == 3, "257 Byte: unzulaessig, nicht \"zu kurz\"");
+    NSString *u = [@"" stringByPaddingToLength:128 withString:@"ü" startingAtIndex:0];
+    pruefe(qc_passwort_pruefen(u, u) == 0, "128 x \"ü\" = 256 Byte: gut");
+    u = [u stringByAppendingString:@"a"];
+    pruefe(qc_passwort_pruefen(u, u) == 3, "257 Byte UTF-8: unzulaessig");
+    pruefe(qc_passwort_pruefen(@"abcd\nefgh", @"abcd\nefgh") == 3 && qc_passwort_pruefen(@"abcdefgh\r", @"abcdefgh\r") == 3,
+           "Zeilenumbruch (eingefuegt): unzulaessig");
+    pruefe(qc_passwort_pruefen(p257, @"anders") == 3, "unzulaessig geht vor ungleich");
 }
 
 // ------------------------------------------------------------ Modell
@@ -333,7 +348,7 @@ static void modell_pruefen(void) {
         @"---",
         @"Geräte-ID: 581 729 911",
         @"Passwort: k7m-4wq-9tz",
-        @"Passwort ändern ...",
+        @"Passwort ändern …",
         @"Neues Zufallspasswort",
         @"---",
         @"Erlaubte Geräte",
@@ -342,7 +357,7 @@ static void modell_pruefen(void) {
         @"  Büro-Laptop – ID 123 456 789 – seit 02.01.2026",
         @"    Entfernen",
         @"  ---",
-        @"  Alle Geräte entfernen ...",
+        @"  Alle Geräte entfernen …",
         @"---",
         @"(Beim Anmelden starten)",
         @"(QuadChroma zuerst in den Ordner Programme bewegen)",
@@ -366,12 +381,10 @@ static void modell_pruefen(void) {
     z.bildschirm = NO;
     z.bedienung = NO;
     z.anmelden = QCAnmeldenAn;
-    z.portBelegt = 9001;
     m = qc_menue_modell(z);
     pruefe(titel_gleich(qc_menue_titel(m), @[
         @"# QuadChroma",
         @"(Connected: Robert's PC)",
-        @"(Port 9001 is used by another program)",
         @"---",
         @"Device ID: 581 729 911",
         @"(Password file unreadable - new devices only via \"Allow\".)",
@@ -386,16 +399,27 @@ static void modell_pruefen(void) {
         @"Accessibility not allowed - open System Settings ...",
         @"---",
         @"Quit QuadChroma",
-    ]), "en, verbunden, Passwort unlesbar, Liste beschaedigt, Freigaben fehlen, Port belegt, Anmelden an");
+    ]), "en, verbunden, Passwort unlesbar, Liste beschaedigt, Freigaben fehlen, Anmelden an");
     pruefe(suche(m, QCAktionBildschirmFreigabe) && suche(m, QCAktionBedienungshilfen) && suche(m, QCAktionListeZuruecksetzen),
            "Freigaben und Zuruecksetzen haben ihre Aktionen");
     pruefe(!suche(m, QCAktionPasswortKopieren), "unlesbares Passwort ist nicht kopierbar");
+
+    // Bildport von einem anderen Programm belegt: dann kann niemand
+    // verbinden - die Zustandszeile sagt das statt "Bereit".
+    z = zustand_grund();
+    z.portBelegt = 9001;
+    NSArray<NSString *> *t = qc_menue_titel(qc_menue_modell(z));
+    pruefe([t[1] isEqualToString:@"(Port 9001 is used by another program)"] && ![t containsObject:@"(Ready for connections)"] &&
+           [t[2] isEqualToString:@"---"], "Port belegt: Zustandszeile statt \"Ready\", keine zweite Zeile");
+    z.zuschauer = @"PC";
+    t = qc_menue_titel(qc_menue_modell(z));
+    pruefe([t[1] isEqualToString:@"(Connected: PC)"] && [t[2] isEqualToString:@"---"], "verbunden geht vor Port belegt");
 
     z = zustand_grund();
     z.geraeteAnzahl = 0;
     z.geraete = nil;
     z.anmelden = QCAnmeldenAus;
-    NSArray<NSString *> *t = qc_menue_titel(qc_menue_modell(z));
+    t = qc_menue_titel(qc_menue_modell(z));
     pruefe([t containsObject:@"Allowed devices"] && [t containsObject:@"  (No devices yet)"] &&
            ![t containsObject:@"  Remove all devices ..."], "leere Liste: \"No devices yet\", kein \"Remove all\"");
     pruefe([t containsObject:@"Start at login"] && ![t containsObject:@"(Move QuadChroma to Applications first)"],
@@ -450,9 +474,9 @@ static void zustand_pruefen(void) {
     pruefe(!z.bildschirm && z.bedienung, "Freigaben");
     pruefe(z.anmelden == QCAnmeldenNichtInProgramme, "Pruefstand liegt nicht in /Applications: Anmelden gesperrt");
     pruefe(z.portBelegt == 0, "Port frei");
-    qc_oberflaeche_port_belegt(9001);
-    pruefe(qc_menue_zustand_lesen().portBelegt == 9001, "belegter Port kommt im Zustand an");
-    qc_oberflaeche_port_belegt(0);
+    f_port = 9001;
+    pruefe(qc_menue_zustand_lesen().portBelegt == 9001, "belegter Port kommt im Zustand an (qc_zustand_port_belegt)");
+    f_port = 0;
 
     f_pw_da = 0;
     f_anzahl = -1;
