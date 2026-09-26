@@ -298,8 +298,9 @@ pub enum Key {
     /// {n} = gewuenschte Kennung, {m} = der Bildschirm, der stattdessen laeuft.
     ScreenFallback,
     // Zugang (Spezifikation Pairing v1, Abschnitt 14). EN und DE wie dort;
-    // die uebrigen 27 Tabellen tragen vorerst den englischen Text - Paket P6
-    // uebersetzt sie (gleiche Uebersetzung wie in host/texte.m des Mac-Hosts).
+    // die uebrigen 27 Tabellen uebersetzt (Paket P6) - jeder Text, den auch
+    // der Mac-Host fuehrt, steht in host/texte.m wortgleich (Test
+    // zugang_texte_wie_mac_host).
     // Platzhalter: {n} Name, {i} ID "ddd ddd ddd", {c} Code "628 306",
     // {s} Sekunden, {p} Passwort bzw. Port, {d} Datum.
     // Client: Zugangsdialog und Meldungen
@@ -1118,7 +1119,7 @@ mod tests {
     /// Enums hinter der Bildschirmwahl, in jeder Tabelle, mit genau den
     /// Platzhaltern, die der Aufrufer ersetzt, und keinem weiteren. EN und DE
     /// wie vorgegeben, DE mit Umlauten und typografischen Zeichen. Die 27
-    /// weiteren Tabellen tragen bis Paket P6 den englischen Text.
+    /// weiteren Tabellen uebersetzt, in der Schreibweise ihrer Tabelle.
     #[test]
     fn zugang_texte() {
         let n: &[&str] = &["{n}"];
@@ -1248,12 +1249,78 @@ mod tests {
         assert_eq!(DE.get(HostPasswordUnreadable), "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“.");
         assert_eq!(DE.get(StartShare), "Diesen PC freigeben");
         assert_eq!(EN.get(HostTooltip), "QuadChroma - sharing this PC (ID {i})");
-        // Bis P6: die uebrigen 27 Sprachen tragen den englischen Text (P6
-        // ersetzt diese Pruefung, sobald die Uebersetzungen stehen).
+        // Die uebrigen 27 Sprachen sind uebersetzt (Paket P6): gleich wie
+        // Englisch nur Code, ID und OK - und die Woerter, die eine Sprache
+        // aus dem Englischen uebernimmt (italienisch "Password",
+        // niederlaendisch "Code").
+        let lehnwort = [("it", AccessPassword), ("it", HostPassword), ("nl", AccessCode)];
         for l in all().iter().skip(2) {
             for (k, _) in &alle {
-                assert_eq!(l.get(*k), EN.get(*k), "{} {k:?}", l.code);
+                if l.get(*k) == EN.get(*k) {
+                    assert!(gleich.contains(k) || lehnwort.contains(&(l.code, *k)), "{} {k:?}: noch englisch", l.code);
+                }
             }
         }
+        // Jede Sprache wie ihre Tabelle: "…" statt "...", Gedankenstrich
+        // statt " - " (nur Englisch steht wie vorgegeben); genau die
+        // Menuepunkte, die ein Fenster oder eine Folge oeffnen, und "wird
+        // geprueft" enden auf " …". Das Wort fuer "Zulassen" steht im Hinweis
+        // genauso wie auf dem Knopf, Abbrechen heisst wie im Benchmark,
+        // Beenden wie auf dem Startbildschirm. Kein Text doppelt je Sprache.
+        let punkte = [AccessChecking, HostChangePassword, HostRemoveAll, HostScreenMissing, HostAccessMissing];
+        for l in all() {
+            let mut texte = std::collections::HashSet::new();
+            for (k, _) in &alle {
+                let t = l.get(*k);
+                assert!(texte.insert(t), "{} {k:?}: doppelt ({t})", l.code);
+                if l.code != "en" {
+                    assert!(!t.contains("...") && !t.contains(" - "), "{} {k:?}: {t}", l.code);
+                    assert_eq!(t.ends_with(" …"), punkte.contains(k), "{} {k:?}: {t}", l.code);
+                }
+            }
+            for k in [AccessOrAllow, HostPasswordUnreadable] {
+                assert!(l.get(k).contains(l.get(HostAllow)), "{} {k:?}: {}", l.code, l.get(k));
+            }
+            assert_eq!(l.get(AccessCancel), l.get(BenchAbort), "{}", l.code);
+            let beenden = l.get(Quit).to_lowercase();
+            assert!(l.get(HostQuit).to_lowercase().contains(&beenden), "{}: {}", l.code, l.get(HostQuit));
+        }
+    }
+
+    /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der
+    /// Mac-Host fuehrt (host/texte.m, Schluessel QCText<Name>), steht dort in
+    /// allen 29 Sprachen wortgleich wie hier. Fehlt die Datei (Bau nur aus
+    /// client/, etwa auf der Windows-VM), gibt es nichts zu vergleichen.
+    #[test]
+    fn zugang_texte_wie_mac_host() {
+        let pfad = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../host/texte.m");
+        let Ok(quelle) = std::fs::read_to_string(&pfad) else {
+            eprintln!("{} fehlt - Vergleich mit dem Mac-Host uebersprungen", pfad.display());
+            return;
+        };
+        let zugang = &EN.table[AccessTitle as usize..];
+        let mut je_sprache = Vec::new();
+        for block in quelle.split("static const qc_sprache QC_").skip(1) {
+            // Kopf: XX = { "xx", "Name", {
+            let code = block.split('"').nth(1).expect("Sprachcode");
+            let l = all().iter().find(|l| l.code == code).unwrap_or_else(|| panic!("{code}: keine Tabelle im Client"));
+            let ende = block.find("}};").expect("Tabellenende");
+            let mut verglichen = 0;
+            for zeile in block[..ende].lines() {
+                let Some(rest) = zeile.trim().strip_prefix("[QCText") else { continue };
+                let (name, wert) = rest.split_once(']').expect("Schluessel");
+                // Schluessel nur des Mac-Hosts (HostPasswordNotSaved) haben
+                // hier kein Gegenstueck.
+                let Some((k, _)) = zugang.iter().find(|(k, _)| format!("{k:?}") == name) else { continue };
+                let wert = wert.trim().strip_prefix('=').and_then(|w| w.trim().strip_suffix(','));
+                let wert = wert.and_then(|w| w.strip_prefix('"')?.strip_suffix('"')).expect("Zeichenkette");
+                assert_eq!(wert.replace("\\\"", "\""), l.get(*k), "{code} {k:?}");
+                verglichen += 1;
+            }
+            je_sprache.push(verglichen);
+        }
+        assert_eq!(je_sprache.len(), 29);
+        // Alle 34 Host-Texte und dazu Code und Abbrechen, in jeder Sprache.
+        assert!(je_sprache.iter().all(|&n| n == 36), "{je_sprache:?}");
     }
 }

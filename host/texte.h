@@ -8,7 +8,9 @@
 // gleich dem eines Client-Schluessels ist (QCTextAccessCode, QCTextAccessCancel),
 // gilt dieselbe Uebersetzung. Neue Schluessel kommen ans Ende des Enums und in
 // jede Tabelle - der Pruefstand menuetest prueft, dass jede Tabelle jeden Text
-// hat und dieselben Platzhalter wie Englisch.
+// hat und dieselben Platzhalter wie Englisch; der Client-Test
+// zugang_texte_wie_mac_host (client/src/strings.rs) prueft, dass jeder Text
+// mit Client-Gegenstueck in allen 29 Sprachen wortgleich dort steht.
 //
 // Platzhalter: {n} Name, {i} ID ("ddd ddd ddd"), {c} Code ("628 306"),
 // {s} Sekunden, {p} Passwort bzw. Port, {d} Datum.
@@ -52,7 +54,7 @@ typedef enum QCText {
     // Nur im Mac-Host, gleicher Text wie der Client-Schluessel gleichen Namens:
     QCTextAccessCode,             // Code im Zulassen-Fenster
     QCTextAccessCancel,           // Abbrechen im Passwort-Fenster und bei der Rueckfrage
-    // Nur im Mac-Host, ohne Gegenstueck im Client (Paket P6 uebersetzt ihn mit):
+    // Nur im Mac-Host, ohne Gegenstueck im Client (in allen 29 Sprachen):
     QCTextHostPasswordNotSaved,   // qc_zugang_passwort_setzen meldet einen Schreibfehler
     QCTextAnzahl
 } QCText;

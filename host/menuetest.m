@@ -212,22 +212,59 @@ static void texte_pruefen(void) {
     pruefe(en, "Englisch wortgleich mit der Spezifikation");
     pruefe(de, "Deutsch wortgleich mit der Spezifikation (Umlaute, typografische Zeichen)");
 
-    // Wie im Client: innerhalb einer Sprache kein Text doppelt (nur fuer die
-    // echten Uebersetzungen - Platzhalter-Englisch doppelt nichts in sich).
+    // Wie im Client: innerhalb einer Sprache kein Text doppelt.
     int doppelt = 0;
-    for (int s = 0; s < 2; s++)
+    for (int s = 0; s < qc_texte_sprachen(); s++)
         for (int a = 0; a < QCTextAnzahl; a++)
             for (int b = a + 1; b < QCTextAnzahl; b++)
                 if (qc_texte_eintrag(s, (QCText)a) && qc_texte_eintrag(s, (QCText)b) &&
-                    !strcmp(qc_texte_eintrag(s, (QCText)a), qc_texte_eintrag(s, (QCText)b))) doppelt++;
-    pruefe(doppelt == 0, "kein Text doppelt innerhalb von en und de");
+                    !strcmp(qc_texte_eintrag(s, (QCText)a), qc_texte_eintrag(s, (QCText)b))) {
+                    doppelt++;
+                    printf("         doppelt: %s, Schluessel %d und %d\n", qc_texte_code(s), a, b);
+                }
+    pruefe(doppelt == 0, "kein Text doppelt innerhalb einer Sprache (alle 29)");
 
-    // Die 27 weiteren Sprachen tragen vorerst den englischen Text (P6 uebersetzt).
-    int platzhalter_en = 1;
+    // Die 27 weiteren Sprachen sind uebersetzt (Paket P6, wortgleich mit
+    // client/src/strings*.rs): gleich wie Englisch nur OK und die Woerter,
+    // die eine Sprache aus dem Englischen uebernimmt (italienisch
+    // "Password", niederlaendisch "Code").
+    int englisch = 0;
     for (int s = 2; s < qc_texte_sprachen(); s++)
-        for (int t = 0; t < QCTextAnzahl; t++)
-            if (!qc_texte_eintrag(s, (QCText)t)) platzhalter_en = 0;
-    pruefe(platzhalter_en, "weitere Sprachen: vollstaendig (vorerst englische Platzhalter)");
+        for (int t = 0; t < QCTextAnzahl; t++) {
+            const char *x = qc_texte_eintrag(s, (QCText)t), *code = qc_texte_code(s);
+            if (!x || strcmp(x, qc_texte_eintrag(0, (QCText)t))) continue;
+            if (t == QCTextHostOk || (!strcmp(code, "it") && t == QCTextHostPassword) ||
+                (!strcmp(code, "nl") && t == QCTextAccessCode)) continue;
+            englisch++;
+            printf("         noch englisch: %s, Schluessel %d\n", code, t);
+        }
+    pruefe(englisch == 0, "weitere Sprachen: uebersetzt");
+
+    // Schreibweise wie in den Tabellen des Clients: ausser im vorgegebenen
+    // Englisch "…" statt "..." und Gedankenstrich statt " - "; genau die
+    // Menuepunkte mit Fenster oder Folge enden auf " …"; der Hinweis zur
+    // unlesbaren Passwortdatei nennt den Knopf "Zulassen" mit seinem Wort.
+    int schreibweise = 0;
+    for (int s = 1; s < qc_texte_sprachen(); s++) {
+        for (int t = 0; t < QCTextAnzahl; t++) {
+            const char *x = qc_texte_eintrag(s, (QCText)t);
+            if (!x) continue;
+            size_t l = strlen(x);
+            int punkte = l >= 4 && !strcmp(x + l - 4, " \xE2\x80\xA6");
+            int soll = t == QCTextHostChangePassword || t == QCTextHostRemoveAll ||
+                       t == QCTextHostScreenMissing || t == QCTextHostAccessMissing;
+            if (strstr(x, "...") || strstr(x, " - ") || punkte != soll) {
+                schreibweise++;
+                printf("         Schreibweise: %s, Schluessel %d: %s\n", qc_texte_code(s), t, x);
+            }
+        }
+        const char *u = qc_texte_eintrag(s, QCTextHostPasswordUnreadable), *z = qc_texte_eintrag(s, QCTextHostAllow);
+        if (!u || !z || !strstr(u, z)) {
+            schreibweise++;
+            printf("         \"Zulassen\" fehlt im Hinweis: %s\n", qc_texte_code(s));
+        }
+    }
+    pruefe(schreibweise == 0, "Auslassungspunkte, Gedankenstrich und \"Zulassen\" wie im Client");
 
     printf("\n-- Sprachwahl\n");
     struct { NSArray<NSString *> *bevorzugt; const char *soll; } faelle[] = {
