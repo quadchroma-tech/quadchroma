@@ -65,4 +65,7 @@ windows = { version = "0.62", features = [
     # (GetDiskFreeSpaceExW, siehe dateien.rs); Desktop-Verknuepfung:
     # IShellLinkW::GetPath beim Zuruecklesen im Test (verknuepfung.rs)
     "Win32_Storage_FileSystem",
+    # Host-Rolle: Anzeigename eines Bildschirms (QueryDisplayConfig,
+    # DisplayConfigGetDeviceInfo, siehe host/aufnahme.rs)
+    "Win32_Devices_Display",
 ] }

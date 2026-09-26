@@ -47,6 +47,11 @@ pub const MSG_ABGELOEST: u8 = 10;
 /// Bytes werden uebergangen. Geht an jeden neuen Zuschauer, zusammen mit
 /// Einstellungen und Codecliste. Ein aelterer Client uebergeht Typ 11.
 pub const MSG_FAEHIGKEITEN: u8 = 11;
+/// Bildschirme des Hosts (Liste mit Wunsch, Format in bildschirm.rs). Geht
+/// an jeden neuen Zuschauer nach MSG_FAEHIGKEITEN, nach jedem
+/// Bildschirmwechsel, nach jeder Aenderung der Liste und als Antwort auf
+/// jeden Wunsch (IN_BILDSCHIRM). Ein aelterer Client uebergeht Typ 12.
+pub const MSG_BILDSCHIRME: u8 = 12;
 /// Tonformat: u32 Rate, u8 Kanaele, u8 1 = float32 verschachtelt, 2 frei.
 pub const MSG_AUDIO_INFO: u8 = 32;
 /// Ton: float32 LE verschachtelt.
@@ -79,6 +84,10 @@ pub const DATEI_QUITTUNG: u8 = 53;
 
 /// Bit 0 in MSG_FAEHIGKEITEN / IN_FAEHIGKEITEN: "Dateien Fassung 1".
 pub const FAEHIG_DATEIEN: u32 = 1;
+/// Bit 1 in MSG_FAEHIGKEITEN: der Host kennt die Bildschirmwahl (Typ 12
+/// und 70). Der Client schickt IN_BILDSCHIRM nur an einen Host mit diesem
+/// Bit; er selbst meldet in IN_FAEHIGKEITEN weiter nur FAEHIG_DATEIEN.
+pub const FAEHIG_BILDSCHIRM: u32 = 2;
 
 /// Flag Bit 0 im Bildkopf: Vollbild.
 pub const FLAG_KEY: u8 = 0x01;
@@ -109,6 +118,10 @@ pub const IN_TESTBILD: u8 = 68;
 /// erste Nachricht auf JEDEM neu stehenden Eingabekanal (gehoert zu
 /// NACHREICHEN). Ein aelterer Host uebergeht sie, weil sie unter 256 Byte hat.
 pub const IN_FAEHIGKEITEN: u8 = 69;
+/// Bildschirmwunsch: u8 Laenge (0 = Automatik, sonst 1..=64), dann die
+/// Kennung des Bildschirms aus MSG_BILDSCHIRME (UTF-8). Hoechstens 65 Byte;
+/// ein aelterer Host uebergeht sie. Format in bildschirm.rs.
+pub const IN_BILDSCHIRM: u8 = 70;
 
 // Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
 pub const MOD_SHIFT: u32 = 1;
