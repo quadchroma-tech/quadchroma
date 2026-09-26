@@ -33,7 +33,9 @@ pub enum Fehler {
     Schreiben { pfad: PathBuf, grund: String },
     /// Verbunden ueber eine Geraete-ID (Liste, Eingabe, Verknuepfung), aber
     /// der Schluessel der Gegenstelle ergibt eine andere ID (Spezifikation
-    /// Pairing v1, 8.2). Geprueft nach Nachricht 2, vor Nachricht 3.
+    /// Pairing v1, 8.2) - oder dieselbe, doch zu ihr ist in hosts.txt ein
+    /// anderer voller Schluessel gemerkt (`erwartet == gemeldet`: eine
+    /// errechnete Kollision). Geprueft nach Nachricht 2, vor Nachricht 3.
     AnderesGeraet { addr: String, erwartet: u32, gemeldet: u32 },
     /// Die Adresse ergibt kein Ziel; `grund` ist der Wortlaut des Systems,
     /// None: aufgeloest, aber ohne eine einzige Adresse.
@@ -61,6 +63,12 @@ impl std::fmt::Display for Fehler {
             Fehler::Unlesbar { pfad, grund } => write!(f, "{} nicht lesbar: {grund}", pfad.display()),
             Fehler::KeinUtf8 { pfad } => write!(f, "{} ist kein UTF-8", pfad.display()),
             Fehler::Schreiben { pfad, grund } => write!(f, "{} nicht zu schreiben: {grund}", pfad.display()),
+            Fehler::AnderesGeraet { addr, erwartet, gemeldet } if erwartet == gemeldet => write!(
+                f,
+                "An {addr} antwortet ein anderes Geraet: ID {} wie gewaehlt, aber nicht der dazu in hosts.txt \
+                 gemerkte Schluessel (moeglicher Angriff) - Abbruch vor Nachricht 3",
+                crate::zugang::id_text(*erwartet)
+            ),
             Fehler::AnderesGeraet { addr, erwartet, gemeldet } => write!(
                 f,
                 "An {addr} antwortet ein anderes Geraet (ID {} statt der gewaehlten {}) - Abbruch vor Nachricht 3",
@@ -434,9 +442,10 @@ fn basis_ordner() -> Result<PathBuf, String> {
 /// Name des Testordners dieses Laufs: "qc-test-<pid>-<Startzeit in ms>".
 /// Nur die pid reichte nicht: die Ordner bleiben liegen, Windows vergibt
 /// pids neu, und ein neuer Lauf mit derselben pid fand dann eine alte
-/// known_hosts.txt mit einem anderen Schluessel fuer 127.0.0.1 - die
-/// Loopback-Tests scheiterten am Pin. Einmal je Prozess bestimmt, damit alle
-/// Tests eines Laufs denselben Ordner teilen (Testschluessel, known_hosts).
+/// Vertrauensliste (damals known_hosts.txt) mit einem anderen Schluessel
+/// fuer 127.0.0.1 - die Loopback-Tests scheiterten am Pin. Einmal je Prozess
+/// bestimmt, damit alle Tests eines Laufs denselben Ordner teilen
+/// (Testschluessel, hosts.txt).
 #[cfg(test)]
 pub fn test_lauf() -> &'static str {
     static LAUF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -817,7 +826,7 @@ mod tests {
     const B: [u8; 32] = [0xbb; 32];
 
     /// Die Ablage der Tests ist je Prozess frisch: nicht der Ordner, den ein
-    /// frueherer Lauf mit derselben pid hinterliess (samt known_hosts.txt
+    /// frueherer Lauf mit derselben pid hinterliess (samt einer hosts.txt
     /// mit einem anderen Schluessel fuer 127.0.0.1), aber innerhalb eines
     /// Laufs immer derselbe - auch fuer ordner(name).
     #[test]

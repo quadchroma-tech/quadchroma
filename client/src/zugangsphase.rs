@@ -148,6 +148,10 @@ pub enum Ausgang {
     Abgebrochen,
     /// Der Host schwieg laenger als RUHE_FRIST.
     KeineAntwort,
+    /// Der Host hat die Leitung sauber geschlossen (EOF), bevor er seine
+    /// Kennung sagte - so antworten aeltere Fassungen einem unbekannten
+    /// Geraet (siehe `kennung_lesen`).
+    Geschlossen,
     /// Die Leitung fiel zu oder scheiterte (Wortlaut).
     Leitung(String),
     /// Eine Nachricht passte nicht (Wortlaut, deutsch).
@@ -279,6 +283,19 @@ impl Automat {
                 let echt = self.k.is_some_and(|k| zugang::host_beweis_pruefen(&k, &self.hh, &host_beweis));
                 Schritt::ende(if echt { Ausgang::Angenommen { per_passwort: true } } else { Ausgang::HostBeweisFalsch })
             }
+            // "Zulassen" gibt es nur, wenn der Host es in Nachricht 20
+            // angeboten hat (Bit 1) - ein echter Host stellt die Anfrage
+            // sonst gar nicht. Ohne diese Pruefung koennte ein falscher Host
+            // den Passwortweg umgehen: kein Zulassen anbieten (der Dialog
+            // fragt nur nach dem Passwort), den Beweis nehmen und statt
+            // 22/0 mit host_proof einfach 22/1 sagen - der Client pinnte ihn,
+            // ohne dass etwas bewiesen waere. Ging schon ein Beweis hinaus,
+            // ist das der Fall "Host konnte das Passwort nicht bestaetigen".
+            Ergebnis::Zulassen if !self.dialog.zulassen => Schritt::ende(if self.k.is_some() || self.fehlversuche > 0 {
+                Ausgang::HostBeweisFalsch
+            } else {
+                Ausgang::Protokoll("Zugangsphase: Ergebnis 1 (zugelassen), obwohl Nachricht 20 kein Zulassen anbot".into())
+            }),
             Ergebnis::Zulassen => Schritt::ende(Ausgang::Angenommen { per_passwort: false }),
             Ergebnis::Falsch { warten_ms } => {
                 self.fehlversuche += 1;
@@ -318,22 +335,33 @@ impl Leitung for crate::secure::Secure {
 }
 
 /// Liest die ersten 4 Byte nach dem Handschlag (bzw. nach der Annahme).
-/// Err(Ausgang::KeineAntwort): Frist abgelaufen; Err(Ausgang::Leitung):
-/// Leitung zu oder gestoert. Die Frist setzt der Aufrufer an der Leitung.
+/// Err(Ausgang::KeineAntwort): Frist abgelaufen; Err(Ausgang::Geschlossen):
+/// der Host hat sauber zugemacht (EOF - so antwortet eine aeltere Fassung
+/// einem unbekannten Geraet); Err(Ausgang::Leitung): Leitung gestoert
+/// (zurueckgesetzt, Datensatz nicht echt ...). Die Frist setzt der Aufrufer
+/// an der Leitung.
 pub fn kennung_lesen(l: &mut impl Leitung) -> Result<Kennung, Ausgang> {
     use std::io::ErrorKind as E;
     let mut b = [0u8; 4];
     match l.lesen(&mut b) {
         Ok(()) => Ok(kennung(&b)),
         Err(e) if matches!(e.kind(), E::WouldBlock | E::TimedOut) => Err(Ausgang::KeineAntwort),
+        Err(e) if e.kind() == E::UnexpectedEof => Err(Ausgang::Geschlossen),
         Err(e) => Err(Ausgang::Leitung(e.to_string())),
     }
 }
 
-/// Liest Nachricht 20 - die erste nach "QCA1".
+/// Liest Nachricht 20 - die erste nach "QCA1". Hat der Host keinen Platz
+/// frei (zu viele Zugangsphasen, Spezifikation 3.2), kommt statt 20 gleich
+/// Ergebnis 4 mit Wartezeit, dann macht er zu (Mac- und Windows-Host:
+/// "QCA1", 22/4) - das endet wie jedes Ergebnis 4 ("zu viele Versuche", kein
+/// Neuversuch), nicht als Protokollfehler. Ebenso eine sofortige Ablehnung
+/// (22/3). Eine Annahme ohne Nachricht 20 gibt es nicht.
 pub fn noetig_lesen(l: &mut impl Leitung) -> Result<ZugangNoetig, Ausgang> {
     match zugang::empfangen(|b| l.lesen(b)) {
         Ok(Nachricht::Noetig(n)) => Ok(n),
+        Ok(Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms })) => Err(Ausgang::Schluss { warten_ms, fehlversuche: 0 }),
+        Ok(Nachricht::Ergebnis(Ergebnis::Abgelehnt)) => Err(Ausgang::Abgelehnt),
         Ok(andere) => Err(Ausgang::Protokoll(format!("Zugangsphase: Nachricht {} statt 20", andere.typ()))),
         Err(zugang::LeseFehler::Leitung(g)) => Err(Ausgang::Leitung(g)),
         Err(e) => Err(Ausgang::Protokoll(e.to_string())),
@@ -412,15 +440,22 @@ impl Vorwissen {
     /// Im Handschlag nach Nachricht 2 (8.2): beim Verbinden ueber eine ID
     /// muss der Schluessel genau diese ID ergeben. Sonst Abbruch, bevor
     /// Nachricht 3 den eigenen Schluessel zeigt.
+    ///
+    /// Die ID ist nur ein Suchschluessel (30 Bit; 1.2: "vertraut wird immer
+    /// dem vollen Schluessel") - einen anderen Schluessel mit derselben ID
+    /// kann man sich errechnen. Steht zu der gewaehlten ID schon ein
+    /// Schluessel in hosts.txt, muss es deshalb einer der gemerkten sein;
+    /// ein fremder mit derselben ID ist ebenso "ein anderes Geraet". Ein
+    /// echter Host mit neuem Schluessel hat auch eine neue ID (bis auf einen
+    /// Zufall von 1 zu 10^9) und faellt schon am ersten Vergleich.
     pub fn pruefen(&self, peer: &[u8]) -> Result<(), crate::secure::Fehler> {
-        match self.erwartet {
-            Some(id) if zugang::geraete_id(peer) != id => Err(crate::secure::Fehler::AnderesGeraet {
-                addr: self.adresse.clone(),
-                erwartet: id,
-                gemeldet: zugang::geraete_id(peer),
-            }),
-            _ => Ok(()),
+        let Some(id) = self.erwartet else { return Ok(()) };
+        let gemeldet = zugang::geraete_id(peer);
+        let fremd_mit_id = || self.bekannt(peer).is_none() && self.liste.hosts.iter().any(|h| h.id == id);
+        if gemeldet != id || fremd_mit_id() {
+            return Err(crate::secure::Fehler::AnderesGeraet { addr: self.adresse.clone(), erwartet: id, gemeldet });
         }
+        Ok(())
     }
 
     /// Der gepinnte Eintrag zu diesem Schluessel, egal unter welcher Adresse.
@@ -598,6 +633,30 @@ mod tests {
         }
     }
 
+    /// 22/1 gilt nur, wenn Nachricht 20 "Zulassen" anbot (Bit 1). Sonst ist
+    /// es kein "angenommen": ohne eigenen Beweis ein Protokollfehler, nach
+    /// einem Beweis (auch einem, den der Host "falsch" nannte) der Fall
+    /// "Host konnte das Passwort nicht bestaetigen" - nichts wird gepinnt.
+    /// Mit Bit 1 darf "Zulassen" auch kommen, waehrend ein Beweis unterwegs
+    /// ist (am Host wurde geklickt, bevor er den Beweis pruefte).
+    #[test]
+    fn zulassen_nur_wenn_angeboten() {
+        let t = Instant::now();
+        let zugelassen = || Nachricht::Ergebnis(Ergebnis::Zulassen);
+        let mut a = automat(false, 0, t);
+        assert!(matches!(a.nachricht(zugelassen(), t).ende, Some(Ausgang::Protokoll(_))));
+        let mut a = automat(false, 0, t);
+        assert!(a.eingabe(Eingabe::Passwort("k7m-4wq-9tz".into()), t).senden.is_some());
+        assert_eq!(a.nachricht(zugelassen(), t).ende, Some(Ausgang::HostBeweisFalsch));
+        let mut a = automat(false, 0, t);
+        a.eingabe(Eingabe::Passwort("falsch".into()), t);
+        assert_eq!(a.nachricht(Nachricht::Ergebnis(Ergebnis::Falsch { warten_ms: 0 }), t), Schritt::default());
+        assert_eq!(a.nachricht(zugelassen(), t).ende, Some(Ausgang::HostBeweisFalsch));
+        let mut a = automat(true, 0, t);
+        a.eingabe(Eingabe::Passwort("k7m-4wq-9tz".into()), t);
+        assert_eq!(a.nachricht(zugelassen(), t).ende, Some(Ausgang::Angenommen { per_passwort: false }));
+    }
+
     /// Ohne Namen in Nachricht 20 steht der Ersatzname (Adresse) da.
     #[test]
     fn name_aus_20_oder_ersatz() {
@@ -719,18 +778,51 @@ mod tests {
         assert!(matches!(fuehren(&mut l, &mut a, |_| None, Duration::from_secs(5)), Ausgang::Protokoll(_)));
     }
 
+    /// Eine Leitung, an der jedes Lesen mit dieser Art scheitert.
+    struct Gestoert(std::io::ErrorKind);
+
+    impl Leitung for Gestoert {
+        fn senden(&mut self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn bereit(&mut self, _: Duration) -> std::io::Result<bool> {
+            Ok(true)
+        }
+        fn lesen(&mut self, _: &mut [u8]) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "gestoert"))
+        }
+    }
+
     #[test]
     fn kennung_und_noetig_lesen() {
+        use std::io::ErrorKind as E;
         let mut l = Drehbuch { herein: VecDeque::new(), hinaus: Vec::new(), antwort: |_: &[u8]| Vec::new(), zu: false };
         l.herein.extend(*b"QCA1");
         l.herein.extend(Nachricht::Noetig(ZugangNoetig::neu(true, 7, "Mac")).kodieren());
         assert_eq!(kennung_lesen(&mut l), Ok(Kennung::Zugang));
         let n = noetig_lesen(&mut l).unwrap();
         assert_eq!((n.hostname.as_str(), n.warten_ms, n.zulassen_moeglich()), ("Mac", 7, true));
-        // Leitung zu: Leitung; statt 20 ein Ergebnis: Protokoll.
-        assert!(matches!(kennung_lesen(&mut l), Err(Ausgang::Leitung(_))));
+        // Sauber zu (EOF): Geschlossen - eine aeltere Fassung. Gestoert
+        // (zurueckgesetzt, Datensatz nicht echt): Leitung. Frist: keine Antwort.
+        assert_eq!(kennung_lesen(&mut l), Err(Ausgang::Geschlossen));
+        for art in [E::ConnectionReset, E::InvalidData, E::ConnectionAborted] {
+            assert!(matches!(kennung_lesen(&mut Gestoert(art)), Err(Ausgang::Leitung(_))), "{art:?}");
+        }
+        for art in [E::WouldBlock, E::TimedOut] {
+            assert_eq!(kennung_lesen(&mut Gestoert(art)), Err(Ausgang::KeineAntwort), "{art:?}");
+        }
+        // Kein Platz am Host: statt 20 gleich 22/4 mit Wartezeit (so senden
+        // es Mac- und Windows-Host) - ein Ergebnis 4, kein Protokollfehler.
+        // Ebenso eine sofortige Ablehnung. Eine Annahme ohne 20: Protokoll.
+        l.herein.extend(ergebnis(Ergebnis::Schluss { warten_ms: 5000 }));
+        assert_eq!(noetig_lesen(&mut l), Err(Ausgang::Schluss { warten_ms: 5000, fehlversuche: 0 }));
         l.herein.extend(ergebnis(Ergebnis::Abgelehnt));
-        assert!(matches!(noetig_lesen(&mut l), Err(Ausgang::Protokoll(_))));
+        assert_eq!(noetig_lesen(&mut l), Err(Ausgang::Abgelehnt));
+        for e in [Ergebnis::Zulassen, Ergebnis::Falsch { warten_ms: 0 }, Ergebnis::Passwort { host_beweis: host_proof() }] {
+            l.herein.extend(ergebnis(e));
+            assert!(matches!(noetig_lesen(&mut l), Err(Ausgang::Protokoll(_))), "{e:?}");
+        }
+        assert!(matches!(noetig_lesen(&mut l), Err(Ausgang::Leitung(_))));
     }
 
     fn ordner(name: &str) -> std::path::PathBuf {
@@ -759,9 +851,27 @@ mod tests {
             })
         );
         assert!(!v.neue_identitaet(&a), "leere Liste: nichts ist neu");
+        // Gemerkt ist zu dieser ID ein anderer voller Schluessel (errechnete
+        // Kollision; hier nachgestellt mit einem Eintrag, der b die ID von a
+        // gibt): dieselbe ID reicht nicht.
+        let mut kollision = Vorwissen { liste: Hostliste::default(), adresse: "10.0.0.5:9001".into(), erwartet: Some(zugang::geraete_id(&a)) };
+        kollision.liste.hosts.push(BekannterHost { id: zugang::geraete_id(&a), schluessel: b, adresse: "10.0.0.5:9001".into(), name: "Mac".into() });
+        assert_eq!(
+            kollision.pruefen(&a),
+            Err(crate::secure::Fehler::AnderesGeraet {
+                addr: "10.0.0.5:9001".into(),
+                erwartet: zugang::geraete_id(&a),
+                gemeldet: zugang::geraete_id(&a)
+            })
+        );
+        // Ist a selbst (auch) gemerkt, gilt es.
+        kollision.liste.hosts.push(BekannterHost::neu(a, "10.0.0.7:9001", "Mac"));
+        assert_eq!(kollision.pruefen(&a), Ok(()));
         assert!(pinnen(&p, &a, "10.0.0.5:9001", "Mac").unwrap());
         let v = Vorwissen::laden(&p, "10.0.0.5:9001", None).unwrap();
         assert_eq!(v.pruefen(&b), Ok(()), "ohne ID prueft der Handschlag nichts");
+        let v = Vorwissen::laden(&p, "10.0.0.5:9001", Some(zugang::geraete_id(&a))).unwrap();
+        assert_eq!(v.pruefen(&a), Ok(()), "gemerkt unter dieser ID");
         assert!(v.bekannt(&a).is_some());
         assert!(!v.neue_identitaet(&a));
         assert!(v.neue_identitaet(&b));
