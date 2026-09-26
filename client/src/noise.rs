@@ -60,9 +60,14 @@ pub struct Session {
 /// Scheitert die Pruefung, geht Nachricht 3 nicht hinaus: die Gegenstelle
 /// lernt den eigenen Schluessel nie kennen, und ein Host nimmt diesen
 /// Anrufer gar nicht erst als Zuschauer an (und loest dafuer niemanden ab).
+///
+/// `nutzlast3` geht verschluesselt mit Nachricht 3 hinaus: der Client
+/// schickt "QCN1" mit seinem Geraetenamen (zugang::nachricht3), aeltere
+/// Fassungen schickten b"client" - Hosts, die sie nicht kennen, uebergehen sie.
 pub fn handshake_initiator<R, W, P>(
     static_key: &[u8],
     prologue: &[u8],
+    nutzlast3: &[u8],
     mut recv: R,
     mut send: W,
     pruefen: P,
@@ -94,7 +99,7 @@ where
     // eigenen Schluessel zeigen.
     pruefen(hs.get_remote_static().unwrap_or_default())?;
 
-    let n = hs.write_message(b"client", &mut buf).map_err(|e| format!("Nachricht 3: {e:?}"))?;
+    let n = hs.write_message(nutzlast3, &mut buf).map_err(|e| format!("Nachricht 3: {e:?}"))?;
     send(&buf[..n])?;
 
     let handshake_hash = hs.get_handshake_hash().to_vec();
@@ -179,7 +184,7 @@ pub fn selftest_against(addr: &str) -> Result<(), String> {
         (&sock).write_all(&out).map_err(|e| format!("Senden: {e}"))
     };
 
-    let mut s = handshake_initiator(&priv_key, &prologue_video(), recv, send, |_| Ok(()))?;
+    let mut s = handshake_initiator(&priv_key, &prologue_video(), b"client", recv, send, |_| Ok(()))?;
     println!("Handschlag fertig");
     println!("Vergleichscode: {}", sas(&s.handshake_hash));
     println!("Host-Fingerabdruck: {}", fingerprint(&s.remote_static));
@@ -235,6 +240,7 @@ mod tests {
             let r = handshake_initiator(
                 &client_priv,
                 &prologue_video(),
+                b"client",
                 |b| {
                     *b = beim_client.recv().map_err(|_| "Leitung zu".to_string())?;
                     Ok(())
@@ -258,5 +264,47 @@ mod tests {
                 assert_eq!(beim_host.err().as_deref(), Some("Leitung zu"), "Nachricht 3 kam an");
             }
         }
+    }
+
+    /// Nachricht 3 traegt die Nutzlast des Anrufers (Pairing v1: "QCN1" mit
+    /// dem Geraetenamen) - verschluesselt; der Angerufene liest genau sie.
+    #[test]
+    fn nutzlast_in_nachricht_3() {
+        let (host_priv, _) = keypair().unwrap();
+        let (client_priv, _) = keypair().unwrap();
+        let (zum_host, beim_host) = mpsc::channel::<Vec<u8>>();
+        let (zum_client, beim_client) = mpsc::channel::<Vec<u8>>();
+        let host = std::thread::spawn(move || {
+            let mut hs = Builder::new(PATTERN.parse().unwrap())
+                .local_private_key(&host_priv)
+                .unwrap()
+                .prologue(&prologue_video())
+                .unwrap()
+                .build_responder()
+                .unwrap();
+            let mut p = vec![0u8; 65535];
+            let mut b = vec![0u8; 65535];
+            hs.read_message(&beim_host.recv().unwrap(), &mut p).unwrap();
+            let n = hs.write_message(&[], &mut b).unwrap();
+            zum_client.send(b[..n].to_vec()).unwrap();
+            let n = hs.read_message(&beim_host.recv().unwrap(), &mut p).unwrap();
+            p[..n].to_vec()
+        });
+        let nutzlast = crate::zugang::nachricht3("B\u{fc}ro-PC");
+        handshake_initiator(
+            &client_priv,
+            &prologue_video(),
+            &nutzlast,
+            |b| {
+                *b = beim_client.recv().map_err(|_| "Leitung zu".to_string())?;
+                Ok(())
+            },
+            |d| zum_host.send(d.to_vec()).map_err(|_| "Leitung zu".to_string()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let gelesen = host.join().unwrap();
+        assert_eq!(gelesen, nutzlast);
+        assert_eq!(crate::zugang::nachricht3_name(&gelesen).as_deref(), Some("B\u{fc}ro-PC"));
     }
 }
