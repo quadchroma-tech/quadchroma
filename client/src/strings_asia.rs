@@ -188,6 +188,11 @@ pub static RU: Lang = Lang {
         (FilesAbortRead, "ошибка чтения"),
         (FilesAbortWrite, "ошибка записи"),
         (FilesAbortClipboard, "буфер обмена недоступен"),
+        (ScreenLabel, "Экран хоста"),
+        (ScreenAuto, "Автоматически"),
+        (TipScreen, "Какой экран хоста ты видишь. Автоматически следует за главным экраном; фиксированный экран действует, пока ты не выберешь другое."),
+        (ScreenSwitching, "Смена экрана …"),
+        (ScreenFallback, "{n} не подключён – запасной: {m}"),
     ],
 };
 
@@ -375,6 +380,11 @@ pub static ZH: Lang = Lang {
         (FilesAbortRead, "读取错误"),
         (FilesAbortWrite, "写入错误"),
         (FilesAbortClipboard, "剪贴板不可用"),
+        (ScreenLabel, "主机屏幕"),
+        (ScreenAuto, "自动"),
+        (TipScreen, "你看到主机的哪个屏幕。\"自动\" 跟随主屏幕；固定屏幕一直有效，直到你选择其他。"),
+        (ScreenSwitching, "正在切换屏幕 …"),
+        (ScreenFallback, "{n} 未连接 – 备用：{m}"),
     ],
 };
 
@@ -562,6 +572,11 @@ pub static JA: Lang = Lang {
         (FilesAbortRead, "読み取りエラー"),
         (FilesAbortWrite, "書き込みエラー"),
         (FilesAbortClipboard, "クリップボードを使用できません"),
+        (ScreenLabel, "ホストの画面"),
+        (ScreenAuto, "自動"),
+        (TipScreen, "ホストのどの画面を見るか。「自動」はメイン画面に追従します。固定した画面は、別のものを選ぶまで有効です。"),
+        (ScreenSwitching, "画面を切り替え中 …"),
+        (ScreenFallback, "{n} は未接続 – 代替: {m}"),
     ],
 };
 
@@ -747,5 +762,10 @@ pub static TR: Lang = Lang {
         (FilesAbortRead, "okuma hatası"),
         (FilesAbortWrite, "yazma hatası"),
         (FilesAbortClipboard, "pano kullanılamıyor"),
+        (ScreenLabel, "Host ekranı"),
+        (ScreenAuto, "Otomatik"),
+        (TipScreen, "Host'un hangi ekranını gördüğün. Otomatik ana ekranı izler; sabit bir ekran, başka bir şey seçene kadar geçerlidir."),
+        (ScreenSwitching, "Ekran değiştiriliyor …"),
+        (ScreenFallback, "{n} bağlı değil – yedek: {m}"),
     ],
 };

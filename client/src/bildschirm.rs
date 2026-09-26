@@ -301,6 +301,44 @@ mod tests {
         assert_eq!(wunsch_lesen(&w), None);
     }
 
+    /// 17 angekuendigte und mitgeschickte Eintraege: der Leser nimmt die
+    /// ersten 16 und uebergeht den Rest; Bytes hinter dem letzten Eintrag
+    /// (ein spaeteres Format mit Anhang) stoeren nicht.
+    #[test]
+    fn leser_nimmt_hoechstens_16_und_uebergeht_anhang() {
+        let mut b = beispiel();
+        for i in 0..15 {
+            let mut e = b.eintraege[1].clone();
+            e.kennung = format!("v{i}-m{i}-s{i}");
+            b.eintraege.push(e);
+        }
+        assert_eq!(b.eintraege.len(), 17);
+        // Von Hand kodieren, denn der Kodierer selbst begrenzt schon auf 16.
+        let mut p = vec![FASSUNG, 17, 0, 0];
+        for e in &b.eintraege {
+            p.push(e.kennung.len() as u8);
+            p.push(e.name.len() as u8);
+            p.extend_from_slice(&e.breite.to_le_bytes());
+            p.extend_from_slice(&e.hoehe.to_le_bytes());
+            p.extend_from_slice(&e.hz.to_le_bytes());
+            p.push((e.haupt as u8) | ((e.gestreamt as u8) << 1));
+            p.push(0);
+            p.extend_from_slice(e.kennung.as_bytes());
+            p.extend_from_slice(e.name.as_bytes());
+        }
+        let g = bildschirme_lesen(&p).unwrap();
+        assert_eq!(g.eintraege.len(), EINTRAEGE_MAX);
+        assert_eq!(g.eintraege[..], b.eintraege[..EINTRAEGE_MAX]);
+        // Anhang hinter der Liste: uebergangen, nicht abgelehnt.
+        let mut a = bildschirme_kodieren(&beispiel());
+        a.extend_from_slice(&[9, 9, 9]);
+        assert_eq!(bildschirme_lesen(&a), Some(beispiel()));
+        // Ein 17. Eintrag, der abgeschnitten ist, stoert ebenfalls nicht:
+        // gelesen werden nur 16.
+        p.truncate(p.len() - 5);
+        assert_eq!(bildschirme_lesen(&p).map(|g| g.eintraege.len()), Some(EINTRAEGE_MAX));
+    }
+
     #[test]
     fn kodierer_kuerzt_und_begrenzt() {
         let mut b = beispiel();

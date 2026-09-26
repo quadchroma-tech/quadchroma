@@ -286,6 +286,17 @@ pub enum Key {
     FilesAbortWrite,
     /// Die Ablage liess sich nicht setzen.
     FilesAbortClipboard,
+    // Bildschirmwahl im Reiter "Bild" (Spezifikation Bildschirmwahl 3.1)
+    /// Zeile "Bildschirm" ueber den Codecknoepfen.
+    ScreenLabel,
+    /// Knopf "Automatisch": der Host folgt seinem Hauptbildschirm.
+    ScreenAuto,
+    /// Tooltip der Bildschirmzeile.
+    TipScreen,
+    /// Ein Bildschirmwunsch ist unterwegs.
+    ScreenSwitching,
+    /// {n} = gewuenschte Kennung, {m} = der Bildschirm, der stattdessen laeuft.
+    ScreenFallback,
 }
 
 pub struct Lang {
@@ -494,6 +505,11 @@ pub static EN: Lang = Lang {
         (FilesAbortRead, "read error"),
         (FilesAbortWrite, "write error"),
         (FilesAbortClipboard, "clipboard not available"),
+        (ScreenLabel, "Screen"),
+        (ScreenAuto, "Automatic"),
+        (TipScreen, "Which of the host's screens you see. Automatic follows the main screen; a fixed screen stays until you choose something else."),
+        (ScreenSwitching, "Switching screen …"),
+        (ScreenFallback, "{n} not connected – fallback: {m}"),
     ],
 };
 
@@ -679,6 +695,11 @@ pub static DE: Lang = Lang {
         (FilesAbortRead, "Lesefehler"),
         (FilesAbortWrite, "Schreibfehler"),
         (FilesAbortClipboard, "Zwischenablage nicht verfügbar"),
+        (ScreenLabel, "Bildschirm"),
+        (ScreenAuto, "Automatisch"),
+        (TipScreen, "Welchen Bildschirm des Hosts du siehst. Automatisch folgt dem Hauptbildschirm; ein fester Bildschirm gilt, bis du etwas anderes wählst."),
+        (ScreenSwitching, "Bildschirm wird gewechselt …"),
+        (ScreenFallback, "{n} nicht angeschlossen – Ausweichplatz: {m}"),
     ],
 };
 
@@ -724,8 +745,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > FilesAbortClipboard as usize);
-        assert_eq!(n, FilesAbortClipboard as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > ScreenFallback as usize);
+        assert_eq!(n, ScreenFallback as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Abbruchgruende der Datei-Zeile: in jeder Sprache vorhanden, ohne
@@ -803,6 +824,39 @@ mod tests {
         assert_eq!(DE.get(TrayStillRunning), "QuadChroma läuft im Infobereich weiter.");
         assert_eq!(DE.get(TrayStillRunningMac), "QuadChroma läuft in der Menüleiste weiter.");
         assert_eq!(DE.get(TrayConnect), "Verbinden: {n}");
+    }
+
+    /// Die Texte der Bildschirmwahl (Spezifikation Bildschirmwahl 3.1): in
+    /// jeder Sprache vorhanden, der Ausweichplatz mit beiden Platzhaltern,
+    /// die anderen ohne; die Zeile heisst nie wie der Reiter "Anzeige", auf
+    /// dem sie steht; EN/DE verschieden; die deutschen Texte wie vorgegeben.
+    #[test]
+    fn bildschirm_texte() {
+        for l in all() {
+            let f = l.get(ScreenFallback);
+            assert!(f.contains("{n}") && f.contains("{m}"), "{}: {f}", l.code);
+            for k in [ScreenLabel, ScreenAuto, TipScreen, ScreenSwitching] {
+                assert!(!l.get(k).contains('{'), "{}: {k:?}", l.code);
+            }
+            assert_ne!(l.get(ScreenLabel).to_lowercase(), l.get(TabDisplay).to_lowercase(), "{}", l.code);
+            // Der Hinweis "wird gewechselt" endet wie beim Codec mit "…".
+            assert!(l.get(ScreenSwitching).ends_with('…'), "{}: {}", l.code, l.get(ScreenSwitching));
+        }
+        for k in [ScreenLabel, ScreenAuto, TipScreen, ScreenSwitching, ScreenFallback] {
+            assert_ne!(EN.get(k), DE.get(k), "{k:?}");
+        }
+        assert_eq!(DE.get(ScreenLabel), "Bildschirm");
+        assert_eq!(DE.get(ScreenAuto), "Automatisch");
+        assert_eq!(
+            DE.get(TipScreen),
+            "Welchen Bildschirm des Hosts du siehst. Automatisch folgt dem Hauptbildschirm; ein fester Bildschirm gilt, bis du etwas anderes wählst."
+        );
+        assert_eq!(DE.get(ScreenSwitching), "Bildschirm wird gewechselt …");
+        assert_eq!(DE.get(ScreenFallback), "{n} nicht angeschlossen – Ausweichplatz: {m}");
+        // Die fuenf Schluessel stehen am Ende des Enums, hinter dem letzten
+        // Abbruchgrund - so bleiben alle 29 Tabellen davor unveraendert.
+        assert_eq!(ScreenLabel as usize, FilesAbortClipboard as usize + 1);
+        assert_eq!(ScreenFallback as usize, ScreenLabel as usize + 4);
     }
 
     /// Die Texte der Desktop-Verknuepfung: in jeder Sprache eigene Worte
