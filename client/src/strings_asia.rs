@@ -249,6 +249,12 @@ pub static RU: Lang = Lang {
         (HostStopSharing, "Закрыть доступ"),
         (HostTooltip, "QuadChroma – доступ к этому ПК открыт (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Скрыть"),
+        (MsgShareFailed, "Не удалось открыть доступ к этому ПК."),
+        (MsgDeviceRemoved, "{n} больше не знает это устройство. Подключитесь снова и введите пароль."),
+        (HostPasswordNotSaved, "Не удалось сохранить пароль."),
+        (HostPasswordInvalid, "Пароль содержит недопустимые символы."),
+        (HostPasswordTitle, "Изменить пароль"),
     ],
 };
 
@@ -497,6 +503,12 @@ pub static ZH: Lang = Lang {
         (HostStopSharing, "停止共享"),
         (HostTooltip, "QuadChroma – 正在共享此电脑（ID {i}）"),
         (HostOk, "确定"),
+        (AccessHide, "隐藏"),
+        (MsgShareFailed, "无法开始共享此电脑。"),
+        (MsgDeviceRemoved, "{n} 已不再记录此设备。 请重新连接并输入密码。"),
+        (HostPasswordNotSaved, "无法保存密码。"),
+        (HostPasswordInvalid, "密码包含不允许的字符。"),
+        (HostPasswordTitle, "更改密码"),
     ],
 };
 
@@ -745,6 +757,12 @@ pub static JA: Lang = Lang {
         (HostStopSharing, "共有を停止"),
         (HostTooltip, "QuadChroma – この PC を共有中（ID {i}）"),
         (HostOk, "OK"),
+        (AccessHide, "非表示"),
+        (MsgShareFailed, "この PC の共有を開始できませんでした。"),
+        (MsgDeviceRemoved, "{n} はこのデバイスをもう認識していません。 もう一度接続して、パスワードを入力してください。"),
+        (HostPasswordNotSaved, "パスワードを保存できませんでした。"),
+        (HostPasswordInvalid, "パスワードに使用できない文字が含まれています。"),
+        (HostPasswordTitle, "パスワードを変更"),
     ],
 };
 
@@ -991,5 +1009,11 @@ pub static TR: Lang = Lang {
         (HostStopSharing, "Paylaşımı durdur"),
         (HostTooltip, "QuadChroma – bu bilgisayar paylaşılıyor (ID {i})"),
         (HostOk, "Tamam"),
+        (AccessHide, "Gizle"),
+        (MsgShareFailed, "Bu bilgisayarın paylaşımı başlatılamadı."),
+        (MsgDeviceRemoved, "{n} bu cihazı artık tanımıyor. Yeniden bağlanın ve parolayı girin."),
+        (HostPasswordNotSaved, "Parola kaydedilemedi."),
+        (HostPasswordInvalid, "Parola izin verilmeyen karakterler içeriyor."),
+        (HostPasswordTitle, "Parolayı değiştir"),
     ],
 };

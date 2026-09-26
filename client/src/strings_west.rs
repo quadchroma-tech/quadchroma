@@ -248,6 +248,12 @@ pub static FR: Lang = Lang {
         (HostStopSharing, "Arrêter le partage"),
         (HostTooltip, "QuadChroma – ce PC est partagé (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Masquer"),
+        (MsgShareFailed, "Impossible de démarrer le partage de ce PC."),
+        (MsgDeviceRemoved, "{n} ne connaît plus cet appareil. Reconnectez-vous et saisissez le mot de passe."),
+        (HostPasswordNotSaved, "Le mot de passe n'a pas pu être enregistré."),
+        (HostPasswordInvalid, "Le mot de passe contient des caractères non autorisés."),
+        (HostPasswordTitle, "Changer le mot de passe"),
     ],
 };
 
@@ -494,6 +500,12 @@ pub static ES: Lang = Lang {
         (HostStopSharing, "Dejar de compartir"),
         (HostTooltip, "QuadChroma – este PC está compartido (ID {i})"),
         (HostOk, "Aceptar"),
+        (AccessHide, "Ocultar"),
+        (MsgShareFailed, "No se ha podido iniciar el uso compartido de este PC."),
+        (MsgDeviceRemoved, "{n} ya no conoce este dispositivo. Vuelve a conectarte e introduce la contraseña."),
+        (HostPasswordNotSaved, "No se ha podido guardar la contraseña."),
+        (HostPasswordInvalid, "La contraseña contiene caracteres no permitidos."),
+        (HostPasswordTitle, "Cambiar contraseña"),
     ],
 };
 
@@ -740,6 +752,12 @@ pub static IT: Lang = Lang {
         (HostStopSharing, "Interrompi condivisione"),
         (HostTooltip, "QuadChroma – questo PC è condiviso (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Nascondi"),
+        (MsgShareFailed, "Impossibile avviare la condivisione di questo PC."),
+        (MsgDeviceRemoved, "{n} non conosce più questo dispositivo. Connettiti di nuovo e inserisci la password."),
+        (HostPasswordNotSaved, "Impossibile salvare la password."),
+        (HostPasswordInvalid, "La password contiene caratteri non consentiti."),
+        (HostPasswordTitle, "Cambia password"),
     ],
 };
 
@@ -986,6 +1004,12 @@ pub static PT: Lang = Lang {
         (HostStopSharing, "Parar a partilha"),
         (HostTooltip, "QuadChroma – este PC está partilhado (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Ocultar"),
+        (MsgShareFailed, "Não foi possível iniciar a partilha deste PC."),
+        (MsgDeviceRemoved, "{n} já não conhece este dispositivo. Ligue-se novamente e introduza a palavra-passe."),
+        (HostPasswordNotSaved, "Não foi possível guardar a palavra-passe."),
+        (HostPasswordInvalid, "A palavra-passe contém caracteres não permitidos."),
+        (HostPasswordTitle, "Alterar palavra-passe"),
     ],
 };
 
@@ -1232,5 +1256,11 @@ pub static NL: Lang = Lang {
         (HostStopSharing, "Delen stoppen"),
         (HostTooltip, "QuadChroma – deze pc wordt gedeeld (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Verbergen"),
+        (MsgShareFailed, "Het delen van deze pc kon niet worden gestart."),
+        (MsgDeviceRemoved, "{n} kent dit apparaat niet meer. Maak opnieuw verbinding en voer het wachtwoord in."),
+        (HostPasswordNotSaved, "Het wachtwoord kon niet worden opgeslagen."),
+        (HostPasswordInvalid, "Het wachtwoord bevat tekens die niet zijn toegestaan."),
+        (HostPasswordTitle, "Wachtwoord wijzigen"),
     ],
 };

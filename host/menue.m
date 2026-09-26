@@ -677,6 +677,7 @@ static void anfrage_abgleichen(void) {
 
 - (void)zeigen {
     if (!self.panel) [self bauen];
+    self.panel.title = qc_text(QCTextHostPasswordTitle);
     self.eins.stringValue = @"";
     self.zwei.stringValue = @"";
     self.hinweis.stringValue = @"";
@@ -692,7 +693,7 @@ static void anfrage_abgleichen(void) {
     NSString *pw = self.eins.stringValue;
     int r = qc_passwort_pruefen(pw, self.zwei.stringValue);
     if (r == 2) { [self hinweis:QCTextHostPasswordShort fehler:YES]; return; }
-    if (r == 3) { [self hinweis:QCTextHostPasswordNotSaved fehler:YES]; return; }
+    if (r == 3) { [self hinweis:QCTextHostPasswordInvalid fehler:YES]; return; }
     if (r == 1) { [self hinweis:QCTextHostPasswordsDiffer fehler:YES]; return; }
     self.eins.enabled = self.zwei.enabled = self.ok.enabled = NO;
     self.hinweis.stringValue = @"";
@@ -714,8 +715,9 @@ static void anfrage_abgleichen(void) {
                 return;
             }
             // Die Laenge hat das Fenster schon geprueft: ein -1 des Kerns
-            // heisst hier "so nicht annehmbar", nicht "zu kurz".
-            [f hinweis:QCTextHostPasswordNotSaved fehler:YES];
+            // heisst hier "so nicht annehmbar" (unzulaessig), nicht "zu
+            // kurz"; -2 ist ein Schreibfehler - das alte Passwort gilt weiter.
+            [f hinweis:e == -1 ? QCTextHostPasswordInvalid : QCTextHostPasswordNotSaved fehler:YES];
             f.eins.enabled = f.zwei.enabled = f.ok.enabled = YES;
         });
     });

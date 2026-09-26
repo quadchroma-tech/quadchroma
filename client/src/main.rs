@@ -687,6 +687,7 @@ impl Meldung {
                     | MsgHostProofBad
                     | MsgOtherDevice
                     | MsgIdNotFound
+                    | MsgDeviceRemoved
             )
     }
 
@@ -2348,7 +2349,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         Ok(zugangsphase::Kennung::Zugang) if shared.lock().unwrap().angenommen => {
             let _ = sock.write_all(&zugang::Nachricht::Abbruch.kodieren());
             return Err(Meldung::neu(
-                strings::Key::MsgRefused,
+                strings::Key::MsgDeviceRemoved,
                 format!(
                     "Zugang: {name} ({addr}) kennt dieses Geraet nach der Sitzung nicht mehr (am Host entfernt?) - \
                      keine Anfrage ohne den Nutzer, zurueckgezogen"
@@ -6662,7 +6663,12 @@ impl App {
                 self.freigabe_gestartet = Some(Instant::now());
                 self.freigabe_geprueft = None;
             }
-            Err(e) => protokoll::zeile(format!("Freigabe: Host-Rolle nicht gestartet - {e}")),
+            // Meldung auf dem Startbildschirm; meldung_zeigen schreibt die
+            // Protokollzeile mit dem Grund.
+            Err(e) => self.meldung_zeigen(Meldung::neu(
+                strings::Key::MsgShareFailed,
+                format!("Freigabe: Host-Rolle nicht gestartet - {e}"),
+            )),
         }
     }
 
@@ -7974,9 +7980,12 @@ fn zugang_zeichnen(
     c.rect(feld.x, feld.y, feld.w, feld.h, 0x0a1018, 200);
     c.glow_hline(feld.x, feld.y + feld.h - 1, feld.w, ui::CYAN);
     u.text.draw(c, feld.x + 2, feld.y - 6, lang.get(AccessPassword), 11, ui::DIM, 2);
-    let sw = (u.text.width(lang.get(AccessShow), 12, 1) + 24).clamp(70, 150);
+    // "Anzeigen" bzw. "Verbergen", solange das Passwort lesbar steht; die
+    // Breite passt fuer beide, damit der Knopf beim Umschalten nicht springt.
+    let sw = (u.text.width(lang.get(AccessShow), 12, 1).max(u.text.width(lang.get(AccessHide), 12, 1)) + 24).clamp(70, 150);
     let knopf = ui::Rect { x: feld.x + feld.w - sw - 4, y: feld.y + 4, w: sw, h: feld.h - 8 };
-    if u.button_mit(c, knopf, lang.get(AccessShow), if zeigen { ui::CYAN } else { ui::DIM }, 12, 1) {
+    let knopf_text = lang.get(if zeigen { AccessHide } else { AccessShow });
+    if u.button_mit(c, knopf, knopf_text, if zeigen { ui::CYAN } else { ui::DIM }, 12, 1) {
         aktion = ZugangAktion::Zeigen;
     }
     // Wo jede Zeichengrenze liegt (in Bildpunkten ab Textanfang): Punkte
@@ -9196,7 +9205,9 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // gewaehlten ID dasteht (frueher: geaenderter Host-Schluessel) - ueber
     // dieselben Schluessel wie im Betrieb, in der Sprache der Ansicht.
     // "veraltet", "abgelehnt" und "idfehlt": weitere Meldungen der
-    // Zugangsphase (9.6).
+    // Zugangsphase (9.6); "entfernt": der Host hat dieses Geraet entfernt
+    // (beim Wiederverbinden); "freigabefehler": "Diesen PC freigeben" konnte
+    // die Host-Rolle nicht starten.
     let meldung = match view {
         "abgeloest" => Some(lang.get(strings::Key::SessionTakenOver).to_string()),
         "fingerabdruck" => Some(
@@ -9206,6 +9217,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         "veraltet" => Some(Meldung::neu(strings::Key::MsgHostOutdated, "").mit("{n}", "studio.local").text(lang)),
         "abgelehnt" => Some(Meldung::neu(strings::Key::MsgRefused, "").mit("{n}", "Roberts Mac mini").text(lang)),
         "idfehlt" => Some(Meldung::neu(strings::Key::MsgIdNotFound, "").mit("{i}", "123 456 789").text(lang)),
+        "entfernt" => Some(Meldung::neu(strings::Key::MsgDeviceRemoved, "").mit("{n}", "Roberts Mac mini").text(lang)),
+        "freigabefehler" => Some(lang.get(strings::Key::MsgShareFailed).to_string()),
         _ => None,
     };
     // "starttip": die Maus steht ueber dem Knopf "Verknuepfung" der ersten
@@ -14198,7 +14211,8 @@ mod tests {
 
     /// Am Host entfernt: die laufende Sitzung reisst ab, beim Wiederverbinden
     /// sagt der Host "QCA1". Der Client stellt keine Anfrage von selbst -
-    /// kein Dialog, Nachricht 23 sofort, Meldung "abgelehnt", die bleibt.
+    /// kein Dialog, Nachricht 23 sofort, Meldung "kennt dieses Geraet nicht
+    /// mehr", die bleibt.
     #[test]
     fn zugang_nach_entfernen_keine_anfrage_von_selbst() {
         let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::Entfernt, "");
@@ -14206,7 +14220,9 @@ mod tests {
         assert!(dialoge.is_empty(), "Zugangsdialog ohne Nutzer: {dialoge:?}");
         assert_eq!(ereignisse.recv_timeout(Duration::from_secs(5)).as_deref(), Ok("Abbruch"));
         let m = fehler_von(&s).expect("keine Meldung");
-        assert_eq!(m.key, strings::Key::MsgRefused, "{}", m.protokoll);
+        assert_eq!(m.key, strings::Key::MsgDeviceRemoved, "{}", m.protokoll);
+        let t = m.text(&strings::DE);
+        assert!(t.contains(" kennt dieses Gerät nicht mehr. ") && !t.contains('{'), "{t}");
         assert!(gepinnt(&host_pub).is_some(), "die erste Sitzung war angenommen");
         std::thread::sleep(Duration::from_millis(2300));
         assert_eq!(verbindungen.load(Ordering::SeqCst), 2);
@@ -14357,7 +14373,7 @@ mod tests {
     #[test]
     fn zugangstexte_und_dauer() {
         use strings::Key::*;
-        for k in [MsgRefused, MsgNoAnswer, MsgTooManyAttempts, MsgHostOutdated, MsgHostProofBad, MsgOtherDevice, MsgIdNotFound] {
+        for k in [MsgRefused, MsgNoAnswer, MsgTooManyAttempts, MsgHostOutdated, MsgHostProofBad, MsgOtherDevice, MsgIdNotFound, MsgDeviceRemoved] {
             let m = Meldung::neu(k, "x").mit("{n}", "Mac").mit("{i}", "581 729 911");
             assert!(m.dauerhaft(), "{k:?}");
             for lang in strings::all() {

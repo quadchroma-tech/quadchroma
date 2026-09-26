@@ -6,9 +6,11 @@
 // QCTextHost... entsprechen den Host-Schluesseln Host... in
 // client/src/strings.rs (Spezifikation Pairing, Abschnitt 14); wo ein Text
 // gleich dem eines Client-Schluessels ist (QCTextAccessCode, QCTextAccessCancel),
-// gilt dieselbe Uebersetzung. Neue Schluessel kommen ans Ende des Enums und in
-// jede Tabelle - der Pruefstand menuetest prueft, dass jede Tabelle jeden Text
-// hat und dieselben Platzhalter wie Englisch; der Client-Test
+// gilt dieselbe Uebersetzung; ebenso fuer die Texte des Passwort-Fensters
+// (QCTextHostPasswordNotSaved, ...Invalid, ...Title). Neue Schluessel kommen
+// ans Ende des Enums und in jede Tabelle - der Pruefstand menuetest prueft,
+// dass jede Tabelle jeden Text hat und dieselben Platzhalter wie Englisch;
+// der Client-Test
 // zugang_texte_wie_mac_host (client/src/strings.rs) prueft, dass jeder Text
 // mit Client-Gegenstueck in allen 29 Sprachen wortgleich dort steht.
 //
@@ -54,8 +56,11 @@ typedef enum QCText {
     // Nur im Mac-Host, gleicher Text wie der Client-Schluessel gleichen Namens:
     QCTextAccessCode,             // Code im Zulassen-Fenster
     QCTextAccessCancel,           // Abbrechen im Passwort-Fenster und bei der Rueckfrage
-    // Nur im Mac-Host, ohne Gegenstueck im Client (in allen 29 Sprachen):
+    // Passwort-Fenster, gleicher Text wie der Client-Schluessel gleichen
+    // Namens (die Windows-Host-Rolle braucht sie ebenso):
     QCTextHostPasswordNotSaved,   // qc_zugang_passwort_setzen meldet einen Schreibfehler
+    QCTextHostPasswordInvalid,    // zu lang oder Zeilenumbruch (qc_passwort_pruefen 3, Kern -1)
+    QCTextHostPasswordTitle,      // Titel des Passwort-Fensters
     QCTextAnzahl
 } QCText;
 

@@ -521,26 +521,15 @@ pub fn passwort_eingabe(neu: &str, wieder: &str) -> Result<String, Key> {
     } else {
         match zugang::passwort_pruefen(neu.trim_matches([' ', '\t'])) {
             Ok(()) => return Ok(neu),
-            // Steuerzeichen gibt es hier nicht mehr, und mehr als 128 Byte
-            // verhindert die Feldgrenze (PASSWORT_ZEICHEN) - bleibt "zu kurz".
-            Err(_) => Err(Key::HostPasswordShort),
+            Err(zugang::PasswortFehler::ZuKurz) => Err(Key::HostPasswordShort),
+            // Steuerzeichen gibt es hier nicht mehr; mehr als 128 Byte gehen
+            // trotz der Feldgrenze (PASSWORT_ZEICHEN zaehlt Zeichen, nicht
+            // Byte - etwa 42 Emoji): unzulaessig, nicht "zu kurz".
+            Err(_) => Err(Key::HostPasswordInvalid),
         }
     };
     nullen(&mut neu);
     r
-}
-
-/// Text fuer ein Passwort, das sich nicht speichern liess (das alte gilt
-/// weiter). Einen eigenen Schluessel dafuer gibt es noch nicht (gemeldet:
-/// HostPasswordNotSaved) - bis dahin das allgemeine "Schreibfehler" der
-/// Dateiuebertragung, mit grossem Anfang.
-fn text_nicht_gespeichert(lang: &Lang) -> String {
-    let t = lang.get(Key::FilesAbortWrite);
-    let mut z = t.chars();
-    match z.next() {
-        Some(c) => c.to_uppercase().chain(z).collect(),
-        None => String::new(),
-    }
 }
 
 /// Was das Passwortfenster in seinem Faden weiss.
@@ -580,11 +569,14 @@ unsafe extern "system" fn passwort_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                                         None
                                     }
                                     Err(zugang::PasswortFehler::ZuKurz) => Some(d.lang.get(Key::HostPasswordShort).to_string()),
-                                    // Schreibfehler (das alte Passwort gilt
+                                    // Schreibfehler: das alte Passwort gilt
                                     // weiter; die Zeile im Protokoll nennt den
-                                    // Grund). Andere Fehler hat
-                                    // passwort_eingabe schon abgefangen.
-                                    Err(_) => Some(text_nicht_gespeichert(d.lang)),
+                                    // Grund.
+                                    Err(zugang::PasswortFehler::Datei(_)) => {
+                                        Some(d.lang.get(Key::HostPasswordNotSaved).to_string())
+                                    }
+                                    // Hat passwort_eingabe schon abgefangen.
+                                    Err(_) => Some(d.lang.get(Key::HostPasswordInvalid).to_string()),
                                 }
                             }
                         };
@@ -629,11 +621,6 @@ unsafe extern "system" fn passwort_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     }
 }
 
-/// Titel aus "Passwort aendern ...": ohne die Auslassungspunkte des Menues.
-fn ohne_punkte(t: &str) -> &str {
-    t.trim_end_matches(['.', '…', ' '])
-}
-
 fn passwort_bauen(lang: &Lang) -> Result<(HWND, HFONT, bool), String> {
     let m = Mass::neu();
     let (font, eigen) = schrift(&m);
@@ -650,7 +637,7 @@ fn passwort_bauen(lang: &Lang) -> Result<(HWND, HFONT, bool), String> {
         breite + 2 * rand,
         rand + h_neu + m.px(4) + feld_h + m.px(10) + h_wieder + m.px(4) + feld_h + m.px(8) + h_meldung + m.px(8) + knopf_h + rand,
     );
-    let hwnd = rahmen(KLASSE_PASSWORT, Some(passwort_proc), ohne_punkte(lang.get(Key::HostChangePassword)), innen, WINDOW_EX_STYLE(0))?;
+    let hwnd = rahmen(KLASSE_PASSWORT, Some(passwort_proc), lang.get(Key::HostPasswordTitle), innen, WINDOW_EX_STYLE(0))?;
     let passwort_stil = WS_TABSTOP.0 | (ES_PASSWORD | ES_AUTOHSCROLL) as u32;
     let mut y = rand;
     feld(hwnd, w!("STATIC"), lang.get(Key::HostNewPassword), SS_NOPREFIX, WINDOW_EX_STYLE(0), (rand, y, breite, h_neu), -1, font);
@@ -969,11 +956,10 @@ mod tests {
             zugang::passwort_schluessel("mit\ttab-abcdefgh", &[1u8; 32])
         );
         assert_eq!(passwort_eingabe("\u{1}\u{2}abc", "abc"), Err(Key::HostPasswordShort));
-        // Schreibfehler: nie "Passwortdatei unlesbar".
-        assert_eq!(text_nicht_gespeichert(crate::strings::pick("de")), "Schreibfehler");
-        assert_eq!(text_nicht_gespeichert(crate::strings::pick("en")), "Write error");
-        assert_eq!(ohne_punkte("Passwort ändern …"), "Passwort ändern");
-        assert_eq!(ohne_punkte("Change password ..."), "Change password");
+        // Mehr als 128 Byte in 42 Zeichen (Feldgrenze): unzulaessig, nicht
+        // "mindestens 8 Zeichen".
+        let lang = "\u{1f600}".repeat(40);
+        assert_eq!(passwort_eingabe(&lang, &lang), Err(Key::HostPasswordInvalid));
     }
 
     /// Das echte Passwortfenster: ungleiche Eingaben zeigen den Text und
@@ -1028,9 +1014,10 @@ mod tests {
         assert_eq!(PASSWORT_FENSTER.load(Ordering::SeqCst), 0);
     }
 
-    /// Schreibfehler beim Speichern: das Fenster bleibt offen und sagt
-    /// "Schreibfehler" - nicht "Passwortdatei unlesbar" (das alte Passwort
-    /// gilt ja weiter).
+    /// Schreibfehler beim Speichern: das Fenster bleibt offen und sagt, dass
+    /// das Passwort nicht gespeichert wurde (HostPasswordNotSaved) - nicht
+    /// "Passwortdatei unlesbar" (das alte Passwort gilt ja weiter). Der Titel
+    /// ist HostPasswordTitle, ohne die Auslassungspunkte des Menuepunkts.
     #[test]
     fn passwort_fenster_schreibfehler() {
         // Nicht neben passwort_fenster_prueft_und_speichert: es gibt
@@ -1053,10 +1040,18 @@ mod tests {
         feldtext_setzen(h, ID_NEU, "Geheim 1234");
         feldtext_setzen(h, ID_WIEDERHOLEN, "Geheim 1234");
         unsafe { SendMessageW(h, WM_COMMAND, Some(WPARAM(ID_OK as usize)), Some(LPARAM(0))) };
-        assert_eq!(feldtext(h, ID_MELDUNG), "Schreibfehler");
+        assert_eq!(feldtext(h, ID_MELDUNG), "Das Passwort konnte nicht gespeichert werden.");
+        assert_eq!(fenstertitel(h), "Passwort ändern");
         assert!(unsafe { IsWindow(Some(h)) }.as_bool());
         unsafe { PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
         assert!(warten_bis(|| PASSWORT_FENSTER.load(Ordering::SeqCst) == 0));
+    }
+
+    /// Titel eines Fensters (Titelzeile).
+    fn fenstertitel(h: HWND) -> String {
+        let mut b = [0u16; 256];
+        let n = unsafe { GetWindowTextW(h, &mut b) }.max(0) as usize;
+        String::from_utf16_lossy(&b[..n.min(b.len())])
     }
 
     /// Die Fenster oberster Ebene dieses Prozesses mit dieser Klasse (und

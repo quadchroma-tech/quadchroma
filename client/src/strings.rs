@@ -418,6 +418,22 @@ pub enum Key {
     HostTooltip,
     /// Host-Fenster: Knopf OK.
     HostOk,
+    // Nachgetragen bei der Zusammenfuehrung (gemeldet von P3/P4/P5)
+    /// Zugangsdialog: Gegenstueck zu AccessShow, solange das Passwort
+    /// lesbar angezeigt wird.
+    AccessHide,
+    /// Meldung (9.5): "Diesen PC freigeben" konnte die Host-Rolle nicht starten.
+    MsgShareFailed,
+    /// Meldung: {n} Name des Hosts - er hat dieses Geraet entfernt und
+    /// antwortet beim Wiederverbinden mit der Zugangsphase.
+    MsgDeviceRemoved,
+    /// Passwortfenster: Schreibfehler beim Speichern (das alte gilt weiter).
+    HostPasswordNotSaved,
+    /// Passwortfenster: unzulaessige Zeichen (Zeilenumbruch, Steuerzeichen,
+    /// zu lang).
+    HostPasswordInvalid,
+    /// Passwortfenster: Titel.
+    HostPasswordTitle,
 }
 
 pub struct Lang {
@@ -687,6 +703,12 @@ pub static EN: Lang = Lang {
         (HostStopSharing, "Stop sharing"),
         (HostTooltip, "QuadChroma - sharing this PC (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Hide"),
+        (MsgShareFailed, "Could not start sharing this PC."),
+        (MsgDeviceRemoved, "{n} no longer knows this device. Connect again and enter the password."),
+        (HostPasswordNotSaved, "The password could not be saved."),
+        (HostPasswordInvalid, "The password contains characters that are not allowed."),
+        (HostPasswordTitle, "Change password"),
     ],
 };
 
@@ -933,6 +955,12 @@ pub static DE: Lang = Lang {
         (HostStopSharing, "Freigabe beenden"),
         (HostTooltip, "QuadChroma – Freigabe läuft (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Verbergen"),
+        (MsgShareFailed, "Die Freigabe dieses PCs konnte nicht gestartet werden."),
+        (MsgDeviceRemoved, "{n} kennt dieses Gerät nicht mehr. Verbinde erneut und gib das Passwort ein."),
+        (HostPasswordNotSaved, "Das Passwort konnte nicht gespeichert werden."),
+        (HostPasswordInvalid, "Das Passwort enthält unzulässige Zeichen."),
+        (HostPasswordTitle, "Passwort ändern"),
     ],
 };
 
@@ -978,8 +1006,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > HostOk as usize);
-        assert_eq!(n, HostOk as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > HostPasswordTitle as usize);
+        assert_eq!(n, HostPasswordTitle as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Abbruchgruende der Datei-Zeile: in jeder Sprache vorhanden, ohne
@@ -1115,17 +1143,18 @@ mod tests {
         }
     }
 
-    /// Die Zugangstexte (Spezifikation Pairing v1, Abschnitt 14): am Ende des
-    /// Enums hinter der Bildschirmwahl, in jeder Tabelle, mit genau den
-    /// Platzhaltern, die der Aufrufer ersetzt, und keinem weiteren. EN und DE
-    /// wie vorgegeben, DE mit Umlauten und typografischen Zeichen. Die 27
-    /// weiteren Tabellen uebersetzt, in der Schreibweise ihrer Tabelle.
+    /// Die Zugangstexte (Spezifikation Pairing v1, Abschnitt 14, und die bei
+    /// der Zusammenfuehrung nachgetragenen): am Ende des Enums hinter der
+    /// Bildschirmwahl, in jeder Tabelle, mit genau den Platzhaltern, die der
+    /// Aufrufer ersetzt, und keinem weiteren. EN und DE wie vorgegeben, DE
+    /// mit Umlauten und typografischen Zeichen. Die 27 weiteren Tabellen
+    /// uebersetzt, in der Schreibweise ihrer Tabelle.
     #[test]
     fn zugang_texte() {
         let n: &[&str] = &["{n}"];
         let i: &[&str] = &["{i}"];
         let keiner: &[&str] = &[];
-        let alle: [(Key, &[&str]); 55] = [
+        let alle: [(Key, &[&str]); 61] = [
             (AccessTitle, n),
             (AccessText, n),
             (AccessOrAllow, n),
@@ -1181,13 +1210,19 @@ mod tests {
             (HostStopSharing, keiner),
             (HostTooltip, i),
             (HostOk, keiner),
+            (AccessHide, keiner),
+            (MsgShareFailed, keiner),
+            (MsgDeviceRemoved, n),
+            (HostPasswordNotSaved, keiner),
+            (HostPasswordInvalid, keiner),
+            (HostPasswordTitle, keiner),
         ];
         // Lueckenlos am Ende: so bleiben alle 29 Tabellen davor unveraendert.
         assert_eq!(AccessTitle as usize, ScreenFallback as usize + 1);
         for (nr, (k, _)) in alle.iter().enumerate() {
             assert_eq!(*k as usize, AccessTitle as usize + nr, "{k:?}");
         }
-        assert_eq!(HostOk as usize + 1, EN.table.len());
+        assert_eq!(HostPasswordTitle as usize + 1, EN.table.len());
         let bekannt = ["{n}", "{m}", "{i}", "{c}", "{s}", "{p}", "{d}"];
         for l in all() {
             for (k, soll) in &alle {
@@ -1249,6 +1284,18 @@ mod tests {
         assert_eq!(DE.get(HostPasswordUnreadable), "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“.");
         assert_eq!(DE.get(StartShare), "Diesen PC freigeben");
         assert_eq!(EN.get(HostTooltip), "QuadChroma - sharing this PC (ID {i})");
+        assert_eq!(EN.get(AccessHide), "Hide");
+        assert_eq!(DE.get(AccessHide), "Verbergen");
+        assert_eq!(EN.get(MsgShareFailed), "Could not start sharing this PC.");
+        assert_eq!(DE.get(MsgShareFailed), "Die Freigabe dieses PCs konnte nicht gestartet werden.");
+        assert_eq!(EN.get(MsgDeviceRemoved), "{n} no longer knows this device. Connect again and enter the password.");
+        assert_eq!(DE.get(MsgDeviceRemoved), "{n} kennt dieses Gerät nicht mehr. Verbinde erneut und gib das Passwort ein.");
+        assert_eq!(EN.get(HostPasswordNotSaved), "The password could not be saved.");
+        assert_eq!(DE.get(HostPasswordNotSaved), "Das Passwort konnte nicht gespeichert werden.");
+        assert_eq!(EN.get(HostPasswordInvalid), "The password contains characters that are not allowed.");
+        assert_eq!(DE.get(HostPasswordInvalid), "Das Passwort enthält unzulässige Zeichen.");
+        assert_eq!(EN.get(HostPasswordTitle), "Change password");
+        assert_eq!(DE.get(HostPasswordTitle), "Passwort ändern");
         // Die uebrigen 27 Sprachen sind uebersetzt (Paket P6): gleich wie
         // Englisch nur Code, ID und OK - und die Woerter, die eine Sprache
         // aus dem Englischen uebernimmt (italienisch "Password",
@@ -1309,8 +1356,8 @@ mod tests {
             for zeile in block[..ende].lines() {
                 let Some(rest) = zeile.trim().strip_prefix("[QCText") else { continue };
                 let (name, wert) = rest.split_once(']').expect("Schluessel");
-                // Schluessel nur des Mac-Hosts (HostPasswordNotSaved) haben
-                // hier kein Gegenstueck.
+                // Schluessel, die es nur in einer der beiden Dateien gibt,
+                // haben hier kein Gegenstueck.
                 let Some((k, _)) = zugang.iter().find(|(k, _)| format!("{k:?}") == name) else { continue };
                 let wert = wert.trim().strip_prefix('=').and_then(|w| w.trim().strip_suffix(','));
                 let wert = wert.and_then(|w| w.strip_prefix('"')?.strip_suffix('"')).expect("Zeichenkette");
@@ -1320,7 +1367,9 @@ mod tests {
             je_sprache.push(verglichen);
         }
         assert_eq!(je_sprache.len(), 29);
-        // Alle 34 Host-Texte und dazu Code und Abbrechen, in jeder Sprache.
-        assert!(je_sprache.iter().all(|&n| n == 36), "{je_sprache:?}");
+        // Alle 34 Host-Texte, Code und Abbrechen und die drei Texte des
+        // Passwortfensters (nicht gespeichert, unzulaessig, Titel), in jeder
+        // Sprache.
+        assert!(je_sprache.iter().all(|&n| n == 39), "{je_sprache:?}");
     }
 }

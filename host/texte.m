@@ -52,6 +52,8 @@ static const qc_sprache QC_EN = { "en", "English", {
     [QCTextAccessCode]             = "Code: {c}",
     [QCTextAccessCancel]           = "Cancel",
     [QCTextHostPasswordNotSaved]   = "The password could not be saved.",
+    [QCTextHostPasswordInvalid]    = "The password contains characters that are not allowed.",
+    [QCTextHostPasswordTitle]      = "Change password",
 }};
 
 // Deutsch: echte Umlaute, typografische Anfuehrungszeichen, Gedankenstrich und
@@ -94,7 +96,9 @@ static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostOk]                 = "OK",
     [QCTextAccessCode]             = "Code: {c}",
     [QCTextAccessCancel]           = "Abbrechen",
-    [QCTextHostPasswordNotSaved]   = "Das Passwort ließ sich nicht speichern.",
+    [QCTextHostPasswordNotSaved]   = "Das Passwort konnte nicht gespeichert werden.",
+    [QCTextHostPasswordInvalid]    = "Das Passwort enthält unzulässige Zeichen.",
+    [QCTextHostPasswordTitle]      = "Passwort ändern",
 }};
 
 // Die uebrigen 27 Sprachen (Paket P6): dieselben Uebersetzungen wie in
@@ -138,6 +142,8 @@ static const qc_sprache QC_FR = { "fr", "Français", {
     [QCTextAccessCode]             = "Code : {c}",
     [QCTextAccessCancel]           = "Annuler",
     [QCTextHostPasswordNotSaved]   = "Le mot de passe n'a pas pu être enregistré.",
+    [QCTextHostPasswordInvalid]    = "Le mot de passe contient des caractères non autorisés.",
+    [QCTextHostPasswordTitle]      = "Changer le mot de passe",
 }};
 
 static const qc_sprache QC_ES = { "es", "Español", {
@@ -178,6 +184,8 @@ static const qc_sprache QC_ES = { "es", "Español", {
     [QCTextAccessCode]             = "Código: {c}",
     [QCTextAccessCancel]           = "Cancelar",
     [QCTextHostPasswordNotSaved]   = "No se ha podido guardar la contraseña.",
+    [QCTextHostPasswordInvalid]    = "La contraseña contiene caracteres no permitidos.",
+    [QCTextHostPasswordTitle]      = "Cambiar contraseña",
 }};
 
 static const qc_sprache QC_IT = { "it", "Italiano", {
@@ -218,6 +226,8 @@ static const qc_sprache QC_IT = { "it", "Italiano", {
     [QCTextAccessCode]             = "Codice: {c}",
     [QCTextAccessCancel]           = "Annulla",
     [QCTextHostPasswordNotSaved]   = "Impossibile salvare la password.",
+    [QCTextHostPasswordInvalid]    = "La password contiene caratteri non consentiti.",
+    [QCTextHostPasswordTitle]      = "Cambia password",
 }};
 
 static const qc_sprache QC_PT = { "pt", "Português", {
@@ -258,6 +268,8 @@ static const qc_sprache QC_PT = { "pt", "Português", {
     [QCTextAccessCode]             = "Código: {c}",
     [QCTextAccessCancel]           = "Cancelar",
     [QCTextHostPasswordNotSaved]   = "Não foi possível guardar a palavra-passe.",
+    [QCTextHostPasswordInvalid]    = "A palavra-passe contém caracteres não permitidos.",
+    [QCTextHostPasswordTitle]      = "Alterar palavra-passe",
 }};
 
 static const qc_sprache QC_NL = { "nl", "Nederlands", {
@@ -298,6 +310,8 @@ static const qc_sprache QC_NL = { "nl", "Nederlands", {
     [QCTextAccessCode]             = "Code: {c}",
     [QCTextAccessCancel]           = "Annuleren",
     [QCTextHostPasswordNotSaved]   = "Het wachtwoord kon niet worden opgeslagen.",
+    [QCTextHostPasswordInvalid]    = "Het wachtwoord bevat tekens die niet zijn toegestaan.",
+    [QCTextHostPasswordTitle]      = "Wachtwoord wijzigen",
 }};
 
 static const qc_sprache QC_SV = { "sv", "Svenska", {
@@ -338,6 +352,8 @@ static const qc_sprache QC_SV = { "sv", "Svenska", {
     [QCTextAccessCode]             = "Kod: {c}",
     [QCTextAccessCancel]           = "Avbryt",
     [QCTextHostPasswordNotSaved]   = "Lösenordet kunde inte sparas.",
+    [QCTextHostPasswordInvalid]    = "Lösenordet innehåller otillåtna tecken.",
+    [QCTextHostPasswordTitle]      = "Ändra lösenord",
 }};
 
 static const qc_sprache QC_DA = { "da", "Dansk", {
@@ -378,6 +394,8 @@ static const qc_sprache QC_DA = { "da", "Dansk", {
     [QCTextAccessCode]             = "Kode: {c}",
     [QCTextAccessCancel]           = "Afbryd",
     [QCTextHostPasswordNotSaved]   = "Adgangskoden kunne ikke gemmes.",
+    [QCTextHostPasswordInvalid]    = "Adgangskoden indeholder tegn, der ikke er tilladt.",
+    [QCTextHostPasswordTitle]      = "Skift adgangskode",
 }};
 
 static const qc_sprache QC_NB = { "nb", "Norsk bokmål", {
@@ -418,6 +436,8 @@ static const qc_sprache QC_NB = { "nb", "Norsk bokmål", {
     [QCTextAccessCode]             = "Kode: {c}",
     [QCTextAccessCancel]           = "Avbryt",
     [QCTextHostPasswordNotSaved]   = "Passordet kunne ikke lagres.",
+    [QCTextHostPasswordInvalid]    = "Passordet inneholder tegn som ikke er tillatt.",
+    [QCTextHostPasswordTitle]      = "Endre passord",
 }};
 
 static const qc_sprache QC_FI = { "fi", "Suomi", {
@@ -458,6 +478,8 @@ static const qc_sprache QC_FI = { "fi", "Suomi", {
     [QCTextAccessCode]             = "Koodi: {c}",
     [QCTextAccessCancel]           = "Keskeytä",
     [QCTextHostPasswordNotSaved]   = "Salasanaa ei voitu tallentaa.",
+    [QCTextHostPasswordInvalid]    = "Salasana sisältää merkkejä, jotka eivät ole sallittuja.",
+    [QCTextHostPasswordTitle]      = "Vaihda salasana",
 }};
 
 static const qc_sprache QC_IS = { "is", "Íslenska", {
@@ -498,6 +520,8 @@ static const qc_sprache QC_IS = { "is", "Íslenska", {
     [QCTextAccessCode]             = "Kóði: {c}",
     [QCTextAccessCancel]           = "Hætta við",
     [QCTextHostPasswordNotSaved]   = "Ekki tókst að vista lykilorðið.",
+    [QCTextHostPasswordInvalid]    = "Lykilorðið inniheldur stafi sem eru ekki leyfðir.",
+    [QCTextHostPasswordTitle]      = "Breyta lykilorði",
 }};
 
 static const qc_sprache QC_PL = { "pl", "Polski", {
@@ -538,6 +562,8 @@ static const qc_sprache QC_PL = { "pl", "Polski", {
     [QCTextAccessCode]             = "Kod: {c}",
     [QCTextAccessCancel]           = "Anuluj",
     [QCTextHostPasswordNotSaved]   = "Nie udało się zapisać hasła.",
+    [QCTextHostPasswordInvalid]    = "Hasło zawiera niedozwolone znaki.",
+    [QCTextHostPasswordTitle]      = "Zmień hasło",
 }};
 
 static const qc_sprache QC_CS = { "cs", "Čeština", {
@@ -578,6 +604,8 @@ static const qc_sprache QC_CS = { "cs", "Čeština", {
     [QCTextAccessCode]             = "Kód: {c}",
     [QCTextAccessCancel]           = "Zrušit",
     [QCTextHostPasswordNotSaved]   = "Heslo se nepodařilo uložit.",
+    [QCTextHostPasswordInvalid]    = "Heslo obsahuje nepovolené znaky.",
+    [QCTextHostPasswordTitle]      = "Změnit heslo",
 }};
 
 static const qc_sprache QC_SK = { "sk", "Slovenčina", {
@@ -618,6 +646,8 @@ static const qc_sprache QC_SK = { "sk", "Slovenčina", {
     [QCTextAccessCode]             = "Kód: {c}",
     [QCTextAccessCancel]           = "Zrušiť",
     [QCTextHostPasswordNotSaved]   = "Heslo sa nepodarilo uložiť.",
+    [QCTextHostPasswordInvalid]    = "Heslo obsahuje nepovolené znaky.",
+    [QCTextHostPasswordTitle]      = "Zmeniť heslo",
 }};
 
 static const qc_sprache QC_HU = { "hu", "Magyar", {
@@ -658,6 +688,8 @@ static const qc_sprache QC_HU = { "hu", "Magyar", {
     [QCTextAccessCode]             = "Kód: {c}",
     [QCTextAccessCancel]           = "Mégse",
     [QCTextHostPasswordNotSaved]   = "A jelszót nem sikerült menteni.",
+    [QCTextHostPasswordInvalid]    = "A jelszó nem engedélyezett karaktereket tartalmaz.",
+    [QCTextHostPasswordTitle]      = "Jelszó módosítása",
 }};
 
 static const qc_sprache QC_RO = { "ro", "Română", {
@@ -698,6 +730,8 @@ static const qc_sprache QC_RO = { "ro", "Română", {
     [QCTextAccessCode]             = "Cod: {c}",
     [QCTextAccessCancel]           = "Anulare",
     [QCTextHostPasswordNotSaved]   = "Parola nu a putut fi salvată.",
+    [QCTextHostPasswordInvalid]    = "Parola conține caractere nepermise.",
+    [QCTextHostPasswordTitle]      = "Schimbă parola",
 }};
 
 static const qc_sprache QC_BG = { "bg", "Български", {
@@ -738,6 +772,8 @@ static const qc_sprache QC_BG = { "bg", "Български", {
     [QCTextAccessCode]             = "Код: {c}",
     [QCTextAccessCancel]           = "Отказ",
     [QCTextHostPasswordNotSaved]   = "Паролата не можа да бъде запазена.",
+    [QCTextHostPasswordInvalid]    = "Паролата съдържа непозволени знаци.",
+    [QCTextHostPasswordTitle]      = "Смяна на паролата",
 }};
 
 static const qc_sprache QC_EL = { "el", "Ελληνικά", {
@@ -778,6 +814,8 @@ static const qc_sprache QC_EL = { "el", "Ελληνικά", {
     [QCTextAccessCode]             = "Κωδικός επαλήθευσης: {c}",
     [QCTextAccessCancel]           = "Ακύρωση",
     [QCTextHostPasswordNotSaved]   = "Δεν ήταν δυνατή η αποθήκευση του κωδικού πρόσβασης.",
+    [QCTextHostPasswordInvalid]    = "Ο κωδικός πρόσβασης περιέχει μη επιτρεπόμενους χαρακτήρες.",
+    [QCTextHostPasswordTitle]      = "Αλλαγή κωδικού πρόσβασης",
 }};
 
 static const qc_sprache QC_ET = { "et", "Eesti", {
@@ -818,6 +856,8 @@ static const qc_sprache QC_ET = { "et", "Eesti", {
     [QCTextAccessCode]             = "Kood: {c}",
     [QCTextAccessCancel]           = "Katkesta",
     [QCTextHostPasswordNotSaved]   = "Parooli ei õnnestunud salvestada.",
+    [QCTextHostPasswordInvalid]    = "Parool sisaldab lubamatuid märke.",
+    [QCTextHostPasswordTitle]      = "Muuda parooli",
 }};
 
 static const qc_sprache QC_LV = { "lv", "Latviešu", {
@@ -858,6 +898,8 @@ static const qc_sprache QC_LV = { "lv", "Latviešu", {
     [QCTextAccessCode]             = "Kods: {c}",
     [QCTextAccessCancel]           = "Atcelt",
     [QCTextHostPasswordNotSaved]   = "Paroli neizdevās saglabāt.",
+    [QCTextHostPasswordInvalid]    = "Parolē ir neatļautas rakstzīmes.",
+    [QCTextHostPasswordTitle]      = "Mainīt paroli",
 }};
 
 static const qc_sprache QC_LT = { "lt", "Lietuvių", {
@@ -898,6 +940,8 @@ static const qc_sprache QC_LT = { "lt", "Lietuvių", {
     [QCTextAccessCode]             = "Kodas: {c}",
     [QCTextAccessCancel]           = "Atšaukti",
     [QCTextHostPasswordNotSaved]   = "Nepavyko išsaugoti slaptažodžio.",
+    [QCTextHostPasswordInvalid]    = "Slaptažodyje yra neleistinų simbolių.",
+    [QCTextHostPasswordTitle]      = "Keisti slaptažodį",
 }};
 
 static const qc_sprache QC_SL = { "sl", "Slovenščina", {
@@ -938,6 +982,8 @@ static const qc_sprache QC_SL = { "sl", "Slovenščina", {
     [QCTextAccessCode]             = "Koda: {c}",
     [QCTextAccessCancel]           = "Prekliči",
     [QCTextHostPasswordNotSaved]   = "Gesla ni bilo mogoče shraniti.",
+    [QCTextHostPasswordInvalid]    = "Geslo vsebuje nedovoljene znake.",
+    [QCTextHostPasswordTitle]      = "Spremeni geslo",
 }};
 
 static const qc_sprache QC_HR = { "hr", "Hrvatski", {
@@ -978,6 +1024,8 @@ static const qc_sprache QC_HR = { "hr", "Hrvatski", {
     [QCTextAccessCode]             = "Kod: {c}",
     [QCTextAccessCancel]           = "Odustani",
     [QCTextHostPasswordNotSaved]   = "Lozinku nije bilo moguće spremiti.",
+    [QCTextHostPasswordInvalid]    = "Lozinka sadrži nedopuštene znakove.",
+    [QCTextHostPasswordTitle]      = "Promijeni lozinku",
 }};
 
 static const qc_sprache QC_UK = { "uk", "Українська", {
@@ -1018,6 +1066,8 @@ static const qc_sprache QC_UK = { "uk", "Українська", {
     [QCTextAccessCode]             = "Код: {c}",
     [QCTextAccessCancel]           = "Скасувати",
     [QCTextHostPasswordNotSaved]   = "Не вдалося зберегти пароль.",
+    [QCTextHostPasswordInvalid]    = "Пароль містить неприпустимі символи.",
+    [QCTextHostPasswordTitle]      = "Змінити пароль",
 }};
 
 static const qc_sprache QC_RU = { "ru", "Русский", {
@@ -1058,6 +1108,8 @@ static const qc_sprache QC_RU = { "ru", "Русский", {
     [QCTextAccessCode]             = "Код: {c}",
     [QCTextAccessCancel]           = "Отмена",
     [QCTextHostPasswordNotSaved]   = "Не удалось сохранить пароль.",
+    [QCTextHostPasswordInvalid]    = "Пароль содержит недопустимые символы.",
+    [QCTextHostPasswordTitle]      = "Изменить пароль",
 }};
 
 static const qc_sprache QC_ZH = { "zh", "简体中文", {
@@ -1098,6 +1150,8 @@ static const qc_sprache QC_ZH = { "zh", "简体中文", {
     [QCTextAccessCode]             = "校验码：{c}",
     [QCTextAccessCancel]           = "取消",
     [QCTextHostPasswordNotSaved]   = "无法保存密码。",
+    [QCTextHostPasswordInvalid]    = "密码包含不允许的字符。",
+    [QCTextHostPasswordTitle]      = "更改密码",
 }};
 
 static const qc_sprache QC_JA = { "ja", "日本語", {
@@ -1138,6 +1192,8 @@ static const qc_sprache QC_JA = { "ja", "日本語", {
     [QCTextAccessCode]             = "確認コード: {c}",
     [QCTextAccessCancel]           = "中止",
     [QCTextHostPasswordNotSaved]   = "パスワードを保存できませんでした。",
+    [QCTextHostPasswordInvalid]    = "パスワードに使用できない文字が含まれています。",
+    [QCTextHostPasswordTitle]      = "パスワードを変更",
 }};
 
 static const qc_sprache QC_TR = { "tr", "Türkçe", {
@@ -1178,6 +1234,8 @@ static const qc_sprache QC_TR = { "tr", "Türkçe", {
     [QCTextAccessCode]             = "Kod: {c}",
     [QCTextAccessCancel]           = "İptal",
     [QCTextHostPasswordNotSaved]   = "Parola kaydedilemedi.",
+    [QCTextHostPasswordInvalid]    = "Parola izin verilmeyen karakterler içeriyor.",
+    [QCTextHostPasswordTitle]      = "Parolayı değiştir",
 }};
 
 static const qc_sprache *const g_sprachen[] = {

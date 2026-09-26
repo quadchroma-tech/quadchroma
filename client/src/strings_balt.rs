@@ -246,6 +246,12 @@ pub static ET: Lang = Lang {
         (HostStopSharing, "Lõpeta jagamine"),
         (HostTooltip, "QuadChroma – seda arvutit jagatakse (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Peida"),
+        (MsgShareFailed, "Selle arvuti jagamist ei õnnestunud käivitada."),
+        (MsgDeviceRemoved, "{n} ei tunne seda seadet enam. Ühenda uuesti ja sisesta parool."),
+        (HostPasswordNotSaved, "Parooli ei õnnestunud salvestada."),
+        (HostPasswordInvalid, "Parool sisaldab lubamatuid märke."),
+        (HostPasswordTitle, "Muuda parooli"),
     ],
 };
 
@@ -492,6 +498,12 @@ pub static LV: Lang = Lang {
         (HostStopSharing, "Pārtraukt koplietošanu"),
         (HostTooltip, "QuadChroma – šis dators tiek koplietots (ID {i})"),
         (HostOk, "Labi"),
+        (AccessHide, "Paslēpt"),
+        (MsgShareFailed, "Šī datora koplietošanu neizdevās sākt."),
+        (MsgDeviceRemoved, "{n} vairs nepazīst šo ierīci. Savienojiet vēlreiz un ievadiet paroli."),
+        (HostPasswordNotSaved, "Paroli neizdevās saglabāt."),
+        (HostPasswordInvalid, "Parolē ir neatļautas rakstzīmes."),
+        (HostPasswordTitle, "Mainīt paroli"),
     ],
 };
 
@@ -738,6 +750,12 @@ pub static LT: Lang = Lang {
         (HostStopSharing, "Nutraukti bendrinimą"),
         (HostTooltip, "QuadChroma – šis kompiuteris bendrinamas (ID {i})"),
         (HostOk, "Gerai"),
+        (AccessHide, "Slėpti"),
+        (MsgShareFailed, "Nepavyko pradėti šio kompiuterio bendrinimo."),
+        (MsgDeviceRemoved, "{n} nebepažįsta šio įrenginio. Prisijunkite dar kartą ir įveskite slaptažodį."),
+        (HostPasswordNotSaved, "Nepavyko išsaugoti slaptažodžio."),
+        (HostPasswordInvalid, "Slaptažodyje yra neleistinų simbolių."),
+        (HostPasswordTitle, "Keisti slaptažodį"),
     ],
 };
 
@@ -984,6 +1002,12 @@ pub static SL: Lang = Lang {
         (HostStopSharing, "Ustavi deljenje"),
         (HostTooltip, "QuadChroma – ta računalnik je deljen (ID {i})"),
         (HostOk, "V redu"),
+        (AccessHide, "Skrij"),
+        (MsgShareFailed, "Deljenja tega računalnika ni bilo mogoče zagnati."),
+        (MsgDeviceRemoved, "{n} te naprave ne pozna več. Znova vzpostavite povezavo in vnesite geslo."),
+        (HostPasswordNotSaved, "Gesla ni bilo mogoče shraniti."),
+        (HostPasswordInvalid, "Geslo vsebuje nedovoljene znake."),
+        (HostPasswordTitle, "Spremeni geslo"),
     ],
 };
 
@@ -1230,6 +1254,12 @@ pub static HR: Lang = Lang {
         (HostStopSharing, "Zaustavi dijeljenje"),
         (HostTooltip, "QuadChroma – ovo računalo se dijeli (ID {i})"),
         (HostOk, "U redu"),
+        (AccessHide, "Sakrij"),
+        (MsgShareFailed, "Dijeljenje ovog računala nije bilo moguće pokrenuti."),
+        (MsgDeviceRemoved, "{n} više ne poznaje ovaj uređaj. Ponovno se povežite i unesite lozinku."),
+        (HostPasswordNotSaved, "Lozinku nije bilo moguće spremiti."),
+        (HostPasswordInvalid, "Lozinka sadrži nedopuštene znakove."),
+        (HostPasswordTitle, "Promijeni lozinku"),
     ],
 };
 
@@ -1476,5 +1506,11 @@ pub static UK: Lang = Lang {
         (HostStopSharing, "Припинити надання доступу"),
         (HostTooltip, "QuadChroma – доступ до цього ПК надано (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Приховати"),
+        (MsgShareFailed, "Не вдалося надати доступ до цього ПК."),
+        (MsgDeviceRemoved, "{n} більше не знає цього пристрою. Підключіться знову й введіть пароль."),
+        (HostPasswordNotSaved, "Не вдалося зберегти пароль."),
+        (HostPasswordInvalid, "Пароль містить неприпустимі символи."),
+        (HostPasswordTitle, "Змінити пароль"),
     ],
 };

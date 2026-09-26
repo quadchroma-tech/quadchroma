@@ -76,10 +76,10 @@ static qc_geraet geraet(uint8_t schluessel, uint32_t id, const char *name, const
 
 // ------------------------------------------------------------ Texte
 
-// Wortgleich mit der Spezifikation (Pairing, Abschnitt 14) und den drei
-// Mac-eigenen Schluesseln; Deutsch mit Umlauten, „…“, Gedankenstrich und
-// Auslassungszeichen "…" wie die Host-Schluessel in client/src/strings.rs
-// (Englisch dort mit "...").
+// Wortgleich mit der Spezifikation (Pairing, Abschnitt 14) und den
+// Schluesseln des Passwort-Fensters, wie in client/src/strings.rs; Deutsch
+// mit Umlauten, „…“, Gedankenstrich und Auslassungszeichen "…" (Englisch
+// dort mit "...").
 static const char *const SOLL_EN[QCTextAnzahl] = {
     [QCTextHostReady] = "Ready for connections",
     [QCTextHostConnected] = "Connected: {n}",
@@ -118,6 +118,8 @@ static const char *const SOLL_EN[QCTextAnzahl] = {
     [QCTextAccessCode] = "Code: {c}",
     [QCTextAccessCancel] = "Cancel",
     [QCTextHostPasswordNotSaved] = "The password could not be saved.",
+    [QCTextHostPasswordInvalid] = "The password contains characters that are not allowed.",
+    [QCTextHostPasswordTitle] = "Change password",
 };
 
 static const char *const SOLL_DE[QCTextAnzahl] = {
@@ -157,7 +159,9 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostOk] = "OK",
     [QCTextAccessCode] = "Code: {c}",
     [QCTextAccessCancel] = "Abbrechen",
-    [QCTextHostPasswordNotSaved] = "Das Passwort ließ sich nicht speichern.",
+    [QCTextHostPasswordNotSaved] = "Das Passwort konnte nicht gespeichert werden.",
+    [QCTextHostPasswordInvalid] = "Das Passwort enthält unzulässige Zeichen.",
+    [QCTextHostPasswordTitle] = "Passwort ändern",
 };
 
 // Die Platzhalter eines Textes ("{n}", "{i}" ...), sortiert.

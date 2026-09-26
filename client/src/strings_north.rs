@@ -246,6 +246,12 @@ pub static SV: Lang = Lang {
         (HostStopSharing, "Sluta dela"),
         (HostTooltip, "QuadChroma – den här datorn delas (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Dölj"),
+        (MsgShareFailed, "Det gick inte att starta delningen av den här datorn."),
+        (MsgDeviceRemoved, "{n} känner inte längre till den här enheten. Anslut igen och ange lösenordet."),
+        (HostPasswordNotSaved, "Lösenordet kunde inte sparas."),
+        (HostPasswordInvalid, "Lösenordet innehåller otillåtna tecken."),
+        (HostPasswordTitle, "Ändra lösenord"),
     ],
 };
 
@@ -492,6 +498,12 @@ pub static DA: Lang = Lang {
         (HostStopSharing, "Stop deling"),
         (HostTooltip, "QuadChroma – denne pc deles (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Skjul"),
+        (MsgShareFailed, "Delingen af denne pc kunne ikke startes."),
+        (MsgDeviceRemoved, "{n} kender ikke længere denne enhed. Forbind igen, og indtast adgangskoden."),
+        (HostPasswordNotSaved, "Adgangskoden kunne ikke gemmes."),
+        (HostPasswordInvalid, "Adgangskoden indeholder tegn, der ikke er tilladt."),
+        (HostPasswordTitle, "Skift adgangskode"),
     ],
 };
 
@@ -738,6 +750,12 @@ pub static NB: Lang = Lang {
         (HostStopSharing, "Stopp deling"),
         (HostTooltip, "QuadChroma – denne PC-en deles (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Skjul"),
+        (MsgShareFailed, "Kunne ikke starte delingen av denne PC-en."),
+        (MsgDeviceRemoved, "{n} kjenner ikke lenger denne enheten. Koble til igjen og skriv inn passordet."),
+        (HostPasswordNotSaved, "Passordet kunne ikke lagres."),
+        (HostPasswordInvalid, "Passordet inneholder tegn som ikke er tillatt."),
+        (HostPasswordTitle, "Endre passord"),
     ],
 };
 
@@ -984,6 +1002,12 @@ pub static FI: Lang = Lang {
         (HostStopSharing, "Lopeta jakaminen"),
         (HostTooltip, "QuadChroma – tämä tietokone on jaettu (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Piilota"),
+        (MsgShareFailed, "Tämän tietokoneen jakamista ei voitu käynnistää."),
+        (MsgDeviceRemoved, "{n} ei enää tunne tätä laitetta. Yhdistä uudelleen ja anna salasana."),
+        (HostPasswordNotSaved, "Salasanaa ei voitu tallentaa."),
+        (HostPasswordInvalid, "Salasana sisältää merkkejä, jotka eivät ole sallittuja."),
+        (HostPasswordTitle, "Vaihda salasana"),
     ],
 };
 
@@ -1230,5 +1254,11 @@ pub static IS: Lang = Lang {
         (HostStopSharing, "Hætta að deila"),
         (HostTooltip, "QuadChroma – þessari tölvu er deilt (ID {i})"),
         (HostOk, "Í lagi"),
+        (AccessHide, "Fela"),
+        (MsgShareFailed, "Ekki tókst að hefja deilingu þessarar tölvu."),
+        (MsgDeviceRemoved, "{n} þekkir þetta tæki ekki lengur. Tengstu aftur og sláðu inn lykilorðið."),
+        (HostPasswordNotSaved, "Ekki tókst að vista lykilorðið."),
+        (HostPasswordInvalid, "Lykilorðið inniheldur stafi sem eru ekki leyfðir."),
+        (HostPasswordTitle, "Breyta lykilorði"),
     ],
 };

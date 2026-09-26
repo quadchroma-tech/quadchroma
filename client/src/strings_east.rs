@@ -246,6 +246,12 @@ pub static PL: Lang = Lang {
         (HostStopSharing, "Zatrzymaj udostępnianie"),
         (HostTooltip, "QuadChroma – ten komputer jest udostępniony (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Ukryj"),
+        (MsgShareFailed, "Nie udało się uruchomić udostępniania tego komputera."),
+        (MsgDeviceRemoved, "{n} nie zna już tego urządzenia. Połącz się ponownie i wpisz hasło."),
+        (HostPasswordNotSaved, "Nie udało się zapisać hasła."),
+        (HostPasswordInvalid, "Hasło zawiera niedozwolone znaki."),
+        (HostPasswordTitle, "Zmień hasło"),
     ],
 };
 
@@ -492,6 +498,12 @@ pub static CS: Lang = Lang {
         (HostStopSharing, "Ukončit sdílení"),
         (HostTooltip, "QuadChroma – tento počítač je sdílen (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Skrýt"),
+        (MsgShareFailed, "Sdílení tohoto počítače se nepodařilo spustit."),
+        (MsgDeviceRemoved, "{n} toto zařízení už nezná. Připojte se znovu a zadejte heslo."),
+        (HostPasswordNotSaved, "Heslo se nepodařilo uložit."),
+        (HostPasswordInvalid, "Heslo obsahuje nepovolené znaky."),
+        (HostPasswordTitle, "Změnit heslo"),
     ],
 };
 
@@ -738,6 +750,12 @@ pub static SK: Lang = Lang {
         (HostStopSharing, "Ukončiť zdieľanie"),
         (HostTooltip, "QuadChroma – tento počítač je zdieľaný (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Skryť"),
+        (MsgShareFailed, "Zdieľanie tohto počítača sa nepodarilo spustiť."),
+        (MsgDeviceRemoved, "{n} toto zariadenie už nepozná. Pripojte sa znova a zadajte heslo."),
+        (HostPasswordNotSaved, "Heslo sa nepodarilo uložiť."),
+        (HostPasswordInvalid, "Heslo obsahuje nepovolené znaky."),
+        (HostPasswordTitle, "Zmeniť heslo"),
     ],
 };
 
@@ -984,6 +1002,12 @@ pub static HU: Lang = Lang {
         (HostStopSharing, "Megosztás leállítása"),
         (HostTooltip, "QuadChroma – a számítógép megosztva (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Elrejtés"),
+        (MsgShareFailed, "A számítógép megosztását nem sikerült elindítani."),
+        (MsgDeviceRemoved, "{n} már nem ismeri ezt az eszközt. Csatlakozzon újra, és adja meg a jelszót."),
+        (HostPasswordNotSaved, "A jelszót nem sikerült menteni."),
+        (HostPasswordInvalid, "A jelszó nem engedélyezett karaktereket tartalmaz."),
+        (HostPasswordTitle, "Jelszó módosítása"),
     ],
 };
 
@@ -1230,6 +1254,12 @@ pub static RO: Lang = Lang {
         (HostStopSharing, "Oprește partajarea"),
         (HostTooltip, "QuadChroma – acest PC este partajat (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Ascunde"),
+        (MsgShareFailed, "Partajarea acestui PC nu a putut fi pornită."),
+        (MsgDeviceRemoved, "{n} nu mai cunoaște acest dispozitiv. Conectați-vă din nou și introduceți parola."),
+        (HostPasswordNotSaved, "Parola nu a putut fi salvată."),
+        (HostPasswordInvalid, "Parola conține caractere nepermise."),
+        (HostPasswordTitle, "Schimbă parola"),
     ],
 };
 
@@ -1476,6 +1506,12 @@ pub static BG: Lang = Lang {
         (HostStopSharing, "Спиране на споделянето"),
         (HostTooltip, "QuadChroma – този компютър е споделен (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Скрий"),
+        (MsgShareFailed, "Споделянето на този компютър не можа да бъде стартирано."),
+        (MsgDeviceRemoved, "{n} вече не познава това устройство. Свържете се отново и въведете паролата."),
+        (HostPasswordNotSaved, "Паролата не можа да бъде запазена."),
+        (HostPasswordInvalid, "Паролата съдържа непозволени знаци."),
+        (HostPasswordTitle, "Смяна на паролата"),
     ],
 };
 
@@ -1722,5 +1758,11 @@ pub static EL: Lang = Lang {
         (HostStopSharing, "Διακοπή κοινής χρήσης"),
         (HostTooltip, "QuadChroma – ο υπολογιστής είναι σε κοινή χρήση (ID {i})"),
         (HostOk, "OK"),
+        (AccessHide, "Απόκρυψη"),
+        (MsgShareFailed, "Δεν ήταν δυνατή η έναρξη της κοινής χρήσης αυτού του υπολογιστή."),
+        (MsgDeviceRemoved, "Ο υπολογιστής {n} δεν γνωρίζει πλέον αυτή τη συσκευή. Συνδεθείτε ξανά και πληκτρολογήστε τον κωδικό πρόσβασης."),
+        (HostPasswordNotSaved, "Δεν ήταν δυνατή η αποθήκευση του κωδικού πρόσβασης."),
+        (HostPasswordInvalid, "Ο κωδικός πρόσβασης περιέχει μη επιτρεπόμενους χαρακτήρες."),
+        (HostPasswordTitle, "Αλλαγή κωδικού πρόσβασης"),
     ],
 };
