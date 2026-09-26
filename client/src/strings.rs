@@ -655,7 +655,7 @@ pub static EN: Lang = Lang {
         (AccessPassword, "Password"),
         (AccessShow, "Show"),
         (AccessCancel, "Cancel"),
-        (AccessChecking, "Checking ..."),
+        (AccessChecking, "Checking …"),
         (AccessWrong, "Wrong password."),
         (AccessWait, "Too many attempts. Try again in {s} s."),
         (AccessNewIdentity, "The device at this address has a new identity (ID {i})."),
@@ -674,19 +674,19 @@ pub static EN: Lang = Lang {
         (HostDeviceId, "Device ID: {i}"),
         (HostPassword, "Password: {p}"),
         (HostCopied, "Copied"),
-        (HostChangePassword, "Change password ..."),
+        (HostChangePassword, "Change password …"),
         (HostRandomPassword, "New random password"),
         (HostNewPassword, "New password (at least 8 characters)"),
         (HostRepeatPassword, "Repeat password"),
         (HostPasswordsDiffer, "The passwords do not match."),
         (HostPasswordShort, "At least 8 characters, please."),
         (HostPasswordSaved, "Password saved."),
-        (HostPasswordUnreadable, "Password file unreadable - new devices only via \"Allow\"."),
+        (HostPasswordUnreadable, "Password file unreadable – new devices only via \"Allow\"."),
         (HostDevices, "Allowed devices"),
         (HostNoDevices, "No devices yet"),
-        (HostDeviceLine, "{n} - ID {i} - since {d}"),
+        (HostDeviceLine, "{n} – ID {i} – since {d}"),
         (HostRemove, "Remove"),
-        (HostRemoveAll, "Remove all devices ..."),
+        (HostRemoveAll, "Remove all devices …"),
         (HostRemoveAllAsk, "Remove all allowed devices? They will need the password again."),
         (HostListDamaged, "Device list damaged"),
         (HostListReset, "Reset device list"),
@@ -696,12 +696,12 @@ pub static EN: Lang = Lang {
         (HostStartLogin, "Start at login"),
         (HostStartWindows, "Start with Windows"),
         (HostMoveToApps, "Move QuadChroma to Applications first"),
-        (HostScreenMissing, "Screen Recording not allowed - open System Settings ..."),
-        (HostAccessMissing, "Accessibility not allowed - open System Settings ..."),
+        (HostScreenMissing, "Screen Recording not allowed – open System Settings …"),
+        (HostAccessMissing, "Accessibility not allowed – open System Settings …"),
         (HostPortBusy, "Port {p} is used by another program"),
         (HostQuit, "Quit QuadChroma"),
         (HostStopSharing, "Stop sharing"),
-        (HostTooltip, "QuadChroma - sharing this PC (ID {i})"),
+        (HostTooltip, "QuadChroma – sharing this PC (ID {i})"),
         (HostOk, "OK"),
         (AccessHide, "Hide"),
         (MsgShareFailed, "Could not start sharing this PC."),
@@ -1146,8 +1146,9 @@ mod tests {
     /// Die Zugangstexte (Spezifikation Pairing v1, Abschnitt 14, und die bei
     /// der Zusammenfuehrung nachgetragenen): am Ende des Enums hinter der
     /// Bildschirmwahl, in jeder Tabelle, mit genau den Platzhaltern, die der
-    /// Aufrufer ersetzt, und keinem weiteren. EN und DE wie vorgegeben, DE
-    /// mit Umlauten und typografischen Zeichen. Die 27 weiteren Tabellen
+    /// Aufrufer ersetzt, und keinem weiteren. EN und DE wie vorgegeben, beide
+    /// typografisch wie ihr Bestand ("…", Gedankenstrich), DE mit Umlauten
+    /// und typografischen Anfuehrungszeichen. Die 27 weiteren Tabellen
     /// uebersetzt, in der Schreibweise ihrer Tabelle.
     #[test]
     fn zugang_texte() {
@@ -1283,7 +1284,9 @@ mod tests {
         assert_eq!(DE.get(HostDeviceLine), "{n} – ID {i} – seit {d}");
         assert_eq!(DE.get(HostPasswordUnreadable), "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“.");
         assert_eq!(DE.get(StartShare), "Diesen PC freigeben");
-        assert_eq!(EN.get(HostTooltip), "QuadChroma - sharing this PC (ID {i})");
+        assert_eq!(EN.get(HostTooltip), "QuadChroma – sharing this PC (ID {i})");
+        assert_eq!(EN.get(HostDeviceLine), "{n} – ID {i} – since {d}");
+        assert_eq!(EN.get(AccessChecking), "Checking …");
         assert_eq!(EN.get(AccessHide), "Hide");
         assert_eq!(DE.get(AccessHide), "Verbergen");
         assert_eq!(EN.get(MsgShareFailed), "Could not start sharing this PC.");
@@ -1308,8 +1311,8 @@ mod tests {
                 }
             }
         }
-        // Jede Sprache wie ihre Tabelle: "…" statt "...", Gedankenstrich
-        // statt " - " (nur Englisch steht wie vorgegeben); genau die
+        // Jede Sprache wie ihre Tabelle, Englisch eingeschlossen: "…" statt
+        // "...", Gedankenstrich statt " - "; genau die
         // Menuepunkte, die ein Fenster oder eine Folge oeffnen, und "wird
         // geprueft" enden auf " …". Das Wort fuer "Zulassen" steht im Hinweis
         // genauso wie auf dem Knopf, Abbrechen heisst wie im Benchmark,
@@ -1320,10 +1323,8 @@ mod tests {
             for (k, _) in &alle {
                 let t = l.get(*k);
                 assert!(texte.insert(t), "{} {k:?}: doppelt ({t})", l.code);
-                if l.code != "en" {
-                    assert!(!t.contains("...") && !t.contains(" - "), "{} {k:?}: {t}", l.code);
-                    assert_eq!(t.ends_with(" …"), punkte.contains(k), "{} {k:?}: {t}", l.code);
-                }
+                assert!(!t.contains("...") && !t.contains(" - "), "{} {k:?}: {t}", l.code);
+                assert_eq!(t.ends_with(" …"), punkte.contains(k), "{} {k:?}: {t}", l.code);
             }
             for k in [AccessOrAllow, HostPasswordUnreadable] {
                 assert!(l.get(k).contains(l.get(HostAllow)), "{} {k:?}: {}", l.code, l.get(k));

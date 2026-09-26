@@ -13,26 +13,27 @@ typedef struct {
     const char *t[QCTextAnzahl];
 } qc_sprache;
 
-// Englisch: Grundlage und Rueckfall fuer jeden fehlenden Eintrag.
+// Englisch: Grundlage und Rueckfall fuer jeden fehlenden Eintrag. Wie die
+// englische Tabelle des Clients mit "…" und Gedankenstrich (" – ").
 static const qc_sprache QC_EN = { "en", "English", {
     [QCTextHostReady]              = "Ready for connections",
     [QCTextHostConnected]          = "Connected: {n}",
     [QCTextHostDeviceId]           = "Device ID: {i}",
     [QCTextHostPassword]           = "Password: {p}",
     [QCTextHostCopied]             = "Copied",
-    [QCTextHostChangePassword]     = "Change password ...",
+    [QCTextHostChangePassword]     = "Change password …",
     [QCTextHostRandomPassword]     = "New random password",
     [QCTextHostNewPassword]        = "New password (at least 8 characters)",
     [QCTextHostRepeatPassword]     = "Repeat password",
     [QCTextHostPasswordsDiffer]    = "The passwords do not match.",
     [QCTextHostPasswordShort]      = "At least 8 characters, please.",
     [QCTextHostPasswordSaved]      = "Password saved.",
-    [QCTextHostPasswordUnreadable] = "Password file unreadable - new devices only via \"Allow\".",
+    [QCTextHostPasswordUnreadable] = "Password file unreadable – new devices only via \"Allow\".",
     [QCTextHostDevices]            = "Allowed devices",
     [QCTextHostNoDevices]          = "No devices yet",
-    [QCTextHostDeviceLine]         = "{n} - ID {i} - since {d}",
+    [QCTextHostDeviceLine]         = "{n} – ID {i} – since {d}",
     [QCTextHostRemove]             = "Remove",
-    [QCTextHostRemoveAll]          = "Remove all devices ...",
+    [QCTextHostRemoveAll]          = "Remove all devices …",
     [QCTextHostRemoveAllAsk]       = "Remove all allowed devices? They will need the password again.",
     [QCTextHostListDamaged]        = "Device list damaged",
     [QCTextHostListReset]          = "Reset device list",
@@ -42,12 +43,12 @@ static const qc_sprache QC_EN = { "en", "English", {
     [QCTextHostStartLogin]         = "Start at login",
     [QCTextHostStartWindows]       = "Start with Windows",
     [QCTextHostMoveToApps]         = "Move QuadChroma to Applications first",
-    [QCTextHostScreenMissing]      = "Screen Recording not allowed - open System Settings ...",
-    [QCTextHostAccessMissing]      = "Accessibility not allowed - open System Settings ...",
+    [QCTextHostScreenMissing]      = "Screen Recording not allowed – open System Settings …",
+    [QCTextHostAccessMissing]      = "Accessibility not allowed – open System Settings …",
     [QCTextHostPortBusy]           = "Port {p} is used by another program",
     [QCTextHostQuit]               = "Quit QuadChroma",
     [QCTextHostStopSharing]        = "Stop sharing",
-    [QCTextHostTooltip]            = "QuadChroma - sharing this PC (ID {i})",
+    [QCTextHostTooltip]            = "QuadChroma – sharing this PC (ID {i})",
     [QCTextHostOk]                 = "OK",
     [QCTextAccessCode]             = "Code: {c}",
     [QCTextAccessCancel]           = "Cancel",
@@ -58,7 +59,7 @@ static const qc_sprache QC_EN = { "en", "English", {
 
 // Deutsch: echte Umlaute, typografische Anfuehrungszeichen, Gedankenstrich und
 // Auslassungszeichen (U+2026) - zeichengleich mit den Host-Schluesseln in
-// client/src/strings.rs (Englisch dort wie hier mit "...").
+// client/src/strings.rs.
 static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostReady]              = "Bereit für Verbindungen",
     [QCTextHostConnected]          = "Verbunden: {n}",

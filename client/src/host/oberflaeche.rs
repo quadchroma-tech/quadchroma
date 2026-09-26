@@ -359,7 +359,7 @@ mod tests {
         assert!(matches!(&m[9], Eintrag::Punkt { nummer: NR_ZURUECKSETZEN, aktiv: true, .. }));
         assert_eq!(t[9], "Geräteliste zurücksetzen");
         assert_eq!(tooltip(de, 581_729_911), "QuadChroma – Freigabe läuft (ID 581 729 911)");
-        assert_eq!(tooltip(en, 5), "QuadChroma - sharing this PC (ID 000 000 005)");
+        assert_eq!(tooltip(en, 5), "QuadChroma – sharing this PC (ID 000 000 005)");
     }
 
     /// Einzelinstanz: der zweite Anspruch auf denselben Namen scheitert,

@@ -77,28 +77,28 @@ static qc_geraet geraet(uint8_t schluessel, uint32_t id, const char *name, const
 // ------------------------------------------------------------ Texte
 
 // Wortgleich mit der Spezifikation (Pairing, Abschnitt 14) und den
-// Schluesseln des Passwort-Fensters, wie in client/src/strings.rs; Deutsch
-// mit Umlauten, „…“, Gedankenstrich und Auslassungszeichen "…" (Englisch
-// dort mit "...").
+// Schluesseln des Passwort-Fensters, wie in client/src/strings.rs: beide
+// Sprachen mit Auslassungszeichen "…" und Gedankenstrich (" – ") wie ihr
+// Bestand, Deutsch dazu mit Umlauten und „…“.
 static const char *const SOLL_EN[QCTextAnzahl] = {
     [QCTextHostReady] = "Ready for connections",
     [QCTextHostConnected] = "Connected: {n}",
     [QCTextHostDeviceId] = "Device ID: {i}",
     [QCTextHostPassword] = "Password: {p}",
     [QCTextHostCopied] = "Copied",
-    [QCTextHostChangePassword] = "Change password ...",
+    [QCTextHostChangePassword] = "Change password …",
     [QCTextHostRandomPassword] = "New random password",
     [QCTextHostNewPassword] = "New password (at least 8 characters)",
     [QCTextHostRepeatPassword] = "Repeat password",
     [QCTextHostPasswordsDiffer] = "The passwords do not match.",
     [QCTextHostPasswordShort] = "At least 8 characters, please.",
     [QCTextHostPasswordSaved] = "Password saved.",
-    [QCTextHostPasswordUnreadable] = "Password file unreadable - new devices only via \"Allow\".",
+    [QCTextHostPasswordUnreadable] = "Password file unreadable – new devices only via \"Allow\".",
     [QCTextHostDevices] = "Allowed devices",
     [QCTextHostNoDevices] = "No devices yet",
-    [QCTextHostDeviceLine] = "{n} - ID {i} - since {d}",
+    [QCTextHostDeviceLine] = "{n} – ID {i} – since {d}",
     [QCTextHostRemove] = "Remove",
-    [QCTextHostRemoveAll] = "Remove all devices ...",
+    [QCTextHostRemoveAll] = "Remove all devices …",
     [QCTextHostRemoveAllAsk] = "Remove all allowed devices? They will need the password again.",
     [QCTextHostListDamaged] = "Device list damaged",
     [QCTextHostListReset] = "Reset device list",
@@ -108,12 +108,12 @@ static const char *const SOLL_EN[QCTextAnzahl] = {
     [QCTextHostStartLogin] = "Start at login",
     [QCTextHostStartWindows] = "Start with Windows",
     [QCTextHostMoveToApps] = "Move QuadChroma to Applications first",
-    [QCTextHostScreenMissing] = "Screen Recording not allowed - open System Settings ...",
-    [QCTextHostAccessMissing] = "Accessibility not allowed - open System Settings ...",
+    [QCTextHostScreenMissing] = "Screen Recording not allowed – open System Settings …",
+    [QCTextHostAccessMissing] = "Accessibility not allowed – open System Settings …",
     [QCTextHostPortBusy] = "Port {p} is used by another program",
     [QCTextHostQuit] = "Quit QuadChroma",
     [QCTextHostStopSharing] = "Stop sharing",
-    [QCTextHostTooltip] = "QuadChroma - sharing this PC (ID {i})",
+    [QCTextHostTooltip] = "QuadChroma – sharing this PC (ID {i})",
     [QCTextHostOk] = "OK",
     [QCTextAccessCode] = "Code: {c}",
     [QCTextAccessCancel] = "Cancel",
@@ -217,7 +217,7 @@ static void texte_pruefen(void) {
             printf("         de %d: \"%s\"\n", t, qc_texte_eintrag(1, (QCText)t));
         }
     }
-    pruefe(en, "Englisch wortgleich mit der Spezifikation");
+    pruefe(en, "Englisch wortgleich mit der Spezifikation (mit \"…\" und \" – \" wie der Client)");
     pruefe(de, "Deutsch wortgleich mit der Spezifikation (Umlaute, typografische Zeichen)");
 
     // Wie im Client: innerhalb einer Sprache kein Text doppelt.
@@ -248,12 +248,12 @@ static void texte_pruefen(void) {
         }
     pruefe(englisch == 0, "weitere Sprachen: uebersetzt");
 
-    // Schreibweise wie in den Tabellen des Clients: ausser im vorgegebenen
-    // Englisch "…" statt "..." und Gedankenstrich statt " - "; genau die
+    // Schreibweise wie in den Tabellen des Clients, Englisch eingeschlossen:
+    // "…" statt "..." und Gedankenstrich statt " - "; genau die
     // Menuepunkte mit Fenster oder Folge enden auf " …"; der Hinweis zur
     // unlesbaren Passwortdatei nennt den Knopf "Zulassen" mit seinem Wort.
     int schreibweise = 0;
-    for (int s = 1; s < qc_texte_sprachen(); s++) {
+    for (int s = 0; s < qc_texte_sprachen(); s++) {
         for (int t = 0; t < QCTextAnzahl; t++) {
             const char *x = qc_texte_eintrag(s, (QCText)t);
             if (!x) continue;
@@ -297,7 +297,7 @@ static void texte_pruefen(void) {
     qc_texte_setzen(0);
     pruefe([qc_text_mit(QCTextHostConnected, @{ @"n": @"{n}{i}", @"i": @"X" }) isEqualToString:@"Connected: {n}{i}"],
            "ein Durchgang: ein Name, der wie ein Platzhalter aussieht, bleibt stehen");
-    pruefe([qc_text_mit(QCTextHostDeviceLine, @{ @"n": @"PC" }) isEqualToString:@"PC - ID {i} - since {d}"],
+    pruefe([qc_text_mit(QCTextHostDeviceLine, @{ @"n": @"PC" }) isEqualToString:@"PC – ID {i} – since {d}"],
            "Platzhalter ohne Wert bleibt stehen");
     qc_texte_setzen(1);
     pruefe([qc_text_mit(QCTextHostRequest, @{ @"n": @"Büro-PC", @"i": @"581 729 911" })
@@ -428,16 +428,16 @@ static void modell_pruefen(void) {
         @"(Connected: Robert's PC)",
         @"---",
         @"Device ID: 581 729 911",
-        @"(Password file unreadable - new devices only via \"Allow\".)",
-        @"Change password ...",
+        @"(Password file unreadable – new devices only via \"Allow\".)",
+        @"Change password …",
         @"New random password",
         @"---",
         @"(Device list damaged)",
         @"Reset device list",
         @"---",
         @"[x] Start at login",
-        @"Screen Recording not allowed - open System Settings ...",
-        @"Accessibility not allowed - open System Settings ...",
+        @"Screen Recording not allowed – open System Settings …",
+        @"Accessibility not allowed – open System Settings …",
         @"---",
         @"Quit QuadChroma",
     ]), "en, verbunden, Passwort unlesbar, Liste beschaedigt, Freigaben fehlen, Anmelden an");
@@ -462,7 +462,7 @@ static void modell_pruefen(void) {
     z.anmelden = QCAnmeldenAus;
     t = qc_menue_titel(qc_menue_modell(z));
     pruefe([t containsObject:@"Allowed devices"] && [t containsObject:@"  (No devices yet)"] &&
-           ![t containsObject:@"  Remove all devices ..."], "leere Liste: \"No devices yet\", kein \"Remove all\"");
+           ![t containsObject:@"  Remove all devices …"], "leere Liste: \"No devices yet\", kein \"Remove all\"");
     pruefe([t containsObject:@"Start at login"] && ![t containsObject:@"(Move QuadChroma to Applications first)"],
            "in /Applications, aus: anklickbar, ohne Haken, ohne Hinweis");
     z.anmelden = QCAnmeldenFreigabeNoetig;
@@ -478,9 +478,9 @@ static void modell_pruefen(void) {
     t = qc_menue_titel(qc_menue_modell(z));
     NSString *zeile = nil, *voll = nil;
     NSString *a41 = [@"" stringByPaddingToLength:41 withString:@"A" startingAtIndex:0];
-    NSString *voll_soll = [NSString stringWithFormat:@"  %@ - ID 000 000 008 - since ?", a41];
+    NSString *voll_soll = [NSString stringWithFormat:@"  %@ – ID 000 000 008 – since ?", a41];
     for (NSString *s in t) {
-        if ([s hasPrefix:@"  {i} - ID 000 000 007 - since "]) zeile = s;
+        if ([s hasPrefix:@"  {i} – ID 000 000 007 – since "]) zeile = s;
         if ([s isEqualToString:voll_soll]) voll = s;
     }
     pruefe(zeile != nil, "Geraetename \"{i}\" bleibt stehen, wie er ist");
