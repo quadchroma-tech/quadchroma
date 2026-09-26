@@ -412,7 +412,7 @@ ESC zwei Sekunden halten (das ESC selbst kommt dann nicht beim Mac an) oder
 F10. Fuenf Reiter:
 
     Bild            Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton,
-                    Codecwahl
+                    Bildschirm des Hosts, Codecwahl
     Anzeige         Vollbild, pixelgenau, Statistik, Nerd-Modus, welche
                     Statistikzeilen, Karte fuer Anzeige und Decoder
                     (Automatik, Grafikkarte, Integriert, Prozessor)
@@ -494,7 +494,8 @@ Die Nummer ist der Eintrag in der Liste des Hosts (0 = HEVC 4:4:4 10 Bit,
 Ebenfalls im Pruefmodus prueft --eingabeprobe den Eingabeweg: Sobald der
 Eingabekanal steht, schickt der Client zwei Mausbewegungen (Bildmitte,
 dann rechts unten, im Abstand von einer Sekunde) und endet. Ob sie ankamen,
-zeigt die Zeigerposition auf dem Host.
+zeigt die Zeigerposition auf dem Host - nach einem Bildschirmwechsel auf
+dem gestreamten Bildschirm (siehe "Bildschirm des Hosts").
 
 Bildrate: der Host schickt nie mehr Bilder als eingestellt. ScreenCaptureKit
 liefert auf einem 120-Hz-Bildschirm gern 148 echte Bilder je Sekunde - jedes
@@ -645,11 +646,281 @@ Alles andere geht an den Mac. Uebertragen wird die Position der Taste, nicht
 das Zeichen, deshalb stimmen Umlaute und AltGr von selbst. Die Windows-Taste
 ist die Befehlstaste des Macs.
 
-Bildschirmwahl auf dem Mac: ohne Angabe nimmt der Host den Hauptbildschirm
-(den mit der Menueleiste) und merkt sich dessen Kennung - Maus und Bild
-gehoeren immer auf denselben Bildschirm. --display n waehlt einen anderen
-Platz aus der Liste (--list zeigt sie). Ein Wechsel gilt ab dem naechsten
-Start des Hosts.
+Bildschirm des Hosts
+--------------------
+
+Der Host streamt genau einen Bildschirm. Welchen, stellt der Client im
+Menue ein: Reiter "Bild", Zeile "Bildschirm", ueber den Codecknoepfen.
+Dort steht ein Knopf "Automatisch" und je Bildschirm des Hosts einer mit
+Name, Groesse und Bildrate ("X27 X1 - 1920x1080 - 120 Hz", im Programm
+mit Mittelpunkten und Malkreuz; ohne Hz-Teil, wenn der Host die Rate
+nicht kennt; ohne Namen steht die Kennung). Der gestreamte Bildschirm
+steht in Cyan; bei Automatik dazu "Automatisch", bei festem Wunsch der
+gewuenschte Eintrag, sofern er angeschlossen ist. Ein Klick auf den
+Eintrag, der schon der Wunsch ist, tut nichts. Wer mit der Maus ueber
+die Zeile faehrt, liest: "Welchen Bildschirm des Hosts du siehst.
+Automatisch folgt dem Hauptbildschirm; ein fester Bildschirm gilt, bis
+du etwas anderes waehlst."
+
+Nach einem Klick steht rechts in der Zeile in Amber "Bildschirm wird
+gewechselt ...", bei geschlossenem Menue derselbe Hinweis ueber dem Bild
+wie beim Codecwechsel. Er geht, sobald der Host mit seiner Liste
+antwortet und der Wunsch darin erfuellt ist (bei Automatik: der
+Hauptbildschirm wird gestreamt) oder der gewuenschte Bildschirm gar
+nicht angeschlossen ist, spaetestens nach 5 s. Ist der gewuenschte
+Bildschirm nicht angeschlossen, steht rechts in Amber "<Kennung> nicht
+angeschlossen - Ausweichplatz: <Name>" (im Programm mit Gedankenstrich).
+Die Zeile gibt es nur bei einem Host, der die Wahl kennt (Bit 1 seiner
+Faehigkeiten, siehe unten); ein aelterer Host bekommt nie einen Wunsch,
+und ein aelterer Client uebergeht die Liste.
+
+Zwei Betriebsarten, auf beiden Hosts gleich:
+
+    Automatisch   Vorgabe. Der Host streamt seinen Hauptbildschirm -
+                  auf dem Mac den mit der Menueleiste, auf Windows den
+                  Monitor, den Windows als primaer fuehrt - und folgt
+                  ihm, wenn er wechselt: Monitor angeschlossen,
+                  abgezogen, in den Einstellungen umgestellt. Ohne
+                  Neustart, ohne neuen Zuschauer.
+    Fest          Der Host streamt den gewaehlten Bildschirm, erkannt
+                  an seiner Kennung. Faellt er weg, streamt der Host
+                  den Hauptbildschirm als Ausweichplatz und sagt es
+                  dem Zuschauer (Liste mit dem Wunsch, im Menue der
+                  Amber-Hinweis); kommt er zurueck, wechselt der Host
+                  von selbst zurueck. Der Wunsch bleibt, bis jemand
+                  etwas anderes waehlt.
+
+Der Anlass: Am 26.09. war am Mac mini ein Monitor angeschlossen worden
+und Hauptbildschirm geworden. Der Host streamte weiter den beim Start
+gewaehlten virtuellen Bildschirm, auf dem kein Fenster lag - das Bild
+war leer, Maus und Tastatur schienen tot. Jetzt folgt der Host in der
+Automatik dem Hauptbildschirm; wer den virtuellen Bildschirm will,
+waehlt ihn fest.
+
+Die Betriebsart ist ein Zustand des Hosts, nicht des Clients: der Host
+hat einen Strom, der Wunsch gilt fuer jeden Zuschauer, der letzte
+Wunsch gewinnt. Die Kennung ist stabil, kein Listenplatz:
+
+    Mac       v<Vendor>-m<Model>-s<Serial> aus den Nummern des
+              Bildschirms (etwa v1138-m1234-s0); zwei gleiche in der
+              Liste bekommen -u<Unit> angehaengt. Der Name ist der
+              Name des Bildschirms aus den Systemeinstellungen, sonst
+              "Bildschirm <n>".
+    Windows   der zweite Teil der Geraete-ID des Monitors (aus
+              MONITOR\ACR0501\{...}\0001 wird ACR0501); zwei gleiche
+              bekommen -<Listenplatz> angehaengt, der beim Umstecken
+              wandern kann. Ohne Geraete-ID gilt der Geraetename
+              (\\.\DISPLAYn). Der Name ist der Monitorname von Windows,
+              sonst die Geraetebeschreibung, sonst der Geraetename.
+
+Eine Kennung hat hoechstens 64 Byte, ein Name 48; Laengeres wird an
+Zeichengrenzen gekuerzt.
+
+Wann der Host neu bewertet: beim Start, bei jedem Wunsch, bei jedem
+Aufnahmestart (neuer Zuschauer, Wiederherstellung) und bei jeder
+Aenderung der Bildschirme. Die meldet macOS dem Mac-Host sofort; er
+bewertet 300 ms nach der letzten Meldung neu (entprellt - drei Meldungen
+kurz nacheinander sind ein Wechsel). Die Windows-Host-Rolle zaehlt ihre
+Ausgaenge im Aufnahmefaden alle 2 s neu auf, nach einem Verlust der
+Duplication sofort; ein Monitorwechsel ist dort also nach rund 2 s
+bemerkt. Ziel ist der Wunsch, wenn er angeschlossen ist, sonst der
+Hauptbildschirm, sonst der erste der Liste, sonst keiner ("kein
+Bildschirm", Nachricht 9). Weicht das Ziel vom gestreamten Bildschirm
+ab, wird gewechselt; ohne Zuschauer merkt sich der Host nur das Ziel,
+der Strom laeuft erst mit dem naechsten.
+
+Der Wechsel laeuft wie ein Codecwechsel, im Faden des Stroms: alten
+Strom anhalten, Stromgroesse aus dem neuen Bildschirm (Mac: ab 3840
+bzw. 2160 Pixel halbiert, gerade, --out hat Vorrang; Windows: ab 3840
+Breite halbiert), bei anderer Groesse ein neuer Encoder, dann an den
+Zuschauer Nachricht 7 (SWITCH mit dem laufenden Codec - der Client baut
+den Decoder neu), Nachricht 1 (INFO mit den Massen), das erste Bild als
+Vollbild, danach die neue Liste (12); die Maus folgt dem Bild. Das gilt
+auch bei gleicher Groesse; dann bleibt der Encoder stehen, und der
+Wechsel ist fuer den Client nur ein Vollbild. Das letzte Bild des alten
+Bildschirms faellt weg, das erste danach stammt immer vom neuen. Das
+Bild steht dabei kurz still (Mac: Anhalten und Neustart des Stroms;
+Windows: Duplication neu, dazu ein neuer Encoder, wenn sich die Groesse
+oder der fuer den Ausgang entschiedene Encoderweg aendert). Der Client
+baut auch bei einer INFO mit neuen Massen seinen Decoder neu und wartet
+auf ein Vollbild ("Strominfo: neue Groesse BxH (vorher BxH) - Decoder
+neu, warte auf Vollbild" in protokoll.txt). Laeuft gerade ein Codecwechsel,
+wartet der Bildschirmwechsel, bis er fertig ist: der Mac-Host sieht
+alle 200 ms nach und wechselt nach 5 s trotzdem; jeder Wunsch bekommt
+derweil sofort die Liste als Antwort, nach dem Wechsel noch einmal.
+Scheitert der neue Strom, gilt der Ausweichweg wie beim
+Bildschirmverlust (Nachricht 9, neuer Versuch); meldet macOS
+voruebergehend gar keinen Bildschirm, laeuft der Strom weiter.
+
+bildschirm.txt: der Wunsch steht im Ablageordner des Hosts, genau eine
+Zeile, "auto" oder die Kennung:
+
+    Mac       ~/Library/Application Support/QuadChroma/bildschirm.txt
+    Windows   %APPDATA%\QuadChroma\bildschirm.txt
+
+Geschrieben bei jedem Wunsch aus dem Menue (erst eine temporaere Datei
+daneben, dann umbenannt; die Windows-Host-Rolle raeumt liegengebliebene
+bildschirm.*.neu beim Start weg), gelesen beim Start. Fehlt sie, gilt
+Automatik ohne Vermerk; ist sie unlesbar oder kaputt (leer, mehr als
+eine Zeile, kein UTF-8, Steuerzeichen, ueber 64 Byte), gilt Automatik
+mit der Zeile "Bildschirmwahl: bildschirm.txt unlesbar - Automatik",
+und die Datei bleibt, wie sie ist - sie wird nie still ersetzt. Von
+Hand eintragen geht auch, bei beendetem Host.
+
+--display N (Mac) bzw. --output n (Windows-Host-Rolle) pinnt fuer
+diesen Lauf den Bildschirm am Listenplatz N von --list als Wunsch
+(gemerkt wird seine Kennung, sobald die Liste einmal gelesen ist),
+ohne bildschirm.txt zu aendern; ein Wunsch aus dem Menue ueberschreibt
+den Pin und wird gespeichert. Ein Platz ausser Bereich ergibt eine
+Zeile, dann gilt die Datei bzw. Automatik. --list zeigt je Bildschirm
+Kennung, Name, Groesse, Bildrate und den Hauptbildschirm.
+
+Pruefmodus: --bildschirm <Kennung|auto> schickt den Wunsch einmal,
+sobald der Eingabekanal steht und der Host die Wahl gemeldet hat
+("Bildschirmwunsch gesendet: <Kennung|auto>"; bei einem Host ohne Bit 1
+"Bildschirmwunsch nicht gesendet: der Host kennt keine
+Bildschirmwahl"). Jede Liste des Hosts ergibt eine Zeile, im
+Fensterbetrieb in protokoll.txt:
+
+    "Bildschirme des Hosts (Wunsch <Kennung|Automatik>): <Name>
+     <Kennung> <B>x<H> <Hz> Hz [Haupt] [gestreamt]; ..."
+                                        (ohne Eintraege: "...: keine")
+
+Die Statuszeile alle drei Sekunden traegt hinter dem Codec das Feld
+"| Strom <B>x<H>@<fps>" ("?" ohne Strominfo), damit ein Wechsel auch
+bei gleichem Codec zu sehen ist. Ob Maus und Bild danach auf demselben
+Bildschirm liegen, zeigt --eingabeprobe (siehe "Das Menue").
+
+    quadchroma.exe 192.168.178.194:9001 --headless --bildschirm v0-m0-s0
+    quadchroma.exe 192.168.178.194:9001 --headless --bildschirm auto
+
+Protokollzeilen des Mac-Hosts (/tmp/quadchroma-m1.log); <Text> ist
+'Kennung <n> (<Kennung>) "<Name>"', etwa 'Kennung 2 (v1138-m1234-s0)
+"X27 X1"':
+
+    "Bildschirmwahl: Wunsch <Kennung> aus bildschirm.txt"
+    "Bildschirmwahl: bildschirm.txt unlesbar - Automatik"
+    "Bildschirm --display N: <Text> gilt als Wunsch fuer diesen Lauf"
+    "Bildschirm N nicht verfuegbar (M in der Liste) - Automatik" bzw.
+     "... - der Wunsch aus bildschirm.txt gilt"
+    "Bildschirm <Text> (<B>x<H> Pixel, <Hz> Hz) -> <B>x<H>, <fps> fps
+     - Automatik (folgt dem Hauptbildschirm)" bzw. "... - Wunsch
+     <Kennung>"                                   (beim Dienststart)
+    "Bildschirm gewaehlt: <Text>, <B>x<H> Pixel, <Hz> Hz
+     [ (Hauptbildschirm)][ - Ausweichplatz]"       (je Ziel einmal)
+    "Aufnahme gestartet: Bildschirm <B>x<H>, <Hz> Hz, <Text> -> <B>x<H>"
+    "Bildschirmwunsch: <Kennung|Automatik>" (dazu " - bildschirm.txt
+     liess sich nicht schreiben", wenn das Speichern scheitert)
+    "Bildschirmwunsch: <Kennung> - nicht angeschlossen, Ausweichplatz
+     <Text>"
+    "Bildschirmwunsch ungueltig (<n> Byte) - uebergangen"
+    "Bildschirmwunsch <Kennung|Automatik> verworfen: Aufnahme laeuft
+     noch nicht"
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" mit den Gruenden
+     "Wunsch des Zuschauers", "Hauptbildschirm gewechselt",
+     "Ausweichplatz" und "zurueck zum gewuenschten Bildschirm"
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>) nicht vollzogen -
+     Ausweichweg wie beim Bildschirmverlust"
+    "Bildschirmwechsel auf <Text> wartet auf den laufenden Codecwechsel"
+    "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem"
+    "Bildschirme nicht abrufbar - der Stand bleibt"
+    "Kein Bildschirm in der Liste - der laufende Strom bleibt"
+    "Aufnahme wiederhergestellt: Bildschirm <B>x<H>, <Hz> Hz, <Text>"
+
+--list schreibt je Bildschirm "Display N: id=<n>, Kennung <Kennung>,
+Name "<Name>", <B> x <H> Pixel, <Hz> Hz  (Hauptbildschirm)".
+
+Protokollzeilen der Windows-Host-Rolle (host-protokoll.txt); <Text> ist
+"<Kennung> (<Name>)", etwa "ACR0501 (X27 X1)":
+
+    "Ausgang N: \\.\DISPLAYn <B>x<H> bei (x,y)  an Karte K (<Karte>)
+     [ (Hauptbildschirm)]  Kennung <Kennung> (<Name>), <Hz> Hz"
+                                                  (Start und --list)
+    "Bildschirmwahl: Automatik (bildschirm.txt)" bzw.
+     "Bildschirmwahl: <Kennung> (bildschirm.txt)"
+    "Bildschirmwahl: bildschirm.txt unlesbar - Automatik"
+    "Bildschirmwahl: N liegengebliebene temporaere Datei(en)
+     bildschirm.*.neu entfernt"
+    "Bildschirmwahl: Wunsch nicht gespeichert (<Grund>)"
+    "--output n: Bildschirm <Text> gilt fuer diesen Lauf (bildschirm.txt
+     bleibt)"
+    "Ausgang n nicht verfuegbar (M in der Liste) - kein Pin, es gilt
+     bildschirm.txt bzw. der Hauptbildschirm"
+    "Ausgang gewaehlt: \\.\DISPLAYn <B>x<H> bei (x,y) an Karte K
+     [ (Hauptbildschirm)], Kennung <Kennung> (<Name>), <Hz> Hz
+     [ - gewuenschter Bildschirm | - Ausweichplatz, <Kennung> nicht
+     angeschlossen]"
+    "Bildschirmwunsch: <Kennung>" bzw. "Bildschirmwunsch: Automatik"
+     (dazu " (laeuft bereits)", wenn nichts zu wechseln ist)
+    "Bildschirmwunsch: <Kennung> - nicht angeschlossen, Ausweichplatz
+     <Text>"
+    "Bildschirmwunsch: <Kennung|Automatik> - <Grund>, kein Wechsel
+     moeglich"          (ohne Aufnahme: Konserve, kein DXGI-Ausgang,
+                         kein Encoder; die Antwort ist die alte Liste)
+    "Bildschirmwunsch: ungueltig (<n> Byte) - uebergangen"
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" mit denselben vier
+     Gruenden; ohne Zuschauer mit dem Zusatz " - ohne laufenden Strom
+     nur das Ziel, gilt ab dem naechsten Aufbau"
+    "Ausgaenge: <Fehler> - die letzte Liste gilt weiter", spaeter
+     "Ausgaenge: wieder aufzaehlbar"
+
+Nachrichten der Leitung (Kopf wie ueberall):
+
+    12  Bildschirme   Host -> Client, Bildkanal: u8 Fassung (1), u8
+                      Anzahl (0 bis 16), u8 Laenge des Wunsches (0 =
+                      Automatik), u8 0, die Kennung des Wunsches (auch
+                      wenn er gerade nicht angeschlossen ist), dann je
+                      Eintrag u8 Kennungslaenge (1 bis 64), u8
+                      Namenslaenge (0 bis 48), u16 Breite, u16 Hoehe in
+                      Pixeln, u16 Hz (0 = unbekannt), u8 Flags (Bit 0
+                      Hauptbildschirm, Bit 1 wird gestreamt), u8 0,
+                      Kennung, Name (UTF-8). Hoechstens 2020 Byte. Geht
+                      an jeden neuen Zuschauer gleich nach den
+                      Faehigkeiten (11), nach jedem Wechsel, nach jeder
+                      Aenderung der Liste und als Antwort auf jeden
+                      Wunsch, auch einen unerfuellbaren. Der Client
+                      liest vorsichtig: eine fremde Fassung oder krumme
+                      Bytes lassen die letzte gute Liste stehen, mehr
+                      als 16 Eintraege werden auf 16 gekuerzt.
+    70  Wunsch        Client -> Host, Eingabekanal: u8 Kennungslaenge
+                      (0 = Automatik, sonst 1 bis 64), dann die Kennung
+                      - hoechstens 65 Byte (auf dem Eingabekanal der
+                      Hosts gilt die Grenze von 256 Byte wie fuer alle
+                      kleinen Typen). Ungueltiges (Laenge, kein UTF-8,
+                      Steuerzeichen) uebergeht der Host, der Kanal
+                      bleibt. Zustandsnachricht: steht der Eingabekanal
+                      erst spaeter, reicht der Client den letzten Wunsch
+                      nach. Geht nur an einen Host, der in dieser
+                      Sitzung Bit 1 gemeldet hat.
+
+Bit 1 in den Faehigkeiten (11) heisst "Bildschirmwahl"; beide Hosts
+melden 3 (Dateien und Bildschirmwahl). Der Client meldet in seinen
+Faehigkeiten (69) weiter nur Bit 0.
+
+Pruefvektor: die Liste mit Automatik, "X27 X1" (v1138-m1234-s0,
+1920x1080, 120 Hz, Haupt und gestreamt) und "Virtuell 16:9" (v0-m0-s0,
+1920x1080, 240 Hz) lautet
+
+    01 02 00 00
+    0e 06 80 07 38 04 78 00 03 00  76 31 31 33 38 2d 6d 31 32 33 34
+    2d 73 30  58 32 37 20 58 31
+    08 0d 80 07 38 04 f0 00 00 00  76 30 2d 6d 30 2d 73 30  56 69 72
+    74 75 65 6c 6c 20 31 36 3a 39
+
+der Wunsch auf v0-m0-s0 "08 76 30 2d 6d 30 2d 73 30", Automatik "00".
+Beide Hosts und der Client erzeugen und lesen diese Bytes in ihren
+Tests; der hosttest des Mac-Hosts (Abschnitt Bildschirm) spielt das
+Umschalten mit Attrappen fuer Liste und Strom und echten Encodern
+durch, die Tests der Windows-Host-Rolle die Wahl, die Kennungen,
+bildschirm.txt, den Wunsch ueber den echten Eingabekanal und die
+Begruessung mit 3 und 12.
+
+Noch nicht am Geraet belegt, nur in Pruefstaenden und am Code: bei der
+Windows-Host-Rolle der Wechsel selbst (Duplication neu, Switch, Info,
+Vollbild, Liste danach; bei gleicher Groesse bleibt der Encoder auf dem
+Prozessorweg stehen) - er braucht zwei echte Ausgaenge, die VM hat
+einen -, dort auch Kennung, Name und Bildrate aus echten Monitoren;
+beim Mac-Host der Hauptbildschirmwechsel live samt Namen aus AppKit.
 
 Zwischenablage
 --------------
@@ -970,7 +1241,7 @@ Fuenf-Sekunden-Takt in host-protokoll.txt. Dort stehen sie also bis zu
 
 nur im Client:
 
-    "Host meldet Faehigkeiten 0x1: Dateien ja"
+    "Host meldet Faehigkeiten 0x3: Dateien ja, Bildschirmwahl ja"
     "Dateien: N Eintraege vorgemerkt - die Faehigkeiten des Hosts stehen
      noch aus (hoechstens 5 s)"
     "Dateien: Host kann keine Dateien empfangen (aelterer Host)"
@@ -1015,8 +1286,11 @@ u32 Laenge; alle Zahlen little endian):
 
     11  Faehigkeiten  Host -> Client, Bildkanal: u32 Bits (mindestens
                       4 Byte, weitere werden uebergangen), Bit 0 heisst
-                      "Dateien Fassung 1". Geht an jeden neuen Zuschauer
-                      nach Begruessung, Einstellungen und Codecliste.
+                      "Dateien Fassung 1", Bit 1 "Bildschirmwahl" (siehe
+                      "Bildschirm des Hosts"; beide Hosts melden 3). Geht
+                      an jeden neuen Zuschauer nach Begruessung,
+                      Einstellungen und Codecliste; gleich danach folgt
+                      die Bildschirmliste (12).
     69  Faehigkeiten  Client -> Host, Eingabekanal, dasselbe Format; die
                       erste Nachricht jedes Eingabekanals. Sie gilt nur
                       fuer den Kanal, der sie geschickt hat.
@@ -1124,7 +1398,8 @@ Pruefmodus ohne Fenster, falls etwas klemmt:
     quadchroma.exe 192.168.178.194:9001 --headless
 
 Gibt alle drei Sekunden eine Zeile aus: empfangene Bilder, Bildrate, Codec,
-Decoder, Verzoegerung, Hostlast, Fehler. Ohne Verbindung steht statt der
+Strom (Breite x Hoehe @ Bildrate des Hosts, "?" ohne Strominfo), Decoder,
+Verzoegerung, Hostlast, Fehler. Ohne Verbindung steht statt der
 Verzoegerung "nicht verbunden"; der Fehler steht so da, wie ihn die
 Oberflaeche zeigt, auf Englisch mit seinem Schluessel davor, etwa
 'Fehler Some("SessionTakenOver: Another device has taken over the
@@ -1157,17 +1432,19 @@ erzwingt die Karte und sagt, was sie dazu meint;
 zaehlt die Karten auf und probiert jede Decoderwahl mit HEVC 4:4:4, 4:2:0
 und H.264 durch, ohne Verbindung.
 
-    quadchroma.exe --shot datei.bmp [sprache] [ansicht]
+    quadchroma.exe --shot datei.bmp [sprache] [ansicht[@BxH]]
 
 schreibt ein Bild der Oberflaeche als BMP, ohne Fenster und ohne
 Verbindung, und endet (Vorgabe ui.bmp, de, start; Sprache als Kuerzel
 wie en). Ansichten: start, starttip (Tooltip des Knopfs "Verknuepfung"),
 abgeloest und fingerabdruck (Startbildschirm mit der jeweiligen
 Meldung), sitzung und nerd (Statistik ueber einem angedeuteten Bild),
-hud, hud2 bis hud5 und hud2tip (das Menue, je ein Reiter), dateien und
+hud, hud2 bis hud5 und hud2tip (das Menue, je ein Reiter; hud ist der
+Reiter "Bild" mit einer nachgestellten Bildschirmliste), dateien und
 dateienfehler (die Zeilen der Dateiuebertragung, laufend und fertig bzw.
 mit Abbruchgruenden). Die Startbildschirme sind 900x700 gross, alle
-anderen 1280x720.
+anderen 1280x720; ein Anhang @BxH an der Ansicht (etwa hud@1920x1080,
+je Seite 320 bis 7680) zeichnet sie in dieser Groesse.
 
     quadchroma.exe 192.168.178.194:9001 --ohne-aud
 
@@ -1189,8 +1466,9 @@ an, den sonst der Mac bekommt - gleiche Verschluesselung, gleiche
 Kopplung, gleiche Nachrichten, ein Client merkt keinen Unterschied.
 Aufnahme ueber die Desktop Duplication des gewaehlten Ausgangs, Encoder
 ueber FFmpeg (hevc_nvenc/h264_nvenc auf NVIDIA; ohne NVIDIA nur H.264 in
-Software ueber Media Foundation), Schrittmacher, Codecwechsel, Testbild,
-Ton (WASAPI-Loopback), Zeigerform, Last und Wachhalten wie beim Mac.
+Software ueber Media Foundation), Schrittmacher, Codecwechsel,
+Bildschirmwahl mit Umschalten, Testbild, Ton (WASAPI-Loopback),
+Zeigerform, Last und Wachhalten wie beim Mac.
 Ohne Zuschauer arbeitet der Host nicht: keine Duplication, kein Encoder,
 kein Wachhalten (Leerlauf unter 1 % eines Kerns). Alles laeuft ohne
 Fenster ueber die Befehlszeile; jede Zeile steht auch in
@@ -1214,11 +1492,15 @@ Fuenf-Sekunden-Takt.
     --host [port]   Host starten: Bild auf port (9001), Eingaben auf port+1,
                     Bekanntgabe auf port+2. Beim ersten Start entsteht
                     host.key; der Fingerabdruck steht im Protokoll.
-    --output n      Ausgang aus der Liste von --list (ohne Angabe der
-                    Hauptbildschirm). Bild und Maus beziehen sich auf
-                    denselben Ausgang; gemerkt wird sein Geraetename:
-                    faellt er weg, weicht der Host aus, kommt er zurueck,
-                    gilt er wieder. Ab 3840 Breite wird halbiert, bei
+    --output n      Ausgang aus der Liste von --list, als Wunsch nur fuer
+                    diesen Lauf (bildschirm.txt bleibt; ein Wunsch aus
+                    dem Menue des Clients ueberschreibt ihn). Ohne Angabe
+                    gilt bildschirm.txt, sonst der Hauptbildschirm, dem
+                    der Host dann folgt. Bild und Maus beziehen sich auf
+                    denselben Ausgang; gemerkt wird seine Kennung: faellt
+                    er weg, weicht der Host auf den Hauptbildschirm aus,
+                    kommt er zurueck, gilt er wieder (siehe "Bildschirm
+                    des Hosts"). Ab 3840 Breite wird halbiert, bei
                     ungeraden Massen faellt ein Pixel Rand weg.
     --fps N, --mbit N, --fest   wie beim Mac (Vorgabe 120, 150, aus).
     --pair          die naechste unbekannte Gegenstelle wird aufgenommen
@@ -1243,7 +1525,8 @@ Fuenf-Sekunden-Takt.
                     ueber den Prozessor; der Host stellt die Quelle selbst
                     um ("Aufnahme: Quelle auf Prozessorweg umgestellt ..."
                     bzw. "Null-Kopien-Weg: ... - Prozessorweg (bgra)").
-    --list          Karten, Ausgaenge und was dieser Rechner codieren kann
+    --list          Karten, Ausgaenge (je mit Kennung, Name und Hz) und
+                    was dieser Rechner codieren kann
                     (hevc_nvenc und h264_nvenc je Kandidat ueber
                     avcodec_open2; ohne NVIDIA-Treiber steht dort
                     "Cannot load nvcuda.dll"), dazu ob die Media-Foundation-
@@ -1304,7 +1587,10 @@ Faellt der Bildschirm weg (Modewechsel, UAC-Abfrage, Vollbild-exklusiv),
 meldet der Host dem Zuschauer "kein Bildschirm" (Nachricht 9), versucht es
 alle 2 s neu und erzwingt danach ein Vollbild. Derselbe Verlust steht dabei
 nur einmal im Protokoll, am Ende "Aufnahme laeuft wieder (derselbe Verlust
-hatte sich N-mal wiederholt)". Die Zeigerform kommt aus der Duplication
+hatte sich N-mal wiederholt)". Nach einem Verlust zaehlt der Host die
+Ausgaenge gleich neu auf - oft steckt ein Monitorwechsel dahinter, dann
+folgt er dem Hauptbildschirm bzw. seinem Wunsch (siehe "Bildschirm des
+Hosts"). Die Zeigerform kommt aus der Duplication
 (Windows-Zeiger sind meist 32x32; einfarbige und maskierte Formen werden
 umgerechnet, Invertier-Punkte deckend genaehert), das Bild selbst enthaelt
 keinen Zeiger. Ton: Loopback des Standard-Ausgabegeraets,
@@ -1366,7 +1652,8 @@ Fenster.
 
 Ablage auf Windows als Host: %APPDATA%\QuadChroma\host.key (64 Byte:
 privat, dann oeffentlich) und authorized.txt im Format des Macs (64 Hex,
-Fingerabdruck, Name) - getrennt von client.key und known_hosts.txt.
+Fingerabdruck, Name) - getrennt von client.key und known_hosts.txt -,
+dazu bildschirm.txt mit dem gewuenschten Bildschirm.
 
 Tasten kommen ueber die Leitung als Position (macOS-Tastencode) an und
 werden auf Windows in Scancodes uebersetzt; die Befehlstaste des Clients
@@ -1387,4 +1674,4 @@ Voraussetzung ist Windows 10 oder 11, 64 Bit. Eine Visual-C++-Laufzeit
 braucht es nicht: die C-Laufzeit steckt in der exe, und die FFmpeg-Dateien
 nutzen nur die Universal C Runtime, die zu Windows 10 und 11 gehoert.
 
-Stand: 24.09.2026
+Stand: 26.09.2026

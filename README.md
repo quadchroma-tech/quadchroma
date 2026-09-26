@@ -7,7 +7,7 @@ Windows, der Mac zieht unsichtbar mit. Deshalb fühlt sich die Maus lokal an —
 damit er trotzdem aussieht wie auf dem Mac, schickt der Host nur die *Form* des
 Zeigers (Pfeil, Hand, Ziehpfeile, Textcursor, Wartekugel), sobald sie sich ändert.
 
-Stand: 24.09.2026. Läuft, ist aber noch ein Gerüst, keine fertige Anwendung.
+Stand: 26.09.2026. Läuft, ist aber noch ein Gerüst, keine fertige Anwendung.
 
 ## Warum 4:4:4
 
@@ -32,10 +32,11 @@ Datenschutz & Sicherheit:
 - **Bedienungshilfen** für Maus und Tastatur
 
 Ohne Zuschauer tut der Host nichts: keine Aufnahme, kein Encoder (0,6 % Last im
-Leerlauf). Aufgenommen wird der Hauptbildschirm, `--display n` wählt einen anderen.
-`--fest` schickt Bilder im festen Takt von `--fps`, auch bei stillem Bildschirm;
-ohne die Angabe kommen neue Bilder nur bei Änderungen (umschaltbar im Menü des
-Clients, dort je Host gespeichert).
+Leerlauf). Aufgenommen wird der Hauptbildschirm; einen anderen wählt der Client im
+Menü, und `--display n` pinnt für diesen Lauf den Listenplatz n (siehe „Bildschirm
+des Hosts“). `--fest` schickt Bilder im festen Takt von `--fps`, auch bei stillem
+Bildschirm; ohne die Angabe kommen neue Bilder nur bei Änderungen (umschaltbar im
+Menü des Clients, dort je Host gespeichert).
 Sein Protokoll steht in `/tmp/quadchroma-m1.log`; über 8 MB wandert es nach
 `/tmp/quadchroma-m1.alt.log` und beginnt neu.
 
@@ -98,9 +99,9 @@ Ordnung, zur Weitergabe des Mac-Clients braucht es einen LGPL-Build ohne GPL-Tei
 Jede Tastenfunktion ist im Menü auch ein Schalter. Alle übrigen Tasten gehen an den
 Mac. Übertragen wird die **Position** der Taste, nicht das Zeichen, deshalb
 funktionieren Umlaute und AltGr ohne Zutun. Die Windows-Taste ist die Befehlstaste des
-Macs. Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton und Codec stellt man im
-laufenden Betrieb um; der Mac meldet zurück, was gilt, und der Client merkt sich die
-Werte je Host.
+Macs. Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton, Codec und den Bildschirm
+des Hosts stellt man im laufenden Betrieb um; der Mac meldet zurück, was gilt, und
+der Client merkt sich die Werte je Host (den Bildschirm merkt sich der Host selbst).
 
 Der Reiter **Benchmark** misst Codecs, Bildraten und Datenraten der Reihe nach, je
 Schritt einige Sekunden, ohne das Bild anzuhalten: angekommene Bildrate, die ganze
@@ -116,6 +117,62 @@ Automatik, Grafikkarte, Integriert und Prozessor. Der Client erkennt die Karten 
 Start (gemeinsamer Speicher heißt integriert), zeigt nur Knöpfe, zu denen es eine Karte
 gibt, und nennt die erkannte Karte im Tooltip. Der Decoder wechselt sofort, die
 Anzeige ab dem nächsten Start.
+
+## Bildschirm des Hosts
+
+Der Host streamt genau einen Bildschirm. Welchen, stellt der Client im Menü ein,
+Reiter **Bild**, Zeile „Bildschirm“ über den Codecknöpfen: ein Knopf **Automatisch**
+und je Bildschirm des Hosts einer mit Name, Größe und Bildrate („X27 X1 · 1920×1080 ·
+120 Hz“, ohne Hz-Teil, wenn der Host die Rate nicht kennt). Der gestreamte Bildschirm
+steht in Cyan; bei Automatik dazu „Automatisch“, bei festem Wunsch der gewünschte
+Eintrag, sofern er angeschlossen ist. Ein Klick auf den Eintrag, der schon gilt, tut
+nichts. Bis der Host geantwortet hat, steht rechts in Amber „Bildschirm wird
+gewechselt …“, bei geschlossenem Menü derselbe Hinweis über dem Bild wie beim
+Codecwechsel (höchstens 5 s). Die Zeile gibt es nur bei einem Host, der die Wahl
+kennt (Bit 1 seiner Fähigkeiten); ein älterer Host bekommt nie einen Wunsch, ein
+älterer Client übergeht die Liste.
+
+- **Automatisch** (Vorgabe): Der Host streamt seinen Hauptbildschirm — auf dem Mac
+  den mit der Menüleiste, auf Windows den Monitor, den Windows als primär führt —
+  und folgt ihm, wenn er wechselt, ohne Neustart und ohne neuen Zuschauer. Der
+  Anlass: Am 26.09. war am Mac mini ein Monitor angeschlossen worden und
+  Hauptbildschirm geworden; der Host streamte weiter den beim Start gewählten
+  virtuellen Bildschirm, auf dem kein Fenster lag — das Bild war leer, Maus und
+  Tastatur schienen tot.
+- **Fest**: Der Host streamt den gewählten Bildschirm, erkannt an einer stabilen
+  Kennung (Mac `v<Vendor>-m<Model>-s<Serial>`, bei zwei gleichen mit `-u<Unit>`;
+  Windows der zweite Teil der Geräte-ID des Monitors wie `ACR0501`, bei zwei
+  gleichen mit `-<Listenplatz>`), nie an einem Listenplatz. Fällt er weg, streamt
+  der Host den Hauptbildschirm als Ausweichplatz — im Menü steht dann in Amber
+  „<Kennung> nicht angeschlossen – Ausweichplatz: <Name>“ —, kommt er zurück,
+  wechselt der Host von selbst zurück. Der Wunsch gilt hostweit (ein Strom, der
+  letzte Wunsch gewinnt) und bleibt, bis jemand etwas anderes wählt: er steht in
+  `bildschirm.txt` im Ablageordner des Hosts, eine Zeile, `auto` oder die Kennung.
+  Fehlt sie oder ist sie kaputt, gilt Automatik; eine kaputte Datei wird nie still
+  ersetzt.
+- `--display N` (Mac) bzw. `--output n` (Windows-Host-Rolle) pinnt für diesen Lauf
+  den Bildschirm am Listenplatz N (`--list` zeigt ihn samt Kennung und Name), ohne
+  die Datei zu ändern; ein Wunsch aus dem Menü überschreibt den Pin und wird
+  gespeichert.
+
+Einen Monitorwechsel meldet macOS dem Mac-Host sofort; er bewertet 300 ms nach der
+letzten Meldung neu (entprellt: drei Meldungen kurz nacheinander sind ein Wechsel).
+Die Windows-Host-Rolle zählt ihre Ausgänge alle 2 s neu auf, nach einem Verlust der
+Duplication sofort. Der Wechsel selbst läuft wie ein Codecwechsel: alter Strom
+anhalten, neuer Strom auf dem Zielbildschirm, an den Zuschauer erst Nachricht 7
+(SWITCH mit dem laufenden Codec, damit der Client den Decoder neu baut), dann 1
+(INFO mit den Maßen), dann das erste Bild als Vollbild, danach die neue Liste
+(Nachricht 12); die Maus folgt dem Bild, das Bild steht kurz still. Hat der neue
+Bildschirm eine andere Größe, entsteht der Encoder neu; der Client baut auch bei
+einer INFO mit neuen Maßen seinen Decoder neu und wartet auf das Vollbild. Läuft
+gerade ein Codecwechsel, wartet der Bildschirmwechsel, bis er fertig ist (der
+Mac-Host nach 5 s trotzdem).
+
+Im Protokoll beider Hosts steht `Bildschirmwechsel: <alt> -> <neu> (<Grund>)` mit
+`Wunsch des Zuschauers`, `Hauptbildschirm gewechselt`, `Ausweichplatz` oder `zurueck
+zum gewuenschten Bildschirm`. Alle Zeilen, die Nachrichten 12 und 70 im Einzelnen
+und der Prüfmodus (`--bildschirm <Kennung|auto>`, Feld „Strom“ in der Statuszeile)
+stehen in `BENUTZUNG.txt`.
 
 ## Dateien über die Zwischenablage
 
@@ -264,7 +321,13 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
   Codecwechsel mit Formatwechsel, alles mit fester Bildrate) der Codecwechsel bei
   wirklich stillem Bildschirm, der Zuschauerwechsel mit Nachricht 10, das Nachreichen
   bei stillem Bildschirm, Tonformat mit 44,1 kHz, Ablageverwalter, beschädigte
-  Freigabeliste;
+  Freigabeliste; die Bildschirmwahl am Gerät: bei der Windows-Host-Rolle der
+  Wechsel selbst (Duplication neu, Switch, Info, Vollbild, Liste danach; bei
+  gleicher Größe bleibt der Encoder auf dem Prozessorweg stehen) — er braucht zwei
+  echte Ausgänge, die VM hat einen, belegt sind die reinen Teile in Unit-Tests —,
+  dort auch Kennung, Name und Bildrate aus echten Monitoren; beim Mac-Host der
+  Hauptbildschirmwechsel live samt Namen aus AppKit, den `hosttest` mit Attrappen
+  für Liste und Strom belegt;
   der Windows-Client mit zwei NVIDIA-Karten, bei Tonverlust, mit einem Tongerät,
   das erst nach dem Verbinden dazukommt, und auf einem frischen Windows ohne
   Visual-C++-Laufzeit; der Mac-Client mit Handoff und Ablageverwaltern.
@@ -304,17 +367,17 @@ Fingerabdrücke, verschlüsselter Austausch in beide Richtungen.
 - Kopplungsdialog in der Oberfläche statt Kommandozeilenschalter
 - Rollenwahl (Windows als Host): `--host` ist da (Zuschauerplatz, Kopplung, Bekanntgabe,
   Eingaben, Zwischenablage samt Dateien, Desktop Duplication, Encoder über NVENC bzw.
-  ohne NVIDIA H.264 in Software, Schrittmacher, Codecwechsel, Testbild, Ton,
-  Zeigerform, Last, Wachhalten), dazu `--list`, `--messen` und die Konserve als
-  Prüfweg. Es fehlen AMF/QSV, HDR-Ausgänge, Skalieren und Drehen auf der Karte
-  (beides läuft heute über den Prozessor), die Bildschirmwahl im Menü und ein
-  Menüeintrag "Diesen Rechner freigeben". Beschreibung in `BENUTZUNG.txt`.
+  ohne NVIDIA H.264 in Software, Schrittmacher, Codecwechsel, Bildschirmwahl mit
+  Umschalten, Testbild, Ton, Zeigerform, Last, Wachhalten), dazu `--list`, `--messen`
+  und die Konserve als Prüfweg. Es fehlen AMF/QSV, HDR-Ausgänge, Skalieren und
+  Drehen auf der Karte (beides läuft heute über den Prozessor) und ein Menüeintrag
+  "Diesen Rechner freigeben". Beschreibung in `BENUTZUNG.txt`.
 - AV1: Kein Host bietet ihn an, bis Protokoll und Client ihn kennen
 - Tonkomprimierung als Wahlmöglichkeit; unkomprimiert braucht mehr Bandbreite als das Bild
 - Virtuelles Mikrofon auf dem Host, damit Programme dort den Client hören
 - Mehrere Zuschauer gleichzeitig
-- Auflösungswechsel im laufenden Betrieb (der Client meldet seine Fenstergröße, der Host stellt den Strom um)
-- Bildschirmwahl im Menü statt nur beim Start
+- Stromgröße nach Wunsch des Clients (er meldet seine Fenstergröße, der Host stellt den Strom um);
+  heute wechselt die Größe nur mit dem Bildschirm des Hosts, und der Client folgt ihr
 - Anzeige: Wahl Sofort/Bildsynchron im Menü, frisches Fenster nach Geräteverlust; ab 4K der Null-Kopien-Weg (NVDEC-Bild bleibt auf der Karte)
 - D3D11VA ohne Kopie: das decodierte Bild bleibt auf der Karte, die zeichnet (heute eine Kopie über den Prozessor)
 - Später als Zusatz denkbar: beide Bildschirme des Hosts auf Wunsch streamen; ein Relay, an das sich weitere Zuschauer heften (Bild und Ton, ohne Eingabe)
@@ -427,6 +490,15 @@ Ablageordner fassen die Tests nie an: Schlüssel, Einstellungen, `protokoll.txt`
 `APPDATA` muss also nicht umgelenkt werden. Empfangene Dateien schreiben die Tests
 in `qc-test-<pid>-ablage` bzw. `qc-test-<pid>-host-ablage`, ebenfalls im
 Temp-Ordner, nie in `QuadChroma-Ablage`.
+Zur Bildschirmwahl prüfen die Rust-Tests die Prüfvektoren der Nachrichten 12 und 70
+(`bildschirm.rs`), im Client die Sitzung gegen einen Scheinhost (Bit 1, Liste, Wunsch
+samt Hinweis und Nachreichen, eine Strominfo mit neuer Größe baut den Decoder neu,
+Rücksetzen am Sitzungsende) und die Texte in allen 29 Sprachen, in der
+Windows-Host-Rolle die reine Wahl (Automatik folgt dem Hauptbildschirm, Wunsch,
+Ausweichplatz, Rückkehr, Gründe), Kennung und Name aus der Geräte-ID,
+`bildschirm.txt` samt Resten, Nachricht 12 erst nach dem Aufbau, die Win32-Wege der
+Liste, den Wunsch über den echten Eingabekanal und die Begrüßung mit Fähigkeiten 3
+und Liste 12.
 
 Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Netz:
 `quadchroma.exe --tray-selbsttest` (braucht eine Sitzung mit Explorer) bzw.
@@ -434,11 +506,14 @@ Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Net
 
 ## Aufbau
 
-    host/        Mac: Aufnahme, Encoder, Netz, Eingaben, Ton, Zwischenablage, Dateien (dateien.m), Zeigerform
+    host/        Mac: Aufnahme, Encoder, Netz, Eingaben, Ton, Zwischenablage, Dateien (dateien.m),
+                 Bildschirmwahl (bildschirm.m), Zeigerform
     client/      Windows: Empfang, Decodieren, Anzeige (anzeige.rs: Direct3D 11), Eingaben, Ton, Zwischenablage;
-                 Dateien (dateien.rs, gemeinsam mit der Host-Rolle), Infobereich bzw. Menüleiste (tray*.rs),
-                 Einzelinstanz (einzel.rs), Desktop-Verknüpfung (verknuepfung.rs), Programmsymbol (logo.rs);
-                 dazu die Host-Rolle (client/src/host/: Aufnahme, Encoder, Netz, Eingaben, Ton, Zeigerform)
+                 Dateien (dateien.rs) und Bildschirmliste (bildschirm.rs), beide gemeinsam mit der Host-Rolle,
+                 Infobereich bzw. Menüleiste (tray*.rs), Einzelinstanz (einzel.rs),
+                 Desktop-Verknüpfung (verknuepfung.rs), Programmsymbol (logo.rs);
+                 dazu die Host-Rolle (client/src/host/: Aufnahme mit Bildschirmwahl, Encoder, Netz, Eingaben,
+                 Ton, Zeigerform)
     Makefile     baut und signiert das App-Bündel
 
 Der Host ist in C und Objective-C geschrieben, der Client in Rust.
