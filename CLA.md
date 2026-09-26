@@ -23,7 +23,7 @@ Project: QuadChroma, https://github.com/quadchroma-tech/quadchroma
 ## 1. Why this Agreement exists, and why it works per contribution
 
 QuadChroma is published under the PolyForm Strict License 1.0.0 with the Licensor's
-Additional Terms (`LICENSE.md`). That licence lets people use the software, but not
+Additional Terms (`LICENSE.txt`). That licence lets people use the software, but not
 change it, distribute it or sublicense it. A contribution offered "under the project
 licence" would therefore give the Licensor nothing he could merge, build and ship. The
 Licensor also wants to offer QuadChroma under other terms - free of charge to private
@@ -56,7 +56,7 @@ pull request are enough. Copyright itself cannot be transferred under German law
   based on it.
 - **"Project License"** means the licence under which the Licensor publishes the Project
   on the Submission Date: today the PolyForm Strict License 1.0.0 together with the
-  Licensor's Additional Terms, as reproduced in `LICENSE.md`.
+  Licensor's Additional Terms, as reproduced in `LICENSE.txt`.
 - **"Contribution"** means any work of authorship - source code, documentation,
   translations, images, test data, build or CI scripts or anything else protected by
   copyright or related rights - that You intentionally Submit to the Licensor for
@@ -279,10 +279,10 @@ origin (project, URL, version, authors) and its licence;
 distribution and sublicensing under the Project License and under commercial and
 proprietary terms without any source-disclosure or copyleft obligation (for example
 MIT, BSD-2-Clause, BSD-3-Clause, ISC, Apache-2.0, Zlib, 0BSD, CC0-1.0, or the licences
-already listed in `THIRD_PARTY_NOTICES.md`); and
+already listed in `THIRD_PARTY_NOTICES.txt`); and
 
 (c) is accompanied by the notices its licence requires, added to
-`THIRD_PARTY_NOTICES.md` in the same Submission.
+`THIRD_PARTY_NOTICES.txt` in the same Submission.
 
 Material under the GPL, LGPL, AGPL, MPL, EPL, SSPL or any other copyleft licence, under
 a non-commercial-only or another third party's source-available licence, or of unclear
@@ -360,7 +360,7 @@ without a general place of jurisdiction in Germany, the courts of the Federal Re
 of Germany have exclusive jurisdiction over all disputes arising from or in connection
 with this Agreement, and the competent court is the court having jurisdiction for the
 Licensor's seat or, absent a seat, the Licensor's place of residence at the time the
-action is brought (the same rule as in `LICENSE.md`). For all other contributors the
+action is brought (the same rule as in `LICENSE.txt`). For all other contributors the
 statutory rules on jurisdiction apply.
 
 **11.4 Language.** This Agreement is written in English and is to be interpreted in the
@@ -396,7 +396,7 @@ Agreement is not a waiver of that provision.
 Parts of this Agreement are adapted from the Individual Contributor License Agreement
 V2.2 of The Apache Software Foundation (https://www.apache.org/licenses/icla.pdf,
 Copyright (c) The Apache Software Foundation, licensed under the Apache License,
-Version 2.0; a copy of that licence is in `THIRD_PARTY_NOTICES.md`) - in particular the
+Version 2.0; a copy of that licence is in `THIRD_PARTY_NOTICES.txt`) - in particular the
 definition of "Contribution", the patent licence in Section 5 and the representations in
 Section 7 - and from the Harmony Individual Contributor License Agreement, Version 1.0
 (https://www.harmonyagreements.org/, licensed under the Creative Commons Attribution 3.0

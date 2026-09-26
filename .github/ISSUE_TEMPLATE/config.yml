@@ -5,9 +5,9 @@ contact_links:
   - name: Security vulnerability
     url: https://github.com/quadchroma-tech/quadchroma/blob/main/SECURITY.md
     about: Please do not report security problems in a public issue. SECURITY.md describes private reporting on GitHub and the e-mail channel.
-  - name: Commercial licence or use beyond LICENSE.md
+  - name: Commercial licence or use beyond LICENSE.txt
     url: mailto:hello@quadchroma.tech?subject=QuadChroma%20commercial%20licence
-    about: Business use, embedding, or any permission that LICENSE.md does not give - write to hello@quadchroma.tech.
+    about: Business use, embedding, or any permission that LICENSE.txt does not give - write to hello@quadchroma.tech.
   - name: Questions about using QuadChroma
     url: https://github.com/quadchroma-tech/quadchroma/blob/main/README.en.md
     about: README.en.md covers setup, pairing, the client and the Windows host role; BENUTZUNG.txt (German) is the full reference. Still stuck? E-mail hello@quadchroma.tech.

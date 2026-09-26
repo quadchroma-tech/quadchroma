@@ -37,7 +37,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # Die FFmpeg-Quellen (Version, Pruefsummen) stehen in scripts/build-ffmpeg-windows.sh;
-  # ausgeliefert werden nur avcodec-63.dll und avutil-61.dll (THIRD_PARTY_NOTICES.md, 2).
+  # ausgeliefert werden nur avcodec-63.dll und avutil-61.dll (THIRD_PARTY_NOTICES.txt, 2).
 
 jobs:
   vorpruefung:
@@ -219,7 +219,7 @@ jobs:
           "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
           "$llvm" >> $env:GITHUB_PATH
           # Nur die zwei DLLs, die quadchroma.exe laedt, und die Bauangaben (Groesse und
-          # SHA-256 jeder DLL, Konfiguration) - THIRD_PARTY_NOTICES.md verweist darauf.
+          # SHA-256 jeder DLL, Konfiguration) - THIRD_PARTY_NOTICES.txt verweist darauf.
           $ziel = Join-Path $env:RUNNER_TEMP 'dlls'
           New-Item -ItemType Directory -Force -Path $ziel | Out-Null
           foreach ($name in 'avcodec-63.dll', 'avutil-61.dll') {
@@ -367,19 +367,15 @@ jobs:
         run: |
           set -euo pipefail
           d="stage/quadchroma-$VERSION"
-          # Die vier Begleitdateien sind Pflicht (Lizenz- und Hinweistexte gehoeren in jedes
-          # verteilte Paket; LICENSE.md und THIRD_PARTY_NOTICES.md muessen vor dem ersten
-          # Release-Tag auf main liegen). Fehlt eine, endet der Job mit dem Dateinamen als
-          # Fehler - dieselbe Regel wie make dmg DMG_EXTRA_REQUIRED=1 im macOS-Job.
-          for f in LICENSE.md THIRD_PARTY_NOTICES.md README.en.md BENUTZUNG.txt; do
-            [ -f "$f" ] || { echo "::error::Begleitdatei $f fehlt im Repository - ohne sie kein Windows-Paket"; exit 1; }
-            cp "$f" "$d/"
-          done
+          # Die vier Begleitdateien sind Pflicht und im Paket alle .txt (README.txt aus
+          # README.en.md) - dasselbe Skript wie make dmg im macOS-Job. Fehlt eine Quelle,
+          # endet der Job mit dem Dateinamen als Fehler.
+          scripts/package-texts.sh "$d" 1
           # Inhalt pruefen: exe, zwei DLLs, FFmpeg-Bauangaben, vier Begleitdateien - nicht
           # mehr, nicht weniger.
           # Sollliste in C-Sortierung (Grossbuchstaben vor Kleinbuchstaben); die Istliste wird
           # mit LC_ALL=C genauso sortiert, unabhaengig von der Locale des Runners.
-          erwartet="BENUTZUNG.txt FFMPEG-BUILDINFO.txt LICENSE.md README.en.md THIRD_PARTY_NOTICES.md avcodec-63.dll avutil-61.dll quadchroma.exe"
+          erwartet="BENUTZUNG.txt FFMPEG-BUILDINFO.txt LICENSE.txt README.txt THIRD_PARTY_NOTICES.txt avcodec-63.dll avutil-61.dll quadchroma.exe"
           ist=$(ls "$d" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
           [ "$ist" = "$erwartet" ] || { echo "::error::Paketinhalt weicht ab: $ist"; exit 1; }
           suffix=""; [ "$SIGNED" = "true" ] || suffix="-unsigned"
@@ -606,7 +602,7 @@ jobs:
             echo
             # FFmpeg-Checkliste (ffmpeg.org/legal.html): dieser Satz auf jeder Seite mit Download.
             quellen="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/ffmpeg-9.0.2.tar.xz"
-            echo "This software uses code of [FFmpeg](https://ffmpeg.org) licensed under the [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html) and its source can be downloaded [here]($quellen). The complete corresponding source of the FFmpeg DLLs is attached to this release: \`ffmpeg-9.0.2.tar.xz\`, \`nv-codec-headers-*.tar.gz\` and \`build-ffmpeg-windows.sh\` (see THIRD_PARTY_NOTICES.md, section 2)."
+            echo "This software uses code of [FFmpeg](https://ffmpeg.org) licensed under the [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html) and its source can be downloaded [here]($quellen). The complete corresponding source of the FFmpeg DLLs is attached to this release: \`ffmpeg-9.0.2.tar.xz\`, \`nv-codec-headers-*.tar.gz\` and \`build-ffmpeg-windows.sh\` (see THIRD_PARTY_NOTICES.txt, section 2)."
             echo
             echo "Verify downloads: sha256sum -c SHA256SUMS.txt (Windows: Get-FileHash -Algorithm SHA256 <file>)."
           } > ../notes.md

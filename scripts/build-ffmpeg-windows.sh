@@ -104,7 +104,7 @@ for b in avcodec avformat avutil; do
     [ -f "$ZIEL/bin/$b.lib" ] && cp "$ZIEL/bin/$b.lib" "$ZIEL/lib/$b.lib"
 done
 
-# Bauangaben fuer THIRD_PARTY_NOTICES.md und zur Nachpruefung.
+# Bauangaben fuer THIRD_PARTY_NOTICES.txt und zur Nachpruefung.
 {
     echo "FFmpeg ${FFMPEG_VERSION} (${FFMPEG_URL}, sha256 ${FFMPEG_SHA256})"
     echo "nv-codec-headers ${NVHDR_COMMIT} (sha256 ${NVHDR_SHA256})"

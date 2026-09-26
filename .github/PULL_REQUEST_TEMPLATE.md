@@ -43,11 +43,11 @@ Fixes #
 
 - [ ] One program per side: no helper process, service, driver or second program.
 - [ ] The mouse pointer stays on the client side.
-- [ ] No new Rust crate: the dependencies in `client/Cargo.toml` and `client/Cargo.lock` are unchanged (or a crate was agreed in the linked issue and its notices are in `THIRD_PARTY_NOTICES.md`).
+- [ ] No new Rust crate: the dependencies in `client/Cargo.toml` and `client/Cargo.lock` are unchanged (or a crate was agreed in the linked issue and its notices are in `THIRD_PARTY_NOTICES.txt`).
 - [ ] New or changed user-interface texts go through a `Key` in `client/src/strings.rs` with an entry in every language table (`strings.rs`, `strings_west.rs`, `strings_north.rs`, `strings_east.rs`, `strings_balt.rs`, `strings_asia.rs`), in enum order; `cargo test` passes `alle_tabellen_in_enum_reihenfolge`.
 - [ ] Code comments and log lines are in German with `ae`, `oe`, `ue`, `ss` instead of umlauts and ß.
 - [ ] No reformatting of code I did not otherwise touch; no `cargo fmt` on whole files.
 - [ ] `host/vendor/monocypher` is untouched.
-- [ ] Third-party code, if any, is marked with origin and licence, is under a permissive licence, and its notice is added to `THIRD_PARTY_NOTICES.md`; nothing under GPL, LGPL, AGPL, MPL, EPL or SSPL, nothing from other remote-desktop projects.
+- [ ] Third-party code, if any, is marked with origin and licence, is under a permissive licence, and its notice is added to `THIRD_PARTY_NOTICES.txt`; nothing under GPL, LGPL, AGPL, MPL, EPL or SSPL, nothing from other remote-desktop projects.
 - [ ] Documentation updated where behaviour changed (`README.en.md`; `README.md` and `BENUTZUNG.txt` in German, or the change is described above for the author to document).
 - [ ] No secrets, keys, `known_hosts*`, recordings or build output in the diff.

@@ -258,9 +258,9 @@ const COPYRIGHT: &str = "© 2026 Robert Brandt";
 const WEBSITE: &str = "quadchroma.tech";
 /// FFmpeg-Hinweis (LGPL 2.1 Abschnitt 6 und Checkliste auf ffmpeg.org/legal):
 /// zeigt das Programm im Betrieb Urheberhinweise, gehoert der von FFmpeg
-/// dazu, samt Verweis auf den Lizenztext - THIRD_PARTY_NOTICES.md liegt
+/// dazu, samt Verweis auf den Lizenztext - THIRD_PARTY_NOTICES.txt liegt
 /// jeder Weitergabe bei. Wie COPYRIGHT ein Rechtshinweis, nicht uebersetzt.
-const FFMPEG_HINWEIS: &str = "Uses libraries from the FFmpeg project under the LGPLv2.1 · THIRD_PARTY_NOTICES.md";
+const FFMPEG_HINWEIS: &str = "Uses libraries from the FFmpeg project under the LGPLv2.1 · THIRD_PARTY_NOTICES.txt";
 
 /// Die Projektseite im Standardbrowser oeffnen. Wir starten nichts selbst,
 /// sondern reichen die Adresse an das System weiter - das ist der einzige Weg,

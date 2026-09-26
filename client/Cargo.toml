@@ -7,11 +7,11 @@ description = "QuadChroma remote desktop (HEVC 4:4:4): Windows client and host r
 homepage = "https://quadchroma.tech"
 repository = "https://github.com/quadchroma-tech/quadchroma"
 # PolyForm Strict 1.0.0 samt den Zusatzbedingungen des Lizenzgebers; der
-# Wortlaut steht in LICENSE.md im Wurzelverzeichnis. Kein crates.io-Paket.
+# Wortlaut steht in LICENSE.txt im Wurzelverzeichnis. Kein crates.io-Paket.
 # PolyForm Strict steht nicht auf der SPDX-Lizenzliste (dort nur Noncommercial
 # und Small Business), deshalb beide Teile als LicenseRef- (SPDX 2.3, Lizenzen
 # ausserhalb der Liste): der Ausdruck bleibt fuer cargo-deny, cargo-about und
-# REUSE maschinenlesbar. Derselbe Bezeichner gehoert in LICENSE.md und in
+# REUSE maschinenlesbar. Derselbe Bezeichner gehoert in LICENSE.txt und in
 # etwaige SPDX-Kopfzeilen.
 license = "LicenseRef-PolyForm-Strict-1.0.0 AND LicenseRef-QuadChroma-Additional-Terms-1.0"
 publish = false

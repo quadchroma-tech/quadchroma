@@ -1740,7 +1740,7 @@ FFmpeg-Projekts unter der LGPLv2.1, als eigenstaendige Dateien
 eingebunden und austauschbar. Sie entstehen mit
 scripts/build-ffmpeg-windows.sh aus dem unveraenderten FFmpeg 9.0.2 ohne
 Fremdbibliotheken; die Quellen haengen an jedem Release, Einzelheiten
-und alle Lizenztexte stehen in THIRD_PARTY_NOTICES.md. Direct3D, DXGI und
+und alle Lizenztexte stehen in THIRD_PARTY_NOTICES.txt. Direct3D, DXGI und
 der Shader-Uebersetzer (d3dcompiler_47.dll) sind Bestandteile von
 Windows, nichts davon wird mitgeliefert.
 

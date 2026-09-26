@@ -6,7 +6,7 @@
 
 This file accompanies every binary distribution of QuadChroma (the Windows ZIP and the macOS DMG/ZIP) and is kept unchanged in the source repository. It lists every third-party component contained in, or shipped next to, the distributed binaries, states the license each component is under, reproduces the license texts verbatim and records where the exact source code of the FFmpeg libraries comes from.
 
-The third-party components are **not** licensed under QuadChroma's own license (`LICENSE.md`, PolyForm Strict 1.0.0 plus Additional Terms). Each of them is governed solely by its own license as reproduced below; the Additional Terms in `LICENSE.md` say so expressly and do not restrict modifying or replacing the LGPL-licensed FFmpeg libraries or reverse engineering for debugging such modifications. Nothing in this file grants any right in QuadChroma itself.
+The third-party components are **not** licensed under QuadChroma's own license (`LICENSE.txt`, PolyForm Strict 1.0.0 plus Additional Terms). Each of them is governed solely by its own license as reproduced below; the Additional Terms in `LICENSE.txt` say so expressly and do not restrict modifying or replacing the LGPL-licensed FFmpeg libraries or reverse engineering for debugging such modifications. Nothing in this file grants any right in QuadChroma itself.
 
 Conventions: SPDX identifiers are used for license names; where a component offers a choice of licenses, the line *applied* states which option QuadChroma takes. Verbatim texts are shown in fenced blocks and were copied from the upstream repository at the revision that was actually built (the source URL is given above each block; the URL points to the pinned commit or tag). SHA-256 values are lower-case hexadecimal.
 
@@ -37,7 +37,7 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 | `FFMPEG-BUILDINFO.txt` | Windows | - | Sizes and SHA-256 of the two DLLs and the exact build configuration. | 2.2 |
 | `QuadChroma.app` | macOS 14 or later | Objective-C/C (host) | Monocypher (vendored), Apple system frameworks. No FFmpeg, no Rust. | 4 |
 
-The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.md`, this file, `README.en.md` and `BENUTZUNG.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
+The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the English README) and `BENUTZUNG.txt` (German manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
 
 **Not distributed as a binary: the Mac client.** The Mac client is built from the same Rust source as the Windows program (section 5), but its binary links the FFmpeg installed by Homebrew (`/opt/homebrew/opt/ffmpeg`), and that FFmpeg is a GPL build (it contains libx264 and libx265). A Mac client binary is therefore not distributed. Distributing one would require an FFmpeg built without GPL parts, in the same way as section 2 describes for Windows.
 
@@ -56,7 +56,7 @@ The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINF
 
 Robert Brandt does not own FFmpeg. Its copyright holders are the FFmpeg developers named in the FFmpeg source (`CREDITS`, `MAINTAINERS` and the version history at <https://git.ffmpeg.org/ffmpeg.git>).
 
-`quadchroma.exe` is not licensed under the LGPL. It is a "work that uses the Library" in the sense of section 5 of the LGPL v2.1 and is combined with the FFmpeg libraries only at run time, through Windows' dynamic linking of the DLLs named above (section 6(b)). QuadChroma's own license (`LICENSE.md`) does not restrict any right the LGPL gives you: you may modify the FFmpeg libraries for your own use, replace the DLLs with modified versions (2.4), and reverse engineer QuadChroma to the extent necessary to debug such modifications.
+`quadchroma.exe` is not licensed under the LGPL. It is a "work that uses the Library" in the sense of section 5 of the LGPL v2.1 and is combined with the FFmpeg libraries only at run time, through Windows' dynamic linking of the DLLs named above (section 6(b)). QuadChroma's own license (`LICENSE.txt`) does not restrict any right the LGPL gives you: you may modify the FFmpeg libraries for your own use, replace the DLLs with modified versions (2.4), and reverse engineer QuadChroma to the extent necessary to debug such modifications.
 
 ### 2.2 How the FFmpeg DLLs were built
 
@@ -2876,7 +2876,7 @@ SOFTWARE.
 
 Applies to (0.5-series releases): block2 0.5.1, objc-sys 0.3.5, objc2 0.5.2, objc2-app-kit 0.2.2, objc2-foundation 0.2.2.
 
-For the 0.6-series releases the repository's `LICENSE.md` at the tags `objc2-0.6.4` and `objc2-encode-4.1.0` states that `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are licensed under the MIT license and all other crates under Zlib OR Apache-2.0 OR MIT, but links to the generic MIT text and names no copyright holder. The maintainer and author per Cargo.toml is Mads Marquart <mads@marquart.dk>; the current `LICENSE-MIT.txt` on master reads:
+For the 0.6-series releases the repository's `LICENSE.txt` at the tags `objc2-0.6.4` and `objc2-encode-4.1.0` states that `objc2`, `block2`, `objc2-foundation` and `objc2-encode` are licensed under the MIT license and all other crates under Zlib OR Apache-2.0 OR MIT, but links to the generic MIT text and names no copyright holder. The maintainer and author per Cargo.toml is Mads Marquart <mads@marquart.dk>; the current `LICENSE-MIT.txt` on master reads:
 
 ```text
 Copyright 2026 Mads Marquart
@@ -2908,17 +2908,17 @@ DEALINGS IN THE SOFTWARE.
 
 Applies to (0.6-series releases): objc2 0.6.4, objc2-core-foundation 0.3.2, objc2-core-graphics 0.3.2, objc2-encode 4.1.0, objc2-foundation 0.3.2, objc2-quartz-core 0.3.2.
 
-Note from the upstream `LICENSE.md` (both tags): the crates are derived from Apple SDKs shipped with Xcode; using them requires the Xcode SDK, whose license (https://www.apple.com/legal/sla/docs/xcode.pdf) the builder has accepted. This affects only builders of the Mac client, not recipients of a binary (none is distributed).
+Note from the upstream `LICENSE.txt` (both tags): the crates are derived from Apple SDKs shipped with Xcode; using them requires the Xcode SDK, whose license (https://www.apple.com/legal/sla/docs/xcode.pdf) the builder has accepted. This affects only builders of the Mac client, not recipients of a binary (none is distributed).
 
 - **block2 0.5.1**: The crate ships no license file. `license = "MIT"` in Cargo.toml. Copyright line taken from LICENSE.txt at the upstream release tag `block2-0.5.1` (https://github.com/madsmtm/objc2). Authors per Cargo.toml: Steven Sheldon, Mads Marquart <mads@marquart.dk>.
 - **objc-sys 0.3.5**: The crate ships no license file. `license = "MIT"`. Copyright line from LICENSE.txt at the upstream release tag `objc-sys-0.3.5` (https://github.com/madsmtm/objc2). Author per Cargo.toml: Mads Marquart <mads@marquart.dk>.
 - **objc2 0.5.2**: The crate ships no license file. `license = "MIT"`. Copyright line from LICENSE.txt at the upstream release tag `objc2-0.5.2`. Authors per Cargo.toml: Steven Sheldon, Mads Marquart <mads@marquart.dk>.
 - **objc2-app-kit 0.2.2**: The crate ships no license file. `license = "MIT"` (Cargo.toml). Released in the objc2 0.5 series (depends on objc2 0.5), whose release tag `objc2-0.5.2` carries LICENSE.txt "Copyright (c) Steven Sheldon"; maintainer Mads Marquart. Derived from Apple SDK headers, see the objc2 note below.
 - **objc2-foundation 0.2.2**: The crate ships no license file. `license = "MIT"`. Released in the objc2 0.5 series; see objc2-app-kit 0.2.2.
-- **objc2 0.6.4**: The crate ships no license file. `license = "MIT"`. At the release tag `objc2-0.6.4` the repository's LICENSE.md only links to the MIT text and names no holder; the current LICENSE-MIT.txt on master reads "Copyright 2026 Mads Marquart" (fetched 2026-09-26). Author per Cargo.toml: Mads Marquart <mads@marquart.dk>.
+- **objc2 0.6.4**: The crate ships no license file. `license = "MIT"`. At the release tag `objc2-0.6.4` the repository's LICENSE.txt only links to the MIT text and names no holder; the current LICENSE-MIT.txt on master reads "Copyright 2026 Mads Marquart" (fetched 2026-09-26). Author per Cargo.toml: Mads Marquart <mads@marquart.dk>.
 - **objc2-core-foundation 0.3.2**: `license = "Zlib OR Apache-2.0 OR MIT"`; MIT chosen. No license file in the crate; no holder named at the objc2 0.6 release tags; maintainer Mads Marquart (master LICENSE-MIT.txt: "Copyright 2026 Mads Marquart"). Derived from Apple SDK headers.
 - **objc2-core-graphics 0.3.2**: `license = "Zlib OR Apache-2.0 OR MIT"`; MIT chosen. No license file in the crate; see objc2-core-foundation.
-- **objc2-encode 4.1.0**: The crate ships no license file. `license = "MIT"`. At the release tag `objc2-encode-4.1.0` the repository's LICENSE.md names no holder. Author per Cargo.toml: Mads Marquart <mads@marquart.dk>.
+- **objc2-encode 4.1.0**: The crate ships no license file. `license = "MIT"`. At the release tag `objc2-encode-4.1.0` the repository's LICENSE.txt names no holder. Author per Cargo.toml: Mads Marquart <mads@marquart.dk>.
 - **objc2-foundation 0.3.2**: The crate ships no license file. `license = "MIT"` (Cargo.toml.orig notes that future contributions are Zlib OR Apache-2.0 OR MIT). Released in the objc2 0.6 series; see objc2 0.6.4.
 - **objc2-quartz-core 0.3.2**: `license = "Zlib OR Apache-2.0 OR MIT"`; MIT chosen. No license file in the crate; see objc2-core-foundation.
 
@@ -4338,5 +4338,5 @@ Source: <https://www.apache.org/licenses/LICENSE-2.0.txt> (text as contained in 
 
 ---
 
-End of THIRD_PARTY_NOTICES.md (generated 26 September 2026 from the primary sources named above; QuadChroma - Robert Brandt - hello@quadchroma.tech).
+End of THIRD_PARTY_NOTICES.txt (generated 26 September 2026 from the primary sources named above; QuadChroma - Robert Brandt - hello@quadchroma.tech).
 

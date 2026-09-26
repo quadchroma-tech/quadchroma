@@ -533,12 +533,12 @@ Das Symbol im Infobereich bzw. in der Menüleiste prüft ein Selbsttest ohne Net
 
 Alle Rechtstexte und die Dateien für GitHub sind englisch:
 
-- `LICENSE.md` – PolyForm Strict License 1.0.0 im Wortlaut, dazu die Zusatzbedingungen
+- `LICENSE.txt` – PolyForm Strict License 1.0.0 im Wortlaut, dazu die Zusatzbedingungen
   des Lizenzgebers: nur persönliche, nichtkommerzielle Nutzung (jede Nutzung in oder für
   Unternehmen, Behörden und andere Organisationen ist kommerziell, auch intern), kein
   Einbetten in andere Produkte, Geräte oder Dienste, keine Weitergabe, keine
   Bearbeitung. Kommerzielle Lizenzen auf Anfrage an hello@quadchroma.tech.
-- `THIRD_PARTY_NOTICES.md` – alle Fremdanteile der verteilten Programme mit ihren
+- `THIRD_PARTY_NOTICES.txt` – alle Fremdanteile der verteilten Programme mit ihren
   Lizenztexten: FFmpeg (LGPL 2.1, eigener Bau, Quellen und schriftliches Angebot),
   die NVIDIA-Header, die Compiler-Laufzeit, die Rust-Crates je Ziel, Monocypher.
 - `CLA.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,

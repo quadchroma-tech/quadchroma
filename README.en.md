@@ -311,7 +311,7 @@ test otherwise reads and writes the real clipboard.
     README.md      full documentation, German
     BENUTZUNG.txt  usage reference for client and Windows host role, German
     *.png          screenshots used by the documentation
-    LICENSE.md, THIRD_PARTY_NOTICES.md, CLA.md, CONTRIBUTING.md, SECURITY.md,
+    LICENSE.txt, THIRD_PARTY_NOTICES.txt, CLA.md, CONTRIBUTING.md, SECURITY.md,
     CODE_OF_CONDUCT.md   licence and community files, see below
 
 Code comments are in German.
@@ -328,7 +328,7 @@ signing and notarization for the Mac host and a signature for the Windows exe.
 ## License
 
 QuadChroma is source-available, not open source. The project is licensed under the
-**PolyForm Strict License 1.0.0**, reproduced unchanged in `LICENSE.md`, together
+**PolyForm Strict License 1.0.0**, reproduced unchanged in `LICENSE.txt`, together
 with **Additional Terms of the licensor** in the same file. In short:
 
 - You may use QuadChroma for personal, noncommercial purposes.
@@ -338,7 +338,7 @@ with **Additional Terms of the licensor** in the same file. In short:
 - Any commercial or business use, including purely internal use within a company,
   requires a separate licence from the licensor.
 
-This summary is for orientation only and has no legal effect; `LICENSE.md` is the
+This summary is for orientation only and has no legal effect; `LICENSE.txt` is the
 binding text. Commercial licences and other permissions are available on request:
 hello@quadchroma.tech.
 
@@ -350,7 +350,7 @@ be replaced by another build of the same FFmpeg version. The FFmpeg source is at
 to every release that contains the Windows package and available at https://ffmpeg.org.
 The Mac host contains Monocypher (BSD-2-Clause OR CC0-1.0). The licences of these
 components and of the Rust crates per target, together with the FFmpeg build details,
-the source references and a written offer, are collected in `THIRD_PARTY_NOTICES.md`.
+the source references and a written offer, are collected in `THIRD_PARTY_NOTICES.txt`.
 
 Contributions are accepted only under the Contributor License Agreement in `CLA.md`,
 which lets the licensor offer the project under other terms as well; see

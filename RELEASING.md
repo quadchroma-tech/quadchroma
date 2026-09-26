@@ -2,7 +2,7 @@
 
 How a release is built, signed, notarized and published; what has to be set up
 once (and by whom); and what users still see after everything is signed. The
-licence texts are `LICENSE.md` and `THIRD_PARTY_NOTICES.md`; the German user
+licence texts are `LICENSE.txt` and `THIRD_PARTY_NOTICES.txt`; the German user
 manual is `BENUTZUNG.txt`; the build scripts referenced here are the `Makefile`
 (Mac host), `scripts/sign-windows.ps1` (Windows signing) and the two workflows
 under `.github/workflows/`.
@@ -320,14 +320,14 @@ agree; the `vorpruefung` job refuses the release otherwise.
    `QC_RESSOURCEN_PFLICHT=1` (a runner without `rc.exe`/`llvm-rc` fails at
    once), and `ci.yml` checks that the embedded `ProductVersion` equals the
    crate version.
-5. `THIRD_PARTY_NOTICES.md` (section 2) must describe the FFmpeg build that
+5. `THIRD_PARTY_NOTICES.txt` (section 2) must describe the FFmpeg build that
    `scripts/build-ffmpeg-windows.sh` produces: FFmpeg version, SHA-256 of the two
    source archives and the configure line. If you change the script, update
    section 2 in the same commit. The release workflow builds FFmpeg fresh with
    the script, ships `avcodec-63.dll`, `avutil-61.dll` and
    `FFMPEG-BUILDINFO.txt`, and attaches the source archives and the script to
    the release (LGPL v2.1 section 6).
-6. The four companion files `LICENSE.md`, `THIRD_PARTY_NOTICES.md`,
+6. The four companion files `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`,
    `README.en.md` and `BENUTZUNG.txt` exist in the repository root on `main`
    (the first two come from the licensing work and must land before the first
    release tag). Both packaging paths refuse to package without them: the
@@ -410,7 +410,7 @@ Three details of the Makefile worth knowing. `IDENT` may also be the
 a hash as a Developer ID (adds `--timestamp`, `make release` accepts it) - if a
 hash ever belongs to a non-Apple certificate, pass `TIMESTAMP=` (empty). Before
 uploading anything, `make release` checks the identity, the timestamp option and
-the four companion files (`LICENSE.md`, `THIRD_PARTY_NOTICES.md`, `README.en.md`,
+the four companion files (`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` made from `README.en.md`,
 `BENUTZUNG.txt`) and stops with `FEHLER:` if one is missing. And an explicitly
 given `IDENT` is enforced: `make IDENT=...` (likewise `make verify`, `make zip`,
 `make dmg` with `IDENT=...`) re-signs the existing app without rebuilding when
@@ -459,7 +459,7 @@ verify. SimplySign asks for the OTP when signtool touches the key. Then build
 the ZIP with the layout of section 7 (top-level folder `quadchroma-X.Y.Z/`, the
 exe, `avcodec-63.dll`, `avutil-61.dll` and `BUILDINFO.txt` renamed to
 `FFMPEG-BUILDINFO.txt` from the output of `scripts/build-ffmpeg-windows.sh`,
-`LICENSE.md`, `THIRD_PARTY_NOTICES.md`, `README.en.md`, `BENUTZUNG.txt`), and
+`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` and `BENUTZUNG.txt`, as written by `scripts/package-texts.sh`), and
 publish the files in its `quellen/` folder (`ffmpeg-9.0.2.tar.xz`, the
 nv-codec-headers archive and `build-ffmpeg-windows.sh`) on the same release
 page.
@@ -588,10 +588,10 @@ at least 30 days old).
 
 | File | Contents |
 |---|---|
-| `quadchroma-X.Y.Z-windows-x64.zip` (`-unsigned` if not signed) | folder `quadchroma-X.Y.Z/` with `quadchroma.exe`, `avcodec-63.dll`, `avutil-61.dll` (FFmpeg 9.0.2, minimal LGPL build by `scripts/build-ffmpeg-windows.sh`), `FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two DLLs), `LICENSE.md`, `THIRD_PARTY_NOTICES.md`, `README.en.md`, `BENUTZUNG.txt` |
+| `quadchroma-X.Y.Z-windows-x64.zip` (`-unsigned` if not signed) | folder `quadchroma-X.Y.Z/` with `quadchroma.exe`, `avcodec-63.dll`, `avutil-61.dll` (FFmpeg 9.0.2, minimal LGPL build by `scripts/build-ffmpeg-windows.sh`), `FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two DLLs), `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `BENUTZUNG.txt` |
 | `ffmpeg-9.0.2.tar.xz`, `nv-codec-headers-<commit>.tar.gz`, `build-ffmpeg-windows.sh` | the complete corresponding source of the FFmpeg DLLs (LGPL v2.1 section 6); the release notes carry the sentence from the FFmpeg license checklist with a link to the source archive |
 | `QuadChroma-X.Y.Z-macos-arm64.zip` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` as the top-level entry (`ditto --keepParent --norsrc`: no AppleDouble `._*` entries, so the Finder, `ditto -x -k` and the command-line `unzip` all restore a valid bundle), signed, notarized and stapled - the form the notary service accepts |
-| `QuadChroma-X.Y.Z-macos-arm64.dmg` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` (stapled), a link to `/Applications`, `LICENSE.md`, `THIRD_PARTY_NOTICES.md`, `README.en.md`, `BENUTZUNG.txt`; UDZO image, signed with identifier `tech.quadchroma.host.dmg`, notarized and stapled |
+| `QuadChroma-X.Y.Z-macos-arm64.dmg` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` (stapled), a link to `/Applications`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `BENUTZUNG.txt`; UDZO image, signed with identifier `tech.quadchroma.host.dmg`, notarized and stapled |
 | `SHA256SUMS.txt` | `sha256sum` of every file above (`sha256sum -c SHA256SUMS.txt`) |
 
 Not released: the Mac client, the test harnesses, `.pdb` files, the CI's

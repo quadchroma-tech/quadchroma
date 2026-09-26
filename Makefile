@@ -11,7 +11,7 @@
 # Veroeffentlichung - braucht das Developer-ID-Zertifikat und ein notarytool-Profil
 # im Schluesselbund (siehe RELEASING.md); alles davon richtet der Urheber selbst ein:
 #   make release IDENT="Developer ID Application: Robert Brandt (TEAMID)"
-#   Vorab werden IDENT, TIMESTAMP und die vier Beilagen (DMG_EXTRA) geprueft, dann laeuft
+#   Vorab werden IDENT, TIMESTAMP und die vier Beilagen geprueft, dann laeuft
 #   der Reihe nach: sign verify notarize staple notarize-dmg (baut die DMG) staple-dmg gatekeeper.
 #   Einzelschritte:
 #   make sign            signiert die gebaute App erneut mit IDENT (Zeitstempel kommt bei
@@ -59,9 +59,11 @@
 #   NOTARY_PROFILE  Profilname aus `xcrun notarytool store-credentials <name> ...`.
 #   VERSION         wird aus CFBundleShortVersionString in host/Info.plist gelesen und
 #                   bestimmt die Paketnamen; CFBundleVersion dort vor jedem verteilten Bau erhoehen.
-#   DMG_EXTRA       Beilagen fuer die DMG (Lizenz- und Hinweistexte). Fehlt eine, bricht
-#                   make dmg mit einer Developer ID ab (oder wenn DMG_EXTRA_REQUIRED=1 gesetzt
-#                   ist, so in release.yml); im Alltagsbau gibt es nur eine WARNUNG.
+#   Beilagen        Lizenz- und Hinweistexte fuer die DMG, alle als .txt (LICENSE.txt,
+#                   THIRD_PARTY_NOTICES.txt, README.txt aus README.en.md, BENUTZUNG.txt) -
+#                   scripts/package-texts.sh legt sie ab. Fehlt eine Quelle, bricht make dmg
+#                   mit einer Developer ID ab (oder wenn DMG_EXTRA_REQUIRED=1 gesetzt ist, so
+#                   in release.yml); im Alltagsbau gibt es nur eine WARNUNG.
 #
 # Warum immer signiert wird: TCC merkt sich Freigaben ueber die Designated Requirement der
 # App (Bezeichner + Zertifikat). Mit dem selbstsignierten Zertifikat ueberlebt die einmal
@@ -95,9 +97,9 @@ BIN      := $(APP)/Contents/MacOS/quadchroma-host
 ZIP      ?= build/QuadChroma-$(VERSION)-macos.zip
 DMG      ?= build/QuadChroma-$(VERSION).dmg
 DMG_ROOT := build/dmg-root
-# Beilagen fuer die DMG (ungesiegelt, aber von der DMG-Signatur abgedeckt). Alle vier sind
-# Pflicht, sobald mit einer Developer ID signiert wird oder DMG_EXTRA_REQUIRED gesetzt ist.
-DMG_EXTRA          ?= LICENSE.md THIRD_PARTY_NOTICES.md README.en.md BENUTZUNG.txt
+# Beilagen fuer die DMG (ungesiegelt, aber von der DMG-Signatur abgedeckt), abgelegt von
+# scripts/package-texts.sh. Pflicht, sobald mit einer Developer ID signiert wird oder
+# DMG_EXTRA_REQUIRED gesetzt ist.
 DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 # Stempel: womit zuletzt signiert wurde (Identitaet, Bezeichner, Zeitstempel, Entitlements).
 IDENT_STAMP := build/.ident
@@ -195,13 +197,10 @@ zip: sign-if-changed
 # sei ("Please use 'diskutil image create from ...'"); sie funktioniert weiterhin und laeuft
 # auch auf aelteren Systemen. hdiutil verify prueft die Pruefsumme des Abbilds.
 dmg: sign-if-changed
-	@for f in $(DMG_EXTRA); do [ -f "$$f" ] && continue; \
-	   if [ -n "$(DMG_EXTRA_REQUIRED)" ]; then echo "FEHLER: Beilage $$f fehlt - eine verteilte DMG braucht alle Lizenz- und Hinweistexte"; exit 1; \
-	   else echo "WARNUNG: Beilage $$f fehlt - nur im Alltagsbau erlaubt"; fi; done
 	rm -rf $(DMG_ROOT) $(DMG)
 	mkdir -p $(DMG_ROOT)
+	scripts/package-texts.sh $(DMG_ROOT) $(if $(DMG_EXTRA_REQUIRED),1,0)
 	ditto $(APP) $(DMG_ROOT)/QuadChroma.app
-	@for f in $(DMG_EXTRA); do if [ -f "$$f" ]; then cp "$$f" $(DMG_ROOT)/; fi; done
 	ln -s /Applications $(DMG_ROOT)/Applications
 	hdiutil create -volname QuadChroma -srcfolder $(DMG_ROOT) -ov -format UDZO $(DMG)
 	hdiutil verify $(DMG)
@@ -245,7 +244,7 @@ gatekeeper:
 release:
 	@if [ -z "$(RELEASE_IDENT)" ]; then echo "FEHLER: make release braucht IDENT=\"Developer ID Application: <Name> (<TEAMID>)\" oder den SHA-1-Hash dieser Identitaet (jetzt: \"$(IDENT)\")"; exit 1; fi
 	@if [ -z "$(TIMESTAMP)" ]; then echo "FEHLER: TIMESTAMP ist leer - ohne sicheren Zeitstempel lehnt der Notar ab (bei Developer ID TIMESTAMP=--timestamp)"; exit 1; fi
-	@for f in $(DMG_EXTRA); do [ -f "$$f" ] || { echo "FEHLER: Beilage $$f fehlt - erst ablegen, dann veroeffentlichen"; exit 1; }; done
+	@scripts/package-texts.sh build/beilagen-probe 1 && rm -rf build/beilagen-probe
 	$(MAKE) sign
 	$(MAKE) verify
 	$(MAKE) notarize

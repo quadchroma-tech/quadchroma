@@ -2,7 +2,7 @@
 
 Thank you for your interest. QuadChroma is a one-person project by Robert Brandt
 (hello@quadchroma.tech). It is source-available under the PolyForm Strict License 1.0.0
-with Additional Terms (`LICENSE.md`), not open source, and contributions are accepted
+with Additional Terms (`LICENSE.txt`), not open source, and contributions are accepted
 only under the Contributor License Agreement in `CLA.md`. Please read this page before
 you start. It is short on purpose, and the rules in it are binding for pull requests.
 
@@ -67,7 +67,7 @@ them are closed.
 3. **No new Rust crates without prior agreement.** The dependency list in
    `client/Cargo.toml` and `client/Cargo.lock` stays as it is. Propose a new crate in an
    issue with a reason, and expect "no" more often than "yes": every crate ends up in the
-   binary and in `THIRD_PARTY_NOTICES.md`. New features of the `windows` crate are fine.
+   binary and in `THIRD_PARTY_NOTICES.txt`. New features of the `windows` crate are fine.
    Helper scripts (PowerShell, sh, Makefile targets, `build.rs`) are fine.
 4. **User-interface text only through keys in `strings.rs`, in all languages.** Every
    text shown in the client's window, in the notification area or menu bar, or in a
@@ -187,24 +187,24 @@ sufficient.
 ## 6. Licensing of contributions and third-party code
 
 - PolyForm Strict does not allow changes. The section "Contributions" at the end of
-  `LICENSE.md` gives you a narrow permission to change the source code solely to
+  `LICENSE.txt` gives you a narrow permission to change the source code solely to
   prepare a contribution, to build and test it on your own devices, and to submit it
   through the official repository (a fork and a pull request on GitHub). It does not
   allow using or distributing the changed program for anything else.
-- Your contribution is published under `LICENSE.md` (PolyForm Strict 1.0.0 with the
+- Your contribution is published under `LICENSE.txt` (PolyForm Strict 1.0.0 with the
   Additional Terms) as part of QuadChroma and may also be licensed by the author under
   other terms, as set out in `CLA.md`. You keep your copyright and may use your own code
   elsewhere.
 - **Third-party code** only under permissive licences (MIT, BSD-2-Clause, BSD-3-Clause,
   ISC, Apache-2.0, Zlib, 0BSD, CC0-1.0), clearly marked in the code and in the pull
   request with origin, version and licence, and with the required notice added to
-  `THIRD_PARTY_NOTICES.md` in the same pull request. Nothing under GPL, LGPL, AGPL, MPL,
+  `THIRD_PARTY_NOTICES.txt` in the same pull request. Nothing under GPL, LGPL, AGPL, MPL,
   EPL, SSPL or any other copyleft or non-commercial licence, no snippets of unclear
   origin, nothing copied from other remote-desktop projects (most of them are GPL or
   AGPL). This also applies to anything a code assistant produces for you: you are
   responsible for what you submit (`CLA.md`, Section 7).
 - **New Rust crates:** see rule 3 in Section 3. If one is agreed, its licence and notices
-  go into `THIRD_PARTY_NOTICES.md` in the same pull request.
+  go into `THIRD_PARTY_NOTICES.txt` in the same pull request.
 
 ## 7. Code of conduct
 
@@ -219,4 +219,4 @@ together.
 
 Robert Brandt - hello@quadchroma.tech - https://quadchroma.tech
 
-Commercial licences and any use beyond `LICENSE.md`: same address.
+Commercial licences and any use beyond `LICENSE.txt`: same address.

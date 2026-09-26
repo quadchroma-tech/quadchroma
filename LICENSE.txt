@@ -16,7 +16,7 @@ provides with the software; Part II, the Additional Terms of the Licensor,
 version 1.0; and a closing note on commercial licenses and contributions.
 Third-party components distributed with or contained in the software are not
 licensed under this file (Part II, clause 10); their licenses are collected in
-`THIRD_PARTY_NOTICES.md`.
+`THIRD_PARTY_NOTICES.txt`.
 
 Note on the SPDX identifiers: the PolyForm Strict License 1.0.0 is not on the
 SPDX License List (list version 3.29.0 of 2026-09-16 contains only
@@ -386,7 +386,7 @@ The obligation in clause 9.1 arises from the Additional Terms.
 10.1 The software is distributed together with, or contains, components of
 third parties. They are not licensed under the License. Each such component is
 licensed under its own terms, which are reproduced or referenced in
-`THIRD_PARTY_NOTICES.md`, and those terms alone govern that component. Nothing
+`THIRD_PARTY_NOTICES.txt`, and those terms alone govern that component. Nothing
 in the License limits, and the Licensor does not purport to limit, any right You
 have under the license of a third-party component.
 
@@ -395,7 +395,7 @@ LGPLv2.1. The Windows distribution includes libraries of the FFmpeg project
 (avcodec-63.dll and avutil-61.dll) as separate, dynamically linked files. They
 are licensed under the GNU Lesser General Public License, version 2.1 or later
 (LGPLv2.1) - not under the License. The Licensor does not own FFmpeg; its
-copyright holders are the FFmpeg developers named in `THIRD_PARTY_NOTICES.md`.
+copyright holders are the FFmpeg developers named in `THIRD_PARTY_NOTICES.txt`.
 As section 6 of the LGPLv2.1 requires, the License permits modification of those
 libraries for Your own use and reverse engineering of the software for debugging
 such modifications; You may replace those files with a modified version of the
@@ -403,15 +403,15 @@ same libraries that is interface-compatible with the version supplied; and
 clauses 3 to 6 do not restrict the exercise of any right the LGPLv2.1 grants You
 with respect to those libraries. The corresponding source code of the FFmpeg
 libraries, the build instructions and a written offer are given in
-`THIRD_PARTY_NOTICES.md`.
+`THIRD_PARTY_NOTICES.txt`.
 
 10.3 Monocypher. The Mac host contains Monocypher, licensed under
-BSD-2-Clause OR CC0-1.0; see `THIRD_PARTY_NOTICES.md`.
+BSD-2-Clause OR CC0-1.0; see `THIRD_PARTY_NOTICES.txt`.
 
 10.4 Rust crates and other components. The executables are built from Rust
 crates and other components under their own licenses (among them MIT,
 Apache-2.0, BSD-3-Clause, ISC, Unicode-3.0, WTFPL and zlib licenses); their
-notices are collected in `THIRD_PARTY_NOTICES.md`.
+notices are collected in `THIRD_PARTY_NOTICES.txt`.
 
 ### 11. No Warranty; Limitation of Liability
 
