@@ -2653,10 +2653,22 @@ static int g_out_fest_w = 0, g_out_fest_h = 0;
 static pthread_mutex_t g_bildschirm_mtx = PTHREAD_MUTEX_INITIALIZER;
 static NSData *g_bildschirm_payload = nil;
 // Ein Bildschirmwechsel wartet auf einen laufenden Codecwechsel: seit wann
-// (Hostuhr in us, 0 = wartet nicht). Nur auf g_lifeq.
+// (Hostuhr in us, 0 = wartet nicht), auf welchen Bildschirm, aus welchem
+// Anlass (fuer den Grund in der Zeile), und ob die Wiederholung schon
+// eingereiht ist (genau eine, nicht eine je Wunsch). Nur auf g_lifeq. Das
+// Warten endet mit dem vollzogenen Wechsel - oder sobald eine Bewertung
+// keinen Wechsel mehr braucht (das Ziel ist wieder der gestreamte
+// Bildschirm, der Zuschauer ist weg): bliebe es stehen, bekaeme kein
+// spaeterer Wunsch mehr Antwort und Zeile, und ein spaeterer Wechsel wuerde
+// nach 5 s erzwungen, mitten in einem frischen Codecwechsel.
 static uint64_t g_bildschirm_wartet_seit = 0;
+static CGDirectDisplayID g_bildschirm_wartet_ziel = 0;
+static int g_bildschirm_wartet_anlass = 0;
+static BOOL g_bildschirm_wartet_eingereiht = NO;
 
-enum { QC_ANLASS_START = 0, QC_ANLASS_KONFIG = 1, QC_ANLASS_WUNSCH = 2 };
+// Anlass einer Neubewertung. WARTEN ist die Wiederholung eines wartenden
+// Wechsels: sie antwortet keinem Wunsch und schreibt keine Wahl-Zeile.
+enum { QC_ANLASS_START = 0, QC_ANLASS_KONFIG = 1, QC_ANLASS_WUNSCH = 2, QC_ANLASS_WARTEN = 3 };
 #define QC_BILDSCHIRM_ENTPRELLEN_MS 300
 #define QC_BILDSCHIRM_WARTEN_MS     200
 #define QC_BILDSCHIRM_WARTEN_MAX_US (5ull * 1000000ull)
@@ -2731,7 +2743,10 @@ static void bildschirme_senden(void) {
 // laufendem Encoder (Wiederherstellung auf einem anderen Bildschirm) ebenso.
 // Beides auf g_capq, damit zwischen SWITCH und dem Vollbild-Merker kein Bild
 // hinausgeht; CompleteFrames holt vorher die Bilder aus dem Encoder, deren
-// Rueckruf sonst hinter dem SWITCH landen koennte.
+// Rueckruf sonst hinter dem SWITCH landen koennte. Das letzte Bild des alten
+// Bildschirms faellt bei jedem Wechsel weg, auch bei gleicher Groesse: der
+// Takt reichte es sonst als erstes Vollbild des neuen nach, bevor
+// ScreenCaptureKit das erste echte liefert (ein Bild vom falschen Bildschirm).
 // YES = laeuft (g_stream gesetzt, Maus folgt); NO = nicht gestartet, mit Zeile.
 static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
     int w = 0, h = 0;
@@ -2742,7 +2757,7 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
         int fps = atomic_load(&g_cur_fps), mbit = atomic_load(&g_cur_mbit);
         BOOL neue_groesse = (w != g_info_w || h != g_info_h);
         BOOL ansagen = wechsel || (neue_groesse && g_session != NULL);
-        if (neue_groesse) {
+        if (neue_groesse || wechsel) {
             if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
             g_behelf = 0;
             atomic_store(&g_bild_offen, 0);
@@ -2769,7 +2784,9 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
             g_cfg.pixelFormat = pixfmt_fuer(codec);
             if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
         }
-        if (ansagen) {
+        // Ohne Encoder keine Ansage: der Client baute sonst den Decoder um
+        // und bekaeme kein Bild, bis die Wiederherstellung greift.
+        if (ansagen && enc) {
             switch_senden(codec);
             strominfo_senden();
         }
@@ -2824,35 +2841,57 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
     return YES;
 }
 
+// Das Warten ist zu Ende (Wechsel vollzogen oder hinfaellig). Auf g_lifeq.
+static void bildschirm_warten_beenden(void) {
+    g_bildschirm_wartet_seit = 0;
+    g_bildschirm_wartet_ziel = 0;
+    g_bildschirm_wartet_anlass = 0;
+}
+
+// Die Wiederholung eines wartenden Wechsels einreihen: nach
+// QC_BILDSCHIRM_WARTEN_MS auf g_lifeq neu bewerten - genau einmal, gleich
+// wie viele Wuensche waehrend des Wartens kommen. Auf g_lifeq.
+static void bildschirm_warten_einreihen(void) {
+    if (g_bildschirm_wartet_eingereiht) return;
+    g_bildschirm_wartet_eingereiht = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, QC_BILDSCHIRM_WARTEN_MS * NSEC_PER_MSEC), g_lifeq, ^{
+        g_bildschirm_wartet_eingereiht = NO;
+        bildschirm_neu_bewerten(QC_ANLASS_WARTEN);
+    });
+}
+
 // Der Wechsel im laufenden Betrieb (Spezifikation 1.4): alten Strom anhalten,
 // Groesse und Encoder nachziehen, SWITCH und INFO, neuer Strom, Maus, Liste,
-// Zeile. Auf g_lifeq. anlass: wofuer die Neubewertung wiederholt wird, wenn
-// der Wechsel warten muss; ein Wunsch bekommt seine Antwort (die Liste)
-// schon beim Warten.
+// Zeile. Auf g_lifeq. anlass: was die Bewertung ausgeloest hat; ein Wunsch
+// bekommt seine Antwort (die Liste) schon beim Warten, jeder Wunsch.
 static void bildschirm_wechseln(QCBildschirm *neu, NSString *grund, int anlass) {
-    BOOL antwort = anlass == QC_ANLASS_WUNSCH;
     // Laeuft ein Codecwechsel (auf g_capq), wartet der Bildschirmwechsel: nach
-    // QC_BILDSCHIRM_WARTEN_MS noch einmal bewerten, hoechstens 5 s, dann trotzdem.
+    // QC_BILDSCHIRM_WARTEN_MS noch einmal bewerten, hoechstens 5 s ab dem
+    // Beginn dieses Wartens, dann trotzdem.
     __block int codec_aktiv = 0;
     dispatch_sync(g_capq, ^{ codec_aktiv = g_wechsel_aktiv; });
     uint64_t jetzt = now_us();
     if (codec_aktiv) {
-        if (!g_bildschirm_wartet_seit) {
-            g_bildschirm_wartet_seit = jetzt;
+        if (!g_bildschirm_wartet_seit) g_bildschirm_wartet_seit = jetzt;
+        if (g_bildschirm_wartet_ziel != neu.displayID) {
+            // Ein neues Ziel: Zeile, und sein Anlass bestimmt den Grund. Hat
+            // die Wiederholung selbst ein anderes Ziel gefunden (die Liste
+            // hat sich waehrend des Wartens geaendert), gilt das wie eine
+            // Konfigurationsaenderung.
+            g_bildschirm_wartet_ziel = neu.displayID;
+            g_bildschirm_wartet_anlass = anlass == QC_ANLASS_WARTEN ? QC_ANLASS_KONFIG : anlass;
             logf_(@"Bildschirmwechsel auf %@ wartet auf den laufenden Codecwechsel", bildschirm_text(neu));
-            // Die Antwort auf einen Wunsch geht gleich hinaus, mit dem noch
-            // gestreamten Bildschirm; nach dem Wechsel kommt die Liste erneut.
-            if (antwort) { bildschirm_zustand_nachfuehren(); bildschirme_senden(); }
         }
+        // Die Antwort auf einen Wunsch geht gleich hinaus, mit dem noch
+        // gestreamten Bildschirm; nach dem Wechsel kommt die Liste erneut.
+        if (anlass == QC_ANLASS_WUNSCH) { bildschirm_zustand_nachfuehren(); bildschirme_senden(); }
         if (jetzt - g_bildschirm_wartet_seit < QC_BILDSCHIRM_WARTEN_MAX_US) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, QC_BILDSCHIRM_WARTEN_MS * NSEC_PER_MSEC), g_lifeq, ^{
-                bildschirm_neu_bewerten(anlass);
-            });
+            bildschirm_warten_einreihen();
             return;
         }
         logf_(@"Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem");
     }
-    g_bildschirm_wartet_seit = 0;
+    bildschirm_warten_beenden();
     QCBildschirm *alt = g_display_aktuell;
     // 1. Alten Strom anhalten. Ab hier gibt es keinen Strom: ein Codecwunsch
     //    wird abgelehnt, ein spaeter Bescheid des alten Stroms uebergangen.
@@ -2893,12 +2932,16 @@ static void bildschirm_wechseln(QCBildschirm *neu, NSString *grund, int anlass) 
 // hat oder ein Wunsch die Antwort verlangt. Ohne Strom werden nur Ziel und
 // Liste nachgefuehrt; der Strom laeuft erst mit dem naechsten Zuschauer. Auf
 // g_lifeq, oder in main vor den Warteschlangen. Rueckgabe: das Ziel, nil =
-// kein Bildschirm.
+// kein Bildschirm. Steht kein Wechsel (mehr) an, endet hier ein etwaiges
+// Warten auf den Codecwechsel.
 static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
+    BOOL wunsch = anlass == QC_ANLASS_WUNSCH;           // bekommt Antwort und Zeilen
+    BOOL wiederholung = anlass == QC_ANLASS_WARTEN;     // weder Antwort noch Wahl-Zeile
     NSArray<QCBildschirm *> *liste = qc_bildschirme_holen();
     if (!liste) {
         logf_(@"Bildschirme nicht abrufbar - der Stand bleibt");
-        if (anlass == QC_ANLASS_WUNSCH) bildschirme_senden();
+        if (wunsch) bildschirme_senden();
+        if (wiederholung && g_bildschirm_wartet_seit) bildschirm_warten_einreihen();   // das Warten geht weiter
         return g_stream ? g_display_aktuell : nil;
     }
     // --display N: einmal, nach der ersten Wahl. Der Wunsch fuer diesen Lauf
@@ -2918,34 +2961,54 @@ static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
     QCBildschirm *ziel = qc_bildschirm_wahl(liste, g_display_wunsch, &art);
     BOOL liste_neu = ![liste isEqualToArray:g_bildschirme];
     g_bildschirme = liste;
-    if (anlass == QC_ANLASS_WUNSCH && g_display_wunsch && art != QC_WAHL_WUNSCH && !g_bildschirm_wartet_seit)
+    if (wunsch && g_display_wunsch && art != QC_WAHL_WUNSCH)
         logf_(@"Bildschirmwunsch: %@ - nicht angeschlossen, Ausweichplatz %@", g_display_wunsch, bildschirm_text(ziel));
     if (!ziel) {
+        bildschirm_warten_beenden();
+        if (g_stream) {
+            // ScreenCaptureKit meldet gerade keinen Bildschirm, der Strom
+            // laeuft aber: der Stand bleibt, sonst baute die naechste
+            // Bewertung mit gefuellter Liste den Strom auf demselben
+            // Bildschirm unnoetig neu. Faellt der Bildschirm wirklich weg,
+            // endet der Strom (didStopWithError), und die Wiederherstellung
+            // bewertet neu.
+            if (liste_neu) logf_(@"Kein Bildschirm in der Liste - der laufende Strom bleibt");
+            bildschirm_zustand_nachfuehren();
+            if (liste_neu || wunsch) bildschirme_senden();
+            return g_display_aktuell;
+        }
         BOOL ziel_neu = g_display_id != 0;
         g_display_id = 0;
         g_display_aktuell = nil;
         bildschirm_zustand_nachfuehren();
-        if (liste_neu || ziel_neu || anlass == QC_ANLASS_WUNSCH) bildschirme_senden();
+        if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
         return nil;
     }
     BOOL ziel_neu = ziel.displayID != g_display_id;
-    if (ziel_neu && !g_bildschirm_wartet_seit)
+    // Die Zeile je Ziel einmal: nicht fuer die Wiederholungen des Wartens und
+    // nicht erneut fuer ein Ziel, auf das der Wechsel schon wartet.
+    if (ziel_neu && !wiederholung && ziel.displayID != g_bildschirm_wartet_ziel)
         logf_(@"Bildschirm gewaehlt: %@, %zux%zu Pixel, %.0f Hz%@%@", bildschirm_text(ziel), ziel.w, ziel.h, ziel.hz,
               ziel.haupt ? @" (Hauptbildschirm)" : @"",
               (g_display_wunsch && art != QC_WAHL_WUNSCH) ? @" - Ausweichplatz" : @"");
     if (g_stream && ziel_neu) {
+        // Der Grund: bei der Wiederholung eines wartenden Wechsels der
+        // Anlass, aus dem er wartet.
+        int wirksam = wiederholung ? g_bildschirm_wartet_anlass : anlass;
         NSString *grund;
         if (art == QC_WAHL_WUNSCH)
-            grund = anlass == QC_ANLASS_WUNSCH ? @"Wunsch des Zuschauers" : @"zurueck zum gewuenschten Bildschirm";
+            grund = wirksam == QC_ANLASS_WUNSCH ? @"Wunsch des Zuschauers" : @"zurueck zum gewuenschten Bildschirm";
         else
             grund = g_display_wunsch ? @"Ausweichplatz" : @"Hauptbildschirm gewechselt";
         bildschirm_wechseln(ziel, grund, anlass);
         return ziel;
     }
+    // Kein Wechsel (mehr) noetig - auch ein wartender ist damit hinfaellig.
+    bildschirm_warten_beenden();
     if (!g_stream) g_display_id = ziel.displayID;       // Ziel des naechsten Starts
     g_display_aktuell = ziel;
     bildschirm_zustand_nachfuehren();
-    if (liste_neu || ziel_neu || (anlass == QC_ANLASS_WUNSCH && !g_bildschirm_wartet_seit)) bildschirme_senden();
+    if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
     return ziel;
 }
 
@@ -3354,14 +3417,17 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         // Hauptfaden (die Dienstschleife unten dreht die Run-Loop); der Host
         // bewertet dann entprellt neu und folgt dem Hauptbildschirm bzw.
         // kehrt zum gewuenschten zurueck - ohne Neustart, ohne neuen Zuschauer.
+        // Der Wunsch fuer die Zeile unten wird hier gelesen: sobald die
+        // Annahme laeuft, gehoert g_display_wunsch der Lebenslauf-Warteschlange.
+        NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
+                                                 : @" - Automatik (folgt dem Hauptbildschirm)";
         CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
         if (start_server(port) < 0) return 9;
         start_input_server(port + 1, display.displayID);
         start_beacon(port);
         BOOL ax = AXIsProcessTrusted();
         logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-        logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps,
-              g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch] : @" - Automatik (folgt dem Hauptbildschirm)");
+        logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {
         // Aufnahme in eine Datei: sofort loslegen.

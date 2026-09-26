@@ -16,8 +16,9 @@
 // Begruessung mit Faehigkeiten 3 und Liste, Automatik folgt dem
 // Hauptbildschirm entprellt, Wunsch ueber den echten Eingabekanal, fehlender
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
-// Warten auf einen Codecwechsel, Bildschirmverlust und Wiederherstellung -
-// Liste und Strom aus Attrappen, Encoder echt).
+// Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
+// 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
+// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -46,7 +47,7 @@
 // Dateien: die Ablagebasis liegt im eigenen HOME, und statt
 // qc_clip_set_dateien bekommt ein Rekorder die fertigen Pfade - die
 // Zwischenablage des Nutzers bleibt unberuehrt.
-// Dauer rund 80 s. Rueckgabe: Zahl der Fehler.
+// Dauer rund 100 s. Rueckgabe: Zahl der Fehler.
 
 #define main host_main
 #include "main.m"
@@ -2311,6 +2312,26 @@ static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
 static uint16_t info_w(const gelesen *g) { uint16_t v; memcpy(&v, g->info, 2); return v; }
 static uint16_t info_h(const gelesen *g) { uint16_t v; memcpy(&v, g->info + 2, 2); return v; }
 
+// Wie oft der Typ in der Folge steht (die Folge sind Zahlen mit Leerzeichen).
+static int typen_zaehlen(const char *folge, int typ) {
+    int n = 0;
+    for (const char *p = folge; *p;) {
+        char *ende = NULL;
+        long t = strtol(p, &ende, 10);
+        if (ende == p) break;
+        if (t == typ) n++;
+        p = ende;
+        while (*p == ' ') p++;
+    }
+    return n;
+}
+
+static uint64_t wartet_seit_jetzt(void) {
+    __block uint64_t seit = 0;
+    dispatch_sync(g_lifeq, ^{ seit = g_bildschirm_wartet_seit; });
+    return seit;
+}
+
 // Ein Bild der Aufnahme in den Grabber des Hosts, wie ScreenCaptureKit.
 static void bild_einspeisen(CVPixelBufferRef pb) {
     CMSampleBufferRef sb = aufnahme_bild(pb, uhr());
@@ -2585,6 +2606,8 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pruefe(strstr(g.folge, "7 1 12") && g.wechsel == 1 && g.wechsel_codec == 3 && info_w(&g) == 1920 && info_h(&g) == 1080 &&
            !wunsch[0] && eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) && ea.flags == 0 && session_jetzt() == s_a,
            "SWITCH mit dem laufenden Codec, INFO (gleiche Masse, Encoder bleibt), dann die Liste mit dem neuen als Haupt und gestreamt");
+    pruefe(!letztes_bild_da() && g.bilder == 0,
+           "auch bei gleicher Groesse ist das letzte Bild des alten Bildschirms weg - es kaeme sonst als erstes Vollbild des neuen");
     stdout_stumm(1);
     bild_einspeisen(pb_gross);
     alles_lesen(&H, 300, &g);
@@ -2673,7 +2696,13 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     int n_c = liste_lesen(g.liste, g.liste_n, wunsch, 2, &e2);
     pruefe(atomic_load(&g_fabrik_aufrufe) == 5 && g.wechsel == 0 && n_c == 3 && strcmp(e2.kennung, "v7-m7-s7") == 0 && e2.w == 1280,
            "ein Bildschirm kommt dazu, der gewuenschte laeuft weiter: kein Wechsel, nur die neue Liste");
-    int bild_vorher = letztes_bild_da();
+    // Ein letztes Bild des alten Bildschirms liegt an (jeder Wechsel raeumt
+    // es weg, deshalb hier frisch einspeisen).
+    stdout_stumm(1);
+    bild_einspeisen(pb_gross);
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int bild_vorher = letztes_bild_da() && g.bilder == 1;
     stdout_stumm(1);
     ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));
     usleep(400 * 1000);
@@ -2720,7 +2749,154 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
            info_w(&g) == 1920 && zeilen_mit(logpfad, "(Wunsch des Zuschauers)") == 3 && zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == 1,
            "danach folgt der Wechsel, mit dem Grund des Wunsches (der dritte Wunsch-Wechsel), ohne weitere Wartezeile");
 
+    printf("\n-- Bildschirm: der Wartezustand endet, sobald kein Wechsel mehr ansteht\n");
+    // Ausgang: Strom auf Kennung 2 (Wunsch v1138-m1234-s0), Liste [B2, A2, C],
+    // kein Codecwechsel. Ein Wunsch auf C muss auf den Codecwechsel warten;
+    // der naechste Wunsch, zurueck auf den gestreamten Bildschirm, macht den
+    // Wechsel hinfaellig. Jeder Wunsch bekommt seine Antwort (Spezifikation
+    // 2.2), der Wartezustand endet mit dem hinfaelligen Wechsel - sonst
+    // bliebe er stehen und unterdrueckte jede spaetere Antwort und Zeile
+    // (Befund der Gegenpruefung) und erzwaenge nach 5 s einen spaeteren
+    // Wechsel mitten im Codecwechsel.
+    int warte_vorher = zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel");
+    int fehlt_vorher = zeilen_mit(logpfad, "nicht angeschlossen, Ausweichplatz");
+    int gewaehlt_vorher = zeilen_mit(logpfad, "Bildschirm gewaehlt:");
+    int wunsch_vorher = zeilen_mit(logpfad, "(Wunsch des Zuschauers)");
+    int fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 1; });
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));          // muss warten
+    usleep(100 * 1000);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));   // zurueck auf den gestreamten
+    usleep(700 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int listen = typen_zaehlen(g.folge, QC_MSG_BILDSCHIRME);
+    liste_lesen(g.liste, g.liste_n, wunsch, 1, &ea);
+    uint64_t seit_hinfaellig = wartet_seit_jetzt();
+    printf("         (waehrend des Codecwechsels: Folge \"%s\", letzte Liste mit Wunsch \"%s\", %s Flags %d; Wartezeilen %d -> %d; wartet seit %llu)\n",
+           g.folge, wunsch, ea.kennung, ea.flags, warte_vorher, zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel"),
+           (unsigned long long)seit_hinfaellig);
+    pruefe(listen == 2 && strcmp(wunsch, "v1138-m1234-s0") == 0 && ea.flags == QC_BILDSCHIRM_FLAG_GESTREAMT && g.wechsel == 0 &&
+           atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && display_jetzt() == 2 &&
+           zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == warte_vorher + 1,
+           "zwei Wuensche waehrend des Codecwechsels (weg und zurueck): je eine Liste als Antwort, die letzte mit dem letzten Wunsch, kein Wechsel, eine Wartezeile");
+    pruefe(seit_hinfaellig == 0, "der Wartezustand endet, sobald kein Wechsel mehr ansteht (das Ziel ist wieder der gestreamte Bildschirm)");
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 0; });
+    stdout_stumm(1);
+    usleep(500 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 200, &g);
+    stdout_stumm(0);
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && display_jetzt() == 2 && [wunsch_jetzt() isEqualToString:@"v1138-m1234-s0"],
+           "nach dem Ende des Codecwechsels bleibt es beim gestreamten Bildschirm: kein Wechsel");
+    // Danach bekommt ein unerfuellbarer Wunsch wieder Antwort und Zeile (2.3).
+    // Der Strom laeuft auf A (nicht Haupt): der Ausweichplatz ist der
+    // Hauptbildschirm B, also ein Wechsel mit Grund "Ausweichplatz".
+    int ausweich_vorher = zeilen_mit(logpfad, "(Ausweichplatz)");
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v9-m9-s9"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_v9 = liste_lesen(g.liste, g.liste_n, wunsch, 0, &eb);
+    printf("         (nach dem Wunsch v9-m9-s9: Folge \"%s\", %d Eintraege, Wunsch \"%s\", %s Flags %d; Zeilen 'nicht angeschlossen' %d -> %d)\n",
+           g.folge, n_v9, wunsch, eb.kennung, eb.flags, fehlt_vorher, zeilen_mit(logpfad, "nicht angeschlossen, Ausweichplatz"));
+    pruefe(n_v9 == 3 && strcmp(wunsch, "v9-m9-s9") == 0 && eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) &&
+           strstr(g.folge, "7 1 12") && g.wechsel == 1 && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && display_jetzt() == 6 &&
+           zeilen_mit(logpfad, "nicht angeschlossen, Ausweichplatz Kennung 6 (v0-m0-s0) \"Virtuell 16:9\"") == fehlt_vorher + 1 &&
+           zeilen_mit(logpfad, "(Ausweichplatz)") == ausweich_vorher + 1,
+           "danach bekommt ein Wunsch auf einen nicht angeschlossenen Bildschirm wieder seine Zeile und die Liste mit dem Wunsch, hier mit Wechsel auf den Ausweichplatz");
+    // Ein neues Warten beginnt frisch: die 5-s-Frist zaehlt ab SEINEM Beginn.
+    // Zurueck auf A (ein Wechsel, kein Codecwechsel), dann Wunsch auf C bei
+    // laufendem Codecwechsel: er wartet, nichts wird erzwungen.
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    int zurueck_auf_a = atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 2 && g.wechsel == 1 && display_jetzt() == 2;
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 1; });
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));
+    usleep(100 * 1000);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v7-m7-s7"));   // derselbe Wunsch noch einmal: auch er bekommt seine Antwort
+    usleep(700 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    uint64_t seit_neu = wartet_seit_jetzt();
+    printf("         (Wunsch v7-m7-s7 bei laufendem Codecwechsel: Folge \"%s\", Fabrik %d, gestreamt %u, Wartezeilen %d, 'trotzdem' %d, wartet seit %llu)\n",
+           g.folge, atomic_load(&g_fabrik_aufrufe), display_jetzt(), zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel"),
+           zeilen_mit(logpfad, "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem"), (unsigned long long)seit_neu);
+    pruefe(zurueck_auf_a && seit_neu != 0 && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 2 && g.wechsel == 0 && display_jetzt() == 2 &&
+           typen_zaehlen(g.folge, QC_MSG_BILDSCHIRME) == 2 && zeilen_mit(logpfad, "wartet auf den laufenden Codecwechsel") == warte_vorher + 2 &&
+           zeilen_mit(logpfad, "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem") == 0,
+           "ein neues Warten beginnt frisch: der Wechsel wartet mit einer Zeile, jeder Wunsch bekommt seine Antwort, nichts wird erzwungen");
+    // Die 5-s-Frist selbst: liegt der Beginn des Wartens laenger zurueck,
+    // kommt der Wechsel trotzdem, mit Zeile, und das Warten ist zu Ende.
+    stdout_stumm(1);
+    dispatch_sync(g_lifeq, ^{ g_bildschirm_wartet_seit -= 6ull * 1000000ull; });
+    usleep(500 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    stand_zeile("Codecwechsel nach 5 s nicht fertig");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 3 && atomic_load(&g_fabrik_zuletzt) == 9 && display_jetzt() == 9 &&
+           strstr(g.folge, "7 1 12") && g.wechsel == 1 && wartet_seit_jetzt() == 0 &&
+           zeilen_mit(logpfad, "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem") == 1 &&
+           zeilen_mit(logpfad, "(Wunsch des Zuschauers)") == wunsch_vorher + 2,
+           "nach 5 s kommt der Bildschirmwechsel trotzdem, mit dem Grund des Wunsches, und das Warten ist zu Ende");
+    dispatch_sync(g_capq, ^{ g_wechsel_aktiv = 0; });
+    // Zurueck auf A fuer die naechsten Abschnitte. Die Zeile "Bildschirm
+    // gewaehlt" kam je Ziel einmal (v7-m7-s7 beim Warten, Ausweichplatz,
+    // zurueck auf A, v7-m7-s7 beim zweiten Warten - nicht noch einmal fuer
+    // den wiederholten Wunsch -, jetzt), nie fuer die Wiederholungen des
+    // Wartens.
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(@"v1138-m1234-s0"));
+    usleep(400 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    printf("         (Zeilen \"Bildschirm gewaehlt\": %d -> %d)\n", gewaehlt_vorher, zeilen_mit(logpfad, "Bildschirm gewaehlt:"));
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 4 && display_jetzt() == 2 && g.wechsel == 1 && info_w(&g) == 1920 &&
+           zeilen_mit(logpfad, "Bildschirm gewaehlt:") == gewaehlt_vorher + 5,
+           "zurueck auf den grossen Bildschirm: Wechsel, INFO 1920x1080, je Ziel eine Zeile \"Bildschirm gewaehlt\" (nie fuer die Wiederholungen des Wartens)");
+
+    printf("\n-- Bildschirm: leere Liste bei laufendem Strom\n");
+    // Meldet ScreenCaptureKit voruebergehend keinen Bildschirm, laeuft der
+    // Strom weiter: kein Ziel wechseln, kein Neuaufbau, wenn die Liste
+    // zurueckkommt - faellt der Bildschirm wirklich weg, endet der Strom
+    // (didStopWithError), und die Wiederherstellung bewertet neu.
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    liste_setzen(@[]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_leer = liste_lesen(g.liste, g.liste_n, wunsch, -1, NULL);
+    printf("         (leere Liste: Folge \"%s\", %d Eintraege, gestreamt %u)\n", g.folge, n_leer, display_jetzt());
+    pruefe(strom_jetzt() != nil && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && display_jetzt() == 2 &&
+           typen_zaehlen(g.folge, QC_MSG_BILDSCHIRME) == 1 && n_leer == 0,
+           "leere Liste bei laufendem Strom: der Strom und sein Bildschirm bleiben, die leere Liste geht hinaus");
+    liste_setzen(@[ B2, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_wieder = liste_lesen(g.liste, g.liste_n, wunsch, 1, &ea);
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && display_jetzt() == 2 && n_wieder == 3 &&
+           ea.flags == QC_BILDSCHIRM_FLAG_GESTREAMT,
+           "kommt die Liste zurueck, bleibt der Strom stehen: kein unnoetiger Neuaufbau, die Liste traegt den gestreamten Bildschirm");
+
     printf("\n-- Bildschirm: Bildschirmverlust und Wiederherstellung (ohne Hauptwarteschlange)\n");
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
     NSError *err = [NSError errorWithDomain:@"hosttest" code:-3801 userInfo:@{ NSLocalizedDescriptionKey: @"Bildschirm weg" }];
     stdout_stumm(1);
     [g_grab stream:strom_jetzt() didStopWithError:err];
@@ -2734,7 +2910,7 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     stdout_stumm(0);
     pruefe(verlust, "Bildschirmverlust: der Strom ist weg, der Zuschauer bekommt Hoststatus 1");
     stand_zeile("nach der Wiederherstellung");
-    pruefe(strom_jetzt() != nil && atomic_load(&g_fabrik_aufrufe) == 8 && atomic_load(&g_fabrik_zuletzt) == 2 && g.status == 0 && g.liste_n > 0 &&
+    pruefe(strom_jetzt() != nil && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && atomic_load(&g_fabrik_zuletzt) == 2 && g.status == 0 && g.liste_n > 0 &&
            zeilen_mit(logpfad, "Aufnahme wiederhergestellt: Bildschirm 1920x1080, 120 Hz, Kennung 2 (v1138-m1234-s0) \"X27 X1\"") == 1,
            "nach 2 s ist die Aufnahme auf dem gewuenschten Bildschirm wieder da: Hoststatus 0, Liste, Zeile");
 
