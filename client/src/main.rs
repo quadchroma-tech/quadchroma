@@ -5261,33 +5261,15 @@ const FREIGABE_TAKT: Duration = Duration::from_secs(1);
 /// So lange nach dem Klick gilt die Freigabe als laufend, auch bevor die
 /// neue Host-Rolle ihren Mutex angelegt hat - kein zweiter Start.
 const FREIGABE_ANLAUF: Duration = Duration::from_secs(5);
-/// Mutex der Host-Rolle (ihre Einzelinstanz, Spezifikation 10.1).
-#[cfg(windows)]
-const HOST_MUTEX: &str = "Local\\QuadChroma-Host";
-
-/// Laeuft in dieser Nutzersitzung eine Host-Rolle? Sie haelt den Mutex
-/// HOST_MUTEX, solange sie laeuft.
+/// Laeuft in dieser Nutzersitzung eine Host-Rolle? Sie haelt ihren
+/// Einzelinstanz-Mutex (Spezifikation 10.1), solange sie laeuft - derselbe
+/// Name und dieselbe Pruefung wie in der Host-Rolle selbst
+/// (host::oberflaeche::MUTEX, "Local\\QuadChroma-Host"; verweigert das
+/// System den Zugriff, etwa bei einer Host-Rolle mit erhoehten Rechten,
+/// laeuft sie ebenfalls).
 #[cfg(windows)]
 fn host_rolle_laeuft() -> bool {
-    mutex_da(HOST_MUTEX)
-}
-
-/// Gibt es diesen benannten Mutex? Verweigert das System den Zugriff (etwa
-/// eine Host-Rolle mit erhoehten Rechten), gibt es ihn ebenfalls.
-#[cfg(windows)]
-fn mutex_da(name: &str) -> bool {
-    use windows::core::HSTRING;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
-    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) } {
-        Ok(h) => {
-            unsafe {
-                let _ = CloseHandle(h);
-            }
-            true
-        }
-        Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
-    }
+    host::oberflaeche::laeuft(host::oberflaeche::MUTEX)
 }
 
 #[cfg(not(windows))]
@@ -14395,15 +14377,19 @@ mod tests {
         use windows::core::HSTRING;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::CreateMutexW;
-        // Nicht der Name der Einzelinstanz-Tests (einzel.rs), die im selben
-        // Lauf nebenher ihren Mutex halten.
-        let name = format!("Local\\QuadChroma-Host-Test-{}", std::process::id());
-        assert!(!mutex_da(&name));
+        // Der Knopf fragt genau den Mutex ab, den die Host-Rolle anlegt.
+        assert_eq!(host::oberflaeche::MUTEX, "Local\\QuadChroma-Host");
+        // Ein eigener Name: nicht der der Einzelinstanz-Tests (einzel.rs)
+        // und nicht der der Host-Rolle (host::oberflaeche), die im selben
+        // Lauf nebenher ihre Mutexe halten.
+        let name = format!("Local\\QuadChroma-Host-Test-Knopf-{}", std::process::id());
+        let da = |n: &str| host::oberflaeche::laeuft(n);
+        assert!(!da(&name));
         let h = unsafe { CreateMutexW(None, false, &HSTRING::from(name.as_str())) }.unwrap();
-        assert!(mutex_da(&name));
+        assert!(da(&name));
         unsafe {
             let _ = CloseHandle(h);
         }
-        assert!(!mutex_da(&name));
+        assert!(!da(&name));
     }
 }

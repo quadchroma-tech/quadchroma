@@ -245,6 +245,75 @@ fn lnk_speichern(
     }
 }
 
+// ------------------------------------------------ Mit Windows starten
+//
+// Die Host-Rolle startet mit der Anmeldung ueber eine Verknuepfung im
+// Autostart-Ordner des Nutzers (FOLDERID_Startup) auf dieselbe exe mit
+// --host (Spezifikation Pairing v1, 10.2) - keine Registry, kein Dienst:
+// Desktop Duplication braucht die Sitzung des Nutzers. Ob der Punkt einen
+// Haken traegt, sagt allein, ob die Datei da ist.
+
+/// Dateiname der Autostart-Verknuepfung.
+pub const AUTOSTART_DATEI: &str = "QuadChroma - Freigabe.lnk";
+
+/// Der Autostart-Ordner des Nutzers.
+#[cfg(all(windows, not(test)))]
+fn autostart_ordner() -> Result<PathBuf, String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Startup, KF_FLAG_DEFAULT};
+    unsafe {
+        let p = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None).map_err(|e| e.message())?;
+        let s = p.to_string();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(PathBuf::from).map_err(|e| e.to_string())
+    }
+}
+
+/// Tests legen nie etwas in den echten Autostart-Ordner.
+#[cfg(all(windows, test))]
+fn autostart_ordner() -> Result<PathBuf, String> {
+    Err("im Test gibt es keinen Autostart-Ordner - Ordner angeben".into())
+}
+
+/// Pfad der Autostart-Verknuepfung (in `ordner`, sonst im Autostart-Ordner).
+#[cfg(windows)]
+pub fn autostart_pfad(ordner: Option<&Path>) -> Result<PathBuf, String> {
+    Ok(match ordner {
+        Some(o) => o.to_path_buf(),
+        None => autostart_ordner()?,
+    }
+    .join(AUTOSTART_DATEI))
+}
+
+/// Startet die Freigabe mit Windows (liegt die Verknuepfung da)?
+#[cfg(windows)]
+pub fn autostart_an(ordner: Option<&Path>) -> bool {
+    autostart_pfad(ordner).map(|p| p.is_file()).unwrap_or(false)
+}
+
+/// "Mit Windows starten" an (Verknuepfung auf die laufende exe mit --host
+/// anlegen bzw. erneuern) oder aus (Verknuepfung loeschen; fehlt sie
+/// schon, ist das kein Fehler). `beschreibung`: Kommentar der Verknuepfung.
+#[cfg(windows)]
+pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> Result<(), String> {
+    let pfad = autostart_pfad(ordner)?;
+    if !an {
+        return match std::fs::remove_file(&pfad) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", pfad.display())),
+        };
+    }
+    let ziel_ordner = pfad.parent().map(Path::to_path_buf).unwrap_or_default();
+    if !ziel_ordner.is_dir() {
+        std::fs::create_dir_all(&ziel_ordner).map_err(|e| format!("{}: {e}", ziel_ordner.display()))?;
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
+    let arbeitsordner = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    let symbol = crate::logo::ico_schreiben().unwrap_or_else(|_| exe.clone());
+    im_sta(|| lnk_speichern(&pfad, &exe, "--host", &arbeitsordner, beschreibung, &symbol, 0))
+}
+
 /// Eine Verknuepfung zuruecklesen (Tests): Ziel, Argumente, Arbeitsordner,
 /// Kommentar, Symbol und Index.
 #[cfg(all(windows, test))]
@@ -392,6 +461,35 @@ mod tests {
         // Ohne Ordner kein Desktop im Test, und ein fehlender Ordner ist ein Fehler.
         assert!(verknuepfung_anlegen(None, "h:1", None, "", de).is_err());
         assert!(verknuepfung_anlegen(Some(&ordner.join("fehlt")), "h:1", None, "", de).is_err());
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// "Mit Windows starten": an legt die Verknuepfung auf die exe mit
+    /// --host an (zweimal an ist dieselbe Datei), aus loescht sie, zweimal
+    /// aus ist kein Fehler. Im Test nie im echten Autostart-Ordner.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_an_und_aus() {
+        let ordner = std::env::temp_dir().join(format!("{}-autostart", crate::secure::test_lauf()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        assert!(!autostart_an(Some(&ordner)));
+        autostart_setzen(Some(&ordner), true, "QuadChroma: Diesen PC freigeben").unwrap();
+        assert!(autostart_an(Some(&ordner)));
+        let pfad = ordner.join(AUTOSTART_DATEI);
+        let (ziel, arg, arbeit, kommentar, _, _) = lnk_lesen(&pfad).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(ziel.to_lowercase(), exe.display().to_string().to_lowercase());
+        assert_eq!(arg, "--host");
+        assert_eq!(arbeit.to_lowercase(), exe.parent().unwrap().display().to_string().to_lowercase());
+        assert_eq!(kommentar, "QuadChroma: Diesen PC freigeben");
+        autostart_setzen(Some(&ordner), true, "x").unwrap();
+        assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
+        autostart_setzen(Some(&ordner), false, "").unwrap();
+        assert!(!autostart_an(Some(&ordner)));
+        autostart_setzen(Some(&ordner), false, "").unwrap();
+        // Ohne Ordner im Test kein Autostart-Ordner.
+        assert!(autostart_pfad(None).is_err());
+        assert!(!autostart_an(None));
         let _ = std::fs::remove_dir_all(&ordner);
     }
 }

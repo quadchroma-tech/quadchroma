@@ -176,6 +176,37 @@ impl<'a> Rahmen<'a> {
     }
 }
 
+/// `buf` ganz von der Leitung lesen - der eine Lesepfad unter allen
+/// Leseaufrufen von Secure (`lesen`, `read_exact`, `read_exact_bis`).
+/// Ohne Frist (`bis` None) gilt die Lesefrist der Leitung (`lesefrist`), je
+/// Leseaufruf. Mit Frist gilt EINE fuer das ganze Lesen: vor jedem Stueck
+/// nur noch die Restzeit, wie `Rahmen::lesen` im Handschlag - sonst hielte
+/// eine Gegenstelle, die alle paar Sekunden ein Byte schickt, den Leser
+/// beliebig lange fest. Die Art des Fehlers bleibt erhalten: UnexpectedEof
+/// heisst Leitung zu, WouldBlock/TimedOut Frist abgelaufen.
+fn leitung_lesen(sock: &TcpStream, buf: &mut [u8], bis: Option<Instant>, was: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind as E};
+    let abgelaufen = || Error::new(E::TimedOut, format!("{was}: Lesefrist abgelaufen"));
+    let mut fertig = 0;
+    while fertig < buf.len() {
+        if let Some(bis) = bis {
+            let rest = bis.saturating_duration_since(Instant::now());
+            if rest.is_zero() {
+                return Err(abgelaufen());
+            }
+            sock.set_read_timeout(Some(rest.max(Duration::from_millis(1)))).ok();
+        }
+        match (&*sock).read(&mut buf[fertig..]) {
+            Ok(0) => return Err(Error::new(E::UnexpectedEof, format!("{was}: Leitung zu"))),
+            Ok(n) => fertig += n,
+            Err(e) if e.kind() == E::Interrupted => {}
+            Err(e) if bis.is_some() && matches!(e.kind(), E::WouldBlock | E::TimedOut) => return Err(abgelaufen()),
+            Err(e) => return Err(Error::new(e.kind(), format!("{was}: {}", wortlaut(&e)))),
+        }
+    }
+    Ok(())
+}
+
 pub struct Secure {
     sock: TcpStream,
     tx: snow::TransportState,
@@ -185,6 +216,10 @@ pub struct Secure {
     pub handshake_hash: Vec<u8>,
     pub peer: Vec<u8>,
     pub sas: String,
+    /// Nutzlast von Handschlag-Nachricht 3 (nur beim Angerufenen, also in
+    /// der Host-Rolle): der Name des Clients (zugang::nachricht3_name).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub nachricht3: Vec<u8>,
 }
 
 impl Secure {
@@ -269,6 +304,7 @@ impl Secure {
             handshake_hash: s.handshake_hash,
             peer: s.remote_static,
             sas,
+            nachricht3: Vec::new(),
         })
     }
 
@@ -291,12 +327,31 @@ impl Secure {
             handshake_hash: s.handshake_hash,
             peer: s.remote_static,
             sas,
+            nachricht3: s.nachricht3,
         })
     }
 
     /// Die Leitung selbst - fuer Socketoptionen der Host-Rolle (Sendepuffer).
     pub fn socket(&self) -> &TcpStream {
         &self.sock
+    }
+
+    /// Liegt schon entschluesselter, noch nicht gelesener Klartext bereit?
+    /// Dann kommt das Lesen ohne die Leitung aus (siehe `bereit`).
+    fn gepuffert(&self) -> bool {
+        self.inpos < self.inbuf.len()
+    }
+
+    /// Wie `read_exact`, aber mit EINER Frist fuer das ganze Lesen (`bis`)
+    /// statt einer je Leseaufruf (siehe `leitung_lesen`) - fuer die
+    /// Zugangsphase der Host-Rolle (host/einlass.rs), in der ein
+    /// unbeglaubigtes Gegenueber sonst mit einzelnen Bytes die Gesamtfrist
+    /// aushebeln koennte. Nach einem Fehler taugt die Leitung nur noch zum
+    /// Schliessen (ein Datensatz kann halb gelesen sein). Die Lesefrist der
+    /// Leitung setzt der Aufrufer danach selbst.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn read_exact_bis(&mut self, dst: &mut [u8], bis: Instant) -> Result<(), String> {
+        self.lesen_bis(dst, Some(bis)).map_err(|e| e.to_string())
     }
 
     /// Eine zweite Hand an derselben Leitung, um sie von aussen zu kappen.
@@ -342,9 +397,9 @@ impl Secure {
     /// wird nur hineingeschaut (peek): eine Wartezeit, die ablaeuft, zerreisst
     /// nie einen Datensatz - so kann die Zugangsphase zwischendurch nach dem
     /// Nutzer sehen, ohne einen eigenen Lesefaden.
-    pub fn bereit(&mut self, warten: Duration) -> std::io::Result<bool> {
+    pub fn bereit(&self, warten: Duration) -> std::io::Result<bool> {
         use std::io::ErrorKind as E;
-        if self.inpos < self.inbuf.len() {
+        if self.gepuffert() {
             return Ok(true);
         }
         let vorher = self.sock.read_timeout().ok().flatten();
@@ -365,18 +420,25 @@ impl Secure {
     /// InvalidData ein Datensatz, der nicht echt oder unplausibel ist. Der
     /// Text ist derselbe wie bei `read_exact`.
     pub fn lesen(&mut self, dst: &mut [u8]) -> std::io::Result<()> {
+        self.lesen_bis(dst, None)
+    }
+
+    /// Entschluesseln und in `dst` verteilen - fuer alle Leseaufrufe gleich;
+    /// die Frist (None: die der Leitung, sonst eine fuer das Ganze) haengt
+    /// an `leitung_lesen`.
+    fn lesen_bis(&mut self, dst: &mut [u8], bis: Option<Instant>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
         let mut done = 0;
         while done < dst.len() {
-            if self.inpos == self.inbuf.len() {
+            if !self.gepuffert() {
                 let mut l = [0u8; 2];
-                (&self.sock).read_exact(&mut l).map_err(|e| Error::new(e.kind(), format!("Laenge: {}", wortlaut(&e))))?;
+                leitung_lesen(&self.sock, &mut l, bis, "Laenge")?;
                 let n = u16::from_le_bytes(l) as usize;
                 if n > CHUNK_MAX + 16 {
                     return Err(Error::new(ErrorKind::InvalidData, "unplausible Datensatzlaenge"));
                 }
                 let mut ct = vec![0u8; n];
-                (&self.sock).read_exact(&mut ct).map_err(|e| Error::new(e.kind(), format!("Daten: {}", wortlaut(&e))))?;
+                leitung_lesen(&self.sock, &mut ct, bis, "Daten")?;
                 let mut pt = vec![0u8; CHUNK_MAX];
                 let got = self
                     .tx
@@ -414,7 +476,7 @@ fn nachricht3() -> &'static [u8] {
 /// hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt.
 /// Windows: %APPDATA%\QuadChroma (ohne APPDATA: unter HOME).
 /// macOS: ~/Library/Application Support/QuadChroma - derselbe Ordner, in dem
-/// der Mac-Host host.key und authorized.txt haelt; getrennte Dateinamen, keine
+/// der Mac-Host host.key und host-devices.txt haelt; getrennte Dateinamen, keine
 /// Kollision.
 ///
 /// Rechte: Unter Unix wird ein neu angelegter Ordner nur fuer den Eigentuemer
@@ -582,220 +644,18 @@ fn exklusiv_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
     r
 }
 
-/// Liest eine Vertrauensliste (authorized.txt der Host-Rolle). Eine
-/// FEHLENDE Datei ergibt None - bei der Freigabeliste heissen "leer" und
-/// "fehlt" nicht dasselbe. Jeder andere Fehler - keine Leserechte, Sperre
-/// durch ein anderes Programm, kein UTF-8 (etwa als ANSI oder UTF-16
-/// gespeichert) - ist ein Fehler: sonst saehe eine vorhandene, aber
-/// unlesbare Liste aus wie der allererste Start. Ein fuehrendes BOM (Editor
-/// "UTF-8 mit BOM") wird uebergangen - sonst traefe die erste Zeile nie.
-fn liste_lesen_falls_da(path: &Path) -> Result<Option<String>, Fehler> {
-    let b = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Fehler::Unlesbar { pfad: path.to_path_buf(), grund: wortlaut(&e) }),
-    };
-    let text = String::from_utf8(b).map_err(|_| Fehler::KeinUtf8 { pfad: path.to_path_buf() })?;
-    Ok(Some(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text)))
-}
-
-/// Haengt eine Zeile an eine Vertrauensliste an. Die vorhandenen Zeilen
-/// werden nie neu geschrieben - ein Fehler beim Schreiben kann also keinen
-/// bestehenden Eintrag kosten. `bisher` ist der gerade gelesene Inhalt; fehlt
-/// ihm das letzte Zeilenende, kommt es vor die neue Zeile. `schreiben`
-/// schreibt die neuen Bytes (Tests schieben dort einen Schreibfehler ein).
-/// Scheitert es, wird die Datei auf ihre alte Laenge zurueckgekuerzt, wie
-/// mit ftruncate beim Mac-Host: eine halbe Zeile bliebe sonst stehen und
-/// zaehlte womoeglich als Eintrag.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn liste_anhaengen_mit(
-    path: &Path,
-    bisher: &str,
-    zeile: &str,
-    schreiben: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let mut o = std::fs::OpenOptions::new();
-    o.create(true).append(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    let mut f = o.open(path)?;
-    let alt = f.metadata()?.len();
-    let mut neu = String::new();
-    if !bisher.is_empty() && !bisher.ends_with('\n') {
-        neu.push('\n');
-    }
-    neu.push_str(zeile);
-    neu.push('\n');
-    let r = schreiben(&mut f, neu.as_bytes());
-    if r.is_err() {
-        // Kuerzen ueber einen eigenen Griff zum Schreiben: einer zum
-        // Anhaengen darf unter Windows die Laenge nicht setzen.
-        drop(f);
-        if let Ok(g) = std::fs::OpenOptions::new().write(true).open(path) {
-            let _ = g.set_len(alt);
-            let _ = g.sync_all();
-        }
-    }
-    r
-}
-
 // ------------------------------------------------- Ablage der Host-Rolle
 //
-// Der Windows-Host hat seinen eigenen dauerhaften Schluessel (host.key) und
-// seine Liste freigegebener Gegenstellen (authorized.txt), beide unter
-// %APPDATA%\QuadChroma neben client.key und known_hosts.txt - getrennte
-// Dateien, keine Kollision. authorized.txt hat das Format des Macs:
-// 64 Hex + zwei Leerzeichen + Fingerabdruck + zwei Leerzeichen + Name.
-// host.key liegt hier wie client.key mit 64 Byte (privat, dann oeffentlich),
-// damit der eigene Fingerabdruck ohne Nachrechnen im Protokoll stehen kann.
+// Der Windows-Host hat seinen eigenen dauerhaften Schluessel (host.key)
+// unter %APPDATA%\QuadChroma neben client.key - getrennte Dateien, keine
+// Kollision. host.key liegt hier wie client.key mit 64 Byte (privat, dann
+// oeffentlich), damit der eigene Fingerabdruck ohne Nachrechnen im
+// Protokoll stehen kann. Die erlaubten Geraete (host-devices.txt, frueher
+// authorized.txt) und das Zugangspasswort fuehrt zugang.rs.
 
 /// Dauerhafter Schluessel des Hosts. Entsteht beim ersten Start.
 pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("host.key"))
-}
-
-fn hex(peer: &[u8]) -> String {
-    peer.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn authorized_path() -> Option<PathBuf> {
-    config_dir().ok().map(|d| d.join("authorized.txt"))
-}
-
-/// Die Freigabeliste, einmal gelesen. Wer ueber eine Gegenstelle
-/// entscheidet, liest sie genau einmal und entscheidet auf diesem Stand -
-/// Pruefen, Erstkontakt und Eintragen sehen dieselbe Datei. Nur die
-/// Host-Rolle (Windows) braucht sie.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub struct Freigaben {
-    pfad: PathBuf,
-    text: String,
-    /// Gab es die Datei? Nur wenn nicht, ist es ein Erstkontakt.
-    vorhanden: bool,
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-impl Freigaben {
-    /// Liest authorized.txt. Err, wenn sie vorhanden, aber nicht lesbar ist
-    /// (Rechte, Sperre, kein UTF-8) - dann entscheidet der Aufrufer auf
-    /// Abweisen, nicht auf Erstkontakt. Ohne Ablageort ebenfalls Err.
-    pub fn lesen() -> Result<Freigaben, String> {
-        let p = authorized_path().ok_or("kein Ablageort fuer authorized.txt")?;
-        Freigaben::lesen_aus(p)
-    }
-
-    fn lesen_aus(pfad: PathBuf) -> Result<Freigaben, String> {
-        let gelesen = liste_lesen_falls_da(&pfad)?;
-        let vorhanden = gelesen.is_some();
-        Ok(Freigaben { pfad, text: gelesen.unwrap_or_default(), vorhanden })
-    }
-
-    /// Ist diese Gegenstelle freigegeben? Verglichen werden die ersten 64
-    /// Zeichen der Zeile ohne Ruecksicht auf Gross- und Kleinschreibung, wie
-    /// mit strncasecmp auf dem Mac - `anzahl` zaehlt solche Zeilen ohnehin
-    /// als gueltig.
-    pub fn enthaelt(&self, peer: &[u8]) -> bool {
-        let h = hex(peer);
-        self.text.lines().any(|l| l.len() >= h.len() && l.as_bytes()[..h.len()].eq_ignore_ascii_case(h.as_bytes()))
-    }
-
-    /// Gueltige Eintraege: Zeilen, die mit 64 Hexziffern beginnen.
-    pub fn anzahl(&self) -> usize {
-        self.text
-            .lines()
-            .filter(|l| l.len() >= 64 && l.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit))
-            .count()
-    }
-
-    /// Darf die naechste unbekannte Gegenstelle ohne --pair herein? Nur,
-    /// wenn es authorized.txt noch gar nicht gibt. Ist sie vorhanden, aber
-    /// ohne einen einzigen gueltigen Eintrag (leer, nur Kommentare, von Hand
-    /// verdorben, beim Schreiben abgeschnitten), ist das KEIN Erststart: Err
-    /// mit dem Grund. Neu koppeln geht dann mit --pair oder nach Loeschen.
-    pub fn erstkontakt(&self) -> Result<bool, String> {
-        if !self.vorhanden {
-            return Ok(true);
-        }
-        if self.anzahl() == 0 {
-            return Err("authorized.txt ist vorhanden, enthaelt aber keine gueltige Freigabe - kein Erstkontakt, \
-                 neue Gegenstellen nur mit --pair (oder Datei loeschen)"
-                .into());
-        }
-        Ok(false)
-    }
-
-    /// Gegenstelle aufnehmen. Schon bekannte Zeilen werden nicht verdoppelt;
-    /// die vorhandenen Zeilen bleiben unberuehrt (angehaengt, nicht neu
-    /// geschrieben). Err heisst: nicht gespeichert - dann nicht zulassen.
-    pub fn aufnehmen(&self, peer: &[u8], name: &str) -> Result<(), String> {
-        self.aufnehmen_mit(peer, name, |f, b| f.write_all(b).and_then(|_| f.sync_all()))
-    }
-
-    /// Wie `aufnehmen`; `schreiben` wie bei `liste_anhaengen_mit`.
-    fn aufnehmen_mit(
-        &self,
-        peer: &[u8],
-        name: &str,
-        schreiben: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
-    ) -> Result<(), String> {
-        if self.enthaelt(peer) {
-            return Ok(());
-        }
-        let zeile = format!("{}  {}  {}", hex(peer), noise::fingerprint(peer), if name.is_empty() { "-" } else { name });
-        liste_anhaengen_mit(&self.pfad, &self.text, &zeile, schreiben).map_err(|e| {
-            // War die Liste vorher nicht da, darf ein gescheitertes Speichern
-            // keine leere Datei hinterlassen - sonst waere der Erstkontakt
-            // verloren (der Mac-Host wertet eine leere Liste ohnehin als
-            // Erstkontakt). Geloescht wird erst hier, mit geschlossenem Griff:
-            // eine offene Datei loescht Windows nicht. Und nur, wenn sie nach
-            // dem Zurueckkuerzen leer ist: hat ein zweiter Host-Prozess mit
-            // derselben Ablage sie inzwischen angelegt und beschrieben, bleibt
-            // seine Zeile stehen.
-            let leer = std::fs::metadata(&self.pfad).map(|m| m.len() == 0).unwrap_or(false);
-            if !self.vorhanden && leer {
-                let _ = std::fs::remove_file(&self.pfad);
-            }
-            format!("authorized.txt: {}", wortlaut(&e))
-        })
-    }
-}
-
-/// Anzahl der freigegebenen Gegenstellen, nur fuer die Startzeile im
-/// Protokoll (unlesbar: 0). Entscheidungen laufen ueber `Freigaben`.
-pub fn authorized_count() -> usize {
-    Freigaben::lesen().map(|f| f.anzahl()).unwrap_or(0)
-}
-
-/// Alle Freigaben loeschen (--forget). Scheitert das Loeschen, gelten die
-/// bisherigen Freigaben weiter - ein verlorenes Geraet kaeme also weiter
-/// herein. Dann bricht die Host-Rolle hier ab (Rueckgabe 8), statt mit der
-/// alten Liste weiterzulaufen und "geloescht" zu melden.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn forget_all() {
-    if let Err(e) = freigaben_loeschen() {
-        let zeile = format!("Freigaben NICHT geloescht: {e} - Abbruch, die bisherigen Gegenstellen waeren weiter freigegeben.");
-        #[cfg(windows)]
-        crate::host::log(zeile);
-        #[cfg(not(windows))]
-        eprintln!("{zeile}");
-        std::process::exit(8);
-    }
-}
-
-/// Loescht authorized.txt. Fehlt sie, ist das Erfolg; jeder andere Fehler
-/// heisst: die alten Freigaben gelten weiter.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn freigaben_loeschen() -> Result<(), String> {
-    datei_loeschen(&authorized_path().ok_or("kein Ablageort fuer authorized.txt")?)
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn datei_loeschen(p: &Path) -> Result<(), String> {
-    match std::fs::remove_file(p) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("{}: {}", p.display(), wortlaut(&e))),
-    }
 }
 
 /// Eigener Schluessel fuer Tests, einmal je Lauf angelegt. Nebeneinander
@@ -822,9 +682,6 @@ mod tests {
         d
     }
 
-    const A: [u8; 32] = [0xaa; 32];
-    const B: [u8; 32] = [0xbb; 32];
-
     /// Die Ablage der Tests ist je Prozess frisch: nicht der Ordner, den ein
     /// frueherer Lauf mit derselben pid hinterliess (samt einer hosts.txt
     /// mit einem anderen Schluessel fuer 127.0.0.1), aber innerhalb eines
@@ -845,57 +702,6 @@ mod tests {
         let o = ordner("lauf");
         assert_eq!(o.file_name().unwrap().to_str().unwrap(), format!("{name}-lauf"));
         let _ = std::fs::remove_dir_all(&o);
-    }
-
-    #[test]
-    fn freigaben_unlesbar_heisst_abweisen() {
-        let d = ordner("auth-ff");
-        let p = d.join("authorized.txt");
-        // Ein gueltiger Eintrag, dessen Namensfeld ein 0xFF-Byte traegt.
-        let mut inhalt = format!("{}  {}  ", hex(&A), noise::fingerprint(&A)).into_bytes();
-        inhalt.extend_from_slice(b"Rechner\xff\n");
-        std::fs::write(&p, &inhalt).unwrap();
-        // Pruefen, Erstkontakt und Eintragen haengen alle an diesem einen
-        // Lesen - scheitert es, gibt es weder Erstkontakt noch Schreiben.
-        assert!(Freigaben::lesen_aus(p.clone()).is_err());
-        assert_eq!(std::fs::read(&p).unwrap(), inhalt);
-
-        // Fehlt die Datei: Erstkontakt, dann genau eine Zeile.
-        let q = d.join("neu.txt");
-        let f = Freigaben::lesen_aus(q.clone()).unwrap();
-        assert_eq!((f.anzahl(), f.enthaelt(&A), f.erstkontakt()), (0, false, Ok(true)));
-        f.aufnehmen(&A, "10.0.0.5").unwrap();
-        let f = Freigaben::lesen_aus(q.clone()).unwrap();
-        assert_eq!((f.anzahl(), f.enthaelt(&A), f.erstkontakt()), (1, true, Ok(false)));
-        // Schon bekannt: keine zweite Zeile. Neuer: angehaengt.
-        f.aufnehmen(&A, "10.0.0.5").unwrap();
-        f.aufnehmen(&B, "").unwrap();
-        let f = Freigaben::lesen_aus(q.clone()).unwrap();
-        assert_eq!(f.anzahl(), 2);
-        assert!(f.text.lines().next().unwrap().starts_with(&hex(&A)));
-    }
-
-    /// Vorhanden, lesbar, aber ohne gueltigen Eintrag: kein Erstkontakt.
-    /// Aufnehmen (der Weg von --pair) geht trotzdem, und die Zeilen davor
-    /// bleiben stehen.
-    #[test]
-    fn freigaben_ohne_gueltigen_eintrag_sind_kein_erstkontakt() {
-        let d = ordner("auth-leer");
-        let p = d.join("authorized.txt");
-        let kaputt = format!("# Freigaben\n{}\n\n", &hex(&A)[..40]);
-        for inhalt in ["", "\n", "\u{feff}", "# nur ein Kommentar, lang genug fuer 64 Zeichen ........................\n", &kaputt] {
-            std::fs::write(&p, inhalt).unwrap();
-            let f = Freigaben::lesen_aus(p.clone()).unwrap();
-            assert_eq!(f.anzahl(), 0, "{inhalt:?}");
-            let e = f.erstkontakt().unwrap_err();
-            assert!(e.contains("keine gueltige Freigabe"), "{e}");
-            assert_eq!(std::fs::read_to_string(&p).unwrap(), inhalt);
-        }
-        let f = Freigaben::lesen_aus(p.clone()).unwrap();
-        f.aufnehmen(&B, "10.0.0.6").unwrap();
-        let f = Freigaben::lesen_aus(p.clone()).unwrap();
-        assert!(f.text.starts_with(&kaputt));
-        assert_eq!((f.anzahl(), f.enthaelt(&B), f.erstkontakt()), (1, true, Ok(false)));
     }
 
     #[test]
@@ -1047,39 +853,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
     }
 
-    /// Ein Schreibfehler mitten im Anhaengen hinterlaesst nichts: eine
-    /// vorhandene Liste hat danach ihre alte Laenge, eine vorher fehlende
-    /// ist wieder weg - der Erstkontakt bleibt erhalten.
-    #[test]
-    fn anhaengen_scheitert_ohne_reste() {
-        let d = ordner("auth-rest");
-        let halb = |f: &mut std::fs::File, b: &[u8]| -> std::io::Result<()> {
-            f.write_all(&b[..b.len() / 2])?;
-            Err(std::io::Error::other("Platte voll"))
-        };
-        let p = d.join("authorized.txt");
-        let f = Freigaben::lesen_aus(p.clone()).unwrap();
-        assert!(f.aufnehmen_mit(&A, "10.0.0.5", halb).is_err());
-        assert!(!p.exists(), "leere oder halbe Liste blieb stehen");
-        let f = Freigaben::lesen_aus(p.clone()).unwrap();
-        assert_eq!(f.erstkontakt(), Ok(true));
-
-        let alt = format!("{}  {}  x\n", hex(&A), noise::fingerprint(&A));
-        std::fs::write(&p, &alt).unwrap();
-        let f = Freigaben::lesen_aus(p.clone()).unwrap();
-        assert!(f.aufnehmen_mit(&B, "10.0.0.6", halb).is_err());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), alt);
-
-        // Beim Lesen fehlte die Liste, dann legt ein zweiter Host-Prozess sie
-        // mit seiner Zeile an, und erst danach scheitert das eigene
-        // Anhaengen: seine Liste bleibt stehen, nur der halbe eigene Teil geht.
-        std::fs::remove_file(&p).unwrap();
-        let f = Freigaben::lesen_aus(p.clone()).unwrap();
-        std::fs::write(&p, &alt).unwrap();
-        assert!(f.aufnehmen_mit(&B, "10.0.0.6", halb).is_err());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), alt);
-    }
-
     /// Eine zu kurze Schluesseldatei wird einmal neu gelesen, bevor sie als
     /// beschaedigt gilt: ohne harte Verweise legt ein zweiter Prozess sie
     /// direkt an, und wer mitten darin liest, saehe sie halb.
@@ -1111,49 +884,6 @@ mod tests {
     fn wortlaut_in_einer_zeile() {
         let e = std::io::Error::other("Eine bestehende Verbindung wurde softwaregesteuert\r\ndurch den Hostcomputer abgebrochen.");
         assert_eq!(wortlaut(&e), "Eine bestehende Verbindung wurde softwaregesteuert durch den Hostcomputer abgebrochen.");
-    }
-
-    /// Grossbuchstaben im Hex zaehlen wie auf dem Mac (strncasecmp).
-    #[test]
-    fn freigabe_ohne_ruecksicht_auf_schreibweise() {
-        let d = ordner("auth-gross");
-        let p = d.join("authorized.txt");
-        std::fs::write(&p, format!("{}  x\n", hex(&A).to_uppercase())).unwrap();
-        let f = Freigaben::lesen_aus(p).unwrap();
-        assert_eq!((f.anzahl(), f.enthaelt(&A), f.enthaelt(&B)), (1, true, false));
-    }
-
-    /// --forget: fehlt die Liste, ist das Erfolg; laesst sie sich nicht
-    /// loeschen, ist es ein Fehler (dann bricht die Host-Rolle ab).
-    #[test]
-    fn freigaben_loeschen_meldet_fehler() {
-        let d = ordner("forget");
-        let p = d.join("authorized.txt");
-        assert_eq!(datei_loeschen(&p), Ok(()));
-        std::fs::write(&p, "x\n").unwrap();
-        assert_eq!(datei_loeschen(&p), Ok(()));
-        assert!(!p.exists());
-        // Nicht zu loeschen: unter Windows eine Datei, die ein anderes
-        // Programm ohne FILE_SHARE_DELETE offen haelt (Virenscanner,
-        // Sicherung - eine schreibgeschuetzte loescht remove_file dort
-        // inzwischen trotzdem), unter Unix ein Ordner ohne Schreibrecht.
-        std::fs::write(&p, "x\n").unwrap();
-        #[cfg(windows)]
-        let r = {
-            use std::os::windows::fs::OpenOptionsExt;
-            let _offen = std::fs::OpenOptions::new().read(true).share_mode(0).open(&p).unwrap();
-            datei_loeschen(&p)
-        };
-        #[cfg(unix)]
-        let r = {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let r = datei_loeschen(&p);
-            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
-            r
-        };
-        assert!(r.is_err(), "{r:?}");
-        assert!(p.exists());
     }
 
     /// Weder ein stummes noch ein troepfelndes Gegenueber haelt die Annahme
