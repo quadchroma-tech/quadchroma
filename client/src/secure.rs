@@ -217,9 +217,14 @@ pub struct Secure {
     pub peer: Vec<u8>,
     pub sas: String,
     /// Nutzlast von Handschlag-Nachricht 3 (nur beim Angerufenen, also in
-    /// der Host-Rolle): der Name des Clients (zugang::nachricht3_name).
+    /// der Host-Rolle): der Name des Clients (zugang::nachricht3_name) und
+    /// seine Flags (zugang::nachricht3_flags).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub nachricht3: Vec<u8>,
+    /// Die Flags, die dieser Anrufer selbst in Nachricht 3 gesendet hat
+    /// (NAME_FLAG_*; beim Angerufenen 0) - Bit 0: er kennt den Schluessel
+    /// der Gegenstelle nicht, sie muss sich in der Zugangsphase ausweisen.
+    pub flags3: u8,
 }
 
 impl Secure {
@@ -228,7 +233,7 @@ impl Secure {
     /// host/netz.rs). Der Client selbst verbindet ueber `connect_pruefend`.
     #[cfg(test)]
     pub fn connect(addr: &str, prologue: &[u8]) -> Result<Secure, Fehler> {
-        Secure::connect_pruefend(addr, prologue, |_| Ok(()))
+        Secure::connect_pruefend(addr, prologue, |_| Ok(0))
     }
 
     /// Verbindet und fuehrt den Handschlag als Anrufer. `pruefen` sieht den
@@ -237,11 +242,12 @@ impl Secure {
     /// nie hinaus, die Leitung faellt zu, und ihr Fehler kommt unveraendert
     /// zurueck. Der Host sieht dann nur einen abgebrochenen Handschlag -
     /// angenommen, und damit ein laufender Zuschauer abgeloest, wird dort
-    /// erst nach Nachricht 3.
+    /// erst nach Nachricht 3. Gelingt sie, liefert sie die Flags fuer
+    /// Nachricht 3 (NAME_FLAG_*, neben dem eigenen Namen; `flags3`).
     pub fn connect_pruefend(
         addr: &str,
         prologue: &[u8],
-        pruefen: impl FnOnce(&[u8]) -> Result<(), Fehler>,
+        pruefen: impl FnOnce(&[u8]) -> Result<u8, Fehler>,
     ) -> Result<Secure, Fehler> {
         // Der eigene Schluessel zuerst: ist client.key beschaedigt oder die
         // Ablage weg, geht gar nicht erst eine Leitung auf - sonst oeffnete
@@ -268,7 +274,7 @@ impl Secure {
         sock: TcpStream,
         prologue: &[u8],
         priv_key: &[u8],
-        pruefen: impl FnOnce(&[u8]) -> Result<(), Fehler>,
+        pruefen: impl FnOnce(&[u8]) -> Result<u8, Fehler>,
     ) -> Result<Secure, Fehler> {
         // Waehrend des Handschlags gilt eine Frist. Danach wird sie wieder
         // aufgehoben: der Bildkanal darf beliebig lange still sein, ohne dass
@@ -277,12 +283,17 @@ impl Secure {
         // Der Handschlag kennt nur Text; der Fehler der Pruefung (Pin,
         // Ablage) wartet hier, damit er mit seiner Art zurueckkommt.
         let mut pruef_fehler: Option<Fehler> = None;
-        let s = noise::handshake_initiator(priv_key, prologue, nachricht3(), |b| r.recv(b), |d| r.send(d), |rs| {
-            pruefen(rs).map_err(|f| {
+        let mut flags3 = 0;
+        let s = noise::handshake_initiator(priv_key, prologue, |b| r.recv(b), |d| r.send(d), |rs| match pruefen(rs) {
+            Ok(f) => {
+                flags3 = f;
+                Ok(crate::zugang::nachricht3(eigener_name(), f))
+            }
+            Err(f) => {
                 let text = f.to_string();
                 pruef_fehler = Some(f);
-                text
-            })
+                Err(text)
+            }
         });
         let s = match s {
             Ok(s) => s,
@@ -305,6 +316,7 @@ impl Secure {
             peer: s.remote_static,
             sas,
             nachricht3: Vec::new(),
+            flags3,
         })
     }
 
@@ -328,6 +340,7 @@ impl Secure {
             peer: s.remote_static,
             sas,
             nachricht3: s.nachricht3,
+            flags3: 0,
         })
     }
 
@@ -460,14 +473,15 @@ impl Secure {
     }
 }
 
-/// Nutzlast von Nachricht 3: "QCN1" mit dem Namen dieses Geraets
-/// (Spezifikation Pairing v1, 1.4) - der Host zeigt ihn im Zulassen-Fenster
-/// und in seiner Geraeteliste; unbeglaubigt, nur Anzeige. Einmal je Prozess
-/// bestimmt: der Rechnername aendert sich im Lauf nicht, und jeder Aufbau
-/// (auch der des Eingabekanals) schickt ihn.
-fn nachricht3() -> &'static [u8] {
-    static N: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    N.get_or_init(|| crate::zugang::nachricht3(&crate::zugang::geraetename()))
+/// Der Name dieses Geraets fuer Nachricht 3 ("QCN1", Spezifikation Pairing
+/// v1, 1.4) - der Host zeigt ihn im Zulassen-Fenster und in seiner
+/// Geraeteliste; unbeglaubigt, nur Anzeige. Einmal je Prozess bestimmt: der
+/// Rechnername aendert sich im Lauf nicht, und jeder Aufbau (auch der des
+/// Eingabekanals) schickt ihn. Die Flags dahinter haengen vom Schluessel
+/// der Gegenstelle ab (connect_pruefend).
+fn eigener_name() -> &'static str {
+    static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    N.get_or_init(crate::zugang::geraetename)
 }
 
 // ------------------------------------------------------------ Schluesselablage

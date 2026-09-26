@@ -251,6 +251,7 @@ pub static PL: Lang = Lang {
         (HostPasswordNotSaved, "Nie udało się zapisać hasła."),
         (HostPasswordInvalid, "Hasło zawiera niedozwolone znaki."),
         (HostPasswordTitle, "Zmień hasło"),
+        (MsgHostUnverified, "Komputer {n} nie potwierdził swojej tożsamości. Ze względów bezpieczeństwa połączenie zostało przerwane."),
     ],
 };
 
@@ -502,6 +503,7 @@ pub static CS: Lang = Lang {
         (HostPasswordNotSaved, "Heslo se nepodařilo uložit."),
         (HostPasswordInvalid, "Heslo obsahuje nepovolené znaky."),
         (HostPasswordTitle, "Změnit heslo"),
+        (MsgHostUnverified, "Počítač {n} neprokázal svou identitu. Připojení bylo z bezpečnostních důvodů ukončeno."),
     ],
 };
 
@@ -753,6 +755,7 @@ pub static SK: Lang = Lang {
         (HostPasswordNotSaved, "Heslo sa nepodarilo uložiť."),
         (HostPasswordInvalid, "Heslo obsahuje nepovolené znaky."),
         (HostPasswordTitle, "Zmeniť heslo"),
+        (MsgHostUnverified, "Počítač {n} nepreukázal svoju identitu. Pripojenie bolo z bezpečnostných dôvodov ukončené."),
     ],
 };
 
@@ -1004,6 +1007,7 @@ pub static HU: Lang = Lang {
         (HostPasswordNotSaved, "A jelszót nem sikerült menteni."),
         (HostPasswordInvalid, "A jelszó nem engedélyezett karaktereket tartalmaz."),
         (HostPasswordTitle, "Jelszó módosítása"),
+        (MsgHostUnverified, "{n} nem igazolta a kilétét. A kapcsolat biztonsági okból megszakadt."),
     ],
 };
 
@@ -1255,6 +1259,7 @@ pub static RO: Lang = Lang {
         (HostPasswordNotSaved, "Parola nu a putut fi salvată."),
         (HostPasswordInvalid, "Parola conține caractere nepermise."),
         (HostPasswordTitle, "Schimbă parola"),
+        (MsgHostUnverified, "{n} nu și-a dovedit identitatea. Din motive de siguranță, conexiunea a fost oprită."),
     ],
 };
 
@@ -1506,6 +1511,7 @@ pub static BG: Lang = Lang {
         (HostPasswordNotSaved, "Паролата не можа да бъде запазена."),
         (HostPasswordInvalid, "Паролата съдържа непозволени знаци."),
         (HostPasswordTitle, "Смяна на паролата"),
+        (MsgHostUnverified, "{n} не доказа идентичността си. Връзката беше прекъсната от съображения за сигурност."),
     ],
 };
 
@@ -1757,5 +1763,6 @@ pub static EL: Lang = Lang {
         (HostPasswordNotSaved, "Δεν ήταν δυνατή η αποθήκευση του κωδικού πρόσβασης."),
         (HostPasswordInvalid, "Ο κωδικός πρόσβασης περιέχει μη επιτρεπόμενους χαρακτήρες."),
         (HostPasswordTitle, "Αλλαγή κωδικού πρόσβασης"),
+        (MsgHostUnverified, "Ο υπολογιστής {n} δεν απέδειξε την ταυτότητά του. Η σύνδεση διακόπηκε για λόγους ασφαλείας."),
     ],
 };

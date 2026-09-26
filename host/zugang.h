@@ -5,7 +5,10 @@
 // bisher "QCH1". Ein unbekanntes Geraet bekommt "QCA1" und die Zugangsphase
 // (Nachrichten 20-23 auf dem Bildkanal): es beweist das Zugangspasswort des
 // Hosts (host-password.txt), oder jemand am Host klickt "Zulassen". Danach
-// ist es eingetragen.
+// ist es eingetragen. Setzt ein Client Bit 0 in Nachricht 3 (er kennt den
+// Schluessel dieses Hosts nicht), bekommt er die Zugangsphase auch als
+// bekanntes Geraet: der host_proof in 22/0 (oder "Zulassen") weist den Host
+// aus; der Eintrag bleibt, wie er ist.
 //
 // Hier steht alles, was ohne AppKit und ohne Netz geht und sich deshalb im
 // Pruefstand zugangtest rechnen laesst: ID, Namen, Nachrichten, Kryptografie
@@ -32,6 +35,9 @@
 #define QC_ZUGANG_FASSUNG      1
 #define QC_ZUGANG_WEG_PASSWORT 0x01     // Bit 0: immer gesetzt
 #define QC_ZUGANG_WEG_ZULASSEN 0x02     // Bit 1: am Host kann jemand "Zulassen" klicken
+#define QC_ZUGANG_N3_HOST_UNBEKANNT 0x01 // Flags in Nachricht 3, Bit 0: der Client kennt den
+                                        // Schluessel dieses Hosts nicht - Zugangsphase auch
+                                        // fuer ein bekanntes Geraet (der Host weist sich aus)
 
 enum {
     QC_ERGEBNIS_PASSWORT   = 0,         // angenommen per Passwort, 32 Byte host_proof folgen
@@ -100,13 +106,21 @@ void qc_zugang_code_text(uint32_t code, char out[8]);
 /// Rueckgabe: Laenge ohne Nullbyte.
 size_t qc_zugang_name_saeubern(const void *in, size_t n, char *out, size_t max);
 
-/// Nutzlast von Handschlag-Nachricht 3: "QCN1" | u8 n | n Byte UTF-8 (n <= 40).
-/// 1 = Name gelesen (gesaeubert, nicht leer), 0 = fehlt oder kaputt - dann ist
-/// name leer und der Aufrufer nimmt die Adresse der Gegenstelle.
+/// Nutzlast von Handschlag-Nachricht 3: "QCN1" | u8 n | n Byte UTF-8 (n <= 40) |
+/// u8 flags. 1 = Name gelesen (gesaeubert, nicht leer), 0 = fehlt oder kaputt -
+/// dann ist name leer und der Aufrufer nimmt die Adresse der Gegenstelle.
 int qc_zugang_name_lesen(const uint8_t *nutzlast, size_t n, char name[QC_ZUGANG_NAME_MAX + 1]);
 
-/// Gegenstueck fuer Clients und Pruefstaende. cap >= 45. Rueckgabe: Laenge.
-size_t qc_zugang_name_kodieren(const char *name, uint8_t *out, size_t cap);
+/// Die Flags aus Nachricht 3 (QC_ZUGANG_N3_*): das Byte direkt hinter dem
+/// Namen. 0, wenn es fehlt (aeltere Fassung ohne Flags, "client") oder der
+/// Aufbau nicht stimmt (Kennung, Laenge ueber 40, abgeschnitten); ob der Name
+/// selbst taugt, spielt keine Rolle. Bytes dahinter und unbekannte Bits zaehlen
+/// nicht.
+uint8_t qc_zugang_name_flags(const uint8_t *nutzlast, size_t n);
+
+/// Gegenstueck fuer Clients und Pruefstaende: "QCN1" | n | Name | flags.
+/// cap >= 46. Rueckgabe: Laenge (0: cap zu klein).
+size_t qc_zugang_name_kodieren(const char *name, uint8_t flags, uint8_t *out, size_t cap);
 
 // ----------------------------------------------------------- Bekanntgabe (2)
 

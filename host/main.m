@@ -1086,7 +1086,10 @@ static void zuschauer_entfernt(const uint8_t *pub) {
 // Ein Geraet, das nicht in host-devices.txt steht (oder die Liste ist
 // beschaedigt), bekommt nach dem Handschlag "QCA1" statt "QCH1" und die
 // Nachrichten 20-23 (zugang.h, Spezifikation 3.2): es beweist das
-// Zugangspasswort, oder jemand am Host klickt "Zulassen". Bis dahin
+// Zugangspasswort, oder jemand am Host klickt "Zulassen". Ebenso ein
+// bekanntes Geraet mit Bit 0 in Nachricht 3 (1.4): es kennt den Schluessel
+// dieses Hosts nicht, und erst der host_proof in 22/0 (oder "Zulassen" mit
+// dem Vergleichscode) weist den Host ihm gegenueber aus. Bis dahin
 // geschieht nichts, was einen laufenden Zuschauer beruehrt: keine Abloesung,
 // keine Aufnahme, kein g_vid_hh - also auch kein Eingabekanal. Gewartet wird
 // ohne jede Sperre; wach wird die Phase durch den Client (poll auf den
@@ -1115,10 +1118,13 @@ static int zugang_ergebnis(qc_chan *c, uint8_t ergebnis, uint32_t warten_ms, con
 
 // Eintragen nach Passwort oder Klick. Laesst sich die Liste nicht schreiben
 // (beschaedigt, Platte), kommt das Geraet fuer diese Sitzung trotzdem herein -
-// es hat sich ausgewiesen; beim naechsten Mal fragt der Host eben wieder.
-static void zugang_eintragen(qc_chan *chan, const char *name, const char *id_text, const char *ip, const char *weg) {
+// es hat sich ausgewiesen; beim naechsten Mal fragt der Host eben wieder. Ein
+// Geraet, das schon in der Liste stand (Bit 0), bleibt, wie es eingetragen ist.
+static void zugang_eintragen(qc_chan *chan, const char *name, const char *id_text, const char *ip, const char *weg,
+                             int bekannt) {
     if (qc_zugang_eintragen(chan->peer, name) == 0)
-        logf_(@"Zugang: %@ (ID %s, %s) %s und eingetragen", utf8(name), id_text, ip, weg);
+        logf_(@"Zugang: %@ (ID %s, %s) %s und %s", utf8(name), id_text, ip, weg,
+              bekannt ? "war schon eingetragen (Host auf Wunsch des Clients ausgewiesen)" : "eingetragen");
     else
         logf_(@"Zugang: %@ (ID %s, %s) %s - Eintrag in host-devices.txt liess sich nicht speichern, "
                "diese Sitzung laeuft trotzdem", utf8(name), id_text, ip, weg);
@@ -1134,8 +1140,9 @@ static int zugang_lesen(qc_chan *c, void *p, size_t n, int64_t bis) {
 
 // YES = zugelassen: 22/0 oder 22/1 ist hinaus, der Aufrufer macht weiter wie
 // bei einem bekannten Geraet ("QCH1"). NO = nicht: alles Noetige ist gesagt,
-// der Aufrufer schliesst.
-static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const char *ip, const char *name_c) {
+// der Aufrufer schliesst. bekannt: das Geraet steht schon in der Liste und ist
+// nur hier, weil es mit Bit 0 in Nachricht 3 den Ausweis des Hosts verlangt.
+static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const char *ip, const char *name_c, int bekannt) {
     uint32_t cid = qc_zugang_id(chan->peer);
     char id_text[12];
     qc_zugang_id_text(cid, id_text);
@@ -1168,7 +1175,8 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
         qc_zugang_phase_ende(platz);
         return NO;
     }
-    logf_gedrosselt(&d_zugang, ip, @"Zugang noetig: %@ (ID %s) von %s%s%@", name, id_text, ip,
+    logf_gedrosselt(&d_zugang, ip, @"Zugang noetig: %@ (ID %s) von %s%s%s%@", name, id_text, ip,
+                    bekannt ? " - bekannt, kennt diesen Host aber nicht (Bit 0 in Nachricht 3), der Host weist sich aus" : "",
                     wege & QC_ZUGANG_WEG_ZULASSEN ? " - Passwort oder Zulassen" : " - Passwort",
                     warten ? [[NSString alloc] initWithFormat:@", Drossel %u s", (warten + 999) / 1000] : @"");
 
@@ -1189,7 +1197,7 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
         int stand = anfrage ? qc_zugang_anfrage_stand(anfrage) : -1;
         if (stand == 1) {
             if (zugang_ergebnis(chan, QC_ERGEBNIS_ZUGELASSEN, 0, NULL) == 0) {
-                zugang_eintragen(chan, name_c, id_text, ip, "am Host zugelassen");
+                zugang_eintragen(chan, name_c, id_text, ip, "am Host zugelassen", bekannt);
                 zugelassen = YES;
             } else {
                 logf_(@"Zugang: %@ (ID %s, %s) am Host zugelassen, aber nicht mehr erreichbar", name, id_text, ip);
@@ -1269,7 +1277,7 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
             // Das Fenster am Host schliesst, bevor die Sitzung beginnt.
             if (anfrage) { qc_zugang_anfrage_zurueckziehen(anfrage); anfrage = 0; }
             if (zugang_ergebnis(chan, QC_ERGEBNIS_PASSWORT, 0, host_proof) == 0) {
-                zugang_eintragen(chan, name_c, id_text, ip, "mit Passwort angenommen");
+                zugang_eintragen(chan, name_c, id_text, ip, "mit Passwort angenommen", bekannt);
                 zugelassen = YES;
             }
             qc_wipe(host_proof, sizeof host_proof);
@@ -1359,9 +1367,12 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     // Liste, sonst ist es die Adresse. Bekannte Geraete kommen sofort
     // herein, alle anderen - auch wenn die Liste beschaedigt ist - muessen
     // sich in der Zugangsphase ausweisen. Die Liste ist dafuer nur fuer
-    // diesen einen Blick gesperrt.
+    // diesen einen Blick gesperrt. Verlangt ein bekanntes Geraet mit Bit 0
+    // in Nachricht 3, dass sich der Host ausweist (es kennt dessen
+    // Schluessel nicht), durchlaeuft es die Zugangsphase ebenso.
     char name[QC_ZUGANG_NAME_MAX + 1], gespeichert[QC_ZUGANG_NAME_MAX + 1];
     qc_zugang_name_lesen(chan->nutzlast3, chan->nutzlast3_len, name);
+    int ausweis = (qc_zugang_name_flags(chan->nutzlast3, chan->nutzlast3_len) & QC_ZUGANG_N3_HOST_UNBEKANNT) != 0;
     if (name[0] && name_taeuscht_id_vor(name)) name[0] = 0;
     uint64_t entfernt_stand = atomic_load(&g_entfernt_zaehler);   // vor dem Blick in die Liste
     int bekannt = qc_zugang_bekannt(chan->peer, gespeichert);
@@ -1369,7 +1380,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     if (bekannt < 0)
         logf_gedrosselt(&d_liste_defekt, ip, @"Geraeteliste host-devices.txt nicht lesbar oder beschaedigt - %s (%s) muss sich ausweisen",
                         fp, ip);
-    if (bekannt <= 0 && !zugang_phase(chan, &peer, ip, name)) {
+    if ((bekannt <= 0 || ausweis) && !zugang_phase(chan, &peer, ip, name, bekannt > 0)) {
         qc_chan_free(chan);
         close(fd);
         return;

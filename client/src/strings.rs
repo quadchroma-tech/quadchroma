@@ -433,6 +433,10 @@ pub enum Key {
     HostPasswordInvalid,
     /// Passwortfenster: Titel.
     HostPasswordTitle,
+    /// Meldung (1.4, 3.5): Bit 0 in Nachricht 3 war gesetzt (Schluessel des
+    /// Hosts nicht gepinnt), der Host sagte trotzdem gleich QCH1 - er hat
+    /// sich nicht ausgewiesen; {n} Name des Hosts.
+    MsgHostUnverified,
 }
 
 pub struct Lang {
@@ -707,6 +711,7 @@ pub static EN: Lang = Lang {
         (HostPasswordNotSaved, "The password could not be saved."),
         (HostPasswordInvalid, "The password contains characters that are not allowed."),
         (HostPasswordTitle, "Change password"),
+        (MsgHostUnverified, "{n} did not prove its identity. The connection was stopped for safety."),
     ],
 };
 
@@ -958,6 +963,7 @@ pub static DE: Lang = Lang {
         (HostPasswordNotSaved, "Das Passwort konnte nicht gespeichert werden."),
         (HostPasswordInvalid, "Das Passwort enthält unzulässige Zeichen."),
         (HostPasswordTitle, "Passwort ändern"),
+        (MsgHostUnverified, "{n} hat seine Identität nicht nachgewiesen. Die Verbindung wurde sicherheitshalber beendet."),
     ],
 };
 
@@ -1003,8 +1009,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > HostPasswordTitle as usize);
-        assert_eq!(n, HostPasswordTitle as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > MsgHostUnverified as usize);
+        assert_eq!(n, MsgHostUnverified as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Abbruchgruende der Datei-Zeile: in jeder Sprache vorhanden, ohne
@@ -1152,7 +1158,7 @@ mod tests {
         let n: &[&str] = &["{n}"];
         let i: &[&str] = &["{i}"];
         let keiner: &[&str] = &[];
-        let alle: [(Key, &[&str]); 61] = [
+        let alle: [(Key, &[&str]); 62] = [
             (AccessTitle, n),
             (AccessText, n),
             (AccessOrAllow, n),
@@ -1214,13 +1220,14 @@ mod tests {
             (HostPasswordNotSaved, keiner),
             (HostPasswordInvalid, keiner),
             (HostPasswordTitle, keiner),
+            (MsgHostUnverified, n),
         ];
         // Lueckenlos am Ende: so bleiben alle 29 Tabellen davor unveraendert.
         assert_eq!(AccessTitle as usize, ScreenFallback as usize + 1);
         for (nr, (k, _)) in alle.iter().enumerate() {
             assert_eq!(*k as usize, AccessTitle as usize + nr, "{k:?}");
         }
-        assert_eq!(HostPasswordTitle as usize + 1, EN.table.len());
+        assert_eq!(MsgHostUnverified as usize + 1, EN.table.len());
         let bekannt = ["{n}", "{m}", "{i}", "{c}", "{s}", "{p}", "{d}"];
         for l in all() {
             for (k, soll) in &alle {
@@ -1296,6 +1303,11 @@ mod tests {
         assert_eq!(DE.get(HostPasswordInvalid), "Das Passwort enthält unzulässige Zeichen.");
         assert_eq!(EN.get(HostPasswordTitle), "Change password");
         assert_eq!(DE.get(HostPasswordTitle), "Passwort ändern");
+        assert_eq!(EN.get(MsgHostUnverified), "{n} did not prove its identity. The connection was stopped for safety.");
+        assert_eq!(
+            DE.get(MsgHostUnverified),
+            "{n} hat seine Identität nicht nachgewiesen. Die Verbindung wurde sicherheitshalber beendet."
+        );
         // Die uebrigen 27 Sprachen sind uebersetzt (Paket P6): gleich wie
         // Englisch nur Code, ID und OK - und die Woerter, die eine Sprache
         // aus dem Englischen uebernimmt (italienisch "Password",

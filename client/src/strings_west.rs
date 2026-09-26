@@ -253,6 +253,7 @@ pub static FR: Lang = Lang {
         (HostPasswordNotSaved, "Le mot de passe n'a pas pu être enregistré."),
         (HostPasswordInvalid, "Le mot de passe contient des caractères non autorisés."),
         (HostPasswordTitle, "Changer le mot de passe"),
+        (MsgHostUnverified, "{n} n'a pas prouvé son identité. Par sécurité, la connexion a été interrompue."),
     ],
 };
 
@@ -504,6 +505,7 @@ pub static ES: Lang = Lang {
         (HostPasswordNotSaved, "No se ha podido guardar la contraseña."),
         (HostPasswordInvalid, "La contraseña contiene caracteres no permitidos."),
         (HostPasswordTitle, "Cambiar contraseña"),
+        (MsgHostUnverified, "{n} no ha demostrado su identidad. Por seguridad, se ha cortado la conexión."),
     ],
 };
 
@@ -755,6 +757,7 @@ pub static IT: Lang = Lang {
         (HostPasswordNotSaved, "Impossibile salvare la password."),
         (HostPasswordInvalid, "La password contiene caratteri non consentiti."),
         (HostPasswordTitle, "Cambia password"),
+        (MsgHostUnverified, "{n} non ha dimostrato la propria identità. Per sicurezza la connessione è stata interrotta."),
     ],
 };
 
@@ -1006,6 +1009,7 @@ pub static PT: Lang = Lang {
         (HostPasswordNotSaved, "Não foi possível guardar a palavra-passe."),
         (HostPasswordInvalid, "A palavra-passe contém caracteres não permitidos."),
         (HostPasswordTitle, "Alterar palavra-passe"),
+        (MsgHostUnverified, "{n} não comprovou a sua identidade. Por segurança, a ligação foi terminada."),
     ],
 };
 
@@ -1257,5 +1261,6 @@ pub static NL: Lang = Lang {
         (HostPasswordNotSaved, "Het wachtwoord kon niet worden opgeslagen."),
         (HostPasswordInvalid, "Het wachtwoord bevat tekens die niet zijn toegestaan."),
         (HostPasswordTitle, "Wachtwoord wijzigen"),
+        (MsgHostUnverified, "{n} heeft zijn identiteit niet aangetoond. Voor de veiligheid is de verbinding verbroken."),
     ],
 };

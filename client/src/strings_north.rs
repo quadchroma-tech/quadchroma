@@ -251,6 +251,7 @@ pub static SV: Lang = Lang {
         (HostPasswordNotSaved, "Lösenordet kunde inte sparas."),
         (HostPasswordInvalid, "Lösenordet innehåller otillåtna tecken."),
         (HostPasswordTitle, "Ändra lösenord"),
+        (MsgHostUnverified, "{n} styrkte inte sin identitet. Anslutningen avbröts av säkerhetsskäl."),
     ],
 };
 
@@ -502,6 +503,7 @@ pub static DA: Lang = Lang {
         (HostPasswordNotSaved, "Adgangskoden kunne ikke gemmes."),
         (HostPasswordInvalid, "Adgangskoden indeholder tegn, der ikke er tilladt."),
         (HostPasswordTitle, "Skift adgangskode"),
+        (MsgHostUnverified, "{n} beviste ikke sin identitet. Forbindelsen blev afbrudt af sikkerhedshensyn."),
     ],
 };
 
@@ -753,6 +755,7 @@ pub static NB: Lang = Lang {
         (HostPasswordNotSaved, "Passordet kunne ikke lagres."),
         (HostPasswordInvalid, "Passordet inneholder tegn som ikke er tillatt."),
         (HostPasswordTitle, "Endre passord"),
+        (MsgHostUnverified, "{n} beviste ikke identiteten sin. Tilkoblingen ble stoppet av sikkerhetshensyn."),
     ],
 };
 
@@ -1004,6 +1007,7 @@ pub static FI: Lang = Lang {
         (HostPasswordNotSaved, "Salasanaa ei voitu tallentaa."),
         (HostPasswordInvalid, "Salasana sisältää merkkejä, jotka eivät ole sallittuja."),
         (HostPasswordTitle, "Vaihda salasana"),
+        (MsgHostUnverified, "{n} ei todistanut identiteettiään. Yhteys katkaistiin turvallisuussyistä."),
     ],
 };
 
@@ -1255,5 +1259,6 @@ pub static IS: Lang = Lang {
         (HostPasswordNotSaved, "Ekki tókst að vista lykilorðið."),
         (HostPasswordInvalid, "Lykilorðið inniheldur stafi sem eru ekki leyfðir."),
         (HostPasswordTitle, "Breyta lykilorði"),
+        (MsgHostUnverified, "{n} sannaði ekki auðkenni sitt. Tengingin var rofin af öryggisástæðum."),
     ],
 };

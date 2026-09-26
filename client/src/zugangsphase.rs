@@ -25,10 +25,19 @@
 //
 // Dazu, was der Client vor dem Verbinden weiss (`Vorwissen`): hosts.txt,
 // VOR jeder Leitung gelesen, die Pruefung der gewaehlten ID nach Nachricht 2
-// (8.2) und die Frage, ob an einer bekannten Adresse ein neues Geraet
-// antwortet (8.3 - kein Dauerfehler mehr, sondern ein Hinweis im Dialog).
+// (8.2), die Flags fuer Nachricht 3 und die Frage, ob an einer bekannten
+// Adresse ein neues Geraet antwortet (8.3 - kein Dauerfehler mehr, sondern
+// ein Hinweis im Dialog).
+//
+// Erstkontakt (1.4, 3.5): Kennt der Client den Schluessel des Hosts nicht,
+// setzt er Bit 0 in Nachricht 3 ("weise dich aus"). Ein Host, der ihn
+// kennt, fuehrt dann trotzdem die Zugangsphase - und beweist mit 22/0 und
+// host_proof, dass er das Passwort kennt (oder jemand klickt dort
+// "Zulassen", 22/1 mit dem Vergleichscode auf beiden Seiten). Sagt er
+// stattdessen gleich "QCH1", hat er sich nicht ausgewiesen: der Client
+// bricht ab und pinnt nichts (main.rs, MsgHostUnverified).
 
-use crate::protokoll_konst::{MAGIC, MAGIC_ZUGANG};
+use crate::protokoll_konst::{MAGIC, MAGIC_ZUGANG, NAME_FLAG_HOST_UNBEKANNT};
 use crate::zugang::{self, BekannterHost, DateiFehler, Ergebnis, Hostliste, Nachricht, ZugangNoetig};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -43,11 +52,16 @@ pub const KENNUNG_FRIST: Duration = Duration::from_millis(1500);
 
 /// Laengste Stille in der Zugangsphase, bevor der Client aufgibt: die
 /// Gesamtfrist des Hosts (120 s, danach sendet er Ergebnis 4) und etwas
-/// Luft. Wartet der Nutzer auf "Zulassen", kommt so lange nichts.
+/// Luft. Wartet der Nutzer auf "Zulassen", kommt so lange nichts. In
+/// Tests kuerzer - aber nicht zu kurz: in einem Testbau ohne Optimierung
+/// braucht PBKDF2 (100 000 Runden) je Seite gut 1,5 s, und die Stille zaehlt
+/// ab der letzten Nachricht des Hosts, also samt Wartezeit der Drossel und
+/// beiden Rechnungen fuer einen Beweis (bei 3 s scheiterten die
+/// Passworttests dann je nach Last).
 #[cfg(not(test))]
 pub const RUHE_FRIST: Duration = Duration::from_secs(zugang::PHASE_FRIST.as_secs() + 10);
 #[cfg(test)]
-pub const RUHE_FRIST: Duration = Duration::from_secs(3);
+pub const RUHE_FRIST: Duration = Duration::from_secs(10);
 
 /// Takt der Zugangsphase: so oft wird nach dem Nutzer gesehen.
 pub const TAKT: Duration = Duration::from_millis(50);
@@ -428,13 +442,33 @@ pub struct Vorwissen {
     pub adresse: String,
     /// Verbunden ueber eine ID (Liste, Eingabe, Verknuepfung): diese.
     pub erwartet: Option<u32>,
+    /// Der Schluessel des Hosts, der dieses Geraet seit der Wahl durch den
+    /// Nutzer schon angenommen hat (Shared::angenommen) - er gilt beim
+    /// Wiederverbinden als gepinnt, auch wenn hosts.txt ihn nicht (mehr)
+    /// fuehrt (Schreiben scheiterte, Datei geloescht). Sonst saehe der Host
+    /// Bit 0, verlangte die Zugangsphase, und der Client zoege sie zurueck
+    /// (keine Anfrage ohne den Nutzer).
+    pub angenommen: Option<Vec<u8>>,
 }
 
 impl Vorwissen {
     /// hosts.txt lesen. Unlesbar oder kein UTF-8: Err - dann wird nicht
     /// verbunden (wie known_hosts.txt bisher).
     pub fn laden(pfad: &Path, adresse: &str, erwartet: Option<u32>) -> Result<Vorwissen, DateiFehler> {
-        Ok(Vorwissen { liste: Hostliste::laden(pfad)?, adresse: adresse.to_string(), erwartet })
+        Ok(Vorwissen { liste: Hostliste::laden(pfad)?, adresse: adresse.to_string(), erwartet, angenommen: None })
+    }
+
+    /// Die Flags fuer Nachricht 3 (1.4), nach Nachricht 2: Bit 0
+    /// (NAME_FLAG_HOST_UNBEKANNT), wenn dieser Schluessel nicht gepinnt ist -
+    /// weder in hosts.txt noch als der Host, der dieses Geraet eben schon
+    /// angenommen hat. Dann muss der Host sich in der Zugangsphase ausweisen,
+    /// auch wenn er dieses Geraet kennt.
+    pub fn flags3(&self, peer: &[u8]) -> u8 {
+        if self.bekannt(peer).is_some() || self.angenommen.as_deref() == Some(peer) {
+            0
+        } else {
+            NAME_FLAG_HOST_UNBEKANNT
+        }
     }
 
     /// Im Handschlag nach Nachricht 2 (8.2): beim Verbinden ueber eine ID
@@ -854,7 +888,12 @@ mod tests {
         // Gemerkt ist zu dieser ID ein anderer voller Schluessel (errechnete
         // Kollision; hier nachgestellt mit einem Eintrag, der b die ID von a
         // gibt): dieselbe ID reicht nicht.
-        let mut kollision = Vorwissen { liste: Hostliste::default(), adresse: "10.0.0.5:9001".into(), erwartet: Some(zugang::geraete_id(&a)) };
+        let mut kollision = Vorwissen {
+            liste: Hostliste::default(),
+            adresse: "10.0.0.5:9001".into(),
+            erwartet: Some(zugang::geraete_id(&a)),
+            angenommen: None,
+        };
         kollision.liste.hosts.push(BekannterHost { id: zugang::geraete_id(&a), schluessel: b, adresse: "10.0.0.5:9001".into(), name: "Mac".into() });
         assert_eq!(
             kollision.pruefen(&a),
@@ -882,6 +921,26 @@ mod tests {
         // Kaputte Liste (kein UTF-8): nicht verbinden.
         std::fs::write(&p, b"\xff\xfe").unwrap();
         assert!(Vorwissen::laden(&p, "10.0.0.5:9001", None).is_err());
+    }
+
+    /// Bit 0 in Nachricht 3 (1.4): gesetzt, solange der Schluessel des Hosts
+    /// nicht gepinnt ist - egal, unter welcher Adresse er gemerkt ist; der
+    /// Host, der dieses Geraet eben angenommen hat, gilt auch ohne Eintrag
+    /// als gepinnt.
+    #[test]
+    fn flags_fuer_nachricht_3() {
+        let d = ordner("flags3");
+        let p = d.join("hosts.txt");
+        let (a, b) = ([0x31u8; 32], [0x32u8; 32]);
+        let v = Vorwissen::laden(&p, "10.0.0.5:9001", None).unwrap();
+        assert_eq!(v.flags3(&a), NAME_FLAG_HOST_UNBEKANNT, "leere Liste");
+        assert!(pinnen(&p, &a, "10.0.0.9:9001", "Mac").unwrap());
+        let mut v = Vorwissen::laden(&p, "10.0.0.5:9001", Some(zugang::geraete_id(&a))).unwrap();
+        assert_eq!(v.flags3(&a), 0, "gepinnt, auch unter anderer Adresse");
+        assert_eq!(v.flags3(&b), NAME_FLAG_HOST_UNBEKANNT);
+        v.angenommen = Some(b.to_vec());
+        assert_eq!(v.flags3(&b), 0, "eben angenommen");
+        assert_eq!(v.flags3(&[0x33u8; 32]), NAME_FLAG_HOST_UNBEKANNT);
     }
 
     /// Pinnen schreibt nur, wenn sich etwas aendert; ein neuer Schluessel

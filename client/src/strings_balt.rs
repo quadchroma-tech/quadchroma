@@ -251,6 +251,7 @@ pub static ET: Lang = Lang {
         (HostPasswordNotSaved, "Parooli ei õnnestunud salvestada."),
         (HostPasswordInvalid, "Parool sisaldab lubamatuid märke."),
         (HostPasswordTitle, "Muuda parooli"),
+        (MsgHostUnverified, "{n} ei tõendanud oma identiteeti. Ühendus katkestati turvalisuse huvides."),
     ],
 };
 
@@ -502,6 +503,7 @@ pub static LV: Lang = Lang {
         (HostPasswordNotSaved, "Paroli neizdevās saglabāt."),
         (HostPasswordInvalid, "Parolē ir neatļautas rakstzīmes."),
         (HostPasswordTitle, "Mainīt paroli"),
+        (MsgHostUnverified, "Dators {n} nepierādīja savu identitāti. Drošības nolūkos savienojums tika pārtraukts."),
     ],
 };
 
@@ -753,6 +755,7 @@ pub static LT: Lang = Lang {
         (HostPasswordNotSaved, "Nepavyko išsaugoti slaptažodžio."),
         (HostPasswordInvalid, "Slaptažodyje yra neleistinų simbolių."),
         (HostPasswordTitle, "Keisti slaptažodį"),
+        (MsgHostUnverified, "Kompiuteris {n} neįrodė savo tapatybės. Saugumo sumetimais ryšys nutrauktas."),
     ],
 };
 
@@ -1004,6 +1007,7 @@ pub static SL: Lang = Lang {
         (HostPasswordNotSaved, "Gesla ni bilo mogoče shraniti."),
         (HostPasswordInvalid, "Geslo vsebuje nedovoljene znake."),
         (HostPasswordTitle, "Spremeni geslo"),
+        (MsgHostUnverified, "Računalnik {n} ni dokazal svoje identitete. Povezava je bila iz varnostnih razlogov prekinjena."),
     ],
 };
 
@@ -1255,6 +1259,7 @@ pub static HR: Lang = Lang {
         (HostPasswordNotSaved, "Lozinku nije bilo moguće spremiti."),
         (HostPasswordInvalid, "Lozinka sadrži nedopuštene znakove."),
         (HostPasswordTitle, "Promijeni lozinku"),
+        (MsgHostUnverified, "Računalo {n} nije dokazalo svoj identitet. Veza je prekinuta iz sigurnosnih razloga."),
     ],
 };
 
@@ -1506,5 +1511,6 @@ pub static UK: Lang = Lang {
         (HostPasswordNotSaved, "Не вдалося зберегти пароль."),
         (HostPasswordInvalid, "Пароль містить неприпустимі символи."),
         (HostPasswordTitle, "Змінити пароль"),
+        (MsgHostUnverified, "Комп'ютер {n} не довів свою ідентичність. З'єднання розірвано з міркувань безпеки."),
     ],
 };

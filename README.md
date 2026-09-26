@@ -265,6 +265,12 @@ that it does not know the device yet, and the client shows a dialog with two way
   "628 306"; the client's dialog shows the same code. If both match, nobody sits in
   between.
 
+It works the other way round, too: a client that does not know the host's key yet (the
+first connection, or after `hosts.txt` was deleted) asks the host to prove itself, so
+even a host that already knows the device goes through the password or "Allow" step.
+A host that just answers "known" is refused ("… did not prove its identity …") and not
+remembered.
+
 Afterwards the host lists the device under "Allowed devices" in its menu, where
 "Remove" takes it out again; the client remembers the host by its key in `hosts.txt`,
 whatever address it has, and marks it with a check mark in the host list. Every device
@@ -603,11 +609,14 @@ ID (a row of the host list, a desktop shortcut) is the safer way: before identif
 itself the client checks that the host's key gives that ID and, for a host it knows,
 that it is exactly the remembered key. Connecting by a bare address (typed IP or
 name), the client accepts whatever key answers there as soon as that side lets it in:
-only the password answer is a proof - "Allow", or the plain statement that the device
-is already known, can come from any device that answers in the host's place. A
-different key at a remembered address shows up in the access dialog, if there is one,
-and in the client's log, and the comparison code tells the real host from an impostor,
-but nothing stops such a connection by itself. The device ID has nine digits and is
+only the password answer is a proof - "Allow" can come from any device that answers in
+the host's place. The plain statement that the device is already known counts only
+from a remembered key: to any other key the client says in the handshake that it does
+not know it (bit 0 of message 3), the host then has to go through the password or
+"Allow" step, and a host that lets the client in without it is refused and not
+remembered. A different key at a remembered address shows up in the access dialog and
+in the client's log, and the comparison code tells the real host from an impostor,
+but nothing stops a connection that is let in by "Allow". The device ID has nine digits and is
 not a secret; it serves display and search. The access password lies in plain text in
 `host-password.txt`, because the host has to show it, and whoever watches the host's
 screen - a connected viewer included - can read it in the menu. The clipboard is read
@@ -787,7 +796,7 @@ exit code is the number of failures.
   end of connection, trickling, buffered bytes); the client's name in handshake
   message 3; `host.key`. Loopback from port 19000, its own `HOME`, about 25 s.
 - `host/zugangtest.c`: the access core `host/zugang.c` without network - device ID,
-  names, announcement, messages 20 to 23, norm, HMAC (RFC 4231) and PBKDF2 with the
+  names, name and flags of handshake message 3, announcement, messages 20 to 23, norm, HMAC (RFC 4231) and PBKDF2 with the
   test vectors of the Rust side, the proofs, constant-time comparison, throttle,
   limits of the access phases, requests to the menu bar, `host-devices.txt` (format,
   damaged files, removing, resetting), the takeover from `authorized.txt`,
@@ -820,8 +829,10 @@ exit code is the number of failures.
     encoders are real.
   - Access, with real handshakes and a client that behaves like the Rust client: an
     unknown client gets "QCA1" and message 20; the right password gives result 0 with
-    a correct host proof and then "QCH1"; wrong passwords with the throttle and the
-    end after five; "Allow" and "Deny" through a test hook instead of the menu bar;
+    a correct host proof and then "QCH1"; a known client with bit 0 in message 3 goes
+    through the same access phase (password or "Allow") and keeps its entry; wrong
+    passwords with the throttle and the end after five; "Allow" and "Deny" through a
+    test hook instead of the menu bar;
     cancel and end of connection withdraw the request; only one request shown at a
     time; the limits per address and per key; the deadline; a waiting client does not
     disturb the running viewer; a damaged device list; removing a device ends its

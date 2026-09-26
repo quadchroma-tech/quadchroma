@@ -254,6 +254,7 @@ pub static RU: Lang = Lang {
         (HostPasswordNotSaved, "Не удалось сохранить пароль."),
         (HostPasswordInvalid, "Пароль содержит недопустимые символы."),
         (HostPasswordTitle, "Изменить пароль"),
+        (MsgHostUnverified, "Компьютер {n} не подтвердил свою подлинность. Подключение прервано в целях безопасности."),
     ],
 };
 
@@ -507,6 +508,7 @@ pub static ZH: Lang = Lang {
         (HostPasswordNotSaved, "无法保存密码。"),
         (HostPasswordInvalid, "密码包含不允许的字符。"),
         (HostPasswordTitle, "更改密码"),
+        (MsgHostUnverified, "{n} 未能证明其身份。 为安全起见，连接已中断。"),
     ],
 };
 
@@ -760,6 +762,7 @@ pub static JA: Lang = Lang {
         (HostPasswordNotSaved, "パスワードを保存できませんでした。"),
         (HostPasswordInvalid, "パスワードに使用できない文字が含まれています。"),
         (HostPasswordTitle, "パスワードを変更"),
+        (MsgHostUnverified, "{n} は身元を証明しませんでした。 安全のため接続を中止しました。"),
     ],
 };
 
@@ -1011,5 +1014,6 @@ pub static TR: Lang = Lang {
         (HostPasswordNotSaved, "Parola kaydedilemedi."),
         (HostPasswordInvalid, "Parola izin verilmeyen karakterler içeriyor."),
         (HostPasswordTitle, "Parolayı değiştir"),
+        (MsgHostUnverified, "{n} kimliğini kanıtlamadı. Güvenlik nedeniyle bağlantı kesildi."),
     ],
 };

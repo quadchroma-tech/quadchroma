@@ -85,8 +85,17 @@ normalization). A new password removes no allowed device. Both hosts
 read the file on every check, so a password written into it by hand
 applies at once.
 
+First contact works in both directions: a client that does not know
+the host's key yet (not in hosts.txt - the first connection, or after
+hosts.txt was deleted) asks the host to prove itself. Then even a host
+that knows the device goes through the same step - password or "Allow"
+- and the host's answer to the password proves it to the client. A host
+that simply says "known" instead is refused (see the messages below);
+the client remembers nothing.
+
 The access dialog (client): when the host does not know this device,
-the client opens a dialog over the waiting screen (the program writes
+or the client does not know the host, the client opens a dialog over
+the waiting screen (the program writes
 typographic dashes and ellipses where this manual writes "-" and
 "..."):
 
@@ -160,6 +169,11 @@ retried automatically - connect again yourself:
                     this counts as a lost connection and is retried)
     "<name> could not confirm the password. The connection was stopped
      for safety."   the host's proof was wrong (see above)
+    "<name> did not prove its identity. The connection was stopped for
+     safety."       the client did not know the host's key and asked it
+                    to prove itself, but the host let it in at once
+                    ("QCH1") without the password step or "Allow" -
+                    it may not be the host it claims to be
     "A different device answers at this address."
                     connecting by ID, the host's key does not give that
                     ID, or it is not the key remembered for it
@@ -191,11 +205,13 @@ answers at a new address). Connecting by address or name alone, an
 unknown key there is a new host: the access dialog comes (with the note
 about a new identity if another key was remembered for that address),
 and after acceptance the new entry stands for the address while the old
-one stays for its ID. If the host at the address already knows this
-client and answers "QCH1" at once, the client connects and remembers
-the new key; the log says so ("<Adresse>: neue Identitaet (ID ...,
-Fingerabdruck ...) - ..."). A changed key is no longer an error you
-have to clear by hand. The settings per host (see "The menu") stay tied
+one stays for its ID. This holds even if the host at the address
+already knows this client: to a key it does not know the client always
+sets bit 0 in handshake message 3, so the host has to prove itself
+(password or "Allow"); a host that answers "QCH1" at once is refused
+with "<name> did not prove its identity. ...", and nothing is
+remembered. A changed key is no longer an error you have to clear by
+hand. The settings per host (see "The menu") stay tied
 to the host's fingerprint.
 
 Allowed devices (host): the host's menu lists them under "Allowed
@@ -342,11 +358,13 @@ host does not start ("Schluessel host.key ist vorhanden, aber nicht
 lesbar oder beschaedigt - Abbruch. ..." or on Windows "Schluessel
 konnte nicht angelegt werden - Abbruch: ..."). Deleting a key file
 gives the device a new identity and a new ID. After a new host.key the
-host still knows its allowed devices, so they get in without a
-password, but a client that connects by the old ID (a desktop shortcut,
-say) stops with "A different device answers at this address." - pick
-the host from the list, which shows its new ID, and create shortcuts
-anew. After a new client.key every host treats the device as new.
+host still knows its allowed devices, but they do not know its new key:
+each of them asks it to prove itself and needs the password (or
+"Allow") once more; a client that connects by the old ID (a desktop
+shortcut, say) stops with "A different device answers at this address."
+- pick the host from the list, which shows its new ID, and create
+shortcuts anew. After a new client.key every host treats the device as
+new.
 
 The client reads client.key and hosts.txt before it opens a connection:
 
@@ -389,9 +407,13 @@ Log lines of the access phase in the Mac host (/tmp/quadchroma-m1.log);
      erlaubte Geraete: N"                                    (at start)
     "Zugang noetig: <Name> (ID <ID>) von <IP> - Passwort oder Zulassen"
      (" - Passwort" when nobody can click "Allow"; plus ", Drossel N s"
-     while the throttle runs)
+     while the throttle runs; for a known device with bit 0 "... von
+     <IP> - bekannt, kennt diesen Host aber nicht (Bit 0 in Nachricht
+     3), der Host weist sich aus - Passwort ...")
     "Zugang: <Name> (ID <ID>, <IP>) mit Passwort angenommen und
-     eingetragen" or "... am Host zugelassen und eingetragen"
+     eingetragen" or "... am Host zugelassen und eingetragen" (for a
+     known device "... und war schon eingetragen (Host auf Wunsch des
+     Clients ausgewiesen)"; its entry stays as it was)
     "Zugang: <Name> (ID <ID>, <IP>) am Host abgelehnt"
     "Zugang: Passwort falsch fuer <Name> (ID <ID>, <IP>), Fehlversuch N
      in dieser Verbindung - Drossel S s" (with "Beweis vor Ablauf der
@@ -422,7 +444,10 @@ Log lines of the Windows host role (host-protokoll.txt), where <wer> is
      <Fingerabdruck>   erlaubte Geraete: N"                  (at start)
     "Zugang noetig: <wer> ist unbekannt - Passwort oder "Zulassen" am
      Host, Wartezeit N ms" (without the icon: "... - Passwort (kein
-     "Zulassen": keine Oberflaeche), ...")
+     "Zulassen": keine Oberflaeche), ..."; a known device with bit 0:
+     "<wer> ist bekannt, kennt diesen Host aber nicht (Bit 0 in
+     Nachricht 3) - der Host weist sich aus - Passwort ...", and after
+     acceptance "Geraet <Name>, ID <ID> stand schon in der Liste")
     "Zugang: <wer> - Passwort richtig", "Zugang: <wer> am Host
      zugelassen", then "Geraet eingetragen: <Name>, ID <ID>"
     "Zugang: <wer> am Host abgelehnt"
@@ -446,7 +471,13 @@ Log lines of the client (protokoll.txt):
 
     "Zugang noetig: <Name> (<Adresse>, ID <ID>, Vergleichscode <Code>)
      kennt dieses Geraet noch nicht - Passwort oder Zulassen am Host"
-     (or "- nur Passwort")
+     (or "- nur Passwort"; if the client does not know the host's key:
+     "... ist hier noch nicht gemerkt (Bit 0 in Nachricht 3: der Host
+     weist sich aus) - ...")
+    "<Adresse>: <Name> (ID <ID>, Fingerabdruck <Fingerabdruck>)
+     antwortet mit QCH1, obwohl dieser Client seinen Schluessel nicht
+     kennt (Bit 0 in Nachricht 3) - der Host hat sich nicht ausgewiesen
+     ..."           (the host did not prove itself; nothing remembered)
     "Zugang: Passwort falsch (N. Mal)"
     "Zugang: <Name> hat dieses Geraet angenommen (Passwort, Beweis des
      Hosts stimmt)" or "(Zulassen am Host)"
@@ -460,15 +491,23 @@ Log lines of the client (protokoll.txt):
 Wire format of the access (header as everywhere: u8 type, u8 flags 0,
 u16 0, u32 length; numbers little endian unless noted):
 
-    Handshake message 3 (client -> host) carries "QCN1", u8 n and n
-    bytes of UTF-8, the client's name (1 to 40 bytes). Older clients
-    send "client"; then, and for a broken payload, the host shows the
-    client's IP address.
+    Handshake message 3 (client -> host) carries "QCN1", u8 n, n bytes
+    of UTF-8, the client's name (1 to 40 bytes), and u8 flags. Bit 0:
+    the client does not know the host's key (it is not in hosts.txt) -
+    "prove yourself"; bits 1 to 7 are 0. Older clients send "client" or
+    "QCN1" without the flags byte (flags 0); then, and for a broken
+    payload, the host shows the client's IP address. Hosts ignore
+    further bytes. The client decides on bit 0 after message 2, when it
+    has the host's key.
 
     After the handshake the host sends 4 bytes on the video channel:
     "QCH1" - the device is known, the session starts as before - or
-    "QCA1" - the access phase follows. When the device is accepted,
-    "QCH1" follows and then everything as before.
+    "QCA1" - the access phase follows. With bit 0 set the host always
+    sends "QCA1", even for a device in its list (whose entry then stays
+    as it is); a client that set bit 0 and gets "QCH1" at once stops
+    ("<name> did not prove its identity. ...") and remembers nothing.
+    When the device is accepted, "QCH1" follows and then everything as
+    before.
 
     20  Access needed Host -> client, length 8 + n: u8 version (1), u8
                       ways (bit 0 password, always set; bit 1 "Allow"

@@ -3105,11 +3105,12 @@ static int niemand_anmeldend(void) { return atomic_load(&g_anmeldend) == 0; }
 static int zuschauer_da(void) { return atomic_load(&g_client_fd) >= 0; }
 static int zuschauer_fort(void) { return atomic_load(&g_client_fd) < 0; }
 
-// Ein Client wie der Rust-Client: Nachricht 3 traegt "QCN1" und den Namen,
-// danach liest er die Kennung und spricht in der Zugangsphase 21 und 23.
+// Ein Client wie der Rust-Client: Nachricht 3 traegt "QCN1", den Namen und
+// die Flags (Bit 0: er kennt den Schluessel des Hosts nicht), danach liest er
+// die Kennung und spricht in der Zugangsphase 21 und 23.
 typedef struct { int fd; leser l; qc_cipher tx; uint8_t hh[QC_HASHLEN]; } zclient;
 
-static int zc_verbinden(zclient *z, int port, const uint8_t priv[32], const char *name) {
+static int zc_verbinden_flags(zclient *z, int port, const uint8_t priv[32], const char *name, uint8_t flags) {
     memset(z, 0, sizeof *z);
     z->fd = -1;
     int c = verbinden(port);
@@ -3117,7 +3118,7 @@ static int zc_verbinden(zclient *z, int port, const uint8_t priv[32], const char
     qc_handshake hs;
     qc_handshake_init(&hs, 1, priv, (const uint8_t *)QC_PRO_VIDEO, strlen(QC_PRO_VIDEO));
     uint8_t msg[8192], pl[8192], n3[64];
-    size_t ml = 0, pln = 0, n3l = name ? qc_zugang_name_kodieren(name, n3, sizeof n3) : 0;
+    size_t ml = 0, pln = 0, n3l = name ? qc_zugang_name_kodieren(name, flags, n3, sizeof n3) : 0;
     if (qc_handshake_write(&hs, NULL, 0, msg, &ml) || rahmen_schreiben(c, msg, ml) ||
         rahmen_lesen(c, msg, sizeof msg, &ml) || qc_handshake_read(&hs, msg, ml, pl, &pln) ||
         qc_handshake_write(&hs, n3l ? n3 : NULL, n3l, msg, &ml) || rahmen_schreiben(c, msg, ml)) {
@@ -3131,6 +3132,10 @@ static int zc_verbinden(zclient *z, int port, const uint8_t priv[32], const char
     leser_init(&z->l, c, 0);
     z->l.rx = rx;
     return 0;
+}
+
+static int zc_verbinden(zclient *z, int port, const uint8_t priv[32], const char *name) {
+    return zc_verbinden_flags(z, port, priv, name, 0);
 }
 
 static void zc_zu(zclient *z) {
@@ -3251,6 +3256,39 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     zuschauer_weg();
     zc_zu(&z);
 
+    // Bekannt, aber der Client kennt diesen Host nicht (Bit 0 in Nachricht
+    // 3, Spezifikation 1.4): trotzdem die Zugangsphase - erst der host_proof
+    // weist den Host aus. Ein falsches Passwort nimmt den Eintrag nicht weg,
+    // und er bleibt, wie er war (Name aus der ersten Aufnahme).
+    printf("\n-- Zugang: bekanntes Geraet mit Bit 0 (der Host weist sich aus)\n");
+    drossel_altern(&d_zugang);
+    strom_attrappe_setzen();
+    stdout_stumm(1);
+    int ok_b0 = zc_verbinden_flags(&z, bild_port, a_priv, "Testgeraet A neu", QC_ZUGANG_N3_HOST_UNBEKANNT) == 0 &&
+                zc_kennung(&z, QC_ZUGANG_KENNUNG) && zc_noetig(&z, &wege, &warten, hn) == 0;
+    uint8_t e_b0f = 9, e_b0r = 9;
+    uint32_t w_b0 = 9;
+    int ok_b0f = ok_b0 && zc_beweis(&z, "falsch-falsch") == 0 && zc_ergebnis(&z, &e_b0f, &w_b0, NULL, 3000) == 0;
+    int bek_b0f = qc_zugang_bekannt(a_pub, NULL);
+    int ok_b0r = ok_b0f && zc_beweis(&z, PW) == 0 && zc_ergebnis(&z, &e_b0r, &w, hp, 3000) == 0;
+    qc_zugang_beweis(k, z.hh, 1, hp_soll);
+    int ok_b0s = ok_b0r && zc_sitzung(&z);
+    warten_bis(zuschauer_da, 1);
+    char gname_b0[QC_ZUGANG_NAME_MAX + 1] = {0};
+    int bek_b0 = qc_zugang_bekannt(a_pub, gname_b0);
+    stdout_stumm(0);
+    pruefe(ok_b0 && wege == QC_ZUGANG_WEG_PASSWORT, "Bit 0: \"QCA1\" und 20, obwohl das Geraet in der Liste steht");
+    pruefe(ok_b0f && e_b0f == QC_ERGEBNIS_FALSCH && w_b0 == 0 && bek_b0f == 1, "falsches Passwort: 22/2, der Eintrag bleibt");
+    pruefe(ok_b0r && e_b0r == QC_ERGEBNIS_PASSWORT && memcmp(hp, hp_soll, 32) == 0,
+           "richtiges Passwort: 22/0 mit dem host_proof, den der Client nachrechnet");
+    pruefe(ok_b0s, "danach \"QCH1\" und Strominfo");
+    pruefe(bek_b0 == 1 && strcmp(gname_b0, "Testgeraet A") == 0, "der Eintrag bleibt, wie er war");
+    pruefe(zeilen_mit(logpfad, "kennt diesen Host aber nicht (Bit 0 in Nachricht 3)") == 1 &&
+           zeilen_mit(logpfad, "mit Passwort angenommen und war schon eingetragen") == 1,
+           "Zeilen: Zugang noetig mit Bit 0, angenommen, schon eingetragen");
+    zuschauer_weg();
+    zc_zu(&z);
+
     printf("\n-- Zugang: falsches Passwort, Drossel\n");
     drossel_altern(&d_zugang_falsch);
     uint8_t b_priv[32], b_pub[32];
@@ -3313,6 +3351,32 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     pruefe(ok_c22 && ok_cs && qc_zugang_bekannt(c_pub, NULL) == 1, "Zulassen: 22/1, \"QCH1\", eingetragen");
     pruefe(ui_zurueck_abwarten(a, 1) && zeilen_mit(logpfad, "am Host zugelassen und eingetragen") == 1,
            "das Fenster schliesst (qc_ui_anfrage_zurueck), Zeile");
+    zuschauer_weg();
+    zc_zu(&z);
+
+    // Bit 0 von einem bekannten Geraet, und am Host wird "Zulassen" geklickt:
+    // die Anfrage kommt wie bei einem neuen Geraet (mit Vergleichscode), dann
+    // 22/1 und "QCH1"; der Eintrag bleibt.
+    strom_attrappe_setzen();
+    stdout_stumm(1);
+    int ok_cb = zc_verbinden_flags(&z, bild_port, c_priv, "Tablet neu", QC_ZUGANG_N3_HOST_UNBEKANNT) == 0 &&
+                zc_kennung(&z, QC_ZUGANG_KENNUNG) && zc_noetig(&z, &wege, &warten, hn) == 0;
+    uint64_t a_cb = anfrage_neu(a, 2);
+    pthread_mutex_lock(&g_test_ui_mtx);
+    int anfrage_cb = strcmp(g_test_anfrage_name, "Tablet neu") == 0 && g_test_anfrage_code == qc_zugang_code(z.hh);
+    pthread_mutex_unlock(&g_test_ui_mtx);
+    qc_zugang_entscheiden(a_cb, 1);
+    int ok_cb22 = ok_cb && zc_ergebnis(&z, &erg, &w, proof, 3000) == 0 && erg == QC_ERGEBNIS_ZUGELASSEN && zc_sitzung(&z);
+    warten_bis(zuschauer_da, 1);
+    char gname_cb[QC_ZUGANG_NAME_MAX + 1] = {0};
+    int bek_cb = qc_zugang_bekannt(c_pub, gname_cb);
+    stdout_stumm(0);
+    pruefe(ok_cb && wege == (QC_ZUGANG_WEG_PASSWORT | QC_ZUGANG_WEG_ZULASSEN) && a_cb && anfrage_cb,
+           "Bit 0, bekannt: Anfrage an die Oberflaeche mit Name und Vergleichscode");
+    pruefe(ok_cb22 && bek_cb == 1 && strcmp(gname_cb, "Tablet") == 0 &&
+           zeilen_mit(logpfad, "am Host zugelassen und war schon eingetragen") == 1,
+           "Zulassen: 22/1, \"QCH1\", der Eintrag bleibt, Zeile");
+    if (a_cb) a = a_cb;
     zuschauer_weg();
     zc_zu(&z);
 

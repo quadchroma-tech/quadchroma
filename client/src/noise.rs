@@ -65,13 +65,14 @@ pub struct Session {
 /// lernt den eigenen Schluessel nie kennen, und ein Host nimmt diesen
 /// Anrufer gar nicht erst als Zuschauer an (und loest dafuer niemanden ab).
 ///
-/// `nutzlast3` geht verschluesselt mit Nachricht 3 hinaus: der Client
-/// schickt "QCN1" mit seinem Geraetenamen (zugang::nachricht3), aeltere
-/// Fassungen schickten b"client" - Hosts, die sie nicht kennen, uebergehen sie.
+/// Gelingt sie, liefert sie die Nutzlast, die verschluesselt mit Nachricht 3
+/// hinausgeht - sie darf also vom Schluessel abhaengen: der Client schickt
+/// "QCN1" mit seinem Geraetenamen und Flags (zugang::nachricht3), Bit 0,
+/// wenn er diesen Schluessel nicht kennt. Aeltere Fassungen schickten
+/// b"client" - Hosts, die sie nicht kennen, uebergehen sie.
 pub fn handshake_initiator<R, W, P>(
     static_key: &[u8],
     prologue: &[u8],
-    nutzlast3: &[u8],
     mut recv: R,
     mut send: W,
     pruefen: P,
@@ -79,7 +80,7 @@ pub fn handshake_initiator<R, W, P>(
 where
     R: FnMut(&mut Vec<u8>) -> Result<(), String>,
     W: FnMut(&[u8]) -> Result<(), String>,
-    P: FnOnce(&[u8]) -> Result<(), String>,
+    P: FnOnce(&[u8]) -> Result<Vec<u8>, String>,
 {
     let params = PATTERN.parse().map_err(|e| format!("Muster: {e:?}"))?;
     let mut hs: HandshakeState = Builder::new(params)
@@ -101,9 +102,9 @@ where
 
     // Wer am anderen Ende sitzt, steht jetzt fest - erst pruefen, dann den
     // eigenen Schluessel zeigen.
-    pruefen(hs.get_remote_static().unwrap_or_default())?;
+    let nutzlast3 = pruefen(hs.get_remote_static().unwrap_or_default())?;
 
-    let n = hs.write_message(nutzlast3, &mut buf).map_err(|e| format!("Nachricht 3: {e:?}"))?;
+    let n = hs.write_message(&nutzlast3, &mut buf).map_err(|e| format!("Nachricht 3: {e:?}"))?;
     send(&buf[..n])?;
 
     let handshake_hash = hs.get_handshake_hash().to_vec();
@@ -190,7 +191,7 @@ pub fn selftest_against(addr: &str) -> Result<(), String> {
         (&sock).write_all(&out).map_err(|e| format!("Senden: {e}"))
     };
 
-    let mut s = handshake_initiator(&priv_key, &prologue_video(), b"client", recv, send, |_| Ok(()))?;
+    let mut s = handshake_initiator(&priv_key, &prologue_video(), recv, send, |_| Ok(b"client".to_vec()))?;
     println!("Handschlag fertig");
     println!("Vergleichscode: {}", sas(&s.handshake_hash));
     println!("Host-Fingerabdruck: {}", fingerprint(&s.remote_static));
@@ -246,7 +247,6 @@ mod tests {
             let r = handshake_initiator(
                 &client_priv,
                 &prologue_video(),
-                b"client",
                 |b| {
                     *b = beim_client.recv().map_err(|_| "Leitung zu".to_string())?;
                     Ok(())
@@ -254,7 +254,7 @@ mod tests {
                 |d| zum_host.send(d.to_vec()).map_err(|_| "Leitung zu".to_string()),
                 |rs| {
                     gesehen = rs.to_vec();
-                    if gilt { Ok(()) } else { Err("fremder Host".into()) }
+                    if gilt { Ok(b"client".to_vec()) } else { Err("fremder Host".into()) }
                 },
             );
             // Leitung zu: wartet der Angerufene noch auf Nachricht 3, endet
@@ -273,11 +273,13 @@ mod tests {
     }
 
     /// Nachricht 3 traegt die Nutzlast des Anrufers (Pairing v1: "QCN1" mit
-    /// dem Geraetenamen) - verschluesselt; der Angerufene bekommt genau sie
-    /// (Session.nachricht3, Name des Clients), der Anrufer hat keine.
+    /// dem Geraetenamen und Flags) - verschluesselt; der Angerufene bekommt
+    /// genau sie (Session.nachricht3, Name des Clients), der Anrufer hat
+    /// keine. Die Pruefung nach Nachricht 2 bestimmt sie: sie sieht den
+    /// Schluessel des Angerufenen (hier: unbekannt, also Bit 0).
     #[test]
     fn nutzlast_in_nachricht_3() {
-        let (host_priv, _) = keypair().unwrap();
+        let (host_priv, host_pub) = keypair().unwrap();
         let (client_priv, _) = keypair().unwrap();
         let (zum_host, beim_host) = mpsc::channel::<Vec<u8>>();
         let (zum_client, beim_client) = mpsc::channel::<Vec<u8>>();
@@ -293,22 +295,23 @@ mod tests {
             )
             .map(|s| s.nachricht3)
         });
-        let nutzlast = crate::zugang::nachricht3("B\u{fc}ro-PC");
+        let flag = crate::protokoll_konst::NAME_FLAG_HOST_UNBEKANNT;
+        let nutzlast = crate::zugang::nachricht3("B\u{fc}ro-PC", flag);
         let anrufer = handshake_initiator(
             &client_priv,
             &prologue_video(),
-            &nutzlast,
             |b| {
                 *b = beim_client.recv().map_err(|_| "Leitung zu".to_string())?;
                 Ok(())
             },
             |d| zum_host.send(d.to_vec()).map_err(|_| "Leitung zu".to_string()),
-            |_| Ok(()),
+            |rs| Ok(crate::zugang::nachricht3("B\u{fc}ro-PC", if rs == host_pub.as_slice() { flag } else { 0 })),
         )
         .unwrap();
         let empfangen = host.join().unwrap().unwrap();
         assert_eq!(empfangen, nutzlast);
         assert_eq!(crate::zugang::nachricht3_name(&empfangen).as_deref(), Some("B\u{fc}ro-PC"));
+        assert_eq!(crate::zugang::nachricht3_flags(&empfangen), flag);
         assert!(anrufer.nachricht3.is_empty(), "der Anrufer hat keine Nutzlast von Nachricht 3");
     }
 }

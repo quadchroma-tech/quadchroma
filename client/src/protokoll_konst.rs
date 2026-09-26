@@ -52,8 +52,16 @@ pub const ERGEBNIS_ABGELEHNT: u8 = 3;
 pub const ERGEBNIS_SCHLUSS: u8 = 4;
 
 /// Nutzlast von Handschlag-Nachricht 3 (Client -> Host): "QCN1" | u8 n |
-/// n <= 40 Byte UTF-8-Name des Clients. Aeltere Clients senden b"client".
+/// n <= 40 Byte UTF-8-Name des Clients | u8 Flags (NAME_FLAG_*). Aeltere
+/// Clients senden b"client" oder "QCN1" ohne das Flag-Byte (dann Flags 0);
+/// Bytes dahinter bleiben spaeteren Fassungen.
 pub const NAME_KENNUNG: &[u8; 4] = b"QCN1";
+/// Flag in Nachricht 3, Bit 0: der Client kennt den Schluessel dieses Hosts
+/// nicht (nicht in hosts.txt) - "weise dich aus". Der Host fuehrt dann die
+/// Zugangsphase auch fuer ein Geraet aus seiner Liste: Passwort mit
+/// host_proof (22/0) oder "Zulassen" (22/1). Antwortet er trotzdem gleich
+/// mit MAGIC, bricht der Client ab und merkt sich nichts. Bit 1-7: 0.
+pub const NAME_FLAG_HOST_UNBEKANNT: u8 = 1;
 
 // ------------------------------------------------ Host -> Client (Bildkanal)
 

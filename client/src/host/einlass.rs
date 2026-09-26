@@ -2,8 +2,9 @@
 // (Spezifikation Pairing v1, Abschnitte 3.1-3.4, 4.1-4.3 und 10.5).
 //
 // Nach dem Noise-Handschlag entscheidet `Einlass::pruefen`:
-//   - Steht der Schluessel der Gegenstelle in host-devices.txt, geht es wie
-//     bisher weiter (der Aufrufer sendet MAGIC "QCH1").
+//   - Steht der Schluessel der Gegenstelle in host-devices.txt und traegt
+//     Nachricht 3 kein Bit 0, geht es wie bisher weiter (der Aufrufer sendet
+//     MAGIC "QCH1").
 //   - Sonst folgt die Zugangsphase: "QCA1", Nachricht 20 (Wege, Wartezeit
 //     der Drossel, Rechnername), dann wird gelesen - mit Gesamtfrist -, bis
 //     ein richtiger Beweis (21) kommt, jemand am Host "Zulassen" oder
@@ -12,6 +13,13 @@
 //     bekannt. Falsch -> Drossel, 22/2 und weiterlesen; der fuenfte
 //     Fehlversuch dieser Verbindung -> 22/4. Zulassen -> eintragen, 22/1.
 //     Ablehnen -> 22/3. Frist -> 22/4.
+//   - Bit 0 in Nachricht 3 (NAME_FLAG_HOST_UNBEKANNT, Spezifikation 1.4):
+//     der Client kennt den Schluessel dieses Hosts nicht und verlangt, dass
+//     er sich ausweist. Dann laeuft die Zugangsphase auch fuer ein Geraet
+//     aus der Liste - der host_proof in 22/0 beweist dem Client, dass dieser
+//     Host das Passwort kennt (bzw. am Host wird "Zulassen" geklickt, 22/1).
+//     Der Eintrag in der Liste bleibt dabei, wie er ist; ein falsches
+//     Passwort nimmt ihn auch nicht weg.
 //   - Hoechstens PLAETZE_GESAMT Zugangsphasen zugleich, eine je Schluessel,
 //     zwei je IP (zugang::Plaetze); wer keinen Platz bekommt, erhaelt sofort
 //     22/4 mit BESETZT_WARTEN_MS - hinter "QCA1" und einer Nachricht 20
@@ -53,7 +61,7 @@ use std::time::{Duration, Instant};
 
 use super::log;
 use super::netz::Drossel;
-use crate::protokoll_konst::MAGIC_ZUGANG;
+use crate::protokoll_konst::{MAGIC_ZUGANG, NAME_FLAG_HOST_UNBEKANNT};
 use crate::secure;
 use crate::zugang::{self, DateiFehler, Ergebnis, Geraeteliste, Nachricht, PasswortFehler, Wertung, ZugangNoetig};
 
@@ -145,11 +153,12 @@ struct Anfragen {
 /// Wie eine Pruefung ausging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ausgang {
-    /// Stand schon in der Geraeteliste.
+    /// Stand schon in der Geraeteliste (und verlangte keinen Ausweis).
     Bekannt,
-    /// Unbekannt, Passwort bewiesen (22/0 ist hinaus).
+    /// Zugangsphase, Passwort bewiesen (22/0 ist hinaus) - ein unbekanntes
+    /// Geraet oder eines, das mit Bit 0 den Ausweis des Hosts verlangte.
     Passwort,
-    /// Unbekannt, am Host zugelassen (22/1 ist hinaus).
+    /// Zugangsphase, am Host zugelassen (22/1 ist hinaus).
     Zugelassen,
     /// Nicht herein: abgelehnt, abgebrochen, Frist, zu viele Versuche,
     /// kein Platz, Leitung zu oder Protokollfehler.
@@ -552,20 +561,26 @@ impl Einlass {
     /// vor MAGIC). `ip`: Absender; `name`: Name aus Nachricht 3, sonst die
     /// IP. Bei `herein()` sendet der Aufrufer danach MAGIC "QCH1" und alles
     /// Weitere; sonst schliesst er die Leitung. Fristen an der Leitung sind
-    /// danach wieder aufgehoben.
+    /// danach wieder aufgehoben. Traegt Nachricht 3 Bit 0 (der Client kennt
+    /// diesen Host nicht), laeuft die Zugangsphase auch fuer ein bekanntes
+    /// Geraet: nur so weist sich der Host aus.
     pub fn pruefen(&self, sock: &mut secure::Secure, ip: IpAddr, name: &str) -> Ausgang {
         let peer = sock.peer.clone();
-        if self.bekannt(&peer, ip) {
+        let ausweis = zugang::nachricht3_flags(&sock.nachricht3) & NAME_FLAG_HOST_UNBEKANNT != 0;
+        let bekannt = self.bekannt(&peer, ip);
+        if bekannt && !ausweis {
             return Ausgang::Bekannt;
         }
         sock.socket().set_write_timeout(Some(SCHREIBFRIST)).ok();
-        let a = self.zugangsphase(sock, ip, name, &peer);
+        let a = self.zugangsphase(sock, ip, name, &peer, bekannt);
         sock.socket().set_read_timeout(None).ok();
         sock.socket().set_write_timeout(None).ok();
         a
     }
 
-    fn zugangsphase(&self, sock: &mut secure::Secure, ip: IpAddr, name: &str, peer: &[u8]) -> Ausgang {
+    /// `bekannt`: das Geraet steht schon in der Liste und ist nur hier, weil
+    /// es mit Bit 0 den Ausweis dieses Hosts verlangt.
+    fn zugangsphase(&self, sock: &mut secure::Secure, ip: IpAddr, name: &str, peer: &[u8], bekannt: bool) -> Ausgang {
         let id = zugang::geraete_id(peer);
         let wer = format!("{name} ({ip}), ID {}", zugang::id_text(id));
         // Ein Platz, oder sofort 22/4 mit BESETZT_WARTEN_MS.
@@ -598,7 +613,12 @@ impl Einlass {
         let warten_ms = phase.warten_ms(beginn);
         DROSSEL_NOETIG.melden(Some(ip), || {
             format!(
-                "Zugang noetig: {wer} ist unbekannt - Passwort{}, Wartezeit {warten_ms} ms",
+                "Zugang noetig: {wer} {} - Passwort{}, Wartezeit {warten_ms} ms",
+                if bekannt {
+                    "ist bekannt, kennt diesen Host aber nicht (Bit 0 in Nachricht 3) - der Host weist sich aus"
+                } else {
+                    "ist unbekannt"
+                },
                 if zulassen { " oder \"Zulassen\" am Host" } else { " (kein \"Zulassen\": keine Oberflaeche)" }
             )
         });
@@ -783,7 +803,7 @@ pub(super) mod stub {
     impl Stub {
         /// Verbinden und den Handschlag als Anrufer fuehren; `nachricht3`
         /// ist die Nutzlast von Nachricht 3 (b"client" wie ein alter Client,
-        /// zugang::nachricht3(name) wie ein neuer).
+        /// zugang::nachricht3(name, flags) wie ein neuer).
         pub fn verbinden(addr: &str, priv_key: &[u8], nachricht3: &[u8]) -> Result<Stub, String> {
             let mut sock = TcpStream::connect(addr).map_err(|e| format!("Verbindung: {e}"))?;
             sock.set_nodelay(true).ok();
@@ -1002,6 +1022,75 @@ mod tests {
         assert_eq!(h.ausgang(), Ausgang::Bekannt);
         // Der Eintrag bleibt, wie er war.
         assert_eq!(h.liste().finden(&cpub).unwrap().datum, "2026-01-02");
+        // Nachricht 3 in der alten Form (ohne Flag-Byte) und mit Flags 0:
+        // ebenso bekannt.
+        for n3 in [&b"QCN1\x02PC"[..], &zugang::nachricht3("PC", 0)] {
+            let mut s = Stub::verbinden(&h.addr, &cp, n3).unwrap();
+            assert_eq!(&s.kennung().unwrap(), MAGIC);
+            assert_eq!(h.ausgang(), Ausgang::Bekannt);
+        }
+    }
+
+    /// Bekannt, aber der Client kennt diesen Host nicht (Bit 0 in
+    /// Nachricht 3, Spezifikation 1.4 - etwa hosts.txt geloescht): trotzdem
+    /// die Zugangsphase, damit sich der Host ausweist. Ein falsches Passwort
+    /// gibt 22/2, das richtige 22/0 mit einem host_proof, den der Client
+    /// nachrechnet, dann QCH1. Der Eintrag bleibt in beiden Faellen, wie er
+    /// war. Ohne Bit 0 wieder gleich QCH1.
+    #[test]
+    fn bekanntes_geraet_mit_bit_0_bekommt_den_ausweis_des_hosts() {
+        let h = Host::neu("ausweis", zugang::PHASE_FRIST);
+        let (cp, cpub) = client();
+        let k: [u8; 32] = cpub.clone().try_into().unwrap();
+        zugang::geraet_eintragen(&h.ordner.join(zugang::GERAETE_DATEI), &k, "Alt", "2026-01-02").unwrap();
+        let bit0 = crate::protokoll_konst::NAME_FLAG_HOST_UNBEKANNT;
+        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Neu aufgesetzt", bit0)).unwrap();
+        let n = noetig(&mut s);
+        assert_eq!((n.wege, n.warten_ms, n.hostname.as_str()), (WEG_PASSWORT, 0, "Testhost"));
+        s.senden(&Nachricht::Beweis(s.beweis("falsch-falsch"))).unwrap();
+        assert_eq!(ergebnis(&mut s), Ergebnis::Falsch { warten_ms: 0 });
+        assert!(h.liste().enthaelt(&cpub), "ein falsches Passwort nimmt den Eintrag nicht weg");
+        s.senden(&Nachricht::Beweis(s.beweis(PW))).unwrap();
+        match ergebnis(&mut s) {
+            Ergebnis::Passwort { host_beweis } => {
+                let k = zugang::passwort_schluessel(PW, &s.host_pub);
+                assert!(zugang::host_beweis_pruefen(&k, &s.hh, &host_beweis), "host_proof falsch");
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(&s.kennung().unwrap(), MAGIC);
+        assert_eq!(h.ausgang(), Ausgang::Passwort);
+        let l = h.liste();
+        let g = l.finden(&cpub).unwrap();
+        assert_eq!((g.name.as_str(), g.datum.as_str(), l.geraete.len()), ("Alt", "2026-01-02", 1), "Eintrag veraendert");
+        drop(s);
+        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Neu aufgesetzt", 0)).unwrap();
+        assert_eq!(&s.kennung().unwrap(), MAGIC);
+        assert_eq!(h.ausgang(), Ausgang::Bekannt);
+    }
+
+    /// Dasselbe ueber "Zulassen": die Anfrage erscheint wie bei einem neuen
+    /// Geraet, mit dem Vergleichscode des Handschlags; nach dem Klick 22/1
+    /// und QCH1, der Eintrag bleibt.
+    #[test]
+    fn bekanntes_geraet_mit_bit_0_zulassen() {
+        let h = Host::neu("ausweis-zulassen", zugang::PHASE_FRIST);
+        let (gezeigt, _geschlossen) = haken(&h.einlass);
+        let (cp, cpub) = client();
+        let k: [u8; 32] = cpub.clone().try_into().unwrap();
+        zugang::geraet_eintragen(&h.ordner.join(zugang::GERAETE_DATEI), &k, "Alt", "2026-01-02").unwrap();
+        let bit0 = crate::protokoll_konst::NAME_FLAG_HOST_UNBEKANNT;
+        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Laptop", bit0)).unwrap();
+        let n = noetig(&mut s);
+        assert_eq!(n.wege, WEG_PASSWORT | WEG_ZULASSEN);
+        let a = gezeigt.recv_timeout(Duration::from_secs(5)).expect("keine Anfrage gezeigt");
+        assert_eq!((a.name.as_str(), a.id, a.code.as_str()), ("Laptop", zugang::geraete_id(&cpub), s.sas.as_str()));
+        assert!(h.einlass.entscheiden(a.nr, true));
+        assert_eq!(ergebnis(&mut s), Ergebnis::Zulassen);
+        assert_eq!(&s.kennung().unwrap(), MAGIC);
+        assert_eq!(h.ausgang(), Ausgang::Zugelassen);
+        let g = h.liste().finden(&cpub).cloned().unwrap();
+        assert_eq!((g.name.as_str(), g.datum.as_str()), ("Alt", "2026-01-02"));
     }
 
     /// Unbekannt + richtiges Passwort: QCA1, 20 (nur Passwort, ohne
@@ -1012,7 +1101,7 @@ mod tests {
     fn unbekannt_mit_richtigem_passwort() {
         let h = Host::neu("richtig", zugang::PHASE_FRIST);
         let (cp, cpub) = client();
-        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Büro-PC")).unwrap();
+        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Büro-PC", 0)).unwrap();
         let n = noetig(&mut s);
         assert_eq!(n.wege, WEG_PASSWORT, "ohne Oberflaeche kein Zulassen");
         assert_eq!(n.warten_ms, 0);
@@ -1097,7 +1186,7 @@ mod tests {
         let h = Host::neu("zulassen", zugang::PHASE_FRIST);
         let (gezeigt, _geschlossen) = haken(&h.einlass);
         let (cp, cpub) = client();
-        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Laptop")).unwrap();
+        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Laptop", 0)).unwrap();
         let n = noetig(&mut s);
         assert_eq!(n.wege, WEG_PASSWORT | WEG_ZULASSEN);
         let a = gezeigt.recv_timeout(Duration::from_secs(5)).expect("keine Anfrage gezeigt");
@@ -1138,10 +1227,10 @@ mod tests {
         let (gezeigt, geschlossen) = haken(&h.einlass);
         let (cp1, _) = client();
         let (cp2, _) = client();
-        let mut s1 = Stub::verbinden(&h.addr, &cp1, &zugang::nachricht3("Erster")).unwrap();
+        let mut s1 = Stub::verbinden(&h.addr, &cp1, &zugang::nachricht3("Erster", 0)).unwrap();
         noetig(&mut s1);
         let a1 = gezeigt.recv_timeout(Duration::from_secs(5)).unwrap();
-        let mut s2 = Stub::verbinden(&h.addr, &cp2, &zugang::nachricht3("Zweiter")).unwrap();
+        let mut s2 = Stub::verbinden(&h.addr, &cp2, &zugang::nachricht3("Zweiter", 0)).unwrap();
         noetig(&mut s2);
         // Die zweite wartet, solange die erste gezeigt wird.
         assert!(gezeigt.recv_timeout(Duration::from_millis(300)).is_err(), "zwei Anfragen zugleich gezeigt");
@@ -1417,12 +1506,12 @@ mod tests {
     #[test]
     fn anzeigename_ohne_vorgetaeuschte_id() {
         let ip = "192.168.1.20";
-        assert_eq!(anzeigename(&zugang::nachricht3("Büro-PC 2"), ip), "Büro-PC 2");
+        assert_eq!(anzeigename(&zugang::nachricht3("Büro-PC 2", 0), ip), "Büro-PC 2");
         assert_eq!(anzeigename(b"client", ip), ip);
-        assert_eq!(anzeigename(&zugang::nachricht3("DESKTOP-4F7K2Q9"), ip), "DESKTOP-4F7K2Q9");
-        assert_eq!(anzeigename(&zugang::nachricht3("Laptop 12345678"), ip), "Laptop 12345678");
-        assert_eq!(anzeigename(&zugang::nachricht3("Roberts Mac (ID 123 456 789)"), ip), ip);
-        assert_eq!(anzeigename(&zugang::nachricht3("PC-123-456-789"), ip), ip);
-        assert_eq!(anzeigename(&zugang::nachricht3("ID １２３４５６７８９"), ip), ip);
+        assert_eq!(anzeigename(&zugang::nachricht3("DESKTOP-4F7K2Q9", 0), ip), "DESKTOP-4F7K2Q9");
+        assert_eq!(anzeigename(&zugang::nachricht3("Laptop 12345678", 0), ip), "Laptop 12345678");
+        assert_eq!(anzeigename(&zugang::nachricht3("Roberts Mac (ID 123 456 789)", 0), ip), ip);
+        assert_eq!(anzeigename(&zugang::nachricht3("PC-123-456-789", 0), ip), ip);
+        assert_eq!(anzeigename(&zugang::nachricht3("ID １２３４５６７８９", 0), ip), ip);
     }
 }

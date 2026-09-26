@@ -167,19 +167,28 @@ int qc_zugang_name_lesen(const uint8_t *nutzlast, size_t n, char name[QC_ZUGANG_
     name[0] = 0;
     if (!nutzlast || n < 5 || memcmp(nutzlast, "QCN1", 4) != 0) return 0;
     size_t l = nutzlast[4];
-    // Was hinter dem Namen steht, bleibt fuer spaetere Fassungen frei.
+    // Was hinter dem Namen steht (Flags, spaetere Felder), liest
+    // qc_zugang_name_flags bzw. bleibt fuer spaetere Fassungen frei.
     if (l > QC_ZUGANG_NAME_MAX || n < 5 + l) return 0;
     return qc_zugang_name_saeubern(nutzlast + 5, l, name, QC_ZUGANG_NAME_MAX) > 0;
 }
 
-size_t qc_zugang_name_kodieren(const char *name, uint8_t *out, size_t cap) {
+uint8_t qc_zugang_name_flags(const uint8_t *nutzlast, size_t n) {
+    if (!nutzlast || n < 5 || memcmp(nutzlast, "QCN1", 4) != 0) return 0;
+    size_t l = nutzlast[4];
+    if (l > QC_ZUGANG_NAME_MAX || n < 6 + l) return 0;       // alte Form ohne Flag-Byte
+    return nutzlast[5 + l] & QC_ZUGANG_N3_HOST_UNBEKANNT;
+}
+
+size_t qc_zugang_name_kodieren(const char *name, uint8_t flags, uint8_t *out, size_t cap) {
     char s[QC_ZUGANG_NAME_MAX + 1];
     size_t l = qc_zugang_name_saeubern(name, name ? strlen(name) : 0, s, QC_ZUGANG_NAME_MAX);
-    if (cap < 5 + l) return 0;
+    if (cap < 6 + l) return 0;
     memcpy(out, "QCN1", 4);
     out[4] = (uint8_t)l;
     memcpy(out + 5, s, l);
-    return 5 + l;
+    out[5 + l] = flags & QC_ZUGANG_N3_HOST_UNBEKANNT;
+    return 6 + l;
 }
 
 // ------------------------------------------------------------- Bekanntgabe

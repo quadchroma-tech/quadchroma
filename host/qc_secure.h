@@ -23,9 +23,10 @@ typedef struct {
     uint8_t hh[QC_HASHLEN];         // Handschlagpruefsumme, bindet den zweiten Kanal
     uint8_t peer[32];               // langlebiger Schluessel der Gegenseite
     // Nutzlast der Handschlag-Nachricht 3 (Client -> Host, verschluesselt):
-    // heute "QCN1" | u8 n | Name des Clients (zugang.h), bei alten Clients
-    // "client". Nur Anzeige, unbeglaubigt; was ueber QC_NUTZLAST3_MAX liegt,
-    // faellt weg.
+    // heute "QCN1" | u8 n | Name des Clients | u8 Flags (zugang.h), bei alten
+    // Clients ohne Flags oder "client". Der Name ist nur Anzeige und
+    // unbeglaubigt; Bit 0 der Flags verlangt den Ausweis des Hosts in der
+    // Zugangsphase. Was ueber QC_NUTZLAST3_MAX liegt, faellt weg.
     uint8_t nutzlast3[QC_NUTZLAST3_MAX];
     size_t nutzlast3_len;
     uint8_t ct[QC_CHUNK_MAX + QC_TAGLEN];   // eingehender Datensatz

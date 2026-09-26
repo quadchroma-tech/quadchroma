@@ -207,11 +207,12 @@ static void namen_pruefen(void) {
     pruefe(l == 7 && strcmp(n, "Gr\xc3\xbc\xc3\x9f" "e") == 0, "Umlaute bleiben");
 
     uint8_t q[64];
-    size_t ql = qc_zugang_name_kodieren("PC-Buero", q, sizeof q);
-    pruefe(ql == 13 && memcmp(q, "QCN1\x08PC-Buero", 13) == 0, "QCN1 kodieren");
+    size_t ql = qc_zugang_name_kodieren("PC-Buero", 0, q, sizeof q);
+    pruefe(ql == 14 && memcmp(q, "QCN1\x08PC-Buero\x00", 14) == 0, "QCN1 kodieren (Name, Flags 0)");
     pruefe(qc_zugang_name_lesen(q, ql, n) == 1 && strcmp(n, "PC-Buero") == 0, "QCN1 lesen");
     pruefe(qc_zugang_name_lesen((const uint8_t *)"client", 6, n) == 0 && n[0] == 0, "alter Client (\"client\"): kein Name");
-    pruefe(qc_zugang_name_lesen(q, ql - 1, n) == 0, "QCN1 abgeschnitten: kein Name");
+    pruefe(qc_zugang_name_lesen(q, ql - 2, n) == 0, "QCN1 abgeschnitten: kein Name");
+    pruefe(qc_zugang_name_lesen(q, ql - 1, n) == 1 && strcmp(n, "PC-Buero") == 0, "QCN1 in der alten Form (ohne Flag-Byte): Name");
     uint8_t z[64];
     memcpy(z, "QCN1", 4);
     z[4] = 41;
@@ -223,6 +224,31 @@ static void namen_pruefen(void) {
     pruefe(qc_zugang_name_lesen(z, 7, n) == 0, "QCN1 nur aus Steuerzeichen: kein Name");
     memcpy(q + ql, "zukunft", 7);
     pruefe(qc_zugang_name_lesen(q, ql + 7, n) == 1 && strcmp(n, "PC-Buero") == 0, "QCN1: Bytes hinter dem Namen bleiben frei");
+
+    // Flags hinter dem Namen (1.4): Bit 0 = der Client kennt den Schluessel
+    // dieses Hosts nicht. Wie im Rust-Client (zugang::nachricht3_flags).
+    uint8_t nf[64];
+    size_t nfl = qc_zugang_name_kodieren("PC-Buero", QC_ZUGANG_N3_HOST_UNBEKANNT, nf, sizeof nf);
+    pruefe(nfl == 14 && nf[13] == 1 && qc_zugang_name_flags(nf, nfl) == QC_ZUGANG_N3_HOST_UNBEKANNT &&
+           qc_zugang_name_lesen(nf, nfl, n) == 1 && strcmp(n, "PC-Buero") == 0, "QCN1 mit Bit 0: Name und Flag gelesen");
+    pruefe(qc_zugang_name_kodieren("PC-Buero", 0xff, nf, sizeof nf) == 14 && nf[13] == 1, "nur Bit 0 geht hinaus");
+    pruefe(qc_zugang_name_flags(q, 14) == 0, "Flags 0");
+    pruefe(qc_zugang_name_flags(q, 13) == 0, "alte Form ohne Flag-Byte: Flags 0");
+    pruefe(qc_zugang_name_flags((const uint8_t *)"client", 6) == 0 && qc_zugang_name_flags(NULL, 0) == 0,
+           "\"client\" und nichts: Flags 0");
+    nf[13] = 0xfe;
+    pruefe(qc_zugang_name_flags(nf, nfl) == 0, "unbekannte Bits zaehlen nicht");
+    nf[13] = 0x01;
+    memcpy(nf + nfl, "zukunft", 7);
+    pruefe(qc_zugang_name_flags(nf, nfl + 7) == QC_ZUGANG_N3_HOST_UNBEKANNT, "Bytes hinter den Flags bleiben frei");
+    uint8_t leer[6] = { 'Q', 'C', 'N', '1', 0, 1 };
+    pruefe(qc_zugang_name_flags(leer, 6) == 1 && qc_zugang_name_lesen(leer, 6, n) == 0,
+           "leerer Name, Aufbau heil: Flags gelten, der Name nicht");
+    z[4] = 41;
+    memset(z + 5, 'x', 41);
+    z[46] = 1;
+    pruefe(qc_zugang_name_flags(z, 47) == 0, "Name ueber 40 Byte: Aufbau kaputt, Flags 0");
+    pruefe(qc_zugang_name_kodieren("PC-Buero", 1, nf, 13) == 0, "zu kleiner Puffer: 0");
 
     uint8_t p[QC_BEKANNTGABE_MAX];
     size_t pl = qc_zugang_bekanntgabe(p, sizeof p, 9001, "Roberts Mac mini", 581729911, QC_BEKANNTGABE_ZULASSEN);

@@ -29,9 +29,10 @@
 //                                             SCDynamicStoreCopyComputerName, Rueckfall gethostname)
 //
 // 1.4 Handschlag-Nachricht 3 (Client -> Host)
-//   nachricht3(name) -> Vec<u8>               "QCN1" | u8 n | Name - statt b"client"
+//   nachricht3(name, flags) -> Vec<u8>        "QCN1" | u8 n | Name | u8 Flags - statt b"client"
 //   nachricht3_name(nutzlast) -> Option<String>
 //                                             None: alter Client oder kaputt -> IP anzeigen
+//   nachricht3_flags(nutzlast) -> u8          NAME_FLAG_*; ohne Flag-Byte (aeltere Fassung) 0
 //
 // 2 Bekanntgabe (UDP 9003)
 //   bekanntgabe(port, name, id, flags) -> Vec<u8>          mit Erweiterung (ext 1, ID, Flags)
@@ -114,8 +115,8 @@
 
 use crate::protokoll_konst::{
     BEACON_EXT, BEACON_FLAG_ZULASSEN, BEACON_MAGIC, BEACON_VERSION, ERGEBNIS_ABGELEHNT, ERGEBNIS_FALSCH,
-    ERGEBNIS_PASSWORT, ERGEBNIS_SCHLUSS, ERGEBNIS_ZULASSEN, NAME_KENNUNG, WEG_PASSWORT, WEG_ZULASSEN, ZUGANG_ABBRUCH,
-    ZUGANG_BEWEIS, ZUGANG_ERGEBNIS, ZUGANG_FASSUNG, ZUGANG_NOETIG,
+    ERGEBNIS_PASSWORT, ERGEBNIS_SCHLUSS, ERGEBNIS_ZULASSEN, NAME_FLAG_HOST_UNBEKANNT, NAME_KENNUNG, WEG_PASSWORT,
+    WEG_ZULASSEN, ZUGANG_ABBRUCH, ZUGANG_BEWEIS, ZUGANG_ERGEBNIS, ZUGANG_FASSUNG, ZUGANG_NOETIG,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -310,21 +311,25 @@ fn hostname_unix() -> Option<String> {
 
 // ------------------------------------------------- 1.4 Handschlag-Nachricht 3
 
-/// Nutzlast von Nachricht 3: "QCN1" | u8 n | n Byte UTF-8-Name (n <= 40).
-/// Der Name wird vorher bereinigt; aeltere Hosts uebergehen die Nutzlast.
-pub fn nachricht3(name: &str) -> Vec<u8> {
+/// Nutzlast von Nachricht 3: "QCN1" | u8 n | n Byte UTF-8-Name (n <= 40) |
+/// u8 Flags. Der Name wird vorher bereinigt; aeltere Hosts uebergehen die
+/// Nutzlast bzw. alles hinter dem Namen. Flags: NAME_FLAG_HOST_UNBEKANNT,
+/// wenn dieser Client den Schluessel des Hosts nicht kennt (Bit 1-7 bleiben 0).
+pub fn nachricht3(name: &str, flags: u8) -> Vec<u8> {
     let n = name_bereinigen(name);
-    let mut v = Vec::with_capacity(5 + n.len());
+    let mut v = Vec::with_capacity(6 + n.len());
     v.extend_from_slice(NAME_KENNUNG);
     v.push(n.len() as u8);
     v.extend_from_slice(n.as_bytes());
+    v.push(flags & NAME_FLAG_HOST_UNBEKANNT);
     v
 }
 
 /// Der Name aus Nachricht 3, bereinigt. None, wenn die Kennung fehlt
 /// (aelterer Client: b"client") oder die Nutzlast kaputt ist (Laenge 0 oder
 /// ueber 40, abgeschnitten, kein UTF-8) - dann zeigt der Host die IP der
-/// Gegenstelle. Bytes hinter dem Namen werden uebergangen (spaetere Felder).
+/// Gegenstelle. Bytes hinter dem Namen werden uebergangen (Flags, spaetere
+/// Felder).
 pub fn nachricht3_name(nutzlast: &[u8]) -> Option<String> {
     if nutzlast.len() < 5 || &nutzlast[..4] != NAME_KENNUNG {
         return None;
@@ -335,6 +340,22 @@ pub fn nachricht3_name(nutzlast: &[u8]) -> Option<String> {
     }
     let name = name_bereinigen(std::str::from_utf8(&nutzlast[5..5 + n]).ok()?);
     (!name.is_empty()).then_some(name)
+}
+
+/// Die Flags aus Nachricht 3 (NAME_FLAG_*): das Byte direkt hinter dem
+/// Namen. 0, wenn es fehlt (aeltere Fassung: "QCN1" ohne Flags, b"client")
+/// oder der Aufbau nicht stimmt (Kennung, Laenge ueber 40, abgeschnitten) -
+/// ob der Name selbst taugt (UTF-8, nicht leer), spielt keine Rolle. Bytes
+/// dahinter und unbekannte Bits werden uebergangen.
+pub fn nachricht3_flags(nutzlast: &[u8]) -> u8 {
+    if nutzlast.len() < 5 || &nutzlast[..4] != NAME_KENNUNG {
+        return 0;
+    }
+    let n = nutzlast[4] as usize;
+    match nutzlast.get(5 + n) {
+        Some(f) if n <= NAME_MAX => f & NAME_FLAG_HOST_UNBEKANNT,
+        _ => 0,
+    }
 }
 
 // ------------------------------------------------------------ 2 Bekanntgabe
@@ -2172,18 +2193,22 @@ mod tests {
 
     #[test]
     fn nachricht3_name_hin_und_zurueck() {
-        let n = nachricht3("Roberts PC");
+        let n = nachricht3("Roberts PC", 0);
         assert_eq!(&n[..5], b"QCN1\x0a");
-        assert_eq!(&n[5..], b"Roberts PC");
+        assert_eq!(&n[5..], b"Roberts PC\x00");
         assert_eq!(nachricht3_name(&n).as_deref(), Some("Roberts PC"));
+        assert_eq!(nachricht3_flags(&n), 0);
         // Zu lang: auf 40 Byte gekuerzt, UTF-8-sicher.
-        let n = nachricht3(&"ß".repeat(30));
+        let n = nachricht3(&"ß".repeat(30), NAME_FLAG_HOST_UNBEKANNT);
         assert_eq!(n[4], 40);
+        assert_eq!(n.len(), 46);
         assert_eq!(nachricht3_name(&n), Some("ß".repeat(20)));
-        // Spaetere Felder hinter dem Namen werden uebergangen.
-        let mut n = nachricht3("PC");
+        assert_eq!(nachricht3_flags(&n), NAME_FLAG_HOST_UNBEKANNT);
+        // Spaetere Felder hinter den Flags werden uebergangen.
+        let mut n = nachricht3("PC", NAME_FLAG_HOST_UNBEKANNT);
         n.extend_from_slice(b"\x01\x02\x03");
         assert_eq!(nachricht3_name(&n).as_deref(), Some("PC"));
+        assert_eq!(nachricht3_flags(&n), NAME_FLAG_HOST_UNBEKANNT);
         // Steuerzeichen kommen nicht durch.
         let mut n = b"QCN1\x03".to_vec();
         n.extend_from_slice(b"a\nb");
@@ -2207,6 +2232,41 @@ mod tests {
             &ueber40,
         ] {
             assert_eq!(nachricht3_name(n), None, "{n:?}");
+        }
+    }
+
+    /// Bit 0 hinter dem Namen: "der Client kennt den Schluessel des Hosts
+    /// nicht". Die alte Form ohne Flag-Byte (und b"client") heisst 0,
+    /// unbekannte Bits und Bytes dahinter werden uebergangen; ein kaputter
+    /// Aufbau heisst 0, ein unbrauchbarer Name allein nicht.
+    #[test]
+    fn nachricht3_flags_lesen() {
+        let f = NAME_FLAG_HOST_UNBEKANNT;
+        assert_eq!(f, 1);
+        assert_eq!(nachricht3("Laptop", 0).last(), Some(&0));
+        assert_eq!(nachricht3("Laptop", f).last(), Some(&1));
+        // Nur Bit 0 geht hinaus, nur Bit 0 wird gelesen.
+        assert_eq!(nachricht3("Laptop", 0xff).last(), Some(&1));
+        assert_eq!(nachricht3_flags(b"QCN1\x02PC\xff"), f);
+        assert_eq!(nachricht3_flags(b"QCN1\x02PC\xfe"), 0);
+        // Alte Form: ohne Flag-Byte.
+        assert_eq!(nachricht3_flags(b"QCN1\x02PC"), 0);
+        assert_eq!(nachricht3_name(b"QCN1\x02PC").as_deref(), Some("PC"));
+        assert_eq!(nachricht3_flags(b"client"), 0);
+        assert_eq!(nachricht3_flags(b""), 0);
+        // Bytes hinter den Flags: uebergangen.
+        assert_eq!(nachricht3_flags(b"QCN1\x02PC\x01zukunft"), f);
+        // Der Name taugt nicht (leer, kein UTF-8), der Aufbau schon: die
+        // Flags gelten - der Host zeigt dann die Adresse.
+        assert_eq!(nachricht3_flags(b"QCN1\x00\x01"), f);
+        assert_eq!(nachricht3_flags(b"QCN1\x02\xff\xfe\x01"), f);
+        assert_eq!(nachricht3_name(b"QCN1\x02\xff\xfe\x01"), None);
+        // Kaputter Aufbau: 0.
+        let mut ueber40 = b"QCN1\x29".to_vec();
+        ueber40.extend_from_slice(&[b'a'; 41]);
+        ueber40.push(1);
+        for n in [&b"QCN1"[..], b"QCN1\x05abc\x01", b"QCN2\x02ab\x01", b"qcn1\x02ab\x01", &ueber40] {
+            assert_eq!(nachricht3_flags(n), 0, "{n:?}");
         }
     }
 

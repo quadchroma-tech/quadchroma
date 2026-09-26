@@ -657,7 +657,8 @@ impl Meldung {
     /// Ablage oder Schluesseldatei kaputt, Liste kein UTF-8 oder nicht
     /// schreibbar - und jeder Ausgang des Zugangs (Spezifikation Pairing v1,
     /// 9.6: abgelehnt, zu viele Versuche, keine Antwort, Host veraltet,
-    /// Host-Beweis falsch, anderes Geraet unter der ID, ID nicht gefunden).
+    /// Host-Beweis falsch, Host ohne Ausweis, anderes Geraet unter der ID,
+    /// ID nicht gefunden).
     /// Dann verbindet der Empfangsfaden nicht alle 2 s neu, sondern nimmt das
     /// Ziel zurueck (wie bei einer Abloesung); der Startbildschirm zeigt die
     /// Meldung, und der Nutzer verbindet selbst wieder.
@@ -685,6 +686,7 @@ impl Meldung {
                     | MsgTooManyAttempts
                     | MsgHostOutdated
                     | MsgHostProofBad
+                    | MsgHostUnverified
                     | MsgOtherDevice
                     | MsgIdNotFound
                     | MsgDeviceRemoved
@@ -771,12 +773,15 @@ struct Shared {
     /// unter seiner neuen Adresse findet. None in Tests.
     bekanntgaben: Option<Arc<Mutex<discovery::Hosts>>>,
     /// Zu diesem Ziel lief seit der Wahl durch den Nutzer (`App::verbinden`)
-    /// schon eine angenommene Sitzung. Sagt der Host beim Wiederverbinden
-    /// danach "QCA1" (dort entfernt, Liste zurueckgesetzt), stellt der
-    /// Client keine Zugangsanfrage von selbst: der Nutzer hat nicht darum
-    /// gebeten, und am Host ginge ein Zulassen-Fenster auf, das niemand
-    /// erwartet. Er zieht sie sofort zurueck (23), und die Meldung bleibt.
-    angenommen: bool,
+    /// schon eine angenommene Sitzung: der Schluessel dieses Hosts. Sagt der
+    /// Host beim Wiederverbinden danach "QCA1" (dort entfernt, Liste
+    /// zurueckgesetzt), stellt der Client keine Zugangsanfrage von selbst:
+    /// der Nutzer hat nicht darum gebeten, und am Host ginge ein
+    /// Zulassen-Fenster auf, das niemand erwartet. Er zieht sie sofort
+    /// zurueck (23), und die Meldung bleibt. Der Schluessel gilt beim
+    /// Wiederverbinden als gepinnt (Vorwissen::angenommen), auch wenn
+    /// hosts.txt sich nicht schreiben liess.
+    angenommen: Option<Vec<u8>>,
     /// Zugangsphase laeuft: was der Dialog zeigt (Empfangsfaden -> Fenster).
     zugang: Option<zugangsphase::Dialog>,
     /// Eingabe des Nutzers im Zugangsdialog (Fenster -> Empfangsfaden).
@@ -2181,10 +2186,15 @@ fn zugang_durchlaufen(
     );
     let d = automat.dialog().clone();
     protokoll::zeile(format!(
-        "Zugang noetig: {} ({addr}, ID {}, Vergleichscode {}) kennt dieses Geraet noch nicht - {}{}{}",
+        "Zugang noetig: {} ({addr}, ID {}, Vergleichscode {}) {} - {}{}{}",
         d.name,
         zugang::id_text(d.id),
         d.code,
+        if sock.flags3 & NAME_FLAG_HOST_UNBEKANNT != 0 {
+            "ist hier noch nicht gemerkt (Bit 0 in Nachricht 3: der Host weist sich aus)"
+        } else {
+            "kennt dieses Geraet noch nicht"
+        },
         if d.zulassen { "Passwort oder Zulassen am Host" } else { "nur Passwort" },
         if noetig.warten_ms > 0 { format!(", Beweis fruehestens in {} ms", noetig.warten_ms) } else { String::new() },
         if neue_identitaet { ", neue Identitaet unter bekannter Adresse" } else { "" }
@@ -2297,14 +2307,20 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // bevor Nachricht 3 den eigenen zeigt (Spezifikation Pairing v1, 8.2) -
     // der Host nimmt diesen Client erst mit Nachricht 3 an und loest dafuer
     // den laufenden Zuschauer ab. Ein anderes Geraet unter der ID kommt so
-    // weit nicht.
-    let (ziel_id, ziel_name) = {
+    // weit nicht. Ist der Schluessel des Hosts nicht gepinnt, traegt
+    // Nachricht 3 Bit 0 (1.4): der Host muss sich in der Zugangsphase
+    // ausweisen, auch wenn er dieses Geraet kennt.
+    let (ziel_id, ziel_name, angenommen) = {
         let s = shared.lock().unwrap();
-        (s.ziel_id, s.ziel_name.clone())
+        (s.ziel_id, s.ziel_name.clone(), s.angenommen.clone())
     };
     let hosts_pfad = zugang::ablage_pfad(zugang::HOSTS_DATEI).map_err(|g| Meldung::from(secure::Fehler::Ablage(g)))?;
-    let vorwissen = zugangsphase::Vorwissen::laden(&hosts_pfad, addr, ziel_id).map_err(|f| Meldung::from(secure::Fehler::from(f)))?;
-    let mut sock = secure::Secure::connect_pruefend(addr, &noise::prologue_video(), |k| vorwissen.pruefen(k))?;
+    let mut vorwissen =
+        zugangsphase::Vorwissen::laden(&hosts_pfad, addr, ziel_id).map_err(|f| Meldung::from(secure::Fehler::from(f)))?;
+    vorwissen.angenommen = angenommen;
+    let mut sock = secure::Secure::connect_pruefend(addr, &noise::prologue_video(), |k| {
+        vorwissen.pruefen(k).map(|()| vorwissen.flags3(k))
+    })?;
     shared.lock().unwrap().abbruch = sock.abbruchgriff();
     let fp = sock.peer_fingerprint();
     // Wie der Host in Meldungen und in hosts.txt heisst, bis er selbst einen
@@ -2328,25 +2344,31 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // sondern eine Aussage - und wird nicht alle 2 s wiederholt.
     sock.lesefrist(Some(zugangsphase::KENNUNG_FRIST));
     let name = match zugangsphase::kennung_lesen(&mut sock) {
-        Ok(zugangsphase::Kennung::Sitzung) => {
-            // 8.3 ohne Zugangsphase: an dieser Adresse war ein anderer
-            // Schluessel gemerkt, und der Host kennt dieses Geraet schon
-            // (etwa neu aufgesetzt mit alter Geraeteliste). Kein Dauerfehler
-            // (8.4) - aber eine eigene Zeile, damit es nachzulesen ist.
-            if vorwissen.neue_identitaet(&sock.peer) {
-                protokoll::zeile(format!(
-                    "{addr}: neue Identitaet (ID {}, Fingerabdruck {fp}) - unter dieser Adresse war ein anderer Schluessel \
-                     gemerkt; der Host kennt dieses Geraet (QCH1), der neue wird gemerkt, der alte bleibt fuer seine ID",
+        // Bit 0 war gesetzt - dieser Client kennt den Schluessel des Hosts
+        // nicht -, und der Host sagt trotzdem gleich "QCH1": er hat sich
+        // nicht ausgewiesen, weder mit dem Beweis des Passworts (22/0) noch
+        // ueber "Zulassen" mit dem Vergleichscode (22/1). Ein Geraet, das
+        // sich nur als der Host ausgibt, kaeme so herein und wuerde
+        // gemerkt. Also abbrechen, nichts pinnen, kein Neuversuch (9.6).
+        Ok(zugangsphase::Kennung::Sitzung) if sock.flags3 & NAME_FLAG_HOST_UNBEKANNT != 0 => {
+            return Err(Meldung::neu(
+                strings::Key::MsgHostUnverified,
+                format!(
+                    "{addr}: {name} (ID {}, Fingerabdruck {fp}) antwortet mit QCH1, obwohl dieser Client seinen Schluessel \
+                     nicht kennt (Bit 0 in Nachricht 3) - der Host hat sich nicht ausgewiesen (weder Passwortbeweis \
+                     noch Zulassen); abgebrochen, nichts gemerkt",
                     zugang::id_text(zugang::geraete_id(&sock.peer))
-                ));
-            }
-            name
+                ),
+            )
+            .mit("{n}", name));
         }
+        // Gepinnt (oder eben in dieser Wahl angenommen): die Sitzung beginnt.
+        Ok(zugangsphase::Kennung::Sitzung) => name,
         // Wiederverbinden nach einer angenommenen Sitzung, und der Host
         // kennt dieses Geraet nicht mehr: keine Anfrage ohne den Nutzer
         // (siehe Shared::angenommen). Nachricht 23 zieht sie am Host gleich
         // zurueck; verbindet der Nutzer selbst neu, kommt der Dialog.
-        Ok(zugangsphase::Kennung::Zugang) if shared.lock().unwrap().angenommen => {
+        Ok(zugangsphase::Kennung::Zugang) if shared.lock().unwrap().angenommen.is_some() => {
             let _ = sock.write_all(&zugang::Nachricht::Abbruch.kodieren());
             return Err(Meldung::neu(
                 strings::Key::MsgDeviceRemoved,
@@ -2387,7 +2409,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         // Leitungsfehler, der naechste Versuch in 2 s darf. Kennt der Host
         // das Geraet nicht mehr, sagt er beim naechsten Mal "QCA1"
         // (MsgDeviceRemoved, oben).
-        Err(zugangsphase::Ausgang::Geschlossen) if shared.lock().unwrap().angenommen => {
+        Err(zugangsphase::Ausgang::Geschlossen) if shared.lock().unwrap().angenommen.is_some() => {
             return Err(Meldung::neu(
                 strings::Key::ConnectionLost,
                 format!(
@@ -2441,7 +2463,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let (sitzung, alt) = {
         let mut s = shared.lock().unwrap();
         s.connected = true;
-        s.angenommen = true;
+        s.angenommen = Some(sock.peer.clone());
         s.error = None;
         s.error_key = None;
         // Die Bindung fuer den Eingabekanal erst jetzt: vor der Annahme
@@ -4297,9 +4319,11 @@ impl InputLink {
         let prologue = noise::prologue_input(&hh);
         std::thread::spawn(move || {
             let mut fremd = None;
+            // Nachricht 3 ohne Flags: den Host des Bildkanals kennt dieser
+            // Client schon (er hat ihn eben angenommen).
             let r = secure::Secure::connect_pruefend(&addr, &prologue, |k| {
                 if k == host.as_slice() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 fremd = Some(noise::fingerprint(k));
                 Err(secure::Fehler::Handschlag {
@@ -6390,7 +6414,7 @@ impl App {
         let (griff, datei) = {
             let mut s = self.shared.lock().unwrap();
             s.target = None;
-            s.angenommen = false;
+            s.angenommen = None;
             // Eine laufende Datei-Sendung sofort ab (der Empfaenger bricht
             // mit dem Ende von run_session ab).
             (s.abbruch.take(), s.dateien_zuruecksetzen())
@@ -6434,7 +6458,7 @@ impl App {
         s.target = Some(addr);
         s.ziel_id = ziel.id;
         s.ziel_name = ziel.name;
-        s.angenommen = false;
+        s.angenommen = None;
         s.error = None;
         s.error_key = None;
         s.zugang_eingabe = None;
@@ -11414,9 +11438,26 @@ mod tests {
     /// Ein gemeinsamer Schluessel fuer die Schein-Hosts auf 127.0.0.1 (aus
     /// der Zeit, als die Tests sich eine known_hosts.txt teilten, in der
     /// 127.0.0.1 nur einmal stand; heute pinnt hosts.txt nach Schluessel).
+    /// Er steht von Anfang an in hosts.txt dieses Testlaufs: die
+    /// Schein-Hosts sagen gleich "QCH1", und das nimmt der Client nur von
+    /// einem Host an, dessen Schluessel er kennt (sonst Bit 0 in Nachricht 3,
+    /// Spezifikation Pairing v1, 1.4).
     fn test_host() -> (Vec<u8>, Vec<u8>) {
         static K: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
-        K.get_or_init(|| noise::keypair().unwrap()).clone()
+        K.get_or_init(|| {
+            let k = noise::keypair().unwrap();
+            vorher_pinnen(&k.1, "127.0.0.1:1");
+            k
+        })
+        .clone()
+    }
+
+    /// Diesen Host in hosts.txt des Testlaufs eintragen, als waere er schon
+    /// einmal angenommen worden.
+    fn vorher_pinnen(host_pub: &[u8], addr: &str) {
+        secure::test_identitaet();
+        let p = zugang::ablage_pfad(zugang::HOSTS_DATEI).unwrap();
+        zugangsphase::pinnen(&p, host_pub, addr, "Vorher").unwrap();
     }
 
     /// Ruft ensure, bis der Eingabekanal steht oder ein fremder Schluessel
@@ -12818,7 +12859,7 @@ mod tests {
             let _ = los_rx.recv();
             drop(h);
         });
-        let sock = secure::Secure::connect_pruefend(&addr, &noise::prologue_input(&hh), |_| Ok(())).expect("Eingabekanal");
+        let sock = secure::Secure::connect_pruefend(&addr, &noise::prologue_input(&hh), |_| Ok(0)).expect("Eingabekanal");
         sendepuffer_setzen(sock.socket(), 8 * 1024);
         assert_eq!(sendepuffer_lesen(sock.socket()), Some(8 * 1024), "8 KiB nicht gesetzt");
         let k = Schreiber::neu(sock, SCHREIBFRIST);
@@ -13865,8 +13906,16 @@ mod tests {
     /// Wie sich der Test-Host der Zugangsphase verhaelt.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Zugangshost {
-        /// Kennt jeden: "QCH1".
+        /// Kennt jeden: "QCH1" - auch wenn der Client Bit 0 setzt (ein Host,
+        /// der sich nicht ausweist).
         Bekannt,
+        /// Kennt diesen Client: ohne Bit 0 in Nachricht 3 "QCH1"; mit Bit 0
+        /// (der Client kennt den Host nicht) die Zugangsphase wie Passwort.
+        /// Meldet "Bit 0" bzw. "ohne Bit 0".
+        KenntClient,
+        /// Unbekannt, 20 ohne "Zulassen" (Bit 1 aus) - und nach 300 ms
+        /// trotzdem 22/1, ohne dass ein Beweis kam.
+        ZulassenUngefragt,
         /// Unbekannt: "QCA1", 20; prueft Beweise gegen das Passwort.
         Passwort,
         /// Wie Passwort, aber Ergebnis 0 mit falschem host_proof.
@@ -13933,8 +13982,13 @@ mod tests {
                 let ergebnis = |h: &mut secure::Secure, e: Ergebnis| {
                     let _ = h.write_all(&Nachricht::Ergebnis(e).kodieren());
                 };
+                let bit0 = zugang::nachricht3_flags(&h.nachricht3) & NAME_FLAG_HOST_UNBEKANNT != 0;
+                if art == Zugangshost::KenntClient {
+                    let _ = tx.send(if bit0 { "Bit 0" } else { "ohne Bit 0" }.into());
+                }
                 match art {
                     Zugangshost::Bekannt => annahme(&mut h),
+                    Zugangshost::KenntClient if !bit0 => annahme(&mut h),
                     Zugangshost::Alt => continue,
                     Zugangshost::Stumm => std::thread::sleep(zugangsphase::KENNUNG_FRIST + Duration::from_millis(500)),
                     Zugangshost::Fremd => {
@@ -13979,6 +14033,11 @@ mod tests {
                                 std::thread::sleep(Duration::from_millis(300));
                                 ergebnis(&mut h, Ergebnis::Schluss { warten_ms: 0 });
                             }
+                            Zugangshost::ZulassenUngefragt => {
+                                std::thread::sleep(Duration::from_millis(300));
+                                ergebnis(&mut h, Ergebnis::Zulassen);
+                                annahme(&mut h);
+                            }
                             _ => loop {
                                 match zugang::empfangen(|b| h.lesen(b)) {
                                     Ok(Nachricht::Beweis(_)) if art == Zugangshost::ZulassenOhneAngebot => {
@@ -14006,7 +14065,7 @@ mod tests {
                                             zugang::host_beweis(&k, &h.handshake_hash)
                                         };
                                         ergebnis(&mut h, Ergebnis::Passwort { host_beweis });
-                                        if matches!(art, Zugangshost::Passwort | Zugangshost::Drossel) {
+                                        if matches!(art, Zugangshost::Passwort | Zugangshost::Drossel | Zugangshost::KenntClient) {
                                             annahme(&mut h);
                                         }
                                         break;
@@ -14094,13 +14153,14 @@ mod tests {
         s.lock().unwrap().error.clone()
     }
 
-    /// Bekannt ("QCH1"): Sitzung ohne Dialog, und erst danach gepinnt - mit
-    /// ID, Adresse und dem Namen aus der Bekanntgabe. Mit der richtigen ID
-    /// als Ziel geht es ebenso.
+    /// Bekannt ("QCH1") und hier gepinnt: Sitzung ohne Dialog, danach der
+    /// Eintrag erneuert - mit ID, Adresse und dem Namen aus der Bekanntgabe.
+    /// Mit der richtigen ID als Ziel geht es ebenso.
     #[test]
     fn zugang_bekannter_host_wird_gepinnt() {
         let (addr, host_pub, _ereignisse, verbindungen) = zugangshost(Zugangshost::Bekannt, "");
-        assert!(gepinnt(&host_pub).is_none());
+        vorher_pinnen(&host_pub, "127.0.0.1:2");
+        assert_eq!(gepinnt(&host_pub).map(|h| h.name), Some("Vorher".into()));
         let (s, dialoge) = zugang_durchspielen(&addr, Some(zugang::geraete_id(&host_pub)), |_| None);
         assert!(dialoge.is_empty());
         assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
@@ -14108,6 +14168,81 @@ mod tests {
         let h = gepinnt(&host_pub).expect("nicht gepinnt");
         assert_eq!((h.id, h.adresse.as_str(), h.name.as_str()), (zugang::geraete_id(&host_pub), addr.as_str(), "aus der Bekanntgabe"));
         assert_eq!(verbindungen.load(Ordering::SeqCst), 1);
+    }
+
+    /// Erstkontakt (1.4, 3.5): der Client kennt den Schluessel des Hosts
+    /// nicht und setzt Bit 0 - der Host sagt trotzdem gleich "QCH1", ohne
+    /// sich mit Passwort oder "Zulassen" auszuweisen. Abbruch mit
+    /// MsgHostUnverified, nichts gepinnt, kein Neuversuch.
+    #[test]
+    fn zugang_host_ohne_ausweis_wird_nicht_angenommen() {
+        let (addr, host_pub, _, verbindungen) = zugangshost(Zugangshost::Bekannt, "");
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
+        assert!(dialoge.is_empty());
+        let m = fehler_von(&s).expect("keine Meldung");
+        assert_eq!(m.key, strings::Key::MsgHostUnverified, "{}", m.protokoll);
+        assert_eq!(
+            m.text(&strings::EN),
+            "aus der Bekanntgabe did not prove its identity. The connection was stopped for safety."
+        );
+        assert!(m.dauerhaft());
+        assert!(m.protokoll.contains("Bit 0"), "{}", m.protokoll);
+        assert!(!s.lock().unwrap().connected);
+        assert!(gepinnt(&host_pub).is_none());
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
+    }
+
+    /// Der Host kennt diesen Client, der Client ihn aber nicht (etwa
+    /// hosts.txt geloescht): Bit 0 in Nachricht 3, also die Zugangsphase
+    /// trotz bekanntem Geraet - mit Passwort und host_proof, danach
+    /// gepinnt. Beim Wiederverbinden ist er gepinnt: kein Bit 0, gleich
+    /// "QCH1", kein Dialog. Wieder vergessen: wieder Bit 0 und Passwort.
+    #[test]
+    fn zugang_bekannter_client_verlangt_ausweis_des_hosts() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::KenntClient, "k7m-4wq-9tz");
+        let passwort = |d: &zugangsphase::Dialog| {
+            (d.lage == zugangsphase::Lage::Eingabe).then(|| zugangsphase::Eingabe::Passwort("k7m-4wq-9tz".into()))
+        };
+        let (s, dialoge) = zugang_durchspielen(&addr, None, passwort);
+        assert_eq!(ereignisse.try_iter().collect::<Vec<_>>(), vec!["Bit 0", "richtig"]);
+        assert_eq!((dialoge[0].name.as_str(), dialoge[0].zulassen), ("Testhost", false));
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+        assert_eq!(gepinnt(&host_pub).map(|h| h.name), Some("Testhost".into()));
+
+        let (s, dialoge) = zugang_durchspielen(&addr, None, passwort);
+        assert!(dialoge.is_empty(), "{dialoge:?}");
+        assert_eq!(ereignisse.try_iter().collect::<Vec<_>>(), vec!["ohne Bit 0"]);
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+
+        let p = zugang::ablage_pfad(zugang::HOSTS_DATEI).unwrap();
+        let k: [u8; 32] = host_pub.clone().try_into().unwrap();
+        zugang::host_vergessen(&p, &k).unwrap();
+        assert!(gepinnt(&host_pub).is_none());
+        let (s, dialoge) = zugang_durchspielen(&addr, None, passwort);
+        assert!(!dialoge.is_empty());
+        assert_eq!(ereignisse.try_iter().collect::<Vec<_>>(), vec!["Bit 0", "richtig"]);
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+        assert!(gepinnt(&host_pub).is_some());
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 3);
+    }
+
+    /// 22/1, obwohl Nachricht 20 kein "Zulassen" anbot (Bit 1 aus), und ohne
+    /// dass ein Beweis hinausging: ein Protokollfehler - nichts gepinnt, die
+    /// Meldung bleibt, kein Neuversuch.
+    #[test]
+    fn zugang_zulassen_ungefragt_ist_protokollfehler() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::ZulassenUngefragt, "");
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
+        assert!(!dialoge.is_empty() && !dialoge[0].zulassen);
+        let m = fehler_von(&s).expect("keine Meldung");
+        assert_eq!(m.key, strings::Key::ErrorProtocol, "{}", m.protokoll);
+        assert!(m.protokoll.contains("Ergebnis 1"), "{}", m.protokoll);
+        assert!(m.dauerhaft());
+        assert!(gepinnt(&host_pub).is_none());
+        assert_eq!(ereignisse.try_iter().count(), 0, "ein Beweis ging hinaus");
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
     }
 
     /// Unbekannt, erst ein falsches, dann das richtige Passwort: der Dialog
@@ -14239,6 +14374,7 @@ mod tests {
     #[test]
     fn zugang_nach_entfernen_keine_anfrage_von_selbst() {
         let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::Entfernt, "");
+        vorher_pinnen(&host_pub, &addr);
         let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
         assert!(dialoge.is_empty(), "Zugangsdialog ohne Nutzer: {dialoge:?}");
         assert_eq!(ereignisse.recv_timeout(Duration::from_secs(5)).as_deref(), Ok("Abbruch"));
@@ -14259,6 +14395,7 @@ mod tests {
     #[test]
     fn zugang_aussetzer_nach_sitzung_ist_kein_alter_host() {
         let (addr, host_pub, _, verbindungen) = zugangshost(Zugangshost::Aussetzer, "");
+        vorher_pinnen(&host_pub, &addr);
         let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
         assert!(dialoge.is_empty(), "{dialoge:?}");
         assert_eq!(verbindungen.load(Ordering::SeqCst), 3, "kein Neuversuch nach dem Aussetzer");
@@ -14412,7 +14549,17 @@ mod tests {
     #[test]
     fn zugangstexte_und_dauer() {
         use strings::Key::*;
-        for k in [MsgRefused, MsgNoAnswer, MsgTooManyAttempts, MsgHostOutdated, MsgHostProofBad, MsgOtherDevice, MsgIdNotFound, MsgDeviceRemoved] {
+        for k in [
+            MsgRefused,
+            MsgNoAnswer,
+            MsgTooManyAttempts,
+            MsgHostOutdated,
+            MsgHostProofBad,
+            MsgHostUnverified,
+            MsgOtherDevice,
+            MsgIdNotFound,
+            MsgDeviceRemoved,
+        ] {
             let m = Meldung::neu(k, "x").mit("{n}", "Mac").mit("{i}", "581 729 911");
             assert!(m.dauerhaft(), "{k:?}");
             for lang in strings::all() {

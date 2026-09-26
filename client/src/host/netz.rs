@@ -2617,7 +2617,7 @@ mod tests {
         // Zuschauer (gleiche Nummer), und B's Leitung laeuft weiter.
         let nr_b = zuschauer_nr();
         let (fremd_priv, _) = noise::keypair().unwrap();
-        let mut fremd = super::super::einlass::stub::Stub::verbinden(&bild_addr, &fremd_priv, &zugang::nachricht3("Fremd")).unwrap();
+        let mut fremd = super::super::einlass::stub::Stub::verbinden(&bild_addr, &fremd_priv, &zugang::nachricht3("Fremd", 0)).unwrap();
         assert_eq!(&fremd.kennung().unwrap(), MAGIC_ZUGANG);
         assert!(matches!(fremd.nachricht(), Ok(zugang::Nachricht::Noetig(_))));
         assert_eq!(zuschauer_nr(), nr_b, "Zugangsphase hat den Zuschauer abgeloest");
@@ -2660,7 +2660,7 @@ mod tests {
             }));
             let addr = bild_addr.clone();
             let t = std::thread::spawn(move || {
-                let mut s = super::super::einlass::stub::Stub::verbinden(&addr, &wer, &zugang::nachricht3(name))?;
+                let mut s = super::super::einlass::stub::Stub::verbinden(&addr, &wer, &zugang::nachricht3(name, 0))?;
                 s.kennung()
             });
             da_rx.recv_timeout(Duration::from_secs(5)).expect("Einlass nicht erreicht");
