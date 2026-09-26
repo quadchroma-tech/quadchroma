@@ -3585,7 +3585,7 @@ mod tests {
             (DATEI_ENDE, 256),
             (DATEI_QUITTUNG, 256),
             (IN_FAEHIGKEITEN, 256),
-            (70, 256),
+            (200, 256),
         ];
         for (typ, grenze) in faelle {
             let (mut h, mut c) = paar();

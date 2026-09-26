@@ -26,6 +26,7 @@ use rayon::prelude::*;
 
 /// Dateien ueber die Zwischenablage: Protokoll, Sender, Empfaenger und
 /// Ablageverzeichnis, gemeinsam fuer Client und Windows-Host-Rolle.
+mod bildschirm;
 mod dateien;
 mod discovery;
 mod einstellungen;
