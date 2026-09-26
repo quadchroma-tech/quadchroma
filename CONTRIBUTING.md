@@ -85,10 +85,10 @@ them are closed.
    with `ae`, `oe`, `ue` and `ss` instead of umlauts and ß, as in the existing code
    (`// Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.`).
    Identifiers follow the file you are editing (mostly German as well). The
-   documentation for GitHub - `README.en.md`, this file, `CLA.md`, `SECURITY.md`,
+   documentation for GitHub - `.github/README.md`, this file, `CLA.md`, `SECURITY.md`,
    `CODE_OF_CONDUCT.md`, the issue and pull request templates - is in English;
    `README.md` and `BENUTZUNG.txt` are German. If your change alters documented
-   behaviour, update `README.en.md`, and `README.md` or `BENUTZUNG.txt` too if you can
+   behaviour, update `.github/README.md`, and `README.md` or `BENUTZUNG.txt` too if you can
    write German (`BENUTZUNG.txt` is plain ASCII with lines of at most 78 characters);
    otherwise describe the change in the pull request and the author updates the German
    documents. If you really cannot write German comments, say so in the issue before
@@ -109,7 +109,7 @@ them are closed.
 
 ## 4. Building and testing
 
-Short form; the complete recipes with paths and explanations are in `README.en.md`
+Short form; the complete recipes with paths and explanations are in `.github/README.md`
 ("Building from source") and in `README.md`. Continuous integration
 (`.github/workflows/ci.yml`) runs the same steps on Windows and macOS for every pull
 request with `cargo ... --locked`, so `Cargo.lock` must be committed exactly as your

@@ -60,7 +60,7 @@
 #   VERSION         wird aus CFBundleShortVersionString in host/Info.plist gelesen und
 #                   bestimmt die Paketnamen; CFBundleVersion dort vor jedem verteilten Bau erhoehen.
 #   Beilagen        Lizenz- und Hinweistexte fuer die DMG, alle als .txt (LICENSE.txt,
-#                   THIRD_PARTY_NOTICES.txt, README.txt aus README.en.md, BENUTZUNG.txt) -
+#                   THIRD_PARTY_NOTICES.txt, README.txt aus .github/README.md, BENUTZUNG.txt) -
 #                   scripts/package-texts.sh legt sie ab. Fehlt eine Quelle, bricht make dmg
 #                   mit einer Developer ID ab (oder wenn DMG_EXTRA_REQUIRED=1 gesetzt ist, so
 #                   in release.yml); im Alltagsbau gibt es nur eine WARNUNG.

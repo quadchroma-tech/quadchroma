@@ -11,7 +11,7 @@ body:
       value: |
         Please read `CONTRIBUTING.md`, Section 3 (project rules), first. Proposals that
         need a helper process, a second program, a pointer encoded into the video stream
-        or a new Rust crate are very unlikely to be accepted. The list in `README.en.md`
+        or a new Rust crate are very unlikely to be accepted. The list in `.github/README.md`
         ("What is missing") shows what is already planned.
   - type: dropdown
     id: side
@@ -75,5 +75,5 @@ body:
     attributes:
       label: Before you submit
       options:
-        - label: I searched the existing issues and README.en.md ("What is missing"), and this is not already there.
+        - label: I searched the existing issues and .github/README.md ("What is missing"), and this is not already there.
           required: true

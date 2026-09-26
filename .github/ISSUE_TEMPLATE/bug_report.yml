@@ -2,7 +2,7 @@
 # Sichtbare Texte auf Englisch (GitHub-Datei), Kommentare auf Deutsch (Projektregel).
 # Das Label "bug" muss im Repository existieren, sonst setzt GitHub es stillschweigend nicht.
 name: Bug report
-description: Something does not work as documented in README.en.md or BENUTZUNG.txt.
+description: Something does not work as documented in .github/README.md or BENUTZUNG.txt.
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -14,7 +14,7 @@ body:
         **Security problems do not belong here.** See
         [SECURITY.md](https://github.com/quadchroma-tech/quadchroma/blob/main/SECURITY.md)
         for private reporting. Before you post, search the existing issues and check
-        `README.en.md` ("Using the client", "What is missing") and `BENUTZUNG.txt`.
+        `.github/README.md` ("Using the client", "What is missing") and `BENUTZUNG.txt`.
   - type: dropdown
     id: side
     attributes:
@@ -61,7 +61,7 @@ body:
     id: expected
     attributes:
       label: Expected behaviour
-      description: What should have happened, with a reference to README.en.md or BENUTZUNG.txt if it is documented.
+      description: What should have happened, with a reference to .github/README.md or BENUTZUNG.txt if it is documented.
     validations:
       required: true
   - type: textarea
@@ -94,5 +94,5 @@ body:
           required: true
         - label: This is not a security vulnerability (those go through SECURITY.md, not through a public issue).
           required: true
-        - label: I searched the existing issues and README.en.md ("What is missing") and did not find this problem.
+        - label: I searched the existing issues and .github/README.md ("What is missing") and did not find this problem.
           required: true

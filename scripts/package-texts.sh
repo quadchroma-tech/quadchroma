@@ -4,7 +4,7 @@
 #
 #   LICENSE.txt              Lizenz (liegt im Repository schon als .txt)
 #   THIRD_PARTY_NOTICES.txt  Fremdlizenzen (ebenso)
-#   README.txt               aus README.en.md, ohne die Bildzeilen
+#   README.txt               aus .github/README.md, ohne die Bildzeilen
 #   BENUTZUNG.txt            deutsche Anleitung
 #
 # Aufruf: scripts/package-texts.sh ZIEL [pflicht]
@@ -31,8 +31,8 @@ for f in LICENSE.txt THIRD_PARTY_NOTICES.txt BENUTZUNG.txt; do
     if [ -f "$f" ]; then cp "$f" "$ZIEL/"; else fehlt "$f"; fi
 done
 # Bildzeilen (![...](datei.png)) haben im Paket kein Bild - weg damit.
-if [ -f README.en.md ]; then
-    sed '/^!\[/d' README.en.md > "$ZIEL/README.txt"
+if [ -f .github/README.md ]; then
+    sed '/^!\[/d' .github/README.md > "$ZIEL/README.txt"
 else
-    fehlt README.en.md
+    fehlt .github/README.md
 fi

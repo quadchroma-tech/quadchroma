@@ -383,7 +383,7 @@ jobs:
           set -euo pipefail
           d="stage/quadchroma-$VERSION"
           # Die vier Begleitdateien sind Pflicht und im Paket alle .txt (README.txt aus
-          # README.en.md) - dasselbe Skript wie make dmg im macOS-Job. Fehlt eine Quelle,
+          # .github/README.md) - dasselbe Skript wie make dmg im macOS-Job. Fehlt eine Quelle,
           # endet der Job mit dem Dateinamen als Fehler.
           scripts/package-texts.sh "$d" 1
           # Inhalt pruefen: exe, zwei DLLs, FFmpeg-Bauangaben, vier Begleitdateien - nicht

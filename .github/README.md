@@ -1,5 +1,55 @@
 # QuadChroma
 
+**Your Mac on a Windows screen, pixel-sharp: HEVC 4:4:4 with 10 bits, encoded in the
+Mac's hardware, decoded by NVIDIA GPUs - free for personal use.**
+
+As far as we know, QuadChroma is the only free remote desktop that streams a Mac to a
+Windows PC with full colour for every pixel at 10 bits **in hardware** - encoded by
+the Media Engine of Apple silicon, decoded by the NVIDIA GPU in the PC (comparison
+below). Without an NVIDIA GPU the PC decodes 4:4:4 in software.
+
+- **Sharp text, clean colour edges.** 4:4:4 keeps a colour value for every pixel;
+  the usual 4:2:0 shares one between four, which makes red text and thin coloured
+  lines fray. 10 bits per sample instead of 8 remove banding in gradients.
+- **The pointer is yours.** It is never part of the video: Windows draws its own
+  pointer in the shape the Mac reports, so the mouse feels local even when the
+  picture is a few milliseconds behind.
+- **Latency you can see.** 15 to 20 ms from capture on a Mac mini M1 to hand-over to
+  the display at 1080p and 120 frames/s in the LAN; the statistics panel shows every link
+  of the chain live (encoder, network, decoder), and a built-in benchmark recommends
+  codec, bit rate and frame rate for your network.
+- **One program per side, nothing else.** No account, no cloud, no relay server, no
+  extra driver or helper service: `QuadChroma.app` on the Mac, `quadchroma.exe` on
+  Windows, connected directly in your network (or through your VPN). Always
+  encrypted (Noise protocol), devices paired by fingerprint.
+- **Everyday comfort.** Copy files between Mac and PC through the clipboard, like
+  with Windows Remote Desktop; choose which Mac display to show (it follows the main
+  display automatically); audio; a desktop shortcut per host; 29 languages.
+
+### How it compares
+
+Streaming *from a Mac* in 4:4:4, checked on 26 September 2026 from the vendors'
+documentation and source code:
+
+| | 4:4:4 from a Mac host | 10 bit | Encoding on the Mac | Cost |
+|---|---|---|---|---|
+| **QuadChroma** | yes | yes | hardware (VideoToolbox, HEVC) | free for personal use |
+| Jump Desktop (Fluid) | yes | only "Ultra" mode | not stated | paid app; 10-bit 4:4:4 only in Jump Desktop for Teams Enterprise |
+| Parsec | no - "Prefer 4:4:4 color" needs a host with NVIDIA or Intel H.265 4:4:4 encoding | - | - | 4:4:4 only in Teams and Warp |
+| Sunshine + Moonlight | only with the software encoder (the VideoToolbox encoder has no 4:4:4) | not documented for this path | software | free |
+| Splashtop | no - 4:4:4 on Windows streamers only | - | - | paid |
+| RustDesk | yes, VP9/AV1 4:4:4 | not documented | software | free |
+
+Sources: [Jump Desktop Fluid 2.0](https://changelog.jumpdesktop.com/fluid-2.0-beta-2-studio-quality-remote-desktop-with-4-4-4-and-10-bit-color-1IKhva),
+[Jump Desktop 10](https://docs.jumpdesktop.com/whats-new/jump-desktop-10/),
+[Parsec: stream quality and color accuracy](https://support.parsec.app/hc/en-us/articles/32381785123860-Improve-Stream-Quality-and-Color-Accuracy),
+[Sunshine `src/video.cpp`](https://github.com/LizardByte/Sunshine/blob/master/src/video.cpp) (encoder flags),
+[Splashtop performance options](https://support-splashtopbusiness.splashtop.com/hc/en-us/articles/6193537936027-Performance-Options),
+[RustDesk discussion #8128](https://github.com/rustdesk/rustdesk/discussions/8128).
+Products change; corrections are welcome as an issue.
+
+## Details
+
 Remote desktop with full colour resolution. The Mac captures its screen, encodes it
 in hardware as HEVC 4:4:4 with 10 bits per sample and sends it to a Windows PC. The
 mouse pointer is deliberately *not* rendered into the video: what you see is the
@@ -16,7 +66,7 @@ This file is an English overview. The complete documentation is in German,
 `README.md` and `BENUTZUNG.txt` (every switch, log line and protocol message), and
 it is authoritative where this overview differs.
 
-![Start screen of the Windows client. The German interface is shown; the interface is available in 29 languages, English among them.](oberflaeche.png)
+![Start screen of the Windows client. The German interface is shown; the interface is available in 29 languages, English among them.](../oberflaeche.png)
 
 ## Why 4:4:4
 
@@ -50,9 +100,11 @@ encoder directly through VideoToolbox.
 | Host role | Windows, the same `quadchroma.exe` with `--host` | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today), a menu entry to share this computer. Not yet verified on real NVIDIA hardware. |
 | Client | Mac (arm64), the same Rust source | Secondary, under construction. Audio via AudioToolbox, clipboard including files via NSPasteboard, display on the CPU (no Metal yet), menu-bar icon, no desktop shortcut. Not distributed as a binary, see License. |
 
-Signing: today the Mac bundle is signed with a local development certificate only and
-the Windows executable is not signed. Developer ID signing with notarization for the
-Mac host and a signature for the exe are on the list of open points.
+Signing: the project does not pay for certificates yet. Mac releases are signed with
+the project's own free certificate "QuadChroma Release" (permissions survive updates,
+but macOS asks once before the first start), the Windows executable is unsigned; see
+"First start of a downloaded release". `RELEASING.md` describes the paid route (Apple
+Developer ID with notarization, a Windows code-signing certificate) for later.
 
 ## Requirements
 
@@ -220,7 +272,7 @@ sends a fixed moving test pattern so that every step sees the same content. At t
 end a recommendation can be applied with one click; the table is written to
 `benchmark.txt`. Headless: `quadchroma.exe <address> --headless --benchmark 5`.
 
-![Nerd mode: the F9 statistics panel widened, with the latency chain as a bar on a millisecond scale, shown during first contact with the comparison code.](nerd.png)
+![Nerd mode: the F9 statistics panel widened, with the latency chain as a bar on a millisecond scale, shown during first contact with the comparison code.](../nerd.png)
 
 **Test mode.** `quadchroma.exe <address> --headless` runs without a window and prints
 a status line every three seconds; `--decodertest` tries every decoder choice without

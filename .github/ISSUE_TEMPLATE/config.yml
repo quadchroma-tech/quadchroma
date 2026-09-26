@@ -9,5 +9,5 @@ contact_links:
     url: mailto:hello@quadchroma.tech?subject=QuadChroma%20commercial%20licence
     about: Business use, embedding, or any permission that LICENSE.txt does not give - write to hello@quadchroma.tech.
   - name: Questions about using QuadChroma
-    url: https://github.com/quadchroma-tech/quadchroma/blob/main/README.en.md
-    about: README.en.md covers setup, pairing, the client and the Windows host role; BENUTZUNG.txt (German) is the full reference. Still stuck? E-mail hello@quadchroma.tech.
+    url: https://github.com/quadchroma-tech/quadchroma/blob/main/.github/README.md
+    about: .github/README.md covers setup, pairing, the client and the Windows host role; BENUTZUNG.txt (German) is the full reference. Still stuck? E-mail hello@quadchroma.tech.

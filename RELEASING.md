@@ -22,7 +22,7 @@ change; check before buying.
 | Needs the author | a code-signing certificate on the author's own name (or, only for organisations in the EU, an Azure Artifact Signing account) | Apple Developer Program membership (individual), Developer ID certificate, notarytool credentials |
 
 The Mac *client* (same Rust source as the Windows program) is not released as a
-binary: the Homebrew FFmpeg it links against is a GPL build (`README.en.md`).
+binary: the Homebrew FFmpeg it links against is a GPL build (`.github/README.md`).
 The CI builds and tests it, nothing more.
 
 Two ways to produce a release:
@@ -53,7 +53,7 @@ folder: a release signed with a different certificate makes every user grant
 Screen Recording and Accessibility again.
 
 What it gives: Gatekeeper still refuses the first start (the app is not
-notarized; users click "Open Anyway" once, see README.en.md), but macOS ties the
+notarized; users click "Open Anyway" once, see .github/README.md), but macOS ties the
 two permissions to the designated requirement `identifier "tech.quadchroma.host"
 and certificate root = H"eddb251662679f9761f59df958e435273230c095"`, which stays
 the same for every release signed with this certificate - permissions survive
@@ -251,6 +251,25 @@ and `CertificateProfileName`, sign in with `az login`, then
 (without `-Metadata`, pass `-Endpoint`, `-Account` and `-CertificateProfile`, or
 set `QC_SIGN_ENDPOINT`, `QC_SIGN_ACCOUNT` and `QC_SIGN_PROFILE`).
 
+### 3.2a GitHub repository page ("About", topics)
+
+Repository: `github.com/quadchroma-tech/quadchroma` (the name "quadchroma" is taken
+by an unrelated account). In the repository's "About" box (gear icon):
+
+- **Description** (GitHub allows 350 characters; this is 230):
+  `Remote desktop from a Mac to a Windows PC in HEVC 4:4:4 at 10 bit - hardware-encoded
+  on Apple silicon, hardware-decoded on NVIDIA. Sharp text, local mouse pointer, no
+  account, no cloud, one program per side. Free for personal use.`
+- **Website:** `https://quadchroma.tech`
+- **Topics:** `remote-desktop`, `screen-sharing`, `macos`, `windows`, `hevc`, `h265`,
+  `yuv444`, `chroma-subsampling`, `10-bit`, `videotoolbox`, `nvdec`, `low-latency`,
+  `apple-silicon`, `rust`, `objective-c`
+- Tick "Releases", untick "Packages" and "Deployments" (not used).
+
+GitHub shows `.github/README.md` (English) on the repository page; it takes
+precedence over the German `README.md` in the root, which stays the complete German
+documentation.
+
 ### 3.3 GitHub: secrets, settings, protection
 
 **Secrets** (Settings > Secrets and variables > Actions > Secrets > New
@@ -359,13 +378,13 @@ agree; the `vorpruefung` job refuses the release otherwise.
    `FFMPEG-BUILDINFO.txt`, and attaches the source archives and the script to
    the release (LGPL v2.1 section 6).
 6. The four companion files `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`,
-   `README.en.md` and `BENUTZUNG.txt` exist in the repository root on `main`
+   `.github/README.md` and `BENUTZUNG.txt` exist on `main`
    (the first two come from the licensing work and must land before the first
    release tag). Both packaging paths refuse to package without them: the
    `windows-paket` job stops with the name of the missing file, and `make dmg`
    does the same with a Developer ID identity or `DMG_EXTRA_REQUIRED=1` (as in
    CI).
-7. Status lines in `README.md`, `README.en.md` and `BENUTZUNG.txt`.
+7. Status lines in `README.md`, `.github/README.md` and `BENUTZUNG.txt`.
 8. Commit on `main`, then `git tag -a vX.Y.Z -m "QuadChroma X.Y.Z"` and
    `git push origin vX.Y.Z`.
 
@@ -441,7 +460,7 @@ Three details of the Makefile worth knowing. `IDENT` may also be the
 a hash as a Developer ID (adds `--timestamp`, `make release` accepts it) - if a
 hash ever belongs to a non-Apple certificate, pass `TIMESTAMP=` (empty). Before
 uploading anything, `make release` checks the identity, the timestamp option and
-the four companion files (`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` made from `README.en.md`,
+the four companion files (`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` made from `.github/README.md`,
 `BENUTZUNG.txt`) and stops with `FEHLER:` if one is missing. And an explicitly
 given `IDENT` is enforced: `make IDENT=...` (likewise `make verify`, `make zip`,
 `make dmg` with `IDENT=...`) re-signs the existing app without rebuilding when

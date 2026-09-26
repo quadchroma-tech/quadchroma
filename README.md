@@ -565,7 +565,7 @@ Alle Rechtstexte und die Dateien für GitHub sind englisch:
   `.github/` (Vorlagen für Issues und Pull Requests) – Beiträge nur mit der
   Beitragsvereinbarung; sie räumt je Beitrag die Rechte ein, die eine spätere
   Doppel-Lizenzierung braucht.
-- `README.en.md` – englische Übersicht für GitHub; dieses README und `BENUTZUNG.txt`
+- `.github/README.md` – englische Übersicht für GitHub; dieses README und `BENUTZUNG.txt`
   bleiben die vollständige deutsche Dokumentation.
 - `RELEASING.md` – Signieren und Veröffentlichen: was einmalig nötig ist (Apple
   Developer Program und Developer-ID-Zertifikat; für Windows Azure Artifact Signing

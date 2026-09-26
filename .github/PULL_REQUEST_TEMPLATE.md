@@ -49,5 +49,5 @@ Fixes #
 - [ ] No reformatting of code I did not otherwise touch; no `cargo fmt` on whole files.
 - [ ] `host/vendor/monocypher` is untouched.
 - [ ] Third-party code, if any, is marked with origin and licence, is under a permissive licence, and its notice is added to `THIRD_PARTY_NOTICES.txt`; nothing under GPL, LGPL, AGPL, MPL, EPL or SSPL, nothing from other remote-desktop projects.
-- [ ] Documentation updated where behaviour changed (`README.en.md`; `README.md` and `BENUTZUNG.txt` in German, or the change is described above for the author to document).
+- [ ] Documentation updated where behaviour changed (`.github/README.md`; `README.md` and `BENUTZUNG.txt` in German, or the change is described above for the author to document).
 - [ ] No secrets, keys, `known_hosts*`, recordings or build output in the diff.
