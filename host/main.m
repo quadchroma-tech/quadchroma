@@ -4126,6 +4126,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
         g_dienst_port = port;
         g_dienst_display = display ? display.displayID : CGMainDisplayID();
+        // Die Oberflaeche vor der Annahme: ab hier ist "Zulassen" moeglich
+        // (qc_ui_vorhanden) - schon in der ersten Bekanntgabe (Flag) und in
+        // Nachricht 20 an einen Client, der gleich beim Start verbindet.
+        // Anfragen vor [NSApp run] warten auf der Main Queue.
+        qc_oberflaeche_cfg ui = { .abschied = host_abschied, .protokoll = ui_protokoll };
+        qc_oberflaeche_starten(&ui);
         BOOL laeuft = dienst_starten();
         zustand_takt_starten();
         BOOL ax = AXIsProcessTrusted();
@@ -4168,8 +4174,6 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         // ueber [NSApp terminate:] (menue.m), erst nach dem Abschied
         // (host_abschied schliesst die Verbindung zum Zuschauer).
         dienst_takt_starten(QC_TAKT_S);
-        qc_oberflaeche_cfg ui = { .abschied = host_abschied, .protokoll = ui_protokoll };
-        qc_oberflaeche_starten(&ui);
         [NSApp run];
         return 0;
     }
