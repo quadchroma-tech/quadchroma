@@ -2379,6 +2379,23 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             )
             .mit("{n}", name))
         }
+        // Sauber zugemacht (EOF) beim Wiederverbinden nach einer
+        // angenommenen Sitzung (Shared::angenommen): dieser Host hat eben
+        // noch "QCH1" gesagt - eine aeltere Fassung, die dieses Geraet nicht
+        // kennt, ist das nicht. Eher ging gerade etwas nicht (Aufnahme
+        // startet nicht, Verbindung verdraengt, Host startet neu): ein
+        // Leitungsfehler, der naechste Versuch in 2 s darf. Kennt der Host
+        // das Geraet nicht mehr, sagt er beim naechsten Mal "QCA1"
+        // (MsgDeviceRemoved, oben).
+        Err(zugangsphase::Ausgang::Geschlossen) if shared.lock().unwrap().angenommen => {
+            return Err(Meldung::neu(
+                strings::Key::ConnectionLost,
+                format!(
+                    "{addr} hat die Leitung nach dem Handschlag geschlossen (weder QCH1 noch QCA1) - nach einer \
+                     angenommenen Sitzung kein Zeichen einer aelteren Fassung, neuer Versuch"
+                ),
+            ));
+        }
         // Sauber zugemacht (EOF): so antwortet eine aeltere Fassung einem
         // Geraet, das sie nicht kennt.
         Err(zugangsphase::Ausgang::Geschlossen) => {
@@ -13880,6 +13897,10 @@ mod tests {
         Entfernt,
         /// Schickt nach dem Handschlag einen Datensatz, der nicht echt ist.
         Kaputt,
+        /// Erste Verbindung: "QCH1", eine Sitzung, die er nach 300 ms kappt;
+        /// die zweite macht er nach dem Handschlag zu (Aufnahme startet
+        /// nicht, verdraengt ...); ab der dritten wieder "QCH1".
+        Aussetzer,
     }
 
     /// Ein kleiner Host fuer die Zugangsphase mit eigenem Schluessel: nimmt
@@ -13928,11 +13949,13 @@ mod tests {
                         m.extend_from_slice(&Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms: 5000 }).kodieren());
                         let _ = h.write_all(&m);
                     }
-                    Zugangshost::Entfernt if nummer == 0 => {
+                    Zugangshost::Entfernt | Zugangshost::Aussetzer if nummer == 0 => {
                         let _ = h.write_all(MAGIC);
                         std::thread::sleep(Duration::from_millis(300));
                         continue;
                     }
+                    Zugangshost::Aussetzer if nummer == 1 => continue,
+                    Zugangshost::Aussetzer => annahme(&mut h),
                     _ => {
                         let mut m = MAGIC_ZUGANG.to_vec();
                         let zulassen = matches!(art, Zugangshost::Zulassen | Zugangshost::Entfernt);
@@ -14226,6 +14249,22 @@ mod tests {
         assert!(gepinnt(&host_pub).is_some(), "die erste Sitzung war angenommen");
         std::thread::sleep(Duration::from_millis(2300));
         assert_eq!(verbindungen.load(Ordering::SeqCst), 2);
+    }
+
+    /// Wiederverbinden nach einer angenommenen Sitzung, und der Host macht
+    /// einmal nach dem Handschlag zu (etwa weil seine Aufnahme gerade nicht
+    /// startet): das ist kein alter Host - er hat eben noch "QCH1" gesagt.
+    /// Keine dauerhafte Meldung "bitte aktualisieren", sondern ein neuer
+    /// Versuch nach 2 s, und der kommt wieder herein.
+    #[test]
+    fn zugang_aussetzer_nach_sitzung_ist_kein_alter_host() {
+        let (addr, host_pub, _, verbindungen) = zugangshost(Zugangshost::Aussetzer, "");
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
+        assert!(dialoge.is_empty(), "{dialoge:?}");
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 3, "kein Neuversuch nach dem Aussetzer");
+        let s = s.lock().unwrap();
+        assert_eq!(s.error_key, Some(strings::Key::SessionTakenOver), "{:?}", s.error.as_ref().map(|m| &m.protokoll));
+        assert!(gepinnt(&host_pub).is_some());
     }
 
     /// Eine Leitung, die nach dem Handschlag gestoert ist (hier: ein
