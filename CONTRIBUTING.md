@@ -10,7 +10,7 @@ you start. It is short on purpose, and the rules in it are binding for pull requ
 
 - **Bugs:** use the bug report form (Issues > New issue). Include the log excerpt the
   form asks for, with secrets removed.
-- **Features, and any change in behaviour, protocol or user interface:** use the feature
+- **Features, and any change in behavior, protocol or user interface:** use the feature
   request form and wait for a reply before you start. QuadChroma has a tight design
   (Section 3); a pull request that conflicts with it is closed no matter how good the
   code is, and an issue first saves both of us that.
@@ -43,8 +43,8 @@ opening the pull request: a separate agreement is needed. It is not a big thing,
 has to exist first. Contributions from minors are not accepted.
 
 What the CLA does, in one paragraph: you keep your copyright; you give the author a
-non-exclusive licence to use your contribution in every known way, including under
-other licences (commercial and proprietary), so that QuadChroma can stay free for private
+non-exclusive license to use your contribution in every known way, including under
+other licenses (commercial and proprietary), so that QuadChroma can stay free for private
 users and be licensed to companies for a fee; you confirm that the code is yours and
 free of copyleft; you are credited in the Git history and in `CONTRIBUTORS.md`; there is
 no payment. Read the full text - it is written to be readable, and it explains why the
@@ -78,24 +78,26 @@ them are closed.
    `alle_tabellen_in_enum_reihenfolge` fails otherwise. If you cannot translate a text
    into all of these languages, put the English text into the tables you cannot fill and
    say so in the pull request; the author translates. No string literals in UI code.
-5. **Code comments and log lines are written in German.** Yes, this is a project rule,
-   and it applies to contributors: comments (including `///` doc comments) in Rust,
-   Objective-C, C, shell, PowerShell, Makefile and workflow files, and every line written
-   to `protokoll.txt`, `host-protokoll.txt` or `/tmp/quadchroma-m1.log`, are German,
-   with `ae`, `oe`, `ue` and `ss` instead of umlauts and ß, as in the existing code
-   (`// Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.`).
-   Identifiers follow the file you are editing (mostly German as well). The
-   documentation for GitHub - `.github/README.md`, this file, `CLA.md`, `SECURITY.md`,
-   `CODE_OF_CONDUCT.md`, the issue and pull request templates - is in English;
-   `README.md` and `BENUTZUNG.txt` are German. If your change alters documented
-   behaviour, update `.github/README.md`, and `README.md` or `BENUTZUNG.txt` too if you can
-   write German (`BENUTZUNG.txt` is plain ASCII with lines of at most 78 characters);
-   otherwise describe the change in the pull request and the author updates the German
-   documents. If you really cannot write German comments, say so in the issue before
-   you start; the author may, at his discretion, accept English comments in the pull
-   request and translate them himself before merging, which takes longer.
+5. **Code comments and log lines in German, everything else in English.** Code
+   comments and the program's log and console lines are written in German (a project
+   rule for the source code); documentation, commit messages and everything else on
+   GitHub are English. The German part applies to contributors too: comments (including
+   `///` doc comments) in Rust, Objective-C, C, shell, PowerShell, Makefile and workflow
+   files, and every line the program writes to the console, `protokoll.txt`,
+   `host-protokoll.txt` or `/tmp/quadchroma-m1.log`, are German, with `ae`, `oe`, `ue`
+   and `ss` instead of umlauts and ß, as in the existing code
+   (`// Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.` -
+   "pairing open: the next unknown peer is accepted"). Identifiers follow the file you
+   are editing (mostly German as well). The documentation - `README.md`, `MANUAL.txt`,
+   this file, `CLA.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `RELEASING.md`, the issue
+   and pull request templates - is in English. If your change alters documented
+   behavior, update `README.md` and `MANUAL.txt` in the same pull request (`MANUAL.txt`
+   is plain ASCII with lines of at most 78 characters). If you really cannot write
+   German comments, say so in the issue before you start; the author may, at his
+   discretion, accept English comments in the pull request and translate them himself
+   before merging, which takes longer.
 6. **No changes to the user interface without an issue first.** Layout, controls,
-   colours, behaviour of the window - agree first.
+   colors, behavior of the window - agree first.
 7. **`host/vendor/monocypher` is third-party code.** Never modify it; updates come from
    upstream as a whole.
 8. **Protocol changes** (message numbers, capability bits, wire formats, the pairing
@@ -109,8 +111,8 @@ them are closed.
 
 ## 4. Building and testing
 
-Short form; the complete recipes with paths and explanations are in `.github/README.md`
-("Building from source") and in `README.md`. Continuous integration
+Short form; the complete recipes with paths and explanations are in `README.md`
+("Building from source"). Continuous integration
 (`.github/workflows/ci.yml`) runs the same steps on Windows and macOS for every pull
 request with `cargo ... --locked`, so `Cargo.lock` must be committed exactly as your
 build used it.
@@ -144,7 +146,7 @@ and `make dmg` are described in `RELEASING.md`). Do not start the freshly built 
 macOS to ask for Screen Recording and Accessibility permissions on that machine and
 unless no host is running there. The test harnesses `noisetest`, `annahmetest`,
 `dateitest` and `ablagetest` run without screen capture and without touching a running
-host; their `clang` lines are in `README.md` ("Prüfstände"), and CI runs them.
+host; their `clang` lines are in `.github/workflows/ci.yml`, which runs them.
 `hosttest` includes `main.m`, needs the Screen Recording permission granted to your
 terminal, and uses real HEVC encoders for about 100 seconds: run it only on a machine
 where you have granted that permission, never during a stream, never in CI.
@@ -174,8 +176,8 @@ sufficient.
   are in the file headers and in the Makefile.
 - Every source file starts with a short German header comment saying what the file does
   and how it fits in - look at any existing file.
-- **Commits:** one logical change per commit, message in the imperative, German or
-  English, `Signed-off-by` trailer (Section 2). Rebase on `main` before opening the pull
+- **Commits:** one logical change per commit, message in English and in the
+  imperative, `Signed-off-by` trailer (Section 2). Rebase on `main` before opening the pull
   request; the history is linear (squash or rebase merges, no merge commits from
   contributors).
 - Line endings are handled by `.gitattributes` (LF in the repository, CRLF for `*.ps1`,
@@ -195,15 +197,15 @@ sufficient.
   Additional Terms) as part of QuadChroma and may also be licensed by the author under
   other terms, as set out in `CLA.md`. You keep your copyright and may use your own code
   elsewhere.
-- **Third-party code** only under permissive licences (MIT, BSD-2-Clause, BSD-3-Clause,
+- **Third-party code** only under permissive licenses (MIT, BSD-2-Clause, BSD-3-Clause,
   ISC, Apache-2.0, Zlib, 0BSD, CC0-1.0), clearly marked in the code and in the pull
-  request with origin, version and licence, and with the required notice added to
+  request with origin, version and license, and with the required notice added to
   `THIRD_PARTY_NOTICES.txt` in the same pull request. Nothing under GPL, LGPL, AGPL, MPL,
-  EPL, SSPL or any other copyleft or non-commercial licence, no snippets of unclear
+  EPL, SSPL or any other copyleft or non-commercial license, no snippets of unclear
   origin, nothing copied from other remote-desktop projects (most of them are GPL or
   AGPL). This also applies to anything a code assistant produces for you: you are
   responsible for what you submit (`CLA.md`, Section 7).
-- **New Rust crates:** see rule 3 in Section 3. If one is agreed, its licence and notices
+- **New Rust crates:** see rule 3 in Section 3. If one is agreed, its license and notices
   go into `THIRD_PARTY_NOTICES.txt` in the same pull request.
 
 ## 7. Code of conduct
@@ -211,7 +213,7 @@ sufficient.
 `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1) applies in issues, pull requests and all
 other project spaces. Reports go to hello@quadchroma.tech. Be aware that the project has
 a single maintainer: reports are read and handled by him, including reports about his
-own behaviour; there is no separate committee. If that is not acceptable for a
+own behavior; there is no separate committee. If that is not acceptable for a
 particular report, say so in your message and we will look for a neutral person
 together.
 
@@ -219,4 +221,4 @@ together.
 
 Robert Brandt - hello@quadchroma.tech - https://github.com/quadchroma-tech/quadchroma
 
-Commercial licences and any use beyond `LICENSE.txt`: same address.
+Commercial licenses and any use beyond `LICENSE.txt`: same address.

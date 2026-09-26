@@ -1,8 +1,7 @@
-# Vorschlag (Feature) als GitHub-Issue-Formular (.github/ISSUE_TEMPLATE, YAML-Form).
-# Sichtbare Texte auf Englisch (GitHub-Datei), Kommentare auf Deutsch (Projektregel).
-# Das Label "enhancement" muss im Repository existieren, sonst setzt GitHub es nicht.
+# Feature request as a GitHub issue form (.github/ISSUE_TEMPLATE, YAML form).
+# The label "enhancement" must exist in the repository; otherwise GitHub does not apply it.
 name: Feature request
-description: Propose a change in behaviour, protocol or user interface - before writing any code.
+description: Propose a change in behavior, protocol or user interface - before writing any code.
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
@@ -11,7 +10,7 @@ body:
       value: |
         Please read `CONTRIBUTING.md`, Section 3 (project rules), first. Proposals that
         need a helper process, a second program, a pointer encoded into the video stream
-        or a new Rust crate are very unlikely to be accepted. The list in `.github/README.md`
+        or a new Rust crate are very unlikely to be accepted. The list in `README.md`
         ("What is missing") shows what is already planned.
   - type: dropdown
     id: side
@@ -75,5 +74,5 @@ body:
     attributes:
       label: Before you submit
       options:
-        - label: I searched the existing issues and .github/README.md ("What is missing"), and this is not already there.
+        - label: I searched the existing issues and README.md ("What is missing"), and this is not already there.
           required: true

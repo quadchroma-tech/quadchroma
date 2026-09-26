@@ -1,13 +1,13 @@
-// quadchroma.rc - Versionsinfo, Programmsymbol und Anwendungsmanifest der
-// Windows-exe. client/build.rs uebersetzt die Datei mit rc.exe (Windows SDK)
-// oder llvm-rc; die Zahlen und der Manifest-Pfad stehen in
-// quadchroma_version.h, das build.rs aus Cargo.toml nach OUT_DIR schreibt
-// (eingebunden ueber /I).
+// quadchroma.rc - version info, program icon and application manifest of the
+// Windows exe. client/build.rs compiles this file with rc.exe (Windows SDK)
+// or llvm-rc; the version numbers and the manifest path are in
+// quadchroma_version.h, which build.rs writes from Cargo.toml to OUT_DIR
+// (included via /I).
 #pragma code_page(65001)
 #include "quadchroma_version.h"
 
-// Konstanten aus winver.h/winresrc.h, hier selbst definiert: so braucht die
-// Datei keinen SDK-Include-Pfad (INCLUDE) und geht auch mit llvm-rc.
+// Constants from winver.h/winresrc.h, defined here directly: that way the
+// file needs no SDK include path (INCLUDE) and also works with llvm-rc.
 #define VS_VERSION_INFO                    1
 #define VS_FFI_FILEFLAGSMASK               0x3F
 #define VOS_NT_WINDOWS32                   0x40004
@@ -16,13 +16,13 @@
 #define RT_MANIFEST                        24
 #define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
 
-// Das Programmsymbol: der Explorer zeigt die ICON-Ressource mit der
-// kleinsten ID. Dieselbe .ico, die logo.rs zur Laufzeit schreibt
-// (logo::ico(&ICO_GROESSEN)); res/quadchroma.ico ist daraus erzeugt.
+// The program icon: Explorer shows the ICON resource with the lowest ID.
+// The same .ico that logo.rs writes at run time (logo::ico(&ICO_GROESSEN));
+// res/quadchroma.ico was generated from it.
 1 ICON "quadchroma.ico"
 
-// Anwendungsmanifest (asInvoker, Per-Monitor-DPI v2, lange Pfade, UTF-8,
-// Windows 10/11); build.rs fuellt die Vorlage res/quadchroma.manifest.
+// Application manifest (asInvoker, per-monitor DPI v2, long paths, UTF-8,
+// Windows 10/11); build.rs fills in the template res/quadchroma.manifest.
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST QC_MANIFEST_PFAD
 
 VS_VERSION_INFO VERSIONINFO
@@ -36,11 +36,11 @@ FILESUBTYPE     VFT2_UNKNOWN
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
-        // 0409 = Englisch (USA), 04B0 = Unicode (1200)
+        // 0409 = English (United States), 04B0 = Unicode (1200)
         BLOCK "040904B0"
         BEGIN
-            // FileDescription ist der Name, den Task-Manager, Firewall- und
-            // SmartScreen-Dialoge zeigen - deshalb kurz.
+            // FileDescription is the name that Task Manager and the firewall
+            // and SmartScreen dialogs show - hence short.
             VALUE "CompanyName",      "Robert Brandt"
             VALUE "FileDescription",  "QuadChroma"
             VALUE "FileVersion",      QC_VERSION_TEXT

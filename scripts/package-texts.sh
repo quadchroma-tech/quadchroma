@@ -1,38 +1,38 @@
 #!/usr/bin/env bash
-# Legt die Begleittexte eines verteilten Pakets (Windows-ZIP, macOS-DMG) in
-# ZIEL ab - alle als .txt, damit sie jeder ohne Markdown-Kenntnis oeffnet:
+# Puts the companion texts of a distributed package (Windows ZIP, macOS DMG)
+# into TARGET - all as .txt, so that anyone can open them without knowing Markdown:
 #
-#   LICENSE.txt              Lizenz (liegt im Repository schon als .txt)
-#   THIRD_PARTY_NOTICES.txt  Fremdlizenzen (ebenso)
-#   README.txt               aus .github/README.md, ohne die Bildzeilen
-#   BENUTZUNG.txt            deutsche Anleitung
+#   LICENSE.txt              license (already a .txt in the repository)
+#   THIRD_PARTY_NOTICES.txt  third-party licenses (likewise)
+#   README.txt               made from README.md, without the image lines
+#   MANUAL.txt               manual (likewise)
 #
-# Aufruf: scripts/package-texts.sh ZIEL [pflicht]
-#   pflicht = 1 (Voreinstellung): fehlt eine Quelle, Abbruch mit Fehler -
-#             ein verteiltes Paket braucht alle Lizenz- und Hinweistexte.
-#   pflicht = 0: fehlende Quellen nur melden (Alltagsbau).
+# Usage: scripts/package-texts.sh TARGET [required]
+#   required = 1 (default): if a source is missing, stop with an error -
+#              a distributed package needs all license and notice texts.
+#   required = 0: only report missing sources (non-release build).
 
 set -euo pipefail
 
-ZIEL="${1:?Aufruf: scripts/package-texts.sh ZIEL [pflicht]}"
+ZIEL="${1:?usage: scripts/package-texts.sh TARGET [required]}"
 PFLICHT="${2:-1}"
 cd "$(dirname "$0")/.."
 mkdir -p "$ZIEL"
 
 fehlt() {
     if [ "$PFLICHT" = "1" ]; then
-        echo "FEHLER: Begleittext $1 fehlt - ein verteiltes Paket braucht alle Lizenz- und Hinweistexte" >&2
+        echo "ERROR: companion text $1 is missing - a distributed package needs all license and notice texts" >&2
         exit 1
     fi
-    echo "WARNUNG: Begleittext $1 fehlt - nur im Alltagsbau erlaubt" >&2
+    echo "WARNING: companion text $1 is missing - allowed only in a non-release build" >&2
 }
 
-for f in LICENSE.txt THIRD_PARTY_NOTICES.txt BENUTZUNG.txt; do
+for f in LICENSE.txt THIRD_PARTY_NOTICES.txt MANUAL.txt; do
     if [ -f "$f" ]; then cp "$f" "$ZIEL/"; else fehlt "$f"; fi
 done
-# Bildzeilen (![...](datei.png)) haben im Paket kein Bild - weg damit.
-if [ -f .github/README.md ]; then
-    sed '/^!\[/d' .github/README.md > "$ZIEL/README.txt"
+# Image lines (![...](file.png)) have no image in the package - drop them.
+if [ -f README.md ]; then
+    sed '/^!\[/d' README.md > "$ZIEL/README.txt"
 else
-    fehlt .github/README.md
+    fehlt README.md
 fi

@@ -1,8 +1,8 @@
-# Dependabot: haelt die per Commit-SHA gepinnten GitHub Actions in
-# .github/workflows/*.yml aktuell (SHA und Tag-Kommentar in einem Pull Request).
+# Dependabot: keeps the GitHub Actions pinned by commit SHA in
+# .github/workflows/*.yml up to date (SHA and tag comment in one pull request).
 #
-# Absichtlich NUR github-actions: die Rust-Abhaengigkeiten (client/Cargo.lock)
-# werden von Hand gepflegt - keine neuen Crates, keine ungefragten Updates.
+# Deliberately ONLY github-actions: the Rust dependencies (client/Cargo.lock)
+# are maintained by hand - no new crates, no unrequested updates.
 version: 2
 updates:
   - package-ecosystem: "github-actions"

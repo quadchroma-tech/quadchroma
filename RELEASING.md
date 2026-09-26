@@ -2,8 +2,8 @@
 
 How a release is built, signed, notarized and published; what has to be set up
 once (and by whom); and what users still see after everything is signed. The
-licence texts are `LICENSE.txt` and `THIRD_PARTY_NOTICES.txt`; the German user
-manual is `BENUTZUNG.txt`; the build scripts referenced here are the `Makefile`
+license texts are `LICENSE.txt` and `THIRD_PARTY_NOTICES.txt`; the user
+manual is `MANUAL.txt`; the build scripts referenced here are the `Makefile`
 (Mac host), `scripts/sign-windows.ps1` (Windows signing) and the two workflows
 under `.github/workflows/`.
 
@@ -19,10 +19,10 @@ change; check before buying.
 | Signature | Authenticode (SHA-256, RFC 3161 timestamp) with a publicly trusted code-signing certificate | Developer ID Application certificate, Hardened Runtime, secure timestamp, then notarized by Apple and the ticket stapled |
 | Tooling | `scripts/sign-windows.ps1` (signtool) locally, or `azure/artifact-signing-action` in CI | `make sign`, `make notarize`, `make staple`, `make dmg` ... locally; most of the same targets in CI (notarization there runs through `notarytool --apple-id` instead of `make notarize`) |
 | What users see afterwards | SmartScreen still warns until the certificate has built reputation, but shows the verified publisher name (section 6) | One "downloaded from the internet" confirmation on first launch, no warning; then the usual Screen Recording and Accessibility prompts |
-| Needs the author | a code-signing certificate on the author's own name (or, only for organisations in the EU, an Azure Artifact Signing account) | Apple Developer Program membership (individual), Developer ID certificate, notarytool credentials |
+| Needs the author | a code-signing certificate on the author's own name (or, only for organizations in the EU, an Azure Artifact Signing account) | Apple Developer Program membership (individual), Developer ID certificate, notarytool credentials |
 
 The Mac *client* (same Rust source as the Windows program) is not released as a
-binary: the Homebrew FFmpeg it links against is a GPL build (`.github/README.md`).
+binary: the Homebrew FFmpeg it links against is a GPL build (`README.md`).
 The CI builds and tests it, nothing more.
 
 Two ways to produce a release:
@@ -53,7 +53,7 @@ folder: a release signed with a different certificate makes every user grant
 Screen Recording and Accessibility again.
 
 What it gives: Gatekeeper still refuses the first start (the app is not
-notarized; users click "Open Anyway" once, see .github/README.md), but macOS ties the
+notarized; users click "Open Anyway" once, see README.md), but macOS ties the
 two permissions to the designated requirement `identifier "tech.quadchroma.host"
 and certificate root = H"eddb251662679f9761f59df958e435273230c095"`, which stays
 the same for every release signed with this certificate - permissions survive
@@ -188,7 +188,7 @@ Two facts shape the choice:
 Not suitable:
 
 - **Certum "Open Source Code Signing"** (from 25 EUR): the certificate carries
-  "Open Source Developer" as common name and organisation, and Certum states "If
+  "Open Source Developer" as common name and organization, and Certum states "If
   Certum determines that the certificate is being used to sign software
   distributed commercially, the certificate will be revoked"
   (<https://support.certum.eu/en/code-signing-required-documents/>). QuadChroma is
@@ -219,8 +219,8 @@ support it already. But the decisive restriction in the Quickstart
 26 Sep 2026): "Public Trust certificates are available to organizations in the
 United States, Canada, the European Union, ... **Individual developers must be
 located in the United States or Canada.**" A private person in Germany cannot
-book it; an organisation in the EU can, but then the certificate's common name is
-the validated legal name of the organisation ("CN values must always be the legal
+book it; an organization in the EU can, but then the certificate's common name is
+the validated legal name of the organization ("CN values must always be the legal
 entity's validated name", FAQ), which contradicts "no company name anywhere".
 Keep this option in mind only if that ever changes.
 
@@ -256,19 +256,19 @@ set `QC_SIGN_ENDPOINT`, `QC_SIGN_ACCOUNT` and `QC_SIGN_PROFILE`).
 Repository: `github.com/quadchroma-tech/quadchroma` (the name "quadchroma" is taken
 by an unrelated account). In the repository's "About" box (gear icon):
 
-- **Description** (GitHub allows 350 characters; this is 230):
+- **Description** (GitHub allows 350 characters; this is 281):
   `Remote desktop from a Mac to a Windows PC in HEVC 4:4:4 at 10 bit - hardware-encoded
-  on Apple silicon, hardware-decoded on NVIDIA. Sharp text, local mouse pointer, no
-  account, no cloud, one program per side. Free for personal use.`
+  on Apple silicon, decoded on any Windows PC (in hardware on NVIDIA GPUs, otherwise in
+  software). Sharp text, local mouse pointer, no account, no cloud, one program per
+  side. Free for personal use.`
 - **Website:** leave empty until `https://quadchroma.tech` exists (the domain is registered, the site is not online yet)
 - **Topics:** `remote-desktop`, `screen-sharing`, `macos`, `windows`, `hevc`, `h265`,
   `yuv444`, `chroma-subsampling`, `10-bit`, `videotoolbox`, `nvdec`, `low-latency`,
   `apple-silicon`, `rust`, `objective-c`
 - Tick "Releases", untick "Packages" and "Deployments" (not used).
 
-GitHub shows `.github/README.md` (English) on the repository page; it takes
-precedence over the German `README.md` in the root, which stays the complete German
-documentation.
+GitHub shows the `README.md` in the repository root on the repository page. Do
+not add a `README.md` under `.github/`: GitHub would show that one instead.
 
 ### 3.3 GitHub: secrets, settings, protection
 
@@ -378,13 +378,13 @@ agree; the `vorpruefung` job refuses the release otherwise.
    `FFMPEG-BUILDINFO.txt`, and attaches the source archives and the script to
    the release (LGPL v2.1 section 6).
 6. The four companion files `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`,
-   `.github/README.md` and `BENUTZUNG.txt` exist on `main`
+   `README.md` and `MANUAL.txt` exist on `main`
    (the first two come from the licensing work and must land before the first
    release tag). Both packaging paths refuse to package without them: the
    `windows-paket` job stops with the name of the missing file, and `make dmg`
    does the same with a Developer ID identity or `DMG_EXTRA_REQUIRED=1` (as in
    CI).
-7. Status lines in `README.md`, `.github/README.md` and `BENUTZUNG.txt`.
+7. Status lines in `README.md` and `MANUAL.txt`.
 8. Commit on `main`, then `git tag -a vX.Y.Z -m "QuadChroma X.Y.Z"` and
    `git push origin vX.Y.Z`.
 
@@ -460,8 +460,8 @@ Three details of the Makefile worth knowing. `IDENT` may also be the
 a hash as a Developer ID (adds `--timestamp`, `make release` accepts it) - if a
 hash ever belongs to a non-Apple certificate, pass `TIMESTAMP=` (empty). Before
 uploading anything, `make release` checks the identity, the timestamp option and
-the four companion files (`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` made from `.github/README.md`,
-`BENUTZUNG.txt`) and stops with `FEHLER:` if one is missing. And an explicitly
+the four companion files (`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` made from `README.md`,
+`MANUAL.txt`) and stops with `ERROR:` if one is missing. And an explicitly
 given `IDENT` is enforced: `make IDENT=...` (likewise `make verify`, `make zip`,
 `make dmg` with `IDENT=...`) re-signs the existing app without rebuilding when
 the identity differs from the last signature (recorded in `build/.ident`),
@@ -499,8 +499,7 @@ any script, so call the script through `powershell -NoProfile -ExecutionPolicy
 Bypass -File scripts\sign-windows.ps1 ...` (or `pwsh -File`, as `release.yml`
 does), not as `.\scripts\sign-windows.ps1`; alternatively run
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once and `Unblock-File` on
-a copy that came out of a downloaded ZIP. The German parameter names used in
-older notes (`-Datei`, `-Fingerabdruck`, `-NurPruefen`) still work as aliases.
+a copy that came out of a downloaded ZIP.
 
 The script runs `signtool sign /v /fd SHA256 /tr http://timestamp.digicert.com
 /td SHA256 /d QuadChroma /du https://github.com/quadchroma-tech/quadchroma /sha1 <thumbprint>`
@@ -509,7 +508,7 @@ verify. SimplySign asks for the OTP when signtool touches the key. Then build
 the ZIP with the layout of section 7 (top-level folder `quadchroma-X.Y.Z/`, the
 exe, `avcodec-63.dll`, `avutil-61.dll` and `BUILDINFO.txt` renamed to
 `FFMPEG-BUILDINFO.txt` from the output of `scripts/build-ffmpeg-windows.sh`,
-`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` and `BENUTZUNG.txt`, as written by `scripts/package-texts.sh`), and
+`LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt` and `MANUAL.txt`, as written by `scripts/package-texts.sh`), and
 publish the files in its `quellen/` folder (`ffmpeg-9.0.2.tar.xz`, the
 nv-codec-headers archive and `build-ffmpeg-windows.sh`) on the same release
 page.
@@ -638,10 +637,10 @@ at least 30 days old).
 
 | File | Contents |
 |---|---|
-| `quadchroma-X.Y.Z-windows-x64.zip` (`-unsigned` if not signed) | folder `quadchroma-X.Y.Z/` with `quadchroma.exe`, `avcodec-63.dll`, `avutil-61.dll` (FFmpeg 9.0.2, minimal LGPL build by `scripts/build-ffmpeg-windows.sh`), `FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two DLLs), `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `BENUTZUNG.txt` |
+| `quadchroma-X.Y.Z-windows-x64.zip` (`-unsigned` if not signed) | folder `quadchroma-X.Y.Z/` with `quadchroma.exe`, `avcodec-63.dll`, `avutil-61.dll` (FFmpeg 9.0.2, minimal LGPL build by `scripts/build-ffmpeg-windows.sh`), `FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two DLLs), `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `MANUAL.txt` |
 | `ffmpeg-9.0.2.tar.xz`, `nv-codec-headers-<commit>.tar.gz`, `build-ffmpeg-windows.sh` | the complete corresponding source of the FFmpeg DLLs (LGPL v2.1 section 6); the release notes carry the sentence from the FFmpeg license checklist with a link to the source archive |
 | `QuadChroma-X.Y.Z-macos-arm64.zip` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` as the top-level entry (`ditto --keepParent --norsrc`: no AppleDouble `._*` entries, so the Finder, `ditto -x -k` and the command-line `unzip` all restore a valid bundle), signed, notarized and stapled - the form the notary service accepts |
-| `QuadChroma-X.Y.Z-macos-arm64.dmg` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` (stapled), a link to `/Applications`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `BENUTZUNG.txt`; UDZO image, signed with identifier `tech.quadchroma.host.dmg`, notarized and stapled |
+| `QuadChroma-X.Y.Z-macos-arm64.dmg` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` (stapled), a link to `/Applications`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `MANUAL.txt`; UDZO image, signed with identifier `tech.quadchroma.host.dmg`, notarized and stapled |
 | `SHA256SUMS.txt` | `sha256sum` of every file above (`sha256sum -c SHA256SUMS.txt`) |
 
 Not released: the Mac client, the test harnesses, `.pdb` files, the CI's
