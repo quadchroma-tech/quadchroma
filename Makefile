@@ -105,11 +105,19 @@ DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 # Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
-SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
+SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
+# UI_STUB: a stand-in for the access core host/zugang.c (menu bar work only, until
+# the core is merged): make UI_STUB=host/zugang_stub.c replaces host/zugang.c in SRC.
+# Remove this variable and host/zugang_stub.c once host/zugang.c exists.
+UI_STUB ?=
+BUILD_SRC := $(if $(UI_STUB),$(filter-out host/zugang.c,$(SRC)) $(UI_STUB),$(SRC))
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
+# ServiceManagement: "Start at login" (SMAppService); SystemConfiguration: the computer
+# name for the announcement (SCDynamicStoreCopyComputerName).
 FRAMEWORKS := -framework Foundation -framework AppKit -framework ScreenCaptureKit \
               -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-              -framework CoreGraphics -framework CoreFoundation -framework IOKit
+              -framework CoreGraphics -framework CoreFoundation -framework IOKit \
+              -framework ServiceManagement -framework SystemConfiguration
 
 SECONDS ?= 10
 OUT     ?= /tmp/qc.hevc
@@ -151,11 +159,11 @@ endef
 
 all: sign-if-changed
 
-$(BIN): $(SRC) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
+$(BIN): $(BUILD_SRC) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
 	@$(BUNDLE_CHECK)
 	@mkdir -p $(APP)/Contents/MacOS
 	cp host/Info.plist $(APP)/Contents/Info.plist
-	clang $(FLAGS) $(FRAMEWORKS) $(SRC) -o $(BIN)
+	clang $(FLAGS) $(FRAMEWORKS) $(BUILD_SRC) -o $(BIN)
 	$(CODESIGN_APP)
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1
