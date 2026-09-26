@@ -1439,18 +1439,28 @@ static void sender_pruefen(void) {
     for (int i = 0; i < 100 && stueck_summe() < QC_DATEI_FENSTER; i++) schlafen(0.01);   // steht am Fenster
     angebot_pfade(&k);
     NSData *null_q = qc_datei_quittung_kodieren(k, 0, 0);
+    CFAbsoluteTime t_erste = CFAbsoluteTimeGetCurrent();
     qc_senden_quittung(SITZUNG, null_q.bytes, null_q.length);
+    // Nach gemessener Zeit statt nach Schritten: auf virtuellen Macs (CI)
+    // dauert ein Schlaf von 50 ms deutlich laenger.
     BOOL frueh_zeit = NO;
-    for (int i = 0; i < 14; i++) {
+    double ende_nach = -1;
+    // Mindestens 700 ms Wiederholungen, und weiter, bis das Ende da ist
+    // (hoechstens 1,5 s) - die Frist betraegt 400 ms.
+    for (double el = 0; el < 0.7 || (ende_nach < 0 && el < 1.5); el = CFAbsoluteTimeGetCurrent() - t_erste) {
         schlafen(0.05);
-        if (i == 3) frueh_zeit = letztes_ende() != -1;               // 200 ms nach der ersten: laeuft noch
+        el = CFAbsoluteTimeGetCurrent() - t_erste;
+        if (letztes_ende() != -1 && ende_nach < 0) ende_nach = el;
+        if (el < 0.2 && letztes_ende() != -1) frueh_zeit = YES;        // 200 ms nach der ersten: laeuft noch
         qc_senden_quittung(SITZUNG, null_q.bytes, null_q.length);
     }
     int ende_waehrend = letztes_ende();                               // noch waehrend der Wiederholungen
+    uint64_t summe = stueck_summe();
     qc_senden_abbrechen();
     qc_dateien_abwarten();
     qc_dateien_stillstand_setzen(5000);
-    pruefe(!frueh_zeit && ende_waehrend == QC_ENDE_ZEIT && stueck_summe() == QC_DATEI_FENSTER,
+    printf("         (Ende %d nach %.0f ms, frueh %d, %llu Byte hinaus)\n", ende_waehrend, ende_nach * 1000, frueh_zeit, summe);
+    pruefe(!frueh_zeit && ende_waehrend == QC_ENDE_ZEIT && summe == QC_DATEI_FENSTER,
            "Wiederholte Quittung ohne Fortschritt erneuert die Frist nicht: ENDE mit Grund 3, obwohl sie weiter kommt");
 
     printf("\n-- Was der Sender gar nicht erst sendet\n");
