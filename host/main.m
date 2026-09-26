@@ -1353,25 +1353,22 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     }
 
     // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
-    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung - ausser es
-    // fehlt nur die Freigabe fuer die Bildschirmaufnahme (g_ohne_aufnahme).
+    // jetzt. Schlaegt das fehl - Freigabe fehlt, kein Bildschirm (Monitor
+    // aus, KVM umgeschaltet), ScreenCaptureKit oder Encoder streiken -,
+    // kommt der Zuschauer trotzdem herein (g_ohne_aufnahme): "QCH1" mit
+    // Ersatzmassen, dann Hoststatus 1, und die Wiederherstellung versucht es
+    // alle 3 s, bis ein Bild da ist - wie die Windows-Host-Rolle. Nach dem
+    // Handschlag still zuzumachen hiesse fuer den Client "aeltere Fassung,
+    // bitte aktualisieren" (Pairing v1, 9.6) - dauerhaft und falsch.
     // Ab hier zaehlt dieser Zuschauer als unterwegs (g_anmeldend), bis er
     // eingetragen ist oder aufgibt - jeder Weg unten zieht ihn wieder ab.
     atomic_fetch_add(&g_anmeldend, 1);
-    BOOL ohne_aufnahme = NO;
+    BOOL ohne_aufnahme = NO, ohne_freigabe = NO;
     if (stream_hochfahren_sync()) {
         atomic_store(&g_ohne_aufnahme, 0);
-    } else if (!g_tcc_bildschirm()) {
-        ohne_aufnahme = YES;
     } else {
-        atomic_fetch_sub(&g_anmeldend, 1);
-        // Was halb steht (Encoder ohne Aufnahme), raeumt der Abbau weg; er
-        // prueft selbst, ob noch jemand zuschaut.
-        stream_herunterfahren_anstossen();
-        logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s abgewiesen", ip);
-        qc_chan_free(chan);
-        close(fd);
-        return;
+        ohne_aufnahme = YES;
+        ohne_freigabe = !g_tcc_bildschirm();
     }
 
     // Wurde seit dem Blick in die Liste ein Geraet entfernt, hat
@@ -1488,8 +1485,12 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
           utf8(name), id_text, ip, ntohs(peer.sin_port), fp, sas);
     if (ohne_aufnahme) {
         // Wie bei einem fehlenden Bildschirm: Hoststatus 1, und die
-        // Wiederherstellung fragt alle 3 s nach, bis die Freigabe da ist.
-        logf_(@"Bildschirmaufnahme nicht freigegeben - Zuschauer bekommt Hoststatus 1, Aufnahme startet mit der Freigabe");
+        // Wiederherstellung fragt alle 3 s nach, bis die Freigabe bzw. der
+        // Bildschirm da ist und die Aufnahme laeuft.
+        if (ohne_freigabe)
+            logf_(@"Bildschirmaufnahme nicht freigegeben - Zuschauer bekommt Hoststatus 1, Aufnahme startet mit der Freigabe");
+        else
+            logf_(@"Aufnahme laesst sich nicht starten - Zuschauer %s bekommt Hoststatus 1, neuer Versuch alle 3 s", ip);
         hoststatus_senden(1);
         if (g_lifeq)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), g_lifeq, ^{ aufnahme_wiederherstellen(); });

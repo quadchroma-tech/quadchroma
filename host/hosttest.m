@@ -3689,6 +3689,31 @@ static void zugang_pruefen(int bild_port, int ein_port) {
            "keine Freigabe: der Zuschauer kommt herein (\"QCH1\", Strominfo) und bekommt Hoststatus 1 statt einer Abweisung");
     pruefe(zeilen_mit(logpfad, "Bildschirmaufnahme nicht freigegeben - Zuschauer bekommt Hoststatus 1") == 1, "Zeile");
 
+    printf("\n-- Zugang: Freigabe da, Aufnahme startet nicht\n");
+    // Freigabe erteilt, aber kein Bildschirm (Monitor aus, KVM umgeschaltet;
+    // hier die leere Liste der Attrappe): der Zuschauer kommt ebenso herein
+    // und bekommt Hoststatus 1. Still zuzumachen hiesse fuer den Client
+    // "aeltere Fassung, bitte aktualisieren" - dauerhaft und falsch.
+    stream_setzen(nil);
+    g_tcc_bildschirm = test_tcc_ja;
+    stdout_stumm(1);
+    t_ein = sek();
+    int ok_ob = zc_verbinden(&z, bild_port, n_priv, "ohne Freigabe") == 0 && zc_sitzung(&z);
+    status = -1;
+    while (ok_ob && status < 0 && nachricht_ganz(&z.l, &h, &d, 2000) == 1)
+        if (h.type == QC_MSG_HOSTSTATUS && d.length >= 1) status = ((const uint8_t *)d.bytes)[0];
+    int drin_b = atomic_load(&g_client_fd) >= 0 && atomic_load(&g_ohne_aufnahme);
+    zuschauer_weg();
+    zc_zu(&z);
+    while (sek() - t_ein < 3.5) usleep(50 * 1000);
+    dispatch_sync(g_lifeq, ^{ g_kein_bildschirm_gemeldet = 0; });
+    stdout_stumm(0);
+    atomic_store(&g_ohne_aufnahme, 0);
+    pruefe(ok_ob && status == 1 && drin_b,
+           "kein Bildschirm trotz Freigabe: der Zuschauer kommt herein (\"QCH1\", Strominfo) und bekommt Hoststatus 1");
+    pruefe(zeilen_mit(logpfad, "Aufnahme laesst sich nicht starten - Zuschauer 127.0.0.1 bekommt Hoststatus 1") == 1 &&
+           zeilen_mit(logpfad, "Zuschauer 127.0.0.1 abgewiesen") == 0, "Zeile, keine Abweisung");
+
     pthread_mutex_lock(&g_log_mtx);
     fclose(g_log);
     g_log = NULL;
