@@ -1,6 +1,7 @@
 // Zuschauerplatz des Windows-Hosts: Annahme auf dem Bildkanal (port) und
 // dem Eingabekanal (port + 1), Bekanntgabe per Rundruf (port + 2), Versand
-// mit Stauregel, Kopplung.
+// mit Stauregel. Wer nach dem Handschlag herein darf, entscheidet der
+// Einlass (einlass.rs: Geraeteliste, Passwort, "Zulassen").
 //
 // Ein Zuschauer zur Zeit; ein neuer ersetzt den alten (wie main.m). Der
 // alte bekommt als letzte Nachricht MSG_ABGELOEST - statt dessen, was noch
@@ -37,9 +38,9 @@
 // Handschlaege laufen je
 // Verbindung in einem eigenen Faden, mit Frist (secure.rs, FRIST_ANNAHME) und
 // Obergrenze (HANDSCHLAEGE_MAX) - stumme Verbindungen sperren damit niemanden
-// mehr aus. Was jede Verbindung ins Protokoll bringen kann, ohne gekoppelt
-// zu sein (gescheiterter Handschlag, Abweisung), laeuft ueber eine Drossel
-// je Art und Adresse (Drossel, drosseln_nachtragen).
+// mehr aus. Was jede Verbindung ins Protokoll bringen kann, ohne erlaubt
+// zu sein (gescheiterter Handschlag, Zugangsphase), laeuft ueber eine
+// Drossel je Art und Adresse (Drossel, drosseln_nachtragen).
 // Windows bricht ein blockierendes recv/send auf ein shutdown hin nicht ab,
 // solange die Gegenstelle lebt, aber schweigt (eingefrorener Prozess) - der
 // Faden des alten Kanals bliebe samt Leitung stehen, bis sie geht. Deshalb
@@ -87,7 +88,7 @@ use std::time::{Duration, Instant};
 use super::{eingabe, encoder, log, now_us, Z};
 use crate::dateien::{self, Gesendet};
 use crate::protokoll_konst::*;
-use crate::{noise, secure};
+use crate::{noise, secure, zugang};
 
 /// Rueckstand, ab dem Bilder gar nicht erst in den Encoder gehen
 /// (stau_vor_dem_encoder); im Spielmodus ein Viertel. Wie QC_BACKLOG_LIMIT
@@ -169,7 +170,7 @@ fn fenster_host(spielmodus: bool) -> u64 {
 }
 
 /// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
-/// ist. Die Sperren hier schuetzen Abfolgen (EINSPEISEN, FREIGABE) oder Daten,
+/// ist. Die Sperren hier schuetzen Abfolgen (EINSPEISEN) oder Daten,
 /// die jeder Schritt heil hinterlaesst; mit einem blossen unwrap zoege eine
 /// einzige Panik beim Einspeisen jede weitere Annahme mit - und der Sendefaden
 /// raeumte AKTUELL nie mehr ab ("kein Zuschauer, keine Arbeit").
@@ -222,7 +223,7 @@ struct Drosselbuch {
 }
 
 /// Drossel fuer eine Art Protokollzeile, die jede Verbindung ausloesen kann -
-/// auch eine ohne Schluessel oder von einer ungekoppelten Gegenstelle. Wie
+/// auch eine ohne Schluessel oder von einem unbekannten Geraet. Wie
 /// beim Mac-Host (logf_gedrosselt in main.m) je Art UND Adresse: die erste
 /// Zeile einer Adresse kommt sofort, danach hoechstens alle MELDEFRIST eine,
 /// mit der Zahl der dazwischen unterdrueckten dieser Adresse. So geht die
@@ -236,17 +237,17 @@ struct Drosselbuch {
 /// ist - vorher zaehlt sie noch. Gibt es keine solche, zaehlen weitere
 /// Adressen gemeinsam ("von anderen Adressen", mit der letzten davon). Mehr
 /// als DROSSEL_ADRESSEN + 1 Zeilen je Art und Frist gibt es so nie, auch
-/// nicht bei einer Flut von vielen Adressen. Wer ungekoppelt alle 2 s neu
-/// versucht, fuellt weder Protokoll noch Platte. Ereignisse gekoppelter
-/// Gegenstellen (Kopplung, Zuschauer verbunden) laufen nie hierueber.
-struct Drossel {
+/// nicht bei einer Flut von vielen Adressen. Wer unbekannt immer wieder neu
+/// versucht, fuellt weder Protokoll noch Platte. Ereignisse erlaubter
+/// Geraete (Eintrag, Zuschauer verbunden) laufen nie hierueber.
+pub(super) struct Drossel {
     /// Name der Art fuer die Sammelzeile.
     art: &'static str,
     buch: Mutex<Drosselbuch>,
 }
 
 impl Drossel {
-    const fn neu(art: &'static str) -> Drossel {
+    pub(super) const fn neu(art: &'static str) -> Drossel {
         Drossel { art, buch: Mutex::new(Drosselbuch { gemerkt: Vec::new(), sonst: 0, sonst_von: None, sonst_zuletzt: None }) }
     }
 
@@ -254,7 +255,7 @@ impl Drossel {
     /// durchlaesst - dann mit der Zahl der seit der letzten unterdrueckten
     /// dieser Adresse -, sonst nur zaehlen. Der Text entsteht nur, wenn er
     /// geschrieben wird. Liefert die geschriebene Zeile.
-    fn melden(&self, von: Option<IpAddr>, text: impl FnOnce() -> String) -> Option<String> {
+    pub(super) fn melden(&self, von: Option<IpAddr>, text: impl FnOnce() -> String) -> Option<String> {
         self.melden_zu(von, Instant::now(), text)
     }
 
@@ -331,23 +332,15 @@ impl Drossel {
 
 /// Gescheiterte Handschlaege auf dem Bildkanal (Muell, Frist, falsches Protokoll).
 static DROSSEL_HANDSCHLAG_BILD: Drossel = Drossel::neu("Bildkanal: Handschlag gescheitert");
-/// Unbekannte Gegenstellen ohne Kopplungsfenster (etwa ein ungekoppelter
-/// Client, der alle 2 s neu versucht).
-static DROSSEL_UNBEKANNT: Drossel = Drossel::neu("Abgewiesen: unbekannte Gegenstelle");
-/// Abweisungen, weil die Freigabeliste nicht zu lesen oder nicht zu
-/// schreiben ist - auch die kann jede Gegenstelle ausloesen.
-static DROSSEL_FREIGABE: Drossel = Drossel::neu("Abgewiesen: Freigabeliste nicht lesbar oder nicht speicherbar");
 /// Gescheiterte Handschlaege auf dem Eingabekanal.
 static DROSSEL_HANDSCHLAG_EINGABE: Drossel = Drossel::neu("Eingabekanal: Handschlag gescheitert");
 /// Eingabekanaele, die nach dem Handschlag abgewiesen werden.
 static DROSSEL_EINGABE_ABGEWIESEN: Drossel = Drossel::neu("Eingabekanal abgewiesen");
 
-/// Alle Drosseln, fuer drosseln_nachtragen.
-fn alle_drosseln() -> [&'static Drossel; 10] {
-    [
+/// Alle Drosseln, fuer drosseln_nachtragen (dazu die der Zugangsphase).
+fn alle_drosseln() -> Vec<&'static Drossel> {
+    let mut d: Vec<&'static Drossel> = vec![
         &DROSSEL_HANDSCHLAG_BILD,
-        &DROSSEL_UNBEKANNT,
-        &DROSSEL_FREIGABE,
         &DROSSEL_HANDSCHLAG_EINGABE,
         &DROSSEL_EINGABE_ABGEWIESEN,
         &DROSSEL_KEIN_BILD,
@@ -355,7 +348,9 @@ fn alle_drosseln() -> [&'static Drossel; 10] {
         &DROSSEL_TON,
         &PLAETZE_BILD.gemeldet,
         &PLAETZE_EINGABE.gemeldet,
-    ]
+    ];
+    d.extend(super::einlass::drosseln());
+    d
 }
 
 /// Unterdrueckte Zeilen bleiben nicht liegen, auch wenn danach keine
@@ -601,6 +596,9 @@ pub struct Leitung {
     pub peer: Vec<u8>,
     pub hh: Vec<u8>,
     pub ip: String,
+    /// Name des Geraets (Nachricht 3, sonst die IP) - fuer die Oberflaeche
+    /// ("Verbunden: <Name>").
+    pub name: String,
     /// Nummer dieses Zuschauers (zuschauer_nr). bild_annehmen setzt sie unter
     /// AKTUELL, bevor ihn jemand sieht; die Datei-Wege binden sich daran.
     nr: AtomicU64,
@@ -631,6 +629,7 @@ impl Leitung {
             bild_griff,
             peer,
             hh,
+            name: ip.clone(),
             ip,
             nr: AtomicU64::new(0),
             dateien: Mutex::new(DateiStand::default()),
@@ -1053,10 +1052,6 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 static NR: AtomicU64 = AtomicU64::new(0);
 /// Laufende Nummer der Eingabekanaele (siehe Leitung::eingabe_loesen).
 static EINGABE_NR: AtomicU64 = AtomicU64::new(0);
-/// Entscheidung ueber die Freigabe samt Eintrag: seit die Handschlaege
-/// nebeneinander laufen, kaemen sonst zwei Unbekannte zugleich durch das
-/// eine Kopplungsfenster (oder den Erstkontakt).
-static FREIGABE: Mutex<()> = Mutex::new(());
 /// Einspeisen und Abloesen schliessen sich aus: Die Eingabeschleife prueft
 /// unter dieser Sperre, ob ihr Kanal noch gilt, und fuehrt die Nachricht
 /// aus; wer einen Zuschauer oder Eingabekanal abloest und danach alle Tasten
@@ -1132,6 +1127,25 @@ fn absender(s: &TcpStream) -> IpAddr {
 
 pub fn zuschauer_da() -> bool {
     sperre(&AKTUELL).is_some()
+}
+
+/// Name des verbundenen Zuschauers (Oberflaeche: "Verbunden: <Name>").
+pub fn zuschauer_name() -> Option<String> {
+    sperre(&AKTUELL).as_ref().map(|l| l.name.clone())
+}
+
+/// Den Zuschauer trennen - nur, wenn er dieses Geraet ist (`peer`; None:
+/// jeden). Etwa wenn sein Geraet aus der Liste entfernt wird oder die
+/// Freigabe endet. Er kann sich neu verbinden und braucht dann, was jedes
+/// unbekannte Geraet braucht. Liefert, ob einer getrennt wurde.
+pub fn zuschauer_trennen(peer: Option<&[u8]>) -> bool {
+    let Some(l) = aktuell() else { return false };
+    if peer.is_some_and(|p| p != l.peer.as_slice()) {
+        return false;
+    }
+    log(format!("Zuschauer {} ({}) wird getrennt", l.name, l.ip));
+    l.schliessen();
+    true
 }
 
 /// Nummer des aktuellen Zuschauers. Sie aendert sich bei jeder Annahme -
@@ -1699,7 +1713,8 @@ fn annahme_bild(listener: TcpListener) {
 
 fn bild_annehmen(stream: TcpStream, platz: Platz) {
     // Schluessel der Drossel: dieselbe Adresse wie beim Handschlagplatz.
-    let von = Some(platz.ip);
+    let absender_ip = platz.ip;
+    let von = Some(absender_ip);
     let ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let port = stream.peer_addr().map(|a| a.port()).unwrap_or(0);
     sendepuffer_setzen(&stream);
@@ -1713,50 +1728,26 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
         }
     };
     drop(platz);
+    let mut sock = sock;
     let fp = sock.peer_fingerprint();
     let sas = sock.sas.clone();
+    // Der Name aus Nachricht 3 (unbeglaubigt, nur Anzeige); aeltere Clients
+    // senden keinen - dann steht die Adresse da.
+    let name = zugang::nachricht3_name(&sock.nachricht3).unwrap_or_else(|| ip.clone());
 
-    // Freigabe: bekannte Gegenstelle, oder das Kopplungsfenster steht
-    // offen, oder es gibt authorized.txt noch gar nicht (Erstkontakt). Eine
-    // vorhandene, aber unlesbare Liste ist KEIN Erstkontakt, ebenso wenig
-    // eine vorhandene ohne gueltigen Eintrag (secure::Freigaben::erstkontakt)
-    // - dann wird abgewiesen, ebenso wenn sich die neue Freigabe nicht
-    // speichern laesst. Die Liste wird dafuer genau einmal gelesen; Pruefen,
-    // Erstkontakt und Eintragen entscheiden auf demselben Stand.
-    {
-        let _freigabe = sperre(&FREIGABE);
-        let liste = match secure::Freigaben::lesen() {
-            Ok(l) => l,
-            Err(e) => {
-                DROSSEL_FREIGABE.melden(von, || format!("Abgewiesen: Gegenstelle {fp} von {ip} - {e}"));
-                return;
-            }
-        };
-        if !liste.enthaelt(&sock.peer) {
-            let aufnehmen = if Z.pair_open.load(Ordering::Relaxed) { Ok(true) } else { liste.erstkontakt() };
-            match aufnehmen {
-                Ok(true) => {
-                    if let Err(e) = liste.aufnehmen(&sock.peer, &ip) {
-                        DROSSEL_FREIGABE.melden(von, || format!("Abgewiesen: Freigabe fuer {fp} ({ip}) konnte nicht gespeichert werden: {e}"));
-                        return;
-                    }
-                    log(format!("Neue Gegenstelle gekoppelt: {fp} ({ip}), Vergleichscode {sas}"));
-                    Z.pair_open.store(false, Ordering::Relaxed);
-                }
-                // Die Leitung faellt mit `sock` zu - der Client deutet das
-                // Ende nach dem Handschlag als "nicht gekoppelt".
-                Ok(false) => {
-                    DROSSEL_UNBEKANNT.melden(von, || {
-                        format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip}. Host mit --pair starten, um sie aufzunehmen.")
-                    });
-                    return;
-                }
-                Err(e) => {
-                    DROSSEL_UNBEKANNT.melden(von, || format!("Abgewiesen: unbekannte Gegenstelle {fp} von {ip} - {e}"));
-                    return;
-                }
-            }
-        }
+    // Einlass (Spezifikation Pairing v1, 3.1-3.4): ein Geraet aus der Liste
+    // kommt wie bisher herein; ein unbekanntes durchlaeuft die Zugangsphase
+    // (Passwort oder "Zulassen"), ohne dass dabei eine globale Sperre
+    // gehalten wird - ein laufender Zuschauer merkt davon nichts. Wer nicht
+    // herein darf, hat sein Ergebnis (22) schon bekommen; die Leitung faellt
+    // mit `sock` zu.
+    let Some(einlass) = super::einlass::einlass() else {
+        log(format!("Abgewiesen: {name} ({ip}) - kein Einlass eingerichtet"));
+        return;
+    };
+    let ausgang = einlass.pruefen(&mut sock, absender_ip, &name);
+    if !ausgang.herein() {
+        return;
     }
 
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
@@ -1766,7 +1757,9 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     hello.extend_from_slice(&kopf(MSG_INFO, 0, 0, 8));
     hello.extend_from_slice(&super::strominfo());
 
-    let leitung = Arc::new(Leitung::neu(sock.abbruchgriff(), sock.peer.clone(), sock.handshake_hash.clone(), ip.clone()));
+    let mut leitung = Leitung::neu(sock.abbruchgriff(), sock.peer.clone(), sock.handshake_hash.clone(), ip.clone());
+    leitung.name = name.clone();
+    let leitung = Arc::new(leitung);
     // Ein neuer Zuschauer ersetzt den alten: dessen Eingabekanal wird
     // gekappt, seine Warteschlange verworfen; er bekommt nur noch
     // MSG_ABGELOEST, dann endet sein Sendefaden (unten wird darauf gewartet).
@@ -1810,7 +1803,15 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     // aelterer Client uebergeht Typ 11 und 12.
     send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN | FAEHIG_BILDSCHIRM));
     send_small_an(&AKTUELL, &NR, nr, MSG_BILDSCHIRME, &bildschirme_payload());
-    log(format!("Zuschauer verbunden: {ip}:{port}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}"));
+    log(format!(
+        "Zuschauer verbunden: {name} ({ip}:{port}), ID {}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}{}",
+        zugang::id_text(zugang::geraete_id(&leitung.peer)),
+        match ausgang {
+            super::einlass::Ausgang::Passwort => " - eben per Passwort erlaubt",
+            super::einlass::Ausgang::Zugelassen => " - eben am Host zugelassen",
+            _ => "",
+        }
+    ));
     // Der Neue laeuft schon; jetzt erst auf den Abgeloesten warten: solange
     // er abnimmt (Rest des laufenden Pakets, dann das Schlusswort), sonst
     // wird seine Bildleitung gekappt.
@@ -2084,22 +2085,22 @@ fn rundruf_adressen() -> Vec<std::net::Ipv4Addr> {
     adressen
 }
 
+/// Das Paket der Bekanntgabe (Spezifikation Pairing v1, Abschnitt 2):
+/// Rechnername, dahinter ID und Flags - Bit 0, wenn am Host jemand
+/// "Zulassen" klicken kann.
+fn bekanntgabe_paket(port: u16, name: &str, id: u32, zulassen: bool) -> Vec<u8> {
+    zugang::bekanntgabe(port, name, id, if zulassen { BEACON_FLAG_ZULASSEN } else { 0 })
+}
+
 fn bekanntgabe(port: u16) {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
     sock.set_broadcast(true).ok();
-    let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into());
-    let mut nlen = name.len().min(40);
-    while !name.is_char_boundary(nlen) {
-        nlen -= 1;
-    }
-    let mut pkt = Vec::with_capacity(8 + nlen);
-    pkt.extend_from_slice(BEACON_MAGIC);
-    pkt.push(BEACON_VERSION);
-    pkt.extend_from_slice(&port.to_le_bytes());
-    pkt.push(nlen as u8);
-    pkt.extend_from_slice(&name.as_bytes()[..nlen]);
+    let name = zugang::geraetename();
     let mut erste = true;
     loop {
+        // Je Runde neu: ob "Zulassen" geht, haengt an der Oberflaeche.
+        let (id, zulassen) = super::einlass::einlass().map(|e| (e.id(), e.zulassen_moeglich())).unwrap_or((0, false));
+        let pkt = bekanntgabe_paket(port, &name, id, zulassen);
         let mut ziele = rundruf_adressen();
         if ziele.is_empty() {
             ziele.push(std::net::Ipv4Addr::BROADCAST);
@@ -2111,25 +2112,22 @@ fn bekanntgabe(port: u16) {
             }
         }
         if erste {
-            log(format!("Bekanntgabe: an {gesendet} Netze, Port {}", port + 2));
+            log(format!(
+                "Bekanntgabe: an {gesendet} Netze, Port {}, Name {name}, ID {}",
+                port + 2,
+                zugang::id_text(id)
+            ));
             erste = false;
         }
         std::thread::sleep(Duration::from_secs(2));
     }
 }
 
-/// Annahmefaeden und Bekanntgabe starten.
+/// Annahmefaeden und Bekanntgabe starten. Der Einlass (einlass::einrichten)
+/// muss vorher stehen. Scheitert das Binden (Port belegt), laesst sich
+/// `start` spaeter noch einmal rufen.
 pub fn start(port: u16, priv_key: Vec<u8>) -> Result<(), String> {
     PRIV.set(priv_key).ok();
-    // Die Startzeile zaehlt eine unlesbare Liste als 0 - hier steht, was das heisst.
-    match secure::Freigaben::lesen() {
-        Err(e) => log(format!("Freigabeliste: {e} - jede Gegenstelle wird abgewiesen, bis die Datei repariert ist")),
-        Ok(l) => {
-            if let Err(e) = l.erstkontakt() {
-                log(format!("Freigabeliste: {e}"));
-            }
-        }
-    }
     let bild = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("Bild-Port {port} nicht verfuegbar: {e}"))?;
     let eingabe = TcpListener::bind(("0.0.0.0", port + 1))
         .map_err(|e| format!("Eingabe-Port {} nicht verfuegbar: {e}", port + 1))?;
@@ -2473,28 +2471,34 @@ mod tests {
     /// Der ganze Zuschauerplatz auf Loopback: stumme Verbindungen halten die
     /// Annahme nicht auf, ein neuer Zuschauer kappt den Eingabekanal des
     /// alten und bekommt selbst einen funktionierenden, und je Absender
-    /// laufen hoechstens zwei Handschlaege.
+    /// laufen hoechstens zwei Handschlaege. Der Testschluessel steht in der
+    /// Geraeteliste des Einlasses (kein Erstkontakt mehr); ein unbekanntes
+    /// Geraet in der Zugangsphase stoert den laufenden Zuschauer nicht.
     #[test]
     fn zuschauerwechsel_und_parallele_annahme() {
-        let (host_priv, _) = noise::keypair().unwrap();
+        let (host_priv, host_pub) = noise::keypair().unwrap();
         PRIV.set(host_priv).unwrap();
-        secure::test_identitaet();
+        let (_, client_pub) = secure::test_identitaet();
+        let geraete = zugang::ablage_pfad(zugang::GERAETE_DATEI).unwrap();
+        let passwort = zugang::ablage_pfad(zugang::PASSWORT_DATEI).unwrap();
+        let k: [u8; 32] = client_pub.clone().try_into().unwrap();
+        zugang::geraet_eintragen(&geraete, &k, "Testclient", "2026-09-26").unwrap();
+        super::super::einlass::einrichten(Arc::new(super::super::einlass::Einlass::neu(geraete, passwort, &host_pub, "Testhost")))
+            .unwrap();
         // Ist irgendwann ein Faden unter einer der Sperren in Panik geraten,
         // muss der Zuschauerplatz trotzdem weiterlaufen. Hier mit Absicht:
-        // alle drei vergiftet, bevor es losgeht.
-        for m in [&EINSPEISEN, &FREIGABE] {
-            let _ = std::thread::spawn(move || {
-                let _g = m.lock();
-                panic!("mit Absicht: Sperre vergiften (Test)");
-            })
-            .join();
-        }
+        // beide vergiftet, bevor es losgeht.
+        let _ = std::thread::spawn(|| {
+            let _g = EINSPEISEN.lock();
+            panic!("mit Absicht: Sperre vergiften (Test)");
+        })
+        .join();
         let _ = std::thread::spawn(|| {
             let _g = AKTUELL.lock();
             panic!("mit Absicht: Sperre vergiften (Test)");
         })
         .join();
-        assert!(EINSPEISEN.is_poisoned() && FREIGABE.is_poisoned() && AKTUELL.is_poisoned());
+        assert!(EINSPEISEN.is_poisoned() && AKTUELL.is_poisoned());
         let bild_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let ein_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let bild_addr = bild_l.local_addr().unwrap().to_string();
@@ -2572,6 +2576,30 @@ mod tests {
         // Die alte Pruefsumme passt nicht mehr: A kommt nicht wieder herein.
         assert!(secure::Secure::connect(&ein_addr, &noise::prologue_input(&a.handshake_hash)).is_err());
 
+        // Ein unbekanntes Geraet: QCA1 und Nachricht 20 statt MAGIC; solange
+        // es in der Zugangsphase steht und wenn es abbricht, bleibt B der
+        // Zuschauer (gleiche Nummer), und B's Leitung laeuft weiter.
+        let nr_b = zuschauer_nr();
+        let (fremd_priv, _) = noise::keypair().unwrap();
+        let mut fremd = super::super::einlass::stub::Stub::verbinden(&bild_addr, &fremd_priv, &zugang::nachricht3("Fremd")).unwrap();
+        assert_eq!(&fremd.kennung().unwrap(), MAGIC_ZUGANG);
+        assert!(matches!(fremd.nachricht(), Ok(zugang::Nachricht::Noetig(_))));
+        assert_eq!(zuschauer_nr(), nr_b, "Zugangsphase hat den Zuschauer abgeloest");
+        // Der Name aus Nachricht 3 - oder die Adresse, solange der Client
+        // keinen sendet.
+        let n = zuschauer_name().unwrap();
+        assert!(n == "127.0.0.1" || n == zugang::geraetename(), "{n}");
+        zeitfrage(&mut b_ein, 0xB2).unwrap();
+        assert_eq!(zeitantwort(&mut b), Ok(0xB2));
+        fremd.senden(&zugang::Nachricht::Abbruch).unwrap();
+        assert!(fremd.zu());
+        zeitfrage(&mut b_ein, 0xB3).unwrap();
+        assert_eq!(zeitantwort(&mut b), Ok(0xB3));
+        assert_eq!(zuschauer_nr(), nr_b);
+        // Ein fremdes Geraet trennt zuschauer_trennen nicht, das eigene schon.
+        assert!(!zuschauer_trennen(Some(&[7u8; 32])));
+        assert_eq!(zuschauer_nr(), nr_b);
+
         // Zwei laufende Handschlaege von einem Absender: der dritte wird
         // sofort abgewiesen, nicht erst nach der Frist.
         let s1 = TcpStream::connect(&bild_addr).unwrap();
@@ -2584,6 +2612,26 @@ mod tests {
         drop((s1, s2));
         std::thread::sleep(Duration::from_millis(200));
         let _c = bild_verbinden(&bild_addr);
+    }
+
+    /// Bekanntgabe (Spezifikation 2): Rechnername, dahinter ID und Flags;
+    /// Bit 0 nur, wenn "Zulassen" moeglich ist. Ein alter Leser (bis zum
+    /// Namen) sieht dasselbe wie frueher.
+    #[test]
+    fn bekanntgabe_mit_id_und_flags() {
+        let p = bekanntgabe_paket(9001, "BUERO-PC", 581_729_911, true);
+        assert!(p.len() <= zugang::BEKANNTGABE_MAX);
+        assert_eq!(&p[..4], BEACON_MAGIC);
+        assert_eq!((p[4], u16::from_le_bytes([p[5], p[6]]), p[7]), (BEACON_VERSION, 9001, 8));
+        assert_eq!(&p[8..16], b"BUERO-PC");
+        let b = zugang::bekanntgabe_lesen(&p).unwrap();
+        assert_eq!((b.id, b.flags, b.zulassen_moeglich()), (Some(581_729_911), BEACON_FLAG_ZULASSEN, true));
+        let b = zugang::bekanntgabe_lesen(&bekanntgabe_paket(9101, "PC", 5, false)).unwrap();
+        assert_eq!((b.port, b.name.as_str(), b.id, b.flags), (9101, "PC", Some(5), 0));
+        // Ein langer Name wird auf 40 Byte gekuerzt, nie mitten im Zeichen.
+        let p = bekanntgabe_paket(9001, &"ä".repeat(30), 1, false);
+        assert_eq!(p[7], 40);
+        assert!(p.len() <= zugang::BEKANNTGABE_MAX);
     }
 
     /// Die Grenzen der laufenden Handschlaege: je Absender zwei, insgesamt

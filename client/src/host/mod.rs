@@ -1,17 +1,28 @@
 // Windows als Host - Rolle in derselben Programmdatei wie der Client.
 //
 //   quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
-//                  [--pair] [--forget] [--konserve datei.hevc]
+//                  [--konserve datei.hevc]
 //                  [--encoderweg bgra|yuv444|d3d11|auto]
 //   quadchroma.exe --list
 //   quadchroma.exe --messen [--output n] [--sekunden 10]
 //
-// Ohne Fenster; Konsole ueber AttachConsole wie der Client, jede Zeile
-// ausserdem in %APPDATA%\QuadChroma\host-protokoll.txt. Das Protokoll auf
-// der Leitung ist das des Mac-Hosts (host/main.m), Byte fuer Byte - ein
-// Client darf den Host nicht erkennen.
+// Fuer Nutzer startet der Knopf "Diesen PC freigeben" im Client die Rolle
+// als zweiten Prozess (oberflaeche::freigabe_starten, intern mit
+// --hintergrund), ebenso die Verknuepfung "Mit Windows starten". Hoechstens
+// eine Host-Rolle je Sitzung (Mutex Local\QuadChroma-Host); ein zweiter
+// Start endet still, bevor er das Protokoll anfasst.
 //
-// Stand: Zuschauerplatz (Noise-Responder, Kopplung, Bekanntgabe), Eingaben,
+// Oberflaeche (Spezifikation Pairing v1, 10): Symbol im Infobereich mit
+// Geraete-ID, Zugangspasswort, erlaubten Geraeten, Autostart und "Freigabe
+// beenden" (oberflaeche.rs), Zulassen-Anfragen und Passwortfenster
+// (fenster.rs). Wer herein darf, entscheidet der Einlass (einlass.rs:
+// host-devices.txt, host-password.txt, Passwortbeweis oder "Zulassen").
+// Konsole ueber AttachConsole wie der Client, jede Zeile ausserdem in
+// %APPDATA%\QuadChroma\host-protokoll.txt. Das Protokoll auf der Leitung
+// ist das des Mac-Hosts (host/main.m), Byte fuer Byte - ein Client darf den
+// Host nicht erkennen.
+//
+// Stand: Zuschauerplatz (Noise-Responder, Einlass, Bekanntgabe), Eingaben,
 // Zwischenablage (Text und Dateien, netz.rs mit dateien.rs), Aufnahme
 // (Desktop Duplication) mit Schrittmacher und Encoder im Betrieb (nvenc,
 // ohne NVIDIA h264_mf in Software), Codecwechsel, Bildschirmwahl mit
@@ -21,10 +32,13 @@
 
 pub mod aufnahme;
 pub mod eingabe;
+pub mod einlass;
 pub mod encoder;
+pub mod fenster;
 pub mod konserve;
 pub mod messen;
 pub mod netz;
+pub mod oberflaeche;
 pub mod takt;
 pub mod testbild;
 pub mod ton;
@@ -35,7 +49,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::protokoll_konst::*;
-use crate::{noise, protokoll, secure};
+use crate::{noise, protokoll, secure, zugang};
 
 // ------------------------------------------------------------------ Zustand
 //
@@ -48,9 +62,6 @@ pub struct Zustand {
     pub gaming: AtomicBool,
     pub fest: AtomicBool,
     pub ton: AtomicBool,
-    /// Kopplungsfenster offen (--pair): die naechste unbekannte Gegenstelle
-    /// wird aufgenommen.
-    pub pair_open: AtomicBool,
     /// Das naechste Bild soll ein Vollbild sein.
     pub force_key: AtomicBool,
     /// Frisch verbundener Zuschauer wartet auf ein Vollbild.
@@ -96,7 +107,6 @@ pub static Z: Zustand = Zustand {
     gaming: AtomicBool::new(false),
     fest: AtomicBool::new(false),
     ton: AtomicBool::new(true),
-    pair_open: AtomicBool::new(false),
     force_key: AtomicBool::new(false),
     wait_key: AtomicBool::new(false),
     sent_frames: AtomicU64::new(0),
@@ -386,8 +396,142 @@ fn dpi_bewusst() -> String {
     }
 }
 
+/// "Diesen PC freigeben" (Knopf im Client, Spezifikation 9.5/10.1): die
+/// Host-Rolle als zweiten Prozess derselben exe starten, ohne Konsole.
+#[allow(dead_code)] // der Knopf des Clients (main.rs) ruft es
+pub fn freigabe_starten() -> Result<(), String> {
+    oberflaeche::freigabe_starten()
+}
+
+/// Laeuft in dieser Sitzung schon eine Host-Rolle? (Knopf "Freigabe laeuft")
+#[allow(dead_code)] // der Knopf des Clients (main.rs) fragt es
+pub fn freigabe_laeuft() -> bool {
+    oberflaeche::laeuft(oberflaeche::MUTEX)
+}
+
+/// Sperre nehmen, auch nach einer Panik in einem anderen Faden.
+fn sperre<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Was das Menue im Infobereich gerade zeigt (bei jedem Oeffnen neu).
+fn menue_stand(e: &einlass::Einlass, port: u16, port_belegt: bool) -> oberflaeche::MenueStand {
+    oberflaeche::MenueStand {
+        zuschauer: netz::zuschauer_name(),
+        port_belegt: port_belegt.then_some(port),
+        id: e.id(),
+        passwort: e.passwort().map_err(|_| ()),
+        geraete: e.geraete().map(|l| l.geraete).map_err(|_| ()),
+        autostart: crate::verknuepfung::autostart_an(None),
+    }
+}
+
+/// Einen Menuepunkt ausfuehren (Hauptfaden der Host-Rolle). "Beenden"
+/// erledigt die Schleife selbst.
+fn aktion_ausfuehren(
+    a: oberflaeche::Aktion,
+    e: &std::sync::Arc<einlass::Einlass>,
+    lang: &'static crate::strings::Lang,
+    symbol: &mut Option<crate::tray_win::Symbol>,
+    tx: &std::sync::mpsc::Sender<oberflaeche::Aktion>,
+) {
+    use crate::strings::Key;
+    use oberflaeche::Aktion;
+    let mut hinweis = |k: Key| {
+        if let Some(s) = symbol.as_mut() {
+            s.hinweis("QuadChroma", lang.get(k));
+        }
+    };
+    match a {
+        Aktion::IdKopieren => {
+            crate::clipboard::set(&zugang::id_ziffern(e.id()));
+            log("Geraete-ID in die Zwischenablage kopiert");
+            hinweis(Key::HostCopied);
+        }
+        Aktion::PasswortKopieren => {
+            if let Ok(pw) = e.passwort() {
+                // clipboard::set markiert den Eintrag als verdeckt: kein
+                // Verlauf, keine Cloud, und der Ablagewaechter schickt ihn
+                // nicht an einen Zuschauer.
+                crate::clipboard::set(&pw);
+                log("Zugangspasswort in die Zwischenablage kopiert (verdeckt)");
+                hinweis(Key::HostCopied);
+            }
+        }
+        Aktion::PasswortAendern => {
+            let (e2, tx2) = (e.clone(), tx.clone());
+            fenster::passwort_aendern(
+                lang,
+                Box::new(move |pw| e2.passwort_setzen(pw)),
+                Box::new(move || {
+                    let _ = tx2.send(Aktion::PasswortGespeichert);
+                }),
+            );
+        }
+        Aktion::PasswortGespeichert => hinweis(Key::HostPasswordSaved),
+        Aktion::Zufallspasswort => {
+            let _ = e.passwort_zufall();
+        }
+        Aktion::Entfernen(k) => {
+            // Wer entfernt ist, bleibt nicht verbunden.
+            if e.geraet_entfernen(&k).is_ok() {
+                netz::zuschauer_trennen(Some(&k));
+            }
+        }
+        Aktion::AlleEntfernen => {
+            let e2 = e.clone();
+            fenster::rueckfrage(
+                lang.get(Key::HostRemoveAllAsk),
+                Box::new(move || {
+                    if e2.alle_entfernen().is_ok() {
+                        netz::zuschauer_trennen(None);
+                    }
+                }),
+            );
+        }
+        Aktion::ListeZuruecksetzen => {
+            let _ = e.liste_zuruecksetzen();
+        }
+        Aktion::Autostart => {
+            let an = !crate::verknuepfung::autostart_an(None);
+            match crate::verknuepfung::autostart_setzen(None, an, lang.get(Key::StartShare)) {
+                Ok(()) => log(if an { "Mit Windows starten: an (Verknuepfung im Autostart-Ordner)" } else { "Mit Windows starten: aus" }),
+                Err(f) => log(format!("Mit Windows starten nicht umgestellt: {f}")),
+            }
+        }
+        Aktion::Beenden => {}
+    }
+}
+
 /// Rollenwahl: --list, --messen oder --host. Rueckgabe ist der Exit-Code.
 pub fn main_host(args: &[String]) -> i32 {
+    // Einzelinstanz der Freigabe (Spezifikation 10.1) - vor allem anderen,
+    // auch vor der Protokolldatei: ein zweiter Start leerte sonst das
+    // Protokoll des laufenden.
+    let freigabe = !args.iter().any(|a| a == "--list" || a == "--messen");
+    let mut instanz_fehler = None;
+    let _instanz = if freigabe {
+        match oberflaeche::einzelinstanz(oberflaeche::MUTEX) {
+            Ok(Some(i)) => Some(i),
+            Ok(None) => {
+                println!("Die Freigabe laeuft in dieser Sitzung schon ({}) - dieser Start endet.", oberflaeche::MUTEX);
+                return 0;
+            }
+            Err(e) => {
+                instanz_fehler = Some(e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if args.iter().any(|a| a == oberflaeche::HINTERGRUND) {
+        // Vom Client gestartet: keine geerbte Konsole - schloesse jemand
+        // sie, endete die Freigabe mit.
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
+    }
     // Vor allem anderen, das Ausgaenge, Bildschirm oder Maus anfasst -
     // fuer alle Hostrollen.
     let dpi = dpi_bewusst();
@@ -407,6 +551,9 @@ pub fn main_host(args: &[String]) -> i32 {
 
     protokoll_oeffnen("host-protokoll.txt");
     log(&dpi);
+    if let Some(e) = instanz_fehler {
+        log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
+    }
 
     if args.iter().any(|a| a == "--list") {
         aufnahme::ausgaenge_melden(&mut Vec::new());
@@ -433,19 +580,61 @@ pub fn main_host(args: &[String]) -> i32 {
             return 5;
         }
     };
-    if args.iter().any(|a| a == "--forget") {
-        secure::forget_all();
-        log("Alle Freigaben geloescht.");
+    // --pair und --forget gibt es nicht mehr (Spezifikation 6).
+    for alt in ["--pair", "--forget"] {
+        if args.iter().any(|a| a == alt) {
+            log(format!("Unbekanntes Argument {alt} - uebergangen (neue Geraete kommen per Passwort oder \"Zulassen\" herein)"));
+        }
     }
-    log(format!(
-        "Fingerabdruck dieses Hosts: {}   freigegebene Gegenstellen: {}",
-        noise::fingerprint(&pub_key),
-        secure::authorized_count()
+
+    // Einlass (Spezifikation 3, 4): Geraeteliste und Zugangspasswort im
+    // Ablageordner; einmal aus authorized.txt uebernehmen.
+    let ordner = match secure::config_dir() {
+        Ok(o) => o,
+        Err(e) => {
+            log(format!("Kein Ablageordner - Abbruch: {e}"));
+            return 5;
+        }
+    };
+    match zugang::geraete_migrieren(&ordner, &zugang::heute()) {
+        zugang::Migration::Keine => {}
+        zugang::Migration::Uebernommen { anzahl, umbenannt } => log(format!(
+            "Uebernahme: {anzahl} Geraete aus {} nach {}{}",
+            zugang::ALTE_FREIGABEN,
+            zugang::GERAETE_DATEI,
+            match umbenannt {
+                Ok(()) => format!(", alte Liste heisst jetzt {}{}", zugang::ALTE_FREIGABEN, zugang::MIGRIERT),
+                Err(e) => format!(" - alte Liste nicht umbenannt ({e}), wird aber nicht noch einmal uebernommen"),
+            }
+        )),
+        zugang::Migration::Fehler(e) => log(format!("Uebernahme aus {} gescheitert: {e} - naechster Start versucht es wieder", zugang::ALTE_FREIGABEN)),
+    }
+    for datei in [zugang::GERAETE_DATEI, zugang::PASSWORT_DATEI] {
+        let n = zugang::zwischendateien_aufraeumen(&ordner.join(datei));
+        if n > 0 {
+            log(format!("{n} Zwischendateien von {datei} aus einem abgebrochenen Lauf entfernt"));
+        }
+    }
+    let rechnername = zugang::geraetename();
+    let einlass = std::sync::Arc::new(einlass::Einlass::neu(
+        ordner.join(zugang::GERAETE_DATEI),
+        ordner.join(zugang::PASSWORT_DATEI),
+        &pub_key,
+        &rechnername,
     ));
-    if args.iter().any(|a| a == "--pair") {
-        Z.pair_open.store(true, Ordering::Relaxed);
-        log("Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.");
+    let _ = einlass::einrichten(einlass.clone());
+    if let Err(e) = einlass.passwort() {
+        log(format!("Zugangspasswort: {e} - neue Geraete nur ueber \"Zulassen\" (Menue: Neues Zufallspasswort)"));
     }
+    let erlaubt = match einlass.geraete() {
+        Ok(l) => l.geraete.len().to_string(),
+        Err(e) => format!("keins - {e}; niemand gilt als bekannt"),
+    };
+    log(format!(
+        "Geraete-ID dieses Hosts: {}   Name: {rechnername}   Fingerabdruck: {}   erlaubte Geraete: {erlaubt}",
+        zugang::id_text(einlass.id()),
+        noise::fingerprint(&pub_key)
+    ));
 
     if let Some(f) = arg_zahl(args, "--fps") {
         Z.fps.store(f.clamp(10, 240), Ordering::Relaxed);
@@ -560,11 +749,74 @@ pub fn main_host(args: &[String]) -> i32 {
         ));
     }
 
-    // Zuschauerplatz: Bild, Eingabe, Bekanntgabe.
-    if let Err(e) = netz::start(port, priv_key) {
-        log(format!("{e}"));
-        return 9;
+    // Oberflaeche (Spezifikation 10): Zulassen-Fenster, deren Antwort an
+    // den Einlass geht, und das Symbol im Infobereich. Die Sprache wie im
+    // Fenster des Clients.
+    let lang = match &crate::einstellungen::Einstellungen::laden().sprache {
+        Some(c) => crate::strings::pick(c),
+        None => crate::strings::pick(&crate::system_language()),
+    };
+    let zulassen = std::sync::Arc::new(fenster::Zulassen::neu(
+        lang,
+        std::sync::Arc::new(|nr, ja| {
+            if let Some(e) = einlass::einlass() {
+                e.entscheiden(nr, ja);
+            }
+        }),
+    ));
+    einlass.oberflaeche_setzen(zulassen.clone());
+    let port_belegt = std::sync::Arc::new(AtomicBool::new(false));
+    let (aktionen_tx, aktionen) = std::sync::mpsc::channel::<oberflaeche::Aktion>();
+    let schluessel: std::sync::Arc<Mutex<Vec<[u8; 32]>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut symbol = {
+        let (tx, sk) = (aktionen_tx.clone(), schluessel.clone());
+        let befehl = Box::new(move |nr: u32| {
+            let k = sperre(&sk).clone();
+            if let Some(a) = oberflaeche::aktion_zu(nr, &k) {
+                let _ = tx.send(a);
+            }
+        });
+        let (e, pb, sk) = (einlass.clone(), port_belegt.clone(), schluessel.clone());
+        let menue = Box::new(move || {
+            let stand = menue_stand(&e, port, pb.load(Ordering::Relaxed));
+            let (m, k) = oberflaeche::menue(lang, &stand);
+            *sperre(&sk) = k;
+            m
+        });
+        match crate::tray_win::Symbol::neu_allgemein(befehl, menue, &oberflaeche::tooltip(lang, einlass.id())) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log(format!("Infobereich: kein Symbol ({e}) - ohne Oberflaeche, neue Geraete nur per Passwort"));
+                None
+            }
+        }
+    };
+    let steht = symbol.as_ref().is_some_and(|s| s.steht());
+    zulassen.vorhanden_setzen(steht);
+    match &symbol {
+        Some(s) if !steht => log(format!(
+            "Infobereich: Symbol nicht angemeldet ({}) - \"Zulassen\" erst, wenn es steht",
+            s.grund().unwrap_or_default()
+        )),
+        Some(_) => log("Infobereich: Symbol steht - \"Zulassen\" moeglich"),
+        None => {}
     }
+
+    // Zuschauerplatz: Bild, Eingabe, Bekanntgabe. Ist der Port belegt und
+    // gibt es die Oberflaeche, zeigt sie das, und es wird alle 5 s neu
+    // versucht; ohne Oberflaeche endet die Rolle wie bisher (Exit 9).
+    let mut netz_laeuft = match netz::start(port, priv_key.clone()) {
+        Ok(()) => true,
+        Err(e) if steht => {
+            log(format!("{e} - neuer Versuch alle 5 s, das Menue zeigt es"));
+            port_belegt.store(true, Ordering::Relaxed);
+            false
+        }
+        Err(e) => {
+            log(format!("{e}"));
+            return 9;
+        }
+    };
     // Zwischenablage: was hier kopiert wird, geht zum Zuschauer - Text als
     // 48, eine Dateiliste ueber den Sender (50-52), beides auf dem
     // Bildkanal; neuer Inhalt bricht eine laufende Datei-Sendung ab. Was von
@@ -619,13 +871,36 @@ pub fn main_host(args: &[String]) -> i32 {
     // Alle fuenf Sekunden eine Zeile mit dem Stand und Nachricht 6 - nur,
     // wenn jemand zuschaut; sonst misst sich der Host selbst ohne Zweck.
     // Die Drosseln tragen in diesem Takt immer nach, auch ohne Zuschauer:
-    // eine Flut kommt gerade dann, wenn keiner verbunden ist.
+    // eine Flut kommt gerade dann, wenn keiner verbunden ist. Dazwischen
+    // laufen die Menuepunkte des Infobereichs (Kanal `aktionen`), und jede
+    // Sekunde wird nachgesehen, ob das Symbol steht ("Zulassen" moeglich).
     let t0 = Instant::now();
     let mut vorher = last_probe();
     let mut last_frames = 0u64;
     let mut last_bytes = 0u64;
+    let mut takt = Instant::now() + Duration::from_secs(5);
     loop {
-        std::thread::sleep(Duration::from_secs(5));
+        let warten = takt.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+        match aktionen.recv_timeout(warten) {
+            Ok(oberflaeche::Aktion::Beenden) => {
+                log("Freigabe beendet (Infobereich)");
+                netz::zuschauer_trennen(None);
+                drop(symbol.take());
+                std::process::exit(0);
+            }
+            Ok(a) => aktion_ausfuehren(a, &einlass, lang, &mut symbol, &aktionen_tx),
+            Err(_) => {}
+        }
+        zulassen.vorhanden_setzen(symbol.as_ref().is_some_and(|s| s.steht()));
+        if Instant::now() < takt {
+            continue;
+        }
+        takt = Instant::now() + Duration::from_secs(5);
+        if !netz_laeuft && netz::start(port, priv_key.clone()).is_ok() {
+            netz_laeuft = true;
+            port_belegt.store(false, Ordering::Relaxed);
+            log(format!("Port {port} ist frei - Dienst laeuft"));
+        }
         ffmpeg_zeilen();
         netz::drosseln_nachtragen();
         let f = Z.sent_frames.load(Ordering::Relaxed);

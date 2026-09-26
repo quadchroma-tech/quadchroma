@@ -49,6 +49,10 @@ pub struct Session {
     pub transport: TransportState,
     pub handshake_hash: Vec<u8>,
     pub remote_static: Vec<u8>,
+    /// Nutzlast von Nachricht 3, wie sie beim Angerufenen ankam (Name des
+    /// Clients, zugang::nachricht3_name); beim Anrufer leer.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub nachricht3: Vec<u8>,
 }
 
 /// Fuehrt den Handschlag als Anrufer ueber eine beliebige Leitung. Die beiden
@@ -100,14 +104,15 @@ where
     let handshake_hash = hs.get_handshake_hash().to_vec();
     let remote_static = hs.get_remote_static().map(|k| k.to_vec()).unwrap_or_default();
     let transport = hs.into_transport_mode().map_err(|e| format!("Umschalten: {e:?}"))?;
-    Ok(Session { transport, handshake_hash, remote_static })
+    Ok(Session { transport, handshake_hash, remote_static, nachricht3: Vec::new() })
 }
 
 /// Fuehrt den Handschlag als Angerufener (Host-Rolle) ueber eine beliebige
 /// Leitung - das Gegenstueck zu qc_chan_accept auf dem Mac: Nachricht 1
-/// lesen, Nachricht 2 ohne Nutzlast schreiben, Nachricht 3 lesen (die
-/// Nutzlast "client" wird uebergangen), dann Pruefsumme und Gegenschluessel
-/// festhalten und in den Betrieb umschalten.
+/// lesen, Nachricht 2 ohne Nutzlast schreiben, Nachricht 3 lesen, dann
+/// Pruefsumme, Gegenschluessel und die Nutzlast von Nachricht 3 festhalten
+/// (Name des Clients, "QCN1" - aeltere Clients senden "client") und in den
+/// Betrieb umschalten.
 pub fn handshake_responder<R, W>(
     static_key: &[u8],
     prologue: &[u8],
@@ -137,12 +142,13 @@ where
     send(&buf[..n])?;
 
     recv(&mut incoming)?;
-    hs.read_message(&incoming, &mut payload).map_err(|e| format!("Nachricht 3: {e:?}"))?;
+    let n3 = hs.read_message(&incoming, &mut payload).map_err(|e| format!("Nachricht 3: {e:?}"))?;
+    let nachricht3 = payload[..n3].to_vec();
 
     let handshake_hash = hs.get_handshake_hash().to_vec();
     let remote_static = hs.get_remote_static().map(|k| k.to_vec()).unwrap_or_default();
     let transport = hs.into_transport_mode().map_err(|e| format!("Umschalten: {e:?}"))?;
-    Ok(Session { transport, handshake_hash, remote_static })
+    Ok(Session { transport, handshake_hash, remote_static, nachricht3 })
 }
 
 /// Erzeugt ein langlebiges Schluesselpaar.
@@ -258,5 +264,46 @@ mod tests {
                 assert_eq!(beim_host.err().as_deref(), Some("Leitung zu"), "Nachricht 3 kam an");
             }
         }
+    }
+
+    /// Die Nutzlast von Nachricht 3 (Name des Clients, "QCN1") kommt beim
+    /// Angerufenen an; der Anrufer hat keine.
+    #[test]
+    fn nachricht3_kommt_beim_angerufenen_an() {
+        let (host_priv, _) = keypair().unwrap();
+        let (client_priv, _) = keypair().unwrap();
+        let (zum_host, beim_host) = mpsc::channel::<Vec<u8>>();
+        let (zum_client, beim_client) = mpsc::channel::<Vec<u8>>();
+        let host = std::thread::spawn(move || {
+            handshake_responder(
+                &host_priv,
+                &prologue_video(),
+                |b| {
+                    *b = beim_host.recv().map_err(|_| "Leitung zu".to_string())?;
+                    Ok(())
+                },
+                |d| zum_client.send(d.to_vec()).map_err(|_| "Leitung zu".to_string()),
+            )
+            .map(|s| s.nachricht3)
+        });
+        let nutzlast = crate::zugang::nachricht3("Büro-PC");
+        let params: snow::params::NoiseParams = PATTERN.parse().unwrap();
+        let mut hs = Builder::new(params)
+            .local_private_key(&client_priv)
+            .unwrap()
+            .prologue(&prologue_video())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut buf = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf).unwrap();
+        zum_host.send(buf[..n].to_vec()).unwrap();
+        let m2 = beim_client.recv().unwrap();
+        hs.read_message(&m2, &mut vec![0u8; 65535]).unwrap();
+        let n = hs.write_message(&nutzlast, &mut buf).unwrap();
+        zum_host.send(buf[..n].to_vec()).unwrap();
+        let empfangen = host.join().unwrap().unwrap();
+        assert_eq!(empfangen, nutzlast);
+        assert_eq!(crate::zugang::nachricht3_name(&empfangen).as_deref(), Some("Büro-PC"));
     }
 }

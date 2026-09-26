@@ -27,6 +27,14 @@
 //   - Tooltip ueber NIF_TIP mit NIF_SHOWTIP (Fassung 4 blendet ihn sonst aus).
 //   - Die einmalige Sprechblase ueber NIF_INFO, ebenfalls mit NIF_SHOWTIP
 //     (jedes NIM_MODIFY ohne das Kennzeichen blendet den Tooltip aus).
+//
+// Zweite Art (Host-Rolle, Pairing v1 Abschnitt 10.2, `Symbol::neu_allgemein`):
+// ein allgemeines Menue aus `Eintrag` - Untermenues, Haken, deaktivierte
+// Eintraege, eigene Befehlsnummern. Es wird bei jedem Oeffnen frisch
+// gebaut (Rueckruf `menue` im Symbolfaden), damit Geraeteliste, Passwort und
+// Zustand stimmen; Links- und Rechtsklick oeffnen es gleichermassen (die
+// Host-Rolle hat kein Fenster). Die gewaehlte Nummer geht an `befehl`. Der
+// Client (erste Art) baut sein Menue ebenso aus Eintraegen (client_eintraege).
 
 use crate::tray::{self, Befehl, Punkt, Stand};
 use std::cell::RefCell;
@@ -45,9 +53,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetMessageW, GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage,
-    HICON, HMENU, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON, SM_MENUDROPALIGNMENT,
-    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    HICON, HMENU, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    SMTO_ABORTIFHUNG, SM_CXSMICON, SM_MENUDROPALIGNMENT, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 /// Fensterklasse des Symbolfensters (eigene, nicht die der Einzelinstanz).
@@ -95,10 +104,43 @@ struct Geteilt {
     versucht: AtomicBool,
 }
 
+/// Ein Eintrag eines allgemeinen Menues (zweite Art, Host-Rolle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Eintrag {
+    /// Waehlbarer (oder deaktivierter) Punkt mit eigener Befehlsnummer
+    /// (nicht 0). `haken`: mit Haken davor; `fett`: Vorgabe des Menues.
+    Punkt { text: String, nummer: u32, haken: bool, aktiv: bool, fett: bool },
+    /// Untermenue.
+    Unter { text: String, eintraege: Vec<Eintrag>, aktiv: bool },
+    Trenner,
+}
+
+impl Eintrag {
+    /// Ein gewoehnlicher, waehlbarer Punkt.
+    pub fn punkt(text: impl Into<String>, nummer: u32) -> Eintrag {
+        Eintrag::Punkt { text: text.into(), nummer, haken: false, aktiv: true, fett: false }
+    }
+
+    /// Eine Zeile, die nur etwas anzeigt (deaktiviert, ohne Befehl).
+    pub fn anzeige(text: impl Into<String>) -> Eintrag {
+        Eintrag::Punkt { text: text.into(), nummer: 0, haken: false, aktiv: false, fett: false }
+    }
+}
+
+/// Wie der Symbolfaden Wahlen weitergibt.
+enum Art {
+    /// Der Client: Menue aus dem geteilten Stand (tray::Punkt), Linksklick
+    /// oeffnet das Fenster.
+    Client(Box<dyn Fn(Befehl) + Send>),
+    /// Allgemein (Host-Rolle): Menue bei jedem Oeffnen aus `menue`, die
+    /// gewaehlte Nummer an `befehl`; auch der Linksklick oeffnet das Menue.
+    Allgemein { befehl: Box<dyn Fn(u32) + Send>, menue: Box<dyn Fn() -> Vec<Eintrag> + Send> },
+}
+
 /// Was nur der Symbolfaden braucht (je Faden einer, siehe FADEN).
 struct Faden {
     geteilt: Arc<Geteilt>,
-    befehl: Box<dyn Fn(Befehl) + Send>,
+    art: Art,
     symbol: HICON,
     /// Nummer der Rundnachricht "TaskbarCreated" (Explorer neu gestartet).
     taskbar_created: u32,
@@ -133,6 +175,23 @@ impl Symbol {
     /// liefe bei Ueberlast ein Faden ohne Besitzer weiter, dessen Symbol nie
     /// mehr entfernt wuerde (Durchsicht [4]).
     pub fn neu(befehl: Box<dyn Fn(Befehl) + Send>, stand: &Stand) -> Result<Symbol, String> {
+        Symbol::neu_mit(Art::Client(befehl), stand)
+    }
+
+    /// Zweite Art (Host-Rolle): `menue` liefert bei jedem Oeffnen die
+    /// Eintraege (im Symbolfaden gerufen), `befehl` bekommt die gewaehlte
+    /// Nummer (ebenfalls im Symbolfaden - lange Arbeit gehoert in einen
+    /// anderen Faden). Sonst wie `neu`.
+    pub fn neu_allgemein(
+        befehl: Box<dyn Fn(u32) + Send>,
+        menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
+        tooltip: &str,
+    ) -> Result<Symbol, String> {
+        let stand = Stand { menue: Vec::new(), tooltip: tooltip.to_string() };
+        Symbol::neu_mit(Art::Allgemein { befehl, menue }, &stand)
+    }
+
+    fn neu_mit(art: Art, stand: &Stand) -> Result<Symbol, String> {
         let geteilt = Arc::new(Geteilt {
             stand: Mutex::new(stand.clone()),
             hinweis: Mutex::new((String::new(), String::new())),
@@ -146,7 +205,7 @@ impl Symbol {
         std::thread::Builder::new()
             .name("infobereich".into())
             .spawn(move || {
-                faden_laufen(g, befehl, bereit_tx);
+                faden_laufen(g, art, bereit_tx);
                 let _ = ende_tx.send(());
             })
             .map_err(|e| format!("Faden: {e}"))?;
@@ -353,39 +412,97 @@ fn befehl_zu(punkte: &[Punkt], gewaehlt: u32) -> Option<Befehl> {
     }
 }
 
-/// Das Kontextmenue aus den Punkten bauen: Nummern nach menue_nummer,
-/// "Oeffnen" fett (die Vorgabe, die auch der Doppelklick ausloest). Der
-/// Aufrufer gibt es mit DestroyMenu frei.
+/// Die Punkte des Clients als allgemeine Eintraege: Nummern nach
+/// menue_nummer, "Oeffnen" fett (die Vorgabe, die auch der Doppelklick
+/// ausloest).
+fn client_eintraege(punkte: &[Punkt]) -> Vec<Eintrag> {
+    punkte
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let nummer = menue_nummer(i, p).unwrap_or(0);
+            match p {
+                Punkt::Oeffnen(t) => Eintrag::Punkt { text: t.clone(), nummer, haken: false, aktiv: true, fett: true },
+                Punkt::Beenden(t) => Eintrag::punkt(t.clone(), nummer),
+                Punkt::Verbinden { text, .. } => Eintrag::punkt(text.clone(), nummer),
+                Punkt::Trenner => Eintrag::Trenner,
+            }
+        })
+        .collect()
+}
+
+/// Das Kontextmenue des Clients aus den Punkten bauen (Tests; gezeigt wird
+/// es ueber menue_zeigen). Der Aufrufer gibt es mit DestroyMenu frei.
+#[cfg(test)]
 fn menue_bauen(punkte: &[Punkt]) -> Option<HMENU> {
+    eintraege_bauen(&client_eintraege(punkte))
+}
+
+/// Ein Menue aus allgemeinen Eintraegen bauen, Untermenues eingeschlossen
+/// (sie gehoeren danach dem Menue und fallen mit dessen DestroyMenu). Der
+/// Aufrufer gibt es mit DestroyMenu frei.
+fn eintraege_bauen(eintraege: &[Eintrag]) -> Option<HMENU> {
     unsafe {
         let menue = CreatePopupMenu().ok()?;
-        for (i, p) in punkte.iter().enumerate() {
-            let nummer = menue_nummer(i, p).unwrap_or(0) as usize;
-            let _ = match p {
-                Punkt::Oeffnen(t) | Punkt::Beenden(t) => AppendMenuW(menue, MF_STRING, nummer, &menuetext(t)),
-                Punkt::Verbinden { text, .. } => AppendMenuW(menue, MF_STRING, nummer, &menuetext(text)),
-                Punkt::Trenner => AppendMenuW(menue, MF_SEPARATOR, 0, PCWSTR::null()),
-            };
-        }
-        let _ = SetMenuDefaultItem(menue, ID_OEFFNEN, 0);
+        eintraege_anhaengen(menue, eintraege);
         Some(menue)
     }
 }
 
-/// Das Kontextmenue an der Stelle (x, y) zeigen und den gewaehlten Befehl
-/// liefern. Gebaut aus dem Stand dieses Augenblicks; die Wahl wird gegen
-/// genau diese Liste aufgeloest.
-fn menue_zeigen(hwnd: HWND, f: &Faden, x: i32, y: i32) -> Option<Befehl> {
-    let punkte = f.geteilt.stand.lock().map(|s| s.menue.clone()).unwrap_or_default();
+/// Das echte Menue aus Eintraegen fuer Tests anderer Teile (host/oberflaeche.rs).
+#[cfg(test)]
+pub fn menue_fuer_test(eintraege: &[Eintrag]) -> Option<HMENU> {
+    eintraege_bauen(eintraege)
+}
+
+fn eintraege_anhaengen(menue: HMENU, eintraege: &[Eintrag]) {
+    let grau = |aktiv: bool| if aktiv { MENU_ITEM_FLAGS(0) } else { MF_GRAYED };
+    for e in eintraege {
+        unsafe {
+            match e {
+                Eintrag::Punkt { text, nummer, haken, aktiv, fett } => {
+                    let haken = if *haken { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
+                    let _ = AppendMenuW(menue, MF_STRING | haken | grau(*aktiv), *nummer as usize, &menuetext(text));
+                    if *fett && *nummer != 0 {
+                        let _ = SetMenuDefaultItem(menue, *nummer, 0);
+                    }
+                }
+                Eintrag::Unter { text, eintraege, aktiv } => {
+                    let Ok(unter) = CreatePopupMenu() else { continue };
+                    eintraege_anhaengen(unter, eintraege);
+                    if AppendMenuW(menue, MF_STRING | MF_POPUP | grau(*aktiv), unter.0 as usize, &menuetext(text)).is_err() {
+                        let _ = DestroyMenu(unter);
+                    }
+                }
+                Eintrag::Trenner => {
+                    let _ = AppendMenuW(menue, MF_SEPARATOR, 0, PCWSTR::null());
+                }
+            }
+        }
+    }
+}
+
+/// Ein Menue an der Stelle (x, y) zeigen und die gewaehlte Nummer liefern
+/// (0: nichts gewaehlt).
+fn nummer_waehlen(hwnd: HWND, eintraege: &[Eintrag], x: i32, y: i32) -> u32 {
+    let Some(menue) = eintraege_bauen(eintraege) else { return 0 };
     unsafe {
-        let menue = menue_bauen(&punkte)?;
         let ausrichtung = if GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
         let _ = SetForegroundWindow(hwnd);
         let gewaehlt = TrackPopupMenu(menue, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY | ausrichtung, x, y, None, hwnd, None).0 as u32;
         let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menue);
-        befehl_zu(&punkte, gewaehlt)
+        gewaehlt
     }
+}
+
+/// Das Kontextmenue des Clients an der Stelle (x, y) zeigen und den
+/// gewaehlten Befehl liefern. Gebaut aus dem Stand dieses Augenblicks; die
+/// Wahl wird gegen genau diese Liste aufgeloest.
+fn menue_zeigen(hwnd: HWND, f: &Faden, x: i32, y: i32) -> Option<Befehl> {
+    let punkte = f.geteilt.stand.lock().map(|s| s.menue.clone()).unwrap_or_default();
+    let gewaehlt = nummer_waehlen(hwnd, &client_eintraege(&punkte), x, y);
+    befehl_zu(&punkte, gewaehlt)
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -400,16 +517,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Fassung 4: Ereignis im unteren Wort von lParam, Ankerpunkt in
             // wParam (x unten, y oben, je mit Vorzeichen).
             let ereignis = (lp.0 as u32) & 0xffff;
-            match ereignis {
-                NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => (f.befehl)(Befehl::Oeffnen),
-                WM_CONTEXTMENU => {
-                    let x = (wp.0 & 0xffff) as u16 as i16 as i32;
-                    let y = ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32;
-                    if let Some(b) = menue_zeigen(hwnd, &f, x, y) {
-                        (f.befehl)(b);
+            let x = (wp.0 & 0xffff) as u16 as i16 as i32;
+            let y = ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32;
+            match &f.art {
+                Art::Client(befehl) => match ereignis {
+                    NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => befehl(Befehl::Oeffnen),
+                    WM_CONTEXTMENU => {
+                        if let Some(b) = menue_zeigen(hwnd, &f, x, y) {
+                            befehl(b);
+                        }
+                    }
+                    _ => {}
+                },
+                Art::Allgemein { befehl, menue } => {
+                    if matches!(ereignis, NIN_SELECT | NIN_KEYSELECT | WM_CONTEXTMENU) {
+                        let eintraege = menue();
+                        let nr = nummer_waehlen(hwnd, &eintraege, x, y);
+                        if nr != 0 {
+                            befehl(nr);
+                        }
                     }
                 }
-                _ => {}
             }
             LRESULT(0)
         }
@@ -437,7 +565,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 /// Der Symbolfaden: Fenster anlegen, Symbol anmelden, Nachrichtenschleife.
-fn faden_laufen(geteilt: Arc<Geteilt>, befehl: Box<dyn Fn(Befehl) + Send>, bereit: mpsc::SyncSender<Result<isize, String>>) {
+fn faden_laufen(geteilt: Arc<Geteilt>, art: Art, bereit: mpsc::SyncSender<Result<isize, String>>) {
     let symbol = match symbol_bauen() {
         Ok(s) => s,
         Err(e) => {
@@ -467,7 +595,7 @@ fn faden_laufen(geteilt: Arc<Geteilt>, befehl: Box<dyn Fn(Befehl) + Send>, berei
         }
     };
     let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
-    let f = Rc::new(Faden { geteilt, befehl, symbol, taskbar_created });
+    let f = Rc::new(Faden { geteilt, art, symbol, taskbar_created });
     FADEN.with(|z| *z.borrow_mut() = Some(f.clone()));
     let _ = bereit.send(Ok(hwnd.0 as isize));
     // Scheitert die erste Anmeldung (kein Explorer), laeuft der Faden

@@ -87,4 +87,7 @@ windows = { version = "0.62", features = [
     # Access (pairing): random access password from the system CSPRNG
     # (BCryptGenRandom, see zugang.rs)
     "Win32_Security_Cryptography",
+    # Host role: a sound when a device asks to be allowed (MessageBeep, see
+    # host/fenster.rs)
+    "Win32_System_Diagnostics_Debug",
 ] }
