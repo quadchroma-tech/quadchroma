@@ -185,6 +185,11 @@ pub static ET: Lang = Lang {
         (FilesAbortRead, "lugemisviga"),
         (FilesAbortWrite, "kirjutamisviga"),
         (FilesAbortClipboard, "lõikelaud pole saadaval"),
+        (ScreenLabel, "Hosti ekraan"),
+        (ScreenAuto, "Automaatne"),
+        (TipScreen, "Millist hosti ekraani sa näed. Automaatne järgib põhiekraani; kindel ekraan kehtib, kuni valid midagi muud."),
+        (ScreenSwitching, "Vahetan ekraani …"),
+        (ScreenFallback, "{n} pole ühendatud – asendus: {m}"),
     ],
 };
 
@@ -370,6 +375,11 @@ pub static LV: Lang = Lang {
         (FilesAbortRead, "lasīšanas kļūda"),
         (FilesAbortWrite, "rakstīšanas kļūda"),
         (FilesAbortClipboard, "starpliktuve nav pieejama"),
+        (ScreenLabel, "Hosta ekrāns"),
+        (ScreenAuto, "Automātiski"),
+        (TipScreen, "Kuru hosta ekrānu tu redzi. Automātiski seko galvenajam ekrānam; fiksēts ekrāns ir spēkā, līdz izvēlies ko citu."),
+        (ScreenSwitching, "Pārslēdz ekrānu …"),
+        (ScreenFallback, "{n} nav pievienots – rezerve: {m}"),
     ],
 };
 
@@ -555,6 +565,11 @@ pub static LT: Lang = Lang {
         (FilesAbortRead, "skaitymo klaida"),
         (FilesAbortWrite, "rašymo klaida"),
         (FilesAbortClipboard, "iškarpinė nepasiekiama"),
+        (ScreenLabel, "Hosto ekranas"),
+        (ScreenAuto, "Automatiškai"),
+        (TipScreen, "Kurį hosto ekraną matai. Automatiškai seka pagrindinį ekraną; fiksuotas ekranas galioja, kol pasirinksi ką nors kita."),
+        (ScreenSwitching, "Keičiamas ekranas …"),
+        (ScreenFallback, "{n} neprijungtas – atsarginis: {m}"),
     ],
 };
 
@@ -740,6 +755,11 @@ pub static SL: Lang = Lang {
         (FilesAbortRead, "napaka pri branju"),
         (FilesAbortWrite, "napaka pri pisanju"),
         (FilesAbortClipboard, "odložišče ni na voljo"),
+        (ScreenLabel, "Zaslon gostitelja"),
+        (ScreenAuto, "Samodejno"),
+        (TipScreen, "Kateri zaslon gostitelja vidiš. Samodejno sledi glavnemu zaslonu; stalni zaslon velja, dokler ne izbereš česa drugega."),
+        (ScreenSwitching, "Menjava zaslona …"),
+        (ScreenFallback, "{n} ni priključen – nadomestni: {m}"),
     ],
 };
 
@@ -925,6 +945,11 @@ pub static HR: Lang = Lang {
         (FilesAbortRead, "pogreška čitanja"),
         (FilesAbortWrite, "pogreška pisanja"),
         (FilesAbortClipboard, "međuspremnik nije dostupan"),
+        (ScreenLabel, "Zaslon hosta"),
+        (ScreenAuto, "Automatski"),
+        (TipScreen, "Koji zaslon hosta vidiš. Automatski prati glavni zaslon; fiksni zaslon vrijedi dok ne odabereš nešto drugo."),
+        (ScreenSwitching, "Promjena zaslona …"),
+        (ScreenFallback, "{n} nije priključen – zamjenski: {m}"),
     ],
 };
 
@@ -1110,5 +1135,10 @@ pub static UK: Lang = Lang {
         (FilesAbortRead, "помилка читання"),
         (FilesAbortWrite, "помилка запису"),
         (FilesAbortClipboard, "буфер обміну недоступний"),
+        (ScreenLabel, "Екран хоста"),
+        (ScreenAuto, "Автоматично"),
+        (TipScreen, "Який екран хоста ти бачиш. Автоматично слідує за головним екраном; фіксований екран діє, доки ти не обереш щось інше."),
+        (ScreenSwitching, "Зміна екрана …"),
+        (ScreenFallback, "{n} не підключено – запасний: {m}"),
     ],
 };

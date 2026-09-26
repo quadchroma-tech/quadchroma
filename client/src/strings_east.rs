@@ -185,6 +185,11 @@ pub static PL: Lang = Lang {
         (FilesAbortRead, "błąd odczytu"),
         (FilesAbortWrite, "błąd zapisu"),
         (FilesAbortClipboard, "schowek niedostępny"),
+        (ScreenLabel, "Ekran hosta"),
+        (ScreenAuto, "Automatycznie"),
+        (TipScreen, "Który ekran hosta widzisz. Automatycznie podąża za ekranem głównym; stały ekran obowiązuje, dopóki nie wybierzesz czegoś innego."),
+        (ScreenSwitching, "Zmiana ekranu …"),
+        (ScreenFallback, "{n} niepodłączony – ekran zastępczy: {m}"),
     ],
 };
 
@@ -370,6 +375,11 @@ pub static CS: Lang = Lang {
         (FilesAbortRead, "chyba čtení"),
         (FilesAbortWrite, "chyba zápisu"),
         (FilesAbortClipboard, "schránka není k dispozici"),
+        (ScreenLabel, "Obrazovka hostitele"),
+        (ScreenAuto, "Automaticky"),
+        (TipScreen, "Kterou obrazovku hostitele vidíš. Automaticky sleduje hlavní obrazovku; pevná obrazovka platí, dokud nezvolíš něco jiného."),
+        (ScreenSwitching, "Přepínání obrazovky …"),
+        (ScreenFallback, "{n} nepřipojena – náhradní: {m}"),
     ],
 };
 
@@ -555,6 +565,11 @@ pub static SK: Lang = Lang {
         (FilesAbortRead, "chyba čítania"),
         (FilesAbortWrite, "chyba zápisu"),
         (FilesAbortClipboard, "schránka nie je k dispozícii"),
+        (ScreenLabel, "Obrazovka hostiteľa"),
+        (ScreenAuto, "Automaticky"),
+        (TipScreen, "Ktorú obrazovku hostiteľa vidíš. Automaticky sleduje hlavnú obrazovku; pevná obrazovka platí, kým nezvolíš niečo iné."),
+        (ScreenSwitching, "Prepínanie obrazovky …"),
+        (ScreenFallback, "{n} nepripojená – náhradná: {m}"),
     ],
 };
 
@@ -740,6 +755,11 @@ pub static HU: Lang = Lang {
         (FilesAbortRead, "olvasási hiba"),
         (FilesAbortWrite, "írási hiba"),
         (FilesAbortClipboard, "a vágólap nem érhető el"),
+        (ScreenLabel, "A gazdagép képernyője"),
+        (ScreenAuto, "Automatikus"),
+        (TipScreen, "A gazdagép melyik képernyőjét látod. Az Automatikus a fő képernyőt követi; a rögzített képernyő addig érvényes, amíg mást nem választasz."),
+        (ScreenSwitching, "Képernyőváltás …"),
+        (ScreenFallback, "{n} nincs csatlakoztatva – tartalék: {m}"),
     ],
 };
 
@@ -925,6 +945,11 @@ pub static RO: Lang = Lang {
         (FilesAbortRead, "eroare de citire"),
         (FilesAbortWrite, "eroare de scriere"),
         (FilesAbortClipboard, "clipboard indisponibil"),
+        (ScreenLabel, "Ecranul gazdei"),
+        (ScreenAuto, "Automat"),
+        (TipScreen, "Ce ecran al gazdei vezi. Automat urmează ecranul principal; un ecran fix rămâne valabil până alegi altceva."),
+        (ScreenSwitching, "Se schimbă ecranul …"),
+        (ScreenFallback, "{n} neconectat – ecran de rezervă: {m}"),
     ],
 };
 
@@ -1110,6 +1135,11 @@ pub static BG: Lang = Lang {
         (FilesAbortRead, "грешка при четене"),
         (FilesAbortWrite, "грешка при запис"),
         (FilesAbortClipboard, "клипбордът не е достъпен"),
+        (ScreenLabel, "Екран на хоста"),
+        (ScreenAuto, "Автоматично"),
+        (TipScreen, "Кой екран на хоста виждаш. Автоматично следва главния екран; фиксиран екран важи, докато не избереш нещо друго."),
+        (ScreenSwitching, "Сменя се екранът …"),
+        (ScreenFallback, "{n} не е свързан – резервен: {m}"),
     ],
 };
 
@@ -1295,5 +1325,10 @@ pub static EL: Lang = Lang {
         (FilesAbortRead, "σφάλμα ανάγνωσης"),
         (FilesAbortWrite, "σφάλμα εγγραφής"),
         (FilesAbortClipboard, "το πρόχειρο δεν είναι διαθέσιμο"),
+        (ScreenLabel, "Οθόνη του host"),
+        (ScreenAuto, "Αυτόματα"),
+        (TipScreen, "Ποια οθόνη του host βλέπεις. Το Αυτόματα ακολουθεί την κύρια οθόνη· μια σταθερή οθόνη ισχύει μέχρι να επιλέξεις κάτι άλλο."),
+        (ScreenSwitching, "Γίνεται αλλαγή οθόνης …"),
+        (ScreenFallback, "{n} δεν είναι συνδεδεμένη – εναλλακτική: {m}"),
     ],
 };

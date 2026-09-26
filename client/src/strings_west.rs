@@ -187,6 +187,11 @@ pub static FR: Lang = Lang {
         (FilesAbortRead, "erreur de lecture"),
         (FilesAbortWrite, "erreur d'écriture"),
         (FilesAbortClipboard, "presse-papiers indisponible"),
+        (ScreenLabel, "Écran de l'hôte"),
+        (ScreenAuto, "Automatique"),
+        (TipScreen, "Quel écran de l'hôte tu vois. Automatique suit l'écran principal ; un écran fixe reste valable jusqu'à ce que tu choisisses autre chose."),
+        (ScreenSwitching, "Changement d'écran …"),
+        (ScreenFallback, "{n} non connecté – écran de repli : {m}"),
     ],
 };
 
@@ -372,6 +377,11 @@ pub static ES: Lang = Lang {
         (FilesAbortRead, "error de lectura"),
         (FilesAbortWrite, "error de escritura"),
         (FilesAbortClipboard, "portapapeles no disponible"),
+        (ScreenLabel, "Pantalla del host"),
+        (ScreenAuto, "Automático"),
+        (TipScreen, "Qué pantalla del host ves. Automático sigue la pantalla principal; una pantalla fija vale hasta que elijas otra cosa."),
+        (ScreenSwitching, "Cambiando de pantalla …"),
+        (ScreenFallback, "{n} no conectada – alternativa: {m}"),
     ],
 };
 
@@ -557,6 +567,11 @@ pub static IT: Lang = Lang {
         (FilesAbortRead, "errore di lettura"),
         (FilesAbortWrite, "errore di scrittura"),
         (FilesAbortClipboard, "appunti non disponibili"),
+        (ScreenLabel, "Schermo dell'host"),
+        (ScreenAuto, "Automatico"),
+        (TipScreen, "Quale schermo dell'host vedi. Automatico segue lo schermo principale; uno schermo fisso vale finché non scegli altro."),
+        (ScreenSwitching, "Cambio schermo in corso …"),
+        (ScreenFallback, "{n} non collegato – ripiego: {m}"),
     ],
 };
 
@@ -742,6 +757,11 @@ pub static PT: Lang = Lang {
         (FilesAbortRead, "erro de leitura"),
         (FilesAbortWrite, "erro de escrita"),
         (FilesAbortClipboard, "área de transferência indisponível"),
+        (ScreenLabel, "Ecrã do host"),
+        (ScreenAuto, "Automático"),
+        (TipScreen, "Que ecrã do host vês. Automático segue o ecrã principal; um ecrã fixo vale até escolheres outra coisa."),
+        (ScreenSwitching, "A mudar de ecrã …"),
+        (ScreenFallback, "{n} não ligado – alternativa: {m}"),
     ],
 };
 
@@ -927,5 +947,10 @@ pub static NL: Lang = Lang {
         (FilesAbortRead, "leesfout"),
         (FilesAbortWrite, "schrijffout"),
         (FilesAbortClipboard, "klembord niet beschikbaar"),
+        (ScreenLabel, "Scherm van de host"),
+        (ScreenAuto, "Automatisch"),
+        (TipScreen, "Welk scherm van de host je ziet. Automatisch volgt het hoofdscherm; een vast scherm geldt tot je iets anders kiest."),
+        (ScreenSwitching, "Scherm wordt gewisseld …"),
+        (ScreenFallback, "{n} niet aangesloten – uitwijk: {m}"),
     ],
 };

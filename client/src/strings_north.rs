@@ -185,6 +185,11 @@ pub static SV: Lang = Lang {
         (FilesAbortRead, "läsfel"),
         (FilesAbortWrite, "skrivfel"),
         (FilesAbortClipboard, "urklipp är inte tillgängligt"),
+        (ScreenLabel, "Värdens skärm"),
+        (ScreenAuto, "Automatiskt"),
+        (TipScreen, "Vilken av värdens skärmar du ser. Automatiskt följer huvudskärmen; en fast skärm gäller tills du väljer något annat."),
+        (ScreenSwitching, "Byter skärm …"),
+        (ScreenFallback, "{n} inte ansluten – reserv: {m}"),
     ],
 };
 
@@ -370,6 +375,11 @@ pub static DA: Lang = Lang {
         (FilesAbortRead, "læsefejl"),
         (FilesAbortWrite, "skrivefejl"),
         (FilesAbortClipboard, "udklipsholderen er ikke tilgængelig"),
+        (ScreenLabel, "Værtens skærm"),
+        (ScreenAuto, "Automatisk"),
+        (TipScreen, "Hvilken af værtens skærme du ser. Automatisk følger hovedskærmen; en fast skærm gælder, indtil du vælger noget andet."),
+        (ScreenSwitching, "Skifter skærm …"),
+        (ScreenFallback, "{n} ikke tilsluttet – reserve: {m}"),
     ],
 };
 
@@ -555,6 +565,11 @@ pub static NB: Lang = Lang {
         (FilesAbortRead, "lesefeil"),
         (FilesAbortWrite, "skrivefeil"),
         (FilesAbortClipboard, "utklippstavlen er ikke tilgjengelig"),
+        (ScreenLabel, "Vertens skjerm"),
+        (ScreenAuto, "Automatisk"),
+        (TipScreen, "Hvilken av vertens skjermer du ser. Automatisk følger hovedskjermen; en fast skjerm gjelder til du velger noe annet."),
+        (ScreenSwitching, "Bytter skjerm …"),
+        (ScreenFallback, "{n} ikke tilkoblet – reserve: {m}"),
     ],
 };
 
@@ -740,6 +755,11 @@ pub static FI: Lang = Lang {
         (FilesAbortRead, "lukuvirhe"),
         (FilesAbortWrite, "kirjoitusvirhe"),
         (FilesAbortClipboard, "leikepöytä ei ole käytettävissä"),
+        (ScreenLabel, "Isäntäkoneen näyttö"),
+        (ScreenAuto, "Automaattinen"),
+        (TipScreen, "Minkä isäntäkoneen näytön näet. Automaattinen seuraa päänäyttöä; kiinteä näyttö on voimassa, kunnes valitset jotain muuta."),
+        (ScreenSwitching, "Näyttö vaihtuu …"),
+        (ScreenFallback, "{n} ei kytketty – varanäyttö: {m}"),
     ],
 };
 
@@ -925,5 +945,10 @@ pub static IS: Lang = Lang {
         (FilesAbortRead, "lesvilla"),
         (FilesAbortWrite, "skrifvilla"),
         (FilesAbortClipboard, "klippiborð ekki tiltækt"),
+        (ScreenLabel, "Skjár hýsilsins"),
+        (ScreenAuto, "Sjálfvirkt"),
+        (TipScreen, "Hvaða skjá hýsilsins þú sérð. Sjálfvirkt fylgir aðalskjánum; fastur skjár gildir þar til þú velur annað."),
+        (ScreenSwitching, "Skiptir um skjá …"),
+        (ScreenFallback, "{n} ekki tengdur – varaskjár: {m}"),
     ],
 };

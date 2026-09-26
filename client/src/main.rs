@@ -460,6 +460,64 @@ impl CodecWechsel {
     }
 }
 
+/// Wie ein Bildschirm des Hosts im Menue heisst: sein Name, sonst seine
+/// Kennung (ein Host ohne Namen fuer den Bildschirm schickt einen leeren).
+fn bildschirm_anzeigename(e: &bildschirm::BildschirmEintrag) -> &str {
+    if e.name.is_empty() { &e.kennung } else { &e.name }
+}
+
+/// Der Knopftext eines Bildschirms: "<Name> · <Breite>×<Hoehe> · <Hz> Hz",
+/// ohne den Hz-Teil, wenn der Host die Bildrate nicht kennt (0).
+fn bildschirm_knopftext(e: &bildschirm::BildschirmEintrag) -> String {
+    let mut t = format!("{} · {}×{}", bildschirm_anzeigename(e), e.breite, e.hoehe);
+    if e.hz > 0 {
+        t.push_str(&format!(" · {} Hz", e.hz));
+    }
+    t
+}
+
+/// Hat der Host mit dieser Liste einen Wunsch beantwortet? Ja, wenn der
+/// gestreamte Eintrag zum Wunsch passt (bei Automatik: der Hauptbildschirm),
+/// und ja, wenn der gewuenschte Bildschirm gar nicht angeschlossen ist -
+/// dann streamt der Host den Ausweichplatz, und mehr passiert erst, wenn
+/// der Bildschirm zurueckkommt.
+fn bildschirm_wunsch_beantwortet(liste: &bildschirm::Bildschirme) -> bool {
+    match liste.wunsch.as_deref() {
+        Some(k) => liste.gestreamt().is_some_and(|e| e.kennung == k) || liste.gewuenschter().is_none(),
+        None => liste.gestreamt().is_some_and(|e| e.haupt),
+    }
+}
+
+/// Die Protokollzeile zu einer Liste (auch im Pruefmodus auf der Konsole):
+/// "Bildschirme des Hosts (Wunsch <Kennung|Automatik>): <Name> <Kennung>
+/// <B>x<H> <Hz> Hz [Haupt] [gestreamt]; ...".
+fn bildschirme_zeile(liste: &bildschirm::Bildschirme) -> String {
+    let eintraege: Vec<String> = liste
+        .eintraege
+        .iter()
+        .map(|e| {
+            let mut t = String::new();
+            if !e.name.is_empty() {
+                t.push_str(&e.name);
+                t.push(' ');
+            }
+            t.push_str(&format!("{} {}x{} {} Hz", e.kennung, e.breite, e.hoehe, e.hz));
+            if e.haupt {
+                t.push_str(" [Haupt]");
+            }
+            if e.gestreamt {
+                t.push_str(" [gestreamt]");
+            }
+            t
+        })
+        .collect();
+    format!(
+        "Bildschirme des Hosts (Wunsch {}): {}",
+        liste.wunsch.as_deref().unwrap_or("Automatik"),
+        if eintraege.is_empty() { "keine".to_string() } else { eintraege.join("; ") }
+    )
+}
+
 /// Auslastung des Hosts. Was fehlt, fehlt mit Absicht: die Video-Einheit
 /// meldet ihre Auslastung nirgends, deshalb steht dort die Encoderzeit je
 /// Bild statt einer erfundenen Prozentzahl.
@@ -711,6 +769,23 @@ struct Shared {
     /// mit dem ersten Bild aus dem neuen Decoder. Solange steht das Bild
     /// still, und der Hinweis erklaert, warum.
     codec_wechsel: Option<Instant>,
+    /// Bildschirme des Hosts, wie sie mit MSG_BILDSCHIRME zuletzt ankamen,
+    /// und sein Wunsch dazu (None = Automatik, der Host folgt seinem
+    /// Hauptbildschirm). Je Sitzung zurueckgesetzt wie `codecs`.
+    bildschirme: Vec<bildschirm::BildschirmEintrag>,
+    bildschirm_wunsch: Option<String>,
+    /// Der Host kennt die Bildschirmwahl: Bit 1 (FAEHIG_BILDSCHIRM) in
+    /// MSG_FAEHIGKEITEN DIESER Sitzung. Ohne das Bit zeigt das Menue keine
+    /// Bildschirmzeile, und kein IN_BILDSCHIRM geht hinaus.
+    host_bildschirmwahl: bool,
+    /// Ein Bildschirmwunsch ist unterwegs: seit wann, und welcher (None =
+    /// Automatik). Geloescht, sobald eine Liste kommt, deren gestreamter
+    /// Eintrag zu diesem Wunsch passt (oder die ihn als nicht angeschlossen
+    /// beantwortet), sonst nach CODEC_WECHSEL_FRIST.
+    bildschirm_wechsel: Option<(Instant, Option<String>)>,
+    /// Wie oft in dieser Sitzung ein Decoder gebaut wurde - Pruefnaht: eine
+    /// Strominfo mit anderer Groesse muss einen neuen Bau ergeben.
+    decoder_baue: u32,
     /// Gewuenschter Decoderpfad (Menue, Datei oder --decoder).
     decoder_wunsch: einstellungen::DecoderWunsch,
     /// Der Wunsch hat sich geaendert: der Empfangsfaden baut den Decoder
@@ -977,6 +1052,22 @@ impl Shared {
         self.codec_wechsel.map(|t| t.elapsed() < CODEC_WECHSEL_FRIST).unwrap_or(false)
     }
 
+    /// Laeuft gerade ein Bildschirmwechsel? Dieselbe Frist wie beim Codec:
+    /// antwortet der Host nie, verschwindet der Hinweis von selbst.
+    fn bildschirm_wechsel_laeuft(&self) -> bool {
+        self.bildschirm_wechsel.as_ref().map(|(t, _)| t.elapsed() < CODEC_WECHSEL_FRIST).unwrap_or(false)
+    }
+
+    /// Sitzungsanfang und -ende fuer die Bildschirmwahl: Liste, Wunsch,
+    /// Faehigkeit und Hinweis des vorigen Hosts haben in der naechsten
+    /// Sitzung nichts mehr zu suchen.
+    fn bildschirme_zuruecksetzen(&mut self) {
+        self.bildschirme.clear();
+        self.bildschirm_wunsch = None;
+        self.host_bildschirmwahl = false;
+        self.bildschirm_wechsel = None;
+    }
+
     /// Die Latenzzerlegung samt Anzeige-Glied. Der Empfangsfaden schreibt
     /// `clock` als Ganzes; die Anzeigezeit misst der Fensterfaden und haelt
     /// sie in einem eigenen Feld, damit die beiden sich nicht ueberschreiben.
@@ -1119,6 +1210,7 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             s.connected = false;
             s.codec_wechsel = None;
             s.codec_idx = None;
+            s.bildschirme_zuruecksetzen();
             // Dateien: Sender ab, Faehigkeit zurueck (das tat schon das Ende
             // von run_session; der Empfaenger fiel mit ihr weg).
             s.dateien_zuruecksetzen()
@@ -1874,6 +1966,7 @@ fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstel
     let mut s = shared.lock().unwrap();
     s.decoder_pfad = Some(bau.pfad);
     s.decoder_hinweis = bau.grund.clone();
+    s.decoder_baue = s.decoder_baue.saturating_add(1);
     if !matches!(wunsch, einstellungen::DecoderWunsch::Automatik | einstellungen::DecoderWunsch::Software) {
         if let Some(g) = &bau.grund {
             // Der Grund steht schon im Protokoll (bau.meldung) und in der
@@ -1986,10 +2079,15 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.peer_fp = Some(fp.clone());
         s.first_time = first;
         // Die Liste des vorigen Hosts hat hier nichts mehr zu suchen; die
-        // neue kommt gleich nach dem Gruss.
+        // neue kommt gleich nach dem Gruss. Ebenso seine Strominfo: bis die
+        // neue da ist, zeigen Statistik und Wartebild sonst die Masse des
+        // vorigen Hosts.
         s.codecs.clear();
         s.codec_idx = None;
         s.codec_wechsel = None;
+        s.info = None;
+        s.bildschirme_zuruecksetzen();
+        s.decoder_baue = 0;
         s.sitzung_nr += 1;
         s.sitzung_seit = Some(Instant::now());
         s.host_zu_alt_gemeldet = false;
@@ -2186,12 +2284,29 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // kein 4:4:4).
                     let h264 = i.codec == 2;
                     let neubau = h264 != bedarf.h264 || chroma_erzwingt_neubau(&bau, i.chroma444);
+                    // Eine andere Groesse mitten in der Sitzung: der Host hat
+                    // den Bildschirm gewechselt (Spezifikation Bildschirmwahl
+                    // 1.4 und 3.1). Dann wie nach Nachricht 7: Decoder neu und
+                    // erst mit dem naechsten Vollbild weiter - die alten
+                    // Parametersaetze taugen nicht mehr, und ein Hardware-
+                    // Decoder, der drei Bilder in Folge nicht lesen kann,
+                    // fiele sonst still auf Software zurueck. So ist der
+                    // Client auch gegen einen Host robust, der nur MSG_INFO
+                    // schickt und kein MSG_SWITCH davor.
+                    let groesse_neu = info.is_some_and(|alt| (alt.width, alt.height) != (i.width, i.height));
+                    if groesse_neu {
+                        let alt = info.unwrap_or(i);
+                        protokoll::zeile(format!(
+                            "Strominfo: neue Groesse {}x{} (vorher {}x{}) - Decoder neu, warte auf Vollbild",
+                            i.width, i.height, alt.width, alt.height
+                        ));
+                    }
                     // Der Bedarf gilt ab jetzt auch fuer spaetere Baue (Wechsel
                     // des Wunsches), ob jetzt neu gebaut wird oder nicht.
                     bedarf.h264 = h264;
                     bedarf.chroma444 = Some(i.chroma444);
                     bau.chroma444 = Some(i.chroma444);
-                    if neubau {
+                    if neubau || groesse_neu {
                         bau = decoder_bauen(bedarf, wunsch).map_err(kein_decoder)?;
                         decoder_melden(shared, &bau, wunsch);
                         warte_auf_schluesselbild = true;
@@ -2234,6 +2349,26 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             MSG_CODECS => {
                 let liste = codecs_parsen(&payload);
                 shared.lock().unwrap().codecs = liste;
+            }
+            MSG_BILDSCHIRME => {
+                // Die Bildschirme des Hosts samt seinem Wunsch (Spezifikation
+                // Bildschirmwahl 2.2). Krumme Bytes oder eine fremde Fassung
+                // werden uebergangen - die letzte gute Liste bleibt stehen.
+                if let Some(liste) = bildschirm::bildschirme_lesen(&payload) {
+                    protokoll::zeile(bildschirme_zeile(&liste));
+                    let mut s = shared.lock().unwrap();
+                    // Der Hinweis "wird gewechselt" endet, sobald der Host den
+                    // Wunsch beantwortet hat: der gestreamte Eintrag passt zu
+                    // ihm, oder er ist gar nicht angeschlossen (Ausweichplatz -
+                    // mehr passiert erst, wenn er zurueckkommt).
+                    if let Some((_, gewollt)) = &s.bildschirm_wechsel {
+                        if *gewollt == liste.wunsch && bildschirm_wunsch_beantwortet(&liste) {
+                            s.bildschirm_wechsel = None;
+                        }
+                    }
+                    s.bildschirm_wunsch = liste.wunsch;
+                    s.bildschirme = liste.eintraege;
+                }
             }
             MSG_SWITCH => {
                 // Ab hier spricht der Host einen anderen Codec. Der alte
@@ -2660,14 +2795,20 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // das Dateisystem, und der Empfangsfaden darf nicht warten.
                 if let Some(bits) = dateien::faehigkeiten_lesen(&payload) {
                     let kann = dateien::kann_dateien(bits);
+                    // Bit 1: der Host kennt die Bildschirmwahl (Spezifikation
+                    // Bildschirmwahl 2.1). Erst damit zeigt das Menue die
+                    // Zeile, und erst damit geht ein Wunsch hinaus.
+                    let bildschirmwahl = bits & FAEHIG_BILDSCHIRM != 0;
                     {
                         let mut s = shared.lock().unwrap();
                         s.host_dateien = kann;
+                        s.host_bildschirmwahl = bildschirmwahl;
                         s.faehigkeiten_da = true;
                     }
                     protokoll::zeile(format!(
-                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}",
-                        if kann { "ja" } else { "nein" }
+                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}, Bildschirmwahl {}",
+                        if kann { "ja" } else { "nein" },
+                        if bildschirmwahl { "ja" } else { "nein" }
                     ));
                 }
             }
@@ -2757,7 +2898,11 @@ struct SitzungsEnde<'a>(&'a Arc<Mutex<Shared>>);
 impl Drop for SitzungsEnde<'_> {
     fn drop(&mut self) {
         let griff = match self.0.lock() {
-            Ok(mut s) => s.dateien_zuruecksetzen(),
+            Ok(mut s) => {
+                // Die Bildschirmwahl gilt nur je Sitzung, wie die Dateien.
+                s.bildschirme_zuruecksetzen();
+                s.dateien_zuruecksetzen()
+            }
             Err(_) => None,
         };
         // Ausserhalb der Sperre: Griff::drop bricht ab und kehrt sofort zurueck.
@@ -3373,7 +3518,8 @@ struct InputLink {
 type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
 
 /// Nachrichten, die einen Zustand setzen statt ein Ereignis zu melden:
-/// Faehigkeiten, Einstellungen, Codec, Testbild, Zwischenablage. Steht der
+/// Faehigkeiten, Einstellungen, Codec, Testbild, Zwischenablage,
+/// Bildschirmwunsch. Steht der
 /// Kanal gerade nicht (Aufbau im Hintergrund, Schreibfaden gescheitert),
 /// wird je Art die letzte gemerkt und nachgereicht, sobald er steht -
 /// frueher baute das naechste `send` den Kanal selbst auf und lieferte sie
@@ -3385,7 +3531,7 @@ type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
 /// haengen. IN_FAEHIGKEITEN geht ohnehin als erste Nachricht auf jedem neu
 /// stehenden Kanal hinaus (siehe ensure); gemerkt wird sie trotzdem, falls
 /// sie jemand ohne Kanal sendet.
-const NACHREICHEN: [u8; 5] = [IN_FAEHIGKEITEN, IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP];
+const NACHREICHEN: [u8; 6] = [IN_FAEHIGKEITEN, IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP, IN_BILDSCHIRM];
 
 /// Was dieser Client kann (Spezifikation 2.2), als erste Nachricht auf
 /// jedem Eingabekanal: Dateien Fassung 1. Ein aelterer Host uebergeht sie
@@ -3894,6 +4040,15 @@ impl InputLink {
         self.send(IN_CODEC, &[idx]);
     }
 
+    /// Wunsch an den Host: diesen Bildschirm streamen (None = Automatik,
+    /// der Host folgt seinem Hauptbildschirm). Die Antwort kommt ueber den
+    /// Bildkanal als Nachricht 12; die Bytes macht bildschirm.rs. Nur fuer
+    /// einen Host mit FAEHIG_BILDSCHIRM - das prueft der Aufrufer
+    /// (bildschirm_wunsch_senden).
+    fn bildschirm(&mut self, wunsch: Option<&str>) {
+        self.send(IN_BILDSCHIRM, &bildschirm::wunsch_kodieren(wunsch));
+    }
+
     /// Wunsch an den Host: Testbild an oder aus. Ein Host, der die
     /// Nachricht nicht kennt, uebergeht sie - dann laeuft der Benchmark
     /// eben auf dem Bildschirminhalt.
@@ -3971,6 +4126,26 @@ impl InputLink {
         p[4..8].copy_from_slice(&dy.to_le_bytes());
         self.send(IN_SCROLL, &p);
     }
+}
+
+/// Ein Bildschirmwunsch an den Host (None = Automatik), aus dem Menue oder
+/// dem Pruefmodus. Nur, wenn der Host die Wahl in dieser Sitzung gemeldet
+/// hat (Bit 1 seiner Faehigkeiten) - ein aelterer Host bekommt nie Typ 70.
+/// Erst den Hinweis setzen, dann den Wunsch abschicken (wie
+/// codec_wuenschen: sonst koennte die Antwort den Hinweis loeschen, bevor
+/// er steht). `shared` und `input` werden nacheinander genommen, nie
+/// ineinander. Liefert, ob der Wunsch hinausging (oder zum Nachreichen
+/// gemerkt ist).
+fn bildschirm_wunsch_senden(shared: &Mutex<Shared>, input: &Mutex<InputLink>, wunsch: Option<String>) -> bool {
+    {
+        let mut s = shared.lock().unwrap();
+        if !s.host_bildschirmwahl {
+            return false;
+        }
+        s.bildschirm_wechsel = Some((Instant::now(), wunsch.clone()));
+    }
+    input.lock().unwrap().bildschirm(wunsch.as_deref());
+    true
 }
 
 /// Je Durchlauf des Fensterfadens (about_to_wait): Der Eingabekanal haengt am
@@ -5492,7 +5667,7 @@ impl ApplicationHandler<Benutzer> for App {
             (
                 s.frame.is_some(),
                 s.error_key.is_some() || s.datei_stand.sichtbar(Instant::now()),
-                s.wechsel_laeuft(),
+                s.wechsel_laeuft() || s.bildschirm_wechsel_laeuft(),
             )
         };
         // Ein ausgelassenes Present (DXGI war noch nicht bereit) wird beim
@@ -5691,6 +5866,12 @@ impl App {
     fn codec_wuenschen(&mut self, idx: u8) {
         self.shared.lock().unwrap().codec_wechsel = Some(Instant::now());
         self.input.lock().unwrap().codec(idx);
+    }
+
+    /// Wunsch nach einem Bildschirm des Hosts (None = Automatik), aus dem
+    /// Menue. Reihenfolge wie beim Codec: erst der Hinweis, dann der Wunsch.
+    fn bildschirm_wuenschen(&mut self, wunsch: Option<String>) {
+        bildschirm_wunsch_senden(&self.shared, &self.input, wunsch);
     }
 
     fn verbindung_trennen(&mut self) {
@@ -6239,7 +6420,7 @@ impl App {
         // Oberflaeche wird nicht mehr je Videobild neu gezeichnet.
         let (lage, wechsel) = {
             let s = self.shared.lock().unwrap();
-            (s.error_key.is_some() || s.datei_stand.sichtbar(jetzt), s.wechsel_laeuft())
+            (s.error_key.is_some() || s.datei_stand.sichtbar(jetzt), s.wechsel_laeuft() || s.bildschirm_wechsel_laeuft())
         };
         let sichtbar = self.oberflaeche_sichtbar(lage, wechsel);
         let mut nach = None;
@@ -6568,6 +6749,10 @@ impl App {
                             sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(), sh.decoder_wunsch, sh.decoder_pfad,
                         )
                     };
+                    let (bildschirmwahl, bildschirme, bildschirm_wunsch, bildschirm_wechsel) = {
+                        let sh = self.shared.lock().unwrap();
+                        (sh.host_bildschirmwahl, sh.bildschirme.clone(), sh.bildschirm_wunsch.clone(), sh.bildschirm_wechsel_laeuft())
+                    };
                     let gespeichert = self
                         .angewandt_fuer
                         .as_ref()
@@ -6588,6 +6773,10 @@ impl App {
                         codecs,
                         codec_idx,
                         wechsel,
+                        bildschirmwahl,
+                        bildschirme,
+                        bildschirm_wunsch,
+                        bildschirm_wechsel,
                         decoder: decoder_wunsch,
                         decoder_aktiv,
                         karten: self.karten.clone(),
@@ -6609,11 +6798,22 @@ impl App {
                     return n;
                 }
 
-                // Codecwechsel unterwegs: der Host baut den Encoder um, das
-                // Bild steht ein paar hundert Millisekunden. Ohne Hinweis
-                // saehe das nach einem Haenger aus.
-                if self.shared.lock().unwrap().wechsel_laeuft() {
-                    let t = self.lang.get(strings::Key::CodecSwitching);
+                // Codec- oder Bildschirmwechsel unterwegs: der Host baut den
+                // Encoder um bzw. startet den Strom neu, das Bild steht ein
+                // paar hundert Millisekunden. Ohne Hinweis saehe das nach
+                // einem Haenger aus.
+                let hinweis = {
+                    let s = self.shared.lock().unwrap();
+                    if s.wechsel_laeuft() {
+                        Some(strings::Key::CodecSwitching)
+                    } else if s.bildschirm_wechsel_laeuft() {
+                        Some(strings::Key::ScreenSwitching)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(k) = hinweis {
+                    let t = self.lang.get(k);
                     let bw = (self.ui.text.width(t, 12, 2) + 60).max(220).min(ww as i32 - 40);
                     let bh = 44i32;
                     let bx = ww as i32 / 2 - bw / 2;
@@ -6712,6 +6912,7 @@ impl App {
             }
             HudAktion::Stellen(m, f, g, fx, ton) => self.stellen(m, f, g, fx, ton),
             HudAktion::Codec(idx) => self.codec_wuenschen(idx),
+            HudAktion::Bildschirm(w) => self.bildschirm_wuenschen(w),
             // --- Benchmark: Konfiguration nur, solange keiner laeuft -----
             HudAktion::BenchCodec(idx) => {
                 let aus = &mut self.bench_konfig.codecs_aus;
@@ -7705,12 +7906,27 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             Karte { index: 0, name: "NVIDIA GeForce RTX 3080 Ti Laptop GPU".into(), vendor: 0x10de, speicher_mb: 16384, hat_ausgang: false, luid: 1, rolle: Rolle::Grafikkarte(1) },
             Karte { index: 1, name: "Intel(R) Iris(R) Xe Graphics".into(), vendor: 0x8086, speicher_mb: 128, hat_ausgang: true, luid: 2, rolle: Rolle::Integriert },
         ];
+        // Nachgestellte Bildschirmliste, wie sie der Mac mini schickt
+        // (Spezifikation Bildschirmwahl 2.4): Monitor und virtueller
+        // Bildschirm, Automatik, der Monitor ist Haupt und wird gestreamt.
+        let bildschirme = vec![
+            bildschirm::BildschirmEintrag {
+                kennung: "v1138-m1234-s0".into(), name: "X27 X1".into(), breite: 1920, hoehe: 1080, hz: 120, haupt: true, gestreamt: true,
+            },
+            bildschirm::BildschirmEintrag {
+                kennung: "v0-m0-s0".into(), name: "Virtuell 16:9".into(), breite: 1920, hoehe: 1080, hz: 240, haupt: false, gestreamt: false,
+            },
+        ];
         let stand = HudStand {
             vollbild: true, pixelgenau: false, statistik: true, nerd: true,
             wahl: einstellungen::StatWahl::default(),
             codecs,
             codec_idx: None,
             wechsel: false,
+            bildschirmwahl: true,
+            bildschirme,
+            bildschirm_wunsch: None,
+            bildschirm_wechsel: false,
             decoder: einstellungen::DecoderWunsch::Automatik,
             decoder_aktiv: Some(DecoderPfad::Nvdec(Some(1))),
             karten,
@@ -7810,11 +8026,20 @@ fn write_bmp(path: &str, w: usize, h: usize, buf: &[u32], lang: &'static strings
     println!("geschrieben: {path} ({w}x{h}, Sprache {})", lang.name);
 }
 
+/// Die Groesse hinter "@" einer --shot-Ansicht, "BxH" in Pixeln; None, wenn
+/// sie nicht lesbar ist (dann gilt die Vorgabe der Ansicht). Begrenzt auf
+/// 320..=7680 je Seite, damit ein Tippfehler keinen Riesenpuffer anlegt.
+fn shot_groesse(g: &str) -> Option<(usize, usize)> {
+    let (b, h) = g.split_once('x')?;
+    let (b, h): (usize, usize) = (b.parse().ok()?, h.parse().ok()?);
+    ((320..=7680).contains(&b) && (320..=7680).contains(&h)).then_some((b, h))
+}
+
 /// Schalter mit Werten: ihre Werte sind nie die Adresse. Ohne diese Liste
 /// wurde aus `--anzeige cpu` die Adresse "cpu:9001" - und die echte Adresse
 /// dahinter ignoriert.
 const WERTIG: &[(&str, usize)] = &[
-    ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1),
+    ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1), ("--bildschirm", 1),
     ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
     ("--benchmark-auswahl", 1), ("--mitschnitt", 1),
     // Desktop-Verknuepfung: --verknuepfung <adresse> [--name <name>]
@@ -8065,11 +8290,19 @@ fn main() {
         let path = args.get(i + 1).cloned().unwrap_or_else(|| "ui.bmp".into());
         let code = args.get(i + 2).cloned().unwrap_or_else(|| "de".into());
         let view = args.get(i + 3).cloned().unwrap_or_else(|| "start".into());
-        let (w, h) = if view == "sitzung" || view == "nerd" || view.starts_with("dateien") || view.starts_with("hud") {
-            (1280, 720)
-        } else {
-            (900, 700)
+        // "ansicht@BxH" zeichnet in dieser Groesse statt der Vorgabe - fuer
+        // die Pruefung des Menues bei 1920x1080, wo alles 1,5-fach skaliert.
+        let (view, groesse) = match view.split_once('@') {
+            Some((v, g)) => (v.to_string(), shot_groesse(g)),
+            None => (view, None),
         };
+        let (w, h) = groesse.unwrap_or(
+            if view == "sitzung" || view == "nerd" || view.starts_with("dateien") || view.starts_with("hud") {
+                (1280, 720)
+            } else {
+                (900, 700)
+            },
+        );
         screenshot(&path, w, h, strings::pick(&code), &view);
         return;
     }
@@ -8232,6 +8465,13 @@ fn main() {
             let args: Vec<String> = std::env::args().collect();
             codec_wunsch = args.get(i + 1).and_then(|v| v.parse().ok());
         }
+        // Einmaliger Bildschirmwunsch aus der Befehlszeile: --bildschirm
+        // <Kennung|auto> (Spezifikation Bildschirmwahl 3.1). Aeusseres Some:
+        // ein Wunsch liegt vor; inneres None: Automatik.
+        let mut bildschirm_wunsch: Option<Option<String>> = std::env::args()
+            .position(|a| a == "--bildschirm")
+            .and_then(|i| std::env::args().nth(i + 1))
+            .map(|v| if v == "auto" { None } else { Some(v) });
         // --benchmark [dauer]: derselbe Ablauf wie im Reiter, angetrieben
         // aus diesem Takt, Tabelle und Empfehlung auf die Konsole, danach
         // Schluss. Testbild an, ausser mit --ohne-testbild.
@@ -8409,9 +8649,12 @@ fn main() {
             // Der laufende Codec steht in jeder Zeile, damit ein Wechsel im
             // Protokoll sichtbar wird - derselbe Name wie im Menue und Overlay.
             let codec = s.info.map(|i| i.codec_name()).unwrap_or_else(|| "?".into());
+            // Dazu die Masse des Stroms: ein Bildschirmwechsel des Hosts wird
+            // so in der Zeile sichtbar, auch wenn der Codec bleibt.
+            let strom = s.info.map(|i| format!("{}x{}@{}", i.width, i.height, i.fps)).unwrap_or_else(|| "?".into());
             let line = format!(
-                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Decoder {} | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, pfad, lat, hl, fehler
+                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Strom {} | Decoder {} | {}{} | Fehler {:?}",
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, strom, pfad, lat, hl, fehler
             );
             println!("{line}");
             std::io::stdout().flush().ok();
@@ -8419,7 +8662,23 @@ fn main() {
             // aufgehen, wenn der Bildkanal steht, und das wollen wir sehen.
             let link = s.link.clone();
             let cur = s.settings;
+            let (faehig_da, bildschirmwahl) = (s.faehigkeiten_da, s.host_bildschirmwahl);
             drop(s);
+            // --bildschirm <Kennung|auto> wuenscht einmal einen Bildschirm:
+            // erst, wenn der Eingabekanal steht und der Host die Wahl
+            // gemeldet hat (Bit 1) - ein aelterer Host bekommt nie Typ 70,
+            // das sagt die Zeile dann statt des Wunsches.
+            if let Some(w) = bildschirm_wunsch.as_ref() {
+                if input.lock().unwrap().steht() {
+                    if bildschirm_wunsch_senden(&shared, &input, w.clone()) {
+                        println!("Bildschirmwunsch gesendet: {}", w.as_deref().unwrap_or("auto"));
+                        bildschirm_wunsch = None;
+                    } else if faehig_da && !bildschirmwahl {
+                        println!("Bildschirmwunsch nicht gesendet: der Host kennt keine Bildschirmwahl");
+                        bildschirm_wunsch = None;
+                    }
+                }
+            }
             {
                 let mut l = input.lock().unwrap();
                 l.set_link(link);
@@ -8602,6 +8861,8 @@ pub enum HudAktion {
     Schalter(u8),
     /// Wunsch nach diesem Kandidaten der Koennensliste.
     Codec(u8),
+    /// Wunsch nach diesem Bildschirm des Hosts (Kennung), None = Automatik.
+    Bildschirm(Option<String>),
     /// Anderer Decoderpfad gewuenscht.
     Decoder(einstellungen::DecoderWunsch),
     /// Andere Anzeige gewuenscht - wird gespeichert, gilt ab dem naechsten Start.
@@ -8653,6 +8914,13 @@ pub struct HudStand {
     pub codec_idx: Option<u8>,
     /// Ein Codecwunsch ist unterwegs.
     pub wechsel: bool,
+    /// Bildschirmwahl im Reiter "Bild": kennt der Host sie (Bit 1 seiner
+    /// Faehigkeiten - sonst keine Zeile), seine Liste, sein Wunsch (None =
+    /// Automatik) und ob ein Bildschirmwunsch unterwegs ist.
+    pub bildschirmwahl: bool,
+    pub bildschirme: Vec<bildschirm::BildschirmEintrag>,
+    pub bildschirm_wunsch: Option<String>,
+    pub bildschirm_wechsel: bool,
     /// Gewuenschter Decoderpfad und der, der wirklich laeuft.
     pub decoder: einstellungen::DecoderWunsch,
     pub decoder_aktiv: Option<DecoderPfad>,
@@ -8949,12 +9217,80 @@ fn hud(
                 u.text.draw_right(c, x0 + breite - rand, cy + p(146), lang.get(SavedForHost), sz(11), ui::DIM, p(1));
             }
 
+            // --- Bildschirmwahl: "Automatisch" und ein Knopf je Bildschirm --
+            // Nur, wenn der Host die Wahl kennt (Bit 1 seiner Faehigkeiten).
+            // Der gestreamte Eintrag in Cyan; bei Automatik dazu
+            // "Automatisch", bei festem Wunsch der gewuenschte Eintrag, falls
+            // er angeschlossen ist. Rechts in Amber: der laufende Wechsel,
+            // sonst der Ausweichplatz, wenn der gewuenschte Bildschirm fehlt.
+            // Die Knoepfe fliessen zeilenweise wie die Codecknoepfe; der
+            // Codecblock rueckt darunter, der Fusszeilenschutz bleibt.
+            // Ohne die Zeile steht der Codecblock, wo er immer stand.
+            let mut oy = cy + p(176);
+            if stand.bildschirmwahl {
+                let ly = cy + p(170);
+                let lw = u.text.width(lang.get(ScreenLabel), sz(11), p(3));
+                u.text.draw(c, ix, ly, lang.get(ScreenLabel), sz(11), ui::DIM, p(3));
+                let gestreamt = stand.bildschirme.iter().find(|e| e.gestreamt);
+                let fehlt = stand
+                    .bildschirm_wunsch
+                    .as_deref()
+                    .filter(|w| !stand.bildschirme.iter().any(|e| e.kennung == *w));
+                let hinweis: Option<String> = if stand.bildschirm_wechsel {
+                    Some(lang.get(ScreenSwitching).to_string())
+                } else {
+                    fehlt.map(|w| {
+                        let m = gestreamt.map(bildschirm_anzeigename).unwrap_or("?");
+                        lang.get(ScreenFallback).replace("{n}", w).replace("{m}", m)
+                    })
+                };
+                if let Some(h) = hinweis {
+                    let t = kuerzen(u, &h, iw - lw - p(24), sz(11), p(1));
+                    u.text.draw_right(c, x0 + breite - rand, ly, &t, sz(11), ui::AMBER, p(1));
+                }
+                if (ui::Rect { x: ix, y: ly - p(12), w: iw, h: p(16) }).hit(maus.0, maus.1) {
+                    tip = Some(TipScreen);
+                }
+                // Knopf: Text, in Cyan, schon der Wunsch (dann kein Klick),
+                // und was ein Klick wuenscht (None = Automatik).
+                let auto = stand.bildschirm_wunsch.is_none();
+                let mut knoepfe: Vec<(String, bool, bool, Option<String>)> =
+                    vec![(lang.get(ScreenAuto).to_string(), auto, auto, None)];
+                for e in &stand.bildschirme {
+                    let gewuenscht = stand.bildschirm_wunsch.as_deref() == Some(e.kennung.as_str());
+                    knoepfe.push((bildschirm_knopftext(e), e.gestreamt || gewuenscht, gewuenscht, Some(e.kennung.clone())));
+                }
+                let mut kx = ix;
+                let mut ky = ly + p(10);
+                let kh = p(30);
+                let pitch = p(40);
+                let luecke = p(10);
+                let mut letzte = ky;
+                for (text, cyan, ist_wunsch, wunsch) in knoepfe {
+                    let bw = u.text.width(&text, 15, 2) + p(28);
+                    if kx + bw > ix + iw && kx > ix {
+                        kx = ix;
+                        ky += pitch;
+                    }
+                    if ky + kh + p(14) > fy - p(24) {
+                        break;
+                    }
+                    let r = ui::Rect { x: kx, y: ky, w: bw, h: kh };
+                    if r.hit(maus.0, maus.1) { tip = Some(TipScreen); }
+                    if u.button(c, r, &text, if cyan { ui::CYAN } else { ui::DIM }) && !ist_wunsch {
+                        aktion = HudAktion::Bildschirm(wunsch);
+                    }
+                    letzte = ky;
+                    kx += bw + luecke;
+                }
+                oy = letzte + kh + p(22);
+            }
+
             // --- Codecwahl: ein Knopf je Eintrag der Koennensliste ----------
             // Der laufende Eintrag in Cyan, die anderen gedaempft, was der
             // Mac nicht kann, noch dunkler und ohne Klick. Die Knoepfe
             // fliessen zeilenweise, damit auch ein schmales Fenster alle zeigt.
             if !stand.codecs.is_empty() {
-                let oy = cy + p(176);
                 u.text.draw(c, ix, oy, lang.get(Codec), sz(11), ui::DIM, p(3));
                 let suffix = lang.get(CodecConverted);
                 // Farbe fuer "nicht verfuegbar": noch stiller als DIM.
@@ -9835,12 +10171,16 @@ mod tests {
         l.key(7, true, 0);
         l.codec(2);
         l.settings(20, 120, true, true, false);
+        // Der Bildschirmwunsch ist ebenfalls ein Zustand (Spezifikation
+        // Bildschirmwahl 2.3): der letzte je Art wird gemerkt.
+        l.bildschirm(Some("v1138-m1234-s0"));
+        l.bildschirm(Some("v0-m0-s0"));
         assert!(!l.steht());
         assert_eq!(l.sent, 0);
         eingabe_abwarten(&mut l);
         assert!(l.steht());
-        // Die Faehigkeiten vorweg, dann die drei gemerkten Zustaende.
-        assert_eq!(l.sent, 4);
+        // Die Faehigkeiten vorweg, dann die vier gemerkten Zustaende.
+        assert_eq!(l.sent, 5);
         l.key(9, true, 0);
         let _ = los.send(());
         let (gelesen, _) = host.join().unwrap();
@@ -9856,6 +10196,7 @@ mod tests {
                 (IN_TESTBILD, vec![1]),
                 (IN_CODEC, vec![2]),
                 (IN_SETTINGS, einst),
+                (IN_BILDSCHIRM, bildschirm::wunsch_kodieren(Some("v0-m0-s0"))),
                 (IN_KEY, taste)
             ]
         );
@@ -10344,6 +10685,23 @@ mod tests {
         assert_eq!(adresse_aus_argumenten(&argumente(&[])), "");
     }
 
+    /// --bildschirm und sein Wert (Kennung oder "auto") sind nie die
+    /// Verbindungsadresse (Spezifikation Bildschirmwahl 3.1, WERTIG).
+    #[test]
+    fn bildschirm_nie_als_adresse() {
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--bildschirm", "v0-m0-s0"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--bildschirm", "auto"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--headless", "--bildschirm", "v0-m0-s0", "h"])), "h:9001");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["h:9101", "--bildschirm", "auto"])), "h:9101");
+        assert!(WERTIG.iter().any(|(s, n)| *s == "--bildschirm" && *n == 1));
+        // --shot: die Groesse hinter "@" der Ansicht.
+        assert_eq!(shot_groesse("1920x1080"), Some((1920, 1080)));
+        assert_eq!(shot_groesse("1280x720"), Some((1280, 720)));
+        assert_eq!(shot_groesse("gross"), None);
+        assert_eq!(shot_groesse("10x10"), None);
+        assert_eq!(shot_groesse("1920x"), None);
+    }
+
     /// Die Selbsttests des Symbols (--tray-selbsttest, --menueleiste-
     /// selbsttest) haben keinen Wert: nie eine Adresse, und eine Angabe
     /// dahinter gehoert nicht zu ihnen.
@@ -10410,6 +10768,319 @@ mod tests {
         let r = rx.recv_timeout(Duration::from_secs(3));
         halt.store(true, Ordering::SeqCst);
         assert!(matches!(r, Ok(Ok(()))), "Sitzung lief nach dem Zielwechsel weiter: {r:?}");
+    }
+
+    /// Hexbytes, wie sie in der Spezifikation stehen.
+    fn hex(s: &str) -> Vec<u8> {
+        s.split_whitespace().map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
+    }
+
+    /// Zwei winzige H.264-Vollbilder (x264 Baseline, ohne SEI): 64x64 und
+    /// 96x64, je SPS, PPS und IDR - fuer einen Scheinhost, der Bilder schickt.
+    const BILD_64X64: &str = "00 00 00 01 67 42 c0 0a dc 42 6c 04 40 00 00 03 00 40 00 00 0f 23 c4 89 e0 \
+        00 00 00 01 68 ce 0f c8 00 00 00 01 65 88 84 3a 11 8a 00 02 18 f1 c0 00 40 f6 38 00 08 79 49 c9 c9 \
+        d7 5d 75 d7 5d 75 d7 5d 75 e0";
+    const BILD_96X64: &str = "00 00 00 01 67 42 c0 0a dc 62 6c 04 40 00 00 03 00 40 00 00 0f 23 c4 89 e0 \
+        00 00 00 01 68 ce 0f c8 00 00 00 01 65 88 84 3a 11 8a 00 02 31 71 c0 00 43 ca 38 00 08 05 c9 c9 c9 \
+        c9 c9 d7 5d 75 d7 5d 75 d7 5d 75 d7 5d 75 d7 5e";
+
+    /// Die Liste aus den Pruefvektoren der Spezifikation (Bildschirmwahl
+    /// 2.4): "X27 X1" (Haupt, gestreamt) und "Virtuell 16:9", Automatik.
+    const BILDSCHIRME_2_4: &str = "01 02 00 00 \
+        0e 06 80 07 38 04 78 00 03 00 76 31 31 33 38 2d 6d 31 32 33 34 2d 73 30 58 32 37 20 58 31 \
+        08 0d 80 07 38 04 f0 00 00 00 76 30 2d 6d 30 2d 73 30 56 69 72 74 75 65 6c 6c 20 31 36 3a 39";
+
+    /// Ein Scheinhost am Bildkanal: nimmt einen Client an, schickt MAGIC und
+    /// danach alles, was der Test ueber den Sender reicht; faellt der
+    /// Sender, geht die Leitung zu. Liefert Adresse und Sender.
+    fn scheinhost_bild() -> (String, std::sync::mpsc::Sender<Vec<u8>>) {
+        use std::net::TcpListener;
+        let (host_priv, _) = test_host();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let Ok((s, _)) = l.accept() else { return };
+            let Ok(mut sock) = secure::Secure::accept(s, &noise::prologue_video(), &host_priv) else { return };
+            if sock.write_all(MAGIC).is_err() {
+                return;
+            }
+            while let Ok(m) = rx.recv() {
+                if sock.write_all(&m).is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, tx)
+    }
+
+    /// run_session gegen den Scheinhost, im eigenen Faden; Software-Decoder.
+    fn sitzung_starten(addr: &str) -> (Arc<Mutex<Shared>>, Arc<Mutex<InputLink>>, std::sync::mpsc::Receiver<Result<(), Meldung>>) {
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr.to_string()),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (s, i, a) = (shared.clone(), input.clone(), addr.to_string());
+            std::thread::spawn(move || {
+                let _ = tx.send(run_session(&a, &s, &i));
+            });
+        }
+        (shared, input, rx)
+    }
+
+    /// Eine Strominfo mit dieser Groesse: 30 fps, H.264, 4:2:0 8 Bit.
+    fn strominfo(w: u16, h: u16) -> Vec<u8> {
+        let mut p = w.to_le_bytes().to_vec();
+        p.extend_from_slice(&h.to_le_bytes());
+        p.extend_from_slice(&30u16.to_le_bytes());
+        p.extend_from_slice(&[2, 3, 1, 0]);
+        eingabe_rahmen(MSG_INFO, &p)
+    }
+
+    /// Eine Bildnachricht mit Bildnummer und Vollbild-Flagge.
+    fn bildnachricht(bild: &[u8], vollbild: bool, seq: u16) -> Vec<u8> {
+        let mut m = vec![MSG_VIDEO, if vollbild { FLAG_KEY } else { 0 }];
+        m.extend_from_slice(&seq.to_le_bytes());
+        m.extend_from_slice(&(bild.len() as u32).to_le_bytes());
+        m.extend_from_slice(bild);
+        m
+    }
+
+    /// Eine Strominfo mit anderer Groesse mitten in der Sitzung
+    /// (Spezifikation Bildschirmwahl 3.1): der Decoder wird neu gebaut, und
+    /// bis zum naechsten Vollbild wird nichts decodiert - auch nicht ein
+    /// Bild, das der alte Decoder gelesen haette. Gleiche Groesse noch einmal:
+    /// kein neuer Bau. Gegenprobe: ohne die Regel zaehlt `decoder_baue` nach
+    /// der zweiten Strominfo nicht hoch, und das Bild ohne Flagge wird
+    /// decodiert (decodiert 4 statt 3).
+    #[test]
+    fn strominfo_mit_neuer_groesse_baut_den_decoder_neu() {
+        secure::test_identitaet();
+        ffmpeg::init().unwrap();
+        let (addr, tx) = scheinhost_bild();
+        let (shared, _input, ende) = sitzung_starten(&addr);
+        let frist = Duration::from_secs(10);
+        let decodiert = || shared.lock().unwrap().decoded;
+        let baue = || shared.lock().unwrap().decoder_baue;
+        let (b64, b96) = (hex(BILD_64X64), hex(BILD_96X64));
+        // Strominfo 64x64 H.264: der Decoder (erst HEVC) wird fuer H.264 neu
+        // gebaut - der zweite Bau der Sitzung.
+        tx.send(strominfo(64, 64)).unwrap();
+        assert!(warten_bis(frist, || baue() == 2), "kein H.264-Decoder: {} Baue", baue());
+        // Ein Vollbild, dann dasselbe Bild ohne Flagge: beide werden decodiert.
+        tx.send(bildnachricht(&b64, true, 1)).unwrap();
+        tx.send(bildnachricht(&b64, false, 2)).unwrap();
+        assert!(warten_bis(frist, || decodiert() == 2), "decodiert {}", decodiert());
+        // Neue Groesse bei gleichem Codec: ein neuer Decoder ...
+        tx.send(strominfo(96, 64)).unwrap();
+        assert!(warten_bis(frist, || baue() == 3), "kein neuer Decoder nach der Groessenaenderung: {} Baue", baue());
+        // ... und bis zum naechsten Vollbild nichts: das Bild ohne Flagge
+        // faellt weg, das Vollbild danach kommt an. Die Lagenachricht
+        // dahinter zeigt, dass alles davor verarbeitet ist.
+        tx.send(bildnachricht(&b96, false, 3)).unwrap();
+        tx.send(bildnachricht(&b96, true, 4)).unwrap();
+        tx.send(eingabe_rahmen(MSG_HOSTSTATUS, &[1, 0])).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().error_key == Some(strings::Key::NoDisplay)));
+        assert_eq!(decodiert(), 3, "ein Bild ohne Vollbild-Flagge nach der Groessenaenderung wurde decodiert");
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.info.map(|i| (i.width, i.height)), Some((96, 64)));
+            match &s.frame {
+                Some(Bild::Rgb(f)) => assert_eq!((f.width, f.height), (96, 64)),
+                _ => panic!("kein Bild aus dem neuen Decoder"),
+            }
+        }
+        // Dieselbe Groesse noch einmal: kein neuer Bau, nichts wartet.
+        tx.send(strominfo(96, 64)).unwrap();
+        tx.send(bildnachricht(&b96, false, 5)).unwrap();
+        tx.send(eingabe_rahmen(MSG_HOSTSTATUS, &[0, 0])).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().error_key.is_none()));
+        assert_eq!(baue(), 3);
+        assert_eq!(decodiert(), 4);
+        drop(tx);
+        assert!(ende.recv_timeout(frist).is_ok(), "Sitzung endete nicht mit der Leitung");
+    }
+
+    /// Bildschirmwahl ueber die Sitzung (Spezifikation Bildschirmwahl 2.1,
+    /// 2.2, 3.1): ohne Bit 1 der Faehigkeiten geht kein Wunsch hinaus; mit
+    /// Bit 1 landet die Liste der Pruefvektoren in Shared; ein Wunsch setzt
+    /// den Hinweis und legt Typ 70 zum Nachreichen bereit; die Antwort des
+    /// Hosts beendet den Hinweis erst, wenn der gestreamte Eintrag zum
+    /// Wunsch passt (oder der Wunsch nicht angeschlossen ist), eine fremde
+    /// Antwort nicht; krumme Bytes aendern nichts; die Strominfo des vorigen
+    /// Hosts ist zu Beginn weg; am Ende ist alles zurueckgesetzt.
+    #[test]
+    fn bildschirme_ueber_die_sitzung() {
+        secure::test_identitaet();
+        ffmpeg::init().unwrap();
+        let (addr, tx) = scheinhost_bild();
+        let shared_vor = Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr.clone()),
+            // Reste eines vorigen Hosts: Strominfo, Liste, Faehigkeit.
+            info: Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true }),
+            host_bildschirmwahl: true,
+            bildschirm_wunsch: Some("alt".into()),
+            ..Shared::default()
+        };
+        let shared = Arc::new(Mutex::new(shared_vor));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        let (ende_tx, ende) = std::sync::mpsc::channel();
+        {
+            let (s, i, a) = (shared.clone(), input.clone(), addr.clone());
+            std::thread::spawn(move || {
+                let _ = ende_tx.send(run_session(&a, &s, &i));
+            });
+        }
+        let frist = Duration::from_secs(10);
+        let liste = |wunsch: Option<&str>, gestreamt: usize| {
+            let mut b = bildschirm::bildschirme_lesen(&hex(BILDSCHIRME_2_4)).unwrap();
+            b.wunsch = wunsch.map(str::to_string);
+            for (i, e) in b.eintraege.iter_mut().enumerate() {
+                e.gestreamt = i == gestreamt;
+            }
+            eingabe_rahmen(MSG_BILDSCHIRME, &bildschirm::bildschirme_kodieren(&b))
+        };
+        let wunsch_gemerkt = |erwartet: Option<&str>| {
+            let l = input.lock().unwrap();
+            let w = l.nachreichen.iter().find(|b| b.first() == Some(&IN_BILDSCHIRM)).map(|b| b[8..].to_vec());
+            assert_eq!(w, erwartet.map(|e| bildschirm::wunsch_kodieren(Some(e))));
+        };
+        let laeuft = || shared.lock().unwrap().bildschirm_wechsel_laeuft();
+        let lage = |b: u8| eingabe_rahmen(MSG_HOSTSTATUS, &[b, 0]);
+        let lage_abwarten = |b: u8| {
+            let soll = (b == 1).then_some(strings::Key::NoDisplay);
+            assert!(warten_bis(frist, || shared.lock().unwrap().error_key == soll), "Lage {b} kam nicht an");
+        };
+
+        // Sitzungsbeginn: die Reste des vorigen Hosts sind weg.
+        assert!(warten_bis(frist, || shared.lock().unwrap().connected), "keine Sitzung");
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.info.is_none(), "Strominfo des vorigen Hosts steht noch");
+            assert!(!s.host_bildschirmwahl && s.bildschirm_wunsch.is_none() && s.bildschirme.is_empty());
+        }
+        // Ohne Bit 1 kein Wunsch: nichts gemerkt, kein Hinweis.
+        assert!(!bildschirm_wunsch_senden(&shared, &input, Some("v0-m0-s0".into())));
+        assert!(!laeuft());
+        wunsch_gemerkt(None);
+
+        // Faehigkeiten 3: Dateien und Bildschirmwahl.
+        tx.send(eingabe_rahmen(MSG_FAEHIGKEITEN, &[3, 0, 0, 0])).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().host_bildschirmwahl), "Bit 1 kam nicht an");
+        assert!(shared.lock().unwrap().host_dateien);
+        // Die Liste der Pruefvektoren, byte-genau wie der Mac-Host sie schickt.
+        tx.send(eingabe_rahmen(MSG_BILDSCHIRME, &hex(BILDSCHIRME_2_4))).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().bildschirme.len() == 2), "Liste kam nicht an");
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.bildschirm_wunsch, None);
+            let e = &s.bildschirme;
+            assert_eq!((e[0].kennung.as_str(), e[0].name.as_str(), e[0].breite, e[0].hoehe, e[0].hz), ("v1138-m1234-s0", "X27 X1", 1920, 1080, 120));
+            assert!(e[0].haupt && e[0].gestreamt);
+            assert_eq!((e[1].kennung.as_str(), e[1].name.as_str(), e[1].hz), ("v0-m0-s0", "Virtuell 16:9", 240));
+            assert!(!e[1].haupt && !e[1].gestreamt);
+        }
+
+        // Wunsch aus dem Menue: Hinweis steht, Typ 70 liegt zum Nachreichen
+        // bereit (es gibt keinen Eingabekanal), mit den Bytes aus 2.4.
+        assert!(bildschirm_wunsch_senden(&shared, &input, Some("v0-m0-s0".into())));
+        assert!(laeuft());
+        wunsch_gemerkt(Some("v0-m0-s0"));
+        // Antwort mit dem Wunsch, aber noch dem alten Strom: der Hinweis bleibt.
+        tx.send(liste(Some("v0-m0-s0"), 0)).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().bildschirm_wunsch.as_deref() == Some("v0-m0-s0")));
+        assert!(laeuft(), "Hinweis endete, bevor der Strom auf dem Wunsch lief");
+        // Der Strom laeuft auf dem Wunsch: Hinweis weg.
+        tx.send(liste(Some("v0-m0-s0"), 1)).unwrap();
+        assert!(warten_bis(frist, || !laeuft()), "Hinweis blieb, obwohl der Wunsch gestreamt wird");
+        assert!(shared.lock().unwrap().bildschirme[1].gestreamt);
+
+        // Wunsch auf einen Bildschirm, der nicht angeschlossen ist: der Host
+        // antwortet mit dem Wunsch und dem unveraenderten Strom - damit ist
+        // er beantwortet (Ausweichplatz), der Hinweis geht.
+        assert!(bildschirm_wunsch_senden(&shared, &input, Some("v9-m9-s9".into())));
+        assert!(laeuft());
+        tx.send(liste(Some("v9-m9-s9"), 1)).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().bildschirm_wunsch.as_deref() == Some("v9-m9-s9")));
+        assert!(!laeuft(), "Hinweis blieb nach der Antwort 'nicht angeschlossen'");
+
+        // Wunsch Automatik unterwegs; eine Liste mit einem anderen Wunsch
+        // (der Host hat noch nicht geantwortet) beendet den Hinweis nicht.
+        assert!(bildschirm_wunsch_senden(&shared, &input, None));
+        {
+            let l = input.lock().unwrap();
+            let w = l.nachreichen.iter().find(|b| b.first() == Some(&IN_BILDSCHIRM)).map(|b| b[8..].to_vec());
+            assert_eq!(w, Some(vec![0]));
+        }
+        tx.send(liste(Some("v9-m9-s9"), 1)).unwrap();
+        tx.send(lage(1)).unwrap();
+        lage_abwarten(1);
+        assert!(laeuft(), "eine fremde Antwort beendete den Hinweis");
+        // Automatik beantwortet: gestreamt ist der Hauptbildschirm.
+        tx.send(liste(None, 0)).unwrap();
+        assert!(warten_bis(frist, || !laeuft()), "Hinweis blieb nach der Antwort auf Automatik");
+        assert_eq!(shared.lock().unwrap().bildschirm_wunsch, None);
+
+        // Krumme Bytes (fremde Fassung) aendern nichts an der Liste.
+        let mut kaputt = hex(BILDSCHIRME_2_4);
+        kaputt[0] = 2;
+        tx.send(eingabe_rahmen(MSG_BILDSCHIRME, &kaputt)).unwrap();
+        tx.send(lage(0)).unwrap();
+        lage_abwarten(0);
+        {
+            let s = shared.lock().unwrap();
+            assert_eq!(s.bildschirme.len(), 2);
+            assert!(s.bildschirme[0].gestreamt && s.bildschirm_wunsch.is_none());
+        }
+
+        // Sitzungsende: Liste, Wunsch, Faehigkeit und Hinweis sind zurueck.
+        assert!(bildschirm_wunsch_senden(&shared, &input, Some("v0-m0-s0".into())));
+        drop(tx);
+        assert!(ende.recv_timeout(frist).is_ok(), "Sitzung endete nicht mit der Leitung");
+        {
+            let s = shared.lock().unwrap();
+            assert!(!s.host_bildschirmwahl && s.bildschirme.is_empty() && s.bildschirm_wunsch.is_none());
+            assert!(s.bildschirm_wechsel.is_none());
+        }
+        assert!(!bildschirm_wunsch_senden(&shared, &input, None));
+    }
+
+    /// Die Zeile zur Liste im Protokoll und die Knopftexte im Menue.
+    #[test]
+    fn bildschirm_zeile_und_knopftexte() {
+        let mut b = bildschirm::bildschirme_lesen(&hex(BILDSCHIRME_2_4)).unwrap();
+        assert_eq!(
+            bildschirme_zeile(&b),
+            "Bildschirme des Hosts (Wunsch Automatik): X27 X1 v1138-m1234-s0 1920x1080 120 Hz [Haupt] [gestreamt]; \
+             Virtuell 16:9 v0-m0-s0 1920x1080 240 Hz"
+        );
+        assert_eq!(bildschirm_knopftext(&b.eintraege[0]), "X27 X1 · 1920×1080 · 120 Hz");
+        // Ohne Namen steht die Kennung, ohne Hz kein Hz-Teil.
+        b.wunsch = Some("v0-m0-s0".into());
+        b.eintraege[1].name.clear();
+        b.eintraege[1].hz = 0;
+        assert_eq!(bildschirm_knopftext(&b.eintraege[1]), "v0-m0-s0 · 1920×1080");
+        assert_eq!(bildschirm_anzeigename(&b.eintraege[1]), "v0-m0-s0");
+        assert!(bildschirme_zeile(&b).starts_with("Bildschirme des Hosts (Wunsch v0-m0-s0): X27 X1 "));
+        assert!(bildschirme_zeile(&b).ends_with("; v0-m0-s0 1920x1080 0 Hz"));
+        assert_eq!(bildschirme_zeile(&bildschirm::Bildschirme::default()), "Bildschirme des Hosts (Wunsch Automatik): keine");
+        // Beantwortet: gestreamt passt zum Wunsch, oder der Wunsch fehlt;
+        // bei Automatik der Hauptbildschirm.
+        assert!(!bildschirm_wunsch_beantwortet(&b));
+        b.eintraege[0].gestreamt = false;
+        b.eintraege[1].gestreamt = true;
+        assert!(bildschirm_wunsch_beantwortet(&b));
+        b.wunsch = Some("v9-m9-s9".into());
+        assert!(bildschirm_wunsch_beantwortet(&b));
+        b.wunsch = None;
+        assert!(!bildschirm_wunsch_beantwortet(&b));
+        b.eintraege[1].haupt = true;
+        assert!(bildschirm_wunsch_beantwortet(&b));
     }
 
     /// Weitergereichter Start: ohne Adresse nur nach vorn; zum selben Host
