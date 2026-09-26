@@ -742,6 +742,78 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok((4, false)));
     }
 
+    /// Beide Fenster als Bild (BMP) in den Ordner QC_FENSTER_BILD, in allen
+    /// Sprachen aus QC_FENSTER_SPRACHEN (Vorgabe "de,en") - zum Ansehen des
+    /// Aufbaus ohne Bildschirm (WM_PRINT). Nur ausdruecklich aufrufen.
+    #[test]
+    #[ignore = "schreibt Bilder nach QC_FENSTER_BILD; nur ausdruecklich aufrufen"]
+    fn fenster_als_bild() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, WM_PRINT};
+        let ordner = std::path::PathBuf::from(std::env::var("QC_FENSTER_BILD").expect("QC_FENSTER_BILD"));
+        std::fs::create_dir_all(&ordner).unwrap();
+        let sprachen = std::env::var("QC_FENSTER_SPRACHEN").unwrap_or_else(|_| "de,en".into());
+        let bild = |hwnd: HWND, datei: &str| unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let mut r = RECT::default();
+            GetWindowRect(hwnd, &mut r).unwrap();
+            let (b, h) = (r.right - r.left, r.bottom - r.top);
+            let schirm = GetDC(None);
+            let dc = CreateCompatibleDC(Some(schirm));
+            let bmp = CreateCompatibleBitmap(schirm, b, h);
+            let alt = SelectObject(dc, HGDIOBJ(bmp.0));
+            // PRF_CHECKVISIBLE nicht; PRF_NONCLIENT | PRF_CLIENT | PRF_ERASEBKGND | PRF_CHILDREN
+            SendMessageW(hwnd, WM_PRINT, Some(WPARAM(dc.0 as usize)), Some(LPARAM(0x02 | 0x04 | 0x08 | 0x10)));
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: b,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixel = vec![0u8; (b * h * 4) as usize];
+            SelectObject(dc, alt);
+            GetDIBits(dc, bmp, 0, h as u32, Some(pixel.as_mut_ptr() as *mut _), &mut info, DIB_RGB_COLORS);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, schirm);
+            // BMP: Dateikopf, Infokopf (oben nach unten), 32 Bit.
+            let mut f = Vec::new();
+            let groesse = 14 + 40 + pixel.len() as u32;
+            f.extend_from_slice(b"BM");
+            f.extend_from_slice(&groesse.to_le_bytes());
+            f.extend_from_slice(&[0; 4]);
+            f.extend_from_slice(&54u32.to_le_bytes());
+            f.extend_from_slice(&40u32.to_le_bytes());
+            f.extend_from_slice(&b.to_le_bytes());
+            f.extend_from_slice(&(-h).to_le_bytes());
+            f.extend_from_slice(&1u16.to_le_bytes());
+            f.extend_from_slice(&32u16.to_le_bytes());
+            f.extend_from_slice(&[0; 24]);
+            f.extend_from_slice(&pixel);
+            std::fs::write(ordner.join(datei), f).unwrap();
+            let _ = DestroyWindow(hwnd);
+        };
+        for code in sprachen.split(',') {
+            let lang = crate::strings::pick(code);
+            let a = Anfrage { nr: 1, name: "Roberts MacBook Pro".into(), id: 581_729_911, code: "628 306".into() };
+            let (h, _, _) = zulassen_bauen(lang, &a).unwrap();
+            bild(h, &format!("zulassen-{code}.bmp"));
+            let (h, _, _) = passwort_bauen(lang).unwrap();
+            feldtext_setzen(h, ID_NEU, "geheim");
+            feldtext_setzen(h, ID_MELDUNG, lang.get(Key::HostPasswordsDiffer));
+            bild(h, &format!("passwort-{code}.bmp"));
+        }
+    }
+
     #[test]
     fn passwort_eingabe_regeln() {
         assert_eq!(passwort_eingabe_pruefen("abcdefgh", "abcdefgh"), Ok(()));

@@ -66,10 +66,11 @@ static DROSSEL_FALSCH: Drossel = Drossel::neu("Zugang: Passwort falsch");
 static DROSSEL_ENDE: Drossel = Drossel::neu("Zugang: ohne Ergebnis beendet");
 static DROSSEL_BESETZT: Drossel = Drossel::neu("Zugang: kein Platz frei");
 static DROSSEL_LISTE: Drossel = Drossel::neu("Geraeteliste nicht lesbar");
+static DROSSEL_PASSWORT: Drossel = Drossel::neu("Zugangspasswort nicht lesbar");
 
 /// Die Drosseln dieses Teils, fuer netz::drosseln_nachtragen.
-pub(super) fn drosseln() -> [&'static Drossel; 5] {
-    [&DROSSEL_NOETIG, &DROSSEL_FALSCH, &DROSSEL_ENDE, &DROSSEL_BESETZT, &DROSSEL_LISTE]
+pub(super) fn drosseln() -> [&'static Drossel; 6] {
+    [&DROSSEL_NOETIG, &DROSSEL_FALSCH, &DROSSEL_ENDE, &DROSSEL_BESETZT, &DROSSEL_LISTE, &DROSSEL_PASSWORT]
 }
 
 /// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
@@ -414,11 +415,13 @@ impl Einlass {
 
     /// K fuer das aktuelle Passwort; None, wenn es keins gibt (unlesbar) -
     /// dann ist jeder Beweis falsch.
-    fn schluessel(&self) -> Option<[u8; 32]> {
+    fn schluessel(&self, ip: IpAddr) -> Option<[u8; 32]> {
         match self.passwort() {
             Ok(pw) => Some(sperre(&self.cache).schluessel(&pw, &self.host_pub)),
             Err(e) => {
-                log(format!("Zugangspasswort nicht lesbar ({e}) - Beweis gilt als falsch, Zugang nur ueber \"Zulassen\""));
+                DROSSEL_PASSWORT.melden(Some(ip), || {
+                    format!("Zugangspasswort nicht lesbar ({e}) - Beweis von {ip} gilt als falsch, Zugang nur ueber \"Zulassen\"")
+                });
                 None
             }
         }
@@ -587,7 +590,7 @@ impl Einlass {
             let n = zugang::empfangen(|b| sock.read_exact(b));
             match n {
                 Ok(Nachricht::Beweis(beweis)) => {
-                    let k = self.schluessel();
+                    let k = self.schluessel(ip);
                     let richtig = k.is_some_and(|k| zugang::beweis_pruefen(&k, &hh, &beweis));
                     let wertung = self.buch().drossel.beweis_werten(&mut phase, ip, peer, richtig, Instant::now());
                     let warten_ms = match (wertung, k) {
