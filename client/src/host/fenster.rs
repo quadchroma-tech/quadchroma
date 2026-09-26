@@ -347,13 +347,10 @@ fn zulassen_bauen(lang: &Lang, a: &Anfrage) -> Result<(HWND, HFONT, bool), Strin
     y += h_code + m.px(20);
     let x_ab = innen.0 - rand - knopf_b;
     let x_zu = x_ab - m.px(8) - knopf_b;
-    let zu = feld(hwnd, w!("BUTTON"), lang.get(Key::HostAllow), WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_zu, y, knopf_b, knopf_h), ID_OK, font);
+    // Kein SetFocus: das Fenster soll niemandem den Fokus nehmen (siehe
+    // Kopf); ein Klick hinein gibt ihn dem Knopf.
+    feld(hwnd, w!("BUTTON"), lang.get(Key::HostAllow), WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_zu, y, knopf_b, knopf_h), ID_OK, font);
     feld(hwnd, w!("BUTTON"), lang.get(Key::HostDeny), WS_TABSTOP.0 | BS_PUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_ab, y, knopf_b, knopf_h), ID_ABBRECHEN, font);
-    if let Some(zu) = zu {
-        unsafe {
-            let _ = SetFocus(Some(zu));
-        }
-    }
     Ok((hwnd, font, eigen))
 }
 
