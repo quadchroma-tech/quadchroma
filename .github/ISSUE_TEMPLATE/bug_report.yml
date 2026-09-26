@@ -80,7 +80,7 @@ body:
         Windows host role `%APPDATA%\QuadChroma\host-protokoll.txt`;
         Mac host `/tmp/quadchroma-m1.log` (older part in `/tmp/quadchroma-m1.alt.log`);
         Mac client `~/Library/Application Support/QuadChroma/protokoll.txt`.
-        Remove pairing codes, key material and anything else you do not want public.
+        Remove the access password, comparison codes, key material and anything else you do not want public.
       render: text
     validations:
       required: false
@@ -89,7 +89,7 @@ body:
     attributes:
       label: Before you submit
       options:
-        - label: The log excerpt and the text above contain no secrets or keys - no pairing codes, no contents of host.key, client.key or known_hosts.txt, no addresses I want to keep private.
+        - label: The log excerpt and the text above contain no secrets or keys - no access password, no comparison codes, no contents of host.key, client.key, host-password.txt, host-devices.txt or hosts.txt, no addresses I want to keep private.
           required: true
         - label: This is not a security vulnerability (those go through SECURITY.md, not through a public issue).
           required: true

@@ -616,8 +616,11 @@ were changed in one step rather than two. Afterwards a renewed or replaced
 Developer ID certificate of the same Team ID keeps the grants. Leftover entries
 for the previous bundle identifier can be removed with `tccutil reset
 ScreenCapture <old-bundle-id>` and `tccutil reset Accessibility <old-bundle-id>`
-(never without the bundle id: that resets every app). After granting, the host
-must be restarted for the capture to start.
+(never without the bundle id: that resets every app). The host no longer quits
+without Screen Recording: it waits, shows the missing permission in its menu bar
+menu and checks again every 3 s. Whether macOS lets the running host use a permission
+granted meanwhile without a restart is not verified on a device yet; if the menu
+still shows it as missing, quit the host from its menu and start it again.
 
 **Unsigned releases (until the certificates exist).** macOS refuses an ad-hoc or
 locally signed app; since macOS 15 the Control-click trick no longer works

@@ -18,6 +18,13 @@ host), 9003 the network announcement. On the first start the Windows
 Firewall asks whether the program may access the network - this must be
 allowed, otherwise the list stays empty.
 
+Each host in the list shows its name and its device ID, a small check
+mark once the client knows it; hovering over the row shows its address.
+The address field also takes a device ID (nine digits, spaces or
+hyphens allowed) and pastes with Ctrl+V. The first time this PC
+connects to a host, the host wants its access password or a click on
+"Allow" there - see "Encryption and access".
+
 First start of a downloaded release: QuadChroma is not signed with a
 paid certificate. Simplest is to do this before unpacking: right-click
 the ZIP, Properties, tick "Unblock", OK - then Windows does not warn.
@@ -32,43 +39,194 @@ a time: a second start hands its address over to it. The desktop
 shortcut per host relies on this. All three are described further
 below, as is copying files between client and host.
 
-Encryption and pairing
-----------------------
+"Share this PC" on the start screen does the opposite: it lets another
+device control this PC (see "Windows as host").
+
+Encryption and access
+---------------------
 
 The connection is always encrypted; there is no switch for it. On their
 first start both sides create their own permanent key and recognize each
 other by it from then on.
 
-So that not just anyone on the network can connect, a device has to be
-authorized once. The very first time this happens by itself: as long as
-the host has no authorization list (authorized.txt) yet, it accepts the
-first peer that connects - the Mac host does so even when the file is
-empty (0 bytes). After that it is closed: every further new device needs
-a host that was started with --pair.
+Device ID: every device has a fixed nine-digit ID derived from its key,
+written in groups of three, such as "581 729 911". It is there for
+people and for searching - the host's menu, the client's host list and
+the access windows show it; trust always goes to the full key behind it.
+A Windows PC has two IDs: one as a client (client.key) and one for
+"Share this PC" (host.key).
 
-    open -n build/QuadChroma.app --args --serve 9001 --pair
+Who gets in: every host keeps a list of allowed devices, and a device on
+it comes straight in. A new device has two ways in:
 
-The host log (/tmp/quadchroma-m1.log) then shows a six-digit comparison
-code, for example "628 306". The client shows the same code with F9. If
-both match, nobody is sitting in between. If they do not match,
-disconnect.
+    Password    Its user types the host's access password, which the
+                host shows in its menu (menu bar on the Mac,
+                notification area on Windows).
+    Allow       Someone at the host clicks "Allow" in the window that
+                appears there.
 
-The client remembers the host's fingerprint per address (without port)
-and checks it during the handshake, before it identifies itself
-(message 3). If the fingerprint changes later, the client stops at that
-point: the host never accepts it, and a viewer already connected notices
-nothing. The client returns to the start screen with a message and does
-not try again; the message names the address, the new fingerprint and
-the path of the file, in the language of the interface. Only after the
-entry in known_hosts.txt has been deleted by hand do you reconnect
-yourself. Conversely, a host at a new address is a first contact for the
-client, even under a known name; in that case check the comparison code.
+Either way the host adds the device to its list, and the next connection
+needs neither. There are no command-line switches for this; a host that
+is started with the former switches --pair or --forget only notes them
+in its log as unknown arguments.
 
-One viewer at a time: if a second paired device connects, it takes over
-the session. The previous one receives message 10 from the host, shows
-"Another device has taken over the session." on the start screen and
-does not reconnect by itself; "Connect" brings the session back. Older
-clients do not know this message, reconnect after 2 s and take the
+The access password: at its first start the host makes up a random one,
+nine characters in three groups such as "k7m-4wq-9tz" (lower-case
+letters and digits without i, l, o, 0 and 1). The host's menu shows it,
+and a click on it copies it, marked as concealed, so that clipboard
+histories and QuadChroma's own clipboard transfer leave it alone.
+"Change password ..." sets your own, "New random password" makes a new
+random one. An own password needs at least 8 characters that are not
+spaces, tabs, line breaks or hyphens, and at most 128 bytes in one line.
+Spaces, tabs, line breaks and hyphens do not count when comparing, and
+A-Z count as a-z: "K7M 4WQ-9TZ" is the same password as "k7m-4wq-9tz".
+Nothing else is changed (no other letters are lowered, no Unicode
+normalization). A new password removes no allowed device. Both hosts
+read the file on every check, so a password written into it by hand
+applies at once.
+
+The access dialog (client): when the host does not know this device,
+the client opens a dialog over the waiting screen (the program writes
+typographic dashes and ellipses where this manual writes "-" and
+"..."):
+
+    Password for <name>
+    <name> does not know this device yet. Enter the password shown in
+    the QuadChroma menu on <name>.
+    Or ask someone at <name> to click "Allow".     (only if possible)
+    Code: 628 306                                  (likewise)
+    Password [ .......... ] [Show]
+    [Connect] [Cancel]
+
+The field shows dots; "Show" reveals the text and then reads "Hide".
+Typing, Ctrl+V (Cmd+V on the Mac), the arrow keys, Home, End, Backspace
+and Del work as usual, at most 128 bytes; Enter means "Connect", Esc
+"Cancel". While the dialog is open, no key goes to the host. Below the
+field it says "Checking ..." while the host checks, "Wrong password."
+after a wrong one, and "Too many attempts. Try again in N s." while the
+host's throttle runs - "Connect" is disabled until the seconds have
+counted down. "Cancel" goes back to the start screen. The client sends a
+proof only after you have typed a password, never by itself; a click on
+"Allow" at the host lets it in without one. If another key was
+remembered for this address before, the dialog adds "The device at this
+address has a new identity (ID ...)." (see "Remembered hosts" below).
+
+The password never crosses the network, not even encrypted: the client
+derives a key from it and from the host's public key and sends a proof
+that is valid for this one connection only; the host answers with a
+proof of its own. The client checks that one before it remembers the
+host. If it does not match, the client stops with "<name> could not
+confirm the password. The connection was stopped for safety." and
+remembers nothing: whoever answered did not know the password.
+
+Comparison code: the handshake yields a six-digit code such as
+"628 306"; both sides compute the same one unless someone sits in
+between. It stands in the host's Allow window and, when "Allow" is
+possible, in the client's access dialog; the client also shows it on
+the waiting screen, with F9 and in the "Encryption" tab of the menu.
+Whoever clicks "Allow" should compare it with the code on the client
+first. With the password it is not needed: the two proofs already show
+that both sides know it.
+
+The Allow window (host): "<name> (ID 123 456 789) wants to control this
+computer.", below it "Code: 628 306" and the buttons "Allow" and "Deny".
+It floats above other windows and plays a sound, but it does not take
+the keyboard: click into it first, then Return means "Allow". So that a
+click meant for another window lets nobody in, "Allow" is disabled for
+the first second; "Deny" works at once, and so do Esc and, on Windows,
+the close box. One window at a time; further requests wait for it. If
+the client cancels, disconnects or the 120 s of the access phase run
+out, the window closes by itself. <name> is what the client calls
+itself; nobody checks it. The ID next to it comes from the client's key,
+and a name with nine or more digits, which could pass for an ID, is
+replaced by the client's IP address.
+
+Messages on the client's start screen, in amber. None of them is
+retried automatically - connect again yourself:
+
+    "<name> refused the connection."
+                    someone clicked "Deny" at the host
+    "Too many attempts. Please wait a moment and try again."
+                    five wrong passwords in one connection, the
+                    throttle, or no free place for another access phase
+    "No answer from <name>. Please try again."
+                    nobody decided within the 120 s, the host closed the
+                    connection during the access phase, or it said
+                    nothing for 10 s after the handshake
+    "<name> uses an older QuadChroma version. Please update it there."
+                    the host closed the connection right after the
+                    handshake, as older versions do with an unknown
+                    device (on a reconnect after an accepted session
+                    this counts as a lost connection and is retried)
+    "<name> could not confirm the password. The connection was stopped
+     for safety."   the host's proof was wrong (see above)
+    "A different device answers at this address."
+                    connecting by ID, the host's key does not give that
+                    ID, or it is not the key remembered for it
+    "No device with ID <ID> found in the network."
+                    an ID that neither announces itself nor is in
+                    hosts.txt
+    "<name> no longer knows this device. Connect again and enter the
+     password."     after a session, the host asked for access again on
+                    the automatic reconnect (the device was removed
+                    there); the client withdraws at once instead of
+                    raising an Allow window nobody asked for
+    "The other side speaks a different protocol"
+                    the host answered with something other than "QCH1"
+                    or "QCA1", or broke the rules of the access phase
+
+Remembered hosts (client): only after a host has let the client in -
+after "QCH1", see the wire format below - the client writes it into
+hosts.txt: ID, key, the address it was reached at, and its name. A
+remembered host has a small check mark in the host list and is
+recognized by its key at any address. Connecting by ID - a row of the
+host list, a desktop shortcut, or nine digits in the address field -
+the client checks right after the host's second handshake message,
+before it identifies itself, that the host's key gives this ID and, if
+a key is remembered for the ID, that it is exactly that key; otherwise
+it stops with "A different device answers at this address.". A host
+that announces its ID from a new address is followed there ("Ziel ID
+<ID> meldet sich jetzt unter <neu> (vorher <alt>)", the target now
+answers at a new address). Connecting by address or name alone, an
+unknown key there is a new host: the access dialog comes (with the note
+about a new identity if another key was remembered for that address),
+and after acceptance the new entry stands for the address while the old
+one stays for its ID. If the host at the address already knows this
+client and answers "QCH1" at once, the client connects and remembers
+the new key; the log says so ("<Adresse>: neue Identitaet (ID ...,
+Fingerabdruck ...) - ..."). A changed key is no longer an error you
+have to clear by hand. The settings per host (see "The menu") stay tied
+to the host's fingerprint.
+
+Allowed devices (host): the host's menu lists them under "Allowed
+devices" as "<name> - ID 581 729 911 - since <date>", each with a
+"Remove" entry; "Remove all devices ..." asks first ("Remove all allowed
+devices? They will need the password again."). An empty list shows "No
+devices yet". A removed device that is connected right now is
+disconnected, also when it is just coming in; next time it needs the
+password or "Allow" again.
+
+Throttle, the same on both hosts: counted per address and per client
+key, the larger value applies. The first two wrong passwords cost
+nothing, the third 5 s, then the wait doubles up to 300 s; a correct
+proof resets both counters, and a counter expires 15 min after its last
+failure. More than 30 failures within 60 s from all senders together:
+every new access phase, and every further failure, waits at least 60 s.
+A proof that comes before the wait is over counts as a failure and is
+not even checked. Five failures in one connection end it (result 4). At
+most 4 access phases run at a time, 1 per client key and 2 per address;
+anyone beyond that gets "QCA1" and at once result 4 with 5000 ms. A
+phase lasts at most 120 s, and every message of the client must arrive
+complete within 10 s - trickling bytes does not keep a phase open.
+While a device waits in the access phase, nothing else is held up: no
+global lock, a running viewer is not disturbed, and the waiting device
+gets no input channel.
+
+One viewer at a time: if a second allowed device connects, it takes
+over the session. The previous one receives message 10 from the host,
+shows "Another device has taken over the session." on the start screen
+and does not reconnect by itself; "Connect" brings the session back.
+Older clients do not know this message, reconnect after 2 s and take the
 session back from the new viewer. On the switch the host immediately
 cuts the old viewer's input channel and releases its pressed keys and
 mouse buttons. The Mac host's log shows "Bisheriger Zuschauer
@@ -95,34 +253,38 @@ Handschlaege offen ..."). On the input channel (9002) the client checks,
 still during the handshake, that the same host answers as on the video
 channel; otherwise not a single key goes out (log: "Eingabekanal:
 Gegenstelle <Fingerabdruck> ist nicht der Host des Bildkanals - vor
-Nachricht 3 abgebrochen", at most every 10 s). The input channel is set
-up in the background; its first message always states what the client
-can do (capabilities, see "Files via the clipboard"). Settings, codec,
-test pattern and clipboard changes that come before that are sent by the
-client afterwards (the latest of each kind); mouse movements and keys
-are not. The stored values of a host (see "The menu") apply from the
-video channel on (so a stored "Sound" set to off takes effect at once);
-the client sends them to the host as soon as the input channel is up.
+Nachricht 3 abgebrochen", at most every 10 s). The host accepts an
+input channel only for the viewer whose video channel it has let in.
+The input channel is set up in the background; its first message always
+states what the client can do (capabilities, see "Files via the
+clipboard"). Settings, codec, test pattern and clipboard changes that
+come before that are sent by the client afterwards (the latest of each
+kind); mouse movements and keys are not. The stored values of a host
+(see "The menu") apply from the video channel on (so a stored "Sound"
+set to off takes effect at once); the client sends them to the host as
+soon as the input channel is up.
 
-Host logs: lines that anyone on the network can trigger without pairing
-(failed handshake, unknown peer, broken authorization list or one that
-cannot be saved, input channel without video, on the Windows host also
-full handshake slots) are rate-limited: the first one immediately, after
-that at most one of the same kind and address every 10 s.
-Both hosts count per kind and address (the Mac host four addresses per
-kind, the Windows host 64, any further ones together) and append the
-count to the line ("<Zeile> - dazu N weitere von dieser Adresse seit der
-letzten Meldung", i.e. N more from this address since the last report);
-counts not followed by another line appear after the interval as a
-summary line ("<Art>: N weitere von <IP> seit der letzten Meldung" or
-"<Art>: N weitere von anderen Adressen seit der letzten Meldung,
-zuletzt von <IP>", where <Art> is the kind of line), on the Windows
-host at the latest 15 s after the last line let through. The
-rate-limited lines name the address, including those of the input
-channel ("Eingabekanal abgewiesen: kein Bildkanal offen (<IP>)", input
-rejected because no video channel is open). "Neue Gegenstelle gekoppelt"
-(new peer paired) and "Zuschauer verbunden" (viewer connected) always
-appear.
+Host logs: lines that anyone on the network can trigger without being
+allowed (failed handshake, the access phase of an unknown device -
+access needed, wrong password, cancelled, deadline, no free place -, a
+damaged device list, input channel without video, on the Windows host
+also full handshake slots and the Allow window) are rate-limited: the
+first one immediately, after that at most one of the same kind and
+address every 10 s. Both hosts count per kind and address (the Mac host
+four addresses per kind, the Windows host 64, any further ones
+together) and append the count to the line ("<Zeile> - dazu N weitere
+von dieser Adresse seit der letzten Meldung", i.e. N more from this
+address since the last report); counts not followed by another line
+appear after the interval as a summary line ("<Art>: N weitere von <IP>
+seit der letzten Meldung" or "<Art>: N weitere von anderen Adressen seit
+der letzten Meldung, zuletzt von <IP>", where <Art> is the kind of
+line), on the Windows host at the latest 15 s after the last line let
+through. The rate-limited lines name the address, including those of
+the input channel ("Eingabekanal abgewiesen: kein Bildkanal offen
+(<IP>)", input rejected because no video channel is open). What happens
+only after the password or a click - accepted, allowed, denied, entered
+into the list - and "Zuschauer verbunden" (viewer connected) always
+appear. Neither host ever writes the password into its log.
 
 Both hosts limit their log to 8 MB. The Mac host then moves
 /tmp/quadchroma-m1.log to /tmp/quadchroma-m1.alt.log (an earlier one is
@@ -136,69 +298,338 @@ anew at every start and moves it to host-protokoll.alt.txt at 8 MB
 ("Protokoll ueber 8 MB - der vorige Teil steht in
 host-protokoll.alt.txt"), and likewise messung.txt to messung.alt.txt.
 
-Broken files never lead to a new pairing. A key is created only when its
-file is missing. If host.key exists but is unreadable or has the wrong
-length (Mac host 32 bytes, Windows 64), the host does not start
-("Schluessel host.key ist vorhanden, aber nicht lesbar oder
-beschaedigt - Abbruch. ..." or on Windows "Schluessel konnte nicht
-angelegt werden - Abbruch: ..."). The client reads client.key and
-known_hosts.txt before it opens a connection:
-
-    unreadable     (locked by a virus scanner or backup, permissions):
-                   no connection to the host. The client retries every
-                   2 s, writes this to the log once and connects by
-                   itself as soon as the file is readable.
-    damaged        (client.key has the wrong length, known_hosts.txt is
-                   not UTF-8, e.g. ANSI) or not writable, and likewise a
-                   changed fingerprint: the client does not try again
-                   ("Verbindung zu <Adresse> beendet: der Fehler bleibt
-                   bis zur Behebung - kein neuer Versuch"). After fixing
-                   the problem, reconnect yourself.
-
-UTF-8 with BOM works. Deleting a key file gives you a new identity. A
-new host.key means: authorized.txt stays valid, each client only deletes
-its line for this host in known_hosts.txt and checks the comparison code
-on the next connection. A new client.key means: pair again. For an
-existing authorized.txt:
-
-    Mac       Only lines beginning with 64 hex digits, blank lines and
-              comments (#) are allowed. If the file is unreadable, larger
-              than 1 MiB or a dangling link, or if it contains null
-              bytes, any other line (a BOM too) or not a single
-              authorization, the host rejects EVERY peer, known ones too
-              and also with --pair. Start line "... Freigabeliste
-              authorized.txt NICHT LESBAR ODER BESCHAEDIGT - jede
-              Gegenstelle wird abgewiesen, bis sie repariert oder mit
-              --forget geloescht ist", per connection (rate-limited)
-              "Abgewiesen: <Fingerabdruck> von <IP> - Freigabeliste
-              authorized.txt nicht lesbar oder beschaedigt".
-    Windows   Unreadable or not UTF-8: every peer is rejected
-              ("Freigabeliste: ... - jede Gegenstelle wird abgewiesen,
-              bis die Datei repariert ist"). Without a single valid line
-              (empty, only comments, truncated) unknown peers get in only
-              with --pair ("Freigabeliste: authorized.txt ist vorhanden,
-              enthaelt aber keine gueltige Freigabe - kein Erstkontakt,
-              ..."). Other lines are skipped.
-
-Remedy: repair the file or delete it with --forget. New authorizations
-and new entries in known_hosts.txt are appended; existing lines are left
-untouched. If an authorization cannot be saved, the peer does not get in
-("Abgewiesen: ... - Freigabe liess sich nicht speichern" on the Mac),
-and the pairing window stays open.
-
-Where the keys are stored:
+Where the files are: the names of the host's files begin with "host",
+because host and client share the folder (the Mac host with the Mac
+client, the Windows host role with the Windows client):
 
     Mac       ~/Library/Application Support/QuadChroma/
-              host.key, authorized.txt
+              host.key, host-devices.txt, host-password.txt (host);
+              client.key, hosts.txt (Mac client)
     Windows   %APPDATA%\QuadChroma\
-              client.key, known_hosts.txt
+              client.key, hosts.txt (client);
+              host.key, host-devices.txt, host-password.txt (host role)
 
-To delete all authorizations on the Mac, start the host once with
---forget. If authorized.txt cannot be deleted, it exits with exit code 8
-("Freigaben NICHT geloescht: <Grund> - Abbruch, die bisherigen
-Gegenstellen waeren weiter freigegeben.") instead of carrying on with the
-old authorizations; the Windows host does the same. A missing file
-counts as deleted.
+    host-devices.txt   the allowed devices, one line each: 64 hex digits
+                       of the key, two spaces, the date it was added
+                       (YYYY-MM-DD), two spaces, the name (at most 40
+                       bytes). Blank lines and lines starting with # are
+                       allowed.
+    host-password.txt  the access password, one line, in plain text -
+                       the host has to be able to show it.
+    hosts.txt          the client's remembered hosts, newest first, one
+                       line each: ID (9 digits), 64 hex digits of the
+                       key, the last address (ip:port) and the name.
+                       Lines the client does not understand stay in the
+                       file.
+
+All three are written completely into a temporary file first and then
+renamed into place; on the Mac they are for the owner only (0600).
+
+Taking over the old lists (once, at the first start of this version):
+if authorized.txt exists and host-devices.txt does not, the host takes
+over every valid entry of authorized.txt (date today, name as before,
+usually the IP address) and renames the old file to
+authorized.txt.migriert. Likewise the client with known_hosts.txt: each
+key once, ID from the key, address "<host>:9001" (an IPv6 address in
+brackets), the old host as the name; the old file becomes
+known_hosts.txt.migriert. A host no longer takes in the first device by
+itself, not even with an empty or missing list.
+
+Broken files never let anyone in and are never replaced silently. A key
+is created only when its file is missing. If host.key exists but is
+unreadable or has the wrong length (Mac host 32 bytes, Windows 64), the
+host does not start ("Schluessel host.key ist vorhanden, aber nicht
+lesbar oder beschaedigt - Abbruch. ..." or on Windows "Schluessel
+konnte nicht angelegt werden - Abbruch: ..."). Deleting a key file
+gives the device a new identity and a new ID. After a new host.key the
+host still knows its allowed devices, so they get in without a
+password, but a client that connects by the old ID (a desktop shortcut,
+say) stops with "A different device answers at this address." - pick
+the host from the list, which shows its new ID, and create shortcuts
+anew. After a new client.key every host treats the device as new.
+
+The client reads client.key and hosts.txt before it opens a connection:
+
+    unreadable     (locked by a virus scanner or backup, permissions,
+                   or hosts.txt larger than 1 MiB): no connection to the
+                   host. The client retries every 2 s, writes this to
+                   the log once and connects by itself as soon as the
+                   file is readable.
+    damaged        (client.key has the wrong length or cannot be
+                   written, hosts.txt is not UTF-8, e.g. ANSI): the
+                   client does not try again ("Verbindung zu <Adresse>
+                   beendet: der Fehler bleibt bis zur Behebung - kein
+                   neuer Versuch"). After fixing the problem, reconnect
+                   yourself.
+
+UTF-8 with BOM works for hosts.txt. If hosts.txt cannot be written after
+an accepted connection, the session runs anyway and the host is simply
+not remembered ("hosts.txt: <Name> nicht gemerkt - <Grund>").
+
+On the hosts, an unreadable or damaged host-devices.txt (a line that is
+not an entry, a comment or blank, or more than 1 MiB; on Windows also
+not UTF-8) means: nobody counts as known, every device needs the
+password or "Allow", and the file stays as it is. The menu shows "Device
+list damaged" and "Reset device list"; resetting moves the file aside as
+host-devices.txt.defekt-<YYYYMMDD-hhmmss> and starts an empty list. A
+device let in while the list is damaged gets this session only. An
+unreadable or invalid host-password.txt (empty, fewer than 8 counted
+characters, more than one line, over 128 bytes; on Windows also control
+characters such as a tab) means no password: new devices get in only
+through "Allow". The menu shows "Password file unreadable - new devices
+only via "Allow"." instead of the password, and "New random password"
+writes a new file. A proof that arrives meanwhile is answered with
+result 2 without a wait: the fault lies with the host, so it does not
+feed the throttle.
+
+Log lines of the access phase in the Mac host (/tmp/quadchroma-m1.log);
+<Name> is the client's name, <ID> its device ID, <IP> its address:
+
+    "Geraete-ID dieses Hosts: <ID> (Fingerabdruck <Fingerabdruck>)
+     erlaubte Geraete: N"                                    (at start)
+    "Zugang noetig: <Name> (ID <ID>) von <IP> - Passwort oder Zulassen"
+     (" - Passwort" when nobody can click "Allow"; plus ", Drossel N s"
+     while the throttle runs)
+    "Zugang: <Name> (ID <ID>, <IP>) mit Passwort angenommen und
+     eingetragen" or "... am Host zugelassen und eingetragen"
+    "Zugang: <Name> (ID <ID>, <IP>) am Host abgelehnt"
+    "Zugang: Passwort falsch fuer <Name> (ID <ID>, <IP>), Fehlversuch N
+     in dieser Verbindung - Drossel S s" (with "Beweis vor Ablauf der
+     Wartezeit" for a proof that came too early; after the fifth
+     ", zu viele Versuche - geschlossen")
+    "Zugang: Frist fuer <Name> (ID <ID>, <IP>) abgelaufen - geschlossen"
+    "Zugang: <Name> (ID <ID>, <IP>) hat abgebrochen" or "... hat die
+     Verbindung beendet"
+    "Zugang: kein Platz fuer <Name> (ID <ID>, <IP>) - zu viele
+     Zugangsphasen, geschlossen"
+    "Zuschauer verbunden: <Name> (ID <ID>) <IP>:<Port>, verschluesselt,
+     Gegenstelle <Fingerabdruck>, Vergleichscode <Code>"
+    "Geraet entfernt: <Name> (ID <ID>)", "Alle Geraete entfernt (N)",
+     "Zuschauer getrennt: sein Geraet wurde aus der Liste entfernt"
+    "Geraeteliste host-devices.txt nicht lesbar oder beschaedigt -
+     niemand gilt als bekannt, jedes Geraet braucht Passwort oder
+     Zulassen; die Datei bleibt unangetastet"
+    "Zugangspasswort neu erzeugt (host-password.txt; es steht im Menue)",
+     "Zugangspasswort geaendert", "Zugangspasswort geaendert (neues
+     Zufallspasswort)"
+    "Migration: N Geraet(e) aus authorized.txt in host-devices.txt
+     uebernommen, die alte Liste heisst jetzt authorized.txt.migriert"
+
+Log lines of the Windows host role (host-protokoll.txt), where <wer> is
+"<Name> (<IP>), ID <ID>":
+
+    "Geraete-ID dieses Hosts: <ID>   Name: <Rechnername>   Fingerabdruck:
+     <Fingerabdruck>   erlaubte Geraete: N"                  (at start)
+    "Zugang noetig: <wer> ist unbekannt - Passwort oder "Zulassen" am
+     Host, Wartezeit N ms" (without the icon: "... - Passwort (kein
+     "Zulassen": keine Oberflaeche), ...")
+    "Zugang: <wer> - Passwort richtig", "Zugang: <wer> am Host
+     zugelassen", then "Geraet eingetragen: <Name>, ID <ID>"
+    "Zugang: <wer> am Host abgelehnt"
+    "Zugang: <wer> - Passwort falsch (Fehlversuch N), naechster Versuch
+     fruehestens in M ms"
+    "Zugang: <wer> - N Fehlversuche in dieser Verbindung, getrennt
+     (naechster Versuch fruehestens in M ms)"
+    "Zugang: <wer> - Frist von 120 s abgelaufen, getrennt", "Zugang:
+     <wer> hat abgebrochen", "Zugang: <wer> hat die Leitung geschlossen"
+    "Zugang: kein Platz fuer <wer> - schon zu viele Zugangsphasen (je
+     Geraet eine, je Adresse zwei, zusammen 4), abgewiesen"
+    "Zuschauer verbunden: <Name> (<IP>:<Port>), ID <ID>, verschluesselt,
+     Gegenstelle <Fingerabdruck>, Vergleichscode <Code>" (plus " - eben
+     per Passwort erlaubt" or " - eben am Host zugelassen")
+    "Geraet entfernt: ID <ID>", "Alle Geraete entfernt"
+    "Zugangspasswort: neues Zufallspasswort angelegt (host-password.txt)"
+    "Uebernahme: N Geraete aus authorized.txt nach host-devices.txt, alte
+     Liste heisst jetzt authorized.txt.migriert"
+
+Log lines of the client (protokoll.txt):
+
+    "Zugang noetig: <Name> (<Adresse>, ID <ID>, Vergleichscode <Code>)
+     kennt dieses Geraet noch nicht - Passwort oder Zulassen am Host"
+     (or "- nur Passwort")
+    "Zugang: Passwort falsch (N. Mal)"
+    "Zugang: <Name> hat dieses Geraet angenommen (Passwort, Beweis des
+     Hosts stimmt)" or "(Zulassen am Host)"
+    "Zugang: vom Nutzer abgebrochen (<Name>)"
+    "hosts.txt: <Name> (ID <ID>) unter <Adresse> gemerkt"
+    "hosts.txt: N bekannte Hosts aus known_hosts.txt uebernommen - die
+     alte Datei heisst jetzt known_hosts.txt.migriert"
+    "An <Adresse> antwortet ein anderes Geraet (ID <ID> statt der
+     gewaehlten <ID>) - Abbruch vor Nachricht 3"
+
+Wire format of the access (header as everywhere: u8 type, u8 flags 0,
+u16 0, u32 length; numbers little endian unless noted):
+
+    Handshake message 3 (client -> host) carries "QCN1", u8 n and n
+    bytes of UTF-8, the client's name (1 to 40 bytes). Older clients
+    send "client"; then, and for a broken payload, the host shows the
+    client's IP address.
+
+    After the handshake the host sends 4 bytes on the video channel:
+    "QCH1" - the device is known, the session starts as before - or
+    "QCA1" - the access phase follows. When the device is accepted,
+    "QCH1" follows and then everything as before.
+
+    20  Access needed Host -> client, length 8 + n: u8 version (1), u8
+                      ways (bit 0 password, always set; bit 1 "Allow"
+                      possible, the host's menu is running), u16 0,
+                      u32 wait in ms (no proof before that; 0 = at
+                      once), then n (at most 40) bytes of UTF-8, the
+                      host's name.
+    21  Proof         Client -> host, length 32: client_proof.
+    22  Result        Host -> client, length 8, or 40 with result 0: u8
+                      result, u8 0, u16 0, u32 wait in ms, and with
+                      result 0 the 32 bytes of host_proof. Results:
+                      0 accepted by password, 1 accepted by "Allow",
+                      2 wrong password (try again after the wait),
+                      3 denied, 4 too many attempts, deadline or no
+                      free place (the host closes the connection).
+    23  Cancel        Client -> host, length 0: the user cancelled.
+
+    Without a free place the host sends "QCA1" and at once 22 with
+    result 4 and 5000 ms, without 20. The client accepts 22 with
+    result 3 or 4 in place of 20. It accepts result 1 only if 20 set
+    bit 1, and result 0 only with a correct host_proof.
+
+    norm(pw)      the UTF-8 bytes as typed, without space, tab, CR, LF
+                  and "-", A-Z turned into a-z
+    K             PBKDF2-HMAC-SHA256(norm(pw), salt "QuadChroma/1 pw\0"
+                  followed by the host's public key, 100000 rounds,
+                  32 bytes)
+    client_proof  HMAC-SHA256(K, "QuadChroma/1 auth client\0" + hh)
+    host_proof    HMAC-SHA256(K, "QuadChroma/1 auth host\0" + hh)
+    hh            the handshake hash of this video channel
+    device ID     SHA-256("QuadChroma/1 ID\0" + public key); its first
+                  four bytes as a big-endian number, modulo 10^9
+
+    Proofs are compared in constant time. Test vectors (host public key
+    the bytes 01 to 20 hex, hh 32 times AA): device ID 581 729 911,
+    norm("K7M 4WQ-9TZ") = "k7m4wq9tz", and for "k7m-4wq-9tz"
+      K            0d49cfceed95c9e251f41acead7e619c
+                   3983ab763249052d022a2efe03149842
+      client_proof 647398d505263b3af01ba1a04d74aeb4
+                   67a774588902489bca97c8d3544e3fc0
+      host_proof   2f9d511fa97017f1d5b60806aa5ff4d7
+                   81766e386b92f79d77391e4090cef55d
+    The Rust side (client/src/zugang.rs) and the Mac host
+    (host/zugang.c, test harness zugangtest) check them in their tests.
+
+    Announcement (UDP 9003, every 2 s): "QCHB", u8 1, u16 video port,
+    u8 n, n bytes of name (at most 40), then u8 ext (1), u32 device ID,
+    u8 flags (bit 0: someone at the host can click "Allow"; bits 1 to 7
+    are 0) - at most 54 bytes. Older clients stop reading after the
+    name; a client shows "ID -" for a host without the extension. The
+    name is the computer name: on the Mac the one from System Settings
+    (read again every 30 s), on Windows the DNS host name. Nothing in
+    the announcement is authenticated; the client uses the ID only to
+    show and find a host.
+
+Mac host: the menu bar
+----------------------
+
+QuadChroma.app on the Mac is the host. A double-click in the Finder
+starts it; without arguments it runs as a host on port 9001. It has no
+Dock icon and no window, only an icon in the menu bar: four squares like
+the program icon, the lower right one only outlined, with a dot in it
+while a viewer is connected. A click on it opens the menu:
+
+    QuadChroma
+    Ready for connections      or "Connected: <name>", or "Port 9001 is
+                               used by another program"
+    Device ID: 581 729 911     a click copies the nine digits
+    Password: k7m-4wq-9tz      a click copies it, marked as concealed
+    Change password ...
+    New random password
+    Allowed devices >          per device "<name> - ID ... - since
+                               <date>" > "Remove"; then "Remove all
+                               devices ..."; empty: "No devices yet"
+    Start at login             with a check mark when it is on
+    Screen Recording not allowed - open System Settings ...
+    Accessibility not allowed - open System Settings ...
+                               both only while that permission is
+                               missing; a click opens its page in
+                               System Settings > Privacy & Security
+    Quit QuadChroma            also Cmd+Q
+
+After a copy, "Copied" appears next to the icon for a moment. "Change
+password ..." opens a small window "Change password" with the fields
+"New password (at least 8 characters)" and "Repeat password" and the
+buttons "OK" and "Cancel". It answers "At least 8 characters, please.",
+"The passwords do not match.", "The password contains characters that
+are not allowed." (a line break, or more than 128 bytes), "Password
+saved." or "The password could not be saved." - then the old password
+still applies. If "New random password" cannot save, the same sentence
+appears next to the icon for 4 s. With a damaged device list the menu
+shows "Device list damaged" and "Reset device list" instead of "Allowed
+devices", with an unreadable password file "Password file unreadable -
+new devices only via "Allow"." instead of the password (see "Encryption
+and access"). The date in the list is written the way the menu's
+language writes dates. The menu speaks the first of the Mac's preferred
+languages (System Settings > General > Language & Region) that
+QuadChroma knows - the same 29 as the client -, otherwise English.
+
+Start at login registers the app as a login item in System Settings. It
+works only when QuadChroma.app lies in /Applications; elsewhere the
+entry is disabled and "Move QuadChroma to Applications first" appears
+below it. If macOS wants the login item approved first, the check mark
+becomes a dash, and a click opens the Login Items settings.
+
+Permissions: without Screen Recording the host no longer quits. At start
+it asks for it (macOS shows its dialog), the menu shows the missing
+permission, and the host checks again every 3 s. A viewer who connects
+meanwhile gets in and sees "The host has no display right now" until the
+capture can start - the same happens when the capture cannot start for
+another reason (no display, for example). Whether macOS lets the running
+host use a permission granted later without a restart has not been
+verified on a device yet; if the menu line stays after granting, quit
+QuadChroma and start it again. Accessibility (for mouse and keyboard) is
+asked for only once, at the very first start (remembered by the empty
+file host-bedienungshilfen-gefragt next to host.key); after that only
+the menu shows it. Without it the host ignores mouse and keyboard.
+
+One host per user: a second start ends at once with exit code 0 ("Es
+laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start
+endet"; the lock is the file host-instanz.lock next to host.key). A
+double-click on the running app shows its menu, also when macOS hides
+the icon in a full menu bar (the log then says "Oberflaeche: Symbol in
+der Menueleiste nicht sichtbar - Doppelklick auf die App zeigt das
+Menue"). The tools --list, --capture and --formattest may run next to
+a host.
+
+If another program holds port 9001, the host keeps running: the menu
+says so, and the host tries again every 3 s ("Port 9001 ist belegt
+(anderes Programm?) - der Host wartet und versucht es alle 3 s erneut",
+later "Port 9001 wieder frei - der Dienst laeuft"). It announces itself
+only once it has the port.
+
+Quitting - "Quit QuadChroma", Cmd+Q, logging out, SIGTERM or SIGINT -
+first closes the connection to the viewer (waiting at most 3 s), then
+the host ends ("Beenden: Verbindung zum Zuschauer <Fingerabdruck>
+geschlossen", "Host beendet"). The client sees the connection end and
+connects again by itself as soon as the host runs again.
+
+For experts the switches stay: --serve [port], --fps N, --mbit N,
+--fest, --display N, --out <B>x<H>, and the tools --list, --capture
+and --formattest, for example
+
+    open -n build/QuadChroma.app --args --serve 9001 --fps 120 --mbit 50
+
+A switch without its value keeps the default and says so ("--fps: Wert
+1 fehlt - der Standard gilt"); unknown arguments are only logged
+("Unbekanntes Argument <Argument> - uebergangen").
+
+More log lines of the Mac host's menu bar (the access phase: see
+"Encryption and access"):
+
+    "Oberflaeche: Menueleiste, Sprache <Code>"
+    "Oberflaeche: Beim Anmelden starten eingeschaltet" or
+     "... ausgeschaltet"
+    "Bildschirmaufnahme-Freigabe jetzt erteilt" or "... entzogen", the
+     same for "Bedienungshilfen-Freigabe"
+    "Bildschirmaufnahme nicht freigegeben - Zuschauer bekommt
+     Hoststatus 1, Aufnahme startet mit der Freigabe"
+    "Oberflaeche: Beenden - Verbindung zum Zuschauer wird geschlossen"
+    "Oberflaeche: Signal SIGTERM - beende"
 
 Mac as client (under construction)
 ----------------------------------
@@ -206,20 +637,22 @@ Mac as client (under construction)
 The same client also builds on the Mac (arm64): audio via AudioToolbox,
 clipboard via NSPasteboard (text and files), display on the CPU for now
 (no Metal, no graphics cards in the Display tab). Closing hides it in the
-menu bar; there is no desktop shortcut on the Mac. Build it with Rust
-and the FFmpeg from Homebrew:
+menu bar, with the client's icon (four filled squares - the host's has
+an outlined fourth one); there is no desktop shortcut on the Mac and no
+"Share this PC". Build it with Rust and the FFmpeg from Homebrew:
 
     cd client
     FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
 
 Storage: ~/Library/Application Support/QuadChroma/ (client.key,
-known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
+hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
 einzel.sock and einzel.lock of the single instance) - the same folder as
-the host, separate files. The client creates a new folder for the owner
-only (0700), new keys and lists with 0600; existing files and folders
-keep their permissions. Pairing works as with any client: the host has
-to be started once with --pair.
+the host, separate files (host.key, bildschirm.txt and the files named
+host-* belong to the host). The client creates a new folder for the
+owner only (0700), new keys and lists with 0600; existing files and
+folders keep their permissions. A host lets it
+in like any client: with the access password or a click on "Allow".
 
 License note: the FFmpeg from Homebrew is a GPL build (libx264, libx265).
 That is fine for personal use; distributing the Mac client requires an
@@ -248,7 +681,9 @@ as with "Disconnect" - the host stops working. While hidden, the client
 neither draws nor decodes; the search for hosts and the single instance
 (see below) keep running. On the Mac the window leaves full screen first
 and returns to it when opened again; while hidden, the app has no Dock
-icon there and does not appear in the app switcher.
+icon there and does not appear in the app switcher. This section is about
+the client's icon; the Mac host and the Windows host role have icons of
+their own (see "Mac host: the menu bar" and "Windows as host").
 
 The icon is there from the start, not only after closing (except with
 tray=aus, see below):
@@ -343,10 +778,15 @@ for the two cases just named, "... - Sitzung dorthin laeuft schon" and
 an address, "Einzelinstanz: zweiter Start ohne Adresse - Fenster nach
 vorn".
 
+A shortcut that also carries a device ID hands the ID on too (the
+second start then prints <Adresse>#<ID>), and the first one connects by
+ID.
+
 This does not apply to anything that runs without a window: test mode
-(--headless), the host role (--host, --list, --messen), --verknuepfung,
---shot and the self-tests (--tray-selbsttest, --menueleiste-selbsttest,
---decodertest, --anzeigetest, --noisetest).
+(--headless), the host role (--host has a single instance of its own,
+see "Windows as host"; --list, --messen), --verknuepfung, --shot and the
+self-tests (--tray-selbsttest, --menueleiste-selbsttest, --decodertest,
+--anzeigetest, --noisetest).
 
 Limits: an address longer than 508 bytes or containing control characters
 is not handed on by the second start; it only brings the app to the front
@@ -392,10 +832,14 @@ characters. Without a name the address is used, with "_" instead of ":"
 ("QuadChroma - 192.168.178.194_9001.lnk"). An existing file of the same
 name is overwritten - it is the same host. The shortcut calls
 
-    <Ordner der exe>\quadchroma.exe "192.168.178.194:9001"
+    <Ordner der exe>\quadchroma.exe --verbinden "192.168.178.194:9001"
+                                    --id 581729911
 
 (<Ordner der exe> is the folder of the exe, which is also the working
-folder) - the same route as an address given at startup. Its icon is the
+folder; everything on one line) - the same route as an address given at
+startup. The device ID comes from the host's announcement (start screen)
+or from its key (menu); for a host that announces no ID the shortcut
+carries only the address, "192.168.178.194:9001" as before. Its icon is the
 program icon (four colored squares) from %APPDATA%\QuadChroma\quadchroma.ico;
 the file is written or renewed each time a shortcut is created. The exe
 carries the same icon as a resource, so Explorer shows it for
@@ -406,24 +850,27 @@ the comment, Windows shows "QuadChroma: connect to <name> (<address>)" in
 the language of the interface.
 
 Limits: the shortcut points with its full path to the exe it was created
-with - if you move the exe, create it again. And it carries the address,
-not the name: if the host gets a new address, the double-click leads
-nowhere, and under the new address the host is a first contact for the
-client anyway (see "Encryption and pairing").
+with - if you move the exe, create it again. If the host gets a new
+address, the ID finds it there as long as it announces itself in the
+same network; the key must still give that ID (see "Remembered hosts"
+under "Encryption and access"). A shortcut without an ID, or a host
+outside the network announcement, still depends on the address.
 
 Without a window and without a connection:
 
     quadchroma.exe --verknuepfung <adresse> [--name <name>]
-                   [--ordner <verzeichnis>]
+                   [--ordner <verzeichnis>] [--id <ID>]
 
 creates it (<adresse> is the host address, <verzeichnis> the target
-folder; without --ordner on the desktop; without a port, 9001 applies),
-prints the path and exits with 0; otherwise it prints "Verknuepfung nicht
-angelegt: <Grund>" (shortcut not created) and returns 1 (for example
-without an address, with a switch that has no value, or when the folder
-does not exist). protokoll.txt is left untouched. On the Mac the switch
-exits with 2, saying that the desktop shortcut exists only on Windows
-("Die Desktop-Verknuepfung (--verknuepfung) gibt es nur unter Windows.").
+folder, <ID> the host's device ID; without --ordner on the desktop;
+without a port, 9001 applies), prints the path and exits with 0;
+otherwise it prints "Verknuepfung nicht angelegt: <Grund>" (shortcut not
+created) and returns 1 (for example without an address, with a switch
+that has no value, with an --id that is not nine digits, or when the
+folder does not exist). protokoll.txt is left untouched. On the Mac the
+switch exits with 2, saying that the desktop shortcut exists only on
+Windows ("Die Desktop-Verknuepfung (--verknuepfung) gibt es nur unter
+Windows.").
 
 The menu
 --------
@@ -1073,18 +1520,18 @@ Files via the clipboard
 -----------------------
 
 Files and folders are copied as usual - "Copy" in Explorer or in
-Finder - and pasted on the other side. This works in both directions,
-between the client (Windows or Mac) and any host (Mac or Windows host
-role), over the existing encrypted connection, so only between paired
-devices. Unlike with RDP, the transfer starts as soon as you copy, not
-only when you paste: the other side writes the files into a directory
-of its own (see "Receive directory") and, once everything has arrived,
-puts them on its clipboard as a file list - this replaces whatever is on
-it at that moment. "Paste" in Explorer or Finder copies them from there
-to the desired location. Cut works like copy: the source stays where it
-is. If the clipboard on Windows is busy when the list is put there, this
-is retried for about 2 s; if it fails, the transfer is aborted (in the
-client "clipboard not available").
+Finder - and pasted on the other side. This works in both directions, between
+the client (Windows or Mac) and any host (Mac or Windows host role),
+over the existing encrypted connection, so only once the host has let
+the client in. Unlike with RDP, the transfer starts as soon as you copy,
+not only when you paste: the other side writes the files into a
+directory of its own (see "Receive directory") and, once everything has
+arrived, puts them on its clipboard as a file list - this replaces
+whatever is on it at that moment. "Paste" in Explorer or Finder copies
+them from there to the desired location. Cut works like copy: the source
+stays where it is. If the clipboard on Windows is busy when the list is
+put there, this is retried for about 2 s; if it fails, the transfer is
+aborted (in the client "clipboard not available").
 
 As with text, the clipboard is read only during a session; whatever was
 copied before does not go across on connecting. A single copy often
@@ -1534,15 +1981,28 @@ started afresh at every launch and additionally records the display there
 display time, chain, dropped and skipped frames and the client's CPU load. A
 connection error is recorded there with all details ("Verbindung: <Grund>",
 i.e. connection: <reason>), but the same error only once as long as no frame
-has arrived in between - so "Host hat die Leitung nach dem Handschlag
-geschlossen - dieses Geraet ist dort nicht gekoppelt" (the host closed the
-connection after the handshake because this device is not paired there) does
-not appear every 2 s either. Errors that do not go away with the next attempt
-(fingerprint changed, file damaged or not writable) end the attempts with
-"Verbindung zu <Adresse> beendet: der Fehler bleibt bis zur Behebung - kein
-neuer Versuch" (connection ended, no new attempt until the error is fixed).
-The start screen shows the error in the interface language, with the system's
-wording, where there is one, in parentheses after it.
+has arrived in between - so a host that is switched off does not appear every
+2 s either. Errors that do not go away with the next attempt (a file damaged
+or not writable, and every outcome of the access phase, see "Encryption and
+access") end the attempts with "Verbindung zu <Adresse> beendet: der Fehler
+bleibt bis zur Behebung - kein neuer Versuch" (connection ended, no new
+attempt until the error is fixed). The start screen shows the error in the
+interface language, with the system's wording, where there is one, in
+parentheses after it.
+
+When the host asks for access, test mode prints the access lines as well.
+--passwort <password> answers the access phase once with that password (only
+with --headless; a wrong one is not repeated, so as not to feed the host's
+throttle); without it the client waits for "Allow" at the host ("Zugang: kein
+--passwort - warte auf "Zulassen" am Host"). If the connection ends with a
+message that stays, test mode ends with exit code 1 ("Verbindung beendet, die
+Meldung bleibt - Ende des Pruefmodus"). Instead of an address, test mode also
+takes a device ID (nine digits, or --id <ID>): it uses the last address from
+hosts.txt, otherwise it waits up to 5 s for the ID's announcement ("ID <ID>
+gefunden: <Adresse>") and else ends with exit code 1.
+
+    quadchroma.exe 192.168.178.194:9001 --headless --passwort k7m-4wq-9tz
+    quadchroma.exe "581 729 911" --headless
 
     quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
     quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
@@ -1559,14 +2019,20 @@ H.264, without a connection.
 writes a picture of the interface as BMP, without a window and without a
 connection, and exits (defaults ui.bmp, de, start; the language as a code such
 as en). Views: start, starttip (tooltip of the "Desktop shortcut" button),
-abgeloest and fingerabdruck (start screen with the respective message: session
-taken over, fingerprint changed), sitzung and nerd (statistics over a mock
-picture), hud, hud2 to hud5 and hud2tip (the menu, one tab each; hud is the
-"Picture" tab with a trailing display list), dateien and dateienfehler (the
-file transfer lines, running and finished, or with abort reasons). The start
-screens are 900x700, all others 1280x720; a suffix @BxH (width x height) on
-the view (such as hud@1920x1080, 320 to 7680 per side) draws them at that
-size.
+startzeile (tooltip of a host row with its address), startfreigabe (the
+button "Sharing is on", Windows only), abgeloest, fingerabdruck, veraltet,
+abgelehnt, idfehlt, entfernt and freigabefehler (start screen with the
+respective message: session taken over, a different device at the address,
+older host version, refused, ID not found, device removed at the host,
+sharing could not start), zugang, zugangfalsch, zugangwarten and zugangneu
+(the access dialog: with "Allow" and code, wrong password, throttle
+countdown, new identity at a known address), sitzung and nerd (statistics
+over a mock picture), hud, hud2 to hud5 and hud2tip (the menu, one tab each;
+hud is the "Picture" tab with a trailing display list), dateien and
+dateienfehler (the file transfer lines, running and finished, or with abort
+reasons). The start screens and the access dialog are 900x700, all others
+1280x720; a suffix @BxH (width x height) on the view (such as
+hud@1920x1080, 320 to 7680 per side) draws them at that size.
 
     quadchroma.exe 192.168.178.194:9001 --ohne-aud
 
@@ -1584,34 +2050,88 @@ Windows as host
 ---------------
 
 The same quadchroma.exe can also be the host: it accepts the viewer that the
-Mac otherwise gets - same encryption, same pairing, same messages; a client
-notices no difference. Capture via Desktop Duplication of the selected output,
-encoder via FFmpeg (hevc_nvenc/h264_nvenc on NVIDIA; without NVIDIA only H.264
-in software via Media Foundation), frame pacing, codec switching, display
-selection with switching while running, test pattern, audio (WASAPI loopback),
-pointer shape, load reporting and keep-awake as on the Mac.
-Without a viewer the host does no work: no Duplication, no encoder, no
-keep-awake (idle below 1 % of one core). Everything runs without a window from
-the command line; every line also goes to
-%APPDATA%\QuadChroma\host-protokoll.txt (throttling and size cap: see the
-paragraph on the hosts' logs above).
+Mac otherwise gets - same encryption, same access with password or "Allow",
+same messages; a client notices no difference. Capture via Desktop
+Duplication of the selected output, encoder via FFmpeg (hevc_nvenc/h264_nvenc
+on NVIDIA; without NVIDIA only H.264 in software via Media Foundation), frame
+pacing, codec switching, display selection with switching while running, test
+pattern, audio (WASAPI loopback), pointer shape, load reporting and
+keep-awake as on the Mac. Without a viewer the host does no work: no
+Duplication, no encoder, no keep-awake (idle below 1 % of one core). The host
+role has no window of its own, only an icon in the notification area (below);
+every line also goes to %APPDATA%\QuadChroma\host-protokoll.txt (throttling
+and size cap: see the paragraph on the hosts' logs above).
+
+Sharing this PC: the button "Share this PC" on the client's start screen,
+between "Connect" and "Quit", starts the same exe a second time as the host
+role (quadchroma.exe --host), without a console window; it keeps running when
+the client quits. While a host role runs in this Windows session, the button
+reads "Sharing is on" and cannot be clicked (the client looks about once a
+second while the start screen is visible, and counts the 5 s after its own
+click). If the start fails, the start screen says "Could not start sharing
+this PC."; the client's log shows "Freigabe: Host-Rolle gestartet (Prozess
+N)" or "Freigabe: Host-Rolle nicht gestartet - <Grund>".
+
+The host role's icon has the tooltip "QuadChroma - sharing this PC (ID
+581 729 911)"; a click, left or right, opens its menu:
+
+    QuadChroma
+    Ready for connections      or "Connected: <name>", or "Port 9001 is
+                               used by another program"
+    Device ID: 581 729 911     a click copies the nine digits
+    Password: k7m-4wq-9tz      a click copies it, marked as concealed
+    Change password ...
+    New random password
+    Allowed devices >          as on the Mac, the date as YYYY-MM-DD
+    Start with Windows         with a check mark when it is on
+    Stop sharing
+
+"Copied" and "Password saved." appear as a balloon at the icon. "Change
+password ..." opens a small window "Change password" with two password fields,
+"OK" and "Cancel", and the same checks and answers as on the Mac (see "Mac
+host: the menu bar"); "Remove all devices ..." asks in a Yes/No box whose
+default is No. The Allow window is a small window of its own; it stays on top,
+beeps and flashes in the taskbar, but does not take the focus (see "Encryption
+and access"). "Start with Windows" puts the shortcut "QuadChroma -
+Freigabe.lnk" - the exe with --host - into the user's Startup folder, or
+removes it; the check mark shows whether it is there ("Mit Windows starten: an
+(Verknuepfung im Autostart-Ordner)" or "... aus"). "Stop sharing" disconnects
+the viewer and ends the host role ("Freigabe beendet (Infobereich)"). Menu and
+windows speak the language set in the client (einstellungen.txt), otherwise
+the one of Windows.
+
+Without an icon - no Explorer, as over ssh or in session 0 - the host role
+runs without a menu, and new devices get in only with the password
+("Infobereich: kein Symbol (<Grund>) - ohne Oberflaeche, neue Geraete nur per
+Passwort"); announcement and message 20 then do not offer "Allow". Only one
+host role runs per Windows session (mutex Local\QuadChroma-Host): a second
+--host start ends at once with exit code 0 ("Die Freigabe laeuft in dieser
+Sitzung schon (Local\QuadChroma-Host) - dieser Start endet."), before it
+touches host-protokoll.txt. --list may run next to it and then writes only to
+the console. If port 9001 is taken, the menu says so and the host role tries
+again every 5 s ("Bild-Port 9001 nicht verfuegbar: <Fehler> - neuer Versuch
+alle 5 s, das Menue zeigt es", later "Port 9001 ist frei - Dienst laeuft");
+without an icon it ends with exit code 9 as before.
 
 The host role also writes to protokoll.txt - its card lines at startup,
 FFmpeg's messages and the "Zwischenablage: ..." (clipboard) lines - and in
-doing so starts the file afresh, like the client. So if client and host role
-run under the same user, both write to the same protokoll.txt, and whichever
-starts last empties it. host-protokoll.txt contains these lines as well, but
-while running only at the five-second interval.
+doing so starts the file afresh, like the client. So when client and host role
+run under the same user - as after "Share this PC" - both write to the same
+protokoll.txt, and the one that begins writing later empties what the other
+had written so far. host-protokoll.txt contains these lines as well, but while
+running only at the five-second interval.
 
     quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
-                   [--pair] [--forget] [--konserve datei.hevc]
+                   [--konserve datei.hevc]
                    [--encoderweg bgra|yuv444|d3d11|auto]
     quadchroma.exe --list
     quadchroma.exe --messen [--output n] [--sekunden 10]
 
     --host [port]   start the host: video on port (9001), input on port+1,
-                    announcement on port+2. host.key is created on the first
-                    start; the fingerprint is in the log.
+                    announcement on port+2 - what "Share this PC" does.
+                    host.key and the access password are created on the
+                    first start; the start line in the log shows device ID,
+                    name and fingerprint.
     --output n      output from the list of --list, as a request for this run
                     only (bildschirm.txt stays; a request from the client's
                     menu overrides it). If not given, bildschirm.txt applies,
@@ -1623,10 +2143,6 @@ while running only at the five-second interval.
                     on, the picture is halved; with odd dimensions one pixel
                     of border is dropped.
     --fps N, --mbit N, --fest   as on the Mac (defaults 120, 150, off).
-    --pair          the next unknown peer is accepted (comparison code in the
-                    log); the very first time this happens automatically.
-    --forget        delete all authorizations (authorized.txt); if that fails,
-                    exit with return code 8 (as on the Mac).
     --konserve datei.hevc   an Annex B stream (HEVC or H.264) as the picture
                     source instead of capture, looped at the frame rate - the
                     test path without a card. The capability list then shows
@@ -1768,13 +2284,13 @@ as a file list in the clipboard of the session in which the host role runs,
 and pasting in Explorer copies it from %TEMP%\QuadChroma-Host-Ablage. The host
 role sends with a fixed window of 64 KiB, holds back a copy made right after
 connecting for up to 5 s until the viewer has reported its capabilities, and
-cleans up its clipboard folder at startup. It has no notification-area icon
-and no single instance either - both belong to the client with a window.
+cleans up its clipboard folder at startup.
 
-Files of the Windows host: %APPDATA%\QuadChroma\host.key (64 bytes: private,
-then public) and authorized.txt in the Mac's format (64 hex digits,
-fingerprint, name) - separate from client.key and known_hosts.txt -, plus
-bildschirm.txt with the requested display.
+Files of the Windows host role, in %APPDATA%\QuadChroma\: host.key (64 bytes:
+private, then public), host-devices.txt and host-password.txt in the same
+format as on the Mac (see "Encryption and access"), bildschirm.txt with the
+requested display and host-protokoll.txt - separate from the client's
+client.key and hosts.txt.
 
 Keys arrive over the connection as positions (macOS key codes) and are
 translated into scancodes on Windows; the client's Command key becomes the
@@ -1783,8 +2299,9 @@ keys. Application windows with elevated privileges (UAC) get no input - that
 is how Windows works.
 
 The client's test mode shows every host that announces itself on the network
-once, as a line "Host gefunden: Name (Adresse)" (host found: name and
-address).
+once, as a line "Host gefunden: <Name> (<Adresse>, ID <ID>, Zulassen
+moeglich)" (host found: name, address, device ID or "-", and whether "Allow"
+is possible there; that part only if it is).
 
 The files next to the executable belong to it and must be copied along:
 avcodec-63.dll and avutil-61.dll. These are libraries of the FFmpeg project

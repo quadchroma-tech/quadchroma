@@ -62,8 +62,9 @@ beyond what is needed to demonstrate it.
   protocol between them, or the build and release scripts.
 - The version (release tag) or the commit hash if you built from source, and the
   operating system and hardware (macOS version and Mac model; Windows version and GPU).
-- Your setup: which host and which client, same local network or not, paired or first
-  contact, any command-line options (`--host`, `--display`, `--fest` ...).
+- Your setup: which host and which client, same local network or not, whether the
+  device was already allowed or came in by password or "Allow", any command-line
+  options (`--host`, `--display`, `--fest` ...).
 - Steps to reproduce, ideally a minimal proof of concept (a script, a captured message
   sequence, a crafted file). A description of the impact: what an attacker can do, from
   where, with what prerequisites.
@@ -71,9 +72,10 @@ beyond what is needed to demonstrate it.
   Windows host role `%APPDATA%\QuadChroma\host-protokoll.txt`, Mac host
   `/tmp/quadchroma-m1.log` (older part in `/tmp/quadchroma-m1.alt.log`), Mac client
   `~/Library/Application Support/QuadChroma/protokoll.txt`.
-- **Remove secrets before sending:** pairing codes, the contents of `host.key`,
-  `client.key` and `known_hosts.txt`, and any addresses or host names you do not want
-  the maintainer to see.
+- **Remove secrets before sending:** the host's access password, comparison codes,
+  the contents of `host.key`, `client.key`, `host-password.txt`, `host-devices.txt` and
+  `hosts.txt`, and any addresses or host names you do not want the maintainer to
+  see.
 
 ## Scope
 
@@ -81,8 +83,9 @@ In scope:
 
 - the Mac host (`host/`), the Windows client and the Windows host role (`client/`), the
   Mac client, and the release binaries built from them;
-- the protocol: discovery and announcement (port 9003), pairing and the Noise
-  handshake, key storage (`host.key`, `client.key`, `known_hosts.txt`), the video and
+- the protocol: discovery and announcement (port 9003), the Noise handshake and the
+  access phase (password proof, "Allow", throttle), key and list storage (`host.key`,
+  `client.key`, `host-devices.txt`, `host-password.txt`, `hosts.txt`), the video and
   audio channel (port 9001), the input channel with clipboard and file transfer
   (port 9002);
 - input injection, clipboard and file handling on all sides (path handling, size
@@ -90,8 +93,9 @@ In scope:
 - the build, signing and release scripts, the CI workflows and the integrity of the
   released archives.
 
-Examples of what the maintainer wants to hear about: access without pairing or bypass of
-the pairing; remote code execution or memory-safety bugs reachable from the network or
+Examples of what the maintainer wants to hear about: access without the password or an
+"Allow" click, bypassing the access phase or its throttle, a client that trusts a host
+it should not; remote code execution or memory-safety bugs reachable from the network or
 through a crafted stream, message or file; path traversal or overwriting files through
 the file transfer; leaking keys or clipboard contents; making the host unusable from the
 network; weaknesses in the cryptography or its use.
@@ -102,7 +106,8 @@ Out of scope, or lower priority:
   upstream (https://ffmpeg.org/security.html), but tell the maintainer too so that the
   shipped build can be updated;
 - anything that requires an already compromised machine, physical access, or an
-  attacker who already holds a paired key;
+  attacker whose device is already allowed on the host or who knows its access
+  password;
 - reports from automated scanners without a reproducible impact, best-practice
   suggestions without an attack, and social engineering;
 - the ad-hoc or development-signed builds that are not distributed.

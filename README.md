@@ -26,12 +26,13 @@ and the codec can be switched while the session runs.
 - **One program per side, nothing else.** No account, no cloud, no relay server, no
   extra driver or helper service: `QuadChroma.app` on the Mac, `quadchroma.exe` on
   Windows, connected directly in your network (or through your VPN). Always
-  encrypted (Noise protocol), devices paired by fingerprint.
+  encrypted (Noise protocol). A new device gets in with the host's access
+  password or a click on "Allow" at the host - no command-line switches.
 - **Everyday comfort.** Copy files between Mac and PC through the clipboard, like
   with Windows Remote Desktop; choose which of the Mac's screens to show (it follows
   the main screen automatically); audio; a desktop shortcut per host; 29 languages.
 
-![Start screen of the Windows client: two hosts found on the network, each with a Desktop shortcut button, and the address field. The interface is available in 29 languages.](oberflaeche.png)
+![Start screen of the Windows client: two hosts found on the network - one already known (check mark) with its device ID, one older host without an ID - each with a Desktop shortcut button, the address field, and the buttons Connect, Share this PC and Quit. The interface is available in 29 languages.](oberflaeche.png)
 
 ## How it compares
 
@@ -125,10 +126,11 @@ graphics card the CPU draws.
   host reports; the video never contains one.
 - Always encrypted: Noise XX with X25519, ChaCha20-Poly1305 and SHA-256, no switch to
   turn it off.
-- Pairing with fingerprints: both sides keep a permanent key, a host accepts a new
-  device only when started with `--pair` (the very first one automatically), both
-  sides show a six-digit comparison code, and the client refuses a host whose key has
-  changed.
+- Access by password or click: every device has a permanent key and a nine-digit
+  device ID derived from it. A host lets a new device in when it proves the host's
+  access password - the password itself never crosses the network - or when someone
+  at the host clicks "Allow"; after that it knows the device by its key. The client
+  remembers every host that let it in by its key as well, whatever address it has.
 - The host does nothing without a viewer: no capture, no encoder, 0.6 % CPU load when
   idle; capture and encoder appear when someone connects and go when the viewer leaves.
 
@@ -136,9 +138,9 @@ graphics card the CPU draws.
 
 | Side | Platform | State |
 |---|---|---|
-| Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen. |
+| Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; menu-bar icon with device ID, access password, allowed devices and "Start at login". |
 | Client | Windows 10 or 11, 64-bit; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
-| Host role | Windows, the same `quadchroma.exe` with `--host` | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today), a menu entry to share this computer. Not yet verified on real NVIDIA hardware. |
+| Host role | Windows, the same `quadchroma.exe`, started with "Share this PC" on the start screen (or `--host`) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. Icon in the notification area with device ID, access password, allowed devices and "Start with Windows". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
 | Client | Mac (arm64), the same Rust source | Secondary, under construction. Audio via AudioToolbox, clipboard including files via NSPasteboard, display on the CPU (no Metal yet), menu-bar icon, no desktop shortcut. Not distributed as a binary, see "Building from source". |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
@@ -189,6 +191,12 @@ signed with the project's own free certificate "QuadChroma Release": both permis
 stay granted across updates. Files named `-unsigned` carry only an ad-hoc signature;
 after each update the two permissions must be granted again.
 
+The host then sits as an icon in the menu bar - four squares, the lower right one
+only outlined - not in the Dock. Its menu shows the Mac's device ID and access
+password, the allowed devices and "Start at login" (offered once the app lies in
+Applications). While a permission is missing, the host keeps running; the menu says
+which one and opens its page in System Settings.
+
 ## Getting started
 
 ### Mac host
@@ -196,7 +204,10 @@ after each update the two permissions must be granted again.
     make
     open -n build/QuadChroma.app --args --serve 9001 --fps 120 --mbit 50 --fest
 
-On the first start grant the two permissions listed above. `make` signs the bundle
+Without arguments - a double-click in the Finder, or as a login item - the app runs
+as a host on port 9001 with the default values. Only one host runs per user: a second
+start ends at once, and a double-click on the running app shows its menu. On the
+first start grant the two permissions listed above. `make` signs the bundle
 with a local development certificate so that the Screen Recording permission survives
 a rebuild. The host captures its main screen; the client can choose another one in
 its menu, and `--display n` pins entry `n` of the `--list` output for this run (see
@@ -206,7 +217,8 @@ stores it per host). `--mbit` is a cap the encoder does use: 150 Mbit/s means
 150 Mbit/s with motion, so outside your own network 25 to 50 is the better choice.
 Log: `/tmp/quadchroma-m1.log`; above 8 MB it moves to `/tmp/quadchroma-m1.alt.log`
 and starts anew. Keys and lists: `~/Library/Application Support/QuadChroma/`
-(`host.key`, `authorized.txt`, `bildschirm.txt`).
+(`host.key`, `host-devices.txt` with the allowed devices, `host-password.txt` with
+the access password, `bildschirm.txt`).
 
 ### Windows client
 
@@ -214,37 +226,78 @@ and starts anew. Keys and lists: `~/Library/Application Support/QuadChroma/`
     quadchroma.exe 192.168.178.194:9001
 
 Without an address the start screen opens; the Mac appears in the list after a few
-seconds, and a click connects. Closing the window does not quit: the client goes to
-the notification area (see "Closing, single instance, desktop shortcut").
+seconds with its name and device ID, and a click connects. The address field also
+takes a device ID. Closing the window does not quit: the client goes to the
+notification area (see "Closing, single instance, desktop shortcut").
 
-The client's files live in `%APPDATA%\QuadChroma\`: `client.key`, `known_hosts.txt`,
-`einstellungen.txt` (settings), `protokoll.txt` (the log, restarted at every start),
-`benchmark.txt`. The log records what the client decides (decoder, display, pointer
-shape) and what FFmpeg reports about it.
+The client's files live in `%APPDATA%\QuadChroma\`: `client.key`, `hosts.txt` (the
+hosts that let this PC in), `einstellungen.txt` (settings), `protokoll.txt` (the log,
+restarted at every start), `benchmark.txt`. The log records what the client decides
+(decoder, display, pointer shape) and what FFmpeg reports about it.
+
+### Sharing a Windows PC
+
+The same `quadchroma.exe` can also be the host. "Share this PC" on the start screen
+starts it a second time in the background as the host role (`quadchroma.exe --host`);
+the button then reads "Sharing is on", and the host role keeps running when the client
+quits. It has an icon in the notification area with the same menu as the Mac host -
+device ID, access password, allowed devices - plus "Start with Windows" (a shortcut in
+the Startup folder) and "Stop sharing". Its files are `host.key`, `host-devices.txt`,
+`host-password.txt` and `host-protokoll.txt` in `%APPDATA%\QuadChroma\`. What it can
+and cannot do yet is under "Platforms and status"; details in `MANUAL.txt`, "Windows
+as host".
 
 ### Pairing
 
-While the host has no authorization list (`authorized.txt`) it accepts the first
-device that connects - the Mac host also when the file exists but is empty (0 bytes);
-after that every new device needs a host started with `--pair`:
+A host lets a device in once; after that the device comes straight in. There are no
+command-line switches for this. The first time a client connects, the host answers
+that it does not know the device yet, and the client shows a dialog with two ways in:
 
-    open -n build/QuadChroma.app --args --serve 9001 --pair
+- **Password.** Type the host's access password. The host shows it in its menu (menu
+  bar on the Mac, notification area on Windows): nine characters such as
+  `k7m-4wq-9tz`, made up at random on the first start; "Change password …" sets your
+  own (at least 8 characters). Spaces, hyphens and the case of A-Z do not matter. The
+  password never crosses the network: the client sends a proof derived from it that
+  is valid for this one connection, and the host proves in return that it knows the
+  password as well - otherwise the client stops and remembers nothing.
+- **Allow.** Someone at the host clicks "Allow" in the window that appears there. It
+  shows the client's name, its device ID and a six-digit comparison code such as
+  "628 306"; the client's dialog shows the same code. If both match, nobody sits in
+  between.
 
-The host log then shows a six-digit comparison code such as "628 306"; the client
-shows the same code with F9. If both match, nobody is in between; if not, disconnect.
-The client stores the host's fingerprint per address (without the port) in
-`known_hosts.txt` and checks it during the handshake, before identifying itself. If
-it has changed, the client stops there: the host never accepts it, a running viewer
-is not disturbed, and the client does not retry every 2 s; it connects again only
-after you have deleted that entry by hand and reconnect yourself. A host under a new
-address is a first contact, even under a known name, so compare the code again. A key
-or list file that exists but is unreadable or damaged never counts as a first start:
-the connection is refused instead of paired anew, and no key is replaced silently
-(details in `MANUAL.txt`). `--forget` deletes all authorizations.
+Afterwards the host lists the device under "Allowed devices" in its menu, where
+"Remove" takes it out again; the client remembers the host by its key in `hosts.txt`,
+whatever address it has, and marks it with a check mark in the host list. Every device
+has a nine-digit device ID derived from its key, shown in the host's menu and in the
+client's host list; the address field, a desktop shortcut and the command line accept
+it instead of an address. Wrong passwords are throttled (from the third on 5 s,
+doubling up to 300 s), five in one connection end it, and an attempt that is refused,
+fails or gets no answer ends with a message on the start screen instead of an
+automatic retry. A key or list file that exists but is unreadable or damaged never
+lets anyone in and is never replaced silently. All of it in detail - messages, files,
+log lines, the wire format - is in `MANUAL.txt`, "Encryption and access".
 
-![Statistics panel (F9) during a session with HEVC 4:4:4 at 10 bits, 1920x1080, decoded by NVDEC, and the hint shown on first contact with a host: compare the six-digit code with the one on the host.](oberflaeche-sitzung.png)
+Earlier pairings stay valid: at its first start a host takes over `authorized.txt`
+into `host-devices.txt`, a client `known_hosts.txt` into `hosts.txt`, and the old
+files are renamed to `*.migriert`. A client of an earlier version that a new host does
+not know yet cannot answer its access request, and a new client reports a host of an
+earlier version that does not know it ("… uses an older QuadChroma version"): update
+both sides.
+
+![Statistics panel (F9) during a session with HEVC 4:4:4 at 10 bits, 1920x1080, decoded by NVDEC; the last line shows the six-digit comparison code.](oberflaeche-sitzung.png)
 
 ## Using the client
+
+### Start screen
+
+The list shows every host that announces itself in the network: its name on the left,
+its device ID on the right ("ID -" for a host of an earlier version), and a check mark
+for a host that has let this client in before; hovering shows the address. A click
+connects, and on Windows the "Desktop shortcut" button puts a shortcut to that host on
+the Desktop. The address field takes an IP address, a name or a device ID (nine
+digits, spaces allowed) and pastes with Ctrl+V (Cmd+V on the Mac). On Windows, "Share
+this PC" starts the host role (see "Sharing a Windows PC"). While the access dialog is
+open (see "Pairing"), Enter connects, Esc cancels, and no key reaches the host.
 
 ### Keys
 
@@ -306,9 +359,10 @@ recommendation can be applied with one click; the table is written to
 ### Test mode
 
 `quadchroma.exe <address> --headless` runs without a window and prints a status line
-every three seconds; `--decodertest` tries every decoder choice without a connection,
-`--anzeigetest <dir>` checks the GPU display path against the CPU path, `--shot`
-writes a BMP of the interface. `MANUAL.txt` lists all switches.
+every three seconds; with `--passwort <password>` it answers a host's access request
+once; `--decodertest` tries every decoder choice without a connection, `--anzeigetest
+<dir>` checks the GPU display path against the CPU path, `--shot` writes a BMP of the
+interface. `MANUAL.txt` lists all switches.
 
 ## The host's screen
 
@@ -429,9 +483,13 @@ connects at once, even when the client already sits in the notification area. Wi
 a window:
 
     quadchroma.exe --verknuepfung <address> [--name <name>] [--ordner <folder>]
+                   [--id <id>]
 
-The shortcut carries the full path of the exe and the host's address, not its name:
-after moving the exe, or when the host gets a new address, create it again.
+The shortcut carries the full path of the exe, the host's address and - if the host
+announces one - its device ID (`--verbinden "<address>" --id <id>`). With the ID the
+client finds the host under a new address as long as it announces itself in the same
+network, and it checks that the key behind it gives that ID. After moving the exe,
+create the shortcut again.
 
 The client draws its program icon, four coloured squares, itself: on Windows for the
 title bar, taskbar and notification area, on the Mac in monochrome for the menu bar.
@@ -451,7 +509,7 @@ marks for one frame and one monitor refresh, plus the load on host and client; a
 is marked as the bottleneck when the chain is longer than one frame and that link
 makes up more than half of it.
 
-![Nerd mode: the statistics panel widened, with host and client load and the latency chain as a bar on a millisecond scale, shown during first contact with the comparison code.](nerd.png)
+![Nerd mode: the statistics panel widened, with the comparison code, host and client load and the latency chain as a bar on a millisecond scale.](nerd.png)
 
 ## Measurements
 
@@ -487,8 +545,9 @@ The Windows host role has been verified on the VM and in the test harnesses only
 Every connection is encrypted and mutually authenticated; there is no switch to turn
 that off. QuadChroma uses the Noise pattern XX with X25519, ChaCha20-Poly1305 and
 SHA-256: both sides identify themselves with a permanent key, every connection gets
-fresh session keys, and the handshake yields a six-digit comparison code that both
-sides show. If the codes match, nobody sits in between.
+fresh session keys, and the handshake yields a six-digit comparison code - the client
+shows it (F9, menu, access dialog), the host in its "Allow" window and its log. If the
+codes match, nobody sits in between.
 
 The video channel is set up first. The input channel includes the video channel's
 handshake hash in its own handshake, and without that hash nobody gets in. So nobody
@@ -500,20 +559,32 @@ clipboard and files go only to that same host. The host binds the input channel 
 exactly one viewer: when a new viewer replaces it or its picture breaks off, the host
 cuts the channel and releases that viewer's pressed keys and mouse buttons.
 
-A host admits a new device only while it has no authorization list yet or when it
-was started with `--pair`, and the client checks the host's fingerprint before it
-identifies itself; see "Pairing" under "Getting started".
+A host lets a device in only if its full key is in the host's list of allowed devices,
+or if it proves the host's access password, or if someone at the host clicks "Allow";
+see "Pairing" under "Getting started". The password stays on both machines: the client
+derives a key from it with PBKDF2-HMAC-SHA256 (100,000 rounds, salted with the host's
+public key) and sends an HMAC proof bound to the handshake hash of this very
+connection; the host answers with a proof of its own, which the client checks before
+it remembers the host. Proofs are compared in constant time, and a replayed proof is
+worthless on another connection. Wrong passwords are throttled per address and per key
+(from the third on 5 s, doubling up to 300 s; after more than 30 failures in 60 s
+every new attempt waits at least 60 s), and a proof that comes too early is not even
+checked. An unknown device waits in an access phase of at most 120 s that takes no
+lock: at most 4 of them at a time, 2 per address and 1 per key, and until it is let in
+it touches no running viewer and gets no input channel. The "Allow" window does not
+take the keyboard, and its "Allow" button stays disabled for the first second, so that
+a stray click or Return lets nobody in.
 
 Every handshake has an overall deadline (host 5 s, client 3 s) and runs in its own
 thread on the host, at most 32 at a time per port and only a few per sender; whoever
 stays silent or trickles holds only their own slot. What anyone on the network can
-trigger without pairing - failed handshakes, unknown peers, input channels without a
-picture - goes into the host log rate-limited: at most one line per 10 s per kind and
-address, with the number of suppressed lines (counted per address for up to 4 (Mac
-host) or 64 (Windows host) addresses per kind, beyond that together). Both hosts cap
-their log at 8 MB and move the older part to an `.alt` file.
+trigger without being let in - failed handshakes, access requests and wrong passwords,
+input channels without a picture - goes into the host log rate-limited: at most one
+line per 10 s per kind and address, with the number of suppressed lines (counted per
+address for up to 4 (Mac host) or 64 (Windows host) addresses per kind, beyond that
+together). Both hosts cap their log at 8 MB and move the older part to an `.alt` file.
 
-One viewer at a time: when another paired device connects, it takes over the
+One viewer at a time: when another allowed device connects, it takes over the
 session. The previous one first receives message 10, shows "Another device has taken
 over the session." and does not reconnect by itself. The new viewer inherits nothing
 from the old one: a test pattern ends, and it gets a first frame at once, even on a
@@ -522,14 +593,26 @@ still screen.
 On the Mac the Noise pattern is implemented in-house (about 400 lines of C on
 Monocypher); the Windows side uses the established Rust implementation `snow`. The two
 were checked against each other: same comparison code, same fingerprints, encrypted
-exchange in both directions.
+exchange in both directions. The proofs of the access phase use CommonCrypto on the
+Mac and a small HMAC and PBKDF2 on top of the `sha2` crate in Rust; both sides check
+the same test vectors.
 
-Known limitations: pairing is tied to the address. `known_hosts.txt` remembers the key
-per address and the network announcement is not authenticated, so a different device
-under a known name at a new address counts as a first contact, and then only the
-comparison code protects you. The clipboard is read during a session even when the
-client window has no focus (see "What is missing"). Report vulnerabilities as
-described in `SECURITY.md`.
+Known limitations: the network announcement - name, device ID, whether "Allow" is
+possible - is not authenticated, and names are only for display. Connecting by device
+ID (a row of the host list, a desktop shortcut) is the safer way: before identifying
+itself the client checks that the host's key gives that ID and, for a host it knows,
+that it is exactly the remembered key. Connecting by a bare address (typed IP or
+name), the client accepts whatever key answers there as soon as that side lets it in:
+only the password answer is a proof - "Allow", or the plain statement that the device
+is already known, can come from any device that answers in the host's place. A
+different key at a remembered address shows up in the access dialog, if there is one,
+and in the client's log, and the comparison code tells the real host from an impostor,
+but nothing stops such a connection by itself. The device ID has nine digits and is
+not a secret; it serves display and search. The access password lies in plain text in
+`host-password.txt`, because the host has to show it, and whoever watches the host's
+screen - a connected viewer included - can read it in the menu. The clipboard is read
+during a session even when the client window has no focus (see "What is missing").
+Report vulnerabilities as described in `SECURITY.md`.
 
 ## What is missing
 
@@ -546,7 +629,16 @@ open on real devices:
   after a codec switch with a format change are verified, all at a fixed frame rate:
   the codec switch on a truly still screen, the viewer takeover with message 10,
   re-sending the last frame on a still screen, an audio format of 44.1 kHz, clipboard
-  managers, a damaged authorization list.
+  managers, a damaged device list.
+- The access with password or "Allow": covered by the same test vectors on both sides,
+  `zugangtest`, `menuetest`, the access sections of `hosttest` and loopback tests in
+  Rust (the client against a test host, the Windows host role against a test client).
+  Still open on real devices: the Mac host's menu bar, its windows and "Start at
+  login" with the project's own certificate; whether a Screen Recording permission
+  granted while the host runs takes effect without a restart; the Windows host role's
+  icon, windows and "Start with Windows" on an interactive desktop (the VM is driven
+  over ssh, without Explorer); and a Windows client against the Mac host through the
+  access phase.
 - Screen selection on the device: for the Windows host role the switch itself (new
   Duplication, SWITCH, INFO, keyframe, list afterwards; with the same size the encoder
   on the CPU path stays) - it needs two real outputs and the VM has one; the pure parts
@@ -583,7 +675,9 @@ are in `RELEASING.md`.
 
 **Known limitations.**
 
-- Pairing is tied to the address (see "Security").
+- Connecting by a bare address trusts the answering side more than connecting by
+  device ID, and the access password lies in plain text on the host (see
+  "Security").
 - The clipboard crosses over during a session even when the client window has no
   focus - copied files immediately and up to 4 GB, even if they are never pasted on
   the other side. On all sides it is read only while a counterpart is connected;
@@ -594,16 +688,15 @@ are in `RELEASING.md`.
 - Transfer files only on paste (like RDP) instead of immediately on copy; send the
   list of entries in parts instead of in one piece (up to 1 MiB, during which
   keystrokes or frames wait briefly).
-- A desktop shortcut on the Mac client; an icon in the notification area or menu bar
-  for the hosts (they have no window).
-- A pairing dialog in the interface instead of command-line switches.
-- Role choice (Windows as host): `--host` exists (viewer slot, pairing, announcement,
-  input, clipboard including files, Desktop Duplication, encoder via NVENC or without
-  NVIDIA H.264 in software, frame pacing, codec switch, screen selection with
-  switching, test pattern, audio, pointer shape, load, keep-awake), plus `--list`,
-  `--messen` and the recorded stream (`--konserve`) as a test path. Missing are
-  AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today)
-  and a menu entry "Share this computer". Described in `MANUAL.txt`.
+- A desktop shortcut on the Mac client.
+- Windows as host: "Share this PC" and `--host` exist (viewer slot, access with
+  password or "Allow", icon in the notification area, announcement, input, clipboard
+  including files, Desktop Duplication, encoder via NVENC or without NVIDIA H.264 in
+  software, frame pacing, codec switch, screen selection with switching, test
+  pattern, audio, pointer shape, load, keep-awake), plus `--list`, `--messen` and the
+  recorded stream (`--konserve`) as a test path. Missing are AMF/QSV, HDR outputs,
+  scaling and rotation on the GPU (both run on the CPU today). Described in
+  `MANUAL.txt`.
 - AV1: no host offers it until protocol and client support it.
 - Audio compression as an option; uncompressed audio can take more bandwidth than the
   picture.
@@ -656,8 +749,10 @@ The Xcode Command Line Tools are enough; a full Xcode installation is not requir
 `make` builds `build/QuadChroma.app` from `host/` and signs it with the local
 development identity named in the Makefile. The host uses only its own code, Apple
 frameworks (Foundation, AppKit, ScreenCaptureKit, VideoToolbox, CoreMedia, CoreVideo,
-CoreGraphics, CoreFoundation, IOKit) and the vendored Monocypher; no FFmpeg. Its test
-harnesses run without screen capture, see "Test harnesses".
+CoreGraphics, CoreFoundation, IOKit, ServiceManagement for "Start at login",
+SystemConfiguration for the computer name; CommonCrypto for the access proofs) and the
+vendored Monocypher; no FFmpeg. Its test harnesses run without screen capture, see
+"Test harnesses".
 
 ### Mac client
 
@@ -671,10 +766,10 @@ desktop shortcut on the Mac. Build it with Rust and the FFmpeg from Homebrew:
     ./target/release/quadchroma 192.168.178.194:9001
 
 Its files live in `~/Library/Application Support/QuadChroma` (`client.key`,
-`known_hosts.txt`, `einstellungen.txt`, `protokoll.txt`, `benchmark.txt`, and
+`hosts.txt`, `einstellungen.txt`, `protokoll.txt`, `benchmark.txt`, and
 `einzel.sock` and `einzel.lock` for the single instance) - next to the host's
-`host.key` and `authorized.txt`, as separate files. Pairing works as with every
-client: start the host once with `--pair`.
+`host.key`, `host-devices.txt` and `host-password.txt`, as separate files. A host lets
+it in like every client: with its access password or a click on "Allow".
 
 License note: the FFmpeg from Homebrew is a GPL build (libx264, libx265). That is
 fine for your own use, but passing on a Mac client built this way would require an
@@ -683,12 +778,20 @@ LGPL build without the GPL parts. This is why no Mac client binary is distribute
 ## Test harnesses
 
 For the Mac host there are small test programs that run without screen capture and
-leave a running host, with its ports, authorizations and clipboard, alone. Build them
-from the repository root; each file's header holds its build line, and the exit code
-is the number of failures.
+leave a running host, with its ports, device list, password and clipboard, alone.
+Build them from the repository root; each file's header holds its build line, and the
+exit code is the number of failures.
 
-- `host/annahmetest.c`: handshake deadline, slots and eviction, authorization list,
-  `host.key`. Loopback from port 19000, its own `HOME`, about 25 s.
+- `host/annahmetest.c`: handshake deadline, slots and eviction; reading with a
+  deadline after the handshake (as the access phase waits for the client: deadline,
+  end of connection, trickling, buffered bytes); the client's name in handshake
+  message 3; `host.key`. Loopback from port 19000, its own `HOME`, about 25 s.
+- `host/zugangtest.c`: the access core `host/zugang.c` without network - device ID,
+  names, announcement, messages 20 to 23, norm, HMAC (RFC 4231) and PBKDF2 with the
+  test vectors of the Rust side, the proofs, constant-time comparison, throttle,
+  limits of the access phases, requests to the menu bar, `host-devices.txt` (format,
+  damaged files, removing, resetting), the takeover from `authorized.txt`,
+  `host-password.txt` and the single instance. Its own `HOME`, about 2 s.
 - `host/hosttest.m`: includes `main.m` and checks the rate limiting (per kind and
   address) and the size cap of the log; the viewer takeover (message 10) including a
   leftover test pattern; teardown between start-up and registration; re-sending the
@@ -715,6 +818,16 @@ is the number of failures.
     no switch is pending, after 5 s the switch happens anyway); an empty list with a
     running stream; screen loss and recovery. List and stream come from mocks, the
     encoders are real.
+  - Access, with real handshakes and a client that behaves like the Rust client: an
+    unknown client gets "QCA1" and message 20; the right password gives result 0 with
+    a correct host proof and then "QCH1"; wrong passwords with the throttle and the
+    end after five; "Allow" and "Deny" through a test hook instead of the menu bar;
+    cancel and end of connection withdraw the request; only one request shown at a
+    time; the limits per address and per key; the deadline; a waiting client does not
+    disturb the running viewer; a damaged device list; removing a device ends its
+    session; host status 1 instead of a refusal without the Screen Recording
+    permission or without a screen; a name that fakes a device ID; switches without
+    a value. Also the service clock without a run loop and the farewell on quitting.
 
   Loopback from ports 19100 and 19400/19450, its own `HOME` under `$TMPDIR` (removed
   after a passing run), about 100 s. It briefly uses real HEVC encoders (640×360,
@@ -751,6 +864,10 @@ is the number of failures.
   viewer", and reading and writing file references (`public.file-url`), on a
   separate named pasteboard instead of the general one; its files are under
   `$TMPDIR`.
+- `host/menuetest.m`: the menu bar without showing anything - the text tables in 29
+  languages (every text in every table, placeholders, no duplicates), the choice of
+  language, the menu for various states, the password check of the password window
+  and the queue of "Allow" requests, against a stand-in for the access core.
 
 ```
 clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \
@@ -813,6 +930,21 @@ fallback, return, reasons), identifier and name from the device ID, `bildschirm.
 including leftovers, message 12 only after setup, the Win32 paths of the list, the
 request over the real input channel and the greeting with capabilities 3 and list 12.
 
+For the access the Rust tests check the test vectors (device ID, norm, K, both proofs,
+HMAC after RFC 4231, PBKDF2), messages 20 to 23 including truncated ones and a wrong
+version, the throttle, `hosts.txt` and `host-devices.txt` with the takeover from the
+old lists, the announcement with ID, and the texts in all 29 languages, which must
+match `host/texte.m` of the Mac host for every shared text (the test skips that part
+when `host/` is missing). End to end over loopback: the client against test hosts
+(known, password wrong then right, "Allow" with and without having been offered, a
+wrong host proof that pins nothing, refused, deadline, no free place, older host,
+silent host, foreign reply, cancel, new identity at a known address, another ID,
+removed device) and the Windows host role against a test client (known, password
+right and wrong with the throttle, "Allow" and "Deny" through a test hook, cancel,
+deadline, replayed proofs, limits, damaged list, unreadable password, trickling
+bytes, removal while a device comes in), plus the host role's Win32 windows driven by
+messages.
+
 A self-test without network checks the icon in the notification area or menu bar:
 `quadchroma.exe --tray-selbsttest` (needs a session with Explorer) or
 `quadchroma --menueleiste-selbsttest` on the Mac; exit code 0 or 1.
@@ -821,16 +953,23 @@ A self-test without network checks the icon in the notification area or menu bar
 
     host/          Mac host (Objective-C and C): capture, encoder, network, input,
                    audio, clipboard, files (dateien.m), screen selection
-                   (bildschirm.m), pointer shape, the test harnesses;
+                   (bildschirm.m), pointer shape, access with password or Allow
+                   (zugang.c), menu bar and its windows (menue.m) with the texts
+                   in 29 languages (texte.m), the test harnesses;
                    host/vendor/monocypher is the vendored Monocypher
     client/        Rust: receive, decode, display (anzeige.rs: Direct3D 11), input,
                    audio, clipboard; files (dateien.rs) and screen list
-                   (bildschirm.rs), both shared with the host role; notification
-                   area and menu bar (tray*.rs), single instance (einzel.rs),
-                   desktop shortcut (verknuepfung.rs), program icon (logo.rs);
-                   version information, icon and manifest of the exe (build.rs,
-                   res/); the Windows host role in client/src/host/ (capture with
-                   screen selection, encoder, network, input, audio, pointer shape)
+                   (bildschirm.rs), both shared with the host role; device ID,
+                   access proofs, throttle and the lists (zugang.rs, shared with
+                   the host role) and the client's access dialog
+                   (zugangsphase.rs); notification area and menu bar (tray*.rs),
+                   single instance (einzel.rs), desktop shortcut and "Start with
+                   Windows" (verknuepfung.rs), program icon (logo.rs); version
+                   information, icon and manifest of the exe (build.rs, res/); the
+                   Windows host role in client/src/host/ (capture with screen
+                   selection, encoder, network, access phase (einlass.rs), menu
+                   and windows (oberflaeche.rs, fenster.rs), input, audio, pointer
+                   shape)
     Makefile       builds and signs the Mac app bundle; sign, notarize, staple, zip
                    and dmg for distribution
     scripts/       build-ffmpeg-windows.sh (FFmpeg for Windows), sign-windows.ps1

@@ -10,4 +10,4 @@ contact_links:
     about: Business use, embedding, or any permission that LICENSE.txt does not give - write to hello@quadchroma.tech.
   - name: Questions about using QuadChroma
     url: https://github.com/quadchroma-tech/quadchroma/blob/main/README.md
-    about: README.md covers setup, pairing, the client and the Windows host role; MANUAL.txt is the full reference. Still stuck? E-mail hello@quadchroma.tech.
+    about: README.md covers setup, pairing with password or "Allow", the client and the Windows host role; MANUAL.txt is the full reference. Still stuck? E-mail hello@quadchroma.tech.

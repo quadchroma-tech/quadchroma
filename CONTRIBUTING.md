@@ -78,6 +78,11 @@ them are closed.
    `alle_tabellen_in_enum_reihenfolge` fails otherwise. If you cannot translate a text
    into all of these languages, put the English text into the tables you cannot fill and
    say so in the pull request; the author translates. No string literals in UI code.
+   The Mac host is the one exception to the file: the texts of its menu bar and windows
+   live in `host/texte.m` (`QCText`), with the same 29 languages in the same order, and
+   a text the client or the Windows host role shows as well must read exactly the same
+   there (the Rust test `zugang_texte_wie_mac_host` compares them; `menuetest` checks
+   the tables of `texte.m` themselves).
 5. **Code comments and log lines in German, everything else in English.** Code
    comments and the program's log and console lines are written in German (a project
    rule for the source code); documentation, commit messages and everything else on
@@ -86,8 +91,9 @@ them are closed.
    files, and every line the program writes to the console, `protokoll.txt`,
    `host-protokoll.txt` or `/tmp/quadchroma-m1.log`, are German, with `ae`, `oe`, `ue`
    and `ss` instead of umlauts and ß, as in the existing code
-   (`// Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.` -
-   "pairing open: the next unknown peer is accepted"). Identifiers follow the file you
+   (`// Zu frueh wird gar nicht erst gerechnet - so kostet Raten nichts ausser Zeit.` -
+   "a proof that comes too early is not even computed, so guessing costs nothing but
+   time"). Identifiers follow the file you
    are editing (mostly German as well). The documentation - `README.md`, `MANUAL.txt`,
    this file, `CLA.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `RELEASING.md`, the issue
    and pull request templates - is in English. If your change alters documented
@@ -100,8 +106,8 @@ them are closed.
    colors, behavior of the window - agree first.
 7. **`host/vendor/monocypher` is third-party code.** Never modify it; updates come from
    upstream as a whole.
-8. **Protocol changes** (message numbers, capability bits, wire formats, the pairing
-   and handshake) affect the Mac host (`host/`), the Windows host role
+8. **Protocol changes** (message numbers, capability bits, wire formats, the handshake,
+   the access phase and its proofs) affect the Mac host (`host/`), the Windows host role
    (`client/src/host/`) and the client. They need an issue first, all sides in the same
    pull request, test vectors in the unit tests on both sides, and compatibility with
    older peers wherever the capability mechanism allows it.
@@ -145,8 +151,9 @@ and `make dmg` are described in `RELEASING.md`). Do not start the freshly built 
 (`open build/QuadChroma.app`, `make list`, `make capture`) unless you are prepared for
 macOS to ask for Screen Recording and Accessibility permissions on that machine and
 unless no host is running there. The test harnesses `noisetest`, `annahmetest`,
-`dateitest` and `ablagetest` run without screen capture and without touching a running
-host; their `clang` lines are in `.github/workflows/ci.yml`, which runs them.
+`zugangtest`, `dateitest`, `ablagetest` and `menuetest` run without screen capture and
+without touching a running host; their `clang` lines are in
+`.github/workflows/ci.yml`, which runs them.
 `hosttest` includes `main.m`, needs the Screen Recording permission granted to your
 terminal, and uses real HEVC encoders for about 100 seconds: run it only on a machine
 where you have granted that permission, never during a stream, never in CI.
@@ -183,8 +190,11 @@ sufficient.
 - Line endings are handled by `.gitattributes` (LF in the repository, CRLF for `*.ps1`,
   `*.bat`, `*.cmd`); UTF-8 without BOM; no trailing whitespace.
 - Do not commit anything from `build/`, `client/target/` or `paket/`, no keys (`vmkey`,
-  `host.key`, `client.key`), no `known_hosts*`, no recordings (`*.hevc`, `*.bmp`).
-  `.gitignore` covers these; check `git status` anyway.
+  `host.key`, `client.key`), no `known_hosts*`, no device lists or passwords
+  (`host-devices.txt`, `host-password.txt`, `hosts.txt`), no recordings (`*.hevc`,
+  `*.bmp`). `.gitignore` covers the build output, `vmkey`, `known_hosts`, `*.hevc` and
+  `*.bmp`; the program's own files live outside the repository anyway. Check
+  `git status` all the same.
 
 ## 6. Licensing of contributions and third-party code
 
