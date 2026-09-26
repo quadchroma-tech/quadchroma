@@ -105,11 +105,12 @@ DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 # Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
-SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
+SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/zugang.c host/vendor/monocypher/monocypher.c
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
 FRAMEWORKS := -framework Foundation -framework AppKit -framework ScreenCaptureKit \
               -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
-              -framework CoreGraphics -framework CoreFoundation -framework IOKit
+              -framework CoreGraphics -framework CoreFoundation -framework IOKit \
+              -framework SystemConfiguration
 
 SECONDS ?= 10
 OUT     ?= /tmp/qc.hevc

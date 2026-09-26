@@ -3,10 +3,16 @@
 //   noisetest              Selbsttest gegen sich selbst
 //   noisetest <port>       wartet auf die Gegenstelle und fuehrt den Handschlag
 //
-// Beim Netztest gibt jede Seite Pruefsumme und Vergleichscode aus. Stimmen die
-// ueberein, sprechen C und Rust nachweislich dieselbe Sprache.
+// Beim Netztest gibt jede Seite Pruefsumme, Vergleichscode und Geraete-IDs
+// aus, dazu den Namen, den der Client in Nachricht 3 schickt ("QCN1",
+// zugang.h). Stimmen die ueberein, sprechen C und Rust nachweislich dieselbe
+// Sprache.
+//
+//   clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c host/zugang.c \
+//         host/qc_secure.c host/vendor/monocypher/monocypher.c -o /tmp/noisetest
 
 #include "qc_noise.h"
+#include "zugang.h"
 #include "monocypher.h"
 #include <stdio.h>
 #include <string.h>
@@ -138,6 +144,9 @@ int main(int argc, char **argv) {
     char fp[24];
     qc_fingerprint(s_pub, fp);
     printf("Host-Fingerabdruck: %s\n", fp);
+    char id[12];
+    qc_zugang_id_text(qc_zugang_id(s_pub), id);
+    printf("Geraete-ID des Hosts: %s\n", id);
     printf("oeffentlicher Schluessel (hex): ");
     for (int i = 0; i < 32; i++) printf("%02x", s_pub[i]);
     printf("\n");
@@ -175,14 +184,18 @@ int main(int argc, char **argv) {
 
     if (read_msg(fd, msg, &mlen)) { printf("Nachricht 3 nicht lesbar\n"); return 6; }
     if (qc_handshake_read(&hs, msg, mlen, payload, &plen)) { printf("Nachricht 3 abgelehnt\n"); return 7; }
-    payload[plen] = 0;
-    printf("Nachricht 3 gelesen, Nutzdaten: %s\n", payload);
+    char name[QC_ZUGANG_NAME_MAX + 1];
+    if (qc_zugang_name_lesen(payload, plen, name))
+        printf("Nachricht 3 gelesen, Name des Clients: %s\n", name);
+    else
+        printf("Nachricht 3 gelesen, ohne Namen (%zu Byte - aelterer Client)\n", plen);
 
-    char sas[8], cfp[24];
+    char sas[8], cfp[24], cid[12];
     qc_sas(qc_handshake_hash(&hs), sas);
     qc_fingerprint(hs.rs, cfp);
+    qc_zugang_id_text(qc_zugang_id(hs.rs), cid);
     printf("Vergleichscode: %s\n", sas);
-    printf("Client-Fingerabdruck: %s\n", cfp);
+    printf("Client-Fingerabdruck: %s, Geraete-ID %s\n", cfp, cid);
 
     qc_cipher send, recv;
     qc_handshake_split(&hs, &send, &recv);

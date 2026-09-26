@@ -176,10 +176,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c \
-                host/vendor/monocypher/monocypher.c -o build/noisetest
+          clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c host/zugang.c \
+                host/qc_secure.c host/vendor/monocypher/monocypher.c -o build/noisetest
           clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \
                 host/qc_secure.c host/qc_noise.c host/vendor/monocypher/monocypher.c -o build/annahmetest
+          clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/zugangtest.c host/zugang.c \
+                host/qc_secure.c host/qc_noise.c host/vendor/monocypher/monocypher.c -o build/zugangtest
           clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
                 -framework Foundation host/dateitest.m host/dateien.m -o build/dateitest
           clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 -framework Foundation \
@@ -190,16 +192,18 @@ jobs:
                 -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
                 -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
                 -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
+                -framework SystemConfiguration \
                 host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
                 host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
-                host/vendor/monocypher/monocypher.c -o build/hosttest
+                host/zugang.c host/vendor/monocypher/monocypher.c -o build/hosttest
 
-      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, dateitest, ablagetest)
+      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, zugangtest, dateitest, ablagetest)
         run: |
           set -euo pipefail
           # noisetest prints two log lines and "OK" as the last line.
           out=$(build/noisetest); echo "$out"; [ "$(printf '%s\n' "$out" | tail -n 1)" = "OK" ]
           build/annahmetest
+          build/zugangtest
           build/dateitest
           build/ablagetest
 

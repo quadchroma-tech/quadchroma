@@ -3,11 +3,15 @@
 //   M2: den Strom ueber TCP ausliefern statt in eine Datei zu schreiben.
 //
 // Aufrufe:
+//   quadchroma-host                                   Host auf Port 9001 (Doppelklick im Finder)
 //   quadchroma-host --list
 //   quadchroma-host --capture <sekunden> <datei.hevc> [optionen]
 //   quadchroma-host --serve [port]                    [optionen]
 //
 // Optionen: --display N  --out BxH  --fps N  --mbit N  --fest
+//
+// Wer hereinkommt, entscheidet zugang.h: bekannte Geraete (host-devices.txt)
+// sofort, neue mit dem Zugangspasswort oder per Klick "Zulassen" am Host.
 //
 // Der Codec laesst sich im Betrieb wechseln (Nachricht 66 vom Client); der
 // Start erfolgt immer mit Kandidat 0, HEVC 4:4:4 10 Bit.
@@ -15,8 +19,10 @@
 // folgt der Host dem Hauptbildschirm, mit Wunsch dem gewuenschten, siehe
 // bildschirm.h. --display N pinnt fuer diesen Lauf den Listenplatz N.
 //
-// Ueber "open -n QuadChroma.app --args ..." starten, damit die Freigaben am
-// Bundle haengen. Ausgaben zusaetzlich in /tmp/quadchroma-m1.log.
+// Ueber "open QuadChroma.app" starten (Argumente fuer Kenner mit
+// "open -n ... --args"), damit die Freigaben am Bundle haengen. Es laeuft
+// hoechstens ein Host je Nutzer (host-instanz.lock). Ausgaben zusaetzlich in
+// /tmp/quadchroma-m1.log.
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -47,6 +53,10 @@
 #include "qc_annahme.h"
 #import "last.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#include <fcntl.h>
+#include <poll.h>
+#include "zugang.h"
 
 // ------------------------------------------------------------------ Logging
 
@@ -141,15 +151,22 @@ typedef struct {
 #define QC_DROSSEL(name) { .art = name, .m = PTHREAD_MUTEX_INITIALIZER, .sonst_s = -QC_MELDEN_S }
 
 static qc_drossel d_bild_handschlag = QC_DROSSEL("Bildkanal: Handschlag gescheitert");
-static qc_drossel d_liste_defekt    = QC_DROSSEL("Abgewiesen: Freigabeliste nicht lesbar oder beschaedigt");
-static qc_drossel d_nicht_speicherbar = QC_DROSSEL("Abgewiesen: Freigabe liess sich nicht speichern");
-static qc_drossel d_unbekannt       = QC_DROSSEL("Abgewiesen: unbekannte Gegenstelle");
+static qc_drossel d_liste_defekt    = QC_DROSSEL("Geraeteliste nicht lesbar oder beschaedigt");
+// Zugangsphase (zugang.h): alles, was ein Unbekannter ausloesen kann. Was erst
+// nach Passwort oder Klick geschieht (angenommen, zugelassen, abgelehnt,
+// eingetragen), bleibt ungedrosselt.
+static qc_drossel d_zugang          = QC_DROSSEL("Zugang noetig");
+static qc_drossel d_zugang_voll     = QC_DROSSEL("Zugang: kein Platz");
+static qc_drossel d_zugang_falsch   = QC_DROSSEL("Zugang: Passwort falsch");
+static qc_drossel d_zugang_abbruch  = QC_DROSSEL("Zugang: abgebrochen");
+static qc_drossel d_zugang_frist    = QC_DROSSEL("Zugang: Frist abgelaufen");
 static qc_drossel d_ein_ohne_bild   = QC_DROSSEL("Eingabekanal abgewiesen: kein Bildkanal offen");
 static qc_drossel d_ein_handschlag  = QC_DROSSEL("Eingabekanal: Handschlag gescheitert");
 static qc_drossel d_ein_fremd       = QC_DROSSEL("Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
 static qc_drossel d_ton_verworfen   = QC_DROSSEL("Ton verworfen: Leitung langsamer als der Ton");
 static qc_drossel *const g_drosseln[] = {
-    &d_bild_handschlag, &d_liste_defekt, &d_nicht_speicherbar, &d_unbekannt,
+    &d_bild_handschlag, &d_liste_defekt, &d_zugang, &d_zugang_voll, &d_zugang_falsch,
+    &d_zugang_abbruch, &d_zugang_frist,
     &d_ein_ohne_bild, &d_ein_handschlag, &d_ein_fremd, &d_ton_verworfen,
 };
 
@@ -303,7 +320,6 @@ static qc_chan *g_vid = NULL;               // durch g_send_mtx geschuetzt
 static _Atomic int g_vid_ready = 0;
 static uint8_t g_vid_hh[QC_HASHLEN];        // Pruefsumme des Bildkanals
 static uint8_t g_vid_peer[32];              // Schluessel des verbundenen Clients
-static _Atomic int g_pair_open = 0;         // Kopplungsfenster offen?
 static char g_last_sas[8] = {0};
 // Der Eingabekanal gilt nur, solange sein Bildkanal lebt. Jeder Wechsel und
 // jeder Verlust des Bildkanals beginnt eine neue Sitzung und bricht den
@@ -324,10 +340,20 @@ static uint64_t g_in_kanal = 0;             // seine Nummer; unter g_send_mtx
 static uint64_t g_faehig_sitzung = 0, g_faehig_kanal = 0;
 static uint32_t g_faehig_bits = 0;
 static char g_vid_ip[INET_ADDRSTRLEN] = {0};  // Adresse des Zuschauers, fuers Protokoll; unter g_send_mtx
-// Freigabe pruefen und eintragen geschieht am Stueck: Handschlaege laufen
-// nebeneinander, und zwei Unbekannte duerfen nicht beide durch dasselbe
-// Kopplungsfenster schluepfen.
-static pthread_mutex_t g_freigabe_mtx = PTHREAD_MUTEX_INITIALIZER;
+// Wer hereinkommt, steht in host-devices.txt (zugang.c, mit eigener kleiner
+// Sperre nur fuer das Lesen und Eintragen). Eine Zugangsphase haelt keine
+// Sperre, solange sie auf Passwort oder Klick wartet.
+
+// Zustand fuer die Oberflaeche (qc_zustand_*). Der Name des Zuschauers hat
+// eine eigene Sperre, ein Blatt: g_send_mtx kann bis zu 2 s haengen, das
+// Menue darf das nicht. Gesetzt, bevor g_client_fd ihn als verbunden zeigt.
+static pthread_mutex_t g_zustand_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char g_zuschauer_name[QC_ZUGANG_NAME_MAX + 1] = {0};
+// Bildport, den ein anderes Programm belegt (0 = keiner): der Host wartet
+// dann, statt zu enden, und versucht es alle 3 s erneut.
+static _Atomic int g_port_belegt = 0;
+// Gesamtfrist einer Zugangsphase; der Pruefstand verkuerzt sie.
+static int g_zugang_frist_ms = QC_ZUGANG_FRIST_MS;
 
 // Was sich im Betrieb verstellen laesst. Der Client schickt Wuensche, der Host
 // setzt sie um und meldet zurueck, was wirklich gilt.
@@ -450,6 +476,16 @@ static id g_grab = nil;                       // der Empfaenger der Aufnahme, wi
 static _Atomic int g_fixed_gewollt = 0;       // was der Benutzer will, unabhaengig vom Ausfall
 static int g_kein_bildschirm_gemeldet = 0;
 static IOPMAssertionID g_wach = kIOPMNullAssertionID;
+// Ohne Bildschirmaufnahme-Freigabe endet der Host nicht mehr (Spezifikation
+// 7.4): ein Zuschauer kommt trotzdem herein, bekommt Hoststatus 1 wie bei
+// einem fehlenden Bildschirm, und die Wiederherstellung versucht es alle 3 s,
+// bis die Freigabe da ist. Dann bekommt er SWITCH und INFO, als haette er den
+// Bildschirm gewechselt (seine Begruessung kannte nur Ersatzmasse).
+static _Atomic int g_ohne_aufnahme = 0;
+// Freigabe fuer die Bildschirmaufnahme. Ersetzbar, damit der Pruefstand den
+// Weg ohne Freigabe fahren kann.
+static BOOL tcc_bildschirm_system(void) { return CGPreflightScreenCaptureAccess(); }
+static BOOL (*g_tcc_bildschirm)(void) = tcc_bildschirm_system;
 static void aufnahme_wiederherstellen(void);
 static void hoststatus_senden(uint8_t lage);
 static void bildschirme_senden(void);
@@ -607,6 +643,7 @@ static int klein_senden_gesperrt(int fd, uint8_t type, const void *data, size_t 
     qc_chan_free(g_vid);
     g_vid = NULL;
     stream_herunterfahren_anstossen();
+    qc_ui_zustand_geaendert();
     return -1;
 }
 
@@ -943,6 +980,268 @@ static int zuschauer_abloesen(int neu_fd, char fp_alt[24]) {
     return gemeldet;
 }
 
+// ------------------------------------------------------------ Rechnername
+// Der Name dieses Macs, wie ihn die Systemeinstellungen zeigen ("Roberts Mac
+// mini"), sonst der Hostname - UTF-8-sicher auf 40 Byte. Er steht in der
+// Bekanntgabe und in Nachricht 20. Die Bekanntgabe frischt ihn auf.
+static pthread_mutex_t g_rechnername_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char g_rechnername[QC_ZUGANG_NAME_MAX + 1] = {0};
+
+static void rechnername_auffrischen(void) {
+    char roh[1024] = {0};
+    CFStringRef cn = SCDynamicStoreCopyComputerName(NULL, NULL);
+    if (cn) {
+        if (!CFStringGetCString(cn, roh, sizeof roh, kCFStringEncodingUTF8)) roh[0] = 0;
+        CFRelease(cn);
+    }
+    if (!roh[0]) gethostname(roh, sizeof roh - 1);
+    char n[QC_ZUGANG_NAME_MAX + 1];
+    qc_zugang_name_saeubern(roh, strlen(roh), n, QC_ZUGANG_NAME_MAX);
+    pthread_mutex_lock(&g_rechnername_mtx);
+    memcpy(g_rechnername, n, sizeof n);
+    pthread_mutex_unlock(&g_rechnername_mtx);
+}
+
+static void rechnername(char out[QC_ZUGANG_NAME_MAX + 1]) {
+    pthread_mutex_lock(&g_rechnername_mtx);
+    BOOL leer = !g_rechnername[0];
+    pthread_mutex_unlock(&g_rechnername_mtx);
+    if (leer) rechnername_auffrischen();
+    pthread_mutex_lock(&g_rechnername_mtx);
+    memcpy(out, g_rechnername, sizeof g_rechnername);
+    pthread_mutex_unlock(&g_rechnername_mtx);
+}
+
+// ------------------------------------------------ Zustand fuer die Oberflaeche
+
+int qc_zustand_zuschauer(char *name, size_t groesse) {
+    if (atomic_load(&g_client_fd) < 0) {
+        if (name && groesse) name[0] = 0;
+        return 0;
+    }
+    pthread_mutex_lock(&g_zustand_mtx);
+    if (name && groesse) snprintf(name, groesse, "%s", g_zuschauer_name);
+    pthread_mutex_unlock(&g_zustand_mtx);
+    return 1;
+}
+
+int qc_zustand_bildschirmfreigabe(void) { return g_tcc_bildschirm() ? 1 : 0; }
+int qc_zustand_bedienungshilfen(void) { return AXIsProcessTrusted() ? 1 : 0; }
+int qc_zustand_port_belegt(void) { return atomic_load(&g_port_belegt); }
+
+// Ein Geraet wurde aus der Liste entfernt (zugang.c, pub NULL = alle): eine
+// laufende Sitzung dieses Schluessels endet - wie beim Senden-gescheitert,
+// ohne Abloese-Nachricht. Ein neuer Client verbindet dann von selbst neu und
+// landet in der Zugangsphase. Aus einem Faden der Oberflaeche, nie der Main
+// Queue (g_send_mtx kann bis zu 2 s haengen).
+static void zuschauer_entfernt(const uint8_t *pub) {
+    pthread_mutex_lock(&g_send_mtx);
+    int fd = atomic_load(&g_client_fd);
+    BOOL treffer = fd >= 0 && g_vid && (!pub || memcmp(g_vid_peer, pub, 32) == 0);
+    if (treffer) {
+        atomic_store(&g_vid_ready, 0);
+        atomic_store(&g_client_fd, -1);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        eingabe_abbrechen();
+        qc_chan_free(g_vid);
+        g_vid = NULL;
+        stream_herunterfahren_anstossen();
+    }
+    pthread_mutex_unlock(&g_send_mtx);
+    if (treffer) {
+        logf_(@"Zuschauer getrennt: sein Geraet wurde aus der Liste entfernt");
+        qc_ui_zustand_geaendert();
+    }
+}
+
+// ------------------------------------------------------------ Zugangsphase
+// Ein Geraet, das nicht in host-devices.txt steht (oder die Liste ist
+// beschaedigt), bekommt nach dem Handschlag "QCA1" statt "QCH1" und die
+// Nachrichten 20-23 (zugang.h, Spezifikation 3.2): es beweist das
+// Zugangspasswort, oder jemand am Host klickt "Zulassen". Bis dahin
+// geschieht nichts, was einen laufenden Zuschauer beruehrt: keine Abloesung,
+// keine Aufnahme, kein g_vid_hh - also auch kein Eingabekanal. Gewartet wird
+// ohne jede Sperre; wach wird die Phase durch den Client (poll auf den
+// Socket, auch sein Verschwinden), durch eine Entscheidung am Host (Pipe)
+// oder durch die Frist.
+
+static int64_t mono_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static int zugang_senden(qc_chan *c, const void *p, size_t n) {
+    if (!n) return -1;
+    struct iovec iov = { .iov_base = (void *)p, .iov_len = n };
+    return qc_chan_send(c, &iov, 1);
+}
+
+static int zugang_ergebnis(qc_chan *c, uint8_t ergebnis, uint32_t warten_ms, const uint8_t *host_proof) {
+    uint8_t m[QC_ZUGANG_ERGEBNIS_MAX];
+    size_t n = qc_zugang_ergebnis_kodieren(m, sizeof m, ergebnis, warten_ms, host_proof);
+    int r = zugang_senden(c, m, n);
+    qc_wipe(m, sizeof m);
+    return r;
+}
+
+// Eintragen nach Passwort oder Klick. Laesst sich die Liste nicht schreiben
+// (beschaedigt, Platte), kommt das Geraet fuer diese Sitzung trotzdem herein -
+// es hat sich ausgewiesen; beim naechsten Mal fragt der Host eben wieder.
+static void zugang_eintragen(qc_chan *chan, const char *name, const char *id_text, const char *ip, const char *weg) {
+    if (qc_zugang_eintragen(chan->peer, name) == 0)
+        logf_(@"Zugang: %s (ID %s, %s) %s und eingetragen", name, id_text, ip, weg);
+    else
+        logf_(@"Zugang: %s (ID %s, %s) %s - Eintrag in host-devices.txt liess sich nicht speichern, "
+               "diese Sitzung laeuft trotzdem", name, id_text, ip, weg);
+}
+
+// YES = zugelassen: 22/0 oder 22/1 ist hinaus, der Aufrufer macht weiter wie
+// bei einem bekannten Geraet ("QCH1"). NO = nicht: alles Noetige ist gesagt,
+// der Aufrufer schliesst.
+static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const char *ip, const char *name) {
+    uint32_t cid = qc_zugang_id(chan->peer);
+    char id_text[12];
+    qc_zugang_id_text(cid, id_text);
+    uint32_t adr = peer->sin_addr.s_addr;
+
+    // Grenzen: 4 Phasen gleichzeitig, 2 je Adresse, 1 je Schluessel.
+    int platz = qc_zugang_phase_beginnen(adr, chan->peer);
+    if (platz < 0) {
+        uint8_t m[4 + QC_ZUGANG_ERGEBNIS_MAX];
+        memcpy(m, QC_ZUGANG_KENNUNG, 4);
+        size_t n = qc_zugang_ergebnis_kodieren(m + 4, sizeof m - 4, QC_ERGEBNIS_SCHLUSS, QC_ZUGANG_VOLL_WARTEN_MS, NULL);
+        zugang_senden(chan, m, 4 + n);
+        logf_gedrosselt(&d_zugang_voll, ip, @"Zugang: kein Platz fuer %s (ID %s, %s) - zu viele Zugangsphasen, geschlossen",
+                        name, id_text, ip);
+        return NO;
+    }
+
+    int64_t jetzt = mono_ms();
+    uint32_t warten = qc_zugang_drossel_warten(adr, chan->peer, jetzt);
+    int64_t frueh_bis = jetzt + warten;          // ein Beweis davor zaehlt als Fehlversuch
+    int64_t frist = jetzt + g_zugang_frist_ms;
+    uint8_t wege = QC_ZUGANG_WEG_PASSWORT | (qc_ui_vorhanden() ? QC_ZUGANG_WEG_ZULASSEN : 0);
+    char host[QC_ZUGANG_NAME_MAX + 1];
+    rechnername(host);
+    uint8_t m[4 + QC_ZUGANG_NOETIG_MAX];
+    memcpy(m, QC_ZUGANG_KENNUNG, 4);
+    size_t n = 4 + qc_zugang_noetig_kodieren(m + 4, sizeof m - 4, wege, warten, host);
+    if (zugang_senden(chan, m, n) != 0) {
+        qc_zugang_phase_ende(platz);
+        return NO;
+    }
+    logf_gedrosselt(&d_zugang, ip, @"Zugang noetig: %s (ID %s) von %s%s%@", name, id_text, ip,
+                    wege & QC_ZUGANG_WEG_ZULASSEN ? " - Passwort oder Zulassen" : " - Passwort",
+                    warten ? [NSString stringWithFormat:@", Drossel %u s", (warten + 999) / 1000] : @"");
+
+    // Die Anfrage an die Oberflaeche; eine Entscheidung weckt die Phase ueber die Pipe.
+    int weck[2] = { -1, -1 };
+    uint64_t anfrage = 0;
+    if ((wege & QC_ZUGANG_WEG_ZULASSEN) && pipe(weck) == 0) {
+        for (int i = 0; i < 2; i++) {
+            fcntl(weck[i], F_SETFL, O_NONBLOCK);
+            fcntl(weck[i], F_SETFD, FD_CLOEXEC);
+        }
+        anfrage = qc_zugang_anfrage_stellen(name, cid, qc_zugang_code(chan->hh), weck[1]);
+    }
+
+    BOOL zugelassen = NO;
+    int fehl = 0;
+    for (;;) {
+        int stand = anfrage ? qc_zugang_anfrage_stand(anfrage) : -1;
+        if (stand == 1) {
+            if (zugang_ergebnis(chan, QC_ERGEBNIS_ZUGELASSEN, 0, NULL) == 0) {
+                zugang_eintragen(chan, name, id_text, ip, "am Host zugelassen");
+                zugelassen = YES;
+            } else {
+                logf_(@"Zugang: %s (ID %s, %s) am Host zugelassen, aber nicht mehr erreichbar", name, id_text, ip);
+            }
+            break;
+        }
+        if (stand == 0) {
+            zugang_ergebnis(chan, QC_ERGEBNIS_ABGELEHNT, 0, NULL);
+            logf_(@"Zugang: %s (ID %s, %s) am Host abgelehnt", name, id_text, ip);
+            break;
+        }
+        jetzt = mono_ms();
+        if (jetzt >= frist) {
+            zugang_ergebnis(chan, QC_ERGEBNIS_SCHLUSS, qc_zugang_drossel_warten(adr, chan->peer, jetzt), NULL);
+            logf_gedrosselt(&d_zugang_frist, ip, @"Zugang: Frist fuer %s (ID %s, %s) abgelaufen - geschlossen", name, id_text, ip);
+            break;
+        }
+        // Warten auf den Client, die Entscheidung oder die Frist. Schon
+        // entschluesselte Bytes meldet poll nicht - dann gleich lesen.
+        if (qc_chan_gepuffert(chan) == 0) {
+            struct pollfd pf[2] = { { .fd = chan->fd, .events = POLLIN, .revents = 0 },
+                                    { .fd = weck[0], .events = POLLIN, .revents = 0 } };
+            int64_t rest = frist - jetzt;
+            int r = poll(pf, weck[0] >= 0 ? 2 : 1, rest > 60000 ? 60000 : (int)rest);
+            if (r < 0 && errno != EINTR) break;
+            if (r <= 0) continue;
+            if (weck[0] >= 0 && pf[1].revents) {
+                uint8_t b[16];
+                while (read(weck[0], b, sizeof b) > 0) {}
+            }
+            // POLLHUP/POLLERR ohne POLLIN: weg - das sagt gleich das Lesen.
+            if (!(pf[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+        }
+        // Eine Nachricht des Clients. Die Frist gilt fuer die ganze Nachricht:
+        // wer tropfenweise sendet, haelt die Phase nicht laenger auf.
+        int64_t rest = frist - mono_ms();
+        int lesefrist = rest < 1 ? 1 : rest > 10000 ? 10000 : (int)rest;
+        qc_hdr h;
+        if (qc_chan_read_frist(chan, &h, sizeof h, lesefrist) != 0) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) hat die Verbindung beendet", name, id_text, ip);
+            break;
+        }
+        if (h.type == QC_ZUGANG_ABBRUCH && h.len == 0) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) hat abgebrochen", name, id_text, ip);
+            break;
+        }
+        if (h.type != QC_ZUGANG_BEWEIS || h.len != 32) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) schickt Unerwartetes (Typ %u, %u Byte) - geschlossen",
+                            name, id_text, ip, h.type, h.len);
+            break;
+        }
+        uint8_t beweis[32], host_proof[32];
+        if (qc_chan_read_frist(chan, beweis, sizeof beweis, lesefrist) != 0) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) hat die Verbindung beendet", name, id_text, ip);
+            break;
+        }
+        jetzt = mono_ms();
+        BOOL zu_frueh = jetzt < frueh_bis;
+        // Zu frueh wird gar nicht erst gerechnet - so kostet Raten nichts ausser Zeit.
+        int ok = zu_frueh ? 0 : qc_zugang_pruefen(chan->hh, beweis, host_proof);
+        qc_wipe(beweis, sizeof beweis);
+        if (ok == 1) {
+            qc_zugang_drossel_erfolg(adr, chan->peer);
+            // Das Fenster am Host schliesst, bevor die Sitzung beginnt.
+            if (anfrage) { qc_zugang_anfrage_zurueckziehen(anfrage); anfrage = 0; }
+            if (zugang_ergebnis(chan, QC_ERGEBNIS_PASSWORT, 0, host_proof) == 0) {
+                zugang_eintragen(chan, name, id_text, ip, "mit Passwort angenommen");
+                zugelassen = YES;
+            }
+            qc_wipe(host_proof, sizeof host_proof);
+            break;
+        }
+        fehl++;
+        warten = qc_zugang_drossel_fehler(adr, chan->peer, jetzt);
+        frueh_bis = jetzt + warten;
+        BOOL schluss = fehl >= QC_ZUGANG_VERSUCHE;
+        logf_gedrosselt(&d_zugang_falsch, ip, @"Zugang: %s fuer %s (ID %s, %s), Fehlversuch %d in dieser Verbindung - Drossel %u s%s",
+                        zu_frueh ? "Beweis vor Ablauf der Wartezeit" : ok < 0 ? "kein lesbares Passwort" : "Passwort falsch",
+                        name, id_text, ip, fehl, (warten + 999) / 1000, schluss ? ", zu viele Versuche - geschlossen" : "");
+        if (zugang_ergebnis(chan, schluss ? QC_ERGEBNIS_SCHLUSS : QC_ERGEBNIS_FALSCH, warten, NULL) != 0 || schluss) break;
+    }
+    // Zurueckgezogen (Abbruch, EOF, Frist ...): das Fenster am Host schliesst.
+    if (anfrage) qc_zugang_anfrage_zurueckziehen(anfrage);
+    if (weck[0] >= 0) { close(weck[0]); close(weck[1]); }
+    qc_zugang_phase_ende(platz);
+    return zugelassen;
+}
+
 static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     struct sockaddr_in peer = *von;
     tune_socket(fd);
@@ -968,48 +1267,41 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         return;
     }
 
-    char fp[24], sas[8];
+    char fp[24], sas[8], id_text[12];
     qc_fingerprint(chan->peer, fp);
     qc_sas(chan->hh, sas);
+    qc_zugang_id_text(qc_zugang_id(chan->peer), id_text);
 
-    // Freigabe: bekannte Gegenstelle, oder das Kopplungsfenster steht offen.
-    // Erstkontakt heisst: es gibt nachweislich noch keine Freigabe. Eine Liste,
-    // die da ist, sich aber nicht lesen laesst oder beschaedigt ist, ist kein
-    // Erstkontakt - dann kommt niemand herein, auch kein Bekannter.
-    pthread_mutex_lock(&g_freigabe_mtx);
-    int known = qc_is_authorized(chan->peer);
-    int anz = known == 0 ? qc_authorized_count() : 0;
-    BOOL rein = known > 0;
-    if (known < 0 || anz < 0) {
-        logf_gedrosselt(&d_liste_defekt, ip, @"Abgewiesen: %s von %s - Freigabeliste authorized.txt nicht lesbar oder beschaedigt", fp, ip);
-    } else if (!known) {
-        if (atomic_load(&g_pair_open) || anz == 0) {
-            if (qc_authorize(chan->peer, ip) != 0) {
-                // Ohne gespeicherte Freigabe keine Sitzung - und das
-                // Kopplungsfenster bleibt, wie es war.
-                logf_gedrosselt(&d_nicht_speicherbar, ip, @"Abgewiesen: %s von %s - Freigabe liess sich nicht speichern", fp, ip);
-            } else {
-                logf_(@"Neue Gegenstelle gekoppelt: %s (%s), Vergleichscode %s", fp, ip, sas);
-                atomic_store(&g_pair_open, 0);
-                rein = YES;
-            }
-        } else {
-            logf_gedrosselt(&d_unbekannt, ip, @"Abgewiesen: unbekannte Gegenstelle %s von %s. Host mit --pair starten, um sie aufzunehmen.", fp, ip);
-        }
-    }
-    pthread_mutex_unlock(&g_freigabe_mtx);
-    if (!rein) {
+    // Wer ist das? Der Name kommt aus Nachricht 3 (unbeglaubigt, nur
+    // Anzeige), sonst aus der Liste, sonst ist es die Adresse. Bekannte
+    // Geraete kommen sofort herein, alle anderen - auch wenn die Liste
+    // beschaedigt ist - muessen sich in der Zugangsphase ausweisen. Die
+    // Liste ist dafuer nur fuer diesen einen Blick gesperrt.
+    char name[QC_ZUGANG_NAME_MAX + 1], gespeichert[QC_ZUGANG_NAME_MAX + 1];
+    qc_zugang_name_lesen(chan->nutzlast3, chan->nutzlast3_len, name);
+    int bekannt = qc_zugang_bekannt(chan->peer, gespeichert);
+    if (!name[0]) snprintf(name, sizeof name, "%s", bekannt > 0 && gespeichert[0] ? gespeichert : ip);
+    if (bekannt < 0)
+        logf_gedrosselt(&d_liste_defekt, ip, @"Geraeteliste host-devices.txt nicht lesbar oder beschaedigt - %s (%s) muss sich ausweisen",
+                        fp, ip);
+    if (bekannt <= 0 && !zugang_phase(chan, &peer, ip, name)) {
         qc_chan_free(chan);
         close(fd);
         return;
     }
 
     // Kein Zuschauer, keine Arbeit: Aufnahme und Encoder entstehen erst
-    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung. Ab hier
-    // zaehlt dieser Zuschauer als unterwegs (g_anmeldend), bis er eingetragen
-    // ist oder aufgibt - jeder Weg unten zieht ihn wieder ab.
+    // jetzt. Schlaegt das fehl, gibt es auch keine Begruessung - ausser es
+    // fehlt nur die Freigabe fuer die Bildschirmaufnahme (g_ohne_aufnahme).
+    // Ab hier zaehlt dieser Zuschauer als unterwegs (g_anmeldend), bis er
+    // eingetragen ist oder aufgibt - jeder Weg unten zieht ihn wieder ab.
     atomic_fetch_add(&g_anmeldend, 1);
-    if (!stream_hochfahren_sync()) {
+    BOOL ohne_aufnahme = NO;
+    if (stream_hochfahren_sync()) {
+        atomic_store(&g_ohne_aufnahme, 0);
+    } else if (!g_tcc_bildschirm()) {
+        ohne_aufnahme = YES;
+    } else {
         atomic_fetch_sub(&g_anmeldend, 1);
         // Was halb steht (Encoder ohne Aufnahme), raeumt der Abbau weg; er
         // prueft selbst, ob noch jemand zuschaut.
@@ -1056,6 +1348,10 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         // der Takt ihm keinen Balken mehr schickt; Aufraeumen auf g_capq unten.
         testbild_aus = atomic_exchange(&g_testbild, 0);
         strlcpy(g_vid_ip, ip, sizeof g_vid_ip);
+        pthread_mutex_lock(&g_zustand_mtx);
+        memcpy(g_zuschauer_name, name, sizeof g_zuschauer_name);
+        pthread_mutex_unlock(&g_zustand_mtx);
+        if (ohne_aufnahme) atomic_store(&g_ohne_aufnahme, 1);
         atomic_store(&g_client_fd, fd);
         atomic_store(&g_vid_ready, 1);
     } else {
@@ -1069,6 +1365,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     // schaut zu, also laufen auch Aufnahme und Encoder nicht weiter.
     if (sent != 0) stream_herunterfahren_anstossen();
     pthread_mutex_unlock(&g_send_mtx);
+    qc_ui_zustand_geaendert();
     if (abgeloest >= 0)
         logf_(@"Bisheriger Zuschauer %s abgeloest und getrennt%s", fp_alt,
               abgeloest ? "" : " - die Abloese-Nachricht kam nicht an");
@@ -1104,11 +1401,22 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         send_small(QC_MSG_FAEHIGKEITEN, f.bytes, f.length);
     }
     bildschirme_senden();
-    logf_(@"Zuschauer verbunden: %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
-          ip, ntohs(peer.sin_port), fp, sas);
+    // chan gehoert jetzt dem Versand (g_vid) und kann schon wieder frei sein.
+    logf_(@"Zuschauer verbunden: %s (ID %s) %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
+          name, id_text, ip, ntohs(peer.sin_port), fp, sas);
+    if (ohne_aufnahme) {
+        // Wie bei einem fehlenden Bildschirm: Hoststatus 1, und die
+        // Wiederherstellung fragt alle 3 s nach, bis die Freigabe da ist.
+        logf_(@"Bildschirmaufnahme nicht freigegeben - Zuschauer bekommt Hoststatus 1, Aufnahme startet mit der Freigabe");
+        hoststatus_senden(1);
+        if (g_lifeq)
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), g_lifeq, ^{ aufnahme_wiederherstellen(); });
+    }
 }
 
-static int start_server(int port) {
+// melden: eine Zeile, wenn bind scheitert (der Zustandstakt versucht es
+// wiederholt und meldet nur den Wechsel).
+static int start_server(int port, BOOL melden) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
@@ -1117,7 +1425,11 @@ static int start_server(int port) {
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { logf_(@"bind fehlgeschlagen: %s", strerror(errno)); close(fd); return -1; }
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        if (melden) logf_(@"bind fehlgeschlagen: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
     if (listen(fd, QC_LISTEN_WARTESCHLANGE) != 0) { logf_(@"listen fehlgeschlagen: %s", strerror(errno)); close(fd); return -1; }
     qc_annahme_cfg cfg = { QC_HANDSCHLAEGE, QC_HANDSCHLAEGE_JE_IP, bild_verbindung, annahme_andrang, (void *)"Bildkanal" };
     if (qc_annahme_starten(fd, &cfg) != 0) { logf_(@"Annahme fuer Port %d nicht startbar", port); close(fd); return -1; }
@@ -1129,6 +1441,8 @@ static int start_server(int port) {
 // ohne eingetippte Adresse finden. Winziges Paket, kein Dienst, keine Abhaengigkeit.
 //
 // Aufbau: "QCHB" | u8 Version | u16 Bildport | u8 Namenslaenge | Name (UTF-8)
+//          | u8 ext = 1 | u32 Geraete-ID | u8 Flags (Bit 0: Zulassen moeglich)
+// Aeltere Clients lesen nur bis zum Namen (zugang.h, Spezifikation 2).
 
 static void *beacon_thread(void *arg) {
     int port = (int)(intptr_t)arg;
@@ -1136,25 +1450,21 @@ static void *beacon_thread(void *arg) {
     if (fd < 0) return NULL;
     int on = 1;
     setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
-
-    char name[64] = {0};
-    gethostname(name, sizeof name - 1);
-    size_t nlen = strlen(name);
-    if (nlen > 40) nlen = 40;
-
-    uint8_t pkt[64];
-    memcpy(pkt, "QCHB", 4);
-    pkt[4] = 1;
-    uint16_t p16 = (uint16_t)port;
-    memcpy(pkt + 5, &p16, 2);
-    pkt[7] = (uint8_t)nlen;
-    memcpy(pkt + 8, name, nlen);
-    size_t len = 8 + nlen;
+    uint32_t id = qc_zugang_eigene_id();
 
     // An die Rundrufadresse JEDER aktiven Netzwerkkarte senden. Die allgemeine
     // 255.255.255.255 verlaesst den Mac nicht zuverlaessig, die Netzadresse
-    // (zum Beispiel 192.168.178.255) dagegen schon.
-    for (;;) {
+    // (zum Beispiel 192.168.178.255) dagegen schon. Das Paket entsteht jede
+    // Runde neu: ob jemand "Zulassen" klicken kann, aendert sich mit der
+    // Oberflaeche, und den Rechnernamen kann man in den Systemeinstellungen
+    // umbenennen (alle 30 s nachgelesen).
+    for (unsigned runde = 0;; runde++) {
+        if (runde % 15 == 0) rechnername_auffrischen();
+        char name[QC_ZUGANG_NAME_MAX + 1];
+        rechnername(name);
+        uint8_t pkt[QC_BEKANNTGABE_MAX];
+        size_t len = qc_zugang_bekanntgabe(pkt, sizeof pkt, (uint16_t)port, name, id,
+                                           qc_ui_vorhanden() ? QC_BEKANNTGABE_ZULASSEN : 0);
         struct ifaddrs *list = NULL;
         int gesendet = 0;
         if (getifaddrs(&list) == 0) {
@@ -1171,8 +1481,11 @@ static void *beacon_thread(void *arg) {
             }
             freeifaddrs(list);
         }
-        static int erste = 1;
-        if (erste) { logf_(@"Bekanntgabe: an %d Netze, Port %d", gesendet, port + 2); erste = 0; }
+        if (runde == 0) {
+            char id_text[12];
+            qc_zugang_id_text(id, id_text);
+            logf_(@"Bekanntgabe: an %d Netze, Port %d, als \"%s\" (ID %s)", gesendet, port + 2, name, id_text);
+        }
         usleep(2000 * 1000);
     }
     return NULL;
@@ -1840,6 +2153,7 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
             qc_chan_free(g_vid);
             g_vid = NULL;
             pthread_mutex_unlock(&g_send_mtx);
+            qc_ui_zustand_geaendert();
             return;
         }
         atomic_fetch_add(&g_sent_frames, 1);
@@ -2309,6 +2623,7 @@ static BOOL stau_vor_dem_encoder(void) {
                 qc_chan_free(g_vid);
                 g_vid = NULL;
                 g_stau_seit = 0;
+                qc_ui_zustand_geaendert();
             }
         } else {
             g_stau_seit = 0;
@@ -3085,10 +3400,14 @@ static void aufnahme_wiederherstellen(void) {
         return;
     }
     g_kein_bildschirm_gemeldet = 0;
-    if (!strom_fuer_bildschirm_starten(ziel, NO)) {
+    // Kam der Zuschauer ohne Aufnahme herein (keine Freigabe), kennt er nur
+    // Ersatzmasse: er bekommt SWITCH und INFO wie bei einem Bildschirmwechsel.
+    BOOL ansagen = atomic_load(&g_ohne_aufnahme) != 0;
+    if (!strom_fuer_bildschirm_starten(ziel, ansagen)) {
         if (zuschauer_braucht_strom()) { logf_(@"Aufnahme: neuer Versuch in 3 s"); wiederherstellen_spaeter(); }
         return;
     }
+    atomic_store(&g_ohne_aufnahme, 0);
     bildschirm_zustand_nachfuehren();
     bildschirme_senden();
     hoststatus_senden(0);
@@ -3159,6 +3478,145 @@ static void stream_herunterfahren_anstossen(void) {
     });
 }
 
+// --------------------------------------------------------- Dienst und Zustand
+//
+// Annahme, Eingabe und Bekanntgabe. Ist der Bildport belegt (ein anderes
+// Programm), endet der Host nicht mehr (frueher Exit 9): der Zustand geht an
+// die Oberflaeche (qc_zustand_port_belegt), und der Zustandstakt versucht es
+// alle 3 s erneut. Die Bekanntgabe startet erst mit der Annahme - sonst
+// fuehrte sie Clients zu dem fremden Programm.
+static int g_dienst_port = 9001;
+static CGDirectDisplayID g_dienst_display = 0;
+static _Atomic int g_dienst_laeuft = 0;
+
+static BOOL dienst_starten(void) {
+    if (atomic_load(&g_dienst_laeuft)) return YES;
+    int belegt = atomic_load(&g_port_belegt);
+    if (start_server(g_dienst_port, !belegt) < 0) {
+        if (!belegt) {
+            atomic_store(&g_port_belegt, g_dienst_port);
+            logf_(@"Port %d ist belegt (anderes Programm?) - der Host wartet und versucht es alle 3 s erneut", g_dienst_port);
+            qc_ui_zustand_geaendert();
+        }
+        return NO;
+    }
+    start_input_server(g_dienst_port + 1, g_dienst_display);
+    start_beacon(g_dienst_port);
+    atomic_store(&g_dienst_laeuft, 1);
+    if (atomic_exchange(&g_port_belegt, 0)) {
+        logf_(@"Port %d wieder frei - der Dienst laeuft", g_dienst_port);
+        qc_ui_zustand_geaendert();
+    }
+    return YES;
+}
+
+// Alle 3 s, auf einer eigenen seriellen Warteschlange (nie der Main Queue):
+// Freigaben nachsehen (Spezifikation 7.4 - der Host endet ohne sie nicht mehr,
+// die Oberflaeche zeigt den Stand), einen belegten Port erneut versuchen.
+// Eine Aenderung bekommt eine Zeile und geht an die Oberflaeche. Ein
+// Zuschauer, der ohne Aufnahme wartet, bekommt seine Aufnahme ueber die
+// Wiederherstellung, die ebenfalls alle 3 s nachfragt.
+static int g_zustand_bild = -1, g_zustand_ax = -1;      // nur im Zustandstakt
+
+static void zustand_takt(void) {
+    int b = qc_zustand_bildschirmfreigabe(), a = qc_zustand_bedienungshilfen();
+    BOOL anders = NO;
+    if (b != g_zustand_bild) {
+        if (g_zustand_bild >= 0) logf_(@"Bildschirmaufnahme-Freigabe jetzt %@", b ? @"erteilt" : @"entzogen");
+        g_zustand_bild = b;
+        anders = YES;
+    }
+    if (a != g_zustand_ax) {
+        if (g_zustand_ax >= 0) logf_(@"Bedienungshilfen-Freigabe jetzt %@", a ? @"erteilt" : @"entzogen");
+        g_zustand_ax = a;
+        anders = YES;
+    }
+    if (!atomic_load(&g_dienst_laeuft)) dienst_starten();
+    if (anders) qc_ui_zustand_geaendert();
+}
+
+static dispatch_source_t g_zustand_quelle = NULL;
+
+static void zustand_takt_starten(void) {
+    if (g_zustand_quelle) return;
+    dispatch_queue_t q = dispatch_queue_create("tech.quadchroma.zustand", DISPATCH_QUEUE_SERIAL);
+    g_zustand_quelle = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    if (!g_zustand_quelle) return;
+    dispatch_source_set_timer(g_zustand_quelle, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                              3 * NSEC_PER_SEC, NSEC_PER_SEC / 4);
+    dispatch_source_set_event_handler(g_zustand_quelle, ^{ zustand_takt(); });
+    dispatch_resume(g_zustand_quelle);
+}
+
+// Bedienungshilfen (Spezifikation 7.4): beim ersten Start einmal nachfragen -
+// das System zeigt dann seinen Dialog. Danach steht der Stand nur noch im
+// Menue; sonst kaeme der Dialog bei jedem Anmelden wieder. Gemerkt als leere
+// Datei host-bedienungshilfen-gefragt im Ablageordner.
+static void bedienungshilfen_einmal_fragen(void) {
+    if (AXIsProcessTrusted()) return;
+    char pfad[1200];
+    if (qc_config_path("host-bedienungshilfen-gefragt", pfad, sizeof pfad) != 0) return;
+    int fd = open(pfad, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return;                 // schon gefragt (oder nicht schreibbar: dann lieber nie als jedes Mal)
+    close(fd);
+    AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{ (__bridge id)kAXTrustedCheckOptionPrompt: @YES });
+    logf_(@"Bedienungshilfen fehlen - einmal nachgefragt (Systemdialog)");
+}
+
+// Zeilen aus zugang.c (Migration, Entfernen, Passwort) ins Protokoll.
+static void zugang_zeile(const char *z) { logf_(@"%s", z); }
+
+// Stromgroesse ohne Bildschirmliste (keine Freigabe, kein Monitor beim Start):
+// aus dem Hauptbildschirm wie stromgroesse_fuer, sonst 1920x1080. Sie steht
+// nur in der Begruessung eines Zuschauers, der ohne Aufnahme hereinkommt; mit
+// der Aufnahme bekommt er die echten Masse (SWITCH und INFO).
+static void ersatzgroesse(int *w, int *h) {
+    int ow = g_out_fest_w, oh = g_out_fest_h;
+    if (ow <= 0 || oh <= 0) {
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        size_t pw = m ? CGDisplayModeGetPixelWidth(m) : 0, ph = m ? CGDisplayModeGetPixelHeight(m) : 0;
+        if (m) CGDisplayModeRelease(m);
+        if (!pw || !ph) { pw = 1920; ph = 1080; }
+        ow = (int)(pw >= 3840 ? pw / 2 : pw);
+        oh = (int)(ph >= 2160 ? ph / 2 : ph);
+    }
+    *w = ow & ~1;
+    *h = oh & ~1;
+}
+
+// Wert hinter einem Schalter (versatz 1 = gleich dahinter). Fehlt er - Ende
+// der Zeile oder schon der naechste Schalter -, gilt der Standard, und eine
+// Zeile sagt es; frueher endete das mit einer NSRangeException.
+static NSString *wert_nach(NSArray<NSString *> *args, NSString *schalter, NSInteger versatz) {
+    NSInteger i = [args indexOfObject:schalter];
+    if (i == NSNotFound) return nil;
+    for (NSInteger k = 1; k <= versatz; k++) {
+        if (i + k >= (NSInteger)args.count || [args[i + k] hasPrefix:@"--"]) {
+            logf_(@"%@: Wert %ld fehlt - der Standard gilt", schalter, (long)versatz);
+            return nil;
+        }
+    }
+    return args[i + versatz];
+}
+
+// Was nicht (mehr) bekannt ist, wird nur protokolliert. --pair und --forget
+// gibt es nicht mehr: neue Geraete kommen mit dem Zugangspasswort oder per
+// "Zulassen" herein, entfernt wird im Menue.
+static void argumente_pruefen(NSArray<NSString *> *args) {
+    NSSet<NSString *> *bekannt = [NSSet setWithArray:@[ @"--serve", @"--list", @"--capture", @"--formattest",
+                                                        @"--display", @"--fps", @"--mbit", @"--out", @"--fest", @"--fixed" ]];
+    for (NSUInteger i = 1; i < args.count; i++) {
+        NSString *a = args[i];
+        // Werte, und was macOS selbst anhaengt (-psn_..., -NSDocumentRevisions...).
+        if (![a hasPrefix:@"--"] || [bekannt containsObject:a]) continue;
+        if ([a isEqualToString:@"--pair"] || [a isEqualToString:@"--forget"])
+            logf_(@"Unbekanntes Argument %@ - uebergangen (entfallen: neue Geraete kommen mit dem Zugangspasswort "
+                   "oder per Zulassen am Host herein, entfernt wird im Menue)", a);
+        else
+            logf_(@"Unbekanntes Argument %@ - uebergangen", a);
+    }
+}
+
 // --fest (oder --fixed): feste Bildrate von Anfang an. Ohne die Angabe ist sie
 // aus (MANUAL.txt: "Vorgabe ... aus"), bis der Client etwas anderes wuenscht.
 // Frueher stand hier nur die erste Zuweisung im if (Klammern fehlten):
@@ -3181,6 +3639,30 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
     NSArray<NSString *> *args = [[NSProcessInfo processInfo] arguments];
+    argumente_pruefen(args);
+
+    NSInteger capIdx = [args indexOfObject:@"--capture"];
+    NSInteger srvIdx = [args indexOfObject:@"--serve"];
+    BOOL do_list = [args containsObject:@"--list"];
+    if (!do_list && capIdx == NSNotFound && srvIdx == NSNotFound && ![args containsObject:@"--formattest"]) {
+        // Ohne Modus - so startet der Finder die App per Doppelklick, und so
+        // startet sie beim Anmelden - laeuft der Host wie mit --serve auf dem
+        // Standard-Port; die uebrigen Schalter (--fps ...) gelten wie gewohnt.
+        logf_(@"Host-Modus (ohne Modus-Argument) auf dem Standard-Port");
+        srvIdx = (NSInteger)args.count;   // Host-Modus ohne Portangabe: der Standard-Port bleibt
+    }
+
+    // Hoechstens ein Host je Nutzer (Spezifikation 7.5): ein zweiter Start -
+    // Doppelklick, Anmeldeobjekt, "open -n" - endet still. Die Werkzeuge
+    // (--list, --capture, --formattest) duerfen daneben laufen.
+    if (srvIdx != NSNotFound) {
+        int instanz = qc_zugang_einzelinstanz();
+        if (instanz == 0) {
+            logf_(@"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start endet");
+            return 0;
+        }
+        if (instanz < 0) logf_(@"Einzelinstanz: host-instanz.lock laesst sich nicht sperren - der Host laeuft trotzdem");
+    }
 
     // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und bleibt
     // danach liegen, damit Gegenstellen den Host wiedererkennen.
@@ -3197,64 +3679,31 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         logf_(@"Schluessel konnte nicht angelegt werden - Abbruch.");
         return 5;
     }
-    {
-        char fp[24];
+    if (srvIdx != NSNotFound) {
+        // Zugang (zugang.h): Migration aus authorized.txt, Zugangspasswort
+        // anlegen, wenn es fehlt. Vor der Annahme.
+        qc_zugang_protokoll_setzen(zugang_zeile);
+        qc_zugang_entfernt_setzen(zuschauer_entfernt);
+        qc_zugang_start(g_id_pub);
+        char fp[24], id_text[12];
         qc_fingerprint(g_id_pub, fp);
-        int anz = qc_authorized_count();
+        qc_zugang_id_text(qc_zugang_eigene_id(), id_text);
+        int anz = qc_zugang_geraete(NULL, 0);
         if (anz < 0)
-            logf_(@"Fingerabdruck dieses Hosts: %s   Freigabeliste authorized.txt NICHT LESBAR ODER BESCHAEDIGT - "
-                   "jede Gegenstelle wird abgewiesen, bis sie repariert oder mit --forget geloescht ist", fp);
+            logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   Geraeteliste host-devices.txt NICHT LESBAR ODER "
+                   "BESCHAEDIGT - jedes Geraet braucht Passwort oder Zulassen, bis sie im Menue zurueckgesetzt ist", id_text, fp);
         else
-            logf_(@"Fingerabdruck dieses Hosts: %s   freigegebene Gegenstellen: %d", fp, anz);
-    }
-    if ([args containsObject:@"--pair"]) {
-        atomic_store(&g_pair_open, 1);
-        logf_(@"Kopplung offen: die naechste unbekannte Gegenstelle wird aufgenommen.");
-    }
-    if ([args containsObject:@"--forget"]) {
-        // Alle Freigaben loeschen. Danach koppelt sich die naechste Gegenstelle neu.
-        // Scheitert das Loeschen, gelten die bisherigen Freigaben weiter - ein
-        // verlorenes Geraet kaeme also weiter herein. Dann nicht mit der alten
-        // Liste weiterlaufen und "geloescht" melden, sondern abbrechen (wie der
-        // Windows-Host). Eine fehlende Liste ist Erfolg.
-        const char *home = getenv("HOME");
-        if (!home) {
-            logf_(@"Freigaben NICHT geloescht: HOME fehlt - Abbruch, die bisherigen Gegenstellen waeren weiter freigegeben.");
-            return 8;
-        }
-        NSString *pf = [NSString stringWithFormat:@"%s/Library/Application Support/QuadChroma/authorized.txt", home];
-        NSError *fehler = nil;
-        if (![[NSFileManager defaultManager] removeItemAtPath:pf error:&fehler]) {
-            BOOL fehlt = [fehler.domain isEqualToString:NSCocoaErrorDomain] && fehler.code == NSFileNoSuchFileError;
-            NSError *posix = fehler.userInfo[NSUnderlyingErrorKey];
-            if (!fehlt && !([posix.domain isEqualToString:NSPOSIXErrorDomain] && posix.code == ENOENT)) {
-                logf_(@"Freigaben NICHT geloescht: %@ - Abbruch, die bisherigen Gegenstellen waeren weiter freigegeben.",
-                      fehler.localizedDescription ?: @"unbekannter Fehler");
-                return 8;
-            }
-        }
-        logf_(@"Alle Freigaben geloescht.");
+            logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   erlaubte Geraete: %d", id_text, fp, anz);
     }
 
-    NSInteger capIdx = [args indexOfObject:@"--capture"];
-    NSInteger srvIdx = [args indexOfObject:@"--serve"];
-    BOOL do_list = [args containsObject:@"--list"];
-    if (!do_list && capIdx == NSNotFound && srvIdx == NSNotFound && ![args containsObject:@"--formattest"]) {
-        // Ohne Modus - so startet der Finder die App per Doppelklick - laeuft
-        // der Host wie mit --serve auf dem Standard-Port; die uebrigen
-        // Schalter (--pair, --fps ...) gelten wie gewohnt. Vorher endete
-        // der Start hier mit der Aufrufzeile, und wer die App aus der DMG
-        // startete, sah nichts.
-        logf_(@"Aufruf: --list | --capture <sekunden> <datei.hevc> | --serve [port]   "
-               "[--display N (Listenplatz, nur fuer diesen Lauf)] [--out BxH] [--fps N] [--mbit N] [--fest] [--pair] [--forget]");
-        logf_(@"Kein Modus angegeben (Start aus dem Finder?) - laeuft als Host wie mit --serve auf dem Standard-Port");
-        srvIdx = (NSInteger)args.count;   // Host-Modus ohne Portangabe: der Standard-Port bleibt
-    }
-
-    if (!CGPreflightScreenCaptureAccess()) {
+    // Ohne Freigabe fuer die Bildschirmaufnahme einmal nachfragen. Die
+    // Werkzeuge brauchen sie sofort; der Host laeuft weiter (Spezifikation
+    // 7.4), zeigt den Stand im Menue und nimmt auf, sobald sie erteilt ist.
+    if (!g_tcc_bildschirm()) {
         logf_(@"Bildschirmaufnahme nicht freigegeben, frage nach.");
         CGRequestScreenCaptureAccess();
-        return 3;
+        if (srvIdx == NSNotFound) return 3;
+        logf_(@"Der Host laeuft ohne Bildschirmaufnahme weiter - sie startet, sobald die Freigabe erteilt ist");
     }
     // Die Namen der Bildschirme kommen von AppKit, auf dem Hauptfaden.
     qc_bildschirm_namen_auffrischen();
@@ -3313,17 +3762,20 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     double seconds = 0;
     NSString *outPath = nil;
     fest_einlesen(args);
-    NSInteger i;
+    NSString *w;
     if (capIdx != NSNotFound) {
-        seconds = [args[capIdx + 1] doubleValue];
-        outPath = args[capIdx + 2];
+        // Wie die Voreinstellungen im Makefile (make capture).
+        seconds = (w = wert_nach(args, @"--capture", 1)) ? w.doubleValue : 10;
+        outPath = wert_nach(args, @"--capture", 2) ?: @"/tmp/qc.hevc";
     }
     if (srvIdx != NSNotFound && srvIdx + 1 < (NSInteger)args.count && ![args[srvIdx + 1] hasPrefix:@"--"])
         port = [args[srvIdx + 1] intValue];
-    if ((i = [args indexOfObject:@"--display"]) != NSNotFound && i + 1 < (NSInteger)args.count) g_display_pin = [args[i + 1] intValue];
-    if ((i = [args indexOfObject:@"--fps"]) != NSNotFound) fps = [args[i + 1] intValue];
-    if ((i = [args indexOfObject:@"--mbit"]) != NSNotFound) mbit = [args[i + 1] intValue];
-    if ((i = [args indexOfObject:@"--out"]) != NSNotFound) sscanf(args[i + 1].UTF8String, "%dx%d", &outW, &outH);
+    if ((w = wert_nach(args, @"--display", 1))) g_display_pin = w.intValue;
+    if ((w = wert_nach(args, @"--fps", 1))) fps = w.intValue;
+    if ((w = wert_nach(args, @"--mbit", 1))) mbit = w.intValue;
+    if ((w = wert_nach(args, @"--out", 1))) sscanf(w.UTF8String, "%dx%d", &outW, &outH);
+    if (fps <= 0) { logf_(@"--fps %d ungueltig - 120", fps); fps = 120; }
+    if (mbit <= 0) { logf_(@"--mbit %d ungueltig - 150", mbit); mbit = 150; }
     if (outW > 0 && outH > 0) { g_out_fest_w = outW; g_out_fest_h = outH; }
 
     // Der gemerkte Wunsch (bildschirm.txt), dann die erste Wahl - hier auf
@@ -3337,8 +3789,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         else if (r == 0 && gemerkt) { g_display_wunsch = gemerkt; logf_(@"Bildschirmwahl: Wunsch %@ aus bildschirm.txt", gemerkt); }
     }
     QCBildschirm *display = bildschirm_neu_bewerten(QC_ANLASS_START);
-    if (!display) { logf_(@"Kein Bildschirm - Abbruch"); return 4; }
-    stromgroesse_fuer(display, &outW, &outH);
+    if (!display && srvIdx == NSNotFound) { logf_(@"Kein Bildschirm - Abbruch"); return 4; }
+    // Der Host wartet ohne Bildschirmliste (keine Freigabe, kein Monitor
+    // beim Anmelden) - die Aufnahme entsteht ohnehin erst mit einem Zuschauer.
+    if (!display) logf_(@"Kein Bildschirm abrufbar (Freigabe fehlt oder kein Monitor) - der Host laeuft und wartet");
+    if (display) stromgroesse_fuer(display, &outW, &outH);
+    else ersatzgroesse(&outW, &outH);
     size_t pxW = display.w, pxH = display.h;
     double hz = display.hz;
 
@@ -3433,11 +3889,13 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
                                                  : @" - Automatik (folgt dem Hauptbildschirm)";
         CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
-        if (start_server(port) < 0) return 9;
-        start_input_server(port + 1, display.displayID);
-        start_beacon(port);
+        g_dienst_port = port;
+        g_dienst_display = display ? display.displayID : CGMainDisplayID();
+        BOOL laeuft = dienst_starten();
+        zustand_takt_starten();
         BOOL ax = AXIsProcessTrusted();
-        logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
+        bedienungshilfen_einmal_fragen();
+        if (laeuft) logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
         logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {

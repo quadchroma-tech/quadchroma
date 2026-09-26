@@ -18,15 +18,23 @@
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
 // Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
-// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt).
+// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt), Zugang
+// (zugang.h: ein unbekannter Client wie der Rust-Client bekommt "QCA1" und 20,
+// Passwort richtig mit host_proof und danach "QCH1", falsch mit Drossel und
+// Schluss nach 5 Versuchen, Zulassen und Ablehnen ueber den Test-Haken statt
+// der Oberflaeche, Abbruch, Verbindungsende, nur eine Anfrage zugleich,
+// Grenzen je Adresse und Schluessel, Frist, ein Wartender stoert den
+// laufenden Zuschauer nicht, beschaedigte Liste, Entfernen trennt die
+// Sitzung, ohne Bildschirmfreigabe Hoststatus 1, Argumente ohne Wert).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
 //         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
 //         -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
+//         -framework SystemConfiguration \
 //         host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
 //         host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
-//         host/vendor/monocypher/monocypher.c -o /tmp/hosttest
+//         host/zugang.c host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 //   /tmp/hosttest
 //
 // main.m wird hier eingebunden; sein main heisst dann host_main und laeuft
@@ -37,8 +45,8 @@
 // tune_socket aus main.m; der Kanal hat einen festen Schluessel statt eines
 // Handschlags. Wo es auf den Weg durch die Annahme ankommt, laufen echte
 // Handschlaege gegen bild_verbindung und eingabe_verbindung (Ports ab 19400);
-// HOME ist dann ein frischer Ordner unter $TMPDIR, die Freigabeliste des
-// Nutzers und ein laufender Host bleiben unberuehrt. Die Bilder sind kuenstliche Zugriffseinheiten gegebener
+// HOME ist dann ein frischer Ordner unter $TMPDIR, Geraeteliste und Passwort
+// des Nutzers und ein laufender Host bleiben unberuehrt. Die Bilder sind kuenstliche Zugriffseinheiten gegebener
 // Groesse; sie gehen wie in encode_buffer erst durch stau_vor_dem_encoder
 // und dann durch emit_access_unit - Stauregel und Versand sind also die des
 // Hosts, nur der Encoder ist nachgebildet (liefert sofort, nichts im Flug).
@@ -47,7 +55,7 @@
 // Dateien: die Ablagebasis liegt im eigenen HOME, und statt
 // qc_clip_set_dateien bekommt ein Rekorder die fertigen Pfade - die
 // Zwischenablage des Nutzers bleibt unberuehrt.
-// Dauer rund 100 s. Rueckgabe: Zahl der Fehler.
+// Dauer rund 110 s. Rueckgabe: Zahl der Fehler.
 
 #define main host_main
 #include "main.m"
@@ -854,27 +862,38 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
     pruefe(s_bild == 1 && s_ein == 1 && s_1 == 1 && s_sonst == 1 && s_alle == 3 && drossel_weitere(&d_bild_handschlag) == 0,
            "nach der Frist genau eine Sammelzeile je Adresse mit der Zahl, eine fuer die Adressen ohne Platz");
 
-    // Voller Handschlag mit Wegwerfschluessel, wie ein ungekoppelter Client,
-    // der alle zwei Sekunden neu versucht - nur schneller.
-    uint8_t anderer_priv[32], anderer_pub[32];
-    qc_keypair(anderer_priv, anderer_pub);
-    // Liste nicht leer: kein Erstkontakt, der Wegwerfschluessel ist unbekannt.
-    pruefe(qc_authorize(anderer_pub, "hosttest") == 0, "Freigabeliste im eigenen HOME angelegt");
-    int gelungen = 0;
+    // Voller Handschlag mit Wegwerfschluessel, wie ein neuer Client, der
+    // alle zwei Sekunden neu versucht und aufgibt - nur schneller: jeder
+    // bekommt die Zugangsphase ("QCA1", 20), und das Protokoll bleibt kurz.
+    int gelungen = 0, qca1 = 0;
     stdout_stumm(1);
     for (int i = 0; i < 6; i++) {
         uint8_t wegwerf[32], wp[32];
         qc_keypair(wegwerf, wp);
-        int c = client_verbinden(bild_port, wegwerf, NULL, NULL);
-        if (c >= 0) { gelungen++; usleep(30 * 1000); close(c); }
+        qc_cipher rx;
+        int c = client_verbinden(bild_port, wegwerf, &rx, NULL);
+        if (c >= 0) {
+            gelungen++;
+            leser l;
+            leser_init(&l, c, 0);
+            l.rx = rx;
+            char k[4];
+            if (klartext(&l, k, 4, 2000) == 1 && memcmp(k, QC_ZUGANG_KENNUNG, 4) == 0) qca1++;
+            free(l.buf);
+            close(c);
+        }
+        // Die Phase endet mit der Verbindung; hoechstens 2 je Adresse.
+        for (int k = 0; k < 200 && qc_zugang_phasen_offen(); k++) usleep(5 * 1000);
     }
-    usleep(200 * 1000);
+    usleep(100 * 1000);
     stdout_stumm(0);
-    int z_unb = zeilen_mit(pfad, "Abgewiesen: unbekannte Gegenstelle");
-    printf("         (%d Handschlaege mit fremden Schluesseln, %d Zeilen 'unbekannte Gegenstelle', zurueckgehalten %ld)\n",
-           gelungen, z_unb, drossel_weitere(&d_unbekannt));
-    pruefe(gelungen == 6 && z_unb == 1 && drossel_weitere(&d_unbekannt) == 5,
-           "unbekannte Gegenstelle: eine Zeile, der Rest gezaehlt");
+    int z_noetig = zeilen_mit(pfad, "Zugang noetig: 127.0.0.1 (ID ");
+    int z_ende = zeilen_mit(pfad, "hat die Verbindung beendet");
+    printf("         (%d Handschlaege mit fremden Schluesseln, %d mit \"QCA1\", %d Zeilen 'Zugang noetig', %d 'beendet', "
+           "zurueckgehalten %ld + %ld)\n", gelungen, qca1, z_noetig, z_ende, drossel_weitere(&d_zugang), drossel_weitere(&d_zugang_abbruch));
+    pruefe(gelungen == 6 && qca1 == 6, "unbekannte Gegenstelle: Zugangsphase (\"QCA1\") statt stummen Schliessens");
+    pruefe(z_noetig == 1 && drossel_weitere(&d_zugang) == 5 && z_ende == 1 && drossel_weitere(&d_zugang_abbruch) == 5,
+           "Zugang noetig und Verbindungsende: je eine Zeile, der Rest gezaehlt");
 
     printf("\n-- Protokoll: Obergrenze der Datei\n");
     long grenze_vorher = g_log_grenze;
@@ -1030,7 +1049,7 @@ static void wechsel_pruefen(int bild_port) {
     printf("\n-- Zuschauerwechsel im laufenden Strom\n");
     uint8_t b_priv[32], b_pub[32];
     qc_keypair(b_priv, b_pub);
-    qc_authorize(b_pub, "hosttest B");
+    qc_zugang_eintragen(b_pub, "hosttest B");
     atomic_store(&g_cur_ton, 1);
     // Das Fenster, in dem der Neue den Stand des Vorgaengers erbte, ist kurz:
     // mehrere Wechsel, jeder mit Bildern und Ton im Dauerlauf.
@@ -1064,7 +1083,7 @@ static void abbau_wettlauf_pruefen(int bild_port) {
     printf("\n-- Abbau zwischen Hochfahren und Eintragen\n");
     uint8_t c_priv[32], c_pub[32];
     qc_keypair(c_priv, c_pub);
-    qc_authorize(c_pub, "hosttest C");
+    qc_zugang_eintragen(c_pub, "hosttest C");
     int schlecht = 0, laeufe = 2;
     for (int i = 0; i < laeufe; i++) {
         strom_attrappe_setzen();
@@ -1227,7 +1246,7 @@ static void nachreichen_pruefen(int bild_port) {
 
     uint8_t d_priv[32], d_pub[32];
     qc_keypair(d_priv, d_pub);
-    qc_authorize(d_pub, "hosttest D");
+    qc_zugang_eintragen(d_pub, "hosttest D");
     qc_cipher rx;
     stdout_stumm(1);
     int b = client_verbinden(bild_port, d_priv, &rx, NULL);
@@ -1556,7 +1575,7 @@ static void formatwechsel_pruefen(int bild_port) {
 
     uint8_t e_priv[32], e_pub[32];
     qc_keypair(e_priv, e_pub);
-    qc_authorize(e_pub, "hosttest E");
+    qc_zugang_eintragen(e_pub, "hosttest E");
     qc_cipher rx;
     stdout_stumm(1);
     int b = client_verbinden(bild_port, e_priv, &rx, NULL);
@@ -1970,8 +1989,8 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     uint8_t f_priv[32], f_pub[32], g_priv[32], g_pub[32];
     qc_keypair(f_priv, f_pub);
     qc_keypair(g_priv, g_pub);
-    qc_authorize(f_pub, "hosttest F");
-    qc_authorize(g_pub, "hosttest G");
+    qc_zugang_eintragen(f_pub, "hosttest F");
+    qc_zugang_eintragen(g_pub, "hosttest G");
     schein F, G;
     stdout_stumm(1);
     int ok = schein_verbinden(&F, bild_port, ein_port, f_priv) == 0;
@@ -2552,7 +2571,7 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
 
     uint8_t h_priv[32], h_pub[32];
     qc_keypair(h_priv, h_pub);
-    qc_authorize(h_pub, "hosttest H");
+    qc_zugang_eintragen(h_pub, "hosttest H");
     schein H;
     g_schein_attrappe = 0;
     stdout_stumm(1);
@@ -2961,6 +2980,508 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pthread_mutex_unlock(&g_log_mtx);
 }
 
+// ------------------------------------------------------------ Zugang
+//
+// Die Oberflaeche (P3) ersetzt hier ein Test-Haken: qc_ui_* schreiben mit,
+// entschieden wird mit qc_zugang_entscheiden wie spaeter per Klick.
+
+static _Atomic int g_test_ui = 0;
+static _Atomic int g_test_zustand = 0;
+static pthread_mutex_t g_test_ui_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char g_test_ui_folge[4096];                  // "a<nr> " gezeigt, "z<nr> " zurueck
+static uint64_t g_test_anfrage = 0;                 // zuletzt gezeigte
+static char g_test_anfrage_name[QC_ZUGANG_NAME_MAX + 1];
+static uint32_t g_test_anfrage_id = 0, g_test_anfrage_code = 0;
+
+void qc_ui_anfrage(uint64_t anfrage, const char *name, uint32_t id, uint32_t code) {
+    pthread_mutex_lock(&g_test_ui_mtx);
+    size_t n = strlen(g_test_ui_folge);
+    snprintf(g_test_ui_folge + n, sizeof g_test_ui_folge - n, "a%llu ", (unsigned long long)anfrage);
+    g_test_anfrage = anfrage;
+    snprintf(g_test_anfrage_name, sizeof g_test_anfrage_name, "%s", name);
+    g_test_anfrage_id = id;
+    g_test_anfrage_code = code;
+    pthread_mutex_unlock(&g_test_ui_mtx);
+}
+void qc_ui_anfrage_zurueck(uint64_t anfrage) {
+    pthread_mutex_lock(&g_test_ui_mtx);
+    size_t n = strlen(g_test_ui_folge);
+    snprintf(g_test_ui_folge + n, sizeof g_test_ui_folge - n, "z%llu ", (unsigned long long)anfrage);
+    pthread_mutex_unlock(&g_test_ui_mtx);
+}
+void qc_ui_zustand_geaendert(void) { atomic_fetch_add(&g_test_zustand, 1); }
+int qc_ui_vorhanden(void) { return atomic_load(&g_test_ui); }
+
+// Wartet, bis eine andere Anfrage als alt gezeigt wird. 0 = keine.
+static uint64_t anfrage_neu(uint64_t alt, double sekunden) {
+    double t0 = sek();
+    for (;;) {
+        pthread_mutex_lock(&g_test_ui_mtx);
+        uint64_t a = g_test_anfrage;
+        pthread_mutex_unlock(&g_test_ui_mtx);
+        if (a && a != alt) return a;
+        if (sek() - t0 > sekunden) return 0;
+        usleep(5 * 1000);
+    }
+}
+
+static int ui_folge_hat(const char *was) {
+    pthread_mutex_lock(&g_test_ui_mtx);
+    int r = strstr(g_test_ui_folge, was) != NULL;
+    pthread_mutex_unlock(&g_test_ui_mtx);
+    return r;
+}
+
+static int ui_zurueck_abwarten(uint64_t a, double sekunden) {
+    char z[32];
+    snprintf(z, sizeof z, "z%llu ", (unsigned long long)a);
+    double t0 = sek();
+    while (!ui_folge_hat(z) && sek() - t0 < sekunden) usleep(5 * 1000);
+    return ui_folge_hat(z);
+}
+
+static int zugang_ruht(void) { return qc_zugang_phasen_offen() == 0; }
+static int zuschauer_da(void) { return atomic_load(&g_client_fd) >= 0; }
+static int zuschauer_fort(void) { return atomic_load(&g_client_fd) < 0; }
+
+// Ein Client wie der Rust-Client: Nachricht 3 traegt "QCN1" und den Namen,
+// danach liest er die Kennung und spricht in der Zugangsphase 21 und 23.
+typedef struct { int fd; leser l; qc_cipher tx; uint8_t hh[QC_HASHLEN]; } zclient;
+
+static int zc_verbinden(zclient *z, int port, const uint8_t priv[32], const char *name) {
+    memset(z, 0, sizeof *z);
+    z->fd = -1;
+    int c = verbinden(port);
+    if (c < 0) return -1;
+    qc_handshake hs;
+    qc_handshake_init(&hs, 1, priv, (const uint8_t *)QC_PRO_VIDEO, strlen(QC_PRO_VIDEO));
+    uint8_t msg[8192], pl[8192], n3[64];
+    size_t ml = 0, pln = 0, n3l = name ? qc_zugang_name_kodieren(name, n3, sizeof n3) : 0;
+    if (qc_handshake_write(&hs, NULL, 0, msg, &ml) || rahmen_schreiben(c, msg, ml) ||
+        rahmen_lesen(c, msg, sizeof msg, &ml) || qc_handshake_read(&hs, msg, ml, pl, &pln) ||
+        qc_handshake_write(&hs, n3l ? n3 : NULL, n3l, msg, &ml) || rahmen_schreiben(c, msg, ml)) {
+        close(c);
+        return -1;
+    }
+    qc_cipher rx;
+    qc_handshake_split(&hs, &z->tx, &rx);
+    memcpy(z->hh, qc_handshake_hash(&hs), QC_HASHLEN);
+    z->fd = c;
+    leser_init(&z->l, c, 0);
+    z->l.rx = rx;
+    return 0;
+}
+
+static void zc_zu(zclient *z) {
+    if (z->fd >= 0) close(z->fd);
+    z->fd = -1;
+    free(z->l.buf);
+    z->l.buf = NULL;
+}
+
+static int zc_kennung(zclient *z, const char *soll) {
+    char k[4];
+    return z->fd >= 0 && klartext(&z->l, k, 4, 2000) == 1 && memcmp(k, soll, 4) == 0;
+}
+
+static int zc_noetig(zclient *z, uint8_t *wege, uint32_t *warten, char name[QC_ZUGANG_NAME_MAX + 1]) {
+    qc_hdr h;
+    NSData *d = nil;
+    if (nachricht_ganz(&z->l, &h, &d, 2000) != 1 || h.type != QC_ZUGANG_NOETIG) return -1;
+    return qc_zugang_noetig_lesen(d.bytes, d.length, wege, warten, name);
+}
+
+static int zc_ergebnis(zclient *z, uint8_t *erg, uint32_t *warten, uint8_t proof[32], int frist_ms) {
+    qc_hdr h;
+    NSData *d = nil;
+    if (nachricht_ganz(&z->l, &h, &d, frist_ms) != 1 || h.type != QC_ZUGANG_ERGEBNIS) return -1;
+    return qc_zugang_ergebnis_lesen(d.bytes, d.length, erg, warten, proof);
+}
+
+static int zc_beweis(zclient *z, const char *pw) {
+    uint8_t k[32], p[32];
+    if (qc_zugang_schluessel(pw, g_id_pub, k)) return -1;       // host_pub aus dem Handschlag
+    qc_zugang_beweis(k, z->hh, 0, p);
+    return ein_senden(z->fd, &z->tx, QC_ZUGANG_BEWEIS, p, sizeof p);
+}
+
+static int zc_abbruch(zclient *z) { return ein_senden(z->fd, &z->tx, QC_ZUGANG_ABBRUCH, NULL, 0); }
+
+// 1 = der Host schliesst (nach allem, was noch kam), 0 = nicht in der Frist.
+static int zc_schliesst(zclient *z, int frist_ms) {
+    qc_hdr h;
+    NSData *d = nil;
+    int r;
+    while ((r = nachricht_ganz(&z->l, &h, &d, frist_ms)) == 1) {}
+    return r == 0;
+}
+
+// Bis zur Strominfo: 1 = "QCH1" und INFO kamen.
+static int zc_sitzung(zclient *z) {
+    qc_hdr h;
+    uint8_t anf[8];
+    return zc_kennung(z, QC_MAGIC) && nachricht(&z->l, &h, anf, 2000) == 1 && h.type == QC_MSG_INFO;
+}
+
+static BOOL test_tcc_ja(void) { return YES; }
+static BOOL test_tcc_nein(void) { return NO; }
+
+static void zugang_pruefen(int bild_port, int ein_port) {
+    printf("\n-- Zugang: unbekanntes Geraet mit Passwort\n");
+    static char logpfad[1100];
+    snprintf(logpfad, sizeof logpfad, "%s/zugang.log", g_home);
+    g_log_pfad = logpfad;
+    pthread_mutex_lock(&g_log_mtx);
+    log_oeffnen("w");
+    pthread_mutex_unlock(&g_log_mtx);
+    qc_zugang_drossel_leeren();
+    const char *PW = "Hosttest-Passwort 1";
+    stdout_stumm(1);
+    int pw_ok = qc_zugang_passwort_setzen(PW) == 0;
+    stdout_stumm(0);
+    pruefe(pw_ok, "Zugangspasswort im eigenen HOME gesetzt");
+    drossel_altern(&d_zugang);
+
+    uint8_t a_priv[32], a_pub[32];
+    qc_keypair(a_priv, a_pub);
+    char a_id[12];
+    qc_zugang_id_text(qc_zugang_id(a_pub), a_id);
+    strom_attrappe_setzen();
+    zclient z;
+    stdout_stumm(1);
+    int ok_k = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG);
+    uint8_t wege = 0, erg = 9, hp[32], hp_soll[32], k[32];
+    uint32_t warten = 99, w = 99;
+    char hn[QC_ZUGANG_NAME_MAX + 1] = {0}, rn[QC_ZUGANG_NAME_MAX + 1];
+    rechnername(rn);
+    int ok_20 = ok_k && zc_noetig(&z, &wege, &warten, hn) == 0;
+    int ok_22 = ok_20 && zc_beweis(&z, PW) == 0 && zc_ergebnis(&z, &erg, &w, hp, 3000) == 0;
+    qc_zugang_schluessel(PW, g_id_pub, k);
+    qc_zugang_beweis(k, z.hh, 1, hp_soll);
+    int ok_s = ok_22 && zc_sitzung(&z);
+    warten_bis(zuschauer_da, 1);
+    char zn[64] = {0}, gname[QC_ZUGANG_NAME_MAX + 1] = {0};
+    int verbunden = qc_zustand_zuschauer(zn, sizeof zn);
+    int bek = qc_zugang_bekannt(a_pub, gname);
+    stdout_stumm(0);
+    char zeile[200];
+    snprintf(zeile, sizeof zeile, "Zugang noetig: Testgeraet A (ID %s) von 127.0.0.1 - Passwort", a_id);
+    printf("         (20: Wege %u, warten %u ms, Host \"%s\"; 22: Ergebnis %u)\n", wege, warten, hn, erg);
+    pruefe(ok_k, "unbekannt: nach dem Handschlag \"QCA1\" statt \"QCH1\"");
+    pruefe(ok_20 && wege == QC_ZUGANG_WEG_PASSWORT && warten == 0 && strcmp(hn, rn) == 0 && hn[0],
+           "20: nur Passwort (keine Oberflaeche), keine Wartezeit, Rechnername des Hosts");
+    pruefe(ok_22 && erg == QC_ERGEBNIS_PASSWORT && w == 0 && memcmp(hp, hp_soll, 32) == 0,
+           "richtiges Passwort: 22/0 mit dem host_proof, den der Client nachrechnet");
+    pruefe(ok_s, "danach \"QCH1\" und Strominfo wie bei einem bekannten Geraet");
+    pruefe(bek == 1 && strcmp(gname, "Testgeraet A") == 0, "eingetragen mit dem Namen aus Nachricht 3 (QCN1)");
+    pruefe(verbunden && strcmp(zn, "Testgeraet A") == 0, "qc_zustand_zuschauer: verbunden, mit Namen");
+    pruefe(zeilen_mit(logpfad, zeile) == 1 && zeilen_mit(logpfad, "mit Passwort angenommen und eingetragen") == 1,
+           "Zeilen: Zugang noetig (Name, ID, Adresse), angenommen und eingetragen");
+    zuschauer_weg();
+    zc_zu(&z);
+
+    // Bekannt: sofort "QCH1".
+    strom_attrappe_setzen();
+    stdout_stumm(1);
+    int ok_bek = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_sitzung(&z);
+    warten_bis(zuschauer_da, 1);
+    stdout_stumm(0);
+    pruefe(ok_bek, "bekanntes Geraet: sofort \"QCH1\" und Strominfo, keine Zugangsphase");
+    zuschauer_weg();
+    zc_zu(&z);
+
+    printf("\n-- Zugang: falsches Passwort, Drossel\n");
+    drossel_altern(&d_zugang_falsch);
+    uint8_t b_priv[32], b_pub[32];
+    qc_keypair(b_priv, b_pub);
+    stdout_stumm(1);
+    int ok_b = zc_verbinden(&z, bild_port, b_priv, "Rater") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    uint8_t e[5] = {9, 9, 9, 9, 9};
+    uint32_t ws[5] = {1, 1, 1, 1, 1};
+    const char *versuche[5] = { "falsch eins", "falsch zwei", "falsch drei", PW /* zu frueh */, "falsch vier" };
+    for (int i = 0; i < 5 && ok_b; i++)
+        if (zc_beweis(&z, versuche[i]) != 0 || zc_ergebnis(&z, &e[i], &ws[i], NULL, 3000) != 0) ok_b = 0;
+    int zu = ok_b && zc_schliesst(&z, 2000);
+    int b_bek = qc_zugang_bekannt(b_pub, NULL);
+    stdout_stumm(0);
+    printf("         (Ergebnisse %u %u %u %u %u, warten %u %u %u %u %u ms)\n", e[0], e[1], e[2], e[3], e[4],
+           ws[0], ws[1], ws[2], ws[3], ws[4]);
+    pruefe(ok_b && e[0] == 2 && e[1] == 2 && e[2] == 2 && ws[0] == 0 && ws[1] == 0 && ws[2] == 5000,
+           "falsch: 22/2, die ersten zwei ohne Wartezeit, der dritte 5 s");
+    pruefe(e[3] == 2 && ws[3] == 10000, "das richtige Passwort vor Ablauf der Wartezeit zaehlt als Fehlversuch (10 s)");
+    pruefe(e[4] == 4 && ws[4] == 20000 && zu, "der fuenfte Fehlversuch: 22/4 mit 20 s, dann schliesst der Host");
+    pruefe(b_bek == 0, "nichts eingetragen");
+    pruefe(zeilen_mit(logpfad, "Zugang: Passwort falsch fuer Rater (ID ") == 1 && drossel_weitere(&d_zugang_falsch) == 4,
+           "Zeile \"Passwort falsch\" mit Name und ID, die weiteren gedrosselt gezaehlt");
+    zc_zu(&z);
+    stdout_stumm(1);
+    int ok_b2 = zc_verbinden(&z, bild_port, b_priv, "Rater") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+                zc_noetig(&z, &wege, &warten, hn) == 0;
+    zc_abbruch(&z);
+    int zu2 = zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    printf("         (neue Verbindung desselben Geraets: warten %u ms)\n", warten);
+    pruefe(ok_b2 && warten > 15000 && warten <= 20000 && zu2,
+           "die Drossel gilt ueber die Verbindung hinaus: 20 meldet die Wartezeit, Abbruch (23) schliesst");
+    zc_zu(&z);
+    qc_zugang_drossel_leeren();
+
+    printf("\n-- Zugang: Zulassen und Ablehnen (Test-Haken statt Oberflaeche)\n");
+    atomic_store(&g_test_ui, 1);
+    uint8_t c_priv[32], c_pub[32];
+    qc_keypair(c_priv, c_pub);
+    strom_attrappe_setzen();
+    uint64_t vorher = anfrage_neu(0, 0);
+    stdout_stumm(1);
+    int ok_c = zc_verbinden(&z, bild_port, c_priv, "Tablet") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    uint64_t a = anfrage_neu(vorher, 2);
+    pthread_mutex_lock(&g_test_ui_mtx);
+    int anfrage_gut = strcmp(g_test_anfrage_name, "Tablet") == 0 && g_test_anfrage_id == qc_zugang_id(c_pub) &&
+                      g_test_anfrage_code == qc_zugang_code(z.hh);
+    pthread_mutex_unlock(&g_test_ui_mtx);
+    qc_zugang_entscheiden(a, 1);
+    uint8_t proof[32];
+    int ok_c22 = ok_c && zc_ergebnis(&z, &erg, &w, proof, 3000) == 0 && erg == QC_ERGEBNIS_ZUGELASSEN && w == 0;
+    int ok_cs = ok_c22 && zc_sitzung(&z);
+    warten_bis(zuschauer_da, 1);
+    stdout_stumm(0);
+    pruefe(ok_c && wege == (QC_ZUGANG_WEG_PASSWORT | QC_ZUGANG_WEG_ZULASSEN), "20: Passwort oder Zulassen, wenn die Oberflaeche da ist");
+    pruefe(a && anfrage_gut, "die Oberflaeche bekommt die Anfrage mit Name, ID und Vergleichscode");
+    pruefe(ok_c22 && ok_cs && qc_zugang_bekannt(c_pub, NULL) == 1, "Zulassen: 22/1, \"QCH1\", eingetragen");
+    pruefe(ui_zurueck_abwarten(a, 1) && zeilen_mit(logpfad, "am Host zugelassen und eingetragen") == 1,
+           "das Fenster schliesst (qc_ui_anfrage_zurueck), Zeile");
+    zuschauer_weg();
+    zc_zu(&z);
+
+    uint8_t d_priv[32], d_pub[32];
+    qc_keypair(d_priv, d_pub);
+    stdout_stumm(1);
+    int ok_d = zc_verbinden(&z, bild_port, d_priv, "Fremd") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    a = anfrage_neu(a, 2);
+    qc_zugang_entscheiden(a, 0);
+    int ok_d22 = ok_d && zc_ergebnis(&z, &erg, &w, NULL, 3000) == 0 && erg == QC_ERGEBNIS_ABGELEHNT && zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    pruefe(ok_d22 && qc_zugang_bekannt(d_pub, NULL) == 0 && zeilen_mit(logpfad, "Zugang: Fremd (ID ") == 1 &&
+           zeilen_mit(logpfad, "am Host abgelehnt") == 1, "Ablehnen: 22/3, der Host schliesst, nichts eingetragen, Zeile");
+    zc_zu(&z);
+
+    printf("\n-- Zugang: Abbruch, Verbindungsende, Warteschlange\n");
+    uint8_t e_priv[32], e_pub[32];
+    qc_keypair(e_priv, e_pub);
+    stdout_stumm(1);
+    int ok_e = zc_verbinden(&z, bild_port, e_priv, "Abbrecher") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    a = anfrage_neu(a, 2);
+    zc_abbruch(&z);
+    int ok_e_zu = zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    pruefe(ok_e && a && ok_e_zu && ui_zurueck_abwarten(a, 1) && warten_bis(zugang_ruht, 1),
+           "Abbruch (23): der Host schliesst, das Fenster schliesst, die Phase ist zu Ende");
+    zc_zu(&z);
+
+    stdout_stumm(1);
+    int ok_f = zc_verbinden(&z, bild_port, e_priv, "Weggeher") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    a = anfrage_neu(a, 2);
+    zc_zu(&z);                                          // einfach weg, ohne 23
+    stdout_stumm(0);
+    pruefe(ok_f && a && ui_zurueck_abwarten(a, 2) && warten_bis(zugang_ruht, 2),
+           "Verbindungsende waehrend des Wartens: das Fenster schliesst, die Phase ist zu Ende");
+
+    // Zwei Unbekannte zugleich: die Oberflaeche sieht eine, dann die naechste.
+    uint8_t g1_priv[32], g1_pub[32], g2_priv[32], g2_pub[32];
+    qc_keypair(g1_priv, g1_pub);
+    qc_keypair(g2_priv, g2_pub);
+    zclient z2;
+    stdout_stumm(1);
+    int ok_g = zc_verbinden(&z, bild_port, g1_priv, "Erster") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    uint64_t a1 = anfrage_neu(a, 2);
+    ok_g = ok_g && zc_verbinden(&z2, bild_port, g2_priv, "Zweiter") == 0 && zc_kennung(&z2, QC_ZUGANG_KENNUNG) &&
+           zc_noetig(&z2, &wege, &warten, hn) == 0;
+    usleep(200 * 1000);
+    pthread_mutex_lock(&g_test_ui_mtx);
+    int nur_eine = g_test_anfrage == a1;
+    pthread_mutex_unlock(&g_test_ui_mtx);
+    zc_abbruch(&z);
+    uint64_t a2 = anfrage_neu(a1, 2);
+    pthread_mutex_lock(&g_test_ui_mtx);
+    int zweiter_gezeigt = strcmp(g_test_anfrage_name, "Zweiter") == 0;
+    pthread_mutex_unlock(&g_test_ui_mtx);
+    char folge[64];
+    snprintf(folge, sizeof folge, "z%llu a%llu ", (unsigned long long)a1, (unsigned long long)a2);
+    int reihenfolge = ui_folge_hat(folge);
+    qc_zugang_entscheiden(a2, 0);
+    int ok_g2 = zc_ergebnis(&z2, &erg, &w, NULL, 3000) == 0 && erg == QC_ERGEBNIS_ABGELEHNT;
+    stdout_stumm(0);
+    pruefe(ok_g && nur_eine, "zwei Anfragen zugleich: die Oberflaeche zeigt nur die erste");
+    pruefe(a2 && zweiter_gezeigt && reihenfolge && ok_g2, "zieht sich die erste zurueck: erst zurueck, dann die zweite");
+    zc_zu(&z);
+    zc_zu(&z2);
+    warten_bis(zugang_ruht, 2);
+
+    printf("\n-- Zugang: Grenzen, Frist\n");
+    atomic_store(&g_test_ui, 0);
+    uint8_t h1[32], h1p[32], h2[32], h2p[32], h3[32], h3p[32];
+    qc_keypair(h1, h1p);
+    qc_keypair(h2, h2p);
+    qc_keypair(h3, h3p);
+    zclient y1, y2, y3;
+    stdout_stumm(1);
+    int ok_h = zc_verbinden(&y1, bild_port, h1, "H1") == 0 && zc_kennung(&y1, QC_ZUGANG_KENNUNG) && zc_noetig(&y1, &wege, &warten, hn) == 0 &&
+               zc_verbinden(&y2, bild_port, h2, "H2") == 0 && zc_kennung(&y2, QC_ZUGANG_KENNUNG) && zc_noetig(&y2, &wege, &warten, hn) == 0;
+    int ok_h3 = zc_verbinden(&y3, bild_port, h3, "H3") == 0 && zc_kennung(&y3, QC_ZUGANG_KENNUNG) &&
+                zc_ergebnis(&y3, &erg, &w, NULL, 2000) == 0 && erg == QC_ERGEBNIS_SCHLUSS && w == QC_ZUGANG_VOLL_WARTEN_MS &&
+                zc_schliesst(&y3, 2000);
+    zc_zu(&y3);
+    zc_abbruch(&y2);
+    zc_schliesst(&y2, 2000);
+    for (int i = 0; i < 200 && qc_zugang_phasen_offen() > 1; i++) usleep(5 * 1000);
+    // Derselbe Schluessel ein zweites Mal, waehrend seine Phase laeuft.
+    int ok_h1b = zc_verbinden(&y3, bild_port, h1, "H1 nochmal") == 0 && zc_kennung(&y3, QC_ZUGANG_KENNUNG) &&
+                 zc_ergebnis(&y3, &erg, &w, NULL, 2000) == 0 && erg == QC_ERGEBNIS_SCHLUSS && zc_schliesst(&y3, 2000);
+    stdout_stumm(0);
+    pruefe(ok_h && ok_h3, "dritte Zugangsphase derselben Adresse: \"QCA1\", sofort 22/4 mit 5 s, geschlossen");
+    pruefe(ok_h1b, "zweite Zugangsphase desselben Schluessels: 22/4, geschlossen");
+    zc_zu(&y1); zc_zu(&y2); zc_zu(&y3);
+    warten_bis(zugang_ruht, 2);
+
+    g_zugang_frist_ms = 1200;
+    drossel_altern(&d_zugang_frist);
+    stdout_stumm(1);
+    double t0 = sek();
+    int ok_i = zc_verbinden(&z, bild_port, h2, "Schlaefer") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0 && zc_ergebnis(&z, &erg, &w, NULL, 4000) == 0 &&
+               erg == QC_ERGEBNIS_SCHLUSS && zc_schliesst(&z, 2000);
+    double dauer = sek() - t0;
+    stdout_stumm(0);
+    g_zugang_frist_ms = QC_ZUGANG_FRIST_MS;
+    printf("         (Frist 1,2 s: geschlossen nach %.2f s)\n", dauer);
+    pruefe(ok_i && dauer > 1.0 && dauer < 3.0 && zeilen_mit(logpfad, "Zugang: Frist fuer Schlaefer (ID ") == 1,
+           "Gesamtfrist abgelaufen: 22/4, geschlossen, Zeile");
+    zc_zu(&z);
+    warten_bis(zugang_ruht, 2);
+
+    printf("\n-- Zugang: ein Wartender stoert den laufenden Zuschauer nicht\n");
+    atomic_store(&g_test_ui, 1);
+    int hfd, cfd;
+    if (paar(&hfd, &cfd, 0)) { pruefe(0, "Verbindung"); return; }
+    zuschauer_setzen(hfd, kanal(hfd, 0x61));
+    uint8_t j_priv[32], j_pub[32];
+    qc_keypair(j_priv, j_pub);
+    stdout_stumm(1);
+    int ok_j = zc_verbinden(&z, bild_port, j_priv, "Wartender") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    a = anfrage_neu(a2, 2);
+    qc_cipher etx;
+    int ein = eingabe_verbinden(ein_port, j_priv, z.hh, &etx);
+    usleep(100 * 1000);
+    int unberuehrt = atomic_load(&g_client_fd) == hfd && atomic_load(&g_vid_ready) && atomic_load(&g_in_fd) < 0;
+    struct pollfd pf = { .fd = cfd, .events = POLLIN, .revents = 0 };
+    int still = poll(&pf, 1, 100) == 0;
+    zc_abbruch(&z);
+    zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    pruefe(ok_j && a && unberuehrt && still, "waehrend der Zugangsphase: der Zuschauer bleibt eingetragen und bekommt nichts");
+    pruefe(ein < 0, "der Wartende bekommt keinen Eingabekanal (sein Handschlag passt nicht zum Bildkanal)");
+    if (ein >= 0) close(ein);
+    zc_zu(&z);
+    zuschauer_weg();
+    close(cfd);
+    atomic_store(&g_test_ui, 0);
+    warten_bis(zugang_ruht, 2);
+
+    printf("\n-- Zugang: beschaedigte Liste, Entfernen\n");
+    char listenpfad[1200];
+    qc_config_path("host-devices.txt", listenpfad, sizeof listenpfad);
+    NSData *heil = [NSData dataWithContentsOfFile:@(listenpfad)];
+    [@"kaputt\n" writeToFile:@(listenpfad) atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    stdout_stumm(1);
+    int ok_l = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG);
+    zc_abbruch(&z);
+    zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    NSData *danach = [NSData dataWithContentsOfFile:@(listenpfad)];
+    pruefe(ok_l && [danach isEqualToData:[@"kaputt\n" dataUsingEncoding:NSUTF8StringEncoding]],
+           "Liste beschaedigt: auch ein bekanntes Geraet muss sich ausweisen, die Datei bleibt unangetastet");
+    zc_zu(&z);
+    [heil writeToFile:@(listenpfad) atomically:NO];
+    warten_bis(zugang_ruht, 2);
+
+    strom_attrappe_setzen();
+    stdout_stumm(1);
+    int ok_m = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_sitzung(&z) && warten_bis(zuschauer_da, 1);
+    int zust = atomic_load(&g_test_zustand);
+    int entfernt = qc_zugang_geraet_entfernen(a_pub) == 0;
+    int getrennt = warten_bis(zuschauer_fort, 1) && zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    pruefe(ok_m && entfernt && getrennt && qc_zugang_bekannt(a_pub, NULL) == 0 && atomic_load(&g_test_zustand) > zust,
+           "Geraet entfernen: seine laufende Sitzung endet, die Oberflaeche erfaehrt es");
+    zc_zu(&z);
+    stdout_stumm(1);
+    int ok_m2 = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG);
+    zc_abbruch(&z);
+    zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    pruefe(ok_m2, "danach braucht es wieder die Zugangsphase");
+    zc_zu(&z);
+    warten_bis(zugang_ruht, 2);
+
+    printf("\n-- Argumente ohne Wert (7.7), entfernte Schalter\n");
+    stdout_stumm(1);
+    NSString *w1 = wert_nach(@[ @"host", @"--fps" ], @"--fps", 1);
+    NSString *w2 = wert_nach(@[ @"host", @"--fps", @"--mbit", @"80" ], @"--fps", 1);
+    NSString *w3 = wert_nach(@[ @"host", @"--fps", @"--mbit", @"80" ], @"--mbit", 1);
+    NSString *w4 = wert_nach(@[ @"host", @"--capture", @"5" ], @"--capture", 2);
+    NSString *w5 = wert_nach(@[ @"host", @"--capture", @"5", @"x.hevc" ], @"--capture", 2);
+    argumente_pruefen(@[ @"host", @"--pair", @"--forget", @"--fps", @"60", @"--gibtsnicht", @"-psn_0_1" ]);
+    stdout_stumm(0);
+    pruefe(!w1 && !w2 && [w3 isEqualToString:@"80"] && !w4 && [w5 isEqualToString:@"x.hevc"] &&
+           zeilen_mit(logpfad, "--fps: Wert 1 fehlt - der Standard gilt") == 2,
+           "--fps am Ende oder vor dem naechsten Schalter: kein Absturz, Standard und Zeile");
+    pruefe(zeilen_mit(logpfad, "Unbekanntes Argument --pair - uebergangen (entfallen") == 1 &&
+           zeilen_mit(logpfad, "Unbekanntes Argument --forget") == 1 && zeilen_mit(logpfad, "Unbekanntes Argument --gibtsnicht") == 1 &&
+           zeilen_mit(logpfad, "Unbekanntes Argument") == 3, "--pair und --forget werden nur noch als unbekannt protokolliert");
+
+    printf("\n-- Zugang: ohne Bildschirmfreigabe\n");
+    // Ohne Freigabe (und ohne Bildschirmliste) kommt ein Zuschauer trotzdem
+    // herein und bekommt Hoststatus 1; die Wiederherstellung fragt nach.
+    uint8_t n_priv[32], n_pub[32];
+    qc_keypair(n_priv, n_pub);
+    qc_zugang_eintragen(n_pub, "ohne Freigabe");
+    stream_setzen(nil);
+    g_tcc_bildschirm = test_tcc_nein;
+    int tcc = qc_zustand_bildschirmfreigabe();
+    stdout_stumm(1);
+    double t_ein = sek();
+    int ok_n = zc_verbinden(&z, bild_port, n_priv, "ohne Freigabe") == 0 && zc_sitzung(&z);
+    int status = -1;
+    qc_hdr h;
+    NSData *d = nil;
+    while (ok_n && status < 0 && nachricht_ganz(&z.l, &h, &d, 2000) == 1)
+        if (h.type == QC_MSG_HOSTSTATUS && d.length >= 1) status = ((const uint8_t *)d.bytes)[0];
+    int drin = atomic_load(&g_client_fd) >= 0 && atomic_load(&g_ohne_aufnahme);
+    zuschauer_weg();
+    zc_zu(&z);
+    // Die eingereihte Wiederherstellung (3 s) muss ohne Zuschauer ins Leere laufen.
+    while (sek() - t_ein < 3.5) usleep(50 * 1000);
+    dispatch_sync(g_lifeq, ^{ g_kein_bildschirm_gemeldet = 0; });
+    stdout_stumm(0);
+    g_tcc_bildschirm = test_tcc_ja;
+    atomic_store(&g_ohne_aufnahme, 0);
+    pruefe(tcc == 0 && ok_n && status == 1 && drin,
+           "keine Freigabe: der Zuschauer kommt herein (\"QCH1\", Strominfo) und bekommt Hoststatus 1 statt einer Abweisung");
+    pruefe(zeilen_mit(logpfad, "Bildschirmaufnahme nicht freigegeben - Zuschauer bekommt Hoststatus 1") == 1, "Zeile");
+
+    pthread_mutex_lock(&g_log_mtx);
+    fclose(g_log);
+    g_log = NULL;
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -2988,6 +3509,13 @@ int main(void) {
         setenv("HOME", g_home, 1);
         printf("HOME %s\n", g_home);
         qc_keypair(g_id_priv, g_id_pub);
+        // Zugang wie im Host: Zeilen ins Protokoll, Entfernen trennt, Passwort
+        // im eigenen HOME. Die Freigabe fuer die Bildschirmaufnahme gilt als
+        // erteilt - nur der Abschnitt Zugang nimmt sie weg.
+        qc_zugang_protokoll_setzen(zugang_zeile);
+        qc_zugang_entfernt_setzen(zuschauer_entfernt);
+        qc_zugang_start(g_id_pub);
+        g_tcc_bildschirm = test_tcc_ja;
         g_capq = dispatch_queue_create("hosttest.aufnahme", DISPATCH_QUEUE_SERIAL);
         g_lifeq = dispatch_queue_create("hosttest.lebenslauf", DISPATCH_QUEUE_SERIAL);
         int bild_port = annahme_lauschen(19400, bild_verbindung, "Bildkanal");
@@ -3002,6 +3530,7 @@ int main(void) {
         qc_bildschirm_liste_setzen(test_liste);
         qc_strom_fabrik_setzen(test_fabrik);
         protokoll_pruefen(bild_port, ein_port);
+        zugang_pruefen(bild_port, ein_port);
         abloesen_pruefen();
         wechsel_pruefen(bild_port);
         testbild_rest_pruefen();
