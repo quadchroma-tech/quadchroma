@@ -125,12 +125,13 @@ Reiter **Bild**, Zeile „Bildschirm“ über den Codecknöpfen: ein Knopf **Aut
 und je Bildschirm des Hosts einer mit Name, Größe und Bildrate („X27 X1 · 1920×1080 ·
 120 Hz“, ohne Hz-Teil, wenn der Host die Rate nicht kennt). Der gestreamte Bildschirm
 steht in Cyan; bei Automatik dazu „Automatisch“, bei festem Wunsch der gewünschte
-Eintrag, sofern er angeschlossen ist. Ein Klick auf den Eintrag, der schon gilt, tut
-nichts. Bis der Host geantwortet hat, steht rechts in Amber „Bildschirm wird
-gewechselt …“, bei geschlossenem Menü derselbe Hinweis über dem Bild wie beim
-Codecwechsel (höchstens 5 s). Die Zeile gibt es nur bei einem Host, der die Wahl
-kennt (Bit 1 seiner Fähigkeiten); ein älterer Host bekommt nie einen Wunsch, ein
-älterer Client übergeht die Liste.
+Eintrag, sofern er angeschlossen ist. Ein Klick auf den Eintrag, der schon der Wunsch
+ist, tut nichts — der gestreamte Eintrag ist bei Automatik nicht der Wunsch, ein Klick
+darauf wählt ihn fest. Bis der Host geantwortet hat, steht rechts in Amber „Bildschirm
+wird gewechselt …“, bei geschlossenem Menü derselbe Hinweis über dem Bild wie beim
+Codecwechsel (höchstens 5 s; läuft gerade beides, zeigt der Kasten den Codecwechsel).
+Die Zeile gibt es nur bei einem Host, der die Wahl kennt (Bit 1 seiner Fähigkeiten);
+ein älterer Host bekommt nie einen Wunsch, ein älterer Client übergeht die Liste.
 
 - **Automatisch** (Vorgabe): Der Host streamt seinen Hauptbildschirm — auf dem Mac
   den mit der Menüleiste, auf Windows den Monitor, den Windows als primär führt —
@@ -161,18 +162,28 @@ Die Windows-Host-Rolle zählt ihre Ausgänge alle 2 s neu auf, nach einem Verlus
 Duplication sofort. Der Wechsel selbst läuft wie ein Codecwechsel: alter Strom
 anhalten, neuer Strom auf dem Zielbildschirm, an den Zuschauer erst Nachricht 7
 (SWITCH mit dem laufenden Codec, damit der Client den Decoder neu baut), dann 1
-(INFO mit den Maßen), dann das erste Bild als Vollbild, danach die neue Liste
-(Nachricht 12); die Maus folgt dem Bild, das Bild steht kurz still. Hat der neue
-Bildschirm eine andere Größe, entsteht der Encoder neu; der Client baut auch bei
-einer INFO mit neuen Maßen seinen Decoder neu und wartet auf das Vollbild. Läuft
-gerade ein Codecwechsel, wartet der Bildschirmwechsel, bis er fertig ist (der
-Mac-Host nach 5 s trotzdem).
+(INFO mit den Maßen), dann die neue Liste (Nachricht 12), dann das erste Bild als
+Vollbild; die Maus folgt dem Bild, das Bild steht kurz still. Hat der neue
+Bildschirm eine andere Größe, entsteht der Encoder neu; bei gleicher Größe bleibt
+er auf dem Mac stehen, auf Windows nur ein Encoder auf dem Prozessorweg (einer auf
+dem Texturweg hängt am Gerät der alten Duplication). Der Client baut auch bei einer
+INFO mit neuen Maßen seinen Decoder neu und wartet auf das Vollbild. Läuft gerade
+ein Codecwechsel, wartet der Bildschirmwechsel, bis er fertig ist (der Mac-Host
+nach 5 s trotzdem).
 
-Im Protokoll beider Hosts steht `Bildschirmwechsel: <alt> -> <neu> (<Grund>)` mit
-`Wunsch des Zuschauers`, `Hauptbildschirm gewechselt`, `Ausweichplatz` oder `zurueck
-zum gewuenschten Bildschirm`. Alle Zeilen, die Nachrichten 12 und 70 im Einzelnen
-und der Prüfmodus (`--bildschirm <Kennung|auto>`, Feld „Strom“ in der Statuszeile)
-stehen in `BENUTZUNG.txt`.
+Wird der gestreamte Bildschirm abgezogen, ist das kein Wechsel, sondern ein Verlust:
+der Strom endet, der Host meldet „kein Bildschirm“ (Nachricht 9) und baut ihn neu
+auf — der Mac nach 2 s, die Windows-Host-Rolle alle 2 s — auf dem dann gewählten
+Bildschirm, bei festem Wunsch also dem Ausweichplatz. SWITCH und INFO bekommt der
+Zuschauer dabei vom Mac nur bei anderer Stromgröße, von der Windows-Host-Rolle,
+sobald es ein anderer Bildschirm ist; der Mac schreibt dazu keine Zeile
+`Bildschirmwechsel`, sondern `Aufnahme wiederhergestellt`.
+
+Bei einem Wechsel steht im Protokoll beider Hosts `Bildschirmwechsel: <alt> -> <neu>
+(<Grund>)` mit `Wunsch des Zuschauers`, `Hauptbildschirm gewechselt`, `Ausweichplatz`
+oder `zurueck zum gewuenschten Bildschirm`. Alle Zeilen, die Nachrichten 12 und 70 im
+Einzelnen und der Prüfmodus (`--bildschirm <Kennung|auto>`, Feld „Strom“ in der
+Statuszeile) stehen in `BENUTZUNG.txt`.
 
 ## Dateien über die Zwischenablage
 
