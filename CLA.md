@@ -3,7 +3,7 @@
 Version 1.0, 26 September 2026
 
 Licensor: Robert Brandt, hello@quadchroma.tech, https://quadchroma.tech
-Project: QuadChroma, https://github.com/quadchroma/quadchroma
+Project: QuadChroma, https://github.com/quadchroma-tech/quadchroma
 
 ## Summary (for orientation only, not part of the Agreement)
 
@@ -50,7 +50,7 @@ pull request are enough. Copyright itself cannot be transferred under German law
 - **"Licensor"** means Robert Brandt, hello@quadchroma.tech, and any successor to whom
   the Licensor transfers the Project under Section 4.6.
 - **"Project"** means QuadChroma: the software published in the repository
-  https://github.com/quadchroma/quadchroma (Mac host, Windows client, Windows host role,
+  https://github.com/quadchroma-tech/quadchroma (Mac host, Windows client, Windows host role,
   Mac client), its protocol implementation, documentation, translations, build and
   release scripts and related material, and any product or service of the Licensor
   based on it.

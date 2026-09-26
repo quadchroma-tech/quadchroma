@@ -209,7 +209,7 @@ If it becomes possible:
 3. An Entra app registration for the signer with the role "Artifact Signing
    Certificate Profile Signer" on the profile. Either a client secret (secret
    `AZURE_CLIENT_SECRET`) or, better, a federated credential for GitHub OIDC
-   (subject `repo:quadchroma/quadchroma:ref:refs/tags/v0.1.0` per tag, or use an
+   (subject `repo:quadchroma-tech/quadchroma:ref:refs/tags/v0.1.0` per tag, or use an
    environment) and the secret `AZURE_SUBSCRIPTION_ID` instead of a client
    secret.
 4. Fill in the `AZURE_*` secrets of section 3.3. The next tag push signs the exe.

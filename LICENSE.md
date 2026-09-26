@@ -316,7 +316,7 @@ notices (clause 9) and are not made available to any other person.
 
 6.3 Pointing others to the official sources of the software is permitted and is
 not distribution: You may share the addresses <https://quadchroma.tech> and
-<https://github.com/quadchroma/quadchroma>, or an official download address
+<https://github.com/quadchroma-tech/quadchroma>, or an official download address
 published there. The Licensor publishes the software only at those sources;
 copies obtained elsewhere may have been altered, and the Licensor does not
 vouch for them.

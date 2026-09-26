@@ -16,7 +16,7 @@ QuadChroma is developed by one person and has no maintenance branches. Fixes go 
 | Older releases | No - please update to the latest release |
 
 At the time of writing the version line is 0.1.x; the Releases page of
-https://github.com/quadchroma/quadchroma is authoritative.
+https://github.com/quadchroma-tech/quadchroma is authoritative.
 
 ## How to report a vulnerability
 
@@ -25,7 +25,7 @@ channels:
 
 1. **GitHub private vulnerability reporting** (preferred): on the repository's
    *Security* tab, choose *Report a vulnerability*
-   (https://github.com/quadchroma/quadchroma/security/advisories/new). The report is
+   (https://github.com/quadchroma-tech/quadchroma/security/advisories/new). The report is
    visible only to you and the maintainer, the fix can be discussed there, and the
    result is published as a GitHub Security Advisory with credit to you.
 2. **E-mail:** hello@quadchroma.tech, subject starting with `[security]`. There is no

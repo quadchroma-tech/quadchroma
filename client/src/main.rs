@@ -4995,6 +4995,8 @@ struct App {
     hosts: Arc<Mutex<discovery::Hosts>>,
     addr_input: String,
     lang: &'static strings::Lang,
+    /// Die Sprachwahl auf dem Startbildschirm ist offen.
+    sprachwahl: bool,
     show_overlay: bool,
     fps_hist: Vec<f32>,
     last_frame: Option<Frame>,
@@ -5360,6 +5362,8 @@ impl ApplicationHandler<Benutzer> for App {
                                 }
                                 return;
                             }
+                            // Esc schliesst zuerst eine offene Sprachwahl.
+                            KC::Escape if self.sprachwahl => { self.sprachwahl = false; return; }
                             KC::Escape => { self.quit = true; return; }
                             // Cmd+W schliesst auf dem Startbildschirm wie das
                             // rote Knoepfchen (winit legt dafuer keinen
@@ -6652,7 +6656,7 @@ impl App {
                 let hinweis = self.verknuepfung_hinweis();
                 n.act = start_screen(
                     &mut self.ui, c, self.lang, &hosts, &self.addr_input, err.as_deref(),
-                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)),
+                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl,
                 );
             }
             Screen::Session => {
@@ -6860,10 +6864,14 @@ impl App {
             Action::Connect(addr) => self.verbinden(&addr),
             Action::Verknuepfung { adresse, name } => self.verknuepfung_anlegen(&adresse, &name),
             Action::Quit => self.quit = true,
-            Action::NextLang => {
-                let all = strings::all();
-                let i = all.iter().position(|l| l.code == self.lang.code).unwrap_or(0);
-                self.lang = all[(i + 1) % all.len()];
+            Action::Sprachwahl => self.sprachwahl = !self.sprachwahl,
+            Action::Sprache(code) => {
+                // Gewaehlt wird aus der Liste, gemerkt in einstellungen.txt -
+                // vorher galt nach jedem Start wieder die Systemsprache.
+                self.lang = strings::pick(code);
+                self.sprachwahl = false;
+                self.cfg.sprache = Some(code.to_string());
+                self.cfg.sichern();
             }
             Action::Website => website_oeffnen(),
             Action::None => {}
@@ -7066,7 +7074,10 @@ enum Action {
     /// Desktop-Verknuepfung fuer diesen Host anlegen (nur Windows).
     Verknuepfung { adresse: String, name: String },
     Quit,
-    NextLang,
+    /// Sprachwahl oeffnen bzw. schliessen.
+    Sprachwahl,
+    /// Diese Sprache nehmen (Code wie in strings.rs).
+    Sprache(&'static str),
     Website,
 }
 
@@ -7244,9 +7255,17 @@ fn start_screen(
     addr: &str,
     error: Option<&str>,
     hinweis: Option<(&str, u32)>,
+    sprachwahl: bool,
 ) -> Action {
     use strings::Key::*;
     c.backdrop(u.tick);
+    // Offene Sprachwahl: sie liegt ueber allem und bekommt Maus und Klick
+    // allein - darunter reagiert nichts, bis sie wieder zu ist.
+    let (echte_maus, echter_klick) = (u.mouse, u.click);
+    if sprachwahl {
+        u.mouse = (-10_000, -10_000);
+        u.click = false;
+    }
 
     let cx = c.w as i32 / 2;
     let (px, panel_w, py) = start_rahmen(c.w as i32, c.h as i32);
@@ -7327,7 +7346,7 @@ fn start_screen(
     }
 
     // Fussleiste: Oben die Urheberzeile mit Projektseite und FFmpeg-Hinweis,
-    // darunter Version, Tastenhinweise und die Sprache zum Durchschalten.
+    // darunter Version, Tastenhinweise und die Sprache (Klick oeffnet die Wahl).
     // Passt die Urheberzeile nicht in eine Zeile, steht der FFmpeg-Hinweis
     // in einer eigenen Zeile darunter, und die Trennlinie rueckt nach oben.
     let fy2 = c.h as i32 - 22;
@@ -7339,12 +7358,24 @@ fn start_screen(
         let einzeilig = cw + luecke + ww_ + luecke + fw <= c.w as i32 - 40;
         let gesamt = cw + luecke + ww_ + if einzeilig { luecke + fw } else { 0 };
         let x0 = cx - gesamt / 2;
-        let wy = if einzeilig { fy2 - 16 } else { fy2 - 31 };
+        // Eigene Zeile(n): in sehr schmalen Fenstern umgebrochen statt
+        // links und rechts abgeschnitten.
+        let hinweis_zeilen = if einzeilig {
+            Vec::new()
+        } else if fw <= c.w as i32 - 40 {
+            vec![FFMPEG_HINWEIS.to_string()]
+        } else {
+            umbruch(u, FFMPEG_HINWEIS, c.w as i32 - 40, 11)
+        };
+        let n = hinweis_zeilen.len() as i32;
+        let wy = if einzeilig { fy2 - 16 } else { fy2 - 31 - (n - 1) * 14 };
         c.hline(0, wy - 22, c.w as i32, ui::CYAN, 30);
         if einzeilig {
             u.text.draw(c, x0 + cw + luecke + ww_ + luecke, wy, FFMPEG_HINWEIS, 11, ui::DIM, 2);
-        } else {
-            u.text.draw_centered(c, cx, fy2 - 16, FFMPEG_HINWEIS, 11, ui::DIM, 2);
+        }
+        let abstand = if n > 1 { 1 } else { 2 };
+        for (i, z) in hinweis_zeilen.iter().enumerate() {
+            u.text.draw_centered(c, cx, wy + 15 + i as i32 * 14, z, 11, ui::DIM, abstand);
         }
         u.text.draw(c, x0, wy, COPYRIGHT, 11, ui::DIM, 2);
         let wx = x0 + cw + luecke;
@@ -7361,17 +7392,88 @@ fn start_screen(
         "F9 {}   F10 {}   F11 {}   F12 {}",
         lang.get(ShowOverlay), lang.get(Settings), lang.get(Fullscreen), lang.get(PixelExact)
     );
-    u.text.draw_centered(c, cx, fy2, &hints, 11, ui::DIM, 1);
     let lw = u.text.width(lang.name, 12, 2);
     let lr = ui::Rect { x: c.w as i32 - lw - 34, y: fy2 - 16, w: lw + 22, h: 22 };
+    // Die Tastenhinweise nur, wenn sie zwischen Version und Sprache passen -
+    // in schmalen Fenstern lagen sie sonst ueber dem Sprachknopf.
+    let hw = u.text.width(&hints, 11, 1);
+    if cx - hw / 2 > 20 + u.text.width("v0.1", 11, 2) + 12 && cx + hw / 2 < lr.x - 4 {
+        u.text.draw_centered(c, cx, fy2, &hints, 11, ui::DIM, 1);
+    }
     let hot = lr.hit(u.mouse.0, u.mouse.1);
     u.text.draw(c, lr.x + 10, fy2, lang.name, 12, if hot { ui::CYAN } else { ui::DIM }, 2);
     if hot {
         c.hline(lr.x, lr.y + lr.h, lr.w, ui::CYAN, 160);
-        if u.click { action = Action::NextLang; }
+        if u.click { action = Action::Sprachwahl; }
+    }
+    if sprachwahl {
+        u.mouse = echte_maus;
+        u.click = echter_klick;
+        return sprachwahl_zeichnen(u, c, lang);
     }
     if let Some(k) = tip {
         tooltip(u, c, lang.get(k), maus, c.w as i32, c.h as i32, 11, 1);
+    }
+    action
+}
+
+/// Spalten und Zeilen der Sprachwahl: gern vier Spalten, weniger, wenn die
+/// Breite nicht reicht, mehr, wenn die Hoehe sonst nicht reicht - aber nie
+/// breiter als der Platz.
+fn sprachwahl_raster(platz_w: i32, platz_h: i32, anzahl: i32, zelle_w: i32, zelle_h: i32) -> (i32, i32) {
+    let max_breite = (platz_w / zelle_w.max(1)).max(1);
+    let zeilen_hoch = (platz_h / zelle_h.max(1)).max(1);
+    let fuer_hoehe = (anzahl + zeilen_hoch - 1) / zeilen_hoch;
+    let spalten = 4.min(max_breite).max(fuer_hoehe).min(max_breite).max(1);
+    (spalten, (anzahl + spalten - 1) / spalten)
+}
+
+/// Die Sprachwahl: alle Sprachen auf einen Blick, jede in ihrem eigenen
+/// Namen, die aktuelle in Cyan. Ein Klick waehlt, ein Klick daneben (oder
+/// Esc) schliesst ohne Wechsel. Frueher ging es nur reihum durch alle.
+fn sprachwahl_zeichnen(u: &mut ui::Ui, c: &mut ui::Canvas, lang: &'static strings::Lang) -> Action {
+    let alle = strings::all();
+    let groesse = 13;
+    let zelle_w = alle.iter().map(|l| u.text.width(l.name, groesse, 1)).max().unwrap_or(80) + 30;
+    let zelle_h = 30;
+    let (rand, titel_h) = (22, 46);
+    let (spalten, zeilen) = sprachwahl_raster(
+        c.w as i32 - 32 - 2 * rand,
+        c.h as i32 - 16 - titel_h - rand,
+        alle.len() as i32,
+        zelle_w,
+        zelle_h,
+    );
+    let pw = spalten * zelle_w + 2 * rand;
+    let ph = titel_h + zeilen * zelle_h + rand;
+    let px = (c.w as i32 - pw) / 2;
+    let py = ((c.h as i32 - ph) / 2).max(8);
+    c.fill(0, 0, c.w as i32, c.h as i32, ui::BG, 170);
+    // Deckend unter der Tafel: die Hostliste darf nicht durchscheinen.
+    c.fill(px, py, pw, ph, ui::BG, 255);
+    c.panel(px, py, pw, ph, ui::CYAN);
+    u.text.draw(c, px + rand, py + 30, lang.get(strings::Key::Language), 12, ui::DIM, 2);
+    let mut action = Action::None;
+    for (i, l) in alle.iter().enumerate() {
+        let (sp, ze) = (i as i32 % spalten, i as i32 / spalten);
+        let r = ui::Rect { x: px + rand + sp * zelle_w, y: py + titel_h + ze * zelle_h, w: zelle_w - 8, h: zelle_h - 6 };
+        let hot = r.hit(u.mouse.0, u.mouse.1);
+        let aktuell = l.code == lang.code;
+        if hot {
+            c.fill(r.x, r.y, r.w, r.h, ui::CYAN, 26);
+        }
+        let farbe = if aktuell { ui::CYAN } else if hot { ui::TEXT } else { ui::DIM };
+        u.text.draw(c, r.x + 10, r.y + r.h - 8, l.name, groesse, farbe, 1);
+        if aktuell {
+            c.hline(r.x + 10, r.y + r.h - 2, u.text.width(l.name, groesse, 1), ui::CYAN, 160);
+        }
+        if hot && u.click {
+            action = Action::Sprache(l.code);
+        }
+    }
+    let tafel = ui::Rect { x: px, y: py, w: pw, h: ph };
+    if u.click && !tafel.hit(u.mouse.0, u.mouse.1) {
+        action = Action::Sprachwahl;
     }
     action
 }
@@ -8003,7 +8105,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     }
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
-        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", meldung.as_deref(), None);
+        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", meldung.as_deref(), None, view == "sprachwahl");
     }
 
     write_bmp(path, w, h, &buf, lang);
@@ -8794,6 +8896,7 @@ fn main() {
         hosts: discovery::start(9003),
         addr_input: start_addr,
         lang: sprache,
+        sprachwahl: false,
         fps_hist: Vec::new(),
         last_frame: None,
         quit: false,
@@ -9828,6 +9931,17 @@ fn tooltip(u: &mut ui::Ui, c: &mut ui::Canvas, text: &str, maus: (i32, i32), ww:
 
 #[cfg(test)]
 mod tests {
+    /// Sprachwahl: vier Spalten, wenn Platz ist; schmale Fenster bekommen
+    /// weniger, niedrige mehr - nie mehr Spalten, als in die Breite passen.
+    #[test]
+    fn sprachwahl_raster_passt_sich_an() {
+        assert_eq!(sprachwahl_raster(1800, 900, 29, 200, 30), (4, 8));
+        assert_eq!(sprachwahl_raster(820, 500, 29, 200, 30), (4, 8));
+        assert_eq!(sprachwahl_raster(450, 900, 29, 200, 30), (2, 15));
+        assert_eq!(sprachwahl_raster(1800, 200, 29, 200, 30), (5, 6));
+        assert_eq!(sprachwahl_raster(100, 100, 29, 200, 30), (1, 29));
+    }
+
     use super::*;
 
     /// Ein gemessener Schritt mit sonst unauffaelligen Werten.
