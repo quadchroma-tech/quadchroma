@@ -48,6 +48,7 @@ enum {
 
 // Ablauf und Grenzen (3.2).
 #define QC_ZUGANG_FRIST_MS            120000  // Gesamtfrist einer Zugangsphase
+#define QC_ZUGANG_NACHRICHT_MS        10000   // eine Nachricht des Clients, Kopf und Nutzlast zusammen
 #define QC_ZUGANG_VERSUCHE            5       // Fehlversuche je Verbindung, dann Schluss
 #define QC_ZUGANG_PHASEN              4       // gleichzeitig
 #define QC_ZUGANG_PHASEN_JE_IP        2
@@ -183,8 +184,15 @@ int qc_zugang_pruefen(const uint8_t hh[32], const uint8_t client_proof[32], uint
 // (alle zusammen): jede weitere Abfrage bekommt mindestens 60 s.
 // ip: IPv4-Adresse wie in sin_addr.s_addr. jetzt_ms: monotone Uhr.
 
-/// Wie lange diese Gegenstelle noch warten muss, bevor ein Beweis zaehlt.
+/// Wie lange diese Gegenstelle noch warten muss, bevor ein Beweis zaehlt -
+/// fuer den Beginn einer Phase (Nachricht 20), samt der globalen Grenze.
 uint32_t qc_zugang_drossel_warten(uint32_t ip, const uint8_t pub[32], int64_t jetzt_ms);
+
+/// Wie qc_zugang_drossel_warten, aber nur je Adresse und je Schluessel, ohne
+/// die globale Grenze (die gilt fuer jede weitere Phase, nicht fuer jeden
+/// Beweis darin). Fuer den Blick beim Eintreffen eines Beweises: eine zweite
+/// Verbindung derselben Adresse darf nicht raten, waehrend die erste wartet.
+uint32_t qc_zugang_drossel_rest(uint32_t ip, const uint8_t pub[32], int64_t jetzt_ms);
 
 /// Ein Fehlversuch (auch: ein Beweis, der zu frueh kam). Rueckgabe: die
 /// Wartezeit, die jetzt gilt.
@@ -294,9 +302,18 @@ int qc_zustand_port_belegt(void);                       // 0, oder der Bildport,
 
 // Von der Oberflaeche bereitgestellt (P3), vom Kern gerufen. zugang.c
 // liefert schwache Standardfassungen, damit Pruefstaende ohne Oberflaeche
-// bauen. Sie werden aus Netzfaeden gerufen, qc_ui_anfrage und
-// qc_ui_anfrage_zurueck unter einer Sperre des Kerns (damit ihre Reihenfolge
-// stimmt): nur per dispatch_async(main) arbeiten, nie zurueck in den Kern rufen.
+// bauen. Sie werden aus Netzfaeden gerufen, die drei Meldungen auch unter
+// einer Sperre des Kerns: qc_ui_anfrage und qc_ui_anfrage_zurueck unter der
+// Sperre der Anfragen (damit ihre Reihenfolge stimmt), qc_ui_zustand_geaendert
+// auch unter der Versandsperre von main.m (Zuschauer weg beim Senden). Also
+// arbeiten die Meldungen nur per dispatch_async, rufen im Aufruf selbst nie
+// zurueck in den Kern und warten nie synchron auf die Main Queue
+// (dispatch_sync). Was die Oberflaeche danach vom Kern wissen will, holt sie
+// spaeter aus dem eingereihten Block (wie oben: auf einer eigenen
+// Warteschlange). qc_ui_vorhanden antwortet sofort, ohne zu warten.
+// qc_ui_anfrage: name zeigt in die Tabelle der Anfragen und gilt nur waehrend
+// des Aufrufs - wer ihn spaeter braucht, kopiert ihn vorher (etwa als
+// NSString) in den Block.
 void qc_ui_anfrage(uint64_t anfrage, const char *name, uint32_t id, uint32_t code);
 void qc_ui_anfrage_zurueck(uint64_t anfrage);           // entschieden oder zurueckgezogen: Fenster zu
 void qc_ui_zustand_geaendert(void);                     // Zuschauer/Freigaben/Liste/Passwort -> Menue neu

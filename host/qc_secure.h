@@ -32,6 +32,10 @@ typedef struct {
     uint8_t in[QC_CHUNK_MAX + QC_TAGLEN];   // entschluesselt
     size_t in_len, in_pos;
     int ok;
+    // Nach einem gescheiterten qc_chan_read_frist ist der Empfang hin (ein
+    // halber Datensatz ist verloren), das Senden nicht: tx haengt nicht an rx.
+    // So kann der Host noch eine letzte Nachricht schicken (Zugang: 22/4).
+    int lesen_aus;
     // Bytes, die qc_chan_send bisher dem Socket uebergeben hat, samt Laengen
     // und Tags - dieselbe Zaehlung wie SO_NWRITE. Aus beiden zusammen folgt,
     // wie viel die Gegenstelle abgenommen hat (Stauregel in main.m).
@@ -58,8 +62,9 @@ int qc_chan_read(qc_chan *c, void *buf, size_t n);
 
 /// Wie qc_chan_read, aber mit Frist: nach frist_ms (ab jetzt, fuer alle n
 /// Bytes zusammen) ist Schluss, auch wenn die Gegenstelle tropfenweise sendet.
-/// 0 = Erfolg, -1 = Frist, Ende der Verbindung oder Fehler - danach taugt der
-/// Kanal nur noch zum Schliessen.
+/// 0 = Erfolg, -1 = Frist, Ende der Verbindung oder Fehler - danach liest der
+/// Kanal nichts mehr; senden laesst sich noch (eine letzte Nachricht), dann
+/// wird er geschlossen.
 int qc_chan_read_frist(qc_chan *c, void *buf, size_t n, int frist_ms);
 
 /// Schon entschluesselte, noch nicht abgeholte Bytes. Solange es welche gibt,

@@ -400,13 +400,18 @@ static void ip_schluessel(uint32_t ip, uint8_t k[32]) {
     memcpy(k, &ip, 4);
 }
 
-// Unter g_drossel_mtx.
-static uint32_t warten_gesperrt(uint32_t ip, const uint8_t pub[32], int64_t jetzt) {
+// Unter g_drossel_mtx: nur Adresse und Schluessel, der groessere Wert.
+static int64_t rest_gesperrt(uint32_t ip, const uint8_t pub[32], int64_t jetzt) {
     uint8_t k[32];
     ip_schluessel(ip, k);
     int64_t w = eintrag_rest(drossel_suchen(g_dr_ip, k), jetzt);
     int64_t w2 = eintrag_rest(drossel_suchen(g_dr_pub, pub), jetzt);
-    if (w2 > w) w = w2;
+    return w2 > w ? w2 : w;
+}
+
+// Unter g_drossel_mtx: dazu die globale Grenze.
+static uint32_t warten_gesperrt(uint32_t ip, const uint8_t pub[32], int64_t jetzt) {
+    int64_t w = rest_gesperrt(ip, pub, jetzt);
     if (g_dr_global_n > QC_DROSSEL_GLOBAL_ANZAHL &&
         jetzt - g_dr_global[g_dr_global_pos] < QC_DROSSEL_GLOBAL_FENSTER_MS && w < QC_DROSSEL_GLOBAL_WARTEN_MS)
         w = QC_DROSSEL_GLOBAL_WARTEN_MS;
@@ -416,6 +421,13 @@ static uint32_t warten_gesperrt(uint32_t ip, const uint8_t pub[32], int64_t jetz
 uint32_t qc_zugang_drossel_warten(uint32_t ip, const uint8_t pub[32], int64_t jetzt_ms) {
     pthread_mutex_lock(&g_drossel_mtx);
     uint32_t w = warten_gesperrt(ip, pub, jetzt_ms);
+    pthread_mutex_unlock(&g_drossel_mtx);
+    return w;
+}
+
+uint32_t qc_zugang_drossel_rest(uint32_t ip, const uint8_t pub[32], int64_t jetzt_ms) {
+    pthread_mutex_lock(&g_drossel_mtx);
+    uint32_t w = (uint32_t)rest_gesperrt(ip, pub, jetzt_ms);
     pthread_mutex_unlock(&g_drossel_mtx);
     return w;
 }
@@ -789,14 +801,16 @@ static int liste_schreiben(const liste *l) {
 }
 
 // Unter g_liste_mtx: eine beschaedigte Liste einmal melden, bis sie wieder
-// heil ist; die Oberflaeche erfaehrt jeden Wechsel ("Geraeteliste beschaedigt").
-static void defekt_melden(int defekt) {
+// heil ist. 1 = der Zustand hat gewechselt - dann erfaehrt es die Oberflaeche
+// ("Geraeteliste beschaedigt"), aber erst nach der Sperre: ruft sie die
+// Liste selbst ab, stuende sie sonst vor der eigenen Tuer.
+static int defekt_melden(int defekt) {
     if (defekt && !g_liste_defekt_gemeldet)
         zeile("Geraeteliste host-devices.txt nicht lesbar oder beschaedigt - niemand gilt als bekannt, "
               "jedes Geraet braucht Passwort oder Zulassen; die Datei bleibt unangetastet");
     int wechsel = defekt != g_liste_defekt_gemeldet;
     g_liste_defekt_gemeldet = defekt;
-    if (wechsel) qc_ui_zustand_geaendert();
+    return wechsel;
 }
 
 int qc_zugang_bekannt(const uint8_t pub[32], char name[QC_ZUGANG_NAME_MAX + 1]) {
@@ -804,8 +818,9 @@ int qc_zugang_bekannt(const uint8_t pub[32], char name[QC_ZUGANG_NAME_MAX + 1]) 
     liste l;
     pthread_mutex_lock(&g_liste_mtx);
     int r = liste_lesen(&l);
-    defekt_melden(r < 0);
+    int wechsel = defekt_melden(r < 0);
     pthread_mutex_unlock(&g_liste_mtx);
+    if (wechsel) qc_ui_zustand_geaendert();
     if (r < 0) return -1;
     int i = liste_suchen(&l, pub);
     if (i >= 0 && name) memcpy(name, l.e[i].name, sizeof l.e[i].name);
@@ -817,7 +832,7 @@ int qc_zugang_eintragen(const uint8_t pub[32], const char *name) {
     liste l;
     pthread_mutex_lock(&g_liste_mtx);
     int r = liste_lesen(&l);
-    defekt_melden(r < 0);
+    int wechsel = defekt_melden(r < 0);
     int neu = 0;
     if (r == 0 && liste_suchen(&l, pub) < 0) {
         char datum[11];
@@ -828,7 +843,7 @@ int qc_zugang_eintragen(const uint8_t pub[32], const char *name) {
     }
     pthread_mutex_unlock(&g_liste_mtx);
     liste_frei(&l);
-    if (neu) qc_ui_zustand_geaendert();
+    if (neu || wechsel) qc_ui_zustand_geaendert();
     return r;
 }
 
@@ -836,8 +851,9 @@ int qc_zugang_geraete(qc_geraet *ziel, int max) {
     liste l;
     pthread_mutex_lock(&g_liste_mtx);
     int r = liste_lesen(&l);
-    defekt_melden(r < 0);
+    int wechsel = defekt_melden(r < 0);
     pthread_mutex_unlock(&g_liste_mtx);
+    if (wechsel) qc_ui_zustand_geaendert();
     if (r < 0) return -1;
     for (int i = 0; ziel && i < l.n && i < max; i++) ziel[i] = l.e[i];
     int n = l.n;
@@ -854,7 +870,7 @@ int qc_zugang_geraet_entfernen(const uint8_t pub[32]) {
     char name[QC_ZUGANG_NAME_MAX + 1] = {0};
     pthread_mutex_lock(&g_liste_mtx);
     int r = liste_lesen(&l);
-    defekt_melden(r < 0);
+    int wechsel = defekt_melden(r < 0);
     int i = r == 0 ? liste_suchen(&l, pub) : -1;
     if (i >= 0) {
         memcpy(name, l.e[i].name, sizeof name);
@@ -864,6 +880,7 @@ int qc_zugang_geraet_entfernen(const uint8_t pub[32]) {
     }
     pthread_mutex_unlock(&g_liste_mtx);
     liste_frei(&l);
+    if (wechsel) qc_ui_zustand_geaendert();
     if (r != 0) {
         zeile("Geraet konnte nicht entfernt werden: Geraeteliste %s",
               i >= 0 ? "liess sich nicht schreiben" : "beschaedigt");
@@ -885,7 +902,7 @@ int qc_zugang_alle_entfernen(void) {
     liste l;
     pthread_mutex_lock(&g_liste_mtx);
     int r = liste_lesen(&l);
-    defekt_melden(r < 0);
+    int wechsel = defekt_melden(r < 0);
     int n = l.n;
     if (r == 0) {
         liste leer = {0};
@@ -893,6 +910,7 @@ int qc_zugang_alle_entfernen(void) {
     }
     pthread_mutex_unlock(&g_liste_mtx);
     liste_frei(&l);
+    if (wechsel) qc_ui_zustand_geaendert();
     if (r != 0) {
         zeile("Geraete konnten nicht entfernt werden: Geraeteliste beschaedigt oder nicht schreibbar");
         return -1;

@@ -3041,6 +3041,8 @@ static int ui_zurueck_abwarten(uint64_t a, double sekunden) {
 }
 
 static int zugang_ruht(void) { return qc_zugang_phasen_offen() == 0; }
+static int jemand_anmeldend(void) { return atomic_load(&g_anmeldend) > 0; }
+static int niemand_anmeldend(void) { return atomic_load(&g_anmeldend) == 0; }
 static int zuschauer_da(void) { return atomic_load(&g_client_fd) >= 0; }
 static int zuschauer_fort(void) { return atomic_load(&g_client_fd) < 0; }
 
@@ -3365,6 +3367,121 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     zc_zu(&z);
     warten_bis(zugang_ruht, 2);
 
+    // Der Kopf kommt tropfenweise (0,7 s), vom Beweis nur ein Stueck: die
+    // Frist gilt fuer Kopf und Beweis zusammen, nie ueber die Gesamtfrist
+    // hinaus - und am Ende steht 22/4, kein stilles Schliessen.
+    g_zugang_frist_ms = 1200;
+    drossel_altern(&d_zugang_frist);
+    uint8_t hb[32], hbp[32];
+    qc_keypair(hb, hbp);
+    stdout_stumm(1);
+    int ok_hb = zc_verbinden(&z, bild_port, hb, "Halber") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+                zc_noetig(&z, &wege, &warten, hn) == 0;
+    double t_hb = sek();
+    if (ok_hb) {
+        qc_hdr kopf = { .type = QC_ZUGANG_BEWEIS, .flags = 0, .reserved = 0, .len = 32 };
+        uint8_t ct[64], l[2];
+        size_t cl = 0;
+        ok_hb = qc_encrypt(&z.tx, (const uint8_t *)&kopf, sizeof kopf, ct, &cl) == 0 && cl > 5;
+        l[0] = (uint8_t)cl;
+        l[1] = 0;
+        ok_hb = ok_hb && send(z.fd, l, 2, 0) == 2 && send(z.fd, ct, 5, 0) == 5;
+        usleep(700 * 1000);
+        ok_hb = ok_hb && send(z.fd, ct + 5, cl - 5, 0) == (ssize_t)(cl - 5);
+        uint8_t halb[7] = { 48, 0, 1, 2, 3, 4, 5 };     // Laenge des Beweis-Datensatzes, dann fuenf von 48 Byte
+        ok_hb = ok_hb && send(z.fd, halb, sizeof halb, 0) == (ssize_t)sizeof halb;
+    }
+    int ok_hb22 = ok_hb && zc_ergebnis(&z, &erg, &w, NULL, 4000) == 0 && erg == QC_ERGEBNIS_SCHLUSS && zc_schliesst(&z, 2000);
+    double d_hb = sek() - t_hb;
+    stdout_stumm(0);
+    g_zugang_frist_ms = QC_ZUGANG_FRIST_MS;
+    printf("         (Frist 1,2 s, Kopf nach 0,7 s, Beweis halb: Ende nach %.2f s)\n", d_hb);
+    pruefe(ok_hb22 && d_hb > 0.9 && d_hb < 1.6 && zeilen_mit(logpfad, "Zugang: Frist fuer Halber (ID ") == 1,
+           "halbe Nachricht: eine Frist fuer Kopf und Beweis, nie ueber die Gesamtfrist; dann 22/4 und Zeile");
+    zc_zu(&z);
+    warten_bis(zugang_ruht, 2);
+
+    printf("\n-- Zugang: zwei Verbindungen derselben Adresse, UTF-8-Namen\n");
+    // Zwei Phasen von einer Adresse mit verschiedenen Schluesseln (erlaubt:
+    // 2 je Adresse). Die erste raet dreimal falsch - ab da wartet die Adresse
+    // 5 s. Die zweite bekam in 20 keine Wartezeit, darf jetzt aber auch nicht
+    // raten: ihr Beweis (sogar der richtige) zaehlt als Fehlversuch.
+    qc_zugang_drossel_leeren();
+    drossel_altern(&d_zugang);
+    drossel_altern(&d_zugang_falsch);
+    uint8_t p1[32], p1p[32], p2[32], p2p[32];
+    qc_keypair(p1, p1p);
+    qc_keypair(p2, p2p);
+    // "Juergens Mac - Buero" mit echten Umlauten und Gedankenstrich (UTF-8).
+    const char *jn = "J\xc3\xbcrgens Mac \xe2\x80\x93 B\xc3\xbcro";
+    uint32_t w_p2 = 99;
+    stdout_stumm(1);
+    int ok_p = zc_verbinden(&y1, bild_port, p1, jn) == 0 && zc_kennung(&y1, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&y1, &wege, &warten, hn) == 0 &&
+               zc_verbinden(&y2, bild_port, p2, "Nachbar") == 0 && zc_kennung(&y2, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&y2, &wege, &w_p2, hn) == 0;
+    uint8_t pe[3] = {9, 9, 9};
+    uint32_t pws[3] = {1, 1, 1};
+    for (int i = 0; i < 3 && ok_p; i++)
+        if (zc_beweis(&y1, "falsch geraten") != 0 || zc_ergebnis(&y1, &pe[i], &pws[i], NULL, 3000) != 0) ok_p = 0;
+    drossel_altern(&d_zugang_falsch);
+    uint8_t e2 = 9;
+    uint32_t wp2 = 0;
+    int ok_p2 = ok_p && zc_beweis(&y2, PW) == 0 && zc_ergebnis(&y2, &e2, &wp2, NULL, 3000) == 0;
+    int p2_bek = qc_zugang_bekannt(p2p, NULL);
+    zc_abbruch(&y1);
+    zc_abbruch(&y2);
+    zc_schliesst(&y1, 2000);
+    zc_schliesst(&y2, 2000);
+    stdout_stumm(0);
+    char jz[200];
+    snprintf(jz, sizeof jz, "Zugang noetig: %s (ID ", jn);
+    printf("         (erste: %u %u %u / %u %u %u ms; zweite: warten in 20 %u ms, dann Ergebnis %u, %u ms)\n",
+           pe[0], pe[1], pe[2], pws[0], pws[1], pws[2], w_p2, e2, wp2);
+    pruefe(ok_p && w_p2 == 0 && pe[2] == QC_ERGEBNIS_FALSCH && pws[2] == 5000,
+           "erste Verbindung: der dritte Fehlversuch bringt der Adresse 5 s");
+    pruefe(ok_p2 && e2 == QC_ERGEBNIS_FALSCH && wp2 == 10000 && p2_bek == 0,
+           "zweite Verbindung derselben Adresse: ihr Beweis kommt vor Ablauf der Wartezeit der Adresse - "
+           "Fehlversuch (10 s), nicht geprueft, nicht eingetragen");
+    pruefe(zeilen_mit(logpfad, "Zugang: Beweis vor Ablauf der Wartezeit fuer Nachbar (ID ") == 1, "Zeile dazu");
+    pruefe(zeilen_mit(logpfad, jz) == 1, "Namen in UTF-8 stehen unverfaelscht im Protokoll (Umlaute, Gedankenstrich)");
+    zc_zu(&y1);
+    zc_zu(&y2);
+    warten_bis(zugang_ruht, 2);
+    qc_zugang_drossel_leeren();
+
+    printf("\n-- Zugang: Passwortdatei unlesbar\n");
+    // Dann gibt es nur Zulassen (4.3). Ein Beweis ist kein Fehler des
+    // Clients: 22/2 ohne Wartezeit, die Drossel bleibt, wie sie ist.
+    char pwpfad[1200];
+    qc_config_path("host-password.txt", pwpfad, sizeof pwpfad);
+    [@"kurz\n" writeToFile:@(pwpfad) atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    drossel_altern(&d_zugang);
+    drossel_altern(&d_zugang_falsch);
+    uint8_t u_priv[32], u_pub[32];
+    qc_keypair(u_priv, u_pub);
+    stdout_stumm(1);
+    int ok_u = zc_verbinden(&z, bild_port, u_priv, "Ohne Passwort") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+               zc_noetig(&z, &wege, &warten, hn) == 0;
+    uint8_t ue[3] = {9, 9, 9};
+    uint32_t uw[3] = {1, 1, 1};
+    for (int i = 0; i < 3 && ok_u; i++)
+        if (zc_beweis(&z, PW) != 0 || zc_ergebnis(&z, &ue[i], &uw[i], NULL, 3000) != 0) ok_u = 0;
+    uint32_t u_drossel = qc_zugang_drossel_warten(inet_addr("127.0.0.1"), u_pub, mono_ms());
+    zc_abbruch(&z);
+    zc_schliesst(&z, 2000);
+    int u_bek = qc_zugang_bekannt(u_pub, NULL);
+    int pw_wieder = qc_zugang_passwort_setzen(PW) == 0;
+    stdout_stumm(0);
+    printf("         (Ergebnisse %u %u %u, warten %u %u %u ms, Drossel danach %u ms)\n", ue[0], ue[1], ue[2],
+           uw[0], uw[1], uw[2], u_drossel);
+    pruefe(ok_u && ue[0] == 2 && ue[1] == 2 && ue[2] == 2 && !uw[0] && !uw[1] && !uw[2] && u_drossel == 0 && u_bek == 0,
+           "unlesbares Passwort: 22/2 ohne Wartezeit, die Drossel waechst nicht (auch nicht beim dritten)");
+    pruefe(zeilen_mit(logpfad, "Zugang: Beweis von Ohne Passwort (ID ") == 1, "Zeile: nicht pruefbar, nur Zulassen");
+    pruefe(pw_wieder, "Passwort wieder gesetzt");
+    zc_zu(&z);
+    warten_bis(zugang_ruht, 2);
+
     printf("\n-- Zugang: ein Wartender stoert den laufenden Zuschauer nicht\n");
     atomic_store(&g_test_ui, 1);
     int hfd, cfd;
@@ -3429,6 +3546,44 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     pruefe(ok_m2, "danach braucht es wieder die Zugangsphase");
     zc_zu(&z);
     warten_bis(zugang_ruht, 2);
+
+    // Entfernen, waehrend ein bekanntes Geraet hereinkommt: es steht schon in
+    // der Liste, faehrt aber noch die Aufnahme hoch (hier: die angehaltene
+    // Lebenslauf-Warteschlange) und ist noch kein Zuschauer.
+    uint8_t r_priv[32], r_pub[32], x_priv[32], x_pub[32];
+    qc_keypair(r_priv, r_pub);
+    qc_keypair(x_priv, x_pub);
+    qc_zugang_eintragen(r_pub, "Wettlauf");
+    qc_zugang_eintragen(x_pub, "Unbeteiligt");
+    strom_attrappe_setzen();
+    dispatch_semaphore_t halt = dispatch_semaphore_create(0);
+    dispatch_async(g_lifeq, ^{ dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)); });
+    stdout_stumm(1);
+    int ok_r1 = zc_verbinden(&z, bild_port, r_priv, "Wettlauf") == 0 && warten_bis(jemand_anmeldend, 2);
+    int x_weg = qc_zugang_geraet_entfernen(x_pub) == 0;
+    dispatch_semaphore_signal(halt);
+    ok_r1 = ok_r1 && zc_sitzung(&z) && warten_bis(zuschauer_da, 1);
+    stdout_stumm(0);
+    pruefe(ok_r1 && x_weg, "ein anderes Geraet wird entfernt, waehrend eins hereinkommt: das kommt trotzdem herein");
+    zuschauer_weg();
+    zc_zu(&z);
+
+    strom_attrappe_setzen();
+    halt = dispatch_semaphore_create(0);
+    dispatch_async(g_lifeq, ^{ dispatch_semaphore_wait(halt, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)); });
+    stdout_stumm(1);
+    int ok_r2 = zc_verbinden(&z, bild_port, r_priv, "Wettlauf") == 0 && warten_bis(jemand_anmeldend, 2);
+    int r_weg = qc_zugang_geraet_entfernen(r_pub) == 0;
+    dispatch_semaphore_signal(halt);
+    int kein_qch1 = !zc_kennung(&z, QC_MAGIC);
+    int nicht_drin = warten_bis(niemand_anmeldend, 2) && atomic_load(&g_client_fd) < 0;
+    stdout_stumm(0);
+    pruefe(ok_r2 && r_weg && kein_qch1 && nicht_drin &&
+           zeilen_mit(logpfad, "Zuschauer Wettlauf (ID ") == 1 &&
+           zeilen_mit(logpfad, "abgewiesen: sein Geraet wurde eben aus der Liste entfernt") == 1,
+           "genau dieses Geraet wird entfernt, waehrend es hereinkommt: kein \"QCH1\", kein Zuschauer, Zeile");
+    zc_zu(&z);
+    strom_jetzt();                                      // der Abbau ist durch
 
     printf("\n-- Argumente ohne Wert (7.7), entfernte Schalter\n");
     stdout_stumm(1);

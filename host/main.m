@@ -118,6 +118,17 @@ static void logf_(NSString *fmt, ...) {
     pthread_mutex_unlock(&g_log_mtx);
 }
 
+// Namen (Client aus Nachricht 3, Rechnername, Geraeteliste) sind UTF-8. Nicht
+// ueber "%s" ins Format: das liest NSString in der Standardkodierung (hier
+// MacRoman), aus jedem Umlaut und jedem typografischen Apostroph (U+2019 in
+// "Robert's MacBook", wie macOS Rechner ab Werk nennt) wuerde Zeichensalat.
+// Also als NSString ueber "%@". Kein gueltiges UTF-8 (sollte bei gesaeuberten
+// Namen nicht vorkommen): dann eben MacRoman, verloren geht nichts.
+static NSString *utf8(const char *s) {
+    if (!s) return @"";
+    return [[NSString alloc] initWithUTF8String:s] ?: [[NSString alloc] initWithCString:s encoding:NSMacOSRomanStringEncoding];
+}
+
 // Zeilen, die jeder im Netz ohne Anmeldung ausloesen kann - gescheiterter
 // Handschlag, unbekannte Gegenstelle, Eingabekanal ohne Bild -, gehen
 // gedrosselt ins Protokoll. Sonst schriebe jede Verbindung eine Zeile, und
@@ -1034,8 +1045,18 @@ int qc_zustand_port_belegt(void) { return atomic_load(&g_port_belegt); }
 // ohne Abloese-Nachricht. Ein neuer Client verbindet dann von selbst neu und
 // landet in der Zugangsphase. Aus einem Faden der Oberflaeche, nie der Main
 // Queue (g_send_mtx kann bis zu 2 s haengen).
+//
+// Wer gerade hereinkommt, ist hier noch nicht zu sehen: bild_verbindung hat
+// ihn in der Liste gefunden (oder eben eingetragen), faehrt aber noch die
+// Aufnahme hoch. Dafuer zaehlt g_entfernt_zaehler jedes Entfernen, unter
+// g_send_mtx; bild_verbindung vergleicht beim Eintragen des Zuschauers mit
+// dem Stand vor seinem Blick in die Liste und sieht bei einem Unterschied
+// noch einmal nach.
+static _Atomic uint64_t g_entfernt_zaehler = 0;
+
 static void zuschauer_entfernt(const uint8_t *pub) {
     pthread_mutex_lock(&g_send_mtx);
+    atomic_fetch_add(&g_entfernt_zaehler, 1);
     int fd = atomic_load(&g_client_fd);
     BOOL treffer = fd >= 0 && g_vid && (!pub || memcmp(g_vid_peer, pub, 32) == 0);
     if (treffer) {
@@ -1091,20 +1112,29 @@ static int zugang_ergebnis(qc_chan *c, uint8_t ergebnis, uint32_t warten_ms, con
 // es hat sich ausgewiesen; beim naechsten Mal fragt der Host eben wieder.
 static void zugang_eintragen(qc_chan *chan, const char *name, const char *id_text, const char *ip, const char *weg) {
     if (qc_zugang_eintragen(chan->peer, name) == 0)
-        logf_(@"Zugang: %s (ID %s, %s) %s und eingetragen", name, id_text, ip, weg);
+        logf_(@"Zugang: %@ (ID %s, %s) %s und eingetragen", utf8(name), id_text, ip, weg);
     else
-        logf_(@"Zugang: %s (ID %s, %s) %s - Eintrag in host-devices.txt liess sich nicht speichern, "
-               "diese Sitzung laeuft trotzdem", name, id_text, ip, weg);
+        logf_(@"Zugang: %@ (ID %s, %s) %s - Eintrag in host-devices.txt liess sich nicht speichern, "
+               "diese Sitzung laeuft trotzdem", utf8(name), id_text, ip, weg);
+}
+
+// Liest n Byte bis zum Zeitpunkt bis (monotone Uhr). 0 = gelesen, 1 = die
+// Frist lief ab, -1 = die Verbindung ist zu oder kaputt.
+static int zugang_lesen(qc_chan *c, void *p, size_t n, int64_t bis) {
+    int64_t rest = bis - mono_ms();             // bis liegt hoechstens QC_ZUGANG_NACHRICHT_MS voraus
+    if (qc_chan_read_frist(c, p, n, rest < 1 ? 1 : (int)rest) == 0) return 0;
+    return mono_ms() >= bis ? 1 : -1;
 }
 
 // YES = zugelassen: 22/0 oder 22/1 ist hinaus, der Aufrufer macht weiter wie
 // bei einem bekannten Geraet ("QCH1"). NO = nicht: alles Noetige ist gesagt,
 // der Aufrufer schliesst.
-static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const char *ip, const char *name) {
+static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const char *ip, const char *name_c) {
     uint32_t cid = qc_zugang_id(chan->peer);
     char id_text[12];
     qc_zugang_id_text(cid, id_text);
     uint32_t adr = peer->sin_addr.s_addr;
+    NSString *name = utf8(name_c);
 
     // Grenzen: 4 Phasen gleichzeitig, 2 je Adresse, 1 je Schluessel.
     int platz = qc_zugang_phase_beginnen(adr, chan->peer);
@@ -1113,7 +1143,7 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
         memcpy(m, QC_ZUGANG_KENNUNG, 4);
         size_t n = qc_zugang_ergebnis_kodieren(m + 4, sizeof m - 4, QC_ERGEBNIS_SCHLUSS, QC_ZUGANG_VOLL_WARTEN_MS, NULL);
         zugang_senden(chan, m, 4 + n);
-        logf_gedrosselt(&d_zugang_voll, ip, @"Zugang: kein Platz fuer %s (ID %s, %s) - zu viele Zugangsphasen, geschlossen",
+        logf_gedrosselt(&d_zugang_voll, ip, @"Zugang: kein Platz fuer %@ (ID %s, %s) - zu viele Zugangsphasen, geschlossen",
                         name, id_text, ip);
         return NO;
     }
@@ -1132,9 +1162,9 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
         qc_zugang_phase_ende(platz);
         return NO;
     }
-    logf_gedrosselt(&d_zugang, ip, @"Zugang noetig: %s (ID %s) von %s%s%@", name, id_text, ip,
+    logf_gedrosselt(&d_zugang, ip, @"Zugang noetig: %@ (ID %s) von %s%s%@", name, id_text, ip,
                     wege & QC_ZUGANG_WEG_ZULASSEN ? " - Passwort oder Zulassen" : " - Passwort",
-                    warten ? [NSString stringWithFormat:@", Drossel %u s", (warten + 999) / 1000] : @"");
+                    warten ? [[NSString alloc] initWithFormat:@", Drossel %u s", (warten + 999) / 1000] : @"");
 
     // Die Anfrage an die Oberflaeche; eine Entscheidung weckt die Phase ueber die Pipe.
     int weck[2] = { -1, -1 };
@@ -1144,7 +1174,7 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
             fcntl(weck[i], F_SETFL, O_NONBLOCK);
             fcntl(weck[i], F_SETFD, FD_CLOEXEC);
         }
-        anfrage = qc_zugang_anfrage_stellen(name, cid, qc_zugang_code(chan->hh), weck[1]);
+        anfrage = qc_zugang_anfrage_stellen(name_c, cid, qc_zugang_code(chan->hh), weck[1]);
     }
 
     BOOL zugelassen = NO;
@@ -1153,22 +1183,22 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
         int stand = anfrage ? qc_zugang_anfrage_stand(anfrage) : -1;
         if (stand == 1) {
             if (zugang_ergebnis(chan, QC_ERGEBNIS_ZUGELASSEN, 0, NULL) == 0) {
-                zugang_eintragen(chan, name, id_text, ip, "am Host zugelassen");
+                zugang_eintragen(chan, name_c, id_text, ip, "am Host zugelassen");
                 zugelassen = YES;
             } else {
-                logf_(@"Zugang: %s (ID %s, %s) am Host zugelassen, aber nicht mehr erreichbar", name, id_text, ip);
+                logf_(@"Zugang: %@ (ID %s, %s) am Host zugelassen, aber nicht mehr erreichbar", name, id_text, ip);
             }
             break;
         }
         if (stand == 0) {
             zugang_ergebnis(chan, QC_ERGEBNIS_ABGELEHNT, 0, NULL);
-            logf_(@"Zugang: %s (ID %s, %s) am Host abgelehnt", name, id_text, ip);
+            logf_(@"Zugang: %@ (ID %s, %s) am Host abgelehnt", name, id_text, ip);
             break;
         }
         jetzt = mono_ms();
         if (jetzt >= frist) {
             zugang_ergebnis(chan, QC_ERGEBNIS_SCHLUSS, qc_zugang_drossel_warten(adr, chan->peer, jetzt), NULL);
-            logf_gedrosselt(&d_zugang_frist, ip, @"Zugang: Frist fuer %s (ID %s, %s) abgelaufen - geschlossen", name, id_text, ip);
+            logf_gedrosselt(&d_zugang_frist, ip, @"Zugang: Frist fuer %@ (ID %s, %s) abgelaufen - geschlossen", name, id_text, ip);
             break;
         }
         // Warten auf den Client, die Entscheidung oder die Frist. Schon
@@ -1187,31 +1217,44 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
             // POLLHUP/POLLERR ohne POLLIN: weg - das sagt gleich das Lesen.
             if (!(pf[0].revents & (POLLIN | POLLHUP | POLLERR))) continue;
         }
-        // Eine Nachricht des Clients. Die Frist gilt fuer die ganze Nachricht:
-        // wer tropfenweise sendet, haelt die Phase nicht laenger auf.
-        int64_t rest = frist - mono_ms();
-        int lesefrist = rest < 1 ? 1 : rest > 10000 ? 10000 : (int)rest;
+        // Eine Nachricht des Clients: Kopf und Beweis zusammen in hoechstens
+        // QC_ZUGANG_NACHRICHT_MS und nie ueber die Gesamtfrist hinaus - wer
+        // tropfenweise sendet, haelt die Phase nicht laenger auf. Laeuft die
+        // Frist dabei ab, ist der halbe Datensatz verloren; der Client bekommt
+        // noch 22/4 (senden geht, siehe qc_chan_read_frist), dann ist Schluss.
+        int64_t nachricht_bis = mono_ms() + QC_ZUGANG_NACHRICHT_MS;
+        if (nachricht_bis > frist) nachricht_bis = frist;
         qc_hdr h;
-        if (qc_chan_read_frist(chan, &h, sizeof h, lesefrist) != 0) {
-            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) hat die Verbindung beendet", name, id_text, ip);
+        uint8_t beweis[32], host_proof[32];
+        int gelesen = zugang_lesen(chan, &h, sizeof h, nachricht_bis);
+        if (gelesen == 0 && h.type == QC_ZUGANG_ABBRUCH && h.len == 0) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %@ (ID %s, %s) hat abgebrochen", name, id_text, ip);
             break;
         }
-        if (h.type == QC_ZUGANG_ABBRUCH && h.len == 0) {
-            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) hat abgebrochen", name, id_text, ip);
-            break;
-        }
-        if (h.type != QC_ZUGANG_BEWEIS || h.len != 32) {
-            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) schickt Unerwartetes (Typ %u, %u Byte) - geschlossen",
+        if (gelesen == 0 && (h.type != QC_ZUGANG_BEWEIS || h.len != 32)) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %@ (ID %s, %s) schickt Unerwartetes (Typ %u, %u Byte) - geschlossen",
                             name, id_text, ip, h.type, h.len);
             break;
         }
-        uint8_t beweis[32], host_proof[32];
-        if (qc_chan_read_frist(chan, beweis, sizeof beweis, lesefrist) != 0) {
-            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %s (ID %s, %s) hat die Verbindung beendet", name, id_text, ip);
+        if (gelesen == 0) gelesen = zugang_lesen(chan, beweis, sizeof beweis, nachricht_bis);
+        if (gelesen > 0) {
+            jetzt = mono_ms();
+            zugang_ergebnis(chan, QC_ERGEBNIS_SCHLUSS, qc_zugang_drossel_warten(adr, chan->peer, jetzt), NULL);
+            logf_gedrosselt(&d_zugang_frist, ip, @"Zugang: Frist fuer %@ (ID %s, %s) abgelaufen%s - geschlossen", name, id_text, ip,
+                            jetzt >= frist ? "" : ", Nachricht kam nicht vollstaendig");
+            break;
+        }
+        if (gelesen < 0) {
+            logf_gedrosselt(&d_zugang_abbruch, ip, @"Zugang: %@ (ID %s, %s) hat die Verbindung beendet", name, id_text, ip);
             break;
         }
         jetzt = mono_ms();
-        BOOL zu_frueh = jetzt < frueh_bis;
+        // Zu frueh ist ein Beweis vor Ablauf dessen, was diese Verbindung als
+        // Wartezeit gesagt bekam - und ebenso, solange die Drossel ihrer
+        // Adresse oder ihres Schluessels jetzt noch laeuft (3.3: der groessere
+        // Wert gilt). Sonst riete eine zweite Verbindung derselben Adresse mit
+        // anderem Schluessel ungebremst weiter, waehrend die erste wartet.
+        BOOL zu_frueh = jetzt < frueh_bis || qc_zugang_drossel_rest(adr, chan->peer, jetzt) > 0;
         // Zu frueh wird gar nicht erst gerechnet - so kostet Raten nichts ausser Zeit.
         int ok = zu_frueh ? 0 : qc_zugang_pruefen(chan->hh, beweis, host_proof);
         qc_wipe(beweis, sizeof beweis);
@@ -1220,19 +1263,31 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
             // Das Fenster am Host schliesst, bevor die Sitzung beginnt.
             if (anfrage) { qc_zugang_anfrage_zurueckziehen(anfrage); anfrage = 0; }
             if (zugang_ergebnis(chan, QC_ERGEBNIS_PASSWORT, 0, host_proof) == 0) {
-                zugang_eintragen(chan, name, id_text, ip, "mit Passwort angenommen");
+                zugang_eintragen(chan, name_c, id_text, ip, "mit Passwort angenommen");
                 zugelassen = YES;
             }
             qc_wipe(host_proof, sizeof host_proof);
             break;
         }
         fehl++;
-        warten = qc_zugang_drossel_fehler(adr, chan->peer, jetzt);
-        frueh_bis = jetzt + warten;
         BOOL schluss = fehl >= QC_ZUGANG_VERSUCHE;
-        logf_gedrosselt(&d_zugang_falsch, ip, @"Zugang: %s fuer %s (ID %s, %s), Fehlversuch %d in dieser Verbindung - Drossel %u s%s",
-                        zu_frueh ? "Beweis vor Ablauf der Wartezeit" : ok < 0 ? "kein lesbares Passwort" : "Passwort falsch",
-                        name, id_text, ip, fehl, (warten + 999) / 1000, schluss ? ", zu viele Versuche - geschlossen" : "");
+        if (ok < 0) {
+            // Kein lesbares Passwort (4.3: dann nur Zulassen): der Fehler liegt
+            // beim Host, nicht beim Client. Also keine Drossel - wer das
+            // richtige Passwort kennt, soll nach dem Reparieren nicht erst
+            // Minuten warten. Die Versuche dieser Verbindung zaehlen trotzdem,
+            // damit niemand die Phase in einer Schleife beschaeftigt.
+            warten = 0;
+            logf_gedrosselt(&d_zugang_falsch, ip, @"Zugang: Beweis von %@ (ID %s, %s) nicht pruefbar - kein lesbares Passwort, "
+                            "nur Zulassen moeglich; keine Drossel, Versuch %d in dieser Verbindung%s",
+                            name, id_text, ip, fehl, schluss ? ", zu viele Versuche - geschlossen" : "");
+        } else {
+            warten = qc_zugang_drossel_fehler(adr, chan->peer, jetzt);
+            frueh_bis = jetzt + warten;
+            logf_gedrosselt(&d_zugang_falsch, ip, @"Zugang: %s fuer %@ (ID %s, %s), Fehlversuch %d in dieser Verbindung - Drossel %u s%s",
+                            zu_frueh ? "Beweis vor Ablauf der Wartezeit" : "Passwort falsch",
+                            name, id_text, ip, fehl, (warten + 999) / 1000, schluss ? ", zu viele Versuche - geschlossen" : "");
+        }
         if (zugang_ergebnis(chan, schluss ? QC_ERGEBNIS_SCHLUSS : QC_ERGEBNIS_FALSCH, warten, NULL) != 0 || schluss) break;
     }
     // Zurueckgezogen (Abbruch, EOF, Frist ...): das Fenster am Host schliesst.
@@ -1279,6 +1334,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     // Liste ist dafuer nur fuer diesen einen Blick gesperrt.
     char name[QC_ZUGANG_NAME_MAX + 1], gespeichert[QC_ZUGANG_NAME_MAX + 1];
     qc_zugang_name_lesen(chan->nutzlast3, chan->nutzlast3_len, name);
+    uint64_t entfernt_stand = atomic_load(&g_entfernt_zaehler);   // vor dem Blick in die Liste
     int bekannt = qc_zugang_bekannt(chan->peer, gespeichert);
     if (!name[0]) snprintf(name, sizeof name, "%s", bekannt > 0 && gespeichert[0] ? gespeichert : ip);
     if (bekannt < 0)
@@ -1312,8 +1368,28 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         return;
     }
 
-    uint8_t hello[4 + sizeof(qc_hdr) + 8];
+    // Wurde seit dem Blick in die Liste ein Geraet entfernt, hat
+    // zuschauer_entfernt diesen hier nicht gesehen - vielleicht war es
+    // genau seins ("Alle entfernen" trifft auch ein gerade zugelassenes).
+    // Dann noch einmal nachsehen, ausserhalb der Sperre (Datei). Unter ihr
+    // gilt der Stand erst, wenn seitdem nichts mehr entfernt wurde: jedes
+    // spaetere Entfernen sieht ihn dann als Zuschauer und trennt ihn selbst.
     pthread_mutex_lock(&g_send_mtx);
+    while (atomic_load(&g_entfernt_zaehler) != entfernt_stand) {
+        entfernt_stand = atomic_load(&g_entfernt_zaehler);
+        pthread_mutex_unlock(&g_send_mtx);
+        if (qc_zugang_bekannt(chan->peer, NULL) != 1) {
+            atomic_fetch_sub(&g_anmeldend, 1);
+            stream_herunterfahren_anstossen();
+            logf_(@"Zuschauer %@ (ID %s, %s) abgewiesen: sein Geraet wurde eben aus der Liste entfernt", utf8(name), id_text, ip);
+            qc_chan_free(chan);
+            close(fd);
+            return;
+        }
+        pthread_mutex_lock(&g_send_mtx);
+    }
+
+    uint8_t hello[4 + sizeof(qc_hdr) + 8];
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
     // Fenstergroesse und Format kennt, bevor das erste Bild kommt. Erst unter
     // der Sperre gefuellt: ein Codecwechsel, der gerade fertig wird, steht
@@ -1402,8 +1478,8 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     }
     bildschirme_senden();
     // chan gehoert jetzt dem Versand (g_vid) und kann schon wieder frei sein.
-    logf_(@"Zuschauer verbunden: %s (ID %s) %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
-          name, id_text, ip, ntohs(peer.sin_port), fp, sas);
+    logf_(@"Zuschauer verbunden: %@ (ID %s) %s:%d, verschluesselt, Gegenstelle %s, Vergleichscode %s",
+          utf8(name), id_text, ip, ntohs(peer.sin_port), fp, sas);
     if (ohne_aufnahme) {
         // Wie bei einem fehlenden Bildschirm: Hoststatus 1, und die
         // Wiederherstellung fragt alle 3 s nach, bis die Freigabe da ist.
@@ -1484,7 +1560,7 @@ static void *beacon_thread(void *arg) {
         if (runde == 0) {
             char id_text[12];
             qc_zugang_id_text(id, id_text);
-            logf_(@"Bekanntgabe: an %d Netze, Port %d, als \"%s\" (ID %s)", gesendet, port + 2, name, id_text);
+            logf_(@"Bekanntgabe: an %d Netze, Port %d, als \"%@\" (ID %s)", gesendet, port + 2, utf8(name), id_text);
         }
         usleep(2000 * 1000);
     }
@@ -3563,8 +3639,9 @@ static void bedienungshilfen_einmal_fragen(void) {
     logf_(@"Bedienungshilfen fehlen - einmal nachgefragt (Systemdialog)");
 }
 
-// Zeilen aus zugang.c (Migration, Entfernen, Passwort) ins Protokoll.
-static void zugang_zeile(const char *z) { logf_(@"%s", z); }
+// Zeilen aus zugang.c (Migration, Entfernen, Passwort) ins Protokoll. Sie
+// tragen Geraetenamen in UTF-8 - also nicht ueber "%s" (siehe utf8).
+static void zugang_zeile(const char *z) { logf_(@"%@", utf8(z)); }
 
 // Stromgroesse ohne Bildschirmliste (keine Freigabe, kein Monitor beim Start):
 // aus dem Hauptbildschirm wie stromgroesse_fuer, sonst 1920x1080. Sie steht

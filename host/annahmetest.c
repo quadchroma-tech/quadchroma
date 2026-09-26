@@ -282,8 +282,14 @@ typedef struct {
     int poll_still;                     // poll meldet die gepufferten Bytes nicht
     uint8_t n3[QC_NUTZLAST3_MAX];
     size_t n3_len;
+    // Nach gescheitertem Lesen: ein zweites Lesen scheitert sofort, Senden
+    // geht noch (die Zugangsphase schickt so ihr 22/4).
+    int nochmal;                        // Rueckgabe des zweiten Lesens
+    int64_t nochmal_dauer;              // ms
+    int senden;                         // Rueckgabe von qc_chan_send danach
 } frist_t;
 static frist_t g_fr;
+static qc_cipher g_fr_rx;               // Empfang des Clients, fuer die letzte Nachricht des Hosts
 
 static void frist_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *peer, void *ctx) {
     (void)peer; (void)ctx;
@@ -299,6 +305,14 @@ static void frist_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *
         g_fr.gepuffert = qc_chan_gepuffert(c);
         struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
         g_fr.poll_still = poll(&p, 1, 50) == 0;
+        if (g_fr.r != 0) {
+            uint8_t x;
+            int64_t t1 = jetzt_ms();
+            g_fr.nochmal = qc_chan_read_frist(c, &x, 1, 1000);
+            g_fr.nochmal_dauer = jetzt_ms() - t1;
+            struct iovec iov = { .iov_base = (void *)"ENDE", .iov_len = 4 };
+            g_fr.senden = qc_chan_send(c, &iov, 1);
+        }
     } else {
         g_fr.r = -99;
     }
@@ -324,8 +338,7 @@ static int frist_client(int port, const void *n3, size_t n3_len, qc_cipher *tx) 
         close(fd);
         return -1;
     }
-    qc_cipher rx;
-    qc_handshake_split(&hs, tx, &rx);
+    qc_handshake_split(&hs, tx, &g_fr_rx);
     return fd;
 }
 
@@ -372,6 +385,12 @@ static void frist_pruefen(int port) {
     printf("         (troepfelnd: nach %lld ms)\n", (long long)g_fr.dauer);
     pruefe(ok && g_fr.r == -1 && g_fr.dauer >= 900 && g_fr.dauer <= 1500,
            "troepfelnder Client: die Frist gilt fuer die ganze Nachricht");
+    uint8_t ende_ct[64], ende[64];
+    size_t ende_cl = 0, ende_l = 0;
+    int ende_ok = ok && lies_rahmen(fd, ende_ct, sizeof ende_ct, &ende_cl) == 0 &&
+                  qc_decrypt(&g_fr_rx, ende_ct, ende_cl, ende, &ende_l) == 0 && ende_l == 4 && memcmp(ende, "ENDE", 4) == 0;
+    pruefe(ok && g_fr.nochmal == -1 && g_fr.nochmal_dauer < 100 && g_fr.senden == 0 && ende_ok,
+           "danach: Lesen scheitert sofort, eine letzte Nachricht laesst sich noch senden und kommt an");
     pruefe(ok && g_fr.n3_len == QC_NUTZLAST3_MAX, "zu lange Nutzlast in Nachricht 3: nur QC_NUTZLAST3_MAX Byte aufgehoben");
     if (fd >= 0) close(fd);
 

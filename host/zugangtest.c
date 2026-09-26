@@ -185,7 +185,7 @@ static void id_pruefen(void) {
 static void namen_pruefen(void) {
     printf("\n-- Namen (UTF-8-sicher kuerzen, saeubern), QCN1, Bekanntgabe\n");
     char n[64];
-    // 39 x 'a' + "ü" (2 Byte) = 41 Byte: das ü passt nicht mehr ganz hinein.
+    // 39 x 'a' + U+00FC (ue, 2 Byte) = 41 Byte: das ue passt nicht mehr ganz hinein.
     char lang[64];
     memset(lang, 'a', 39);
     strcpy(lang + 39, "\xc3\xbc");
@@ -348,6 +348,9 @@ static void drossel_pruefen(void) {
     pruefe(qc_zugang_drossel_warten(ip1, s2, t) == 20000, "je Adresse: ein anderer Schluessel von derselben Adresse wartet mit");
     pruefe(qc_zugang_drossel_warten(ip2, s1, t) == 20000, "je Schluessel: derselbe Schluessel von einer anderen Adresse wartet mit");
     pruefe(qc_zugang_drossel_warten(ip2, s2, t) == 0, "andere Adresse, anderer Schluessel: frei");
+    pruefe(qc_zugang_drossel_rest(ip1, s2, t) == 20000 && qc_zugang_drossel_rest(ip2, s1, t + 5000) == 15000 &&
+           qc_zugang_drossel_rest(ip2, s2, t) == 0,
+           "Rest beim Beweis: je Adresse und je Schluessel wie beim Beginn der Phase");
     uint32_t w = 0;
     for (int i = 0; i < 20; i++) w = qc_zugang_drossel_fehler(ip1, s1, t);
     pruefe(w == 300000, "hoechstens 300 s");
@@ -378,12 +381,14 @@ static void drossel_pruefen(void) {
     uint32_t nach = qc_zugang_drossel_fehler(0x0a00001eu, s, g + 30000);
     s[0] = 201;
     uint32_t frisch31 = qc_zugang_drossel_warten(0x0b000001u, s, g + 30000);
+    uint32_t rest31 = qc_zugang_drossel_rest(0x0b000001u, s, g + 30000);
     uint32_t spaet = qc_zugang_drossel_warten(0x0b000001u, s, g + 60001);
     printf("         (30 Fehlversuche: %u / neue Gegenstelle %u ms; 31.: %u / neue %u ms; eine Minute spaeter %u ms)\n",
            vor, frisch30, nach, frisch31, spaet);
     pruefe(vor == 0 && frisch30 == 0 && nach == 60000 && frisch31 == 60000,
            "mehr als 30 Fehlversuche in 60 s: jede weitere Phase bekommt 60 s");
     pruefe(spaet == 0, "... bis die Minute vorbei ist");
+    pruefe(rest31 == 0, "die globale Grenze gilt fuer den Beginn einer Phase, nicht fuer den Rest beim Beweis");
     qc_zugang_drossel_leeren();
 
     // Viele Gegenstellen: die Tabelle ist begrenzt, der aelteste Eintrag weicht.

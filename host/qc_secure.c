@@ -195,7 +195,7 @@ int qc_chan_send(qc_chan *c, const struct iovec *iov, int cnt) {
 
 // frist: Zeitpunkt auf der monotonen Uhr (ms), 0 = ohne.
 static int chan_lesen(qc_chan *c, void *buf, size_t n, int64_t frist) {
-    if (!c->ok) return -1;
+    if (!c->ok || c->lesen_aus) return -1;
     uint8_t *p = buf;
     while (n) {
         if (c->in_pos == c->in_len) {
@@ -223,14 +223,14 @@ int qc_chan_read(qc_chan *c, void *buf, size_t n) {
 int qc_chan_read_frist(qc_chan *c, void *buf, size_t n, int frist_ms) {
     // Die Frist gilt fuer das Ganze: ein Datensatz, der tropfenweise kommt,
     // verlaengert sie nicht. Ein halb gelesener Datensatz ist danach verloren -
-    // der Kanal wird dann ohnehin geschlossen.
+    // gelesen wird nicht mehr, gesendet noch (die Antwort auf die Frist).
     int r = chan_lesen(c, buf, n, jetzt_ms() + (frist_ms > 0 ? frist_ms : 1));
-    if (r != 0) c->ok = 0;
+    if (r != 0) c->lesen_aus = 1;
     return r;
 }
 
 size_t qc_chan_gepuffert(const qc_chan *c) {
-    return c->ok ? c->in_len - c->in_pos : 0;
+    return c->ok && !c->lesen_aus ? c->in_len - c->in_pos : 0;
 }
 
 // ------------------------------------------------------------ Schluesselablage
