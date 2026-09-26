@@ -15,16 +15,27 @@
 
 #define QC_CHUNK_MAX 65519          // groesstes Klartextstueck je Datensatz
 #define QC_HANDSCHLAG_MS 5000       // Frist fuer den ganzen Handschlag
+#define QC_NUTZLAST3_MAX 64         // so viel von der Nutzlast der Nachricht 3 wird aufgehoben
 
 typedef struct {
     int fd;
     qc_cipher tx, rx;
     uint8_t hh[QC_HASHLEN];         // Handschlagpruefsumme, bindet den zweiten Kanal
     uint8_t peer[32];               // langlebiger Schluessel der Gegenseite
+    // Nutzlast der Handschlag-Nachricht 3 (Client -> Host, verschluesselt):
+    // heute "QCN1" | u8 n | Name des Clients (zugang.h), bei alten Clients
+    // "client". Nur Anzeige, unbeglaubigt; was ueber QC_NUTZLAST3_MAX liegt,
+    // faellt weg.
+    uint8_t nutzlast3[QC_NUTZLAST3_MAX];
+    size_t nutzlast3_len;
     uint8_t ct[QC_CHUNK_MAX + QC_TAGLEN];   // eingehender Datensatz
     uint8_t in[QC_CHUNK_MAX + QC_TAGLEN];   // entschluesselt
     size_t in_len, in_pos;
     int ok;
+    // Nach einem gescheiterten qc_chan_read_frist ist der Empfang hin (ein
+    // halber Datensatz ist verloren), das Senden nicht: tx haengt nicht an rx.
+    // So kann der Host noch eine letzte Nachricht schicken (Zugang: 22/4).
+    int lesen_aus;
     // Bytes, die qc_chan_send bisher dem Socket uebergeben hat, samt Laengen
     // und Tags - dieselbe Zaehlung wie SO_NWRITE. Aus beiden zusammen folgt,
     // wie viel die Gegenstelle abgenommen hat (Stauregel in main.m).
@@ -49,24 +60,25 @@ int qc_chan_send(qc_chan *c, const struct iovec *iov, int cnt);
 /// Liest genau n Klartextbytes. 0 = Erfolg.
 int qc_chan_read(qc_chan *c, void *buf, size_t n);
 
+/// Wie qc_chan_read, aber mit Frist: nach frist_ms (ab jetzt, fuer alle n
+/// Bytes zusammen) ist Schluss, auch wenn die Gegenstelle tropfenweise sendet.
+/// 0 = Erfolg, -1 = Frist, Ende der Verbindung oder Fehler - danach liest der
+/// Kanal nichts mehr; senden laesst sich noch (eine letzte Nachricht), dann
+/// wird er geschlossen.
+int qc_chan_read_frist(qc_chan *c, void *buf, size_t n, int frist_ms);
+
+/// Schon entschluesselte, noch nicht abgeholte Bytes. Solange es welche gibt,
+/// meldet poll() auf dem Socket nichts - wer vor dem Lesen wartet, fragt erst hier.
+size_t qc_chan_gepuffert(const qc_chan *c);
+
 /// Dauerhafter eigener Schluessel. Legt ihn beim ersten Start an.
 /// Pfad: ~/Library/Application Support/QuadChroma/host.key
 /// 0 = geladen oder neu angelegt, -1 = liess sich nicht anlegen,
 /// -2 = vorhanden, aber nicht lesbar oder beschaedigt (bleibt unangetastet).
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]);
 
-/// Ist dieser oeffentliche Schluessel schon freigegeben?
-/// 1 = ja, 0 = nein (auch: es gibt noch keine Liste oder sie hat 0 Bytes),
-/// -1 = Liste nicht lesbar oder beschaedigt - dann auch fuer Bekannte.
-int qc_is_authorized(const uint8_t pub[32]);
-
-/// Schluessel dauerhaft freigeben. 0 erst, wenn er wirklich in der Liste
-/// steht und sich von dort wieder lesen laesst.
-int qc_authorize(const uint8_t pub[32], const char *name);
-
-/// Wie viele Gegenstellen sind bisher freigegeben? 0 nur, wenn es keine
-/// Liste gibt oder sie 0 Bytes hat. -1 = nicht lesbar oder beschaedigt.
-int qc_authorized_count(void);
+// Die Liste der erlaubten Geraete (frueher authorized.txt, hier) steht jetzt
+// in zugang.h (host-devices.txt, samt Migration).
 
 /// Pfad einer Datei im Ablageordner ~/Library/Application Support/QuadChroma
 /// (der Ordner wird angelegt). HOME aus der Umgebung, sonst aus getpwuid.

@@ -106,19 +106,6 @@ DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 IDENT_STAMP := build/.ident
 
 SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
-# UI_STUB: a stand-in for the access core host/zugang.c (menu bar work only, until
-# the core is merged). As long as host/zugang.c does not exist, the stand-in replaces it
-# in SRC automatically (with a warning), so that make and CI build on this branch alone;
-# make UI_STUB=host/zugang_stub.c forces it. A release identity refuses the stand-in.
-# Remove this variable and host/zugang_stub.c once host/zugang.c exists.
-UI_STUB ?= $(if $(wildcard host/zugang.c),,host/zugang_stub.c)
-BUILD_SRC := $(if $(UI_STUB),$(filter-out host/zugang.c,$(SRC)) $(UI_STUB),$(SRC))
-ifneq ($(UI_STUB),)
-$(warning Building the host with the stand-in access core $(UI_STUB) instead of host/zugang.c - menu bar work only, never a release)
-ifneq ($(RELEASE_IDENT),)
-$(error The stand-in access core $(UI_STUB) must not be signed with a release identity ($(IDENT)))
-endif
-endif
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
 # ServiceManagement: "Start at login" (SMAppService); SystemConfiguration: the computer
 # name for the announcement (SCDynamicStoreCopyComputerName).
@@ -167,11 +154,11 @@ endef
 
 all: sign-if-changed
 
-$(BIN): $(BUILD_SRC) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
+$(BIN): $(SRC) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
 	@$(BUNDLE_CHECK)
 	@mkdir -p $(APP)/Contents/MacOS
 	cp host/Info.plist $(APP)/Contents/Info.plist
-	clang $(FLAGS) $(FRAMEWORKS) $(BUILD_SRC) -o $(BIN)
+	clang $(FLAGS) $(FRAMEWORKS) $(SRC) -o $(BIN)
 	$(CODESIGN_APP)
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1

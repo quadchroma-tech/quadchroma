@@ -1,5 +1,8 @@
 // Pruefprogramm fuer die Annahme: Frist im Handschlag, Plaetze und Verdraengen,
-// Freigabeliste, eigener Schluessel.
+// Lesen mit Frist nach dem Handschlag (so wartet die Zugangsphase auf den
+// Client: Frist, Verbindungsende, Troepfeln, gepufferte Bytes), Nutzlast der
+// Handschlag-Nachricht 3 (Name des Clients), eigener Schluessel. Die
+// Geraeteliste (frueher authorized.txt hier) prueft zugangtest.
 //
 //   clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \
 //         host/qc_secure.c host/qc_noise.c host/vendor/monocypher/monocypher.c -o /tmp/annahmetest
@@ -238,19 +241,15 @@ static void *angreifer(void *arg) {
     return NULL;
 }
 
-// ---------------------------------------------------- Freigabeliste (B8)
+// ------------------------------------------ Hilfen fuer Dateien im HOME
 
-static char g_ablage[1100], g_liste[1200];
+static char g_ablage[1100];
 
 static void datei_schreiben(const char *pfad, const void *inhalt, size_t n) {
     unlink(pfad);
     FILE *f = fopen(pfad, "w");
     if (f) { fwrite(inhalt, 1, n, f); fclose(f); }
     chmod(pfad, 0600);
-}
-
-static void liste_schreiben(const char *inhalt) {
-    datei_schreiben(g_liste, inhalt, strlen(inhalt));
 }
 
 static int datei_gleich(const char *pfad, const void *inhalt, size_t n) {
@@ -262,152 +261,144 @@ static int datei_gleich(const char *pfad, const void *inhalt, size_t n) {
     return r == n && memcmp(buf, inhalt, n) == 0;
 }
 
-static int liste_gleich(const char *inhalt) {
-    return datei_gleich(g_liste, inhalt, strlen(inhalt));
-}
-
 static int gibt_es(const char *pfad) {
     struct stat st;
     return lstat(pfad, &st) == 0;
 }
 
-static void freigaben_pruefen(void) {
-    printf("\n-- Freigabeliste\n");
-    uint8_t a[32], b[32], c[32];
-    memset(a, 0x11, 32);
-    memset(b, 0xab, 32);
-    memset(c, 0x33, 32);
-    char hex_a[65], hex_b[65], hex_b_gross[65];
-    for (int i = 0; i < 32; i++) {
-        snprintf(hex_a + i * 2, 3, "%02x", a[i]);
-        snprintf(hex_b + i * 2, 3, "%02x", b[i]);
-        snprintf(hex_b_gross + i * 2, 3, "%02X", b[i]);
+// ------------------------------------------ Lesen mit Frist, Nachricht 3
+//
+// Nach dem Handschlag wartet die Zugangsphase auf den Client (main.m): mit
+// qc_chan_read_frist, damit ein stummer oder tropfender Client sie nicht
+// festhaelt und ein verschwundener sofort auffaellt. Die Hostseite hier
+// liest 8 Byte mit 1 s Frist und merkt sich, was sie erlebt.
+
+typedef struct {
+    _Atomic int fertig;
+    int r;                              // Rueckgabe von qc_chan_read_frist
+    int64_t dauer;                      // ms
+    uint8_t daten[8];
+    size_t gepuffert;                   // danach noch entschluesselt vorraetig
+    int poll_still;                     // poll meldet die gepufferten Bytes nicht
+    uint8_t n3[QC_NUTZLAST3_MAX];
+    size_t n3_len;
+    // Nach gescheitertem Lesen: ein zweites Lesen scheitert sofort, Senden
+    // geht noch (die Zugangsphase schickt so ihr 22/4).
+    int nochmal;                        // Rueckgabe des zweiten Lesens
+    int64_t nochmal_dauer;              // ms
+    int senden;                         // Rueckgabe von qc_chan_send danach
+} frist_t;
+static frist_t g_fr;
+static qc_cipher g_fr_rx;               // Empfang des Clients, fuer die letzte Nachricht des Hosts
+
+static void frist_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *peer, void *ctx) {
+    (void)peer; (void)ctx;
+    qc_chan *c = malloc(sizeof *c);
+    int r = c ? qc_chan_accept(c, fd, g_s_priv, (const uint8_t *)PRO, strlen(PRO)) : -1;
+    qc_platz_frei(platz);
+    if (r == 0) {
+        memcpy(g_fr.n3, c->nutzlast3, c->nutzlast3_len);
+        g_fr.n3_len = c->nutzlast3_len;
+        int64_t t0 = jetzt_ms();
+        g_fr.r = qc_chan_read_frist(c, g_fr.daten, sizeof g_fr.daten, 1000);
+        g_fr.dauer = jetzt_ms() - t0;
+        g_fr.gepuffert = qc_chan_gepuffert(c);
+        struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+        g_fr.poll_still = poll(&p, 1, 50) == 0;
+        if (g_fr.r != 0) {
+            uint8_t x;
+            int64_t t1 = jetzt_ms();
+            g_fr.nochmal = qc_chan_read_frist(c, &x, 1, 1000);
+            g_fr.nochmal_dauer = jetzt_ms() - t1;
+            struct iovec iov = { .iov_base = (void *)"ENDE", .iov_len = 4 };
+            g_fr.senden = qc_chan_send(c, &iov, 1);
+        }
+    } else {
+        g_fr.r = -99;
     }
-    char zeile_a[200], text[4096];
-    snprintf(zeile_a, sizeof zeile_a, "%s  AAAA-AAAA-AAAA-AAAA  alt\n", hex_a);
+    atomic_store(&g_fr.fertig, 1);
+    qc_chan_free(c);
+    close(fd);
+}
 
-    unlink(g_liste);
-    pruefe(qc_authorized_count() == 0, "keine Liste: 0 Freigaben (Erstkontakt)");
-    pruefe(qc_is_authorized(a) == 0, "keine Liste: unbekannt, kein Fehler");
-    pruefe(qc_authorize(a, "neu") == 0 && qc_is_authorized(a) == 1 && qc_authorized_count() == 1,
-           "erste Freigabe wird gespeichert und gefunden");
-
-    liste_schreiben(zeile_a);
-    chmod(g_liste, 0000);
-    pruefe(qc_authorized_count() == -1, "Liste ohne Leserecht: count -1, kein Erstkontakt");
-    pruefe(qc_is_authorized(a) == -1, "Liste ohne Leserecht: auch Bekannte -1");
-    pruefe(qc_is_authorized(b) == -1, "Liste ohne Leserecht: Fremde -1");
-    pruefe(qc_authorize(b, "fremd") == -1, "Liste ohne Leserecht: nichts wird angehaengt");
-    chmod(g_liste, 0600);
-    pruefe(liste_gleich(zeile_a), "Liste danach byte-gleich");
-
-    liste_schreiben(zeile_a);
-    chmod(g_liste, 0400);
-    pruefe(qc_is_authorized(a) == 1, "nur lesbare Liste: Bekannte werden erkannt");
-    pruefe(qc_authorize(b, "fremd") == -1, "nur lesbare Liste: Speichern scheitert mit -1");
-    chmod(g_liste, 0600);
-    pruefe(liste_gleich(zeile_a), "Liste danach byte-gleich");
-
-    unlink(g_liste);
-    mkdir(g_liste, 0700);   // ein Ordner an ihrer Stelle: oeffnen geht, lesen nicht
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(a) == -1, "Ordner statt Liste: Lesefehler -1");
-    rmdir(g_liste);
-
-    liste_schreiben(zeile_a);
-    pruefe(qc_authorize(b, "zweiter") == 0 && qc_authorized_count() == 2 &&
-           qc_is_authorized(a) == 1 && qc_is_authorized(b) == 1,
-           "zweite Freigabe wird angehaengt, die erste bleibt");
-
-    // Vorhanden, aber beschaedigt: nie Erstkontakt, nichts wird angehaengt.
-    static uint8_t nullen[4096];
-    datei_schreiben(g_liste, nullen, sizeof nullen);
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(a) == -1 && qc_is_authorized(c) == -1,
-           "4096 Nullbytes: -1, kein Erstkontakt");
-    pruefe(qc_authorize(c, "fremd") == -1 && qc_authorize(b, "fremd") == -1 &&
-           datei_gleich(g_liste, nullen, sizeof nullen),
-           "4096 Nullbytes: niemand wird gekoppelt, Datei unveraendert");
-
-    liste_schreiben("hallo welt\n");
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(c) == -1 && qc_authorize(c, "x") == -1 &&
-           liste_gleich("hallo welt\n"), "Muell ohne Freigabe: -1, nichts angehaengt");
-
-    liste_schreiben("# nur ein Kommentar\n\n");
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(c) == -1,
-           "nur Kommentar und Leerzeile: -1 (vorhanden, aber ohne Freigabe)");
-
-    snprintf(text, sizeof text, "%skaputt\n", zeile_a);
-    liste_schreiben(text);
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(a) == -1,
-           "gueltige Zeile plus Muellzeile: -1, auch fuer den Bekannten");
-
-    snprintf(text, sizeof text, "%s%s0  x\n", zeile_a, hex_b);
-    liste_schreiben(text);
-    pruefe(qc_authorized_count() == -1, "Zeile mit 65 Hexziffern: -1");
-
-    snprintf(text, sizeof text, " %s", zeile_a);
-    liste_schreiben(text);
-    pruefe(qc_authorized_count() == -1, "Schluessel mit Leerraum davor: -1");
-
-    snprintf(text, sizeof text, "%s%c%s", zeile_a, 0, zeile_a);
-    datei_schreiben(g_liste, text, strlen(zeile_a) * 2 + 1);
-    pruefe(qc_authorized_count() == -1, "Nullbyte zwischen gueltigen Zeilen: -1");
-
-    datei_schreiben(g_liste, "", 0);
-    pruefe(qc_authorized_count() == 0 && qc_is_authorized(a) == 0, "Datei mit 0 Bytes: 0 (Erstkontakt)");
-    pruefe(qc_authorize(a, "neu") == 0 && qc_authorized_count() == 1, "Datei mit 0 Bytes: erste Freigabe landet darin");
-
-    // Von Hand gepflegt: Kommentar, Leerzeile, Windows-Zeilenende, Grossbuchstaben.
-    snprintf(text, sizeof text, "# Freigaben\n\n%s  AAAA-AAAA-AAAA-AAAA  alt\r\n   \n%s\n", hex_a, hex_b_gross);
-    liste_schreiben(text);
-    pruefe(qc_authorized_count() == 2 && qc_is_authorized(a) == 1 && qc_is_authorized(b) == 1 &&
-           qc_is_authorized(c) == 0, "Kommentar, Leerzeilen, CRLF, Grossbuchstaben: 2 Freigaben");
-
-    // Eine Zeile laenger als jeder feste Puffer.
-    int n = snprintf(text, sizeof text, "%s  AAAA-AAAA-AAAA-AAAA  ", hex_a);
-    memset(text + n, 'n', 1500);
-    text[n + 1500] = '\n';
-    text[n + 1501] = 0;
-    liste_schreiben(text);
-    pruefe(qc_authorized_count() == 1 && qc_is_authorized(a) == 1, "Name mit 1500 Zeichen: 1 Freigabe");
-
-    // Groesser als 1 MiB: keine Freigabeliste mehr.
-    unlink(g_liste);
-    FILE *f = fopen(g_liste, "w");
-    if (f) {
-        fputs(zeile_a, f);
-        for (int i = 0; i < 20000; i++) fputs("# ............................................................\n", f);
-        fclose(f);
+// Handschlag als Client mit Nutzlast in Nachricht 3; tx fuer eigene Datensaetze.
+static int frist_client(int port, const void *n3, size_t n3_len, qc_cipher *tx) {
+    memset(&g_fr, 0, sizeof g_fr);
+    int fd = verbinden(port);
+    if (fd < 0) return -1;
+    uint8_t priv[32], pub[32];
+    qc_keypair(priv, pub);
+    qc_handshake hs;
+    qc_handshake_init(&hs, 1, priv, (const uint8_t *)PRO, strlen(PRO));
+    uint8_t m[8192], p[8192];
+    size_t ml = 0, pl = 0;
+    if (qc_handshake_write(&hs, NULL, 0, m, &ml) || schreib_rahmen(fd, m, ml) ||
+        lies_rahmen(fd, m, sizeof m, &ml) || qc_handshake_read(&hs, m, ml, p, &pl) ||
+        qc_handshake_write(&hs, n3, n3_len, m, &ml) || schreib_rahmen(fd, m, ml)) {
+        close(fd);
+        return -1;
     }
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(a) == -1, "Liste ueber 1 MiB: -1");
+    qc_handshake_split(&hs, tx, &g_fr_rx);
+    return fd;
+}
 
-    // Verweis ins Leere: meldet beim Oeffnen ENOENT, ist aber nicht "keine Liste".
-    char ziel[1300];
-    snprintf(ziel, sizeof ziel, "%s/ziel-gibt-es-nicht.txt", g_ablage);
-    unlink(g_liste);
-    symlink(ziel, g_liste);
-    pruefe(qc_authorized_count() == -1 && qc_is_authorized(c) == -1, "haengender Verweis: -1, kein Erstkontakt");
-    pruefe(qc_authorize(c, "fremd") == -1 && !gibt_es(ziel), "haengender Verweis: nichts gekoppelt, kein Ziel angelegt");
-    unlink(g_liste);
+static int frist_fertig(int max_ms) { return warte_zaehler(&g_fr.fertig, 1, max_ms); }
 
-    // Letzte Zeile ohne Zeilenende (von Hand bearbeitet): die neue Freigabe
-    // muss in eine eigene Zeile, sonst waere sie nie wieder zu finden.
-    size_t la = strlen(zeile_a);
-    datei_schreiben(g_liste, zeile_a, la - 1);
-    pruefe(qc_authorized_count() == 1 && qc_is_authorized(a) == 1, "ohne Zeilenende: die Freigabe gilt");
-    pruefe(qc_authorize(b, "neu") == 0 && qc_is_authorized(b) == 1 && qc_is_authorized(a) == 1 &&
-           qc_authorized_count() == 2, "ohne Zeilenende: neue Freigabe wird gefunden, die alte bleibt");
-    snprintf(text, sizeof text, "%.*s\n%s  ", (int)(la - 1), zeile_a, hex_b);
-    char buf[512] = {0};
-    f = fopen(g_liste, "r");
-    size_t r = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
-    if (f) fclose(f);
-    pruefe(r > strlen(text) && memcmp(buf, text, strlen(text)) == 0, "ohne Zeilenende: Zeilenwechsel davor ergaenzt");
+static void frist_pruefen(int port) {
+    printf("\n-- Lesen mit Frist nach dem Handschlag, Nachricht 3\n");
+    qc_cipher tx;
+    // Name wie der neue Client, dann 16 Byte in einem Datensatz.
+    static const uint8_t name[] = "QCN1\x06Laptop";
+    int fd = frist_client(port, name, sizeof name - 1, &tx);
+    uint8_t klar[16], ct[64];
+    for (int i = 0; i < 16; i++) klar[i] = (uint8_t)(0x40 + i);
+    size_t cl = 0;
+    int ok = fd >= 0 && qc_encrypt(&tx, klar, sizeof klar, ct, &cl) == 0 && schreib_rahmen(fd, ct, cl) == 0 && frist_fertig(3000);
+    pruefe(ok && g_fr.n3_len == sizeof name - 1 && memcmp(g_fr.n3, name, sizeof name - 1) == 0,
+           "Nutzlast der Nachricht 3 (\"QCN1\" und Name) kommt beim Host an");
+    pruefe(ok && g_fr.r == 0 && memcmp(g_fr.daten, klar, 8) == 0 && g_fr.gepuffert == 8 && g_fr.poll_still,
+           "Daten innerhalb der Frist: gelesen; der Rest des Datensatzes ist gepuffert, poll meldet ihn nicht");
+    if (fd >= 0) close(fd);
 
-    // Ein Name mit Zeilenwechsel bleibt eine Zeile.
-    unlink(g_liste);
-    pruefe(qc_authorize(a, "boese\n0000000000000000000000000000000000000000000000000000000000000000") == 0 &&
-           qc_authorized_count() == 1, "Name mit Zeilenwechsel: eine Zeile, eine Freigabe");
-    unlink(g_liste);
+    fd = frist_client(port, "client", 6, &tx);
+    ok = fd >= 0 && frist_fertig(3000);
+    printf("         (stumm: nach %lld ms)\n", (long long)g_fr.dauer);
+    pruefe(ok && g_fr.r == -1 && g_fr.dauer >= 900 && g_fr.dauer <= 1500 && g_fr.n3_len == 6,
+           "stummer Client: -1 nach der Frist (1 s), alter Client mit \"client\" in Nachricht 3");
+    if (fd >= 0) close(fd);
+
+    // Troepfeln: Laenge eines Datensatzes, dann alle 300 ms ein Byte.
+    uint8_t lang[100];
+    memset(lang, 'n', sizeof lang);
+    fd = frist_client(port, lang, sizeof lang, &tx);
+    ok = fd >= 0;
+    if (ok) {
+        uint8_t l[2] = { 24, 0 };
+        send(fd, l, 2, 0);
+        for (int i = 0; i < 8 && !atomic_load(&g_fr.fertig); i++) {
+            uint8_t x = 0x55;
+            send(fd, &x, 1, 0);
+            usleep(300 * 1000);
+        }
+    }
+    ok = ok && frist_fertig(3000);
+    printf("         (troepfelnd: nach %lld ms)\n", (long long)g_fr.dauer);
+    pruefe(ok && g_fr.r == -1 && g_fr.dauer >= 900 && g_fr.dauer <= 1500,
+           "troepfelnder Client: die Frist gilt fuer die ganze Nachricht");
+    uint8_t ende_ct[64], ende[64];
+    size_t ende_cl = 0, ende_l = 0;
+    int ende_ok = ok && lies_rahmen(fd, ende_ct, sizeof ende_ct, &ende_cl) == 0 &&
+                  qc_decrypt(&g_fr_rx, ende_ct, ende_cl, ende, &ende_l) == 0 && ende_l == 4 && memcmp(ende, "ENDE", 4) == 0;
+    pruefe(ok && g_fr.nochmal == -1 && g_fr.nochmal_dauer < 100 && g_fr.senden == 0 && ende_ok,
+           "danach: Lesen scheitert sofort, eine letzte Nachricht laesst sich noch senden und kommt an");
+    pruefe(ok && g_fr.n3_len == QC_NUTZLAST3_MAX, "zu lange Nutzlast in Nachricht 3: nur QC_NUTZLAST3_MAX Byte aufgehoben");
+    if (fd >= 0) close(fd);
+
+    fd = frist_client(port, NULL, 0, &tx);
+    if (fd >= 0) close(fd);
+    ok = fd >= 0 && frist_fertig(3000);
+    printf("         (Verbindungsende: nach %lld ms)\n", (long long)g_fr.dauer);
+    pruefe(ok && g_fr.r == -1 && g_fr.dauer < 300, "Client verschwindet: -1 sofort, nicht erst nach der Frist");
 }
 
 // ------------------------------------------------ eigener Schluessel
@@ -466,7 +457,6 @@ int main(void) {
     snprintf(pfad, sizeof pfad, "%s/Library", home); mkdir(pfad, 0700);
     snprintf(pfad, sizeof pfad, "%s/Library/Application Support", home); mkdir(pfad, 0700);
     snprintf(g_ablage, sizeof g_ablage, "%s/Library/Application Support/QuadChroma", home); mkdir(g_ablage, 0700);
-    snprintf(g_liste, sizeof g_liste, "%s/authorized.txt", g_ablage);
     printf("HOME fuer diesen Test: %s\n", home);
 
     qc_keypair(g_s_priv, g_s_pub);
@@ -600,11 +590,13 @@ int main(void) {
     pruefe(atomic_load(&za.erfolg) == 2 && atomic_load(&zb.erfolg) == 1 + versuche,
            "Hostseite: alle echten Handschlaege erfolgreich");
 
-    freigaben_pruefen();
+    static zaehler zd;
+    int port4 = lauschen(port3 + 1, 4, 4, frist_verbindung, &zd);
+    if (port4 < 0) pruefe(0, "Port fuer die Frist-Pruefung");
+    else frist_pruefen(port4);
     schluessel_pruefen();
 
     // Eigenes HOME wieder wegraeumen.
-    unlink(g_liste);
     rmdir(g_ablage);
     snprintf(pfad, sizeof pfad, "%s/Library/Application Support", home); rmdir(pfad);
     snprintf(pfad, sizeof pfad, "%s/Library", home); rmdir(pfad);

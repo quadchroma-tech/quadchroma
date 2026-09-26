@@ -760,9 +760,10 @@ clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-decla
       -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
       -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
       -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
+      -framework SystemConfiguration \
       host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
       host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
-      host/vendor/monocypher/monocypher.c -o /tmp/hosttest
+      host/zugang.c host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 
 clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
       -framework Foundation host/dateitest.m host/dateien.m -o /tmp/dateitest
@@ -770,16 +771,24 @@ clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version
 clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 -framework Foundation \
       -framework AppKit host/ablagetest.m -o /tmp/ablagetest
 
-clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c \
-      host/vendor/monocypher/monocypher.c -o /tmp/noisetest
+clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c host/zugang.c \
+      host/qc_secure.c host/vendor/monocypher/monocypher.c -o /tmp/noisetest
+
+clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/zugangtest.c host/zugang.c \
+      host/qc_secure.c host/qc_noise.c host/vendor/monocypher/monocypher.c -o /tmp/zugangtest
+
+clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
+      -framework Foundation -framework AppKit -framework ServiceManagement \
+      host/menuetest.m host/menue.m host/texte.m -o /tmp/menuetest
 ```
 
 `noisetest` without an argument is the self-test of the crypto layer ("OK", otherwise
 the place of the failure), including a failed handshake after which no DH result may
 remain on the stack; with a port it waits for the counterpart test of the Rust side
 (`quadchroma --noisetest address:port`). CI (`.github/workflows/ci.yml`) compiles all
-five and runs `noisetest`, `annahmetest`, `dateitest` and `ablagetest`; `hosttest`
-needs the Screen Recording permission at run time and is only compiled there.
+seven and runs `noisetest`, `annahmetest`, `zugangtest`, `dateitest`, `ablagetest` and
+`menuetest` (the menu bar texts in 29 languages and the menu model, nothing shown);
+`hosttest` needs the Screen Recording permission at run time and is only compiled there.
 
 The Rust side tests itself with `cargo test --release` in `client\` or `client/`;
 several tests need loopback (TCP over 127.0.0.1). On Windows, FFmpeg's `bin` folder

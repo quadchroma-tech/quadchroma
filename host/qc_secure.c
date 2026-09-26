@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -26,8 +25,9 @@ void qc_wipe(void *p, size_t n) {
 // ------------------------------------------------------------- Rohes Lesen
 //
 // frist ist ein Zeitpunkt auf der monotonen Uhr in Millisekunden, 0 heisst
-// ohne Frist. Der Handschlag hat eine, der Transport nicht: ein stiller
-// Bildkanal ist kein Fehler.
+// ohne Frist. Der Handschlag hat eine und die Zugangsphase danach
+// (qc_chan_read_frist), der Transport nicht: ein stiller Bildkanal ist kein
+// Fehler.
 
 static int64_t jetzt_ms(void) {
     struct timespec t;
@@ -121,6 +121,10 @@ int qc_chan_accept(qc_chan *c, int fd, const uint8_t s_priv[32],
     if (read_frame(fd, msg, sizeof msg, &mlen, frist)) { r = -5; goto ende; }
     if (qc_handshake_read(&hs, msg, mlen, payload, &plen)) { r = -6; goto ende; }
 
+    // Nutzlast der Nachricht 3: der Name des Clients (zugang.h). Erst jetzt
+    // ist sie beglaubigt verschluesselt angekommen.
+    c->nutzlast3_len = plen < sizeof c->nutzlast3 ? plen : sizeof c->nutzlast3;
+    memcpy(c->nutzlast3, payload, c->nutzlast3_len);
     memcpy(c->hh, qc_handshake_hash(&hs), QC_HASHLEN);
     memcpy(c->peer, hs.rs, 32);
     qc_handshake_split(&hs, &c->tx, &c->rx);
@@ -189,13 +193,14 @@ int qc_chan_send(qc_chan *c, const struct iovec *iov, int cnt) {
     return r;
 }
 
-int qc_chan_read(qc_chan *c, void *buf, size_t n) {
-    if (!c->ok) return -1;
+// frist: Zeitpunkt auf der monotonen Uhr (ms), 0 = ohne.
+static int chan_lesen(qc_chan *c, void *buf, size_t n, int64_t frist) {
+    if (!c->ok || c->lesen_aus) return -1;
     uint8_t *p = buf;
     while (n) {
         if (c->in_pos == c->in_len) {
             size_t ctlen = 0;
-            if (read_frame(c->fd, c->ct, sizeof c->ct, &ctlen, 0)) return -1;
+            if (read_frame(c->fd, c->ct, sizeof c->ct, &ctlen, frist)) return -1;
             size_t pt = 0;
             if (qc_decrypt(&c->rx, c->ct, ctlen, c->in, &pt)) return -1;
             c->in_len = pt;
@@ -209,6 +214,23 @@ int qc_chan_read(qc_chan *c, void *buf, size_t n) {
         p += take; n -= take;
     }
     return 0;
+}
+
+int qc_chan_read(qc_chan *c, void *buf, size_t n) {
+    return chan_lesen(c, buf, n, 0);
+}
+
+int qc_chan_read_frist(qc_chan *c, void *buf, size_t n, int frist_ms) {
+    // Die Frist gilt fuer das Ganze: ein Datensatz, der tropfenweise kommt,
+    // verlaengert sie nicht. Ein halb gelesener Datensatz ist danach verloren -
+    // gelesen wird nicht mehr, gesendet noch (die Antwort auf die Frist).
+    int r = chan_lesen(c, buf, n, jetzt_ms() + (frist_ms > 0 ? frist_ms : 1));
+    if (r != 0) c->lesen_aus = 1;
+    return r;
+}
+
+size_t qc_chan_gepuffert(const qc_chan *c) {
+    return c->ok && !c->lesen_aus ? c->in_len - c->in_pos : 0;
 }
 
 // ------------------------------------------------------------ Schluesselablage
@@ -268,130 +290,4 @@ int qc_identity_load(uint8_t priv[32], uint8_t pub[32]) {
     if (close(fd) != 0) ok = 0;
     if (!ok) { unlink(path); return -1; }
     return 0;
-}
-
-// ---------------------------------------------------------- Freigabeliste
-//
-// Eine Zeile je Gegenstelle: 64 Hexziffern ganz vorn, dann zwei Leerzeichen,
-// Fingerabdruck, zwei Leerzeichen, Name. Leerzeilen und Kommentare (#) sind
-// erlaubt, sonst nichts.
-
-#define QC_FREIGABEN_MAX (1 << 20)     // groesser ist es keine Freigabeliste mehr
-
-static int ist_hex(int c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-}
-
-// Eine Zeile ohne Zeilenwechsel: 1 = Freigabe, 0 = leer oder Kommentar,
-// -1 = etwas anderes - dann ist die Liste beschaedigt.
-static int freigabe_zeile(const char *z, size_t n) {
-    if (n && z[n - 1] == '\r') n--;     // von Hand unter Windows bearbeitet
-    if (memchr(z, 0, n)) return -1;     // Nullbytes: Muell nach einem Absturz
-    size_t i = 0;
-    while (i < n && (z[i] == ' ' || z[i] == '\t')) i++;
-    if (i == n || z[i] == '#') return 0;
-    if (n < 64) return -1;
-    for (i = 0; i < 64; i++) if (!ist_hex((unsigned char)z[i])) return -1;
-    return n == 64 || z[64] == ' ' || z[64] == '\t' ? 1 : -1;
-}
-
-// Liest die ganze Liste und prueft jede Zeile. Ergebnis: Zahl der Freigaben,
-// mit pub steht in *gefunden, ob er darunter ist.
-//
-// Nur "gibt es nicht" ist ein leerer Anfang (erster Start, nach --forget),
-// ebenso eine Datei mit 0 Bytes: dann 0. Alles andere, was nicht glatt geht -
-// Rechte, Besitzer nach einer Wiederherstellung, Ein- und Ausgabe, ein Verweis
-// ins Leere, Nullbytes, eine Zeile, die keine Freigabe ist, eine Datei ohne
-// eine einzige Freigabe - heisst: unbekannt, was gemeint war. Das ist -1, und
-// dann gilt weder jemand als freigegeben noch als Erstkontakt.
-static int freigaben_lesen(const uint8_t *pub, int *gefunden) {
-    char path[1200];
-    int dummy;
-    if (!gefunden) gefunden = &dummy;
-    *gefunden = 0;
-    if (config_path("authorized.txt", path, sizeof path)) return -1;
-    FILE *f = fopen(path, "r");
-    if (!f) return fehlt(path, errno) ? 0 : -1;
-    struct stat st;
-    if (fstat(fileno(f), &st) != 0 || st.st_size > QC_FREIGABEN_MAX) { fclose(f); return -1; }
-
-    char hex[65];
-    if (pub) for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", pub[i]);
-    char *z = NULL;
-    size_t cap = 0, gelesen = 0;
-    ssize_t len;
-    int n = 0, kaputt = 0;
-    while ((len = getline(&z, &cap, f)) > 0) {
-        gelesen += (size_t)len;
-        size_t l = (size_t)len;
-        if (z[l - 1] == '\n') l--;
-        int art = freigabe_zeile(z, l);
-        if (art < 0) { kaputt = 1; break; }
-        if (art == 1) {
-            n++;
-            if (pub && strncasecmp(z, hex, 64) == 0) *gefunden = 1;
-        }
-    }
-    if (ferror(f)) kaputt = 1;
-    free(z);
-    fclose(f);
-    if (kaputt || (gelesen && !n)) { *gefunden = 0; return -1; }
-    return n;
-}
-
-int qc_is_authorized(const uint8_t pub[32]) {
-    int gefunden;
-    if (freigaben_lesen(pub, &gefunden) < 0) return -1;
-    return gefunden;
-}
-
-int qc_authorized_count(void) {
-    return freigaben_lesen(NULL, NULL);
-}
-
-int qc_authorize(const uint8_t pub[32], const char *name) {
-    int bek = qc_is_authorized(pub);
-    if (bek < 0) return -1;             // Liste nicht lesbar oder beschaedigt: nichts anhaengen
-    if (bek) return 0;
-    char path[1200];
-    if (config_path("authorized.txt", path, sizeof path)) return -1;
-
-    // Die Zeile entsteht vorher ganz und geht mit einem einzigen write ans
-    // Ende. zeile[0] haelt Platz fuer einen Zeilenwechsel davor frei.
-    char zeile[400], fp[24];
-    size_t n = 1;
-    for (int i = 0; i < 32; i++) n += (size_t)snprintf(zeile + n, sizeof zeile - n, "%02x", pub[i]);
-    qc_fingerprint(pub, fp);
-    n += (size_t)snprintf(zeile + n, sizeof zeile - n, "  %s  ", fp);
-    const char *nm = name && *name ? name : "-";
-    for (size_t i = 0; nm[i] && i < 200; i++) {
-        unsigned char c = (unsigned char)nm[i];
-        zeile[n++] = c < 0x20 || c == 0x7f ? '?' : (char)c;     // ein Name bleibt eine Zeile
-    }
-    zeile[n++] = '\n';
-
-    int fd = open(path, O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
-    struct stat st;
-    int fehler = fstat(fd, &st) != 0;
-    // Endet die letzte Zeile ohne Zeilenwechsel (von Hand bearbeitet), landete
-    // die neue Freigabe sonst mit in dieser Zeile - und wuerde nie gefunden.
-    const char *von = zeile + 1;
-    if (!fehler && st.st_size > 0) {
-        char letztes = 0;
-        if (pread(fd, &letztes, 1, st.st_size - 1) != 1) fehler = 1;
-        else if (letztes != '\n') { zeile[0] = '\n'; von = zeile; }
-    }
-    size_t soll = (size_t)(zeile + n - von);
-    if (!fehler && (write(fd, von, soll) != (ssize_t)soll || fsync(fd) != 0)) {
-        // Halb oder unsicher geschrieben (Platte voll, Ein- und Ausgabe):
-        // zurueck auf den alten Stand, sonst waere die ganze Liste beschaedigt.
-        (void)ftruncate(fd, st.st_size);
-        fehler = 1;
-    }
-    fchmod(fd, 0600);
-    if (close(fd) != 0) fehler = 1;
-    if (fehler) return -1;
-    // 0 erst, wenn sich die Freigabe aus der Liste wieder lesen laesst.
-    return qc_is_authorized(pub) == 1 ? 0 : -1;
 }

@@ -991,7 +991,10 @@ void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) {
 
 // ------------------------------------------------ Rueckrufe aus dem Kern
 
-void qc_ui_anfrage(uint64_t anfrage, const char *name, uint32_t geraete_id, uint32_t code) {
+// name gilt nur waehrend des Aufrufs (zugang.h): er wird hier, noch im
+// Faden des Kerns, in einen NSString kopiert; alles Weitere laeuft per
+// dispatch_async auf der Main Queue (der Kern haelt dabei seine Sperre).
+void qc_ui_anfrage(uint64_t anfrage, const char *name, uint32_t geraete_id, uint32_t code) { @autoreleasepool {
     QCAnfrage *a = [[QCAnfrage alloc] init];
     a.nr = anfrage;
     a.name = (name ? [NSString stringWithUTF8String:name] : nil) ?: @"?";
@@ -1002,7 +1005,7 @@ void qc_ui_anfrage(uint64_t anfrage, const char *name, uint32_t geraete_id, uint
         [g_anfragen neu:a];
         anfrage_abgleichen();
     });
-}
+}}
 
 void qc_ui_anfrage_zurueck(uint64_t anfrage) {
     dispatch_async(dispatch_get_main_queue(), ^{
