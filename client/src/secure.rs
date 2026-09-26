@@ -31,9 +31,12 @@ pub enum Fehler {
     KeinUtf8 { pfad: PathBuf },
     /// Schreiben gescheitert (neuer Schluessel, neuer Eintrag).
     Schreiben { pfad: PathBuf, grund: String },
-    /// Der Fingerabdruck einer bekannten Adresse hat sich geaendert;
-    /// `fingerabdruck` ist der neue, `pfad` die Liste mit dem alten.
-    FingerabdruckGeaendert { host: String, fingerabdruck: String, pfad: PathBuf },
+    /// Verbunden ueber eine Geraete-ID (Liste, Eingabe, Verknuepfung), aber
+    /// der Schluessel der Gegenstelle ergibt eine andere ID (Spezifikation
+    /// Pairing v1, 8.2) - oder dieselbe, doch zu ihr ist in hosts.txt ein
+    /// anderer voller Schluessel gemerkt (`erwartet == gemeldet`: eine
+    /// errechnete Kollision). Geprueft nach Nachricht 2, vor Nachricht 3.
+    AnderesGeraet { addr: String, erwartet: u32, gemeldet: u32 },
     /// Die Adresse ergibt kein Ziel; `grund` ist der Wortlaut des Systems,
     /// None: aufgeloest, aber ohne eine einzige Adresse.
     Adresse { addr: String, grund: Option<String> },
@@ -60,11 +63,17 @@ impl std::fmt::Display for Fehler {
             Fehler::Unlesbar { pfad, grund } => write!(f, "{} nicht lesbar: {grund}", pfad.display()),
             Fehler::KeinUtf8 { pfad } => write!(f, "{} ist kein UTF-8", pfad.display()),
             Fehler::Schreiben { pfad, grund } => write!(f, "{} nicht zu schreiben: {grund}", pfad.display()),
-            Fehler::FingerabdruckGeaendert { host, fingerabdruck, pfad } => write!(
+            Fehler::AnderesGeraet { addr, erwartet, gemeldet } if erwartet == gemeldet => write!(
                 f,
-                "Der Fingerabdruck von {host} hat sich geaendert (jetzt {fingerabdruck}). Verbindung abgelehnt. \
-                 Wenn der Host neu aufgesetzt wurde, den Eintrag in {} loeschen.",
-                pfad.display()
+                "An {addr} antwortet ein anderes Geraet: ID {} wie gewaehlt, aber nicht der dazu in hosts.txt \
+                 gemerkte Schluessel (moeglicher Angriff) - Abbruch vor Nachricht 3",
+                crate::zugang::id_text(*erwartet)
+            ),
+            Fehler::AnderesGeraet { addr, erwartet, gemeldet } => write!(
+                f,
+                "An {addr} antwortet ein anderes Geraet (ID {} statt der gewaehlten {}) - Abbruch vor Nachricht 3",
+                crate::zugang::id_text(*gemeldet),
+                crate::zugang::id_text(*erwartet)
             ),
             Fehler::Adresse { addr, grund: Some(g) } => write!(f, "Adresse {addr}: {g}"),
             Fehler::Adresse { addr, grund: None } => write!(f, "Adresse {addr} ergibt kein Ziel"),
@@ -233,7 +242,7 @@ impl Secure {
         // Der Handschlag kennt nur Text; der Fehler der Pruefung (Pin,
         // Ablage) wartet hier, damit er mit seiner Art zurueckkommt.
         let mut pruef_fehler: Option<Fehler> = None;
-        let s = noise::handshake_initiator(priv_key, prologue, |b| r.recv(b), |d| r.send(d), |rs| {
+        let s = noise::handshake_initiator(priv_key, prologue, nachricht3(), |b| r.recv(b), |d| r.send(d), |rs| {
             pruefen(rs).map_err(|f| {
                 let text = f.to_string();
                 pruef_fehler = Some(f);
@@ -315,22 +324,64 @@ impl Secure {
     }
 
     pub fn read_exact(&mut self, dst: &mut [u8]) -> Result<(), String> {
+        self.lesen(dst).map_err(|e| e.to_string())
+    }
+
+    /// Frist fuer jedes folgende Lesen an der Leitung (None: ohne). Die
+    /// Antwort des Hosts nach dem Handschlag und die Zugangsphase lesen mit
+    /// Frist, die Sitzung danach wieder ohne - der Bildkanal darf beliebig
+    /// lange still sein.
+    pub fn lesefrist(&self, frist: Option<Duration>) {
+        self.sock.set_read_timeout(frist).ok();
+    }
+
+    /// Liegt etwas zum Lesen an? true: entschluesselte Bytes warten schon,
+    /// oder an der Leitung kommt binnen `warten` etwas an - dann liest
+    /// `lesen` die Nachricht (mit der Frist aus `lesefrist`). false: in der
+    /// Zeit kam nichts. Err: Leitung zu (UnexpectedEof) oder gestoert. Es
+    /// wird nur hineingeschaut (peek): eine Wartezeit, die ablaeuft, zerreisst
+    /// nie einen Datensatz - so kann die Zugangsphase zwischendurch nach dem
+    /// Nutzer sehen, ohne einen eigenen Lesefaden.
+    pub fn bereit(&mut self, warten: Duration) -> std::io::Result<bool> {
+        use std::io::ErrorKind as E;
+        if self.inpos < self.inbuf.len() {
+            return Ok(true);
+        }
+        let vorher = self.sock.read_timeout().ok().flatten();
+        self.sock.set_read_timeout(Some(warten.max(Duration::from_millis(1))))?;
+        let mut b = [0u8; 1];
+        let r = self.sock.peek(&mut b);
+        self.sock.set_read_timeout(vorher).ok();
+        match r {
+            Ok(0) => Err(std::io::Error::new(E::UnexpectedEof, "Leitung zu")),
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), E::WouldBlock | E::TimedOut | E::Interrupted) => Ok(false),
+            Err(e) => Err(std::io::Error::new(e.kind(), wortlaut(&e))),
+        }
+    }
+
+    /// Wie `read_exact`, aber mit der Art des Fehlers: UnexpectedEof heisst
+    /// Leitung zu, WouldBlock bzw. TimedOut Frist abgelaufen (`lesefrist`),
+    /// InvalidData ein Datensatz, der nicht echt oder unplausibel ist. Der
+    /// Text ist derselbe wie bei `read_exact`.
+    pub fn lesen(&mut self, dst: &mut [u8]) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
         let mut done = 0;
         while done < dst.len() {
             if self.inpos == self.inbuf.len() {
                 let mut l = [0u8; 2];
-                (&self.sock).read_exact(&mut l).map_err(|e| format!("Laenge: {}", wortlaut(&e)))?;
+                (&self.sock).read_exact(&mut l).map_err(|e| Error::new(e.kind(), format!("Laenge: {}", wortlaut(&e))))?;
                 let n = u16::from_le_bytes(l) as usize;
                 if n > CHUNK_MAX + 16 {
-                    return Err("unplausible Datensatzlaenge".into());
+                    return Err(Error::new(ErrorKind::InvalidData, "unplausible Datensatzlaenge"));
                 }
                 let mut ct = vec![0u8; n];
-                (&self.sock).read_exact(&mut ct).map_err(|e| format!("Daten: {}", wortlaut(&e)))?;
+                (&self.sock).read_exact(&mut ct).map_err(|e| Error::new(e.kind(), format!("Daten: {}", wortlaut(&e))))?;
                 let mut pt = vec![0u8; CHUNK_MAX];
                 let got = self
                     .tx
                     .read_message(&ct, &mut pt)
-                    .map_err(|_| "Datensatz nicht echt - abgebrochen".to_string())?;
+                    .map_err(|_| Error::new(ErrorKind::InvalidData, "Datensatz nicht echt - abgebrochen"))?;
                 pt.truncate(got);
                 self.inbuf = pt;
                 self.inpos = 0;
@@ -347,10 +398,20 @@ impl Secure {
     }
 }
 
+/// Nutzlast von Nachricht 3: "QCN1" mit dem Namen dieses Geraets
+/// (Spezifikation Pairing v1, 1.4) - der Host zeigt ihn im Zulassen-Fenster
+/// und in seiner Geraeteliste; unbeglaubigt, nur Anzeige. Einmal je Prozess
+/// bestimmt: der Rechnername aendert sich im Lauf nicht, und jeder Aufbau
+/// (auch der des Eingabekanals) schickt ihn.
+fn nachricht3() -> &'static [u8] {
+    static N: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    N.get_or_init(|| crate::zugang::nachricht3(&crate::zugang::geraetename()))
+}
+
 // ------------------------------------------------------------ Schluesselablage
 
 /// Der Ordner fuer alles, was der Client dauerhaft ablegt: client.key,
-/// known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt.
+/// hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt.
 /// Windows: %APPDATA%\QuadChroma (ohne APPDATA: unter HOME).
 /// macOS: ~/Library/Application Support/QuadChroma - derselbe Ordner, in dem
 /// der Mac-Host host.key und authorized.txt haelt; getrennte Dateinamen, keine
@@ -381,9 +442,10 @@ fn basis_ordner() -> Result<PathBuf, String> {
 /// Name des Testordners dieses Laufs: "qc-test-<pid>-<Startzeit in ms>".
 /// Nur die pid reichte nicht: die Ordner bleiben liegen, Windows vergibt
 /// pids neu, und ein neuer Lauf mit derselben pid fand dann eine alte
-/// known_hosts.txt mit einem anderen Schluessel fuer 127.0.0.1 - die
-/// Loopback-Tests scheiterten am Pin. Einmal je Prozess bestimmt, damit alle
-/// Tests eines Laufs denselben Ordner teilen (Testschluessel, known_hosts).
+/// Vertrauensliste (damals known_hosts.txt) mit einem anderen Schluessel
+/// fuer 127.0.0.1 - die Loopback-Tests scheiterten am Pin. Einmal je Prozess
+/// bestimmt, damit alle Tests eines Laufs denselben Ordner teilen
+/// (Testschluessel, hosts.txt).
 #[cfg(test)]
 pub fn test_lauf() -> &'static str {
     static LAUF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -520,20 +582,13 @@ fn exklusiv_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
     r
 }
 
-/// Liest eine Vertrauensliste (known_hosts.txt, authorized.txt). Nur eine
-/// FEHLENDE Datei gilt als leer. Jeder andere Fehler - keine Leserechte,
-/// Sperre durch ein anderes Programm, kein UTF-8 (etwa als ANSI oder UTF-16
+/// Liest eine Vertrauensliste (authorized.txt der Host-Rolle). Eine
+/// FEHLENDE Datei ergibt None - bei der Freigabeliste heissen "leer" und
+/// "fehlt" nicht dasselbe. Jeder andere Fehler - keine Leserechte, Sperre
+/// durch ein anderes Programm, kein UTF-8 (etwa als ANSI oder UTF-16
 /// gespeichert) - ist ein Fehler: sonst saehe eine vorhandene, aber
-/// unlesbare Liste aus wie der allererste Start, und der Erstkontakt nahme
-/// die naechste fremde Gegenstelle auf. Ein fuehrendes BOM (Editor "UTF-8
-/// mit BOM") wird uebergangen - sonst traefe die erste Zeile nie.
-fn liste_lesen(path: &Path) -> Result<String, Fehler> {
-    liste_lesen_falls_da(path).map(Option::unwrap_or_default)
-}
-
-/// Wie `liste_lesen`, aber eine fehlende Datei ergibt None statt eines
-/// leeren Texts - fuer die Freigabeliste, bei der "leer" und "fehlt" nicht
-/// dasselbe heissen.
+/// unlesbare Liste aus wie der allererste Start. Ein fuehrendes BOM (Editor
+/// "UTF-8 mit BOM") wird uebergangen - sonst traefe die erste Zeile nie.
 fn liste_lesen_falls_da(path: &Path) -> Result<Option<String>, Fehler> {
     let b = match std::fs::read(path) {
         Ok(b) => b,
@@ -547,15 +602,12 @@ fn liste_lesen_falls_da(path: &Path) -> Result<Option<String>, Fehler> {
 /// Haengt eine Zeile an eine Vertrauensliste an. Die vorhandenen Zeilen
 /// werden nie neu geschrieben - ein Fehler beim Schreiben kann also keinen
 /// bestehenden Eintrag kosten. `bisher` ist der gerade gelesene Inhalt; fehlt
-/// ihm das letzte Zeilenende, kommt es vor die neue Zeile.
-fn liste_anhaengen(path: &Path, bisher: &str, zeile: &str) -> std::io::Result<()> {
-    liste_anhaengen_mit(path, bisher, zeile, |f, b| f.write_all(b).and_then(|_| f.sync_all()))
-}
-
-/// Wie `liste_anhaengen`; `schreiben` schreibt die neuen Bytes (Tests
-/// schieben dort einen Schreibfehler ein). Scheitert es, wird die Datei auf
-/// ihre alte Laenge zurueckgekuerzt, wie mit ftruncate beim Mac-Host: eine
-/// halbe Zeile bliebe sonst stehen und zaehlte womoeglich als Eintrag.
+/// ihm das letzte Zeilenende, kommt es vor die neue Zeile. `schreiben`
+/// schreibt die neuen Bytes (Tests schieben dort einen Schreibfehler ein).
+/// Scheitert es, wird die Datei auf ihre alte Laenge zurueckgekuerzt, wie
+/// mit ftruncate beim Mac-Host: eine halbe Zeile bliebe sonst stehen und
+/// zaehlte womoeglich als Eintrag.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn liste_anhaengen_mit(
     path: &Path,
     bisher: &str,
@@ -585,109 +637,6 @@ fn liste_anhaengen_mit(
         }
     }
     r
-}
-
-/// Host-Teil einer Adresse, so wie er in known_hosts.txt steht.
-fn host_von(addr: &str) -> String {
-    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr).to_string()
-}
-
-/// Der gemerkte Schluessel (Hex) eines Hosts. Es zaehlt die erste Zeile mit
-/// diesem Host.
-fn gemerkt(text: &str, host: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let mut it = line.split_whitespace();
-        match (it.next(), it.next()) {
-            (Some(h), Some(k)) if h == host => Some(k.to_string()),
-            _ => None,
-        }
-    })
-}
-
-/// Merkt sich den Schluessel eines Hosts. Gibt Err zurueck, wenn sich der
-/// Fingerabdruck einer bekannten Adresse geaendert hat - dann stimmt etwas
-/// nicht. Ebenso, wenn known_hosts.txt vorhanden, aber nicht lesbar ist.
-/// Ok(true): erstmals gesehen und eingetragen.
-fn known_host_pruefen(path: &Path, addr: &str, peer: &[u8]) -> Result<bool, Fehler> {
-    let host = host_von(addr);
-    let text = liste_lesen(path)?;
-    match gemerkt(&text, &host) {
-        Some(k) if k == hex(peer) => Ok(false), // bekannt und unveraendert
-        Some(_) => Err(Fehler::FingerabdruckGeaendert {
-            host,
-            fingerabdruck: noise::fingerprint(peer),
-            pfad: path.to_path_buf(),
-        }),
-        None => {
-            liste_anhaengen(path, &text, &format!("{host} {} {}", hex(peer), noise::fingerprint(peer)))
-                .map_err(|e| Fehler::Schreiben { pfad: path.to_path_buf(), grund: wortlaut(&e) })?;
-            Ok(true) // erstmals gesehen
-        }
-    }
-}
-
-/// Was known_hosts.txt ueber einen Host weiss - gelesen, BEVOR eine Leitung
-/// aufgeht. Ist die Liste unlesbar (Rechte, Sperre, kein UTF-8), wird gar
-/// nicht erst verbunden. Ist der Host dort bekannt, prueft `pruefen` seinen
-/// Schluessel noch im Handschlag, vor Nachricht 3 (Secure::connect_pruefend):
-/// erst mit Nachricht 3 nimmt ein Host den Anrufer als Zuschauer an und
-/// loest dafuer den laufenden ab - ein Client mit falschem Pin kommt so weit
-/// nicht mehr. Beim ersten Kontakt traegt `eintragen` den Schluessel nach
-/// dem Handschlag ein, wie bisher.
-pub struct HostPin {
-    pfad: PathBuf,
-    addr: String,
-    /// Der gemerkte Schluessel (Hex); None: erster Kontakt mit diesem Host.
-    gemerkt: Option<String>,
-}
-
-impl HostPin {
-    pub fn laden(addr: &str) -> Result<HostPin, Fehler> {
-        HostPin::laden_aus(config_dir().map_err(Fehler::Ablage)?.join("known_hosts.txt"), addr)
-    }
-
-    fn laden_aus(pfad: PathBuf, addr: &str) -> Result<HostPin, Fehler> {
-        let text = liste_lesen(&pfad)?;
-        let gemerkt = gemerkt(&text, &host_von(addr));
-        if gemerkt.is_none() {
-            // Erster Kontakt: eingetragen wird erst nach dem Handschlag. Laesst
-            // sich die Liste gar nicht beschreiben (schreibgeschuetzt, keine
-            // Rechte), soll das jetzt auffallen - nicht erst, wenn der Host
-            // dieses Geraet schon angenommen hat. Eine fehlende Liste entsteht
-            // dabei leer; leer und fehlend heissen hier dasselbe.
-            let mut o = std::fs::OpenOptions::new();
-            o.create(true).append(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-            o.open(&pfad).map_err(|e| Fehler::Schreiben { pfad: pfad.clone(), grund: wortlaut(&e) })?;
-        }
-        Ok(HostPin { pfad, addr: addr.to_string(), gemerkt })
-    }
-
-    /// Im Handschlag, nach Nachricht 2: passt der Schluessel des Hosts zum
-    /// Pin? Ohne Pin (erster Kontakt) passt jeder - dann zeigt die Kopplung
-    /// den Vergleichscode.
-    pub fn pruefen(&self, peer: &[u8]) -> Result<(), Fehler> {
-        match &self.gemerkt {
-            Some(k) if *k != hex(peer) => Err(Fehler::FingerabdruckGeaendert {
-                host: host_von(&self.addr),
-                fingerabdruck: noise::fingerprint(peer),
-                pfad: self.pfad.clone(),
-            }),
-            _ => Ok(()),
-        }
-    }
-
-    /// Nach dem Handschlag: beim ersten Kontakt den Schluessel eintragen.
-    /// Ok(true): erstmals gesehen. Die Liste wird dafuer neu gelesen - hat ein
-    /// zweites Fenster den Host inzwischen eingetragen, gilt dessen Zeile.
-    pub fn eintragen(&self, peer: &[u8]) -> Result<bool, Fehler> {
-        self.pruefen(peer)?;
-        if self.gemerkt.is_some() {
-            return Ok(false);
-        }
-        known_host_pruefen(&self.pfad, &self.addr, peer)
-    }
 }
 
 // ------------------------------------------------- Ablage der Host-Rolle
@@ -875,10 +824,9 @@ mod tests {
 
     const A: [u8; 32] = [0xaa; 32];
     const B: [u8; 32] = [0xbb; 32];
-    const C: [u8; 32] = [0xcc; 32];
 
     /// Die Ablage der Tests ist je Prozess frisch: nicht der Ordner, den ein
-    /// frueherer Lauf mit derselben pid hinterliess (samt known_hosts.txt
+    /// frueherer Lauf mit derselben pid hinterliess (samt einer hosts.txt
     /// mit einem anderen Schluessel fuer 127.0.0.1), aber innerhalb eines
     /// Laufs immer derselbe - auch fuer ordner(name).
     #[test]
@@ -897,66 +845,6 @@ mod tests {
         let o = ordner("lauf");
         assert_eq!(o.file_name().unwrap().to_str().unwrap(), format!("{name}-lauf"));
         let _ = std::fs::remove_dir_all(&o);
-    }
-
-    #[test]
-    fn known_hosts_unlesbar_ist_kein_erstkontakt() {
-        let d = ordner("kh-latin1");
-        let p = d.join("known_hosts.txt");
-        // Zwei gueltige Pins und eine Kommentarzeile in Latin-1 (0xE4 = ae).
-        let mut inhalt = format!("10.0.0.5 {} x\n10.0.0.6 {} y\n", hex(&A), hex(&B)).into_bytes();
-        inhalt.extend_from_slice(b"# Rechner im B\xe4ro\n");
-        std::fs::write(&p, &inhalt).unwrap();
-        // Frueher: leere Liste, Erstkontakt, Datei mit nur dem Fremden ueberschrieben.
-        assert!(known_host_pruefen(&p, "10.0.0.5:9001", &C).is_err());
-        assert!(known_host_pruefen(&p, "10.0.0.7:9001", &C).is_err());
-        assert_eq!(std::fs::read(&p).unwrap(), inhalt);
-    }
-
-    #[test]
-    fn known_hosts_mit_bom() {
-        let d = ordner("kh-bom");
-        let p = d.join("known_hosts.txt");
-        std::fs::write(&p, format!("\u{feff}10.0.0.5 {} x\n", hex(&A))).unwrap();
-        let e = known_host_pruefen(&p, "10.0.0.5:9001", &C).unwrap_err();
-        assert_eq!(
-            e,
-            Fehler::FingerabdruckGeaendert { host: "10.0.0.5".into(), fingerabdruck: noise::fingerprint(&C), pfad: p.clone() }
-        );
-        assert!(e.to_string().contains("geaendert"), "{e}");
-        assert_eq!(known_host_pruefen(&p, "10.0.0.5:9001", &A), Ok(false));
-    }
-
-    #[test]
-    fn known_hosts_neu_und_angehaengt() {
-        let d = ordner("kh-neu");
-        let p = d.join("known_hosts.txt");
-        assert_eq!(known_host_pruefen(&p, "10.0.0.5:9001", &A), Ok(true));
-        assert_eq!(std::fs::read_to_string(&p).unwrap().lines().count(), 1);
-        // Zwei Pins, der zweite ohne Zeilenende; ein dritter Host kommt dazu.
-        let alt = format!("10.0.0.5 {} x\n10.0.0.6 {} y", hex(&A), hex(&B));
-        std::fs::write(&p, &alt).unwrap();
-        assert_eq!(known_host_pruefen(&p, "10.0.0.7:9001", &C), Ok(true));
-        let neu = std::fs::read_to_string(&p).unwrap();
-        assert!(neu.starts_with(&format!("{alt}\n")));
-        assert_eq!(neu.lines().count(), 3);
-        assert_eq!(known_host_pruefen(&p, "10.0.0.7:9001", &C), Ok(false));
-        assert_eq!(known_host_pruefen(&p, "10.0.0.6:9001", &B), Ok(false));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn known_hosts_nur_schreibbar() {
-        use std::os::unix::fs::PermissionsExt;
-        let d = ordner("kh-0200");
-        let p = d.join("known_hosts.txt");
-        let inhalt = format!("10.0.0.5 {} x\n", hex(&A));
-        std::fs::write(&p, &inhalt).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o200)).unwrap();
-        let r = known_host_pruefen(&p, "10.0.0.6:9001", &C);
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(r.is_err());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), inhalt);
     }
 
     #[test]
@@ -1063,59 +951,54 @@ mod tests {
         assert_eq!(c.handshake_hash, hh);
     }
 
-    /// Der Pin wird VOR dem Verbinden gelesen und im Handschlag vor
-    /// Nachricht 3 geprueft; beim ersten Kontakt erst danach eingetragen.
+    /// `bereit` schaut nur hinein: ohne Daten false nach der Wartezeit, mit
+    /// Daten true, und `lesen` bekommt sie danach ganz (auch was schon
+    /// entschluesselt wartet). Macht die Gegenstelle zu: UnexpectedEof. Eine
+    /// abgelaufene `lesefrist` meldet sich als Frist, nicht als Ende.
     #[test]
-    fn pin_vor_dem_verbinden() {
-        let d = ordner("pin");
-        let p = d.join("known_hosts.txt");
-        // Unlesbar (kein UTF-8): gar nicht erst verbinden, Datei bleibt.
-        let mut kaputt = format!("10.0.0.5 {} x\n", hex(&A)).into_bytes();
-        kaputt.extend_from_slice(b"# B\xe4ro\n");
-        std::fs::write(&p, &kaputt).unwrap();
-        assert_eq!(HostPin::laden_aus(p.clone(), "10.0.0.5:9001").err(), Some(Fehler::KeinUtf8 { pfad: p.clone() }));
-        assert_eq!(std::fs::read(&p).unwrap(), kaputt);
+    fn bereit_und_lesefrist() {
+        use std::io::ErrorKind as E;
+        test_identitaet();
+        // Eine Gegenstelle, die schickt, was der Kanal bringt, und zumacht,
+        // wenn er endet.
+        let gegenstelle = || {
+            let (host_priv, _) = noise::keypair().unwrap();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let faden = std::thread::spawn(move || {
+                let (s, _) = l.accept().unwrap();
+                let mut h = Secure::accept(s, &noise::prologue_video(), &host_priv).unwrap();
+                while let Ok(d) = rx.recv() {
+                    h.write_all(&d).unwrap();
+                }
+            });
+            (Secure::connect(&addr, &noise::prologue_video()).unwrap(), tx, faden)
+        };
+        let (mut c, tx, faden) = gegenstelle();
+        let t0 = Instant::now();
+        assert!(!c.bereit(Duration::from_millis(80)).unwrap());
+        assert!(t0.elapsed() >= Duration::from_millis(60));
+        tx.send(b"abcdef".to_vec()).unwrap();
+        assert!(c.bereit(Duration::from_secs(5)).unwrap());
+        let mut b = [0u8; 4];
+        c.lesen(&mut b).unwrap();
+        assert_eq!(&b, b"abcd");
+        assert!(c.bereit(Duration::from_millis(1)).unwrap(), "der Rest wartet entschluesselt");
+        let mut b = [0u8; 2];
+        c.lesen(&mut b).unwrap();
+        assert_eq!(&b, b"ef");
+        drop(tx);
+        faden.join().unwrap();
+        assert_eq!(c.bereit(Duration::from_secs(5)).unwrap_err().kind(), E::UnexpectedEof);
+        assert_eq!(c.lesen(&mut [0u8; 1]).unwrap_err().kind(), E::UnexpectedEof);
 
-        // Bekannter Host: der eigene Schluessel passt, ein anderer nicht;
-        // eintragen schreibt nichts.
-        let inhalt = format!("10.0.0.5 {} x\n", hex(&A));
-        std::fs::write(&p, &inhalt).unwrap();
-        let pin = HostPin::laden_aus(p.clone(), "10.0.0.5:9001").unwrap();
-        assert_eq!(pin.pruefen(&A), Ok(()));
-        assert_eq!(
-            pin.pruefen(&C),
-            Err(Fehler::FingerabdruckGeaendert { host: "10.0.0.5".into(), fingerabdruck: noise::fingerprint(&C), pfad: p.clone() })
-        );
-        assert_eq!(pin.eintragen(&A), Ok(false));
-        assert!(pin.eintragen(&C).is_err());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), inhalt);
-
-        // Erster Kontakt: jeder Schluessel passt, eingetragen wird erst
-        // mit `eintragen`.
-        let pin = HostPin::laden_aus(p.clone(), "10.0.0.6:9001").unwrap();
-        assert_eq!(pin.pruefen(&B), Ok(()));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), inhalt);
-        assert_eq!(pin.eintragen(&B), Ok(true));
-        assert_eq!(known_host_pruefen(&p, "10.0.0.6:9001", &B), Ok(false));
-
-        // Fehlt die Liste, entsteht sie leer; der erste Kontakt geht.
-        let q = d.join("neu.txt");
-        let pin = HostPin::laden_aus(q.clone(), "10.0.0.7:9001").unwrap();
-        assert_eq!(std::fs::read(&q).unwrap(), b"");
-        assert_eq!(pin.eintragen(&C), Ok(true));
-
-        // Schreibgeschuetzt: ein bekannter Host geht weiter, ein neuer wird
-        // schon vor dem Verbinden abgelehnt - nicht erst, wenn der Host
-        // dieses Geraet angenommen hat.
-        let mut rechte = std::fs::metadata(&p).unwrap().permissions();
-        rechte.set_readonly(true);
-        std::fs::set_permissions(&p, rechte.clone()).unwrap();
-        let bekannt = HostPin::laden_aus(p.clone(), "10.0.0.5:9001").map(|p| p.gemerkt.is_some());
-        let neu = HostPin::laden_aus(p.clone(), "10.0.0.9:9001").err();
-        rechte.set_readonly(false);
-        std::fs::set_permissions(&p, rechte).unwrap();
-        assert_eq!(bekannt, Ok(true));
-        assert!(matches!(neu, Some(Fehler::Schreiben { .. })), "{neu:?}");
+        let (mut c, tx, faden) = gegenstelle();
+        c.lesefrist(Some(Duration::from_millis(100)));
+        let e = c.lesen(&mut [0u8; 1]).unwrap_err();
+        assert!(matches!(e.kind(), E::WouldBlock | E::TimedOut), "{e:?}");
+        drop(tx);
+        faden.join().unwrap();
     }
 
     /// Scheitert die Pruefung im Handschlag, kommt ihr Fehler zurueck - und
@@ -1131,13 +1014,12 @@ mod tests {
             let (s, _) = l.accept().unwrap();
             Secure::accept(s, &noise::prologue_video(), &host_priv).map(|h| h.peer)
         });
-        let pfad = PathBuf::from("/ablage/known_hosts.txt");
         let mut gesehen = Vec::new();
         let r = Secure::connect_pruefend(&addr.to_string(), &noise::prologue_video(), |k| {
             gesehen = k.to_vec();
-            Err(Fehler::FingerabdruckGeaendert { host: "127.0.0.1".into(), fingerabdruck: noise::fingerprint(k), pfad: pfad.clone() })
+            Err(Fehler::AnderesGeraet { addr: "127.0.0.1".into(), erwartet: 5, gemeldet: crate::zugang::geraete_id(k) })
         });
-        assert!(matches!(r, Err(Fehler::FingerabdruckGeaendert { .. })));
+        assert!(matches!(r, Err(Fehler::AnderesGeraet { erwartet: 5, .. })));
         assert_eq!(gesehen, host_pub);
         let beim_host = faden.join().unwrap();
         assert!(beim_host.is_err(), "Nachricht 3 kam beim Host an");

@@ -52,6 +52,9 @@ mod verknuepfung;
 /// Drossel, Geraeteliste, Passwortdatei und hosts.txt - Client und
 /// Windows-Host-Rolle.
 mod zugang;
+/// Zugangsphase des Clients: Antwort des Hosts nach dem Handschlag,
+/// Passwortbeweis bzw. "Zulassen", Pinnen in hosts.txt erst nach der Annahme.
+mod zugangsphase;
 /// Schliessen legt die App ab: Symbol im Infobereich (Windows, tray_win.rs)
 /// bzw. in der Menueleiste (macOS, tray_mac.rs); gemeinsame Logik in tray.rs.
 mod tray;
@@ -618,11 +621,25 @@ struct Meldung {
     werte: Vec<(&'static str, String)>,
     anhang: Option<String>,
     protokoll: String,
+    /// Bleibt, auch wenn der Schluessel es allein nicht sagt (siehe
+    /// `bleibend`).
+    bleibt: bool,
 }
 
 impl Meldung {
     fn neu(key: strings::Key, protokoll: impl Into<String>) -> Meldung {
-        Meldung { key, werte: Vec::new(), anhang: None, protokoll: protokoll.into() }
+        Meldung { key, werte: Vec::new(), anhang: None, protokoll: protokoll.into(), bleibt: false }
+    }
+
+    /// Diese Meldung bleibt (siehe `dauerhaft`), auch wenn ihr Schluessel
+    /// sonst einen Neuversuch erlaubt: ein Protokollfehler rund um die
+    /// Zugangsphase gibt sich mit dem naechsten Versuch nicht - jeder neue
+    /// Versuch oeffnete beim Host nur eine neue Zugangsphase samt Anfrage
+    /// (Spezifikation Pairing v1, 3.5 und 9.6: kein Endlos-Neuversuch).
+    /// Derselbe Schluessel mitten in einer Sitzung darf weiter neu verbinden.
+    fn bleibend(mut self) -> Meldung {
+        self.bleibt = true;
+        self
     }
 
     /// Wert fuer einen Platzhalter ("{n}", "{m}", "{p}").
@@ -637,22 +654,40 @@ impl Meldung {
     }
 
     /// Ein Fehler, der sich mit dem naechsten Versuch nicht von selbst gibt:
-    /// Pin geaendert, Ablage oder Schluesseldatei kaputt, Liste kein UTF-8
-    /// oder nicht schreibbar. Dann verbindet der Empfangsfaden nicht alle
-    /// 2 s neu, sondern nimmt das Ziel zurueck (wie bei einer Abloesung);
-    /// der Nutzer verbindet nach dem Beheben selbst wieder.
+    /// Ablage oder Schluesseldatei kaputt, Liste kein UTF-8 oder nicht
+    /// schreibbar - und jeder Ausgang des Zugangs (Spezifikation Pairing v1,
+    /// 9.6: abgelehnt, zu viele Versuche, keine Antwort, Host veraltet,
+    /// Host-Beweis falsch, anderes Geraet unter der ID, ID nicht gefunden).
+    /// Dann verbindet der Empfangsfaden nicht alle 2 s neu, sondern nimmt das
+    /// Ziel zurueck (wie bei einer Abloesung); der Startbildschirm zeigt die
+    /// Meldung, und der Nutzer verbindet selbst wieder.
     ///
     /// "Nicht lesbar" gehoert nicht dazu: das ist oft nur eine kurze Sperre
-    /// (Virenscanner, Sicherung), und client.key wie known_hosts.txt werden
-    /// VOR dem Verbinden gelesen - ein neuer Versuch alle 2 s oeffnet also
-    /// keine Leitung, solange die Sperre besteht, der Host merkt nichts davon,
-    /// und im Protokoll steht es dank der Entdoppelung einmal. (Nur beim
-    /// ersten Kontakt liest HostPin::eintragen die Liste nach dem Handschlag
-    /// noch einmal; scheitert das, haelt der naechste Versuch schon vor dem
-    /// Verbinden an.) Ist die Sperre weg, verbindet der Client von selbst.
+    /// (Virenscanner, Sicherung), und client.key wie hosts.txt werden VOR dem
+    /// Verbinden gelesen - ein neuer Versuch alle 2 s oeffnet also keine
+    /// Leitung, solange die Sperre besteht, der Host merkt nichts davon, und
+    /// im Protokoll steht es dank der Entdoppelung einmal. Ist die Sperre
+    /// weg, verbindet der Client von selbst.
+    ///
+    /// Dazu jede Meldung, die `bleibend` markiert ist (Protokollfehler rund
+    /// um die Zugangsphase).
     fn dauerhaft(&self) -> bool {
         use strings::Key::*;
-        matches!(self.key, HostKeyChanged | FileNotUtf8 | FileNotWritable | KeyFileDamaged | StorageUnavailable)
+        self.bleibt
+            || matches!(
+                self.key,
+                FileNotUtf8
+                    | FileNotWritable
+                    | KeyFileDamaged
+                    | StorageUnavailable
+                    | MsgRefused
+                    | MsgNoAnswer
+                    | MsgTooManyAttempts
+                    | MsgHostOutdated
+                    | MsgHostProofBad
+                    | MsgOtherDevice
+                    | MsgIdNotFound
+            )
     }
 
     /// Der Text in dieser Sprache: Platzhalter ersetzt, Anhang in Klammern.
@@ -689,10 +724,7 @@ impl From<secure::Fehler> for Meldung {
             F::Schreiben { pfad, grund } => {
                 Meldung::neu(FileNotWritable, protokoll).mit("{p}", pfad.display().to_string()).anhang(grund)
             }
-            F::FingerabdruckGeaendert { host, fingerabdruck, pfad } => Meldung::neu(HostKeyChanged, protokoll)
-                .mit("{n}", host)
-                .mit("{m}", fingerabdruck)
-                .mit("{p}", pfad.display().to_string()),
+            F::AnderesGeraet { .. } => Meldung::neu(MsgOtherDevice, protokoll),
             F::Adresse { addr, grund } => {
                 let m = Meldung::neu(ErrorAddress, protokoll).mit("{n}", addr);
                 match grund {
@@ -725,6 +757,32 @@ struct Shared {
     abbruch: Option<std::net::TcpStream>,
     /// Adresse, mit der sich der Empfangsfaden verbinden soll. None = warten.
     target: Option<String>,
+    /// Verbunden ueber eine Geraete-ID (Liste, Eingabe, Verknuepfung): die
+    /// gewaehlte ID. Der Handschlag prueft nach Nachricht 2, dass der
+    /// Schluessel des Hosts sie ergibt (Spezifikation Pairing v1, 8.2), und
+    /// meldet sich der Host inzwischen unter einer anderen Adresse, verbindet
+    /// der naechste Versuch dorthin. Gilt nur zusammen mit `target`.
+    ziel_id: Option<u32>,
+    /// Name des Ziels aus der Bekanntgabe (oder hosts.txt) - fuer Meldungen
+    /// und den Eintrag in hosts.txt, bis der Host selbst einen nennt.
+    ziel_name: Option<String>,
+    /// Die Liste der Bekanntgaben, damit der Empfangsfaden ein Ziel mit ID
+    /// unter seiner neuen Adresse findet. None in Tests.
+    bekanntgaben: Option<Arc<Mutex<discovery::Hosts>>>,
+    /// Zu diesem Ziel lief seit der Wahl durch den Nutzer (`App::verbinden`)
+    /// schon eine angenommene Sitzung. Sagt der Host beim Wiederverbinden
+    /// danach "QCA1" (dort entfernt, Liste zurueckgesetzt), stellt der
+    /// Client keine Zugangsanfrage von selbst: der Nutzer hat nicht darum
+    /// gebeten, und am Host ginge ein Zulassen-Fenster auf, das niemand
+    /// erwartet. Er zieht sie sofort zurueck (23), und die Meldung bleibt.
+    angenommen: bool,
+    /// Zugangsphase laeuft: was der Dialog zeigt (Empfangsfaden -> Fenster).
+    zugang: Option<zugangsphase::Dialog>,
+    /// Eingabe des Nutzers im Zugangsdialog (Fenster -> Empfangsfaden).
+    zugang_eingabe: Option<zugangsphase::Eingabe>,
+    /// Zaehlt jede Aenderung an hosts.txt durch den Empfangsfaden - das
+    /// Fenster liest die Liste (Haken an bekannten Hosts) dann neu.
+    hosts_stand: u64,
     connected: bool,
     frame: Option<Bild>,
     /// Zeichnet die Karte? Dann legt der Empfangsfaden rohe Bilder ab,
@@ -757,7 +815,6 @@ struct Shared {
     /// Vergleichscode und Fingerabdruck der Gegenstelle, zum Anzeigen.
     sas: Option<String>,
     peer_fp: Option<String>,
-    first_time: bool,
     /// Fehler, fuer den es einen uebersetzten Text gibt. Hat Vorrang vor `error`.
     error_key: Option<strings::Key>,
     /// Was auf dem Host gerade gilt: Mbit/s, Bilder je Sekunde, Gaming-Schalter.
@@ -1194,17 +1251,45 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
     // Zuletzt protokollierte Verbindungsmeldung und der Bildzaehler dazu:
     // dieselbe Meldung ohne ein einziges Bild dazwischen steht nur einmal im
     // Protokoll. `error` taugt dafuer nicht - run_session loescht es schon
-    // nach dem Handschlag, also vor "nicht gekoppelt" und allem danach.
+    // nach dem Handschlag, also vor der Antwort des Hosts und allem danach.
     let mut gemeldet: Option<(Meldung, u64)> = None;
     loop {
-        let addr = { shared.lock().unwrap().target.clone() };
-        let Some(addr) = addr else {
+        let (addr, ziel_id, bekanntgaben) = {
+            let s = shared.lock().unwrap();
+            (s.target.clone(), s.ziel_id, s.bekanntgaben.clone())
+        };
+        let Some(mut addr) = addr else {
             // Ohne Ziel beginnt die Entdoppelung von vorn: verbindet der
             // Nutzer neu, steht der erste Fehler wieder im Protokoll.
             gemeldet = None;
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
+        // Ziel ueber eine ID: meldet sich der Host inzwischen nur noch unter
+        // einer anderen Adresse (neue IP vom Router), gilt die neue - solange
+        // er sich (auch) unter der bisherigen meldet, bleibt sie (ein Host
+        // mit zwei Netzkarten ruft unter beiden). Vertraut wird der
+        // Bekanntgabe dabei nicht - der Handschlag prueft die ID am
+        // Schluessel (8.2).
+        if let (Some(id), Some(b)) = (ziel_id, bekanntgaben) {
+            let (neu, bisher) = match b.lock() {
+                Ok(h) => (
+                    h.mit_id(id).map(|g| g.host.addr.to_string()),
+                    h.liste().iter().any(|g| g.id == Some(id) && g.host.addr.to_string().eq_ignore_ascii_case(&addr)),
+                ),
+                Err(_) => (None, true),
+            };
+            if let Some(neu) = neu.filter(|_| !bisher) {
+                let mut s = shared.lock().unwrap();
+                if s.target.as_deref() == Some(addr.as_str()) {
+                    protokoll::zeile(format!("Ziel ID {} meldet sich jetzt unter {neu} (vorher {addr})", zugang::id_text(id)));
+                    s.target = Some(neu.clone());
+                    drop(s);
+                    input.lock().unwrap().set_addr(bump_port(&neu, 1));
+                    addr = neu;
+                }
+            }
+        }
         let ergebnis = run_session(&addr, &shared, &input);
         // Ohne Sitzung liest der Client die Zwischenablage nicht mehr.
         #[cfg(any(windows, target_os = "macos"))]
@@ -1216,6 +1301,9 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             let mut s = shared.lock().unwrap();
             s.abbruch = None;
             s.link = None;
+            // Ein offener Zugangsdialog gehoert zu dieser Leitung.
+            s.zugang = None;
+            s.zugang_eingabe = None;
             // Die Form geht, die Nummer zaehlt weiter: fiele sie auf null,
             // ueberspraenge der Fensterfaden nach dem Wiederverbinden genau die
             // Form mit der alten Nummer.
@@ -2064,33 +2152,283 @@ fn decoder_defekt(e: &ffmpeg::Error) -> bool {
     !matches!(e, ffmpeg::Error::Other { errno: ffmpeg::util::error::EAGAIN } | ffmpeg::Error::Eof)
 }
 
+/// Die Zugangsphase nach "QCA1" (Spezifikation Pairing v1, 3.5): Nachricht
+/// 20 lesen, den Dialog zeigen (`Shared::zugang`), die Eingaben des Nutzers
+/// (`Shared::zugang_eingabe`) an den Automaten geben, bis der Host
+/// entscheidet - nach der Annahme folgt "QCH1". Ok(Some(name)): angenommen,
+/// mit dem Namen, den der Host in Nachricht 20 nennt. Ok(None): der Nutzer
+/// hat abgebrochen (Nachricht 23 ist hinaus). Jeder andere Ausgang ist eine
+/// Meldung, die bleibt - kein automatischer Neuversuch (9.6).
+fn zugang_durchlaufen(
+    sock: &mut secure::Secure,
+    shared: &Arc<Mutex<Shared>>,
+    vorwissen: &zugangsphase::Vorwissen,
+    name: &str,
+    addr: &str,
+) -> Result<Option<String>, Meldung> {
+    use zugangsphase::{Ausgang, Eingabe, Kennung};
+    let noetig = zugangsphase::noetig_lesen(sock).map_err(|a| zugang_meldung(a, name, addr))?;
+    let neue_identitaet = vorwissen.neue_identitaet(&sock.peer);
+    let mut automat = zugangsphase::Automat::neu(
+        &noetig,
+        &sock.peer,
+        &sock.handshake_hash,
+        name,
+        &sock.sas,
+        neue_identitaet,
+        Instant::now(),
+    );
+    let d = automat.dialog().clone();
+    protokoll::zeile(format!(
+        "Zugang noetig: {} ({addr}, ID {}, Vergleichscode {}) kennt dieses Geraet noch nicht - {}{}{}",
+        d.name,
+        zugang::id_text(d.id),
+        d.code,
+        if d.zulassen { "Passwort oder Zulassen am Host" } else { "nur Passwort" },
+        if noetig.warten_ms > 0 { format!(", Beweis fruehestens in {} ms", noetig.warten_ms) } else { String::new() },
+        if neue_identitaet { ", neue Identitaet unter bekannter Adresse" } else { "" }
+    ));
+    let mut zuletzt: Option<(zugangsphase::Lage, u32)> = None;
+    let ausgang = zugangsphase::fuehren(
+        sock,
+        &mut automat,
+        |d| {
+            // Protokoll: jedes "falsch" einmal (ohne das Passwort).
+            if d.lage == zugangsphase::Lage::Falsch && zuletzt != Some((d.lage, d.runde)) {
+                protokoll::zeile(format!(
+                    "Zugang: Passwort falsch ({}. Mal){}",
+                    d.runde,
+                    match d.warten_s(Instant::now()) {
+                        0 => String::new(),
+                        s => format!(", naechster Versuch fruehestens in {s} s"),
+                    }
+                ));
+            }
+            zuletzt = Some((d.lage, d.runde));
+            let mut s = shared.lock().unwrap();
+            // Getrennt (Nutzer, anderes Ziel, Fenster geschlossen): wie Abbrechen.
+            if s.target.as_deref() != Some(addr) {
+                s.zugang = None;
+                return Some(Eingabe::Abbrechen);
+            }
+            if s.zugang.as_ref() != Some(d) {
+                s.zugang = Some(d.clone());
+            }
+            let e = s.zugang_eingabe.take();
+            if matches!(e, Some(Eingabe::Passwort(_))) && d.lage != zugangsphase::Lage::Pruefen {
+                protokoll::zeile(format!("Zugang: Passwort fuer {} eingegeben - Beweis an den Host", d.name));
+            }
+            e
+        },
+        zugangsphase::RUHE_FRIST,
+    );
+    shared.lock().unwrap().zugang = None;
+    let name = automat.dialog().name.clone();
+    match ausgang {
+        Ausgang::Angenommen { per_passwort } => protokoll::zeile(format!(
+            "Zugang: {name} hat dieses Geraet angenommen ({})",
+            if per_passwort { "Passwort, Beweis des Hosts stimmt" } else { "Zulassen am Host" }
+        )),
+        Ausgang::Abgebrochen => {
+            protokoll::zeile(format!("Zugang: vom Nutzer abgebrochen ({name})"));
+            return Ok(None);
+        }
+        andere => return Err(zugang_meldung(andere, &name, addr)),
+    }
+    // Nach der Annahme folgt "QCH1", dann alles wie bisher.
+    match zugangsphase::kennung_lesen(sock) {
+        Ok(Kennung::Sitzung) => Ok(Some(name)),
+        Ok(k) => Err(Meldung::neu(strings::Key::ErrorProtocol, format!("Zugang: nach der Annahme {k:?} statt QCH1")).bleibend()),
+        Err(a) => Err(zugang_meldung(a, &name, addr)),
+    }
+}
+
+/// Ein Ausgang der Zugangsphase als Meldung fuer den Startbildschirm
+/// (Spezifikation 9.6); der deutsche Text mit Einzelheiten geht ins
+/// Protokoll.
+fn zugang_meldung(a: zugangsphase::Ausgang, name: &str, addr: &str) -> Meldung {
+    use strings::Key::*;
+    use zugangsphase::Ausgang as A;
+    match a {
+        A::Abgelehnt => Meldung::neu(MsgRefused, format!("Zugang: {name} ({addr}) hat abgelehnt")).mit("{n}", name),
+        // Ergebnis 4 nach Fehlversuchen oder mit Wartezeit (auch: kein
+        // Platz frei) heisst "zu viele Versuche"; ohne beides lief die Frist
+        // des Hosts ab - niemand hat geantwortet.
+        A::Schluss { warten_ms, fehlversuche } if warten_ms > 0 || fehlversuche > 0 => Meldung::neu(
+            MsgTooManyAttempts,
+            format!("Zugang: {name} ({addr}) beendet - zu viele Versuche ({fehlversuche} falsch, erneut fruehestens in {warten_ms} ms)"),
+        ),
+        A::Schluss { .. } => {
+            Meldung::neu(MsgNoAnswer, format!("Zugang: {name} ({addr}) beendet - Frist abgelaufen")).mit("{n}", name)
+        }
+        A::HostBeweisFalsch => Meldung::neu(
+            MsgHostProofBad,
+            format!(
+                "Zugang: {name} ({addr}) konnte das Passwort nicht bestaetigen (Beweis des Hosts falsch) - \
+                 moeglicher Angriff, abgebrochen, nichts gemerkt"
+            ),
+        )
+        .mit("{n}", name),
+        A::KeineAntwort => Meldung::neu(MsgNoAnswer, format!("Zugang: keine Antwort von {name} ({addr})")).mit("{n}", name),
+        A::Geschlossen => {
+            Meldung::neu(MsgNoAnswer, format!("Zugang: {name} ({addr}) hat die Leitung geschlossen")).mit("{n}", name)
+        }
+        A::Leitung(g) => {
+            Meldung::neu(MsgNoAnswer, format!("Zugang: Leitung zu {name} ({addr}) unterbrochen - {g}")).mit("{n}", name)
+        }
+        // Eine Nachricht, die nicht passt (falsche Fassung, unerwarteter
+        // Typ): der naechste Versuch saehe dasselbe - und oeffnete am Host
+        // nur eine neue Anfrage. Bleibt also (9.6).
+        A::Protokoll(g) => Meldung::neu(ErrorProtocol, format!("{g} ({addr})")).bleibend(),
+        A::Abgebrochen | A::Angenommen { .. } => {
+            Meldung::neu(ErrorProtocol, format!("Zugang: unerwarteter Ausgang {a:?} ({addr})")).bleibend()
+        }
+    }
+}
+
 fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), Meldung> {
     // Erst der Handschlag, dann erst Nutzdaten. Vorher geht nichts ueber die
     // Leitung, was jemand mitlesen koennte.
     //
-    // known_hosts.txt wird VOR dem Verbinden gelesen: ist sie unlesbar, geht
-    // keine Leitung auf. Den Schluessel des Hosts prueft der Handschlag nach
-    // Nachricht 2, bevor Nachricht 3 den eigenen zeigt - der Host nimmt
-    // diesen Client erst mit Nachricht 3 an und loest dafuer den laufenden
-    // Zuschauer ab. Mit falschem Pin kommt es dazu also nicht mehr.
-    let pin = secure::HostPin::laden(addr)?;
-    let mut sock = secure::Secure::connect_pruefend(addr, &noise::prologue_video(), |k| pin.pruefen(k))?;
+    // hosts.txt wird VOR dem Verbinden gelesen: ist sie unlesbar, geht keine
+    // Leitung auf. Beim Verbinden ueber eine Geraete-ID prueft der Handschlag
+    // nach Nachricht 2, dass der Schluessel des Hosts genau diese ID ergibt,
+    // bevor Nachricht 3 den eigenen zeigt (Spezifikation Pairing v1, 8.2) -
+    // der Host nimmt diesen Client erst mit Nachricht 3 an und loest dafuer
+    // den laufenden Zuschauer ab. Ein anderes Geraet unter der ID kommt so
+    // weit nicht.
+    let (ziel_id, ziel_name) = {
+        let s = shared.lock().unwrap();
+        (s.ziel_id, s.ziel_name.clone())
+    };
+    let hosts_pfad = zugang::ablage_pfad(zugang::HOSTS_DATEI).map_err(|g| Meldung::from(secure::Fehler::Ablage(g)))?;
+    let vorwissen = zugangsphase::Vorwissen::laden(&hosts_pfad, addr, ziel_id).map_err(|f| Meldung::from(secure::Fehler::from(f)))?;
+    let mut sock = secure::Secure::connect_pruefend(addr, &noise::prologue_video(), |k| vorwissen.pruefen(k))?;
     shared.lock().unwrap().abbruch = sock.abbruchgriff();
-    // Erster Kontakt: der Schluessel kommt erst nach dem Handschlag in die Liste.
-    let first = pin.eintragen(&sock.peer)?;
     let fp = sock.peer_fingerprint();
+    // Wie der Host in Meldungen und in hosts.txt heisst, bis er selbst einen
+    // Namen nennt (Nachricht 20): aus der Bekanntgabe, sonst der gemerkte,
+    // sonst die Adresse.
+    let name = ziel_name
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| vorwissen.bekannt(&sock.peer).map(|h| h.name.clone()))
+        .unwrap_or_else(|| addr.to_string());
+    {
+        let mut s = shared.lock().unwrap();
+        s.error = None;
+        s.error_key = None;
+        s.sas = Some(sock.sas.clone());
+        s.peer_fp = Some(fp.clone());
+    }
+    // Kennt der Host dieses Geraet? "QCH1": ja, die Sitzung beginnt. "QCA1":
+    // nein - Zugangsphase (Passwort oder "Zulassen"). Ein Host, der nach dem
+    // Handschlag zumacht, ist eine aeltere Fassung, die dieses Geraet nicht
+    // kennt; einer, der schweigt, antwortet nicht. Beides ist kein Netzfehler,
+    // sondern eine Aussage - und wird nicht alle 2 s wiederholt.
+    sock.lesefrist(Some(zugangsphase::KENNUNG_FRIST));
+    let name = match zugangsphase::kennung_lesen(&mut sock) {
+        Ok(zugangsphase::Kennung::Sitzung) => {
+            // 8.3 ohne Zugangsphase: an dieser Adresse war ein anderer
+            // Schluessel gemerkt, und der Host kennt dieses Geraet schon
+            // (etwa neu aufgesetzt mit alter Geraeteliste). Kein Dauerfehler
+            // (8.4) - aber eine eigene Zeile, damit es nachzulesen ist.
+            if vorwissen.neue_identitaet(&sock.peer) {
+                protokoll::zeile(format!(
+                    "{addr}: neue Identitaet (ID {}, Fingerabdruck {fp}) - unter dieser Adresse war ein anderer Schluessel \
+                     gemerkt; der Host kennt dieses Geraet (QCH1), der neue wird gemerkt, der alte bleibt fuer seine ID",
+                    zugang::id_text(zugang::geraete_id(&sock.peer))
+                ));
+            }
+            name
+        }
+        // Wiederverbinden nach einer angenommenen Sitzung, und der Host
+        // kennt dieses Geraet nicht mehr: keine Anfrage ohne den Nutzer
+        // (siehe Shared::angenommen). Nachricht 23 zieht sie am Host gleich
+        // zurueck; verbindet der Nutzer selbst neu, kommt der Dialog.
+        Ok(zugangsphase::Kennung::Zugang) if shared.lock().unwrap().angenommen => {
+            let _ = sock.write_all(&zugang::Nachricht::Abbruch.kodieren());
+            return Err(Meldung::neu(
+                strings::Key::MsgRefused,
+                format!(
+                    "Zugang: {name} ({addr}) kennt dieses Geraet nach der Sitzung nicht mehr (am Host entfernt?) - \
+                     keine Anfrage ohne den Nutzer, zurueckgezogen"
+                ),
+            )
+            .mit("{n}", name));
+        }
+        Ok(zugangsphase::Kennung::Zugang) => match zugang_durchlaufen(&mut sock, shared, &vorwissen, &name, addr)? {
+            Some(n) => n,
+            // Der Nutzer hat abgebrochen: zurueck zum Startbildschirm, ohne Meldung.
+            None => return Ok(()),
+        },
+        // Nach einem Handschlag mit dem Prolog von QuadChroma etwas anderes
+        // als QCH1/QCA1: eine Fassung, die dieser Client nicht versteht.
+        // Das gibt sich mit dem naechsten Versuch nicht (9.6).
+        Ok(zugangsphase::Kennung::Fremd(k)) => {
+            return Err(Meldung::neu(
+                strings::Key::ErrorProtocol,
+                format!("Gegenstelle spricht ein anderes Protokoll (Kennung {k:02x?} statt QCH1/QCA1)"),
+            )
+            .bleibend())
+        }
+        Err(zugangsphase::Ausgang::KeineAntwort) => {
+            return Err(Meldung::neu(
+                strings::Key::MsgNoAnswer,
+                format!("{addr}: keine Antwort nach dem Handschlag (Frist {} s)", zugangsphase::KENNUNG_FRIST.as_secs_f32()),
+            )
+            .mit("{n}", name))
+        }
+        // Sauber zugemacht (EOF): so antwortet eine aeltere Fassung einem
+        // Geraet, das sie nicht kennt.
+        Err(zugangsphase::Ausgang::Geschlossen) => {
+            return Err(Meldung::neu(
+                strings::Key::MsgHostOutdated,
+                format!(
+                    "{addr} hat die Leitung nach dem Handschlag geschlossen - aeltere QuadChroma-Fassung, \
+                     die dieses Geraet nicht kennt (weder QCH1 noch QCA1)"
+                ),
+            )
+            .mit("{n}", name))
+        }
+        // Zurueckgesetzt, Datensatz nicht echt, sonst gestoert: kein Beleg
+        // fuer eine alte Fassung (etwa ein Host, der gerade neu startet) -
+        // ein Leitungsfehler wie jeder andere, der naechste Versuch darf.
+        Err(a) => {
+            let grund = match a {
+                zugangsphase::Ausgang::Leitung(g) => g,
+                andere => format!("{andere:?}"),
+            };
+            return Err(Meldung::neu(strings::Key::ConnectionLost, format!("{addr}: Leitung nach dem Handschlag gestoert - {grund}")));
+        }
+    };
+    sock.lesefrist(None);
+    // Erst jetzt, nach der Annahme, wird der Host gepinnt (8.1) - mit ID,
+    // Schluessel, Adresse und Namen. Scheitert das Schreiben, laeuft die
+    // Sitzung trotzdem: der Host hat entschieden, der Eintrag ist nur das
+    // Gedaechtnis dieses Geraets (Haken, Suche ueber die ID).
+    match zugangsphase::pinnen(&hosts_pfad, &sock.peer, addr, &name) {
+        Ok(true) => {
+            protokoll::zeile(format!(
+                "hosts.txt: {name} (ID {}) unter {addr} gemerkt",
+                zugang::id_text(zugang::geraete_id(&sock.peer))
+            ));
+            shared.lock().unwrap().hosts_stand += 1;
+        }
+        Ok(false) => {}
+        Err(e) => protokoll::zeile(format!("hosts.txt: {name} nicht gemerkt - {e}")),
+    }
     // Dateien: je Sitzung eine Nummer, gegen die Sender und Empfaenger ihren
     // Stand melden; die Faehigkeit des Hosts gilt erst mit MSG_FAEHIGKEITEN
     // dieser Sitzung.
     let (sitzung, alt) = {
         let mut s = shared.lock().unwrap();
         s.connected = true;
+        s.angenommen = true;
         s.error = None;
         s.error_key = None;
+        // Die Bindung fuer den Eingabekanal erst jetzt: vor der Annahme
+        // wiese ihn der Host ohnehin ab (und protokollierte jeden Versuch).
         s.link = Some((sock.handshake_hash.clone(), sock.peer.clone()));
-        s.sas = Some(sock.sas.clone());
-        s.peer_fp = Some(fp.clone());
-        s.first_time = first;
         // Die Liste des vorigen Hosts hat hier nichts mehr zu suchen; die
         // neue kommt gleich nach dem Gruss. Ebenso seine Strominfo: bis die
         // neue da ist, zeigen Statistik und Wartebild sonst die Masse des
@@ -2115,20 +2453,6 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // faellt er mit dieser Funktion weg, bricht er ab und loescht, was halb da ist.
     let mut empfaenger: Option<dateien::Empfaenger> = None;
 
-    // Weist der Host das Geraet ab, macht er die Leitung gleich nach dem
-    // Handschlag zu. Das ist kein Netzfehler, sondern eine Aussage - also
-    // sagen wir es dem Nutzer auch so.
-    let mut magic = [0u8; 4];
-    if sock.read_exact(&mut magic).is_err() {
-        shared.lock().unwrap().error_key = Some(strings::Key::NotPaired);
-        return Err(Meldung::neu(
-            strings::Key::NotPaired,
-            "Host hat die Leitung nach dem Handschlag geschlossen - dieses Geraet ist dort nicht gekoppelt",
-        ));
-    }
-    if &magic != MAGIC {
-        return Err(Meldung::neu(strings::Key::ErrorProtocol, "Gegenstelle spricht ein anderes Protokoll"));
-    }
     // Erst jetzt ist es eine Sitzung: der Host hat dieses Geraet angenommen.
     #[cfg(any(windows, target_os = "macos"))]
     clipboard::sitzung(true);
@@ -4929,6 +5253,93 @@ const MIT_VERKNUEPFUNG: bool = cfg!(windows);
 /// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
 const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
 
+/// Den Knopf "Diesen PC freigeben" gibt es nur unter Windows: dort ist die
+/// Host-Rolle dieselbe exe (Spezifikation Pairing v1, 9.5 und 10.1).
+const MIT_FREIGABE: bool = cfg!(windows);
+/// So oft sieht der Startbildschirm nach, ob eine Host-Rolle laeuft.
+const FREIGABE_TAKT: Duration = Duration::from_secs(1);
+/// So lange nach dem Klick gilt die Freigabe als laufend, auch bevor die
+/// neue Host-Rolle ihren Mutex angelegt hat - kein zweiter Start.
+const FREIGABE_ANLAUF: Duration = Duration::from_secs(5);
+/// Mutex der Host-Rolle (ihre Einzelinstanz, Spezifikation 10.1).
+#[cfg(windows)]
+const HOST_MUTEX: &str = "Local\\QuadChroma-Host";
+
+/// Laeuft in dieser Nutzersitzung eine Host-Rolle? Sie haelt den Mutex
+/// HOST_MUTEX, solange sie laeuft.
+#[cfg(windows)]
+fn host_rolle_laeuft() -> bool {
+    mutex_da(HOST_MUTEX)
+}
+
+/// Gibt es diesen benannten Mutex? Verweigert das System den Zugriff (etwa
+/// eine Host-Rolle mit erhoehten Rechten), gibt es ihn ebenfalls.
+#[cfg(windows)]
+fn mutex_da(name: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) } {
+        Ok(h) => {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            true
+        }
+        Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+    }
+}
+
+#[cfg(not(windows))]
+fn host_rolle_laeuft() -> bool {
+    false
+}
+
+/// Startet die Host-Rolle: dieselbe exe mit --host als eigener Prozess
+/// (erlaubt: ein zweiter Prozess derselben exe im Host-Modus). Die exe ist
+/// ein GUI-Programm, ein Konsolenfenster entsteht ohnehin nicht;
+/// DETACHED_PROCESS trennt sie zudem von einer Konsole, an der der Client
+/// haengt, eine eigene Prozessgruppe von dessen Strg+C. Ein- und Ausgaben
+/// gehen ins Leere - die Host-Rolle schreibt host-protokoll.txt. Liefert
+/// die Prozessnummer.
+#[cfg(windows)]
+fn host_rolle_starten() -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
+    let kind = Command::new(exe)
+        .arg("--host")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(kind.id())
+}
+
+#[cfg(not(windows))]
+fn host_rolle_starten() -> Result<u32, String> {
+    Err("die Host-Rolle gibt es nur unter Windows".into())
+}
+
+/// Einfuegen in eigene Felder: Strg+V unter Windows, Cmd+V auf dem Mac.
+const MOD_EINFUEGEN: u32 = if cfg!(target_os = "macos") { MOD_CMD } else { MOD_CTRL };
+
+/// Text aus der Zwischenablage fuer ein eigenes Feld (Adresse, Passwort).
+fn einfuegen_holen() -> Option<String> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        clipboard::text_einfuegen()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// So oft wird der Stand des Symbols (Menue, Tooltip) neu berechnet.
 const TRAY_TAKT: Duration = Duration::from_millis(500);
 
@@ -5059,9 +5470,26 @@ struct App {
     /// laeuft.
     letzter_gpu_fehler: Option<String>,
     shown: u64,
-    /// Beim ersten Kontakt mit einem Host steht der Vergleichscode eine Weile
-    /// gross im Bild - genau dann kann man ihn noch pruefen.
-    banner_until: Option<Instant>,
+    /// Zugangsdialog (Spezifikation Pairing v1, 9.3): das eingetippte
+    /// Passwort, die Schreibmarke (in Zeichen), ob es lesbar gezeigt wird,
+    /// und die Runde des Dialogs, zu der es gehoert - nach "falsch" wird es
+    /// geleert. Es bleibt im Fensterfaden; hinaus geht nur der Beweis.
+    zugang_pw: String,
+    zugang_caret: usize,
+    zugang_zeigen: bool,
+    zugang_runde: Option<u32>,
+    /// Bekannte Hosts aus hosts.txt (Haken im Startbildschirm, Suche ueber
+    /// die ID), und zu welchem `Shared::hosts_stand` sie gelesen wurden.
+    bekannte: zugang::Hostliste,
+    bekannte_stand: Option<u64>,
+    /// Start ueber eine ID ohne Adresse (Befehlszeile): seit wann auf ihre
+    /// Bekanntgabe gewartet wird.
+    id_ausstehend: Option<(u32, Instant)>,
+    /// "Diesen PC freigeben" (nur Windows, 9.5): laeuft eine Host-Rolle, wann
+    /// zuletzt nachgesehen, und wann der Knopf sie gestartet hat.
+    freigabe: bool,
+    freigabe_geprueft: Option<Instant>,
+    freigabe_gestartet: Option<Instant>,
     /// Gespeicherte Einstellungen. Was hier steht, ueberlebt den Neustart.
     cfg: einstellungen::Einstellungen,
     /// Fuer welchen Host die gespeicherten Werte schon geschickt wurden.
@@ -5351,22 +5779,25 @@ impl ApplicationHandler<Benutzer> for App {
                 use winit::keyboard::KeyCode as KC;
                 let pressed = event.state == winit::event::ElementState::Pressed;
 
-                // Startbildschirm: Adresse eintippen
+                // Startbildschirm: Adresse, Name oder Geraete-ID eintippen
                 if self.screen == Screen::Start {
                     if !pressed { return; }
                     if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
                         match code {
                             KC::Backspace => { self.addr_input.pop(); return; }
                             KC::Enter | KC::NumpadEnter => {
-                                if !self.addr_input.is_empty() {
-                                    let a = adresse_vollstaendig(&self.addr_input);
-                                    self.input.lock().unwrap().set_addr(bump_port(&a, 1));
-                                    let mut sh = self.shared.lock().unwrap();
-                                    sh.target = Some(a);
-                                    sh.error = None;
-                                    sh.error_key = None;
-                                    drop(sh);
-                                    self.screen = Screen::Session;
+                                let text = self.addr_input.clone();
+                                self.eingabe_verbinden(&text);
+                                return;
+                            }
+                            // Einfuegen (Strg+V bzw. Cmd+V): etwa eine kopierte
+                            // ID; ohne Zeilenwechsel und Steuerzeichen.
+                            KC::KeyV if self.mods & MOD_EINFUEGEN != 0 => {
+                                if let Some(t) = einfuegen_holen() {
+                                    for ch in t.trim().chars().filter(|c| !c.is_control()) {
+                                        if self.addr_input.len() + ch.len_utf8() > 64 { break; }
+                                        self.addr_input.push(ch);
+                                    }
                                 }
                                 return;
                             }
@@ -5382,11 +5813,20 @@ impl ApplicationHandler<Benutzer> for App {
                             _ => {}
                         }
                     }
+                    // Cmd+Taste ist auf dem Mac ein Kuerzel, kein Text.
+                    if cfg!(target_os = "macos") && self.mods & MOD_CMD != 0 { return; }
                     if let Some(t) = &event.text {
                         for ch in t.chars() {
                             if !ch.is_control() && self.addr_input.len() < 64 { self.addr_input.push(ch); }
                         }
                     }
+                    return;
+                }
+
+                // Zugangsdialog offen: die Tastatur gehoert ihm - nichts geht
+                // an den Host, auch ESC und die F-Tasten nicht (9.3).
+                if self.zugang_offen() {
+                    self.zugang_taste(&event);
                     return;
                 }
 
@@ -5597,10 +6037,53 @@ impl ApplicationHandler<Benutzer> for App {
         // steht dort, und verbinden geht wieder nur auf Wunsch. Den
         // Eingabekanal hat der Host schon zu und die Tasten losgelassen:
         // erst die Bindung loesen, dann geht beim Trennen nichts mehr hin.
-        if self.screen == Screen::Session && self.shared.lock().unwrap().target.is_none() {
-            self.input.lock().unwrap().set_link(None);
-            self.verbindung_trennen();
+        //
+        // Hat der Empfangsfaden das Ziel ueber seine ID unter einer neuen
+        // Adresse gefunden, zeigt das Wartebild die neue.
+        if self.screen == Screen::Session && self.id_ausstehend.is_none() {
+            let ziel = self.shared.lock().unwrap().target.clone();
+            match ziel {
+                None => {
+                    self.input.lock().unwrap().set_link(None);
+                    self.verbindung_trennen();
+                }
+                Some(t) if t != self.addr_input => self.addr_input = t,
+                Some(_) => {}
+            }
         }
+        // Der Zugangsdialog haelt die Tastatur - also muss er zu sehen sein:
+        // steht noch ein Bild einer vorigen Sitzung, weicht es dem
+        // Wartebildschirm, auf dem er liegt (sonst tippte der Nutzer
+        // ungesehen in ein Passwortfeld). Ist er zu, ist auch sein Passwort
+        // vergessen - ein spaeterer Dialog beginnt mit einem leeren Feld.
+        if self.screen == Screen::Session {
+            let offen = self.shared.lock().unwrap().zugang.is_some();
+            if offen && self.bild_vorhanden() {
+                self.last_frame = None;
+                self.bild_da = None;
+                self.ui_kasten_alt = None;
+            }
+            if !offen && (self.zugang_runde.is_some() || !self.zugang_pw.is_empty()) {
+                self.zugang_leeren();
+            }
+        }
+        // Start ueber eine ID ohne Adresse: verbinden, sobald sie sich im Netz
+        // meldet; nach ID_SUCHE zurueck zum Startbildschirm mit Meldung (9.2).
+        if let Some((id, seit)) = self.id_ausstehend {
+            let g = self.hosts.lock().ok().and_then(|h| h.mit_id(id));
+            if let Some(g) = g {
+                self.verbinden(Ziel { adresse: g.host.addr.to_string(), id: Some(id), name: Some(g.host.name) });
+            } else if seit.elapsed() >= ID_SUCHE {
+                self.id_ausstehend = None;
+                self.screen = Screen::Start;
+                self.meldung_zeigen(
+                    Meldung::neu(strings::Key::MsgIdNotFound, format!("Start: ID {} meldet sich nicht im Netz", zugang::id_text(id)))
+                        .mit("{i}", zugang::id_text(id)),
+                );
+            }
+        }
+        // Windows: laeuft eine Host-Rolle? (Knopf "Diesen PC freigeben")
+        self.freigabe_nachsehen();
 
         // Nachgereichtes ESC-Loslassen.
         if let Some(t) = self.esc_up_faellig {
@@ -5892,12 +6375,22 @@ impl App {
     }
 
     fn verbindung_trennen(&mut self) {
+        self.trennen(true);
+    }
+
+    /// Wie `verbindung_trennen`. `kappen` false laesst die Bildleitung
+    /// offen: beim Abbrechen im Zugangsdialog schickt der Empfangsfaden noch
+    /// Nachricht 23 und schliesst dann selbst (er sieht binnen eines Takts,
+    /// dass das Ziel weg ist).
+    fn trennen(&mut self, kappen: bool) {
         // Ein laufender Benchmark endet mit der Verbindung; wiederherstellen
         // gibt es nichts mehr, nur das Testbild geht noch aus.
         self.benchmark_abbrechen(false);
+        self.id_ausstehend = None;
         let (griff, datei) = {
             let mut s = self.shared.lock().unwrap();
             s.target = None;
+            s.angenommen = false;
             // Eine laufende Datei-Sendung sofort ab (der Empfaenger bricht
             // mit dem Ende von run_session ab).
             (s.abbruch.take(), s.dateien_zuruecksetzen())
@@ -5908,7 +6401,7 @@ impl App {
             l.alle_loslassen();
             l.trennen();
         }
-        if let Some(g) = griff {
+        if let Some(g) = griff.filter(|_| kappen) {
             let _ = g.shutdown(std::net::Shutdown::Both);
         }
         self.hud_offen = false;
@@ -5916,7 +6409,7 @@ impl App {
         self.last_frame = None;
         self.bild_da = None;
         self.ui_kasten_alt = None;
-        self.banner_until = None;
+        self.zugang_leeren();
         if self.zeiger_eigen {
             if let Some(w) = &self.window {
                 w.set_cursor(CursorIcon::Default);
@@ -5928,31 +6421,99 @@ impl App {
         self.angewandt_fuer = None;
     }
 
-    /// Mit einer Adresse verbinden: Port ergaenzen, Eingabekanal und Ziel
-    /// setzen, alte Meldungen weg, in die Sitzung. Derselbe Weg fuer den
-    /// Klick auf dem Startbildschirm und die Weitergabe eines zweiten Starts.
-    fn verbinden(&mut self, addr: &str) {
-        let addr = adresse_vollstaendig(addr);
+    /// Mit einem Ziel verbinden: Port ergaenzen, Eingabekanal und Ziel samt
+    /// ID und Name setzen, alte Meldungen weg, in die Sitzung. Derselbe Weg
+    /// fuer den Klick auf dem Startbildschirm, das Symbol und die Weitergabe
+    /// eines zweiten Starts.
+    fn verbinden(&mut self, ziel: Ziel) {
+        let addr = adresse_vollstaendig(&ziel.adresse);
         self.addr_input = addr.clone();
         let input_addr = bump_port(&addr, 1);
         self.input.lock().unwrap().set_addr(input_addr);
         let mut s = self.shared.lock().unwrap();
         s.target = Some(addr);
+        s.ziel_id = ziel.id;
+        s.ziel_name = ziel.name;
+        s.angenommen = false;
         s.error = None;
         s.error_key = None;
+        s.zugang_eingabe = None;
         drop(s);
+        self.id_ausstehend = None;
+        self.zugang_leeren();
         self.screen = Screen::Session;
     }
 
+    /// Was im Adressfeld steht, verbinden (Knopf, Enter): eine Geraete-ID
+    /// wird unter den gefundenen Hosts und in hosts.txt gesucht (9.2); ist
+    /// sie nirgends, steht die Meldung auf dem Startbildschirm.
+    fn eingabe_verbinden(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.bekannte_nachladen(true);
+        let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
+        match ziel_aus_eingabe(text, &gefunden, &self.bekannte) {
+            Ok(z) => self.verbinden(z),
+            Err(m) => self.meldung_zeigen(m),
+        }
+    }
+
+    /// Eine Meldung auf dem Startbildschirm (ohne Verbindung), samt Protokoll.
+    fn meldung_zeigen(&mut self, m: Meldung) {
+        protokoll::zeile(m.protokoll.clone());
+        let mut s = self.shared.lock().unwrap();
+        s.error_key = None;
+        s.error = Some(m);
+    }
+
+    /// hosts.txt neu lesen, wenn der Empfangsfaden sie geaendert hat (oder
+    /// `erzwingen`) - fuer die Haken der Hostliste und die Suche ueber die ID.
+    fn bekannte_nachladen(&mut self, erzwingen: bool) {
+        let stand = self.shared.lock().unwrap().hosts_stand;
+        if !erzwingen && self.bekannte_stand == Some(stand) {
+            return;
+        }
+        self.bekannte_stand = Some(stand);
+        self.bekannte = zugang::ablage_pfad(zugang::HOSTS_DATEI)
+            .ok()
+            .and_then(|p| zugang::Hostliste::laden(&p).ok())
+            .unwrap_or_default();
+    }
+
+    /// Ein Ziel aus Adresse und/oder ID mit dem, was gerade im Netz und in
+    /// hosts.txt steht (siehe `ziel_bilden`).
+    fn ziel(&mut self, adresse: &str, id: Option<u32>) -> Result<Ziel, Meldung> {
+        self.bekannte_nachladen(true);
+        let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
+        ziel_bilden(adresse, id, &gefunden, &self.bekannte)
+    }
+
     /// Ein zweiter Start hat sich gemeldet (einzel.rs): Fenster sichtbar und
-    /// nach vorn; mit Adresse verbinden wie ein Klick auf "Verbinden". Eine
-    /// Sitzung zu einem anderen Host wird vorher getrennt, eine zum selben
-    /// bleibt bestehen - der Doppelklick auf die Verknuepfung soll sie nicht
-    /// abloesen.
-    fn einzel_empfangen(&mut self, adresse: &str) {
+    /// nach vorn; mit Adresse (und ID, aus einer Verknuepfung) verbinden wie
+    /// ein Klick auf "Verbinden". Eine Sitzung zu einem anderen Host wird
+    /// vorher getrennt, eine zum selben bleibt bestehen - der Doppelklick auf
+    /// die Verknuepfung soll sie nicht abloesen.
+    fn einzel_empfangen(&mut self, text: &str) {
         self.fenster_zeigen();
+        let (adresse, id) = ziel_lesen(text);
+        if adresse.is_empty() && id.is_none() {
+            protokoll::zeile("Einzelinstanz: zweiter Start ohne Adresse - Fenster nach vorn".into());
+            return;
+        }
+        let ziel = match self.ziel(&adresse, id) {
+            Ok(z) => z,
+            Err(m) => {
+                if self.screen == Screen::Start {
+                    self.meldung_zeigen(m);
+                } else {
+                    protokoll::zeile(format!("Einzelinstanz: zweiter Start - {}", m.protokoll));
+                }
+                return;
+            }
+        };
         let sitzung = (self.screen == Screen::Session).then_some(self.addr_input.as_str());
-        match einzel_folge(sitzung, adresse) {
+        match einzel_folge(sitzung, &ziel.adresse) {
             EinzelFolge::NachVorn => {
                 protokoll::zeile("Einzelinstanz: zweiter Start ohne Adresse - Fenster nach vorn".into());
             }
@@ -5961,13 +6522,165 @@ impl App {
             }
             EinzelFolge::Verbinden(a) => {
                 protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {a} - verbinde"));
-                self.verbinden(&a);
+                self.verbinden(ziel);
             }
             EinzelFolge::Wechseln(a) => {
                 protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {a} - trenne {} und verbinde neu", self.addr_input));
                 self.verbindung_trennen();
-                self.verbinden(&a);
+                self.verbinden(ziel);
             }
+        }
+    }
+
+    /// Den Zugangsdialog vergessen: Passwort, Schreibmarke, "Anzeigen".
+    fn zugang_leeren(&mut self) {
+        self.zugang_pw.clear();
+        self.zugang_caret = 0;
+        self.zugang_zeigen = false;
+        self.zugang_runde = None;
+    }
+
+    /// Ist der Zugangsdialog offen? Dann gehoert ihm die Tastatur.
+    fn zugang_offen(&self) -> bool {
+        self.screen == Screen::Session && self.shared.lock().unwrap().zugang.is_some()
+    }
+
+    /// "Verbinden" im Zugangsdialog (Knopf oder Enter): das Passwort geht an
+    /// den Empfangsfaden, der daraus den Beweis baut - nur mit Passwort und
+    /// nach der Wartezeit der Drossel.
+    fn zugang_senden(&mut self) {
+        let mut s = self.shared.lock().unwrap();
+        let Some(d) = s.zugang.as_ref() else { return };
+        if self.zugang_pw.is_empty() || !d.darf_senden(Instant::now()) {
+            return;
+        }
+        s.zugang_eingabe = Some(zugangsphase::Eingabe::Passwort(self.zugang_pw.clone()));
+    }
+
+    /// "Abbrechen" im Zugangsdialog (oder Esc): zurueck zum Startbildschirm,
+    /// ohne Meldung. Nachricht 23 schickt der Empfangsfaden - deshalb wird die
+    /// Leitung hier nicht gekappt.
+    fn zugang_abbrechen(&mut self) {
+        self.shared.lock().unwrap().zugang_eingabe = Some(zugangsphase::Eingabe::Abbrechen);
+        self.trennen(false);
+    }
+
+    /// Text an der Schreibmarke ins Passwortfeld (Tippen, Einfuegen). Ohne
+    /// Steuerzeichen - ein eingefuegter Zeilenwechsel gehoert nicht dazu -
+    /// und hoechstens PASSWORT_MAX Byte.
+    fn zugang_einfuegen(&mut self, t: &str) {
+        for ch in t.chars().filter(|c| !c.is_control()) {
+            if self.zugang_pw.len() + ch.len_utf8() > zugang::PASSWORT_MAX {
+                break;
+            }
+            let i = self.zugang_pw.char_indices().nth(self.zugang_caret).map(|(i, _)| i).unwrap_or(self.zugang_pw.len());
+            self.zugang_pw.insert(i, ch);
+            self.zugang_caret += 1;
+        }
+    }
+
+    /// Eine Taste im offenen Zugangsdialog (9.3): Tippen, Einfuegen,
+    /// Schreibmarke, Enter = Verbinden, Esc = Abbrechen. Nichts davon geht
+    /// an den Host - auch kein ESC-Halten fuer das Menue.
+    fn zugang_taste(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{KeyCode as KC, PhysicalKey};
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+        let n = self.zugang_pw.chars().count();
+        self.zugang_caret = self.zugang_caret.min(n);
+        let byte = |s: &str, i: usize| s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len());
+        if let PhysicalKey::Code(code) = event.physical_key {
+            match code {
+                KC::Enter | KC::NumpadEnter => return self.zugang_senden(),
+                KC::Escape => return self.zugang_abbrechen(),
+                KC::Backspace => {
+                    if self.zugang_caret > 0 {
+                        self.zugang_caret -= 1;
+                        let i = byte(&self.zugang_pw, self.zugang_caret);
+                        self.zugang_pw.remove(i);
+                    }
+                    return;
+                }
+                KC::Delete => {
+                    if self.zugang_caret < n {
+                        let i = byte(&self.zugang_pw, self.zugang_caret);
+                        self.zugang_pw.remove(i);
+                    }
+                    return;
+                }
+                KC::ArrowLeft => {
+                    self.zugang_caret = self.zugang_caret.saturating_sub(1);
+                    return;
+                }
+                KC::ArrowRight => {
+                    self.zugang_caret = (self.zugang_caret + 1).min(n);
+                    return;
+                }
+                KC::Home => {
+                    self.zugang_caret = 0;
+                    return;
+                }
+                KC::End => {
+                    self.zugang_caret = n;
+                    return;
+                }
+                KC::KeyV if self.mods & MOD_EINFUEGEN != 0 => {
+                    if let Some(t) = einfuegen_holen() {
+                        self.zugang_einfuegen(&t);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Cmd+Taste ist auf dem Mac ein Kuerzel, kein Text.
+        if cfg!(target_os = "macos") && self.mods & MOD_CMD != 0 {
+            return;
+        }
+        if let Some(t) = &event.text {
+            let t = t.to_string();
+            self.zugang_einfuegen(&t);
+        }
+    }
+
+    /// "Diesen PC freigeben": Stand des Knopfs - None ausser unter Windows,
+    /// Some(true), solange eine Host-Rolle laeuft oder gerade gestartet wurde.
+    fn freigabe_anzeige(&self) -> Option<bool> {
+        MIT_FREIGABE.then(|| self.freigabe || self.freigabe_gestartet.is_some_and(|t| t.elapsed() < FREIGABE_ANLAUF))
+    }
+
+    /// Etwa einmal je Sekunde, nur auf dem sichtbaren Startbildschirm:
+    /// laeuft eine Host-Rolle (Mutex der Host-Rolle, Paket P5)?
+    fn freigabe_nachsehen(&mut self) {
+        if !MIT_FREIGABE || self.screen != Screen::Start || self.verborgen {
+            return;
+        }
+        if self.freigabe_geprueft.is_some_and(|t| t.elapsed() < FREIGABE_TAKT) {
+            return;
+        }
+        self.freigabe_geprueft = Some(Instant::now());
+        let laeuft = host_rolle_laeuft();
+        if laeuft != self.freigabe {
+            protokoll::zeile(format!("Freigabe: Host-Rolle {}", if laeuft { "laeuft" } else { "laeuft nicht (mehr)" }));
+        }
+        self.freigabe = laeuft;
+    }
+
+    /// Knopf "Diesen PC freigeben" (9.5): dieselbe exe als zweiter Prozess
+    /// mit --host, ohne Konsolenfenster. Sie laeuft unabhaengig weiter, auch
+    /// wenn der Client endet; ihre Oberflaeche ist das Symbol im Infobereich.
+    fn freigabe_starten(&mut self) {
+        if self.freigabe_anzeige() != Some(false) {
+            return;
+        }
+        match host_rolle_starten() {
+            Ok(pid) => {
+                protokoll::zeile(format!("Freigabe: Host-Rolle gestartet (Prozess {pid})"));
+                self.freigabe_gestartet = Some(Instant::now());
+                self.freigabe_geprueft = None;
+            }
+            Err(e) => protokoll::zeile(format!("Freigabe: Host-Rolle nicht gestartet - {e}")),
         }
     }
 
@@ -6060,23 +6773,33 @@ impl App {
         match befehl {
             tray::Befehl::Oeffnen => self.fenster_zeigen(),
             tray::Befehl::Verbinden(adresse) => {
-                // Wie ein Klick auf die Hostzeile: eine Sitzung zum selben
-                // Host bleibt, eine zu einem anderen wird vorher getrennt.
+                // Wie ein Klick auf die Hostzeile (mit der ID, die der Host
+                // unter dieser Adresse meldet): eine Sitzung zum selben Host
+                // bleibt, eine zu einem anderen wird vorher getrennt.
                 self.fenster_zeigen();
+                let id = self
+                    .hosts
+                    .lock()
+                    .map(|h| h.liste())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|g| g.host.addr.to_string() == adresse)
+                    .and_then(|g| g.id);
+                let ziel = self.ziel(&adresse, id).unwrap_or_else(|_| Ziel { adresse: adresse.clone(), ..Ziel::default() });
                 let sitzung = (self.screen == Screen::Session).then_some(self.addr_input.as_str());
-                match einzel_folge(sitzung, &adresse) {
+                match einzel_folge(sitzung, &ziel.adresse) {
                     EinzelFolge::NachVorn => {}
                     EinzelFolge::Bleibt(a) => {
                         protokoll::zeile(format!("{}: Verbinden mit {a} - Sitzung dorthin laeuft schon", tray::ORT));
                     }
                     EinzelFolge::Verbinden(a) => {
                         protokoll::zeile(format!("{}: verbinde mit {a}", tray::ORT));
-                        self.verbinden(&a);
+                        self.verbinden(ziel);
                     }
                     EinzelFolge::Wechseln(a) => {
                         protokoll::zeile(format!("{}: trenne {} und verbinde mit {a}", tray::ORT, self.addr_input));
                         self.verbindung_trennen();
-                        self.verbinden(&a);
+                        self.verbinden(ziel);
                     }
                 }
             }
@@ -6138,14 +6861,14 @@ impl App {
     /// Desktop-Verknuepfung fuer einen Host anlegen; das Ergebnis steht 6 s
     /// im Meldungsbereich bzw. im Reiter. Laeuft im Fensterfaden: dort hat
     /// winit COM (STA) schon eingerichtet.
-    fn verknuepfung_anlegen(&mut self, adresse: &str, name: &str) {
+    fn verknuepfung_anlegen(&mut self, adresse: &str, id: Option<u32>, name: &str) {
         use strings::Key::*;
         let adresse = adresse_vollstaendig(adresse);
         #[cfg(windows)]
-        let ergebnis = verknuepfung::verknuepfung_anlegen(None, &adresse, name, self.lang);
+        let ergebnis = verknuepfung::verknuepfung_anlegen(None, &adresse, id, name, self.lang);
         #[cfg(not(windows))]
         let ergebnis: Result<std::path::PathBuf, String> = {
-            let _ = name;
+            let _ = (name, id);
             Err("nur unter Windows".into())
         };
         let m = match ergebnis {
@@ -6209,7 +6932,6 @@ impl App {
             || self.esc_seit.is_some()
             || lage
             || wechsel
-            || self.banner_until.map(|t| Instant::now() < t).unwrap_or(false)
     }
 
     /// Einmal je Sekunde: Bildrate, Verlauf der Verzoegerung, Fenstertitel.
@@ -6419,15 +7141,6 @@ impl App {
                     self.shown += 1;
                 }
                 Err(e) => self.gpu_fehler(g, e)?,
-            }
-        }
-        // Erstkontakt: die Frist fuer das Banner beginnt mit dem ersten Bild.
-        // Auf dem CPU-Weg setzt sie oberflaeche_zeichnen - das laeuft hier
-        // aber nur, wenn schon etwas sichtbar ist, und ohne Frist waere das
-        // Banner nie sichtbar geworden.
-        if self.screen == Screen::Session && self.bild_vorhanden() && self.banner_until.is_none() {
-            if self.shared.lock().unwrap().first_time {
-                self.banner_until = Some(Instant::now() + Duration::from_secs(25));
             }
         }
         self.sekundentakt(window);
@@ -6641,19 +7354,17 @@ impl App {
         self.ui.click = false;
     }
 
-    /// Alles, was ueber dem Bild liegt: Startbildschirm, Wartebildschirm,
-    /// Lagemeldung, Statistik, Erstkontakt-Banner, Zeile zu Dateien, Menue,
+    /// Alles, was ueber dem Bild liegt: Startbildschirm, Wartebildschirm samt
+    /// Zugangsdialog, Lagemeldung, Statistik, Zeile zu Dateien, Menue,
     /// Codecwechsel-Hinweis, ESC-Balken. Zeichnet nur; was ein Klick bewirkt, kommt als
     /// Nachwirkung zurueck und wird NACH dem Praesentieren ausgefuehrt.
     fn oberflaeche_zeichnen(&mut self, c: &mut ui::Canvas, ww: u32, wh: u32) -> Nachwirkung {
-        let mut n = Nachwirkung { act: Action::None, hud: None, abbrechen: false };
+        let mut n = Nachwirkung { act: Action::None, hud: None, abbrechen: false, zugang: ZugangAktion::Nichts };
         match self.screen {
             Screen::Start => {
-                let hosts = self
-                    .hosts
-                    .lock()
-                    .map(|h| h.list())
-                    .unwrap_or_default();
+                self.bekannte_nachladen(false);
+                let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
+                let zeilen = hostzeilen(&gefunden, &self.bekannte);
                 let err = {
                     let s = self.shared.lock().unwrap();
                     match s.error_key {
@@ -6662,24 +7373,50 @@ impl App {
                     }
                 };
                 let hinweis = self.verknuepfung_hinweis();
+                let freigabe = self.freigabe_anzeige();
                 n.act = start_screen(
-                    &mut self.ui, c, self.lang, &hosts, &self.addr_input, err.as_deref(),
-                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl,
+                    &mut self.ui, c, self.lang, &zeilen, &self.addr_input, err.as_deref(),
+                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl, freigabe,
                 );
             }
             Screen::Session => {
                 // Noch kein Bild da: Wartebildschirm zeichnen statt gar nichts.
                 if !self.bild_vorhanden() {
-                    let stand = {
+                    let (stand, dialog) = {
                         let s = self.shared.lock().unwrap();
                         let f = match s.error_key {
                             Some(k) => Some(self.lang.get(k).to_string()),
                             None => s.error.as_ref().map(|m| m.text(self.lang)),
                         };
-                        (s.connected, f, s.sas.clone(), s.info.is_some())
+                        ((s.connected, f, s.sas.clone(), s.info.is_some()), s.zugang.clone())
                     };
-                    let adresse = self.addr_input.clone();
+                    // Offener Zugangsdialog: er liegt ueber allem und bekommt
+                    // Maus und Klick allein (wie die Sprachwahl).
+                    let (maus, klick) = (self.ui.mouse, self.ui.click);
+                    if dialog.is_some() {
+                        self.ui.mouse = (-10_000, -10_000);
+                        self.ui.click = false;
+                    }
+                    let adresse = match self.id_ausstehend {
+                        Some((id, _)) => self.lang.get(strings::Key::StartId).replace("{i}", &zugang::id_text(id)),
+                        None => self.addr_input.clone(),
+                    };
                     n.abbrechen = warte_screen(&mut self.ui, c, self.lang, &adresse, stand);
+                    self.ui.mouse = maus;
+                    self.ui.click = klick;
+                    if let Some(d) = dialog {
+                        // Nach "falsch" ist das Feld wieder leer.
+                        if self.zugang_runde != Some(d.runde) {
+                            if self.zugang_runde.is_some() {
+                                self.zugang_pw.clear();
+                                self.zugang_caret = 0;
+                            }
+                            self.zugang_runde = Some(d.runde);
+                        }
+                        n.zugang = zugang_zeichnen(
+                            &mut self.ui, c, self.lang, &d, &self.zugang_pw, self.zugang_caret, self.zugang_zeigen, Instant::now(),
+                        );
+                    }
                     return n;
                 }
                 // Lage des Hosts ueber dem stehenden Bild, falls er selbst
@@ -6713,36 +7450,11 @@ impl App {
                     overlay(&mut self.ui, c, self.lang, self.fps_shown, &hist, stats, secure,
                             lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder, &client);
                 }
-                // Erstkontakt: Code gross anzeigen, solange es noch zaehlt.
-                let (first, sas) = {
-                    let s = self.shared.lock().unwrap();
-                    (s.first_time, s.sas.clone())
-                };
-                if first && self.banner_until.is_none() {
-                    self.banner_until = Some(Instant::now() + Duration::from_secs(25));
-                }
-                if let (Some(until), Some(sas)) = (self.banner_until, sas) {
-                    if Instant::now() < until {
-                        let bw = 520.min(ww as i32 - 40);
-                        // Neben der Statistiktafel, nicht darueber: die ist im
-                        // Nerd-Modus breit und mit der Decoder-Zeile hoch.
-                        let frei_ab = if self.show_overlay { 18 + if self.cfg.nerd { 620 } else { 300 } + 20 } else { 0 };
-                        let bx = ((ww as i32 - bw) / 2).max(frei_ab).min((ww as i32 - bw - 18).max(0));
-                        let t = self.lang.get(strings::Key::FirstContact);
-                        // Der Satz ist je nach Sprache verschieden lang, also
-                        // erst messen, dann die Tafel darauf zuschneiden.
-                        let zeilen = umbruch(&mut self.ui, t, bw - 48, 13);
-                        let bh = 62 + zeilen.len() as i32 * 18;
-                        let by = wh as i32 * 3 / 4 - bh / 2;
-                        c.panel(bx, by, bw, bh, ui::AMBER);
-                        let mut ty = by + 28;
-                        for z in &zeilen {
-                            self.ui.text.draw_centered(c, bx + bw / 2, ty, z, 13, ui::TEXT, 1);
-                            ty += 18;
-                        }
-                        self.ui.text.draw_centered(c, bx + bw / 2, ty + 24, &sas, 30, ui::AMBER, 6);
-                    }
-                }
+                // Das Erstkontakt-Banner mit dem Vergleichscode entfaellt
+                // (Spezifikation Pairing v1, 5): den Code zeigt der
+                // Zugangsdialog, solange er etwas entscheidet - beim Zulassen
+                // am Host. Danach steht er im Wartebild, in der Statistik und
+                // im Reiter "Verschluesselung".
                 // Dateien: schmale Zeile unten mittig, solange eine
                 // Uebertragung laeuft und 6 s nach ihrem Ergebnis.
                 let zeilen: Vec<(String, u32)> = {
@@ -6869,8 +7581,10 @@ impl App {
     /// Sprache, Projektseite, Trennen und alles aus dem Menue.
     fn nachwirkung(&mut self, n: Nachwirkung) {
         match n.act {
-            Action::Connect(addr) => self.verbinden(&addr),
-            Action::Verknuepfung { adresse, name } => self.verknuepfung_anlegen(&adresse, &name),
+            Action::Connect(text) => self.eingabe_verbinden(&text),
+            Action::Host(ziel) => self.verbinden(ziel),
+            Action::Verknuepfung { adresse, id, name } => self.verknuepfung_anlegen(&adresse, id, &name),
+            Action::Freigeben => self.freigabe_starten(),
             Action::Quit => self.quit = true,
             Action::Sprachwahl => self.sprachwahl = !self.sprachwahl,
             Action::Sprache(code) => {
@@ -6883,6 +7597,13 @@ impl App {
             }
             Action::Website => website_oeffnen(),
             Action::None => {}
+        }
+        match n.zugang {
+            ZugangAktion::Nichts => {}
+            ZugangAktion::Senden => self.zugang_senden(),
+            ZugangAktion::Abbrechen => self.zugang_abbrechen(),
+            ZugangAktion::Zeigen => self.zugang_zeigen = !self.zugang_zeigen,
+            ZugangAktion::Marke(i) => self.zugang_caret = i,
         }
         if n.abbrechen {
             self.verbindung_trennen();
@@ -6926,10 +7647,12 @@ impl App {
             HudAktion::Trennen => self.verbindung_trennen(),
             HudAktion::Verknuepfung => {
                 // Name aus der Bekanntgabe, falls die Adresse passt, sonst
-                // steht die Adresse im Dateinamen.
+                // steht die Adresse im Dateinamen. Die ID ist die des
+                // verbundenen Hosts - aus seinem Schluessel.
                 let adresse = self.addr_input.clone();
                 let name = self.host_name(&adresse);
-                self.verknuepfung_anlegen(&adresse, &name);
+                let id = self.shared.lock().unwrap().link.as_ref().map(|(_, k)| zugang::geraete_id(k));
+                self.verknuepfung_anlegen(&adresse, id, &name);
             }
             HudAktion::Stellen(m, f, g, fx, ton) => self.stellen(m, f, g, fx, ton),
             HudAktion::Codec(idx) => self.codec_wuenschen(idx),
@@ -7019,6 +7742,8 @@ struct Nachwirkung {
     hud: Option<HudAktion>,
     /// Wartebildschirm: "Trennen" gedrueckt.
     abbrechen: bool,
+    /// Zugangsdialog, falls er offen war.
+    zugang: ZugangAktion,
 }
 
 /// Was zwischen dem Klick auf einen Host und dem ersten Bild zu sehen ist.
@@ -7078,15 +7803,265 @@ fn warte_screen(
 
 enum Action {
     None,
+    /// Was im Adressfeld steht: Adresse, Name oder Geraete-ID (9.2).
     Connect(String),
+    /// Klick auf eine Hostzeile: Adresse, ID (falls der Host eine meldet) und Name.
+    Host(Ziel),
     /// Desktop-Verknuepfung fuer diesen Host anlegen (nur Windows).
-    Verknuepfung { adresse: String, name: String },
+    Verknuepfung { adresse: String, id: Option<u32>, name: String },
+    /// "Diesen PC freigeben" (nur Windows): die Host-Rolle starten.
+    Freigeben,
     Quit,
     /// Sprachwahl oeffnen bzw. schliessen.
     Sprachwahl,
     /// Diese Sprache nehmen (Code wie in strings.rs).
     Sprache(&'static str),
     Website,
+}
+
+/// Wohin verbunden wird: Adresse mit Port; beim Verbinden ueber eine ID
+/// (Liste, Eingabe, Verknuepfung) die ID, die der Handschlag am Schluessel
+/// prueft (8.2); und der Name aus Bekanntgabe bzw. hosts.txt.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Ziel {
+    adresse: String,
+    id: Option<u32>,
+    name: Option<String>,
+}
+
+/// Ein Ziel aus Adresse und/oder ID (Spezifikation Pairing v1, 9.2). Mit ID
+/// zuerst der Host, der sich im Netz damit meldet, sonst die gegebene
+/// Adresse (Verknuepfung), sonst die zuletzt bekannte aus hosts.txt - sonst
+/// "nicht gefunden". Ohne ID die Adresse mit ergaenztem Port, samt dem
+/// Namen, unter dem sie sich meldet.
+fn ziel_bilden(adresse: &str, id: Option<u32>, gefunden: &[discovery::Gefunden], bekannte: &zugang::Hostliste) -> Result<Ziel, Meldung> {
+    let adresse = adresse.trim();
+    let name_bei =
+        |a: &str| gefunden.iter().find(|g| g.host.addr.to_string().eq_ignore_ascii_case(a)).map(|g| g.host.name.clone());
+    let Some(id) = id else {
+        let a = adresse_vollstaendig(adresse);
+        return Ok(Ziel { name: name_bei(&a), adresse: a, id: None });
+    };
+    if let Some(g) = gefunden.iter().filter(|g| g.id == Some(id)).max_by_key(|g| g.host.seen) {
+        return Ok(Ziel { adresse: g.host.addr.to_string(), id: Some(id), name: Some(g.host.name.clone()) });
+    }
+    let bekannt = bekannte.nach_id(id);
+    if !adresse.is_empty() {
+        let a = adresse_vollstaendig(adresse);
+        let name = name_bei(&a).or_else(|| bekannt.map(|h| h.name.clone()));
+        return Ok(Ziel { adresse: a, id: Some(id), name });
+    }
+    match bekannt {
+        Some(h) => Ok(Ziel { adresse: h.adresse.clone(), id: Some(id), name: Some(h.name.clone()) }),
+        None => Err(Meldung::neu(
+            strings::Key::MsgIdNotFound,
+            format!("Verbinden: ID {} meldet sich nicht im Netz und steht nicht in hosts.txt", zugang::id_text(id)),
+        )
+        .mit("{i}", zugang::id_text(id))),
+    }
+}
+
+/// Was im Adressfeld steht: neun Ziffern (mit oder ohne Leerzeichen) sind
+/// eine Geraete-ID, alles andere eine Adresse oder ein Name.
+fn ziel_aus_eingabe(text: &str, gefunden: &[discovery::Gefunden], bekannte: &zugang::Hostliste) -> Result<Ziel, Meldung> {
+    match zugang::id_lesen(text) {
+        Some(id) => ziel_bilden("", Some(id), gefunden, bekannte),
+        None => ziel_bilden(text, None, gefunden, bekannte),
+    }
+}
+
+/// Was im Zugangsdialog geklickt wurde.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZugangAktion {
+    Nichts,
+    Senden,
+    Abbrechen,
+    /// "Anzeigen": Passwort lesbar bzw. wieder als Punkte.
+    Zeigen,
+    /// Klick ins Feld: die Schreibmarke an diese Stelle (in Zeichen).
+    Marke(usize),
+}
+
+/// Abstand der Punkte im maskierten Passwortfeld.
+const PUNKT_ABSTAND: i32 = 14;
+
+/// Ein Punkt des maskierten Passworts, Mitte bei (x, y).
+fn punkt(c: &mut ui::Canvas, x: i32, y: i32, farbe: u32) {
+    for dy in -4i32..=4 {
+        for dx in -4i32..=4 {
+            let d = dx * dx + dy * dy;
+            if d <= 12 {
+                c.px(x + dx, y + dy, farbe, 255);
+            } else if d <= 20 {
+                c.px(x + dx, y + dy, farbe, 110);
+            }
+        }
+    }
+}
+
+/// Der Zugangsdialog (Spezifikation Pairing v1, 9.3) - modal wie die
+/// Sprachwahl: ein Schleier ueber allem, darunter reagiert nichts (der
+/// Aufrufer zeichnet es blind). Titel, Erklaerung, bei neuer Identitaet der
+/// Hinweis dazu, bei "Zulassen" die Bitte samt Vergleichscode, das
+/// Passwortfeld (Punkte oder lesbar, Schreibmarke, Knopf "Anzeigen"), der
+/// Stand (wird geprueft, falsch, Wartezeit mit Countdown) und die Knoepfe
+/// Verbinden und Abbrechen. Verbinden geht nur mit Passwort und nach der
+/// Wartezeit; ein Klick neben die Tafel tut nichts.
+#[allow(clippy::too_many_arguments)]
+fn zugang_zeichnen(
+    u: &mut ui::Ui,
+    c: &mut ui::Canvas,
+    lang: &'static strings::Lang,
+    d: &zugangsphase::Dialog,
+    pw: &str,
+    marke: usize,
+    zeigen: bool,
+    jetzt: Instant,
+) -> ZugangAktion {
+    use strings::Key::*;
+    let (w, h) = (c.w as i32, c.h as i32);
+    let tw = 560.min(w - 32);
+    let rand = 28;
+    let innen = tw - 2 * rand;
+    let titel = kuerzen(u, &lang.get(AccessTitle).replace("{n}", &d.name), innen, 18, 1);
+    let text = umbruch(u, &lang.get(AccessText).replace("{n}", &d.name), innen, 13);
+    // Die ID mit geschuetzten Leerzeichen: der Umbruch soll sie nicht
+    // zerreissen.
+    let neu = if d.neue_identitaet {
+        umbruch(u, &lang.get(AccessNewIdentity).replace("{i}", &zugang::id_text(d.id).replace(' ', "\u{a0}")), innen, 13)
+    } else {
+        Vec::new()
+    };
+    let bitte = if d.zulassen { umbruch(u, &lang.get(AccessOrAllow).replace("{n}", &d.name), innen, 13) } else { Vec::new() };
+    let warten = d.warten_s(jetzt);
+    let mut stand: Vec<(String, u32)> = Vec::new();
+    match d.lage {
+        zugangsphase::Lage::Pruefen => stand.push((lang.get(AccessChecking).to_string(), ui::DIM)),
+        zugangsphase::Lage::Falsch => stand.push((lang.get(AccessWrong).to_string(), ui::AMBER)),
+        zugangsphase::Lage::Eingabe => {}
+    }
+    if warten > 0 {
+        stand.push((lang.get(AccessWait).replace("{s}", &warten.to_string()), ui::AMBER));
+    }
+    // Hoehe aus dem Inhalt: der Text ist je Sprache verschieden lang.
+    let zeile = 19;
+    let mut th = 26 + 24 + 16;
+    th += text.len() as i32 * zeile;
+    if !neu.is_empty() {
+        th += 8 + neu.len() as i32 * zeile;
+    }
+    if d.zulassen {
+        th += 10 + bitte.len() as i32 * zeile + 30;
+    }
+    th += 34 + 40 + 14 + 2 * zeile + 18 + 44 + 26;
+    let tx = (w - tw) / 2;
+    let ty = ((h - th) / 2).max(8);
+    c.fill(0, 0, w, h, ui::BG, 170);
+    // Deckend unter der Tafel: das Wartebild darf nicht durchscheinen.
+    c.fill(tx, ty, tw, th, ui::BG, 255);
+    c.panel(tx, ty, tw, th, ui::CYAN);
+    let x = tx + rand;
+    let mut y = ty + 26 + 18;
+    u.text.draw(c, x, y, &titel, 18, ui::CYAN, 1);
+    y += 16;
+    for z in &text {
+        y += zeile;
+        u.text.draw(c, x, y, z, 13, ui::TEXT, 1);
+    }
+    if !neu.is_empty() {
+        y += 8;
+        for z in &neu {
+            y += zeile;
+            u.text.draw(c, x, y, z, 13, ui::AMBER, 1);
+        }
+    }
+    if d.zulassen {
+        y += 10;
+        for z in &bitte {
+            y += zeile;
+            u.text.draw(c, x, y, z, 13, ui::DIM, 1);
+        }
+        y += 30;
+        u.text.draw(c, x, y, &lang.get(AccessCode).replace("{c}", &d.code), 17, ui::CYAN, 3);
+    }
+
+    // Passwortfeld: Beschriftung darueber wie bei Ui::field.
+    y += 34;
+    let feld = ui::Rect { x, y, w: innen, h: 40 };
+    let mut aktion = ZugangAktion::Nichts;
+    c.rect(feld.x, feld.y, feld.w, feld.h, 0x0a1018, 200);
+    c.glow_hline(feld.x, feld.y + feld.h - 1, feld.w, ui::CYAN);
+    u.text.draw(c, feld.x + 2, feld.y - 6, lang.get(AccessPassword), 11, ui::DIM, 2);
+    let sw = (u.text.width(lang.get(AccessShow), 12, 1) + 24).clamp(70, 150);
+    let knopf = ui::Rect { x: feld.x + feld.w - sw - 4, y: feld.y + 4, w: sw, h: feld.h - 8 };
+    if u.button_mit(c, knopf, lang.get(AccessShow), if zeigen { ui::CYAN } else { ui::DIM }, 12, 1) {
+        aktion = ZugangAktion::Zeigen;
+    }
+    // Wo jede Zeichengrenze liegt (in Bildpunkten ab Textanfang): Punkte
+    // im festen Abstand, lesbar nach der Schrift.
+    let zeichen: Vec<char> = pw.chars().collect();
+    let marke = marke.min(zeichen.len());
+    let grenzen: Vec<i32> = (0..=zeichen.len())
+        .map(|i| {
+            if zeigen {
+                u.text.width(&zeichen[..i].iter().collect::<String>(), 16, 1)
+            } else {
+                i as i32 * PUNKT_ABSTAND
+            }
+        })
+        .collect();
+    let x0 = feld.x + 12;
+    let platz = knopf.x - 8 - x0;
+    // Der sichtbare Ausschnitt beginnt so, dass die Schreibmarke im Feld bleibt.
+    let mut von = 0;
+    while von < marke && grenzen[marke] - grenzen[von] > platz - 4 {
+        von += 1;
+    }
+    let mitte = feld.y + feld.h / 2;
+    for i in von..zeichen.len() {
+        let rechts = grenzen[i + 1] - grenzen[von];
+        if rechts > platz {
+            break;
+        }
+        let links = x0 + grenzen[i] - grenzen[von];
+        if zeigen {
+            u.text.draw(c, links, mitte + 6, &zeichen[i].to_string(), 16, ui::TEXT, 1);
+        } else {
+            punkt(c, links + PUNKT_ABSTAND / 2 - 2, mitte, ui::TEXT);
+        }
+    }
+    if (u.tick / 30) % 2 == 0 {
+        c.rect(x0 + grenzen[marke] - grenzen[von], feld.y + 9, 2, feld.h - 18, ui::CYAN, 230);
+    }
+    let textfeld = ui::Rect { x: feld.x, y: feld.y, w: knopf.x - feld.x, h: feld.h };
+    if u.click && textfeld.hit(u.mouse.0, u.mouse.1) {
+        let mx = u.mouse.0 - x0 + grenzen[von];
+        let naechste = (0..grenzen.len()).min_by_key(|&i| (grenzen[i] - mx).abs()).unwrap_or(0);
+        aktion = ZugangAktion::Marke(naechste);
+    }
+    y += feld.h + 14;
+
+    // Stand: wird geprueft, falsch, Wartezeit.
+    for (t, farbe) in &stand {
+        y += zeile;
+        u.text.draw(c, x, y, t, 13, *farbe, 1);
+    }
+    y += (2 - stand.len() as i32).max(0) * zeile + 18;
+
+    // Knoepfe
+    let bw = (innen - 20) / 2;
+    let verbinden = ui::Rect { x, y, w: bw, h: 44 };
+    if d.darf_senden(jetzt) && !pw.is_empty() {
+        if u.button(c, verbinden, lang.get(Connect), ui::CYAN) {
+            aktion = ZugangAktion::Senden;
+        }
+    } else {
+        knopf_aus(u, c, verbinden, lang.get(Connect), 15, 2);
+    }
+    if u.button(c, ui::Rect { x: x + bw + 20, y, w: innen - bw - 20, h: 44 }, lang.get(AccessCancel), ui::MAGENTA) {
+        aktion = ZugangAktion::Abbrechen;
+    }
+    aktion
 }
 
 /// Fehlt der Port, ergaenzen wir den Standard. Frueher galt das nur fuer die
@@ -7252,18 +8227,88 @@ fn start_zeile(u: &mut ui::Ui, w: i32, h: i32, lang: &'static strings::Lang, i: 
     (ui::Rect { w: zeile.w - kw - 8, ..zeile }, Some(knopf))
 }
 
+/// Eine Zeile der Hostliste auf dem Startbildschirm (Spezifikation Pairing
+/// v1, 9.1): Name links, rechts die ID (ohne ID "-"), bekannte Hosts mit
+/// Haken, die Adresse im Tooltip.
+#[derive(Clone, Debug, PartialEq)]
+struct Hostzeile {
+    name: String,
+    adresse: String,
+    id: Option<u32>,
+    /// In hosts.txt gemerkt: ueber die ID, bei Hosts ohne ID ueber die Adresse.
+    bekannt: bool,
+}
+
+/// Die Zeilen aus den Bekanntgaben und hosts.txt. Der Haken ist nur
+/// Anzeige: vertraut wird im Handschlag dem Schluessel, nie der ID.
+fn hostzeilen(gefunden: &[discovery::Gefunden], bekannte: &zugang::Hostliste) -> Vec<Hostzeile> {
+    gefunden
+        .iter()
+        .map(|g| {
+            let adresse = g.host.addr.to_string();
+            let bekannt = match g.id {
+                Some(id) => bekannte.nach_id(id).is_some(),
+                None => bekannte.nach_adresse(&adresse).is_some(),
+            };
+            let name = if g.host.name.trim().is_empty() { adresse.clone() } else { g.host.name.clone() };
+            Hostzeile { name, adresse, id: g.id, bekannt }
+        })
+        .collect()
+}
+
+/// Breite des Haken-Symbols samt Abstand in der Hostzeile.
+const HAKEN_BREITE: i32 = 18;
+
+/// Kleiner Haken (bekannter Host), links oben bei (x, y), etwa 11 x 9
+/// Bildpunkte - gezeichnet, nicht aus der Schrift (nicht jede hat U+2713).
+fn haken(c: &mut ui::Canvas, x: i32, y: i32, farbe: u32) {
+    for i in 0..4 {
+        c.px(x + i, y + 4 + i, farbe, 255);
+        c.px(x + i, y + 5 + i, farbe, 255);
+    }
+    for i in 0..8 {
+        c.px(x + 3 + i, y + 7 - i, farbe, 255);
+        c.px(x + 3 + i, y + 8 - i, farbe, 255);
+    }
+}
+
+/// Ein Knopf, der gerade nicht geht: dieselbe Form wie `Ui::button_mit`,
+/// aber blass (Klammern und Schrift) und ohne Reaktion auf Maus und Klick.
+fn knopf_aus(u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, label: &str, size: u32, spacing: i32) {
+    c.rect(r.x, r.y, r.w, r.h, ui::DIM, 8);
+    let cut = 10;
+    for (cx, cy, dx, dy) in [
+        (r.x, r.y, 1, 1),
+        (r.x + r.w - 1, r.y, -1, 1),
+        (r.x, r.y + r.h - 1, 1, -1),
+        (r.x + r.w - 1, r.y + r.h - 1, -1, -1),
+    ] {
+        for i in 0..cut {
+            c.px(cx + dx * i, cy, ui::DIM, 150);
+            c.px(cx, cy + dy * i, ui::DIM, 150);
+        }
+    }
+    let ty = r.y + r.h / 2 + size as i32 / 3;
+    u.text.draw_centered(c, r.x + r.w / 2, ty, label, size, ui::DIM, spacing);
+}
+
 /// Startbildschirm: Titel, gefundene Hosts, Adresse, Knoepfe. `hinweis` ist
 /// das Ergebnis einer Desktop-Verknuepfung (Text, Farbe); es steht, solange
-/// es gilt, im Meldungsbereich statt einer Fehlermeldung.
+/// es gilt, im Meldungsbereich statt einer Fehlermeldung. `freigabe`: nur
+/// unter Windows Some - der Knopf "Diesen PC freigeben" neben "Beenden",
+/// Some(true) heisst, eine Host-Rolle laeuft schon (Knopf aus, "Freigabe
+/// laeuft").
+#[allow(clippy::too_many_arguments)]
 fn start_screen(
     u: &mut ui::Ui,
     c: &mut ui::Canvas,
     lang: &'static strings::Lang,
-    hosts: &[discovery::Host],
+    hosts: &[Hostzeile],
     addr: &str,
     error: Option<&str>,
     hinweis: Option<(&str, u32)>,
     sprachwahl: bool,
+    freigabe: Option<bool>,
 ) -> Action {
     use strings::Key::*;
     c.backdrop(u.tick);
@@ -7282,7 +8327,7 @@ fn start_screen(
     // Tooltip wie im Menue: gemerkt, wenn die Maus darueber steht, gezeichnet
     // ganz am Ende ueber allem.
     let maus = u.mouse;
-    let mut tip: Option<strings::Key> = None;
+    let mut tip: Option<String> = None;
 
     // Kopf
     u.text.draw_centered(c, cx, top + 52, "QUADCHROMA", 46, ui::CYAN, 10);
@@ -7304,38 +8349,75 @@ fn start_screen(
     let mut action = Action::None;
     for (i, h) in hosts.iter().take(4).enumerate() {
         let (r, knopf) = start_zeile(u, c.w as i32, c.h as i32, lang, i);
-        let sel = addr == h.addr.to_string();
-        // Die Zeile ist um den Knopf schmaler: ein langer Name wird gekuerzt,
-        // statt in die Adresse zu laufen (Masse wie in Ui::row).
-        let rechts = h.addr.to_string();
-        let platz = r.w - 14 - 12 - u.text.width(&rechts, 13, 1) - 12;
+        let sel = addr == h.adresse || (h.id.is_some() && zugang::id_lesen(addr) == h.id);
+        // Rechts die ID statt der Adresse (die steht im Tooltip), davor bei
+        // bekannten Hosts der Haken. Die Zeile ist um den Knopf schmaler:
+        // ein langer Name wird gekuerzt, statt in die ID zu laufen (Masse
+        // wie in Ui::row).
+        let rechts = lang.get(StartId).replace("{i}", &h.id.map(zugang::id_text).unwrap_or_else(|| "-".into()));
+        let rw = u.text.width(&rechts, 13, 1);
+        let platz = r.w - 14 - 12 - rw - 12 - if h.bekannt { HAKEN_BREITE } else { 0 };
         let name = kuerzen(u, &h.name, platz, 15, 1);
         if u.row(c, r, &name, &rechts, sel) {
-            action = Action::Connect(h.addr.to_string());
+            action = Action::Host(Ziel { adresse: h.adresse.clone(), id: h.id, name: Some(h.name.clone()) });
+        }
+        if h.bekannt {
+            haken(c, r.x + r.w - rw - 12 - HAKEN_BREITE + 2, r.y + r.h / 2 - 5, ui::CYAN);
+        }
+        if r.hit(maus.0, maus.1) {
+            tip = Some(h.adresse.clone());
         }
         if let Some(k) = knopf {
             let (g, lw) = ZEILENKNOPF_SCHRIFT;
             let t = kuerzen(u, lang.get(DesktopShortcut), k.w - 16, g, lw);
             if k.hit(maus.0, maus.1) {
-                tip = Some(TipDesktopShortcut);
+                tip = Some(lang.get(TipDesktopShortcut).to_string());
             }
             if u.button_mit(c, k, &t, ui::CYAN, g, lw) {
-                action = Action::Verknuepfung { adresse: h.addr.to_string(), name: h.name.clone() };
+                action = Action::Verknuepfung { adresse: h.adresse.clone(), id: h.id, name: h.name.clone() };
             }
         }
     }
 
-    // Adressfeld
+    // Adressfeld: IP, Name oder Geraete-ID (9.2).
     let fy = py + list_h + 36;
     u.field(c, ui::Rect { x: px, y: fy, w: panel_w, h: 40 }, addr, lang.get(HostAddress), true);
 
-    // Knoepfe
+    // Knoepfe; unter Windows dazu "Diesen PC freigeben" zwischen Verbinden
+    // und Beenden (9.5), in kleinerer Schrift - der Text ist laenger.
     let by = fy + 62;
-    let bw = (panel_w - 20) / 2;
+    let (bw, freigabe_knopf) = match freigabe {
+        None => ((panel_w - 20) / 2, None),
+        Some(laeuft) => {
+            let t = lang.get(if laeuft { StartSharing } else { StartShare });
+            // Breit genug fuer beide Texte: der Knopf springt nicht, wenn die
+            // Freigabe anlaeuft.
+            let breite = u.text.width(lang.get(StartShare), 13, 1).max(u.text.width(lang.get(StartSharing), 13, 1));
+            // Hoechstens die halbe Leiste - in schmalen Fenstern (unter
+            // 400 Punkten) auch schmaler als 150; der Text wird gekuerzt.
+            // Kein clamp: dessen Untergrenze laege dann ueber der Obergrenze.
+            let sw = (breite + 40).max(150).min((panel_w / 2 - 20).max(0));
+            ((panel_w - sw - 40) / 2, Some((t, sw, laeuft)))
+        }
+    };
     if u.button(c, ui::Rect { x: px, y: by, w: bw, h: 44 }, lang.get(Connect), ui::CYAN) && !addr.is_empty() {
         action = Action::Connect(addr.to_string());
     }
-    if u.button(c, ui::Rect { x: px + bw + 20, y: by, w: bw, h: 44 }, lang.get(Quit), ui::MAGENTA) {
+    let (quit_x, quit_w) = match freigabe_knopf {
+        None => (px + bw + 20, bw),
+        Some((t, sw, laeuft)) => {
+            let r = ui::Rect { x: px + bw + 20, y: by, w: sw, h: 44 };
+            let t = kuerzen(u, t, sw - 16, 13, 1);
+            if laeuft {
+                knopf_aus(u, c, r, &t, 13, 1);
+            } else if u.button_mit(c, r, &t, ui::CYAN, 13, 1) {
+                action = Action::Freigeben;
+            }
+            let x = r.x + sw + 20;
+            (x, px + panel_w - x)
+        }
+    };
+    if u.button(c, ui::Rect { x: quit_x, y: by, w: quit_w, h: 44 }, lang.get(Quit), ui::MAGENTA) {
         action = Action::Quit;
     }
 
@@ -7419,8 +8501,8 @@ fn start_screen(
         u.click = echter_klick;
         return sprachwahl_zeichnen(u, c, lang);
     }
-    if let Some(k) = tip {
-        tooltip(u, c, lang.get(k), maus, c.w as i32, c.h as i32, 11, 1);
+    if let Some(t) = tip {
+        tooltip(u, c, &t, maus, c.w as i32, c.h as i32, 11, 1);
     }
     action
 }
@@ -7931,20 +9013,6 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             overlay(&mut u, &mut c, lang, 98.0, &hist, (2.1, info, 3, None, true), (sas.clone(), fp.clone()),
                     Some(probe), einstellungen::StatWahl::default(), nerd, Some(120),
                     if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec(None)), None), &client);
-            let _ = &fp;
-            let bw = 520.min(w as i32 - 40);
-            let bx = (w as i32 - bw) / 2;
-            let t = lang.get(strings::Key::FirstContact);
-            let zeilen = umbruch(&mut u, t, bw - 48, 13);
-            let bh = 62 + zeilen.len() as i32 * 18;
-            let by = h as i32 * 3 / 4 - bh / 2;
-            c.panel(bx, by, bw, bh, ui::AMBER);
-            let mut ty = by + 28;
-            for z in &zeilen {
-                u.text.draw_centered(&mut c, bx + bw / 2, ty, z, 13, ui::TEXT, 1);
-                ty += 18;
-            }
-            u.text.draw_centered(&mut c, bx + bw / 2, ty + 24, sas.as_ref().unwrap(), 30, ui::AMBER, 6);
         }
         write_bmp(path, w, h, &buf, lang);
         return;
@@ -8077,43 +9145,116 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         write_bmp(path, w, h, &buf, lang);
         return;
     }
+    // Ansichten des Zugangsdialogs (Spezifikation Pairing v1, 9.3) ueber dem
+    // Wartebild: "zugang" (Passwort halb getippt, Zulassen moeglich, Code),
+    // "zugangfalsch" (Passwort falsch, Feld leer), "zugangwarten" (Drossel:
+    // Countdown, Verbinden aus), "zugangneu" (neue Identitaet an bekannter
+    // Adresse, nur Passwort, lesbar gezeigt, wird geprueft).
+    if view.starts_with("zugang") {
+        let jetzt = Instant::now();
+        // Die Schreibmarke blinkt: in diesem Takt steht sie.
+        u.tick = 70;
+        let mut d = zugangsphase::Dialog {
+            name: "Roberts Mac mini".into(),
+            id: 581_729_911,
+            code: "628 306".into(),
+            zulassen: true,
+            neue_identitaet: false,
+            lage: zugangsphase::Lage::Eingabe,
+            frei_ab: None,
+            runde: 0,
+        };
+        let (mut pw, mut zeigen) = ("k7m4wq", false);
+        match view {
+            "zugangfalsch" => {
+                d.lage = zugangsphase::Lage::Falsch;
+                d.runde = 1;
+                pw = "";
+            }
+            "zugangwarten" => {
+                d.lage = zugangsphase::Lage::Falsch;
+                d.runde = 3;
+                d.frei_ab = Some(jetzt + Duration::from_secs(20));
+                pw = "k7m-4wq";
+            }
+            "zugangneu" => {
+                d.zulassen = false;
+                d.neue_identitaet = true;
+                d.lage = zugangsphase::Lage::Pruefen;
+                pw = "k7m-4wq-9tz";
+                zeigen = true;
+            }
+            _ => {}
+        }
+        let mut c = ui::Canvas::neu(&mut buf, w, h);
+        let (maus, klick) = (u.mouse, u.click);
+        u.mouse = (-10_000, -10_000);
+        u.click = false;
+        let _ = warte_screen(&mut u, &mut c, lang, "192.168.178.194:9001", (false, None, Some("628 306".into()), false));
+        u.mouse = maus;
+        u.click = klick;
+        let _ = zugang_zeichnen(&mut u, &mut c, lang, &d, pw, pw.chars().count(), zeigen, jetzt);
+        drop(c);
+        write_bmp(path, w, h, &buf, lang);
+        return;
+    }
+    // Die Hostliste: ein Host mit ID, schon bekannt (Haken), und ein
+    // aelterer ohne ID ("-").
     let hosts = vec![
-        discovery::Host {
-            name: "Mac-mini-von-Robert.local".into(),
-            addr: "192.168.178.194:9001".parse().unwrap(),
-            seen: Instant::now(),
+        Hostzeile {
+            name: "Roberts Mac mini".into(),
+            adresse: "192.168.178.194:9001".into(),
+            id: Some(581_729_911),
+            bekannt: true,
         },
-        discovery::Host {
-            name: "studio.local".into(),
-            addr: "192.168.178.60:9001".parse().unwrap(),
-            seen: Instant::now(),
-        },
+        Hostzeile { name: "studio.local".into(), adresse: "192.168.178.60:9001".into(), id: None, bekannt: false },
     ];
     // "abgeloest" und "fingerabdruck": der Startbildschirm mit der Meldung,
-    // wie sie nach Nachricht 10 bzw. bei geaendertem Host-Schluessel dasteht -
-    // ueber dieselben Schluessel wie im Betrieb, in der Sprache der Ansicht.
+    // wie sie nach Nachricht 10 bzw. bei einem anderen Geraet unter der
+    // gewaehlten ID dasteht (frueher: geaenderter Host-Schluessel) - ueber
+    // dieselben Schluessel wie im Betrieb, in der Sprache der Ansicht.
+    // "veraltet", "abgelehnt" und "idfehlt": weitere Meldungen der
+    // Zugangsphase (9.6).
     let meldung = match view {
         "abgeloest" => Some(lang.get(strings::Key::SessionTakenOver).to_string()),
         "fingerabdruck" => Some(
-            Meldung::from(secure::Fehler::FingerabdruckGeaendert {
-                host: "192.168.178.194".into(),
-                fingerabdruck: "9EB4-EC3D-6856-8AF6".into(),
-                pfad: std::path::PathBuf::from("C:\\Users\\Robert\\AppData\\Roaming\\QuadChroma\\known_hosts.txt"),
-            })
-            .text(lang),
+            Meldung::from(secure::Fehler::AnderesGeraet { addr: "192.168.178.194:9001".into(), erwartet: 581_729_911, gemeldet: 5 })
+                .text(lang),
         ),
+        "veraltet" => Some(Meldung::neu(strings::Key::MsgHostOutdated, "").mit("{n}", "studio.local").text(lang)),
+        "abgelehnt" => Some(Meldung::neu(strings::Key::MsgRefused, "").mit("{n}", "Roberts Mac mini").text(lang)),
+        "idfehlt" => Some(Meldung::neu(strings::Key::MsgIdNotFound, "").mit("{i}", "123 456 789").text(lang)),
         _ => None,
     };
     // "starttip": die Maus steht ueber dem Knopf "Verknuepfung" der ersten
     // Zeile, damit sein Tooltip im Bild ist (nur unter Windows gibt es ihn).
+    // "startzeile": ueber der ersten Zeile selbst - der Tooltip zeigt die
+    // Adresse.
     if view == "starttip" {
         if let (_, Some(k)) = start_zeile(&mut u, w as i32, h as i32, lang, 0) {
             u.mouse = (k.x + k.w / 2, k.y + k.h / 2);
         }
     }
+    if view == "startzeile" {
+        let (r, _) = start_zeile(&mut u, w as i32, h as i32, lang, 0);
+        u.mouse = (r.x + 60, r.y + r.h / 2);
+    }
+    // Unter Windows der Knopf "Diesen PC freigeben"; "startfreigabe" zeigt
+    // ihn, waehrend eine Host-Rolle laeuft.
+    let freigabe = MIT_FREIGABE.then_some(view == "startfreigabe");
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
-        let _ = start_screen(&mut u, &mut c, lang, &hosts, "192.168.178.194:9001", meldung.as_deref(), None, view == "sprachwahl");
+        let _ = start_screen(
+            &mut u,
+            &mut c,
+            lang,
+            &hosts,
+            "192.168.178.194:9001",
+            meldung.as_deref(),
+            None,
+            view == "sprachwahl",
+            freigabe,
+        );
     }
 
     write_bmp(path, w, h, &buf, lang);
@@ -8170,11 +9311,14 @@ const WERTIG: &[(&str, usize)] = &[
     // Host-Rolle (host/mod.rs liest sie selbst; hier nur, damit ihre
     // Werte nie fuer eine Adresse gehalten werden)
     ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1), ("--encoderweg", 1),
+    // Ziel aus einer Verknuepfung (Pairing v1, 9.4): --verbinden <adresse>
+    // --id <id>; --passwort <pw> nur im Pruefmodus.
+    ("--verbinden", 1), ("--id", 1), ("--passwort", 1),
 ];
 
-/// Erstes Argument, das kein Schalter und kein Wert eines Schalters ist:
-/// die Adresse, mit Port ergaenzt; sonst leer.
-fn adresse_aus_argumenten(args: &[String]) -> String {
+/// Erstes Argument, das kein Schalter und kein Wert eines Schalters ist -
+/// so, wie es dasteht.
+fn erstes_argument(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -8195,9 +9339,125 @@ fn adresse_aus_argumenten(args: &[String]) -> String {
             i += 1;
             continue;
         }
-        return adresse_vollstaendig(a);
+        return Some(a);
     }
-    String::new()
+    None
+}
+
+/// Erstes Argument, das kein Schalter und kein Wert eines Schalters ist:
+/// die Adresse, mit Port ergaenzt; sonst leer.
+#[cfg(test)]
+fn adresse_aus_argumenten(args: &[String]) -> String {
+    erstes_argument(args).map(adresse_vollstaendig).unwrap_or_default()
+}
+
+/// Das Ziel von der Befehlszeile: `--verbinden <adresse>` (Verknuepfung)
+/// oder das erste Argument ohne "--" (Adresse oder Name, Port ergaenzt),
+/// dazu `--id <id>`. Neun Ziffern (auch mit Leerzeichen oder Bindestrichen)
+/// sind eine Geraete-ID, keine Adresse (9.2) - dann fehlt die Adresse und
+/// wird ueber die ID gesucht.
+fn ziel_aus_argumenten(args: &[String]) -> (String, Option<u32>) {
+    let wert = |s: &str| args.iter().position(|a| a == s).and_then(|i| args.get(i + 1)).filter(|v| !v.starts_with("--"));
+    let id = wert("--id").and_then(|v| zugang::id_lesen(v));
+    let roh = wert("--verbinden").map(String::as_str).or_else(|| erstes_argument(args)).unwrap_or("").trim();
+    match zugang::id_lesen(roh) {
+        Some(i) => (String::new(), Some(i)),
+        None => (adresse_vollstaendig(roh), id),
+    }
+}
+
+/// Ein Ziel als Text fuer die Weitergabe an die laufende App (einzel.rs):
+/// "<adresse>", mit ID "<adresse>#<9 Ziffern>", nur ID "#<9 Ziffern>".
+fn ziel_text(adresse: &str, id: Option<u32>) -> String {
+    match id {
+        Some(id) => format!("{}#{}", adresse.trim(), zugang::id_ziffern(id)),
+        None => adresse.trim().to_string(),
+    }
+}
+
+/// Gegenstueck zu `ziel_text`: Adresse (vielleicht leer) und ID.
+fn ziel_lesen(t: &str) -> (String, Option<u32>) {
+    match t.trim().rsplit_once('#') {
+        Some((a, i)) if i.len() == 9 && i.bytes().all(|b| b.is_ascii_digit()) => (a.trim().to_string(), zugang::id_lesen(i)),
+        _ => (t.trim().to_string(), None),
+    }
+}
+
+/// So lange sucht ein Start mit einer unbekannten ID ihre Bekanntgabe
+/// (Hosts rufen alle 2 s).
+const ID_SUCHE: Duration = Duration::from_secs(5);
+
+/// Einmal beim Start: known_hosts.txt nach hosts.txt uebernehmen
+/// (Spezifikation Pairing v1, 4.4) und Reste eines abgebrochenen Schreibens
+/// wegraeumen. Die Einstellungen je Host bleiben am Fingerabdruck.
+fn hosts_vorbereiten() {
+    let Ok(ordner) = secure::config_dir() else { return };
+    let weg = zugang::zwischendateien_aufraeumen(&ordner.join(zugang::HOSTS_DATEI));
+    if weg > 0 {
+        protokoll::zeile(format!("hosts.txt: {weg} Zwischendateien eines abgebrochenen Schreibens entfernt"));
+    }
+    match zugang::hosts_migrieren(&ordner) {
+        zugang::Migration::Keine => {}
+        zugang::Migration::Uebernommen { anzahl, umbenannt } => protokoll::zeile(format!(
+            "hosts.txt: {anzahl} bekannte Hosts aus known_hosts.txt uebernommen{}",
+            match umbenannt {
+                Ok(()) => " - die alte Datei heisst jetzt known_hosts.txt.migriert".to_string(),
+                Err(e) => format!(" - alte Datei nicht umbenannt ({e})"),
+            }
+        )),
+        zugang::Migration::Fehler(e) => {
+            protokoll::zeile(format!("hosts.txt: Uebernahme aus known_hosts.txt gescheitert - {e} (naechster Start versucht es wieder)"))
+        }
+    }
+}
+
+/// Die Zugangsphase im Pruefmodus (--headless): bei jeder Wende des Dialogs
+/// sofort die Zeilen, die der Empfangsfaden dazu protokolliert hat (sonst
+/// kaemen sie erst mit dem naechsten Drei-Sekunden-Takt), und --passwort
+/// geht genau einmal hinaus, sobald die Drossel es erlaubt. Ohne --passwort
+/// wartet der Client auf "Zulassen" am Host.
+struct ZugangPruefmodus {
+    passwort: Option<String>,
+    gesendet: bool,
+    zuletzt: Option<(zugangsphase::Lage, u32)>,
+}
+
+impl ZugangPruefmodus {
+    fn neu(passwort: Option<String>) -> ZugangPruefmodus {
+        ZugangPruefmodus { passwort, gesendet: false, zuletzt: None }
+    }
+
+    fn takt(&mut self, shared: &Mutex<Shared>) {
+        use std::io::Write;
+        let mut s = shared.lock().unwrap();
+        let Some(d) = s.zugang.clone() else {
+            if self.zuletzt.take().is_some() {
+                // Die Phase ist vorbei: was der Empfangsfaden dazu sagt, jetzt.
+                for z in protokoll::abholen() {
+                    println!("{z}");
+                }
+                std::io::stdout().flush().ok();
+            }
+            return;
+        };
+        let jetzt = Instant::now();
+        if self.zuletzt != Some((d.lage, d.runde)) {
+            for z in protokoll::abholen() {
+                println!("{z}");
+            }
+            if self.zuletzt.is_none() && self.passwort.is_none() {
+                println!("Zugang: kein --passwort - warte auf \"Zulassen\" am Host");
+            }
+            self.zuletzt = Some((d.lage, d.runde));
+            std::io::stdout().flush().ok();
+        }
+        if !self.gesendet && d.darf_senden(jetzt) {
+            if let Some(pw) = self.passwort.clone() {
+                s.zugang_eingabe = Some(zugangsphase::Eingabe::Passwort(pw));
+                self.gesendet = true;
+            }
+        }
+    }
 }
 
 /// `--verknuepfung`: anlegen, Pfad bzw. Fehler ausgeben, Rueckgabewert 0/1;
@@ -8227,7 +9487,7 @@ fn verknuepfung_befehlszeile(a: Result<verknuepfung::Aufruf, String>) -> i32 {
             None => strings::pick(&system_language()),
         };
         // COM (STA) richtet verknuepfung_anlegen selbst ein.
-        match verknuepfung::verknuepfung_anlegen(a.ordner.as_deref(), &adresse_vollstaendig(&a.adresse), &a.name, lang) {
+        match verknuepfung::verknuepfung_anlegen(a.ordner.as_deref(), &adresse_vollstaendig(&a.adresse), a.id, &a.name, lang) {
             Ok(p) => {
                 println!("{}", p.display());
                 0
@@ -8297,9 +9557,23 @@ fn main() {
         }
     }
 
-    let addr = adresse_aus_argumenten(&args);
+    // Das Ziel: Adresse (auch Name) und/oder Geraete-ID - aus der
+    // Befehlszeile oder einer Verknuepfung ("--verbinden <adresse> --id <id>").
+    let (addr, start_id) = ziel_aus_argumenten(&args);
 
     let headless = std::env::args().any(|a| a == "--headless");
+    // --passwort <pw>: nur im Pruefmodus - beantwortet die Zugangsphase
+    // einmal mit diesem Passwort (Spezifikation Pairing v1, 3.5). Im Fenster
+    // gibt es das nie: dort tippt der Nutzer selbst.
+    let pruef_passwort: Option<String> = args
+        .iter()
+        .position(|a| a == "--passwort")
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned();
+    if pruef_passwort.is_some() && !headless {
+        eprintln!("--passwort gilt nur mit --headless - uebergangen.");
+    }
 
     // Gegentest der Verschluesselung: --noisetest 192.168.178.x:9100
     if let Some(i) = std::env::args().position(|a| a == "--noisetest") {
@@ -8438,16 +9712,17 @@ fn main() {
     let mut einzel_eingang = None;
     let mut einzel_ohne = None;
     if !headless {
-        match einzel::beanspruchen(&addr) {
+        let weiter = ziel_text(&addr, start_id);
+        match einzel::beanspruchen(&weiter) {
             einzel::Start::Erste { waechter, eingang } => {
                 einzel_waechter = Some(waechter);
                 einzel_eingang = Some(eingang);
             }
             einzel::Start::Weitergereicht(None) => {
-                if addr.is_empty() {
+                if weiter.is_empty() {
                     println!("QuadChroma laeuft schon - nach vorn geholt.");
                 } else {
-                    println!("QuadChroma laeuft schon - {addr} weitergereicht.");
+                    println!("QuadChroma laeuft schon - {weiter} weitergereicht.");
                 }
                 std::process::exit(0);
             }
@@ -8462,6 +9737,54 @@ fn main() {
                 std::process::exit(1);
             }
             einzel::Start::Ohne(g) => einzel_ohne = Some(g),
+        }
+    }
+
+    // hosts.txt: einmal known_hosts.txt uebernehmen (Spezifikation 4.4).
+    hosts_vorbereiten();
+    // Wer sich im Netz meldet - fuer Startbildschirm, Symbol, Pruefmodus und
+    // den Empfangsfaden (ein Ziel mit ID unter neuer Adresse). Ein Faden,
+    // ein Port.
+    let bekanntgaben = discovery::start(9003);
+
+    // Ziel mit ID: fehlt die Adresse (nur "--id" oder eine ID als Argument),
+    // gilt die zuletzt bekannte aus hosts.txt; der Name von dort, bis der
+    // Host selbst einen nennt. Ist die ID ganz unbekannt, wartet der Start
+    // kurz auf ihre Bekanntgabe (Fenster: id_ausstehend, Pruefmodus unten).
+    let mut addr = addr;
+    let mut start_name: Option<String> = None;
+    if let Some(id) = start_id {
+        let bekannt = zugang::ablage_pfad(zugang::HOSTS_DATEI)
+            .ok()
+            .and_then(|p| zugang::Hostliste::laden(&p).ok())
+            .and_then(|l| l.nach_id(id).cloned());
+        if let Some(h) = bekannt {
+            if addr.is_empty() {
+                addr = h.adresse.clone();
+            }
+            start_name = Some(h.name);
+        }
+    }
+    let mut id_ausstehend = match start_id {
+        Some(id) if addr.is_empty() => Some((id, Instant::now())),
+        _ => None,
+    };
+    if headless {
+        if let Some((id, seit)) = id_ausstehend.take() {
+            while addr.is_empty() && seit.elapsed() < ID_SUCHE {
+                if let Some(g) = bekanntgaben.lock().ok().and_then(|h| h.mit_id(id)) {
+                    addr = g.host.addr.to_string();
+                    start_name = Some(g.host.name);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if addr.is_empty() {
+                let m = Meldung::neu(strings::Key::MsgIdNotFound, format!("ID {} weder im Netz noch in hosts.txt", zugang::id_text(id)))
+                    .mit("{i}", zugang::id_text(id));
+                println!("Fehler: {:?}: {}", m.key, m.text(&strings::EN));
+                std::process::exit(1);
+            }
+            println!("ID {} gefunden: {addr}", zugang::id_text(id));
         }
     }
 
@@ -8502,7 +9825,12 @@ fn main() {
         .and_then(|v| v.parse().ok());
 
     // Ton ist an, bis jemand ihn abschaltet - Default waere "aus".
-    let shared = Arc::new(Mutex::new(Shared { decoder_wunsch, ton: true, ..Shared::default() }));
+    let shared = Arc::new(Mutex::new(Shared {
+        decoder_wunsch,
+        ton: true,
+        bekanntgaben: Some(bekanntgaben.clone()),
+        ..Shared::default()
+    }));
     // Empfangene Dateien von frueher: was aelter als 24 h ist, geht - in einem
     // eigenen Faden, damit bis zu 4 GB bzw. 10 000 Eintraege je Verzeichnis
     // den Start nicht aufhalten. Neue Uebertragungen stoert das nicht: ihr
@@ -8555,9 +9883,13 @@ fn main() {
         let inp = input.clone();
         std::thread::spawn(move || stream_thread(shared, inp));
     }
-    // Wurde eine Adresse mitgegeben, gleich verbinden.
+    // Wurde eine Adresse mitgegeben, gleich verbinden - mit ID (Verknuepfung)
+    // prueft der Handschlag sie am Schluessel des Hosts.
     if !addr.is_empty() {
-        shared.lock().unwrap().target = Some(addr.clone());
+        let mut s = shared.lock().unwrap();
+        s.target = Some(addr.clone());
+        s.ziel_id = start_id;
+        s.ziel_name = start_name.clone();
     }
 
     // Pruefmodus ohne Fenster: nur empfangen, decodieren, Zahlen ausgeben.
@@ -8621,15 +9953,21 @@ fn main() {
         // Auch ohne Fenster zuhoeren, wer sich im Netz ausruft - jede neue
         // Adresse einmal als Zeile, damit sich die Bekanntgabe eines Hosts
         // ohne Startbildschirm pruefen laesst.
-        let hosts = discovery::start(9003);
+        let hosts = bekanntgaben.clone();
         let mut gefunden: std::collections::HashSet<String> = std::collections::HashSet::new();
         let start = Instant::now();
         let mut last = 0u64;
+        // Zugangsphase im Pruefmodus: Zustandszeilen, und --passwort geht
+        // genau einmal hinaus (ein falsches zu wiederholen hiesse nur,
+        // die Drossel des Hosts zu fuettern).
+        let mut zugang_pruef = ZugangPruefmodus::neu(pruef_passwort);
         loop {
             if let Ok(h) = hosts.lock() {
-                for host in h.list() {
-                    if gefunden.insert(host.addr.to_string()) {
-                        println!("Host gefunden: {} ({})", host.name, host.addr);
+                for g in h.liste() {
+                    if gefunden.insert(g.host.addr.to_string()) {
+                        let id = g.id.map(zugang::id_text).unwrap_or_else(|| "-".into());
+                        let zulassen = if g.flags & BEACON_FLAG_ZULASSEN != 0 { ", Zulassen moeglich" } else { "" };
+                        println!("Host gefunden: {} ({}, ID {id}{zulassen})", g.host.name, g.host.addr);
                     }
                 }
             }
@@ -8638,6 +9976,7 @@ fn main() {
             let takt_ende = Instant::now() + Duration::from_secs(3);
             while Instant::now() < takt_ende {
                 std::thread::sleep(Duration::from_millis(50));
+                zugang_pruef.takt(&shared);
                 // --bildschirm <Kennung|auto> wuenscht einmal einen Bildschirm:
                 // sobald der Eingabekanal steht und der Host die Wahl gemeldet
                 // hat (Bit 1) - ein aelterer Host bekommt nie Typ 70, das sagt
@@ -8807,6 +10146,13 @@ fn main() {
             );
             println!("{line}");
             std::io::stdout().flush().ok();
+            // Endete der Versuch mit einer Meldung, die bleibt (etwa ein
+            // Ausgang des Zugangs: abgelehnt, zu viele Versuche, keine
+            // Antwort), gibt es ohne Ziel nichts mehr zu tun.
+            if s.target.is_none() && s.error.as_ref().is_some_and(Meldung::dauerhaft) {
+                println!("Verbindung beendet, die Meldung bleibt - Ende des Pruefmodus");
+                std::process::exit(1);
+            }
             // Im Pruefmodus auch den Eingabekanal anstossen: Er darf nur
             // aufgehen, wenn der Bildkanal steht, und das wollen wir sehen.
             let link = s.link.clone();
@@ -8900,8 +10246,8 @@ fn main() {
         shared,
         input: input.clone(),
         ui: ui::Ui::new(),
-        screen: if start_addr.is_empty() { Screen::Start } else { Screen::Session },
-        hosts: discovery::start(9003),
+        screen: if start_addr.is_empty() && id_ausstehend.is_none() { Screen::Start } else { Screen::Session },
+        hosts: bekanntgaben,
         addr_input: start_addr,
         lang: sprache,
         sprachwahl: false,
@@ -8931,7 +10277,16 @@ fn main() {
         geraet_verloren: None,
         letzter_gpu_fehler: None,
         shown: 0,
-        banner_until: None,
+        zugang_pw: String::new(),
+        zugang_caret: 0,
+        zugang_zeigen: false,
+        zugang_runde: None,
+        bekannte: zugang::Hostliste::default(),
+        bekannte_stand: None,
+        id_ausstehend,
+        freigabe: false,
+        freigabe_geprueft: None,
+        freigabe_gestartet: None,
         angewandt_fuer: None,
         letzte_zeichnung: Instant::now(),
         oberflaeche_vorher: false,
@@ -10044,8 +11399,9 @@ mod tests {
         assert_eq!(letzter_nal_typ(&[1, 2, 3], false), None);
     }
 
-    /// Schluessel aller Test-Hosts auf 127.0.0.1: die Tests teilen sich
-    /// eine known_hosts.txt, und dort steht 127.0.0.1 nur einmal.
+    /// Ein gemeinsamer Schluessel fuer die Schein-Hosts auf 127.0.0.1 (aus
+    /// der Zeit, als die Tests sich eine known_hosts.txt teilten, in der
+    /// 127.0.0.1 nur einmal stand; heute pinnt hosts.txt nach Schluessel).
     fn test_host() -> (Vec<u8>, Vec<u8>) {
         static K: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
         K.get_or_init(|| noise::keypair().unwrap()).clone()
@@ -10428,11 +11784,7 @@ mod tests {
     /// Trennung (kein Ziel) wird nichts angezeigt.
     #[test]
     fn fehler_gilt_nur_fuer_das_eigene_ziel() {
-        let dauer = Meldung::from(secure::Fehler::FingerabdruckGeaendert {
-            host: "10.0.0.5".into(),
-            fingerabdruck: "AAAA".into(),
-            pfad: "/ablage/known_hosts.txt".into(),
-        });
+        let dauer = Meldung::from(secure::Fehler::AnderesGeraet { addr: "10.0.0.5:9001".into(), erwartet: 1, gemeldet: 2 });
         assert!(dauer.dauerhaft());
         let mut s = Shared { target: Some("10.0.0.6:9001".into()), connected: true, ..Shared::default() };
         let mut gemeldet = None;
@@ -10505,18 +11857,17 @@ mod tests {
         );
     }
 
-    /// Ein Host mit anderem Schluessel als dem Pin: der Client bricht im
-    /// Handschlag vor Nachricht 3 ab - der Host kennt ihn danach nicht, hat
-    /// ihn also auch nicht als Zuschauer angenommen und niemanden
-    /// abgeloest -, und er versucht es nicht alle 2 s erneut: das Ziel geht
-    /// zurueck, die Meldung bleibt.
+    /// Verbunden ueber eine Geraete-ID, aber unter der Adresse antwortet ein
+    /// Host mit anderem Schluessel (Spezifikation Pairing v1, 8.2): der
+    /// Client bricht im Handschlag vor Nachricht 3 ab - der Host kennt ihn
+    /// danach nicht, hat ihn also auch nicht als Zuschauer angenommen und
+    /// niemanden abgeloest -, und er versucht es nicht alle 2 s erneut: das
+    /// Ziel geht zurueck, die Meldung bleibt.
     #[test]
-    fn falscher_pin_ohne_nachricht_3_und_ohne_wiederholung() {
+    fn andere_id_ohne_nachricht_3_und_ohne_wiederholung() {
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
         secure::test_identitaet();
-        // 127.0.0.1 ist auf den gemeinsamen Test-Host gepinnt.
-        secure::HostPin::laden("127.0.0.1:1").unwrap().eintragen(&test_host().1).unwrap();
         let (fremd_priv, _) = noise::keypair().unwrap();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
@@ -10535,6 +11886,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(Shared {
             decoder_wunsch: einstellungen::DecoderWunsch::Software,
             target: Some(addr),
+            // Gewaehlt war der gemeinsame Test-Host - geantwortet hat ein anderer.
+            ziel_id: Some(zugang::geraete_id(&test_host().1)),
             ..Shared::default()
         }));
         let input = Arc::new(Mutex::new(InputLink::new(String::new())));
@@ -10549,7 +11902,11 @@ mod tests {
         {
             let s = shared.lock().unwrap();
             assert!(s.target.is_none(), "Ziel nicht zurueckgenommen");
-            assert_eq!(s.error.as_ref().map(|m| m.key), Some(strings::Key::HostKeyChanged));
+            assert_eq!(s.error.as_ref().map(|m| m.key), Some(strings::Key::MsgOtherDevice));
+            assert_eq!(
+                s.error.as_ref().unwrap().text(&strings::EN),
+                "A different device answers at this address."
+            );
         }
         std::thread::sleep(Duration::from_secs(3));
         assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
@@ -10557,13 +11914,13 @@ mod tests {
     }
 
     /// Dieselbe Meldung ohne ein Bild dazwischen steht nur einmal im
-    /// Protokoll - auch die, die erst nach dem Handschlag entsteht ("nicht
-    /// gekoppelt"); nach einer echten Sitzung (Bilder) wieder.
+    /// Protokoll; nach einer echten Sitzung (Bilder) wieder.
     #[test]
     fn verbindungsfehler_nur_einmal_im_protokoll() {
+        use std::io::Read;
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let e = Meldung::neu(strings::Key::NotPaired, "nicht gekoppelt");
+        let e = Meldung::neu(strings::Key::ErrorHandshake, "Handschlag: Laenge: Leitung zu");
         let f = Meldung::neu(strings::Key::ErrorProtocol, "anderes Protokoll");
         let mut gemeldet = None;
         assert!(neu_zu_melden(&mut gemeldet, &e, 0));
@@ -10574,19 +11931,23 @@ mod tests {
         assert!(neu_zu_melden(&mut gemeldet, &e, 7));
         assert!(!e.dauerhaft() && !f.dauerhaft());
 
-        // Echt: ein Host, der nach dem Handschlag zumacht. Der Client
-        // versucht es weiter (kein Dauerfehler), protokolliert aber einmal.
+        // Echt: eine Gegenstelle, die Nachricht 1 liest und dann zumacht -
+        // der Handschlag scheitert, jedes Mal gleich. Der Client versucht es
+        // weiter (kein Dauerfehler), protokolliert aber einmal.
         secure::test_identitaet();
-        let (host_priv, _) = test_host();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
         let verbindungen = Arc::new(AtomicUsize::new(0));
         let v = verbindungen.clone();
         std::thread::spawn(move || {
             for s in l.incoming() {
-                let Ok(s) = s else { continue };
+                let Ok(mut s) = s else { continue };
                 v.fetch_add(1, Ordering::SeqCst);
-                let _ = secure::Secure::accept(s, &noise::prologue_video(), &host_priv);
+                let mut n = [0u8; 2];
+                if s.read_exact(&mut n).is_ok() {
+                    let mut m = vec![0u8; u16::from_le_bytes(n) as usize];
+                    let _ = s.read_exact(&mut m);
+                }
             }
         });
         let shared = Arc::new(Mutex::new(Shared {
@@ -10604,16 +11965,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(300));
-        let ziel = {
+        let (ziel, protokoll_zeile) = {
             let mut s = shared.lock().unwrap();
-            assert_eq!(s.error_key, Some(strings::Key::NotPaired));
-            s.target.take()
+            assert_eq!(s.error.as_ref().map(|m| m.key), Some(strings::Key::ErrorHandshake));
+            (s.target.take(), format!("Verbindung: {}", s.error.as_ref().unwrap().protokoll))
         };
-        assert!(ziel.is_some(), "Ziel zurueckgenommen - nicht gekoppelt ist kein Dauerfehler");
+        assert!(ziel.is_some(), "Ziel zurueckgenommen - ein gescheiterter Handschlag ist kein Dauerfehler");
         assert!(verbindungen.load(Ordering::SeqCst) >= 3);
         let text = std::fs::read_to_string(einstellungen::datei_pfad("protokoll.txt").unwrap()).unwrap();
-        let zeilen = text.lines().filter(|z| z.starts_with("Verbindung: Host hat die Leitung nach dem Handschlag")).count();
-        assert_eq!(zeilen, 1, "{text}");
+        let zeilen = text.lines().filter(|z| *z == protokoll_zeile).count();
+        assert_eq!(zeilen, 1, "{protokoll_zeile}\n{text}");
     }
 
     /// Fehler von Leitung und Ablage erscheinen ueber Schluessel: in jeder
@@ -10623,26 +11984,19 @@ mod tests {
     fn meldungen_ueber_schluessel() {
         use secure::Fehler as F;
         use strings::Key::*;
-        let pfad = std::path::PathBuf::from("/ablage/known_hosts.txt");
-        let f = F::FingerabdruckGeaendert {
-            host: "10.0.0.5".into(),
-            fingerabdruck: "AAAA-BBBB-CCCC-DDDD".into(),
-            pfad: pfad.clone(),
-        };
+        let pfad = std::path::PathBuf::from("/ablage/hosts.txt");
+        let f = F::AnderesGeraet { addr: "10.0.0.5:9001".into(), erwartet: 581_729_911, gemeldet: 5 };
         let m = Meldung::from(f.clone());
-        assert_eq!(m.key, HostKeyChanged);
+        assert_eq!(m.key, MsgOtherDevice);
         assert_eq!(m.protokoll, f.to_string());
-        assert_eq!(
-            m.text(&strings::EN),
-            "The fingerprint of 10.0.0.5 has changed (now AAAA-BBBB-CCCC-DDDD). Connection refused. \
-             If the host was set up again, delete its line in /ablage/known_hosts.txt."
-        );
-        assert!(m.text(strings::pick("de")).starts_with("Der Fingerabdruck von 10.0.0.5 hat sich geändert (jetzt AAAA-BBBB-CCCC-DDDD)"));
+        assert!(m.protokoll.contains("ID 000 000 005 statt der gewaehlten 581 729 911"), "{}", m.protokoll);
+        assert_eq!(m.text(&strings::EN), "A different device answers at this address.");
+        assert_eq!(m.text(strings::pick("de")), "An dieser Adresse antwortet ein anderes Gerät.");
         // Der Wortlaut des Systems bleibt als Anhang; der Satz davor ist uebersetzt.
         let m = Meldung::from(F::Unlesbar { pfad: pfad.clone(), grund: "Zugriff verweigert (os error 5)".into() });
         assert_eq!(
             m.text(&strings::EN),
-            "/ablage/known_hosts.txt cannot be read – not connecting. (Zugriff verweigert (os error 5))"
+            "/ablage/hosts.txt cannot be read – not connecting. (Zugriff verweigert (os error 5))"
         );
         // Jede Art hat ihren Schluessel, und kein Platzhalter bleibt offen.
         use std::io::ErrorKind as E;
@@ -10677,9 +12031,10 @@ mod tests {
             "The secure connection could not be established (An existing connection was forcibly closed by the remote host. (os error 10054))"
         );
         assert!(m.protokoll.starts_with("Handschlag: Laenge:"));
-        // Dauerfehler: Pin und Ablage; Leitung und Handschlag nicht.
+        // Dauerfehler: anderes Geraet unter der ID und Ablage; Leitung und
+        // Handschlag nicht.
         let dauer = |f: F| Meldung::from(f).dauerhaft();
-        assert!(dauer(F::FingerabdruckGeaendert { host: "h".into(), fingerabdruck: "f".into(), pfad: pfad.clone() }));
+        assert!(dauer(F::AnderesGeraet { addr: "a".into(), erwartet: 1, gemeldet: 2 }));
         assert!(dauer(F::KeinUtf8 { pfad: pfad.clone() }));
         // Nicht lesbar ist oft nur eine kurze Sperre - und gelesen wird vor
         // dem Verbinden, ein neuer Versuch stoert also niemanden.
@@ -10691,7 +12046,7 @@ mod tests {
         assert!(!dauer(F::Handschlag { grund: "g".into(), frist: true, system: None }));
         // Alle neuen Schluessel stehen englisch und deutsch da.
         for k in [
-            SessionTakenOver, HostKeyChanged, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
+            SessionTakenOver, KeyFileDamaged, FileUnreadable, FileNotUtf8, FileNotWritable,
             StorageUnavailable, ErrorAddress, ErrorNoConnection, ErrorHandshake, ErrorFfmpegStart, ErrorSound,
             ErrorGpuDisplay, ErrorGpuLost, ErrorPixelFormat, DecoderFallback,
             FilesSending, FilesReceiving, FilesReady, FilesSent, FilesAborted, FilesTooLarge, FilesPeerOld,
@@ -12488,5 +13843,567 @@ mod tests {
         assert_eq!(abgelaufen.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Weg);
         ohne.lock().unwrap().set_link(Some((hh, host_pub)));
         assert_eq!(abgelaufen.senden(DATEI_ANGEBOT, &[1]), dateien::Gesendet::Weg);
+    }
+
+    // ---------------------------- Zugang (Spezifikation Pairing v1, 3.5, 8, 9)
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    /// Wie sich der Test-Host der Zugangsphase verhaelt.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Zugangshost {
+        /// Kennt jeden: "QCH1".
+        Bekannt,
+        /// Unbekannt: "QCA1", 20; prueft Beweise gegen das Passwort.
+        Passwort,
+        /// Wie Passwort, aber Ergebnis 0 mit falschem host_proof.
+        FalscherBeweis,
+        /// Unbekannt, "Zulassen" moeglich: nach 300 ms Ergebnis 1.
+        Zulassen,
+        /// Nach 300 ms Ergebnis 3.
+        Ablehnen,
+        /// Nach 300 ms Ergebnis 4 ohne Wartezeit (Frist des Hosts abgelaufen).
+        Frist,
+        /// Aeltere Fassung: macht nach dem Handschlag zu.
+        Alt,
+        /// Schweigt nach dem Handschlag.
+        Stumm,
+        /// Kein Platz frei: "QCA1", gleich 22/4 mit 5000 ms statt 20, dann
+        /// zu - so antworten Mac- und Windows-Host.
+        Voll,
+        /// Drossel: 20 mit 600 ms Wartezeit, "falsch" mit 700 ms; meldet
+        /// jeden Beweis, der vor Ablauf kommt ("zu frueh").
+        Drossel,
+        /// Spricht nach dem Handschlag etwas Fremdes ("QCX9").
+        Fremd,
+        /// Ein falscher Host: bietet kein Zulassen an (Bit 1 aus), nimmt den
+        /// Beweis und sagt 22/1 statt 22/0 mit host_proof.
+        ZulassenOhneAngebot,
+        /// Erste Verbindung: "QCH1", eine Sitzung, die er nach 300 ms kappt
+        /// (am Host entfernt); jede weitere: "QCA1", 20 mit Zulassen.
+        Entfernt,
+        /// Schickt nach dem Handschlag einen Datensatz, der nicht echt ist.
+        Kaputt,
+    }
+
+    /// Ein kleiner Host fuer die Zugangsphase mit eigenem Schluessel: nimmt
+    /// jede Verbindung an und folgt `art`. Nach der Annahme ("QCH1") meldet
+    /// er gleich die Abloesung - die Sitzung endet ohne Neuversuch, und der
+    /// Test sieht am Ziel, dass sie vorbei ist. Was er erlebt ("falsch",
+    /// "richtig", Nachrichten des Clients), meldet er ueber den Kanal.
+    fn zugangshost(art: Zugangshost, passwort: &'static str) -> (String, Vec<u8>, mpsc::Receiver<String>, Arc<AtomicUsize>) {
+        use std::net::TcpListener;
+        use zugang::{Ergebnis, Nachricht};
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel::<String>();
+        let zaehler = Arc::new(AtomicUsize::new(0));
+        let (z, hp) = (zaehler.clone(), host_pub.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { continue };
+                let nummer = z.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut h) = secure::Secure::accept(s, &noise::prologue_video(), &host_priv) else {
+                    let _ = tx.send("Handschlag gescheitert".into());
+                    continue;
+                };
+                let annahme = |h: &mut secure::Secure| {
+                    let mut m = MAGIC.to_vec();
+                    m.extend_from_slice(&[MSG_ABGELOEST, 0, 0, 0, 0, 0, 0, 0]);
+                    let _ = h.write_all(&m);
+                };
+                let ergebnis = |h: &mut secure::Secure, e: Ergebnis| {
+                    let _ = h.write_all(&Nachricht::Ergebnis(e).kodieren());
+                };
+                match art {
+                    Zugangshost::Bekannt => annahme(&mut h),
+                    Zugangshost::Alt => continue,
+                    Zugangshost::Stumm => std::thread::sleep(zugangsphase::KENNUNG_FRIST + Duration::from_millis(500)),
+                    Zugangshost::Fremd => {
+                        let _ = h.write_all(b"QCX9");
+                    }
+                    Zugangshost::Kaputt => {
+                        let mut roh: &std::net::TcpStream = h.socket();
+                        let _ = std::io::Write::write_all(&mut roh, &[4, 0, 1, 2, 3, 4]);
+                    }
+                    Zugangshost::Voll => {
+                        let mut m = MAGIC_ZUGANG.to_vec();
+                        m.extend_from_slice(&Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms: 5000 }).kodieren());
+                        let _ = h.write_all(&m);
+                    }
+                    Zugangshost::Entfernt if nummer == 0 => {
+                        let _ = h.write_all(MAGIC);
+                        std::thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
+                    _ => {
+                        let mut m = MAGIC_ZUGANG.to_vec();
+                        let zulassen = matches!(art, Zugangshost::Zulassen | Zugangshost::Entfernt);
+                        let warten_ms = if art == Zugangshost::Drossel { 600 } else { 0 };
+                        let noetig = zugang::ZugangNoetig::neu(zulassen, warten_ms, "Testhost");
+                        m.extend_from_slice(&Nachricht::Noetig(noetig).kodieren());
+                        let _ = h.write_all(&m);
+                        // Vorher ist ein Beweis zu frueh (Drossel).
+                        let mut frei_ab = Instant::now() + Duration::from_millis(warten_ms as u64);
+                        match art {
+                            Zugangshost::Zulassen => {
+                                std::thread::sleep(Duration::from_millis(300));
+                                ergebnis(&mut h, Ergebnis::Zulassen);
+                                annahme(&mut h);
+                            }
+                            Zugangshost::Ablehnen => {
+                                std::thread::sleep(Duration::from_millis(300));
+                                ergebnis(&mut h, Ergebnis::Abgelehnt);
+                            }
+                            Zugangshost::Frist => {
+                                std::thread::sleep(Duration::from_millis(300));
+                                ergebnis(&mut h, Ergebnis::Schluss { warten_ms: 0 });
+                            }
+                            _ => loop {
+                                match zugang::empfangen(|b| h.lesen(b)) {
+                                    Ok(Nachricht::Beweis(_)) if art == Zugangshost::ZulassenOhneAngebot => {
+                                        let _ = tx.send("Beweis".into());
+                                        ergebnis(&mut h, Ergebnis::Zulassen);
+                                        annahme(&mut h);
+                                        break;
+                                    }
+                                    Ok(Nachricht::Beweis(b)) => {
+                                        if Instant::now() < frei_ab {
+                                            let _ = tx.send("zu frueh".into());
+                                        }
+                                        let k = zugang::passwort_schluessel(passwort, &hp);
+                                        if !zugang::beweis_pruefen(&k, &h.handshake_hash, &b) {
+                                            let _ = tx.send("falsch".into());
+                                            let warten_ms = if art == Zugangshost::Drossel { 700 } else { 0 };
+                                            ergebnis(&mut h, Ergebnis::Falsch { warten_ms });
+                                            frei_ab = Instant::now() + Duration::from_millis(warten_ms as u64);
+                                            continue;
+                                        }
+                                        let _ = tx.send("richtig".into());
+                                        let host_beweis = if art == Zugangshost::FalscherBeweis {
+                                            [0x55; 32]
+                                        } else {
+                                            zugang::host_beweis(&k, &h.handshake_hash)
+                                        };
+                                        ergebnis(&mut h, Ergebnis::Passwort { host_beweis });
+                                        if matches!(art, Zugangshost::Passwort | Zugangshost::Drossel) {
+                                            annahme(&mut h);
+                                        }
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        let _ = tx.send(format!("{n:?}"));
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(format!("Ende: {e}"));
+                                        break;
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+                // Offen halten, bis der Client geht: macht der Host zu, bevor
+                // der Client gelesen hat, koennte das System die Daten mit
+                // einem Reset verwerfen.
+                h.lesefrist(Some(Duration::from_secs(5)));
+                let mut b = [0u8; 1];
+                let _ = h.lesen(&mut b);
+            }
+        });
+        (addr, host_pub, rx, zaehler)
+    }
+
+    /// Der Client gegen einen Host, im Empfangsfaden wie im Betrieb.
+    /// `nutzer` spielt den Nutzer am Dialog: es sieht ihn alle 20 ms und
+    /// darf eine Eingabe liefern (Abbrechen nimmt wie im Fenster auch das
+    /// Ziel zurueck). Endet, sobald das Ziel weg ist (hoechstens 20 s);
+    /// liefert den gemeinsamen Stand und alle Dialogstaende, die zu sehen
+    /// waren.
+    fn zugang_durchspielen(
+        addr: &str,
+        ziel_id: Option<u32>,
+        mut nutzer: impl FnMut(&zugangsphase::Dialog) -> Option<zugangsphase::Eingabe>,
+    ) -> (Arc<Mutex<Shared>>, Vec<zugangsphase::Dialog>) {
+        secure::test_identitaet();
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr.to_string()),
+            ziel_id,
+            ziel_name: Some("aus der Bekanntgabe".into()),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        let mut gesehen: Vec<zugangsphase::Dialog> = Vec::new();
+        let t0 = Instant::now();
+        while shared.lock().unwrap().target.is_some() && t0.elapsed() < Duration::from_secs(20) {
+            {
+                let mut s = shared.lock().unwrap();
+                if let Some(d) = s.zugang.clone() {
+                    if gesehen.last() != Some(&d) {
+                        gesehen.push(d.clone());
+                    }
+                    if s.zugang_eingabe.is_none() {
+                        if let Some(e) = nutzer(&d) {
+                            if e == zugangsphase::Eingabe::Abbrechen {
+                                s.target = None;
+                            }
+                            s.zugang_eingabe = Some(e);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(shared.lock().unwrap().target.is_none(), "Ziel nach 20 s noch da");
+        (shared, gesehen)
+    }
+
+    /// Der Eintrag dieses Hosts in hosts.txt, falls gepinnt.
+    fn gepinnt(host_pub: &[u8]) -> Option<zugang::BekannterHost> {
+        let p = zugang::ablage_pfad(zugang::HOSTS_DATEI).unwrap();
+        zugang::Hostliste::laden(&p).unwrap().nach_schluessel(host_pub).cloned()
+    }
+
+    fn fehler_von(s: &Arc<Mutex<Shared>>) -> Option<Meldung> {
+        s.lock().unwrap().error.clone()
+    }
+
+    /// Bekannt ("QCH1"): Sitzung ohne Dialog, und erst danach gepinnt - mit
+    /// ID, Adresse und dem Namen aus der Bekanntgabe. Mit der richtigen ID
+    /// als Ziel geht es ebenso.
+    #[test]
+    fn zugang_bekannter_host_wird_gepinnt() {
+        let (addr, host_pub, _ereignisse, verbindungen) = zugangshost(Zugangshost::Bekannt, "");
+        assert!(gepinnt(&host_pub).is_none());
+        let (s, dialoge) = zugang_durchspielen(&addr, Some(zugang::geraete_id(&host_pub)), |_| None);
+        assert!(dialoge.is_empty());
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+        assert!(s.lock().unwrap().hosts_stand >= 1);
+        let h = gepinnt(&host_pub).expect("nicht gepinnt");
+        assert_eq!((h.id, h.adresse.as_str(), h.name.as_str()), (zugang::geraete_id(&host_pub), addr.as_str(), "aus der Bekanntgabe"));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1);
+    }
+
+    /// Unbekannt, erst ein falsches, dann das richtige Passwort: der Dialog
+    /// zeigt "falsch", der Host prueft beide Beweise, sein host_proof stimmt
+    /// - gepinnt mit dem Namen aus Nachricht 20.
+    #[test]
+    fn zugang_passwort_falsch_dann_richtig() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::Passwort, "k7m-4wq-9tz");
+        let mut runde_gesendet = None;
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |d| {
+            if d.lage == zugangsphase::Lage::Pruefen || runde_gesendet == Some(d.runde) {
+                return None;
+            }
+            runde_gesendet = Some(d.runde);
+            let pw = if d.runde == 0 { "k7m-4wq-9ty" } else { "K7M 4WQ 9TZ" };
+            Some(zugangsphase::Eingabe::Passwort(pw.into()))
+        });
+        assert_eq!(ereignisse.try_iter().collect::<Vec<_>>(), vec!["falsch", "richtig"]);
+        let erster = &dialoge[0];
+        assert_eq!((erster.name.as_str(), erster.zulassen, erster.lage), ("Testhost", false, zugangsphase::Lage::Eingabe));
+        assert_eq!(erster.id, zugang::geraete_id(&host_pub));
+        assert!(dialoge.iter().any(|d| d.lage == zugangsphase::Lage::Falsch && d.runde == 1));
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+        assert_eq!(gepinnt(&host_pub).map(|h| h.name), Some("Testhost".into()));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1);
+    }
+
+    /// "Zulassen" am Host, ohne dass der Nutzer etwas eingibt: kein Beweis
+    /// geht hinaus, der Dialog zeigt den Vergleichscode des Handschlags, und
+    /// der Host wird gepinnt (Erstkontakt ohne Beweis).
+    #[test]
+    fn zugang_zulassen_ohne_beweis() {
+        let (addr, host_pub, ereignisse, _) = zugangshost(Zugangshost::Zulassen, "");
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
+        assert!(dialoge[0].zulassen);
+        assert_eq!(Some(dialoge[0].code.clone()), s.lock().unwrap().sas.clone());
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+        assert!(gepinnt(&host_pub).is_some());
+        assert_eq!(ereignisse.try_iter().count(), 0, "ein Beweis ging hinaus");
+    }
+
+    /// Ergebnis 0 mit falschem host_proof: Abbruch, nichts gepinnt, Meldung
+    /// "konnte das Passwort nicht bestaetigen", kein Neuversuch.
+    #[test]
+    fn zugang_falscher_host_beweis_pinnt_nicht() {
+        let (addr, host_pub, _, verbindungen) = zugangshost(Zugangshost::FalscherBeweis, "geheim123");
+        let (s, _) = zugang_durchspielen(&addr, None, |d| {
+            (d.lage == zugangsphase::Lage::Eingabe).then(|| zugangsphase::Eingabe::Passwort("geheim123".into()))
+        });
+        let m = fehler_von(&s).expect("keine Meldung");
+        assert_eq!(m.key, strings::Key::MsgHostProofBad);
+        assert_eq!(m.text(&strings::EN), "Testhost could not confirm the password. The connection was stopped for safety.");
+        assert!(gepinnt(&host_pub).is_none());
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
+    }
+
+    /// Abgelehnt, Frist, aelterer Host, schweigender Host, kein Platz frei
+    /// (22/4 statt 20), fremde Kennung: je eine Meldung, die bleibt, nichts
+    /// gepinnt, kein Neuversuch.
+    #[test]
+    fn zugang_meldungen_ohne_neuversuch() {
+        use strings::Key::*;
+        for (art, key, en) in [
+            (Zugangshost::Ablehnen, MsgRefused, "Testhost refused the connection."),
+            (Zugangshost::Frist, MsgNoAnswer, "No answer from Testhost. Please try again."),
+            (Zugangshost::Alt, MsgHostOutdated, "aus der Bekanntgabe uses an older QuadChroma version. Please update it there."),
+            (Zugangshost::Stumm, MsgNoAnswer, "No answer from aus der Bekanntgabe. Please try again."),
+            (Zugangshost::Voll, MsgTooManyAttempts, "Too many attempts. Please wait a moment and try again."),
+            (Zugangshost::Fremd, ErrorProtocol, "The other side speaks a different protocol"),
+        ] {
+            let (addr, host_pub, _, verbindungen) = zugangshost(art, "");
+            let (s, _) = zugang_durchspielen(&addr, None, |_| None);
+            let m = fehler_von(&s).unwrap_or_else(|| panic!("{art:?}: keine Meldung"));
+            assert_eq!(m.key, key, "{art:?}: {}", m.protokoll);
+            assert_eq!(m.text(&strings::EN), en, "{art:?}");
+            assert!(m.dauerhaft());
+            assert!(gepinnt(&host_pub).is_none(), "{art:?}");
+            std::thread::sleep(Duration::from_millis(2300));
+            assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "{art:?}: neu verbunden");
+        }
+    }
+
+    /// Drossel (Spezifikation 11, "falsches Passwort (Drossel)"): 20 mit
+    /// Wartezeit und "falsch" mit Wartezeit. Der Nutzer tippt jedes Mal
+    /// sofort - der Client haelt den Beweis zurueck, bis die Wartezeit um
+    /// ist (ein Beweis davor zaehlte beim Host als Fehlversuch); der Dialog
+    /// zeigt sie.
+    #[test]
+    fn zugang_drossel_haelt_den_beweis_zurueck() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::Drossel, "k7m-4wq-9tz");
+        let mut runde_gesendet = None;
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |d| {
+            if d.lage == zugangsphase::Lage::Pruefen || runde_gesendet == Some(d.runde) {
+                return None;
+            }
+            runde_gesendet = Some(d.runde);
+            let pw = if d.runde == 0 { "falsch-123" } else { "k7m-4wq-9tz" };
+            Some(zugangsphase::Eingabe::Passwort(pw.into()))
+        });
+        assert_eq!(ereignisse.try_iter().collect::<Vec<_>>(), vec!["falsch", "richtig"], "Beweis vor Ablauf der Drossel");
+        assert!(dialoge[0].frei_ab.is_some(), "Wartezeit aus Nachricht 20 nicht im Dialog");
+        assert!(dialoge.iter().any(|d| d.lage == zugangsphase::Lage::Falsch && d.frei_ab.is_some()));
+        assert_eq!(s.lock().unwrap().error_key, Some(strings::Key::SessionTakenOver));
+        assert!(gepinnt(&host_pub).is_some());
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1);
+    }
+
+    /// Ein falscher Host bietet kein "Zulassen" an, nimmt den Beweis und sagt
+    /// 22/1 statt 22/0 mit host_proof: kein "angenommen" - Meldung "konnte
+    /// das Passwort nicht bestaetigen", nichts gepinnt, kein Neuversuch.
+    #[test]
+    fn zugang_zulassen_ohne_angebot_pinnt_nicht() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::ZulassenOhneAngebot, "");
+        let (s, _) = zugang_durchspielen(&addr, None, |d| {
+            (d.lage == zugangsphase::Lage::Eingabe).then(|| zugangsphase::Eingabe::Passwort("geheim123".into()))
+        });
+        assert_eq!(ereignisse.try_iter().collect::<Vec<_>>(), vec!["Beweis"]);
+        assert_eq!(fehler_von(&s).map(|m| m.key), Some(strings::Key::MsgHostProofBad));
+        assert!(gepinnt(&host_pub).is_none());
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
+    }
+
+    /// Am Host entfernt: die laufende Sitzung reisst ab, beim Wiederverbinden
+    /// sagt der Host "QCA1". Der Client stellt keine Anfrage von selbst -
+    /// kein Dialog, Nachricht 23 sofort, Meldung "abgelehnt", die bleibt.
+    #[test]
+    fn zugang_nach_entfernen_keine_anfrage_von_selbst() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::Entfernt, "");
+        let (s, dialoge) = zugang_durchspielen(&addr, None, |_| None);
+        assert!(dialoge.is_empty(), "Zugangsdialog ohne Nutzer: {dialoge:?}");
+        assert_eq!(ereignisse.recv_timeout(Duration::from_secs(5)).as_deref(), Ok("Abbruch"));
+        let m = fehler_von(&s).expect("keine Meldung");
+        assert_eq!(m.key, strings::Key::MsgRefused, "{}", m.protokoll);
+        assert!(gepinnt(&host_pub).is_some(), "die erste Sitzung war angenommen");
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 2);
+    }
+
+    /// Eine Leitung, die nach dem Handschlag gestoert ist (hier: ein
+    /// Datensatz, der nicht echt ist), ist kein Beleg fuer einen alten Host:
+    /// "Verbindung verloren", und der Client versucht es weiter.
+    #[test]
+    fn zugang_gestoerte_leitung_ist_kein_alter_host() {
+        let (addr, host_pub, _, verbindungen) = zugangshost(Zugangshost::Kaputt, "");
+        secure::test_identitaet();
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr.clone()),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        // Bis der zweite Versuch laeuft und eine Meldung steht (jeder
+        // Versuch loescht sie nach dem Handschlag kurz).
+        let t0 = Instant::now();
+        let mut s = loop {
+            let s = shared.lock().unwrap();
+            if (verbindungen.load(Ordering::SeqCst) >= 2 && s.error.is_some()) || t0.elapsed() >= Duration::from_secs(10) {
+                break s;
+            }
+            drop(s);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(verbindungen.load(Ordering::SeqCst) >= 2, "kein Neuversuch");
+        assert_eq!(s.target.as_deref(), Some(addr.as_str()));
+        let m = s.error.clone().expect("keine Meldung");
+        assert_eq!(m.key, strings::Key::ConnectionLost, "{}", m.protokoll);
+        assert!(!m.dauerhaft());
+        assert!(gepinnt(&host_pub).is_none());
+        s.target = None;
+    }
+
+    /// Abbrechen im Dialog: Nachricht 23 kommt beim Host an, keine Meldung,
+    /// nichts gepinnt, kein Neuversuch.
+    #[test]
+    fn zugang_abbruch_sendet_23() {
+        let (addr, host_pub, ereignisse, verbindungen) = zugangshost(Zugangshost::Passwort, "x");
+        let (s, _) = zugang_durchspielen(&addr, None, |_| Some(zugangsphase::Eingabe::Abbrechen));
+        assert_eq!(ereignisse.recv_timeout(Duration::from_secs(5)).as_deref(), Ok("Abbruch"));
+        assert_eq!(fehler_von(&s), None);
+        assert!(gepinnt(&host_pub).is_none());
+        std::thread::sleep(Duration::from_millis(2300));
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1);
+    }
+
+    /// 8.3: unter der Adresse war ein anderes Geraet gepinnt - kein
+    /// Dauerfehler, sondern die Zugangsphase mit dem Hinweis "neue
+    /// Identitaet"; danach findet die Adresse den neuen, der alte Eintrag
+    /// bleibt fuer seine ID.
+    #[test]
+    fn zugang_neue_identitaet_an_bekannter_adresse() {
+        let (addr, host_pub, _, _) = zugangshost(Zugangshost::Zulassen, "");
+        let alt = [0x77u8; 32];
+        let pfad = zugang::ablage_pfad(zugang::HOSTS_DATEI).unwrap();
+        zugangsphase::pinnen(&pfad, &alt, &addr, "Frueher").unwrap();
+        let (_, dialoge) = zugang_durchspielen(&addr, None, |_| None);
+        assert!(dialoge[0].neue_identitaet);
+        let liste = zugang::Hostliste::laden(&pfad).unwrap();
+        assert_eq!(liste.nach_adresse(&addr).map(|h| h.schluessel.to_vec()), Some(host_pub.clone()));
+        assert_eq!(liste.nach_id(zugang::geraete_id(&alt)).map(|h| h.name.as_str()), Some("Frueher"));
+    }
+
+    /// Ziele von der Befehlszeile: Adresse, Verknuepfung mit ID, ID allein
+    /// (als Argument oder --id) - und --passwort ist nie die Adresse.
+    #[test]
+    fn ziel_von_der_befehlszeile() {
+        assert_eq!(ziel_aus_argumenten(&argumente(&["10.0.0.5"])), ("10.0.0.5:9001".to_string(), None));
+        assert_eq!(
+            ziel_aus_argumenten(&argumente(&["--verbinden", "10.0.0.5:9101", "--id", "581729911"])),
+            ("10.0.0.5:9101".to_string(), Some(581_729_911))
+        );
+        assert_eq!(ziel_aus_argumenten(&argumente(&["581 729 911"])), (String::new(), Some(581_729_911)));
+        assert_eq!(ziel_aus_argumenten(&argumente(&["--id", "000000005"])), (String::new(), Some(5)));
+        assert_eq!(ziel_aus_argumenten(&argumente(&["--headless", "--passwort", "geheim", "10.0.0.5"])), ("10.0.0.5:9001".to_string(), None));
+        assert_eq!(ziel_aus_argumenten(&argumente(&["--headless", "--passwort", "geheim"])), (String::new(), None));
+        // Weitergabe an die laufende App (einzel.rs) hin und zurueck.
+        for (a, i) in [("10.0.0.5:9001", None), ("10.0.0.5:9001", Some(581_729_911)), ("", Some(5)), ("host#1", None)] {
+            assert_eq!(ziel_lesen(&ziel_text(a, i)), (a.to_string(), i), "{a} {i:?}");
+        }
+        assert_eq!(ziel_text("h:1", Some(5)), "h:1#000000005");
+    }
+
+    fn gefunden(name: &str, addr: &str, id: Option<u32>) -> discovery::Gefunden {
+        discovery::Gefunden {
+            host: discovery::Host { name: name.into(), addr: addr.parse().unwrap(), seen: Instant::now() },
+            id,
+            flags: 0,
+        }
+    }
+
+    /// 9.2: eine ID sucht zuerst im Netz, dann die letzte Adresse aus
+    /// hosts.txt; sonst "nicht gefunden". Eine Adresse bleibt eine Adresse
+    /// (ohne ID - 8.3), mit dem Namen, unter dem sie sich meldet.
+    #[test]
+    fn ziel_suche_ueber_id() {
+        let mut bekannte = zugang::Hostliste::default();
+        let k = [0x42u8; 32];
+        let id_k = zugang::geraete_id(&k);
+        bekannte.merken(zugang::BekannterHost::neu(k, "10.0.0.9:9001", "Buero"));
+        let netz = vec![gefunden("Mac", "10.0.0.5:9001", Some(581_729_911)), gefunden("Alt", "10.0.0.6:9001", None)];
+        let z = ziel_aus_eingabe("581 729 911", &netz, &bekannte).unwrap();
+        assert_eq!(z, Ziel { adresse: "10.0.0.5:9001".into(), id: Some(581_729_911), name: Some("Mac".into()) });
+        let z = ziel_aus_eingabe(&zugang::id_ziffern(id_k), &netz, &bekannte).unwrap();
+        assert_eq!(z, Ziel { adresse: "10.0.0.9:9001".into(), id: Some(id_k), name: Some("Buero".into()) });
+        let m = ziel_aus_eingabe("123-456-789", &netz, &bekannte).unwrap_err();
+        assert_eq!(m.key, strings::Key::MsgIdNotFound);
+        assert_eq!(m.text(&strings::EN), "No device with ID 123 456 789 found in the network.");
+        assert!(m.dauerhaft());
+        let z = ziel_aus_eingabe("10.0.0.6", &netz, &bekannte).unwrap();
+        assert_eq!(z, Ziel { adresse: "10.0.0.6:9001".into(), id: None, name: Some("Alt".into()) });
+        // Verknuepfung: Adresse und ID; meldet sich die ID anderswo, gilt das.
+        let z = ziel_bilden("10.0.0.1:9001", Some(581_729_911), &netz, &bekannte).unwrap();
+        assert_eq!(z.adresse, "10.0.0.5:9001");
+        let z = ziel_bilden("10.0.0.1:9001", Some(7), &netz, &bekannte).unwrap();
+        assert_eq!((z.adresse.as_str(), z.id), ("10.0.0.1:9001", Some(7)));
+    }
+
+    /// 9.1: je Host Name, ID (ohne Erweiterung keine) und der Haken fuer
+    /// bekannte - ueber die ID, bei Hosts ohne ID ueber die Adresse.
+    #[test]
+    fn hostzeilen_mit_id_und_haken() {
+        let mut bekannte = zugang::Hostliste::default();
+        let k = [0x43u8; 32];
+        bekannte.merken(zugang::BekannterHost::neu(k, "10.0.0.6:9001", "Alt"));
+        let netz = vec![
+            gefunden("Mac", "10.0.0.5:9001", Some(zugang::geraete_id(&k))),
+            gefunden("", "10.0.0.6:9001", None),
+            gefunden("Fremd", "10.0.0.7:9001", Some(5)),
+        ];
+        let z = hostzeilen(&netz, &bekannte);
+        assert_eq!(z.iter().map(|z| z.bekannt).collect::<Vec<_>>(), vec![true, true, false]);
+        assert_eq!(z[1].name, "10.0.0.6:9001");
+        assert_eq!(z[2].id, Some(5));
+    }
+
+    /// Die Texte des Zugangs: Platzhalter gefuellt, Meldungen bleiben (kein
+    /// Neuversuch, 9.6), und EN wie DE vorhanden.
+    #[test]
+    fn zugangstexte_und_dauer() {
+        use strings::Key::*;
+        for k in [MsgRefused, MsgNoAnswer, MsgTooManyAttempts, MsgHostOutdated, MsgHostProofBad, MsgOtherDevice, MsgIdNotFound] {
+            let m = Meldung::neu(k, "x").mit("{n}", "Mac").mit("{i}", "581 729 911");
+            assert!(m.dauerhaft(), "{k:?}");
+            for lang in strings::all() {
+                assert!(!m.text(lang).contains('{'), "{k:?} ({})", lang.code);
+            }
+            assert_ne!(strings::EN.get(k), strings::DE.get(k), "{k:?}");
+        }
+        assert_eq!(strings::pick("de").get(MsgHostOutdated).replace("{n}", "Mac"), "Mac verwendet eine ältere QuadChroma-Version. Bitte dort aktualisieren.");
+    }
+
+    /// Die Host-Rolle haelt ihren Mutex; der Knopf sieht nur nach, ob es ihn
+    /// gibt (mit einem eigenen Namen - eine echte Host-Rolle auf derselben
+    /// Maschine stoert so nicht).
+    #[cfg(windows)]
+    #[test]
+    fn freigabe_am_mutex_erkannt() {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::CreateMutexW;
+        // Nicht der Name der Einzelinstanz-Tests (einzel.rs), die im selben
+        // Lauf nebenher ihren Mutex halten.
+        let name = format!("Local\\QuadChroma-Host-Test-{}", std::process::id());
+        assert!(!mutex_da(&name));
+        let h = unsafe { CreateMutexW(None, false, &HSTRING::from(name.as_str())) }.unwrap();
+        assert!(mutex_da(&name));
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        assert!(!mutex_da(&name));
     }
 }

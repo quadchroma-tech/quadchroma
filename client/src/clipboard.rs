@@ -386,6 +386,19 @@ fn lesen() -> Option<Inhalt> {
     text_lesen().map(Inhalt::Text)
 }
 
+/// Text aus der Ablage zum Einfuegen in ein eigenes Feld (Adresse und
+/// Passwort, Strg+V). Anders als der Waechter liest es auch ohne Sitzung und
+/// auch verdeckte Eintraege: der Nutzer fuegt selbst ein, und der Text
+/// bleibt in diesem Programm - er geht nicht zum Host. None: kein Text
+/// oder die Ablage war nicht zu bekommen.
+pub fn text_einfuegen() -> Option<String> {
+    if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_err() {
+        return None;
+    }
+    let _guard = open_clipboard(None, VERSUCHE_KURZ)?;
+    text_lesen()
+}
+
 /// Die Pfade aus CF_HDROP, ueber DragQueryFileW. Nur bei offener Ablage
 /// aufrufen: das Handle gehoert der Ablage und gilt nur, solange sie offen
 /// ist. Deshalb auch nie DragFinish darauf - das gaebe einen Block frei, der

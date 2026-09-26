@@ -379,6 +379,34 @@ fn lesen(b: Id) -> Option<Inhalt> {
     }
 }
 
+/// Text vom Brett zum Einfuegen in ein eigenes Feld (Adresse und Passwort,
+/// Cmd+V). Anders als der Waechter liest es auch ohne Sitzung und auch
+/// verdeckte Eintraege (etwa das Passwort, das der Mac-Host kopiert): der
+/// Nutzer fuegt selbst ein, und der Text bleibt in diesem Programm - er
+/// geht nicht zum Host. None: kein Text, zu gross oder kein AppKit.
+pub fn text_einfuegen() -> Option<String> {
+    let _pool = Pool::neu();
+    let b = brett();
+    if b.is_null() {
+        return None;
+    }
+    unsafe {
+        let s = msg_id_1(b, sel(c"stringForType:"), NSPasteboardTypeString);
+        if s.is_null() {
+            return None;
+        }
+        let len = msg_uint_1(s, sel(c"lengthOfBytesUsingEncoding:"), NS_UTF8);
+        if len == 0 || len > MAX_BYTES {
+            return None;
+        }
+        let p = msg_id(s, sel(c"UTF8String")) as *const u8;
+        if p.is_null() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(std::slice::from_raw_parts(p, len)).into_owned())
+    }
+}
+
 /// Der Pfad hinter dem Dateiverweis (public.file-url) eines Eintrags, ueber
 /// datei_url. Der Pfad kommt aus `path`, also in der Schreibweise des
 /// Verweises. Die kann Umlaute zerlegt (NFD) tragen - fileURLWithPath: legt
