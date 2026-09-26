@@ -2,7 +2,7 @@
 
 Version 1.0, 26 September 2026
 
-Licensor: Robert Brandt, hello@quadchroma.tech, https://quadchroma.tech
+Licensor: Robert Brandt, hello@quadchroma.tech, https://github.com/quadchroma-tech/quadchroma
 Project: QuadChroma, https://github.com/quadchroma-tech/quadchroma
 
 ## Summary (for orientation only, not part of the Agreement)

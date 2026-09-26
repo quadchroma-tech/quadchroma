@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Robert Brandt <hello@quadchroma.tech>"]
 description = "QuadChroma remote desktop (HEVC 4:4:4): Windows client and host role, Mac client"
-homepage = "https://quadchroma.tech"
+homepage = "https://github.com/quadchroma-tech/quadchroma"
 repository = "https://github.com/quadchroma-tech/quadchroma"
 # PolyForm Strict 1.0.0 samt den Zusatzbedingungen des Lizenzgebers; der
 # Wortlaut steht in LICENSE.txt im Wurzelverzeichnis. Kein crates.io-Paket.

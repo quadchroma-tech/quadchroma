@@ -254,8 +254,12 @@ mod protokoll {
 
 /// Urheber. Wird in der Fusszeile des Startbildschirms angezeigt.
 const COPYRIGHT: &str = "© 2026 Robert Brandt";
-/// Projektseite. Steht anklickbar neben der Urheberzeile.
-const WEBSITE: &str = "quadchroma.tech";
+/// Projektseite. Steht anklickbar neben der Urheberzeile. Solange es
+/// quadchroma.tech noch nicht gibt, ist das die GitHub-Seite des Projekts.
+const WEBSITE: &str = "github.com/quadchroma-tech";
+/// Wohin der Klick fuehrt (nur Windows oeffnet den Browser).
+#[cfg_attr(not(windows), allow(dead_code))]
+const WEBSITE_URL: &str = "https://github.com/quadchroma-tech/quadchroma";
 /// FFmpeg-Hinweis (LGPL 2.1 Abschnitt 6 und Checkliste auf ffmpeg.org/legal):
 /// zeigt das Programm im Betrieb Urheberhinweise, gehoert der von FFmpeg
 /// dazu, samt Verweis auf den Lizenztext - THIRD_PARTY_NOTICES.txt liegt
@@ -270,7 +274,7 @@ fn website_oeffnen() {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    let ziel = HSTRING::from(format!("https://{WEBSITE}"));
+    let ziel = HSTRING::from(WEBSITE_URL);
     let verb = HSTRING::from("open");
     unsafe {
         ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(ziel.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);

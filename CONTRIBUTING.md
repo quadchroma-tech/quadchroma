@@ -217,6 +217,6 @@ together.
 
 ## 8. Contact
 
-Robert Brandt - hello@quadchroma.tech - https://quadchroma.tech
+Robert Brandt - hello@quadchroma.tech - https://github.com/quadchroma-tech/quadchroma
 
 Commercial licences and any use beyond `LICENSE.txt`: same address.

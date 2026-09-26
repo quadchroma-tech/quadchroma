@@ -2,7 +2,7 @@
 
 **Date:** 26 September 2026  
 **Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as of commit `26ef895` on `main`, static Microsoft C runtime; the release build of 26 September 2026 was 3,930,624 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS host `QuadChroma.app` 0.1.0 (build 2, bundle identifier `tech.quadchroma.host`).  
-**Maintainer / licensor:** Robert Brandt, <hello@quadchroma.tech>, <https://quadchroma.tech>
+**Maintainer / licensor:** Robert Brandt, <hello@quadchroma.tech>, <https://github.com/quadchroma-tech/quadchroma>
 
 This file accompanies every binary distribution of QuadChroma (the Windows ZIP and the macOS DMG/ZIP) and is kept unchanged in the source repository. It lists every third-party component contained in, or shipped next to, the distributed binaries, states the license each component is under, reproduces the license texts verbatim and records where the exact source code of the FFmpeg libraries comes from.
 

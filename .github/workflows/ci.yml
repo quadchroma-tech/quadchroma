@@ -197,7 +197,8 @@ jobs:
       - name: Pruefstaende ohne TCC ausfuehren (noisetest, annahmetest, dateitest, ablagetest)
         run: |
           set -euo pipefail
-          out=$(build/noisetest); echo "$out"; [ "$out" = "OK" ]
+          # noisetest schreibt zwei Protokollzeilen und zuletzt "OK".
+          out=$(build/noisetest); echo "$out"; [ "$(printf '%s\n' "$out" | tail -n 1)" = "OK" ]
           build/annahmetest
           build/dateitest
           build/ablagetest

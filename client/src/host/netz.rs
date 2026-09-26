@@ -3228,7 +3228,10 @@ mod tests {
         println!("eingefroren: {lauf:?}");
         let weg = lauf.weg_nach.expect("Zuschauer nicht ausgetragen");
         assert!(weg >= Duration::from_micros(STAU_FRIST_US) - Duration::from_millis(50), "{weg:?}");
-        assert!(weg <= Duration::from_micros(STAU_FRIST_US) + Duration::from_millis(500), "{weg:?}");
+        // Nach oben 2 s Spielraum: auf geteilten CI-Runnern (4 Kerne, die
+        // ganze Testreihe parallel) kam der Austrag nach 3,4 s - die Frist
+        // wird dann spaeter geprueft, nicht falsch. Die VM liegt bei gut 2 s.
+        assert!(weg <= Duration::from_micros(STAU_FRIST_US) + Duration::from_secs(2), "{weg:?}");
         assert_eq!(lauf.verworfen, 0, "{lauf:?}");
     }
 

@@ -260,7 +260,7 @@ by an unrelated account). In the repository's "About" box (gear icon):
   `Remote desktop from a Mac to a Windows PC in HEVC 4:4:4 at 10 bit - hardware-encoded
   on Apple silicon, hardware-decoded on NVIDIA. Sharp text, local mouse pointer, no
   account, no cloud, one program per side. Free for personal use.`
-- **Website:** `https://quadchroma.tech`
+- **Website:** leave empty until `https://quadchroma.tech` exists (the domain is registered, the site is not online yet)
 - **Topics:** `remote-desktop`, `screen-sharing`, `macos`, `windows`, `hevc`, `h265`,
   `yuv444`, `chroma-subsampling`, `10-bit`, `videotoolbox`, `nvdec`, `low-latency`,
   `apple-silicon`, `rust`, `objective-c`
@@ -503,7 +503,7 @@ a copy that came out of a downloaded ZIP. The German parameter names used in
 older notes (`-Datei`, `-Fingerabdruck`, `-NurPruefen`) still work as aliases.
 
 The script runs `signtool sign /v /fd SHA256 /tr http://timestamp.digicert.com
-/td SHA256 /d QuadChroma /du https://quadchroma.tech /sha1 <thumbprint>`
+/td SHA256 /d QuadChroma /du https://github.com/quadchroma-tech/quadchroma /sha1 <thumbprint>`
 followed by `signtool verify /pa /v` and exits non-zero if the signature does not
 verify. SimplySign asks for the OTP when signtool touches the key. Then build
 the ZIP with the layout of section 7 (top-level folder `quadchroma-X.Y.Z/`, the

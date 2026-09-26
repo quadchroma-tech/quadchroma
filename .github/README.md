@@ -433,4 +433,4 @@ Contributions are accepted only under the Contributor License Agreement in `CLA.
 which lets the licensor offer the project under other terms as well; see
 `CONTRIBUTING.md`. Security reports: `SECURITY.md`. Conduct: `CODE_OF_CONDUCT.md`.
 
-Copyright 2026 Robert Brandt. Contact: hello@quadchroma.tech, https://quadchroma.tech.
+Copyright 2026 Robert Brandt. Contact: hello@quadchroma.tech, https://github.com/quadchroma-tech/quadchroma.

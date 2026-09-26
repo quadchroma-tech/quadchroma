@@ -84,7 +84,7 @@ param(
     # Beschreibung und URL in der Signatur (/d, /du); Windows zeigt die
     # Beschreibung in seinen Dialogen.
     [Alias('Beschreibung')] [string] $Description = 'QuadChroma',
-    [Alias('BeschreibungUrl')] [string] $DescriptionUrl = 'https://quadchroma.tech',
+    [Alias('BeschreibungUrl')] [string] $DescriptionUrl = 'https://github.com/quadchroma-tech/quadchroma',
     # Nichts signieren, nur pruefen (signtool verify /pa /v und
     # Get-AuthenticodeSignature).
     [Alias('NurPruefen')] [switch] $VerifyOnly

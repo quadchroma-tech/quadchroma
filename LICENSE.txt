@@ -1,6 +1,6 @@
 # QuadChroma License
 
-Copyright (c) 2026 Robert Brandt (hello@quadchroma.tech, https://quadchroma.tech)
+Copyright (c) 2026 Robert Brandt (hello@quadchroma.tech, https://github.com/quadchroma-tech/quadchroma)
 
 The software is licensed under the PolyForm Strict License 1.0.0 (Part I,
 reproduced verbatim) together with the Licensor's Additional Terms (Part II),
@@ -95,7 +95,7 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 
 **Use** means anything you do with the software requiring one of your licenses.
 
-Required Notice: Copyright Robert Brandt (https://quadchroma.tech)
+Required Notice: Copyright Robert Brandt (https://github.com/quadchroma-tech/quadchroma)
 Required Notice: Commercial licenses and other permissions: hello@quadchroma.tech
 
 The two lines above are notices the Licensor provides with the software, in the
@@ -315,9 +315,8 @@ are not distribution, provided the copies remain under Your control, retain all
 notices (clause 9) and are not made available to any other person.
 
 6.3 Pointing others to the official sources of the software is permitted and is
-not distribution: You may share the addresses <https://quadchroma.tech> and
-<https://github.com/quadchroma-tech/quadchroma>, or an official download address
-published there. The Licensor publishes the software only at those sources;
+not distribution: You may share the address <https://github.com/quadchroma-tech/quadchroma>, or an
+official download address published there. The Licensor publishes the software only at those sources;
 copies obtained elsewhere may have been altered, and the Licensor does not
 vouch for them.
 
@@ -500,7 +499,7 @@ guide its interpretation.
 
 ### 16. Contact
 
-Robert Brandt, hello@quadchroma.tech, https://quadchroma.tech. Notices to the
+Robert Brandt, hello@quadchroma.tech, https://github.com/quadchroma-tech/quadchroma. Notices to the
 Licensor are to be sent to that e-mail address. Notices to You, including
 notices under the section "Violations" of Part I, may be given in text form,
 including by e-mail.

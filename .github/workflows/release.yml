@@ -334,7 +334,7 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
           description: QuadChroma
-          description-url: https://quadchroma.tech
+          description-url: https://github.com/quadchroma-tech/quadchroma
 
       - name: Signatur pruefen (signtool verify /pa ueber scripts/sign-windows.ps1)
         shell: pwsh

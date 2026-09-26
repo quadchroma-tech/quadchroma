@@ -49,7 +49,7 @@ BEGIN
             VALUE "OriginalFilename", "quadchroma.exe"
             VALUE "ProductName",      "QuadChroma"
             VALUE "ProductVersion",   QC_VERSION_TEXT
-            VALUE "Comments",         "QuadChroma remote desktop (HEVC 4:4:4) - https://quadchroma.tech"
+            VALUE "Comments",         "QuadChroma remote desktop (HEVC 4:4:4) - https://github.com/quadchroma-tech/quadchroma"
         END
     END
     BLOCK "VarFileInfo"
