@@ -96,6 +96,26 @@ host.key und authorized.txt des Hosts, getrennte Dateien). Lizenzhinweis: das
 Homebrew-FFmpeg ist ein GPL-Build (libx264, libx265); für den Eigengebrauch in
 Ordnung, zur Weitergabe des Mac-Clients braucht es einen LGPL-Build ohne GPL-Teile.
 
+## Erster Start einer heruntergeladenen Version
+
+QuadChroma ist nicht mit einem bezahlten Zertifikat signiert (Apple Developer Program,
+Windows-Codesignatur). Windows und macOS fragen deshalb vor dem ersten Start einmal
+nach. Nur von der Release-Seite laden und die SHA-256 mit `SHA256SUMS.txt` vergleichen.
+
+- **Windows:** vor dem Entpacken Rechtsklick auf das ZIP → Eigenschaften → „Zulassen“
+  anhaken → OK; dann warnt Windows gar nicht. Sonst meldet SmartScreen „Der Computer
+  wurde durch Windows geschützt“: „Weitere Informationen“ → „Trotzdem ausführen“.
+  Mit eingeschalteter intelligenter App-Steuerung (Windows 11) kann ein unsigniertes
+  Programm ganz gesperrt sein; dann hilft nur der Bau aus dem Quelltext.
+- **macOS:** `QuadChroma.app` aus der DMG in „Programme“ ziehen. Den ersten Start lehnt
+  macOS ab (nicht von Apple notarisiert): Systemeinstellungen → Datenschutz & Sicherheit
+  → ganz unten „Dennoch öffnen“, bestätigen. Im Terminal geht dasselbe mit
+  `xattr -dr com.apple.quarantine /Applications/QuadChroma.app`. Danach
+  Bildschirmaufnahme und Bedienungshilfen erlauben. Versionen mit `-selfsigned` im
+  Namen sind mit dem eigenen, kostenlosen Zertifikat „QuadChroma Release“ signiert –
+  die Freigaben bleiben über Updates erhalten. Bei `-unsigned` (nur ad hoc signiert)
+  sind sie nach jedem Update neu zu erteilen.
+
 ## Bedienung im Client
 
 | Taste | Wirkung |

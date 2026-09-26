@@ -72,6 +72,31 @@ Mac host and a signature for the exe are on the list of open points.
   local network. On its first start the Windows Firewall asks whether the program may
   use the network; allow it, otherwise the host list stays empty.
 
+## First start of a downloaded release
+
+QuadChroma is not signed with a paid certificate (Apple Developer Program, Windows
+code-signing certificate), so Windows and macOS ask once before the first start.
+Download only from the project's Releases page and compare the SHA-256 of the file
+with `SHA256SUMS.txt` (Windows: `Get-FileHash -Algorithm SHA256 <file>`; macOS:
+`shasum -a 256 <file>`).
+
+**Windows.** Before unpacking, right-click the ZIP > Properties > tick "Unblock" > OK;
+then Windows does not warn at all. Without that, SmartScreen shows "Windows protected
+your PC": choose "More info" > "Run anyway" once. Keep `avcodec-63.dll` and
+`avutil-61.dll` next to `quadchroma.exe`. On Windows 11 with Smart App Control
+switched on, unsigned programs can be blocked without a "Run anyway" option; then
+only building from source helps.
+
+**macOS (host).** Open the DMG and drag `QuadChroma.app` to Applications. On the
+first start macOS refuses the app because Apple has not notarized it: open System
+Settings > Privacy & Security, scroll down to the message about QuadChroma and click
+"Open Anyway", then confirm. The same in Terminal:
+`xattr -dr com.apple.quarantine /Applications/QuadChroma.app`. Then grant Screen
+Recording and Accessibility (see Requirements). Release files named `-selfsigned` are
+signed with the project's own free certificate "QuadChroma Release": both permissions
+stay granted across updates. Files named `-unsigned` carry only an ad-hoc signature;
+after each update the two permissions must be granted again.
+
 ## Getting started
 
 ### Mac host

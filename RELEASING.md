@@ -40,6 +40,35 @@ be labelled as such in the release notes.
 
 ## 2. One-time setup on the Apple side (needs the author)
 
+### 2.0 Free option: the project's own certificate (no Apple account)
+
+Without the Apple Developer Program the host can still be signed with a
+self-signed code-signing certificate that belongs to the project: "QuadChroma
+Release" (RSA 3072, valid until 26 September 2046, SHA-256 fingerprint
+`3B:6D:5C:A6:EF:08:21:94:88:28:33:74:BC:08:5F:A0:28:FC:9B:9F:E7:66:CA:24:A2:B2:48:67:59:46:20:BA`).
+It was created on 26 September 2026 and lies outside the repository in
+`~/Documents/quadchroma-signierung/` (`quadchroma-release.p12`, its password,
+the Base64 form for GitHub, the public certificate). Keep a backup of that
+folder: a release signed with a different certificate makes every user grant
+Screen Recording and Accessibility again.
+
+What it gives: Gatekeeper still refuses the first start (the app is not
+notarized; users click "Open Anyway" once, see README.en.md), but macOS ties the
+two permissions to the designated requirement `identifier "tech.quadchroma.host"
+and certificate root = H"eddb251662679f9761f59df958e435273230c095"`, which stays
+the same for every release signed with this certificate - permissions survive
+updates. With an ad-hoc signature they would be lost on every update.
+
+To use it in CI, add the two repository secrets `MAC_SELFSIGNED_P12_BASE64`
+(content of `quadchroma-release.p12.base64.txt`) and
+`MAC_SELFSIGNED_P12_PASSWORD` (content of `p12-passwort.txt`). `release.yml`
+then signs with `IDENT="QuadChroma Release"` (no secure timestamp - Apple's
+timestamp service is only meant for Apple-issued certificates) and names the
+macOS files `-selfsigned`. As soon as the Developer ID secrets of 2.1 to 2.3
+exist, they take precedence. Local signing with this certificate would need it
+imported into the login keychain, which asks for the keychain password; the CI
+route needs no local step.
+
 Nothing in this section can be done by a script or by anyone but the account
 holder: it involves identity checks, payment and private keys.
 
@@ -234,6 +263,8 @@ requests from forks, and `ci.yml` uses none.
 
 | Secret | Content | Where it comes from | Used by |
 |---|---|---|---|
+| `MAC_SELFSIGNED_P12_BASE64` | the free project certificate "QuadChroma Release" with private key, Base64 (section 2.0) | `~/Documents/quadchroma-signierung/quadchroma-release.p12.base64.txt` | `macos` job: temporary keychain, only while no Developer ID secrets exist |
+| `MAC_SELFSIGNED_P12_PASSWORD` | password of that `.p12` | `~/Documents/quadchroma-signierung/p12-passwort.txt` | same |
 | `APPLE_CERTIFICATE_P12_BASE64` | the Developer ID Application certificate with private key, Base64 | Keychain Access export of the identity as `.p12`, then `base64 -i DeveloperID.p12 \| pbcopy` | `macos` job: temporary keychain |
 | `APPLE_CERTIFICATE_PASSWORD` | password chosen at the `.p12` export | you | `macos` job |
 | `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Robert Brandt (TEAMID)` (or the identity's 40-character SHA-1 hash) | `security find-identity -p codesigning -v` | `macos` job: `make sign IDENT=...` |

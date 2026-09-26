@@ -50,6 +50,7 @@ jobs:
       azure_oidc: ${{ steps.schalter.outputs.azure_oidc }}
       mac_sign: ${{ steps.schalter.outputs.mac_sign }}
       mac_notarize: ${{ steps.schalter.outputs.mac_notarize }}
+      mac_selbst: ${{ steps.schalter.outputs.mac_selbst }}
     steps:
       - name: Quellen
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,6 +91,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          MAC_SELFSIGNED_P12_BASE64: ${{ secrets.MAC_SELFSIGNED_P12_BASE64 }}
+          MAC_SELFSIGNED_P12_PASSWORD: ${{ secrets.MAC_SELFSIGNED_P12_PASSWORD }}
         run: |
           set -euo pipefail
           # gesetzt NAME...: wahr, wenn alle genannten Variablen nicht leer sind.
@@ -126,17 +129,29 @@ jobs:
             echo "::warning::Apple-Secrets fuer die Signatur unvollstaendig (es fehlen: $(fehlend $apple_sign)) - App wird nur ad-hoc signiert"
           fi
 
+          # macOS ohne Apple-Konto: das kostenlose, selbst erzeugte Zertifikat "QuadChroma Release"
+          # (RELEASING.md). Gatekeeper fragt beim ersten Start trotzdem, aber Bildschirmaufnahme
+          # und Bedienungshilfen ueberstehen jedes Update, das mit demselben Zertifikat signiert
+          # ist - bei ad-hoc waere nach jedem Update eine neue Freigabe noetig.
+          mac_selbst=false
+          if [ "$mac_sign" != "true" ] && gesetzt MAC_SELFSIGNED_P12_BASE64 MAC_SELFSIGNED_P12_PASSWORD; then
+            mac_selbst=true
+          elif [ "$mac_sign" != "true" ] && eine MAC_SELFSIGNED_P12_BASE64 MAC_SELFSIGNED_P12_PASSWORD; then
+            echo "::warning::Secrets fuer das eigene Mac-Zertifikat unvollstaendig (es fehlen: $(fehlend MAC_SELFSIGNED_P12_BASE64 MAC_SELFSIGNED_P12_PASSWORD)) - App wird nur ad-hoc signiert"
+          fi
+
           {
             echo "windows_sign=$windows_sign"
             echo "azure_oidc=$azure_oidc"
             echo "mac_sign=$mac_sign"
             echo "mac_notarize=$mac_notarize"
+            echo "mac_selbst=$mac_selbst"
           } >> "$GITHUB_OUTPUT"
           {
             echo "## Release $GITHUB_REF_NAME"
             echo "- Windows: Authenticode-Signatur ueber Azure Artifact Signing: **$windows_sign** (OIDC: $azure_oidc)"
-            echo "- macOS: Developer-ID-Signatur: **$mac_sign**, Notarisierung: **$mac_notarize**"
-            echo "- Ohne Signatur bekommen die Artefakte den Zusatz -unsigned (macOS auch -unnotarized)."
+            echo "- macOS: Developer-ID-Signatur: **$mac_sign**, Notarisierung: **$mac_notarize**, eigenes Zertifikat: **$mac_selbst**"
+            echo "- Ohne Signatur bekommen die Artefakte den Zusatz -unsigned (macOS auch -unnotarized bzw. -selfsigned)."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_OUTPUT"
 
@@ -399,10 +414,12 @@ jobs:
       VERSION: ${{ needs.vorpruefung.outputs.version }}
       SIGN: ${{ needs.vorpruefung.outputs.mac_sign }}
       NOTARIZE: ${{ needs.vorpruefung.outputs.mac_notarize }}
-      # Signieridentitaet fuer das Makefile; "-" ist die Ad-hoc-Signatur ohne Zertifikat.
+      SELBST: ${{ needs.vorpruefung.outputs.mac_selbst }}
+      # Signieridentitaet fuer das Makefile; "-" ist die Ad-hoc-Signatur ohne Zertifikat,
+      # "QuadChroma Release" das kostenlose eigene Zertifikat (ohne Zeitstempel).
       # Das Makefile haengt --timestamp automatisch an, sobald IDENT "Developer ID" enthaelt
       # oder ein 40-stelliger SHA-1-Hash aus `security find-identity` ist.
-      IDENT: ${{ needs.vorpruefung.outputs.mac_sign == 'true' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+      IDENT: ${{ needs.vorpruefung.outputs.mac_sign == 'true' && secrets.APPLE_SIGNING_IDENTITY || (needs.vorpruefung.outputs.mac_selbst == 'true' && 'QuadChroma Release' || '-') }}
     steps:
       - name: Quellen
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -414,6 +431,7 @@ jobs:
           set -euo pipefail
           suffix=""
           [ "$SIGN" = "true" ] || suffix="-unsigned"
+          [ "$SIGN" = "true" ] || [ "$SELBST" != "true" ] || suffix="-selfsigned"
           [ "$SIGN" != "true" ] || [ "$NOTARIZE" = "true" ] || suffix="-unnotarized"
           echo "NAME=QuadChroma-$VERSION-macos-arm64$suffix" >> "$GITHUB_ENV"
           mkdir -p dist
@@ -449,6 +467,29 @@ jobs:
           security list-keychain -d user -s "$keychain"
           echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
           security find-identity -v -p codesigning "$keychain"
+
+      - name: Eigenes Release-Zertifikat in einen temporaeren Schluesselbund laden
+        if: env.SIGN != 'true' && env.SELBST == 'true'
+        env:
+          P12_BASE64: ${{ secrets.MAC_SELFSIGNED_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MAC_SELFSIGNED_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Wie beim Developer-ID-Zertifikat, nur ohne Apples Zwischenzertifikat: das eigene
+          # Zertifikat ist selbst signiert. codesign braucht dafuer keine Vertrauenseinstellung.
+          keychain="$RUNNER_TEMP/quadchroma-signing.keychain-db"
+          passwort=$(openssl rand -hex 24)
+          echo "::add-mask::$passwort"
+          p12="$RUNNER_TEMP/quadchroma-release.p12"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$passwort" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$passwort" "$keychain"
+          security import "$p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$passwort" "$keychain"
+          security list-keychain -d user -s "$keychain"
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
 
       - name: Host bauen (make; signiert mit IDENT, ohne Zertifikat ad-hoc)
         run: make IDENT="$IDENT"
@@ -539,7 +580,7 @@ jobs:
         if: always()
         run: |
           if [ -n "${KEYCHAIN_PATH:-}" ]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
-          rm -f "$RUNNER_TEMP/notarize.sh" "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/QuadChroma-notarize.zip"
+          rm -f "$RUNNER_TEMP/notarize.sh" "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/quadchroma-release.p12" "$RUNNER_TEMP/QuadChroma-notarize.zip"
 
       - name: macOS-Pakete als Artefakt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -596,6 +637,7 @@ jobs:
             esac
             case "$mac" in
               *-unsigned*)    echo "macOS: QuadChroma.app is ad-hoc signed only, not notarized. Gatekeeper will refuse it: System Settings > Privacy & Security > Open Anyway.";;
+              *-selfsigned*)  echo "macOS: QuadChroma.app is signed with the project's own free certificate \"QuadChroma Release\" (not issued by Apple, not notarized). Gatekeeper refuses the first start: System Settings > Privacy & Security > Open Anyway (see README.txt). Screen Recording and Accessibility stay granted across updates.";;
               *-unnotarized*) echo "macOS: QuadChroma.app is Developer ID signed but NOT notarized.";;
               *)              echo "macOS: QuadChroma.app is Developer ID signed, notarized and stapled (ZIP and DMG).";;
             esac

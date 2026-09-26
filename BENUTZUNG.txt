@@ -17,6 +17,14 @@ Bekanntgabe im Netz. Beim ersten Start fragt die Windows-Firewall, ob das
 Programm ins Netz darf - das muss erlaubt werden, sonst bleibt die Liste
 leer.
 
+Erster Start einer heruntergeladenen Version: QuadChroma ist nicht mit
+einem bezahlten Zertifikat signiert. Am einfachsten vor dem Entpacken:
+Rechtsklick auf das ZIP, Eigenschaften, "Zulassen" anhaken, OK - dann
+warnt Windows nicht. Sonst meldet SmartScreen "Der Computer wurde durch
+Windows geschuetzt": "Weitere Informationen", dann "Trotzdem ausfuehren".
+avcodec-63.dll und avutil-61.dll bleiben neben quadchroma.exe liegen.
+Die Pruefsummen der Dateien stehen in SHA256SUMS.txt auf der Release-Seite.
+
 Schliessen beendet QuadChroma nicht, es legt die App im Infobereich ab
 (auf dem Mac in der Menueleiste). Es laeuft nur eine App mit Fenster: ein
 zweiter Start reicht seine Adresse an sie weiter. Darauf baut die
