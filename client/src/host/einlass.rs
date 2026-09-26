@@ -47,7 +47,7 @@
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -190,6 +190,13 @@ pub struct Einlass {
     /// "Geraeteliste beschaedigt" steht schon im Protokoll (einmal, bis sie
     /// wieder lesbar ist; jede Verbindung einzeln laeuft ueber DROSSEL_LISTE).
     liste_gemeldet: AtomicBool,
+    /// Zaehlt jedes Entfernen aus der Liste (ein Geraet oder alle), erst
+    /// nachdem die Datei geschrieben ist. Wer ein Geraet hereinlaesst,
+    /// merkt sich den Stand vor dem Blick in die Liste und sieht beim
+    /// Eintragen als Zuschauer nach (netz::bild_annehmen): so entgeht ihm
+    /// kein Entfernen, das zuschauer_trennen nicht treffen konnte, weil das
+    /// Geraet noch kein Zuschauer war (wie g_entfernt_zaehler im Mac-Host).
+    entfernt: AtomicU64,
 }
 
 static EINLASS: OnceLock<Arc<Einlass>> = OnceLock::new();
@@ -292,6 +299,7 @@ impl Einlass {
             anfragen: Mutex::new(Anfragen::default()),
             ui: Mutex::new(None),
             liste_gemeldet: AtomicBool::new(false),
+            entfernt: AtomicU64::new(0),
         }
     }
 
@@ -348,6 +356,17 @@ impl Einlass {
         }
     }
 
+    /// Stand des Entfernen-Zaehlers (siehe `entfernt`).
+    pub fn entfernt_stand(&self) -> u64 {
+        self.entfernt.load(Ordering::SeqCst)
+    }
+
+    /// Steht dieser Schluessel (noch) in der Liste? Fuer den zweiten Blick,
+    /// wenn seit dem ersten etwas entfernt wurde (netz::bild_annehmen).
+    pub fn noch_bekannt(&self, peer: &[u8], ip: IpAddr) -> bool {
+        self.bekannt(peer, ip)
+    }
+
     /// Traegt ein angenommenes Geraet ein (heutiges Datum). Scheitert das
     /// (Liste beschaedigt, Schreibfehler), gilt die Annahme nur fuer diese
     /// Sitzung - das steht im Protokoll.
@@ -374,6 +393,9 @@ impl Einlass {
             let _l = sperre(&self.liste);
             zugang::geraet_entfernen(&self.geraete, schluessel)
         };
+        if matches!(r, Ok(true)) {
+            self.entfernt.fetch_add(1, Ordering::SeqCst);
+        }
         let id = zugang::id_text(zugang::geraete_id(schluessel));
         match &r {
             Ok(true) => log(format!("Geraet entfernt: ID {id}")),
@@ -389,6 +411,9 @@ impl Einlass {
             let _l = sperre(&self.liste);
             zugang::alle_geraete_entfernen(&self.geraete)
         };
+        if r.is_ok() {
+            self.entfernt.fetch_add(1, Ordering::SeqCst);
+        }
         match &r {
             Ok(()) => log("Alle Geraete entfernt"),
             Err(e) => log(format!("Geraete nicht entfernt: {e}")),

@@ -1060,6 +1060,11 @@ static EINGABE_NR: AtomicU64 = AtomicU64::new(0);
 /// bleiben. Reihenfolge: erst EINSPEISEN, dann AKTUELL.
 static EINSPEISEN: Mutex<()> = Mutex::new(());
 
+/// Test-Haken: laeuft einmal im Faden der naechsten Verbindung, nach dem
+/// Einlass und vor dem Eintragen als Zuschauer (Wettlauf mit "Entfernen").
+#[cfg(test)]
+static NACH_EINLASS: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
 /// Handschlaege, die gerade laufen - je Port hoechstens 32, je Absender
 /// hoechstens zwei. Mit nur einem Annahmefaden genuegte eine einzige stumme
 /// Verbindung, um jeden weiteren Zuschauer auszusperren; ohne Grenze banden
@@ -1746,9 +1751,18 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
         log(format!("Abgewiesen: {name} ({ip}) - kein Einlass eingerichtet"));
         return;
     };
+    // Stand des Entfernen-Zaehlers vor dem Blick in die Liste (siehe unten).
+    let mut entfernt_stand = einlass.entfernt_stand();
     let ausgang = einlass.pruefen(&mut sock, absender_ip, &name);
     if !ausgang.herein() {
         return;
+    }
+    #[cfg(test)]
+    {
+        let haken = sperre(&NACH_EINLASS).take();
+        if let Some(h) = haken {
+            h();
+        }
     }
 
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
@@ -1764,9 +1778,30 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     // Ein neuer Zuschauer ersetzt den alten: dessen Eingabekanal wird
     // gekappt, seine Warteschlange verworfen; er bekommt nur noch
     // MSG_ABGELOEST, dann endet sein Sendefaden (unten wird darauf gewartet).
-    let (alt, nr) = {
-        let _einspeisen = sperre(&EINSPEISEN);
+    let (alt, nr) = loop {
+        let einspeisen = sperre(&EINSPEISEN);
         let mut a = sperre(&AKTUELL);
+        // Wurde seit dem Blick in die Liste ein Geraet entfernt, hat
+        // zuschauer_trennen dieses hier nicht gesehen (es stand noch nicht
+        // in AKTUELL) - vielleicht war es genau seins ("Alle entfernen"
+        // trifft auch ein eben zugelassenes). Dann ausserhalb der Sperren
+        // noch einmal nachsehen (Datei). Unter AKTUELL gilt der Stand erst,
+        // wenn seitdem nichts mehr entfernt wurde: jedes spaetere Entfernen
+        // zaehlt erst hoch und trennt dann - und sieht den Neuen in AKTUELL.
+        let stand = einlass.entfernt_stand();
+        if stand != entfernt_stand {
+            entfernt_stand = stand;
+            drop(a);
+            drop(einspeisen);
+            if !einlass.noch_bekannt(&leitung.peer, absender_ip) {
+                log(format!(
+                    "Zuschauer {name} ({ip}), ID {} abgewiesen: sein Geraet wurde eben aus der Liste entfernt",
+                    zugang::id_text(zugang::geraete_id(&leitung.peer))
+                ));
+                return;
+            }
+            continue;
+        }
         let alt = a.take();
         if let Some(alt) = &alt {
             log(format!("Zuschauer abgeloest: {}", alt.ip));
@@ -1789,7 +1824,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
         let nr = NR.fetch_add(1, Ordering::Relaxed) + 1;
         leitung.nr.store(nr, Ordering::Relaxed);
         *a = Some(leitung.clone());
-        (alt, nr)
+        break (alt, nr);
     };
     let l2 = leitung.clone();
     std::thread::spawn(move || sendefaden(l2, sock));
@@ -2600,6 +2635,48 @@ mod tests {
         // Ein fremdes Geraet trennt zuschauer_trennen nicht, das eigene schon.
         assert!(!zuschauer_trennen(Some(&[7u8; 32])));
         assert_eq!(zuschauer_nr(), nr_b);
+
+        // Entfernen, waehrend ein bekanntes Geraet hereinkommt: es stand beim
+        // Blick in die Liste noch darin, ist aber noch kein Zuschauer - das
+        // Menue (Entfernen, dann zuschauer_trennen) findet es nicht. Es
+        // bekommt trotzdem kein MAGIC, und B bleibt der Zuschauer. Wird
+        // stattdessen ein anderes Geraet entfernt, kommt es herein.
+        let einlass = super::super::einlass::einlass().unwrap();
+        let liste = zugang::ablage_pfad(zugang::GERAETE_DATEI).unwrap();
+        let (c_priv, c_pub) = noise::keypair().unwrap();
+        let (x_priv, x_pub) = noise::keypair().unwrap();
+        let (_, y_pub) = noise::keypair().unwrap();
+        for (k, n) in [(&c_pub, "Wettlauf"), (&x_pub, "Zweiter"), (&y_pub, "Unbeteiligt")] {
+            let k: [u8; 32] = k.clone().try_into().unwrap();
+            zugang::geraet_eintragen(&liste, &k, n, "2026-09-26").unwrap();
+        }
+        let angehalten = |wer: Vec<u8>, name: &'static str, entfernen: Vec<u8>| {
+            let (da_tx, da_rx) = std::sync::mpsc::channel::<()>();
+            let (weiter_tx, weiter_rx) = std::sync::mpsc::channel::<()>();
+            let weiter_rx = Mutex::new(weiter_rx);
+            *sperre(&NACH_EINLASS) = Some(Box::new(move || {
+                let _ = da_tx.send(());
+                let _ = sperre(&weiter_rx).recv_timeout(Duration::from_secs(5));
+            }));
+            let addr = bild_addr.clone();
+            let t = std::thread::spawn(move || {
+                let mut s = super::super::einlass::stub::Stub::verbinden(&addr, &wer, &zugang::nachricht3(name))?;
+                s.kennung()
+            });
+            da_rx.recv_timeout(Duration::from_secs(5)).expect("Einlass nicht erreicht");
+            // Wie das Menue: erst aus der Liste, dann den Zuschauer trennen.
+            assert_eq!(einlass.geraet_entfernen(&entfernen).unwrap(), true);
+            assert!(!zuschauer_trennen(Some(&entfernen)), "noch kein Zuschauer");
+            weiter_tx.send(()).unwrap();
+            t.join().unwrap()
+        };
+        assert!(angehalten(c_priv, "Wettlauf", c_pub.clone()).is_err(), "trotz Entfernen hereingekommen");
+        assert_eq!(zuschauer_nr(), nr_b, "B abgeloest");
+        zeitfrage(&mut b_ein, 0xB4).unwrap();
+        assert_eq!(zeitantwort(&mut b), Ok(0xB4));
+        assert_eq!(angehalten(x_priv, "Zweiter", y_pub.clone()), Ok(*MAGIC), "ein anderes Geraet entfernt: herein");
+        assert_eq!(zuschauer_nr(), nr_b + 1);
+        assert!(!einlass.noch_bekannt(&c_pub, "127.0.0.1".parse().unwrap()));
 
         // Zwei laufende Handschlaege von einem Absender: der dritte wird
         // sofort abgewiesen, nicht erst nach der Frist.
