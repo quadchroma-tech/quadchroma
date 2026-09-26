@@ -230,7 +230,7 @@ static void *angreifer(void *arg) {
         if (fd >= 0) {
             if (n == 64) { close(fds[0]); memmove(fds, fds + 1, 63 * sizeof fds[0]); n--; }
             fds[n++] = fd;
-            a->geoeffnet++;
+            __atomic_add_fetch(&a->geoeffnet, 1, __ATOMIC_RELAXED);
         }
         usleep(50 * 1000);
     }
@@ -554,16 +554,22 @@ int main(void) {
     pthread_t at;
     pthread_create(&at, NULL, angreifer, &ang);
     usleep(300 * 1000);
-    int durch = 0;
-    for (int i = 0; i < 5; i++) {
+    // Mindestens 5 echte Clients, und weiter, bis der Angreifer 20 stumme
+    // Verbindungen geoeffnet hat - auf langsamen CI-Runnern schafft er in
+    // den ersten gut 1 s nur 14 (hoechstens 10 s).
+    int durch = 0, versuche = 0;
+    int64_t t_ang = jetzt_ms();
+    while ((versuche < 5 || __atomic_load_n(&ang.geoeffnet, __ATOMIC_RELAXED) < 20) && jetzt_ms() - t_ang < 10000) {
         if (echter_client(port2) == 0) durch++;
+        versuche++;
         usleep(200 * 1000);
     }
     atomic_store(&ang.stop, 1);
     pthread_join(at, NULL);
-    printf("         (Angreifer oeffnete %d stumme Verbindungen, %d von 5 echten Clients durch)\n",
-           ang.geoeffnet, durch);
-    pruefe(durch == 5 && ang.geoeffnet >= 20, "Angreifer mit 20 stummen Verbindungen je Sekunde: 5 von 5 echten Clients durch");
+    printf("         (Angreifer oeffnete %d stumme Verbindungen, %d von %d echten Clients durch)\n",
+           ang.geoeffnet, durch, versuche);
+    pruefe(durch == versuche && versuche >= 5 && ang.geoeffnet >= 20,
+           "Angreifer mit 20 stummen Verbindungen (je 50 ms eine): jeder echte Client kommt durch");
     for (int i = 0; i < 4; i++) close(g[i]);
 
     // 5. Obergrenze der Faeden: verdraengte Faeden, die noch nicht fertig
