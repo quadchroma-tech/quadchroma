@@ -15,7 +15,11 @@
 // Das Zulassen-Fenster liegt oben (WS_EX_TOPMOST) und macht mit Ton und
 // Blinken auf sich aufmerksam, nimmt aber nicht von selbst den Fokus: sonst
 // ginge ein Eingabe-Tastendruck, der eigentlich einem anderen Programm
-// galt, als "Zulassen" durch. Ein Klick hinein, dann gilt Eingabe.
+// galt, als "Zulassen" durch. Ein Klick hinein, dann gilt Eingabe. Aus
+// demselben Grund ist der Knopf "Zulassen" die erste ZULASSEN_SPERRE lang
+// gesperrt: jedes Geraet im Netz kann ein neues Fenster aufspringen lassen,
+// immer an derselben Stelle - ein Klick, der eben noch einem anderen Fenster
+// galt, gaebe sonst die volle Steuerung frei. "Ablehnen" geht sofort.
 //
 // Schrift und Masse folgen der Systemskalierung (die Host-Rolle ist
 // Per-Monitor-DPI-bewusst, mod.rs): die Nachrichtenschrift des Systems in
@@ -34,20 +38,22 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, SystemParametersInfoForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FlashWindowEx, GetDlgItem,
-    GetMessageW, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindow, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow,
-    TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_PASSWORD, FLASHWINFO, FLASHW_ALL,
-    FLASHW_TIMERNOFG, HMENU, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONEXCLAMATION, MB_ICONQUESTION, MB_SETFOREGROUND,
-    MB_TOPMOST, MB_YESNO, MSG, NONCLIENTMETRICSW, SM_CXSCREEN, SM_CYSCREEN, SPI_GETNONCLIENTMETRICS, SW_SHOW,
-    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSW,
-    WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_TOPMOST, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetMessageW, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindow, KillTimer,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowTextW, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_PASSWORD,
+    FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, HMENU, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONEXCLAMATION,
+    MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, MSG, NONCLIENTMETRICSW, SM_CXSCREEN, SM_CYSCREEN,
+    SPI_GETNONCLIENTMETRICS, SW_SHOW, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
+    WS_EX_TOPMOST, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-use super::einlass::{Anfrage, Oberflaeche};
+use super::einlass::{Anfrage, Oberflaeche, DROSSEL_FENSTER};
 use super::log;
+use super::oberflaeche::einsetzen;
 use crate::strings::{Key, Lang};
 use crate::zugang;
 
@@ -55,6 +61,10 @@ const KLASSE_ZULASSEN: PCWSTR = w!("QuadChromaZulassen");
 const KLASSE_PASSWORT: PCWSTR = w!("QuadChromaPasswort");
 /// Die Anfrage hat sich zurueckgezogen: schliessen, ohne zu antworten.
 const WM_ZURUECK: u32 = WM_APP + 20;
+/// So lange nach dem Erscheinen ist "Zulassen" gesperrt (siehe Kopf).
+const ZULASSEN_SPERRE_MS: u32 = 1000;
+/// Zeitgeber, der "Zulassen" danach freigibt.
+const TIMER_ZULASSEN: usize = 1;
 /// Kennungen der Felder (OK und Abbrechen sind IDOK und IDCANCEL, damit
 /// IsDialogMessageW Eingabe und Esc richtig zuordnet).
 const ID_OK: i32 = IDOK.0;
@@ -252,9 +262,20 @@ unsafe extern "system" fn zulassen_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     match msg {
         WM_COMMAND => {
             match befehl(wp) {
-                ID_OK => schliessen(Some(true), false),
+                // Nur mit freigegebenem Knopf - auch Eingabe (IsDialogMessageW
+                // schickt IDOK fuer den Standardknopf) zaehlt vorher nicht.
+                ID_OK if zulassen_frei(hwnd) => schliessen(Some(true), false),
                 ID_ABBRECHEN => schliessen(Some(false), false),
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TIMER_ZULASSEN => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_ZULASSEN);
+                if let Ok(k) = GetDlgItem(Some(hwnd), ID_OK) {
+                    let _ = EnableWindow(k, true);
+                }
             }
             LRESULT(0)
         }
@@ -273,6 +294,11 @@ unsafe extern "system" fn zulassen_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
+}
+
+/// Ist der Knopf "Zulassen" schon freigegeben (ZULASSEN_SPERRE vorbei)?
+fn zulassen_frei(hwnd: HWND) -> bool {
+    unsafe { GetDlgItem(Some(hwnd), ID_OK).is_ok_and(|k| IsWindowEnabled(k).as_bool()) }
 }
 
 /// Ein offenes (oder eben entstehendes) Zulassen-Fenster.
@@ -318,12 +344,15 @@ impl Zulassen {
     }
 }
 
-/// Die Texte des Zulassen-Fensters: Frage und Code.
+/// Die Texte des Zulassen-Fensters: Frage und Code. Der Name ist
+/// unbeglaubigt: eingesetzt in einem Durchgang, ein "{i}" darin bleibt
+/// stehen (einlass::anzeigename laesst ausserdem keinen Namen zu, der wie
+/// eine ID aussieht).
 fn zulassen_texte(lang: &Lang, a: &Anfrage) -> (String, String) {
     let id = zugang::id_text(a.id);
     (
-        lang.get(Key::HostRequest).replace("{n}", &a.name).replace("{i}", &id),
-        lang.get(Key::AccessCode).replace("{c}", &a.code),
+        einsetzen(lang.get(Key::HostRequest), &[("{n}", &a.name), ("{i}", &id)]),
+        einsetzen(lang.get(Key::AccessCode), &[("{c}", &a.code)]),
     )
 }
 
@@ -348,8 +377,23 @@ fn zulassen_bauen(lang: &Lang, a: &Anfrage) -> Result<(HWND, HFONT, bool), Strin
     let x_ab = innen.0 - rand - knopf_b;
     let x_zu = x_ab - m.px(8) - knopf_b;
     // Kein SetFocus: das Fenster soll niemandem den Fokus nehmen (siehe
-    // Kopf); ein Klick hinein gibt ihn dem Knopf.
-    feld(hwnd, w!("BUTTON"), lang.get(Key::HostAllow), WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_zu, y, knopf_b, knopf_h), ID_OK, font);
+    // Kopf); ein Klick hinein gibt ihn dem Knopf. "Zulassen" beginnt
+    // gesperrt, der Zeitgeber (zulassen_faden) gibt ihn frei.
+    let zulassen = feld(
+        hwnd,
+        w!("BUTTON"),
+        lang.get(Key::HostAllow),
+        WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
+        WINDOW_EX_STYLE(0),
+        (x_zu, y, knopf_b, knopf_h),
+        ID_OK,
+        font,
+    );
+    if let Some(k) = zulassen {
+        unsafe {
+            let _ = EnableWindow(k, false);
+        }
+    }
     feld(hwnd, w!("BUTTON"), lang.get(Key::HostDeny), WS_TABSTOP.0 | BS_PUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_ab, y, knopf_b, knopf_h), ID_ABBRECHEN, font);
     Ok((hwnd, font, eigen))
 }
@@ -362,7 +406,7 @@ fn zulassen_faden(lang: &'static Lang, a: Anfrage, offen: Arc<Mutex<HashMap<u64,
         Err(e) => {
             // Ohne Fenster bleibt die Anfrage offen, bis die Zugangsphase
             // endet (Passwort, Abbruch, Frist).
-            log(format!("Zulassen-Fenster fuer {} nicht angelegt: {e}", a.name));
+            DROSSEL_FENSTER.melden(Some(a.ip), || format!("Zulassen-Fenster fuer {} nicht angelegt: {e}", a.name));
             sperre(&offen).remove(&a.nr);
             return;
         }
@@ -383,6 +427,13 @@ fn zulassen_faden(lang: &'static Lang, a: Anfrage, offen: Arc<Mutex<HashMap<u64,
     if weiter {
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Ohne Zeitgeber bliebe "Zulassen" gesperrt - dann gibt es ihn
+            // eben gleich frei (wie vor der Sperre).
+            if SetTimer(Some(hwnd), TIMER_ZULASSEN, ZULASSEN_SPERRE_MS, None) == 0 {
+                if let Ok(k) = GetDlgItem(Some(hwnd), ID_OK) {
+                    let _ = EnableWindow(k, true);
+                }
+            }
             let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(MB_ICONEXCLAMATION);
             let fw = FLASHWINFO {
                 cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
@@ -393,7 +444,7 @@ fn zulassen_faden(lang: &'static Lang, a: Anfrage, offen: Arc<Mutex<HashMap<u64,
             };
             let _ = FlashWindowEx(&fw);
         }
-        log(format!("Zulassen-Fenster offen: {} (ID {})", a.name, zugang::id_text(a.id)));
+        DROSSEL_FENSTER.melden(Some(a.ip), || format!("Zulassen-Fenster offen: {} ({}), ID {}", a.name, a.ip, zugang::id_text(a.id)));
         schleife(hwnd);
     } else {
         unsafe {
@@ -422,7 +473,7 @@ impl Oberflaeche for Zulassen {
         let (lang, a2, offen, antwort) = (self.lang, a.clone(), self.offen.clone(), self.antwort.clone());
         let r = std::thread::Builder::new().name("zulassen".into()).spawn(move || zulassen_faden(lang, a2, offen, antwort));
         if let Err(e) = r {
-            log(format!("Zulassen-Fenster: kein Faden ({e})"));
+            DROSSEL_FENSTER.melden(Some(a.ip), || format!("Zulassen-Fenster: kein Faden ({e})"));
             sperre(&self.offen).remove(&a.nr);
         }
     }
@@ -443,18 +494,52 @@ impl Oberflaeche for Zulassen {
 
 // ------------------------------------------------ Passwort aendern (10.4)
 
+/// Klartext im Speicher ueberschreiben, bevor er freigegeben wird.
+fn nullen(s: &mut String) {
+    // SAFETY: lauter Nullbytes sind gueltiges UTF-8.
+    unsafe { s.as_mut_vec().iter_mut().for_each(|b| *b = 0) };
+}
+
+/// Ein Passwortfeld, wie es gilt: Tabulatoren werden zu Leerzeichen (norm
+/// entfernt beide gleich - der Beweis bleibt derselbe), andere
+/// Steuerzeichen fallen weg: tippen laesst sich keins, nur einfuegen, und
+/// sehen kann man sie nicht.
+fn ohne_steuerzeichen(t: &str) -> String {
+    t.chars().filter_map(|c| if c == '\t' { Some(' ') } else if c.is_control() { None } else { Some(c) }).collect()
+}
+
 /// Die Pruefung im Passwortfenster: beide gleich, dann die Regeln aus
-/// zugang.rs. Err: der Text, der im Fenster erscheint.
-pub fn passwort_eingabe_pruefen(neu: &str, wieder: &str) -> Result<(), Key> {
-    if neu != wieder {
-        return Err(Key::HostPasswordsDiffer);
-    }
-    match zugang::passwort_pruefen(neu.trim_matches([' ', '\t'])) {
-        Ok(()) => Ok(()),
-        // Zu lang verhindert die Feldgrenze; Steuerzeichen lassen sich
-        // kaum eingeben (nur einfuegen) - fuer beides gibt es noch keinen
-        // eigenen Text.
-        Err(_) => Err(Key::HostPasswordShort),
+/// zugang.rs. Ok: das Passwort zum Speichern (ohne Steuerzeichen); Err:
+/// der Text, der im Fenster erscheint.
+pub fn passwort_eingabe(neu: &str, wieder: &str) -> Result<String, Key> {
+    let mut neu = ohne_steuerzeichen(neu);
+    let mut wieder = ohne_steuerzeichen(wieder);
+    let gleich = neu == wieder;
+    nullen(&mut wieder);
+    let r = if !gleich {
+        Err(Key::HostPasswordsDiffer)
+    } else {
+        match zugang::passwort_pruefen(neu.trim_matches([' ', '\t'])) {
+            Ok(()) => return Ok(neu),
+            // Steuerzeichen gibt es hier nicht mehr, und mehr als 128 Byte
+            // verhindert die Feldgrenze (PASSWORT_ZEICHEN) - bleibt "zu kurz".
+            Err(_) => Err(Key::HostPasswordShort),
+        }
+    };
+    nullen(&mut neu);
+    r
+}
+
+/// Text fuer ein Passwort, das sich nicht speichern liess (das alte gilt
+/// weiter). Einen eigenen Schluessel dafuer gibt es noch nicht (gemeldet:
+/// HostPasswordNotSaved) - bis dahin das allgemeine "Schreibfehler" der
+/// Dateiuebertragung, mit grossem Anfang.
+fn text_nicht_gespeichert(lang: &Lang) -> String {
+    let t = lang.get(Key::FilesAbortWrite);
+    let mut z = t.chars();
+    match z.next() {
+        Some(c) => c.to_uppercase().chain(z).collect(),
+        None => String::new(),
     }
 }
 
@@ -469,8 +554,10 @@ thread_local! {
     static PASSWORT: RefCell<Option<PasswortDaten>> = const { RefCell::new(None) };
 }
 
-/// Das offene Passwortfenster (0: keins) - es gibt hoechstens eines.
+/// Das offene Passwortfenster (0: keins, PASSWORT_ENTSTEHT: sein Faden baut
+/// es gerade) - es gibt hoechstens eines.
 static PASSWORT_FENSTER: AtomicIsize = AtomicIsize::new(0);
+const PASSWORT_ENTSTEHT: isize = -1;
 
 unsafe extern "system" fn passwort_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -482,33 +569,36 @@ unsafe extern "system" fn passwort_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let fertig = PASSWORT.with(|p| {
                         let mut p = p.borrow_mut();
                         let Some(d) = p.as_mut() else { return true };
-                        let meldung = match passwort_eingabe_pruefen(&neu, &wieder) {
-                            Err(k) => Some(d.lang.get(k)),
-                            Ok(()) => match (d.setzen)(&neu) {
-                                Ok(()) => {
-                                    d.gespeichert = true;
-                                    None
+                        let meldung = match passwort_eingabe(&neu, &wieder) {
+                            Err(k) => Some(d.lang.get(k).to_string()),
+                            Ok(mut pw) => {
+                                let r = (d.setzen)(&pw);
+                                nullen(&mut pw);
+                                match r {
+                                    Ok(()) => {
+                                        d.gespeichert = true;
+                                        None
+                                    }
+                                    Err(zugang::PasswortFehler::ZuKurz) => Some(d.lang.get(Key::HostPasswordShort).to_string()),
+                                    // Schreibfehler (das alte Passwort gilt
+                                    // weiter; die Zeile im Protokoll nennt den
+                                    // Grund). Andere Fehler hat
+                                    // passwort_eingabe schon abgefangen.
+                                    Err(_) => Some(text_nicht_gespeichert(d.lang)),
                                 }
-                                Err(zugang::PasswortFehler::ZuKurz) => Some(d.lang.get(Key::HostPasswordShort)),
-                                // Schreibfehler: dafuer gibt es noch keinen
-                                // eigenen Text - die Zeile im Protokoll nennt
-                                // den Grund.
-                                Err(_) => Some(d.lang.get(Key::HostPasswordUnreadable)),
-                            },
+                            }
                         };
                         match meldung {
                             Some(t) => {
-                                feldtext_setzen(hwnd, ID_MELDUNG, t);
+                                feldtext_setzen(hwnd, ID_MELDUNG, &t);
                                 false
                             }
                             None => true,
                         }
                     });
                     // Den Klartext nicht laenger als noetig im Speicher halten.
-                    unsafe {
-                        neu.as_mut_vec().iter_mut().for_each(|b| *b = 0);
-                        wieder.as_mut_vec().iter_mut().for_each(|b| *b = 0);
-                    }
+                    nullen(&mut neu);
+                    nullen(&mut wieder);
                     if fertig {
                         unsafe {
                             let _ = DestroyWindow(hwnd);
@@ -599,17 +689,30 @@ pub fn passwort_aendern(
     setzen: Box<dyn Fn(&str) -> Result<(), zugang::PasswortFehler> + Send>,
     gespeichert: Box<dyn FnOnce() + Send>,
 ) {
-    let offen = PASSWORT_FENSTER.load(Ordering::SeqCst);
-    if offen != 0 && unsafe { IsWindow(Some(HWND(offen as *mut _))) }.as_bool() {
-        unsafe {
-            let _ = SetForegroundWindow(HWND(offen as *mut _));
+    // Den Platz belegen, BEVOR der Faden startet: zwei schnelle Klicks im
+    // Menue oeffnen sonst zwei Fenster (beide saehen noch "keins").
+    let mut offen = PASSWORT_FENSTER.load(Ordering::SeqCst);
+    loop {
+        if offen == PASSWORT_ENTSTEHT {
+            return;
         }
-        return;
+        if offen != 0 && unsafe { IsWindow(Some(HWND(offen as *mut _))) }.as_bool() {
+            unsafe {
+                let _ = SetForegroundWindow(HWND(offen as *mut _));
+            }
+            return;
+        }
+        // Keins, oder ein Griff, dessen Fenster es nicht mehr gibt.
+        match PASSWORT_FENSTER.compare_exchange(offen, PASSWORT_ENTSTEHT, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(jetzt) => offen = jetzt,
+        }
     }
     let r = std::thread::Builder::new().name("passwortfenster".into()).spawn(move || {
         let (hwnd, font, eigen) = match passwort_bauen(lang) {
             Ok(x) => x,
             Err(e) => {
+                PASSWORT_FENSTER.store(0, Ordering::SeqCst);
                 log(format!("Passwortfenster nicht angelegt: {e}"));
                 return;
             }
@@ -621,7 +724,9 @@ pub fn passwort_aendern(
             let _ = SetForegroundWindow(hwnd);
         }
         schleife(hwnd);
-        PASSWORT_FENSTER.store(0, Ordering::SeqCst);
+        // Nur den eigenen Griff austragen: hat ein Klick schon ein neues
+        // Fenster begonnen (dieses war eben zu), gehoert der Platz dem.
+        let _ = PASSWORT_FENSTER.compare_exchange(hwnd.0 as isize, 0, Ordering::SeqCst, Ordering::SeqCst);
         if eigen {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(font.0));
@@ -633,15 +738,24 @@ pub fn passwort_aendern(
         }
     });
     if let Err(e) = r {
+        PASSWORT_FENSTER.store(0, Ordering::SeqCst);
         log(format!("Passwortfenster: kein Faden ({e})"));
     }
 }
 
 // ---------------------------------------------------------- Rueckfrage
 
+/// Steht gerade eine Rueckfrage offen? Es gibt hoechstens eine - ein
+/// zweiter Klick auf den Menuepunkt stapelt keine weitere.
+static RUECKFRAGE_OFFEN: AtomicBool = AtomicBool::new(false);
+
 /// Eine Ja/Nein-Rueckfrage in eigenem Faden (Nein ist die Vorgabe); bei Ja
-/// laeuft `ja` in diesem Faden.
-pub fn rueckfrage(text: &str, ja: Box<dyn FnOnce() + Send>) {
+/// laeuft `ja` in diesem Faden. Steht schon eine offen, geschieht nichts
+/// (false).
+pub fn rueckfrage(text: &str, ja: Box<dyn FnOnce() + Send>) -> bool {
+    if RUECKFRAGE_OFFEN.swap(true, Ordering::SeqCst) {
+        return false;
+    }
     let text = text.to_string();
     let r = std::thread::Builder::new().name("rueckfrage".into()).spawn(move || {
         let a = unsafe {
@@ -652,13 +766,17 @@ pub fn rueckfrage(text: &str, ja: Box<dyn FnOnce() + Send>) {
                 MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_TOPMOST | MB_SETFOREGROUND,
             )
         };
+        RUECKFRAGE_OFFEN.store(false, Ordering::SeqCst);
         if a == IDYES {
             ja();
         }
     });
     if let Err(e) = r {
+        RUECKFRAGE_OFFEN.store(false, Ordering::SeqCst);
         log(format!("Rueckfrage: kein Faden ({e})"));
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -666,6 +784,10 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    /// Die Tests mit dem Passwortfenster nacheinander: es gibt hoechstens
+    /// eines im Prozess.
+    static PASSWORT_TESTS: Mutex<()> = Mutex::new(());
 
     fn warten_bis(mut f: impl FnMut() -> bool) -> bool {
         let bis = Instant::now() + Duration::from_secs(5);
@@ -679,10 +801,12 @@ mod tests {
     }
 
     fn anfrage(nr: u64) -> Anfrage {
-        Anfrage { nr, name: "Büro-PC & Co".into(), id: 581_729_911, code: "628 306".into() }
+        Anfrage { nr, name: "Büro-PC & Co".into(), ip: [127, 0, 0, 1].into(), id: 581_729_911, code: "628 306".into() }
     }
 
-    /// Texte des Fensters: Name, ID ("ddd ddd ddd"), Code.
+    /// Texte des Fensters: Name, ID ("ddd ddd ddd"), Code. Ein "{i}" im
+    /// (unbeglaubigten) Namen bleibt stehen - eingesetzt wird in einem
+    /// Durchgang.
     #[test]
     fn zulassen_texte_mit_name_id_code() {
         let de = crate::strings::pick("de");
@@ -691,13 +815,18 @@ mod tests {
         assert_eq!(code, "Code: 628 306");
         let (frage, _) = zulassen_texte(crate::strings::pick("en"), &anfrage(1));
         assert_eq!(frage, "Büro-PC & Co (ID 581 729 911) wants to control this computer.");
+        let mut a = anfrage(1);
+        a.name = "PC {i}".into();
+        let (frage, _) = zulassen_texte(de, &a);
+        assert_eq!(frage, "PC {i} (ID 581 729 911) möchte diesen Computer steuern.");
     }
 
-    /// Das echte Fenster (auch ohne angemeldete Sitzung zu bauen): ein
-    /// "Klick" auf Zulassen (WM_COMMAND IDOK, wie ihn der Knopf schickt)
-    /// antwortet true und schliesst; zurueckgezogen schliesst es ohne
+    /// Das echte Fenster (auch ohne angemeldete Sitzung zu bauen): "Zulassen"
+    /// ist die erste ZULASSEN_SPERRE gesperrt - ein Klick (WM_COMMAND IDOK,
+    /// wie ihn der Knopf bzw. Eingabe schickt) zaehlt dann nicht -, danach
+    /// antwortet er true und schliesst; zurueckgezogen schliesst es ohne
     /// Antwort - auch dann, wenn es noch gar nicht stand; Schliessen ueber
-    /// das Kreuz heisst Ablehnen.
+    /// das Kreuz heisst Ablehnen, und das geht sofort.
     #[test]
     fn zulassen_fenster_antwortet_und_zieht_zurueck() {
         let (tx, rx) = mpsc::channel::<(u64, bool)>();
@@ -717,6 +846,16 @@ mod tests {
         assert_eq!(String::from_utf16_lossy(&b[..n]), "Zulassen");
         let n = unsafe { GetWindowTextW(GetDlgItem(Some(h), ID_ABBRECHEN).unwrap(), &mut b) } as usize;
         assert_eq!(String::from_utf16_lossy(&b[..n]), "Ablehnen");
+        // Gleich nach dem Erscheinen: gesperrt, ein Klick geht ins Leere.
+        let t0 = Instant::now();
+        assert!(!zulassen_frei(h), "Zulassen sofort klickbar");
+        unsafe { PostMessageW(Some(h), WM_COMMAND, WPARAM(ID_OK as usize), LPARAM(0)).unwrap() };
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "Klick in der Sperrzeit zaehlte");
+        assert!(unsafe { IsWindow(Some(h)) }.as_bool(), "Fenster nach gesperrtem Klick zu");
+        // Nach der Sperrzeit: frei.
+        assert!(warten_bis(|| zulassen_frei(h)), "Zulassen wurde nicht frei");
+        let gesperrt = t0.elapsed();
+        assert!(gesperrt >= Duration::from_millis(ZULASSEN_SPERRE_MS as u64 - 400), "nur {gesperrt:?} gesperrt");
         unsafe { PostMessageW(Some(h), WM_COMMAND, WPARAM(ID_OK as usize), LPARAM(0)).unwrap() };
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok((1, true)));
         assert!(warten_bis(|| !unsafe { IsWindow(Some(h)) }.as_bool()), "Fenster 1 blieb offen");
@@ -732,9 +871,10 @@ mod tests {
         z.schliessen(3);
         assert!(warten_bis(|| z.offen_zahl() == 0), "Eintrag 3 blieb");
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
-        // Das Kreuz: Ablehnen.
+        // Das Kreuz: Ablehnen - auch in der Sperrzeit.
         z.zeigen(&anfrage(4));
         assert!(warten_bis(|| z.fenster_von(4).is_some()));
+        assert!(!zulassen_frei(z.fenster_von(4).unwrap()));
         unsafe { PostMessageW(z.fenster_von(4), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok((4, false)));
     }
@@ -801,7 +941,7 @@ mod tests {
         };
         for code in sprachen.split(',') {
             let lang = crate::strings::pick(code);
-            let a = Anfrage { nr: 1, name: "Roberts MacBook Pro".into(), id: 581_729_911, code: "628 306".into() };
+            let a = Anfrage { nr: 1, name: "Roberts MacBook Pro".into(), ip: [192, 168, 1, 20].into(), id: 581_729_911, code: "628 306".into() };
             let (h, _, _) = zulassen_bauen(lang, &a).unwrap();
             bild(h, &format!("zulassen-{code}.bmp"));
             let (h, _, _) = passwort_bauen(lang).unwrap();
@@ -813,13 +953,25 @@ mod tests {
 
     #[test]
     fn passwort_eingabe_regeln() {
-        assert_eq!(passwort_eingabe_pruefen("abcdefgh", "abcdefgh"), Ok(()));
-        assert_eq!(passwort_eingabe_pruefen("abcdefgh", "abcdefgi"), Err(Key::HostPasswordsDiffer));
+        assert_eq!(passwort_eingabe("abcdefgh", "abcdefgh").as_deref(), Ok("abcdefgh"));
+        assert_eq!(passwort_eingabe("abcdefgh", "abcdefgi"), Err(Key::HostPasswordsDiffer));
         // norm zaehlt: Bindestriche und Leerzeichen fallen weg.
-        assert_eq!(passwort_eingabe_pruefen("ab-cd ef-g", "ab-cd ef-g"), Err(Key::HostPasswordShort));
-        assert_eq!(passwort_eingabe_pruefen("k7m-4wq-9tz", "k7m-4wq-9tz"), Ok(()));
-        assert_eq!(passwort_eingabe_pruefen("", ""), Err(Key::HostPasswordShort));
-        assert_eq!(passwort_eingabe_pruefen("mit\ttab-abcdefgh", "mit\ttab-abcdefgh"), Err(Key::HostPasswordShort));
+        assert_eq!(passwort_eingabe("ab-cd ef-g", "ab-cd ef-g"), Err(Key::HostPasswordShort));
+        assert_eq!(passwort_eingabe("k7m-4wq-9tz", "k7m-4wq-9tz").as_deref(), Ok("k7m-4wq-9tz"));
+        assert_eq!(passwort_eingabe("", ""), Err(Key::HostPasswordShort));
+        // Eingefuegte Steuerzeichen: der Tabulator wird ein Leerzeichen
+        // (norm entfernt beide - derselbe Beweis), andere fallen weg; nie
+        // der falsche Text "mindestens 8 Zeichen" fuer ein langes Passwort.
+        assert_eq!(passwort_eingabe("mit\ttab-abcdefgh", "mit\ttab-abcdefgh").as_deref(), Ok("mit tab-abcdefgh"));
+        assert_eq!(passwort_eingabe("ab\u{1}cd\u{7f}efgh\r\n", "abcdefgh").as_deref(), Ok("abcdefgh"));
+        assert_eq!(
+            zugang::passwort_schluessel("mit tab-abcdefgh", &[1u8; 32]),
+            zugang::passwort_schluessel("mit\ttab-abcdefgh", &[1u8; 32])
+        );
+        assert_eq!(passwort_eingabe("\u{1}\u{2}abc", "abc"), Err(Key::HostPasswordShort));
+        // Schreibfehler: nie "Passwortdatei unlesbar".
+        assert_eq!(text_nicht_gespeichert(crate::strings::pick("de")), "Schreibfehler");
+        assert_eq!(text_nicht_gespeichert(crate::strings::pick("en")), "Write error");
         assert_eq!(ohne_punkte("Passwort ändern …"), "Passwort ändern");
         assert_eq!(ohne_punkte("Change password ..."), "Change password");
     }
@@ -830,6 +982,7 @@ mod tests {
     /// offen ist, legt kein zweites an.
     #[test]
     fn passwort_fenster_prueft_und_speichert() {
+        let _g = sperre(&PASSWORT_TESTS);
         let (tx, rx) = mpsc::channel::<String>();
         let (fertig_tx, fertig_rx) = mpsc::channel::<()>();
         let de = crate::strings::pick("de");
@@ -843,12 +996,17 @@ mod tests {
                 let _ = fertig_tx.send(());
             }),
         );
-        assert!(warten_bis(|| PASSWORT_FENSTER.load(Ordering::SeqCst) != 0), "Passwortfenster entstand nicht");
+        // Sofort ein zweites Oeffnen (zwei schnelle Klicks im Menue), noch
+        // bevor das erste Fenster steht: es bleibt bei einem.
+        passwort_aendern(de, Box::new(|_| Ok(())), Box::new(|| {}));
+        let frei = |w: isize| w != 0 && w != PASSWORT_ENTSTEHT;
+        assert!(warten_bis(|| frei(PASSWORT_FENSTER.load(Ordering::SeqCst))), "Passwortfenster entstand nicht");
         let h = HWND(PASSWORT_FENSTER.load(Ordering::SeqCst) as *mut _);
-        // Zweites Oeffnen: dasselbe Fenster.
+        // Zweites Oeffnen, waehrend es steht: dasselbe Fenster.
         passwort_aendern(de, Box::new(|_| Ok(())), Box::new(|| {}));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(PASSWORT_FENSTER.load(Ordering::SeqCst), h.0 as isize);
+        assert_eq!(fenster_der_klasse(KLASSE_PASSWORT), 1, "zwei Passwortfenster");
         // Ungleich.
         feldtext_setzen(h, ID_NEU, "geheim-123");
         feldtext_setzen(h, ID_WIEDERHOLEN, "geheim-124");
@@ -868,5 +1026,84 @@ mod tests {
         assert!(fertig_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "gespeichert nicht gemeldet");
         assert!(warten_bis(|| !unsafe { IsWindow(Some(h)) }.as_bool()));
         assert_eq!(PASSWORT_FENSTER.load(Ordering::SeqCst), 0);
+    }
+
+    /// Schreibfehler beim Speichern: das Fenster bleibt offen und sagt
+    /// "Schreibfehler" - nicht "Passwortdatei unlesbar" (das alte Passwort
+    /// gilt ja weiter).
+    #[test]
+    fn passwort_fenster_schreibfehler() {
+        // Nicht neben passwort_fenster_prueft_und_speichert: es gibt
+        // hoechstens ein Passwortfenster im Prozess.
+        let _g = sperre(&PASSWORT_TESTS);
+        let de = crate::strings::pick("de");
+        passwort_aendern(
+            de,
+            Box::new(|_| {
+                Err(zugang::PasswortFehler::Datei(zugang::DateiFehler::Schreiben {
+                    pfad: "host-password.txt".into(),
+                    grund: "Zugriff verweigert".into(),
+                }))
+            }),
+            Box::new(|| {}),
+        );
+        let frei = |w: isize| w != 0 && w != PASSWORT_ENTSTEHT;
+        assert!(warten_bis(|| frei(PASSWORT_FENSTER.load(Ordering::SeqCst))), "Passwortfenster entstand nicht");
+        let h = HWND(PASSWORT_FENSTER.load(Ordering::SeqCst) as *mut _);
+        feldtext_setzen(h, ID_NEU, "Geheim 1234");
+        feldtext_setzen(h, ID_WIEDERHOLEN, "Geheim 1234");
+        unsafe { SendMessageW(h, WM_COMMAND, Some(WPARAM(ID_OK as usize)), Some(LPARAM(0))) };
+        assert_eq!(feldtext(h, ID_MELDUNG), "Schreibfehler");
+        assert!(unsafe { IsWindow(Some(h)) }.as_bool());
+        unsafe { PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+        assert!(warten_bis(|| PASSWORT_FENSTER.load(Ordering::SeqCst) == 0));
+    }
+
+    /// Die Fenster oberster Ebene dieses Prozesses mit dieser Klasse (und
+    /// diesem Titel) - Fenster anderer Prozesse zaehlen nicht.
+    fn eigene_fenster(klasse: PCWSTR, titel: PCWSTR) -> Vec<HWND> {
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+        let mut v = Vec::new();
+        let mut nach: Option<HWND> = None;
+        while let Ok(h) = unsafe { FindWindowExW(None, nach, klasse, titel) } {
+            if h.is_invalid() {
+                break;
+            }
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(h, Some(&mut pid as *mut u32)) };
+            if pid == std::process::id() {
+                v.push(h);
+            }
+            nach = Some(h);
+        }
+        v
+    }
+
+    fn fenster_der_klasse(klasse: PCWSTR) -> usize {
+        eigene_fenster(klasse, PCWSTR::null()).len()
+    }
+
+    /// Hoechstens eine Rueckfrage zugleich: ein zweiter Klick stapelt keine.
+    #[test]
+    fn nur_eine_rueckfrage() {
+        use windows::Win32::UI::WindowsAndMessaging::IDNO;
+        // Die Rueckfrage (Dialogklasse #32770, Titel QuadChroma) dieses
+        // Prozesses mit "Nein" schliessen.
+        let nein = || {
+            let mut h = Vec::new();
+            assert!(warten_bis(|| {
+                h = eigene_fenster(w!("#32770"), w!("QuadChroma"));
+                !h.is_empty()
+            }), "Rueckfrage erschien nicht");
+            assert_eq!(h.len(), 1, "mehr als eine Rueckfrage");
+            unsafe { PostMessageW(Some(h[0]), WM_COMMAND, WPARAM(IDNO.0 as usize), LPARAM(0)).unwrap() };
+            assert!(warten_bis(|| !RUECKFRAGE_OFFEN.load(Ordering::SeqCst)), "Rueckfrage blieb offen");
+        };
+        assert!(rueckfrage("Test: nur eine Rueckfrage?", Box::new(|| panic!("Ja, obwohl Nein"))));
+        assert!(!rueckfrage("Test: zweite Rueckfrage?", Box::new(|| panic!("zweite Rueckfrage lief"))));
+        nein();
+        // Danach geht wieder eine.
+        assert!(rueckfrage("Test: wieder eine?", Box::new(|| {})));
+        nein();
     }
 }

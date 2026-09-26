@@ -14,7 +14,9 @@
 //     Ablehnen -> 22/3. Frist -> 22/4.
 //   - Hoechstens PLAETZE_GESAMT Zugangsphasen zugleich, eine je Schluessel,
 //     zwei je IP (zugang::Plaetze); wer keinen Platz bekommt, erhaelt sofort
-//     22/4 mit BESETZT_WARTEN_MS.
+//     22/4 mit BESETZT_WARTEN_MS - hinter "QCA1" und einer Nachricht 20
+//     (Wartezeit ebenso, kein "Zulassen"), damit jeder Client die Folge
+//     kennt, die auch sonst vorkommt (20, dann irgendwann 22/4).
 //
 // Waehrend der Zugangsphase haelt niemand eine globale Sperre: die
 // Geraeteliste wird nur kurz unter `liste` gelesen bzw. beschrieben,
@@ -27,8 +29,12 @@
 // einem verschluesselten Datensatz braeche den Strom. Stattdessen schaut
 // `warten_auf_daten` mit kurzer Frist nach, ob Bytes da sind (peek, oder
 // schon entschluesselter Klartext), und erst dann wird eine ganze Nachricht
-// gelesen (mit LESEFRIST). Dazwischen fragt die Schleife die Entscheidung
-// der Oberflaeche ab (Kanal, alle ABFRAGE).
+// gelesen - mit EINER Frist fuer die ganze Nachricht (LESEFRIST, hoechstens
+// bis zum Ende der Gesamtfrist), nicht je Leseaufruf: sonst hielte ein
+// Gegenueber, das eine Laenge schickt und dann alle paar Sekunden ein Byte,
+// die Phase samt Platz und Zulassen-Fenster beliebig lange offen.
+// Dazwischen fragt die Schleife die Entscheidung der Oberflaeche ab (Kanal,
+// alle ABFRAGE).
 //
 // Die Oberflaeche (Zulassen-Fenster) haengt ueber `Oberflaeche` an; die
 // Warteschlange der Anfragen fuehrt der Einlass selbst: gezeigt wird
@@ -54,7 +60,8 @@ use crate::zugang::{self, DateiFehler, Ergebnis, Geraeteliste, Nachricht, Passwo
 /// So oft schaut die Zugangsphase nach Leitung, Oberflaeche und Frist.
 const ABFRAGE: Duration = Duration::from_millis(50);
 /// Hat eine Nachricht einmal begonnen, muss sie binnen dieser Zeit ganz da
-/// sein (ein Client schickt sie in einem Stueck).
+/// sein (ein Client schickt sie in einem Stueck) - als Frist fuer die ganze
+/// Nachricht, nicht je Leseaufruf (Secure::read_exact_bis).
 const LESEFRIST: Duration = Duration::from_secs(10);
 /// Frist fuer jedes Schreiben in der Zugangsphase (ein paar Dutzend Byte).
 const SCHREIBFRIST: Duration = Duration::from_secs(5);
@@ -63,14 +70,29 @@ const SCHREIBFRIST: Duration = Duration::from_secs(5);
 /// hoechstens eine alle 10 s (netz::Drossel).
 static DROSSEL_NOETIG: Drossel = Drossel::neu("Zugang noetig");
 static DROSSEL_FALSCH: Drossel = Drossel::neu("Zugang: Passwort falsch");
+/// Fuenf schnelle falsche Beweise je Verbindung kosten nichts (zu fruehe
+/// zaehlen als Fehlversuch) - auch diese Zeile kann jede Verbindung ausloesen.
+static DROSSEL_SCHLUSS: Drossel = Drossel::neu("Zugang: zu viele Fehlversuche");
 static DROSSEL_ENDE: Drossel = Drossel::neu("Zugang: ohne Ergebnis beendet");
 static DROSSEL_BESETZT: Drossel = Drossel::neu("Zugang: kein Platz frei");
 static DROSSEL_LISTE: Drossel = Drossel::neu("Geraeteliste nicht lesbar");
 static DROSSEL_PASSWORT: Drossel = Drossel::neu("Zugangspasswort nicht lesbar");
+/// Zeilen des Zulassen-Fensters (fenster.rs): jede neue Verbindung mit
+/// neuem Schluessel laesst eines aufgehen.
+pub(super) static DROSSEL_FENSTER: Drossel = Drossel::neu("Zulassen-Fenster");
 
 /// Die Drosseln dieses Teils, fuer netz::drosseln_nachtragen.
-pub(super) fn drosseln() -> [&'static Drossel; 6] {
-    [&DROSSEL_NOETIG, &DROSSEL_FALSCH, &DROSSEL_ENDE, &DROSSEL_BESETZT, &DROSSEL_LISTE, &DROSSEL_PASSWORT]
+pub(super) fn drosseln() -> [&'static Drossel; 8] {
+    [
+        &DROSSEL_NOETIG,
+        &DROSSEL_FALSCH,
+        &DROSSEL_SCHLUSS,
+        &DROSSEL_ENDE,
+        &DROSSEL_BESETZT,
+        &DROSSEL_LISTE,
+        &DROSSEL_PASSWORT,
+        &DROSSEL_FENSTER,
+    ]
 }
 
 /// Sperre nehmen, auch wenn ein anderer Faden unter ihr in Panik geraten
@@ -86,6 +108,8 @@ pub struct Anfrage {
     pub nr: u64,
     /// Name des Clients (Nachricht 3, sonst seine IP) - unbeglaubigt.
     pub name: String,
+    /// Absender (fuer die Drossel der Protokollzeilen des Fensters).
+    pub ip: IpAddr,
     /// Geraete-ID des Clients.
     pub id: u32,
     /// Vergleichscode des Handschlags ("628 306").
@@ -178,6 +202,20 @@ pub fn einrichten(e: Arc<Einlass>) -> Result<(), String> {
 /// Der Einlass des Dienstes (None vor `einrichten`).
 pub fn einlass() -> Option<&'static Arc<Einlass>> {
     EINLASS.get()
+}
+
+/// Der Name, unter dem ein Geraet im Zulassen-Fenster, im Protokoll und in
+/// der Geraeteliste erscheint: der aus Nachricht 3 (unbeglaubigt), sonst
+/// die Adresse (Spezifikation 1.4). Ein Name mit neun oder mehr Ziffern gilt
+/// wie ein fehlender: er koennte eine Geraete-ID vortaeuschen ("Roberts Mac
+/// (ID 123 456 789)"), und im Zulassen-Fenster stuende die falsche ID dann
+/// vor der echten - die ID ist das, woran der Nutzer am Host das Geraet
+/// erkennt. Rechnernamen haben so viele Ziffern kaum je.
+pub fn anzeigename(nachricht3: &[u8], ip: &str) -> String {
+    match zugang::nachricht3_name(nachricht3) {
+        Some(n) if n.chars().filter(|c| c.is_numeric()).count() < 9 => n,
+        _ => ip.to_string(),
+    }
 }
 
 /// Wie `warten_auf_daten` ausging.
@@ -431,12 +469,12 @@ impl Einlass {
 
     /// Eine Anfrage stellen; gezeigt wird sie, sobald keine andere mehr
     /// gezeigt wird.
-    fn anfrage_stellen(&self, name: &str, id: u32, code: &str) -> AnfrageGriff<'_> {
+    fn anfrage_stellen(&self, name: &str, ip: IpAddr, id: u32, code: &str) -> AnfrageGriff<'_> {
         let (tx, rx) = mpsc::channel();
         let mut a = sperre(&self.anfragen);
         a.naechste += 1;
         let nr = a.naechste;
-        a.offen.push_back((Anfrage { nr, name: name.to_string(), id, code: code.to_string() }, tx));
+        a.offen.push_back((Anfrage { nr, name: name.to_string(), ip, id, code: code.to_string() }, tx));
         self.naechste_zeigen(&mut a);
         AnfrageGriff { e: self, nr, rx }
     }
@@ -525,7 +563,16 @@ impl Einlass {
             DROSSEL_BESETZT.melden(Some(ip), || {
                 format!("Zugang: kein Platz fuer {wer} - schon zu viele Zugangsphasen (je Geraet eine, je Adresse zwei, zusammen {}), abgewiesen", zugang::PLAETZE_GESAMT)
             });
-            let _ = senden(sock, true, &Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms: zugang::BESETZT_WARTEN_MS }));
+            // "QCA1", 20 (nur Passwort, Wartezeit) und gleich 22/4 - in
+            // einem Datensatz. Ein Client, der nach "QCA1" zuerst 20
+            // erwartet, meldet so "zu viele Versuche" statt eines
+            // Protokollfehlers; einer, der 22 auch sofort naehme, kennt die
+            // Folge 20 -> 22/4 ohnehin.
+            let w = zugang::BESETZT_WARTEN_MS;
+            let mut v = MAGIC_ZUGANG.to_vec();
+            v.extend_from_slice(&Nachricht::Noetig(ZugangNoetig::neu(false, w, &self.hostname)).kodieren());
+            v.extend_from_slice(&Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms: w }).kodieren());
+            let _ = sock.write_all(&v);
             return Ausgang::Draussen;
         };
         let beginn = Instant::now();
@@ -544,7 +591,7 @@ impl Einlass {
             DROSSEL_ENDE.melden(Some(ip), || format!("Zugang: {wer} - Nachricht 20 nicht gesendet: {e}"));
             return Ausgang::Draussen;
         }
-        let anfrage = zulassen.then(|| self.anfrage_stellen(name, id, &sock.sas));
+        let anfrage = zulassen.then(|| self.anfrage_stellen(name, ip, id, &sock.sas));
         let hh = sock.handshake_hash.clone();
         loop {
             // Die Oberflaeche hat entschieden?
@@ -584,10 +631,11 @@ impl Einlass {
                 }
                 Warten::Daten => {}
             }
-            // Eine ganze Nachricht lesen: sie hat begonnen, der Rest folgt gleich.
-            let rest = bis.saturating_duration_since(Instant::now());
-            sock.socket().set_read_timeout(Some(LESEFRIST.min(rest + ABFRAGE).max(Duration::from_millis(10)))).ok();
-            let n = zugang::empfangen(|b| sock.read_exact(b));
+            // Eine ganze Nachricht lesen: sie hat begonnen, der Rest folgt
+            // gleich - EINE Frist fuer die ganze Nachricht, hoechstens bis
+            // kurz nach dem Ende der Gesamtfrist.
+            let nachricht_bis = (Instant::now() + LESEFRIST).min(bis + ABFRAGE);
+            let n = zugang::empfangen(|b| sock.read_exact_bis(b, nachricht_bis));
             match n {
                 Ok(Nachricht::Beweis(beweis)) => {
                     let k = self.schluessel(ip);
@@ -607,10 +655,12 @@ impl Einlass {
                             };
                         }
                         (Wertung::Schluss { warten_ms }, _) => {
-                            log(format!(
-                                "Zugang: {wer} - {} Fehlversuche in dieser Verbindung, getrennt (naechster Versuch fruehestens in {warten_ms} ms)",
-                                phase.fehlversuche
-                            ));
+                            DROSSEL_SCHLUSS.melden(Some(ip), || {
+                                format!(
+                                    "Zugang: {wer} - {} Fehlversuche in dieser Verbindung, getrennt (naechster Versuch fruehestens in {warten_ms} ms)",
+                                    phase.fehlversuche
+                                )
+                            });
                             let _ = senden(sock, false, &Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms }));
                             return Ausgang::Draussen;
                         }
@@ -825,7 +875,7 @@ mod tests {
                     std::thread::spawn(move || {
                         let ip = s.peer_addr().unwrap().ip();
                         let Ok(mut sock) = secure::Secure::accept(s, &noise::prologue_video(), &hp) else { return };
-                        let name = zugang::nachricht3_name(&sock.nachricht3).unwrap_or_else(|| ip.to_string());
+                        let name = anzeigename(&sock.nachricht3, &ip.to_string());
                         let a = e.pruefen(&mut sock, ip, &name);
                         if a.herein() {
                             sock.write_all(MAGIC).unwrap();
@@ -1116,30 +1166,43 @@ mod tests {
         assert!(!h.liste().enthaelt(&cpub2));
     }
 
+    /// Kein Platz: "QCA1", 20 (nur Passwort, Wartezeit 5 s), gleich danach
+    /// 22/4 mit 5 s, dann zu. So sieht auch ein Client, der nach "QCA1"
+    /// zuerst 20 erwartet, "zu viele Versuche" statt eines Protokollfehlers.
+    fn kein_platz(s: &mut Stub) {
+        let n = noetig(s);
+        assert_eq!((n.wege, n.warten_ms, n.hostname.as_str()), (WEG_PASSWORT, zugang::BESETZT_WARTEN_MS, "Testhost"));
+        assert_eq!(ergebnis(s), Ergebnis::Schluss { warten_ms: zugang::BESETZT_WARTEN_MS });
+        assert!(s.zu());
+    }
+
     /// Grenzen: je Schluessel eine Zugangsphase, je Adresse zwei - wer
-    /// darueber kommt, bekommt sofort 22/4 mit 5 s. Ein bekanntes Geraet
-    /// kommt waehrenddessen ohne Warten herein (keine globale Sperre).
+    /// darueber kommt, bekommt sofort 22/4 mit 5 s (hinter einer Nachricht
+    /// 20). Ein bekanntes Geraet kommt waehrenddessen ohne Warten herein
+    /// (keine globale Sperre).
     #[test]
     fn grenzen_und_keine_globale_sperre() {
         let h = Host::neu("grenzen", zugang::PHASE_FRIST);
+        let (gezeigt, _geschlossen) = haken(&h.einlass);
         let (cp1, _) = client();
         let (cp2, _) = client();
         let (cp3, _) = client();
         let mut s1 = Stub::verbinden(&h.addr, &cp1, b"client").unwrap();
         noetig(&mut s1);
+        let a1 = gezeigt.recv_timeout(Duration::from_secs(5)).unwrap();
         // Derselbe Schluessel ein zweites Mal.
         let mut doppelt = Stub::verbinden(&h.addr, &cp1, b"client").unwrap();
-        assert_eq!(&doppelt.kennung().unwrap(), MAGIC_ZUGANG);
-        assert_eq!(ergebnis(&mut doppelt), Ergebnis::Schluss { warten_ms: zugang::BESETZT_WARTEN_MS });
-        assert!(doppelt.zu());
+        kein_platz(&mut doppelt);
         assert_eq!(h.ausgang(), Ausgang::Draussen);
         // Zweite Phase von 127.0.0.1: geht; die dritte nicht.
         let mut s2 = Stub::verbinden(&h.addr, &cp2, b"client").unwrap();
         noetig(&mut s2);
         let mut s3 = Stub::verbinden(&h.addr, &cp3, b"client").unwrap();
-        assert_eq!(&s3.kennung().unwrap(), MAGIC_ZUGANG);
-        assert_eq!(ergebnis(&mut s3), Ergebnis::Schluss { warten_ms: zugang::BESETZT_WARTEN_MS });
+        kein_platz(&mut s3);
         assert_eq!(h.ausgang(), Ausgang::Draussen);
+        // Wer keinen Platz bekam, stellt keine Anfrage: gezeigt bleibt die
+        // erste.
+        assert_eq!(h.einlass.gezeigt(), Some(a1.nr));
         // Ein bekanntes Geraet kommt trotz zweier wartender Phasen sofort.
         let (bp, bpub) = client();
         let k: [u8; 32] = bpub.try_into().unwrap();
@@ -1221,5 +1284,55 @@ mod tests {
         s.senden(&Nachricht::Ergebnis(Ergebnis::Zulassen)).unwrap();
         assert!(s.zu());
         assert_eq!(h.ausgang(), Ausgang::Draussen);
+    }
+
+    /// Troepfeln: eine Datensatzlaenge und danach alle 400 ms ein Byte haelt
+    /// die Phase nicht ueber die Gesamtfrist (hier 1 s) hinaus offen - die
+    /// Frist gilt fuer die ganze Nachricht, nicht je Leseaufruf. Danach 22/4
+    /// ohne Wartezeit, Leitung zu, Anfrage zurueckgezogen.
+    #[test]
+    fn troepfeln_haelt_die_frist_nicht_auf() {
+        use std::io::Write;
+        let h = Host::neu("troepfeln", Duration::from_secs(1));
+        let (gezeigt, geschlossen) = haken(&h.einlass);
+        let (cp, _) = client();
+        let t0 = Instant::now();
+        let mut s = Stub::verbinden(&h.addr, &cp, b"client").unwrap();
+        noetig(&mut s);
+        let a = gezeigt.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut roh = s.sock.try_clone().unwrap();
+        let tropfen = std::thread::spawn(move || {
+            // Ein Datensatz von 200 Byte ist angekuendigt ...
+            let _ = roh.write_all(&200u16.to_le_bytes());
+            // ... und kommt Byte fuer Byte, knapp unter jeder Lesefrist.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(400));
+                if roh.write_all(&[0u8]).is_err() {
+                    break;
+                }
+            }
+        });
+        assert_eq!(h.ausgang(), Ausgang::Draussen);
+        let dauer = t0.elapsed();
+        assert!(dauer < Duration::from_millis(2500), "Gesamtfrist 1 s ueberschritten: {dauer:?}");
+        assert_eq!(ergebnis(&mut s), Ergebnis::Schluss { warten_ms: 0 });
+        assert!(s.zu());
+        assert_eq!(geschlossen.recv_timeout(Duration::from_secs(5)), Ok(a.nr));
+        drop(s);
+        tropfen.join().unwrap();
+    }
+
+    /// Der Name aus Nachricht 3, sonst die Adresse; einer, der wie eine ID
+    /// aussieht (neun Ziffern, gleich wie getrennt), gilt als fehlend.
+    #[test]
+    fn anzeigename_ohne_vorgetaeuschte_id() {
+        let ip = "192.168.1.20";
+        assert_eq!(anzeigename(&zugang::nachricht3("Büro-PC 2"), ip), "Büro-PC 2");
+        assert_eq!(anzeigename(b"client", ip), ip);
+        assert_eq!(anzeigename(&zugang::nachricht3("DESKTOP-4F7K2Q9"), ip), "DESKTOP-4F7K2Q9");
+        assert_eq!(anzeigename(&zugang::nachricht3("Laptop 12345678"), ip), "Laptop 12345678");
+        assert_eq!(anzeigename(&zugang::nachricht3("Roberts Mac (ID 123 456 789)"), ip), ip);
+        assert_eq!(anzeigename(&zugang::nachricht3("PC-123-456-789"), ip), ip);
+        assert_eq!(anzeigename(&zugang::nachricht3("ID １２３４５６７８９"), ip), ip);
     }
 }

@@ -1732,8 +1732,9 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let fp = sock.peer_fingerprint();
     let sas = sock.sas.clone();
     // Der Name aus Nachricht 3 (unbeglaubigt, nur Anzeige); aeltere Clients
-    // senden keinen - dann steht die Adresse da.
-    let name = zugang::nachricht3_name(&sock.nachricht3).unwrap_or_else(|| ip.clone());
+    // senden keinen - dann steht die Adresse da, ebenso bei einem Namen, der
+    // eine ID vortaeuschen koennte (einlass::anzeigename).
+    let name = super::einlass::anzeigename(&sock.nachricht3, &ip);
 
     // Einlass (Spezifikation Pairing v1, 3.1-3.4): ein Geraet aus der Liste
     // kommt wie bisher herein; ein unbekanntes durchlaeuft die Zugangsphase

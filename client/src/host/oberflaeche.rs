@@ -1,6 +1,8 @@
 // Oberflaeche der Host-Rolle (Spezifikation Pairing v1, 10.1-10.4):
-// Einzelinstanz, Start als zweiter Prozess ohne Konsole, das Menue im
-// Infobereich und was seine Punkte tun.
+// Einzelinstanz, das Menue im Infobereich und was seine Punkte tun.
+// Gestartet wird die Rolle vom Knopf "Diesen PC freigeben" des Clients
+// (main.rs: dieselbe exe mit --host) oder von der Verknuepfung "Mit Windows
+// starten"; wie sie dabei eine geerbte Konsole loslaesst, steht in mod.rs.
 //
 // Das Menue (tray_win, zweite Art) wird bei jedem Oeffnen frisch gebaut:
 //   QuadChroma / Zustand ("Bereit fuer Verbindungen", "Verbunden: <Name>",
@@ -27,9 +29,6 @@ use crate::zugang::{self, Geraet};
 
 /// Name des Mutex, der die Host-Rolle einmalig macht (je Sitzung).
 pub const MUTEX: &str = "Local\\QuadChroma-Host";
-/// Internes Argument des zweiten Prozesses (Knopf "Diesen PC freigeben"):
-/// keine Konsole des Aufrufers erben.
-pub const HINTERGRUND: &str = "--hintergrund";
 
 // Befehlsnummern im Menue; Geraete ab NR_GERAET + Stelle in der Liste.
 const NR_ID: u32 = 1;
@@ -74,6 +73,28 @@ pub struct MenueStand {
     pub autostart: bool,
 }
 
+/// Platzhalter einer Vorlage in EINEM Durchgang ersetzen: eingesetzte Werte
+/// werden nicht noch einmal durchsucht. Mit hintereinander gehaengten
+/// .replace() ersetzte der zweite auch ein "{i}" oder "{d}", das in einem
+/// (unbeglaubigten) Geraetenamen steht.
+pub fn einsetzen(vorlage: &str, werte: &[(&str, &str)]) -> String {
+    let mut aus = String::with_capacity(vorlage.len() + 32);
+    let mut rest = vorlage;
+    'aussen: while !rest.is_empty() {
+        for (platz, wert) in werte {
+            if let Some(r) = rest.strip_prefix(platz) {
+                aus.push_str(wert);
+                rest = r;
+                continue 'aussen;
+            }
+        }
+        let c = rest.chars().next().expect("rest ist nicht leer");
+        aus.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    aus
+}
+
 /// Der Tooltip: "QuadChroma - Freigabe laeuft (ID ...)".
 pub fn tooltip(lang: &Lang, id: u32) -> String {
     lang.get(Key::HostTooltip).replace("{i}", &zugang::id_text(id))
@@ -109,11 +130,8 @@ pub fn menue(lang: &Lang, s: &MenueStand) -> (Vec<Eintrag>, Vec<[u8; 32]>) {
                 unter.push(Eintrag::anzeige(lang.get(Key::HostNoDevices)));
             }
             for g in liste {
-                let zeile = lang
-                    .get(Key::HostDeviceLine)
-                    .replace("{n}", &g.name)
-                    .replace("{i}", &zugang::id_text(g.id()))
-                    .replace("{d}", &g.datum);
+                let id = zugang::id_text(g.id());
+                let zeile = einsetzen(lang.get(Key::HostDeviceLine), &[("{n}", &g.name), ("{i}", &id), ("{d}", &g.datum)]);
                 unter.push(Eintrag::Unter {
                     text: zeile,
                     eintraege: vec![Eintrag::punkt(lang.get(Key::HostRemove), NR_GERAET + schluessel.len() as u32)],
@@ -176,12 +194,18 @@ impl Drop for Instanz {
 }
 
 /// Die Host-Rolle fuer diese Sitzung beanspruchen. Ok(None): eine andere
-/// laeuft schon. Err: kein Mutex zu bekommen (dann ohne Einzelinstanz).
+/// laeuft schon - auch, wenn das System den Zugriff auf ihren Mutex
+/// verweigert (etwa eine Freigabe mit erhoehten Rechten): dann besteht er.
+/// Err: kein Mutex zu bekommen (dann ohne Einzelinstanz).
 pub fn einzelinstanz(name: &str) -> Result<Option<Instanz>, String> {
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    let h = unsafe { CreateMutexW(None, false, &HSTRING::from(name)) }.map_err(|e| format!("Mutex {name}: {}", e.message()))?;
+    let h = match unsafe { CreateMutexW(None, false, &HSTRING::from(name)) } {
+        Ok(h) => h,
+        Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => return Ok(None),
+        Err(e) => return Err(format!("Mutex {name}: {}", e.message())),
+    };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
             let _ = CloseHandle(h);
@@ -191,10 +215,11 @@ pub fn einzelinstanz(name: &str) -> Result<Option<Instanz>, String> {
     Ok(Some(Instanz(h.0 as isize)))
 }
 
-/// Laeuft die Host-Rolle in dieser Sitzung (ihr Mutex besteht)?
+/// Laeuft die Host-Rolle in dieser Sitzung (ihr Mutex besteht)? Verweigert
+/// das System den Zugriff, besteht er ebenfalls.
 pub fn laeuft(name: &str) -> bool {
     use windows::core::HSTRING;
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
     use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
     match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) } {
         Ok(h) => {
@@ -203,31 +228,8 @@ pub fn laeuft(name: &str) -> bool {
             }
             true
         }
-        Err(_) => false,
+        Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
     }
-}
-
-/// Startet die Host-Rolle als zweiten Prozess derselben exe (Spezifikation
-/// 9.5/10.1, Knopf "Diesen PC freigeben" im Client): `--host --hintergrund`,
-/// ohne Konsolenfenster (die exe ist ein GUI-Programm; DETACHED_PROCESS
-/// dazu, damit sie auch keine Konsole eines aus der Eingabeaufforderung
-/// gestarteten Clients erbt - schloesse die jemand, endete die Freigabe
-/// mit). Laeuft schon eine, beendet sich die neue still (Einzelinstanz).
-pub fn freigabe_starten() -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
-    Command::new(exe)
-        .args(["--host", HINTERGRUND])
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Freigabe nicht gestartet: {e}"))
 }
 
 #[cfg(test)]
@@ -373,6 +375,60 @@ mod tests {
         drop(erste);
         assert!(!laeuft(&name));
         assert!(einzelinstanz(&name).unwrap().is_some());
+    }
+
+    /// Haelt jemand den Mutex, auf den diese Sitzung nicht zugreifen darf
+    /// (wie bei einer Freigabe mit erhoehten Rechten; hier: leere
+    /// Zugriffsliste), laeuft die Freigabe schon - kein zweiter Start "ohne
+    /// Einzelinstanz", und `laeuft` sagt ja.
+    #[test]
+    fn einzelinstanz_ohne_zugriff_heisst_laeuft() {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Security::{
+            InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, ACL_REVISION, PSECURITY_DESCRIPTOR,
+            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+        };
+        use windows::Win32::System::Threading::CreateMutexW;
+        let name = format!("Local\\QuadChroma-Host-Test-Zugriff-{}", std::process::id());
+        let mut acl = ACL::default();
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut core::ffi::c_void);
+        let h = unsafe {
+            InitializeAcl(&mut acl, std::mem::size_of::<ACL>() as u32, ACL_REVISION).unwrap();
+            // 1 = SECURITY_DESCRIPTOR_REVISION (Win32_System_SystemServices ist nicht eingebunden)
+            InitializeSecurityDescriptor(psd, 1).unwrap();
+            SetSecurityDescriptorDacl(psd, true, Some(&acl as *const ACL), false).unwrap();
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd.0,
+                bInheritHandle: false.into(),
+            };
+            CreateMutexW(Some(&sa as *const SECURITY_ATTRIBUTES), false, &HSTRING::from(name.as_str())).unwrap()
+        };
+        assert!(einzelinstanz(&name).unwrap().is_none(), "Mutex ohne Zugriff galt nicht als laufende Freigabe");
+        assert!(laeuft(&name));
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        assert!(!laeuft(&name));
+    }
+
+    /// Platzhalter in einem Durchgang: ein "{i}" oder "{d}" im Namen bleibt,
+    /// wie es ist.
+    #[test]
+    fn einsetzen_in_einem_durchgang() {
+        let de = crate::strings::pick("de");
+        let mut s = stand();
+        s.geraete = Ok(vec![geraet(1, "Falle {i} {d} {n}")]);
+        let (m, _) = menue(de, &s);
+        let Eintrag::Unter { eintraege, .. } = &m[8] else { panic!() };
+        let id = zugang::id_text(zugang::geraete_id(&[1u8; 32]));
+        assert_eq!(texte(eintraege)[0], format!("Falle {{i}} {{d}} {{n}} – ID {id} – seit 2026-09-26"));
+        assert_eq!(einsetzen("{a}{b}{a}x", &[("{a}", "{b}"), ("{b}", "1")]), "{b}1{b}x");
+        assert_eq!(einsetzen("ohne", &[("{n}", "x")]), "ohne");
+        assert_eq!(einsetzen("Grüße {n}!", &[("{n}", "Ä")]), "Grüße Ä!");
+        assert_eq!(einsetzen("{n", &[("{n}", "x")]), "{n");
     }
 
     /// Das allgemeine Menue als echtes Win32-Menue (ohne Shell): Untermenue,

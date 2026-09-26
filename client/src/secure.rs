@@ -167,6 +167,30 @@ impl<'a> Rahmen<'a> {
     }
 }
 
+/// `buf` ganz von der Leitung lesen, alles bis `bis` (Secure::read_exact_bis):
+/// vor jedem Stueck nur noch mit der Restzeit.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn leitung_lesen_bis(sock: &TcpStream, buf: &mut [u8], bis: Instant, was: &str) -> Result<(), String> {
+    let mut fertig = 0;
+    while fertig < buf.len() {
+        let rest = bis.saturating_duration_since(Instant::now());
+        if rest.is_zero() {
+            return Err(format!("{was}: Lesefrist abgelaufen"));
+        }
+        sock.set_read_timeout(Some(rest.max(Duration::from_millis(1)))).ok();
+        match (&*sock).read(&mut buf[fertig..]) {
+            Ok(0) => return Err(format!("{was}: Leitung zu")),
+            Ok(n) => fertig += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                return Err(format!("{was}: Lesefrist abgelaufen"))
+            }
+            Err(e) => return Err(format!("{was}: {}", wortlaut(&e))),
+        }
+    }
+    Ok(())
+}
+
 pub struct Secure {
     sock: TcpStream,
     tx: snow::TransportState,
@@ -303,6 +327,48 @@ impl Secure {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn gepuffert(&self) -> bool {
         self.inpos < self.inbuf.len()
+    }
+
+    /// Wie `read_exact`, aber mit EINER Frist fuer das ganze Lesen (`bis`)
+    /// statt einer je Leseaufruf: jedes Stueck von der Leitung bekommt nur
+    /// noch die Restzeit - wie `Rahmen::lesen` im Handschlag. Mit einer
+    /// Frist je Aufruf hielte eine Gegenstelle, die eine Datensatzlaenge
+    /// schickt und danach alle paar Sekunden ein Byte, den Leser beliebig
+    /// lange fest (Zugangsphase der Host-Rolle, host/einlass.rs). Nach einem
+    /// Fehler taugt die Leitung nur noch zum Schliessen (ein Datensatz kann
+    /// halb gelesen sein). Die Lesefrist der Leitung setzt der Aufrufer
+    /// danach selbst.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn read_exact_bis(&mut self, dst: &mut [u8], bis: Instant) -> Result<(), String> {
+        let mut done = 0;
+        while done < dst.len() {
+            if self.inpos == self.inbuf.len() {
+                let mut l = [0u8; 2];
+                leitung_lesen_bis(&self.sock, &mut l, bis, "Laenge")?;
+                let n = u16::from_le_bytes(l) as usize;
+                if n > CHUNK_MAX + 16 {
+                    return Err("unplausible Datensatzlaenge".into());
+                }
+                let mut ct = vec![0u8; n];
+                leitung_lesen_bis(&self.sock, &mut ct, bis, "Daten")?;
+                let mut pt = vec![0u8; CHUNK_MAX];
+                let got = self
+                    .tx
+                    .read_message(&ct, &mut pt)
+                    .map_err(|_| "Datensatz nicht echt - abgebrochen".to_string())?;
+                pt.truncate(got);
+                self.inbuf = pt;
+                self.inpos = 0;
+                if got == 0 {
+                    continue;
+                }
+            }
+            let take = (self.inbuf.len() - self.inpos).min(dst.len() - done);
+            dst[done..done + take].copy_from_slice(&self.inbuf[self.inpos..self.inpos + take]);
+            self.inpos += take;
+            done += take;
+        }
+        Ok(())
     }
 
     /// Eine zweite Hand an derselben Leitung, um sie von aussen zu kappen.

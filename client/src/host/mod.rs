@@ -7,10 +7,12 @@
 //   quadchroma.exe --messen [--output n] [--sekunden 10]
 //
 // Fuer Nutzer startet der Knopf "Diesen PC freigeben" im Client die Rolle
-// als zweiten Prozess (oberflaeche::freigabe_starten, intern mit
-// --hintergrund), ebenso die Verknuepfung "Mit Windows starten". Hoechstens
-// eine Host-Rolle je Sitzung (Mutex Local\QuadChroma-Host); ein zweiter
-// Start endet still, bevor er das Protokoll anfasst.
+// als zweiten Prozess derselben exe mit --host (Ausgaben ins Leere,
+// DETACHED_PROCESS), ebenso die Verknuepfung "Mit Windows starten". Eine so
+// gestartete Rolle laesst eine geerbte Konsole los (ausgabe_ins_leere).
+// Hoechstens eine Host-Rolle je Sitzung (Mutex Local\QuadChroma-Host); ein
+// zweiter Start endet still, bevor er das Protokoll anfasst, und --list
+// schreibt nur dann in host-protokoll.txt, wenn keine Freigabe laeuft.
 //
 // Oberflaeche (Spezifikation Pairing v1, 10): Symbol im Infobereich mit
 // Geraete-ID, Zugangspasswort, erlaubten Geraeten, Autostart und "Freigabe
@@ -396,17 +398,26 @@ fn dpi_bewusst() -> String {
     }
 }
 
-/// "Diesen PC freigeben" (Knopf im Client, Spezifikation 9.5/10.1): die
-/// Host-Rolle als zweiten Prozess derselben exe starten, ohne Konsole.
-#[allow(dead_code)] // der Knopf des Clients (main.rs) ruft es
-pub fn freigabe_starten() -> Result<(), String> {
-    oberflaeche::freigabe_starten()
-}
-
-/// Laeuft in dieser Sitzung schon eine Host-Rolle? (Knopf "Freigabe laeuft")
-#[allow(dead_code)] // der Knopf des Clients (main.rs) fragt es
-pub fn freigabe_laeuft() -> bool {
-    oberflaeche::laeuft(oberflaeche::MUTEX)
+/// Gehen die Ausgaben dieses Prozesses ins Leere - war die Standardausgabe
+/// beim Start das Geraet NUL? So startet der Knopf "Diesen PC freigeben"
+/// des Clients die Host-Rolle (Stdio::null, DETACHED_PROCESS). Gefragt wird
+/// nach dem, was der Aufrufer beim Start mitgab (GetStartupInfoW), nicht
+/// nach der Standardausgabe von jetzt: AttachConsole in main.rs kann sie
+/// inzwischen ersetzt haben. Ein Start aus der Eingabeaufforderung (Konsole)
+/// oder mit umgeleiteter Ausgabe (Datei, Pipe) zaehlt nicht.
+fn ausgabe_ins_leere() -> bool {
+    use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_CHAR};
+    use windows::Win32::System::Console::{GetConsoleMode, CONSOLE_MODE};
+    use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESTDHANDLES, STARTUPINFOW};
+    let mut si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    unsafe { GetStartupInfoW(&mut si) };
+    let h = si.hStdOutput;
+    if !si.dwFlags.contains(STARTF_USESTDHANDLES) || h.is_invalid() {
+        return false;
+    }
+    // Ein Zeichengeraet, das keine Konsole ist: NUL.
+    let mut modus = CONSOLE_MODE::default();
+    unsafe { GetFileType(h) == FILE_TYPE_CHAR && GetConsoleMode(h, &mut modus).is_err() }
 }
 
 /// Sperre nehmen, auch nach einer Panik in einem anderen Faden.
@@ -525,9 +536,12 @@ pub fn main_host(args: &[String]) -> i32 {
     } else {
         None
     };
-    if args.iter().any(|a| a == oberflaeche::HINTERGRUND) {
-        // Vom Client gestartet: keine geerbte Konsole - schloesse jemand
-        // sie, endete die Freigabe mit.
+    if freigabe && ausgabe_ins_leere() {
+        // Vom Knopf des Clients gestartet: niemand liest die Ausgaben. Kam
+        // der Client aus einer Eingabeaufforderung, haengt dieser Prozess
+        // trotzdem an ihrer Konsole (AttachConsole in main.rs) - schloesse
+        // jemand das Fenster, endete die Freigabe mit. Also loslassen; das
+        // Protokoll steht in host-protokoll.txt.
         unsafe {
             let _ = windows::Win32::System::Console::FreeConsole();
         }
@@ -549,18 +563,27 @@ pub fn main_host(args: &[String]) -> i32 {
         return messen::laufen(args);
     }
 
-    protokoll_oeffnen("host-protokoll.txt");
-    log(&dpi);
-    if let Some(e) = instanz_fehler {
-        log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
-    }
-
     if args.iter().any(|a| a == "--list") {
+        // --list laeuft ohne Einzelinstanz (neben einer Freigabe erlaubt).
+        // host-protokoll.txt gehoert dann der laufenden Freigabe: neu
+        // beginnen leerte ihr Protokoll - also nur die Konsole.
+        if oberflaeche::laeuft(oberflaeche::MUTEX) {
+            log("Die Freigabe laeuft in dieser Sitzung - --list schreibt nur auf die Konsole, host-protokoll.txt bleibt ihr");
+        } else {
+            protokoll_oeffnen("host-protokoll.txt");
+        }
+        log(&dpi);
         aufnahme::ausgaenge_melden(&mut Vec::new());
         encoder::pruefen();
         encoder::mf_pruefen();
         ffmpeg_zeilen();
         return 0;
+    }
+
+    protokoll_oeffnen("host-protokoll.txt");
+    log(&dpi);
+    if let Some(e) = instanz_fehler {
+        log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
     }
 
     // --host [port]
@@ -948,6 +971,47 @@ pub fn main_host(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wie der Knopf "Diesen PC freigeben" startet (Ausgaben nach NUL,
+    /// DETACHED_PROCESS; danach holt main.rs mit AttachConsole die Konsole
+    /// des Elternprozesses): `ausgabe_ins_leere` sagt ja, und die Rolle
+    /// laesst die Konsole los. Mit einer Ausgabe, die jemand liest (Pipe),
+    /// sagt sie nein. Der Kindprozess ist dieser Test selbst (QC_TEST_AUSGABE).
+    #[test]
+    fn start_ohne_ausgabe_braucht_keine_konsole() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        if let Some(ziel) = std::env::var_os("QC_TEST_AUSGABE") {
+            unsafe {
+                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+            std::fs::write(ziel, if ausgabe_ins_leere() { "leer" } else { "gelesen" }).unwrap();
+            return;
+        }
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let ordner = std::env::temp_dir().join(format!("{}-ausgabe", secure::test_lauf()));
+        std::fs::create_dir_all(&ordner).unwrap();
+        let lauf = |name: &str, ausgabe: Stdio| {
+            let datei = ordner.join(name);
+            let _ = std::fs::remove_file(&datei);
+            let r = Command::new(std::env::current_exe().unwrap())
+                .args(["host::tests::start_ohne_ausgabe_braucht_keine_konsole", "--exact", "--test-threads=1"])
+                .env("QC_TEST_AUSGABE", &datei)
+                .stdin(Stdio::null())
+                .stdout(ausgabe)
+                .stderr(Stdio::null())
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                .output()
+                .unwrap();
+            assert!(r.status.success(), "{name}: {:?}", r.status);
+            std::fs::read_to_string(&datei).unwrap_or_default()
+        };
+        assert_eq!(lauf("null.txt", Stdio::null()), "leer");
+        assert_eq!(lauf("pipe.txt", Stdio::piped()), "gelesen");
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
 
     /// Das Protokoll waechst nicht ohne Ende (Integrationstest: jede
     /// Muell-Verbindung eine Zeile, ohne Grenze): ueber der Grenze wird die
