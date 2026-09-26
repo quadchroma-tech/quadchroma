@@ -332,17 +332,20 @@ static void hilfen_pruefen(void) {
     pruefe(qc_passwort_pruefen(@"langes-passwort", @"langes-passwurt") == 1, "ungleich");
     pruefe(qc_passwort_pruefen(@"kurz", @"anders") == 2, "zu kurz geht vor ungleich");
     pruefe(qc_passwort_pruefen(@"langes passwort", nil) == 1, "zweites Feld fehlt: ungleich");
-    NSString *p256 = [@"" stringByPaddingToLength:256 withString:@"a" startingAtIndex:0];
-    NSString *p257 = [p256 stringByAppendingString:@"a"];
-    pruefe(qc_passwort_pruefen(p256, p256) == 0, "256 Byte: gut (QC_ZUGANG_PW_MAX)");
-    pruefe(qc_passwort_pruefen(p257, p257) == 3, "257 Byte: unzulaessig, nicht \"zu kurz\"");
-    NSString *u = [@"" stringByPaddingToLength:128 withString:@"ü" startingAtIndex:0];
-    pruefe(qc_passwort_pruefen(u, u) == 0, "128 x \"ü\" = 256 Byte: gut");
+    // Grenze 128 Byte wie im Client (zugang::PASSWORT_MAX): ein laengeres
+    // Passwort liesse sich dort gar nicht eingeben.
+    NSString *p128 = [@"" stringByPaddingToLength:128 withString:@"a" startingAtIndex:0];
+    NSString *p129 = [p128 stringByAppendingString:@"a"];
+    pruefe(QC_ZUGANG_PW_MAX == 128, "QC_ZUGANG_PW_MAX ist 128 Byte wie PASSWORT_MAX im Client");
+    pruefe(qc_passwort_pruefen(p128, p128) == 0, "128 Byte: gut (QC_ZUGANG_PW_MAX)");
+    pruefe(qc_passwort_pruefen(p129, p129) == 3, "129 Byte: unzulaessig, nicht \"zu kurz\"");
+    NSString *u = [@"" stringByPaddingToLength:64 withString:@"ü" startingAtIndex:0];
+    pruefe(qc_passwort_pruefen(u, u) == 0, "64 x \"ü\" = 128 Byte: gut");
     u = [u stringByAppendingString:@"a"];
-    pruefe(qc_passwort_pruefen(u, u) == 3, "257 Byte UTF-8: unzulaessig");
+    pruefe(qc_passwort_pruefen(u, u) == 3, "129 Byte UTF-8: unzulaessig");
     pruefe(qc_passwort_pruefen(@"abcd\nefgh", @"abcd\nefgh") == 3 && qc_passwort_pruefen(@"abcdefgh\r", @"abcdefgh\r") == 3,
            "Zeilenumbruch (eingefuegt): unzulaessig");
-    pruefe(qc_passwort_pruefen(p257, @"anders") == 3, "unzulaessig geht vor ungleich");
+    pruefe(qc_passwort_pruefen(p129, @"anders") == 3, "unzulaessig geht vor ungleich");
 }
 
 // ------------------------------------------------------------ Modell

@@ -706,15 +706,23 @@ static void passwort_pruefen(void) {
     pruefe(alle && !gleich && !gesehen['i'] && !gesehen['l'] && !gesehen['o'] && !gesehen['0'] && !gesehen['1'],
            "Zufallspasswort: alle 31 Zeichen kommen vor, keine verwechselbaren, keine Wiederholung");
 
+    // Die Grenze liegt wie im Client (zugang::PASSWORT_MAX) bei 128 Byte.
+    char riesig[400];
+    memset(riesig, 'x', 129);
+    riesig[129] = 0;
+    pruefe(qc_zugang_passwort_setzen(riesig) == -1, "129 Byte: -1 (so lang nimmt das Passwortfeld des Clients nichts)");
+    riesig[128] = 0;
+    pruefe(qc_zugang_passwort_setzen(riesig) == 0 && qc_zugang_passwort(pw2, sizeof pw2) == 0 && strlen(pw2) == 128,
+           "128 Byte: gesetzt und gelesen");
+
     int zust = g_ui_zustand;
     g_zeilen[0] = 0;
     pruefe(qc_zugang_passwort_setzen("abc-def-g") == -1 && qc_zugang_passwort_setzen("ab cd ef g") == -1,
            "norm(pw) unter 8 Byte: -1 (Leerzeichen und Bindestriche zaehlen nicht)");
     pruefe(qc_zugang_passwort_setzen("zwei\nzeilen!") == -1 && qc_zugang_passwort_setzen("") == -1, "Zeilenwechsel oder leer: -1");
-    char riesig[400];
     memset(riesig, 'x', 300);
     riesig[300] = 0;
-    pruefe(qc_zugang_passwort_setzen(riesig) == -1, "ueber 256 Byte: -1");
+    pruefe(qc_zugang_passwort_setzen(riesig) == -1, "ueber 128 Byte: -1");
     pruefe(qc_zugang_passwort_setzen("Gr\xc3\xbc\xc3\x9f" "e, Mac!") == 0 && qc_zugang_passwort(pw2, sizeof pw2) == 0 &&
            strcmp(pw2, "Gr\xc3\xbc\xc3\x9f" "e, Mac!") == 0, "eigenes Passwort gesetzt und gelesen, wie eingegeben");
     pruefe(strstr(g_zeilen, "Zugangspasswort geaendert") && !strstr(g_zeilen, "Mac!") && g_ui_zustand == zust + 1,

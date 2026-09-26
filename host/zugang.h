@@ -66,7 +66,10 @@ enum {
 // Passwort (3.4, 4.3).
 #define QC_ZUGANG_RUNDEN   100000       // PBKDF2-HMAC-SHA256
 #define QC_ZUGANG_PW_MIN   8            // norm(pw) mindestens so viele Byte
-#define QC_ZUGANG_PW_MAX   256          // Byte, wie eingegeben; Puffer also 257
+#define QC_ZUGANG_PW_MAX   128          // Byte, wie eingegeben; Puffer also 129. Gleich
+                                        // zugang::PASSWORT_MAX im Client und in der
+                                        // Windows-Host-Rolle: ein laengeres liesse sich
+                                        // am Client gar nicht eingeben
 
 // Bekanntgabe (2): an das Paket von heute wird angehaengt
 //   u8 ext = 1 | u32 id LE | u8 flags
