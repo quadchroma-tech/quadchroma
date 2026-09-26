@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- Bezeichner der App. Er steckt in der Signatur (Designated Requirement) und
+         damit in den TCC-Freigaben fuer Bildschirmaufnahme und Bedienungshilfen:
+         wer ihn aendert, muss beide Freigaben neu erteilen. Muss zu BUNDLE im
+         Makefile passen. -->
     <key>CFBundleIdentifier</key>
     <string>tech.quadchroma.host</string>
     <key>CFBundleName</key>
@@ -12,12 +16,26 @@
     <string>quadchroma-host</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>de</string>
+    <!-- Versionsnummer, die Nutzer sehen (drei Zahlen). Das Makefile liest sie
+         fuer die Namen von ZIP und DMG. -->
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
+    <!-- Bau-Nummer: vor jedem verteilten Bau um eins erhoehen (Apple:
+         "increment the build version before you distribute a build"). -->
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Robert Brandt</string>
+    <!-- Der Host laeuft ohne Dock-Symbol und ohne Fenster; die Signatur und
+         Gatekeeper interessiert das nicht. -->
     <key>LSBackgroundOnly</key>
     <true/>
     <key>NSHighResolutionCapable</key>

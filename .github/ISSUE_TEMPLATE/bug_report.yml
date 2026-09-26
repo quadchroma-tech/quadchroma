@@ -1,0 +1,98 @@
+# Fehlerbericht als GitHub-Issue-Formular (.github/ISSUE_TEMPLATE, YAML-Form).
+# Sichtbare Texte auf Englisch (GitHub-Datei), Kommentare auf Deutsch (Projektregel).
+# Das Label "bug" muss im Repository existieren, sonst setzt GitHub es stillschweigend nicht.
+name: Bug report
+description: Something does not work as documented in README.en.md or BENUTZUNG.txt.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. One bug per issue, please.
+
+        **Security problems do not belong here.** See
+        [SECURITY.md](https://github.com/quadchroma/quadchroma/blob/main/SECURITY.md)
+        for private reporting. Before you post, search the existing issues and check
+        `README.en.md` ("Using the client", "What is missing") and `BENUTZUNG.txt`.
+  - type: dropdown
+    id: side
+    attributes:
+      label: Side / role
+      description: Which program shows the problem? Pick every side that is involved.
+      multiple: true
+      options:
+        - Mac host (QuadChroma.app)
+        - Windows client (quadchroma.exe)
+        - Windows host role (quadchroma.exe --host)
+        - Mac client (built from source)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Release version (tag on the Releases page) or, for a build from source, the output of `git rev-parse --short HEAD`. If host and client differ, give both.
+      placeholder: "v0.1.0 (client) and v0.1.0 (host), or commit 26ef895"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Operating system and hardware
+      description: macOS version and Mac model; Windows version (Settings > System > About) and GPU; how host and client are connected (Ethernet, Wi-Fi, same switch or not).
+      placeholder: |
+        Host: macOS 15.6 on Mac mini M1
+        Client: Windows 11 Pro 24H2, NVIDIA GeForce RTX 3060, Ethernet
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Start from a fresh start of both programs. Command-line options, menu choices, settings, and what you did in which order.
+      placeholder: |
+        1. Start the host with ...
+        2. Connect the client to ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened, with a reference to README.en.md or BENUTZUNG.txt if it is documented.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include error texts exactly as shown. Screenshots help for display problems; for stream problems, the values from the overlay (fps, decode time, bitrate) help.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: |
+        The lines around the event (20 to 50 lines are usually enough; more is fine). Where the log is:
+        Windows client `%APPDATA%\QuadChroma\protokoll.txt`;
+        Windows host role `%APPDATA%\QuadChroma\host-protokoll.txt`;
+        Mac host `/tmp/quadchroma-m1.log` (older part in `/tmp/quadchroma-m1.alt.log`);
+        Mac client `~/Library/Application Support/QuadChroma/protokoll.txt`.
+        Remove pairing codes, key material and anything else you do not want public.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: The log excerpt and the text above contain no secrets or keys - no pairing codes, no contents of host.key, client.key or known_hosts.txt, no addresses I want to keep private.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md, not through a public issue).
+          required: true
+        - label: I searched the existing issues and README.en.md ("What is missing") and did not find this problem.
+          required: true

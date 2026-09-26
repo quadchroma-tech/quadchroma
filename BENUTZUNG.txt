@@ -1735,9 +1735,13 @@ Der Pruefmodus des Clients zeigt jeden Host, der sich im Netz ausruft,
 einmal als Zeile "Host gefunden: Name (Adresse)".
 
 Die Dateien neben der Programmdatei gehoeren dazu und muessen mitkopiert
-werden. Es ist FFmpeg unter der LGPL, eingebunden als eigenstaendige
-Bibliothek. Der Quelltext dazu liegt bei https://ffmpeg.org. Direct3D,
-DXGI und der Shader-Uebersetzer (d3dcompiler_47.dll) sind Bestandteile von
+werden: avcodec-63.dll und avutil-61.dll. Das sind Bibliotheken des
+FFmpeg-Projekts unter der LGPLv2.1, als eigenstaendige Dateien
+eingebunden und austauschbar. Sie entstehen mit
+scripts/build-ffmpeg-windows.sh aus dem unveraenderten FFmpeg 9.0.2 ohne
+Fremdbibliotheken; die Quellen haengen an jedem Release, Einzelheiten
+und alle Lizenztexte stehen in THIRD_PARTY_NOTICES.md. Direct3D, DXGI und
+der Shader-Uebersetzer (d3dcompiler_47.dll) sind Bestandteile von
 Windows, nichts davon wird mitgeliefert.
 
 Voraussetzung ist Windows 10 oder 11, 64 Bit. Eine Visual-C++-Laufzeit

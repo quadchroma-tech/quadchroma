@@ -1,0 +1,236 @@
+# QuadChroma - Bau und Tests bei jedem Push auf main und jedem Pull Request.
+#
+# FFmpeg (macos-26): die FFmpeg-DLLs fuer Windows mit scripts/build-ffmpeg-windows.sh
+#   (schlanker LGPL-Bau, MinGW-w64 aus Homebrew) - derselbe Weg wie beim Release.
+# Windows (windows-2025): Rust-Client samt Host-Rolle gegen diese DLLs.
+#   build.rs findet rc.exe im Windows SDK des Runners (llvm-rc als Ausweichweg).
+# macOS (macos-26): Host (Objective-C, ad-hoc signiert, wird nie gestartet),
+#   Pruefstaende ohne Bildschirmaufnahme, ZIP/DMG-Verpackung ueber das Makefile,
+#   Rust-Client gegen Homebrew-FFmpeg (GPL-Build: nur fuer Bau und Tests, wird
+#   nie weitergegeben).
+#
+# Braucht keine Geheimnisse und laeuft deshalb auch fuer Pull Requests aus Forks.
+# Actions sind per Commit-SHA gepinnt (Tag als Kommentar; Dependabot pflegt beides).
+# Runner ausdruecklich benannt (nicht -latest), damit Werkzeugstaende nicht
+# unbemerkt wechseln; heute sind windows-2025 und macos-26 die "-latest"-Images.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ffmpeg:
+    name: FFmpeg fuer Windows (LGPL, eigener Bau)
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: FFmpeg aus dem Cache (Schluessel = Bauskript)
+        id: ffmpeg-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ffmpeg-windows
+          key: ffmpeg-windows-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
+
+      - name: FFmpeg bauen (Pruefsummen der Quellarchive stehen im Skript)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          brew install mingw-w64 nasm pkgconf
+          scripts/build-ffmpeg-windows.sh ffmpeg-windows
+          cat ffmpeg-windows/BUILDINFO.txt
+
+      - name: FFmpeg an den Windows-Job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ffmpeg-windows
+          path: ffmpeg-windows
+          retention-days: 7
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x86_64-pc-windows-msvc)
+    needs: ffmpeg
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      # build.rs: ohne rc.exe/llvm-rc abbrechen statt eine exe ohne Versionsinfo, Symbol und
+      # Manifest zu liefern. Auf Job-Ebene, damit Bau und Tests dieselbe Umgebung sehen.
+      QC_RESSOURCEN_PFLICHT: '1'
+    defaults:
+      run:
+        shell: pwsh
+        # Aus client\ bauen, sonst liest Cargo client/.cargo/config.toml (crt-static) nicht.
+        working-directory: client
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust (stable)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: FFmpeg aus dem FFmpeg-Job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ffmpeg-windows
+          path: C:\ffmpeg-qc
+
+      - name: Umgebung fuer ffmpeg-sys-next (FFMPEG_DIR, LIBCLANG_PATH, PATH)
+        run: |
+          if ($env:RUSTFLAGS) { throw "RUSTFLAGS ist gesetzt - client/.cargo/config.toml (crt-static) wuerde verdraengt" }
+          $ffmpeg = "C:\ffmpeg-qc"
+          if (-not (Test-Path "$ffmpeg\lib\avcodec.lib")) { throw "FFmpeg (lib\avcodec.lib) unter $ffmpeg nicht gefunden" }
+          "FFMPEG_DIR=$ffmpeg" >> $env:GITHUB_ENV
+          "$ffmpeg\bin" >> $env:GITHUB_PATH
+          # libclang fuer bindgen: LLVM (Chocolatey) unter C:\Program Files\LLVM, sonst das
+          # Clang aus Visual Studio 2026. Derselbe Ordner enthaelt llvm-rc.exe, den
+          # Ausweichweg von build.rs (rc.exe aus dem Windows SDK hat Vorrang).
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvm\libclang.dll")) {
+            $llvm = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin"
+          }
+          if (-not (Test-Path "$llvm\libclang.dll")) { throw "libclang.dll nicht gefunden (weder LLVM noch Visual-Studio-Clang)" }
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          "$llvm" >> $env:GITHUB_PATH
+          "FFMPEG_DIR=$ffmpeg`nLIBCLANG_PATH=$llvm"
+
+      - name: Cargo-Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: client -> target
+
+      - name: Bauen
+        run: cargo build --release --locked
+
+      - name: exe pruefen (crt-static, Versionsressource aus build.rs)
+        run: |
+          $exe = "target\release\quadchroma.exe"
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          if ($text -match 'VCRUNTIME140') { throw "quadchroma.exe importiert VCRUNTIME140 - crt-static greift nicht" }
+          $vi = (Get-Item $exe).VersionInfo
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          "ProductVersion=$($vi.ProductVersion) FileVersion=$($vi.FileVersion) CompanyName=$($vi.CompanyName) ProductName=$($vi.ProductName)"
+          if ($vi.ProductVersion -ne $cargo) { throw "Versionsressource '$($vi.ProductVersion)' passt nicht zu Cargo.toml '$cargo' (build.rs, res/quadchroma.rc)" }
+
+      - name: Tests (eigenes APPDATA, FFmpeg-DLLs im PATH)
+        env:
+          # %APPDATA%\QuadChroma ist der Ablageordner des Clients - die Tests bekommen einen eigenen.
+          APPDATA: ${{ runner.temp }}\appdata-tests
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+          cargo test --release --locked
+
+      - name: exe als Artefakt (7 Tage, unsigniert - nur zum Ausprobieren)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quadchroma-windows-x64-ci
+          path: client/target/release/quadchroma.exe
+          retention-days: 7
+          if-no-files-found: error
+
+  macos:
+    name: macOS (Host, Pruefstaende, Verpackung, Client)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Host bauen (ad-hoc signiert; die App wird nicht gestartet)
+        run: make IDENT=-
+
+      - name: Signatur pruefen (make verify; Gatekeeper lehnt ad-hoc erwartungsgemaess ab)
+        run: make verify IDENT=-
+
+      - name: ZIP und DMG verpacken (make zip, make dmg)
+        run: |
+          set -euo pipefail
+          make zip IDENT=-
+          make dmg IDENT=-
+          ls -l build/*.zip build/*.dmg
+
+      - name: Pruefstaende uebersetzen (Bauzeilen aus README.md)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/noisetest.c host/qc_noise.c \
+                host/vendor/monocypher/monocypher.c -o build/noisetest
+          clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \
+                host/qc_secure.c host/qc_noise.c host/vendor/monocypher/monocypher.c -o build/annahmetest
+          clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
+                -framework Foundation host/dateitest.m host/dateien.m -o build/dateitest
+          clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 -framework Foundation \
+                -framework AppKit host/ablagetest.m -o build/ablagetest
+          # hosttest braucht zur Laufzeit die Bildschirmaufnahme (TCC-Freigabe), die es auf
+          # einem Runner nicht gibt - hier nur uebersetzen, das faengt Kompilierfehler.
+          clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
+                -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
+                -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
+                -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
+                host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
+                host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+                host/vendor/monocypher/monocypher.c -o build/hosttest
+
+      - name: Pruefstaende ohne TCC ausfuehren (noisetest, annahmetest, dateitest, ablagetest)
+        run: |
+          set -euo pipefail
+          out=$(build/noisetest); echo "$out"; [ "$out" = "OK" ]
+          build/annahmetest
+          build/dateitest
+          build/ablagetest
+
+      - name: FFmpeg (Homebrew, GPL-Build - nur fuer Bau und Tests des Mac-Clients)
+        run: |
+          set -euo pipefail
+          brew install ffmpeg
+          echo "FFMPEG_DIR=$(brew --prefix ffmpeg)" >> "$GITHUB_ENV"
+
+      - name: Rust (stable)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cargo-Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: client -> target
+
+      - name: Client bauen und testen (ohne Zwischenablage-Tests, wie im Rezept)
+        working-directory: client
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          cargo test --release --locked -- --skip clipboard
+
+      - name: Host-Pakete als Artefakt (7 Tage, ad-hoc signiert - nur zum Ausprobieren)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quadchroma-macos-arm64-ci
+          path: |
+            build/*.zip
+            build/*.dmg
+          retention-days: 7
+          if-no-files-found: error

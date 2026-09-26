@@ -1,0 +1,620 @@
+# QuadChroma - Release auf Tag vX.Y.Z (z. B. v0.1.0).
+#
+# Ablauf:
+#   vorpruefung        Version aus dem Tag gegen client/Cargo.toml, client/Cargo.lock und
+#                      host/Info.plist; Schalter aus den Secrets (nur true/false verlassen den Job)
+#   ffmpeg             FFmpeg-DLLs fuer Windows mit scripts/build-ffmpeg-windows.sh (schlanker
+#                      LGPL-Bau, MinGW-w64 aus Homebrew) samt Quellarchiven fuer die Anlagen
+#   windows            bauen, testen, exe und die zwei FFmpeg-DLLs als Artefakte
+#   windows-signieren  Azure Artifact Signing (frueher Trusted Signing) - nur mit Secrets
+#   windows-paket      quadchroma-<version>-windows-x64[-unsigned].zip
+#   macos              Host bauen, Developer-ID-Signatur, Notarisierung, ZIP + DMG ueber das
+#                      Makefile - ohne Secrets ad-hoc signiert, Zusatz -unsigned (bzw.
+#                      -unnotarized: signiert, aber nicht notarisiert)
+#   release            SHA256SUMS.txt und Release-ENTWURF mit allen Anlagen; veroeffentlicht
+#                      wird von Hand nach Pruefung (RELEASING.md)
+#
+# Der secrets-Kontext ist in jobs.<id>.if nicht verfuegbar. Deshalb liest "vorpruefung" die
+# Secrets in seiner Umgebung und gibt nur Schalter (true/false) an die anderen Jobs weiter.
+# Ohne Secrets laeuft der Workflow vollstaendig durch - das ist der Probelauf.
+#
+# Rechte: contents:read fuer alle, id-token:write nur fuer die OIDC-Anmeldung bei Azure,
+# contents:write nur fuer den Job, der den Release-Entwurf anlegt.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+# Ein laufendes Release nie abwuergen; ein zweiter Tag wartet.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Die FFmpeg-Quellen (Version, Pruefsummen) stehen in scripts/build-ffmpeg-windows.sh;
+  # ausgeliefert werden nur avcodec-63.dll und avutil-61.dll (THIRD_PARTY_NOTICES.md, 2).
+
+jobs:
+  vorpruefung:
+    name: Version pruefen, Schalter setzen
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      windows_sign: ${{ steps.schalter.outputs.windows_sign }}
+      azure_oidc: ${{ steps.schalter.outputs.azure_oidc }}
+      mac_sign: ${{ steps.schalter.outputs.mac_sign }}
+      mac_notarize: ${{ steps.schalter.outputs.mac_notarize }}
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version aus dem Tag gegen Cargo.toml, Cargo.lock und Info.plist
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' client/Cargo.toml | head -n 1)
+          lock_version=$(awk '/^name = "quadchroma"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' client/Cargo.lock)
+          plist_version=$(python3 -c 'import plistlib; print(plistlib.load(open("host/Info.plist", "rb"))["CFBundleShortVersionString"])')
+          echo "Tag $version | client/Cargo.toml $cargo_version | client/Cargo.lock $lock_version | host/Info.plist $plist_version"
+          fehler=0
+          [ "$version" = "$cargo_version" ] || { echo "::error file=client/Cargo.toml::version = \"$cargo_version\" passt nicht zum Tag v$version"; fehler=1; }
+          [ "$version" = "$lock_version" ]  || { echo "::error file=client/Cargo.lock::Paket quadchroma steht auf $lock_version - nach dem Versionswechsel einmal cargo build ausfuehren und Cargo.lock einchecken (cargo --locked bricht sonst ab)"; fehler=1; }
+          [ "$version" = "$plist_version" ] || { echo "::error file=host/Info.plist::CFBundleShortVersionString $plist_version passt nicht zum Tag v$version"; fehler=1; }
+          [ "$fehler" = 0 ]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Schalter aus den Secrets (nur true/false verlassen diesen Schritt)
+        id: schalter
+        shell: bash
+        env:
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_CODE_SIGNING_ACCOUNT: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # gesetzt NAME...: wahr, wenn alle genannten Variablen nicht leer sind.
+          gesetzt() { local v; for v in "$@"; do [ -n "${!v:-}" ] || return 1; done; }
+          # eine NAME...: wahr, wenn mindestens eine gesetzt ist (fuer die Warnung "unvollstaendig").
+          eine()    { local v; for v in "$@"; do [ -n "${!v:-}" ] && return 0; done; return 1; }
+          fehlend() { local v; for v in "$@"; do [ -n "${!v:-}" ] || printf '%s ' "$v"; done; }
+
+          # Windows: Azure Artifact Signing. Anmeldung entweder mit Client-Secret
+          # (AZURE_CLIENT_SECRET) oder per OIDC ohne Geheimnis (AZURE_SUBSCRIPTION_ID fuer azure/login).
+          azure_basis="AZURE_ENDPOINT AZURE_CODE_SIGNING_ACCOUNT AZURE_CERT_PROFILE AZURE_TENANT_ID AZURE_CLIENT_ID"
+          windows_sign=false; azure_oidc=false
+          if gesetzt $azure_basis && gesetzt AZURE_CLIENT_SECRET; then
+            windows_sign=true
+          elif gesetzt $azure_basis && gesetzt AZURE_SUBSCRIPTION_ID; then
+            windows_sign=true; azure_oidc=true
+          elif eine $azure_basis AZURE_CLIENT_SECRET AZURE_SUBSCRIPTION_ID; then
+            echo "::warning::Azure-Secrets unvollstaendig (es fehlen: $(fehlend $azure_basis)und AZURE_CLIENT_SECRET oder AZURE_SUBSCRIPTION_ID) - Windows-exe bleibt unsigniert"
+          fi
+
+          # macOS: Developer-ID-Signatur; Notarisierung zusaetzlich mit Apple-ID, Team-ID und
+          # app-spezifischem Passwort.
+          apple_sign="APPLE_CERTIFICATE_P12_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY"
+          apple_notar="APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD"
+          mac_sign=false; mac_notarize=false
+          if gesetzt $apple_sign; then
+            mac_sign=true
+            if gesetzt $apple_notar; then
+              mac_notarize=true
+            elif eine $apple_notar; then
+              echo "::warning::Apple-Secrets fuer die Notarisierung unvollstaendig (es fehlen: $(fehlend $apple_notar)) - App wird signiert, aber nicht notarisiert"
+            fi
+          elif eine $apple_sign $apple_notar; then
+            echo "::warning::Apple-Secrets fuer die Signatur unvollstaendig (es fehlen: $(fehlend $apple_sign)) - App wird nur ad-hoc signiert"
+          fi
+
+          {
+            echo "windows_sign=$windows_sign"
+            echo "azure_oidc=$azure_oidc"
+            echo "mac_sign=$mac_sign"
+            echo "mac_notarize=$mac_notarize"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Release $GITHUB_REF_NAME"
+            echo "- Windows: Authenticode-Signatur ueber Azure Artifact Signing: **$windows_sign** (OIDC: $azure_oidc)"
+            echo "- macOS: Developer-ID-Signatur: **$mac_sign**, Notarisierung: **$mac_notarize**"
+            echo "- Ohne Signatur bekommen die Artefakte den Zusatz -unsigned (macOS auch -unnotarized)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_OUTPUT"
+
+  ffmpeg:
+    name: FFmpeg fuer Windows bauen (LGPL)
+    needs: vorpruefung
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: FFmpeg bauen (frisch, ohne Cache; Pruefsummen der Quellarchive im Skript)
+        run: |
+          set -euo pipefail
+          brew install mingw-w64 nasm pkgconf
+          scripts/build-ffmpeg-windows.sh ffmpeg-windows
+          cat ffmpeg-windows/BUILDINFO.txt
+
+      - name: FFmpeg an den Windows-Job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-ffmpeg-bau
+          path: ffmpeg-windows
+          if-no-files-found: error
+
+      - name: Quellen der FFmpeg-DLLs als Release-Anlagen (LGPL 2.1 Abschnitt 6)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-ffmpeg-quellen
+          path: ffmpeg-windows/quellen/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows bauen und testen
+    needs: [vorpruefung, ffmpeg]
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      # build.rs: ohne rc.exe/llvm-rc abbrechen statt eine exe ohne Versionsinfo, Symbol und
+      # Manifest zu liefern. Auf Job-Ebene, damit Bau und Tests dieselbe Umgebung sehen
+      # (rerun-if-env-changed wuerde build.rs sonst im Test-Schritt erneut laufen lassen).
+      QC_RESSOURCEN_PFLICHT: '1'
+    defaults:
+      run:
+        shell: pwsh
+        # Aus client\ bauen, sonst liest Cargo client/.cargo/config.toml (crt-static) nicht.
+        working-directory: client
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust (stable)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: FFmpeg aus dem FFmpeg-Job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-ffmpeg-bau
+          path: C:\ffmpeg-qc
+
+      - name: Umgebung (FFMPEG_DIR, LIBCLANG_PATH, PATH); auszuliefernde DLLs bereitlegen
+        run: |
+          if ($env:RUSTFLAGS) { throw "RUSTFLAGS ist gesetzt - client/.cargo/config.toml (crt-static) wuerde verdraengt" }
+          $ffmpeg = "C:\ffmpeg-qc"
+          if (-not (Test-Path "$ffmpeg\lib\avcodec.lib")) { throw "FFmpeg (lib\avcodec.lib) unter $ffmpeg nicht gefunden" }
+          "FFMPEG_DIR=$ffmpeg" >> $env:GITHUB_ENV
+          "$ffmpeg\bin" >> $env:GITHUB_PATH
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvm\libclang.dll")) {
+            $llvm = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin"
+          }
+          if (-not (Test-Path "$llvm\libclang.dll")) { throw "libclang.dll nicht gefunden (weder LLVM noch Visual-Studio-Clang)" }
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          "$llvm" >> $env:GITHUB_PATH
+          # Nur die zwei DLLs, die quadchroma.exe laedt, und die Bauangaben (Groesse und
+          # SHA-256 jeder DLL, Konfiguration) - THIRD_PARTY_NOTICES.md verweist darauf.
+          $ziel = Join-Path $env:RUNNER_TEMP 'dlls'
+          New-Item -ItemType Directory -Force -Path $ziel | Out-Null
+          foreach ($name in 'avcodec-63.dll', 'avutil-61.dll') {
+            Copy-Item "$ffmpeg\bin\$name" $ziel
+            "$name " + (Get-FileHash -Algorithm SHA256 "$ffmpeg\bin\$name").Hash.ToLowerInvariant()
+          }
+          Copy-Item "$ffmpeg\BUILDINFO.txt" (Join-Path $ziel 'FFMPEG-BUILDINFO.txt')
+
+      - name: Cargo-Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: client -> target
+
+      - name: Bauen
+        run: cargo build --release --locked
+
+      - name: exe pruefen (crt-static, Versionsressource = Tag)
+        env:
+          VERSION: ${{ needs.vorpruefung.outputs.version }}
+        run: |
+          $exe = "target\release\quadchroma.exe"
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          if ($text -match 'VCRUNTIME140') { throw "quadchroma.exe importiert VCRUNTIME140 - crt-static greift nicht" }
+          # Das Paket enthaelt nur avcodec-63.dll und avutil-61.dll - die exe darf keine
+          # weitere FFmpeg-DLL laden.
+          foreach ($dll in 'avcodec-63.dll', 'avutil-61.dll') { if ($text -notmatch [regex]::Escape($dll)) { throw "quadchroma.exe importiert $dll nicht - Paketinhalt pruefen" } }
+          if ($text -match 'avformat-\d+\.dll|swresample-\d+\.dll|swscale-\d+\.dll|avfilter-\d+\.dll|avdevice-\d+\.dll') { throw "quadchroma.exe importiert eine FFmpeg-DLL, die nicht ausgeliefert wird: $($Matches[0])" }
+          $vi = (Get-Item $exe).VersionInfo
+          "ProductVersion=$($vi.ProductVersion) FileVersion=$($vi.FileVersion) CompanyName=$($vi.CompanyName) ProductName=$($vi.ProductName)"
+          if ($vi.ProductVersion -ne $env:VERSION) { throw "Versionsressource '$($vi.ProductVersion)' passt nicht zum Tag v$env:VERSION" }
+
+      - name: Tests (eigenes APPDATA, FFmpeg-DLLs im PATH)
+        env:
+          APPDATA: ${{ runner.temp }}\appdata-tests
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+          cargo test --release --locked
+
+      - name: exe als Artefakt (unsigniert)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-exe-unsigned
+          path: client/target/release/quadchroma.exe
+          if-no-files-found: error
+
+      - name: FFmpeg-DLLs als Artefakt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-ffmpeg-dlls
+          path: ${{ runner.temp }}\dlls\*
+          if-no-files-found: error
+
+  windows-signieren:
+    name: Windows signieren (Azure Artifact Signing)
+    needs: [vorpruefung, windows]
+    # Schalter aus vorpruefung; secrets sind in jobs.<id>.if nicht verfuegbar.
+    if: needs.vorpruefung.outputs.windows_sign == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write   # nur fuer die OIDC-Anmeldung (azure/login) noetig
+    steps:
+      - name: Quellen (fuer scripts/sign-windows.ps1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unsignierte exe holen
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-exe-unsigned
+          path: ${{ runner.temp }}\sign
+
+      - name: Azure-Anmeldung per OIDC (ohne Client-Secret)
+        if: needs.vorpruefung.outputs.azure_oidc == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Signieren (SHA-256, RFC-3161-Zeitstempel von Microsoft)
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          # Mit Client-Secret meldet sich die Action selbst an (EnvironmentCredential). Ist das
+          # Secret leer, ueberspringt sie diesen Weg und nimmt die Anmeldung aus azure/login (OIDC).
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: ${{ runner.temp }}\sign
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: QuadChroma
+          description-url: https://quadchroma.tech
+
+      - name: Signatur pruefen (signtool verify /pa ueber scripts/sign-windows.ps1)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/sign-windows.ps1 "$env:RUNNER_TEMP\sign\quadchroma.exe" -VerifyOnly
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify: Exit-Code $LASTEXITCODE" }
+
+      - name: Signierte exe als Artefakt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-exe-signed
+          path: ${{ runner.temp }}\sign\quadchroma.exe
+          if-no-files-found: error
+
+  windows-paket:
+    name: Windows-ZIP packen
+    needs: [vorpruefung, windows, windows-signieren]
+    # windows-signieren darf uebersprungen sein (keine Secrets), aber nicht gescheitert.
+    if: ${{ !cancelled() && needs.windows.result == 'success' && (needs.windows-signieren.result == 'success' || needs.windows-signieren.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.vorpruefung.outputs.version }}
+      SIGNED: ${{ needs.windows-signieren.result == 'success' }}
+    steps:
+      - name: Quellen (Begleitdateien)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: exe holen (signiert, wenn vorhanden)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.SIGNED == 'true' && 'windows-exe-signed' || 'windows-exe-unsigned' }}
+          path: stage/quadchroma-${{ env.VERSION }}
+
+      - name: FFmpeg-DLLs holen
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-ffmpeg-dlls
+          path: stage/quadchroma-${{ env.VERSION }}
+
+      - name: Begleitdateien dazulegen und ZIP bauen
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="stage/quadchroma-$VERSION"
+          # Die vier Begleitdateien sind Pflicht (Lizenz- und Hinweistexte gehoeren in jedes
+          # verteilte Paket; LICENSE.md und THIRD_PARTY_NOTICES.md muessen vor dem ersten
+          # Release-Tag auf main liegen). Fehlt eine, endet der Job mit dem Dateinamen als
+          # Fehler - dieselbe Regel wie make dmg DMG_EXTRA_REQUIRED=1 im macOS-Job.
+          for f in LICENSE.md THIRD_PARTY_NOTICES.md README.en.md BENUTZUNG.txt; do
+            [ -f "$f" ] || { echo "::error::Begleitdatei $f fehlt im Repository - ohne sie kein Windows-Paket"; exit 1; }
+            cp "$f" "$d/"
+          done
+          # Inhalt pruefen: exe, zwei DLLs, FFmpeg-Bauangaben, vier Begleitdateien - nicht
+          # mehr, nicht weniger.
+          # Sollliste in C-Sortierung (Grossbuchstaben vor Kleinbuchstaben); die Istliste wird
+          # mit LC_ALL=C genauso sortiert, unabhaengig von der Locale des Runners.
+          erwartet="BENUTZUNG.txt FFMPEG-BUILDINFO.txt LICENSE.md README.en.md THIRD_PARTY_NOTICES.md avcodec-63.dll avutil-61.dll quadchroma.exe"
+          ist=$(ls "$d" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')
+          [ "$ist" = "$erwartet" ] || { echo "::error::Paketinhalt weicht ab: $ist"; exit 1; }
+          suffix=""; [ "$SIGNED" = "true" ] || suffix="-unsigned"
+          mkdir -p dist
+          (cd stage && zip -r -X "../dist/quadchroma-$VERSION-windows-x64$suffix.zip" "quadchroma-$VERSION")
+          ls -l dist
+
+      - name: Windows-Paket als Artefakt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS-Host bauen, signieren, notarisieren, verpacken
+    needs: vorpruefung
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.vorpruefung.outputs.version }}
+      SIGN: ${{ needs.vorpruefung.outputs.mac_sign }}
+      NOTARIZE: ${{ needs.vorpruefung.outputs.mac_notarize }}
+      # Signieridentitaet fuer das Makefile; "-" ist die Ad-hoc-Signatur ohne Zertifikat.
+      # Das Makefile haengt --timestamp automatisch an, sobald IDENT "Developer ID" enthaelt
+      # oder ein 40-stelliger SHA-1-Hash aus `security find-identity` ist.
+      IDENT: ${{ needs.vorpruefung.outputs.mac_sign == 'true' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+    steps:
+      - name: Quellen
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Artefaktname festlegen (Zusatz -unsigned oder -unnotarized)
+        run: |
+          set -euo pipefail
+          suffix=""
+          [ "$SIGN" = "true" ] || suffix="-unsigned"
+          [ "$SIGN" != "true" ] || [ "$NOTARIZE" = "true" ] || suffix="-unnotarized"
+          echo "NAME=QuadChroma-$VERSION-macos-arm64$suffix" >> "$GITHUB_ENV"
+          mkdir -p dist
+          echo "Artefakte: QuadChroma-$VERSION-macos-arm64$suffix.{zip,dmg}"
+
+      - name: Developer-ID-Zertifikat in einen temporaeren Schluesselbund laden
+        if: env.SIGN == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # Apples Zwischenzertifikat "Developer ID - G2" (gueltig bis 17.09.2031), SHA-256 der
+          # DER-Datei von https://www.apple.com/certificateauthority/ - fuer den Fall, dass die
+          # Kette nicht im .p12 steckt (sonst: "unable to build chain to self-signed root").
+          G2_CA_URL: https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          G2_CA_SHA256: f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a
+        run: |
+          set -euo pipefail
+          # Befehle wie in GitHubs Anleitung "Installing an Apple certificate on macOS runners".
+          keychain="$RUNNER_TEMP/quadchroma-signing.keychain-db"
+          passwort=$(openssl rand -hex 24)
+          echo "::add-mask::$passwort"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$passwort" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$passwort" "$keychain"
+          security import "$p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$p12"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" "$G2_CA_URL"
+          echo "$G2_CA_SHA256  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" || echo "Zwischenzertifikat schon vorhanden"
+          security set-key-partition-list -S apple-tool:,apple: -k "$passwort" "$keychain"
+          security list-keychain -d user -s "$keychain"
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$keychain"
+
+      - name: Host bauen (make; signiert mit IDENT, ohne Zertifikat ad-hoc)
+        run: make IDENT="$IDENT"
+
+      - name: Developer-ID-Signatur mit Zeitstempel und Hardened Runtime (make sign)
+        if: env.SIGN == 'true'
+        run: |
+          set -euo pipefail
+          make sign IDENT="$IDENT"
+          codesign -dvv build/QuadChroma.app 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp|Signed Time|Runtime Version)' || true
+          codesign -dvv build/QuadChroma.app 2>&1 | grep -q '^Timestamp=' \
+            || { echo "::error::Signatur ohne sicheren Zeitstempel (Timestamp= fehlt) - der Notar lehnt das ab"; exit 1; }
+
+      - name: Signatur pruefen (make verify - codesign --strict, Entitlements, Gatekeeper-Vorschau)
+        run: make verify IDENT="$IDENT"
+
+      - name: Hilfsskript fuer den Notar (Apple-ID, Team-ID, app-spezifisches Passwort)
+        if: env.NOTARIZE == 'true'
+        run: |
+          set -euo pipefail
+          # notarize.sh <datei> <protokoll.json>: einreichen, warten, Protokoll holen (immer lesen,
+          # auch bei Accepted), bei jedem Status ausser "Accepted" mit Fehler enden. Die
+          # Zugangsdaten kommen aus der Umgebung des aufrufenden Schritts. Gleiche Logik wie das
+          # Makefile-Ziel notarize, nur mit --apple-id statt eines Schluesselbund-Profils.
+          cat > "$RUNNER_TEMP/notarize.sh" <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          datei="$1"; protokoll="$2"
+          args=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD")
+          # "|| true": der Exit-Code von notarytool entscheidet hier nichts (die Manpage legt ihn
+          # nicht fest); massgeblich ist die Statuszeile unten. Ohne das Schutzwort braeche
+          # set -e bei einem Exit-Code ungleich 0 ab, bevor das Protokoll geholt ist.
+          ausgabe=$(xcrun notarytool submit "$datei" "${args[@]}" --wait --timeout 45m | tee /dev/stderr || true)
+          id=$(printf '%s\n' "$ausgabe" | sed -n 's/^ *id: *//p' | head -n 1)
+          [ -n "$id" ] || { echo "::error::keine Submission-ID in der Ausgabe von notarytool"; exit 1; }
+          xcrun notarytool log "$id" "${args[@]}" "$protokoll" || true
+          if [ -f "$protokoll" ]; then cat "$protokoll"; echo; fi
+          printf '%s\n' "$ausgabe" | grep -q '^ *status: Accepted' \
+            || { echo "::error::Notarisierung von $(basename "$datei") nicht angenommen - Protokoll: $protokoll"; exit 1; }
+          EOF
+          chmod +x "$RUNNER_TEMP/notarize.sh"
+
+      - name: App notarisieren und Ticket anheften (make zip, notarytool, make staple)
+        if: env.NOTARIZE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Der Notar nimmt keine nackte .app: ZIP einreichen, danach das Ticket an die App heften.
+          make zip IDENT="$IDENT" ZIP="$RUNNER_TEMP/QuadChroma-notarize.zip"
+          "$RUNNER_TEMP/notarize.sh" "$RUNNER_TEMP/QuadChroma-notarize.zip" "$RUNNER_TEMP/notary-log-app.json"
+          # make staple: stapler staple + validate, dann das Auslieferungs-ZIP mit der gestapelten App.
+          make staple IDENT="$IDENT" ZIP="dist/$NAME.zip"
+
+      - name: ZIP ohne Notarisierung (make zip)
+        if: env.NOTARIZE != 'true'
+        run: make zip IDENT="$IDENT" ZIP="dist/$NAME.zip"
+
+      - name: DMG bauen und signieren (make dmg; enthaelt App, Applications-Verweis, Begleitdateien - fehlt eine, Abbruch)
+        run: make dmg IDENT="$IDENT" DMG="dist/$NAME.dmg" DMG_EXTRA_REQUIRED=1
+
+      - name: DMG notarisieren und Ticket anheften (notarytool, make staple-dmg)
+        if: env.NOTARIZE == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/notarize.sh" "dist/$NAME.dmg" "$RUNNER_TEMP/notary-log-dmg.json"
+          make staple-dmg DMG="dist/$NAME.dmg"
+
+      - name: Gatekeeper-Endpruefung (make gatekeeper - spctl muss annehmen)
+        if: env.NOTARIZE == 'true'
+        run: make gatekeeper ZIP="dist/$NAME.zip" DMG="dist/$NAME.dmg"
+
+      - name: Notar-Protokolle als Artefakt
+        if: ${{ always() && env.NOTARIZE == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notary-logs
+          path: ${{ runner.temp }}/notary-log-*.json
+          if-no-files-found: ignore
+
+      - name: Schluesselbund und Zugangsdaten entfernen
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then security delete-keychain "$KEYCHAIN_PATH" || true; fi
+          rm -f "$RUNNER_TEMP/notarize.sh" "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/QuadChroma-notarize.zip"
+
+      - name: macOS-Pakete als Artefakt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-macos
+          path: |
+            dist/*.zip
+            dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Release-Entwurf anlegen
+    needs: [vorpruefung, ffmpeg, windows-paket, macos]
+    if: ${{ !cancelled() && needs.vorpruefung.result == 'success' && needs.ffmpeg.result == 'success' && needs.windows-paket.result == 'success' && needs.macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # Release anlegen und Anlagen hochladen
+    env:
+      VERSION: ${{ needs.vorpruefung.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Quellen (fuer gh im Repository-Kontext)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Alle Pakete holen
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: SHA256SUMS.txt und Hinweistext
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          win=$(ls quadchroma-*-windows-x64*.zip)
+          mac=$(ls QuadChroma-*-macos-arm64*.dmg)
+          {
+            echo "QuadChroma $VERSION"
+            echo
+            echo "Files:"
+            for f in *; do echo "- $f"; done
+            echo
+            case "$win" in
+              *-unsigned*) echo "Windows: quadchroma.exe is NOT code-signed (unsigned build; see RELEASING.md). SmartScreen will warn: More info > Run anyway.";;
+              *)           echo "Windows: quadchroma.exe is Authenticode-signed (Azure Artifact Signing, SHA-256, RFC 3161 timestamp).";;
+            esac
+            case "$mac" in
+              *-unsigned*)    echo "macOS: QuadChroma.app is ad-hoc signed only, not notarized. Gatekeeper will refuse it: System Settings > Privacy & Security > Open Anyway.";;
+              *-unnotarized*) echo "macOS: QuadChroma.app is Developer ID signed but NOT notarized.";;
+              *)              echo "macOS: QuadChroma.app is Developer ID signed, notarized and stapled (ZIP and DMG).";;
+            esac
+            echo
+            # FFmpeg-Checkliste (ffmpeg.org/legal.html): dieser Satz auf jeder Seite mit Download.
+            quellen="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/ffmpeg-9.0.2.tar.xz"
+            echo "This software uses code of [FFmpeg](https://ffmpeg.org) licensed under the [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html) and its source can be downloaded [here]($quellen). The complete corresponding source of the FFmpeg DLLs is attached to this release: \`ffmpeg-9.0.2.tar.xz\`, \`nv-codec-headers-*.tar.gz\` and \`build-ffmpeg-windows.sh\` (see THIRD_PARTY_NOTICES.md, section 2)."
+            echo
+            echo "Verify downloads: sha256sum -c SHA256SUMS.txt (Windows: Get-FileHash -Algorithm SHA256 <file>)."
+          } > ../notes.md
+          cat ../notes.md
+
+      - name: Entwurf anlegen (gh release create --draft)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "QuadChroma $VERSION" --notes-file notes.md dist/*
+          echo "Release-Entwurf fuer $GITHUB_REF_NAME angelegt - pruefen und von Hand veroeffentlichen." >> "$GITHUB_STEP_SUMMARY"

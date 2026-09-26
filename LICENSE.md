@@ -1,0 +1,533 @@
+# QuadChroma License
+
+Copyright (c) 2026 Robert Brandt (hello@quadchroma.tech, https://quadchroma.tech)
+
+The software is licensed under the PolyForm Strict License 1.0.0 (Part I,
+reproduced verbatim) together with the Licensor's Additional Terms (Part II),
+which apply in addition to and restrict Part I; in case of conflict the more
+restrictive term prevails.
+
+SPDX license expression:
+`LicenseRef-PolyForm-Strict-1.0.0 AND LicenseRef-QuadChroma-Additional-Terms-1.0`
+
+This file contains, in this order: Part I, the PolyForm Strict License 1.0.0,
+copied unchanged from its published source; the notice lines the Licensor
+provides with the software; Part II, the Additional Terms of the Licensor,
+version 1.0; and a closing note on commercial licenses and contributions.
+Third-party components distributed with or contained in the software are not
+licensed under this file (Part II, clause 10); their licenses are collected in
+`THIRD_PARTY_NOTICES.md`.
+
+Note on the SPDX identifiers: the PolyForm Strict License 1.0.0 is not on the
+SPDX License List (list version 3.29.0 of 2026-09-16 contains only
+PolyForm-Noncommercial-1.0.0 and PolyForm-Small-Business-1.0.0), so both parts
+are identified with `LicenseRef-` identifiers as SPDX 2.3 provides for licenses
+outside the list.
+
+## Part I - PolyForm Strict License 1.0.0
+
+The text between the heading `# PolyForm Strict License 1.0.0` and the end of
+the definition of "Use" below is the PolyForm Strict License 1.0.0, reproduced
+verbatim from <https://polyformproject.org/licenses/strict/1.0.0> (Markdown
+source: <https://raw.githubusercontent.com/polyformproject/polyform-licenses/1.0.0/PolyForm-Strict-1.0.0.md>,
+SHA-256 9eb48619fbc193ab7bb327b090cfcc703000265b83e670f81f231d0b1c43c56e).
+Nothing in it has been changed, not even its heading levels. Part II of this
+file is not part of that text, was not written by the PolyForm Project, and is
+not endorsed by it.
+
+# PolyForm Strict License 1.0.0
+
+<https://polyformproject.org/licenses/strict/1.0.0>
+
+## Acceptance
+
+In order to get any license under these terms, you must agree to them as both strict obligations and conditions to all your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the software to do everything you might do with the software that would otherwise infringe the licensor's copyright in it for any permitted purpose, other than distributing the software or making changes or new works based on the software.
+
+## Patent License
+
+The licensor grants you a patent license for the software that covers patent claims the licensor can license, or becomes able to license, that you would infringe by using the software.
+
+## Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose.
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for the benefit of public knowledge, personal study, private entertainment, hobby projects, amateur pursuits, or religious observance, without any anticipated commercial application, is use for a permitted purpose.
+
+## Noncommercial Organizations
+
+Use by any charitable organization, educational institution, public research organization, public safety or health organization, environmental protection organization, or government institution is use for a permitted purpose regardless of the source of funding or obligations resulting from the funding.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the law. These terms do not limit them.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of your licenses to anyone else, or prevent the licensor from granting licenses to anyone else.  These terms do not imply any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or contributes to infringement of any patent, your patent license for the software granted under these terms ends immediately. If your company makes such a claim, your patent license ends immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have violated any of these terms, or done anything with the software not covered by your licenses, your licenses can nonetheless continue if you come into full compliance with these terms, and take practical steps to correct past violations, within 32 days of receiving notice.  Otherwise, all your licenses end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without any warranty or condition, and the licensor will not be liable to you for any damages arising out of these terms or the use or nature of the software, under any kind of legal claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these terms, and the **software** is the software the licensor makes available under these terms.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of organization that you work for, plus all organizations that have control over, are under the control of, or are under common control with that organization.  **Control** means ownership of substantially all the assets of an entity, or the power to direct its management and policies by vote, contract, or otherwise.  Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the software under these terms.
+
+**Use** means anything you do with the software requiring one of your licenses.
+
+Required Notice: Copyright Robert Brandt (https://quadchroma.tech)
+Required Notice: Commercial licenses and other permissions: hello@quadchroma.tech
+
+The two lines above are notices the Licensor provides with the software, in the
+form the PolyForm licenses use for such notices (plain-text lines beginning with
+`Required Notice:`). Part I contains no section "Notices"; the obligation to
+keep these lines on every copy You are permitted to make arises from Part II,
+clause 9.
+
+## Part II - Additional Terms of the Licensor, version 1.0
+
+These Additional Terms (the "Additional Terms") are the Licensor's own terms.
+They are not part of the PolyForm Strict License 1.0.0 and were neither drafted
+nor approved by the PolyForm Project. They are conditions of every license
+granted to You for the software. Version 1.0, 26 September 2026.
+
+### 1. Relationship to Part I
+
+1.1 Part I and the Additional Terms together form the license for the software
+(the "License"). The Additional Terms apply in addition to Part I. They only
+narrow what Part I permits; nothing in them grants any right that Part I does
+not grant, and nothing in them is to be read as implying any other license
+within the meaning of the section "No Other Rights" of Part I. Where Part I and
+the Additional Terms differ, the more restrictive term prevails.
+
+1.2 The Additional Terms are conditions to all Your licenses in the sense of the
+section "Acceptance" of Part I. In order to get any license under Part I, You
+must agree to Part I and to the Additional Terms as strict obligations and
+conditions to all Your licenses.
+
+1.3 Terms defined in Part I - the licensor, the software, you, your company,
+control, your licenses and use - have the same meaning in the Additional Terms.
+"Licensor" means Robert Brandt, the licensor under Part I. "You" is written
+with a capital letter in the Additional Terms for readability only.
+
+1.4 Clause headings are for orientation only.
+
+### 2. Definitions
+
+2.1 "Organization" means any legal entity or other organization of any kind,
+whether or not it has legal personality and whether or not it pursues profit,
+including: a company, corporation, partnership, cooperative, sole proprietorship
+or other business; a public authority, government institution or other public
+body at any level, including its agencies, departments, courts, armed forces and
+public undertakings; a school, university or other educational institution and
+any research organization; a charitable organization, non-profit organization,
+foundation, association, club, society, trade union, political party, religious
+community or other body; and every branch, unit, department or affiliate of any
+of them, together with all organizations that control, are controlled by, or are
+under common control with it (control as defined in Part I).
+
+2.2 "Personal Use" means use of the software by a natural person, in that
+person's own name and private capacity, for that person's own private purposes
+such as personal study, research, experiment, testing, private entertainment,
+hobby projects or amateur pursuits, where the use is a permitted purpose under
+the sections "Noncommercial Purposes" and "Personal Uses" of Part I, is not
+Commercial Use, and involves neither Embedding nor a Service. Private,
+unremunerated use between natural persons acting in their private capacity -
+for example connecting to the computer of a friend or family member with that
+person's consent - is Personal Use for each of them.
+
+2.3 "Commercial Use" means any use of the software that is not Personal Use,
+including in particular:
+
+(a) any use by, for or on behalf of an Organization, whether or not the
+Organization pursues profit, whether or not any fee is charged for the software
+or its use, and whether the use is internal - for example administration,
+remote maintenance, support, remote access to the Organization's computers,
+evaluation, testing, proof of concept, procurement, training, or the
+development or operation of other products or services - or external;
+
+(b) any use in the course of Your employment, trade, business, profession,
+office or other gainful activity, including use by an employee, officer,
+contractor, freelancer, consultant or agent for or on behalf of another person
+or an Organization, and remote access from a private computer to a computer
+that is used for such an activity (for example home office);
+
+(c) any use in connection with the development, testing, validation,
+benchmarking, marketing or provision of any product or service, whether or not
+that product or service is itself offered for a fee;
+
+(d) any use for which You or a third party receives payment or other
+consideration, and any use that is intended for or directed towards commercial
+advantage; and
+
+(e) any Embedding and any Service.
+
+2.4 "Embedding" means incorporating, bundling, packaging, wrapping, linking,
+loading or otherwise combining the software, any part of it (including its
+source code, object code, binaries, resources, protocol implementation and
+file, stream or message formats) or any work based on it, into or with any
+other software, library, framework, product, service, device, appliance,
+system image, installer, container image, virtual machine image, package,
+distribution or store listing, so that the software or any of its
+functionality becomes part of, is delivered with, or is provided through that
+other item - in each case whether or not the software is modified, whether the
+combination is made at build time, install time or run time, and whether or not
+any fee is charged. Automating, scripting or controlling the software from
+another program so that the other program provides the software's functionality
+to its own users is Embedding. Installing the software on Your own devices for
+Personal Use, and including it in a backup or system image of such a device
+that You do not make available to others, is not Embedding.
+
+2.5 "Service" means providing the software's functionality to any person other
+than You: operating the software for, or making the software, any substantial
+set of its features or functionality, or access to a computer on which the
+software runs, available to any other person, whether as a hosted, managed,
+remote, cloud, subscription, time-sharing, service-bureau or on-demand
+offering, through a wrapper, gateway, relay, portal or interface, or by any
+other means, in each case whether or not any fee is charged. Personal Use as
+described in the last sentence of clause 2.2 is not a Service.
+
+### 3. Permitted Purpose: Personal, Noncommercial Use Only
+
+3.1 Notwithstanding the sections "Noncommercial Purposes", "Personal Uses" and
+"Noncommercial Organizations" of Part I, the only permitted purpose under the
+License is Personal Use. Commercial Use is not a permitted purpose, and Your
+licenses under Part I do not extend to it.
+
+3.2 In particular, and notwithstanding the section "Noncommercial
+Organizations" of Part I, use by, for or on behalf of a charitable
+organization, educational institution, public research organization, public
+safety or health organization, environmental protection organization,
+government institution or any other Organization is Commercial Use and requires
+a separate license from the Licensor, regardless of the source of funding or
+obligations resulting from the funding, regardless of whether the Organization
+pursues profit, regardless of whether the use is internal, and regardless of
+whether any fee is charged.
+
+3.3 Use in the course of employment or any other gainful activity, and use by,
+for or on behalf of your company (as defined in Part I), is never Personal Use.
+
+3.4 The Licensor grants permission for Commercial Use, Embedding, Services,
+distribution, changes and new works only by a separate written agreement
+(clause 7). Evaluation licenses for Organizations may be requested from the
+Licensor; the Licensor is not obliged to grant them.
+
+3.5 You may use the software only to access computers, networks and data You
+are authorized to access, and only in compliance with applicable law. The
+License does not authorize access to any computer, network or data.
+
+### 4. No Embedding, No Service
+
+4.1 Embedding is not a permitted purpose and is not licensed. You may not embed,
+build, bundle, wrap, link, package or otherwise incorporate the software, any
+part of it, its code or any work based on it into or with any other software,
+library, product, device, appliance, image, installer, package, distribution or
+store listing, irrespective of the purpose and even where the use would
+otherwise be Personal Use.
+
+4.2 A Service is not a permitted purpose and is not licensed. You may not
+operate the software as, or as part of, a Service; You may not provide a
+wrapper, gateway, relay, portal, interface, automation or remote access
+arrangement through which any other person uses the software's functionality;
+and You may not give any other person access to a computer for the purpose of
+using the software on that computer, except as clause 2.2 allows between
+natural persons acting in their private capacity.
+
+4.3 You may not use the software as a component, tool, test fixture, reference
+or benchmark in the development, testing, validation or operation of another
+product or service. Such use is Commercial Use under clause 2.3(c).
+
+### 5. Protocol, Formats and Interoperability
+
+5.1 The License licenses the software only. It does not license, and the
+Licensor grants no right under, the QuadChroma network protocol, its message
+formats, handshake, pairing and authentication scheme, its file, stream or
+configuration formats, or any specification, documentation or description of
+them, whether or not they are protected by copyright or any other right; and
+it does not license the use of the software, any part of it, its formats or its
+protocol for the purpose of creating compatible, interoperable, derived or
+replacement products, services or works. The Licensor makes no promise to keep
+the protocol or any format stable, compatible or documented.
+
+5.2 To the extent this can be agreed by contract, You may not use the software,
+any part of it, its formats or its protocol to develop, test, validate or
+provide any product, service or work that implements, emulates, interoperates
+with, extends or replaces the software or its protocol. Developing, testing or
+validating another product or service that implements or interoperates with the
+QuadChroma protocol is Commercial Use under clause 2.3(c).
+
+5.3 No part of the software's expression - including its source code, object
+code, tables, constants, parsers, packet layouts, shaders, resources and
+documentation - may be copied into or reused in any other work. Part I grants
+no right to make changes or new works based on the software; this clause
+confirms that the exclusion extends to excerpts and to reuse in other products.
+
+5.4 Mandatory rights. Nothing in clauses 4 and 5 restricts acts that applicable
+mandatory law allows a lawful user of the software to perform without the
+Licensor's consent, in particular observing, studying or testing the
+functioning of the software in order to determine the ideas and principles
+underlying any of its elements while performing acts You are entitled to
+perform, and decompilation where it is indispensable to achieve the
+interoperability of an independently created program, under the conditions and
+within the limits of Articles 5(3) and 6 of Directive 2009/24/EC and their
+national implementations (in Germany sections 69d(3) and 69e of the Copyright
+Act (Urheberrechtsgesetz, UrhG)), of fair use or fair dealing, or of comparable
+provisions. Those acts remain subject to the limits those provisions set,
+including the limits on the use of information obtained by decompilation, and
+they are available only to a person who uses the software for a permitted
+purpose under the License, that is for Personal Use. They do not permit copying
+any part of the software's expression into another work, and they do not make
+any Commercial Use, Embedding or Service a permitted purpose.
+
+### 6. No Redistribution
+
+6.1 Part I grants no right to distribute the software. You may not distribute,
+publish, upload, mirror, share, sell, rent, lend, sublicense, transfer or
+otherwise make the software or any part of it - including the executable, the
+application bundle, installers, the source code and any copy in any form -
+available to any other person, by any channel, including websites, file
+sharing, package repositories, app stores, software catalogs, marketplaces,
+system or container images and devices.
+
+6.2 Copies You make in the course of Personal Use - installing the software on
+devices You own or control, loading it into memory, and keeping backup copies -
+are not distribution, provided the copies remain under Your control, retain all
+notices (clause 9) and are not made available to any other person.
+
+6.3 Pointing others to the official sources of the software is permitted and is
+not distribution: You may share the addresses <https://quadchroma.tech> and
+<https://github.com/quadchroma/quadchroma>, or an official download address
+published there. The Licensor publishes the software only at those sources;
+copies obtained elsewhere may have been altered, and the Licensor does not
+vouch for them.
+
+6.4 GitHub. The Licensor publishes the source code in a public repository on
+GitHub. Nothing in the License restricts the rights that the GitHub Terms of
+Service grant to other GitHub users with respect to public repositories - to
+view the repository and to use, display, perform and reproduce its content
+solely on GitHub as permitted through GitHub's functionality, for example by
+forking. Those rights do not extend beyond GitHub's functionality; in
+particular they do not permit using the software outside the License, and a
+fork does not license anyone to distribute the software or to make changes or
+new works except as the section "Contributions" at the end of this file allows.
+
+### 7. Reservation of Rights; Commercial Licenses
+
+7.1 All rights in the software that Part I, as narrowed by the Additional
+Terms, does not expressly grant are reserved by the Licensor. No license or
+right is granted by implication, estoppel or otherwise.
+
+7.2 Commercial Use, Embedding, Services, distribution, changes and new works,
+and any other use outside the License require a separate written license from
+the Licensor. The Licensor offers such licenses at the Licensor's discretion and
+on the terms the Licensor sets; requests go to hello@quadchroma.tech. A separate
+license applies only to the extent it expressly says so and does not otherwise
+change the License.
+
+7.3 The Licensor may license the software to others on different terms, may
+release future versions of the software under different terms, and may stop
+offering the software. Changes to the License apply to versions of the software
+released after the change.
+
+### 8. Names and Marks
+
+8.1 The License grants no right to use the name "QuadChroma", the QuadChroma
+logo, the domain quadchroma.tech, the name of the Licensor, or any other name,
+mark, logo or domain of the Licensor (the "Marks").
+
+8.2 You may use the name "QuadChroma" only to refer truthfully to the software
+itself - for example in a review, a report, a support request or a description
+of what You use - and only in a way that does not suggest sponsorship,
+endorsement, affiliation or an official status. You may not use the Marks (a)
+as or in the name of any product, service, project, organization, domain name,
+account name or store listing; (b) to advertise, label or describe any product
+or service as compatible with, derived from, connected to or a replacement for
+the software; or (c) in any modified form or combined with other marks.
+
+8.3 The Licensor's rights in the Marks under name law, unfair competition law,
+trademark law (if any) and any other law remain unaffected, whether or not any
+Mark is registered.
+
+### 9. Notices
+
+9.1 You must keep, unaltered, with every copy of the software that You are
+permitted to make, this file and all copyright notices, license notices and
+plain-text lines beginning with `Required Notice:` that the Licensor provides
+with the software, including the two lines that follow Part I above. You may
+not remove, obscure or alter any such notice, and You may not remove, obscure
+or alter the copyright notice, the website and the third-party notices the
+software displays.
+
+9.2 Part I contains no section "Notices" because it permits no distribution.
+The obligation in clause 9.1 arises from the Additional Terms.
+
+### 10. Third-Party Components
+
+10.1 The software is distributed together with, or contains, components of
+third parties. They are not licensed under the License. Each such component is
+licensed under its own terms, which are reproduced or referenced in
+`THIRD_PARTY_NOTICES.md`, and those terms alone govern that component. Nothing
+in the License limits, and the Licensor does not purport to limit, any right You
+have under the license of a third-party component.
+
+10.2 FFmpeg. This software uses libraries from the FFmpeg project under the
+LGPLv2.1. The Windows distribution includes libraries of the FFmpeg project
+(avcodec-63.dll and avutil-61.dll) as separate, dynamically linked files. They
+are licensed under the GNU Lesser General Public License, version 2.1 or later
+(LGPLv2.1) - not under the License. The Licensor does not own FFmpeg; its
+copyright holders are the FFmpeg developers named in `THIRD_PARTY_NOTICES.md`.
+As section 6 of the LGPLv2.1 requires, the License permits modification of those
+libraries for Your own use and reverse engineering of the software for debugging
+such modifications; You may replace those files with a modified version of the
+same libraries that is interface-compatible with the version supplied; and
+clauses 3 to 6 do not restrict the exercise of any right the LGPLv2.1 grants You
+with respect to those libraries. The corresponding source code of the FFmpeg
+libraries, the build instructions and a written offer are given in
+`THIRD_PARTY_NOTICES.md`.
+
+10.3 Monocypher. The Mac host contains Monocypher, licensed under
+BSD-2-Clause OR CC0-1.0; see `THIRD_PARTY_NOTICES.md`.
+
+10.4 Rust crates and other components. The executables are built from Rust
+crates and other components under their own licenses (among them MIT,
+Apache-2.0, BSD-3-Clause, ISC, Unicode-3.0, WTFPL and zlib licenses); their
+notices are collected in `THIRD_PARTY_NOTICES.md`.
+
+### 11. No Warranty; Limitation of Liability
+
+11.1 The section "No Liability" of Part I applies. In addition, and to the
+extent permitted by law, the following applies.
+
+11.2 The software is provided free of charge and "as is". The Licensor gives no
+warranty (Gewaehrleistung) and no guarantee (Garantie), express or implied,
+including as to merchantability, fitness for a particular purpose,
+non-infringement, accuracy, availability, security, or freedom from errors, and
+has no obligation to provide updates, corrections, support or maintenance.
+
+11.3 The Licensor is liable only for intent (Vorsatz) and gross negligence
+(grobe Fahrlaessigkeit). Liability for slight negligence (leichte
+Fahrlaessigkeit) is excluded.
+
+11.4 Nothing in the License excludes or limits liability that cannot be
+excluded or limited under applicable mandatory law. Under German law this
+includes liability for intent and gross negligence, liability for injury to
+life, body or health, liability under the Product Liability Act
+(Produkthaftungsgesetz), liability for fraudulently concealed defects
+(arglistig verschwiegene Maengel) and, where consumer protection law applies,
+any liability that cannot be excluded towards consumers. Clauses 11.2 and 11.3
+apply only to the extent they are compatible with that law.
+
+### 12. Termination
+
+12.1 A breach of the Additional Terms is a violation of the terms under which
+Your licenses are granted. The section "Violations" of Part I applies: the
+first time You are notified in writing that You have violated any of the terms
+of the License, or done anything with the software not covered by Your
+licenses, Your licenses can continue only if You come into full compliance with
+the License, and take practical steps to correct past violations, within 32
+days of receiving notice; otherwise, all Your licenses end immediately. For any
+later violation, all Your licenses end immediately upon notice.
+
+12.2 When Your licenses end, You must stop all use of the software and delete
+or destroy all copies in Your possession or control, including backups, and on
+the Licensor's request confirm in text form that You have done so.
+
+12.3 Clauses 1, 2, 5.1, 5.3, 7, 8, 10, 11, 12.2 to 12.4, 13, 14 and 15 survive
+the end of Your licenses.
+
+12.4 The end of Your licenses does not limit any other right or remedy of the
+Licensor, including claims for infringement of copyright or other rights.
+
+### 13. Governing Law; Jurisdiction
+
+13.1 The License, and any dispute or claim arising out of or in connection with
+it or with the software, including non-contractual disputes or claims, are
+governed by the laws of the Federal Republic of Germany. The United Nations
+Convention on Contracts for the International Sale of Goods (CISG) does not
+apply. This choice of law does not deprive You of the protection of provisions
+that cannot be derogated from by agreement under the law that would apply in
+the absence of this choice if You are a consumer (Article 6(2) of Regulation
+(EC) No 593/2008), and it does not affect the law that governs the existence,
+scope and infringement of intellectual property rights in any country.
+
+13.2 If You are a merchant (Kaufmann), a legal entity under public law, a
+special fund under public law (oeffentlich-rechtliches Sondervermoegen), or
+have no general place of jurisdiction in Germany, the courts of the Federal
+Republic of Germany have exclusive jurisdiction over all disputes arising out of
+or in connection with the License or the software, and the competent court is
+the court having jurisdiction for the Licensor's seat or, absent a seat, the
+Licensor's place of residence at the time the action is brought. The Licensor
+may also bring an action at Your general place of jurisdiction. For all other
+persons the statutory rules on jurisdiction apply.
+
+### 14. Severability
+
+If any provision of the Additional Terms is or becomes invalid or unenforceable
+in whole or in part, or is invalid or unenforceable towards a particular person
+or in a particular jurisdiction, the remaining provisions of the Additional
+Terms and the validity of Part I remain unaffected. A provision that goes beyond
+what mandatory law allows applies to the extent mandatory law allows. In place
+of an invalid or unenforceable provision, and to fill any gap, the provision
+that comes closest to the purpose of the Additional Terms and is valid and
+enforceable applies.
+
+### 15. Language
+
+The License is written in English. The English text is the only binding text;
+translations are for convenience only. German legal terms given in brackets
+identify the concept under German law that the English term designates and
+guide its interpretation.
+
+### 16. Contact
+
+Robert Brandt, hello@quadchroma.tech, https://quadchroma.tech. Notices to the
+Licensor are to be sent to that e-mail address. Notices to You, including
+notices under the section "Violations" of Part I, may be given in text form,
+including by e-mail.
+
+## How to obtain a commercial license
+
+Commercial licenses covering business, organizational, embedded, service,
+distribution and other uses outside this License are available from the
+Licensor; send a short description of the intended use to
+hello@quadchroma.tech. Terms and pricing are agreed individually, and a written
+agreement from the Licensor is the only way to obtain such a license.
+
+## Contributions
+
+Contributions to the software are accepted only under the Contributor License
+Agreement in `CLA.md`, which allows the Licensor to license contributed code
+under this License and under other terms, including commercial licenses; see
+`CONTRIBUTING.md`.
+
+Contribution permission. Part I does not allow changes or new works. Separately
+from the License, the Licensor permits You, as a natural person, to make changes
+to the source code solely in order to prepare a contribution to the software, to
+build and test the changed software for that purpose on Your own devices, and to
+submit the change to the Licensor through the official repository named in
+Part II, clause 6.3 (for example as a pull request from a fork on GitHub) under
+`CLA.md`. This permission does not allow any other use of the changed software,
+does not allow distributing it or any part of it by any other means, and does
+not make any Commercial Use, Embedding or Service a permitted purpose. It ends
+when You stop preparing the contribution or when Your licenses under the License
+end; Part II, clauses 11 to 15, apply to it accordingly.

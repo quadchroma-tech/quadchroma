@@ -1,0 +1,79 @@
+# Vorschlag (Feature) als GitHub-Issue-Formular (.github/ISSUE_TEMPLATE, YAML-Form).
+# Sichtbare Texte auf Englisch (GitHub-Datei), Kommentare auf Deutsch (Projektregel).
+# Das Label "enhancement" muss im Repository existieren, sonst setzt GitHub es nicht.
+name: Feature request
+description: Propose a change in behaviour, protocol or user interface - before writing any code.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read `CONTRIBUTING.md`, Section 3 (project rules), first. Proposals that
+        need a helper process, a second program, a pointer encoded into the video stream
+        or a new Rust crate are very unlikely to be accepted. The list in `README.en.md`
+        ("What is missing") shows what is already planned.
+  - type: dropdown
+    id: side
+    attributes:
+      label: Side / role
+      description: Which programs would change? Pick everything that applies.
+      multiple: true
+      options:
+        - Mac host (QuadChroma.app)
+        - Windows client (quadchroma.exe)
+        - Windows host role (quadchroma.exe --host)
+        - Mac client (built from source)
+        - Protocol (all sides)
+        - Build, release or documentation only
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What do you want to do, and what stops you today? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How should it work? For user-interface changes, describe texts and controls; for protocol changes, which messages or capability bits change and how older peers are handled.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to reach the same goal and why they are worse. Does an existing option or setting already cover part of it?
+    validations:
+      required: false
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Project rules (CONTRIBUTING.md, Section 3)
+      description: Tick what applies. An unticked box is not a blocker by itself, but explain it in the text above.
+      options:
+        - label: The proposal keeps one program per side - no helper process, service, driver or second program.
+        - label: The proposal needs no new Rust crate (or I explained above why one is unavoidable).
+        - label: New user-interface texts would go through keys in client/src/strings.rs in all language tables.
+        - label: The proposal needs no connection to any server (no accounts, telemetry, update checks).
+  - type: dropdown
+    id: implement
+    attributes:
+      label: Would you implement it yourself?
+      description: Contributions need the Contributor License Agreement (CLA.md); see CONTRIBUTING.md, Section 2.
+      options:
+        - Yes, I would open a pull request under the CLA
+        - Maybe, depending on the discussion
+        - No, this is a request only
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues and README.en.md ("What is missing"), and this is not already there.
+          required: true
