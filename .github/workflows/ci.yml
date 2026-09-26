@@ -1,18 +1,18 @@
-# QuadChroma - Bau und Tests bei jedem Push auf main und jedem Pull Request.
+# QuadChroma - build and test on every push to main and on every pull request.
 #
-# FFmpeg (macos-26): die FFmpeg-DLLs fuer Windows mit scripts/build-ffmpeg-windows.sh
-#   (schlanker LGPL-Bau, MinGW-w64 aus Homebrew) - derselbe Weg wie beim Release.
-# Windows (windows-2025): Rust-Client samt Host-Rolle gegen diese DLLs.
-#   build.rs findet rc.exe im Windows SDK des Runners (llvm-rc als Ausweichweg).
-# macOS (macos-26): Host (Objective-C, ad-hoc signiert, wird nie gestartet),
-#   Pruefstaende ohne Bildschirmaufnahme, ZIP/DMG-Verpackung ueber das Makefile,
-#   Rust-Client gegen Homebrew-FFmpeg (GPL-Build: nur fuer Bau und Tests, wird
-#   nie weitergegeben).
+# FFmpeg (macos-26): the FFmpeg DLLs for Windows via scripts/build-ffmpeg-windows.sh
+#   (minimal LGPL build, MinGW-w64 from Homebrew) - the same path as for a release.
+# Windows (windows-2025): Rust client including the host role, built against these DLLs.
+#   build.rs finds rc.exe in the runner's Windows SDK (llvm-rc as the fallback).
+# macOS (macos-26): host (Objective-C, ad-hoc signed, never started),
+#   test harnesses without screen capture, ZIP/DMG packaging through the Makefile,
+#   Rust client against Homebrew FFmpeg (GPL build: only for building and testing,
+#   never distributed).
 #
-# Braucht keine Geheimnisse und laeuft deshalb auch fuer Pull Requests aus Forks.
-# Actions sind per Commit-SHA gepinnt (Tag als Kommentar; Dependabot pflegt beides).
-# Runner ausdruecklich benannt (nicht -latest), damit Werkzeugstaende nicht
-# unbemerkt wechseln; heute sind windows-2025 und macos-26 die "-latest"-Images.
+# Needs no secrets and therefore also runs for pull requests from forks.
+# Actions are pinned by commit SHA (tag as a comment; Dependabot maintains both).
+# Runners are named explicitly (not -latest) so that tool versions do not change
+# unnoticed; today windows-2025 and macos-26 are the "-latest" images.
 name: CI
 
 on:
@@ -33,23 +33,23 @@ env:
 
 jobs:
   ffmpeg:
-    name: FFmpeg fuer Windows (LGPL, eigener Bau)
+    name: FFmpeg for Windows (LGPL, own build)
     runs-on: macos-26
     timeout-minutes: 45
     steps:
-      - name: Quellen
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: FFmpeg aus dem Cache (Schluessel = Bauskript)
+      - name: FFmpeg from the cache (key = build script)
         id: ffmpeg-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ffmpeg-windows
           key: ffmpeg-windows-${{ hashFiles('scripts/build-ffmpeg-windows.sh') }}
 
-      - name: FFmpeg bauen (Pruefsummen der Quellarchive stehen im Skript)
+      - name: Build FFmpeg (the checksums of the source archives are in the script)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -57,7 +57,7 @@ jobs:
           scripts/build-ffmpeg-windows.sh ffmpeg-windows
           cat ffmpeg-windows/BUILDINFO.txt
 
-      - name: FFmpeg an den Windows-Job
+      - name: Hand FFmpeg to the Windows job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ffmpeg-windows
@@ -71,16 +71,16 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     env:
-      # build.rs: ohne rc.exe/llvm-rc abbrechen statt eine exe ohne Versionsinfo, Symbol und
-      # Manifest zu liefern. Auf Job-Ebene, damit Bau und Tests dieselbe Umgebung sehen.
+      # build.rs: fail without rc.exe/llvm-rc instead of producing an exe without version
+      # info, icon and manifest. Set at job level so that build and tests see the same environment.
       QC_RESSOURCEN_PFLICHT: '1'
     defaults:
       run:
         shell: pwsh
-        # Aus client\ bauen, sonst liest Cargo client/.cargo/config.toml (crt-static) nicht.
+        # Build from client\, otherwise Cargo does not read client/.cargo/config.toml (crt-static).
         working-directory: client
     steps:
-      - name: Quellen
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -90,58 +90,58 @@ jobs:
         with:
           toolchain: stable
 
-      - name: FFmpeg aus dem FFmpeg-Job
+      - name: FFmpeg from the FFmpeg job
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ffmpeg-windows
           path: C:\ffmpeg-qc
 
-      - name: Umgebung fuer ffmpeg-sys-next (FFMPEG_DIR, LIBCLANG_PATH, PATH)
+      - name: Environment for ffmpeg-sys-next (FFMPEG_DIR, LIBCLANG_PATH, PATH)
         run: |
-          if ($env:RUSTFLAGS) { throw "RUSTFLAGS ist gesetzt - client/.cargo/config.toml (crt-static) wuerde verdraengt" }
+          if ($env:RUSTFLAGS) { throw "RUSTFLAGS is set - it would override client/.cargo/config.toml (crt-static)" }
           $ffmpeg = "C:\ffmpeg-qc"
-          if (-not (Test-Path "$ffmpeg\lib\avcodec.lib")) { throw "FFmpeg (lib\avcodec.lib) unter $ffmpeg nicht gefunden" }
+          if (-not (Test-Path "$ffmpeg\lib\avcodec.lib")) { throw "FFmpeg (lib\avcodec.lib) not found in $ffmpeg" }
           "FFMPEG_DIR=$ffmpeg" >> $env:GITHUB_ENV
           "$ffmpeg\bin" >> $env:GITHUB_PATH
-          # libclang fuer bindgen: LLVM (Chocolatey) unter C:\Program Files\LLVM, sonst das
-          # Clang aus Visual Studio 2026. Derselbe Ordner enthaelt llvm-rc.exe, den
-          # Ausweichweg von build.rs (rc.exe aus dem Windows SDK hat Vorrang).
+          # libclang for bindgen: LLVM (Chocolatey) in C:\Program Files\LLVM, otherwise the
+          # Clang from Visual Studio 2026. The same folder contains llvm-rc.exe, the
+          # fallback of build.rs (rc.exe from the Windows SDK takes precedence).
           $llvm = "C:\Program Files\LLVM\bin"
           if (-not (Test-Path "$llvm\libclang.dll")) {
             $llvm = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\Llvm\x64\bin"
           }
-          if (-not (Test-Path "$llvm\libclang.dll")) { throw "libclang.dll nicht gefunden (weder LLVM noch Visual-Studio-Clang)" }
+          if (-not (Test-Path "$llvm\libclang.dll")) { throw "libclang.dll not found (neither LLVM nor the Visual Studio Clang)" }
           "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
           "$llvm" >> $env:GITHUB_PATH
           "FFMPEG_DIR=$ffmpeg`nLIBCLANG_PATH=$llvm"
 
-      - name: Cargo-Cache
+      - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: client -> target
 
-      - name: Bauen
+      - name: Build
         run: cargo build --release --locked
 
-      - name: exe pruefen (crt-static, Versionsressource aus build.rs)
+      - name: Check the exe (crt-static, version resource from build.rs)
         run: |
           $exe = "target\release\quadchroma.exe"
           $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
-          if ($text -match 'VCRUNTIME140') { throw "quadchroma.exe importiert VCRUNTIME140 - crt-static greift nicht" }
+          if ($text -match 'VCRUNTIME140') { throw "quadchroma.exe imports VCRUNTIME140 - crt-static is not in effect" }
           $vi = (Get-Item $exe).VersionInfo
           $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           "ProductVersion=$($vi.ProductVersion) FileVersion=$($vi.FileVersion) CompanyName=$($vi.CompanyName) ProductName=$($vi.ProductName)"
-          if ($vi.ProductVersion -ne $cargo) { throw "Versionsressource '$($vi.ProductVersion)' passt nicht zu Cargo.toml '$cargo' (build.rs, res/quadchroma.rc)" }
+          if ($vi.ProductVersion -ne $cargo) { throw "Version resource '$($vi.ProductVersion)' does not match Cargo.toml '$cargo' (build.rs, res/quadchroma.rc)" }
 
-      - name: Tests (eigenes APPDATA, FFmpeg-DLLs im PATH)
+      - name: Tests (separate APPDATA, FFmpeg DLLs in PATH)
         env:
-          # %APPDATA%\QuadChroma ist der Ablageordner des Clients - die Tests bekommen einen eigenen.
+          # %APPDATA%\QuadChroma is the client's data folder - the tests get their own.
           APPDATA: ${{ runner.temp }}\appdata-tests
         run: |
           New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
           cargo test --release --locked
 
-      - name: exe als Artefakt (7 Tage, unsigniert - nur zum Ausprobieren)
+      - name: Upload the exe as an artifact (7 days, unsigned - for trying out only)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quadchroma-windows-x64-ci
@@ -150,29 +150,29 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS (Host, Pruefstaende, Verpackung, Client)
+    name: macOS (host, test harnesses, packaging, client)
     runs-on: macos-26
     timeout-minutes: 60
     steps:
-      - name: Quellen
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Host bauen (ad-hoc signiert; die App wird nicht gestartet)
+      - name: Build the host (ad-hoc signed; the app is not started)
         run: make IDENT=-
 
-      - name: Signatur pruefen (make verify; Gatekeeper lehnt ad-hoc erwartungsgemaess ab)
+      - name: Verify the signature (make verify; Gatekeeper rejects ad-hoc signatures, as expected)
         run: make verify IDENT=-
 
-      - name: ZIP und DMG verpacken (make zip, make dmg)
+      - name: Package ZIP and DMG (make zip, make dmg)
         run: |
           set -euo pipefail
           make zip IDENT=-
           make dmg IDENT=-
           ls -l build/*.zip build/*.dmg
 
-      - name: Pruefstaende uebersetzen (Bauzeilen aus README.md)
+      - name: Compile the test harnesses
         run: |
           set -euo pipefail
           mkdir -p build
@@ -184,8 +184,8 @@ jobs:
                 -framework Foundation host/dateitest.m host/dateien.m -o build/dateitest
           clang -fobjc-arc -O2 -Wall -Ihost -mmacosx-version-min=14.0 -framework Foundation \
                 -framework AppKit host/ablagetest.m -o build/ablagetest
-          # hosttest braucht zur Laufzeit die Bildschirmaufnahme (TCC-Freigabe), die es auf
-          # einem Runner nicht gibt - hier nur uebersetzen, das faengt Kompilierfehler.
+          # hosttest needs Screen Recording (a TCC permission) at run time, which a runner
+          # does not have - only compile it here; that catches compile errors.
           clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
                 -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
                 -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
@@ -194,16 +194,16 @@ jobs:
                 host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
                 host/vendor/monocypher/monocypher.c -o build/hosttest
 
-      - name: Pruefstaende ohne TCC ausfuehren (noisetest, annahmetest, dateitest, ablagetest)
+      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, dateitest, ablagetest)
         run: |
           set -euo pipefail
-          # noisetest schreibt zwei Protokollzeilen und zuletzt "OK".
+          # noisetest prints two log lines and "OK" as the last line.
           out=$(build/noisetest); echo "$out"; [ "$(printf '%s\n' "$out" | tail -n 1)" = "OK" ]
           build/annahmetest
           build/dateitest
           build/ablagetest
 
-      - name: FFmpeg (Homebrew, GPL-Build - nur fuer Bau und Tests des Mac-Clients)
+      - name: FFmpeg (Homebrew, GPL build - only for building and testing the Mac client)
         run: |
           set -euo pipefail
           brew install ffmpeg
@@ -214,19 +214,19 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cargo-Cache
+      - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: client -> target
 
-      - name: Client bauen und testen (ohne Zwischenablage-Tests, wie im Rezept)
+      - name: Build and test the client (without the clipboard tests, as in the documented recipe)
         working-directory: client
         run: |
           set -euo pipefail
           cargo build --release --locked
           cargo test --release --locked -- --skip clipboard
 
-      - name: Host-Pakete als Artefakt (7 Tage, ad-hoc signiert - nur zum Ausprobieren)
+      - name: Upload the host packages as an artifact (7 days, ad-hoc signed - for trying out only)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: quadchroma-macos-arm64-ci

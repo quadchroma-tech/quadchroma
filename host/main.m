@@ -3160,7 +3160,7 @@ static void stream_herunterfahren_anstossen(void) {
 }
 
 // --fest (oder --fixed): feste Bildrate von Anfang an. Ohne die Angabe ist sie
-// aus (BENUTZUNG: "Vorgabe ... aus"), bis der Client etwas anderes wuenscht.
+// aus (MANUAL.txt: "Vorgabe ... aus"), bis der Client etwas anderes wuenscht.
 // Frueher stand hier nur die erste Zuweisung im if (Klammern fehlten):
 // g_fixed_gewollt war immer 1, und jeder neue Strom lief mit fester Bildrate,
 // bei einem Client ohne eigene Einstellung die ganze Sitzung.

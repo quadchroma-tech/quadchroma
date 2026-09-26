@@ -6,17 +6,17 @@ authors = ["Robert Brandt <hello@quadchroma.tech>"]
 description = "QuadChroma remote desktop (HEVC 4:4:4): Windows client and host role, Mac client"
 homepage = "https://github.com/quadchroma-tech/quadchroma"
 repository = "https://github.com/quadchroma-tech/quadchroma"
-# PolyForm Strict 1.0.0 samt den Zusatzbedingungen des Lizenzgebers; der
-# Wortlaut steht in LICENSE.txt im Wurzelverzeichnis. Kein crates.io-Paket.
-# PolyForm Strict steht nicht auf der SPDX-Lizenzliste (dort nur Noncommercial
-# und Small Business), deshalb beide Teile als LicenseRef- (SPDX 2.3, Lizenzen
-# ausserhalb der Liste): der Ausdruck bleibt fuer cargo-deny, cargo-about und
-# REUSE maschinenlesbar. Derselbe Bezeichner gehoert in LICENSE.txt und in
-# etwaige SPDX-Kopfzeilen.
+# PolyForm Strict 1.0.0 plus the licensor's additional terms; the full text
+# is in LICENSE.txt in the repository root. Not a crates.io package.
+# PolyForm Strict is not on the SPDX license list (only Noncommercial and
+# Small Business are), so both parts are given as LicenseRef- (SPDX 2.3,
+# licenses not on the list): the expression stays machine-readable for
+# cargo-deny, cargo-about and REUSE. The same identifier belongs in
+# LICENSE.txt and in any SPDX header lines.
 license = "LicenseRef-PolyForm-Strict-1.0.0 AND LicenseRef-QuadChroma-Additional-Terms-1.0"
 publish = false
-# Windows: Versionsinfo, Programmsymbol und Anwendungsmanifest aus res/ in
-# die exe einbetten (rc.exe oder llvm-rc); auf dem Mac tut build.rs nichts.
+# Windows: embed the version info, program icon and application manifest
+# from res/ into the exe (rc.exe or llvm-rc); on the Mac build.rs does nothing.
 build = "build.rs"
 
 [dependencies]
@@ -63,8 +63,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
-    # Host-Rolle: Eingaben (SendInput), Bildschirm wach, DPI, Speicher/Last,
-    # Rundrufadressen der Netzwerkkarten, Sendepuffer, Hochleistungszaehler
+    # Host role: input (SendInput), keeping the display awake, DPI, memory/load,
+    # broadcast addresses of the network adapters, send buffers, performance counters
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Power",
     "Win32_UI_HiDpi",
@@ -74,14 +74,14 @@ windows = { version = "0.62", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
-    # Host-Rolle: einen haengenden write an einen abgeloesten Zuschauer
-    # abbrechen (CancelIoEx, siehe host/netz.rs)
+    # Host role: cancel a blocked write to a viewer that has been replaced
+    # (CancelIoEx, see host/netz.rs)
     "Win32_System_IO",
-    # Dateien ueber die Zwischenablage: freier Platz vor der Annahme
-    # (GetDiskFreeSpaceExW, siehe dateien.rs); Desktop-Verknuepfung:
-    # IShellLinkW::GetPath beim Zuruecklesen im Test (verknuepfung.rs)
+    # Files via the clipboard: free space before accepting a transfer
+    # (GetDiskFreeSpaceExW, see dateien.rs); desktop shortcut:
+    # IShellLinkW::GetPath when reading it back in the test (verknuepfung.rs)
     "Win32_Storage_FileSystem",
-    # Host-Rolle: Anzeigename eines Bildschirms (QueryDisplayConfig,
-    # DisplayConfigGetDeviceInfo, siehe host/aufnahme.rs)
+    # Host role: display name of a screen (QueryDisplayConfig,
+    # DisplayConfigGetDeviceInfo, see host/aufnahme.rs)
     "Win32_Devices_Display",
 ] }

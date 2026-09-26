@@ -1,91 +1,92 @@
-# QuadChroma - Mac-Host: bauen, signieren, verpacken, notarisieren
+# QuadChroma - Mac host: build, sign, package, notarize
 #
-# Alltag (lokal, mit dem selbstsignierten Zertifikat "QuadChroma Dev"):
-#   make                 baut build/QuadChroma.app und signiert sie
-#   make verify          prueft die Signatur (codesign --strict, Entitlements,
-#                        Gatekeeper-Vorschau; letztere darf lokal scheitern)
-#   make zip             build/QuadChroma-<version>-macos.zip (ditto --norsrc, App als oberster Eintrag)
-#   make dmg             build/QuadChroma-<version>.dmg (UDZO, Verweis auf /Applications, signiert)
+# Everyday use (local, with the self-signed certificate "QuadChroma Dev"):
+#   make                 builds build/QuadChroma.app and signs it
+#   make verify          checks the signature (codesign --strict, entitlements,
+#                        Gatekeeper preview; the latter may fail locally)
+#   make zip             build/QuadChroma-<version>-macos.zip (ditto --norsrc, app as the top-level entry)
+#   make dmg             build/QuadChroma-<version>.dmg (UDZO, link to /Applications, signed)
 #   make clean
 #
-# Veroeffentlichung - braucht das Developer-ID-Zertifikat und ein notarytool-Profil
-# im Schluesselbund (siehe RELEASING.md); alles davon richtet der Urheber selbst ein:
+# Publishing - needs the Developer ID certificate and a notarytool profile
+# in the keychain (see RELEASING.md); the author sets all of this up himself:
 #   make release IDENT="Developer ID Application: Robert Brandt (TEAMID)"
-#   Vorab werden IDENT, TIMESTAMP und die vier Beilagen geprueft, dann laeuft
-#   der Reihe nach: sign verify notarize staple notarize-dmg (baut die DMG) staple-dmg gatekeeper.
-#   Einzelschritte:
-#   make sign            signiert die gebaute App erneut mit IDENT (Zeitstempel kommt bei
-#                        Developer ID automatisch dazu). Achtung: jede neue Signatur
-#                        entwertet ein bereits angeheftetes Notar-Ticket.
-#   make notarize        ZIP neu erzeugen, beim Notar einreichen und warten,
-#                        Protokoll nach build/notary-log.json (immer lesen, auch bei Accepted)
-#   make staple          Ticket an die App heften, ZIP mit der gestapelten App neu erzeugen
-#   make dmg             DMG aus der (gestapelten) App, mit IDENT signiert
-#   make notarize-dmg    DMG neu bauen und einreichen, Protokoll nach build/notary-log-dmg.json
-#   make staple-dmg      Ticket an die DMG heften
-#   make gatekeeper      strenge Endpruefung: spctl muss annehmen, stapler validate,
-#                        SHA-256 von ZIP und DMG fuer die Release-Notizen
-#   make notary-history  Anmeldetest fuer das notarytool-Profil (zeigt fruehere Einreichungen)
+#   IDENT, TIMESTAMP and the four companion files are checked first, then these
+#   targets run in order: sign verify notarize staple notarize-dmg (builds the DMG) staple-dmg gatekeeper.
+#   Individual steps:
+#   make sign            signs the built app again with IDENT (for a Developer ID the
+#                        timestamp is added automatically). Caution: every new signature
+#                        invalidates a notarization ticket that is already stapled.
+#   make notarize        recreate the ZIP, submit it for notarization and wait,
+#                        log to build/notary-log.json (always read it, even for Accepted)
+#   make staple          staple the ticket to the app, recreate the ZIP with the stapled app
+#   make dmg             DMG from the (stapled) app, signed with IDENT
+#   make notarize-dmg    rebuild and submit the DMG, log to build/notary-log-dmg.json
+#   make staple-dmg      staple the ticket to the DMG
+#   make gatekeeper      strict final check: spctl must accept, stapler validate,
+#                        SHA-256 of ZIP and DMG for the release notes
+#   make notary-history  login test for the notarytool profile (lists earlier submissions)
 #
-# Entwicklerziele, die die App STARTEN (loesen die Freigabedialoge aus):
-#   make list            zeigt die Bildschirme
-#   make capture         nimmt 10 s auf und legt sie in /tmp/qc.hevc
-#   make check           zeigt, was ffprobe im Ergebnis sieht
-#   make permissions     Status der Bildschirmaufnahme-Freigabe
+# Developer targets that START the app (they trigger the permission dialogs):
+#   make list            lists the displays
+#   make capture         records 10 s and writes them to /tmp/qc.hevc
+#   make check           shows what ffprobe sees in the result
+#   make permissions     status of the Screen Recording permission
 #
-# Variablen (alle auf der Kommandozeile ueberschreibbar, z. B. make sign IDENT="..."):
-#   IDENT           Signieridentitaet. Standard "QuadChroma Dev" (selbstsigniert, nur auf
-#                   diesem Mac). Release: "Developer ID Application: Robert Brandt (TEAMID)"
-#                   oder der 40-stellige SHA-1-Hash der Identitaet aus
-#                   `security find-identity -p codesigning -v` (Apple: bei gleichnamigen
-#                   Identitaeten "sign your code using this hash rather than the identity
-#                   name"). "-" ist die Ad-hoc-Signatur (CI ohne Zertifikat).
-#                   Ein ausdruecklich angegebenes IDENT wird durchgesetzt: weicht es von der
-#                   letzten Signatur ab (Stempel build/.ident), signiert schon `make IDENT=...`
-#                   die vorhandene App neu (kein Neubau). Ohne IDENT auf der Kommandozeile
-#                   bleibt eine vorhandene Signatur stehen - so ueberlebt die Developer-ID-
-#                   Signatur samt Ticket ein spaeteres `make verify` ohne Variablen.
-#   BUNDLE          Bezeichner in der Signatur; muss CFBundleIdentifier in host/Info.plist
-#                   entsprechen (die Signatur haengt daran, und TCC merkt sich ihn). Weicht
-#                   er ab, bricht jeder Signierpfad mit FEHLER ab.
-#   TIMESTAMP       Zeitstempel-Option fuer codesign. Automatisch "--timestamp", sobald IDENT
-#                   "Developer ID" enthaelt oder ein 40-stelliger Hash ist; sonst leer, weil
-#                   Apples Zeitstempeldienst (timestamp.apple.com) nur von Apple ausgestellte
-#                   Zertifikate bedient. Gehoert ein Hash zu einem anderen Zertifikat:
-#                   TIMESTAMP= (leer) mitgeben.
-#   ENTITLEMENTS    Pfad einer Entitlements-Datei; nur benutzt, wenn sie existiert. Der Host
-#                   braucht keine: Bildschirmaufnahme und Bedienungshilfen sind TCC-Freigaben,
-#                   keine Entitlements, und die Hardened Runtime stoert ihn nicht.
-#   NOTARY_PROFILE  Profilname aus `xcrun notarytool store-credentials <name> ...`.
-#   VERSION         wird aus CFBundleShortVersionString in host/Info.plist gelesen und
-#                   bestimmt die Paketnamen; CFBundleVersion dort vor jedem verteilten Bau erhoehen.
-#   Beilagen        Lizenz- und Hinweistexte fuer die DMG, alle als .txt (LICENSE.txt,
-#                   THIRD_PARTY_NOTICES.txt, README.txt aus .github/README.md, BENUTZUNG.txt) -
-#                   scripts/package-texts.sh legt sie ab. Fehlt eine Quelle, bricht make dmg
-#                   mit einer Developer ID ab (oder wenn DMG_EXTRA_REQUIRED=1 gesetzt ist, so
-#                   in release.yml); im Alltagsbau gibt es nur eine WARNUNG.
+# Variables (all can be overridden on the command line, e.g. make sign IDENT="..."):
+#   IDENT           signing identity. Default "QuadChroma Dev" (self-signed, only on
+#                   this Mac). Release: "Developer ID Application: Robert Brandt (TEAMID)"
+#                   or the 40-character SHA-1 hash of the identity from
+#                   `security find-identity -p codesigning -v` (Apple, for identities with
+#                   the same name: "sign your code using this hash rather than the identity
+#                   name"). "-" is the ad-hoc signature (CI without a certificate).
+#                   An explicitly given IDENT is enforced: if it differs from the last
+#                   signature (stamp build/.ident), even `make IDENT=...` signs the
+#                   existing app again (no rebuild). Without IDENT on the command line an
+#                   existing signature is kept - that way the Developer ID signature and
+#                   its ticket survive a later `make verify` without variables.
+#   BUNDLE          identifier in the signature; must match CFBundleIdentifier in host/Info.plist
+#                   (the signature depends on it, and TCC remembers it). If it differs,
+#                   every signing path stops with an ERROR.
+#   TIMESTAMP       timestamp option for codesign. Automatically "--timestamp" as soon as IDENT
+#                   contains "Developer ID" or is a 40-character hash; empty otherwise, because
+#                   Apple's timestamp service (timestamp.apple.com) only serves certificates
+#                   issued by Apple. If a hash belongs to a different certificate, pass
+#                   TIMESTAMP= (empty).
+#   ENTITLEMENTS    path of an entitlements file; only used if it exists. The host needs
+#                   none: Screen Recording and Accessibility are TCC permissions, not
+#                   entitlements, and the hardened runtime does not get in its way.
+#   NOTARY_PROFILE  profile name from `xcrun notarytool store-credentials <name> ...`.
+#   VERSION         read from CFBundleShortVersionString in host/Info.plist; determines
+#                   the package names. Increase CFBundleVersion there before every distributed build.
+#   Companion files (not a variable)
+#                   license and notice texts for the DMG, all as .txt (LICENSE.txt,
+#                   THIRD_PARTY_NOTICES.txt, README.txt made from README.md, MANUAL.txt) -
+#                   scripts/package-texts.sh puts them in place. If a source is missing, make dmg
+#                   stops when signing with a Developer ID (or when DMG_EXTRA_REQUIRED=1 is set,
+#                   as in release.yml); a non-release build only prints a WARNING.
 #
-# Warum immer signiert wird: TCC merkt sich Freigaben ueber die Designated Requirement der
-# App (Bezeichner + Zertifikat). Mit dem selbstsignierten Zertifikat ueberlebt die einmal
-# erteilte Bildschirmaufnahme-Freigabe jeden Neubau; nach einer Ad-hoc-Signatur (IDENT=-)
-# muesste sie nach jedem Bau neu erteilt werden. Wechsel von Bezeichner oder Zertifikat
-# kosten je eine Neufreigabe - deshalb beides in einem Schritt umstellen.
-# Nach Apples Anleitung "Creating distribution-signed code for macOS": kein --deep,
-# kein sudo, --options runtime fuer die Hardened Runtime, --timestamp fuer Developer ID.
+# Why the app is always signed: TCC remembers permissions by the app's designated requirement
+# (identifier + certificate). With the self-signed certificate, a Screen Recording permission
+# granted once survives every rebuild; after an ad-hoc signature (IDENT=-) it would have to
+# be granted again after every build. Changing the identifier or the certificate costs one
+# new grant each - so change both in the same step.
+# Following Apple's guide "Creating distribution-signed code for macOS": no --deep,
+# no sudo, --options runtime for the hardened runtime, --timestamp for Developer ID.
 
 IDENT          ?= QuadChroma Dev
 BUNDLE         ?= tech.quadchroma.host
 NOTARY_PROFILE ?= quadchroma-notary
 ENTITLEMENTS   ?= host/entitlements.plist
 
-# Developer-ID-Erkennung: der Name oder der 40-stellige SHA-1-Hash aus `security find-identity`.
-# Ein Hash gilt hier als Developer ID (nur dafuer empfiehlt Apple ihn); TIMESTAMP bleibt
-# ueberschreibbar, falls er doch zu einem anderen Zertifikat gehoert.
+# Developer ID detection: the name or the 40-character SHA-1 hash from `security find-identity`.
+# A hash counts as a Developer ID here (Apple recommends it only for that); TIMESTAMP can
+# still be overridden in case the hash belongs to a different certificate after all.
 IDENT_IS_HASH  := $(shell printf '%s' "$(IDENT)" | grep -qxE '[0-9A-Fa-f]{40}' && echo 1)
 RELEASE_IDENT  := $(if $(findstring Developer ID,$(IDENT))$(IDENT_IS_HASH),1,)
 TIMESTAMP      ?= $(if $(RELEASE_IDENT),--timestamp,)
-# Nur eine Identitaet von der Kommandozeile oder aus der Umgebung wird durchgesetzt (siehe
-# sign-if-changed); der Standardwert aus dieser Datei laesst eine vorhandene Signatur stehen.
+# Only an identity from the command line or the environment is enforced (see
+# sign-if-changed); the default value from this file keeps an existing signature.
 IDENT_EXPLICIT := $(if $(filter file default undefined,$(origin IDENT)),,1)
 
 ifndef VERSION
@@ -97,11 +98,11 @@ BIN      := $(APP)/Contents/MacOS/quadchroma-host
 ZIP      ?= build/QuadChroma-$(VERSION)-macos.zip
 DMG      ?= build/QuadChroma-$(VERSION).dmg
 DMG_ROOT := build/dmg-root
-# Beilagen fuer die DMG (ungesiegelt, aber von der DMG-Signatur abgedeckt), abgelegt von
-# scripts/package-texts.sh. Pflicht, sobald mit einer Developer ID signiert wird oder
-# DMG_EXTRA_REQUIRED gesetzt ist.
+# Companion files for the DMG (outside the app's seal, but covered by the DMG signature), put
+# in place by scripts/package-texts.sh. Mandatory as soon as the signing identity is a
+# Developer ID or DMG_EXTRA_REQUIRED is set.
 DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
-# Stempel: womit zuletzt signiert wurde (Identitaet, Bezeichner, Zeitstempel, Entitlements).
+# Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
 SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
@@ -114,35 +115,35 @@ SECONDS ?= 10
 OUT     ?= /tmp/qc.hevc
 ARGS    ?=
 
-# Entitlements nur, wenn die Datei wirklich existiert (heute: keine).
+# Entitlements only if the file actually exists (currently: none).
 ENT_OPT       = $(if $(wildcard $(ENTITLEMENTS)),--entitlements $(ENTITLEMENTS),)
 SIGN_PARAMS   = $(IDENT)|$(BUNDLE)|$(TIMESTAMP)|$(ENT_OPT)
 WRITE_STAMP   = printf '%s\n' '$(SIGN_PARAMS)' > $(IDENT_STAMP)
-# Bezeichner in Signatur und Info.plist muessen uebereinstimmen (Designated Requirement,
-# TCC-Freigaben); sonst FEHLER, bevor irgendetwas signiert wird.
+# The identifiers in the signature and in Info.plist must match (designated requirement,
+# TCC permissions); otherwise ERROR before anything is signed.
 BUNDLE_CHECK  = id=$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' host/Info.plist); \
-                if [ "$$id" != "$(BUNDLE)" ]; then echo "FEHLER: BUNDLE=$(BUNDLE), aber CFBundleIdentifier in host/Info.plist=$$id - Signatur und Info.plist muessen denselben Bezeichner tragen"; exit 1; fi
+                if [ "$$id" != "$(BUNDLE)" ]; then echo "ERROR: BUNDLE=$(BUNDLE), but CFBundleIdentifier in host/Info.plist=$$id - the signature and Info.plist must carry the same identifier"; exit 1; fi
 CODESIGN_APP  = codesign --force --sign "$(IDENT)" --identifier $(BUNDLE) --options runtime $(TIMESTAMP) $(ENT_OPT) $(APP)
-# ZIP fuer Notar und Verteilung: --keepParent legt QuadChroma.app als obersten Eintrag ab.
-# --norsrc laesst erweiterte Attribute (z. B. com.apple.provenance) weg, die ditto sonst als
-# AppleDouble-Eintraege (._*) mitpackt; das Kommandozeilen-unzip macht daraus echte Dateien
-# im Bundle und bricht so das Siegel. Das Bundle hat weder Resource-Forks noch Finder-Infos,
-# Signatur und Notar-Ticket liegen in Dateien, nicht in Attributen. Zur Sicherheit wird das
-# fertige ZIP auf ._-Eintraege geprueft.
+# ZIP for notarization and distribution: --keepParent stores QuadChroma.app as the top-level entry.
+# --norsrc leaves out extended attributes (e.g. com.apple.provenance) that ditto would otherwise
+# pack as AppleDouble entries (._*); the command-line unzip turns those into real files inside
+# the bundle and thereby breaks the seal. The bundle has neither resource forks nor Finder info;
+# the signature and the notarization ticket live in files, not in attributes. To be safe, the
+# finished ZIP is checked for ._ entries.
 MAKE_ZIP      = rm -f $(ZIP) && ditto -c -k --keepParent --norsrc $(APP) $(ZIP) \
-                && if unzip -Z1 $(ZIP) | grep -qE '(^|/)\._'; then echo "FEHLER: $(ZIP) enthaelt AppleDouble-Eintraege (._*)"; exit 1; fi \
+                && if unzip -Z1 $(ZIP) | grep -qE '(^|/)\._'; then echo "ERROR: $(ZIP) contains AppleDouble entries (._*)"; exit 1; fi \
                 && ls -l $(ZIP)
 
-# $(call notarize,<datei>,<protokoll.json>): einreichen, warten, Protokoll holen und anzeigen,
-# bei jedem Status ausser "Accepted" mit Fehler enden. Braucht Internet und das Profil.
+# $(call notarize,<file>,<log.json>): submit, wait, fetch and show the log, exit with an
+# error for any status other than "Accepted". Needs internet access and the profile.
 define notarize
 set -e; \
 ausgabe=$$(xcrun notarytool submit "$(1)" --keychain-profile "$(NOTARY_PROFILE)" --wait --timeout 30m | tee /dev/stderr); \
 id=$$(printf '%s\n' "$$ausgabe" | sed -n 's/^ *id: *//p' | head -n 1); \
-if [ -z "$$id" ]; then echo "FEHLER: keine Submission-ID in der Ausgabe von notarytool"; exit 1; fi; \
+if [ -z "$$id" ]; then echo "ERROR: no submission ID in the notarytool output"; exit 1; fi; \
 xcrun notarytool log "$$id" --keychain-profile "$(NOTARY_PROFILE)" "$(2)"; \
 cat "$(2)"; echo; \
-if ! printf '%s\n' "$$ausgabe" | grep -q '^ *status: Accepted'; then echo "FEHLER: Notarisierung nicht angenommen - Protokoll: $(2)"; exit 1; fi
+if ! printf '%s\n' "$$ausgabe" | grep -q '^ *status: Accepted'; then echo "ERROR: notarization not accepted - log: $(2)"; exit 1; fi
 endef
 
 .PHONY: all sign sign-if-changed verify zip dmg notarize staple notarize-dmg staple-dmg gatekeeper \
@@ -159,43 +160,43 @@ $(BIN): $(SRC) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1
 
-# Signatur an ein ausdruecklich angegebenes IDENT (bzw. BUNDLE, TIMESTAMP, ENTITLEMENTS)
-# angleichen: weicht der Stempel ab, wird nur neu signiert, nicht neu gebaut. Ohne Variablen
-# auf der Kommandozeile passiert hier nichts. Haengt an all, verify, zip und dmg.
+# Bring the signature in line with an explicitly given IDENT (or BUNDLE, TIMESTAMP,
+# ENTITLEMENTS): if the stamp differs, the app is only signed again, not rebuilt. Without
+# variables on the command line nothing happens here. all, verify, zip and dmg depend on it.
 sign-if-changed: $(BIN)
 	@if [ -n "$(IDENT_EXPLICIT)" ] && [ "$$(cat $(IDENT_STAMP) 2>/dev/null)" != '$(SIGN_PARAMS)' ]; then \
-	   echo "Signierparameter geaendert - signiere neu mit IDENT=\"$(IDENT)\""; \
+	   echo "Signing parameters changed - signing again with IDENT=\"$(IDENT)\""; \
 	   $(BUNDLE_CHECK); $(CODESIGN_APP) && $(WRITE_STAMP) && codesign -d -r- $(APP) 2>&1 | tail -1; \
 	 fi
 
-# Erneut signieren, z. B. mit der Developer ID. Info.plist und Binary sind Teil des Siegels,
-# also nach jeder Aenderung daran; ein angeheftetes Ticket ist danach ungueltig (make staple).
+# Sign again, e.g. with the Developer ID. Info.plist and the binary are part of the seal,
+# so do this after every change to them; a stapled ticket is invalid afterwards (make staple).
 sign: $(BIN)
 	@$(BUNDLE_CHECK)
 	$(CODESIGN_APP)
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1
 
-# Pruefen wie der Notar (--strict), Entitlements, Vorabpruefung, Gatekeeper-Vorschau.
+# Check like the notary service (--strict), entitlements, distribution pre-check, Gatekeeper preview.
 verify: sign-if-changed
 	codesign --verify --deep --strict --verbose=2 $(APP)
 	@codesign -dvv $(APP) 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Authority|TeamIdentifier|Timestamp|Signed Time|Runtime Version)'
-	@echo "Entitlements (nur die Executable-Zeile erwartet):"
+	@echo "Entitlements (only the Executable line is expected):"
 	@codesign -d --entitlements - $(APP)
 	@if codesign -d --entitlements - $(APP) 2>/dev/null | grep -q 'get-task-allow'; then \
-	   echo "FEHLER: com.apple.security.get-task-allow ist eingebettet - der Notar lehnt das ab"; exit 1; fi
+	   echo "ERROR: com.apple.security.get-task-allow is embedded - notarization would reject it"; exit 1; fi
 	@syspolicy_check distribution $(APP) || true
-	@if spctl --assess --type execute -vv $(APP) 2>&1; then echo "Gatekeeper: angenommen"; \
-	 else echo "Gatekeeper lehnt ab. Erwartet, solange IDENT=\"$(IDENT)\" keine Developer ID ist oder die App noch nicht notarisiert wurde (make gatekeeper prueft nach dem Release streng)."; fi
+	@if spctl --assess --type execute -vv $(APP) 2>&1; then echo "Gatekeeper: accepted"; \
+	 else echo "Gatekeeper rejects the app. Expected as long as IDENT=\"$(IDENT)\" is not a Developer ID or the app has not been notarized yet (make gatekeeper checks strictly after the release)."; fi
 
 zip: sign-if-changed
 	$(MAKE_ZIP)
 
-# DMG: Ordner mit App, Verweis auf /Applications und Beilagen, dann UDZO-Abbild, dann Signatur
-# mit eigenem Bezeichner (Apple: "Use a unique code-signing identifier that differs from the
-# identifiers on your other products"). Auf macOS 27 warnt hdiutil, dass diese Form veraltet
-# sei ("Please use 'diskutil image create from ...'"); sie funktioniert weiterhin und laeuft
-# auch auf aelteren Systemen. hdiutil verify prueft die Pruefsumme des Abbilds.
+# DMG: a folder with the app, a link to /Applications and the companion files, then a UDZO
+# image, then a signature with its own identifier (Apple: "Use a unique code-signing identifier
+# that differs from the identifiers on your other products"). On macOS 27 hdiutil warns that
+# this form is deprecated ("Please use 'diskutil image create from ...'"); it still works and
+# also runs on older systems. hdiutil verify checks the checksum of the image.
 dmg: sign-if-changed
 	rm -rf $(DMG_ROOT) $(DMG)
 	mkdir -p $(DMG_ROOT)
@@ -207,19 +208,19 @@ dmg: sign-if-changed
 	codesign --force --sign "$(IDENT)" $(TIMESTAMP) --identifier $(BUNDLE).dmg $(DMG)
 	@ls -l $(DMG)
 
-# Notarisierung: erst das ZIP (der Notar nimmt keine nackte .app), dann die App stapeln.
-# Ohne Developer-ID-Signatur endet das absichtlich mit "The binary is not signed with a valid
-# Developer ID certificate." im Protokoll.
+# Notarization: first the ZIP (the notary service does not accept a bare .app), then staple
+# the app. Without a Developer ID signature this deliberately ends with "The binary is not
+# signed with a valid Developer ID certificate." in the log.
 notarize: zip
 	$(call notarize,$(ZIP),build/notary-log.json)
 
-# Ein ZIP laesst sich nicht stapeln: Ticket an die App heften und das ZIP neu erzeugen.
+# A ZIP cannot be stapled: staple the ticket to the app and recreate the ZIP.
 staple:
 	xcrun stapler staple $(APP)
 	xcrun stapler validate -v $(APP)
 	$(MAKE_ZIP)
 
-# Baut die DMG selbst (Voraussetzung dmg), damit sie die gestapelte App enthaelt.
+# Builds the DMG itself (prerequisite dmg) so that it contains the stapled app.
 notarize-dmg: dmg
 	$(call notarize,$(DMG),build/notary-log-dmg.json)
 
@@ -227,8 +228,8 @@ staple-dmg:
 	xcrun stapler staple $(DMG)
 	xcrun stapler validate -v $(DMG)
 
-# Strenge Endpruefung nach dem Release: hier muss Gatekeeper annehmen
-# ("accepted", "source=Notarized Developer ID"), sonst bricht make ab.
+# Strict final check after the release: here Gatekeeper must accept
+# ("accepted", "source=Notarized Developer ID"), otherwise make stops.
 gatekeeper:
 	spctl --assess --type execute -vv $(APP)
 	xcrun stapler validate -v $(APP)
@@ -236,14 +237,14 @@ gatekeeper:
 	xcrun stapler validate -v $(DMG)
 	shasum -a 256 $(ZIP) $(DMG)
 
-# Die ganze Kette. Absichtlich als Folge von Unter-Aufrufen, damit die Reihenfolge auch mit
-# -j stimmt; IDENT und die anderen Kommandozeilenvariablen erben die Unter-Aufrufe ueber MAKEFLAGS.
-# Vorabpruefungen, bevor irgendetwas hochgeladen wird: Developer ID (Name oder Hash), Zeitstempel,
-# alle Beilagen vorhanden. Die DMG baut notarize-dmg; ein eigener dmg-Schritt davor wuerde sie
-# nur ein zweites Mal bauen und signieren (zwei Zeitstempelanfragen).
+# The whole chain. Deliberately a sequence of sub-makes so that the order is also right with
+# -j; the sub-makes inherit IDENT and the other command-line variables through MAKEFLAGS.
+# Checks before anything is uploaded: Developer ID (name or hash), timestamp, all companion
+# files present. notarize-dmg builds the DMG; a separate dmg step before it would only build
+# and sign it a second time (two timestamp requests).
 release:
-	@if [ -z "$(RELEASE_IDENT)" ]; then echo "FEHLER: make release braucht IDENT=\"Developer ID Application: <Name> (<TEAMID>)\" oder den SHA-1-Hash dieser Identitaet (jetzt: \"$(IDENT)\")"; exit 1; fi
-	@if [ -z "$(TIMESTAMP)" ]; then echo "FEHLER: TIMESTAMP ist leer - ohne sicheren Zeitstempel lehnt der Notar ab (bei Developer ID TIMESTAMP=--timestamp)"; exit 1; fi
+	@if [ -z "$(RELEASE_IDENT)" ]; then echo "ERROR: make release needs IDENT=\"Developer ID Application: <Name> (<TEAMID>)\" or the SHA-1 hash of that identity (currently: \"$(IDENT)\")"; exit 1; fi
+	@if [ -z "$(TIMESTAMP)" ]; then echo "ERROR: TIMESTAMP is empty - without a secure timestamp notarization is rejected (for a Developer ID: TIMESTAMP=--timestamp)"; exit 1; fi
 	@scripts/package-texts.sh build/beilagen-probe 1 && rm -rf build/beilagen-probe
 	$(MAKE) sign
 	$(MAKE) verify
@@ -270,8 +271,8 @@ check:
 	@ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nw=1 $(OUT)
 
 permissions:
-	@echo "Bildschirmaufnahme:  Systemeinstellungen > Datenschutz & Sicherheit > Bildschirmaufnahme"
-	@echo "Status laut System:"; open -n $(APP) --args --list; sleep 2; tail -5 /tmp/quadchroma-m1.log
+	@echo "Screen Recording:  System Settings > Privacy & Security > Screen Recording"
+	@echo "Status reported by the system:"; open -n $(APP) --args --list; sleep 2; tail -5 /tmp/quadchroma-m1.log
 
 clean:
 	rm -rf build

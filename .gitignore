@@ -1,15 +1,15 @@
-# Bauergebnisse
+# Build output
 build/
 client/target/
 paket/
 
-# Zugang zur Bau-VM - der private Schluessel gehoert nie ins Repository
+# Access to the build VM - the private key never belongs in the repository
 vmkey
 vmkey.pub
 known_hosts
 
-# Rohbilder aus dem Schnappschussmodus; die PNGs sind Dokumentation und bleiben
+# Raw images from the snapshot mode; the PNGs are documentation and stay
 *.bmp
-# Mitschnitte des Bildstroms (--mitschnitt, Konserve fuer den Windows-Host)
+# Recordings of the video stream (--mitschnitt, canned input for the Windows host)
 *.hevc
 .DS_Store

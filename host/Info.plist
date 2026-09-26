@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Bezeichner der App. Er steckt in der Signatur (Designated Requirement) und
-         damit in den TCC-Freigaben fuer Bildschirmaufnahme und Bedienungshilfen:
-         wer ihn aendert, muss beide Freigaben neu erteilen. Muss zu BUNDLE im
-         Makefile passen. -->
+    <!-- Identifier of the app. It is part of the signature (designated requirement)
+         and therefore of the TCC permissions for Screen Recording and Accessibility:
+         changing it means granting both permissions again. Must match BUNDLE in the
+         Makefile. -->
     <key>CFBundleIdentifier</key>
     <string>tech.quadchroma.host</string>
     <key>CFBundleName</key>
@@ -19,12 +19,12 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleDevelopmentRegion</key>
-    <string>de</string>
-    <!-- Versionsnummer, die Nutzer sehen (drei Zahlen). Das Makefile liest sie
-         fuer die Namen von ZIP und DMG. -->
+    <string>en</string>
+    <!-- Version number shown to users (three numbers). The Makefile reads it for
+         the names of the ZIP and the DMG. -->
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
-    <!-- Bau-Nummer: vor jedem verteilten Bau um eins erhoehen (Apple:
+    <!-- Build number: increase by one before every distributed build (Apple:
          "increment the build version before you distribute a build"). -->
     <key>CFBundleVersion</key>
     <string>2</string>
@@ -34,8 +34,8 @@
     <string>public.app-category.utilities</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Robert Brandt</string>
-    <!-- Der Host laeuft ohne Dock-Symbol und ohne Fenster; die Signatur und
-         Gatekeeper interessiert das nicht. -->
+    <!-- The host runs without a Dock icon and without windows; this does not
+         matter for the signature or Gatekeeper. -->
     <key>LSBackgroundOnly</key>
     <true/>
     <key>NSHighResolutionCapable</key>

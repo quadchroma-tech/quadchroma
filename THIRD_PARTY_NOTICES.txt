@@ -37,7 +37,7 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 | `FFMPEG-BUILDINFO.txt` | Windows | - | Sizes and SHA-256 of the two DLLs and the exact build configuration. | 2.2 |
 | `QuadChroma.app` | macOS 14 or later | Objective-C/C (host) | Monocypher (vendored), Apple system frameworks. No FFmpeg, no Rust. | 4 |
 
-The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the English README) and `BENUTZUNG.txt` (German manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
+The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the README) and `MANUAL.txt` (the manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
 
 **Not distributed as a binary: the Mac client.** The Mac client is built from the same Rust source as the Windows program (section 5), but its binary links the FFmpeg installed by Homebrew (`/opt/homebrew/opt/ffmpeg`), and that FFmpeg is a GPL build (it contains libx264 and libx265). A Mac client binary is therefore not distributed. Distributing one would require an FFmpeg built without GPL parts, in the same way as section 2 describes for Windows.
 

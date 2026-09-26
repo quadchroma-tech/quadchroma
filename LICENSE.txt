@@ -290,8 +290,8 @@ underlying any of its elements while performing acts You are entitled to
 perform, and decompilation where it is indispensable to achieve the
 interoperability of an independently created program, under the conditions and
 within the limits of Articles 5(3) and 6 of Directive 2009/24/EC and their
-national implementations (in Germany sections 69d(3) and 69e of the Copyright
-Act (Urheberrechtsgesetz, UrhG)), of fair use or fair dealing, or of comparable
+national implementations (in Germany sections 69d(3) and 69e of the German
+Copyright Act (UrhG)), of fair use or fair dealing, or of comparable
 provisions. Those acts remain subject to the limits those provisions set,
 including the limits on the use of information obtained by decompilation, and
 they are available only to a person who uses the software for a permitted
@@ -418,23 +418,23 @@ notices are collected in `THIRD_PARTY_NOTICES.txt`.
 extent permitted by law, the following applies.
 
 11.2 The software is provided free of charge and "as is". The Licensor gives no
-warranty (Gewaehrleistung) and no guarantee (Garantie), express or implied,
-including as to merchantability, fitness for a particular purpose,
-non-infringement, accuracy, availability, security, or freedom from errors, and
-has no obligation to provide updates, corrections, support or maintenance.
+warranty (including for material defects and defects of title) and no
+guarantee, express or implied, including as to merchantability, fitness for a
+particular purpose, non-infringement, accuracy, availability, security, or
+freedom from errors, and has no obligation to provide updates, corrections,
+support or maintenance.
 
-11.3 The Licensor is liable only for intent (Vorsatz) and gross negligence
-(grobe Fahrlaessigkeit). Liability for slight negligence (leichte
-Fahrlaessigkeit) is excluded.
+11.3 The Licensor is liable only for intent and gross negligence. Liability for
+slight negligence is excluded.
 
 11.4 Nothing in the License excludes or limits liability that cannot be
 excluded or limited under applicable mandatory law. Under German law this
 includes liability for intent and gross negligence, liability for injury to
-life, body or health, liability under the Product Liability Act
-(Produkthaftungsgesetz), liability for fraudulently concealed defects
-(arglistig verschwiegene Maengel) and, where consumer protection law applies,
-any liability that cannot be excluded towards consumers. Clauses 11.2 and 11.3
-apply only to the extent they are compatible with that law.
+life, body or health, liability under the German Product Liability Act
+(ProdHaftG), liability for fraudulently concealed defects and, where consumer
+protection law applies, any liability that cannot be excluded towards
+consumers. Clauses 11.2 and 11.3 apply only to the extent they are compatible
+with that law.
 
 ### 12. Termination
 
@@ -469,8 +469,9 @@ the absence of this choice if You are a consumer (Article 6(2) of Regulation
 (EC) No 593/2008), and it does not affect the law that governs the existence,
 scope and infringement of intellectual property rights in any country.
 
-13.2 If You are a merchant (Kaufmann), a legal entity under public law, a
-special fund under public law (oeffentlich-rechtliches Sondervermoegen), or
+13.2 If You are a merchant within the meaning of the German Commercial Code
+(HGB), a legal entity under public law, a special fund under public law within
+the meaning of section 38(1) of the German Code of Civil Procedure (ZPO), or
 have no general place of jurisdiction in Germany, the courts of the Federal
 Republic of Germany have exclusive jurisdiction over all disputes arising out of
 or in connection with the License or the software, and the competent court is
@@ -493,9 +494,7 @@ enforceable applies.
 ### 15. Language
 
 The License is written in English. The English text is the only binding text;
-translations are for convenience only. German legal terms given in brackets
-identify the concept under German law that the English term designates and
-guide its interpretation.
+translations are for convenience only.
 
 ### 16. Contact
 

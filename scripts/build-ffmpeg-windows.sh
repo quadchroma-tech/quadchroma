@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# Baut die FFmpeg-Bibliotheken fuer den Windows-Client (quadchroma.exe) als
-# schlanken LGPL-Build: nur das, was QuadChroma wirklich aufruft, ohne jede
-# Fremdbibliothek. Ergebnis: avcodec-63.dll, avformat-63.dll, avutil-61.dll
-# samt Headern und Importbibliotheken - das Verzeichnis ist FFMPEG_DIR fuer
-# den Rust-Bau.
+# Builds the FFmpeg libraries for the Windows client (quadchroma.exe) as a
+# minimal LGPL build: only what QuadChroma actually calls, without any
+# third-party library. Result: avcodec-63.dll, avformat-63.dll, avutil-61.dll
+# plus headers and import libraries - the directory is FFMPEG_DIR for
+# the Rust build.
 #
-# Warum ein eigener Bau: die fertigen "lgpl"-Builds binden Dutzende
-# Fremdbibliotheken statisch ein, darunter GPL-Code (FFTW ueber chromaprint
-# in avformat). Dieser Bau enthaelt nur FFmpeg selbst (LGPL 2.1 oder spaeter)
-# und die NVIDIA-Codec-Header (MIT, nur Header).
+# Why a custom build: the prebuilt "lgpl" builds statically link dozens of
+# third-party libraries, GPL code among them (FFTW via chromaprint
+# in avformat). This build contains only FFmpeg itself (LGPL 2.1 or later)
+# and the NVIDIA codec headers (MIT, headers only).
 #
-# Laeuft auf macOS (Homebrew: mingw-w64, nasm) und Linux (apt: mingw-w64,
-# nasm, make, pkg-config). Aufruf:
+# Runs on macOS (Homebrew: mingw-w64, nasm) and Linux (apt: mingw-w64,
+# nasm, make, pkg-config). Usage:
 #
-#   scripts/build-ffmpeg-windows.sh [ZIELVERZEICHNIS]
+#   scripts/build-ffmpeg-windows.sh [TARGET_DIR]
 #
-# Voreinstellung fuer das Ziel: ./ffmpeg-windows. Das Arbeitsverzeichnis
-# (Quellen, Bau) ist QC_FFMPEG_WORK oder ein Ordner im Temp-Verzeichnis.
+# Default target: ./ffmpeg-windows. The working directory (sources,
+# build) is QC_FFMPEG_WORK or a folder in the temp directory.
 
 set -euo pipefail
 
-# Absoluter Pfad dieses Skripts: es legt sich spaeter zu den Quellen.
+# Absolute path of this script: it later copies itself next to the sources.
 SKRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 FFMPEG_VERSION=9.0.2
 FFMPEG_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
 FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 
-# nv-codec-headers, Zweig sdk/13.0 (NVENC-API 13.0) - nur Header, MIT.
+# nv-codec-headers, branch sdk/13.0 (NVENC API 13.0) - headers only, MIT.
 NVHDR_COMMIT=ced4f8eba3ba5dd431932cba17928f0dffdaeb2b
 NVHDR_URL="https://github.com/FFmpeg/nv-codec-headers/archive/${NVHDR_COMMIT}.tar.gz"
 NVHDR_SHA256=625ddd8f2a603699fdba101bebcde0e7a97bcc7b8a82ec7f45a7d06d61336597
@@ -39,15 +39,15 @@ mkdir -p "$WORK"
 cd "$WORK"
 
 for w in "${CROSS}gcc" "${CROSS}dlltool" nasm make pkg-config; do
-    command -v "$w" >/dev/null || { echo "Fehlt: $w (macOS: brew install mingw-w64 nasm pkg-config; Linux: apt install mingw-w64 nasm make pkg-config)" >&2; exit 1; }
+    command -v "$w" >/dev/null || { echo "Missing: $w (macOS: brew install mingw-w64 nasm pkg-config; Linux: apt install mingw-w64 nasm make pkg-config)" >&2; exit 1; }
 done
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 
-holen() {  # holen <url> <datei> <sha256>
+holen() {  # holen <url> <file> <sha256>
     [ -f "$2" ] || curl -fsSL -o "$2" "$1"
     local ist; ist="$(sha256 "$2")"
-    [ "$ist" = "$3" ] || { echo "Pruefsumme falsch fuer $2: $ist (erwartet $3)" >&2; exit 1; }
+    [ "$ist" = "$3" ] || { echo "Wrong checksum for $2: $ist (expected $3)" >&2; exit 1; }
 }
 
 holen "$FFMPEG_URL" "ffmpeg-${FFMPEG_VERSION}.tar.xz" "$FFMPEG_SHA256"
@@ -57,20 +57,20 @@ rm -rf "ffmpeg-${FFMPEG_VERSION}" "nv-codec-headers-${NVHDR_COMMIT}" prefix-nv
 tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
 tar xzf "nv-codec-headers-${NVHDR_COMMIT}.tar.gz"
 
-# Die Header in ein eigenes Praefix; configure findet sie ueber pkg-config.
+# The headers go into a prefix of their own; configure finds them via pkg-config.
 make -C "nv-codec-headers-${NVHDR_COMMIT}" PREFIX="$WORK/prefix-nv" install >/dev/null
 export PKG_CONFIG_PATH="$WORK/prefix-nv/lib/pkgconfig"
 export PKG_CONFIG_LIBDIR="$WORK/prefix-nv/lib/pkgconfig"
 
 cd "ffmpeg-${FFMPEG_VERSION}"
-# -static bindet libgcc und winpthreads (MinGW-w64-Laufzeit) in die DLLs
-# ein, damit keine libgcc_s-/libwinpthread-DLL mitgeliefert werden muss.
-# Nichts wird automatisch erkannt (--disable-autodetect): jede Bibliothek,
-# jede Hardwareschnittstelle steht hier ausdruecklich. Kein --enable-gpl,
-# kein --enable-version3, kein --enable-nonfree: der Bau bleibt LGPL 2.1+.
-#   Decoder:  hevc, h264 (Software und D3D11VA/DXVA2/NVDEC), hevc_cuvid, h264_cuvid
-#   Encoder:  hevc_nvenc, h264_nvenc, av1_nvenc, hevc_mf, h264_mf (Windows-Host-Rolle)
-#   avformat: wird von der Rust-Bindung gelinkt, bleibt ohne Muxer/Demuxer leer
+# -static links libgcc and winpthreads (the MinGW-w64 runtime) into the DLLs,
+# so that no libgcc_s/libwinpthread DLL has to be shipped.
+# Nothing is detected automatically (--disable-autodetect): every library and
+# every hardware interface is listed here explicitly. No --enable-gpl,
+# no --enable-version3, no --enable-nonfree: the build stays LGPL 2.1+.
+#   Decoders: hevc, h264 (software and D3D11VA/DXVA2/NVDEC), hevc_cuvid, h264_cuvid
+#   Encoders: hevc_nvenc, h264_nvenc, av1_nvenc, hevc_mf, h264_mf (Windows host role)
+#   avformat: linked by the Rust bindings, stays empty without muxers/demuxers
 ./configure \
     --prefix=/ffmpeg \
     --cross-prefix="$CROSS" --arch=x86_64 --target-os=mingw32 \
@@ -91,35 +91,35 @@ cd "ffmpeg-${FFMPEG_VERSION}"
     --extra-version=quadchroma
 
 make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-# Installiert wird ueber DESTDIR, damit im Konfigurationstext der DLLs ein
-# neutraler Pfad (/ffmpeg) steht statt des Bauordners.
+# Install via DESTDIR so that the configuration string in the DLLs contains a
+# neutral path (/ffmpeg) instead of the build folder.
 rm -rf "$WORK/inst"
 make install DESTDIR="$WORK/inst" >/dev/null
 rm -rf "$ZIEL"/bin "$ZIEL"/include "$ZIEL"/lib
 cp -R "$WORK/inst/ffmpeg/." "$ZIEL/"
 
-# Der Rust-Bau (MSVC) erwartet avcodec.lib usw. in lib/; configure legt die
-# mit dlltool erzeugten .lib neben die DLLs in bin/.
+# The Rust build (MSVC) expects avcodec.lib etc. in lib/; configure puts the
+# .lib files generated with dlltool next to the DLLs in bin/.
 for b in avcodec avformat avutil; do
     [ -f "$ZIEL/bin/$b.lib" ] && cp "$ZIEL/bin/$b.lib" "$ZIEL/lib/$b.lib"
 done
 
-# Bauangaben fuer THIRD_PARTY_NOTICES.txt und zur Nachpruefung.
+# Build information for THIRD_PARTY_NOTICES.txt and for verification.
 {
     echo "FFmpeg ${FFMPEG_VERSION} (${FFMPEG_URL}, sha256 ${FFMPEG_SHA256})"
     echo "nv-codec-headers ${NVHDR_COMMIT} (sha256 ${NVHDR_SHA256})"
     echo "Compiler: $(${CROSS}gcc --version | head -1)"
     echo "MinGW-w64: $(echo '#include <_mingw.h>' | ${CROSS}gcc -E -dM - | awk '$2 ~ /^__MINGW64_VERSION_(MAJOR|MINOR|BUGFIX)$/ { v[$2] = $3 } END { print v["__MINGW64_VERSION_MAJOR"] "." v["__MINGW64_VERSION_MINOR"] "." v["__MINGW64_VERSION_BUGFIX"] }')"
     echo "NASM: $(nasm -v | head -1)"
-    echo "Konfiguration: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"/\1/p' config.h)"
-    echo "Lizenz laut configure: $(sed -n 's/^#define FFMPEG_LICENSE "\(.*\)"/\1/p' config.h)"
+    echo "Configuration: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"/\1/p' config.h)"
+    echo "License according to configure: $(sed -n 's/^#define FFMPEG_LICENSE "\(.*\)"/\1/p' config.h)"
     for d in "$ZIEL"/bin/*.dll; do echo "$(basename "$d") $(wc -c < "$d" | tr -d ' ') $(sha256 "$d")"; done
 } > "$ZIEL/BUILDINFO.txt"
 cp COPYING.LGPLv2.1 LICENSE.md "$ZIEL/"
-# Die vollstaendigen Quellen fuer die Weitergabe neben den DLLs (LGPL 2.1
-# Abschnitt 6): beide Archive unveraendert und dieses Skript.
+# The complete sources for distribution alongside the DLLs (LGPL 2.1
+# section 6): both archives unmodified, plus this script.
 mkdir -p "$ZIEL/quellen"
 cp "$WORK/ffmpeg-${FFMPEG_VERSION}.tar.xz" "$WORK/nv-codec-headers-${NVHDR_COMMIT}.tar.gz" "$ZIEL/quellen/"
 cp "$SKRIPT" "$ZIEL/quellen/build-ffmpeg-windows.sh"
-echo "Fertig: $ZIEL"
+echo "Done: $ZIEL"
 cat "$ZIEL/BUILDINFO.txt"

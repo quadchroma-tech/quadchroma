@@ -1,0 +1,1802 @@
+QuadChroma - Windows client
+===========================
+
+Starting:
+
+    quadchroma.exe
+
+Without an address the start screen opens. The Mac announces itself on
+the network, so it appears in the list after a few seconds; a click is
+enough. If you know the address, you can also type it in or pass it
+directly:
+
+    quadchroma.exe 192.168.178.194:9001
+
+Port 9001 carries video and audio (and everything from host to client),
+9002 input and the clipboard including files (everything from client to
+host), 9003 the network announcement. On the first start the Windows
+Firewall asks whether the program may access the network - this must be
+allowed, otherwise the list stays empty.
+
+First start of a downloaded release: QuadChroma is not signed with a
+paid certificate. Simplest is to do this before unpacking: right-click
+the ZIP, Properties, tick "Unblock", OK - then Windows does not warn.
+Otherwise SmartScreen reports "Windows protected your PC": "More info",
+then "Run anyway". avcodec-63.dll and avutil-61.dll stay next to
+quadchroma.exe. The checksums of the files are in SHA256SUMS.txt on the
+release page.
+
+Closing does not quit QuadChroma; it hides the app in the notification
+area (on the Mac, in the menu bar). Only one app with a window runs at
+a time: a second start hands its address over to it. The desktop
+shortcut per host relies on this. All three are described further
+below, as is copying files between client and host.
+
+Encryption and pairing
+----------------------
+
+The connection is always encrypted; there is no switch for it. On their
+first start both sides create their own permanent key and recognize each
+other by it from then on.
+
+So that not just anyone on the network can connect, a device has to be
+authorized once. The very first time this happens by itself: as long as
+the host has no authorization list (authorized.txt) yet, it accepts the
+first peer that connects - the Mac host does so even when the file is
+empty (0 bytes). After that it is closed: every further new device needs
+a host that was started with --pair.
+
+    open -n build/QuadChroma.app --args --serve 9001 --pair
+
+The host log (/tmp/quadchroma-m1.log) then shows a six-digit comparison
+code, for example "628 306". The client shows the same code with F9. If
+both match, nobody is sitting in between. If they do not match,
+disconnect.
+
+The client remembers the host's fingerprint per address (without port)
+and checks it during the handshake, before it identifies itself
+(message 3). If the fingerprint changes later, the client stops at that
+point: the host never accepts it, and a viewer already connected notices
+nothing. The client returns to the start screen with a message and does
+not try again; the message names the address, the new fingerprint and
+the path of the file, in the language of the interface. Only after the
+entry in known_hosts.txt has been deleted by hand do you reconnect
+yourself. Conversely, a host at a new address is a first contact for the
+client, even under a known name; in that case check the comparison code.
+
+One viewer at a time: if a second paired device connects, it takes over
+the session. The previous one receives message 10 from the host, shows
+"Another device has taken over the session." on the start screen and
+does not reconnect by itself; "Connect" brings the session back. Older
+clients do not know this message, reconnect after 2 s and take the
+session back from the new viewer. On the switch the host immediately
+cuts the old viewer's input channel and releases its pressed keys and
+mouse buttons. The Mac host's log shows "Bisheriger Zuschauer
+<Fingerabdruck> abgeloest und getrennt" (previous viewer replaced and
+disconnected; if the old one hangs, " - die Abloese-Nachricht kam nicht
+an" is appended: the takeover message did not arrive), and the old
+client's log shows "Sitzung mit <Adresse> von einem anderen Geraet
+uebernommen (Host meldet Abloesung) - keine automatische Neuverbindung"
+(session taken over by another device, no automatic reconnect). The new
+viewer inherits nothing from the old one: a test pattern ends ("Testbild
+aus (neuer Zuschauer)"), and the host sends it a keyframe right away,
+even when the screen is still. A peer that disappears without saying
+goodbye (lid closed, Wi-Fi gone) is noticed by the Mac host after about
+16 s.
+
+Handshake: each handshake has an overall deadline (host 5 s, client 3 s)
+and runs in its own thread on the host, so a peer that stays silent or
+trickles data only holds its own slot. There are 32 slots per port. The
+Mac host allows 4 per address and, when the slots are full, drops the
+oldest running handshake ("Bildkanal: Andrang - ...", video channel
+crowded); the Windows host allows 2 per sender and rejects anything
+beyond that ("Bildkanal: Verbindung von <IP> abgewiesen - schon N
+Handschlaege offen ..."). On the input channel (9002) the client checks,
+still during the handshake, that the same host answers as on the video
+channel; otherwise not a single key goes out (log: "Eingabekanal:
+Gegenstelle <Fingerabdruck> ist nicht der Host des Bildkanals - vor
+Nachricht 3 abgebrochen", at most every 10 s). The input channel is set
+up in the background; its first message always states what the client
+can do (capabilities, see "Files via the clipboard"). Settings, codec,
+test pattern and clipboard changes that come before that are sent by the
+client afterwards (the latest of each kind); mouse movements and keys
+are not. The stored values of a host (see "The menu") apply from the
+video channel on (so a stored "Sound" set to off takes effect at once);
+the client sends them to the host as soon as the input channel is up.
+
+Host logs: lines that anyone on the network can trigger without pairing
+(failed handshake, unknown peer, broken authorization list or one that
+cannot be saved, input channel without video, on the Windows host also
+full handshake slots) are rate-limited: the first one immediately, after
+that at most one of the same kind and address every 10 s.
+Both hosts count per kind and address (the Mac host four addresses per
+kind, the Windows host 64, any further ones together) and append the
+count to the line ("<Zeile> - dazu N weitere von dieser Adresse seit der
+letzten Meldung", i.e. N more from this address since the last report);
+counts not followed by another line appear after the interval as a
+summary line ("<Art>: N weitere von <IP> seit der letzten Meldung" or
+"<Art>: N weitere von anderen Adressen seit der letzten Meldung,
+zuletzt von <IP>", where <Art> is the kind of line), on the Windows
+host at the latest 15 s after the last line let through. The
+rate-limited lines name the address, including those of the input
+channel ("Eingabekanal abgewiesen: kein Bildkanal offen (<IP>)", input
+rejected because no video channel is open). "Neue Gegenstelle gekoppelt"
+(new peer paired) and "Zuschauer verbunden" (viewer connected) always
+appear.
+
+Both hosts limit their log to 8 MB. The Mac host then moves
+/tmp/quadchroma-m1.log to /tmp/quadchroma-m1.alt.log (an earlier one is
+dropped) and writes as the first new line "Protokoll war ueber 8192 KB -
+die Zeilen davor stehen in /tmp/quadchroma-m1.alt.log"; if the file
+cannot be renamed, it starts empty ("... - die Zeilen davor sind
+verworfen", the earlier lines are discarded). The file grows across
+restarts; the few lines that audio and clipboard write into it
+themselves are not counted. The Windows host starts host-protokoll.txt
+anew at every start and moves it to host-protokoll.alt.txt at 8 MB
+("Protokoll ueber 8 MB - der vorige Teil steht in
+host-protokoll.alt.txt"), and likewise messung.txt to messung.alt.txt.
+
+Broken files never lead to a new pairing. A key is created only when its
+file is missing. If host.key exists but is unreadable or has the wrong
+length (Mac host 32 bytes, Windows 64), the host does not start
+("Schluessel host.key ist vorhanden, aber nicht lesbar oder
+beschaedigt - Abbruch. ..." or on Windows "Schluessel konnte nicht
+angelegt werden - Abbruch: ..."). The client reads client.key and
+known_hosts.txt before it opens a connection:
+
+    unreadable     (locked by a virus scanner or backup, permissions):
+                   no connection to the host. The client retries every
+                   2 s, writes this to the log once and connects by
+                   itself as soon as the file is readable.
+    damaged        (client.key has the wrong length, known_hosts.txt is
+                   not UTF-8, e.g. ANSI) or not writable, and likewise a
+                   changed fingerprint: the client does not try again
+                   ("Verbindung zu <Adresse> beendet: der Fehler bleibt
+                   bis zur Behebung - kein neuer Versuch"). After fixing
+                   the problem, reconnect yourself.
+
+UTF-8 with BOM works. Deleting a key file gives you a new identity. A
+new host.key means: authorized.txt stays valid, each client only deletes
+its line for this host in known_hosts.txt and checks the comparison code
+on the next connection. A new client.key means: pair again. For an
+existing authorized.txt:
+
+    Mac       Only lines beginning with 64 hex digits, blank lines and
+              comments (#) are allowed. If the file is unreadable, larger
+              than 1 MiB or a dangling link, or if it contains null
+              bytes, any other line (a BOM too) or not a single
+              authorization, the host rejects EVERY peer, known ones too
+              and also with --pair. Start line "... Freigabeliste
+              authorized.txt NICHT LESBAR ODER BESCHAEDIGT - jede
+              Gegenstelle wird abgewiesen, bis sie repariert oder mit
+              --forget geloescht ist", per connection (rate-limited)
+              "Abgewiesen: <Fingerabdruck> von <IP> - Freigabeliste
+              authorized.txt nicht lesbar oder beschaedigt".
+    Windows   Unreadable or not UTF-8: every peer is rejected
+              ("Freigabeliste: ... - jede Gegenstelle wird abgewiesen,
+              bis die Datei repariert ist"). Without a single valid line
+              (empty, only comments, truncated) unknown peers get in only
+              with --pair ("Freigabeliste: authorized.txt ist vorhanden,
+              enthaelt aber keine gueltige Freigabe - kein Erstkontakt,
+              ..."). Other lines are skipped.
+
+Remedy: repair the file or delete it with --forget. New authorizations
+and new entries in known_hosts.txt are appended; existing lines are left
+untouched. If an authorization cannot be saved, the peer does not get in
+("Abgewiesen: ... - Freigabe liess sich nicht speichern" on the Mac),
+and the pairing window stays open.
+
+Where the keys are stored:
+
+    Mac       ~/Library/Application Support/QuadChroma/
+              host.key, authorized.txt
+    Windows   %APPDATA%\QuadChroma\
+              client.key, known_hosts.txt
+
+To delete all authorizations on the Mac, start the host once with
+--forget. If authorized.txt cannot be deleted, it exits with exit code 8
+("Freigaben NICHT geloescht: <Grund> - Abbruch, die bisherigen
+Gegenstellen waeren weiter freigegeben.") instead of carrying on with the
+old authorizations; the Windows host does the same. A missing file
+counts as deleted.
+
+Mac as client (under construction)
+----------------------------------
+
+The same client also builds on the Mac (arm64): audio via AudioToolbox,
+clipboard via NSPasteboard (text and files), display on the CPU for now
+(no Metal, no graphics cards in the Display tab). Closing hides it in the
+menu bar; there is no desktop shortcut on the Mac. Build it with Rust
+and the FFmpeg from Homebrew:
+
+    cd client
+    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
+    ./target/release/quadchroma 192.168.178.194:9001
+
+Storage: ~/Library/Application Support/QuadChroma/ (client.key,
+known_hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
+einzel.sock and einzel.lock of the single instance) - the same folder as
+the host, separate files. The client creates a new folder for the owner
+only (0700), new keys and lists with 0600; existing files and folders
+keep their permissions. Pairing works as with any client: the host has
+to be started once with --pair.
+
+License note: the FFmpeg from Homebrew is a GPL build (libx264, libx265).
+That is fine for personal use; distributing the Mac client requires an
+LGPL build without GPL parts.
+
+Keys:
+
+    F9         statistics on and off (the menu sets which lines)
+    F10        menu - or hold ESC for two seconds
+    F11        full screen on and off
+    F12        pixel-exact rendering instead of stretched
+    Ctrl+Esc   back to the start screen
+
+Every key function is also a switch in the menu; nobody has to memorize
+the keys.
+
+Closing the window: notification area and menu bar
+--------------------------------------------------
+
+Closing (the X or Alt+F4, on the Mac the red button or Cmd+W on the
+start screen) does not quit the client, it hides it: on Windows as an
+icon in the notification area next to the clock, on the Mac as an icon
+at the top in the menu bar (the program icon in a single color; if that
+is not possible, "QC" appears there). A running session is disconnected
+as with "Disconnect" - the host stops working. While hidden, the client
+neither draws nor decodes; the search for hosts and the single instance
+(see below) keep running. On the Mac the window leaves full screen first
+and returns to it when opened again; while hidden, the app has no Dock
+icon there and does not appear in the app switcher.
+
+The icon is there from the start, not only after closing (except with
+tray=aus, see below):
+
+    Windows   Left-click, double-click or Enter shows the window,
+              right-click opens the menu.
+    Mac       A click opens the menu.
+
+The menu contains "Open" (bold on Windows), up to four found hosts as
+"Connect: <name>" and "Quit". "Connect" works like a click on the host
+row: a session to the same host stays, a session to another host is
+disconnected first. The tooltip reads "QuadChroma", during a session
+"QuadChroma - <name or address>" (the program uses an en dash instead
+of "-"). Names appear in the menu and in the tooltip with at most 40
+characters; longer ones end in "...". The first time the app is hidden,
+the hint "QuadChroma is still running in the notification area."
+(Windows, balloon) or "QuadChroma is still running in the menu bar."
+(Mac, bubble below the icon, 6 s) appears once. This is recorded in
+einstellungen.txt as tray_hinweis=1, but only once the hint was actually
+visible; with tray_hinweis=0 it appears once more.
+
+Quitting: "Quit" in the icon's menu, the "Quit" button or ESC on the
+start screen, on the Mac also Cmd+Q. A WM_CLOSE to the window only hides
+the app, like the X; a script ends it with taskkill /F or
+Stop-Process -Id. taskkill without /F acts like the X and has a side
+effect: it sends WM_CLOSE to all top-level windows of the process,
+including the invisible one of the single instance (see below), which
+closes as a result. If the app then keeps running in the notification
+area, a second start or a double-click on a shortcut can no longer find
+it and exits after 5 s with exit code 1 ("QuadChroma laeuft schon,
+antwortet aber nicht (<Grund>).", i.e. already running but not
+responding) until the app is quit.
+
+tray=aus in einstellungen.txt turns hiding off: no icon, and closing
+quits the program as it used to. The same applies without an icon: if
+it cannot be created (for example without Explorer), is not registered
+yet, or macOS does not show it (full menu bar, "Allow in the Menu Bar"
+switched off), closing quits the program. So the app never becomes
+invisible with no way back. If Explorer restarts, the icon registers
+itself again.
+
+To change this, edit the existing line tray=an to tray=aus (0, nein or
+off work too), and do it while the app is not running: the file is read
+only at start, and a running app writes it back with its own values on
+the next save (for example when it is first hidden, with F9 or after a
+change in the menu). tray= and tray_hinweis= apply only before the first
+line "host ..."; below it they belong to that host and are skipped.
+
+The log (protokoll.txt) records what happened; on the Mac the lines
+begin with "Menueleiste:" (menu bar) instead of "Infobereich:"
+(notification area):
+
+    "Infobereich: Symbol angelegt"
+    "Infobereich: kein Symbol (<Grund>) - Schliessen beendet das Programm"
+    "Infobereich: Symbol (noch) nicht angemeldet (<Grund>) - Schliessen
+     beendet, bis es steht"
+    "Infobereich: Fenster geschlossen - trenne <Adresse>"
+    "Infobereich: Fenster abgelegt, QuadChroma laeuft weiter"
+    "Infobereich: Hinweis nicht gezeigt - kommt beim naechsten Ablegen
+     noch einmal"
+    "Infobereich: Fenster wieder sichtbar"
+    "Infobereich: verbinde mit <Adresse>" or "Infobereich: trenne
+     <Adresse> und verbinde mit <Adresse>"
+    "Infobereich: Beenden"
+
+Self-test of the icon, without a connection, without the network
+announcement and without protokoll.txt:
+
+    quadchroma.exe --tray-selbsttest                       (Windows)
+    ./target/release/quadchroma --menueleiste-selbsttest   (Mac)
+
+It creates the icon, changes the tooltip and removes the icon again;
+exit code 0 means passed, 1 failed (on Windows for example in a session
+without Explorer, such as over ssh). The Mac test additionally checks
+the image, the menu including its commands and the bubble, shows the
+icon only briefly and reports the duration at the end. The switch of the
+other platform exits with 2.
+Only one app (single instance)
+------------------------------
+
+At most one client with a window runs per user session. If you start it a
+second time - by hand, with an address or by double-clicking a desktop
+shortcut -, the second start hands its address to the first one and exits
+with 0 ("QuadChroma laeuft schon - <Adresse> weitergereicht." or, without
+an address, "QuadChroma laeuft schon - nach vorn geholt."). The first one
+brings its window to the front, also from the notification area or the
+menu bar, and connects as if you had clicked "Connect": a session to the
+same host stays up, a session to a different host is disconnected first.
+Its log shows "Einzelinstanz: zweiter Start mit <Adresse> - verbinde" (or,
+for the two cases just named, "... - Sitzung dorthin laeuft schon" and
+"... - trenne <Adresse> und verbinde neu") or, for a second start without
+an address, "Einzelinstanz: zweiter Start ohne Adresse - Fenster nach
+vorn".
+
+This does not apply to anything that runs without a window: test mode
+(--headless), the host role (--host, --list, --messen), --verknuepfung,
+--shot and the self-tests (--tray-selbsttest, --menueleiste-selbsttest,
+--decodertest, --anzeigetest, --noisetest).
+
+Limits: an address longer than 508 bytes or containing control characters
+is not handed on by the second start; it only brings the app to the front
+and exits with 1 ("QuadChroma laeuft schon - nach vorn geholt, Adresse
+nicht weitergereicht (<Grund>)."). If the running app does not answer for
+5 s, the second start also exits with 1 ("QuadChroma laeuft schon,
+antwortet aber nicht (<Grund>)."). If the running app is just shutting
+down, the second start becomes the app itself and connects. If the single
+instance does not work at all, the app runs without it ("Einzelinstanz:
+nicht moeglich (<Grund>) - weiter ohne").
+
+On Windows a mutex (Local\QuadChroma-Client) identifies the first
+instance; the address is handed on via WM_COPYDATA to an invisible window
+of the class QuadChromaEinzel, and the second start passes its right to
+the foreground on to the first one. On the Mac it is a Unix socket
+einzel.sock with the lock einzel.lock, both in
+~/Library/Application Support/QuadChroma.
+
+Desktop shortcut (Windows only)
+-------------------------------
+
+For every host you can put a shortcut on the desktop. Double-clicking it
+connects at once - even when QuadChroma is already running or sits in the
+notification area, in which case it goes through the single instance. It
+is created
+
+    - on the start screen with the "Desktop shortcut" button at the right
+      of each found host's row,
+    - in the menu, "Encryption" tab, with the "Desktop shortcut" button
+      next to "Disconnect", for the connected host (name from the
+      announcement if the address matches, otherwise the address).
+
+The result stays in the message area or below the button for 6 s:
+"Shortcut created on the desktop: <file>", otherwise in amber "Shortcut
+not created: <reason>". The log shows "Verknuepfung angelegt: <Pfad>" or
+"Verknuepfung fuer <Adresse> nicht angelegt: <Grund>".
+
+The file is named "QuadChroma - <Name>.lnk" and is placed on the user's
+desktop, even when the desktop is redirected to OneDrive. A trailing
+".local" is removed from the name; characters that Windows does not allow
+in file names become "_", trailing dots and spaces are removed, at most 64
+characters. Without a name the address is used, with "_" instead of ":"
+("QuadChroma - 192.168.178.194_9001.lnk"). An existing file of the same
+name is overwritten - it is the same host. The shortcut calls
+
+    <Ordner der exe>\quadchroma.exe "192.168.178.194:9001"
+
+(<Ordner der exe> is the folder of the exe, which is also the working
+folder) - the same route as an address given at startup. Its icon is the
+program icon (four colored squares) from %APPDATA%\QuadChroma\quadchroma.ico;
+the file is written or renewed each time a shortcut is created. The exe
+carries the same icon as a resource, so Explorer shows it for
+quadchroma.exe too. The client draws the same icon itself at
+startup for its window, in the title bar and the taskbar, and for the
+notification area (on the Mac only for the menu bar, in one color). As
+the comment, Windows shows "QuadChroma: connect to <name> (<address>)" in
+the language of the interface.
+
+Limits: the shortcut points with its full path to the exe it was created
+with - if you move the exe, create it again. And it carries the address,
+not the name: if the host gets a new address, the double-click leads
+nowhere, and under the new address the host is a first contact for the
+client anyway (see "Encryption and pairing").
+
+Without a window and without a connection:
+
+    quadchroma.exe --verknuepfung <adresse> [--name <name>]
+                   [--ordner <verzeichnis>]
+
+creates it (<adresse> is the host address, <verzeichnis> the target
+folder; without --ordner on the desktop; without a port, 9001 applies),
+prints the path and exits with 0; otherwise it prints "Verknuepfung nicht
+angelegt: <Grund>" (shortcut not created) and returns 1 (for example
+without an address, with a switch that has no value, or when the folder
+does not exist). protokoll.txt is left untouched. On the Mac the switch
+exits with 2, saying that the desktop shortcut exists only on Windows
+("Die Desktop-Verknuepfung (--verknuepfung) gibt es nur unter Windows.").
+
+The menu
+--------
+
+Hold ESC for two seconds (that ESC then does not reach the Mac) or press
+F10. Five tabs:
+
+    Picture         bitrate, frame rate, gaming mode, fixed frame rate,
+                    sound, host display, codec choice
+    Display         fullscreen, pixel exact, statistics, nerd mode, which
+                    statistics lines, card for display and decoder
+                    (Automatic, Graphics card, Integrated, Processor)
+    Encryption      method, comparison code, fingerprint, Disconnect,
+                    desktop shortcut (Windows)
+    Shortcuts       every key that the client intercepts itself
+    Benchmark       measures codecs, frame rates and bitrates one after
+                    another (see below)
+
+Hovering the mouse over a switch immediately shows a sentence about what
+it does - in each of the 29 languages.
+
+The Mac applies a change at once and reports back what is actually in
+effect - so what is shown is never a request but the state on the other
+side. While the menu is open, mouse and keyboard belong to it and not to
+the Mac. The values are stored per host (by fingerprint, not by address)
+and set again automatically on the next connection.
+
+Nerd mode: the statistics become wider and show the latency chain as bars
+on a fixed millisecond scale - capture and queue, encoder, network,
+decoder, display - with a mark for "One frame" and one for one monitor
+refresh ("Monitor"), plus the load on the host (processor, graphics,
+memory, encoder time against the frame budget) and on the client
+(processor load, monitor rate, skipped frames). A link is marked as the
+bottleneck when the chain is longer than one frame and this link accounts
+for more than half of it.
+
+Fixed frame rate: normally the Mac sends a new frame only when something
+has actually changed - so the rate rises and falls with the content. With
+this switch it holds the configured rate, even when the screen is
+completely still. The timing becomes even, and no time is lost when
+something finally moves again.
+
+Measured on the Mac mini M1 at 1080p, target 120 frames/s:
+
+    off    30 frames/s      9 % CPU load
+    on    104 frames/s     25 % CPU load
+
+The bitrate barely rises (51 to 66 Mbit/s), because an unchanged frame
+costs almost nothing. What it does cost is constant load: the Mac's video
+unit keeps running as long as the switch is on.
+
+Without a viewer the host does no work: no capture, no encoder, and the
+display may go to sleep. Capture and encoder are created only when someone
+connects - which makes connecting take about one second longer - and
+disappear again as soon as the viewer is gone. Measured: 0.6 % CPU load
+when idle.
+
+Codec choice: in the menu (hold ESC for two seconds or press F10),
+"Picture" tab, you find the codecs the Mac actually supports - it queries
+its encoder itself at startup. On the M1 these are HEVC in 4:4:4 and
+4:2:0, each in 8 and 10 bit, and H.264. No host offers AV1 as long as the
+protocol and the client do not know it; it is grayed out and does not run
+in the benchmark, even if an older Windows host reports it. The switch
+happens while running; the picture stands still for a blink. Even with a
+still screen a keyframe follows right away: if the capture format changes
+along with the codec (the Mac captures 4:4:4 and 4:2:0 differently) and
+no new frame arrives, the Mac host converts the last frame into the new
+format ("Takt: letztes Bild von xf44 nach 420f umgerechnet
+(Aufnahmeformat gewechselt, kein neueres Bild)"; if that fails, the frame
+is discarded and the next one comes from the capture: "... liess sich
+nicht ... umrechnen - verworfen, das naechste kommt von der Aufnahme").
+The first real frame after that again goes out as a keyframe. Two modes
+carry the note "converted": the capture has no 4:4:4 in 8 bit, so there
+the Mac converts beforehand, and that costs an extra pass - keep this in
+mind for a fair comparison with the other modes.
+
+Measured over the network, 1080p, target 120 frames/s, software decoder:
+
+    HEVC 4:4:4 10 bit   about 24 ms, decoder  8.6 ms
+    HEVC 4:2:0  8 bit   about 19 ms, decoder  6.8 ms
+    H.264 High          about 33 ms, decoder 15.0 ms
+
+In test mode the switch can be triggered:
+
+    quadchroma.exe 192.168.178.194:9001 --headless --codec 3
+
+The number is the entry in the host's list (0 = HEVC 4:4:4 10 bit,
+3 = HEVC 4:2:0 8 bit, 4 = H.264). The address may be in any position.
+
+Also in test mode, --eingabeprobe checks the input path: as soon as the
+input channel is up, the client sends two mouse movements (center of the
+picture, then bottom right, one second apart) and exits one second later.
+Whether they arrived is shown by the pointer position on the host.
+Together with --bildschirm the probe waits until the request has gone out
+and the host has answered it (at most 5 s): the mouse lands on the
+requested display (see "Host display").
+
+Frame rate: the host never sends more frames than configured.
+ScreenCaptureKit likes to deliver 148 real frames per second on a 120 Hz
+display - each of them used to go through encoder, network and decoder.
+Now a frame gets the next free time slot or is dropped ("zu schnell", too
+fast, in the host's log), and the encoder never gets more than a few
+frames at once ("Encoder voll", encoder full) - better a skipped frame
+than a queue that delays every movement by seconds.
+
+The same applies to congestion on the network: if more than 2 MB for the
+viewer are waiting unsent (512 kB in gaming mode), the next frame does not
+even go into the encoder ("Stau", congestion, in the host's five-second
+status line). An encoded frame always goes out, so a tight link does not
+produce a chain of keyframes that only makes the congestion worse. Only
+the Windows host discards an encoded frame, when the backlog is already
+above 4 MB, and then forces a keyframe ("Stau ueber der harten Grenze
+(4096 kB): codiertes Bild verworfen, Vollbild erzwungen", at most every
+10 s). If the viewer takes nothing for 2 s during congestion, it counts
+as disconnected ("Zuschauer weg: nimmt seit 2 s nichts mehr ab (<n> Byte
+im Stau)"). What counts as progress is what the viewer takes - so audio,
+clipboard and pointer, which also go out during congestion, do not make a
+live viewer look hung. The Mac host checks this even with a still screen,
+every 5 s.
+
+Audio and control messages bypass the congestion rule, but have limits of
+their own. If the link is slower than the uncompressed audio (about
+3 Mbit/s), audio is dropped instead of pushing out the picture: the Mac
+host discards it as long as the backlog has been above the congestion
+limit for 2 s ("Ton verworfen: Rueckstand seit 2 s ueber der Staugrenze -
+Leitung langsamer als der Ton"), the Windows host as soon as more than
+512 kB of audio are waiting (128 kB in gaming mode; "Leitung langsamer
+als der Ton: Tonpaket verworfen (ueber 512 kB Ton wartet)").
+Both lines are rate-limited; the count appears in the five-second status
+line ("Ton: ..., N verworfen" or "| Ton verworfen: N", N being the number
+of discarded packets). The Windows host never discards control messages;
+a viewer that does not take more than 8 MB of them counts as disconnected
+("Zuschauer weg: nimmt ueber 8192 kB Steuernachrichten nicht ab").
+
+Without a fixed frame rate, both hosts deliver a skipped last frame late:
+if the newest frame was dropped as "zu schnell", during congestion or
+because the encoder was full, and no newer one came within one frame
+time, it goes into the encoder after all - so when a movement ends, the
+viewer still sees the final frame (with the software encoder h264_mf the
+Windows host keeps pushing until it is out, see the Windows host section).
+During congestion it waits until the link is free again. Both hosts
+measure the frame time from the arrival of the last frame, not from its
+capture. The Mac host counts it in the five-second status line as
+"nachgereicht" (delivered late); the Windows host counts it under
+"nachgelegt", without a line of its own. Frames delivered late do not
+count toward the measured latency.
+
+Gaming mode tightens the reins: more frequent keyframes and a smaller
+permitted backlog, so that nothing piles up during motion. It costs some
+bandwidth and gives steadier frames in return.
+
+The "Sound" switch in the same tab turns off audio transmission: the host
+then sends no audio packets (about 3 Mbit/s less), and the client plays
+nothing. The setting is stored per host. In test mode it is the fifth
+value of --set (--set 50,120,0,1,0 = sound off).
+
+If the output device goes away on Windows - headphones unplugged, format
+changed in the sound settings, a different default device chosen -, the
+client opens the then-current default device by itself after about one
+second and keeps playing; nobody has to reconnect. If there is no device
+at the moment, it tries again every half second. The log shows the reason
+("Ton: ... - Ausgabegeraet wird neu geoeffnet") and when it works again
+("Ton: Ausgabegeraet wieder offen"). If a device is missing already when
+connecting, it keeps searching the same way ("Ton: Ausgabegeraet oeffnen:
+<Grund> - neuer Versuch alle 500 ms", then "Ton: Ausgabegeraet offen").
+
+If the rate or channel count of the audio changes on the host - on the
+Mac, for example, an output device with 44.1 kHz, on Windows a device
+with a different rate -, the host announces the format anew, and the
+client rebuilds its output for it; it releases the old output first - if
+the rebuild fails, it stays silent rather than wrong. The Mac host logs
+"Tonformat gewechselt: <Rate> Hz, <n> Kanaele - neu angesagt".
+
+About the bitrate: the value is a cap, and the encoder does use all of it.
+150 Mbit/s means 150 Mbit/s with a moving picture. That is fine on your
+own network; otherwise better set 25 to 50. H.264 does not cope with very
+high values: at 500 Mbit/s Apple's encoder only manages about 30 frames
+per second.
+
+Decoder and display on Windows
+------------------------------
+
+Graphics cards: at startup the client enumerates the cards (log:
+"Karte 0: <Name> - Grafikkarte, <MB> MB, Ausgang ja/nein, UMA ja/nein" -
+card, name, role, memory, display output yes/no, unified memory yes/no)
+and assigns roles to them: "Integrated" is the card with shared memory
+(Intel Xe, AMD APU), "Graphics card" is any other - with two of them,
+"Graphics card 1" and "Graphics card 2". The "Display" tab has two rows
+of role buttons, one for the display and one for the decoder:
+
+    Automatic  Graphics card  Integrated  Processor
+
+Buttons without a matching card are left out; the tooltip names the
+detected card with its memory and whether a display is connected to it.
+
+Decoder: Automatic uses NVDEC (through FFmpeg's cuvid decoders) when an
+NVIDIA card is present, otherwise D3D11VA on the card that draws,
+otherwise software. "Graphics card" asks for the card (NVIDIA: NVDEC,
+others: D3D11VA), "Integrated" for D3D11VA on the integrated graphics,
+"Processor" for the CPU. In FFmpeg 9, D3D11VA handles only HEVC 4:2:0
+and H.264 - with a 4:4:4 codec the client says so and decodes in
+software; the codec can be changed in the "Picture" tab. A hardware
+decoder that accepts packets but delivers no picture for 1.5 s, or only
+unreadable ones, is replaced by software automatically; the reason is
+shown in the statistics and in the log. The choice takes effect at once.
+Command line: --decoder auto|gpu|gpu2|integriert|software (the old
+values nvidia/nvdec/cuvid count as gpu).
+
+Two NVIDIA cards: "Graphics card 1" and "Graphics card 2" decode on
+exactly the selected card. CUDA numbers the cards differently from
+Windows; the client matches them by LUID (log: "NVDEC: <Karte> ist
+CUDA-Geraet n", i.e. the card is CUDA device n; --decodertest lists
+"CUDA-Geraet n: <Karte>"). If the selected card cannot be matched, the
+client would rather decode in software and name the reason than decode
+on the wrong card. Automatic uses whatever CUDA lists as device 0.
+
+Display: with a graphics card the client draws through Direct3D 11. The
+raw planes from the decoder go to the card, conversion to RGB and
+scaling run there in shaders (bit-identical to the processor path), and
+the user interface sits on top as a separate layer. Frames are presented
+immediately, with at most one frame in flight, never waiting. Automatic
+takes the first card with a display output, otherwise the first NVIDIA
+card, otherwise the first card at all; without a card the processor
+path is used. At startup the client logs what it chose ("Anzeige: D3D11
+<Karte>, ..." or "Anzeige: Software"). The choice in the menu is saved
+and takes effect from the next start - until then a line below the
+buttons shows "applies from the next start". Command line: --anzeige
+auto|gpu|gpu2|integriert|cpu|warp and --adapter n; in einstellungen.txt
+they can be set permanently as anzeige=... and decoder=... entries.
+
+    quadchroma.exe --anzeigetest C:\ein\verzeichnis
+
+checks the card without a connection: compiles the shaders, runs every
+decoder format once through the card and compares the result with the
+processor path (zero tolerance at 1:1), writes difference images to the
+directory. Also runs without a card, on Windows' software rasterizer
+(WARP).
+
+Mouse pointer: the pointer shown is always the Windows pointer - that is
+what makes the mouse feel local. It takes the shape of the Mac pointer,
+though: arrow, hand over buttons, resize arrows at window edges, text
+cursor, spinning wait cursor. The host sends the shape only when it
+changes. The pointer is never hidden here - macOS hides its pointer while
+you type and keeps it hidden until the physical mouse moves, which,
+driven from the client, it never does. The size follows the picture
+scale: at 1:1 as large as on the Mac.
+
+Everything else goes to the Mac. What is transmitted is the position of
+the key, not the character, so umlauts and AltGr come out right without
+any mapping. The Windows key is the Mac's Command key.
+
+Host display
+------------
+
+The host streams exactly one display. Which one is set in the client's
+menu: "Picture" tab, "Screen" row, above the codec buttons. The row has
+an "Automatic" button and one button per display of the host with name,
+size and refresh rate ("X27 X1 - 1920x1080 - 120 Hz"; in the program
+with middle dots and a multiplication sign; without the Hz part if the
+host does not know the rate; without a name, the identifier is shown).
+The streamed display is shown in cyan; with Automatic, so is
+"Automatic", and with a fixed choice, so is the chosen entry, provided
+it is connected. A click on the entry that is already the requested one
+does nothing (with Automatic, the streamed entry is not the requested
+one - a click on it selects it as a fixed choice). Hovering the mouse
+over the row shows: "Which of the host's screens you see. Automatic
+follows the main screen; a fixed screen stays until you choose something
+else." In all languages other than German and English the row is called
+"<screen> of the host" (for example "Pantalla del host"), never the same
+word as the "Display" tab.
+
+After a click, the right end of the row shows "Switching screen ..." in
+amber; with the menu closed, the same notice appears above the picture
+as during a codec switch (if both are in progress, the box shows the
+codec switch). It goes away as soon as the host answers with its list
+and the request is fulfilled in it (with Automatic: the main display is
+being streamed) or the requested display is not connected at all, after
+5 s at the latest. If the requested display is not connected, the right
+end of the row shows "<identifier> not connected - fallback: <name>" in
+amber (in the program with an en dash). The row exists only with a host
+that supports the choice (bit 1 of its capabilities, see below); an
+older host never receives a request, and an older client ignores the
+list.
+
+Two modes, the same on both hosts:
+
+    Automatic     Default. The host streams its main display - on the
+                  Mac the one with the menu bar, on Windows the monitor
+                  that Windows lists as primary - and follows it when it
+                  changes: monitor connected, unplugged, switched in the
+                  settings. Without a restart, without a new viewer.
+    Fixed         The host streams the chosen display, recognized by
+                  its identifier. If it goes away, the host streams the
+                  main display as the fallback and tells the viewer
+                  (list with the request, the amber notice in the
+                  menu); when it comes back, the host switches back by
+                  itself. The request stays until someone chooses
+                  something else.
+
+The reason: on 26 September a monitor had been connected to the Mac mini
+and had become the main display. The host kept streaming the virtual
+display chosen at startup, which had no windows on it - the picture was
+empty, mouse and keyboard seemed dead. Now, in Automatic mode, the host
+follows the main display; anyone who wants the virtual display selects
+it as a fixed choice.
+
+The mode is a state of the host, not of the client: the host has one
+stream, the request applies to every viewer, the last request wins. The
+identifier is stable, not a list position:
+
+    Mac       v<Vendor>-m<Model>-s<Serial> from the display's numbers
+              (for example v1138-m1234-s0); two identical ones in the
+              list get -u<Unit> appended. The name is the display's
+              name from System Settings (NSScreen), otherwise
+              "Bildschirm <displayID>" (German for "display" plus its
+              ID). The host reads the names into a cache: at startup,
+              on every configuration change notification and every 5 s
+              in the service loop. If AppKit does not know a new
+              monitor yet at evaluation time, it first appears in the
+              list as "Bildschirm <displayID>"; the name arrives with
+              the next evaluation (request, configuration change
+              notification, new viewer), and a changed name counts as
+              a change of the list.
+    Windows   the second part of the monitor's device ID (from
+              MONITOR\ACR0501\{...}\0001 comes ACR0501); two identical
+              ones get -<list position> appended, which can change when
+              monitors are replugged. Without a device ID the device
+              name (\\.\DISPLAYn) is used. The name is Windows' monitor
+              name, otherwise the device description, otherwise the
+              device name.
+
+An identifier is at most 64 bytes, a name 48; anything longer is
+truncated at a character boundary.
+
+When the host re-evaluates: at startup, on every request, on every
+capture start (new viewer, recovery) and on every change of the
+displays. macOS reports such changes to the Mac host immediately; it
+re-evaluates 300 ms after the last notification (debounced - three
+notifications in quick succession are one change). The Windows host
+role re-enumerates its outputs in the capture thread every 2 s, and
+immediately after losing the Duplication; a monitor change is therefore
+noticed there after about 2 s. The target is the requested display if
+it is connected, otherwise the main display, otherwise the first one in
+the list, otherwise none ("no display", message 9). If the target
+differs from the streamed display, the host switches; without a viewer
+it only remembers the target, and the stream starts only with the next
+viewer.
+
+The switch works like a codec switch, in the stream's thread: stop the
+old stream, take the stream size from the new display (Mac: halved from
+3840 pixels wide or 2160 high, kept even, --out takes precedence;
+Windows: halved from 3840 wide), open a new encoder if the size differs,
+then send the viewer message 7 (SWITCH with the current codec - the
+client rebuilds its decoder), message 1 (INFO with the dimensions), the
+new list (12) and then the first frame as a keyframe; the mouse follows
+the picture. On the wire the list therefore comes before the keyframe:
+the Windows host role sends it right after setting up the Duplication,
+before the encoder opens; the Mac host right after the new stream has
+started successfully, and ScreenCaptureKit delivers the first frame
+after that (the hosttest checks the sequence 7 1 12). 7 and 1 are sent
+even when the size stays the same. The encoder then stays in place on
+the Mac; on Windows only an encoder on the processor path, and only if
+the new capture takes the processor path as well - an encoder on the
+texture path (its pool is tied to the device of the old Duplication) is
+reopened on every switch, even at the same size. The last frame of the
+old display is dropped; the first frame afterwards always comes from the
+new one. The picture freezes briefly during the switch (Mac: stopping
+and restarting the stream; Windows: new Duplication, new encoder where
+it does not stay in place). The client also rebuilds its decoder on an
+INFO with new dimensions and waits for a keyframe ("Strominfo: neue
+Groesse BxH (vorher BxH) - Decoder neu, warte auf Vollbild" in
+protokoll.txt). If a codec switch is in progress, the display switch
+waits until it has finished: the Mac host checks every 200 ms and
+switches anyway after 5 s; meanwhile every request gets the list as an
+immediate answer, and once more after the switch. If the new stream
+fails, the fallback path for a display loss applies (message 9, new
+attempt: Mac after 2 s, Windows every 2 s) - on the Mac only with a
+viewer; without a viewer only the target is kept for the next one. If
+macOS temporarily reports no display at all, the stream keeps running.
+
+A display loss is not a switch: if the streamed display is unplugged,
+the stream ends and the host sets it up again - on the display chosen at
+that point, that is, with a fixed request, on the fallback. Mac:
+ScreenCaptureKit reports the end ("Aufnahme gestoppt: <Fehler> (Code
+<n>)", capture stopped); with a viewer, message 9 follows and after 2 s
+the recovery: a new choice ("Bildschirm gewaehlt: ... -
+Ausweichplatz"), a new stream without a "Bildschirmwechsel" line
+(display switch), SWITCH and INFO only if the stream size differs, then
+the list, message 9 withdrawn and "Aufnahme wiederhergestellt: ...".
+Without a display, "Kein Bildschirm - warte auf seine Rueckkehr" (no
+display, waiting for it to return) appears once, then an attempt every
+3 s; if the start fails, "Aufnahme: neuer Versuch in 3 s". If macOS's
+configuration change notification arrives before the stream ends, it is
+an ordinary switch with a line ("Ausweichplatz", fallback, or
+"Hauptbildschirm gewechselt", main display changed). Windows host role:
+the Duplication reports the loss ("Aufnahme verloren: <Fehler> -
+Nachricht 9, neuer Versuch alle 2 s"), the outputs are re-enumerated at
+once - if there is a new target, "Bildschirmwechsel: <alt> -> <neu>
+(Ausweichplatz) - ohne laufenden Strom nur das Ziel, gilt ab dem
+naechsten Aufbau" (without a running stream only the target is set; it
+applies from the next setup) is logged and the list goes out right away;
+if the list is empty, only "Kein Bildschirm - warte auf seine
+Rueckkehr" -, and the setup attempt every 2 s takes the target: SWITCH
+and INFO as soon as it is a different display (INFO also on a different
+size), then "Aufnahme wiederhergestellt: ..." (capture restored) and a
+keyframe.
+
+bildschirm.txt: the request is stored in the host's data folder, exactly
+one line, "auto" or the identifier:
+
+    Mac       ~/Library/Application Support/QuadChroma/bildschirm.txt
+    Windows   %APPDATA%\QuadChroma\bildschirm.txt
+
+Written on every request from the menu (first to a temporary file next
+to it, which is then renamed; the Windows host role removes leftover
+bildschirm.*.neu files at startup), read at startup. If the file is
+missing, Automatic applies without a message; if it is unreadable or
+damaged (empty, more than one line, not UTF-8, control characters, over
+64 bytes), Automatic applies with the line "Bildschirmwahl: bildschirm.txt
+unlesbar - Automatik", and the file stays as it is - it is never replaced
+silently. Editing it by hand works too, while the host is not running.
+
+--display N (Mac) or --output n (Windows host role) pins, for this run,
+the display at position N of --list as the request (its identifier is
+remembered as soon as the list has been read once), without changing
+bildschirm.txt; a request from the menu overrides the pin and is saved.
+A position out of range produces a log line, and then the file or
+Automatic applies. --list shows for each display the identifier, name,
+size, refresh rate and which one is the main display.
+
+Test mode: --bildschirm <identifier|auto> sends the request once, as
+soon as the input channel is up and the host has reported that it
+supports the choice ("Bildschirmwunsch gesendet: <Kennung|auto>"; with
+a host without bit 1 it is not sent: "Bildschirmwunsch nicht gesendet:
+der Host kennt keine Bildschirmwahl"). Every list from the host produces
+a line ([Haupt] = main display, [gestreamt] = streamed), in window mode
+in protokoll.txt:
+
+    "Bildschirme des Hosts (Wunsch <Kennung|Automatik>): <Name>
+     <Kennung> <B>x<H> <Hz> Hz [Haupt] [gestreamt]; ..."
+                                        (no entries: "...: keine")
+
+The status line every three seconds carries, after the codec, the field
+"| Strom <B>x<H>@<fps>" (stream width x height @ frame rate; "?" without
+stream information - also right after connecting, the dimensions of a
+previous host do not linger), so that a switch is visible even when the
+codec stays the same. --eingabeprobe waits for the switch: the probe
+goes out only once the request has been sent and answered by the host
+(a list with the request; without an answer, after 5 s), and quits the
+client about 2 s later. The mouse therefore lands on the requested
+display (see "The menu").
+
+    quadchroma.exe 192.168.178.194:9001 --headless --bildschirm v0-m0-s0
+    quadchroma.exe 192.168.178.194:9001 --headless --bildschirm auto
+
+Log lines of the Mac host (/tmp/quadchroma-m1.log); <Text> is
+'Kennung <n> (<Kennung>) "<Name>"' (<n> is the macOS display ID), for
+example 'Kennung 2 (v1138-m1234-s0) "X27 X1"'. Placeholders: <Kennung>
+identifier, <B>x<H> width x height, <alt>/<neu> old/new, <Grund>
+reason, <Fehler> error:
+
+    "Bildschirmwahl: Wunsch <Kennung> aus bildschirm.txt"
+    "Bildschirmwahl: bildschirm.txt unlesbar - Automatik"
+    "Bildschirm --display N: <Text> gilt als Wunsch fuer diesen Lauf"
+    "Bildschirm N nicht verfuegbar (M in der Liste) - Automatik" or
+     "... - der Wunsch aus bildschirm.txt gilt"
+    "Bildschirm <Text> (<B>x<H> Pixel, <Hz> Hz) -> <B>x<H>, <fps> fps
+     - Automatik (folgt dem Hauptbildschirm)" or "... - Wunsch
+     <Kennung>"                                 (at service start)
+    "Bildschirm gewaehlt: <Text>, <B>x<H> Pixel, <Hz> Hz
+     [ (Hauptbildschirm)][ - Ausweichplatz]"       (once per target)
+    "Aufnahme gestartet: Bildschirm <B>x<H>, <Hz> Hz, <Text> -> <B>x<H>"
+    "Bildschirmwunsch: <Kennung|Automatik>" (plus " - bildschirm.txt
+     liess sich nicht schreiben" if saving fails)
+    "Bildschirmwunsch: <Kennung> - nicht angeschlossen, Ausweichplatz
+     <Text>"
+    "Bildschirmwunsch ungueltig (<n> Byte) - uebergangen"
+    "Bildschirmwunsch <Kennung|Automatik> verworfen: Aufnahme laeuft
+     noch nicht"
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" with the reasons
+     "Wunsch des Zuschauers" (viewer's request), "Wunsch des
+     Zuschauers: Automatik" (the viewer switched to Automatic),
+     "Hauptbildschirm gewechselt" (main display changed),
+     "Ausweichplatz" (fallback) and "zurueck zum gewuenschten
+     Bildschirm" (back to the requested display)
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>) nicht vollzogen"
+     (plus " - Ausweichweg wie beim Bildschirmverlust" if a viewer is
+     present; without a viewer only the target is kept)
+    "Bildschirmwechsel auf <Text> wartet auf den laufenden Codecwechsel"
+    "Codecwechsel nach 5 s nicht fertig - Bildschirmwechsel trotzdem"
+    "Bildschirme nicht abrufbar - der Stand bleibt"
+    "Kein Bildschirm in der Liste - der laufende Strom bleibt"
+    "Kein Bildschirm - Abbruch"                              (at startup)
+    "Aufnahme gestoppt: <Fehler> (Code <n>)"             (display loss)
+    "Kein Bildschirm - warte auf seine Rueckkehr"
+    "Aufnahme: neuer Versuch in 3 s"
+    "Aufnahme wiederhergestellt: Bildschirm <B>x<H>, <Hz> Hz, <Text>"
+
+--list writes for each display "Display N: id=<n>, Kennung <Kennung>,
+Name "<Name>", <B> x <H> Pixel, <Hz> Hz  (Hauptbildschirm)".
+
+Log lines of the Windows host role (host-protokoll.txt); <Text> is
+"<Kennung> (<Name>)", for example "ACR0501 (X27 X1)":
+
+    "Ausgang N: \\.\DISPLAYn <B>x<H> bei (x,y)  an Karte K (<Karte>)
+     [ (Hauptbildschirm)]  Kennung <Kennung> (<Name>), <Hz> Hz"
+                                                  (start and --list)
+    "Bildschirmwahl: Automatik (bildschirm.txt)" or
+     "Bildschirmwahl: <Kennung> (bildschirm.txt)"
+    "Bildschirmwahl: bildschirm.txt unlesbar - Automatik"
+    "Bildschirmwahl: N liegengebliebene temporaere Datei(en)
+     bildschirm.*.neu entfernt"
+    "Bildschirmwahl: Wunsch nicht gespeichert (<Grund>)" or
+     "Bildschirmwahl: kein Ablageordner - Wunsch nicht gespeichert"
+    "--output n: Bildschirm <Text> gilt fuer diesen Lauf (bildschirm.txt
+     bleibt)"
+    "Ausgang n nicht verfuegbar (M in der Liste) - kein Pin, es gilt
+     bildschirm.txt bzw. der Hauptbildschirm"
+    "Ausgang gewaehlt: \\.\DISPLAYn <B>x<H> bei (x,y) an Karte K
+     [ (Hauptbildschirm)], Kennung <Kennung> (<Name>), <Hz> Hz
+     [ - gewuenschter Bildschirm | - Ausweichplatz, <Kennung> nicht
+     angeschlossen]"
+    "Bildschirmwunsch: <Kennung>" or "Bildschirmwunsch: Automatik"
+     (plus " (laeuft bereits)" when there is nothing to switch)
+    "Bildschirmwunsch: <Kennung> - nicht angeschlossen, Ausweichplatz
+     <Text>"
+    "Bildschirmwunsch: <Kennung|Automatik> - <Grund>, kein Wechsel
+     moeglich"          (without capture: canned source, no DXGI
+                         output, no encoder; the answer is the old
+                         list)
+    "Bildschirmwunsch: ungueltig (<n> Byte) - uebergangen"
+    "Bildschirmwechsel: <alt> -> <neu> (<Grund>)" with the same five
+     reasons; as long as no Duplication is set up - no viewer, or a
+     loss in progress -, with the suffix " - ohne laufenden Strom nur
+     das Ziel, gilt ab dem naechsten Aufbau". Only between two
+     displays: if the list is empty or becomes empty, there is no
+     line.
+    "Aufnahme verloren: <Fehler> - Nachricht 9, neuer Versuch alle 2 s"
+    "Kein Bildschirm - warte auf seine Rueckkehr"
+    "Aufnahme wiederhergestellt: \\.\DISPLAYn <B>x<H> an Karte K
+     (<Karte>), Format ..., Strom <B>x<H>, Quelle Textur|Prozessorweg"
+                                        (like "Aufnahme gestartet: ...")
+    "Ausgaenge: <Fehler> - die letzte Liste gilt weiter", later
+     "Ausgaenge: wieder aufzaehlbar"
+
+Wire messages (header as everywhere else):
+
+    12  Displays      Host -> Client, video channel: u8 version (1), u8
+                      count (0 to 16), u8 length of the request (0 =
+                      Automatic), u8 0, the identifier of the request
+                      (even if that display is not connected at the
+                      moment), then per entry u8 identifier length (1
+                      to 64), u8 name length (0 to 48), u16 width, u16
+                      height in pixels, u16 Hz (0 = unknown), u8 flags
+                      (bit 0 main display, bit 1 being streamed), u8 0,
+                      identifier, name (UTF-8). At most 2020 bytes. Sent
+                      to every new viewer right after the capabilities
+                      (11), after every switch, after every change of
+                      the list and as the answer to every request,
+                      including one that cannot be fulfilled. The
+                      client reads cautiously: an unknown version or
+                      malformed bytes leave the last good list in
+                      place, more than 16 entries are cut to 16.
+    70  Request       Client -> Host, input channel: u8 identifier
+                      length (0 = Automatic, otherwise 1 to 64), then
+                      the identifier - at most 65 bytes (on the hosts'
+                      input channel the limit of 256 bytes applies, as
+                      for all small types). The host ignores invalid
+                      data (length, not UTF-8, control characters), and
+                      the channel stays open. State message: if the
+                      input channel comes up only later, the client
+                      sends the last request then. Sent only to a host
+                      that has reported bit 1 in this session.
+
+Bit 1 in the capabilities (11) is called "Bildschirmwahl" (display
+selection); both hosts report 3 (files and display selection). In its
+own capabilities (69) the client still reports only bit 0.
+
+Test vector: the list with Automatic, "X27 X1" (v1138-m1234-s0,
+1920x1080, 120 Hz, main and streamed) and "Virtuell 16:9" (v0-m0-s0,
+1920x1080, 240 Hz) is
+
+    01 02 00 00
+    0e 06 80 07 38 04 78 00 03 00  76 31 31 33 38 2d 6d 31 32 33 34
+    2d 73 30  58 32 37 20 58 31
+    08 0d 80 07 38 04 f0 00 00 00  76 30 2d 6d 30 2d 73 30  56 69 72
+    74 75 65 6c 6c 20 31 36 3a 39
+
+the request for v0-m0-s0 is "08 76 30 2d 6d 30 2d 73 30", Automatic
+"00". Both hosts and the client generate and parse these bytes in their
+tests; the Mac host's hosttest (section Bildschirm) plays through the
+switching with stand-ins for the list and the stream and with real
+encoders, the tests of the Windows host role cover the choice, the
+identifiers, bildschirm.txt, the request over the real input channel
+and the greeting with 3 and 12.
+
+Verified on real hardware (26 September 2026, Windows client against
+the Mac host with two displays): request for the second display with
+switch, list and stream, the mouse via --eingabeprobe on the requested
+display, back with "auto", bildschirm.txt. Not yet verified on real
+hardware, only in test harnesses and in the code: for the Windows host
+role the switch itself (new Duplication, Switch, Info, keyframe, list
+afterwards; at the same size the encoder on the processor path stays in
+place) - it needs two real outputs, and the VM has one -, and there also
+identifier, name and refresh rate from real monitors; for the Mac host
+the main display switch live, including names from AppKit.
+
+Clipboard
+---------
+
+Copied text goes in both directions: from the client to the host over the
+input channel (9002), back over the video channel (9001); text up to
+4 MB. Copied files and folders travel over the same channels, see the
+next section. The same rule applies on every side - Mac or Windows, host
+or client: whatever a program marks as confidential stays on the
+computer where it was copied. On the Mac that is the marker
+org.nspasteboard.ConcealedType (password managers such as 1Password or
+KeePassXC), on Windows ExcludeClipboardContentFromMonitorProcessing or
+"Clipboard Viewer Ignore" (KeePass, for example). The log then shows
+"Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen"
+(the entry is marked as concealed and was not transferred). So a
+password cannot be copied across - that is intentional, and it applies
+to files as well; on the Mac a single concealed entry is enough to hold
+everything back. Of several text entries, only the first goes across on
+the Mac. If there is a file list on the clipboard, no text goes out on
+either side - not even the file name that Finder additionally puts
+there as text.
+
+Only what is copied during a session is sent; whatever was copied
+before does not go across on connecting either. Without a counterpart
+the client (Windows and Mac alike) does not read the clipboard at all,
+and the Windows host likewise reads it only while a viewer is
+connected - otherwise every copied password would show up in the log as
+"verdeckt" (concealed) even without any connection. The Mac host, too,
+reads the content only while a viewer is connected; without one it
+merely keeps track of whether something has changed.
+
+Whatever arrives is meant to end up in no history. On Windows it goes
+neither into the clipboard history (Win+V) nor into the cloud clipboard,
+and clipboard managers skip it. On the Mac - host and client alike - it
+carries org.nspasteboard.TransientType and AutoGeneratedType, the markers
+by which clipboard managers recognize transient content, and it stays on
+this Mac only, not in Universal Clipboard for iPhone and iPad. This
+applies to text as well as to received file lists.
+
+Files via the clipboard
+-----------------------
+
+Files and folders are copied as usual - "Copy" in Explorer or in
+Finder - and pasted on the other side. This works in both directions,
+between the client (Windows or Mac) and any host (Mac or Windows host
+role), over the existing encrypted connection, so only between paired
+devices. Unlike with RDP, the transfer starts as soon as you copy, not
+only when you paste: the other side writes the files into a directory
+of its own (see "Receive directory") and, once everything has arrived,
+puts them on its clipboard as a file list - this replaces whatever is on
+it at that moment. "Paste" in Explorer or Finder copies them from there
+to the desired location. Cut works like copy: the source stays where it
+is. If the clipboard on Windows is busy when the list is put there, this
+is retried for about 2 s; if it fails, the transfer is aborted (in the
+client "clipboard not available").
+
+As with text, the clipboard is read only during a session; whatever was
+copied before does not go across on connecting. A single copy often
+triggers several clipboard notifications. On Windows (client and host
+role) and in the Mac client, the clipboard is therefore read only once
+it has been quiet for 150 ms, and the same file list goes out only once
+within 2 s ("Zwischenablage: dieselbe Dateiliste noch einmal gemeldet -
+uebergangen", the same file list was reported again and is skipped).
+New content - text or other files - aborts a running send from this
+side. If you copy received files again, they do not go back ("Dateien:
+nicht gesendet, sie stammen aus einem Empfang", on the Mac host
+"Dateien: nicht gesendet (stammen aus einem Empfang dieses Hosts)": not
+sent because they come from a receive).
+
+Right after connecting, the client often does not know yet whether the
+host can handle files, and the input channel may not be up yet. A copy
+then waits up to 5 s ("Dateien: N Eintraege vorgemerkt - die
+Faehigkeiten des Hosts stehen noch aus (hoechstens 5 s)", N entries
+queued while the host's capabilities are still pending) and goes out as
+soon as the report is in. Likewise, the Windows host role holds a copy
+back for up to 5 s until the viewer's input channel has reported what it
+can do ("Dateien: Zuschauer meldet Dateien - die vorgemerkte Liste geht
+hinaus", the viewer reports file support and the queued list goes out).
+The Mac host queues nothing; without an input channel it writes
+"Dateien: nicht gesendet (Zuschauer ohne Eingabekanal)" (not sent, the
+viewer has no input channel).
+
+Indicator (only in the client; the hosts write everything to the log): a
+thin line overlaid at the bottom center of the picture, one per
+direction, while the transfer is running and for 6 s afterwards:
+
+    "Sending files: 3.1 of 12.4 MB"
+    "Receiving files: 3.1 of 12.4 MB"
+    "Files transferred: 2"                 sent and acknowledged
+    "Files ready to paste: 2"              received and on the clipboard
+    "File transfer aborted: <reason>"
+    "Files not transferred: more than 4 GB or 10,000 items"
+    "The other side cannot receive files yet."
+
+The number is that of the top-level entries, i.e. of what was selected
+when copying. The reason is "by this device", "by the other side",
+"connection interrupted", "timeout, no progress", "not enough disk
+space", "invalid data", "read error", "write error" or "clipboard not
+available"; details are in protokoll.txt. Results are shown in cyan;
+aborts, limits and "The other side cannot ..." (once per session) in
+amber. "Files not transferred: ..." appears for each of the limits
+below, even if only the entry list were over 1 MiB, and likewise when an
+offer is rejected with acknowledgment 2 - in both directions.
+
+Limits: at most 4 GiB (4295 MB) and 10,000 entries - files and folders -
+per copy, and the entry list may be at most 1 MiB long. Beyond that
+nothing goes out ("Dateien: nicht gesendet, zu gross (5368,7 MB,
+hoechstens 4295,0 MB)" or "(mehr als 10000 Eintraege)" or "(Dateiliste
+ueber 1048576 Byte)"; on the Mac host "Dateien: abgelehnt (mehr als 4 GB
+oder 10000 Eintraege) - nichts gesendet" or "Dateien: abgelehnt (Liste
+der Eintraege ueber 1 MiB) - nichts gesendet"). A path may be at most
+1024 bytes long and 32 levels deep, a name 255 bytes. The receiver
+accepts only if 1 GiB is still free afterwards (Windows and Mac host);
+the Mac client does not check this in advance and aborts cleanly on a
+write error.
+
+Whatever the sender leaves out is logged with one line each, "Dateien:
+uebersprungen (<was>): <Pfad>" (skipped, with the kind and the path):
+links (symbolic links, on Windows also junctions - they are never
+followed), special files such as FIFOs, names the other side would have
+to reject ("\", not UTF-8, too long, too deep), and names a receiver
+would see as identical: after the strictest sanitization (the Windows
+one, see below), in NFC and ignoring case. Of such duplicates only the
+first goes out; this also affects files with the same name from
+different folders (for this the Mac host writes "Dateien: doppelter
+Name <Name> - nur der erste wird gesendet", only the first one is sent).
+Names go out in NFC; Finder often supplies them decomposed. A file goes
+out only if, when opened, it is still the same as when it was listed
+(Unix: device and inode, Windows: the final path); otherwise, and if it
+is shorter than announced, the send aborts with a read error. If it has
+grown, only the announced size goes out.
+
+Low priority ("latency over bandwidth"): video, audio and input go
+first.
+
+    Window        At most 256 KiB are in flight unacknowledged, in
+                  Gaming mode 64 KiB; switching Gaming mode takes effect
+                  immediately on a running send. The Windows host role
+                  always sends with at most 64 KiB: Windows cannot
+                  measure what is in the kernel's send buffer
+                  (256 KiB), and the small window makes up for that. It
+                  costs throughput, at most 64 KiB per round trip - at a
+                  20 ms round-trip time that is about 3.3 MB/s.
+    Client        The input channel's writer thread first writes all
+                  pending input (keys, mouse, settings), then at most
+                  one file packet; there is never more than one waiting.
+                  The input channel's send buffer is only 64 KiB: ahead
+                  of a keystroke there are at most 64 KiB of file data
+                  in the kernel. Acknowledgments are not deprioritized.
+    Windows       A file packet enters the video channel's queue only if
+    host role     no other one is waiting there and at most 128 KiB are
+                  queued; acknowledgments bypass it as a small control
+                  message.
+    Mac host      Files, including the entry list, wait as long as more
+                  than 128 KiB are in the video channel's send buffer;
+                  the sender checks every 2 ms.
+    Threads       Sending and receiving run in threads of their own with
+                  lower priority: Windows "below normal", macOS QoS
+                  "utility". The Mac host sends with "default" and
+                  relative priority -15, because under "utility" macOS
+                  turned a 2 ms wait into about 10 ms. The Mac client
+                  sends under "utility"; macOS stretches deadlines and
+                  sleeps considerably there (in the code's model 20 MB
+                  in 4.1 instead of 1.1 s). How fast it really sends has
+                  not been measured yet.
+
+The entry list (up to 1 MiB) goes out as a single packet: before that it
+waits like any file packet, but it cannot be split. On a thin link,
+keystrokes or frames therefore wait behind it for a moment.
+
+Abort: A send ends when new content is copied on its side (text or other
+files); its end goes out before the new offer, and the client and the
+Windows host role wait at most about 1.5 s for that. Every transfer ends
+when the session ends or another viewer takes over, and when there is
+no progress for 30 s (the sender gets no new acknowledgment, the
+receiver no chunk). If the client loses the input channel during a send
+to the host, it aborts immediately instead of only after 30 s
+("Dateien: Eingabekanal N verloren - Sendung K abgebrochen", input
+channel N lost, send K aborted); its end goes out on the new input
+channel so that the host discards the half-filled directory at once (the
+Mac host discards whatever came over the lost channel anyway).
+Half-received data is deleted; aborted files have to be copied again. A
+lost acknowledgment holds nothing up: the receiver in the client and in
+the Windows host role repeats its state every second while idle.
+
+Receive directory: Received files are stored in the user's temp folder,
+never on the Desktop or in Documents or Downloads:
+
+    Windows client       %TEMP%\QuadChroma-Ablage
+    Mac client           $TMPDIR/QuadChroma-Ablage
+    Windows host role    %TEMP%\QuadChroma-Host-Ablage
+    Mac host             $TMPDIR/QuadChroma-Host-Ablage
+ Client and host have separate folders so that neither clears away the
+other's files when both run under the same user. On macOS the base
+directory has permissions 0700. Each transfer gets a subdirectory
+<unix-ms>-<kennung> (<kennung> is the transfer ID); while it is running,
+the marker <unix-ms>-<kennung>.laeuft sits next to it. After each
+complete receive the three newest transfers are kept (always including
+the one just stored, even if the clock has jumped back); older ones are
+deleted. At startup, whatever is older than 24 h is removed, as is
+whatever an earlier run left half-received: the client and the Windows
+host role write the process ID and start time into the marker and clear
+away a transfer whose process is no longer alive (also at every cleanup
+after that); the Mac host deletes every transfer with a marker at
+startup. Running transfers are neither counted nor deleted, links are
+never followed, and deletion happens only within the program's own base
+directory. The log shows "Dateien: N alte Uebertragungsverzeichnisse beim
+Start geloescht" (client), "Dateien: N Uebertragungen geloescht, aelter
+als 24 h oder verwaist (<Basis>)" (Windows host role) or "Dateien: N
+unfertige Uebertragung(en) eines frueheren Laufs geloescht" (Mac host),
+each with the number N of transfers deleted. If the Mac host's base
+directory is a link or belongs to another user, it cleans up nothing
+("Dateien: Aufraeumen ausgelassen - ...", cleanup skipped).
+
+Names at the receiver: it checks everything that arrives as if it were
+hostile. The whole offer is rejected (acknowledgment 4, nothing is left
+behind) for an empty path, "/" at the start, an empty component, "." or
+"..", NUL or "\" in the path, paths that are too long or too deep, the
+wrong order (a folder after its contents), invalid UTF-8, a wrong total
+and names that are duplicates after sanitization. More than 10,000
+entries or more than 4 GiB result in acknowledgment 2, and so does an
+offer over 1 MiB at the client; at the hosts such an offer never
+arrives, their input channel ends above that size without an
+acknowledgment (see the upper limits below). Too little space results
+in acknowledgment 3 (not at the Mac client, which does not check the
+space in advance). Only what is not a valid name on this particular
+system is sanitized:
+
+    Windows   < > : " | ? * and control characters become "_", as do
+              trailing dots and spaces; device names (CON, PRN, AUX,
+              NUL, CONIN$, CONOUT$, COM0-9, LPT0-9), also with an
+              extension such as con.txt and in any capitalization, get a
+              "_" in front. Duplicate means: identical except for upper
+              and lower case.
+    Mac       Only control characters become "_", ":" stays. Duplicate
+              means: identical after NFC and ignoring case, including ss
+              and sharp s - the way APFS sees it. The Mac host creates
+              the names in NFC.
+
+Files are written only into the fresh transfer directory; every file is
+newly created, and links are never created or followed.
+
+Older peers: The other side states when connecting whether it can
+handle files (capabilities, messages 11 and 69, see below). An older
+version states nothing; then nothing goes out - an older host would
+otherwise drop the input channel, since apart from text it accepts only
+256 bytes per message there - and a notice appears:
+
+    Client               once per session "The other side cannot
+                         receive files yet.", in the log "Dateien: Host
+                         kann keine Dateien empfangen (aelterer Host)"
+    Windows host role    once per viewer, after 5 s: "Dateien: nicht
+                         gesendet, der Eingabekanal des Zuschauers hat
+                         in 5,0 s keine Faehigkeiten gemeldet" (without
+                         an input channel "... stand nach 5,0 s noch
+                         nicht"); if it reports capabilities without
+                         files, "Dateien: Zuschauer kann keine Dateien
+                         empfangen (aelterer Client)"
+    Mac host             once per session "Dateien: Zuschauer kann
+                         keine Dateien empfangen (aelterer Client)"
+
+An older client simply ignores message 11.
+
+On the Mac: If you copy files there - on the host as on the client -
+from Desktop, Documents or Downloads, QuadChroma reads them from there,
+and macOS may ask once whether QuadChroma may access that folder.
+Without permission, reading fails; the log gives the reason. As of
+macOS 15.4, even reading the clipboard can trigger a system prompt
+(pasting from another app), for file references as well as for text.
+Received files, on the other hand, never end up in these folders but in
+the temp folder; Finder copies them from there when pasting.
+
+Measured in the integration test of the final state (24 September 2026)
+on the VM without a graphics card, with the Windows host role and the
+client on the same machine, 1 GiB each, bit-identical:
+- Client -> host: about 30 MB/s. The VM's software encoder took longer
+  meanwhile: about 60 ms more latency and 2 frames per second fewer.
+  The cause has not been determined; it is not the CPU load.
+- Host -> client: 69 to 93 MB/s, without any measurable effect on
+  picture and latency.
+In both directions the host reported no congestion and no dropped frame.
+In the LAN from the Windows client to the Mac host: 209.7 MB in 7.4 s,
+i.e. 28 MB/s, at an unchanged rate of about 114 frames per second and
+30 to 37 ms latency.
+
+Log lines: in the client in protokoll.txt, in the Windows host role in
+host-protokoll.txt, in the Mac host in /tmp/quadchroma-m1.log. These
+read the same on all sides (sending, sent and acknowledged, receiving,
+received and put on the clipboard, rejected, aborted, skipped, nothing
+to send); only the reasons in parentheses differ:
+
+    "Dateien: sende 3 Eintraege, 12,4 MB"    (hosts: "... an <IP>")
+    "Dateien: gesendet und quittiert (12,4 MB in 1,8 s)"
+    "Dateien: empfange 3 Eintraege, 12,4 MB"
+    "Dateien: empfangen 3 Eintraege, 12,4 MB - in die Ablage gelegt"
+    "Dateien: abgelehnt (<Grund>)"      before acceptance; at the sender
+                                        e.g. "(Gegenseite: zu wenig
+                                        Platz)"
+    "Dateien: abgebrochen (<Grund>)"    after it, in the client e.g.
+                                        "(hier abgebrochen)", "(Verbindung
+                                        weg)", "(Gegenseite: abgebrochen)"
+                                        or "(Zeitueberschreitung, kein
+                                        Fortschritt)"
+    "Dateien: uebersprungen (<was>): <Pfad>"
+    "Dateien: nichts zu senden"
+
+Additionally in the client and in the Windows host role (the third line:
+acknowledgment N not sent because the path stayed full; the last two:
+file list not readable, file list not put on the clipboard):
+
+    "Dateien: nicht gesendet, zu gross (<Grund>)"
+    "Dateien: nicht gesendet, sie stammen aus einem Empfang"
+    "Dateien: Quittung N nicht gesendet, der Weg blieb voll (<Zustand>)"
+    "Zwischenablage: dieselbe Dateiliste noch einmal gemeldet -
+     uebergangen"
+    "Zwischenablage: Dateiliste nicht lesbar, nichts uebertragen"
+                                        (Windows)
+    "Zwischenablage: Dateiliste nicht abgelegt (Ablage belegt oder
+     Schreiben gescheitert, 40 Versuche in 1950 ms)"      (Windows)
+
+The Windows host role, like the client, writes the "Zwischenablage: ..."
+(clipboard) lines first to protokoll.txt (see "Windows as host") and
+only in the five-second cycle to host-protokoll.txt. There they
+therefore appear up to 5 s later than the "Dateien: ..." (files) lines
+they belong to.
+
+Only in the client (the first line: the capabilities the host reported;
+the last one: a file reference that could not be resolved):
+
+    "Host meldet Faehigkeiten 0x3: Dateien ja, Bildschirmwahl ja"
+    "Dateien: N Eintraege vorgemerkt - die Faehigkeiten des Hosts stehen
+     noch aus (hoechstens 5 s)"
+    "Dateien: Host kann keine Dateien empfangen (aelterer Host)"
+    "Dateien: Eingabekanal N verloren - Sendung K abgebrochen"
+    "Dateien: N alte Uebertragungsverzeichnisse beim Start geloescht"
+    "Zwischenablage: Dateiverweis nicht aufloesbar, nichts uebertragen"
+                                        (Mac client)
+
+Only in the Windows host role (the first line: the capabilities the
+viewer's input channel reported; the second: message T of N bytes
+exceeded the limit of G bytes and the channel was closed):
+
+    "Eingabekanal: Faehigkeiten 0x1 (Dateien)"
+    "Eingabekanal: Nachricht T mit N Byte ueber der Grenze von G Byte -
+     Kanal beendet"
+    "Dateien: Zuschauer meldet Dateien - die vorgemerkte Liste geht
+     hinaus"
+    "Dateien: nicht gesendet, der Eingabekanal des Zuschauers hat in
+     5,0 s keine Faehigkeiten gemeldet" (or "... stand nach 5,0 s noch
+     nicht")
+    "Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)"
+    "Dateien: N Uebertragungen geloescht, aelter als 24 h oder verwaist
+     (<Basis>)"
+
+Only in the Mac host (the first line: the capabilities the client
+reported; the last three: N file references detected on the Mac, N file
+references from the client put on the clipboard, writing the file
+references refused):
+
+    "Eingabekanal: Client meldet Faehigkeiten 00000001 (Dateien)"
+    "Dateien: Zuschauer kann keine Dateien empfangen (aelterer Client)"
+    "Dateien: nicht gesendet (Zuschauer ohne Eingabekanal)"
+    "Dateien: nicht gesendet (stammen aus einem Empfang dieses Hosts)"
+    "Dateien: abgelehnt (mehr als 4 GB oder 10000 Eintraege) - nichts
+     gesendet"
+    "Dateien: abgelehnt (Liste der Eintraege ueber 1 MiB) - nichts
+     gesendet"
+    "Dateien: doppelter Name <Name> - nur der erste wird gesendet"
+    "Dateien: N unfertige Uebertragung(en) eines frueheren Laufs
+     geloescht"
+    "Zwischenablage: N Dateiverweis(e) vom Mac erkannt"
+    "Zwischenablage: N Dateiverweis(e) vom Client abgelegt"
+    "Zwischenablage: Schreiben der Dateiverweise abgelehnt"
+
+Wire messages (header as everywhere: u8 type, u8 flags, u16 unused,
+u32 length; all numbers little endian):
+
+    11  Capabilities  Host -> client, video channel: u32 bits (at least
+                      4 bytes, further ones are ignored), bit 0 means
+                      "files, version 1", bit 1 "display selection" (see
+                      "Host display"; both hosts report 3). Goes to
+                      every new viewer after the greeting, settings and
+                      codec list; the display list (12) follows right
+                      after it.
+    69  Capabilities  Client -> host, input channel, same format; the
+                      first message on every input channel. It applies
+                      only to the channel that sent it.
+    50  Offer         u32 ID (not 0), u32 count (1 to 10000), u64 total
+                      (sum of the file sizes, exact), then per entry
+                      u8 kind (0 file, 1 folder), u8 0, u16 path length
+                      (1 to 1024), u64 size (folder 0), path (UTF-8,
+                      relative, separator "/"). Ancestor before
+                      descendant; at most 1 MiB.
+    51  Chunk         u32 ID, u32 entry, u64 offset, 1 to 49152 bytes of
+                      data; strictly in order, folders and empty files
+                      skipped.
+    52  End           u32 ID, u8 reason (0 complete, 1 aborted, 2 read
+                      error, 3 timeout); at least 5 bytes.
+    53  Ack           exactly 16 bytes: u32 ID, u8 state, u8 0, u16 0,
+                      u64 received (data bytes written). State 0
+                      running, 1 done and on the clipboard, 2 too large
+                      or too many entries, 3 too little space,
+                      4 invalid, 5 write error, 6 aborted at the
+                      receiver. Anything other than 0 ends the transfer
+                      on both sides.
+
+50 to 52 go from the sender to the receiver (host -> client on the video
+channel, client -> host on the input channel), 53 in the opposite
+direction. Files are sent only to a peer that has reported bit 0 in this
+session; a host requires the report from the viewer's current input
+channel. When the viewer changes and at the end of the session, the
+report no longer applies. Acknowledgments are sent right after
+acceptance (state 0, received 0), at the latest after every 64 KiB of
+written data, when nothing more is waiting, and at the end; the Mac host
+also as soon as more than 16 KiB are outstanding. The receiver accepts
+at most one window plus one chunk of unwritten data and 8 End messages.
+Any deviation in the sequence is a protocol error (acknowledgment 4);
+the channel stays open. On the hosts' input channel the following upper
+limits apply per message; above them the channel ends as before:
+
+    50 Offer              1 MiB
+    51 Chunk              16 + 49152 bytes
+    52, 53, 69            256 bytes
+    48 Text               4 MiB
+    all others            256 bytes
+
+On the client's video channel the general limit of 64 MiB per message
+still applies.
+
+Acknowledgment 1 means, at the client and the Windows host role: the
+file list is on the clipboard; if putting it there fails, 5 is sent
+instead. The Mac host acknowledges 1 and writes "... - in die Ablage
+gelegt" as soon as everything is written, and puts the list on the
+clipboard on its main thread only right after that. If that fails, only
+"Zwischenablage: Schreiben der Dateiverweise abgelehnt" appears in its
+log, and the client still shows "Files transferred".
+
+Benchmark
+---------
+
+The "Benchmark" tab runs through codecs, frame rates and bit rates in
+sequence: which codecs (all that the host supports, each can be deselected),
+60 and 120 frames/s, 10 to 150 Mbit/s, 3 to 15 seconds of measuring time per
+step. A codec stays in place while its rates are run through - switching the
+codec is the most expensive step. The picture keeps running meanwhile, and the
+menu shows the progress; closing the menu cancels the run (ESC or F10). At the
+end, host and client get back the codec and settings they had before.
+
+What is measured is never a requested setting, only what the host has
+confirmed. Per step: arrived frame rate, bit rate, the whole chain in
+milliseconds (encoder, network, decoder, display), dropped frames, the host's
+encoder time against its budget of 1000/fps, CPU load on both sides. A step
+passes when at least 95 % of the target frame rate arrives, under 1 % is
+dropped and the whole chain is at most 30 ms long - an absolute limit,
+independent of the frame rate: measuring latency in frames penalizes high
+frame rates, and 30 ms go unnoticed in remote control. The host's encoder time
+is only shown, not judged (it is already part of the chain). The
+recommendation is the best color quality that passes at the highest frame
+rate, with the highest bit rate at which it still passes; "Apply" sets it and
+saves it for this host. If not all rows fit into the table, the mouse wheel
+scrolls it (three rows per notch, Page Up/Page Down likewise); a scroll bar
+then appears on the right. During the run the table follows the newest row -
+if you scroll yourself, it keeps your position until the run ends or you
+scroll back to the end.
+
+The "Test pattern" switch makes the host send a fixed, moving pattern instead
+of the screen for the duration of the run (color bars, fine stripes, a
+gradient with a circling square) - so every step sees the same content, and
+nothing needs to run on the Mac. Without the test pattern, whatever is
+currently happening on the Mac is measured; the steps are then only comparable
+when something moves.
+
+After every run the table is written to %APPDATA%\QuadChroma\benchmark.txt,
+also after a cancellation. Without a window:
+
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5 --ohne-testbild
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 3 --benchmark-auswahl 0,3:25,50:120
+
+The number after --benchmark is the measuring time per step;
+--benchmark-auswahl narrows the run down to candidates:Mbit:frame rates (empty
+parts keep the default). Without a window there is no "Anzeige" link (the
+display stage of the chain) and nothing that could be dropped - those columns
+then show "-".
+
+Test mode without a window, in case something is stuck:
+
+    quadchroma.exe 192.168.178.194:9001 --headless
+
+Prints a line every three seconds: frames received, frame rate, codec, stream
+(width x height @ the host's frame rate, "?" without stream info), decoder,
+delay, host load, error. Without a connection the delay is replaced by "nicht
+verbunden" (not connected); the error appears as the interface shows it, in
+English with its key in front, for example 'Fehler Some("SessionTakenOver:
+Another device has taken over the session.")', with the German details in the
+log lines above it. It also prints every change of the decoder (which path,
+and why not NVDEC, if so), the first frame of each decoder with size and
+format, the pointer shape, and FFmpeg's own messages. The same goes to
+%APPDATA%\QuadChroma\protokoll.txt, also in windowed mode - the file is
+started afresh at every launch and additionally records the display there
+(card, feature level, tearing) and, once per second, a line with frame rate,
+display time, chain, dropped and skipped frames and the client's CPU load. A
+connection error is recorded there with all details ("Verbindung: <Grund>",
+i.e. connection: <reason>), but the same error only once as long as no frame
+has arrived in between - so "Host hat die Leitung nach dem Handschlag
+geschlossen - dieses Geraet ist dort nicht gekoppelt" (the host closed the
+connection after the handshake because this device is not paired there) does
+not appear every 2 s either. Errors that do not go away with the next attempt
+(fingerprint changed, file damaged or not writable) end the attempts with
+"Verbindung zu <Adresse> beendet: der Fehler bleibt bis zur Behebung - kein
+neuer Versuch" (connection ended, no new attempt until the error is fixed).
+The start screen shows the error in the interface language, with the system's
+wording, where there is one, in parentheses after it.
+
+    quadchroma.exe 192.168.178.194:9001 --headless --decoder gpu
+    quadchroma.exe 192.168.178.194:9001 --headless --decoder integriert
+
+forces that card and reports what it has to say about it;
+
+    quadchroma.exe --decodertest
+
+lists the cards and tries every decoder choice with HEVC 4:4:4, 4:2:0 and
+H.264, without a connection.
+
+    quadchroma.exe --shot datei.bmp [sprache] [ansicht[@BxH]]
+
+writes a picture of the interface as BMP, without a window and without a
+connection, and exits (defaults ui.bmp, de, start; the language as a code such
+as en). Views: start, starttip (tooltip of the "Desktop shortcut" button),
+abgeloest and fingerabdruck (start screen with the respective message: session
+taken over, fingerprint changed), sitzung and nerd (statistics over a mock
+picture), hud, hud2 to hud5 and hud2tip (the menu, one tab each; hud is the
+"Picture" tab with a trailing display list), dateien and dateienfehler (the
+file transfer lines, running and finished, or with abort reasons). The start
+screens are 900x700, all others 1280x720; a suffix @BxH (width x height) on
+the view (such as hud@1920x1080, 320 to 7680 per side) draws them at that
+size.
+
+    quadchroma.exe 192.168.178.194:9001 --ohne-aud
+
+leaves out the access unit delimiter (AUD) that the client otherwise adds to
+every access unit for NVDEC: NVIDIA's parser releases a frame only when it
+sees the start of the next one - without an AUD that costs one frame period of
+decoder time. The switch is there for comparison; the log shows "NVDEC:
+Zugriffseinheiten-Begrenzer angehaengt" (access unit delimiter added) when it
+is not set. Likewise, --ohne-vui leaves out the VUI that the client otherwise
+writes into every SPS for H.264 via NVDEC (max_num_reorder_frames 0 - the Mac
+host encodes without reordering but does not say so in the SPS, and NVIDIA's
+parser then holds back about 16 frames).
+
+Windows as host
+---------------
+
+The same quadchroma.exe can also be the host: it accepts the viewer that the
+Mac otherwise gets - same encryption, same pairing, same messages; a client
+notices no difference. Capture via Desktop Duplication of the selected output,
+encoder via FFmpeg (hevc_nvenc/h264_nvenc on NVIDIA; without NVIDIA only H.264
+in software via Media Foundation), frame pacing, codec switching, display
+selection with switching while running, test pattern, audio (WASAPI loopback),
+pointer shape, load reporting and keep-awake as on the Mac.
+Without a viewer the host does no work: no Duplication, no encoder, no
+keep-awake (idle below 1 % of one core). Everything runs without a window from
+the command line; every line also goes to
+%APPDATA%\QuadChroma\host-protokoll.txt (throttling and size cap: see the
+paragraph on the hosts' logs above).
+
+The host role also writes to protokoll.txt - its card lines at startup,
+FFmpeg's messages and the "Zwischenablage: ..." (clipboard) lines - and in
+doing so starts the file afresh, like the client. So if client and host role
+run under the same user, both write to the same protokoll.txt, and whichever
+starts last empties it. host-protokoll.txt contains these lines as well, but
+while running only at the five-second interval.
+
+    quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
+                   [--pair] [--forget] [--konserve datei.hevc]
+                   [--encoderweg bgra|yuv444|d3d11|auto]
+    quadchroma.exe --list
+    quadchroma.exe --messen [--output n] [--sekunden 10]
+
+    --host [port]   start the host: video on port (9001), input on port+1,
+                    announcement on port+2. host.key is created on the first
+                    start; the fingerprint is in the log.
+    --output n      output from the list of --list, as a request for this run
+                    only (bildschirm.txt stays; a request from the client's
+                    menu overrides it). If not given, bildschirm.txt applies,
+                    otherwise the main display, which the host then follows.
+                    Picture and mouse refer to the same output; its identifier
+                    is remembered: if the output goes away, the host falls
+                    back to the main display, and when it comes back, it
+                    applies again (see "Host display"). From a width of 3840
+                    on, the picture is halved; with odd dimensions one pixel
+                    of border is dropped.
+    --fps N, --mbit N, --fest   as on the Mac (defaults 120, 150, off).
+    --pair          the next unknown peer is accepted (comparison code in the
+                    log); the very first time this happens automatically.
+    --forget        delete all authorizations (authorized.txt); if that fails,
+                    exit with return code 8 (as on the Mac).
+    --konserve datei.hevc   an Annex B stream (HEVC or H.264) as the picture
+                    source instead of capture, looped at the frame rate - the
+                    test path without a card. The capability list then shows
+                    exactly one entry, and a codec switch is refused. The
+                    client writes such a file itself:
+                        quadchroma.exe 192.168.178.194:9001 --headless --mitschnitt C:\qc\qc.hevc
+    --encoderweg    how the picture gets into the encoder: bgra (BGRA directly
+                    into NVENC, which converts on the card), yuv444 (own
+                    conversion on the CPU), d3d11 (textures without a copy,
+                    only for the 8-bit candidates via NVENC and only when the
+                    output is connected to the NVIDIA card) or auto (default:
+                    the decision from messung.txt, otherwise bgra). 10-bit
+                    candidates, Media Foundation, rotated outputs and outputs
+                    from a width of 3840 on always go through the CPU; the
+                    host switches the source itself ("Aufnahme: Quelle auf
+                    Prozessorweg umgestellt ..." or "Null-Kopien-Weg: ... -
+                    Prozessorweg (bgra)", i.e. switched to the CPU path).
+    --list          cards, outputs (each with identifier, name and Hz) and
+                    what this computer can encode (hevc_nvenc and h264_nvenc
+                    per candidate via avcodec_open2; without an NVIDIA driver
+                    it says "Cannot load nvcuda.dll"), plus whether the Media
+                    Foundation encoders open and encode in software. AV1 is
+                    listed there without a probe as "nein (Protokoll und
+                    Client kennen AV1 noch nicht)" (no, protocol and client do
+                    not support AV1 yet).
+    --messen        the measurement for capture: per output Acquire, copy on
+                    the card, staging into main memory, nvenc from memory
+                    (bgra, yuv444p) and, on the NVIDIA card, without a copy
+                    from the texture, each with delay 0 and 2, plus a color
+                    check (test pattern through nvenc and back) and a keyframe
+                    check. Something must move on the output during the
+                    measurement. Result in %APPDATA%\QuadChroma\messung.txt,
+                    at the end one verdict per output ("Null-Kopien, 2,9 ms je
+                    Bild" or "Prozessor, 5,1 ms, hoechstens 120 fps", i.e.
+                    zero-copy or CPU path with the time per frame);
+                    --encoderweg auto reads it.
+
+The candidates are the same six as on the Mac. The desktop is 8 bit, so
+"10 Bit" on Windows is always a conversion (noted in the capability list); the
+start candidate is 0, otherwise the first one available. nvenc changes the bit
+rate while running (without a restart, with a keyframe); a new frame rate or a
+different encoder means a restart of the session with a keyframe. The host
+manages keyframes itself: every 2*fps frames, in Gaming mode every fps frames,
+plus on a codec switch and for a new viewer; under congestion only when an
+encoded frame above the hard limit of 4 MB had to be dropped. After a codec
+switch, a session restart, "Testbild aus" (test pattern switched off) and for
+a new viewer, the host resubmits the last frame once, even without a fixed
+frame rate ("Takt: letztes Bild nachgelegt (frischer Encoder)" or "(Testbild
+aus)" or "(neuer Zuschauer)", i.e. last frame resubmitted because of a fresh
+encoder, the test pattern being switched off or a new viewer), plus, without a
+line of its own, a skipped final frame (see the congestion rule above);
+otherwise, without a fixed frame rate, new frames only come when something
+changes on the desktop.
+
+The host runs with per-monitor DPI awareness: with Windows scaling (125 %,
+150 %) it streams the real resolution of the display mode. The first line in
+the log says whether this worked ("DPI-Awareness: ..."). Rotated outputs
+(portrait, 180 degrees, also portrait panels that Windows runs in landscape,
+as on handhelds) are rotated by the host on the CPU; the stream has the size
+of the desktop ("Aufnahme gestartet: ... gedreht N Grad (Oberflaeche WxH,
+gedreht wird auf dem Prozessor)", i.e. capture started, rotated by N degrees
+on the CPU). This costs some CPU time per frame, --messen measures the
+unrotated surface there without the rotation, and it has not yet been tested
+on real hardware.
+
+Without NVIDIA (for example in a virtual machine) there is only "H.264 High"
+via the Media Foundation software encoder (h264_mf), listed as software in the
+capability list. By design it holds back 16 frames (about 300 ms at 60 frames
+per second) - enough to test the whole chain Duplication -> encoder -> viewer,
+not for real use. So that nothing gets stuck in it without a fixed frame rate
+(the final frame of a movement, the first frame for a new viewer), the host,
+one frame time after the last new frame, pushes the last frame in again at the
+target rate until it has come out (counted as "nachgeschoben: n" in the 5-s
+log, 16 per occasion); after that it stays quiet. Duplication needs the
+console session; in an RDP session there is no DXGI output ("Duplication nicht
+moeglich", i.e. Duplication not possible).
+
+If the display goes away (mode change, UAC prompt, exclusive fullscreen), the
+host reports "no display" to the viewer (message 9), retries every 2 s and
+then forces a keyframe. The same loss appears only once in the log, and at the
+end "Aufnahme laeuft wieder (derselbe Verlust hatte sich N-mal wiederholt)"
+(capture running again, the same loss had repeated N times). After a loss the
+host re-enumerates the outputs right away - often a monitor change is behind
+it, and the host then follows the main display or its requested one (see "Host
+display"). The pointer shape comes from Duplication (Windows pointers are
+mostly 32x32; monochrome and masked shapes are converted, inverting pixels
+approximated as opaque); the picture itself contains no pointer. Audio:
+loopback of the default output device, mixed down to two channels, at the
+device's rate; a silent playback stream in the same process keeps the loopback
+running, and gaps are filled with silence. If the device is lost (unplugged,
+format changed) or the default output device changes, the host reopens
+whichever is then current, one attempt per second as long as someone is
+watching ("Ton: <Grund> - Abgriff wird neu geoeffnet", then "Ton wieder
+angemeldet: ..."); one to two seconds without audio pass in between. Without
+an output device the host keeps running without audio and retries in the same
+way ("Ton: ... - der Host laeuft ohne Ton, neuer Versuch alle 1000 ms, solange
+jemand zuschaut"). If the same loss recurs before the device has run for 30 s,
+it is only counted ("Ton: derselbe Verlust (...) noch N-mal, nicht einzeln
+protokolliert").
+
+A new viewer replaces the old one: the old one's queue is discarded; it only
+gets the rest of the packet that is currently going out, and then message 10
+(if it had only just connected, its greeting before that). As long as it keeps
+taking data, the host waits, at most 15 s; if it takes nothing for 2 s, its
+connection is cut. The new viewer is already running meanwhile. The log shows
+"Zuschauer abgeloest: <IP>" (viewer replaced), followed, depending on the
+state of the old one, by:
+
+    "Abloesung an <IP> gemeldet"
+                    (takeover reported) message 10 is in the kernel's
+                    send buffer; that does not guarantee it arrives.
+    "Abloesung an <IP> nicht zugestellt: <Fehler>"
+                    (takeover not delivered) the old one was already
+                    gone or did not take it within 1 s.
+    "Abgeloester Zuschauer <IP> nimmt nichts mehr ab (nach N s) -
+     Bildleitung gekappt"
+                    (replaced viewer takes nothing, video connection
+                    cut) it took nothing for 2 s, or the 15 s are up;
+                    message 10 then does not reach it.
+
+Usually only one of them appears. If the 15 s run out while message 10 is
+still pending, "... gekappt" appears first and right after it "... nicht
+zugestellt: <Fehler>".
+
+The new viewer inherits nothing from the old one: a test pattern ends
+("Testbild aus (Zuschauer gewechselt)", i.e. test pattern off because the
+viewer changed), an active "no display" report is sent to it again, and the
+host resubmits the last frame to it once, even with a still desktop ("Takt:
+letztes Bild nachgelegt (neuer Zuschauer)"; with h264_mf it keeps pushing
+until the frame has come out, see above).
+
+Without message 10, the old client reconnects by itself as soon as it is
+running again and takes over from the new one - like an older client.
+
+Files via the clipboard also work in both directions with the host role (see
+that section): copying in Explorer on the host sends them to the viewer,
+provided its client supports files; what comes from the viewer is then placed
+as a file list in the clipboard of the session in which the host role runs,
+and pasting in Explorer copies it from %TEMP%\QuadChroma-Host-Ablage. The host
+role sends with a fixed window of 64 KiB, holds back a copy made right after
+connecting for up to 5 s until the viewer has reported its capabilities, and
+cleans up its clipboard folder at startup. It has no notification-area icon
+and no single instance either - both belong to the client with a window.
+
+Files of the Windows host: %APPDATA%\QuadChroma\host.key (64 bytes: private,
+then public) and authorized.txt in the Mac's format (64 hex digits,
+fingerprint, name) - separate from client.key and known_hosts.txt -, plus
+bildschirm.txt with the requested display.
+
+Keys arrive over the connection as positions (macOS key codes) and are
+translated into scancodes on Windows; the client's Command key becomes the
+Windows key, its Option key Alt. On disconnect the host releases all held
+keys. Application windows with elevated privileges (UAC) get no input - that
+is how Windows works.
+
+The client's test mode shows every host that announces itself on the network
+once, as a line "Host gefunden: Name (Adresse)" (host found: name and
+address).
+
+The files next to the executable belong to it and must be copied along:
+avcodec-63.dll and avutil-61.dll. These are libraries of the FFmpeg project
+under the LGPLv2.1, included as separate files and replaceable. They are built
+with scripts/build-ffmpeg-windows.sh from the unmodified FFmpeg 9.0.2 without
+external libraries; the sources are attached to every release, and details and
+all license texts are in THIRD_PARTY_NOTICES.txt. Direct3D, DXGI and the
+shader compiler (d3dcompiler_47.dll) are parts of Windows; none of them is
+shipped.
+
+Requirement: Windows 10 or 11, 64-bit. No Visual C++ runtime is needed: the C
+runtime is inside the exe, and the FFmpeg files use only the Universal C
+Runtime, which is part of Windows 10 and 11.
+
+As of: 26 September 2026
