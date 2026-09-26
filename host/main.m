@@ -3240,9 +3240,15 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     NSInteger srvIdx = [args indexOfObject:@"--serve"];
     BOOL do_list = [args containsObject:@"--list"];
     if (!do_list && capIdx == NSNotFound && srvIdx == NSNotFound && ![args containsObject:@"--formattest"]) {
+        // Ohne Modus - so startet der Finder die App per Doppelklick - laeuft
+        // der Host wie mit --serve auf dem Standard-Port; die uebrigen
+        // Schalter (--pair, --fps ...) gelten wie gewohnt. Vorher endete
+        // der Start hier mit der Aufrufzeile, und wer die App aus der DMG
+        // startete, sah nichts.
         logf_(@"Aufruf: --list | --capture <sekunden> <datei.hevc> | --serve [port]   "
                "[--display N (Listenplatz, nur fuer diesen Lauf)] [--out BxH] [--fps N] [--mbit N] [--fest] [--pair] [--forget]");
-        return 2;
+        logf_(@"Kein Modus angegeben (Start aus dem Finder?) - laeuft als Host wie mit --serve auf dem Standard-Port");
+        srvIdx = (NSInteger)args.count;   // Host-Modus ohne Portangabe: der Standard-Port bleibt
     }
 
     if (!CGPreflightScreenCaptureAccess()) {
