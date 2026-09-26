@@ -834,9 +834,7 @@ impl Drossel {
     /// zaehlt: das Groessere aus IP- und Schluesselzaehler, bei globaler
     /// Sperre mindestens 60 s.
     pub fn warten(&mut self, ip: IpAddr, schluessel: &[u8], jetzt: Instant) -> Duration {
-        let a = self.je_ip.get(&ip).map(|z| z.rest(jetzt)).unwrap_or_default();
-        let b = self.je_schluessel.get(schluessel).map(|z| z.rest(jetzt)).unwrap_or_default();
-        let w = a.max(b);
+        let w = self.rest(ip, schluessel, jetzt);
         if self.global_gesperrt(jetzt) {
             w.max(GLOBAL_WARTEN)
         } else {
@@ -863,6 +861,27 @@ impl Drossel {
         self.je_schluessel.remove(schluessel);
     }
 
+    /// Was die Drossel dieser Adresse bzw. dieses Schluessels ab `jetzt`
+    /// noch verlangt - das Groessere, ohne die globale Regel (wie
+    /// qc_zugang_drossel_rest im Mac-Host). Die globale Sperre gilt beim
+    /// Beginn einer Phase (Nachricht 20); gaelte sie auch beim Beweis, sperrte
+    /// eine laufende Flut jeden rechtmaessigen Nutzer fuer immer aus.
+    pub fn rest(&self, ip: IpAddr, schluessel: &[u8], jetzt: Instant) -> Duration {
+        let a = self.je_ip.get(&ip).map(|z| z.rest(jetzt)).unwrap_or_default();
+        let b = self.je_schluessel.get(schluessel).map(|z| z.rest(jetzt)).unwrap_or_default();
+        a.max(b)
+    }
+
+    /// Kaeme ein Beweis dieser Phase jetzt zu frueh? Vor Ablauf dessen, was
+    /// diese Verbindung als Wartezeit gesagt bekam - und ebenso, solange die
+    /// Drossel ihrer Adresse oder ihres Schluessels jetzt noch laeuft (3.3:
+    /// der groessere Wert gilt). Sonst riete eine zweite Verbindung derselben
+    /// Adresse mit anderem Schluessel ungebremst weiter, waehrend die erste
+    /// wartet - und ein richtiger Beweis kaeme in dieser Wartezeit durch.
+    pub fn zu_frueh(&self, phase: &Phase, ip: IpAddr, schluessel: &[u8], jetzt: Instant) -> bool {
+        phase.zu_frueh(jetzt) || !self.rest(ip, schluessel, jetzt).is_zero()
+    }
+
     /// Die groessere der beiden Zahlen (fuer die Protokollzeile).
     pub fn fehlversuche(&self, ip: IpAddr, schluessel: &[u8], jetzt: Instant) -> u32 {
         let zahl = |z: Option<&Zaehler>| z.filter(|z| !z.verfallen(jetzt)).map(|z| z.fehlversuche).unwrap_or(0);
@@ -877,7 +896,8 @@ impl Drossel {
     }
 
     /// Wertet einen Beweis (Nachricht 21). `richtig`: stimmte er
-    /// (beweis_pruefen)? Kommt er vor Ablauf der Wartezeit, zaehlt er als
+    /// (beweis_pruefen)? Kommt er zu frueh (`zu_frueh`: Wartezeit dieser
+    /// Verbindung oder Drossel von Adresse bzw. Schluessel), zaehlt er als
     /// Fehlversuch, auch wenn er stimmt. Nach dem fuenften Fehlversuch in
     /// dieser Verbindung: Schluss.
     pub fn beweis_werten(
@@ -888,7 +908,7 @@ impl Drossel {
         richtig: bool,
         jetzt: Instant,
     ) -> Wertung {
-        if richtig && !phase.zu_frueh(jetzt) {
+        if richtig && !self.zu_frueh(phase, ip, schluessel, jetzt) {
             self.erfolg(ip, schluessel);
             return Wertung::Angenommen;
         }
@@ -900,6 +920,21 @@ impl Drossel {
             Wertung::Schluss { warten_ms }
         } else {
             Wertung::Falsch { warten_ms }
+        }
+    }
+
+    /// Ein Beweis, der sich nicht pruefen laesst, weil der Host kein lesbares
+    /// Passwort hat (4.3: dann nur "Zulassen"). Der Fehler liegt beim Host,
+    /// nicht beim Client: keine Drossel - wer das richtige Passwort kennt,
+    /// soll nach dem Reparieren nicht minutenlang warten (wie der Mac-Host).
+    /// Die Versuche dieser Verbindung zaehlen trotzdem, damit niemand die
+    /// Phase in einer Schleife beschaeftigt; warten_ms ist 0.
+    pub fn beweis_nicht_pruefbar(&mut self, phase: &mut Phase) -> Wertung {
+        phase.fehlversuche += 1;
+        if phase.fehlversuche >= PHASE_FEHLVERSUCHE {
+            Wertung::Schluss { warten_ms: 0 }
+        } else {
+            Wertung::Falsch { warten_ms: 0 }
         }
     }
 }
@@ -2675,6 +2710,69 @@ mod tests {
         assert_eq!(Wertung::Angenommen.ergebnis([1; 32]), Ergebnis::Passwort { host_beweis: [1; 32] });
         assert_eq!(Wertung::Falsch { warten_ms: 3 }.ergebnis([1; 32]), Ergebnis::Falsch { warten_ms: 3 });
         assert_eq!(Wertung::Schluss { warten_ms: 4 }.ergebnis([1; 32]).code(), ERGEBNIS_SCHLUSS);
+    }
+
+    /// Zwei Phasen derselben Adresse mit verschiedenen Schluesseln (zwei je
+    /// IP sind erlaubt): muss die Adresse laut Drossel warten, gilt das auch
+    /// fuer die zweite, deren Phase nichts davon sagte (3.3: der groessere
+    /// Wert gilt; wie qc_zugang_drossel_rest im Mac-Host). Sonst riete sie
+    /// abwechselnd weiter - und ein richtiger Beweis kaeme in der Wartezeit
+    /// durch und setzte die Zaehler zurueck.
+    #[test]
+    fn drossel_gilt_fuer_parallele_phasen() {
+        let t0 = Instant::now();
+        let (a, b) = ([7u8; 32], [8u8; 32]);
+        let mut d = Drossel::neu();
+        let mut pa = d.phase_beginnen(ip(1), &a, t0);
+        let mut pb = d.phase_beginnen(ip(1), &b, t0);
+        for _ in 0..3 {
+            d.beweis_werten(&mut pa, ip(1), &a, false, t0);
+        }
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(d.rest(ip(1), &b, t1), Duration::from_secs(4), "die Adresse wartet noch 4 s");
+        assert!(!pb.zu_frueh(t1), "die Phase von B allein sagt nichts");
+        assert!(d.zu_frueh(&pb, ip(1), &b, t1));
+        // Richtig, aber in der Wartezeit der Adresse: Fehlversuch (der
+        // vierte der Adresse: 10 s), nicht angenommen.
+        assert_eq!(d.beweis_werten(&mut pb, ip(1), &b, true, t1), Wertung::Falsch { warten_ms: 10_000 });
+        assert_eq!(d.fehlversuche(ip(1), &b, t1), 4, "die Zaehler blieben stehen");
+        // Falsch in der Wartezeit: ebenso gezaehlt, die Wartezeit waechst.
+        let t2 = t1 + Duration::from_secs(2);
+        assert_eq!(d.beweis_werten(&mut pb, ip(1), &b, false, t2), Wertung::Falsch { warten_ms: 20_000 });
+        // Nach Ablauf: angenommen, beide Zaehler zurueck.
+        let t3 = t2 + Duration::from_secs(20);
+        assert!(!d.zu_frueh(&pb, ip(1), &b, t3));
+        assert_eq!(d.beweis_werten(&mut pb, ip(1), &b, true, t3), Wertung::Angenommen);
+        assert_eq!(d.rest(ip(1), &b, t3), Duration::ZERO);
+        // Die globale Sperre zaehlt beim Beweis nicht mit (nur beim Beginn
+        // einer Phase), sonst sperrte eine Flut jeden rechtmaessigen Nutzer aus.
+        let mut g = Drossel::neu();
+        let mut p = g.phase_beginnen(ip(100), &[9; 32], t0);
+        for i in 0..=GLOBAL_GRENZE as u8 {
+            g.fehlversuch(ip(i), &[i; 32], t0);
+        }
+        assert!(g.global_gesperrt(t0));
+        assert_eq!(g.rest(ip(100), &[9; 32], t0), Duration::ZERO);
+        assert_eq!(g.beweis_werten(&mut p, ip(100), &[9; 32], true, t0), Wertung::Angenommen);
+    }
+
+    /// Kein lesbares Passwort am Host: der Beweis ist nicht pruefbar - das
+    /// liegt am Host, also keine Drossel und warten_ms 0; die Versuche der
+    /// Verbindung zaehlen trotzdem (der fuenfte ist Schluss).
+    #[test]
+    fn nicht_pruefbar_ohne_drossel() {
+        let t0 = Instant::now();
+        let k = [3u8; 32];
+        let mut d = Drossel::neu();
+        let mut p = d.phase_beginnen(ip(1), &k, t0);
+        for _ in 1..PHASE_FEHLVERSUCHE {
+            assert_eq!(d.beweis_nicht_pruefbar(&mut p), Wertung::Falsch { warten_ms: 0 });
+        }
+        assert_eq!(d.beweis_nicht_pruefbar(&mut p), Wertung::Schluss { warten_ms: 0 });
+        assert_eq!(p.fehlversuche, PHASE_FEHLVERSUCHE);
+        assert_eq!(d.fehlversuche(ip(1), &k, t0), 0);
+        assert_eq!(d.warten(ip(1), &k, t0), Duration::ZERO);
+        assert!(!d.global_gesperrt(t0));
     }
 
     #[test]

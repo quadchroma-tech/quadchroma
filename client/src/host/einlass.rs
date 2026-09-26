@@ -445,13 +445,13 @@ impl Einlass {
     }
 
     /// K fuer das aktuelle Passwort; None, wenn es keins gibt (unlesbar) -
-    /// dann ist jeder Beweis falsch.
+    /// dann ist kein Beweis pruefbar (Drossel::beweis_nicht_pruefbar).
     fn schluessel(&self, ip: IpAddr) -> Option<[u8; 32]> {
         match self.passwort() {
             Ok(pw) => Some(sperre(&self.cache).schluessel(&pw, &self.host_pub)),
             Err(e) => {
                 DROSSEL_PASSWORT.melden(Some(ip), || {
-                    format!("Zugangspasswort nicht lesbar ({e}) - Beweis von {ip} gilt als falsch, Zugang nur ueber \"Zulassen\"")
+                    format!("Zugangspasswort nicht lesbar ({e}) - Beweis von {ip} nicht pruefbar, Zugang nur ueber \"Zulassen\"")
                 });
                 None
             }
@@ -629,9 +629,24 @@ impl Einlass {
             let n = zugang::empfangen(|b| sock.read_exact_bis(b, nachricht_bis));
             match n {
                 Ok(Nachricht::Beweis(beweis)) => {
-                    let k = self.schluessel(ip);
-                    let richtig = k.is_some_and(|k| zugang::beweis_pruefen(&k, &hh, &beweis));
-                    let wertung = self.buch().drossel.beweis_werten(&mut phase, ip, peer, richtig, Instant::now());
+                    // Zu frueh (Wartezeit dieser Verbindung oder Drossel von
+                    // Adresse bzw. Schluessel, 3.3) wird gar nicht erst
+                    // gerechnet - so kostet Raten nichts ausser Zeit - und
+                    // zaehlt als Fehlversuch. Ohne lesbares Passwort ist der
+                    // Beweis nicht pruefbar: das liegt am Host, also keine
+                    // Drossel (4.3: dann nur "Zulassen"), wie im Mac-Host.
+                    let zu_frueh = {
+                        let b = self.buch();
+                        b.drossel.zu_frueh(&phase, ip, peer, Instant::now())
+                    };
+                    let k = if zu_frueh { None } else { self.schluessel(ip) };
+                    let nicht_pruefbar = !zu_frueh && k.is_none();
+                    let wertung = if nicht_pruefbar {
+                        self.buch().drossel.beweis_nicht_pruefbar(&mut phase)
+                    } else {
+                        let richtig = k.is_some_and(|k| zugang::beweis_pruefen(&k, &hh, &beweis));
+                        self.buch().drossel.beweis_werten(&mut phase, ip, peer, richtig, Instant::now())
+                    };
                     let warten_ms = match (wertung, k) {
                         (Wertung::Angenommen, Some(k)) => {
                             self.eintragen(peer, name);
@@ -648,8 +663,9 @@ impl Einlass {
                         (Wertung::Schluss { warten_ms }, _) => {
                             DROSSEL_SCHLUSS.melden(Some(ip), || {
                                 format!(
-                                    "Zugang: {wer} - {} Fehlversuche in dieser Verbindung, getrennt (naechster Versuch fruehestens in {warten_ms} ms)",
-                                    phase.fehlversuche
+                                    "Zugang: {wer} - {} Fehlversuche in dieser Verbindung{}, getrennt (naechster Versuch fruehestens in {warten_ms} ms)",
+                                    phase.fehlversuche,
+                                    if nicht_pruefbar { " (kein lesbares Passwort, keine Drossel)" } else { "" }
                                 )
                             });
                             let _ = senden(sock, false, &Nachricht::Ergebnis(Ergebnis::Schluss { warten_ms }));
@@ -661,7 +677,18 @@ impl Einlass {
                     };
                     let zahl = self.buch().drossel.fehlversuche(ip, peer, Instant::now());
                     DROSSEL_FALSCH.melden(Some(ip), || {
-                        format!("Zugang: {wer} - Passwort falsch (Fehlversuch {zahl}), naechster Versuch fruehestens in {warten_ms} ms")
+                        if nicht_pruefbar {
+                            format!(
+                                "Zugang: {wer} - Beweis nicht pruefbar (kein lesbares Passwort, nur \"Zulassen\"), keine Drossel, \
+                                 Versuch {} in dieser Verbindung",
+                                phase.fehlversuche
+                            )
+                        } else {
+                            format!(
+                                "Zugang: {wer} - {} (Fehlversuch {zahl}), naechster Versuch fruehestens in {warten_ms} ms",
+                                if zu_frueh { "Beweis vor Ablauf der Wartezeit" } else { "Passwort falsch" }
+                            )
+                        }
                     });
                     if let Err(e) = senden(sock, false, &Nachricht::Ergebnis(Ergebnis::Falsch { warten_ms })) {
                         DROSSEL_ENDE.melden(Some(ip), || format!("Zugang: {wer} - Ergebnis nicht gesendet: {e}"));
@@ -1209,6 +1236,43 @@ mod tests {
         drop((s2, s3));
     }
 
+    /// Zwei Phasen derselben Adresse mit verschiedenen Schluesseln: hat die
+    /// Adresse nach drei Fehlversuchen der ersten 5 s zu warten, gilt das
+    /// auch fuer die zweite - ihr richtiger Beweis in dieser Zeit zaehlt als
+    /// Fehlversuch und kommt nicht herein (3.3, wie im Mac-Host).
+    #[test]
+    fn drossel_der_adresse_gilt_fuer_parallele_phase() {
+        let h = Host::neu("parallel", zugang::PHASE_FRIST);
+        let (cp1, _) = client();
+        let (cp2, cpub2) = client();
+        let mut s1 = Stub::verbinden(&h.addr, &cp1, b"client").unwrap();
+        noetig(&mut s1);
+        let mut s2 = Stub::verbinden(&h.addr, &cp2, b"client").unwrap();
+        assert_eq!(noetig(&mut s2).warten_ms, 0);
+        for _ in 0..3 {
+            s1.senden(&Nachricht::Beweis(s1.beweis("falsch-falsch"))).unwrap();
+            assert!(matches!(ergebnis(&mut s1), Ergebnis::Falsch { .. }));
+        }
+        // Ein richtiger Beweis der zweiten in der Wartezeit der Adresse
+        // kommt nicht herein (Fehlversuch 4 der Adresse: 10 s) ...
+        s2.senden(&Nachricht::Beweis(s2.beweis(PW))).unwrap();
+        match ergebnis(&mut s2) {
+            Ergebnis::Falsch { warten_ms } => assert!((9_000..=10_000).contains(&warten_ms), "{warten_ms}"),
+            e => panic!("richtig in der Wartezeit der Adresse: {e:?}"),
+        }
+        // ... und die erste raet in der Zeit auch nicht weiter (5: 20 s).
+        s1.senden(&Nachricht::Beweis(s1.beweis("falsch-falsch"))).unwrap();
+        match ergebnis(&mut s1) {
+            Ergebnis::Falsch { warten_ms } => assert!((19_000..=20_000).contains(&warten_ms), "{warten_ms}"),
+            e => panic!("{e:?}"),
+        }
+        assert!(!h.liste().enthaelt(&cpub2));
+        s1.senden(&Nachricht::Abbruch).unwrap();
+        s2.senden(&Nachricht::Abbruch).unwrap();
+        assert_eq!(h.ausgang(), Ausgang::Draussen);
+        assert_eq!(h.ausgang(), Ausgang::Draussen);
+    }
+
     /// Beschaedigte Geraeteliste: niemand ist bekannt, auch ein Geraet, das
     /// darin stuende; ein richtiges Passwort laesst es fuer diese Sitzung
     /// herein, die Datei bleibt aber unangetastet. Nach "zuruecksetzen"
@@ -1238,7 +1302,11 @@ mod tests {
         assert!(h.einlass.geraete().unwrap().geraete.is_empty());
     }
 
-    /// Unlesbares Passwort: jeder Beweis ist falsch (auch der "richtige").
+    /// Unlesbares Passwort: kein Beweis ist pruefbar (auch der "richtige"),
+    /// es bleibt nur "Zulassen". Der Fehler liegt beim Host: keine Drossel
+    /// (22/2 mit 0 ms, auch beim dritten und vierten Mal; wie der Mac-Host),
+    /// der fuenfte Versuch der Verbindung ist trotzdem Schluss. Nach dem
+    /// Reparieren kommt das richtige Passwort ohne Wartezeit herein.
     #[test]
     fn ohne_passwort_nur_zulassen() {
         let h = Host::neu("ohne-passwort", zugang::PHASE_FRIST);
@@ -1247,16 +1315,24 @@ mod tests {
         let (cp, _) = client();
         let mut s = Stub::verbinden(&h.addr, &cp, b"client").unwrap();
         noetig(&mut s);
+        for _ in 1..zugang::PHASE_FEHLVERSUCHE {
+            s.senden(&Nachricht::Beweis(s.beweis("kurz"))).unwrap();
+            assert_eq!(ergebnis(&mut s), Ergebnis::Falsch { warten_ms: 0 });
+        }
         s.senden(&Nachricht::Beweis(s.beweis("kurz"))).unwrap();
-        assert!(matches!(ergebnis(&mut s), Ergebnis::Falsch { .. }));
+        assert_eq!(ergebnis(&mut s), Ergebnis::Schluss { warten_ms: 0 });
+        assert!(s.zu(), "Leitung nach 22/4 noch offen");
+        assert_eq!(h.ausgang(), Ausgang::Draussen);
+        let mut s = Stub::verbinden(&h.addr, &cp, b"client").unwrap();
+        assert_eq!(noetig(&mut s).warten_ms, 0, "keine Drossel geerbt");
         s.senden(&Nachricht::Abbruch).unwrap();
         assert_eq!(h.ausgang(), Ausgang::Draussen);
-        // Ein neues Zufallspasswort macht es wieder moeglich.
+        // Ein neues Zufallspasswort macht es wieder moeglich - sofort.
         h.einlass.passwort_zufall().unwrap();
         let pw = h.einlass.passwort().unwrap();
         assert_eq!(pw.len(), 11);
         let mut s = Stub::verbinden(&h.addr, &cp, b"client").unwrap();
-        noetig(&mut s);
+        assert_eq!(noetig(&mut s).warten_ms, 0);
         s.senden(&Nachricht::Beweis(s.beweis(&pw))).unwrap();
         assert!(matches!(ergebnis(&mut s), Ergebnis::Passwort { .. }));
         assert_eq!(h.ausgang(), Ausgang::Passwort);
