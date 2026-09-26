@@ -94,15 +94,9 @@ pub enum Key {
     ClientCpu,
     Monitor,
     Skipped,
-    // Kopplung
-    PairingTitle,
-    PairingHint,
-    PairingCode,
-    PairingWrong,
-    PairingOk,
+    // Reiter Verschluesselung und Wartebild
     SecuredWith,
     HostFingerprint,
-    FirstContact,
     // Fehler
     ErrorConnectRefused,
     ErrorTimeout,
@@ -111,9 +105,6 @@ pub enum Key {
     /// Der Host meldet: ein anderes Geraet hat die Sitzung uebernommen
     /// (Nachricht 10). Keine automatische Neuverbindung.
     SessionTakenOver,
-    /// Fingerabdruck einer bekannten Adresse geaendert: {n} Adresse, {m} neuer
-    /// Fingerabdruck, {p} Pfad von known_hosts.txt - alle bleiben stehen.
-    HostKeyChanged,
     /// client.key hat die falsche Laenge; {p} ist der Pfad.
     KeyFileDamaged,
     /// Datei vorhanden, aber nicht lesbar; {p} ist der Pfad. Dahinter in
@@ -538,21 +529,14 @@ pub static EN: Lang = Lang {
         (ClientCpu, "Client CPU"),
         (Monitor, "Monitor"),
         (Skipped, "skipped"),
-        (PairingTitle, "Pair with host"),
-        (PairingHint, "Enter the code shown on the host"),
-        (PairingCode, "Pairing code"),
-        (PairingWrong, "Wrong code"),
-        (PairingOk, "Paired"),
         (SecuredWith, "Secured · comparison code"),
         (HostFingerprint, "Host fingerprint"),
-        (FirstContact, "First contact with this host. Compare the code with the one on the host."),
         (ErrorConnectRefused, "Host refused the connection"),
         (ErrorTimeout, "Host did not answer"),
         (ErrorProtocol, "The other side speaks a different protocol"),
         (ErrorNoDecoder, "No decoder for this format"),
         (SessionTakenOver, "Another device has taken over the session."),
-        (HostKeyChanged, "The fingerprint of {n} has changed (now {m}). Connection refused. If the host was set up again, delete its line in {p}."),
-        (KeyFileDamaged, "The key file {p} is damaged and was left as it is. Check or delete it – a new key is then created, and the host has to pair this device again."),
+        (KeyFileDamaged, "The key file {p} is damaged and was left as it is. Check or delete it – a new key is then created, and the device has to be allowed again with the password."),
         (FileUnreadable, "{p} cannot be read – not connecting."),
         (FileNotUtf8, "{p} is not saved as UTF-8 – not connecting."),
         (FileNotWritable, "{p} cannot be written – not connecting."),
@@ -790,21 +774,14 @@ pub static DE: Lang = Lang {
         (ClientCpu, "Client-CPU"),
         (Monitor, "Monitor"),
         (Skipped, "ausgelassen"),
-        (PairingTitle, "Mit Host koppeln"),
-        (PairingHint, "Code eingeben, der auf dem Host steht"),
-        (PairingCode, "Kopplungscode"),
-        (PairingWrong, "Falscher Code"),
-        (PairingOk, "Gekoppelt"),
         (SecuredWith, "Gesichert · Vergleichscode"),
         (HostFingerprint, "Fingerabdruck des Hosts"),
-        (FirstContact, "Erstkontakt mit diesem Host. Code mit dem auf dem Host vergleichen."),
         (ErrorConnectRefused, "Host hat die Verbindung abgelehnt"),
         (ErrorTimeout, "Host antwortet nicht"),
         (ErrorProtocol, "Die Gegenstelle spricht ein anderes Protokoll"),
         (ErrorNoDecoder, "Kein Decoder für dieses Format"),
         (SessionTakenOver, "Ein anderes Gerät hat die Sitzung übernommen."),
-        (HostKeyChanged, "Der Fingerabdruck von {n} hat sich geändert (jetzt {m}). Verbindung abgelehnt. Wurde der Host neu aufgesetzt, seine Zeile in {p} löschen."),
-        (KeyFileDamaged, "Die Schlüsseldatei {p} ist beschädigt und bleibt, wie sie ist. Datei prüfen oder löschen – dann entsteht ein neuer Schlüssel, und der Host muss dieses Gerät neu koppeln."),
+        (KeyFileDamaged, "Die Schlüsseldatei {p} ist beschädigt und bleibt, wie sie ist. Datei prüfen oder löschen – dann entsteht ein neuer Schlüssel, und das Gerät muss mit dem Passwort wieder erlaubt werden."),
         (FileUnreadable, "{p} lässt sich nicht lesen – keine Verbindung."),
         (FileNotUtf8, "{p} ist nicht als UTF-8 gespeichert – keine Verbindung."),
         (FileNotWritable, "{p} lässt sich nicht schreiben – keine Verbindung."),
@@ -1011,6 +988,31 @@ mod tests {
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
         assert!(n > MsgHostUnverified as usize);
         assert_eq!(n, MsgHostUnverified as usize + 1, "Tabellen laenger als das Enum");
+    }
+
+    /// Die kaputte Schluesseldatei: in jeder Sprache mit genau einem Pfad
+    /// und ohne weiteren Platzhalter; neu ist nicht mehr "koppeln" (das gibt
+    /// es nicht mehr), sondern: das Geraet muss mit dem Passwort wieder
+    /// erlaubt werden.
+    #[test]
+    fn schluesseldatei_beschaedigt() {
+        for l in all() {
+            let t = l.get(KeyFileDamaged);
+            assert_eq!(t.matches("{p}").count(), 1, "{}: {t}", l.code);
+            assert_eq!(t.matches('{').count(), 1, "{}: {t}", l.code);
+        }
+        assert_eq!(
+            EN.get(KeyFileDamaged),
+            "The key file {p} is damaged and was left as it is. Check or delete it – a new key is then created, and the device has to be allowed again with the password."
+        );
+        assert_eq!(
+            DE.get(KeyFileDamaged),
+            "Die Schlüsseldatei {p} ist beschädigt und bleibt, wie sie ist. Datei prüfen oder löschen – dann entsteht ein neuer Schlüssel, und das Gerät muss mit dem Passwort wieder erlaubt werden."
+        );
+        for (code, alt) in [("en", "pair"), ("de", "koppeln"), ("fr", "associer"), ("nl", "koppelen"), ("pl", "sparować")] {
+            let t = all().iter().find(|l| l.code == code).unwrap().get(KeyFileDamaged);
+            assert!(!t.contains(alt), "{code}: {t}");
+        }
     }
 
     /// Die Abbruchgruende der Datei-Zeile: in jeder Sprache vorhanden, ohne

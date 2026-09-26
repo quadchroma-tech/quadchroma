@@ -3938,11 +3938,12 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     // danach liegen, damit Gegenstellen den Host wiedererkennen.
     int schluessel = qc_identity_load(g_id_priv, g_id_pub);
     if (schluessel == -2) {
-        // Nie still einen neuen anlegen: das waere ein anderer Host, und
-        // jeder gekoppelte Client wiese ihn ab.
+        // Nie still einen neuen anlegen: das waere ein anderer Host (neue
+        // ID), den kein Client kennt - jeder verlangte seinen Ausweis (Bit 0
+        // in Nachricht 3) und braeuchte das Passwort noch einmal.
         logf_(@"Schluessel host.key ist vorhanden, aber nicht lesbar oder beschaedigt - Abbruch. "
                "Ein neuer Schluessel waere eine neue Identitaet; die Datei erst entfernen, "
-               "wenn alle Clients neu koppeln sollen.");
+               "wenn alle Clients diesen Host mit dem Passwort neu erlauben sollen.");
         return 5;
     }
     if (schluessel != 0) {

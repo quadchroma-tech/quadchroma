@@ -21,10 +21,11 @@
 //     Der Eintrag in der Liste bleibt dabei, wie er ist; ein falsches
 //     Passwort nimmt ihn auch nicht weg.
 //   - Hoechstens PLAETZE_GESAMT Zugangsphasen zugleich, eine je Schluessel,
-//     zwei je IP (zugang::Plaetze); wer keinen Platz bekommt, erhaelt sofort
-//     22/4 mit BESETZT_WARTEN_MS - hinter "QCA1" und einer Nachricht 20
-//     (Wartezeit ebenso, kein "Zulassen"), damit jeder Client die Folge
-//     kennt, die auch sonst vorkommt (20, dann irgendwann 22/4).
+//     zwei je IP (zugang::Plaetze); wer keinen Platz bekommt, erhaelt
+//     "QCA1" und sofort 22/4 mit BESETZT_WARTEN_MS in einem Datensatz, ohne
+//     Nachricht 20 (wie der Mac-Host). Der Client nimmt 22 auch als erste
+//     Nachricht nach "QCA1" an und meldet "zu viele Versuche", ohne es von
+//     selbst erneut zu versuchen.
 //
 // Waehrend der Zugangsphase haelt niemand eine globale Sperre: die
 // Geraeteliste wird nur kurz unter `liste` gelesen bzw. beschrieben,
