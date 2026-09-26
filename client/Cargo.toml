@@ -84,4 +84,7 @@ windows = { version = "0.62", features = [
     # Host role: display name of a screen (QueryDisplayConfig,
     # DisplayConfigGetDeviceInfo, see host/aufnahme.rs)
     "Win32_Devices_Display",
+    # Access (pairing): random access password from the system CSPRNG
+    # (BCryptGenRandom, see zugang.rs)
+    "Win32_Security_Cryptography",
 ] }

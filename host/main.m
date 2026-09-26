@@ -17,6 +17,10 @@
 //
 // Ueber "open -n QuadChroma.app --args ..." starten, damit die Freigaben am
 // Bundle haengen. Ausgaben zusaetzlich in /tmp/quadchroma-m1.log.
+//
+// Im Dienstbetrieb gehoert der Hauptfaden AppKit ([NSApp run]): Symbol in der
+// Menueleiste, Zulassen- und Passwort-Fenster (menue.m, Texte in texte.m).
+// Das Regelmaessige laeuft auf dem Dienst-Takt (dienst_takt_starten).
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -46,6 +50,7 @@
 #include "qc_secure.h"
 #include "qc_annahme.h"
 #import "last.h"
+#import "menue.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
 
 // ------------------------------------------------------------------ Logging
@@ -3171,6 +3176,174 @@ static void fest_einlesen(NSArray<NSString *> *args) {
     }
 }
 
+// ------------------------------------------------------------ Dienst-Takt
+// Was im Dienstbetrieb regelmaessig anfaellt - nachgetragene Drosselzeilen,
+// Stau-Frist, Statistikzeile, Auslastung (Typ 6) an den Zuschauer -, lief
+// frueher in einer 5-s-Schleife in main, die dazu die Run-Loop drehte. Jetzt
+// dreht [NSApp run] die Run-Loop (Menueleiste, siehe menue.h), und der Takt
+// ist ein Dispatch-Timer auf einer eigenen seriellen Warteschlange - nicht auf
+// der Main Queue: send_small und stau_frist_pruefen nehmen g_send_mtx, und wer
+// das Senden haelt, kann bis zu 2 s haengen (SO_SNDTIMEO); die Oberflaeche
+// stuende so lange. Nur die Namen der Bildschirme (NSScreen, Hauptfaden)
+// werden auf der Main Queue nachgezogen. Zwischenablage und Zeigerform fragen
+// wie bisher ueber ihre eigenen Timer ab. hosttest ruft dienst_takt_starten
+// direkt, mit kurzem Takt und ohne Run-Loop.
+#define QC_TAKT_S 5.0
+static dispatch_queue_t g_taktq = NULL;
+static dispatch_source_t g_takt = NULL, g_takt_namen = NULL;
+// Nur auf g_taktq angefasst:
+static double g_takt_s = QC_TAKT_S;
+static CFAbsoluteTime g_takt_t0 = 0;
+static long g_takt_bilder = 0, g_takt_bilder2 = 0;   // Bezugspunkte fuer Zeile bzw. gemeldete Bildrate
+static long long g_takt_bytes = 0;
+
+// Bildport, Eingabeport und Bekanntgabe. Belegt ein anderes Programm den
+// Bildport, endet der Host nicht mehr (frueher Code 9): das Menue zeigt es,
+// und der Takt versucht es jede Runde erneut - erst ein Blick, ob der Port
+// frei ist, damit nicht jede Runde "bind fehlgeschlagen" ins Protokoll geht.
+// Eingabeport und Bekanntgabe folgen erst, wenn der Bildport steht; sonst
+// riefe die Bekanntgabe Clients zu einem fremden Dienst.
+static _Atomic int g_port_wartet = 0;         // belegter Bildport; 0 = die Annahme laeuft
+static CGDirectDisplayID g_dienst_display = 0;
+
+static int dienst_ports_oeffnen(int port) {
+    if (start_server(port) < 0) return -1;
+    start_input_server(port + 1, g_dienst_display);
+    start_beacon(port);
+    return 0;
+}
+
+static int port_frei(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons((uint16_t)port);
+    int frei = bind(fd, (struct sockaddr *)&a, sizeof a) == 0;
+    close(fd);
+    return frei;
+}
+
+// Auf g_taktq.
+static void dienst_ports_nachversuchen(void) {
+    int port = atomic_load(&g_port_wartet);
+    if (!port || !port_frei(port) || dienst_ports_oeffnen(port) != 0) return;
+    atomic_store(&g_port_wartet, 0);
+    qc_oberflaeche_port_belegt(0);
+    logf_(@"Bildport %d ist frei geworden - Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d",
+          port, port, port + 1, port + 2);
+}
+
+// Eine Runde des Takts, auf g_taktq.
+static void dienst_takt_schritt(void) {
+    drosseln_nachtragen();
+    if (atomic_load(&g_port_wartet)) dienst_ports_nachversuchen();
+    if (atomic_load(&g_client_fd) >= 0) stau_frist_pruefen();
+    long f = atomic_load(&g_sent_frames);
+    long long b = atomic_load(&g_sent_bytes);
+    const double dt = g_takt_s;
+    if (atomic_load(&g_client_fd) >= 0)
+        logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB, %ld verworfen | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | nachgereicht: %ld | zu schnell: %ld | Encoder voll: %ld",
+              CFAbsoluteTimeGetCurrent() - g_takt_t0, f, (f - g_takt_bilder) / dt,
+              (b - g_takt_bytes) * 8.0 / dt / 1e6,
+              atomic_load(&g_audio_packets), atomic_load(&g_audio_bytes) / 1000.0,
+              atomic_load(&g_audio_verworfen),
+              atomic_load(&g_skipped_backlog), g_stats.dropped,
+              atomic_load(&g_repeats), atomic_load(&g_nachgereicht), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
+    g_takt_bilder = f; g_takt_bytes = b;
+
+    // Auslastung des Hosts. Nur wenn jemand zuschaut - sonst misst
+    // der Mac sich selbst ohne Zweck.
+    if (atomic_load(&g_client_fd) >= 0) {
+        qc_last l;
+        qc_last_probe(&l);
+        long n = atomic_exchange(&g_enc_n, 0);
+        long long summe = atomic_exchange(&g_enc_us, 0);
+        // Gedeckelt: ueber 6,5 s liefe das Feld sonst ueber und zeigte wenig.
+        long long zehntel = n ? (summe / n) / 100 : 0;
+        uint16_t enc_zehntel = (uint16_t)(zehntel > 65535 ? 65535 : zehntel);
+        double fps_zehntel = (f - g_takt_bilder2) * 10.0 / dt;
+        uint16_t host_fps_zehntel = (uint16_t)(fps_zehntel > 65535 ? 65535 : fps_zehntel);
+        g_takt_bilder2 = f;
+
+        uint8_t buf[28] = {0};
+        buf[0] = 1;                       // Fassung
+        memcpy(buf + 2,  &l.cpu_promille, 2);
+        memcpy(buf + 4,  &l.cpu_eigen_promille, 2);
+        memcpy(buf + 6,  &l.gpu_promille, 2);
+        memcpy(buf + 8,  &l.druck, 2);
+        memcpy(buf + 10, &l.ram_benutzt_mb, 4);
+        memcpy(buf + 14, &l.ram_gesamt_mb, 4);
+        memcpy(buf + 18, &l.eigen_mb, 4);
+        memcpy(buf + 22, &enc_zehntel, 2);
+        memcpy(buf + 24, &host_fps_zehntel, 2);
+        send_small(QC_MSG_LAST, buf, sizeof buf);
+    }
+}
+
+// Startet den Takt (alle `sekunden`) und das Nachziehen der Bildschirmnamen.
+// Die erste Runde kommt nach einem vollen Takt, wie frueher nach dem ersten
+// runUntilDate.
+static void dienst_takt_starten(double sekunden) {
+    if (!g_taktq) g_taktq = dispatch_queue_create("tech.quadchroma.takt", DISPATCH_QUEUE_SERIAL);
+    dispatch_sync(g_taktq, ^{
+        g_takt_s = sekunden;
+        g_takt_t0 = CFAbsoluteTimeGetCurrent();
+        g_takt_bilder = g_takt_bilder2 = atomic_load(&g_sent_frames);
+        g_takt_bytes = atomic_load(&g_sent_bytes);
+    });
+    uint64_t iv = (uint64_t)(sekunden * NSEC_PER_SEC);
+    g_takt = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_taktq);
+    if (g_takt) {
+        dispatch_source_set_timer(g_takt, dispatch_time(DISPATCH_TIME_NOW, (int64_t)iv), iv, iv / 20);
+        dispatch_source_set_event_handler(g_takt, ^{ @autoreleasepool { dienst_takt_schritt(); } });
+        dispatch_resume(g_takt);
+    }
+    // Namen der Bildschirme (AppKit, Hauptfaden) nachziehen: NSScreen kennt
+    // einen neuen Monitor womoeglich erst kurz nach dem Rueckruf.
+    g_takt_namen = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (g_takt_namen) {
+        dispatch_source_set_timer(g_takt_namen, dispatch_time(DISPATCH_TIME_NOW, (int64_t)iv), iv, iv / 20);
+        dispatch_source_set_event_handler(g_takt_namen, ^{ @autoreleasepool { qc_bildschirm_namen_auffrischen(); } });
+        dispatch_resume(g_takt_namen);
+    }
+}
+
+// Nur der Pruefstand ruft das (er bindet main.m ein). Kehrt zurueck, wenn
+// keine Runde mehr laeuft.
+__attribute__((unused)) static void dienst_takt_anhalten(void) {
+    if (g_takt) { dispatch_source_cancel(g_takt); g_takt = NULL; }
+    if (g_takt_namen) { dispatch_source_cancel(g_takt_namen); g_takt_namen = NULL; }
+    if (g_taktq) dispatch_sync(g_taktq, ^{});
+}
+
+// Beenden (Menue, Cmd+Q, SIGTERM/SIGINT, Abmelden; menue.m ruft es ausserhalb
+// der Main Queue): der Zuschauer bekommt als letzte Nachricht Typ 10 wie beim
+// Abloesen - sein Client verbindet sich dann nicht alle zwei Sekunden neu mit
+// einem Host, den es nicht mehr gibt. Danach sind Bild- und Eingabekanal zu.
+static void host_abschied(void) {
+    char fp[24] = {0};
+    pthread_mutex_lock(&g_send_mtx);
+    int r = zuschauer_abloesen(-1, fp);
+    pthread_mutex_unlock(&g_send_mtx);
+    if (r >= 0)
+        logf_(@"Beenden: Zuschauer %s verabschiedet%s", fp, r ? "" : " - die letzte Nachricht kam nicht an");
+    logf_(@"Host beendet");
+}
+
+static void ui_protokoll(NSString *zeile) {
+    logf_(@"%@", zeile);
+}
+
+// Schwache Standardfassungen der Oberflaeche (wie die qc_ui_*-Rueckrufe in
+// zugang.h): der Host bindet menue.m und bekommt deren Fassungen; Pruefstaende,
+// die main.m ohne menue.m einbinden (hosttest), bauen auch so.
+__attribute__((weak)) void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) { (void)cfg; }
+__attribute__((weak)) void qc_oberflaeche_port_belegt(int port) { (void)port; }
+
 int main(int argc, const char *argv[]) { @autoreleasepool {
     pthread_mutex_lock(&g_log_mtx);
     log_oeffnen("a");
@@ -3433,11 +3606,16 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
                                                  : @" - Automatik (folgt dem Hauptbildschirm)";
         CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
-        if (start_server(port) < 0) return 9;
-        start_input_server(port + 1, display.displayID);
-        start_beacon(port);
+        g_dienst_display = display.displayID;
+        if (dienst_ports_oeffnen(port) != 0) {
+            atomic_store(&g_port_wartet, port);
+            qc_oberflaeche_port_belegt(port);
+            logf_(@"\n=== Bildport %d belegt oder nicht nutzbar - der Host laeuft weiter, das Menue zeigt es; "
+                   "neuer Versuch alle %.0f s ===", port, QC_TAKT_S);
+        } else {
+            logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
+        }
         BOOL ax = AXIsProcessTrusted();
-        logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
         logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
         logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
     } else {
@@ -3467,63 +3645,25 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     // hat und nicht mit Nullen anfaengt.
     { qc_last vorlauf; qc_last_probe(&vorlauf); }
 
-    NSDate *t0 = [NSDate date];
     if (srvIdx != NSNotFound) {
-        // Dienstbetrieb: alle fuenf Sekunden eine Zeile mit dem Stand.
-        long lastFrames = 0; long long lastBytes = 0;
-        long lastFrames2 = 0;   // eigener Bezugspunkt fuer die gemeldete Bildrate
-        for (;;) {
-            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5.0]];
-            drosseln_nachtragen();
-            // Namen der Bildschirme (AppKit, Hauptfaden) nachziehen: NSScreen
-            // kennt einen neuen Monitor womoeglich erst kurz nach dem Rueckruf.
-            qc_bildschirm_namen_auffrischen();
-            if (atomic_load(&g_client_fd) >= 0) stau_frist_pruefen();
-            long f = atomic_load(&g_sent_frames);
-            long long b = atomic_load(&g_sent_bytes);
-            if (atomic_load(&g_client_fd) >= 0)
-                logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB, %ld verworfen | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | nachgereicht: %ld | zu schnell: %ld | Encoder voll: %ld",
-                      -[t0 timeIntervalSinceNow], f, (f - lastFrames) / 5.0,
-                      (b - lastBytes) * 8.0 / 5.0 / 1e6,
-                      atomic_load(&g_audio_packets), atomic_load(&g_audio_bytes) / 1000.0,
-                      atomic_load(&g_audio_verworfen),
-                      atomic_load(&g_skipped_backlog), g_stats.dropped,
-                      atomic_load(&g_repeats), atomic_load(&g_nachgereicht), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
-            lastFrames = f; lastBytes = b;
-
-            // Auslastung des Hosts. Nur wenn jemand zuschaut - sonst misst
-            // der Mac sich selbst ohne Zweck.
-            if (atomic_load(&g_client_fd) >= 0) {
-                qc_last l;
-                qc_last_probe(&l);
-                long n = atomic_exchange(&g_enc_n, 0);
-                long long summe = atomic_exchange(&g_enc_us, 0);
-                // Gedeckelt: ueber 6,5 s liefe das Feld sonst ueber und zeigte wenig.
-                long long zehntel = n ? (summe / n) / 100 : 0;
-                uint16_t enc_zehntel = (uint16_t)(zehntel > 65535 ? 65535 : zehntel);
-                uint16_t host_fps_zehntel = (uint16_t)(((f - lastFrames2) * 10) / 5);
-                lastFrames2 = f;
-
-                uint8_t buf[28] = {0};
-                buf[0] = 1;                       // Fassung
-                memcpy(buf + 2,  &l.cpu_promille, 2);
-                memcpy(buf + 4,  &l.cpu_eigen_promille, 2);
-                memcpy(buf + 6,  &l.gpu_promille, 2);
-                memcpy(buf + 8,  &l.druck, 2);
-                memcpy(buf + 10, &l.ram_benutzt_mb, 4);
-                memcpy(buf + 14, &l.ram_gesamt_mb, 4);
-                memcpy(buf + 18, &l.eigen_mb, 4);
-                memcpy(buf + 22, &enc_zehntel, 2);
-                memcpy(buf + 24, &host_fps_zehntel, 2);
-                send_small(QC_MSG_LAST, buf, sizeof buf);
-            }
-        }
+        // Dienstbetrieb: der Takt (alle fuenf Sekunden Stand, Auslastung,
+        // Stau-Frist) laeuft auf eigener Warteschlange, der Hauptfaden gehoert
+        // AppKit - Menueleiste, Zulassen-Fenster, Zeigerform, Zwischenablage,
+        // Bildschirmrueckrufe. [NSApp run] kehrt nicht zurueck: Beenden laeuft
+        // ueber [NSApp terminate:] (menue.m), erst mit dem Abschied an den
+        // Zuschauer.
+        dienst_takt_starten(QC_TAKT_S);
+        qc_oberflaeche_cfg ui = { .abschied = host_abschied, .protokoll = ui_protokoll };
+        qc_oberflaeche_starten(&ui);
+        [NSApp run];
+        return 0;
     }
 
+    NSDate *t0 = [NSDate date];
     [[NSRunLoop currentRunLoop] runUntilDate:[t0 dateByAddingTimeInterval:seconds]];
     double dt = -[t0 timeIntervalSinceNow];
     // Nur die Aufnahme in eine Datei kommt hierher; der Dienstbetrieb kehrt
-    // aus seiner Schleife nie zurueck.
+    // aus [NSApp run] nie zurueck.
     dispatch_semaphore_t ende = dispatch_semaphore_create(0);
     [g_stream stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(ende); }];
     dispatch_semaphore_wait(ende, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));

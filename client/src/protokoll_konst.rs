@@ -10,8 +10,50 @@
 
 #![allow(dead_code)]
 
-/// Kennung nach dem Handschlag auf dem Bildkanal.
+/// Kennung nach dem Handschlag auf dem Bildkanal: das Geraet ist bekannt,
+/// die Sitzung beginnt.
 pub const MAGIC: &[u8; 4] = b"QCH1";
+
+// ------------------------------------------ Zugang (Bildkanal, vor MAGIC)
+//
+// Spezifikation Pairing v1, Abschnitt 3.2. Einem unbekannten Geraet sendet
+// der Host nach dem Handschlag statt MAGIC erst MAGIC_ZUGANG und dann
+// Zugangsnachrichten mit dem ueblichen 8-Byte-Kopf (Flags und frei = 0).
+// Wird es angenommen, folgt MAGIC und alles wie bisher. Kodieren, Lesen und
+// alle Laengenpruefungen stehen in zugang.rs. Die Nummern 20-23 gelten nur
+// in dieser Phase auf dem Bildkanal; IN_MOVE..IN_KEY (16-19) liegen auf dem
+// Eingabekanal und kommen sich damit nicht in die Quere.
+
+/// Kennung statt MAGIC: dieses Geraet ist dem Host unbekannt, es folgt die
+/// Zugangsphase.
+pub const MAGIC_ZUGANG: &[u8; 4] = b"QCA1";
+/// Host -> Client, Laenge 8 + n: u8 Fassung (ZUGANG_FASSUNG), u8 Wege
+/// (WEG_*), u16 0, u32 warten_ms (Drossel, 0 = sofort), dann n <= 40 Byte
+/// Hostname (UTF-8).
+pub const ZUGANG_NOETIG: u8 = 20;
+/// Client -> Host, Laenge 32: client_proof (zugang::client_beweis).
+pub const ZUGANG_BEWEIS: u8 = 21;
+/// Host -> Client, Laenge 8 oder 40: u8 Ergebnis (ERGEBNIS_*), u8 0, u16 0,
+/// u32 warten_ms, bei ERGEBNIS_PASSWORT dazu 32 Byte host_proof.
+pub const ZUGANG_ERGEBNIS: u8 = 22;
+/// Client -> Host, Laenge 0: der Nutzer hat abgebrochen.
+pub const ZUGANG_ABBRUCH: u8 = 23;
+/// Fassung der Nachricht ZUGANG_NOETIG.
+pub const ZUGANG_FASSUNG: u8 = 1;
+/// Wege in ZUGANG_NOETIG: Bit 0 Passwort (immer gesetzt), Bit 1 "Zulassen"
+/// am Host moeglich (eine Oberflaeche laeuft).
+pub const WEG_PASSWORT: u8 = 1;
+pub const WEG_ZULASSEN: u8 = 2;
+/// Ergebnisse in ZUGANG_ERGEBNIS.
+pub const ERGEBNIS_PASSWORT: u8 = 0;
+pub const ERGEBNIS_ZULASSEN: u8 = 1;
+pub const ERGEBNIS_FALSCH: u8 = 2;
+pub const ERGEBNIS_ABGELEHNT: u8 = 3;
+pub const ERGEBNIS_SCHLUSS: u8 = 4;
+
+/// Nutzlast von Handschlag-Nachricht 3 (Client -> Host): "QCN1" | u8 n |
+/// n <= 40 Byte UTF-8-Name des Clients. Aeltere Clients senden b"client".
+pub const NAME_KENNUNG: &[u8; 4] = b"QCN1";
 
 // ------------------------------------------------ Host -> Client (Bildkanal)
 
@@ -137,6 +179,12 @@ pub const MOD_CMD: u32 = 8;
 // -------------------------------------------------------------- Bekanntgabe
 
 /// UDP-Rundruf des Hosts auf Bildport + 2: "QCHB" | u8 Version | u16 Bildport
-/// | u8 Namenslaenge | Name (UTF-8), alle zwei Sekunden.
+/// | u8 Namenslaenge | Name (UTF-8), alle zwei Sekunden. Dahinter (Pairing
+/// v1, Abschnitt 2; aeltere Clients uebergehen es): u8 BEACON_EXT | u32 ID
+/// (LE) | u8 Flags (BEACON_FLAG_*). Gesamt hoechstens 128 Byte.
 pub const BEACON_MAGIC: &[u8; 4] = b"QCHB";
 pub const BEACON_VERSION: u8 = 1;
+/// Kennung der Erweiterung hinter dem Namen.
+pub const BEACON_EXT: u8 = 1;
+/// Flag Bit 0: am Host kann jemand "Zulassen" klicken. Bit 1-7: 0.
+pub const BEACON_FLAG_ZULASSEN: u8 = 1;

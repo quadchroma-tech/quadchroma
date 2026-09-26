@@ -48,6 +48,10 @@ mod strings_west;
 mod ui;
 /// Desktop-Verknuepfung je Host (anlegen nur unter Windows).
 mod verknuepfung;
+/// Zugang (Pairing v1): Geraete-ID, Passwortbeweis, Zugangsnachrichten,
+/// Drossel, Geraeteliste, Passwortdatei und hosts.txt - Client und
+/// Windows-Host-Rolle.
+mod zugang;
 /// Schliessen legt die App ab: Symbol im Infobereich (Windows, tray_win.rs)
 /// bzw. in der Menueleiste (macOS, tray_mac.rs); gemeinsame Logik in tray.rs.
 mod tray;
