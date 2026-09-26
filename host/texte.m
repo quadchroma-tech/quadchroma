@@ -54,8 +54,9 @@ static const qc_sprache QC_EN = { "en", "English", {
     [QCTextHostPasswordNotSaved]   = "The password could not be saved.",
 }};
 
-// Deutsch: echte Umlaute, typografische Anfuehrungszeichen und Gedankenstrich
-// wie die deutschen Texte in client/src/strings.rs.
+// Deutsch: echte Umlaute, typografische Anfuehrungszeichen, Gedankenstrich und
+// Auslassungszeichen (U+2026) - zeichengleich mit den Host-Schluesseln in
+// client/src/strings.rs (Englisch dort wie hier mit "...").
 static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostReady]              = "Bereit für Verbindungen",
     [QCTextHostConnected]          = "Verbunden: {n}",
