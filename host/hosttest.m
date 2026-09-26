@@ -2914,6 +2914,30 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
            zeilen_mit(logpfad, "Aufnahme wiederhergestellt: Bildschirm 1920x1080, 120 Hz, Kennung 2 (v1138-m1234-s0) \"X27 X1\"") == 1,
            "nach 2 s ist die Aufnahme auf dem gewuenschten Bildschirm wieder da: Hoststatus 0, Liste, Zeile");
 
+    printf("\n-- Bildschirm: Wunsch Automatik ueber den Eingabekanal\n");
+    // Der Zuschauer stellt auf Automatik, waehrend der gewuenschte Bildschirm
+    // laeuft: Wechsel auf den Hauptbildschirm mit dem Grund des Wunsches -
+    // nicht "Hauptbildschirm gewechselt", der blieb, wo er war (Befund des
+    // Livetests). Liste ohne Wunsch, bildschirm.txt "auto".
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    int haupt_zeilen_vorher = zeilen_mit(logpfad, "(Hauptbildschirm gewechselt)");
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_BILDSCHIRM, qc_bildschirm_wunsch_kodieren(nil));
+    usleep(300 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int n_auto = liste_lesen(g.liste, g.liste_n, wunsch, 0, &eb);
+    stand_zeile("nach dem Wunsch Automatik");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && atomic_load(&g_fabrik_zuletzt) == 6 && display_jetzt() == 6 &&
+           atomic_load(&g_input_display) == 6 && g.wechsel == 1 && n_auto == 3 && wunsch[0] == 0 &&
+           eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) && wunsch_jetzt() == nil &&
+           [datei_inhalt(pfad) isEqualToString:@"auto\n"],
+           "Wunsch Automatik ueber den Eingabekanal: Wechsel auf den Hauptbildschirm, Liste ohne Wunsch, bildschirm.txt \"auto\"");
+    pruefe(zeilen_mit(logpfad, "-> Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" (Wunsch des Zuschauers: Automatik)") == 1 &&
+           zeilen_mit(logpfad, "(Hauptbildschirm gewechselt)") == haupt_zeilen_vorher,
+           "Protokollzeile mit Grund \"Wunsch des Zuschauers: Automatik\", keine weitere \"Hauptbildschirm gewechselt\"");
+
     zuschauer_weg();
     schein_schliessen(&H);
     stdout_stumm(1);

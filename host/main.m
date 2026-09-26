@@ -2998,8 +2998,13 @@ static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
         NSString *grund;
         if (art == QC_WAHL_WUNSCH)
             grund = wirksam == QC_ANLASS_WUNSCH ? @"Wunsch des Zuschauers" : @"zurueck zum gewuenschten Bildschirm";
+        else if (g_display_wunsch)
+            grund = @"Ausweichplatz";
         else
-            grund = g_display_wunsch ? @"Ausweichplatz" : @"Hauptbildschirm gewechselt";
+            // Ohne Wunsch ist das Ziel der Hauptbildschirm - entweder, weil
+            // der Zuschauer gerade auf Automatik gestellt hat, oder weil
+            // der Hauptbildschirm ein anderer wurde.
+            grund = wirksam == QC_ANLASS_WUNSCH ? @"Wunsch des Zuschauers: Automatik" : @"Hauptbildschirm gewechselt";
         bildschirm_wechseln(ziel, grund, anlass);
         return ziel;
     }

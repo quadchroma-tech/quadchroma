@@ -8516,8 +8516,35 @@ fn main() {
             let takt_ende = Instant::now() + Duration::from_secs(3);
             while Instant::now() < takt_ende {
                 std::thread::sleep(Duration::from_millis(50));
+                // --bildschirm <Kennung|auto> wuenscht einmal einen Bildschirm:
+                // sobald der Eingabekanal steht und der Host die Wahl gemeldet
+                // hat (Bit 1) - ein aelterer Host bekommt nie Typ 70, das sagt
+                // die Zeile dann statt des Wunsches. In der 50-ms-Scheibe,
+                // nicht erst im Takt: die Eingabeprobe wartet auf den Wechsel,
+                // und die endet frueher als der naechste Takt.
+                if let Some(w) = bildschirm_wunsch.as_ref() {
+                    if input.lock().unwrap().steht() {
+                        if bildschirm_wunsch_senden(&shared, &input, w.clone()) {
+                            println!("Bildschirmwunsch gesendet: {}", w.as_deref().unwrap_or("auto"));
+                            bildschirm_wunsch = None;
+                        } else {
+                            let s = shared.lock().unwrap();
+                            let ohne_wahl = s.faehigkeiten_da && !s.host_bildschirmwahl;
+                            drop(s);
+                            if ohne_wahl {
+                                println!("Bildschirmwunsch nicht gesendet: der Host kennt keine Bildschirmwahl");
+                                bildschirm_wunsch = None;
+                            }
+                        }
+                    }
+                }
                 if eingabeprobe && probe_stand < PROBEN.len() {
-                    let faellig = probe_zeit.map_or(true, |t| t.elapsed() >= Duration::from_secs(1));
+                    // Mit --bildschirm erst, wenn der Wunsch hinaus ist und der
+                    // Host ihn beantwortet hat (oder die Frist verstrichen
+                    // ist): die Probe soll auf dem gewuenschten Bildschirm
+                    // landen, nicht auf dem davor.
+                    let wechsel = bildschirm_wunsch.is_some() || shared.lock().unwrap().bildschirm_wechsel_laeuft();
+                    let faellig = !wechsel && probe_zeit.map_or(true, |t| t.elapsed() >= Duration::from_secs(1));
                     let mut l = input.lock().unwrap();
                     if faellig && l.steht() {
                         let (nx, ny) = PROBEN[probe_stand];
@@ -8662,23 +8689,7 @@ fn main() {
             // aufgehen, wenn der Bildkanal steht, und das wollen wir sehen.
             let link = s.link.clone();
             let cur = s.settings;
-            let (faehig_da, bildschirmwahl) = (s.faehigkeiten_da, s.host_bildschirmwahl);
             drop(s);
-            // --bildschirm <Kennung|auto> wuenscht einmal einen Bildschirm:
-            // erst, wenn der Eingabekanal steht und der Host die Wahl
-            // gemeldet hat (Bit 1) - ein aelterer Host bekommt nie Typ 70,
-            // das sagt die Zeile dann statt des Wunsches.
-            if let Some(w) = bildschirm_wunsch.as_ref() {
-                if input.lock().unwrap().steht() {
-                    if bildschirm_wunsch_senden(&shared, &input, w.clone()) {
-                        println!("Bildschirmwunsch gesendet: {}", w.as_deref().unwrap_or("auto"));
-                        bildschirm_wunsch = None;
-                    } else if faehig_da && !bildschirmwahl {
-                        println!("Bildschirmwunsch nicht gesendet: der Host kennt keine Bildschirmwahl");
-                        bildschirm_wunsch = None;
-                    }
-                }
-            }
             {
                 let mut l = input.lock().unwrap();
                 l.set_link(link);
