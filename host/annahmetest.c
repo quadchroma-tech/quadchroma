@@ -593,8 +593,12 @@ int main(void) {
     pruefe(warte_zaehler(&za.meld_verdraengt, 2, 11000) && atomic_load(&za.meldungen) == 2,
            "Bildport: zweite Verdraengung kommt nach der Sperre in einer zweiten Meldung");
     pruefe(warte_zaehler(&zc.meld_abgewiesen, 1, 11000), "sofort geschlossene Verbindung wird gemeldet");
-    pruefe(atomic_load(&za.erfolg) == 2 && atomic_load(&zb.erfolg) == 6,
-           "Hostseite: alle echten Handschlaege erfolgreich (2 + 6)");
+    // Zweiter Port: der Client bei vollen Plaetzen plus alle echten Clients
+    // der Angreifer-Probe (mindestens 5, auf langsamen Runnern mehr).
+    printf("         (Hostseite: %d + %d erfolgreich, erwartet 2 + %d)\n",
+           atomic_load(&za.erfolg), atomic_load(&zb.erfolg), 1 + versuche);
+    pruefe(atomic_load(&za.erfolg) == 2 && atomic_load(&zb.erfolg) == 1 + versuche,
+           "Hostseite: alle echten Handschlaege erfolgreich");
 
     freigaben_pruefen();
     schluessel_pruefen();
