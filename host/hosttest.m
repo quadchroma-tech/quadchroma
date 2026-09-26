@@ -27,7 +27,8 @@
 // der Oberflaeche, Abbruch, Verbindungsende, nur eine Anfrage zugleich,
 // Grenzen je Adresse und Schluessel, Frist, ein Wartender stoert den
 // laufenden Zuschauer nicht, beschaedigte Liste, Entfernen trennt die
-// Sitzung, ohne Bildschirmfreigabe Hoststatus 1, Argumente ohne Wert).
+// Sitzung, ohne Bildschirmfreigabe oder ohne Bildschirm Hoststatus 1 statt
+// einer Abweisung, Name mit vorgetaeuschter ID, Argumente ohne Wert).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
 //         -mmacosx-version-min=14.0 -framework Foundation -framework AppKit \
@@ -3327,6 +3328,31 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     pruefe(ok_d22 && qc_zugang_bekannt(d_pub, NULL) == 0 && zeilen_mit(logpfad, "Zugang: Fremd (ID ") == 1 &&
            zeilen_mit(logpfad, "am Host abgelehnt") == 1, "Ablehnen: 22/3, der Host schliesst, nichts eingetragen, Zeile");
     zc_zu(&z);
+
+    // Ein Name aus Nachricht 3, der eine ID vortaeuscht (neun oder mehr
+    // Ziffern, auch Vollbreite), erscheint im Fenster als Adresse - wie in
+    // der Windows-Host-Rolle. Acht Ziffern bleiben stehen.
+    const char *namen[3] = { "Roberts Mac (ID 123 456 789)", "Mac \xef\xbc\x91\xef\xbc\x92\xef\xbc\x93 456 789", "Studio 2024 PC 1234" };
+    const char *soll[3] = { "127.0.0.1", "127.0.0.1", "Studio 2024 PC 1234" };
+    int namen_gut = 1;
+    uint8_t v_priv[32], v_pub[32];
+    qc_keypair(v_priv, v_pub);
+    stdout_stumm(1);
+    for (int i = 0; i < 3; i++) {
+        int ok_v = zc_verbinden(&z, bild_port, v_priv, namen[i]) == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+                   zc_noetig(&z, &wege, &warten, hn) == 0;
+        a = anfrage_neu(a, 2);
+        pthread_mutex_lock(&g_test_ui_mtx);
+        int gleich = strcmp(g_test_anfrage_name, soll[i]) == 0;
+        pthread_mutex_unlock(&g_test_ui_mtx);
+        zc_abbruch(&z);
+        zc_schliesst(&z, 2000);
+        zc_zu(&z);
+        warten_bis(zugang_ruht, 2);
+        if (!(ok_v && a && gleich)) namen_gut = 0;
+    }
+    stdout_stumm(0);
+    pruefe(namen_gut, "Name mit vorgetaeuschter ID (9+ Ziffern, auch Vollbreite): im Zulassen-Fenster steht die Adresse; 8 Ziffern bleiben");
 
     printf("\n-- Zugang: Abbruch, Verbindungsende, Warteschlange\n");
     uint8_t e_priv[32], e_pub[32];

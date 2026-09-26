@@ -478,7 +478,17 @@ static void aktivieren(void) {
 @property (nonatomic, strong) NSPanel *panel;
 @property (nonatomic, copy) void (^antwort)(BOOL ja);
 @property (nonatomic) BOOL zulassen;   // Zulassen-Anfrage: schwebend, nicht aktivierend, mit Ton
+@property (nonatomic, strong) NSButton *jaKnopf;
+@property (nonatomic) BOOL jaFrei;     // "Ja" nimmt Klick und Return an (Zulassen erst nach ZULASSEN_SPERRE_MS)
+@property (nonatomic) NSUInteger runde; // zaehlt jedes gezeigte Fenster
 @end
+
+// So lange ist "Zulassen" nach dem Erscheinen des Fensters gesperrt: jede
+// unbekannte Gegenstelle kann das schwebende Fenster samt Ton beliebig oft
+// neu ausloesen, und ein Klick heisst Vollzugriff - wer gerade dorthin
+// klickt, wo es aufgeht, soll nicht versehentlich zulassen. "Ablehnen"
+// wirkt sofort. Wie die Windows-Host-Rolle (fenster.rs, 1000 ms).
+static const int64_t ZULASSEN_SPERRE_MS = 1000;
 
 @implementation QCFrage
 
@@ -506,6 +516,10 @@ static void aktivieren(void) {
     }
     NSButton *bj = [NSButton buttonWithTitle:ja target:self action:@selector(jaGeklickt:)];
     NSButton *bn = [NSButton buttonWithTitle:nein target:self action:@selector(neinGeklickt:)];
+    self.jaKnopf = bj;
+    self.jaFrei = !self.zulassen;
+    bj.enabled = self.jaFrei;
+    NSUInteger runde = ++self.runde;
     if (jaStandard) {
         bj.keyEquivalent = @"\r";
         bn.keyEquivalent = @"\033";
@@ -542,6 +556,15 @@ static void aktivieren(void) {
         p.level = NSFloatingWindowLevel;
         p.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
         [p orderFrontRegardless];
+        // "Zulassen" erst nach der Sperre - und nur, wenn noch dieses
+        // Fenster steht (nicht schon die naechste Anfrage).
+        __weak QCFrage *ich = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ZULASSEN_SPERRE_MS * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            QCFrage *f = ich;
+            if (!f || !f.panel || f.runde != runde) return;
+            f.jaFrei = YES;
+            f.jaKnopf.enabled = YES;
+        });
         NSSound *ton = [NSSound soundNamed:@"Glass"];
         if (ton) [ton play];
         else NSBeep();
@@ -557,6 +580,7 @@ static void aktivieren(void) {
     NSPanel *p = self.panel;
     self.panel = nil;
     self.antwort = nil;
+    self.jaKnopf = nil;
     p.delegate = nil;
     [p orderOut:nil];
     [p close];
@@ -568,7 +592,11 @@ static void aktivieren(void) {
     if (a) a(ja);
 }
 
-- (void)jaGeklickt:(id)sender { (void)sender; [self fertig:YES]; }
+- (void)jaGeklickt:(id)sender {
+    (void)sender;
+    if (!self.jaFrei) return;          // Zulassen noch gesperrt (auch Return)
+    [self fertig:YES];
+}
 - (void)neinGeklickt:(id)sender { (void)sender; [self fertig:NO]; }
 
 // Schliessknopf der Rueckfrage: wie "Abbrechen". Das Fenster schliesst AppKit
@@ -579,6 +607,7 @@ static void aktivieren(void) {
     self.antwort = nil;
     self.panel.delegate = nil;
     self.panel = nil;
+    self.jaKnopf = nil;
     if (a) a(NO);
     return YES;
 }

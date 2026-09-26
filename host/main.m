@@ -1303,6 +1303,27 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
     return zugelassen;
 }
 
+// Ein Name aus Nachricht 3 mit neun oder mehr Ziffern koennte eine
+// Geraete-ID vortaeuschen ("Roberts Mac (ID 123 456 789)"): im
+// Zulassen-Fenster stuende die falsche ID dann vor der echten - und die ID
+// ist das, woran man am Mac das Geraet erkennt. Er gilt wie ein fehlender
+// (die Windows-Host-Rolle ebenso, einlass::anzeigename). Gezaehlt werden
+// Dezimalziffern jeder Schrift, auch Vollbreite; Rechnernamen haben so
+// viele kaum je.
+static BOOL name_taeuscht_id_vor(const char *name) {
+    NSString *s = name ? [NSString stringWithUTF8String:name] : nil;
+    NSData *d = [s dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+    if (!d) return NO;
+    NSCharacterSet *ziffern = [NSCharacterSet decimalDigitCharacterSet];
+    const uint8_t *b = d.bytes;
+    int n = 0;
+    for (NSUInteger i = 0; i + 4 <= d.length; i += 4) {
+        UTF32Char c = (UTF32Char)b[i] | (UTF32Char)b[i + 1] << 8 | (UTF32Char)b[i + 2] << 16 | (UTF32Char)b[i + 3] << 24;
+        if ([ziffern longCharacterIsMember:c]) n++;
+    }
+    return n >= 9;
+}
+
 static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *von, void *ctx) {
     struct sockaddr_in peer = *von;
     tune_socket(fd);
@@ -1334,12 +1355,14 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     qc_zugang_id_text(qc_zugang_id(chan->peer), id_text);
 
     // Wer ist das? Der Name kommt aus Nachricht 3 (unbeglaubigt, nur
-    // Anzeige), sonst aus der Liste, sonst ist es die Adresse. Bekannte
-    // Geraete kommen sofort herein, alle anderen - auch wenn die Liste
-    // beschaedigt ist - muessen sich in der Zugangsphase ausweisen. Die
-    // Liste ist dafuer nur fuer diesen einen Blick gesperrt.
+    // Anzeige; einer, der eine ID vortaeuscht, zaehlt nicht), sonst aus der
+    // Liste, sonst ist es die Adresse. Bekannte Geraete kommen sofort
+    // herein, alle anderen - auch wenn die Liste beschaedigt ist - muessen
+    // sich in der Zugangsphase ausweisen. Die Liste ist dafuer nur fuer
+    // diesen einen Blick gesperrt.
     char name[QC_ZUGANG_NAME_MAX + 1], gespeichert[QC_ZUGANG_NAME_MAX + 1];
     qc_zugang_name_lesen(chan->nutzlast3, chan->nutzlast3_len, name);
+    if (name[0] && name_taeuscht_id_vor(name)) name[0] = 0;
     uint64_t entfernt_stand = atomic_load(&g_entfernt_zaehler);   // vor dem Blick in die Liste
     int bekannt = qc_zugang_bekannt(chan->peer, gespeichert);
     if (!name[0]) snprintf(name, sizeof name, "%s", bekannt > 0 && gespeichert[0] ? gespeichert : ip);
