@@ -20,7 +20,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-winit = "0.30"
+# Pinned exactly: the Mac menu bar (host/menue.m) adds methods to winit's own
+# application delegate class, an internal detail of this version. Check
+# menue.m (an_winits_delegate_haengen) before moving to another winit.
+winit = "=0.30.13"
 softbuffer = "0.4"
 rayon = "1.10"
 fontdue = "0.9"
