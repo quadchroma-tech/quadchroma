@@ -865,8 +865,10 @@ pub fn main_host(args: &[String]) -> i32 {
     // Bildkanal; neuer Inhalt bricht eine laufende Datei-Sendung ab. Was von
     // dort kommt, legt der Eingabefaden (Text) bzw. der Empfaenger der
     // Dateien ab (netz.rs). Der Waechter wartet dabei nie: das Senden der
-    // Dateien laeuft in eigenen Faeden.
-    crate::clipboard::watch(|inhalt| match inhalt {
+    // Dateien laeuft in eigenen Faeden. Angemeldet als Host-Rolle, mit dem
+    // Zuschauer als Gegenueber (ein Client im selben Prozess teilt sich den
+    // Waechter).
+    crate::clipboard::watch(protokoll::Herkunft::Host, netz::zuschauer_sitzung, |inhalt| match inhalt {
         crate::clipboard::Inhalt::Text(text) => {
             netz::datei_sendung_abbrechen();
             netz::send_small(MSG_CLIP, text.as_bytes());

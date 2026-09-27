@@ -1200,6 +1200,14 @@ pub fn zuschauer_da() -> bool {
     sperre(&AKTUELL).is_some()
 }
 
+/// Das Gegenueber der Host-Rolle fuer den Ablagewaechter
+/// (clipboard::watch): Some(Nummer des Zuschauers), solange einer da ist -
+/// ein neuer Zuschauer ist eine neue Sitzung -, sonst None.
+pub fn zuschauer_sitzung() -> Option<u64> {
+    let a = sperre(&AKTUELL);
+    a.is_some().then(|| NR.load(Ordering::Relaxed))
+}
+
 /// Name des verbundenen Zuschauers (Oberflaeche: "Verbunden: <Name>").
 pub fn zuschauer_name() -> Option<String> {
     sperre(&AKTUELL).as_ref().map(|l| l.name.clone())
@@ -1395,7 +1403,7 @@ impl DateiUmgebung {
 /// der die Host-Rolle laeuft.
 #[cfg(not(test))]
 fn ablage_setzen(pfade: &[PathBuf]) -> bool {
-    crate::clipboard::set_dateien(pfade)
+    crate::clipboard::set_dateien(crate::protokoll::Herkunft::Host, pfade)
 }
 
 /// Unter cfg(test) fasst der Dienstweg die echte Ablage nie an; Tests

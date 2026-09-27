@@ -1124,7 +1124,7 @@ impl DateiAblage {
     fn produktion() -> DateiAblage {
         #[cfg(any(windows, target_os = "macos"))]
         let ablegen: Arc<dyn Fn(Vec<std::path::PathBuf>) -> bool + Send + Sync> =
-            Arc::new(|p: Vec<std::path::PathBuf>| clipboard::set_dateien(&p));
+            Arc::new(|p: Vec<std::path::PathBuf>| clipboard::set_dateien(protokoll::Herkunft::Client, &p));
         #[cfg(not(any(windows, target_os = "macos")))]
         let ablegen: Arc<dyn Fn(Vec<std::path::PathBuf>) -> bool + Send + Sync> = Arc::new(|_| false);
         DateiAblage { basis: dateien::ablage_basis(), ablegen }
@@ -10234,7 +10234,9 @@ fn main() {
 
     // Zwischenablage: Was hier kopiert wird, geht zum Host - Text als
     // IN_CLIP, Dateien ueber den Sender (dateien.rs), nur mit Gegenueber
-    // (der Waechter liest ohne Sitzung nicht). Der Waechter reicht nur
+    // (der Waechter liest ohne Sitzung nicht; angemeldet als Client, mit der
+    // Sitzung als Gegenueber - eine Host-Rolle im selben Prozess meldet sich
+    // am selben Waechter an). Der Waechter reicht nur
     // weiter (unter Windows laeuft er im Faden seines Fensters); Sperren und
     // Senden stehen im eigenen Faden der Weiterleitung, der Reihe nach.
     // Liegt eine Kopie vorgemerkt (Faehigkeiten des Hosts stehen noch aus),
@@ -10263,7 +10265,7 @@ fn main() {
             }
             vorgemerkte_dateien(&sh, &link);
         });
-        clipboard::watch(move |inhalt| {
+        clipboard::watch(protokoll::Herkunft::Client, clipboard::client_gegenueber, move |inhalt| {
             let _ = tx.send(inhalt);
         });
     }

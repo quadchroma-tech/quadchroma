@@ -17,9 +17,25 @@
 // die gerade erst gemeldet wurde, innerhalb von DOPPEL_FRIST nicht noch
 // einmal melden (Entdoppler) - Text dagegen immer, er ist klein und bricht
 // nichts Teures ab.
+//
+// Verteilen nach Herkunft (Verteiler): Client und Host-Rolle koennen sich
+// einen Prozess teilen, die Ablage des Rechners aber gibt es nur einmal -
+// also auch nur EINEN Waechter. Jede Rolle meldet sich mit ihrer Herkunft
+// an (protokoll::Herkunft), dazu, ob sie gerade ein Gegenueber hat (der
+// Client eine Sitzung, die Host-Rolle einen Zuschauer) und in welcher
+// Sitzung. Gelesen wird, wenn irgendeine Rolle ein Gegenueber hat; eine
+// Kopie des Nutzers geht an jede Rolle, die in diesem Augenblick eines hat,
+// entdoppelt je Rolle. Was eine Rolle selbst ablegt (von ihrem Gegenueber),
+// meldet der Waechter keiner Rolle - weder zurueck noch weiter: Ablegen
+// kennzeichnet den Eintrag, und gekennzeichnete Eintraege liest der
+// Waechter nie (clipboard.rs, clipboard_mac.rs). Eine Kette ueber diesen
+// Rechner hinweg gibt es damit nicht.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::protokoll::Herkunft;
 
 /// So lange muss die Ablage nach der letzten Meldung ruhig sein, bevor
 /// gelesen wird.
@@ -115,6 +131,127 @@ impl Entdoppler {
     }
 }
 
+/// Was der Benutzer kopiert hat - fuer beide Waechter dieselbe Art
+/// (clipboard.rs, clipboard_mac.rs), damit die Aufrufer ohne
+/// Plattformweiche auskommen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inhalt {
+    /// Text; unter Windows mit den Zeilenenden, wie Windows sie liefert
+    /// (CRLF), auf dem Mac der Text des ersten Eintrags.
+    Text(String),
+    /// Eine Dateiliste: die obersten Pfade, wie Explorer (CF_HDROP) bzw.
+    /// Finder (Dateiverweise) sie ablegen. Ordner werden nicht aufgeloest.
+    Dateien(Vec<PathBuf>),
+}
+
+impl Inhalt {
+    pub fn leer(&self) -> bool {
+        match self {
+            Inhalt::Text(t) => t.is_empty(),
+            Inhalt::Dateien(p) => p.is_empty(),
+        }
+    }
+}
+
+/// Hat die Rolle gerade ein Gegenueber? Some(sitzung) ja - `sitzung`
+/// aendert sich mit jedem neuen Gegenueber (dieselbe Dateiliste in einer
+/// neuen Sitzung ist eine neue Kopie) -, None nein. Wird im Faden des
+/// Waechters gerufen, ohne eine Sperre dieses Moduls.
+pub type Gegenueber = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Nimmt eine Kopie ab; laeuft im Faden des Waechters, ohne eine Sperre
+/// dieses Moduls, und darf dort nicht lange arbeiten.
+pub type Abnehmer = Arc<dyn Fn(Inhalt) + Send + Sync>;
+
+/// Eine angemeldete Rolle.
+struct Platz {
+    gegenueber: Gegenueber,
+    abnehmer: Abnehmer,
+    doppel: Entdoppler,
+}
+
+/// Was aus einer Kopie fuer eine Rolle wurde.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verteilt {
+    /// Die Rolle hat sie bekommen.
+    Gemeldet,
+    /// Dieselbe Dateiliste gerade eben schon (Entdoppler) - uebergangen.
+    Doppelt,
+}
+
+/// Die Abnehmer des einen Waechters, je Herkunft hoechstens einer.
+pub struct Verteiler {
+    plaetze: Mutex<[Option<Platz>; 2]>,
+}
+
+impl Verteiler {
+    pub const fn neu() -> Verteiler {
+        Verteiler { plaetze: Mutex::new([None, None]) }
+    }
+
+    fn sperre(&self) -> std::sync::MutexGuard<'_, [Option<Platz>; 2]> {
+        self.plaetze.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Die Rolle `h` nimmt ab jetzt Kopien ab; eine fruehere Anmeldung
+    /// derselben Rolle ist damit ersetzt.
+    pub fn anmelden(&self, h: Herkunft, gegenueber: Gegenueber, abnehmer: Abnehmer) {
+        self.sperre()[h.stelle()] = Some(Platz { gegenueber, abnehmer, doppel: Entdoppler::neu(DOPPEL_FRIST) });
+    }
+
+    /// Die angemeldeten Rollen mit ihren Rueckrufen - gerufen wird dann
+    /// ausserhalb der Sperre.
+    fn angemeldet(&self) -> Vec<(Herkunft, Gegenueber, Abnehmer)> {
+        let p = self.sperre();
+        [Herkunft::Client, Herkunft::Host]
+            .into_iter()
+            .filter_map(|h| p[h.stelle()].as_ref().map(|x| (h, x.gegenueber.clone(), x.abnehmer.clone())))
+            .collect()
+    }
+
+    /// Die Rollen, die jetzt ein Gegenueber haben.
+    pub fn mit_gegenueber(&self) -> Vec<Herkunft> {
+        self.angemeldet().into_iter().filter(|(_, g, _)| g().is_some()).map(|(h, _, _)| h).collect()
+    }
+
+    /// Hat irgendeine Rolle ein Gegenueber? Nur dann liest der Waechter.
+    pub fn jemand_da(&self) -> bool {
+        self.angemeldet().iter().any(|(_, g, _)| g().is_some())
+    }
+
+    /// Eine Kopie des Nutzers an jede Rolle, die jetzt ein Gegenueber hat -
+    /// eine Dateiliste nur, wenn sie fuer diese Rolle in dieser Sitzung
+    /// nicht gerade eben schon ging (Entdoppler je Rolle); Text immer, er
+    /// loest die Liste davor ab. Liefert, was fuer welche Rolle geschah;
+    /// Rollen ohne Gegenueber fehlen darin.
+    pub fn verteilen(&self, inhalt: &Inhalt, jetzt: Instant) -> Vec<(Herkunft, Verteilt)> {
+        let mut aus = Vec::new();
+        for (h, gegenueber, abnehmer) in self.angemeldet() {
+            let Some(sitzung) = gegenueber() else { continue };
+            let neu = {
+                let mut p = self.sperre();
+                // Inzwischen neu angemeldet: der neue Abnehmer bekommt die
+                // Kopie beim naechsten Mal.
+                let Some(platz) = p[h.stelle()].as_mut().filter(|x| Arc::ptr_eq(&x.abnehmer, &abnehmer)) else { continue };
+                match inhalt {
+                    Inhalt::Dateien(pfade) => platz.doppel.dateien(pfade, jetzt, sitzung),
+                    Inhalt::Text(_) => {
+                        platz.doppel.text();
+                        true
+                    }
+                }
+            };
+            if neu {
+                abnehmer(inhalt.clone());
+                aus.push((h, Verteilt::Gemeldet));
+            } else {
+                aus.push((h, Verteilt::Doppelt));
+            }
+        }
+        aus
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +322,146 @@ mod tests {
         // Neue Sitzung: auch.
         assert!(d.dateien(&a, t0 + MS(2400), 2));
         assert!(!d.dateien(&a, t0 + MS(2500), 2));
+    }
+
+    /// Ein Abnehmer zum Pruefen: sein Gegenueber (Sitzung oder keins) wird
+    /// von aussen gestellt, was er bekommt, sammelt er.
+    struct Pruefrolle {
+        sitzung: Arc<Mutex<Option<u64>>>,
+        bekommen: Arc<Mutex<Vec<Inhalt>>>,
+    }
+
+    impl Pruefrolle {
+        fn anmelden(v: &Verteiler, h: Herkunft) -> Pruefrolle {
+            let r = Pruefrolle { sitzung: Arc::new(Mutex::new(None)), bekommen: Arc::new(Mutex::new(Vec::new())) };
+            let (s, b) = (r.sitzung.clone(), r.bekommen.clone());
+            v.anmelden(h, Arc::new(move || *s.lock().unwrap()), Arc::new(move |i| b.lock().unwrap().push(i)));
+            r
+        }
+
+        fn gegenueber(&self, s: Option<u64>) {
+            *self.sitzung.lock().unwrap() = s;
+        }
+
+        fn nimm(&self) -> Vec<Inhalt> {
+            std::mem::take(&mut *self.bekommen.lock().unwrap())
+        }
+    }
+
+    /// Zwei Rollen an einem Waechter: gelesen wird, sobald eine ein
+    /// Gegenueber hat; eine Kopie geht an jede Rolle mit Gegenueber und an
+    /// keine ohne. Die Herkunft der Meldungen stimmt.
+    #[test]
+    fn verteilen_nach_herkunft() {
+        let t0 = Instant::now();
+        let v = Verteiler::neu();
+        let text = Inhalt::Text("kopiert".into());
+        // Niemand angemeldet: niemand da, nichts verteilt.
+        assert!(!v.jemand_da());
+        assert!(v.verteilen(&text, t0).is_empty());
+
+        let client = Pruefrolle::anmelden(&v, Herkunft::Client);
+        let host = Pruefrolle::anmelden(&v, Herkunft::Host);
+        assert!(!v.jemand_da(), "ohne Gegenueber wird nicht gelesen");
+        assert!(v.verteilen(&text, t0).is_empty());
+        assert!(client.nimm().is_empty() && host.nimm().is_empty());
+
+        // Nur die Host-Rolle hat einen Zuschauer.
+        host.gegenueber(Some(1));
+        assert!(v.jemand_da());
+        assert_eq!(v.mit_gegenueber(), vec![Herkunft::Host]);
+        assert_eq!(v.verteilen(&text, t0), vec![(Herkunft::Host, Verteilt::Gemeldet)]);
+        assert_eq!(host.nimm(), vec![text.clone()]);
+        assert!(client.nimm().is_empty(), "Client ohne Sitzung hat die Kopie bekommen");
+
+        // Beide haben ein Gegenueber: beide bekommen sie.
+        client.gegenueber(Some(7));
+        assert_eq!(v.mit_gegenueber(), vec![Herkunft::Client, Herkunft::Host]);
+        let t2 = Inhalt::Text("zweite".into());
+        assert_eq!(
+            v.verteilen(&t2, t0),
+            vec![(Herkunft::Client, Verteilt::Gemeldet), (Herkunft::Host, Verteilt::Gemeldet)]
+        );
+        assert_eq!(client.nimm(), vec![t2.clone()]);
+        assert_eq!(host.nimm(), vec![t2]);
+
+        // Nur noch der Client.
+        host.gegenueber(None);
+        assert_eq!(v.mit_gegenueber(), vec![Herkunft::Client]);
+        assert_eq!(v.verteilen(&text, t0), vec![(Herkunft::Client, Verteilt::Gemeldet)]);
+        assert!(host.nimm().is_empty());
+        assert_eq!(client.nimm(), vec![text]);
+    }
+
+    /// Entdoppelt wird je Rolle, mit ihrer eigenen Sitzung: dieselbe Liste
+    /// gleich noch einmal geht an keine Rolle, die sie eben bekam - an eine
+    /// Rolle, die sie noch nicht hatte (ihr Gegenueber kam eben dazu), schon;
+    /// ein neues Gegenueber (neue Sitzung) bekommt sie ebenso.
+    #[test]
+    fn entdoppeln_je_rolle() {
+        let t0 = Instant::now();
+        let v = Verteiler::neu();
+        let client = Pruefrolle::anmelden(&v, Herkunft::Client);
+        let host = Pruefrolle::anmelden(&v, Herkunft::Host);
+        let liste = Inhalt::Dateien(vec![PathBuf::from("/x/a.txt")]);
+        client.gegenueber(Some(1));
+        assert_eq!(v.verteilen(&liste, t0), vec![(Herkunft::Client, Verteilt::Gemeldet)]);
+        host.gegenueber(Some(4));
+        assert_eq!(
+            v.verteilen(&liste, t0 + MS(300)),
+            vec![(Herkunft::Client, Verteilt::Doppelt), (Herkunft::Host, Verteilt::Gemeldet)]
+        );
+        assert_eq!(client.nimm().len(), 1);
+        assert_eq!(host.nimm().len(), 1);
+        // Neuer Zuschauer an der Host-Rolle: neue Sitzung, neue Kopie.
+        host.gegenueber(Some(5));
+        assert_eq!(
+            v.verteilen(&liste, t0 + MS(600)),
+            vec![(Herkunft::Client, Verteilt::Doppelt), (Herkunft::Host, Verteilt::Gemeldet)]
+        );
+        // Nach der Frist fuer beide wieder.
+        assert_eq!(
+            v.verteilen(&liste, t0 + MS(2700)),
+            vec![(Herkunft::Client, Verteilt::Gemeldet), (Herkunft::Host, Verteilt::Gemeldet)]
+        );
+    }
+
+    /// Eine zweite Anmeldung derselben Rolle ersetzt die erste; die andere
+    /// Rolle bleibt, wie sie war. Die Rueckrufe laufen ohne die Sperre des
+    /// Verteilers: ein Abnehmer darf ihn selbst befragen.
+    #[test]
+    fn anmelden_ersetzt_und_ruft_ohne_sperre() {
+        let t0 = Instant::now();
+        let v = Arc::new(Verteiler::neu());
+        let alt = Pruefrolle::anmelden(&v, Herkunft::Client);
+        alt.gegenueber(Some(1));
+        let host = Pruefrolle::anmelden(&v, Herkunft::Host);
+        host.gegenueber(Some(1));
+        let gefragt = Arc::new(Mutex::new(Vec::new()));
+        let (v2, g2) = (v.clone(), gefragt.clone());
+        v.anmelden(
+            Herkunft::Client,
+            Arc::new(|| Some(2)),
+            Arc::new(move |i| {
+                // Im Abnehmer den Verteiler fragen - ginge unter der Sperre nicht.
+                g2.lock().unwrap().push((i, v2.mit_gegenueber()));
+            }),
+        );
+        let text = Inhalt::Text("neu".into());
+        assert_eq!(
+            v.verteilen(&text, t0),
+            vec![(Herkunft::Client, Verteilt::Gemeldet), (Herkunft::Host, Verteilt::Gemeldet)]
+        );
+        assert!(alt.nimm().is_empty(), "ersetzte Anmeldung bekam die Kopie");
+        assert_eq!(host.nimm(), vec![text.clone()]);
+        assert_eq!(*gefragt.lock().unwrap(), vec![(text, vec![Herkunft::Client, Herkunft::Host])]);
+    }
+
+    #[test]
+    fn inhalt_leer() {
+        assert!(Inhalt::Text(String::new()).leer());
+        assert!(Inhalt::Dateien(Vec::new()).leer());
+        assert!(!Inhalt::Text("a".into()).leer());
+        assert!(!Inhalt::Dateien(vec![PathBuf::from("/a")]).leer());
     }
 }

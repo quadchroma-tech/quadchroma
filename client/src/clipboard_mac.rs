@@ -1,10 +1,15 @@
 // Zwischenablage auf der Mac-Seite des Clients.
 //
-// Dieselbe Schnittstelle wie clipboard.rs (Windows): watch() meldet, was der
-// Benutzer hier kopiert hat (Text oder eine Dateiliste, siehe Inhalt), set()
-// legt Text ab und set_dateien() eine Dateiliste, beide ohne die eigene
-// Ueberwachung auszuloesen. Hier werden nur Pfade gelesen bzw. abgelegt, nie
-// Dateien; die uebertraegt ein eigener Teil (dateien.rs).
+// Dieselbe Schnittstelle wie clipboard.rs (Windows): watch() meldet einer
+// Rolle (Herkunft), was der Benutzer hier kopiert hat (Text oder eine
+// Dateiliste, siehe Inhalt), set() legt Text ab und set_dateien() eine
+// Dateiliste, beide ohne die eigene Ueberwachung auszuloesen. Hier werden
+// nur Pfade gelesen bzw. abgelegt, nie Dateien; die uebertraegt ein eigener
+// Teil (dateien.rs). Es gibt einen Waechter; was er liest, verteilt er wie
+// unter Windows an jede angemeldete Rolle mit Gegenueber
+// (ablage_ruhe::Verteiler, dort auch das Entdoppeln je Rolle). Auf dem Mac
+// meldet sich nur der Client an - die Host-Rolle des Macs hat ihre eigene
+// Ablage (host/clipboard.m).
 //
 // NSPasteboard schickt keine Nachricht bei Aenderungen; es gibt nur den
 // changeCount. Deshalb fragt ein Faden alle 300 ms nach. Ist die Zahl
@@ -24,8 +29,9 @@
 // Name, den Finder zusaetzlich als Text ablegt. Sonst zaehlt der Text des
 // ersten Eintrags.
 //
-// Gelesen wird nur waehrend einer Sitzung (`sitzung`). Ohne sie zaehlt der
-// Waechter nur den changeCount mit: ab macOS 15.4 kann jedes Lesen des
+// Gelesen wird nur, solange eine angemeldete Rolle ein Gegenueber hat (der
+// Client: waehrend einer Sitzung, `sitzung`). Ohne zaehlt der Waechter nur
+// den changeCount mit: ab macOS 15.4 kann jedes Lesen des
 // Inhalts durch ein Programm die Rueckfrage des Systems ausloesen (siehe
 // host/clipboard.m), und was ohne Sitzung kopiert wurde, braucht niemand -
 // es geht auch beim Sitzungsbeginn nicht nachtraeglich hinaus. Dieselbe
@@ -51,10 +57,12 @@ use std::ffi::{c_char, c_void, CStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use crate::ablage_ruhe::{Entdoppler, Entpreller, DOPPEL_FRIST, RUHE};
+pub use crate::ablage_ruhe::Inhalt;
+use crate::ablage_ruhe::{Entpreller, Verteilt, Verteiler, RUHE};
+use crate::protokoll::Herkunft;
 
 /// Obergrenze fuer einen Uebertragungsvorgang - wie auf Windows. Groesseres
 /// wird stillschweigend verworfen statt abgeschnitten.
@@ -250,30 +258,34 @@ static SITZUNG: AtomicBool = AtomicBool::new(false);
 /// ist eine neue Kopie (Entdoppler).
 static SITZUNGS_WECHSEL: AtomicU64 = AtomicU64::new(0);
 
-/// Was der Benutzer kopiert hat. Dieselbe Art steht in clipboard.rs, damit
-/// die Aufrufer ohne Plattformweiche auskommen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Inhalt {
-    /// Text des ersten Eintrags.
-    Text(String),
-    /// Dateiverweise aller Eintraege als Pfade, wie Finder sie ablegt: die
-    /// obersten Eintraege, Ordner nicht aufgeloest.
-    Dateien(Vec<PathBuf>),
-}
+/// Die angemeldeten Rollen des einen Waechters.
+static VERTEILER: Verteiler = Verteiler::neu();
 
-impl Inhalt {
-    fn leer(&self) -> bool {
-        match self {
-            Inhalt::Text(t) => t.is_empty(),
-            Inhalt::Dateien(p) => p.is_empty(),
-        }
-    }
-}
+/// Der Waechterfaden laeuft nur einmal, gleich wie viele Rollen sich anmelden.
+static WAECHTER: Once = Once::new();
 
 /// Sitzung beginnt (true, der Host hat angenommen) oder endet (false).
 pub fn sitzung(an: bool) {
     if SITZUNG.swap(an, Ordering::Relaxed) != an {
         SITZUNGS_WECHSEL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Das Gegenueber des Clients fuer seine Anmeldung (watch): Some(Nummer des
+/// Sitzungswechsels) waehrend einer Sitzung, sonst None.
+pub fn client_gegenueber() -> Option<u64> {
+    SITZUNG.load(Ordering::Relaxed).then(|| SITZUNGS_WECHSEL.load(Ordering::Relaxed))
+}
+
+/// Eine Zeile des Waechters: ins Protokoll jeder Rolle, fuer die gerade
+/// gelesen wird; ohne eine solche (Tests) in das des Fadens.
+fn waechter_zeile(text: &str) {
+    let rollen = VERTEILER.mit_gegenueber();
+    if rollen.is_empty() {
+        crate::protokoll::zeile(text.to_string());
+    }
+    for h in rollen {
+        crate::protokoll::zeile_als(h, text.to_string());
     }
 }
 
@@ -331,7 +343,7 @@ fn lesen(b: Id) -> Option<Inhalt> {
                 continue;
             }
             if hat_typ(item, verdeckt) {
-                crate::protokoll::zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen".into());
+                waechter_zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen");
                 return None;
             }
             if hat_typ(item, NSPasteboardTypeFileURL) {
@@ -349,14 +361,14 @@ fn lesen(b: Id) -> Option<Inhalt> {
         }
         if dateiverweise > 0 {
             if unaufloesbar {
-                crate::protokoll::zeile("Zwischenablage: Dateiverweis nicht aufloesbar, nichts uebertragen".into());
+                waechter_zeile("Zwischenablage: Dateiverweis nicht aufloesbar, nichts uebertragen");
                 return None;
             }
             return Some(Inhalt::Dateien(pfade));
         }
 
         if anzahl > 1 {
-            crate::protokoll::zeile(format!("Zwischenablage: {anzahl} Eintraege, nur der erste wird uebertragen"));
+            waechter_zeile(&format!("Zwischenablage: {anzahl} Eintraege, nur der erste wird uebertragen"));
         }
         let item = msg_id(eintraege, sel(c"firstObject"));
         if item.is_null() {
@@ -520,22 +532,27 @@ fn ablegen(b: Id, text: &str) -> Option<(isize, isize)> {
 /// selbst werden hier nicht gelesen. true, wenn die Liste auf dem Brett
 /// liegt; false bei leerer oder ungueltiger Liste (dann bleibt das Brett,
 /// wie es ist) oder wenn das Schreiben scheitert. Aufrufer ist der
-/// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden.
-pub fn set_dateien(pfade: &[PathBuf]) -> bool {
+/// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden;
+/// `h` ist seine Rolle: in ihr Protokoll geht die Zeile, wenn das Schreiben
+/// scheitert (wie unter Windows).
+pub fn set_dateien(h: Herkunft, pfade: &[PathBuf]) -> bool {
     let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
     let b = brett();
     if b.is_null() {
         return false;
     }
-    dateien_setzen(b, pfade)
+    dateien_setzen(h, b, pfade)
 }
 
 /// set_dateien auf dem Brett `b`, mit der Zaehlung fuer den Widerhall.
-fn dateien_setzen(b: Id, pfade: &[PathBuf]) -> bool {
+fn dateien_setzen(h: Herkunft, b: Id, pfade: &[PathBuf]) -> bool {
     match dateien_ablegen(b, pfade) {
         Some((zaehler, ok)) => {
             if let Ok(mut e) = EIGEN.lock() {
                 *e = zaehler;
+            }
+            if !ok {
+                crate::protokoll::zeile_als(h, "Zwischenablage: Dateiliste nicht abgelegt (writeObjects: gescheitert)".into());
             }
             ok
         }
@@ -662,29 +679,21 @@ struct Wache {
     /// changeCount, ueber den nachsehen() zuletzt entschieden hat.
     zuletzt: isize,
     ruhe: Entpreller,
-    doppel: Entdoppler,
 }
 
 impl Wache {
     fn neu(b: Id) -> Wache {
         let c = change_count(b);
-        Wache { gesehen: c, zuletzt: c, ruhe: Entpreller::neu(RUHE), doppel: Entdoppler::neu(DOPPEL_FRIST) }
+        Wache { gesehen: c, zuletzt: c, ruhe: Entpreller::neu(RUHE) }
     }
 
     /// Ein Blick auf `b` zur Zeit `jetzt`: hat sich der changeCount bewegt,
     /// beginnt die Ruhe (neu); ist sie um, wird einmal nachgesehen (nachsehen:
-    /// nur mit Sitzung, nie der eigene Vorgang). Eine Aenderung ohne Sitzung
-    /// wird nur mitgezaehlt - auch dann, wenn die Sitzung waehrend der Ruhe
-    /// beginnt. Dieselbe Dateiliste wie eben (in derselben Sitzung
-    /// `wechsel`) geht nicht noch einmal hinaus. Unter SPERRE aufrufen.
-    fn blick(
-        &mut self,
-        b: Id,
-        jetzt: Instant,
-        sitzung: bool,
-        wechsel: u64,
-        lesen: impl FnOnce(Id) -> Option<Inhalt>,
-    ) -> Option<Inhalt> {
+    /// nur mit Gegenueber - `sitzung`: irgendeine Rolle hat eines -, nie der
+    /// eigene Vorgang). Eine Aenderung ohne Gegenueber wird nur mitgezaehlt -
+    /// auch dann, wenn die Sitzung waehrend der Ruhe beginnt. Entdoppelt wird
+    /// danach beim Verteilen, je Rolle. Unter SPERRE aufrufen.
+    fn blick(&mut self, b: Id, jetzt: Instant, sitzung: bool, lesen: impl FnOnce(Id) -> Option<Inhalt>) -> Option<Inhalt> {
         let c = change_count(b);
         if c != self.gesehen {
             self.gesehen = c;
@@ -699,54 +708,63 @@ impl Wache {
         if !self.ruhe.faellig(jetzt) {
             return None;
         }
-        let inhalt = nachsehen(b, &mut self.zuletzt, sitzung, lesen).filter(|i| !i.leer())?;
-        match &inhalt {
-            Inhalt::Dateien(p) if !self.doppel.dateien(p, jetzt, wechsel) => {
-                crate::protokoll::zeile("Zwischenablage: dieselbe Dateiliste noch einmal gemeldet - uebergangen".into());
-                None
-            }
-            Inhalt::Dateien(_) => Some(inhalt),
-            Inhalt::Text(_) => {
-                self.doppel.text();
-                Some(inhalt)
-            }
+        nachsehen(b, &mut self.zuletzt, sitzung, lesen).filter(|i| !i.leer())
+    }
+}
+
+/// Was der Waechter las, an die Rollen (ablage_ruhe::Verteiler); eine
+/// Dateiliste, die eine Rolle gerade eben schon bekam, steht nur in ihrem
+/// Protokoll.
+fn verteilen(v: &Verteiler, inhalt: &Inhalt, jetzt: Instant) {
+    for (h, verteilt) in v.verteilen(inhalt, jetzt) {
+        if verteilt == Verteilt::Doppelt {
+            crate::protokoll::zeile_als(h, "Zwischenablage: dieselbe Dateiliste noch einmal gemeldet - uebergangen".into());
         }
     }
 }
 
-/// Startet die Ueberwachung in einem eigenen Faden. `cb` bekommt jeden Text
-/// und jede Dateiliste, die der Benutzer auf dem Mac waehrend einer Sitzung
-/// kopiert hat; eigene Schreibvorgaenge aus `set` und `set_dateien` sind
-/// bereits herausgefiltert. Was beim Start oder ohne Sitzung auf das Brett
-/// kam, wird nicht gemeldet - wie auf Windows, wo erst die naechste
-/// Aenderung in einer Sitzung zaehlt. Gemeldet wird erst, wenn das Brett
-/// RUHE lang ruhig war, und dieselbe Dateiliste nur einmal (Wache::blick).
-/// `cb` laeuft ausserhalb der Sperre im Faden des Waechters.
-pub fn watch(cb: impl Fn(Inhalt) + Send + 'static) {
-    std::thread::spawn(move || {
-        let b = brett();
-        if b.is_null() {
-            eprintln!("Zwischenablage: Ueberwachung nicht gestartet: NSPasteboard fehlt");
-            return;
-        }
-        let mut wache = Wache::neu(b);
-        loop {
-            // Im Takt - aber nicht laenger als bis zum Ende der Ruhe.
-            std::thread::sleep(wache.ruhe.schlaf(Instant::now(), TAKT));
-            let inhalt = {
-                let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
-                wache.blick(
-                    b,
-                    Instant::now(),
-                    SITZUNG.load(Ordering::Relaxed),
-                    SITZUNGS_WECHSEL.load(Ordering::Relaxed),
-                    lesen,
-                )
-            };
-            if let Some(i) = inhalt {
-                cb(i);
+/// Meldet die Rolle `h` beim Waechter an und startet ihn beim ersten Mal in
+/// einem eigenen Faden (einer fuer alle Rollen; eine zweite Anmeldung
+/// derselben Rolle ersetzt die erste). `gegenueber` sagt, ob die Rolle
+/// gerade ein Gegenueber hat und in welcher Sitzung (der Client nimmt
+/// client_gegenueber). `cb` bekommt jeden Text und jede Dateiliste, die der
+/// Benutzer auf dem Mac kopiert, solange diese Rolle ein Gegenueber hat;
+/// eigene Schreibvorgaenge aus `set` und `set_dateien` sind bereits
+/// herausgefiltert. Was beim Start oder ohne Gegenueber auf das Brett kam,
+/// wird nicht gemeldet - wie auf Windows, wo erst die naechste Aenderung in
+/// einer Sitzung zaehlt. Gemeldet wird erst, wenn das Brett RUHE lang ruhig
+/// war (Wache::blick), und dieselbe Dateiliste je Rolle nur einmal
+/// (ablage_ruhe::Verteiler). Beide Rueckrufe laufen ausserhalb der Sperre im
+/// Faden des Waechters.
+pub fn watch(
+    h: Herkunft,
+    gegenueber: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    cb: impl Fn(Inhalt) + Send + Sync + 'static,
+) {
+    VERTEILER.anmelden(h, Arc::new(gegenueber), Arc::new(cb));
+    WAECHTER.call_once(|| {
+        std::thread::spawn(|| {
+            let b = brett();
+            if b.is_null() {
+                eprintln!("Zwischenablage: Ueberwachung nicht gestartet: NSPasteboard fehlt");
+                return;
             }
-        }
+            let mut wache = Wache::neu(b);
+            loop {
+                // Im Takt - aber nicht laenger als bis zum Ende der Ruhe.
+                std::thread::sleep(wache.ruhe.schlaf(Instant::now(), TAKT));
+                // Wer ein Gegenueber hat, fragt der Verteiler vor der Sperre -
+                // die Rueckrufe der Rollen laufen nie unter ihr.
+                let da = VERTEILER.jemand_da();
+                let inhalt = {
+                    let _sperre = SPERRE.lock().unwrap_or_else(|e| e.into_inner());
+                    wache.blick(b, Instant::now(), da, lesen)
+                };
+                if let Some(i) = inhalt {
+                    verteilen(&VERTEILER, &i, Instant::now());
+                }
+            }
+        });
     });
 }
 
@@ -1011,7 +1029,7 @@ mod tests {
                 lesen(b)
             };
 
-            assert!(dateien_setzen(b, &pfade), "dateien_setzen scheitert");
+            assert!(dateien_setzen(Herkunft::Client, b, &pfade), "dateien_setzen scheitert");
             assert_eq!(nachsehen(b, &mut zuletzt, true, zaehlend), None, "eigene Dateiliste zurueckgemeldet");
             assert_eq!(gelesen.get(), 0, "eigene Dateiliste gelesen");
 
@@ -1030,7 +1048,8 @@ mod tests {
     /// letzten; dieselbe Dateiliste gleich danach noch einmal geht nicht
     /// hinaus, nach einem Text oder nach DOPPEL_FRIST schon. Eine Kopie ohne
     /// Sitzung wird nie gelesen, auch wenn die Sitzung waehrend der Ruhe
-    /// beginnt.
+    /// beginnt. Gemeldet wird ueber einen eigenen Verteiler mit dem Client
+    /// als einziger Rolle - wie im Betrieb (watch).
     #[test]
     fn waechter_entprellt_und_entdoppelt() {
         let _pool = Pool::neu();
@@ -1049,43 +1068,61 @@ mod tests {
                 p.iter().map(|p| vec![(NSPasteboardTypeFileURL, url_text(p))]).collect()
             };
             let alle = dateien(&pfade);
+            let v = Verteiler::neu();
+            let nummer = Arc::new(AtomicU64::new(1));
+            let gemeldet = Arc::new(Mutex::new(Vec::<Inhalt>::new()));
+            let (n2, g2) = (nummer.clone(), gemeldet.clone());
+            v.anmelden(
+                Herkunft::Client,
+                Arc::new(move || Some(n2.load(Ordering::SeqCst))),
+                Arc::new(move |i| g2.lock().unwrap().push(i)),
+            );
+            // Ein Blick des Waechters mit Sitzung `an` (Nummer `nr`); was er
+            // liest, geht an den Verteiler, und was dort gemeldet wurde, kommt
+            // zurueck.
+            let schau = |w: &mut Wache, t: Instant, an: bool, nr: u64| -> Option<Inhalt> {
+                nummer.store(nr, Ordering::SeqCst);
+                let roh = w.blick(b, t, an, &zaehlend)?;
+                verteilen(&v, &roh, t);
+                gemeldet.lock().unwrap().pop()
+            };
 
             // Zwei Meldungen derselben Kopie, 100 ms auseinander.
             nutzer_kopiert(b, &alle);
-            assert_eq!(w.blick(b, ms(0), true, 1, zaehlend), None);
+            assert_eq!(schau(&mut w, ms(0), true, 1), None);
             nutzer_kopiert(b, &alle);
-            assert_eq!(w.blick(b, ms(100), true, 1, zaehlend), None);
-            assert_eq!(w.blick(b, ms(200), true, 1, zaehlend), None, "vor der Ruhe gelesen");
+            assert_eq!(schau(&mut w, ms(100), true, 1), None);
+            assert_eq!(schau(&mut w, ms(200), true, 1), None, "vor der Ruhe gelesen");
             assert_eq!(gelesen.get(), 0);
-            let r = w.blick(b, ms(250), true, 1, zaehlend);
+            let r = schau(&mut w, ms(250), true, 1);
             assert!(gleiche_dateien(&r, &pfade), "nach der Ruhe nicht gemeldet: {r:?}");
-            assert_eq!(w.blick(b, ms(400), true, 1, zaehlend), None, "zweimal gemeldet");
+            assert_eq!(schau(&mut w, ms(400), true, 1), None, "zweimal gemeldet");
             assert_eq!(gelesen.get(), 1);
 
             // Dieselbe Liste noch einmal (neuer changeCount): gelesen, aber
             // innerhalb der Frist nicht gemeldet.
             nutzer_kopiert(b, &alle);
-            assert_eq!(w.blick(b, ms(500), true, 1, zaehlend), None);
-            assert_eq!(w.blick(b, ms(650), true, 1, zaehlend), None, "dieselbe Liste doppelt gemeldet");
+            assert_eq!(schau(&mut w, ms(500), true, 1), None);
+            assert_eq!(schau(&mut w, ms(650), true, 1), None, "dieselbe Liste doppelt gemeldet");
             assert_eq!(gelesen.get(), 2);
             // Ein Text dazwischen: danach ist dieselbe Liste eine neue Kopie.
             nutzer_kopiert(b, &[vec![(NSPasteboardTypeString, ns("Text"))]]);
-            assert_eq!(w.blick(b, ms(700), true, 1, zaehlend), None);
-            assert_eq!(w.blick(b, ms(850), true, 1, zaehlend), Some(Inhalt::Text("Text".into())));
+            assert_eq!(schau(&mut w, ms(700), true, 1), None);
+            assert_eq!(schau(&mut w, ms(850), true, 1), Some(Inhalt::Text("Text".into())));
             nutzer_kopiert(b, &alle);
-            assert_eq!(w.blick(b, ms(900), true, 1, zaehlend), None);
-            assert!(gleiche_dateien(&w.blick(b, ms(1050), true, 1, zaehlend), &pfade));
+            assert_eq!(schau(&mut w, ms(900), true, 1), None);
+            assert!(gleiche_dateien(&schau(&mut w, ms(1050), true, 1), &pfade));
             // Nach der Frist ebenso.
             nutzer_kopiert(b, &alle);
-            assert_eq!(w.blick(b, ms(3100), true, 1, zaehlend), None);
-            assert!(gleiche_dateien(&w.blick(b, ms(3250), true, 1, zaehlend), &pfade));
+            assert_eq!(schau(&mut w, ms(3100), true, 1), None);
+            assert!(gleiche_dateien(&schau(&mut w, ms(3250), true, 1), &pfade));
 
             // Ohne Sitzung kopiert, Sitzung beginnt waehrend der Ruhe: nie gelesen.
             let vorher = gelesen.get();
             nutzer_kopiert(b, &dateien(&pfade[..1]));
-            assert_eq!(w.blick(b, ms(4000), false, 1, zaehlend), None);
-            assert_eq!(w.blick(b, ms(4100), true, 2, zaehlend), None);
-            assert_eq!(w.blick(b, ms(4500), true, 2, zaehlend), None);
+            assert_eq!(schau(&mut w, ms(4000), false, 1), None);
+            assert_eq!(schau(&mut w, ms(4100), true, 2), None);
+            assert_eq!(schau(&mut w, ms(4500), true, 2), None);
             assert_eq!(gelesen.get(), vorher, "Kopie ohne Sitzung gelesen");
 
             let _ = msg_id(b, sel(c"releaseGlobally"));
@@ -1198,9 +1235,9 @@ mod tests {
             let b = eigenes_brett();
             nutzer_kopiert(b, &[vec![(NSPasteboardTypeString, ns("bleibt"))]]);
             let vorher = change_count(b);
-            assert!(!dateien_setzen(b, &[]));
-            assert!(!dateien_setzen(b, &[PathBuf::from("relativ/a.txt")]));
-            assert!(!dateien_setzen(b, &[PathBuf::from("/tmp/a\u{0}b")]));
+            assert!(!dateien_setzen(Herkunft::Client, b, &[]));
+            assert!(!dateien_setzen(Herkunft::Client, b, &[PathBuf::from("relativ/a.txt")]));
+            assert!(!dateien_setzen(Herkunft::Client, b, &[PathBuf::from("/tmp/a\u{0}b")]));
             assert_eq!(change_count(b), vorher, "ungueltige Liste hat das Brett angefasst");
             assert_eq!(lesen(b), Some(Inhalt::Text("bleibt".into())));
 

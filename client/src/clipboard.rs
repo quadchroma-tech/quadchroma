@@ -1,9 +1,14 @@
 // Zwischenablage auf der Windows-Seite.
 //
-// Dieselbe Datei dient zwei Rollen derselben Programmdatei, nie gleichzeitig:
-// dem Windows-Client und der Windows-Host-Rolle (--host, host/mod.rs). In
-// beiden meldet watch(), was der Benutzer hier kopiert hat, und set() legt
-// ab, was von der Gegenseite kommt, ohne die eigene Ueberwachung auszuloesen.
+// Dieselbe Datei dient zwei Rollen derselben Programmdatei: dem
+// Windows-Client und der Windows-Host-Rolle (host/mod.rs) - auch beiden
+// zugleich in einem Prozess. Jede meldet sich mit ihrer Herkunft an
+// (watch); es gibt aber nur EINEN Waechter mit EINEM Nachrichtenfenster, und
+// er verteilt, was der Benutzer hier kopiert hat, an jede Rolle, die gerade
+// ein Gegenueber hat (ablage_ruhe::Verteiler). set() und set_dateien() legen
+// ab, was von der Gegenseite einer Rolle kommt, ohne die Ueberwachung
+// auszuloesen - fuer keine der beiden Rollen: Abgelegtes geht weder zurueck
+// noch an die andere Rolle weiter.
 //
 // Kanaele (Nachrichtentyp 48, UTF-8, siehe protokoll_konst.rs):
 //   Client -> Host : IN_CLIP auf dem Eingabekanal (Port des Hosts + 1, 9002).
@@ -32,10 +37,13 @@
 //
 // Gelesen wird nur mit Gegenueber ("kein Zuschauer, keine Arbeit"), wie auf
 // dem Mac (clipboard_mac.rs): im Client waehrend einer Sitzung (`sitzung`),
-// in der Host-Rolle, solange ein Zuschauer da ist. Ohne Gegenueber wird die
-// Ablage nicht einmal geoeffnet - sonst stuende auch ohne jede Verbindung
-// jede Passwortkopie als Zeile "verdeckt" im Protokoll. Was davor kopiert
-// wurde, geht beim Sitzungsbeginn nicht nachtraeglich hinaus.
+// in der Host-Rolle, solange ein Zuschauer da ist - jede Rolle sagt das mit
+// ihrer Anmeldung selbst (watch, `gegenueber`). Hat keine ein Gegenueber,
+// wird die Ablage nicht einmal geoeffnet - sonst stuende auch ohne jede
+// Verbindung jede Passwortkopie als Zeile "verdeckt" im Protokoll. Was davor
+// kopiert wurde, geht beim Sitzungsbeginn nicht nachtraeglich hinaus. Die
+// Zeilen des Waechters gehen ins Protokoll der Rollen, fuer die gelesen
+// wurde (protokoll::zeile_als).
 //
 // Benoetigte Abhaengigkeit in Cargo.toml (Lizenz MIT OR Apache-2.0):
 //
@@ -59,10 +67,13 @@ use std::ffi::{c_void, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use crate::ablage_ruhe::{Entdoppler, Entpreller, DOPPEL_FRIST, RUHE};
+pub use crate::ablage_ruhe::Inhalt;
+use crate::ablage_ruhe::{Entpreller, Verteilt, Verteiler, RUHE};
+use crate::protokoll::Herkunft;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -118,14 +129,42 @@ const _: () = assert!(std::mem::size_of::<DROPFILES>() == DROPFILES_GROESSE);
 /// Dateien im Uebertragungsverzeichnis bleiben, wo sie sind.
 const BEVORZUGTE_WIRKUNG: &str = "Preferred DropEffect";
 
-/// Laufnummer unseres eigenen Schreibvorgangs. Zwei Werte, weil nicht sicher
-/// belegt ist, ob Windows die Nummer schon beim SetClipboardData hochzaehlt oder
-/// erst beim CloseClipboard; wir merken uns beide und lassen beide durchfallen.
-/// Gilt fuer Text und Dateilisten gleichermassen (write_locked).
-static OWN_SEQ_OPEN: AtomicU32 = AtomicU32::new(0);
-static OWN_SEQ_CLOSED: AtomicU32 = AtomicU32::new(0);
+/// Laufnummern unserer eigenen Schreibvorgaenge, die letzten EIGENE_MAX.
+/// Je Vorgang zwei Werte, weil nicht sicher belegt ist, ob Windows die
+/// Nummer schon beim SetClipboardData hochzaehlt oder erst beim
+/// CloseClipboard; wir merken uns beide und lassen beide durchfallen. Mehr
+/// als ein Paar, weil zwei Rollen in einem Prozess fast zugleich ablegen
+/// koennen: der eine Vorgang merkt seine zweite Nummer womoeglich erst,
+/// nachdem der andere schon fertig ist - mit nur einem Paar ueberschriebe
+/// er dessen Nummern. Gilt fuer Text und Dateilisten gleichermassen
+/// (write_locked).
+const EIGENE_MAX: usize = 8;
 
-/// Griff auf das Nachrichtenfenster des Ueberwachungsfadens. Zum Schreiben
+struct Eigene {
+    nummern: [u32; EIGENE_MAX],
+    naechste: usize,
+}
+
+static EIGENE: Mutex<Eigene> = Mutex::new(Eigene { nummern: [0; EIGENE_MAX], naechste: 0 });
+
+/// Eine Laufnummer als eigene merken (0 heisst "nicht lesbar" und zaehlt nicht).
+fn eigene_merken(seq: u32) {
+    if seq == 0 {
+        return;
+    }
+    let mut e = EIGENE.lock().unwrap_or_else(|e| e.into_inner());
+    let i = e.naechste;
+    e.nummern[i] = seq;
+    e.naechste = (i + 1) % EIGENE_MAX;
+}
+
+/// Stammt diese Laufnummer von einem unserer Schreibvorgaenge?
+fn eigene_nummer(seq: u32) -> bool {
+    seq != 0 && EIGENE.lock().unwrap_or_else(|e| e.into_inner()).nummern.contains(&seq)
+}
+
+/// Griff auf das Nachrichtenfenster des Ueberwachungsfadens (des einen
+/// Waechters beider Rollen). Zum Schreiben
 /// zwingend noetig: oeffnet man die Ablage ohne Besitzerfenster, dann setzt
 /// EmptyClipboard den Besitzer auf NULL und SetClipboardData scheitert danach
 /// (so dokumentiert bei EmptyClipboard). Die Ablage waere geleert und der neue
@@ -146,25 +185,12 @@ static SITZUNG: AtomicBool = AtomicBool::new(false);
 /// neuen Sitzung ist eine neue Kopie (Entdoppler).
 static SITZUNGS_WECHSEL: AtomicU64 = AtomicU64::new(0);
 
-/// Was der Benutzer kopiert hat. Dieselbe Art steht in clipboard_mac.rs,
-/// damit die Aufrufer ohne Plattformweiche auskommen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Inhalt {
-    /// Text; Zeilenenden, wie Windows sie liefert (CRLF).
-    Text(String),
-    /// Eine Dateiliste (CF_HDROP): die obersten Pfade, wie Explorer sie
-    /// ablegt. Ordner werden hier nicht aufgeloest.
-    Dateien(Vec<PathBuf>),
-}
+/// Die angemeldeten Rollen des einen Waechters.
+static VERTEILER: Verteiler = Verteiler::neu();
 
-impl Inhalt {
-    fn leer(&self) -> bool {
-        match self {
-            Inhalt::Text(t) => t.is_empty(),
-            Inhalt::Dateien(p) => p.is_empty(),
-        }
-    }
-}
+/// Der Waechterfaden wird nur einmal gestartet, gleich wie viele Rollen
+/// sich anmelden.
+static WAECHTER: Once = Once::new();
 
 /// Sitzung des Clients beginnt (true, der Host hat angenommen) oder endet.
 pub fn sitzung(an: bool) {
@@ -173,9 +199,14 @@ pub fn sitzung(an: bool) {
     }
 }
 
-/// Darf der Waechter jetzt lesen? Im Client mit Sitzung, in der Host-Rolle
-/// mit Zuschauer. Die Host-Rolle setzt `sitzung` nicht; ihren Zuschauer
-/// kennt das Netzteil (netz::zuschauer_da), und im Client ist dort nie einer.
+/// Das Gegenueber des Clients fuer seine Anmeldung (watch): Some(Nummer des
+/// Sitzungswechsels) waehrend einer Sitzung, sonst None.
+pub fn client_gegenueber() -> Option<u64> {
+    SITZUNG.load(Ordering::Relaxed).then(|| SITZUNGS_WECHSEL.load(Ordering::Relaxed))
+}
+
+/// Darf der Waechter jetzt lesen? Wenn irgendeine angemeldete Rolle ein
+/// Gegenueber hat (der Client eine Sitzung, die Host-Rolle einen Zuschauer).
 fn darf_lesen() -> bool {
     // Tests des Waechterfadens geben das Gegenueber je Faden vor, statt die
     // Sitzung aller Tests zu kippen.
@@ -183,17 +214,26 @@ fn darf_lesen() -> bool {
     if let Some(d) = tests::GEGENUEBER.with(|g| g.get()) {
         return d;
     }
-    SITZUNG.load(Ordering::Relaxed) || crate::host::netz::zuschauer_da()
+    VERTEILER.jemand_da()
+}
+
+/// Eine Zeile des Waechters: ins Protokoll jeder Rolle, fuer die gerade
+/// gelesen wird; ohne eine solche (Tests) in das des Fadens.
+fn waechter_zeile(text: &str) {
+    let rollen = VERTEILER.mit_gegenueber();
+    if rollen.is_empty() {
+        crate::protokoll::zeile(text.to_string());
+    }
+    for h in rollen {
+        crate::protokoll::zeile_als(h, text.to_string());
+    }
 }
 
 thread_local! {
-    /// Empfaenger des Ueberwachungsfadens. Liegt im Faden selbst, weil die
-    /// Fensterprozedur genau dort und nur dort aufgerufen wird.
-    static SINK: RefCell<Option<Box<dyn Fn(Inhalt)>>> = RefCell::new(None);
-    /// Entprellen und Entdoppeln der Meldungen (ablage_ruhe.rs), ebenso nur
-    /// im Faden des Waechters.
-    static RUHE_STAND: RefCell<(Entpreller, Entdoppler)> =
-        RefCell::new((Entpreller::neu(RUHE), Entdoppler::neu(DOPPEL_FRIST)));
+    /// Entprellen der Meldungen (ablage_ruhe.rs), nur im Faden des
+    /// Waechters - die Fensterprozedur laeuft genau dort und nur dort.
+    /// Entdoppelt wird je Rolle beim Verteilen (ablage_ruhe::Verteiler).
+    static RUHE_STAND: RefCell<Entpreller> = RefCell::new(Entpreller::neu(RUHE));
 }
 
 // ------------------------------------------------------------ Hilfsmittel
@@ -371,14 +411,14 @@ fn lesen() -> Option<Inhalt> {
     // Bei offener Ablage fragen, damit Kennzeichen und Inhalt zum selben
     // Eintrag gehoeren.
     if verdeckt(format_vorhanden) {
-        crate::protokoll::zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen".into());
+        waechter_zeile("Zwischenablage: Eintrag ist als verdeckt markiert, nicht uebertragen");
         return None;
     }
 
     if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok() {
         let pfade = hdrop_pfade();
         if pfade.is_none() {
-            crate::protokoll::zeile("Zwischenablage: Dateiliste nicht lesbar, nichts uebertragen".into());
+            waechter_zeile("Zwischenablage: Dateiliste nicht lesbar, nichts uebertragen");
         }
         return pfade.map(Inhalt::Dateien);
     }
@@ -523,9 +563,11 @@ fn set_exclusion_formats() {
     put_dword("CanUploadToCloudClipboard", 0);
 }
 
-/// Schreibt Text in die Zwischenablage, ohne die eigene Ueberwachung auszuloesen.
-/// Scheitert still: ein verlorener Kopiervorgang ist hinnehmbar, ein Absturz des
-/// Clients waehrend einer laufenden Sitzung nicht.
+/// Schreibt Text in die Zwischenablage, ohne die eigene Ueberwachung
+/// auszuloesen - fuer keine der beiden Rollen, gleich welche ablegt (der
+/// Client, was sein Host schickt; die Host-Rolle, was ihr Zuschauer schickt
+/// oder ihr Menue kopiert). Scheitert still: ein verlorener Kopiervorgang ist
+/// hinnehmbar, ein Absturz waehrend einer laufenden Sitzung nicht.
 pub fn set(text: &str) {
     let mut units: Vec<u16> = text.encode_utf16().collect();
     if (units.len() + 1) * 2 > MAX_BYTES {
@@ -544,25 +586,26 @@ pub fn set(text: &str) {
 /// selbst werden hier nicht angefasst. true, wenn die Liste in der Ablage
 /// liegt; false bei leerer oder ungueltiger Liste (dann bleibt die Ablage,
 /// wie sie ist) oder wenn die Ablage nicht zu bekommen war. Aufrufer ist der
-/// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden.
+/// Empfaenger der Dateiuebertragung (dateien.rs) in seinem Schreibfaden;
+/// `h` ist seine Rolle (dorthin geht die Zeile, wenn es scheitert).
 ///
 /// Haelt ein anderes Programm (oder der eigene Waechter) die Ablage gerade
 /// fest, wird laenger und mit Abstand wiederholt als bei Text
 /// (VERSUCHE_DATEIEN, rund 2 s): ein Fehlschlag hiesse Quittung 5, und die
 /// vollstaendig empfangene Uebertragung waere verworfen.
-pub fn set_dateien(pfade: &[PathBuf]) -> bool {
-    dateien_ablegen_mit(pfade, VERSUCHE_DATEIEN)
+pub fn set_dateien(h: Herkunft, pfade: &[PathBuf]) -> bool {
+    dateien_ablegen_mit(h, pfade, VERSUCHE_DATEIEN)
 }
 
 /// set_dateien mit gegebenen Versuchen (die Tests pruefen damit auch die
 /// kurze Wiederholung).
-fn dateien_ablegen_mit(pfade: &[PathBuf], versuche: Versuche) -> bool {
+fn dateien_ablegen_mit(h: Herkunft, pfade: &[PathBuf], versuche: Versuche) -> bool {
     let Some(block) = dropfiles_bauen(pfade) else {
         return false;
     };
     let ok = block_ablegen(&block, CF_HDROP.0 as u32, &[(BEVORZUGTE_WIRKUNG, DROPEFFECT_COPY.0)], versuche);
     if !ok {
-        crate::protokoll::zeile(format!(
+        crate::protokoll::zeile_als(h, format!(
             "Zwischenablage: Dateiliste nicht abgelegt (Ablage belegt oder Schreiben gescheitert, {} Versuche in {} ms)",
             versuche.anzahl,
             (versuche.abstand * versuche.anzahl.saturating_sub(1)).as_millis()
@@ -646,9 +689,9 @@ fn write_locked(hmem: HGLOBAL, format: u32, owner: HWND, zusatz: &[(&str, u32)],
     // Laufnummer noch bei offener Ablage merken und gleich nach dem Schliessen
     // erneut: WM_CLIPBOARDUPDATE kann uns erreichen, bevor der zweite Wert
     // steht, und dann muss der erste schon passen.
-    OWN_SEQ_OPEN.store(unsafe { GetClipboardSequenceNumber() }, Ordering::SeqCst);
+    eigene_merken(unsafe { GetClipboardSequenceNumber() });
     drop(guard);
-    OWN_SEQ_CLOSED.store(unsafe { GetClipboardSequenceNumber() }, Ordering::SeqCst);
+    eigene_merken(unsafe { GetClipboardSequenceNumber() });
     true
 }
 
@@ -665,9 +708,9 @@ fn ablage_geaendert(hwnd: HWND) {
     let _ = RUHE_STAND.try_with(|r| {
         if let Ok(mut r) = r.try_borrow_mut() {
             if darf {
-                r.0.aenderung(Instant::now());
+                r.aenderung(Instant::now());
             } else {
-                r.0.verwerfen();
+                r.verwerfen();
             }
         }
     });
@@ -688,8 +731,8 @@ fn ruhe_abgelaufen(hwnd: HWND) {
     let (faellig, rest) = RUHE_STAND
         .try_with(|r| match r.try_borrow_mut() {
             Ok(mut r) => {
-                let faellig = r.0.faellig(jetzt);
-                (faellig, r.0.wartet().then(|| r.0.schlaf(jetzt, RUHE)))
+                let faellig = r.faellig(jetzt);
+                (faellig, r.wartet().then(|| r.schlaf(jetzt, RUHE)))
             }
             Err(_) => (false, None),
         })
@@ -709,9 +752,10 @@ fn ruhe_abgelaufen(hwnd: HWND) {
 
 /// Wird aus der Fensterprozedur gerufen, wenn die Ablage ruhig ist. Darf
 /// unter keinen Umstaenden in Panik geraten, sonst reisst es den Faden und
-/// die Ueberwachung ist bis zum Neustart des Clients tot. Keine Dateiarbeit
-/// hier: gelesen werden nur Pfade, und die Ablage ist schon wieder zu, wenn
-/// `cb` sie bekommt.
+/// die Ueberwachung ist bis zum Neustart des Programms tot. Keine
+/// Dateiarbeit hier: gelesen werden nur Pfade, und die Ablage ist schon
+/// wieder zu, wenn die Rollen den Inhalt bekommen (ablage_ruhe::Verteiler:
+/// jede mit Gegenueber, dieselbe Dateiliste je Rolle nur einmal).
 fn on_clipboard_update() {
     #[cfg(test)]
     tests::NACHGESEHEN.with(|n| n.set(n.get() + 1));
@@ -721,34 +765,14 @@ fn on_clipboard_update() {
     if inhalt.leer() {
         return;
     }
-    // Dieselbe Dateiliste gerade eben schon gemeldet: dieselbe Kopie.
-    let sitzung = SITZUNGS_WECHSEL.load(Ordering::Relaxed);
-    let neu = RUHE_STAND
-        .try_with(|r| match r.try_borrow_mut() {
-            Ok(mut r) => match &inhalt {
-                Inhalt::Dateien(p) => r.1.dateien(p, Instant::now(), sitzung),
-                Inhalt::Text(_) => {
-                    r.1.text();
-                    true
-                }
-            },
-            Err(_) => true,
-        })
-        .unwrap_or(true);
-    if !neu {
-        crate::protokoll::zeile("Zwischenablage: dieselbe Dateiliste noch einmal gemeldet - uebergangen".into());
-        return;
-    }
-
     // Zeilenenden bleiben, wie Windows sie liefert (CRLF). Die Umsetzung gehoert,
     // wenn ueberhaupt, an die Stelle, die das Protokoll bedient.
-    let _ = SINK.try_with(|s| {
-        if let Ok(sink) = s.try_borrow() {
-            if let Some(cb) = sink.as_ref() {
-                cb(inhalt);
-            }
+    for (h, verteilt) in VERTEILER.verteilen(&inhalt, Instant::now()) {
+        if verteilt == Verteilt::Doppelt {
+            // Dieselbe Dateiliste gerade eben schon an diese Rolle: dieselbe Kopie.
+            crate::protokoll::zeile_als(h, "Zwischenablage: dieselbe Dateiliste noch einmal gemeldet - uebergangen".into());
         }
-    });
+    }
 }
 
 /// Nach einer Aenderung der Ablage: gelesen wird nur mit Gegenueber (`darf`,
@@ -761,11 +785,8 @@ fn nachsehen(darf: bool, seq: u32, lesen: impl FnOnce() -> Option<Inhalt>) -> Op
     }
     // Null bedeutet, dass wir die Nummer nicht lesen duerfen; dann greift die
     // Schleifensperre nicht und wir melden lieber einmal zu viel.
-    if seq != 0
-        && (seq == OWN_SEQ_OPEN.load(Ordering::SeqCst)
-            || seq == OWN_SEQ_CLOSED.load(Ordering::SeqCst))
-    {
-        return None; // unser eigener Schreibvorgang, nicht zuruecksenden
+    if eigene_nummer(seq) {
+        return None; // unser eigener Schreibvorgang (gleich welcher Rolle), nicht melden
     }
     lesen()
 }
@@ -815,18 +836,29 @@ fn run_listener() -> Result<(), String> {
     Ok(())
 }
 
-/// Startet die Ueberwachung in einem eigenen Faden. `cb` bekommt jeden Text
-/// und jede Dateiliste, die der Benutzer auf der Windows-Seite mit
-/// Gegenueber kopiert hat (siehe `darf_lesen`); eigene Schreibvorgaenge aus
-/// `set` und `set_dateien` sind bereits herausgefiltert. `cb` laeuft im
-/// Faden des Waechters und darf dort nicht lange arbeiten - Dateien lesen
-/// oder senden gehoert in einen eigenen Faden.
-pub fn watch(cb: impl Fn(Inhalt) + Send + 'static) {
-    std::thread::spawn(move || {
-        SINK.with(|s| *s.borrow_mut() = Some(Box::new(cb)));
-        if let Err(e) = run_listener() {
-            eprintln!("Zwischenablage: Ueberwachung nicht gestartet: {e}");
-        }
+/// Meldet die Rolle `h` beim Waechter an und startet ihn beim ersten Mal in
+/// einem eigenen Faden (einer fuer alle Rollen; eine zweite Anmeldung
+/// derselben Rolle ersetzt die erste). `gegenueber` sagt, ob die Rolle
+/// gerade ein Gegenueber hat und in welcher Sitzung (ablage_ruhe::Gegenueber;
+/// der Client nimmt client_gegenueber, die Host-Rolle ihren Zuschauer).
+/// `cb` bekommt jeden Text und jede Dateiliste, die der Benutzer auf der
+/// Windows-Seite kopiert, solange diese Rolle ein Gegenueber hat; eigene
+/// Schreibvorgaenge aus `set` und `set_dateien` (gleich welcher Rolle) sind
+/// bereits herausgefiltert. Beide laufen im Faden des Waechters und duerfen
+/// dort nicht lange arbeiten - Dateien lesen oder senden gehoert in einen
+/// eigenen Faden.
+pub fn watch(
+    h: Herkunft,
+    gegenueber: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    cb: impl Fn(Inhalt) + Send + Sync + 'static,
+) {
+    VERTEILER.anmelden(h, Arc::new(gegenueber), Arc::new(cb));
+    WAECHTER.call_once(|| {
+        std::thread::spawn(|| {
+            if let Err(e) = run_listener() {
+                eprintln!("Zwischenablage: Ueberwachung nicht gestartet: {e}");
+            }
+        });
     });
 }
 
@@ -1126,7 +1158,7 @@ mod tests {
         let fenster = create_message_window().expect("Nachrichtenfenster");
 
         let vorher = unsafe { GetClipboardSequenceNumber() };
-        assert!(set_dateien(&pfade), "set_dateien() meldet Fehlschlag");
+        assert!(set_dateien(Herkunft::Client, &pfade), "set_dateien() meldet Fehlschlag");
         assert_ne!(unsafe { GetClipboardSequenceNumber() }, vorher, "set_dateien() hat nichts geschrieben");
         {
             let _guard = open_clipboard(Some(fenster), VERSUCHE_KURZ).expect("Ablage nicht zu oeffnen");
@@ -1146,8 +1178,8 @@ mod tests {
 
         // Nichts Gueltiges: Ablage bleibt, wie sie ist.
         let vorher = unsafe { GetClipboardSequenceNumber() };
-        assert!(!set_dateien(&[]));
-        assert!(!set_dateien(&[PathBuf::from(r"relativ\a.txt")]));
+        assert!(!set_dateien(Herkunft::Client, &[]));
+        assert!(!set_dateien(Herkunft::Client, &[PathBuf::from(r"relativ\a.txt")]));
         assert_eq!(unsafe { GetClipboardSequenceNumber() }, vorher, "ungueltige Liste hat die Ablage angefasst");
         assert!(unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok());
 
@@ -1164,7 +1196,7 @@ mod tests {
         let (ordner, pfade) = testdateien("set_dateien_ohne_widerhall");
         let fenster = create_message_window().expect("Nachrichtenfenster");
 
-        assert!(set_dateien(&pfade), "set_dateien() meldet Fehlschlag");
+        assert!(set_dateien(Herkunft::Client, &pfade), "set_dateien() meldet Fehlschlag");
         let seq = unsafe { GetClipboardSequenceNumber() };
         let laufnummer_greift = nachsehen(true, seq, || Some(Inhalt::Text("gelesen".into()))).is_none();
         let kennzeichen_greift = lesen().is_none();
@@ -1205,13 +1237,13 @@ mod tests {
 
         let halter = ablage_halten(Duration::from_millis(400));
         let t0 = Instant::now();
-        assert!(!dateien_ablegen_mit(&pfade, VERSUCHE_KURZ), "kurze Wiederholung trotz belegter Ablage gelungen");
+        assert!(!dateien_ablegen_mit(Herkunft::Client, &pfade, VERSUCHE_KURZ), "kurze Wiederholung trotz belegter Ablage gelungen");
         assert!(t0.elapsed() < Duration::from_millis(350), "kurze Wiederholung dauerte {:?}", t0.elapsed());
         halter.join().unwrap();
 
         let halter = ablage_halten(Duration::from_millis(300));
         let t0 = Instant::now();
-        assert!(set_dateien(&pfade), "Dateiliste trotz 300 ms belegter Ablage verworfen");
+        assert!(set_dateien(Herkunft::Client, &pfade), "Dateiliste trotz 300 ms belegter Ablage verworfen");
         let dauer = t0.elapsed();
         halter.join().unwrap();
         assert!(dauer >= Duration::from_millis(200), "nicht gewartet ({dauer:?}) - war die Ablage belegt?");
@@ -1290,5 +1322,91 @@ mod tests {
         assert_eq!(nachgesehen(), 2, "ueberschriebene Kopie nachgesehen");
         GEGENUEBER.with(|g| g.set(None));
         let _ = unsafe { DestroyWindow(fenster) };
+    }
+
+    /// Eigene Laufnummern: jede gemerkte gilt als eigene, auch wenn ein
+    /// zweiter Vorgang (die andere Rolle) dazwischen seine gemerkt hat; 0
+    /// ("nicht lesbar") nie.
+    #[test]
+    fn eigene_laufnummern_beider_rollen() {
+        let basis = 0xF000_0000u32 | (std::process::id() & 0xFFFF) << 8;
+        // Vorgang A merkt die erste Nummer, B beide, dann A die zweite.
+        eigene_merken(basis + 1);
+        eigene_merken(basis + 3);
+        eigene_merken(basis + 4);
+        eigene_merken(basis + 2);
+        for n in 1..=4 {
+            assert!(eigene_nummer(basis + n), "Nummer {n} nicht als eigene erkannt");
+        }
+        assert!(!eigene_nummer(basis + 5));
+        eigene_merken(0);
+        assert!(!eigene_nummer(0));
+    }
+
+    /// Wartet bis zu `frist`, bis `pruefen` gilt.
+    fn warten_bis(frist: Duration, pruefen: impl Fn() -> bool) -> bool {
+        let bis = Instant::now() + frist;
+        while Instant::now() < bis {
+            if pruefen() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pruefen()
+    }
+
+    /// Am echten Windows: Client und Host-Rolle melden sich an EINEM
+    /// Waechter an. Eine Kopie des Nutzers geht an jede Rolle mit
+    /// Gegenueber und an keine ohne; was eine Rolle selbst ablegt, bekommt
+    /// keine - weder zurueck noch die andere. Die Meldung an das Fenster des
+    /// Waechters schickt der Test zusaetzlich selbst (in der ssh-Sitzung der
+    /// Bau-VM ist nicht sicher, dass Windows sie schickt); doppelt schadet
+    /// nicht, der Waechter entprellt. Am Ende haben beide Rollen kein
+    /// Gegenueber mehr, damit der Waechter fuer die anderen Tests wieder
+    /// nicht liest.
+    #[test]
+    fn ein_waechter_fuer_beide_rollen() {
+        use std::sync::atomic::AtomicBool;
+        let _sperre = AblageSperre::nehmen();
+        let fenster = create_message_window().expect("Nachrichtenfenster");
+        let client_da = Arc::new(AtomicBool::new(true));
+        let host_da = Arc::new(AtomicBool::new(true));
+        let client_bekam = Arc::new(Mutex::new(Vec::<Inhalt>::new()));
+        let host_bekam = Arc::new(Mutex::new(Vec::<Inhalt>::new()));
+        let (d, b) = (client_da.clone(), client_bekam.clone());
+        watch(Herkunft::Client, move || d.load(Ordering::SeqCst).then_some(1), move |i| b.lock().unwrap().push(i));
+        let (d, b) = (host_da.clone(), host_bekam.clone());
+        watch(Herkunft::Host, move || d.load(Ordering::SeqCst).then_some(1), move |i| b.lock().unwrap().push(i));
+        assert!(warten_bis(Duration::from_secs(5), || !OWNER.load(Ordering::SeqCst).is_null()), "Waechter laeuft nicht");
+        let waechter = HWND(OWNER.load(Ordering::SeqCst));
+        let kopieren = |text: &str| {
+            nutzer_kopiert(fenster, &[(CF_UNICODETEXT.0 as u32, text_bytes(text))], &[]);
+            unsafe { PostMessageW(Some(waechter), WM_CLIPBOARDUPDATE, WPARAM(0), LPARAM(0)).expect("PostMessageW") };
+        };
+        let bekam = |v: &Arc<Mutex<Vec<Inhalt>>>, t: &str| v.lock().unwrap().contains(&Inhalt::Text(t.into()));
+
+        kopieren("an beide Rollen");
+        let beide = warten_bis(Duration::from_secs(3), || bekam(&client_bekam, "an beide Rollen") && bekam(&host_bekam, "an beide Rollen"));
+
+        // Was eine Rolle ablegt, meldet der Waechter keiner.
+        set("von einem Gegenueber");
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        unsafe { PostMessageW(Some(waechter), WM_CLIPBOARDUPDATE, WPARAM(0), LPARAM(0)).expect("PostMessageW") };
+        std::thread::sleep(RUHE + Duration::from_millis(400));
+        let widerhall = bekam(&client_bekam, "von einem Gegenueber") || bekam(&host_bekam, "von einem Gegenueber");
+
+        // Nur noch der Client hat ein Gegenueber.
+        host_da.store(false, Ordering::SeqCst);
+        kopieren("nur an den Client");
+        let client_allein = warten_bis(Duration::from_secs(3), || bekam(&client_bekam, "nur an den Client"));
+        std::thread::sleep(Duration::from_millis(200));
+        let host_trotzdem = bekam(&host_bekam, "nur an den Client");
+
+        client_da.store(false, Ordering::SeqCst);
+        aufraeumen(fenster);
+        assert!(beide, "Kopie nicht an beide Rollen: Client {:?}, Host {:?}", client_bekam.lock().unwrap(), host_bekam.lock().unwrap());
+        assert!(!widerhall, "eigenes Ablegen gemeldet (Laufnummer {seq} eigen: {})", eigene_nummer(seq));
+        assert!(client_allein, "Kopie nicht beim Client: {:?}", client_bekam.lock().unwrap());
+        assert!(!host_trotzdem, "Host-Rolle ohne Zuschauer bekam die Kopie");
     }
 }
