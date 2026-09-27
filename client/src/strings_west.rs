@@ -262,6 +262,7 @@ pub static FR: Lang = Lang {
         (ThisComputer, "Cet ordinateur : {n} · {i}"),
         (DeviceNameRename, "Renommer"),
         (PreventSleep, "Empêcher la mise en veille tant que QuadChroma est ouvert"),
+        (TipDecoderAutoMac, "VideoToolbox dans le moteur multimédia du Mac (HEVC 4:4:4 compris) ; sinon le processeur."),
     ],
 };
 
@@ -522,6 +523,7 @@ pub static ES: Lang = Lang {
         (ThisComputer, "Este ordenador: {n} · {i}"),
         (DeviceNameRename, "Renombrar"),
         (PreventSleep, "Evitar la suspensión mientras QuadChroma se ejecuta"),
+        (TipDecoderAutoMac, "VideoToolbox en el motor multimedia del Mac (también HEVC 4:4:4); si no, el procesador."),
     ],
 };
 
@@ -782,6 +784,7 @@ pub static IT: Lang = Lang {
         (ThisComputer, "Questo computer: {n} · {i}"),
         (DeviceNameRename, "Rinomina"),
         (PreventSleep, "Impedisci la sospensione mentre QuadChroma è in esecuzione"),
+        (TipDecoderAutoMac, "VideoToolbox nel motore multimediale del Mac (anche HEVC 4:4:4); altrimenti il processore."),
     ],
 };
 
@@ -1042,6 +1045,7 @@ pub static PT: Lang = Lang {
         (ThisComputer, "Este computador: {n} · {i}"),
         (DeviceNameRename, "Mudar o nome"),
         (PreventSleep, "Impedir a suspensão enquanto o QuadChroma estiver em execução"),
+        (TipDecoderAutoMac, "VideoToolbox no motor multimédia do Mac (também HEVC 4:4:4); senão o processador."),
     ],
 };
 
@@ -1302,5 +1306,6 @@ pub static NL: Lang = Lang {
         (ThisComputer, "Deze computer: {n} · {i}"),
         (DeviceNameRename, "Hernoemen"),
         (PreventSleep, "Slaapstand voorkomen zolang QuadChroma draait"),
+        (TipDecoderAutoMac, "VideoToolbox in de media-engine van de Mac (ook HEVC 4:4:4); anders de processor."),
     ],
 };

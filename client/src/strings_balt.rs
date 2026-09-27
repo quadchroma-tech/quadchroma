@@ -260,6 +260,7 @@ pub static ET: Lang = Lang {
         (ThisComputer, "See arvuti: {n} · {i}"),
         (DeviceNameRename, "Nimeta ümber"),
         (PreventSleep, "Takista unerežiimi, kuni QuadChroma töötab"),
+        (TipDecoderAutoMac, "VideoToolbox Maci meediamootoris (ka HEVC 4:4:4); muidu protsessor."),
     ],
 };
 
@@ -520,6 +521,7 @@ pub static LV: Lang = Lang {
         (ThisComputer, "Šis dators: {n} · {i}"),
         (DeviceNameRename, "Pārdēvēt"),
         (PreventSleep, "Novērst miega režīmu, kamēr darbojas QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox Mac mediju dzinējā (arī HEVC 4:4:4); citādi procesors."),
     ],
 };
 
@@ -780,6 +782,7 @@ pub static LT: Lang = Lang {
         (ThisComputer, "Šis kompiuteris: {n} · {i}"),
         (DeviceNameRename, "Pervadinti"),
         (PreventSleep, "Neleisti užmigti, kol veikia QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox Mac medijos variklyje (taip pat HEVC 4:4:4); kitaip procesorius."),
     ],
 };
 
@@ -1040,6 +1043,7 @@ pub static SL: Lang = Lang {
         (ThisComputer, "Ta računalnik: {n} · {i}"),
         (DeviceNameRename, "Preimenuj"),
         (PreventSleep, "Prepreči stanje spanja, dokler se izvaja QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox v medijskem pogonu Maca (tudi HEVC 4:4:4); sicer procesor."),
     ],
 };
 
@@ -1300,6 +1304,7 @@ pub static HR: Lang = Lang {
         (ThisComputer, "Ovo računalo: {n} · {i}"),
         (DeviceNameRename, "Preimenuj"),
         (PreventSleep, "Spriječi stanje mirovanja dok QuadChroma radi"),
+        (TipDecoderAutoMac, "VideoToolbox u medijskom pogonu Maca (i HEVC 4:4:4); inače procesor."),
     ],
 };
 
@@ -1560,5 +1565,6 @@ pub static UK: Lang = Lang {
         (ThisComputer, "Цей комп'ютер: {n} · {i}"),
         (DeviceNameRename, "Перейменувати"),
         (PreventSleep, "Не переходити в режим сну, поки працює QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox у медіарушії Mac (зокрема HEVC 4:4:4); інакше процесор."),
     ],
 };

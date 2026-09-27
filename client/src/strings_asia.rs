@@ -263,6 +263,7 @@ pub static RU: Lang = Lang {
         (ThisComputer, "Этот компьютер: {n} · {i}"),
         (DeviceNameRename, "Переименовать"),
         (PreventSleep, "Не допускать спящего режима, пока работает QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox в медиадвижке Mac (в том числе HEVC 4:4:4); иначе процессор."),
     ],
 };
 
@@ -525,6 +526,7 @@ pub static ZH: Lang = Lang {
         (ThisComputer, "此电脑：{n} · {i}"),
         (DeviceNameRename, "重命名"),
         (PreventSleep, "QuadChroma 运行时阻止睡眠"),
+        (TipDecoderAutoMac, "在 Mac 的媒体引擎上用 VideoToolbox（包括 HEVC 4:4:4）；否则用处理器。"),
     ],
 };
 
@@ -787,6 +789,7 @@ pub static JA: Lang = Lang {
         (ThisComputer, "このコンピューター: {n} · {i}"),
         (DeviceNameRename, "名前を変更"),
         (PreventSleep, "QuadChroma の実行中はスリープしない"),
+        (TipDecoderAutoMac, "Mac のメディアエンジンで VideoToolbox（HEVC 4:4:4 も可）、それができなければ CPU。"),
     ],
 };
 
@@ -1047,5 +1050,6 @@ pub static TR: Lang = Lang {
         (ThisComputer, "Bu bilgisayar: {n} · {i}"),
         (DeviceNameRename, "Yeniden adlandır"),
         (PreventSleep, "QuadChroma çalışırken uyku modunu engelle"),
+        (TipDecoderAutoMac, "Mac'in medya motorunda VideoToolbox (HEVC 4:4:4 dahil); yoksa işlemci."),
     ],
 };

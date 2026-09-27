@@ -260,6 +260,7 @@ pub static PL: Lang = Lang {
         (ThisComputer, "Ten komputer: {n} · {i}"),
         (DeviceNameRename, "Zmień nazwę"),
         (PreventSleep, "Zapobiegaj uśpieniu, gdy QuadChroma działa"),
+        (TipDecoderAutoMac, "VideoToolbox w silniku multimedialnym Maca (także HEVC 4:4:4); inaczej procesor."),
     ],
 };
 
@@ -520,6 +521,7 @@ pub static CS: Lang = Lang {
         (ThisComputer, "Tento počítač: {n} · {i}"),
         (DeviceNameRename, "Přejmenovat"),
         (PreventSleep, "Zabránit režimu spánku, dokud běží QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox v multimediálním jádru Macu (i HEVC 4:4:4); jinak procesor."),
     ],
 };
 
@@ -780,6 +782,7 @@ pub static SK: Lang = Lang {
         (ThisComputer, "Tento počítač: {n} · {i}"),
         (DeviceNameRename, "Premenovať"),
         (PreventSleep, "Zabrániť režimu spánku, kým beží QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox v multimediálnom jadre Macu (aj HEVC 4:4:4); inak procesor."),
     ],
 };
 
@@ -1040,6 +1043,7 @@ pub static HU: Lang = Lang {
         (ThisComputer, "Ez a számítógép: {n} · {i}"),
         (DeviceNameRename, "Átnevezés"),
         (PreventSleep, "Alvó állapot megakadályozása, amíg a QuadChroma fut"),
+        (TipDecoderAutoMac, "VideoToolbox a Mac médiamotorján (a HEVC 4:4:4 is); különben a processzor."),
     ],
 };
 
@@ -1300,6 +1304,7 @@ pub static RO: Lang = Lang {
         (ThisComputer, "Acest computer: {n} · {i}"),
         (DeviceNameRename, "Redenumește"),
         (PreventSleep, "Împiedică repausul cât timp rulează QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox în motorul media al Mac-ului (inclusiv HEVC 4:4:4); altfel procesorul."),
     ],
 };
 
@@ -1560,6 +1565,7 @@ pub static BG: Lang = Lang {
         (ThisComputer, "Този компютър: {n} · {i}"),
         (DeviceNameRename, "Преименуване"),
         (PreventSleep, "Предотвратяване на режим на заспиване, докато QuadChroma работи"),
+        (TipDecoderAutoMac, "VideoToolbox в медийния двигател на Mac (включително HEVC 4:4:4); иначе процесорът."),
     ],
 };
 
@@ -1820,5 +1826,6 @@ pub static EL: Lang = Lang {
         (ThisComputer, "Αυτός ο υπολογιστής: {n} · {i}"),
         (DeviceNameRename, "Μετονομασία"),
         (PreventSleep, "Αποτροπή αναστολής λειτουργίας όσο εκτελείται το QuadChroma"),
+        (TipDecoderAutoMac, "VideoToolbox στη μηχανή πολυμέσων του Mac (και HEVC 4:4:4)· αλλιώς ο επεξεργαστής."),
     ],
 };

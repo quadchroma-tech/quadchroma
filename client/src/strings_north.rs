@@ -260,6 +260,7 @@ pub static SV: Lang = Lang {
         (ThisComputer, "Den här datorn: {n} · {i}"),
         (DeviceNameRename, "Byt namn"),
         (PreventSleep, "Förhindra viloläge medan QuadChroma körs"),
+        (TipDecoderAutoMac, "VideoToolbox i Macens mediemotor (även HEVC 4:4:4); annars processorn."),
     ],
 };
 
@@ -520,6 +521,7 @@ pub static DA: Lang = Lang {
         (ThisComputer, "Denne computer: {n} · {i}"),
         (DeviceNameRename, "Omdøb"),
         (PreventSleep, "Forhindr dvale, mens QuadChroma kører"),
+        (TipDecoderAutoMac, "VideoToolbox i Mac'ens mediemotor (også HEVC 4:4:4); ellers processoren."),
     ],
 };
 
@@ -780,6 +782,7 @@ pub static NB: Lang = Lang {
         (ThisComputer, "Denne datamaskinen: {n} · {i}"),
         (DeviceNameRename, "Gi nytt navn"),
         (PreventSleep, "Hindre hvilemodus mens QuadChroma kjører"),
+        (TipDecoderAutoMac, "VideoToolbox i Mac-ens mediemotor (også HEVC 4:4:4); ellers prosessoren."),
     ],
 };
 
@@ -1040,6 +1043,7 @@ pub static FI: Lang = Lang {
         (ThisComputer, "Tämä tietokone: {n} · {i}"),
         (DeviceNameRename, "Nimeä uudelleen"),
         (PreventSleep, "Estä lepotila, kun QuadChroma on käynnissä"),
+        (TipDecoderAutoMac, "VideoToolbox Macin mediamoottorissa (myös HEVC 4:4:4); muuten suoritin."),
     ],
 };
 
@@ -1300,5 +1304,6 @@ pub static IS: Lang = Lang {
         (ThisComputer, "Þessi tölva: {n} · {i}"),
         (DeviceNameRename, "Endurnefna"),
         (PreventSleep, "Koma í veg fyrir svefnham á meðan QuadChroma er í gangi"),
+        (TipDecoderAutoMac, "VideoToolbox í miðlunarvél Mac-tölvunnar (líka HEVC 4:4:4); annars örgjörvinn."),
     ],
 };

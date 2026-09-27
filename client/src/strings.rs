@@ -467,6 +467,10 @@ pub enum Key {
     /// Haken am Symbol und Kaestchen im Startbildschirm; auch der Grund, der
     /// in powercfg /requests steht.
     PreventSleep,
+    // Decoder des Mac-Clients (Schritt E): VideoToolbox statt FFmpeg
+    /// Tooltip am Knopf "Automatisch" der Decoderwahl auf dem Mac - dort
+    /// decodiert VideoToolbox, NVDEC und D3D11VA gibt es nicht.
+    TipDecoderAutoMac,
 }
 
 pub struct Lang {
@@ -750,6 +754,7 @@ pub static EN: Lang = Lang {
         (ThisComputer, "This computer: {n} · {i}"),
         (DeviceNameRename, "Rename"),
         (PreventSleep, "Prevent sleep while QuadChroma is running"),
+        (TipDecoderAutoMac, "VideoToolbox in the Mac's media engine (HEVC 4:4:4 too); otherwise the processor."),
     ],
 };
 
@@ -1010,6 +1015,7 @@ pub static DE: Lang = Lang {
         (ThisComputer, "Dieser Computer: {n} · {i}"),
         (DeviceNameRename, "Umbenennen"),
         (PreventSleep, "Ruhezustand verhindern, solange QuadChroma läuft"),
+        (TipDecoderAutoMac, "VideoToolbox in der Media-Engine des Mac (auch HEVC 4:4:4); sonst der Prozessor."),
     ],
 };
 
@@ -1055,8 +1061,29 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > PreventSleep as usize);
-        assert_eq!(n, PreventSleep as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > TipDecoderAutoMac as usize);
+        assert_eq!(n, TipDecoderAutoMac as usize + 1, "Tabellen laenger als das Enum");
+    }
+
+    /// Der Tooltip der Decoderwahl auf dem Mac: in jeder Sprache
+    /// VideoToolbox und HEVC 4:4:4, kein Wort von NVDEC oder D3D11VA, ein
+    /// Satz ohne Platzhalter, nicht der Text fuer Windows und ausser im
+    /// Englischen nicht englisch.
+    #[test]
+    fn decoder_text_mac() {
+        assert_eq!(TipDecoderAutoMac as usize, PreventSleep as usize + 1);
+        for l in all() {
+            let t = l.get(TipDecoderAutoMac);
+            assert!(t.contains("VideoToolbox") && t.contains("HEVC 4:4:4"), "{}: {t}", l.code);
+            assert!(!t.contains("NVDEC") && !t.contains("D3D11VA") && !t.contains('{'), "{}: {t}", l.code);
+            assert!(t.ends_with('.') || t.ends_with('。'), "{}: {t}", l.code);
+            assert_ne!(t, l.get(TipDecoderAuto), "{}", l.code);
+            if l.code != "en" {
+                assert_ne!(t, EN.get(TipDecoderAutoMac), "{}: noch englisch", l.code);
+            }
+        }
+        assert_eq!(EN.get(TipDecoderAutoMac), "VideoToolbox in the Mac's media engine (HEVC 4:4:4 too); otherwise the processor.");
+        assert_eq!(DE.get(TipDecoderAutoMac), "VideoToolbox in der Media-Engine des Mac (auch HEVC 4:4:4); sonst der Prozessor.");
     }
 
     /// Die kaputte Schluesseldatei: in jeder Sprache mit genau einem Pfad
