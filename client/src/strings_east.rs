@@ -263,6 +263,7 @@ pub static PL: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox w silniku multimedialnym Maca (także HEVC 4:4:4); inaczej procesor."),
         (TipDisplayAutoMac, "Metal na układzie graficznym Maca. Bez Metal: procesor. Obowiązuje od następnego uruchomienia."),
         (TipDisplayCpuMac, "Rysowanie na procesorze, bez Metal. Działa wszędzie, kosztuje czas obliczeń. Obowiązuje od następnego uruchomienia."),
+        (StartShareMac, "Udostępnij tego Maca"),
     ],
 };
 
@@ -526,6 +527,7 @@ pub static CS: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox v multimediálním jádru Macu (i HEVC 4:4:4); jinak procesor."),
         (TipDisplayAutoMac, "Metal na grafickém čipu Macu. Bez Metalu: procesor. Platí od příštího spuštění."),
         (TipDisplayCpuMac, "Kreslení na procesoru, bez Metalu. Funguje všude, stojí výpočetní čas. Platí od příštího spuštění."),
+        (StartShareMac, "Sdílet tento Mac"),
     ],
 };
 
@@ -789,6 +791,7 @@ pub static SK: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox v multimediálnom jadre Macu (aj HEVC 4:4:4); inak procesor."),
         (TipDisplayAutoMac, "Metal na grafickom čipe Macu. Bez Metalu: procesor. Platí od nasledujúceho spustenia."),
         (TipDisplayCpuMac, "Kreslenie na procesore, bez Metalu. Funguje všade, stojí výpočtový čas. Platí od nasledujúceho spustenia."),
+        (StartShareMac, "Zdieľať tento Mac"),
     ],
 };
 
@@ -1052,6 +1055,7 @@ pub static HU: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox a Mac médiamotorján (a HEVC 4:4:4 is); különben a processzor."),
         (TipDisplayAutoMac, "Metal a Mac grafikus chipjén. Metal nélkül: a processzor. A következő indítástól érvényes."),
         (TipDisplayCpuMac, "Rajzolás a processzoron, Metal nélkül. Mindenhol működik, számítási időbe kerül. A következő indítástól érvényes."),
+        (StartShareMac, "A Mac megosztása"),
     ],
 };
 
@@ -1315,6 +1319,7 @@ pub static RO: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox în motorul media al Mac-ului (inclusiv HEVC 4:4:4); altfel procesorul."),
         (TipDisplayAutoMac, "Metal pe cipul grafic al Mac-ului. Fără Metal: procesorul. Se aplică de la următoarea pornire."),
         (TipDisplayCpuMac, "Desenare pe procesor, fără Metal. Merge oriunde, costă timp de calcul. Se aplică de la următoarea pornire."),
+        (StartShareMac, "Partajează acest Mac"),
     ],
 };
 
@@ -1578,6 +1583,7 @@ pub static BG: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox в медийния двигател на Mac (включително HEVC 4:4:4); иначе процесорът."),
         (TipDisplayAutoMac, "Metal на графичния чип на Mac. Без Metal: процесорът. Важи от следващото стартиране."),
         (TipDisplayCpuMac, "Рисуване на процесора, без Metal. Работи навсякъде, струва процесорно време. Важи от следващото стартиране."),
+        (StartShareMac, "Споделяне на този Mac"),
     ],
 };
 
@@ -1841,5 +1847,6 @@ pub static EL: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox στη μηχανή πολυμέσων του Mac (και HEVC 4:4:4)· αλλιώς ο επεξεργαστής."),
         (TipDisplayAutoMac, "Metal στο γραφικό τσιπ του Mac. Χωρίς Metal: ο επεξεργαστής. Ισχύει από την επόμενη εκκίνηση."),
         (TipDisplayCpuMac, "Σχεδίαση στον επεξεργαστή, χωρίς Metal. Δουλεύει παντού, κοστίζει χρόνο CPU. Ισχύει από την επόμενη εκκίνηση."),
+        (StartShareMac, "Κοινή χρήση αυτού του Mac"),
     ],
 };

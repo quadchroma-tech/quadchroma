@@ -265,6 +265,7 @@ pub static FR: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox dans le moteur multimédia du Mac (HEVC 4:4:4 compris) ; sinon le processeur."),
         (TipDisplayAutoMac, "Metal sur la puce graphique du Mac. Sans Metal : le processeur. Prend effet au prochain démarrage."),
         (TipDisplayCpuMac, "Dessiner sur le processeur, sans Metal. Fonctionne partout, coûte du temps de calcul. Prend effet au prochain démarrage."),
+        (StartShareMac, "Partager ce Mac"),
     ],
 };
 
@@ -528,6 +529,7 @@ pub static ES: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox en el motor multimedia del Mac (también HEVC 4:4:4); si no, el procesador."),
         (TipDisplayAutoMac, "Metal en el chip gráfico del Mac. Sin Metal: el procesador. Se aplica desde el próximo inicio."),
         (TipDisplayCpuMac, "Dibujar en el procesador, sin Metal. Funciona en todas partes, cuesta tiempo de CPU. Se aplica desde el próximo inicio."),
+        (StartShareMac, "Compartir este Mac"),
     ],
 };
 
@@ -791,6 +793,7 @@ pub static IT: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox nel motore multimediale del Mac (anche HEVC 4:4:4); altrimenti il processore."),
         (TipDisplayAutoMac, "Metal sul chip grafico del Mac. Senza Metal: il processore. Vale dal prossimo avvio."),
         (TipDisplayCpuMac, "Disegnare sul processore, senza Metal. Funziona ovunque, costa tempo di calcolo. Vale dal prossimo avvio."),
+        (StartShareMac, "Condividi questo Mac"),
     ],
 };
 
@@ -1054,6 +1057,7 @@ pub static PT: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox no motor multimédia do Mac (também HEVC 4:4:4); senão o processador."),
         (TipDisplayAutoMac, "Metal no chip gráfico do Mac. Sem Metal: o processador. Aplica-se a partir do próximo arranque."),
         (TipDisplayCpuMac, "Desenhar no processador, sem Metal. Funciona em todo o lado, custa tempo de CPU. Aplica-se a partir do próximo arranque."),
+        (StartShareMac, "Partilhar este Mac"),
     ],
 };
 
@@ -1317,5 +1321,6 @@ pub static NL: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox in de media-engine van de Mac (ook HEVC 4:4:4); anders de processor."),
         (TipDisplayAutoMac, "Metal op de grafische chip van de Mac. Zonder Metal: de processor. Geldt vanaf de volgende start."),
         (TipDisplayCpuMac, "Tekenen op de processor, zonder Metal. Werkt overal, kost rekentijd. Geldt vanaf de volgende start."),
+        (StartShareMac, "Deze Mac delen"),
     ],
 };

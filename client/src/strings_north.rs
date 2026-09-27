@@ -263,6 +263,7 @@ pub static SV: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox i Macens mediemotor (även HEVC 4:4:4); annars processorn."),
         (TipDisplayAutoMac, "Metal på Macens grafikkrets. Utan Metal: processorn. Gäller från nästa start."),
         (TipDisplayCpuMac, "Rita på processorn, utan Metal. Fungerar överallt, kostar processortid. Gäller från nästa start."),
+        (StartShareMac, "Dela den här Macen"),
     ],
 };
 
@@ -526,6 +527,7 @@ pub static DA: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox i Mac'ens mediemotor (også HEVC 4:4:4); ellers processoren."),
         (TipDisplayAutoMac, "Metal på Mac'ens grafikchip. Uden Metal: processoren. Gælder fra næste start."),
         (TipDisplayCpuMac, "Tegn på processoren, uden Metal. Virker overalt, koster regnetid. Gælder fra næste start."),
+        (StartShareMac, "Del denne Mac"),
     ],
 };
 
@@ -789,6 +791,7 @@ pub static NB: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox i Mac-ens mediemotor (også HEVC 4:4:4); ellers prosessoren."),
         (TipDisplayAutoMac, "Metal på Mac-ens grafikkbrikke. Uten Metal: prosessoren. Gjelder fra neste start."),
         (TipDisplayCpuMac, "Tegn på prosessoren, uten Metal. Virker overalt, koster regnetid. Gjelder fra neste start."),
+        (StartShareMac, "Del denne Mac-en"),
     ],
 };
 
@@ -1052,6 +1055,7 @@ pub static FI: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox Macin mediamoottorissa (myös HEVC 4:4:4); muuten suoritin."),
         (TipDisplayAutoMac, "Metal Macin grafiikkapiirillä. Ilman Metalia: suoritin. Voimassa seuraavasta käynnistyksestä."),
         (TipDisplayCpuMac, "Piirto suorittimella, ilman Metalia. Toimii kaikkialla, vie laskenta-aikaa. Voimassa seuraavasta käynnistyksestä."),
+        (StartShareMac, "Jaa tämä Mac"),
     ],
 };
 
@@ -1315,5 +1319,6 @@ pub static IS: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox í miðlunarvél Mac-tölvunnar (líka HEVC 4:4:4); annars örgjörvinn."),
         (TipDisplayAutoMac, "Metal á grafíkkubbi Mac-tölvunnar. Án Metal: örgjörvinn. Gildir frá næstu ræsingu."),
         (TipDisplayCpuMac, "Teikna á örgjörvanum, án Metal. Virkar alls staðar, kostar reiknitíma. Gildir frá næstu ræsingu."),
+        (StartShareMac, "Deila þessum Mac"),
     ],
 };

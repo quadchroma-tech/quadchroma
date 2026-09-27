@@ -477,6 +477,10 @@ pub enum Key {
     TipDisplayAutoMac,
     /// Tooltip am Knopf "Prozessor" der Anzeigewahl auf dem Mac.
     TipDisplayCpuMac,
+    // Die eine App auf dem Mac (Schritt G)
+    /// Umschalter im Startbildschirm und Haken im Menue der Menueleiste auf
+    /// dem Mac (unter Windows StartShare, "Diesen PC freigeben").
+    StartShareMac,
 }
 
 pub struct Lang {
@@ -763,6 +767,7 @@ pub static EN: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox in the Mac's media engine (HEVC 4:4:4 too); otherwise the processor."),
         (TipDisplayAutoMac, "Metal on the Mac's graphics chip. Without Metal: the processor. Applies from the next start."),
         (TipDisplayCpuMac, "Draw on the processor, without Metal. Works everywhere, costs CPU time. Applies from the next start."),
+        (StartShareMac, "Share this Mac"),
     ],
 };
 
@@ -1026,6 +1031,7 @@ pub static DE: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox in der Media-Engine des Mac (auch HEVC 4:4:4); sonst der Prozessor."),
         (TipDisplayAutoMac, "Metal auf dem Grafikchip des Mac. Ohne Metal: der Prozessor. Gilt ab dem nächsten Start."),
         (TipDisplayCpuMac, "Zeichnen auf dem Prozessor, ohne Metal. Läuft überall, kostet Rechenzeit. Gilt ab dem nächsten Start."),
+        (StartShareMac, "Diesen Mac freigeben"),
     ],
 };
 
@@ -1071,8 +1077,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > TipDisplayCpuMac as usize);
-        assert_eq!(n, TipDisplayCpuMac as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > StartShareMac as usize);
+        assert_eq!(n, StartShareMac as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1101,6 +1107,27 @@ mod tests {
         }
         assert_eq!(EN.get(TipDisplayAutoMac), "Metal on the Mac's graphics chip. Without Metal: the processor. Applies from the next start.");
         assert_eq!(DE.get(TipDisplayCpuMac), "Zeichnen auf dem Prozessor, ohne Metal. Läuft überall, kostet Rechenzeit. Gilt ab dem nächsten Start.");
+    }
+
+    /// Der Umschalter der Freigabe auf dem Mac: gleich hinter den Texten der
+    /// Metal-Anzeige, in jeder Sprache mit "Mac", ohne Platzhalter, nicht
+    /// der Text fuer Windows ("Diesen PC freigeben"), nicht die Kopfzeile
+    /// "Freigabe ist aus" und ausser im Englischen nicht englisch.
+    #[test]
+    fn freigabe_text_mac() {
+        assert_eq!(StartShareMac as usize, TipDisplayCpuMac as usize + 1);
+        for l in all() {
+            let t = l.get(StartShareMac);
+            assert!(t.contains("Mac") && !t.contains('{') && !t.contains("PC"), "{}: {t}", l.code);
+            assert!(!t.ends_with('.') && !t.ends_with(" …"), "{}: {t}", l.code);
+            assert_ne!(t, l.get(StartShare), "{}", l.code);
+            assert_ne!(t, l.get(HostSharingIsOff), "{}", l.code);
+            if l.code != "en" {
+                assert_ne!(t, EN.get(StartShareMac), "{}: noch englisch", l.code);
+            }
+        }
+        assert_eq!(EN.get(StartShareMac), "Share this Mac");
+        assert_eq!(DE.get(StartShareMac), "Diesen Mac freigeben");
     }
 
     /// Der Tooltip der Decoderwahl auf dem Mac: in jeder Sprache
@@ -1617,7 +1644,9 @@ mod tests {
             eprintln!("{} fehlt - Vergleich mit dem Mac-Host uebersprungen", pfad.display());
             return;
         };
-        let zugang = &EN.table[AccessTitle as usize..];
+        // Alle Schluessel: auch die der einen App (etwa TrayConnect) stehen
+        // im Mac-Host wortgleich.
+        let zugang = &EN.table[..];
         let mut je_sprache = Vec::new();
         for block in quelle.split("static const qc_sprache QC_").skip(1) {
             // Kopf: XX = { "xx", "Name", {
@@ -1639,9 +1668,11 @@ mod tests {
             je_sprache.push(verglichen);
         }
         assert_eq!(je_sprache.len(), 29);
-        // Alle 34 Host-Texte, Code und Abbrechen und die drei Texte des
-        // Passwortfensters (nicht gespeichert, unzulaessig, Titel), in jeder
-        // Sprache.
-        assert!(je_sprache.iter().all(|&n| n == 39), "{je_sprache:?}");
+        // Alle 34 Host-Texte, Code und Abbrechen, die drei Texte des
+        // Passwortfensters (nicht gespeichert, unzulaessig, Titel) und die
+        // elf der einen App auf dem Mac (Oeffnen, Verbinden, Freigabe aus,
+        // "Diesen Mac freigeben", sechs des Fensters "Geraetename",
+        // Ruhezustand), in jeder Sprache.
+        assert!(je_sprache.iter().all(|&n| n == 50), "{je_sprache:?}");
     }
 }

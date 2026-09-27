@@ -55,6 +55,17 @@ static const qc_sprache QC_EN = { "en", "English", {
     [QCTextHostPasswordNotSaved]   = "The password could not be saved.",
     [QCTextHostPasswordInvalid]    = "The password contains characters that are not allowed.",
     [QCTextHostPasswordTitle]      = "Change password",
+    [QCTextTrayOpenApp]            = "Open QuadChroma",
+    [QCTextTrayConnect]            = "Connect: {n}",
+    [QCTextHostSharingIsOff]       = "Sharing is off",
+    [QCTextStartShareMac]          = "Share this Mac",
+    [QCTextDeviceNameChange]       = "Change device name …",
+    [QCTextDeviceNameTitle]        = "Device name",
+    [QCTextDeviceNameLabel]        = "Other devices see this computer under this name:",
+    [QCTextDeviceNameHint]         = "Leave empty to use the computer name ({n}).",
+    [QCTextDeviceNameTooLong]      = "The name is too long (at most 40 bytes).",
+    [QCTextDeviceNameInvalid]      = "The name contains characters that are not allowed.",
+    [QCTextPreventSleep]           = "Prevent sleep while QuadChroma is running",
 }};
 
 // Deutsch: echte Umlaute, typografische Anfuehrungszeichen, Gedankenstrich und
@@ -100,6 +111,17 @@ static const qc_sprache QC_DE = { "de", "Deutsch", {
     [QCTextHostPasswordNotSaved]   = "Das Passwort konnte nicht gespeichert werden.",
     [QCTextHostPasswordInvalid]    = "Das Passwort enthält unzulässige Zeichen.",
     [QCTextHostPasswordTitle]      = "Passwort ändern",
+    [QCTextTrayOpenApp]            = "QuadChroma öffnen",
+    [QCTextTrayConnect]            = "Verbinden: {n}",
+    [QCTextHostSharingIsOff]       = "Freigabe ist aus",
+    [QCTextStartShareMac]          = "Diesen Mac freigeben",
+    [QCTextDeviceNameChange]       = "Gerätename ändern …",
+    [QCTextDeviceNameTitle]        = "Gerätename",
+    [QCTextDeviceNameLabel]        = "Unter diesem Namen sehen andere Geräte diesen Computer:",
+    [QCTextDeviceNameHint]         = "Leer lassen für den Rechnernamen ({n}).",
+    [QCTextDeviceNameTooLong]      = "Der Name ist zu lang (höchstens 40 Byte).",
+    [QCTextDeviceNameInvalid]      = "Der Name enthält unzulässige Zeichen.",
+    [QCTextPreventSleep]           = "Ruhezustand verhindern, solange QuadChroma läuft",
 }};
 
 // Die uebrigen 27 Sprachen (Paket P6): dieselben Uebersetzungen wie in
@@ -145,6 +167,17 @@ static const qc_sprache QC_FR = { "fr", "Français", {
     [QCTextHostPasswordNotSaved]   = "Le mot de passe n'a pas pu être enregistré.",
     [QCTextHostPasswordInvalid]    = "Le mot de passe contient des caractères non autorisés.",
     [QCTextHostPasswordTitle]      = "Changer le mot de passe",
+    [QCTextTrayOpenApp]            = "Ouvrir QuadChroma",
+    [QCTextTrayConnect]            = "Se connecter : {n}",
+    [QCTextHostSharingIsOff]       = "Partage désactivé",
+    [QCTextStartShareMac]          = "Partager ce Mac",
+    [QCTextDeviceNameChange]       = "Modifier le nom de l'appareil …",
+    [QCTextDeviceNameTitle]        = "Nom de l'appareil",
+    [QCTextDeviceNameLabel]        = "Les autres appareils voient cet ordinateur sous ce nom :",
+    [QCTextDeviceNameHint]         = "Laissez vide pour utiliser le nom de l'ordinateur ({n}).",
+    [QCTextDeviceNameTooLong]      = "Le nom est trop long (40 octets au maximum).",
+    [QCTextDeviceNameInvalid]      = "Le nom contient des caractères non autorisés.",
+    [QCTextPreventSleep]           = "Empêcher la mise en veille tant que QuadChroma est ouvert",
 }};
 
 static const qc_sprache QC_ES = { "es", "Español", {
@@ -187,6 +220,17 @@ static const qc_sprache QC_ES = { "es", "Español", {
     [QCTextHostPasswordNotSaved]   = "No se ha podido guardar la contraseña.",
     [QCTextHostPasswordInvalid]    = "La contraseña contiene caracteres no permitidos.",
     [QCTextHostPasswordTitle]      = "Cambiar contraseña",
+    [QCTextTrayOpenApp]            = "Abrir QuadChroma",
+    [QCTextTrayConnect]            = "Conectar: {n}",
+    [QCTextHostSharingIsOff]       = "Uso compartido desactivado",
+    [QCTextStartShareMac]          = "Compartir este Mac",
+    [QCTextDeviceNameChange]       = "Cambiar nombre del dispositivo …",
+    [QCTextDeviceNameTitle]        = "Nombre del dispositivo",
+    [QCTextDeviceNameLabel]        = "Otros dispositivos ven este ordenador con este nombre:",
+    [QCTextDeviceNameHint]         = "Déjalo vacío para usar el nombre del equipo ({n}).",
+    [QCTextDeviceNameTooLong]      = "El nombre es demasiado largo (máximo 40 bytes).",
+    [QCTextDeviceNameInvalid]      = "El nombre contiene caracteres no permitidos.",
+    [QCTextPreventSleep]           = "Evitar la suspensión mientras QuadChroma se ejecuta",
 }};
 
 static const qc_sprache QC_IT = { "it", "Italiano", {
@@ -229,6 +273,17 @@ static const qc_sprache QC_IT = { "it", "Italiano", {
     [QCTextHostPasswordNotSaved]   = "Impossibile salvare la password.",
     [QCTextHostPasswordInvalid]    = "La password contiene caratteri non consentiti.",
     [QCTextHostPasswordTitle]      = "Cambia password",
+    [QCTextTrayOpenApp]            = "Apri QuadChroma",
+    [QCTextTrayConnect]            = "Connetti: {n}",
+    [QCTextHostSharingIsOff]       = "Condivisione disattivata",
+    [QCTextStartShareMac]          = "Condividi questo Mac",
+    [QCTextDeviceNameChange]       = "Cambia nome del dispositivo …",
+    [QCTextDeviceNameTitle]        = "Nome del dispositivo",
+    [QCTextDeviceNameLabel]        = "Gli altri dispositivi vedono questo computer con questo nome:",
+    [QCTextDeviceNameHint]         = "Lascia vuoto per usare il nome del computer ({n}).",
+    [QCTextDeviceNameTooLong]      = "Il nome è troppo lungo (al massimo 40 byte).",
+    [QCTextDeviceNameInvalid]      = "Il nome contiene caratteri non consentiti.",
+    [QCTextPreventSleep]           = "Impedisci la sospensione mentre QuadChroma è in esecuzione",
 }};
 
 static const qc_sprache QC_PT = { "pt", "Português", {
@@ -271,6 +326,17 @@ static const qc_sprache QC_PT = { "pt", "Português", {
     [QCTextHostPasswordNotSaved]   = "Não foi possível guardar a palavra-passe.",
     [QCTextHostPasswordInvalid]    = "A palavra-passe contém caracteres não permitidos.",
     [QCTextHostPasswordTitle]      = "Alterar palavra-passe",
+    [QCTextTrayOpenApp]            = "Abrir QuadChroma",
+    [QCTextTrayConnect]            = "Ligar: {n}",
+    [QCTextHostSharingIsOff]       = "Partilha desativada",
+    [QCTextStartShareMac]          = "Partilhar este Mac",
+    [QCTextDeviceNameChange]       = "Alterar nome do dispositivo …",
+    [QCTextDeviceNameTitle]        = "Nome do dispositivo",
+    [QCTextDeviceNameLabel]        = "Os outros dispositivos veem este computador com este nome:",
+    [QCTextDeviceNameHint]         = "Deixe vazio para usar o nome do computador ({n}).",
+    [QCTextDeviceNameTooLong]      = "O nome é demasiado longo (no máximo 40 bytes).",
+    [QCTextDeviceNameInvalid]      = "O nome contém caracteres não permitidos.",
+    [QCTextPreventSleep]           = "Impedir a suspensão enquanto o QuadChroma estiver em execução",
 }};
 
 static const qc_sprache QC_NL = { "nl", "Nederlands", {
@@ -313,6 +379,17 @@ static const qc_sprache QC_NL = { "nl", "Nederlands", {
     [QCTextHostPasswordNotSaved]   = "Het wachtwoord kon niet worden opgeslagen.",
     [QCTextHostPasswordInvalid]    = "Het wachtwoord bevat tekens die niet zijn toegestaan.",
     [QCTextHostPasswordTitle]      = "Wachtwoord wijzigen",
+    [QCTextTrayOpenApp]            = "QuadChroma openen",
+    [QCTextTrayConnect]            = "Verbinden: {n}",
+    [QCTextHostSharingIsOff]       = "Delen is uit",
+    [QCTextStartShareMac]          = "Deze Mac delen",
+    [QCTextDeviceNameChange]       = "Apparaatnaam wijzigen …",
+    [QCTextDeviceNameTitle]        = "Apparaatnaam",
+    [QCTextDeviceNameLabel]        = "Onder deze naam zien andere apparaten deze computer:",
+    [QCTextDeviceNameHint]         = "Laat leeg voor de computernaam ({n}).",
+    [QCTextDeviceNameTooLong]      = "De naam is te lang (maximaal 40 bytes).",
+    [QCTextDeviceNameInvalid]      = "De naam bevat tekens die niet zijn toegestaan.",
+    [QCTextPreventSleep]           = "Slaapstand voorkomen zolang QuadChroma draait",
 }};
 
 static const qc_sprache QC_SV = { "sv", "Svenska", {
@@ -355,6 +432,17 @@ static const qc_sprache QC_SV = { "sv", "Svenska", {
     [QCTextHostPasswordNotSaved]   = "Lösenordet kunde inte sparas.",
     [QCTextHostPasswordInvalid]    = "Lösenordet innehåller otillåtna tecken.",
     [QCTextHostPasswordTitle]      = "Ändra lösenord",
+    [QCTextTrayOpenApp]            = "Öppna QuadChroma",
+    [QCTextTrayConnect]            = "Anslut: {n}",
+    [QCTextHostSharingIsOff]       = "Delning är av",
+    [QCTextStartShareMac]          = "Dela den här Macen",
+    [QCTextDeviceNameChange]       = "Ändra enhetsnamn …",
+    [QCTextDeviceNameTitle]        = "Enhetsnamn",
+    [QCTextDeviceNameLabel]        = "Andra enheter ser den här datorn under det här namnet:",
+    [QCTextDeviceNameHint]         = "Lämna tomt för datorns namn ({n}).",
+    [QCTextDeviceNameTooLong]      = "Namnet är för långt (högst 40 byte).",
+    [QCTextDeviceNameInvalid]      = "Namnet innehåller otillåtna tecken.",
+    [QCTextPreventSleep]           = "Förhindra viloläge medan QuadChroma körs",
 }};
 
 static const qc_sprache QC_DA = { "da", "Dansk", {
@@ -397,6 +485,17 @@ static const qc_sprache QC_DA = { "da", "Dansk", {
     [QCTextHostPasswordNotSaved]   = "Adgangskoden kunne ikke gemmes.",
     [QCTextHostPasswordInvalid]    = "Adgangskoden indeholder tegn, der ikke er tilladt.",
     [QCTextHostPasswordTitle]      = "Skift adgangskode",
+    [QCTextTrayOpenApp]            = "Åbn QuadChroma",
+    [QCTextTrayConnect]            = "Forbind: {n}",
+    [QCTextHostSharingIsOff]       = "Deling er slået fra",
+    [QCTextStartShareMac]          = "Del denne Mac",
+    [QCTextDeviceNameChange]       = "Skift enhedsnavn …",
+    [QCTextDeviceNameTitle]        = "Enhedsnavn",
+    [QCTextDeviceNameLabel]        = "Andre enheder ser denne computer under dette navn:",
+    [QCTextDeviceNameHint]         = "Lad feltet være tomt for computerens navn ({n}).",
+    [QCTextDeviceNameTooLong]      = "Navnet er for langt (højst 40 byte).",
+    [QCTextDeviceNameInvalid]      = "Navnet indeholder tegn, der ikke er tilladt.",
+    [QCTextPreventSleep]           = "Forhindr dvale, mens QuadChroma kører",
 }};
 
 static const qc_sprache QC_NB = { "nb", "Norsk bokmål", {
@@ -439,6 +538,17 @@ static const qc_sprache QC_NB = { "nb", "Norsk bokmål", {
     [QCTextHostPasswordNotSaved]   = "Passordet kunne ikke lagres.",
     [QCTextHostPasswordInvalid]    = "Passordet inneholder tegn som ikke er tillatt.",
     [QCTextHostPasswordTitle]      = "Endre passord",
+    [QCTextTrayOpenApp]            = "Åpne QuadChroma",
+    [QCTextTrayConnect]            = "Koble til: {n}",
+    [QCTextHostSharingIsOff]       = "Deling er av",
+    [QCTextStartShareMac]          = "Del denne Mac-en",
+    [QCTextDeviceNameChange]       = "Endre enhetsnavn …",
+    [QCTextDeviceNameTitle]        = "Enhetsnavn",
+    [QCTextDeviceNameLabel]        = "Andre enheter ser denne datamaskinen under dette navnet:",
+    [QCTextDeviceNameHint]         = "La feltet stå tomt for datamaskinens navn ({n}).",
+    [QCTextDeviceNameTooLong]      = "Navnet er for langt (maks. 40 byte).",
+    [QCTextDeviceNameInvalid]      = "Navnet inneholder tegn som ikke er tillatt.",
+    [QCTextPreventSleep]           = "Hindre hvilemodus mens QuadChroma kjører",
 }};
 
 static const qc_sprache QC_FI = { "fi", "Suomi", {
@@ -481,6 +591,17 @@ static const qc_sprache QC_FI = { "fi", "Suomi", {
     [QCTextHostPasswordNotSaved]   = "Salasanaa ei voitu tallentaa.",
     [QCTextHostPasswordInvalid]    = "Salasana sisältää merkkejä, jotka eivät ole sallittuja.",
     [QCTextHostPasswordTitle]      = "Vaihda salasana",
+    [QCTextTrayOpenApp]            = "Avaa QuadChroma",
+    [QCTextTrayConnect]            = "Yhdistä: {n}",
+    [QCTextHostSharingIsOff]       = "Jakaminen pois päältä",
+    [QCTextStartShareMac]          = "Jaa tämä Mac",
+    [QCTextDeviceNameChange]       = "Vaihda laitteen nimi …",
+    [QCTextDeviceNameTitle]        = "Laitteen nimi",
+    [QCTextDeviceNameLabel]        = "Muut laitteet näkevät tämän tietokoneen tällä nimellä:",
+    [QCTextDeviceNameHint]         = "Jätä tyhjäksi, niin käytetään tietokoneen nimeä ({n}).",
+    [QCTextDeviceNameTooLong]      = "Nimi on liian pitkä (enintään 40 tavua).",
+    [QCTextDeviceNameInvalid]      = "Nimi sisältää merkkejä, jotka eivät ole sallittuja.",
+    [QCTextPreventSleep]           = "Estä lepotila, kun QuadChroma on käynnissä",
 }};
 
 static const qc_sprache QC_IS = { "is", "Íslenska", {
@@ -523,6 +644,17 @@ static const qc_sprache QC_IS = { "is", "Íslenska", {
     [QCTextHostPasswordNotSaved]   = "Ekki tókst að vista lykilorðið.",
     [QCTextHostPasswordInvalid]    = "Lykilorðið inniheldur stafi sem eru ekki leyfðir.",
     [QCTextHostPasswordTitle]      = "Breyta lykilorði",
+    [QCTextTrayOpenApp]            = "Opna QuadChroma",
+    [QCTextTrayConnect]            = "Tengjast: {n}",
+    [QCTextHostSharingIsOff]       = "Slökkt á deilingu",
+    [QCTextStartShareMac]          = "Deila þessum Mac",
+    [QCTextDeviceNameChange]       = "Breyta heiti tækis …",
+    [QCTextDeviceNameTitle]        = "Heiti tækis",
+    [QCTextDeviceNameLabel]        = "Önnur tæki sjá þessa tölvu undir þessu heiti:",
+    [QCTextDeviceNameHint]         = "Skildu eftir autt til að nota heiti tölvunnar ({n}).",
+    [QCTextDeviceNameTooLong]      = "Heitið er of langt (að hámarki 40 bæti).",
+    [QCTextDeviceNameInvalid]      = "Heitið inniheldur stafi sem eru ekki leyfðir.",
+    [QCTextPreventSleep]           = "Koma í veg fyrir svefnham á meðan QuadChroma er í gangi",
 }};
 
 static const qc_sprache QC_PL = { "pl", "Polski", {
@@ -565,6 +697,17 @@ static const qc_sprache QC_PL = { "pl", "Polski", {
     [QCTextHostPasswordNotSaved]   = "Nie udało się zapisać hasła.",
     [QCTextHostPasswordInvalid]    = "Hasło zawiera niedozwolone znaki.",
     [QCTextHostPasswordTitle]      = "Zmień hasło",
+    [QCTextTrayOpenApp]            = "Otwórz QuadChroma",
+    [QCTextTrayConnect]            = "Połącz: {n}",
+    [QCTextHostSharingIsOff]       = "Udostępnianie wyłączone",
+    [QCTextStartShareMac]          = "Udostępnij tego Maca",
+    [QCTextDeviceNameChange]       = "Zmień nazwę urządzenia …",
+    [QCTextDeviceNameTitle]        = "Nazwa urządzenia",
+    [QCTextDeviceNameLabel]        = "Pod tą nazwą inne urządzenia widzą ten komputer:",
+    [QCTextDeviceNameHint]         = "Pozostaw puste, aby użyć nazwy komputera ({n}).",
+    [QCTextDeviceNameTooLong]      = "Nazwa jest za długa (maksymalnie 40 bajtów).",
+    [QCTextDeviceNameInvalid]      = "Nazwa zawiera niedozwolone znaki.",
+    [QCTextPreventSleep]           = "Zapobiegaj uśpieniu, gdy QuadChroma działa",
 }};
 
 static const qc_sprache QC_CS = { "cs", "Čeština", {
@@ -607,6 +750,17 @@ static const qc_sprache QC_CS = { "cs", "Čeština", {
     [QCTextHostPasswordNotSaved]   = "Heslo se nepodařilo uložit.",
     [QCTextHostPasswordInvalid]    = "Heslo obsahuje nepovolené znaky.",
     [QCTextHostPasswordTitle]      = "Změnit heslo",
+    [QCTextTrayOpenApp]            = "Otevřít QuadChroma",
+    [QCTextTrayConnect]            = "Připojit: {n}",
+    [QCTextHostSharingIsOff]       = "Sdílení je vypnuto",
+    [QCTextStartShareMac]          = "Sdílet tento Mac",
+    [QCTextDeviceNameChange]       = "Změnit název zařízení …",
+    [QCTextDeviceNameTitle]        = "Název zařízení",
+    [QCTextDeviceNameLabel]        = "Pod tímto názvem vidí ostatní zařízení tento počítač:",
+    [QCTextDeviceNameHint]         = "Ponechte prázdné pro název počítače ({n}).",
+    [QCTextDeviceNameTooLong]      = "Název je příliš dlouhý (nejvýše 40 bajtů).",
+    [QCTextDeviceNameInvalid]      = "Název obsahuje nepovolené znaky.",
+    [QCTextPreventSleep]           = "Zabránit režimu spánku, dokud běží QuadChroma",
 }};
 
 static const qc_sprache QC_SK = { "sk", "Slovenčina", {
@@ -649,6 +803,17 @@ static const qc_sprache QC_SK = { "sk", "Slovenčina", {
     [QCTextHostPasswordNotSaved]   = "Heslo sa nepodarilo uložiť.",
     [QCTextHostPasswordInvalid]    = "Heslo obsahuje nepovolené znaky.",
     [QCTextHostPasswordTitle]      = "Zmeniť heslo",
+    [QCTextTrayOpenApp]            = "Otvoriť QuadChroma",
+    [QCTextTrayConnect]            = "Pripojiť: {n}",
+    [QCTextHostSharingIsOff]       = "Zdieľanie je vypnuté",
+    [QCTextStartShareMac]          = "Zdieľať tento Mac",
+    [QCTextDeviceNameChange]       = "Zmeniť názov zariadenia …",
+    [QCTextDeviceNameTitle]        = "Názov zariadenia",
+    [QCTextDeviceNameLabel]        = "Pod týmto názvom vidia ostatné zariadenia tento počítač:",
+    [QCTextDeviceNameHint]         = "Nechajte prázdne pre názov počítača ({n}).",
+    [QCTextDeviceNameTooLong]      = "Názov je príliš dlhý (najviac 40 bajtov).",
+    [QCTextDeviceNameInvalid]      = "Názov obsahuje nepovolené znaky.",
+    [QCTextPreventSleep]           = "Zabrániť režimu spánku, kým beží QuadChroma",
 }};
 
 static const qc_sprache QC_HU = { "hu", "Magyar", {
@@ -691,6 +856,17 @@ static const qc_sprache QC_HU = { "hu", "Magyar", {
     [QCTextHostPasswordNotSaved]   = "A jelszót nem sikerült menteni.",
     [QCTextHostPasswordInvalid]    = "A jelszó nem engedélyezett karaktereket tartalmaz.",
     [QCTextHostPasswordTitle]      = "Jelszó módosítása",
+    [QCTextTrayOpenApp]            = "QuadChroma megnyitása",
+    [QCTextTrayConnect]            = "Csatlakozás: {n}",
+    [QCTextHostSharingIsOff]       = "A megosztás ki van kapcsolva",
+    [QCTextStartShareMac]          = "A Mac megosztása",
+    [QCTextDeviceNameChange]       = "Eszköznév módosítása …",
+    [QCTextDeviceNameTitle]        = "Eszköznév",
+    [QCTextDeviceNameLabel]        = "A többi eszköz ezen a néven látja ezt a számítógépet:",
+    [QCTextDeviceNameHint]         = "Hagyja üresen a számítógép nevéhez ({n}).",
+    [QCTextDeviceNameTooLong]      = "A név túl hosszú (legfeljebb 40 bájt).",
+    [QCTextDeviceNameInvalid]      = "A név nem engedélyezett karaktereket tartalmaz.",
+    [QCTextPreventSleep]           = "Alvó állapot megakadályozása, amíg a QuadChroma fut",
 }};
 
 static const qc_sprache QC_RO = { "ro", "Română", {
@@ -733,6 +909,17 @@ static const qc_sprache QC_RO = { "ro", "Română", {
     [QCTextHostPasswordNotSaved]   = "Parola nu a putut fi salvată.",
     [QCTextHostPasswordInvalid]    = "Parola conține caractere nepermise.",
     [QCTextHostPasswordTitle]      = "Schimbă parola",
+    [QCTextTrayOpenApp]            = "Deschide QuadChroma",
+    [QCTextTrayConnect]            = "Conectare: {n}",
+    [QCTextHostSharingIsOff]       = "Partajarea este oprită",
+    [QCTextStartShareMac]          = "Partajează acest Mac",
+    [QCTextDeviceNameChange]       = "Schimbă numele dispozitivului …",
+    [QCTextDeviceNameTitle]        = "Numele dispozitivului",
+    [QCTextDeviceNameLabel]        = "Celelalte dispozitive văd acest computer sub acest nume:",
+    [QCTextDeviceNameHint]         = "Lăsați gol pentru numele computerului ({n}).",
+    [QCTextDeviceNameTooLong]      = "Numele este prea lung (cel mult 40 de octeți).",
+    [QCTextDeviceNameInvalid]      = "Numele conține caractere nepermise.",
+    [QCTextPreventSleep]           = "Împiedică repausul cât timp rulează QuadChroma",
 }};
 
 static const qc_sprache QC_BG = { "bg", "Български", {
@@ -775,6 +962,17 @@ static const qc_sprache QC_BG = { "bg", "Български", {
     [QCTextHostPasswordNotSaved]   = "Паролата не можа да бъде запазена.",
     [QCTextHostPasswordInvalid]    = "Паролата съдържа непозволени знаци.",
     [QCTextHostPasswordTitle]      = "Смяна на паролата",
+    [QCTextTrayOpenApp]            = "Отвори QuadChroma",
+    [QCTextTrayConnect]            = "Свързване: {n}",
+    [QCTextHostSharingIsOff]       = "Споделянето е изключено",
+    [QCTextStartShareMac]          = "Споделяне на този Mac",
+    [QCTextDeviceNameChange]       = "Смяна на името на устройството …",
+    [QCTextDeviceNameTitle]        = "Име на устройството",
+    [QCTextDeviceNameLabel]        = "Другите устройства виждат този компютър с това име:",
+    [QCTextDeviceNameHint]         = "Оставете празно за името на компютъра ({n}).",
+    [QCTextDeviceNameTooLong]      = "Името е твърде дълго (най-много 40 байта).",
+    [QCTextDeviceNameInvalid]      = "Името съдържа непозволени знаци.",
+    [QCTextPreventSleep]           = "Предотвратяване на режим на заспиване, докато QuadChroma работи",
 }};
 
 static const qc_sprache QC_EL = { "el", "Ελληνικά", {
@@ -817,6 +1015,17 @@ static const qc_sprache QC_EL = { "el", "Ελληνικά", {
     [QCTextHostPasswordNotSaved]   = "Δεν ήταν δυνατή η αποθήκευση του κωδικού πρόσβασης.",
     [QCTextHostPasswordInvalid]    = "Ο κωδικός πρόσβασης περιέχει μη επιτρεπόμενους χαρακτήρες.",
     [QCTextHostPasswordTitle]      = "Αλλαγή κωδικού πρόσβασης",
+    [QCTextTrayOpenApp]            = "Άνοιγμα του QuadChroma",
+    [QCTextTrayConnect]            = "Σύνδεση: {n}",
+    [QCTextHostSharingIsOff]       = "Η κοινή χρήση είναι απενεργοποιημένη",
+    [QCTextStartShareMac]          = "Κοινή χρήση αυτού του Mac",
+    [QCTextDeviceNameChange]       = "Αλλαγή ονόματος συσκευής …",
+    [QCTextDeviceNameTitle]        = "Όνομα συσκευής",
+    [QCTextDeviceNameLabel]        = "Οι άλλες συσκευές βλέπουν αυτόν τον υπολογιστή με αυτό το όνομα:",
+    [QCTextDeviceNameHint]         = "Αφήστε το κενό για το όνομα του υπολογιστή ({n}).",
+    [QCTextDeviceNameTooLong]      = "Το όνομα είναι πολύ μεγάλο (έως 40 byte).",
+    [QCTextDeviceNameInvalid]      = "Το όνομα περιέχει μη επιτρεπόμενους χαρακτήρες.",
+    [QCTextPreventSleep]           = "Αποτροπή αναστολής λειτουργίας όσο εκτελείται το QuadChroma",
 }};
 
 static const qc_sprache QC_ET = { "et", "Eesti", {
@@ -859,6 +1068,17 @@ static const qc_sprache QC_ET = { "et", "Eesti", {
     [QCTextHostPasswordNotSaved]   = "Parooli ei õnnestunud salvestada.",
     [QCTextHostPasswordInvalid]    = "Parool sisaldab lubamatuid märke.",
     [QCTextHostPasswordTitle]      = "Muuda parooli",
+    [QCTextTrayOpenApp]            = "Ava QuadChroma",
+    [QCTextTrayConnect]            = "Ühenda: {n}",
+    [QCTextHostSharingIsOff]       = "Jagamine on väljas",
+    [QCTextStartShareMac]          = "Jaga seda Maci",
+    [QCTextDeviceNameChange]       = "Muuda seadme nime …",
+    [QCTextDeviceNameTitle]        = "Seadme nimi",
+    [QCTextDeviceNameLabel]        = "Teised seadmed näevad seda arvutit selle nime all:",
+    [QCTextDeviceNameHint]         = "Jäta tühjaks, et kasutada arvuti nime ({n}).",
+    [QCTextDeviceNameTooLong]      = "Nimi on liiga pikk (kuni 40 baiti).",
+    [QCTextDeviceNameInvalid]      = "Nimi sisaldab lubamatuid märke.",
+    [QCTextPreventSleep]           = "Takista unerežiimi, kuni QuadChroma töötab",
 }};
 
 static const qc_sprache QC_LV = { "lv", "Latviešu", {
@@ -901,6 +1121,17 @@ static const qc_sprache QC_LV = { "lv", "Latviešu", {
     [QCTextHostPasswordNotSaved]   = "Paroli neizdevās saglabāt.",
     [QCTextHostPasswordInvalid]    = "Parolē ir neatļautas rakstzīmes.",
     [QCTextHostPasswordTitle]      = "Mainīt paroli",
+    [QCTextTrayOpenApp]            = "Atvērt QuadChroma",
+    [QCTextTrayConnect]            = "Savienot: {n}",
+    [QCTextHostSharingIsOff]       = "Koplietošana izslēgta",
+    [QCTextStartShareMac]          = "Koplietot šo Mac datoru",
+    [QCTextDeviceNameChange]       = "Mainīt ierīces nosaukumu …",
+    [QCTextDeviceNameTitle]        = "Ierīces nosaukums",
+    [QCTextDeviceNameLabel]        = "Citas ierīces redz šo datoru ar šādu nosaukumu:",
+    [QCTextDeviceNameHint]         = "Atstājiet tukšu, lai izmantotu datora nosaukumu ({n}).",
+    [QCTextDeviceNameTooLong]      = "Nosaukums ir pārāk garš (ne vairāk kā 40 baiti).",
+    [QCTextDeviceNameInvalid]      = "Nosaukumā ir neatļautas rakstzīmes.",
+    [QCTextPreventSleep]           = "Novērst miega režīmu, kamēr darbojas QuadChroma",
 }};
 
 static const qc_sprache QC_LT = { "lt", "Lietuvių", {
@@ -943,6 +1174,17 @@ static const qc_sprache QC_LT = { "lt", "Lietuvių", {
     [QCTextHostPasswordNotSaved]   = "Nepavyko išsaugoti slaptažodžio.",
     [QCTextHostPasswordInvalid]    = "Slaptažodyje yra neleistinų simbolių.",
     [QCTextHostPasswordTitle]      = "Keisti slaptažodį",
+    [QCTextTrayOpenApp]            = "Atidaryti QuadChroma",
+    [QCTextTrayConnect]            = "Prisijungti: {n}",
+    [QCTextHostSharingIsOff]       = "Bendrinimas išjungtas",
+    [QCTextStartShareMac]          = "Bendrinti šį Mac kompiuterį",
+    [QCTextDeviceNameChange]       = "Keisti įrenginio pavadinimą …",
+    [QCTextDeviceNameTitle]        = "Įrenginio pavadinimas",
+    [QCTextDeviceNameLabel]        = "Kiti įrenginiai mato šį kompiuterį šiuo pavadinimu:",
+    [QCTextDeviceNameHint]         = "Palikite tuščią, kad būtų naudojamas kompiuterio pavadinimas ({n}).",
+    [QCTextDeviceNameTooLong]      = "Pavadinimas per ilgas (ne daugiau kaip 40 baitų).",
+    [QCTextDeviceNameInvalid]      = "Pavadinime yra neleistinų simbolių.",
+    [QCTextPreventSleep]           = "Neleisti užmigti, kol veikia QuadChroma",
 }};
 
 static const qc_sprache QC_SL = { "sl", "Slovenščina", {
@@ -985,6 +1227,17 @@ static const qc_sprache QC_SL = { "sl", "Slovenščina", {
     [QCTextHostPasswordNotSaved]   = "Gesla ni bilo mogoče shraniti.",
     [QCTextHostPasswordInvalid]    = "Geslo vsebuje nedovoljene znake.",
     [QCTextHostPasswordTitle]      = "Spremeni geslo",
+    [QCTextTrayOpenApp]            = "Odpri QuadChroma",
+    [QCTextTrayConnect]            = "Poveži: {n}",
+    [QCTextHostSharingIsOff]       = "Deljenje je izklopljeno",
+    [QCTextStartShareMac]          = "Deli ta Mac",
+    [QCTextDeviceNameChange]       = "Spremeni ime naprave …",
+    [QCTextDeviceNameTitle]        = "Ime naprave",
+    [QCTextDeviceNameLabel]        = "Druge naprave vidijo ta računalnik pod tem imenom:",
+    [QCTextDeviceNameHint]         = "Pustite prazno za ime računalnika ({n}).",
+    [QCTextDeviceNameTooLong]      = "Ime je predolgo (največ 40 bajtov).",
+    [QCTextDeviceNameInvalid]      = "Ime vsebuje nedovoljene znake.",
+    [QCTextPreventSleep]           = "Prepreči stanje spanja, dokler se izvaja QuadChroma",
 }};
 
 static const qc_sprache QC_HR = { "hr", "Hrvatski", {
@@ -1027,6 +1280,17 @@ static const qc_sprache QC_HR = { "hr", "Hrvatski", {
     [QCTextHostPasswordNotSaved]   = "Lozinku nije bilo moguće spremiti.",
     [QCTextHostPasswordInvalid]    = "Lozinka sadrži nedopuštene znakove.",
     [QCTextHostPasswordTitle]      = "Promijeni lozinku",
+    [QCTextTrayOpenApp]            = "Otvori QuadChroma",
+    [QCTextTrayConnect]            = "Poveži: {n}",
+    [QCTextHostSharingIsOff]       = "Dijeljenje je isključeno",
+    [QCTextStartShareMac]          = "Dijeli ovaj Mac",
+    [QCTextDeviceNameChange]       = "Promijeni naziv uređaja …",
+    [QCTextDeviceNameTitle]        = "Naziv uređaja",
+    [QCTextDeviceNameLabel]        = "Drugi uređaji vide ovo računalo pod ovim nazivom:",
+    [QCTextDeviceNameHint]         = "Ostavite prazno za naziv računala ({n}).",
+    [QCTextDeviceNameTooLong]      = "Naziv je predug (najviše 40 bajtova).",
+    [QCTextDeviceNameInvalid]      = "Naziv sadrži nedopuštene znakove.",
+    [QCTextPreventSleep]           = "Spriječi stanje mirovanja dok QuadChroma radi",
 }};
 
 static const qc_sprache QC_UK = { "uk", "Українська", {
@@ -1069,6 +1333,17 @@ static const qc_sprache QC_UK = { "uk", "Українська", {
     [QCTextHostPasswordNotSaved]   = "Не вдалося зберегти пароль.",
     [QCTextHostPasswordInvalid]    = "Пароль містить неприпустимі символи.",
     [QCTextHostPasswordTitle]      = "Змінити пароль",
+    [QCTextTrayOpenApp]            = "Відкрити QuadChroma",
+    [QCTextTrayConnect]            = "Підключитися: {n}",
+    [QCTextHostSharingIsOff]       = "Доступ вимкнено",
+    [QCTextStartShareMac]          = "Надати доступ до цього Mac",
+    [QCTextDeviceNameChange]       = "Змінити назву пристрою …",
+    [QCTextDeviceNameTitle]        = "Назва пристрою",
+    [QCTextDeviceNameLabel]        = "Інші пристрої бачать цей комп'ютер під цією назвою:",
+    [QCTextDeviceNameHint]         = "Залиште порожнім, щоб використати назву комп'ютера ({n}).",
+    [QCTextDeviceNameTooLong]      = "Назва задовга (не більше 40 байтів).",
+    [QCTextDeviceNameInvalid]      = "Назва містить неприпустимі символи.",
+    [QCTextPreventSleep]           = "Не переходити в режим сну, поки працює QuadChroma",
 }};
 
 static const qc_sprache QC_RU = { "ru", "Русский", {
@@ -1111,6 +1386,17 @@ static const qc_sprache QC_RU = { "ru", "Русский", {
     [QCTextHostPasswordNotSaved]   = "Не удалось сохранить пароль.",
     [QCTextHostPasswordInvalid]    = "Пароль содержит недопустимые символы.",
     [QCTextHostPasswordTitle]      = "Изменить пароль",
+    [QCTextTrayOpenApp]            = "Открыть QuadChroma",
+    [QCTextTrayConnect]            = "Подключиться: {n}",
+    [QCTextHostSharingIsOff]       = "Доступ отключён",
+    [QCTextStartShareMac]          = "Открыть доступ к этому Mac",
+    [QCTextDeviceNameChange]       = "Изменить имя устройства …",
+    [QCTextDeviceNameTitle]        = "Имя устройства",
+    [QCTextDeviceNameLabel]        = "Другие устройства видят этот компьютер под этим именем:",
+    [QCTextDeviceNameHint]         = "Оставьте пустым, чтобы использовать имя компьютера ({n}).",
+    [QCTextDeviceNameTooLong]      = "Имя слишком длинное (не более 40 байт).",
+    [QCTextDeviceNameInvalid]      = "Имя содержит недопустимые символы.",
+    [QCTextPreventSleep]           = "Не допускать спящего режима, пока работает QuadChroma",
 }};
 
 static const qc_sprache QC_ZH = { "zh", "简体中文", {
@@ -1153,6 +1439,17 @@ static const qc_sprache QC_ZH = { "zh", "简体中文", {
     [QCTextHostPasswordNotSaved]   = "无法保存密码。",
     [QCTextHostPasswordInvalid]    = "密码包含不允许的字符。",
     [QCTextHostPasswordTitle]      = "更改密码",
+    [QCTextTrayOpenApp]            = "打开 QuadChroma",
+    [QCTextTrayConnect]            = "连接：{n}",
+    [QCTextHostSharingIsOff]       = "共享已关闭",
+    [QCTextStartShareMac]          = "共享此 Mac",
+    [QCTextDeviceNameChange]       = "更改设备名称 …",
+    [QCTextDeviceNameTitle]        = "设备名称",
+    [QCTextDeviceNameLabel]        = "其他设备看到的此电脑名称：",
+    [QCTextDeviceNameHint]         = "留空则使用计算机名称（{n}）。",
+    [QCTextDeviceNameTooLong]      = "名称过长（最多 40 字节）。",
+    [QCTextDeviceNameInvalid]      = "名称包含不允许的字符。",
+    [QCTextPreventSleep]           = "QuadChroma 运行时阻止睡眠",
 }};
 
 static const qc_sprache QC_JA = { "ja", "日本語", {
@@ -1195,6 +1492,17 @@ static const qc_sprache QC_JA = { "ja", "日本語", {
     [QCTextHostPasswordNotSaved]   = "パスワードを保存できませんでした。",
     [QCTextHostPasswordInvalid]    = "パスワードに使用できない文字が含まれています。",
     [QCTextHostPasswordTitle]      = "パスワードを変更",
+    [QCTextTrayOpenApp]            = "QuadChroma を開く",
+    [QCTextTrayConnect]            = "接続: {n}",
+    [QCTextHostSharingIsOff]       = "共有はオフです",
+    [QCTextStartShareMac]          = "この Mac を共有",
+    [QCTextDeviceNameChange]       = "デバイス名を変更 …",
+    [QCTextDeviceNameTitle]        = "デバイス名",
+    [QCTextDeviceNameLabel]        = "ほかのデバイスにはこの名前で表示されます:",
+    [QCTextDeviceNameHint]         = "空欄にするとコンピューター名（{n}）を使います。",
+    [QCTextDeviceNameTooLong]      = "名前が長すぎます（最大 40 バイト）。",
+    [QCTextDeviceNameInvalid]      = "名前に使用できない文字が含まれています。",
+    [QCTextPreventSleep]           = "QuadChroma の実行中はスリープしない",
 }};
 
 static const qc_sprache QC_TR = { "tr", "Türkçe", {
@@ -1237,6 +1545,17 @@ static const qc_sprache QC_TR = { "tr", "Türkçe", {
     [QCTextHostPasswordNotSaved]   = "Parola kaydedilemedi.",
     [QCTextHostPasswordInvalid]    = "Parola izin verilmeyen karakterler içeriyor.",
     [QCTextHostPasswordTitle]      = "Parolayı değiştir",
+    [QCTextTrayOpenApp]            = "QuadChroma'yı aç",
+    [QCTextTrayConnect]            = "Bağlan: {n}",
+    [QCTextHostSharingIsOff]       = "Paylaşım kapalı",
+    [QCTextStartShareMac]          = "Bu Mac'i paylaş",
+    [QCTextDeviceNameChange]       = "Cihaz adını değiştir …",
+    [QCTextDeviceNameTitle]        = "Cihaz adı",
+    [QCTextDeviceNameLabel]        = "Diğer cihazlar bu bilgisayarı bu adla görür:",
+    [QCTextDeviceNameHint]         = "Bilgisayar adını kullanmak için boş bırakın ({n}).",
+    [QCTextDeviceNameTooLong]      = "Ad çok uzun (en fazla 40 bayt).",
+    [QCTextDeviceNameInvalid]      = "Ad izin verilmeyen karakterler içeriyor.",
+    [QCTextPreventSleep]           = "QuadChroma çalışırken uyku modunu engelle",
 }};
 
 static const qc_sprache *const g_sprachen[] = {
@@ -1294,7 +1613,20 @@ void qc_texte_setzen(int sprache) {
 
 int qc_texte_aktuell(void) { return atomic_load(&g_aktuell); }
 
+// Hat die App die Sprache selbst gesetzt (qc_texte_setzen_code), bleibt sie.
+static _Atomic int g_fest = 0;
+
+int qc_texte_setzen_code(const char *code) {
+    if (!code) return -1;
+    int p = platz_fuer(@(code));
+    if (p < 0) return -1;
+    qc_texte_setzen(p);
+    atomic_store(&g_fest, 1);
+    return p;
+}
+
 void qc_texte_systemsprache(void) {
+    if (atomic_load(&g_fest)) return;
     qc_texte_setzen(qc_texte_waehlen([NSLocale preferredLanguages]));
 }
 

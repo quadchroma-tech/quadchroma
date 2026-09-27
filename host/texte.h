@@ -61,6 +61,20 @@ typedef enum QCText {
     QCTextHostPasswordNotSaved,   // qc_zugang_passwort_setzen meldet einen Schreibfehler
     QCTextHostPasswordInvalid,    // zu lang oder Zeilenumbruch (qc_passwort_pruefen 3, Kern -1)
     QCTextHostPasswordTitle,      // Titel des Passwort-Fensters
+    // Die eine App (eingebettet im Client): die Punkte des Clients im Menue,
+    // die Kopfzeile ohne Freigabe und das Fenster "Geraetename" - gleicher
+    // Text wie der Client-Schluessel gleichen Namens.
+    QCTextTrayOpenApp,            // "QuadChroma oeffnen"
+    QCTextTrayConnect,            // "Verbinden: {n}" je gefundenem Host
+    QCTextHostSharingIsOff,       // Zustandszeile, wenn die Freigabe aus ist
+    QCTextStartShareMac,          // Haken "Diesen Mac freigeben"
+    QCTextDeviceNameChange,       // Menuepunkt, oeffnet das Fenster "Geraetename"
+    QCTextDeviceNameTitle,        // dessen Titel
+    QCTextDeviceNameLabel,        // Beschriftung des Felds
+    QCTextDeviceNameHint,         // leer heisst Rechnername ({n})
+    QCTextDeviceNameTooLong,      // mehr als 40 Byte
+    QCTextDeviceNameInvalid,      // Steuer- oder Richtungszeichen
+    QCTextPreventSleep,           // Haken "Ruhezustand verhindern, solange QuadChroma laeuft"
     QCTextAnzahl
 } QCText;
 
@@ -80,6 +94,12 @@ int qc_texte_waehlen(NSArray<NSString *> *bevorzugt);
 void qc_texte_systemsprache(void);
 // Setzt die Sprache (Tabellenplatz); ungueltig -> Englisch.
 void qc_texte_setzen(int sprache);
+// Setzt die Sprache nach ihrem Code ("de", "pt", wie die Tabellen des
+// Clients) - so folgen die Texte der Oberflaeche der Sprachwahl des Clients
+// (die eine App). Danach waehlt qc_texte_systemsprache nicht mehr neu.
+// Rueckgabe: Tabellenplatz, -1 fuer einen unbekannten Code (dann bleibt die
+// Sprache, wie sie war).
+int qc_texte_setzen_code(const char *code);
 int qc_texte_aktuell(void);
 
 // Text in der aktuellen Sprache (fehlt er dort: Englisch).

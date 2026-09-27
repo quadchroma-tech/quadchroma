@@ -266,6 +266,7 @@ pub static RU: Lang = Lang {
         (TipDecoderAutoMac, "VideoToolbox в медиадвижке Mac (в том числе HEVC 4:4:4); иначе процессор."),
         (TipDisplayAutoMac, "Metal на графическом чипе Mac. Без Metal: процессор. Действует со следующего запуска."),
         (TipDisplayCpuMac, "Рисование на процессоре, без Metal. Работает везде, стоит процессорного времени. Действует со следующего запуска."),
+        (StartShareMac, "Открыть доступ к этому Mac"),
     ],
 };
 
@@ -531,6 +532,7 @@ pub static ZH: Lang = Lang {
         (TipDecoderAutoMac, "在 Mac 的媒体引擎上用 VideoToolbox（包括 HEVC 4:4:4）；否则用处理器。"),
         (TipDisplayAutoMac, "在 Mac 的图形芯片上用 Metal。没有 Metal 时：处理器。下次启动起生效。"),
         (TipDisplayCpuMac, "在处理器上绘制，不用 Metal。到处都能用，占用 CPU 时间。下次启动起生效。"),
+        (StartShareMac, "共享此 Mac"),
     ],
 };
 
@@ -796,6 +798,7 @@ pub static JA: Lang = Lang {
         (TipDecoderAutoMac, "Mac のメディアエンジンで VideoToolbox（HEVC 4:4:4 も可）、それができなければ CPU。"),
         (TipDisplayAutoMac, "Mac のグラフィックチップで Metal。Metal が使えなければ CPU。次回起動時から有効。"),
         (TipDisplayCpuMac, "Metal を使わず CPU で描画します。どこでも動きますが、処理時間がかかります。次回起動時から有効。"),
+        (StartShareMac, "この Mac を共有"),
     ],
 };
 
@@ -1059,5 +1062,6 @@ pub static TR: Lang = Lang {
         (TipDecoderAutoMac, "Mac'in medya motorunda VideoToolbox (HEVC 4:4:4 dahil); yoksa işlemci."),
         (TipDisplayAutoMac, "Mac'in grafik yongasında Metal. Metal yoksa: işlemci. Sonraki başlatmadan itibaren geçerli."),
         (TipDisplayCpuMac, "İşlemcide, Metal olmadan çizim. Her yerde çalışır, işlem süresine mal olur. Sonraki başlatmadan itibaren geçerli."),
+        (StartShareMac, "Bu Mac'i paylaş"),
     ],
 };

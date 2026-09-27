@@ -120,6 +120,17 @@ static const char *const SOLL_EN[QCTextAnzahl] = {
     [QCTextHostPasswordNotSaved] = "The password could not be saved.",
     [QCTextHostPasswordInvalid] = "The password contains characters that are not allowed.",
     [QCTextHostPasswordTitle] = "Change password",
+    [QCTextTrayOpenApp] = "Open QuadChroma",
+    [QCTextTrayConnect] = "Connect: {n}",
+    [QCTextHostSharingIsOff] = "Sharing is off",
+    [QCTextStartShareMac] = "Share this Mac",
+    [QCTextDeviceNameChange] = "Change device name …",
+    [QCTextDeviceNameTitle] = "Device name",
+    [QCTextDeviceNameLabel] = "Other devices see this computer under this name:",
+    [QCTextDeviceNameHint] = "Leave empty to use the computer name ({n}).",
+    [QCTextDeviceNameTooLong] = "The name is too long (at most 40 bytes).",
+    [QCTextDeviceNameInvalid] = "The name contains characters that are not allowed.",
+    [QCTextPreventSleep] = "Prevent sleep while QuadChroma is running",
 };
 
 static const char *const SOLL_DE[QCTextAnzahl] = {
@@ -162,6 +173,17 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostPasswordNotSaved] = "Das Passwort konnte nicht gespeichert werden.",
     [QCTextHostPasswordInvalid] = "Das Passwort enthält unzulässige Zeichen.",
     [QCTextHostPasswordTitle] = "Passwort ändern",
+    [QCTextTrayOpenApp] = "QuadChroma öffnen",
+    [QCTextTrayConnect] = "Verbinden: {n}",
+    [QCTextHostSharingIsOff] = "Freigabe ist aus",
+    [QCTextStartShareMac] = "Diesen Mac freigeben",
+    [QCTextDeviceNameChange] = "Gerätename ändern …",
+    [QCTextDeviceNameTitle] = "Gerätename",
+    [QCTextDeviceNameLabel] = "Unter diesem Namen sehen andere Geräte diesen Computer:",
+    [QCTextDeviceNameHint] = "Leer lassen für den Rechnernamen ({n}).",
+    [QCTextDeviceNameTooLong] = "Der Name ist zu lang (höchstens 40 Byte).",
+    [QCTextDeviceNameInvalid] = "Der Name enthält unzulässige Zeichen.",
+    [QCTextPreventSleep] = "Ruhezustand verhindern, solange QuadChroma läuft",
 };
 
 // Die Platzhalter eines Textes ("{n}", "{i}" ...), sortiert.
@@ -260,7 +282,8 @@ static void texte_pruefen(void) {
             size_t l = strlen(x);
             int punkte = l >= 4 && !strcmp(x + l - 4, " \xE2\x80\xA6");
             int soll = t == QCTextHostChangePassword || t == QCTextHostRemoveAll ||
-                       t == QCTextHostScreenMissing || t == QCTextHostAccessMissing;
+                       t == QCTextHostScreenMissing || t == QCTextHostAccessMissing ||
+                       t == QCTextDeviceNameChange;
             if (strstr(x, "...") || strstr(x, " - ") || punkte != soll) {
                 schreibweise++;
                 printf("         Schreibweise: %s, Schluessel %d: %s\n", qc_texte_code(s), t, x);
@@ -304,6 +327,20 @@ static void texte_pruefen(void) {
                isEqualToString:@"Büro-PC (ID 581 729 911) möchte diesen Computer steuern."],
            "Anfrage-Text mit Name und ID (de)");
     pruefe([qc_text(QCTextAccessCancel) isEqualToString:@"Abbrechen"], "qc_text in der gesetzten Sprache");
+
+    printf("\n-- Sprache nach dem Code des Clients\n");
+    pruefe(qc_texte_setzen_code("fr") == 2 && qc_texte_aktuell() == 2 &&
+               [qc_text(QCTextStartShareMac) isEqualToString:@"Partager ce Mac"],
+           "qc_texte_setzen_code(\"fr\"): Franzoesisch");
+    pruefe(qc_texte_setzen_code("xx") == -1 && qc_texte_setzen_code(NULL) == -1 && qc_texte_aktuell() == 2,
+           "unbekannter Code: -1, die Sprache bleibt");
+    qc_texte_systemsprache();
+    pruefe(qc_texte_aktuell() == 2, "danach waehlt die Systemsprache nicht mehr neu");
+    int codes_ok = 1;
+    for (int s = 0; s < qc_texte_sprachen(); s++)
+        if (qc_texte_setzen_code(qc_texte_code(s)) != s) codes_ok = 0;
+    pruefe(codes_ok, "jeder der 29 Codes waehlt seine Tabelle");
+    qc_texte_setzen(1);
 }
 
 // ------------------------------------------------------------ Hilfen
