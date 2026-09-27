@@ -170,7 +170,9 @@ VideoToolbox tests (`vt_decoder`) need the hardware encoder and skip themselves
 without it (they say "uebersprungen"), for example inside a sandbox that blocks the
 services of VideoToolbox; the Metal tests (`anzeige_mac`) do the same without a Metal
 device. `./target/release/quadchroma --anzeigetest <dir>` runs the full comparison of
-the Metal display with the CPU path and measures the frame time at 1440p. The
+the Metal display with the CPU path and measures the frame time at 1440p;
+`--anzeige-selbsttest` opens a small window for a few seconds and checks the display
+there - run it on an unlocked desktop (exit code 3 means the window was not visible). The
 client build also compiles the Mac host engine from `host/` (see `client/build.rs`),
 so a change there is checked by both `make` and `cargo build`.
 

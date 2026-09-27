@@ -787,13 +787,21 @@ top as a separate layer. Frames are shown at the display refresh
 (no tearing), with at most two frames queued; the window thread never
 waits for the display. The Display tab has two buttons there: Automatic
 (Metal) and Processor (softbuffer). If Metal cannot be set up, the client
-draws on the processor by itself. The log says which one it is:
+draws on the processor by itself. It also switches while running: when
+not a single Metal frame reaches the screen of a visible window within
+three seconds and 60 attempts (then the interface, Processor button
+included, would be invisible too), and when the graphics device is lost
+and cannot be rebuilt; the next start tries Metal again. A covered window
+does not present; once it is visible again, the last frame is presented
+once more. The log says which one it is:
 
     "Anzeige: Metal Apple M1 (gemeinsamer Speicher ja), 2560x1440 bei
      Massstab 2, Bildwechsel abwarten, hoechstens 2 Bilder unterwegs"
 
 or "Anzeige: Rueckfall auf Software: <Grund>" followed by "Anzeige:
-Software". Streams in limited range (VideoToolbox then delivers x444,
+Software" (while running, for example "Anzeige: Rueckfall auf Software:
+Metal zeigt nichts - am sichtbaren Fenster kam kein Bild auf dem Schirm
+an"). Streams in limited range (VideoToolbox then delivers x444,
 444v, x420 or 420v) are stretched to full range on both paths.
 
     ./target/release/quadchroma --anzeigetest /tmp/anzeigetest
@@ -807,6 +815,18 @@ through both shaders with the frame time of the window thread and of the
 GPU (M1: about 1.8 ms GPU time per frame; decoding and the way from the
 finished frame to the screen are not included). Exit code 0 only if every
 comparison passed. Neither host nor screen capture is started.
+
+    ./target/release/quadchroma --anzeige-selbsttest
+
+checks Metal in a real window (small, always on top, a few seconds, no
+Dock icon): frames reach the screen (presentedTime), the Metal layer
+covers the view with the right scale and pixel size, also after a
+resize, hiding and showing the window is reported and a frame is
+presented again afterwards, and once Metal is dropped, softbuffer draws
+in the same window. Exit code 0 passed, 1 failed, 3 not verifiable: the
+window was never visible to AppKit (locked screen, sleep, or a virtual
+display nobody is watching) - run it on an unlocked desktop. Neither
+host, screen capture nor network is started.
 
 Storage: ~/Library/Application Support/QuadChroma/ (client.key,
 hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
@@ -1054,8 +1074,8 @@ This does not apply to anything that runs without a window: test mode
 (--headless), the host-only process (--nur-host has a single instance
 of its own, see "Windows as host"; --list, --messen), --verknuepfung,
 --shot and the self-tests (--tray-selbsttest, --menueleiste-selbsttest,
---decodertest, --anzeigetest, --noisetest). None of them starts the host
-role of the app.
+--anzeige-selbsttest, --decodertest, --anzeigetest, --noisetest). None of
+them starts the host role of the app.
 
 Limits: an address longer than 508 bytes or containing control characters
 is not handed on by the second start; it only brings the app to the front

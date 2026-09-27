@@ -6521,11 +6521,23 @@ impl App {
                 }
             }
             // Verdeckt praesentiert Metal nicht: CoreAnimation zeigt dort
-            // nichts, und nextDrawable koennte warten (anzeige_mac.rs).
+            // nichts, und nextDrawable koennte warten (anzeige_mac.rs; ein
+            // Fenster, das schon verdeckt aufging, erkennt die Anzeige
+            // selbst). Wieder sichtbar, nachdem ein Bild ausfiel: das
+            // letzte Bild einmal neu praesentieren. Es wurde verdeckt
+            // hochgeladen, aber nie gezeigt, und AppKit zeichnet eine Ansicht
+            // mit Schicht beim Aufdecken nicht neu - sonst bliebe stehen, was
+            // vor dem Verdecken dort war, bis der Host ein neues Bild schickt
+            // (bei stillem Bildschirm nie).
             #[cfg(target_os = "macos")]
             WindowEvent::Occluded(verdeckt) => {
                 if let Anzeige::Gpu(g) = &mut self.anzeige {
-                    g.verdeckt(verdeckt);
+                    if g.verdeckt(verdeckt) {
+                        self.praesentation_ausstehend = true;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
                 }
             }
 
@@ -8065,6 +8077,14 @@ impl App {
         let Some(window) = self.window.clone() else { return };
         let Anzeige::Gpu(mut g) = std::mem::replace(&mut self.anzeige, Anzeige::Keine) else { return };
         match self.draw_gpu_auf(&window, &mut g) {
+            // Mac: am sichtbaren Fenster kam nie ein Bild auf dem Schirm an
+            // (anzeige_mac.rs, Waechter) - dann waere auch die Oberflaeche
+            // samt Knopf "Prozessor" unsichtbar. softbuffer uebernimmt.
+            #[cfg(target_os = "macos")]
+            Ok(()) if g.nie_auf_dem_schirm() => {
+                drop(g);
+                self.auf_software_wechseln("Metal zeigt nichts - am sichtbaren Fenster kam kein Bild auf dem Schirm an");
+            }
             Ok(()) => self.anzeige = Anzeige::Gpu(g),
             Err(Ausfall::Fehler(e)) => {
                 self.gpu_fehler_melden(e);
@@ -8267,8 +8287,11 @@ impl App {
     /// ins Protokoll, einmal neu auf demselben Fenster - eine Flip-Swapchain
     /// nach einer Flip-Swapchain ist erlaubt. Kommt der Verlust binnen zehn
     /// Sekunden wieder oder scheitert der Neubau, bleibt das Fenster stehen
-    /// und der Nutzer bekommt gesagt, wie es weitergeht. Auf softbuffer am
-    /// selben Fenster wird nicht gewechselt: das ist von DXGI nicht gedeckt.
+    /// und der Nutzer bekommt gesagt, wie es weitergeht. Unter Windows wird
+    /// nicht auf softbuffer am selben Fenster gewechselt: das ist von DXGI
+    /// nicht gedeckt. Auf dem Mac schon - Metal haengt dort als eigene
+    /// Unterschicht an der Ansicht, die mit dem Drop herausfaellt, und
+    /// softbuffer haengt seine an (--anzeige-selbsttest prueft das).
     #[cfg(any(windows, target_os = "macos"))]
     fn geraet_verloren_behandeln(&mut self, alt: anzeige::Gpu, grund: String) {
         protokoll::zeile(format!("Anzeige: Grafikkarte verloren: {grund}"));
@@ -8299,6 +8322,16 @@ impl App {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        self.auf_software_wechseln(&format!("Grafikkarte verloren, kein Neubau: {grund}"));
+        #[cfg(windows)]
+        self.anzeige_aufgeben();
+    }
+
+    /// Keine Anzeige mehr: das Fenster bleibt stehen, Titel und Meldung sagen,
+    /// wie es weitergeht (Neustart mit --anzeige cpu).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn anzeige_aufgeben(&mut self) {
         let meldung = Meldung::neu(strings::Key::ErrorGpuLost, "Grafikkarte verloren - bitte mit --anzeige cpu neu starten");
         protokoll::zeile(format!("Anzeige: {}", meldung.protokoll));
         self.anzeige = Anzeige::Keine;
@@ -8309,6 +8342,51 @@ impl App {
         drop(s);
         if let Some(w) = &self.window {
             w.set_title(&titel);
+        }
+    }
+
+    /// Mac: von Metal auf softbuffer am selben Fenster - wenn der Waechter
+    /// anschlaegt (kein Bild kam je auf dem Schirm an) oder die Karte weg ist
+    /// und kein Neubau gelingt. Die Metal-Schicht ist mit dem Drop der
+    /// Anzeige schon aus der Ansicht; softbuffer haengt seine eigene an. Gilt
+    /// fuer diesen Lauf, der naechste Start versucht Metal wieder. Ab jetzt
+    /// legt der Empfangsfaden fertige RGB-Bilder ab; ein rohes, das schon
+    /// liegt, wandelt draw_cpu_auf. Das Bild, das nur die Karte hatte, ist
+    /// weg - bis zum naechsten vom Host steht der Wartebildschirm.
+    #[cfg(target_os = "macos")]
+    fn auf_software_wechseln(&mut self, grund: &str) {
+        use einstellungen::AnzeigeWunsch as W;
+        protokoll::zeile(format!("Anzeige: Rueckfall auf Software: {grund}"));
+        self.bild_da = None;
+        self.bereit_ausstehend = None;
+        self.ui_kasten_alt = None;
+        self.ui_an = false;
+        self.praesentation_ausstehend = false;
+        self.sofort = false;
+        self.shared.lock().unwrap().gpu_pfad = false;
+        let Some(window) = self.window.clone() else {
+            self.anzeige = Anzeige::Keine;
+            return;
+        };
+        let bau = softbuffer::Context::new(window.clone())
+            .and_then(|context| softbuffer::Surface::new(&context, window.clone()).map(|surface| (context, surface)));
+        match bau {
+            Ok((context, surface)) => {
+                self.anzeige = Anzeige::Cpu { context, surface };
+                self.anzeige_aktiv = W::Cpu;
+                self.anzeige_name = "Software".into();
+                protokoll::zeile("Anzeige: Software".into());
+                // Wie beim Start: still bei Automatik, sonst mit Meldung.
+                if !matches!(self.anzeige_wunsch, W::Automatik | W::Warp) {
+                    let m = Meldung::neu(strings::Key::ErrorGpuDisplay, format!("Metal nicht nutzbar, Anzeige ueber Software: {grund}"));
+                    self.shared.lock().unwrap().error = Some(m);
+                }
+                window.request_redraw();
+            }
+            Err(e) => {
+                protokoll::zeile(format!("Anzeige: softbuffer am selben Fenster gescheitert: {e}"));
+                self.anzeige_aufgeben();
+            }
         }
     }
 
@@ -10826,6 +10904,26 @@ fn main() {
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("Den Menueleisten-Selbsttest (--menueleiste-selbsttest) gibt es nur unter macOS.");
+            std::process::exit(2);
+        }
+    }
+    // Selbsttest der Metal-Anzeige an einem echten Fenster von winit
+    // (anzeige_mac.rs): Bild auf dem Schirm, Schicht passend zur Ansicht,
+    // Verdecken und Aufdecken, Rueckfall auf softbuffer. Ebenso vor allem
+    // anderen; weder Host noch Aufnahme noch Netz. Rueckgabe 0, 1 oder 3
+    // (nicht pruefbar), 2 auf den anderen Plattformen.
+    if args.iter().any(|a| a == "--anzeige-selbsttest") {
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::Write;
+            protokoll::einschalten(false);
+            let code = anzeige::fenster_selbsttest();
+            std::io::stdout().flush().ok();
+            std::process::exit(code);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("Den Anzeige-Selbsttest (--anzeige-selbsttest) gibt es nur unter macOS.");
             std::process::exit(2);
         }
     }

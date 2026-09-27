@@ -22,15 +22,19 @@
 // Bild * T / 255 + Farbe.
 //
 // Praesentation: ein CAMetalLayer als Unterschicht der Ansicht von winit
-// (wie bei softbuffer bleibt die Schicht der Ansicht selbst unberuehrt),
-// in Bildpunkten gross (HiDPI: contentsScale der Ansicht), mit
-// displaySyncEnabled (Bildwechsel abwarten, kein Reissen) und
+// (wie bei softbuffer bleibt die Schicht der Ansicht selbst unberuehrt;
+// Rahmen und Massstab folgen ihr), mit einem Puffer in Bildpunkten (HiDPI),
+// mit displaySyncEnabled (Bildwechsel abwarten, kein Reissen) und
 // presentDrawable. nextDrawable wartet, wenn alle Puffer der Schicht belegt
 // sind - der Fensterfaden traegt aber auch die Eingabe. Deshalb wird vorher
 // gezaehlt: sind schon zwei Bilder praesentiert und noch nicht auf dem
 // Schirm (presentedTime 0), ist die Anzeige nicht bereit, und das Bild
 // wartet auf den naechsten Takt - wie unter Windows mit dem Warteobjekt. Ein
-// verdecktes Fenster zeichnet nicht.
+// verdecktes Fenster zeichnet nicht; beim Aufdecken wird das letzte Bild neu
+// praesentiert. Ein Waechter zaehlt, ob praesentierte Bilder je auf dem
+// Schirm ankommen - tun sie es am sichtbaren Fenster nie, zeichnet main.rs
+// mit softbuffer weiter. `fenster_selbsttest` (--anzeige-selbsttest) prueft
+// das an einem echten Fenster von winit.
 //
 // Lebensdauer: Die Karte liest die IOSurface erst, nachdem bild_roh zurueck
 // ist. Bis der Befehlspuffer fertig ist, haelt die Anzeige deshalb einen
@@ -127,6 +131,8 @@ const LADEN_EGAL: usize = 0;
 const SPEICHERN: usize = 1;
 /// MTLPrimitiveTypeTriangle.
 const DREIECKE: usize = 3;
+/// NSWindowOcclusionStateVisible: ein Teil des Fensters ist zu sehen.
+const FENSTER_SICHTBAR: usize = 1 << 1;
 /// MTLCommandBufferStatusCompleted und ...Error.
 const STATUS_FERTIG: usize = 4;
 const STATUS_FEHLER: usize = 5;
@@ -140,6 +146,12 @@ const HOECHSTENS_UNTERWEGS: usize = 2;
 /// ist, hat CoreAnimation uebersprungen (presentedTime bleibt dann 0) - es
 /// belegt keinen Puffer mehr.
 const PRAESENT_FRIST: Duration = Duration::from_millis(50);
+/// Waechter: kommt am sichtbaren Fenster nach so vielen Versuchen und so
+/// langer Zeit kein einziges Bild auf dem Schirm an, zeichnet main.rs mit
+/// softbuffer weiter. Der Startbildschirm allein praesentiert 30-mal je
+/// Sekunde; ein Fenster, das Metal einmal gezeigt hat, bleibt bei Metal.
+const WAECHTER_VERSUCHE: u32 = 60;
+const WAECHTER_FRIST: Duration = Duration::from_secs(3);
 /// Mehr offene Befehlspuffer als das heisst: die Karte kommt nicht nach.
 /// Dann wird auf den aeltesten gewartet, statt Speicher anzuhaeufen.
 const HOECHSTENS_BEFEHLSPUFFER: usize = 64;
@@ -161,14 +173,14 @@ struct MtlSize {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct CgSize {
     w: f64,
     h: f64,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct CgRect {
     x: f64,
     y: f64,
@@ -179,8 +191,8 @@ struct CgRect {
 /// Ein objc_msgSend mit fester Signatur (wie in tray_mac.rs): jede Form
 /// bekommt ihren eigenen Funktionszeigertyp, damit Zahlen, Kommazahlen und
 /// Strukturen nach der Aufrufkonvention der Plattform uebergeben werden.
-/// Keine der Nachrichten hier gibt eine Struktur zurueck (das braeuchte auf
-/// Intel objc_msgSend_stret).
+/// Rechtecke als Rueckgabe (bounds, frame) gehen ueber `msg_rect` - auf
+/// Intel braucht das objc_msgSend_stret.
 macro_rules! senden {
     ($obj:expr, $sel:expr $(, $arg:expr => $typ:ty)* ; -> $ret:ty) => {{
         let f: unsafe extern "C" fn(Id, Sel $(, $typ)*) -> $ret = std::mem::transmute(objc_msgSend as *const c_void);
@@ -253,6 +265,30 @@ unsafe fn msg_f64(obj: Id, s: &CStr) -> f64 {
         return 0.0;
     }
     senden!(obj, sel(s); -> f64)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[link(name = "objc")]
+extern "C" {
+    fn objc_msgSend_stret();
+}
+
+/// Ein CGRect als Rueckgabe (bounds, frame). Auf Apple silicon kommt es in
+/// vier Gleitkommaregistern zurueck, auf Intel ueber einen versteckten
+/// Zeiger - dafuer gibt es objc_msgSend_stret.
+unsafe fn msg_rect(obj: Id, s: &CStr) -> CgRect {
+    if obj.is_null() {
+        return CgRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f: unsafe extern "C" fn(Id, Sel) -> CgRect = std::mem::transmute(objc_msgSend_stret as *const c_void);
+        f(obj, sel(s))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        senden!(obj, sel(s); -> CgRect)
+    }
 }
 
 /// NSString aus Rust-Text (autoreleased: braucht einen Pool).
@@ -529,7 +565,8 @@ pub struct Gpu {
     cache: Cf,
     /// 1x1, fuer jede Bindung, die gerade keine Textur hat.
     leer: Obj,
-    /// Am Fenster: die Schicht der Ansicht und unsere Unterschicht.
+    /// Am Fenster: die Ansicht, ihre Schicht und unsere Unterschicht.
+    ansicht: Option<Obj>,
     wurzel: Option<Obj>,
     schicht: Option<Obj>,
     /// Bildgroesse, Ziel von Stufe 1, Quelle von Stufe 2.
@@ -542,17 +579,27 @@ pub struct Gpu {
     /// Praesentierte Bilder, noch nicht auf dem Schirm, mit der Zeit ihrer
     /// Uebergabe.
     praesentiert: VecDeque<(Obj, Instant)>,
-    /// Groesse des Ziels in Bildpunkten und der Massstab, fuer den die
-    /// Schicht eingestellt ist.
+    /// Groesse des Ziels in Bildpunkten, der Massstab und der Rahmen der
+    /// Wurzelschicht (Punkte), fuer die die Schicht eingestellt ist.
     pub breite: u32,
     pub hoehe: u32,
     skala: f64,
+    rahmen: CgRect,
     /// Reissen erlaubt (displaySyncEnabled aus)? Auf dem Mac nie: die
     /// Anzeige wartet den Bildwechsel ab. Der Name ist der von Windows.
     pub tearing: bool,
     /// displaySyncEnabled ist gerade aus.
     sync_aus: bool,
+    /// Verdeckt laut winit (Occluded), und ob seit dem letzten Bild ein
+    /// Praesentieren ausfiel, weil das Fenster verdeckt war.
     verdeckt: bool,
+    ausgelassen: bool,
+    /// Waechter: praesentierte Bilder, die auf dem Schirm ankamen
+    /// (presentedTime gesetzt), und - solange es keins gibt - die Versuche
+    /// am sichtbaren Fenster seit dem ersten.
+    gezeigt: u64,
+    versuche: u32,
+    erster_versuch: Option<Instant>,
     pub adapter: AdapterInfo,
     /// Format und Groesse der zuletzt gezeigten Ebenen - neu ins Protokoll
     /// nur, wenn sich daran etwas aendert.
@@ -575,6 +622,12 @@ unsafe fn pipeline(device: Id, vs: Id, fs: Id, format: usize, name: &str) -> Res
     let mut err: Id = std::ptr::null_mut();
     let ps = senden!(device, sel(c"newRenderPipelineStateWithDescriptor:error:"), desc.0 => Id, &mut err as *mut Id => *mut Id; -> Id);
     Obj::eigen(ps).ok_or_else(|| format!("Stufe {name}: {}", fehlertext(err)))
+}
+
+/// Der Waechter als reine Rechnung: kein Bild je auf dem Schirm, und
+/// mindestens `mindest` Versuche seit mindestens `frist`.
+fn nie_gezeigt(gezeigt: u64, versuche: u32, seit_erstem: Option<Duration>, mindest: u32, frist: Duration) -> bool {
+    gezeigt == 0 && versuche >= mindest && seit_erstem.is_some_and(|d| d >= frist)
 }
 
 impl Gpu {
@@ -609,7 +662,9 @@ impl Gpu {
             }
             Obj::halten(wurzel).ok_or("die Ansicht hat keine Schicht")?
         };
-        Gpu::an_schicht(wurzel, ww, wh)
+        let mut gpu = Gpu::an_schicht(wurzel, ww, wh)?;
+        gpu.ansicht = unsafe { Obj::halten(ansicht as Id) };
+        Ok(gpu)
     }
 
     /// Der Teil von `neu` ab der Schicht der Ansicht (die Tests nehmen eine
@@ -674,6 +729,7 @@ impl Gpu {
                 stufe2,
                 cache,
                 leer,
+                ansicht: None,
                 wurzel: None,
                 schicht: None,
                 zwischen: None,
@@ -684,9 +740,14 @@ impl Gpu {
                 breite: 0,
                 hoehe: 0,
                 skala: 1.0,
+                rahmen: CgRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 tearing: false,
                 sync_aus: false,
                 verdeckt: false,
+                ausgelassen: false,
+                gezeigt: 0,
+                versuche: 0,
+                erster_versuch: None,
                 adapter: AdapterInfo { name, gemeinsam },
                 ebenen_stand: None,
                 cache_rueckfall: false,
@@ -697,8 +758,14 @@ impl Gpu {
     }
 
     /// Das Fenster hat eine andere Groesse oder steht auf einem Bildschirm
-    /// mit anderem Massstab: Rahmen der Schicht in Punkten, Massstab und
-    /// Puffergroesse in Bildpunkten neu. Die Oberflaechentextur entsteht beim
+    /// mit anderem Massstab: Rahmen, Massstab und Puffergroesse der Schicht
+    /// neu. Wie bei softbuffer (dem bisherigen, am echten Fenster erprobten
+    /// Weg) folgt die Schicht der Wurzelschicht der Ansicht: Rahmen = deren
+    /// bounds, Massstab = deren contentsScale. Der Puffer hat die Bildpunkte
+    /// von winit (`ww` x `wh`) - danach rechnen Oberflaeche und Bildrechteck.
+    /// Passt beides einmal nicht genau zusammen, streckt CoreAnimation den
+    /// Puffer auf den Rahmen: das Bild deckt die Ansicht immer ganz, ist nie
+    /// zu gross und nie abgeschnitten. Die Oberflaechentextur entsteht beim
     /// naechsten Upload in der neuen Groesse. 0x0 (minimiert): nichts tun.
     /// Billig, wenn sich nichts geaendert hat - main.rs ruft es je Zeichnung.
     pub fn groesse(&mut self, ww: u32, wh: u32) -> Result<(), String> {
@@ -706,16 +773,22 @@ impl Gpu {
             return Ok(());
         }
         let (Some(wurzel), Some(schicht)) = (&self.wurzel, &self.schicht) else { return Err("keine Schicht".into()) };
-        let skala = unsafe { msg_f64(wurzel.0, c"contentsScale") };
+        let (skala, rahmen) = unsafe { (msg_f64(wurzel.0, c"contentsScale"), msg_rect(wurzel.0, c"bounds")) };
         let skala = if skala > 0.0 { skala } else { 1.0 };
-        if (ww, wh, skala) == (self.breite, self.hoehe, self.skala) {
+        // Noch ohne Rahmen (Wurzelschicht nicht ausgelegt): aus den
+        // Bildpunkten und dem Massstab.
+        let rahmen = if rahmen.w > 0.0 && rahmen.h > 0.0 {
+            rahmen
+        } else {
+            CgRect { x: 0.0, y: 0.0, w: ww as f64 / skala, h: wh as f64 / skala }
+        };
+        if (ww, wh, skala, rahmen) == (self.breite, self.hoehe, self.skala, self.rahmen) {
             return Ok(());
         }
         let _pool = Pool::neu();
         unsafe {
             ohne_animation(|| {
                 senden!(schicht.0, sel(c"setContentsScale:"), skala => f64; -> ());
-                let rahmen = CgRect { x: 0.0, y: 0.0, w: ww as f64 / skala, h: wh as f64 / skala };
                 senden!(schicht.0, sel(c"setFrame:"), rahmen => CgRect; -> ());
                 senden!(schicht.0, sel(c"setDrawableSize:"), CgSize { w: ww as f64, h: wh as f64 } => CgSize; -> ());
             });
@@ -726,14 +799,51 @@ impl Gpu {
         self.breite = ww;
         self.hoehe = wh;
         self.skala = skala;
+        self.rahmen = rahmen;
         Ok(())
     }
 
-    /// Das Fenster ist verdeckt (oder nicht mehr): verdeckt wird nicht
-    /// gezeichnet - CoreAnimation zeigt dort nichts, und nextDrawable
-    /// koennte bis zu einer Sekunde warten.
-    pub fn verdeckt(&mut self, v: bool) {
+    /// winit meldet das Fenster verdeckt (oder nicht mehr): verdeckt wird
+    /// nicht gezeichnet - CoreAnimation zeigt dort nichts, und nextDrawable
+    /// koennte bis zu einer Sekunde warten. true: das Fenster ist wieder
+    /// sichtbar, und seit dem letzten Bild fiel ein Praesentieren aus - das
+    /// letzte Bild muss neu praesentiert werden. Es wurde verdeckt zwar
+    /// hochgeladen, aber nie gezeigt; die Schicht zeigt beim Aufdecken
+    /// weiter, was vor dem Verdecken dort stand - und bei stillem Bildschirm
+    /// schickt der Host kein neues Bild, das es ersetzen wuerde.
+    pub fn verdeckt(&mut self, v: bool) -> bool {
+        let nachholen = !v && (self.verdeckt || self.ausgelassen);
         self.verdeckt = v;
+        nachholen
+    }
+
+    /// Sieht AppKit das Fenster (occlusionState mit Visible)? Ein Fenster,
+    /// das schon verdeckt aufgeht - gesperrter Bildschirm, Ruhezustand, ein
+    /// virtueller Bildschirm ohne Zuschauer -, meldet winit nie als verdeckt:
+    /// Occluded kommt nur bei einer Aenderung. Deshalb fragt `zeichnen`
+    /// selbst nach. Ohne Ansicht (Tests) immer ja.
+    pub fn fenster_sichtbar(&self) -> bool {
+        let Some(ansicht) = &self.ansicht else { return true };
+        unsafe {
+            let fenster = msg_id(ansicht.0, c"window");
+            !fenster.is_null() && msg_zahl(fenster, c"occlusionState") & FENSTER_SICHTBAR != 0
+        }
+    }
+
+    /// Wie viele praesentierte Bilder kamen auf dem Schirm an? Gezaehlt in
+    /// `bereit`, an presentedTime.
+    pub fn gezeigt(&self) -> u64 {
+        self.gezeigt
+    }
+
+    /// Waechter: Metal praesentiert am sichtbaren Fenster, aber seit
+    /// WAECHTER_FRIST und WAECHTER_VERSUCHE Versuchen kam nie ein Bild auf
+    /// dem Schirm an - die Schicht haengt nicht sichtbar an der Ansicht, oder
+    /// nextDrawable liefert nichts. Die Oberflaeche liegt in derselben
+    /// Schicht, auch der Knopf "Prozessor" waere nicht zu sehen; main.rs
+    /// zeichnet dann mit softbuffer weiter.
+    pub fn nie_auf_dem_schirm(&self) -> bool {
+        nie_gezeigt(self.gezeigt, self.versuche, self.erster_versuch.map(|t| t.elapsed()), WAECHTER_VERSUCHE, WAECHTER_FRIST)
     }
 
     /// Ist die Schicht bereit fuer ein weiteres Bild, ohne dass nextDrawable
@@ -742,10 +852,15 @@ impl Gpu {
     /// Eingabe. Ohne Schicht immer ja.
     pub fn bereit(&mut self) -> bool {
         let jetzt = Instant::now();
+        let mut neu_gezeigt = 0;
         self.praesentiert.retain(|(d, seit)| {
             let gezeigt = unsafe { msg_f64(d.0, c"presentedTime") };
+            if gezeigt > 0.0 {
+                neu_gezeigt += 1;
+            }
             gezeigt <= 0.0 && jetzt.duration_since(*seit) < PRAESENT_FRIST
         });
+        self.gezeigt += neu_gezeigt;
         self.praesentiert.len() < HOECHSTENS_UNTERWEGS
     }
 
@@ -765,8 +880,15 @@ impl Gpu {
             return Praesentiert::GeraetWeg(grund);
         }
         let Some(schicht) = self.schicht.as_ref().map(|s| s.0) else { return Praesentiert::Fehler("keine Schicht".into()) };
-        if self.verdeckt {
+        if self.verdeckt || !self.fenster_sichtbar() {
+            self.ausgelassen = true;
             return Praesentiert::Verdeckt;
+        }
+        // Waechter: jeder Versuch am sichtbaren Fenster zaehlt, auch ein
+        // gescheiterter - bis das erste Bild auf dem Schirm ankommt.
+        if self.gezeigt == 0 {
+            self.versuche = self.versuche.saturating_add(1);
+            self.erster_versuch.get_or_insert_with(Instant::now);
         }
         let sofort = sofort && self.tearing;
         if sofort != self.sync_aus {
@@ -780,6 +902,7 @@ impl Gpu {
         match self.stufe2(ziel, self.breite, self.hoehe, rect, ui_an, Some(drawable.0)) {
             Ok(_) => {
                 self.praesentiert.push_back((drawable, Instant::now()));
+                self.ausgelassen = false;
                 Praesentiert::Ok
             }
             Err(e) => Praesentiert::Fehler(e),
@@ -1576,6 +1699,571 @@ pub fn anzeigetest(verzeichnis: &str) -> bool {
     ok
 }
 
+/// Stand der Schicht fuer den Selbsttest am Fenster.
+struct Geometrie {
+    /// Rahmen der Schicht und bounds der Wurzelschicht, in Punkten.
+    rahmen: CgRect,
+    wurzel: CgRect,
+    /// contentsScale der Schicht und der Wurzelschicht.
+    skala: f64,
+    wurzel_skala: f64,
+    /// drawableSize der Schicht in Bildpunkten.
+    puffer: CgSize,
+}
+
+impl Gpu {
+    /// Wie die Schicht gerade an der Ansicht haengt (nur Selbsttest). Ein
+    /// CGSize (zwei Gleitkommazahlen) kommt auch auf Intel in Registern
+    /// zurueck; nur Rechtecke brauchen `msg_rect`.
+    fn geometrie(&self) -> Option<Geometrie> {
+        let (wurzel, schicht) = (self.wurzel.as_ref()?, self.schicht.as_ref()?);
+        unsafe {
+            Some(Geometrie {
+                rahmen: msg_rect(schicht.0, c"frame"),
+                wurzel: msg_rect(wurzel.0, c"bounds"),
+                skala: msg_f64(schicht.0, c"contentsScale"),
+                wurzel_skala: msg_f64(wurzel.0, c"contentsScale"),
+                puffer: senden!(schicht.0, sel(c"drawableSize"); -> CgSize),
+            })
+        }
+    }
+}
+
+/// Unterschichten einer Schicht: wie viele, und wie viele davon
+/// CAMetalLayer sind.
+unsafe fn unterschichten(wurzel: Id) -> (usize, usize) {
+    let unter = msg_id(wurzel, c"sublayers");
+    let n = msg_zahl(unter, c"count");
+    let metal = klasse(c"CAMetalLayer");
+    let zahl_metal = (0..n)
+        .filter(|&i| {
+            let l = senden!(unter, sel(c"objectAtIndex:"), i => usize; -> Id);
+            senden!(l, sel(c"isKindOfClass:"), metal => Id; -> u8) != 0
+        })
+        .count();
+    (n, zahl_metal)
+}
+
+/// Die Schritte des Selbsttests am Fenster.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Schritt {
+    Zeigen,
+    Diagnose,
+    Groesse,
+    Verbergen,
+    Aufdecken,
+    Rueckfall,
+    Ende,
+}
+
+/// Zustand des Selbsttests am Fenster.
+struct Fensterprobe {
+    fenster: Option<std::sync::Arc<winit::window::Window>>,
+    /// Die NSView des Fensters (fuer den Fensterstand).
+    ansicht: Id,
+    gpu: Option<Gpu>,
+    /// Kam ein Bild auf dem Schirm an (presentedTime)? Ohne das warten die
+    /// spaeteren Schritte nur auf Geometrie und Ereignisse.
+    schirm: bool,
+    /// Diagnose: ein praesentiertes Bild, eigens festgehalten, und seit wann.
+    festgehalten: Option<(Obj, Instant)>,
+    schritt: Schritt,
+    /// Beginn des Tests und des laufenden Schritts.
+    start: Instant,
+    seit: Instant,
+    /// Gezeigte Bilder, als die Bedingung des Schritts erfuellt war - der
+    /// Schritt endet mit dem naechsten Bild, das danach ankommt.
+    marke: Option<u64>,
+    /// Letztes Occluded von winit, und ob `verdeckt` dabei das Nachholen
+    /// verlangte.
+    verdeckt: Option<bool>,
+    nachholen: bool,
+    /// Groesse, fuer die die Oberflaeche hochgeladen ist.
+    ui_masse: (u32, u32),
+    fehler: Vec<String>,
+    nicht_pruefbar: Option<String>,
+}
+
+/// Groesse des Probebildes; das Fenster ist groesser, das Bild wird
+/// skaliert (Stufe 2 mit Mischung).
+const PROBE_B: u32 = 320;
+const PROBE_H: u32 = 180;
+
+impl Fensterprobe {
+    fn fehler(&mut self, text: String) {
+        println!("Anzeige-Selbsttest: FEHLER {text}");
+        self.fehler.push(text);
+    }
+
+    fn weiter(&mut self, schritt: Schritt) {
+        for z in protokoll::abholen() {
+            println!("    {z}");
+        }
+        self.schritt = schritt;
+        self.seit = Instant::now();
+        self.marke = None;
+    }
+
+    /// Ein Durchgang wie in main.rs: Groesse, Oberflaeche (bei neuer Groesse
+    /// ein weisser Kasten oben links), bereit?, Stufe 2 und praesentieren.
+    fn zeichnen(&mut self) {
+        let (Some(w), Some(g)) = (self.fenster.as_ref(), self.gpu.as_mut()) else { return };
+        let s = w.inner_size();
+        if s.width == 0 || s.height == 0 {
+            return;
+        }
+        let mut fehler = None;
+        if let Err(e) = g.groesse(s.width, s.height) {
+            fehler = Some(format!("groesse: {e}"));
+        } else {
+            if self.ui_masse != (s.width, s.height) {
+                let mut puffer = vec![0xff00_0000u32; (s.width * s.height) as usize];
+                for y in 16..64.min(s.height as usize) {
+                    let z = y * s.width as usize;
+                    puffer[z + 16..z + 64.min(s.width as usize)].fill(0x00ff_ffff);
+                }
+                let kasten = ui::Rect { x: 0, y: 0, w: s.width as i32, h: s.height as i32 };
+                match g.oberflaeche_hochladen(&puffer, s.width, s.height, kasten) {
+                    Ok(()) => self.ui_masse = (s.width, s.height),
+                    Err(e) => fehler = Some(format!("Oberflaeche: {e}")),
+                }
+            }
+            if g.bereit() {
+                let rect = crate::ziel_rechteck(s.width, s.height, PROBE_B, PROBE_H, false);
+                match g.zeichnen(Some(rect), true, false) {
+                    Praesentiert::Ok | Praesentiert::Verdeckt => {}
+                    Praesentiert::Fehler(e) | Praesentiert::GeraetWeg(e) => fehler = Some(format!("zeichnen: {e}")),
+                }
+            }
+        }
+        if let Some(e) = fehler {
+            if !self.fehler.contains(&e) {
+                self.fehler(e);
+            }
+        }
+    }
+
+    /// Stand von Fenster und Bildschirm, wie AppKit ihn sieht.
+    fn fenster_stand(&self) -> String {
+        unsafe {
+            let fenster = msg_id(self.ansicht, c"window");
+            let occ = msg_zahl(fenster, c"occlusionState");
+            let schirm = msg_id(fenster, c"screen");
+            let bildschirme = msg_zahl(msg_id(klasse(c"NSScreen"), c"screens"), c"count");
+            format!(
+                "occlusionState {occ} (sichtbar {}), isVisible {}, aktiver Space {}, Bildschirm \"{}\" bei Massstab {}, {bildschirme} Bildschirm(e)",
+                occ & 2 != 0,
+                msg_bool(fenster, c"isVisible"),
+                msg_bool(fenster, c"isOnActiveSpace"),
+                rust_text(msg_id(schirm, c"localizedName")),
+                msg_f64(schirm, c"backingScaleFactor"),
+            )
+        }
+    }
+
+    /// Rahmen, Massstab und Puffer der Schicht gegen die Ansicht und winit.
+    fn geometrie_pruefen(&mut self, wann: &str) {
+        let (Some(w), Some(g)) = (self.fenster.as_ref(), self.gpu.as_ref()) else { return };
+        let Some(m) = g.geometrie() else {
+            self.fehler(format!("{wann}: keine Schicht"));
+            return;
+        };
+        let (s, skala) = (w.inner_size(), w.scale_factor());
+        println!(
+            "Anzeige-Selbsttest: {wann}: winit {}x{} bei Massstab {skala}, Ansicht {}x{} Punkte bei {}, Schicht {}x{} bei ({}, {}) mit {}, Puffer {}x{}",
+            s.width, s.height, m.wurzel.w, m.wurzel.h, m.wurzel_skala, m.rahmen.w, m.rahmen.h, m.rahmen.x, m.rahmen.y, m.skala, m.puffer.w, m.puffer.h
+        );
+        let mut fehler = Vec::new();
+        if m.rahmen != m.wurzel {
+            fehler.push(format!("{wann}: Rahmen der Schicht {:?} ist nicht der der Ansicht {:?}", m.rahmen, m.wurzel));
+        }
+        if m.skala != m.wurzel_skala || m.wurzel_skala != skala {
+            fehler.push(format!("{wann}: Massstab Schicht {}, Ansicht {}, winit {skala}", m.skala, m.wurzel_skala));
+        }
+        if m.puffer != (CgSize { w: s.width as f64, h: s.height as f64 }) {
+            fehler.push(format!("{wann}: Puffer {:?} statt {}x{}", m.puffer, s.width, s.height));
+        }
+        if ((m.wurzel.w * skala).round(), (m.wurzel.h * skala).round()) != (s.width as f64, s.height as f64) {
+            fehler.push(format!("{wann}: Ansicht {}x{} Punkte passt nicht zu {}x{} Bildpunkten", m.wurzel.w, m.wurzel.h, s.width, s.height));
+        }
+        if fehler.is_empty() {
+            println!("Anzeige-Selbsttest: ok   Schicht deckt die Ansicht, Massstab und Puffer stimmen ({wann})");
+        }
+        for f in fehler {
+            self.fehler(f);
+        }
+    }
+
+    /// Der Rueckfall: Anzeige fallen lassen, keine Metal-Schicht mehr an der
+    /// Ansicht, softbuffer zeichnet am selben Fenster.
+    fn rueckfall_pruefen(&mut self) {
+        let (Some(w), Some(g)) = (self.fenster.clone(), self.gpu.take()) else { return };
+        let Some(wurzel) = g.wurzel.as_ref().map(Obj::zweiter) else {
+            self.fehler("Rueckfall: keine Wurzelschicht".into());
+            return;
+        };
+        drop(g);
+        let (_, metal) = unsafe { unterschichten(wurzel.0) };
+        if metal != 0 {
+            self.fehler(format!("Rueckfall: nach dem Drop haengen noch {metal} Metal-Schichten an der Ansicht"));
+            return;
+        }
+        let s = w.inner_size();
+        let ergebnis = (|| -> Result<(usize, usize), String> {
+            let kontext = softbuffer::Context::new(w.clone()).map_err(|e| format!("softbuffer-Kontext: {e}"))?;
+            let mut flaeche = softbuffer::Surface::new(&kontext, w.clone()).map_err(|e| format!("softbuffer-Flaeche: {e}"))?;
+            let (Some(b), Some(h)) = (std::num::NonZeroU32::new(s.width), std::num::NonZeroU32::new(s.height)) else {
+                return Err("Fenster ohne Groesse".into());
+            };
+            flaeche.resize(b, h).map_err(|e| format!("softbuffer resize: {e}"))?;
+            let mut puffer = flaeche.buffer_mut().map_err(|e| format!("softbuffer buffer_mut: {e}"))?;
+            puffer.fill(0x0020_4060);
+            puffer.present().map_err(|e| format!("softbuffer present: {e}"))?;
+            Ok(unsafe { unterschichten(wurzel.0) })
+        })();
+        match ergebnis {
+            Ok((n, 0)) if n >= 1 => println!("Anzeige-Selbsttest: ok   Rueckfall: Metal-Schicht entfernt, softbuffer zeichnet am selben Fenster"),
+            Ok((n, metal)) => self.fehler(format!("Rueckfall: {n} Unterschichten, davon {metal} Metal")),
+            Err(e) => self.fehler(format!("Rueckfall: {e}")),
+        }
+    }
+
+    /// Ein Takt: der laufende Schritt.
+    fn takt(&mut self) {
+        let dauer = self.seit.elapsed();
+        if self.start.elapsed() > Duration::from_secs(30) {
+            self.fehler(format!("Zeit abgelaufen in Schritt {:?}", self.schritt));
+            self.weiter(Schritt::Ende);
+            return;
+        }
+        match self.schritt {
+            Schritt::Zeigen => {
+                self.zeichnen();
+                let Some(g) = self.gpu.as_ref() else { return self.weiter(Schritt::Ende) };
+                let (gezeigt, versuche, waechter, sichtbar) = (g.gezeigt(), g.versuche, g.nie_auf_dem_schirm(), g.fenster_sichtbar());
+                if gezeigt > 0 {
+                    self.schirm = true;
+                    println!("Anzeige-Selbsttest: ok   Bild auf dem Schirm nach {} ms ({versuche} Versuche)", dauer.as_millis());
+                    if waechter {
+                        self.fehler("Waechter schlaegt an, obwohl ein Bild ankam".into());
+                    }
+                    self.geometrie_pruefen("am Anfang");
+                    self.groesse_aendern();
+                } else if dauer > Duration::from_secs(5) {
+                    println!("Anzeige-Selbsttest: Fenster: {}", self.fenster_stand());
+                    if !sichtbar {
+                        // AppKit sieht das Fenster nicht, und winit hat das
+                        // nie gemeldet: dann darf nicht praesentiert und
+                        // nicht gezaehlt werden - sonst schluege der
+                        // Waechter hier ohne Grund an.
+                        if versuche != 0 || waechter {
+                            self.fehler(format!("am unsichtbaren Fenster {versuche} Versuche gezaehlt, Waechter {waechter}"));
+                        } else {
+                            println!("Anzeige-Selbsttest: ok   unsichtbares Fenster: nicht praesentiert, Waechter zaehlt nicht");
+                        }
+                        self.nicht_pruefbar = Some(
+                            "AppKit meldet das Fenster als nicht sichtbar (gesperrter Bildschirm, Ruhezustand oder ein virtueller Bildschirm ohne Zuschauer) - ob Bilder ankommen und ob Verdecken und Aufdecken gemeldet werden, laesst sich so nicht pruefen".into(),
+                        );
+                        self.geometrie_pruefen("am Anfang");
+                        self.groesse_aendern();
+                    } else {
+                        self.fehler(format!(
+                            "nach 5 s und {versuche} Versuchen kein Bild auf dem Schirm (presentedTime blieb 0); Waechter {}",
+                            if waechter { "schlaegt an - die App faellt hier auf softbuffer zurueck" } else { "still" }
+                        ));
+                        self.geometrie_pruefen("am Anfang");
+                        self.weiter(Schritt::Diagnose);
+                    }
+                }
+            }
+            Schritt::Diagnose => {
+                // Ein Bild praesentieren und festhalten (nicht nach 50 ms
+                // vergessen wie in `bereit`): kommt es spaeter doch an?
+                if self.festgehalten.is_none() {
+                    let Some(g) = self.gpu.as_mut() else { return self.weiter(Schritt::Ende) };
+                    let rect = crate::ziel_rechteck(g.breite, g.hoehe, PROBE_B, PROBE_H, false);
+                    let p = g.zeichnen(Some(rect), true, false);
+                    match (p, g.praesentiert.back()) {
+                        (Praesentiert::Ok, Some((d, _))) => self.festgehalten = Some((d.zweiter(), Instant::now())),
+                        _ => {
+                            println!("Anzeige-Selbsttest: Diagnose: Praesentieren gescheitert");
+                            self.groesse_aendern();
+                        }
+                    }
+                    return;
+                }
+                let Some((d, seit)) = self.festgehalten.as_ref() else { return };
+                let t = unsafe { msg_f64(d.0, c"presentedTime") };
+                if t > 0.0 || seit.elapsed() > Duration::from_secs(3) {
+                    println!(
+                        "Anzeige-Selbsttest: Diagnose: festgehaltenes Bild nach {} ms: presentedTime {t:.3} ({})",
+                        seit.elapsed().as_millis(),
+                        if t > 0.0 { "kam an, nur spaeter als 50 ms" } else { "blieb 0" }
+                    );
+                    self.festgehalten = None;
+                    self.groesse_aendern();
+                }
+            }
+            Schritt::Groesse => {
+                self.zeichnen();
+                let (Some(w), Some(g)) = (self.fenster.as_ref(), self.gpu.as_ref()) else { return self.weiter(Schritt::Ende) };
+                let skala = w.scale_factor();
+                let soll = ((800.0 * skala).round() as u32, (450.0 * skala).round() as u32);
+                let s = w.inner_size();
+                let passt = (s.width, s.height) == soll && (g.breite, g.hoehe) == soll;
+                // Mit Schirm: das naechste Bild, das danach ankommt; ohne:
+                // der naechste Versuch; am unsichtbaren Fenster nur die
+                // Geometrie.
+                let stand = if self.schirm { g.gezeigt() } else { g.versuche as u64 };
+                if passt {
+                    let marke = *self.marke.get_or_insert(stand);
+                    if stand > marke || self.nicht_pruefbar.is_some() {
+                        if self.schirm {
+                            println!("Anzeige-Selbsttest: ok   neue Groesse {}x{} auf dem Schirm", s.width, s.height);
+                        }
+                        self.geometrie_pruefen("nach der Groessenaenderung");
+                        // Ohne sichtbares Fenster aendert Aus- und
+                        // Einblenden nichts, was winit melden koennte.
+                        if self.nicht_pruefbar.is_some() {
+                            self.weiter(Schritt::Rueckfall);
+                        } else {
+                            self.verbergen();
+                        }
+                        return;
+                    }
+                }
+                if dauer > Duration::from_secs(3) {
+                    self.fehler(if passt {
+                        "Groessenaenderung: kein Bild in der neuen Groesse auf dem Schirm".to_string()
+                    } else {
+                        format!("Groessenaenderung: {}x{} statt {}x{}", s.width, s.height, soll.0, soll.1)
+                    });
+                    self.verbergen();
+                }
+            }
+            Schritt::Verbergen => {
+                if self.verdeckt == Some(true) {
+                    let Some(g) = self.gpu.as_mut() else { return self.weiter(Schritt::Ende) };
+                    let (versuche, erster) = (g.versuche, g.erster_versuch);
+                    match g.zeichnen(None, true, false) {
+                        Praesentiert::Verdeckt => println!("Anzeige-Selbsttest: ok   Occluded(true) nach {} ms, verdeckt nicht praesentiert", dauer.as_millis()),
+                        _ => self.fehler("verdeckt trotzdem praesentiert".into()),
+                    }
+                    if let Some(g) = self.gpu.as_ref() {
+                        if (g.versuche, g.erster_versuch) != (versuche, erster) {
+                            self.fehler("verdeckt zaehlt der Waechter mit".into());
+                        }
+                    }
+                    self.aufdecken();
+                } else if dauer > Duration::from_secs(3) {
+                    self.fehler("kein Occluded(true) nach dem Ausblenden des Fensters".into());
+                    self.aufdecken();
+                }
+            }
+            Schritt::Aufdecken => {
+                if self.verdeckt == Some(false) {
+                    if !self.nachholen {
+                        self.fehler("Occluded(false): verdeckt() verlangte kein Neuzeichnen".into());
+                        self.nachholen = true;
+                    }
+                    let schirm = self.schirm;
+                    let stand = |g: Option<&Gpu>| g.map(|g| if schirm { g.gezeigt() } else { g.versuche as u64 }).unwrap_or(0);
+                    let marke = *self.marke.get_or_insert(stand(self.gpu.as_ref()));
+                    self.zeichnen();
+                    if stand(self.gpu.as_ref()) > marke {
+                        println!(
+                            "Anzeige-Selbsttest: ok   Occluded(false), nach dem Aufdecken neu praesentiert{}",
+                            if schirm { " und auf dem Schirm" } else { "" }
+                        );
+                        self.weiter(Schritt::Rueckfall);
+                        return;
+                    }
+                }
+                if dauer > Duration::from_secs(3) {
+                    self.fehler(match self.verdeckt {
+                        Some(false) => "nach dem Aufdecken kein Bild auf dem Schirm".into(),
+                        _ => "kein Occluded(false) nach dem Einblenden des Fensters".to_string(),
+                    });
+                    self.weiter(Schritt::Rueckfall);
+                }
+            }
+            Schritt::Rueckfall => {
+                self.rueckfall_pruefen();
+                self.weiter(Schritt::Ende);
+            }
+            Schritt::Ende => {}
+        }
+    }
+
+    fn groesse_aendern(&mut self) {
+        if let Some(w) = &self.fenster {
+            let _ = w.request_inner_size(winit::dpi::LogicalSize::new(800.0, 450.0));
+        }
+        self.weiter(Schritt::Groesse);
+    }
+
+    fn verbergen(&mut self) {
+        if let Some(w) = &self.fenster {
+            w.set_visible(false);
+        }
+        self.weiter(Schritt::Verbergen);
+    }
+
+    fn aufdecken(&mut self) {
+        self.nachholen = false;
+        if let Some(w) = &self.fenster {
+            w.set_visible(true);
+        }
+        self.weiter(Schritt::Aufdecken);
+    }
+}
+
+impl winit::application::ApplicationHandler for Fensterprobe {
+    fn resumed(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if self.fenster.is_some() {
+            return;
+        }
+        // Klein, immer im Vordergrund (sonst koennte ein anderes Fenster es
+        // verdecken), ohne den Fokus zu nehmen.
+        let attrs = winit::window::Window::default_attributes()
+            .with_title("QuadChroma Anzeige-Selbsttest")
+            .with_inner_size(winit::dpi::LogicalSize::new(640.0, 360.0))
+            .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+            .with_active(false);
+        let w = match el.create_window(attrs) {
+            Ok(w) => std::sync::Arc::new(w),
+            Err(e) => {
+                self.fehler(format!("Fenster: {e}"));
+                self.weiter(Schritt::Ende);
+                el.exit();
+                return;
+            }
+        };
+        let ansicht = match w.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr(),
+            _ => std::ptr::null_mut(),
+        };
+        self.ansicht = ansicht;
+        let s = w.inner_size();
+        let bau = Gpu::neu(ansicht, s.width, s.height).and_then(|mut g| {
+            let bild = probebild(vt_decoder::XF44, PROBE_B, PROBE_H)?;
+            g.bild_roh(&bild)?;
+            Ok(g)
+        });
+        self.fenster = Some(w);
+        match bau {
+            Ok(g) => self.gpu = Some(g),
+            Err(e) => {
+                self.fehler(format!("Metal am Fenster: {e}"));
+                self.weiter(Schritt::Ende);
+                el.exit();
+                return;
+            }
+        }
+        self.weiter(Schritt::Zeigen);
+        el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(8)));
+    }
+
+    fn window_event(&mut self, el: &winit::event_loop::ActiveEventLoop, _id: winit::window::WindowId, event: winit::event::WindowEvent) {
+        use winit::event::WindowEvent;
+        match event {
+            WindowEvent::Occluded(v) => {
+                println!("Anzeige-Selbsttest:      Occluded({v}) nach {} ms", self.start.elapsed().as_millis());
+                self.verdeckt = Some(v);
+                if let Some(g) = self.gpu.as_mut() {
+                    if g.verdeckt(v) {
+                        self.nachholen = true;
+                    }
+                }
+            }
+            WindowEvent::CloseRequested => {
+                self.fehler("Fenster wurde geschlossen".into());
+                self.weiter(Schritt::Ende);
+                el.exit();
+            }
+            // Gezeichnet wird im Takt, nicht auf Anforderung von AppKit.
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &winit::event_loop::ActiveEventLoop) {
+        if self.fenster.is_some() {
+            self.takt();
+        }
+        if self.schritt == Schritt::Ende {
+            el.exit();
+            return;
+        }
+        el.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(8)));
+    }
+}
+
+/// --anzeige-selbsttest: die Anzeige an einem echten Fenster von winit,
+/// gebaut wie in der App (Ansicht aus raw-window-handle, `Gpu::neu`, ein
+/// rohes 4:4:4-Bild ueber Stufe 1). Prueft, was die Tests ohne Fenster nicht
+/// koennen: (1) praesentierte Bilder kommen auf dem Schirm an
+/// (presentedTime), der Waechter bleibt still; (2) Rahmen, Massstab und
+/// Puffer der Schicht passen zur Ansicht und zu winit, auch nach einer
+/// Groessenaenderung; (3) winit meldet Verdecken und Aufdecken (Fenster aus-
+/// und wieder eingeblendet), verdeckt wird nicht praesentiert und nicht
+/// mitgezaehlt, nach dem Aufdecken wird neu praesentiert und kommt an; (4)
+/// der Rueckfall: nach dem Drop haengt keine Metal-Schicht mehr an der
+/// Ansicht, und softbuffer zeichnet am selben Fenster. Ein kleines Fenster
+/// fuer wenige Sekunden, immer im Vordergrund; ohne Dock-Symbol, ohne Host,
+/// ohne Aufnahme, ohne Netz. Rueckgabe 0 bestanden, 1 nicht bestanden, 3
+/// nicht pruefbar (das Fenster war verdeckt, etwa bei gesperrtem Bildschirm).
+pub fn fenster_selbsttest() -> i32 {
+    use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+    let el = match winit::event_loop::EventLoop::builder().with_activation_policy(ActivationPolicy::Accessory).with_default_menu(false).build() {
+        Ok(el) => el,
+        Err(e) => {
+            println!("Anzeige-Selbsttest: keine Ereignisschleife ({e})");
+            return 1;
+        }
+    };
+    let jetzt = Instant::now();
+    let mut probe = Fensterprobe {
+        fenster: None,
+        ansicht: std::ptr::null_mut(),
+        gpu: None,
+        schirm: false,
+        festgehalten: None,
+        schritt: Schritt::Zeigen,
+        start: jetzt,
+        seit: jetzt,
+        marke: None,
+        verdeckt: None,
+        nachholen: false,
+        ui_masse: (0, 0),
+        fehler: Vec::new(),
+        nicht_pruefbar: None,
+    };
+    if let Err(e) = el.run_app(&mut probe) {
+        probe.fehler(format!("Ereignisschleife: {e}"));
+    }
+    probe.festgehalten = None;
+    drop(probe.gpu.take());
+    for z in protokoll::abholen() {
+        println!("    {z}");
+    }
+    let dauer = probe.start.elapsed().as_secs_f32();
+    match (&probe.nicht_pruefbar, probe.fehler.is_empty()) {
+        (Some(grund), true) => {
+            println!("Anzeige-Selbsttest nicht pruefbar: {grund} ({dauer:.1} s)");
+            3
+        }
+        (_, true) => {
+            println!("Anzeige-Selbsttest bestanden ({dauer:.1} s)");
+            0
+        }
+        (_, false) => {
+            println!("Anzeige-Selbsttest NICHT bestanden: {} Fehler ({dauer:.1} s)", probe.fehler.len());
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1633,12 +2321,28 @@ mod tests {
         goldbild(vt_decoder::X420);
     }
 
+    /// Der Waechter als Rechnung: erst nach genug Versuchen UND genug Zeit,
+    /// und nie, sobald ein Bild ankam.
+    #[test]
+    fn waechter_rechnung() {
+        let f = WAECHTER_FRIST;
+        let n = WAECHTER_VERSUCHE;
+        assert!(!nie_gezeigt(0, n - 1, Some(f * 2), n, f), "zu wenige Versuche");
+        assert!(!nie_gezeigt(0, n, Some(f - Duration::from_millis(1)), n, f), "zu frueh");
+        assert!(nie_gezeigt(0, n, Some(f), n, f));
+        assert!(!nie_gezeigt(1, n * 100, Some(f * 10), n, f), "ein Bild kam an");
+        assert!(!nie_gezeigt(0, n, None, n, f), "ohne ersten Versuch");
+    }
+
     /// Der Weg ueber die Schicht, ohne Fenster: eine CALayer als Schicht der
     /// Ansicht, darunter der CAMetalLayer. Praesentieren geht, ohne dass
     /// nextDrawable wartet; nach zwei Bildern, die nicht auf dem Schirm
     /// ankommen (hier nie), ist die Anzeige nicht bereit - bis die Frist
-    /// abgelaufen ist. Groesse und Massstab kommen an, verdeckt wird nicht
-    /// gezeichnet, und Drop nimmt die Schicht wieder heraus.
+    /// abgelaufen ist. Rahmen und Massstab folgen der Wurzelschicht, der
+    /// Puffer den Bildpunkten; verdeckt wird nicht gezeichnet und nicht
+    /// gezaehlt, das Aufdecken verlangt einmal ein Neuzeichnen; der Waechter
+    /// zaehlt die Versuche ohne gezeigtes Bild; Drop nimmt die Schicht wieder
+    /// heraus.
     #[test]
     fn schicht_ohne_fenster() {
         if unsafe { Obj::eigen(MTLCreateSystemDefaultDevice()) }.is_none() {
@@ -1647,11 +2351,19 @@ mod tests {
         }
         let _pool = Pool::neu();
         let wurzel = unsafe { Obj::halten(msg_id(klasse(c"CALayer"), c"layer")).expect("CALayer") };
-        unsafe { senden!(wurzel.0, sel(c"setContentsScale:"), 2.0f64 => f64; -> ()) };
+        let rahmen = |w: f64, h: f64| CgRect { x: 0.0, y: 0.0, w, h };
+        unsafe {
+            senden!(wurzel.0, sel(c"setContentsScale:"), 2.0f64 => f64; -> ());
+            senden!(wurzel.0, sel(c"setBounds:"), rahmen(320.0, 180.0) => CgRect; -> ());
+        }
         let mut g = Gpu::an_schicht(wurzel.zweiter(), 640, 360).expect("Schicht");
         assert_eq!((g.breite, g.hoehe, g.skala), (640, 360, 2.0));
+        let m = g.geometrie().expect("Geometrie");
+        assert_eq!((m.rahmen, m.skala, m.puffer), (rahmen(320.0, 180.0), 2.0, CgSize { w: 640.0, h: 360.0 }));
         let unter = |w: &Obj| unsafe { msg_zahl(msg_id(w.0, c"sublayers"), c"count") };
         assert_eq!(unter(&wurzel), 1);
+        assert!(g.fenster_sichtbar(), "ohne Ansicht gilt die Schicht als sichtbar");
+        assert!(!g.verdeckt(false), "nichts ausgefallen, nichts nachzuholen");
         let bild = probebild(vt_decoder::XF44, 320, 180).expect("Probebild");
         g.bild_roh(&bild).expect("bild_roh");
         drop(bild);
@@ -1665,11 +2377,28 @@ mod tests {
         assert!(!g.bereit(), "zwei Bilder unterwegs, trotzdem bereit");
         std::thread::sleep(PRAESENT_FRIST + Duration::from_millis(20));
         assert!(g.bereit(), "nach der Frist nicht wieder bereit");
+        // Ohne Fenster kommt nie ein Bild an: der Waechter zaehlt, schlaegt
+        // mit den echten Schwellen aber noch nicht an.
+        assert_eq!((g.gezeigt(), g.versuche), (0, HOECHSTENS_UNTERWEGS as u32));
+        assert!(!g.nie_auf_dem_schirm());
+        assert!(nie_gezeigt(g.gezeigt, g.versuche, g.erster_versuch.map(|t| t.elapsed()), HOECHSTENS_UNTERWEGS as u32, Duration::ZERO));
+        // Neue Bildpunkte bei gleicher Ansicht: der Puffer folgt, der Rahmen
+        // bleibt der der Ansicht; dann eine groessere Ansicht.
         g.groesse(800, 600).expect("groesse");
         assert_eq!((g.breite, g.hoehe), (800, 600));
+        let m = g.geometrie().expect("Geometrie");
+        assert_eq!((m.rahmen, m.puffer), (rahmen(320.0, 180.0), CgSize { w: 800.0, h: 600.0 }));
+        unsafe { senden!(wurzel.0, sel(c"setBounds:"), rahmen(400.0, 300.0) => CgRect; -> ()) };
+        g.groesse(800, 600).expect("groesse");
+        assert_eq!(g.geometrie().expect("Geometrie").rahmen, rahmen(400.0, 300.0));
         assert!(matches!(g.zeichnen(None, false, false), Praesentiert::Ok));
-        g.verdeckt(true);
+        let versuche = g.versuche;
+        assert!(!g.verdeckt(true), "Verdecken verlangt kein Neuzeichnen");
         assert!(matches!(g.zeichnen(None, false, false), Praesentiert::Verdeckt));
+        assert_eq!(g.versuche, versuche, "verdeckt zaehlt der Waechter nicht");
+        assert!(g.verdeckt(false), "Aufdecken nach einem ausgefallenen Bild verlangt ein Neuzeichnen");
+        assert!(matches!(g.zeichnen(None, false, false), Praesentiert::Ok));
+        assert!(!g.verdeckt(false), "nach dem neuen Bild ist nichts nachzuholen");
         drop(g);
         assert_eq!(unter(&wurzel), 0, "Schicht haengt nach Drop noch an");
     }

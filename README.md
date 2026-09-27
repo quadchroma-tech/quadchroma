@@ -812,7 +812,12 @@ same source points and integer weights as the CPU scaler, and the user interface
 second texture on top. A `CAMetalLayer` below winit's view presents in pixels (HiDPI),
 synchronized to the display refresh, with at most two frames queued and never waiting
 on the window thread. If Metal cannot be set up, or with `--anzeige cpu`, the client
-draws with softbuffer. `--anzeigetest <dir>` compares every VideoToolbox format with the
+draws with softbuffer; it also switches to softbuffer while running when no Metal frame
+ever reaches the screen of a visible window (`presentedTime`) or the device is lost. A
+covered window does not present, and the last frame is presented again once it is
+visible. `--anzeige-selbsttest` checks this in a real window: frames on screen, the
+layer's geometry, hiding and showing, the fallback (exit code 3: the window was never
+visible, for example on a locked screen). `--anzeigetest <dir>` compares every VideoToolbox format with the
 CPU path (tolerance 0 for the conversion, the scaled and the 1:1 picture; 2 for the
 interface on top, as on Windows) and measures 240 frames at 2560x1440 in a 120 Hz
 cadence (M1: about 1.8 ms GPU time per frame); it opens no window and starts neither
