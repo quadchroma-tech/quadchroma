@@ -6011,6 +6011,10 @@ fn einzel_folge(sitzung: Option<&str>, adresse: &str) -> EinzelFolge {
 /// (und geprueft) wird.
 const MIT_VERKNUEPFUNG: bool = cfg!(windows);
 
+/// So oft liest das Kaestchen des Autostarts im Startbildschirm den Stand
+/// (Verknuepfung bzw. SMAppService) neu.
+const AUTOSTART_TAKT: Duration = Duration::from_millis(500);
+
 /// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
 const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
 
@@ -6424,6 +6428,10 @@ struct App {
     /// Seit wann das Symbol angelegt ist, bis das Protokoll gesagt hat, ob
     /// es steht (tray::symbol_meldung); danach None.
     symbol_seit: Option<Instant>,
+    /// Stand des Autostarts fuer das Kaestchen im Startbildschirm und wann er
+    /// gelesen wurde (hoechstens einmal je AUTOSTART_TAKT; None: neu lesen).
+    autostart: Autostart,
+    autostart_gelesen: Option<Instant>,
 }
 
 /// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
@@ -6531,8 +6539,8 @@ impl ApplicationHandler<Benutzer> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        self.fenster_ereignis(el, event);
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.fenster_ereignis(event);
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
@@ -6681,11 +6689,11 @@ impl App {
         }
     }
 
-    fn fenster_ereignis(&mut self, el: &ActiveEventLoop, event: WindowEvent) {
+    fn fenster_ereignis(&mut self, event: WindowEvent) {
         match event {
             // Schliessen legt die App ab (Infobereich bzw. Menueleiste);
             // ohne Symbol oder mit tray=aus beendet es wie bisher.
-            WindowEvent::CloseRequested => self.schliessen(el),
+            WindowEvent::CloseRequested => self.schliessen(),
             // Abgelegt wird nichts gezeichnet.
             WindowEvent::RedrawRequested => {
                 if !self.verborgen {
@@ -6805,14 +6813,14 @@ impl App {
                             // Esc: in der einen App ablegen wie das Schliessen -
                             // die Freigabe laeuft weiter (ohne Symbol: Ende);
                             // sonst beenden wie bisher.
-                            KC::Escape if MIT_FREIGABE => { self.schliessen(el); return; }
+                            KC::Escape if MIT_FREIGABE => { self.schliessen(); return; }
                             KC::Escape => { self.quit = true; return; }
                             // Cmd+W schliesst auf dem Startbildschirm wie das
                             // rote Knoepfchen (winit legt dafuer keinen
                             // Menuepunkt an). In der Sitzung gehoert Cmd+W
                             // dem Mac drueben.
                             #[cfg(target_os = "macos")]
-                            KC::KeyW if self.mods & MOD_CMD != 0 => { self.schliessen(el); return; }
+                            KC::KeyW if self.mods & MOD_CMD != 0 => { self.schliessen(); return; }
                             _ => {}
                         }
                     }
@@ -7772,9 +7780,21 @@ impl App {
         (an, code.map(|c| self.lang.get(strings::Key::PreventSleepRefused).replace("{c}", &c)))
     }
 
-    /// "Mit Windows starten" (Menue): die eine Verknuepfung im
-    /// Autostart-Ordner an bzw. aus.
+    /// "Mit Windows starten" (Menue, Kaestchen im Startbildschirm): die eine
+    /// Verknuepfung im Autostart-Ordner an bzw. aus. Mac: "Beim Anmelden
+    /// starten" (nur das Kaestchen - den Punkt der Menueleiste schaltet
+    /// menue.m selbst) ueber denselben Weg wie der Menuepunkt: SMAppService
+    /// an bzw. aus, eingetragen aber nicht erlaubt oeffnet die
+    /// Systemeinstellungen, ausserhalb von /Applications nichts. Das Kaestchen
+    /// liest den Stand danach neu - Menue und Kaestchen zeigen immer, was
+    /// gilt.
     fn autostart_umschalten(&mut self) {
+        self.autostart_gelesen = None;
+        #[cfg(target_os = "macos")]
+        {
+            protokoll::zeile(format!("Beim Anmelden starten: umschalten (war {:?})", self.autostart));
+            host_mac::anmeldung_umschalten();
+        }
         #[cfg(windows)]
         {
             let an = !verknuepfung::autostart_an(None);
@@ -7787,6 +7807,31 @@ impl App {
                 Err(f) => protokoll::zeile(format!("Mit Windows starten nicht umgestellt: {f}")),
             }
         }
+    }
+
+    /// Stand des Autostarts fuer das Kaestchen: gelesen hoechstens einmal je
+    /// AUTOSTART_TAKT (der Startbildschirm zeichnet 30-mal je Sekunde; ein
+    /// Wechsel im Menue des Symbols oder in den Systemeinstellungen kommt so
+    /// spaetestens nach dieser Zeit an), nach einem Umschalten sofort.
+    fn autostart_stand(&mut self) -> Autostart {
+        if self.autostart_gelesen.is_some_and(|t| t.elapsed() < AUTOSTART_TAKT) {
+            return self.autostart;
+        }
+        self.autostart_gelesen = Some(Instant::now());
+        #[cfg(windows)]
+        {
+            self.autostart = if verknuepfung::autostart_an(None) { Autostart::An } else { Autostart::Aus };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.autostart = match host_mac::anmeldung_stand() {
+                host_mac::Anmeldung::An => Autostart::An,
+                host_mac::Anmeldung::Aus => Autostart::Aus,
+                host_mac::Anmeldung::FreigabeNoetig => Autostart::FreigabeNoetig,
+                host_mac::Anmeldung::NichtInProgramme => Autostart::NichtInProgramme,
+            };
+        }
+        self.autostart
     }
 
     /// "Geraetename aendern ..." (Menue) bzw. "Umbenennen" (Startbildschirm):
@@ -7853,6 +7898,17 @@ impl App {
             A::Autostart => self.autostart_umschalten(),
             A::RuheVerhindern => self.ruhe_umschalten(),
             A::NameAendern => self.geraetename_fenster(),
+            // Mac: der Punkt im Programmmenue (Cmd+Q), solange das Symbol
+            // steht - schliesst wie das rote Knoepfchen. Ohne sichtbares
+            // Fenster (etwa aus dem Fenster "Geraetename") gibt es nichts zu
+            // schliessen.
+            A::FensterSchliessen => {
+                if self.window.is_some() && !self.verborgen {
+                    self.schliessen();
+                } else {
+                    protokoll::zeile(format!("{}: Fenster schliessen ohne sichtbares Fenster - uebergangen", tray::ORT));
+                }
+            }
             a => {
                 let erledigt = self.rolle.as_ref().is_some_and(|r| r.aktion(&a));
                 if !erledigt {
@@ -7917,17 +7973,20 @@ impl App {
         host_mac::aktivierung(false);
     }
 
-    /// Schliessen des Fensters (X, Alt+F4, Cmd+W): ablegen statt beenden,
-    /// siehe tray::beim_schliessen. Eine laufende Sitzung wird getrennt wie
-    /// mit "Trennen" - kein Zuschauer, keine Arbeit.
-    fn schliessen(&mut self, el: &ActiveEventLoop) {
-        let steht = self.symbol.as_ref().map(|s| s.steht()).unwrap_or(false);
+    /// Schliessen des Fensters (X, Alt+F4, ESC und auf dem Mac Cmd+W bzw.
+    /// Cmd+Q im Startbildschirm, der Knopf "Fenster schliessen"): ablegen
+    /// statt beenden, siehe tray::beim_schliessen - beendet wird nur im Menue
+    /// des Symbols. Eine laufende Sitzung wird getrennt wie mit "Trennen" -
+    /// kein Zuschauer, keine Arbeit. Ohne Symbol (oder mit tray=aus) endet
+    /// das Programm; die Schleife verlaesst vor_dem_warten.
+    fn schliessen(&mut self) {
         let sitzung = self.screen == Screen::Session;
-        match tray::beim_schliessen(self.cfg.tray, steht, sitzung, self.cfg.tray_hinweis) {
+        match tray::beim_schliessen(self.cfg.tray, self.symbol_steht_jetzt(), sitzung, self.cfg.tray_hinweis) {
             tray::Schliessen::Beenden => {
-                // Ab hier uebernimmt die Schleife keine Weitergabe mehr (user_event).
+                // Ab hier uebernimmt die Schleife keine Weitergabe mehr
+                // (user_event); vor_dem_warten verlaesst sie.
+                protokoll::zeile(format!("{}: Fenster geschlossen - ohne Symbol bzw. mit tray=aus endet QuadChroma", tray::ORT));
                 self.quit = true;
-                el.exit();
             }
             tray::Schliessen::Ablegen { trennen, hinweis } => {
                 if trennen {
@@ -7949,6 +8008,11 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Steht das Symbol jetzt sichtbar (Infobereich bzw. Menueleiste)?
+    fn symbol_steht_jetzt(&self) -> bool {
+        self.symbol.as_ref().is_some_and(|s| s.steht())
     }
 
     /// Eine Wahl am Symbol.
@@ -8004,12 +8068,19 @@ impl App {
 
     /// Was der Client zum Menue der Menueleiste beitraegt (macOS): Haken
     /// der Freigabe und des Ruhezustands, bis zu vier gefundene Hosts (Name
-    /// entschaerft, sonst leer), Tooltip, laufende Sitzung.
+    /// entschaerft, sonst leer), Tooltip, laufende Sitzung und der Titel des
+    /// Punkts mit Cmd+Q im Programmmenue.
     #[cfg(target_os = "macos")]
     fn symbol_stand(&self) -> host_mac::Stand {
         let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
         let hosts = menue_hosts(&gefunden, &self.bekannte).into_iter().map(|(n, a)| (tray::anzeigename(&n), a)).collect();
         let (ruhe, ruhe_grund) = self.ruhe_anzeige();
+        // Cmd+Q im Programmmenue: solange das Symbol steht, schliesst es
+        // nur das Fenster (wie der Knopf im Startbildschirm).
+        let schliessen_titel = match tray::schliessen_text(self.cfg.tray, self.symbol_steht_jetzt()) {
+            strings::Key::CloseWindow => self.lang.get(strings::Key::CloseWindow).to_string(),
+            _ => String::new(),
+        };
         host_mac::Stand {
             freigabe: self.cfg.freigabe,
             ruhe,
@@ -8017,6 +8088,7 @@ impl App {
             sitzung: self.screen == Screen::Session,
             tooltip: self.tooltip_jetzt(),
             hosts,
+            schliessen_titel,
         }
     }
 
@@ -8766,17 +8838,20 @@ impl App {
                 let hinweis = self.verknuepfung_hinweis();
                 let name = zugang::geraetename();
                 let (ruhe_an, ruhe_grund) = self.ruhe_anzeige();
+                let autostart = self.autostart_stand();
                 let dieser = (MIT_FREIGABE && self.rolle.is_some()).then(|| DieserComputer {
                     freigabe: self.cfg.freigabe,
                     name: &name,
                     id: self.eigene_id(),
                     ruhe_verhindern: ruhe_an,
                     ruhe_grund: ruhe_grund.as_deref(),
+                    autostart,
                 });
                 self.geraete_scroll = erste_zeile(self.geraete_scroll, START_ZEILEN, zeilen.len());
+                let ende = tray::schliessen_text(self.cfg.tray, self.symbol_steht_jetzt());
                 n.act = start_screen(
                     &mut self.ui, c, self.lang, &zeilen, self.geraete_scroll, &self.addr_input, err.as_deref(),
-                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl, dieser.as_ref(),
+                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl, dieser.as_ref(), ende,
                 );
             }
             Screen::Session => {
@@ -8997,7 +9072,8 @@ impl App {
             Action::FreigabeUmschalten => self.freigabe_umschalten(),
             Action::NameAendern => self.geraetename_fenster(),
             Action::RuheUmschalten => self.ruhe_umschalten(),
-            Action::Quit => self.quit = true,
+            Action::AutostartUmschalten => self.autostart_umschalten(),
+            Action::Schliessen => self.schliessen(),
             Action::Sprachwahl => self.sprachwahl = !self.sprachwahl,
             Action::Sprache(code) => {
                 // Gewaehlt wird aus der Liste, gemerkt in einstellungen.txt -
@@ -9246,7 +9322,12 @@ enum Action {
     NameAendern,
     /// Das Kaestchen "Ruhezustand verhindern".
     RuheUmschalten,
-    Quit,
+    /// Das Kaestchen "Mit Windows starten" bzw. "Beim Anmelden starten".
+    AutostartUmschalten,
+    /// "Fenster schliessen" - wie das X bzw. das rote Knoepfchen: ablegen,
+    /// solange das Symbol steht, sonst beenden (dann heisst der Knopf
+    /// "Beenden"). Beendet wird sonst nur im Menue des Symbols.
+    Schliessen,
     /// Sprachwahl oeffnen bzw. schliessen.
     Sprachwahl,
     /// Diese Sprache nehmen (Code wie in strings.rs).
@@ -9666,9 +9747,39 @@ fn mische(a: u32, b: u32, c: u32, d: u32, wx: u32, wy: u32) -> u32 {
 /// Hoehe der Hostliste auf dem Startbildschirm (vier Zeilen und Kopf).
 const START_LISTE_H: i32 = 34 * 4 + 52;
 
-/// Hoehe der zwei Zeilen der einen App unter den Knoepfen: "Dieser
-/// Computer" mit "Umbenennen" und "Ruhezustand verhindern".
-const EINE_APP_H: i32 = 52;
+/// Hoehe der drei Zeilen der einen App unter den Knoepfen: "Dieser
+/// Computer" mit "Umbenennen", "Ruhezustand verhindern" und darunter "Mit
+/// Windows starten" bzw. "Beim Anmelden starten" (siehe eine_app_zeilen).
+const EINE_APP_H: i32 = 80;
+
+/// Die Zeilen der einen App im Startbildschirm, ab `y` (unter den Knoepfen)
+/// in der Tafel ab `px`, `panel_w` breit; `kw` ist die Breite des Knopfs
+/// "Umbenennen". Je 24 hoch, 4 Punkte Abstand: "Dieser Computer" mit dem
+/// Knopf rechts, das Kaestchen "Ruhezustand verhindern" und direkt darunter
+/// das des Autostarts. Die Kaestchenzeilen sind ganz klickbar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EineAppZeilen {
+    computer: ui::Rect,
+    umbenennen: ui::Rect,
+    ruhe: ui::Rect,
+    autostart: ui::Rect,
+}
+
+/// Breite des Knopfs "Umbenennen" neben "Dieser Computer".
+fn umbenennen_breite(u: &mut ui::Ui, lang: &'static strings::Lang, panel_w: i32) -> i32 {
+    let (g, lw) = ZEILENKNOPF_SCHRIFT;
+    (u.text.width(lang.get(strings::Key::DeviceNameRename), g, lw) + 28).clamp(84, 160).min(panel_w / 3)
+}
+
+fn eine_app_zeilen(px: i32, panel_w: i32, y: i32, kw: i32) -> EineAppZeilen {
+    let zeile = |nr: i32| ui::Rect { x: px, y: y + nr * 28, w: panel_w, h: 24 };
+    EineAppZeilen {
+        computer: zeile(0),
+        umbenennen: ui::Rect { x: px + panel_w - kw, y, w: kw, h: 24 },
+        ruhe: zeile(1),
+        autostart: zeile(2),
+    }
+}
 
 /// Lage der Hostliste auf dem Startbildschirm: (links, Breite, oben der
 /// Tafel). Alles als Block mittig, damit unten kein totes Feld bleibt.
@@ -9678,6 +9789,60 @@ fn start_rahmen(w: i32, h: i32) -> (i32, i32, i32) {
     let block_h = 150 + START_LISTE_H + 40 + 66 + 44 + if MIT_FREIGABE { EINE_APP_H } else { 0 };
     let top = ((h - block_h) / 2).max(24);
     (cx - panel_w / 2, panel_w, top + 130)
+}
+
+/// Oberkante des Adressfelds im Startbildschirm (unter der Hostliste).
+fn start_feld_y(w: i32, h: i32) -> i32 {
+    let (_, _, py) = start_rahmen(w, h);
+    py + START_LISTE_H + 36
+}
+
+/// Lage der Knopfreihe im Startbildschirm und was darunter kommt: Verbinden
+/// links, in der einen App (`eine_app`) der Umschalter der Freigabe in der
+/// Mitte, rechts der Knopf mit dem Text `ende` ("Fenster schliessen" bzw.
+/// "Beenden"); `eine_app_y` ist die Oberkante der Zeilen der einen App
+/// (eine_app_zeilen), `meldung_y` die Grundlinie der ersten Zeile einer
+/// Meldung.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StartKnoepfe {
+    verbinden: ui::Rect,
+    freigabe: Option<ui::Rect>,
+    ende: ui::Rect,
+    eine_app_y: i32,
+    meldung_y: i32,
+}
+
+fn start_knoepfe(u: &mut ui::Ui, lang: &'static strings::Lang, w: i32, h: i32, eine_app: bool, ende: strings::Key) -> StartKnoepfe {
+    let (px, panel_w, _) = start_rahmen(w, h);
+    let by = start_feld_y(w, h) + 62;
+    let knopf = |x: i32, w: i32| ui::Rect { x, y: by, w, h: 44 };
+    if !eine_app {
+        let bw = (panel_w - 20) / 2;
+        return StartKnoepfe { verbinden: knopf(px, bw), freigabe: None, ende: knopf(px + bw + 20, bw), eine_app_y: by + 54, meldung_y: by + 76 };
+    }
+    // Platz fuer Kaestchen und Text; hoechstens die halbe Leiste - in
+    // schmalen Fenstern (unter 400 Punkten) auch schmaler als 150, der Text
+    // wird gekuerzt. Kein clamp: dessen Untergrenze laege dann ueber der
+    // Obergrenze.
+    let breite = u.text.width(lang.get(FREIGABE_TEXT), 13, 1) + 14 + 8;
+    let sw = (breite + 40).max(150).min((panel_w / 2 - 20).max(0));
+    // Die beiden aeusseren Knoepfe teilen sich den Rest; der rechte bekommt
+    // mehr, wenn sein Text ("Fenster schliessen" ist in manchen Sprachen
+    // lang) sonst nicht einmal in der kleinen Schrift passte - solange der
+    // Text von Verbinden in der kleinen Schrift bleibt (knopftext).
+    let rest = panel_w - sw - 40;
+    let bedarf = |u: &mut ui::Ui, k: strings::Key| u.text.width(lang.get(k), 13, 1) + 24;
+    let ende_w = (rest / 2).max(bedarf(u, ende).min(rest - bedarf(u, strings::Key::Connect)));
+    let bw = rest - ende_w;
+    let freigabe = knopf(px + bw + 20, sw);
+    let x = freigabe.x + sw + 20;
+    StartKnoepfe {
+        verbinden: knopf(px, bw),
+        freigabe: Some(freigabe),
+        ende: knopf(x, px + panel_w - x),
+        eine_app_y: by + 54,
+        meldung_y: by + 76 + EINE_APP_H,
+    }
 }
 
 /// Schriftgroesse und Laufweite des kleinen Knopfs in der Hostzeile.
@@ -9914,6 +10079,14 @@ fn kaestchen(c: &mut ui::Canvas, x: i32, y: i32, an: bool, farbe: u32) {
     }
 }
 
+/// Ein Kaestchen mit halbem Haken (ein Strich): gewuenscht, aber noch nicht
+/// wirksam - wie der gemischte Zustand im Menue der Menueleiste.
+fn kaestchen_halb(c: &mut ui::Canvas, x: i32, y: i32, farbe: u32) {
+    kaestchen(c, x, y, false, farbe);
+    c.hline(x + 3, y + 6, 8, farbe, 255);
+    c.hline(x + 3, y + 7, 8, farbe, 255);
+}
+
 /// Ein Knopf, der einen Zustand umschaltet (die Freigabe): dieselbe Form wie
 /// `Ui::button_mit`, darin ein Kaestchen - mit Haken, wenn an - und der Text.
 /// true, wenn er in diesem Bild geklickt wurde.
@@ -9928,9 +10101,10 @@ fn umschalter(u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, label: &str, an: 
     geklickt
 }
 
-/// Was der Startbildschirm der einen App zusaetzlich zeigt (Windows): den
-/// Umschalter "Diesen PC freigeben", die Zeile "Dieser Computer" und das
-/// Kaestchen "Ruhezustand verhindern".
+/// Was der Startbildschirm der einen App zusaetzlich zeigt: den Umschalter
+/// "Diesen PC freigeben" (Mac: "Diesen Mac freigeben"), die Zeile "Dieser
+/// Computer" und die Kaestchen "Ruhezustand verhindern" und "Mit Windows
+/// starten" bzw. "Beim Anmelden starten".
 struct DieserComputer<'a> {
     freigabe: bool,
     name: &'a str,
@@ -9940,11 +10114,37 @@ struct DieserComputer<'a> {
     /// PreventSleepRefused, rechts in Bernstein).
     ruhe_verhindern: bool,
     ruhe_grund: Option<&'a str>,
+    /// Kaestchen unter "Ruhezustand verhindern": derselbe Stand wie der
+    /// Punkt am Symbol (Verknuepfung im Autostart-Ordner bzw. SMAppService).
+    autostart: Autostart,
 }
 
-/// Die Zeilen der einen App unter den Knoepfen (ab `y`): links "Dieser
-/// Computer: <Name> · <ID>", rechts "Umbenennen"; darunter das Kaestchen
-/// "Ruhezustand verhindern" - die ganze Zeile ist klickbar.
+/// Stand von "Mit Windows starten" (Windows) bzw. "Beim Anmelden starten"
+/// (Mac) - im Startbildschirm und am Symbol derselbe, beide lesen ihn an
+/// derselben Stelle (verknuepfung::autostart_an, SMAppService ueber
+/// host_mac::anmeldung_stand).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Autostart {
+    Aus,
+    An,
+    /// Mac: eingetragen, aber in den Systemeinstellungen (Anmeldeobjekte)
+    /// nicht erlaubt - ein halber Haken wie im Menue; ein Klick oeffnet die
+    /// Systemeinstellungen.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    FreigabeNoetig,
+    /// Mac: die App liegt nicht in /Applications - gesperrt, mit Grund (wie
+    /// der Punkt im Menue der Menueleiste).
+    NichtInProgramme,
+}
+
+/// Text des Autostart-Kaestchens: derselbe wie der Punkt am Symbol.
+const AUTOSTART_TEXT: strings::Key = if cfg!(target_os = "macos") { strings::Key::HostStartLogin } else { strings::Key::HostStartWindows };
+
+/// Die Zeilen der einen App unter den Knoepfen (ab `y`, eine_app_zeilen):
+/// links "Dieser Computer: <Name> · <ID>", rechts "Umbenennen"; darunter das
+/// Kaestchen "Ruhezustand verhindern" und direkt darunter das des Autostarts -
+/// je die ganze Zeile klickbar. Lehnt das System den Ruhezustand ab bzw.
+/// liegt die App (Mac) nicht in /Applications, steht der Grund rechts.
 fn dieser_computer_zeichnen(
     u: &mut ui::Ui,
     c: &mut ui::Canvas,
@@ -9957,34 +10157,65 @@ fn dieser_computer_zeichnen(
     use strings::Key::*;
     let mut action = Action::None;
     let (g, lw) = ZEILENKNOPF_SCHRIFT;
-    let kw = (u.text.width(lang.get(DeviceNameRename), g, lw) + 28).clamp(84, 160).min(panel_w / 3);
-    let knopf = ui::Rect { x: px + panel_w - kw, y, w: kw, h: 24 };
+    let kw = umbenennen_breite(u, lang, panel_w);
+    let z = eine_app_zeilen(px, panel_w, y, kw);
     let id = d.id.map(zugang::id_text).unwrap_or_else(|| "-".into());
     let text = symbolmenue::einsetzen(lang.get(ThisComputer), &[("{n}", &tray::anzeigename(d.name)), ("{i}", &id)]);
-    let text = kuerzen(u, &text, knopf.x - px - 12, 13, 1);
-    u.text.draw(c, px + 2, y + 17, &text, 13, ui::TEXT, 1);
+    let text = kuerzen(u, &text, z.umbenennen.x - px - 12, 13, 1);
+    u.text.draw(c, px + 2, z.computer.y + 17, &text, 13, ui::TEXT, 1);
     let t = kuerzen(u, lang.get(DeviceNameRename), kw - 16, g, lw);
-    if u.button_mit(c, knopf, &t, ui::CYAN, g, lw) {
+    if u.button_mit(c, z.umbenennen, &t, ui::CYAN, g, lw) {
         action = Action::NameAendern;
     }
-    let zeile = ui::Rect { x: px, y: y + 28, w: panel_w, h: 24 };
-    let hot = zeile.hit(u.mouse.0, u.mouse.1);
-    kaestchen(c, px + 2, zeile.y + 5, d.ruhe_verhindern, if hot || d.ruhe_verhindern { ui::CYAN } else { ui::DIM });
-    // Lehnt das System ab: der Grund rechts (hoechstens die halbe Zeile),
-    // der Text des Kaestchens davor gekuerzt.
-    let mut platz = panel_w - 28;
-    if let Some(g) = d.ruhe_grund {
-        let g = kuerzen(u, g, panel_w / 2, 12, 1);
-        let gw = u.text.width(&g, 12, 1);
-        u.text.draw(c, px + panel_w - gw, zeile.y + 17, &g, 12, ui::AMBER, 1);
-        platz -= gw + 12;
-    }
-    let t = kuerzen(u, lang.get(PreventSleep), platz, 13, 1);
-    u.text.draw(c, px + 26, zeile.y + 17, &t, 13, if hot { 0xffffff } else { ui::TEXT }, 1);
-    if hot && u.click {
+    // Eine Kaestchenzeile: Kaestchen, Text, rechts ein Grund in seiner
+    // Farbe - so breit, wie der Text daneben Platz laesst, mindestens die
+    // halbe Zeile; der Text davor wird notfalls gekuerzt. Gesperrt: blass,
+    // ohne Reaktion auf Maus und Klick. true = geklickt.
+    let kaestchenzeile = |u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, text: &str, an: bool, halb: bool, grund: Option<(&str, u32)>, gesperrt: bool| -> bool {
+        let hot = !gesperrt && r.hit(u.mouse.0, u.mouse.1);
+        let farbe = if gesperrt { ui::DIM } else if hot || an || halb { ui::CYAN } else { ui::DIM };
+        if halb {
+            kaestchen_halb(c, px + 2, r.y + 5, farbe);
+        } else {
+            kaestchen(c, px + 2, r.y + 5, an, farbe);
+        }
+        let mut platz = panel_w - 28;
+        if let Some((g, f)) = grund {
+            let frei = panel_w - 28 - u.text.width(text, 13, 1) - 12;
+            let g = kuerzen(u, g, frei.max(panel_w / 2), 12, 1);
+            let gw = u.text.width(&g, 12, 1);
+            u.text.draw(c, px + panel_w - gw, r.y + 17, &g, 12, f, 1);
+            platz -= gw + 12;
+        }
+        let t = kuerzen(u, text, platz, 13, 1);
+        let tf = if gesperrt { ui::DIM } else if hot { 0xffffff } else { ui::TEXT };
+        u.text.draw(c, px + 26, r.y + 17, &t, 13, tf, 1);
+        hot && u.click
+    };
+    if kaestchenzeile(u, c, z.ruhe, lang.get(PreventSleep), d.ruhe_verhindern, false, d.ruhe_grund.map(|g| (g, ui::AMBER)), false) {
         action = Action::RuheUmschalten;
     }
+    let gesperrt = d.autostart == Autostart::NichtInProgramme;
+    let grund = gesperrt.then(|| (lang.get(HostMoveToApps), ui::DIM));
+    let (an, halb) = (d.autostart == Autostart::An, d.autostart == Autostart::FreigabeNoetig);
+    if kaestchenzeile(u, c, z.autostart, lang.get(AUTOSTART_TEXT), an, halb, grund, gesperrt) {
+        action = Action::AutostartUmschalten;
+    }
     action
+}
+
+/// Text eines Knopfs, der in `platz` passen muss: in der Schrift der Knoepfe
+/// (15/2 wie `Ui::button`), sonst kleiner (13/1), sonst gekuerzt - "Fenster
+/// schliessen" ist in manchen Sprachen laenger als der Knopf neben dem
+/// Umschalter der Freigabe. Liefert Text, Groesse und Laufweite.
+fn knopftext(u: &mut ui::Ui, text: &str, platz: i32) -> (String, u32, i32) {
+    if u.text.width(text, 15, 2) <= platz {
+        return (text.to_string(), 15, 2);
+    }
+    if u.text.width(text, 13, 1) <= platz {
+        return (text.to_string(), 13, 1);
+    }
+    (kuerzen(u, text, platz, 13, 1), 13, 1)
 }
 
 /// Ein Knopf, der gerade nicht geht: dieselbe Form wie `Ui::button_mit`,
@@ -10010,9 +10241,12 @@ fn knopf_aus(u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, label: &str, size:
 /// Startbildschirm: Titel, gefundene Hosts, Adresse, Knoepfe. `hinweis` ist
 /// das Ergebnis einer Desktop-Verknuepfung (Text, Farbe); es steht, solange
 /// es gilt, im Meldungsbereich statt einer Fehlermeldung. `dieser`: nur in
-/// der einen App (Windows) Some - der Umschalter "Diesen PC freigeben"
-/// zwischen Verbinden und Beenden, darunter "Dieser Computer" mit
-/// "Umbenennen" und das Kaestchen "Ruhezustand verhindern".
+/// der einen App Some - der Umschalter "Diesen PC freigeben" zwischen
+/// Verbinden und dem Knopf rechts, darunter "Dieser Computer" mit
+/// "Umbenennen" und die Kaestchen "Ruhezustand verhindern" und "Mit Windows
+/// starten" bzw. "Beim Anmelden starten". `ende`: Text des Knopfs rechts -
+/// "Fenster schliessen", solange das Symbol steht, sonst "Beenden"
+/// (tray::schliessen_text); er schliesst wie das X (Action::Schliessen).
 #[allow(clippy::too_many_arguments)]
 fn start_screen(
     u: &mut ui::Ui,
@@ -10025,6 +10259,7 @@ fn start_screen(
     hinweis: Option<(&str, u32)>,
     sprachwahl: bool,
     dieser: Option<&DieserComputer>,
+    ende: strings::Key,
 ) -> Action {
     use strings::Key::*;
     c.backdrop(u.tick);
@@ -10100,56 +10335,38 @@ fn start_screen(
     }
 
     // Adressfeld: IP, Name oder Geraete-ID (9.2).
-    let fy = py + list_h + 36;
+    let fy = start_feld_y(c.w as i32, c.h as i32);
     u.field(c, ui::Rect { x: px, y: fy, w: panel_w, h: 40 }, addr, lang.get(HostAddress), true);
 
     // Knoepfe; in der einen App dazu der Umschalter "Diesen PC freigeben"
-    // zwischen Verbinden und Beenden (9.5), in kleinerer Schrift - der Text
-    // ist laenger.
-    let by = fy + 62;
-    let (bw, freigabe_knopf) = match dieser {
-        None => ((panel_w - 20) / 2, None),
-        Some(d) => {
-            // Platz fuer Kaestchen und Text; hoechstens die halbe Leiste - in
-            // schmalen Fenstern (unter 400 Punkten) auch schmaler als 150,
-            // der Text wird gekuerzt. Kein clamp: dessen Untergrenze laege
-            // dann ueber der Obergrenze.
-            let breite = u.text.width(lang.get(FREIGABE_TEXT), 13, 1) + 14 + 8;
-            let sw = (breite + 40).max(150).min((panel_w / 2 - 20).max(0));
-            ((panel_w - sw - 40) / 2, Some((sw, d.freigabe)))
-        }
-    };
-    if u.button(c, ui::Rect { x: px, y: by, w: bw, h: 44 }, lang.get(Connect), ui::CYAN) && !addr.is_empty() {
+    // zwischen Verbinden und "Fenster schliessen" bzw. "Beenden" (9.5), in
+    // kleinerer Schrift - der Text ist laenger.
+    let k = start_knoepfe(u, lang, c.w as i32, c.h as i32, dieser.is_some(), ende);
+    let (t, g, lw) = knopftext(u, lang.get(Connect), k.verbinden.w - 16);
+    if u.button_mit(c, k.verbinden, &t, ui::CYAN, g, lw) && !addr.is_empty() {
         action = Action::Connect(addr.to_string());
     }
-    let (quit_x, quit_w) = match freigabe_knopf {
-        None => (px + bw + 20, bw),
-        Some((sw, an)) => {
-            let r = ui::Rect { x: px + bw + 20, y: by, w: sw, h: 44 };
-            if r.hit(maus.0, maus.1) {
-                tip = Some(lang.get(if an { StartSharing } else { HostSharingIsOff }).to_string());
-            }
-            if umschalter(u, c, r, lang.get(FREIGABE_TEXT), an, 13, 1) {
-                action = Action::FreigabeUmschalten;
-            }
-            let x = r.x + sw + 20;
-            (x, px + panel_w - x)
+    if let (Some(r), Some(d)) = (k.freigabe, dieser) {
+        if r.hit(maus.0, maus.1) {
+            tip = Some(lang.get(if d.freigabe { StartSharing } else { HostSharingIsOff }).to_string());
         }
-    };
-    if u.button(c, ui::Rect { x: quit_x, y: by, w: quit_w, h: 44 }, lang.get(Quit), ui::MAGENTA) {
-        action = Action::Quit;
+        if umschalter(u, c, r, lang.get(FREIGABE_TEXT), d.freigabe, 13, 1) {
+            action = Action::FreigabeUmschalten;
+        }
     }
-    // Die eine App: "Dieser Computer" und "Ruhezustand verhindern".
-    let meldung_y = match dieser {
-        Some(d) => {
-            let a = dieser_computer_zeichnen(u, c, lang, d, px, panel_w, by + 44 + 10);
-            if !matches!(a, Action::None) {
-                action = a;
-            }
-            by + 76 + EINE_APP_H
+    let (t, g, lw) = knopftext(u, lang.get(ende), k.ende.w - 16);
+    if u.button_mit(c, k.ende, &t, ui::MAGENTA, g, lw) {
+        action = Action::Schliessen;
+    }
+    // Die eine App: "Dieser Computer", "Ruhezustand verhindern" und der
+    // Autostart.
+    if let Some(d) = dieser {
+        let a = dieser_computer_zeichnen(u, c, lang, d, px, panel_w, k.eine_app_y);
+        if !matches!(a, Action::None) {
+            action = a;
         }
-        None => by + 76,
-    };
+    }
+    let meldung_y = k.meldung_y;
 
     // Meldungen mit Pfad oder Fingerabdruck sind laenger als eine Zeile -
     // umbrechen statt am Fensterrand abschneiden. Das Ergebnis einer
@@ -11016,12 +11233,27 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         let (r, _) = start_zeile(&mut u, w as i32, h as i32, lang, 0);
         u.mouse = (r.x + 60, r.y + r.h / 2);
     }
-    // In der einen App (Windows) der Umschalter "Diesen PC freigeben", die
-    // Zeile "Dieser Computer" und "Ruhezustand verhindern"; "startfreigabe"
-    // zeigt die Freigabe an und den Ruhezustand verhindert, sonst beides
-    // aus.
+    // In der einen App der Umschalter "Diesen PC freigeben", die Zeile
+    // "Dieser Computer", "Ruhezustand verhindern" und der Autostart;
+    // "startfreigabe" zeigt Freigabe, Ruhezustand und Autostart an, sonst
+    // alles aus. "startbeenden" zeigt den Knopf ohne Symbol ("Beenden"),
+    // sonst steht das Symbol ("Fenster schliessen"); "startgesperrt" den
+    // gesperrten Autostart (Mac: nicht in /Applications).
     let an = view == "startfreigabe";
-    let dieser = MIT_FREIGABE.then_some(DieserComputer { freigabe: an, name: "Büro-PC", id: Some(581_729_911), ruhe_verhindern: an, ruhe_grund: None });
+    let autostart = match view {
+        "startfreigabe" => Autostart::An,
+        "startgesperrt" => Autostart::NichtInProgramme,
+        _ => Autostart::Aus,
+    };
+    let dieser = MIT_FREIGABE.then_some(DieserComputer {
+        freigabe: an,
+        name: "Büro-PC",
+        id: Some(581_729_911),
+        ruhe_verhindern: an,
+        ruhe_grund: None,
+        autostart,
+    });
+    let ende = tray::schliessen_text(view != "startbeenden", MIT_FREIGABE);
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
         let _ = start_screen(
@@ -11035,6 +11267,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             None,
             view == "sprachwahl",
             dieser.as_ref(),
+            ende,
         );
     }
 
@@ -12333,6 +12566,8 @@ fn main() {
         #[cfg(target_os = "macos")]
         verbergen_faellig: None,
         symbol_seit: None,
+        autostart: Autostart::Aus,
+        autostart_gelesen: None,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
@@ -15113,6 +15348,125 @@ mod tests {
         }
     }
 
+    /// Die ueblichen Fenstergroessen fuer die Lage im Startbildschirm (in
+    /// Bildpunkten: --shot-Vorgabe, Fenster, Vollbild, Retina).
+    const START_GROESSEN: [(i32, i32); 9] =
+        [(900, 700), (1024, 768), (1280, 720), (1280, 800), (1366, 768), (1440, 900), (1920, 1080), (2560, 1440), (3840, 2160)];
+
+    /// Startbildschirm der einen App: das Kaestchen des Autostarts steht
+    /// direkt unter "Ruhezustand verhindern" - gleich breit, 28 Punkte
+    /// tiefer, ohne Ueberlappung -, "Umbenennen" bleibt in der Zeile "Dieser
+    /// Computer", alle drei Zeilen unter der Knopfreihe und ueber der ersten
+    /// Meldungszeile, die ueber der Fussleiste steht - in allen 29 Sprachen
+    /// und den ueblichen Fenstergroessen. Die Texte der Kaestchen passen
+    /// ungekuerzt in die Zeile.
+    #[test]
+    fn startbildschirm_autostart_unter_ruhezustand() {
+        let mut u = ui::Ui::new();
+        for (w, h) in START_GROESSEN {
+            let (px, panel_w, _) = start_rahmen(w, h);
+            for lang in strings::all() {
+                let k = start_knoepfe(&mut u, lang, w, h, true, strings::Key::CloseWindow);
+                let z = eine_app_zeilen(px, panel_w, k.eine_app_y, umbenennen_breite(&mut u, lang, panel_w));
+                let ort = format!("{} {w}x{h}", lang.code);
+                assert_eq!(z.autostart.y, z.ruhe.y + 28, "{ort}");
+                assert!(z.ruhe.y + z.ruhe.h < z.autostart.y, "{ort}: Kaestchen ueberlappen");
+                assert_eq!((z.autostart.x, z.autostart.w, z.autostart.h), (z.ruhe.x, z.ruhe.w, z.ruhe.h), "{ort}");
+                assert!(z.computer.y + z.computer.h < z.ruhe.y, "{ort}");
+                assert_eq!((z.umbenennen.y, z.umbenennen.h), (z.computer.y, z.computer.h), "{ort}");
+                assert!(z.umbenennen.x > px && z.umbenennen.x + z.umbenennen.w == px + panel_w, "{ort}");
+                assert!(k.eine_app_y >= k.ende.y + k.ende.h + 8, "{ort}: Zeilen unter den Knoepfen");
+                assert!(z.autostart.y + z.autostart.h + 13 < k.meldung_y, "{ort}: Kaestchen in der Meldung");
+                assert!(k.meldung_y <= h - 60, "{ort}: Meldung in der Fussleiste");
+                assert_eq!(k.eine_app_y + EINE_APP_H, z.autostart.y + z.autostart.h, "{ort}: EINE_APP_H");
+                for t in [strings::Key::PreventSleep, strings::Key::HostStartWindows, strings::Key::HostStartLogin] {
+                    assert!(u.text.width(lang.get(t), 13, 1) <= panel_w - 28, "{ort}: {t:?} gekuerzt");
+                }
+            }
+        }
+    }
+
+    /// Die Knopfreihe: Verbinden, Freigabe und "Fenster schliessen" bzw.
+    /// "Beenden" nebeneinander in der Tafel, ohne sich zu beruehren; die
+    /// Texte des rechten Knopfs und von Verbinden passen in jeder Sprache
+    /// hinein (in der Knopfschrift oder kleiner, nie gekuerzt), mit und ohne
+    /// Freigabe.
+    #[test]
+    fn startbildschirm_knopfreihe() {
+        let mut u = ui::Ui::new();
+        for (w, h) in START_GROESSEN {
+            let (px, panel_w, _) = start_rahmen(w, h);
+            for lang in strings::all() {
+                for (eine_app, t) in [true, false].into_iter().flat_map(|e| [(e, strings::Key::CloseWindow), (e, strings::Key::Quit)]) {
+                    let k = start_knoepfe(&mut u, lang, w, h, eine_app, t);
+                    let ort = format!("{} {w}x{h} eine_app {eine_app} {t:?}", lang.code);
+                    assert_eq!(k.verbinden.x, px, "{ort}");
+                    assert_eq!(k.ende.x + k.ende.w, px + panel_w, "{ort}");
+                    match k.freigabe {
+                        Some(f) => {
+                            assert!(eine_app);
+                            assert!(k.verbinden.x + k.verbinden.w < f.x && f.x + f.w < k.ende.x, "{ort}");
+                        }
+                        None => assert!(!eine_app && k.verbinden.x + k.verbinden.w < k.ende.x, "{ort}"),
+                    }
+                    for (knopf, t) in [(k.ende, t), (k.verbinden, strings::Key::Connect)] {
+                        let (text, g, lw) = knopftext(&mut u, lang.get(t), knopf.w - 16);
+                        assert_eq!(text, lang.get(t), "{ort}: {t:?} gekuerzt");
+                        assert!(u.text.width(&text, g, lw) <= knopf.w - 16, "{ort}: {t:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Klicks im Startbildschirm der einen App: die Zeile des Autostarts
+    /// schaltet ihn um (gesperrt nicht), die Zeile darueber den
+    /// Ruhezustand, der rechte Knopf schliesst das Fenster - in allen
+    /// Sprachen; ohne die eine App schliesst der Knopf ebenso.
+    #[test]
+    fn startbildschirm_klicks() {
+        let mut u = ui::Ui::new();
+        let (w, h) = (1280usize, 720usize);
+        let mut buf = vec![0u32; w * h];
+        let (px, panel_w, _) = start_rahmen(w as i32, h as i32);
+        for lang in strings::all() {
+            for (stand, ziel) in [
+                (Autostart::Aus, "autostart"),
+                (Autostart::An, "autostart"),
+                (Autostart::FreigabeNoetig, "autostart"),
+                (Autostart::NichtInProgramme, "autostart"),
+                (Autostart::Aus, "ruhe"),
+                (Autostart::Aus, "ende"),
+            ] {
+                let d = DieserComputer { freigabe: true, name: "Büro-PC", id: Some(5), ruhe_verhindern: false, ruhe_grund: None, autostart: stand };
+                let k = start_knoepfe(&mut u, lang, w as i32, h as i32, true, strings::Key::CloseWindow);
+                let z = eine_app_zeilen(px, panel_w, k.eine_app_y, umbenennen_breite(&mut u, lang, panel_w));
+                let r = match ziel {
+                    "autostart" => z.autostart,
+                    "ruhe" => z.ruhe,
+                    _ => k.ende,
+                };
+                u.mouse = (r.x + r.w / 3, r.y + r.h / 2);
+                u.click = true;
+                let mut c = ui::Canvas::neu(&mut buf, w, h);
+                let a = start_screen(&mut u, &mut c, lang, &[], 0, "", None, None, false, Some(&d), strings::Key::CloseWindow);
+                let ort = format!("{} {stand:?} {ziel}", lang.code);
+                match (ziel, stand) {
+                    ("autostart", Autostart::NichtInProgramme) => assert!(matches!(a, Action::None), "{ort}: gesperrt"),
+                    ("autostart", _) => assert!(matches!(a, Action::AutostartUmschalten), "{ort}"),
+                    ("ruhe", _) => assert!(matches!(a, Action::RuheUmschalten), "{ort}"),
+                    _ => assert!(matches!(a, Action::Schliessen), "{ort}"),
+                }
+            }
+        }
+        let k = start_knoepfe(&mut u, &strings::EN, w as i32, h as i32, false, strings::Key::Quit);
+        u.mouse = (k.ende.x + 10, k.ende.y + 10);
+        u.click = true;
+        let mut c = ui::Canvas::neu(&mut buf, w, h);
+        let a = start_screen(&mut u, &mut c, &strings::EN, &[], 0, "", None, None, false, None, strings::Key::Quit);
+        assert!(matches!(a, Action::Schliessen), "ohne die eine App");
+    }
+
     /// Ein HudStand ohne Sitzungsdaten fuer die Tests des ESC-Menues; die
     /// Codecs des Hosts nach Wunsch.
     fn hud_stand_leer(codecs: Vec<CodecEintrag>) -> HudStand {
@@ -17377,7 +17731,7 @@ mod tests {
             u.mouse = (r.x + 30, r.y + r.h / 2);
             u.click = true;
             let mut c = ui::Canvas::neu(&mut buf, w, h);
-            let a = start_screen(&mut u, &mut c, &strings::EN, &hosts, scroll, "", None, None, false, None);
+            let a = start_screen(&mut u, &mut c, &strings::EN, &hosts, scroll, "", None, None, false, None, strings::Key::Quit);
             match a {
                 Action::Host(z) => assert_eq!(z.id, Some(500 + erwartet), "Rollstand {scroll}"),
                 _ => panic!("Rollstand {scroll}: keine Verbindung"),

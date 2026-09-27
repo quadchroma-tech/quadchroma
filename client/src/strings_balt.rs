@@ -270,6 +270,7 @@ pub static ET: Lang = Lang {
         (ShareFailedKey, "Jagamist ei õnnestunud käivitada: host.key või selle kausta ei saa kasutada."),
         (ShareFailedSwitch, "Jagamist ei õnnestunud käivitada: {s} pole kasutatav. Uueks katseks lülita jagamine välja ja uuesti sisse."),
         (PreventSleepRefused, "Pole aktiivne: süsteem keeldus ({c})"),
+        (CloseWindow, "Sulge aken"),
     ],
 };
 
@@ -540,6 +541,7 @@ pub static LV: Lang = Lang {
         (ShareFailedKey, "Koplietošanu neizdevās sākt: host.key vai tā mapi nevar izmantot."),
         (ShareFailedSwitch, "Koplietošanu neizdevās sākt: {s} nav izmantojams. Lai mēģinātu vēlreiz, izslēdziet un atkal ieslēdziet koplietošanu."),
         (PreventSleepRefused, "Nav aktīvs: sistēma atteica ({c})"),
+        (CloseWindow, "Aizvērt logu"),
     ],
 };
 
@@ -810,6 +812,7 @@ pub static LT: Lang = Lang {
         (ShareFailedKey, "Nepavyko pradėti bendrinimo: host.key arba jo aplanko negalima naudoti."),
         (ShareFailedSwitch, "Nepavyko pradėti bendrinimo: {s} negalima naudoti. Norėdami bandyti dar kartą, išjunkite ir vėl įjunkite bendrinimą."),
         (PreventSleepRefused, "Neaktyvu: sistema atmetė ({c})"),
+        (CloseWindow, "Uždaryti langą"),
     ],
 };
 
@@ -1080,6 +1083,7 @@ pub static SL: Lang = Lang {
         (ShareFailedKey, "Deljenja ni bilo mogoče zagnati: host.key ali njegove mape ni mogoče uporabiti."),
         (ShareFailedSwitch, "Deljenja ni bilo mogoče zagnati: {s} ni uporaben. Za nov poskus deljenje izklopite in znova vklopite."),
         (PreventSleepRefused, "Ni dejavno: sistem je zavrnil ({c})"),
+        (CloseWindow, "Zapri okno"),
     ],
 };
 
@@ -1350,6 +1354,7 @@ pub static HR: Lang = Lang {
         (ShareFailedKey, "Dijeljenje se nije moglo pokrenuti: host.key ili njegova mapa ne mogu se koristiti."),
         (ShareFailedSwitch, "Dijeljenje se nije moglo pokrenuti: {s} nije upotrebljiv. Za novi pokušaj isključite i ponovno uključite dijeljenje."),
         (PreventSleepRefused, "Nije aktivno: sustav je odbio ({c})"),
+        (CloseWindow, "Zatvori prozor"),
     ],
 };
 
@@ -1620,5 +1625,6 @@ pub static UK: Lang = Lang {
         (ShareFailedKey, "Не вдалося запустити спільний доступ: host.key або його папку не можна використати."),
         (ShareFailedSwitch, "Не вдалося запустити спільний доступ: {s} не можна використати. Вимкніть і знову ввімкніть спільний доступ, щоб спробувати ще раз."),
         (PreventSleepRefused, "Не активно: система відхилила ({c})"),
+        (CloseWindow, "Закрити вікно"),
     ],
 };

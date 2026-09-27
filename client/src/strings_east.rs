@@ -270,6 +270,7 @@ pub static PL: Lang = Lang {
         (ShareFailedKey, "Nie udało się uruchomić udostępniania: nie można użyć pliku host.key lub jego folderu."),
         (ShareFailedSwitch, "Nie udało się uruchomić udostępniania: nie można użyć {s}. Wyłącz i ponownie włącz udostępnianie, aby spróbować jeszcze raz."),
         (PreventSleepRefused, "Nieaktywne: odrzucone przez system ({c})"),
+        (CloseWindow, "Zamknij okno"),
     ],
 };
 
@@ -540,6 +541,7 @@ pub static CS: Lang = Lang {
         (ShareFailedKey, "Sdílení se nepodařilo spustit: soubor host.key nebo jeho složku nelze použít."),
         (ShareFailedSwitch, "Sdílení se nepodařilo spustit: {s} nelze použít. Pro nový pokus sdílení vypněte a znovu zapněte."),
         (PreventSleepRefused, "Neaktivní: systém odmítl ({c})"),
+        (CloseWindow, "Zavřít okno"),
     ],
 };
 
@@ -810,6 +812,7 @@ pub static SK: Lang = Lang {
         (ShareFailedKey, "Zdieľanie sa nepodarilo spustiť: súbor host.key alebo jeho priečinok nemožno použiť."),
         (ShareFailedSwitch, "Zdieľanie sa nepodarilo spustiť: {s} nemožno použiť. Pre nový pokus zdieľanie vypnite a znova zapnite."),
         (PreventSleepRefused, "Neaktívne: systém odmietol ({c})"),
+        (CloseWindow, "Zavrieť okno"),
     ],
 };
 
@@ -1080,6 +1083,7 @@ pub static HU: Lang = Lang {
         (ShareFailedKey, "A megosztás nem indult el: a host.key vagy a mappája nem használható."),
         (ShareFailedSwitch, "A megosztás nem indult el: a(z) {s} nem használható. Az újrapróbáláshoz kapcsolja ki, majd be a megosztást."),
         (PreventSleepRefused, "Nem aktív: a rendszer elutasította ({c})"),
+        (CloseWindow, "Ablak bezárása"),
     ],
 };
 
@@ -1350,6 +1354,7 @@ pub static RO: Lang = Lang {
         (ShareFailedKey, "Partajarea nu a putut porni: host.key sau dosarul său nu poate fi folosit."),
         (ShareFailedSwitch, "Partajarea nu a putut porni: {s} nu poate fi folosit. Dezactivați și reactivați partajarea pentru a reîncerca."),
         (PreventSleepRefused, "Inactiv: refuzat de sistem ({c})"),
+        (CloseWindow, "Închide fereastra"),
     ],
 };
 
@@ -1620,6 +1625,7 @@ pub static BG: Lang = Lang {
         (ShareFailedKey, "Споделянето не можа да стартира: host.key или папката му не може да се използва."),
         (ShareFailedSwitch, "Споделянето не можа да стартира: {s} не може да се използва. Изключете и включете отново споделянето, за да опитате пак."),
         (PreventSleepRefused, "Неактивно: отказано от системата ({c})"),
+        (CloseWindow, "Затвори прозореца"),
     ],
 };
 
@@ -1890,5 +1896,6 @@ pub static EL: Lang = Lang {
         (ShareFailedKey, "Η κοινή χρήση δεν ξεκίνησε: το host.key ή ο φάκελός του δεν μπορεί να χρησιμοποιηθεί."),
         (ShareFailedSwitch, "Η κοινή χρήση δεν ξεκίνησε: το {s} δεν μπορεί να χρησιμοποιηθεί. Απενεργοποιήστε και ενεργοποιήστε ξανά την κοινή χρήση για νέα προσπάθεια."),
         (PreventSleepRefused, "Ανενεργό: απορρίφθηκε από το σύστημα ({c})"),
+        (CloseWindow, "Κλείσιμο παραθύρου"),
     ],
 };

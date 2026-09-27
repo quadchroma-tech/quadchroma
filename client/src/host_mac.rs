@@ -50,6 +50,9 @@ pub const APP_FREIGABE: c_int = 3;
 pub const APP_RUHE: c_int = 4;
 pub const APP_NAME: c_int = 5;
 pub const APP_BEENDEN: c_int = 6;
+/// Punkt im Programmmenue (Cmd+Q), solange das Symbol steht: das Fenster
+/// schliessen wie das rote Knoepfchen.
+pub const APP_SCHLIESSEN: c_int = 7;
 
 /// qc_dienst_cfg aus host/dienst.h.
 #[repr(C)]
@@ -78,6 +81,7 @@ struct AppStandC {
     host_namen: *const *const c_char,
     host_adressen: *const *const c_char,
     ruhe_grund: *const c_char,
+    schliessen_titel: *const c_char,
 }
 
 extern "C" {
@@ -113,6 +117,10 @@ extern "C" {
     fn qc_texte_setzen_code(code: *const c_char) -> c_int;
     /// Werkzeuge der Kommandozeile (--list, --formattest, --capture ohne --serve).
     fn qc_werkzeug(argc: c_int, argv: *const *const c_char) -> c_int;
+    /// "Beim Anmelden starten": Stand (QC_ANMELDUNG_*), wie der Punkt im Menue.
+    fn qc_anmeldung_stand() -> c_int;
+    /// Umschalten wie der Punkt im Menue (Hauptfaden).
+    fn qc_anmeldung_umschalten();
 }
 
 // ------------------------------------------------------------ Befehlszeile
@@ -199,6 +207,7 @@ pub fn wahl_aus(was: c_int, wert: Option<&str>) -> Option<Wahl> {
         APP_RUHE => Wahl::Aktion(Aktion::RuheVerhindern),
         APP_NAME => Wahl::Name(wert.unwrap_or("").to_string()),
         APP_BEENDEN => Wahl::Aktion(Aktion::Beenden),
+        APP_SCHLIESSEN => Wahl::Aktion(Aktion::FensterSchliessen),
         _ => return None,
     })
 }
@@ -418,6 +427,11 @@ pub struct Stand {
     pub tooltip: String,
     /// Gefundene Hosts (Name - schon entschaerft -, Adresse), hoechstens vier.
     pub hosts: Vec<(String, String)>,
+    /// Der Punkt im Programmmenue (Cmd+Q): leer = "QuadChroma beenden" -
+    /// ohne Symbol oder mit tray=aus beendet Schliessen ohnehin; sonst sein
+    /// Titel ("Fenster schliessen", schon uebersetzt): er schliesst nur das
+    /// Fenster, beendet wird im Menue der Menueleiste.
+    pub schliessen_titel: String,
 }
 
 /// Das Symbol der einen App aus Sicht von main.rs. Es selbst baut menue.m
@@ -452,6 +466,7 @@ impl Symbol {
         let c = |t: &str| CString::new(t.replace('\0', " ")).unwrap_or_default();
         let tooltip = c(&s.tooltip);
         let ruhe_grund = c(&s.ruhe_grund);
+        let schliessen_titel = c(&s.schliessen_titel);
         let namen: Vec<CString> = s.hosts.iter().map(|(n, _)| c(n)).collect();
         let adressen: Vec<CString> = s.hosts.iter().map(|(_, a)| c(a)).collect();
         let nz: Vec<*const c_char> = namen.iter().map(|n| n.as_ptr()).collect();
@@ -465,6 +480,7 @@ impl Symbol {
             host_namen: nz.as_ptr(),
             host_adressen: az.as_ptr(),
             ruhe_grund: ruhe_grund.as_ptr(),
+            schliessen_titel: schliessen_titel.as_ptr(),
         };
         // SAFETY: alle Zeiger leben waehrend des Aufrufs; menue.m kopiert.
         unsafe { qc_app_stand_setzen(&st) };
@@ -530,6 +546,47 @@ pub fn leisten_optionen(jetzt: usize) -> Option<usize> {
 /// Betreten setzt winit die Optionen, bevor AppKit FullScreen traegt.
 pub fn leisten_zurueck() -> bool {
     objc::praesentation_zuruecksetzen(leisten_optionen)
+}
+
+// ------------------------------------------------------ Beim Anmelden starten
+
+/// Stand von "Beim Anmelden starten" (SMAppService.mainApp) - derselbe, den
+/// der Punkt im Menue der Menueleiste zeigt (QC_ANMELDUNG_* in dienst.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anmeldung {
+    /// Die App liegt nicht in /Applications: das Anmeldeobjekt zeigte ins
+    /// Leere (DMG, Downloads, App Translocation) - gesperrt.
+    NichtInProgramme,
+    Aus,
+    An,
+    /// Eingetragen, aber in den Systemeinstellungen nicht erlaubt.
+    FreigabeNoetig,
+}
+
+impl Anmeldung {
+    fn aus_c(n: c_int) -> Anmeldung {
+        match n {
+            0 => Anmeldung::NichtInProgramme,
+            2 => Anmeldung::An,
+            3 => Anmeldung::FreigabeNoetig,
+            _ => Anmeldung::Aus,
+        }
+    }
+}
+
+/// Der Stand jetzt (fragt SMAppService - nicht je Bild rufen).
+pub fn anmeldung_stand() -> Anmeldung {
+    // SAFETY: ohne Argumente; liest nur.
+    Anmeldung::aus_c(unsafe { qc_anmeldung_stand() })
+}
+
+/// Umschalten wie der Punkt im Menue: an bzw. aus (auf der Warteschlange
+/// der Oberflaeche, danach liest das Menue neu), eingetragen aber nicht
+/// erlaubt oeffnet die Systemeinstellungen, ausserhalb von /Applications
+/// nichts. Hauptfaden.
+pub fn anmeldung_umschalten() {
+    // SAFETY: Hauptfaden (Ereignisschleife), ohne Argumente.
+    unsafe { qc_anmeldung_umschalten() };
 }
 
 // ------------------------------------------------------------ Objective-C
@@ -714,6 +771,7 @@ pub fn selbsttest() -> i32 {
         sitzung: false,
         tooltip: "QuadChroma – Selbsttest".into(),
         hosts: vec![("Selbsttest".into(), "127.0.0.1:9".into())],
+        schliessen_titel: String::new(),
     });
     // SAFETY: Hauptfaden, nach dem Einrichten.
     unsafe { qc_oberflaeche_fertig() };
@@ -800,6 +858,44 @@ pub fn selbsttest() -> i32 {
     if !cmd_q {
         fehler.push("Programmmenue ohne \"QuadChroma beenden\" (Cmd+Q)".into());
     }
+    // Steht das Symbol, schliesst Cmd+Q nur das Fenster: der Punkt heisst
+    // dann, wie der Client ihn nennt, und seine Wahl ist FensterSchliessen.
+    s.stand_setzen(&Stand {
+        freigabe: false,
+        ruhe: true,
+        ruhe_grund: String::new(),
+        sitzung: false,
+        tooltip: "QuadChroma – Selbsttest".into(),
+        hosts: vec![("Selbsttest".into(), "127.0.0.1:9".into())],
+        schliessen_titel: "Fenster schließen".into(),
+    });
+    // SAFETY: Hauptfaden.
+    let zu = unsafe {
+        let app = objc::id(objc::klasse(c"NSApplication"), c"sharedApplication");
+        let prog = objc::id(objc::id_int(objc::id(app, c"mainMenu"), c"itemAtIndex:", 0), c"submenu");
+        (0..objc::int(prog, c"numberOfItems")).find_map(|i| {
+            let it = objc::id_int(prog, c"itemAtIndex:", i);
+            let passt = objc::text(objc::id(it, c"keyEquivalent")) == "q" && objc::text(objc::id(it, c"title")) == "Fenster schließen";
+            passt.then_some((prog, i))
+        })
+    };
+    match zu {
+        Some((prog, i)) => {
+            AUFGEZEICHNET.lock().map(|mut l| l.clear()).ok();
+            // SAFETY: Hauptfaden, gueltiger Index.
+            unsafe { objc::nichts_int(prog, c"performActionForItemAtIndex:", i) };
+            let ist = AUFGEZEICHNET.lock().map(|l| l.clone()).unwrap_or_default();
+            if ist != [Wahl::Aktion(Aktion::FensterSchliessen)] {
+                fehler.push(format!("\"Fenster schließen\" im Programmmenue: {ist:?}"));
+            }
+        }
+        None => fehler.push("Programmmenue ohne \"Fenster schließen\" (Cmd+Q), obwohl das Symbol steht".into()),
+    }
+    // "Beim Anmelden starten": der Pruefling liegt nicht in /Applications -
+    // gesperrt wie der Punkt im Menue.
+    if anmeldung_stand() != Anmeldung::NichtInProgramme {
+        fehler.push(format!("Beim Anmelden starten ausserhalb von /Applications: {:?}", anmeldung_stand()));
+    }
     // Die Bearbeiten-Tasten (Cmd+Z/X/C/V/A) nicht im Baum des Hauptmenues -
     // dort schluckte es sie auch im Fenster des Clients und in einer Sitzung
     // -, sondern im QCHauptmenue, das sie nur Textfeldern gibt.
@@ -834,6 +930,7 @@ pub fn selbsttest() -> i32 {
         sitzung: false,
         tooltip: "QuadChroma – Selbsttest".into(),
         hosts: vec![("Selbsttest".into(), "127.0.0.1:9".into())],
+        schliessen_titel: String::new(),
     });
     let englisch = (0..40).any(|_| {
         // SAFETY: Hauptfaden; das Menue lebt, solange das Symbol lebt.
@@ -1003,6 +1100,7 @@ mod tests {
         assert_eq!(wahl_aus(APP_NAME, Some("Büro-Mac")), Some(Wahl::Name("Büro-Mac".into())));
         assert_eq!(wahl_aus(APP_NAME, None), Some(Wahl::Name(String::new())));
         assert_eq!(wahl_aus(APP_BEENDEN, None), Some(Wahl::Aktion(Aktion::Beenden)));
+        assert_eq!(wahl_aus(APP_SCHLIESSEN, None), Some(Wahl::Aktion(Aktion::FensterSchliessen)));
         assert_eq!(wahl_aus(0, None), None);
         assert_eq!(wahl_aus(99, Some("x")), None);
     }

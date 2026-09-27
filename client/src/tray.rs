@@ -151,6 +151,17 @@ pub fn beim_schliessen(tray_an: bool, symbol_steht: bool, sitzung: bool, hinweis
     Schliessen::Ablegen { trennen: sitzung, hinweis: !hinweis_gezeigt }
 }
 
+/// Wie der Knopf im Startbildschirm heisst - und auf dem Mac der Punkt im
+/// Programmmenue (Cmd+Q): was er tut. Solange Schliessen ablegt (das Symbol
+/// steht, tray=an), "Fenster schliessen" - beendet wird dann nur im Menue des
+/// Symbols; ohne Symbol oder mit tray=aus beendet er und heisst "Beenden".
+pub fn schliessen_text(tray_an: bool, symbol_steht: bool) -> Key {
+    match beim_schliessen(tray_an, symbol_steht, false, true) {
+        Schliessen::Beenden => Key::Quit,
+        Schliessen::Ablegen { .. } => Key::CloseWindow,
+    }
+}
+
 /// So lange darf ein frisch angelegtes Symbol brauchen, bis es steht, ehe
 /// das Protokoll warnt. Auf dem Mac entsteht es erst auf der Main Queue
 /// (menue.m, nach dem ersten gelesenen Zustand) und steht erst, wenn macOS
@@ -224,6 +235,21 @@ mod tests {
                 assert_eq!(beim_schliessen(true, false, sitzung, hinweis), Schliessen::Beenden);
                 assert_eq!(beim_schliessen(false, false, sitzung, hinweis), Schliessen::Beenden);
             }
+        }
+    }
+
+    /// Der Knopf heisst, was er tut: mit stehendem Symbol "Fenster
+    /// schliessen", ohne Symbol oder mit tray=aus "Beenden" - dieselbe
+    /// Entscheidung wie beim Schliessen.
+    #[test]
+    fn knopf_heisst_was_er_tut() {
+        assert_eq!(schliessen_text(true, true), Key::CloseWindow);
+        assert_eq!(schliessen_text(true, false), Key::Quit);
+        assert_eq!(schliessen_text(false, true), Key::Quit);
+        assert_eq!(schliessen_text(false, false), Key::Quit);
+        for (tray, steht) in [(true, true), (true, false), (false, true), (false, false)] {
+            let beendet = beim_schliessen(tray, steht, false, false) == Schliessen::Beenden;
+            assert_eq!(schliessen_text(tray, steht) == Key::Quit, beendet);
         }
     }
 

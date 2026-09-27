@@ -272,6 +272,7 @@ pub static FR: Lang = Lang {
         (ShareFailedKey, "Le partage n'a pas pu démarrer : host.key ou son dossier est inutilisable."),
         (ShareFailedSwitch, "Le partage n'a pas pu démarrer : {s} est inutilisable. Désactivez puis réactivez le partage pour réessayer."),
         (PreventSleepRefused, "Inactif : refusé par le système ({c})"),
+        (CloseWindow, "Fermer la fenêtre"),
     ],
 };
 
@@ -542,6 +543,7 @@ pub static ES: Lang = Lang {
         (ShareFailedKey, "No se pudo iniciar el uso compartido: host.key o su carpeta no se pueden usar."),
         (ShareFailedSwitch, "No se pudo iniciar el uso compartido: {s} no se puede usar. Desactívalo y vuelve a activarlo para reintentarlo."),
         (PreventSleepRefused, "No activo: rechazado por el sistema ({c})"),
+        (CloseWindow, "Cerrar ventana"),
     ],
 };
 
@@ -812,6 +814,7 @@ pub static IT: Lang = Lang {
         (ShareFailedKey, "Impossibile avviare la condivisione: host.key o la sua cartella non sono utilizzabili."),
         (ShareFailedSwitch, "Impossibile avviare la condivisione: {s} non è utilizzabile. Disattivala e riattivala per riprovare."),
         (PreventSleepRefused, "Non attivo: rifiutato dal sistema ({c})"),
+        (CloseWindow, "Chiudi finestra"),
     ],
 };
 
@@ -1082,6 +1085,7 @@ pub static PT: Lang = Lang {
         (ShareFailedKey, "Não foi possível iniciar a partilha: host.key ou a sua pasta não pode ser usado."),
         (ShareFailedSwitch, "Não foi possível iniciar a partilha: {s} não pode ser usado. Desative e volte a ativar a partilha para tentar de novo."),
         (PreventSleepRefused, "Inativo: recusado pelo sistema ({c})"),
+        (CloseWindow, "Fechar janela"),
     ],
 };
 
@@ -1352,5 +1356,6 @@ pub static NL: Lang = Lang {
         (ShareFailedKey, "Delen kon niet starten: host.key of de map ervan is niet bruikbaar."),
         (ShareFailedSwitch, "Delen kon niet starten: {s} is niet bruikbaar. Zet delen uit en weer aan om het opnieuw te proberen."),
         (PreventSleepRefused, "Niet actief: geweigerd door het systeem ({c})"),
+        (CloseWindow, "Venster sluiten"),
     ],
 };

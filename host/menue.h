@@ -97,6 +97,7 @@ typedef NS_ENUM(NSInteger, QCAktion) {
     QCAktionNameAendern,          // Fenster "Geraetename"
     QCAktionFreigabe,             // Haken "Diesen Mac freigeben"
     QCAktionRuhe,                 // Haken "Ruhezustand verhindern"
+    QCAktionFensterSchliessen,    // Programmmenue (Cmd+Q), solange das Symbol steht
 };
 
 @interface QCMenuePunkt : NSObject
@@ -149,10 +150,14 @@ QCText qc_geraetename_fehler(NSString *eingabe, int (*pruefen)(const char *));
 // Baum schluckte seine Taste auch dort: performKeyEquivalent: liefert YES,
 // auch wenn der Punkt ohne Ziel gesperrt ist. Kein Cmd+W: in der Sitzung
 // gehoert es dem Mac drueben. sitzung: Cmd+Q und Cmd+H ebenso.
+// schliessen (nicht leer, schon uebersetzt): statt "QuadChroma beenden"
+// dieser Punkt mit Cmd+Q und QCAktionFensterSchliessen - solange das Symbol
+// steht, schliesst Cmd+Q nur das Fenster; beendet wird im Menue der
+// Menueleiste (qc_app_stand.schliessen_titel).
 @interface QCHauptmenue : NSMenu
 @property(nonatomic, strong, readonly) NSMenu *bearbeiten;
 @end
-QCHauptmenue *qc_programmmenue_bauen(id ziel, BOOL sitzung);
+QCHauptmenue *qc_programmmenue_bauen(id ziel, BOOL sitzung, NSString *schliessen);
 // Der Teil von performKeyEquivalent: des Hauptmenues fuer die Bearbeiten-
 // Tasten: YES, wenn ersthelfer ein Textfeld ist (Feldeditor, NSText) und
 // bearbeiten die Taste nimmt; sonst NO - dann gilt nur das Programmmenue.

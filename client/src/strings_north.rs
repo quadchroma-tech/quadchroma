@@ -270,6 +270,7 @@ pub static SV: Lang = Lang {
         (ShareFailedKey, "Delningen kunde inte starta: host.key eller dess mapp går inte att använda."),
         (ShareFailedSwitch, "Delningen kunde inte starta: {s} går inte att använda. Stäng av och slå på delningen för att försöka igen."),
         (PreventSleepRefused, "Inte aktiv: nekad av systemet ({c})"),
+        (CloseWindow, "Stäng fönstret"),
     ],
 };
 
@@ -540,6 +541,7 @@ pub static DA: Lang = Lang {
         (ShareFailedKey, "Delingen kunne ikke starte: host.key eller dens mappe kan ikke bruges."),
         (ShareFailedSwitch, "Delingen kunne ikke starte: {s} kan ikke bruges. Slå deling fra og til igen for at prøve igen."),
         (PreventSleepRefused, "Ikke aktiv: afvist af systemet ({c})"),
+        (CloseWindow, "Luk vinduet"),
     ],
 };
 
@@ -810,6 +812,7 @@ pub static NB: Lang = Lang {
         (ShareFailedKey, "Delingen kunne ikke starte: host.key eller mappen kan ikke brukes."),
         (ShareFailedSwitch, "Delingen kunne ikke starte: {s} kan ikke brukes. Slå delingen av og på igjen for å prøve på nytt."),
         (PreventSleepRefused, "Ikke aktiv: avvist av systemet ({c})"),
+        (CloseWindow, "Lukk vinduet"),
     ],
 };
 
@@ -1080,6 +1083,7 @@ pub static FI: Lang = Lang {
         (ShareFailedKey, "Jakamista ei voitu käynnistää: host.key tai sen kansio ei ole käytettävissä."),
         (ShareFailedSwitch, "Jakamista ei voitu käynnistää: {s} ei ole käytettävissä. Yritä uudelleen kytkemällä jakaminen pois ja takaisin päälle."),
         (PreventSleepRefused, "Ei käytössä: järjestelmä kieltäytyi ({c})"),
+        (CloseWindow, "Sulje ikkuna"),
     ],
 };
 
@@ -1350,5 +1354,6 @@ pub static IS: Lang = Lang {
         (ShareFailedKey, "Ekki tókst að hefja deilingu: ekki er hægt að nota host.key eða möppu hennar."),
         (ShareFailedSwitch, "Ekki tókst að hefja deilingu: ekki er hægt að nota {s}. Slökktu á deilingu og kveiktu aftur til að reyna aftur."),
         (PreventSleepRefused, "Ekki virkt: kerfið hafnaði ({c})"),
+        (CloseWindow, "Loka glugganum"),
     ],
 };

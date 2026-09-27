@@ -273,6 +273,7 @@ pub static RU: Lang = Lang {
         (ShareFailedKey, "Не удалось запустить общий доступ: host.key или его папку нельзя использовать."),
         (ShareFailedSwitch, "Не удалось запустить общий доступ: {s} нельзя использовать. Выключите и снова включите общий доступ, чтобы повторить попытку."),
         (PreventSleepRefused, "Не активно: система отклонила ({c})"),
+        (CloseWindow, "Закрыть окно"),
     ],
 };
 
@@ -545,6 +546,7 @@ pub static ZH: Lang = Lang {
         (ShareFailedKey, "无法开始共享：host.key 或其文件夹无法使用。"),
         (ShareFailedSwitch, "无法开始共享：{s} 无法使用。关闭后重新打开共享即可重试。"),
         (PreventSleepRefused, "未生效：被系统拒绝（{c}）"),
+        (CloseWindow, "关闭窗口"),
     ],
 };
 
@@ -817,6 +819,7 @@ pub static JA: Lang = Lang {
         (ShareFailedKey, "共有を開始できませんでした：host.key またはそのフォルダーを使用できません。"),
         (ShareFailedSwitch, "共有を開始できませんでした：{s} を使用できません。共有をオフにしてからオンにすると再試行します。"),
         (PreventSleepRefused, "無効：システムに拒否されました（{c}）"),
+        (CloseWindow, "ウィンドウを閉じる"),
     ],
 };
 
@@ -1087,5 +1090,6 @@ pub static TR: Lang = Lang {
         (ShareFailedKey, "Paylaşım başlatılamadı: host.key veya klasörü kullanılamıyor."),
         (ShareFailedSwitch, "Paylaşım başlatılamadı: {s} kullanılamıyor. Yeniden denemek için paylaşımı kapatıp açın."),
         (PreventSleepRefused, "Etkin değil: sistem reddetti ({c})"),
+        (CloseWindow, "Pencereyi kapat"),
     ],
 };

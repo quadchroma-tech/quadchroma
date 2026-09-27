@@ -699,7 +699,7 @@ static void app_modell_pruefen(void) {
            "nil wird als leerer Text geprueft (leer = Rechnername)");
 
     printf("\n-- Programmmenue der einen App\n");
-    QCHauptmenue *haupt = qc_programmmenue_bauen(nil, NO);
+    QCHauptmenue *haupt = qc_programmmenue_bauen(nil, NO, nil);
     NSMenu *prog = haupt.itemArray.firstObject.submenu;
     NSMenuItem *ende = nil;
     int verborgen_ohne = 0;
@@ -738,13 +738,37 @@ static void app_modell_pruefen(void) {
     pruefe([haupt performKeyEquivalent:taste(@"q", 0)] && [haupt performKeyEquivalent:taste(@"h", 0)],
            "Cmd+Q und Cmd+H nimmt das Programmmenue");
 
-    QCHauptmenue *sitzung = qc_programmmenue_bauen(nil, YES);
+    QCHauptmenue *sitzung = qc_programmmenue_bauen(nil, YES, nil);
     pruefe(tasten_von(sitzung.itemArray.firstObject.submenu).count == 0 && tasten_von(sitzung.bearbeiten).count == 6,
            "in einer Sitzung: Cmd+Q und Cmd+H gehen an den Mac drueben, Bearbeiten bleibt fuer Textfelder");
     genommen = 0;
     for (NSEvent *e in [bearb arrayByAddingObjectsFromArray:@[ taste(@"q", 0), taste(@"h", 0) ]])
         genommen += [sitzung performKeyEquivalent:e];
     pruefe(genommen == 0, "in einer Sitzung nimmt das Hauptmenue ohne Textfeld keine dieser Tasten");
+
+    // Steht das Symbol, beendet nur dessen Menue: Cmd+Q schliesst das
+    // Fenster, der Punkt traegt den Titel des Clients. Leer heisst beenden.
+    QCHauptmenue *nur_fenster = qc_programmmenue_bauen(nil, NO, @"Fenster schließen");
+    NSMenu *prog2 = nur_fenster.itemArray.firstObject.submenu;
+    NSMenuItem *zu = nil;
+    int beenden_da = 0;
+    for (NSMenuItem *it in prog2.itemArray) {
+        if (it.tag == QCAktionFensterSchliessen) zu = it;
+        if (it.tag == QCAktionBeenden) beenden_da++;
+    }
+    pruefe(zu && !zu.hidden && [zu.title isEqualToString:@"Fenster schließen"] && [zu.keyEquivalent isEqualToString:@"q"] &&
+           zu.action == @selector(menueAktion:) && beenden_da == 0,
+           "Symbol steht: \"Fenster schließen\" mit Cmd+Q (QCAktionFensterSchliessen), kein Beenden im Programmmenue");
+    pruefe(titel_gleich(tasten_von(prog2), @[ @"h hide:", @"q menueAktion:" ]), "Programmmenue: Ausblenden, Fenster schliessen");
+    pruefe([nur_fenster performKeyEquivalent:taste(@"q", 0)], "Cmd+Q nimmt das Programmmenue (schliesst das Fenster)");
+    QCHauptmenue *leer = qc_programmmenue_bauen(nil, NO, @"");
+    NSMenuItem *leer_ende = nil;
+    for (NSMenuItem *it in leer.itemArray.firstObject.submenu.itemArray)
+        if (it.tag == QCAktionBeenden) leer_ende = it;
+    pruefe(leer_ende && [leer_ende.title isEqualToString:@"Quit QuadChroma"], "leerer Titel: \"Quit QuadChroma\" wie ohne Symbol");
+    QCHauptmenue *zu_sitzung = qc_programmmenue_bauen(nil, YES, @"Fenster schließen");
+    pruefe(tasten_von(zu_sitzung.itemArray.firstObject.submenu).count == 0,
+           "in einer Sitzung auch als \"Fenster schließen\" ohne Cmd+Q (geht an den Mac drueben)");
 }
 
 static void zustand_pruefen(void) {

@@ -176,6 +176,10 @@ pub enum Aktion {
     FreigabeBeenden,
     /// Die App beenden (Abschied Grund 0).
     Beenden,
+    /// Nur auf dem Mac, aus dem Programmmenue (Cmd+Q, solange das Symbol
+    /// steht): das Fenster schliessen wie das rote Knoepfchen - nicht
+    /// beenden. Das Menue am Symbol unter Windows kennt es nicht.
+    FensterSchliessen,
 }
 
 /// Wozu die Nummern der Hosts und Geraete in genau diesem Menue gehoeren.

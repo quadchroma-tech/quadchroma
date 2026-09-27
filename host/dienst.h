@@ -68,6 +68,7 @@ typedef struct {
 #define QC_APP_RUHE       4   // Haken "Ruhezustand verhindern" umschalten
 #define QC_APP_NAME       5   // neuer Geraetename aus dem Fenster, wert = Eingabe (leer = Rechnername)
 #define QC_APP_BEENDEN    6   // "QuadChroma beenden" (Menue, Cmd+Q)
+#define QC_APP_SCHLIESSEN 7   // Programmmenue (Cmd+Q), solange das Symbol steht: nur das Fenster schliessen
 
 // Startet den Dienst ohne Run-Loop und kehrt zurueck: Einzelinstanz,
 // Schluessel, Zugang, Oberflaeche (Symbol erst mit qc_oberflaeche_fertig),
@@ -131,8 +132,13 @@ void qc_dienst_name_setzen(const char *name);
 // uebersetzt, NULL oder leer = kein Grund), die gefundenen Hosts fuer
 // "Verbinden: <Host>" (hoechstens 4, name darf leer sein), der Tooltip und
 // ob eine Sitzung laeuft (dann gehen Cmd+Q und Cmd+H an den Mac drueben
-// statt an das Programmmenue). Die Texte gelten nur waehrend des Aufrufs.
-// Das Menue wird nur neu gebaut, wenn sich etwas aendert.
+// statt an das Programmmenue). schliessen_titel: der Punkt des
+// Programmmenues mit Cmd+Q - NULL oder leer heisst "QuadChroma beenden"
+// (QC_APP_BEENDEN; ohne Symbol oder mit tray=aus beendet auch das
+// Schliessen), sonst dieser Titel (vom Client uebersetzt, "Fenster
+// schliessen"): er schliesst nur das Fenster (QC_APP_SCHLIESSEN) - beendet
+// wird dann nur im Menue der Menueleiste. Die Texte gelten nur waehrend des
+// Aufrufs. Das Menue wird nur neu gebaut, wenn sich etwas aendert.
 typedef struct {
     int freigabe;
     int ruhe;
@@ -142,6 +148,7 @@ typedef struct {
     const char *const *host_namen;
     const char *const *host_adressen;
     const char *ruhe_grund;
+    const char *schliessen_titel;
 } qc_app_stand;
 void qc_app_stand_setzen(const qc_app_stand *s);
 
@@ -156,6 +163,18 @@ void qc_geraetename_fenster(void);
 // Fuer den Selbsttest des Clients (--menueleiste-selbsttest): das NSMenu des
 // Symbols, NULL solange es kein Symbol gibt.
 void *qc_menueleiste_menue(void);
+
+// "Beim Anmelden starten" (SMAppService.mainApp) fuer das Kaestchen im
+// Startbildschirm: derselbe Stand, den der Punkt im Menue zeigt, und
+// dasselbe Umschalten (an bzw. aus auf der Warteschlange der Oberflaeche,
+// danach liest das Menue neu; eingetragen, aber nicht erlaubt: die
+// Systemeinstellungen oeffnen; nicht in /Applications: nichts). Hauptfaden.
+#define QC_ANMELDUNG_NICHT_IN_PROGRAMME 0   // App nicht in /Applications: gesperrt
+#define QC_ANMELDUNG_AUS                1
+#define QC_ANMELDUNG_AN                 2
+#define QC_ANMELDUNG_FREIGABE_NOETIG    3   // eingetragen, in den Systemeinstellungen nicht erlaubt
+int qc_anmeldung_stand(void);
+void qc_anmeldung_umschalten(void);
 
 // Werkzeuge der Kommandozeile (--list, --formattest, --capture ohne --serve):
 // laufen zu Ende und liefern den Exit-Code. Ohne Werkzeug-Schalter

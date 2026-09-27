@@ -362,12 +362,17 @@ static int g_programm_sprache = -1;        // Sprache des Programmmenues (nur Ha
 static NSArray<NSArray<NSString *> *> *g_app_hosts;
 static NSString *g_app_tooltip;
 static NSString *g_app_ruhe_grund;               // leer = kein Grund
+static NSString *g_app_schliessen_titel;         // Programmmenue: leer = "QuadChroma beenden" (nur Hauptfaden)
 
 static NSObject *app_sperre(void) {
     static dispatch_once_t einmal;
     dispatch_once(&einmal, ^{ g_app_sperre = [[NSObject alloc] init]; });
     return g_app_sperre;
 }
+
+_Static_assert(QCAnmeldenNichtInProgramme == QC_ANMELDUNG_NICHT_IN_PROGRAMME && QCAnmeldenAus == QC_ANMELDUNG_AUS &&
+               QCAnmeldenAn == QC_ANMELDUNG_AN && QCAnmeldenFreigabeNoetig == QC_ANMELDUNG_FREIGABE_NOETIG,
+               "QCAnmelden und QC_ANMELDUNG_* (dienst.h) muessen gleich zaehlen");
 
 static QCAnmelden anmelden_lesen(void) {
     // Ein Anmeldeobjekt zeigt auf den Ort der App. Von der DMG, aus
@@ -1021,12 +1026,16 @@ BOOL qc_bearbeiten_taste(NSMenu *haupt, NSEvent *e, NSResponder *ersthelfer) {
     return [((QCHauptmenue *)haupt).bearbeiten performKeyEquivalent:e];
 }
 
-QCHauptmenue *qc_programmmenue_bauen(id ziel, BOOL sitzung) {
+QCHauptmenue *qc_programmmenue_bauen(id ziel, BOOL sitzung, NSString *schliessen) {
     NSMenu *programm = [[NSMenu alloc] initWithTitle:@"QuadChroma"];
-    NSMenuItem *ende = [[NSMenuItem alloc] initWithTitle:qc_text(QCTextHostQuit) action:@selector(menueAktion:)
+    // Solange das Symbol steht, beendet nur dessen Menue: Cmd+Q schliesst
+    // dann das Fenster wie das rote Knoepfchen, und der Punkt heisst so.
+    BOOL nur_fenster = schliessen.length > 0;
+    NSMenuItem *ende = [[NSMenuItem alloc] initWithTitle:nur_fenster ? schliessen : qc_text(QCTextHostQuit)
+                                                  action:@selector(menueAktion:)
                                            keyEquivalent:sitzung ? @"" : @"q"];
     ende.target = ziel;
-    ende.tag = QCAktionBeenden;
+    ende.tag = nur_fenster ? QCAktionFensterSchliessen : QCAktionBeenden;
     NSMenuItem *weg = [[NSMenuItem alloc] initWithTitle:@"" action:@selector(hide:) keyEquivalent:sitzung ? @"" : @"h"];
     weg.hidden = YES;
     weg.allowsKeyEquivalentWhenHidden = YES;
@@ -1197,6 +1206,9 @@ static NSApplicationTerminateReply beenden_erfragen(void) {
             break;
         case QCAktionRuhe:
             if (g_cfg.app) g_cfg.app(QC_APP_RUHE, NULL);
+            break;
+        case QCAktionFensterSchliessen:
+            if (g_cfg.app) g_cfg.app(QC_APP_SCHLIESSEN, NULL);
             break;
         case QCAktionKeine:
             break;
@@ -1373,7 +1385,7 @@ void qc_oberflaeche_fertig(void) {
     if (g_cfg.app) {
         BOOL sitzung;
         @synchronized (app_sperre()) { sitzung = g_app_sitzung; }
-        NSApp.mainMenu = qc_programmmenue_bauen(g_ui, sitzung);
+        NSApp.mainMenu = qc_programmmenue_bauen(g_ui, sitzung, g_app_schliessen_titel);
         g_programm_sprache = qc_texte_aktuell();
     } else if (!g_eingebettet || !NSApp.mainMenu) {
         bearbeiten_menue_setzen();
@@ -1438,6 +1450,7 @@ void qc_app_stand_setzen(const qc_app_stand *s) {
     }
     NSString *tip = (s->tooltip ? [NSString stringWithUTF8String:s->tooltip] : nil) ?: @"QuadChroma";
     NSString *ruhe_grund = (s->ruhe_grund ? [NSString stringWithUTF8String:s->ruhe_grund] : nil) ?: @"";
+    NSString *schliessen = (s->schliessen_titel ? [NSString stringWithUTF8String:s->schliessen_titel] : nil) ?: @"";
     BOOL sitzung_neu;
     @synchronized (app_sperre()) {
         sitzung_neu = g_app_sitzung != (s->sitzung != 0);
@@ -1451,12 +1464,26 @@ void qc_app_stand_setzen(const qc_app_stand *s) {
     if (![NSThread isMainThread]) return;
     if (g_item && ![g_item.button.toolTip isEqualToString:tip]) g_item.button.toolTip = tip;
     // In einer Sitzung gehoeren Cmd+Q und Cmd+H dem Mac drueben; eine neue
-    // Sprache (qc_texte_setzen_code) braucht den neuen Titel von "Beenden".
-    if ((sitzung_neu || g_programm_sprache != qc_texte_aktuell()) && g_cfg.app && NSApp.mainMenu) {
-        NSApp.mainMenu = qc_programmmenue_bauen(g_ui, s->sitzung != 0);
+    // Sprache (qc_texte_setzen_code) braucht den neuen Titel von "Beenden";
+    // steht das Symbol (nicht mehr), wird aus "Beenden" "Fenster schliessen"
+    // und umgekehrt.
+    BOOL schliessen_neu = ![schliessen isEqualToString:g_app_schliessen_titel ?: @""];
+    g_app_schliessen_titel = schliessen;
+    if ((sitzung_neu || schliessen_neu || g_programm_sprache != qc_texte_aktuell()) && g_cfg.app && NSApp.mainMenu) {
+        NSApp.mainMenu = qc_programmmenue_bauen(g_ui, s->sitzung != 0, schliessen);
         g_programm_sprache = qc_texte_aktuell();
     }
     zustand_auffrischen();
+}
+
+// ------------------------------------------------ Beim Anmelden starten (dienst.h)
+
+int qc_anmeldung_stand(void) {
+    return (int)anmelden_lesen();
+}
+
+void qc_anmeldung_umschalten(void) {
+    anmelden_umschalten(anmelden_lesen());
 }
 
 void *qc_menueleiste_menue(void) {

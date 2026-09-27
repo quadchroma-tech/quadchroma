@@ -33,7 +33,7 @@ pub enum Aktion {
 impl Aktion {
     /// Die Aktion des Dienstes zu einem Menuepunkt; None fuer die Punkte, die
     /// die App selbst ausfuehrt (Oeffnen, Verbinden, Name, Schalter,
-    /// Beenden der App).
+    /// Beenden der App, Fenster schliessen).
     pub fn aus_menue(a: &symbolmenue::Aktion) -> Option<Aktion> {
         use symbolmenue::Aktion as M;
         Some(match a {
@@ -45,7 +45,14 @@ impl Aktion {
             M::AlleEntfernen => Aktion::AlleEntfernen,
             M::ListeZuruecksetzen => Aktion::ListeZuruecksetzen,
             M::FreigabeBeenden => Aktion::Beenden,
-            M::Oeffnen | M::Verbinden(_) | M::NameAendern | M::Freigabe | M::Autostart | M::RuheVerhindern | M::Beenden => return None,
+            M::Oeffnen
+            | M::Verbinden(_)
+            | M::NameAendern
+            | M::Freigabe
+            | M::Autostart
+            | M::RuheVerhindern
+            | M::Beenden
+            | M::FensterSchliessen => return None,
         })
     }
 }

@@ -505,6 +505,12 @@ pub enum Key {
     /// neben dem Kaestchen und unter dem Haken im Menue; {c} Fehlercode des
     /// Systems.
     PreventSleepRefused,
+    // Live-Test der einen App
+    /// Knopf im Startbildschirm statt "Beenden", solange das Symbol steht,
+    /// und auf dem Mac der Punkt im Programmmenue (Cmd+Q): das Fenster geht
+    /// zu wie mit dem X bzw. dem roten Knoepfchen, QuadChroma laeuft beim
+    /// Symbol weiter - beendet wird nur im Menue des Symbols.
+    CloseWindow,
 }
 
 pub struct Lang {
@@ -798,6 +804,7 @@ pub static EN: Lang = Lang {
         (ShareFailedKey, "Sharing could not start: host.key or its folder cannot be used."),
         (ShareFailedSwitch, "Sharing could not start: {s} is not usable. Turn sharing off and on to retry."),
         (PreventSleepRefused, "Not active: refused by the system ({c})"),
+        (CloseWindow, "Close window"),
     ],
 };
 
@@ -1068,6 +1075,7 @@ pub static DE: Lang = Lang {
         (ShareFailedKey, "Die Freigabe konnte nicht starten: host.key oder sein Ordner ist nicht nutzbar."),
         (ShareFailedSwitch, "Die Freigabe konnte nicht starten: {s} ist nicht nutzbar. Zum neuen Versuch aus- und wieder einschalten."),
         (PreventSleepRefused, "Nicht aktiv: vom System abgelehnt ({c})"),
+        (CloseWindow, "Fenster schließen"),
     ],
 };
 
@@ -1113,8 +1121,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > PreventSleepRefused as usize);
-        assert_eq!(n, PreventSleepRefused as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > CloseWindow as usize);
+        assert_eq!(n, CloseWindow as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1755,6 +1763,28 @@ mod tests {
                 assert!(!t.contains(w), "{k:?}: {t}");
             }
         }
+    }
+
+    /// "Fenster schliessen" statt "Beenden" im Startbildschirm (und im
+    /// Programmmenue des Mac): am Ende des Enums, in jeder Sprache ein
+    /// kurzer Knopftext ohne Platzhalter und ohne Punkt, nicht "Beenden" in
+    /// irgendeiner Form und ausser im Englischen nicht englisch.
+    #[test]
+    fn fenster_schliessen_text() {
+        assert_eq!(CloseWindow as usize, PreventSleepRefused as usize + 1);
+        for l in all() {
+            let t = l.get(CloseWindow);
+            assert!(!t.contains('{') && !t.ends_with('.') && t.chars().count() <= 24, "{}: {t}", l.code);
+            for k in [Quit, TrayQuit, HostQuit, Disconnect] {
+                assert_ne!(t, l.get(k), "{}: {t}", l.code);
+            }
+            assert!(!t.to_lowercase().contains(&l.get(Quit).to_lowercase()), "{}: {t}", l.code);
+            if l.code != "en" {
+                assert_ne!(t, EN.get(CloseWindow), "{}: noch englisch", l.code);
+            }
+        }
+        assert_eq!(EN.get(CloseWindow), "Close window");
+        assert_eq!(DE.get(CloseWindow), "Fenster schließen");
     }
 
     /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der
