@@ -25,6 +25,7 @@ win=$(eine 'quadchroma-*-windows-x64*.zip')
 mac=$(eine 'QuadChroma-*-macos-arm64*.dmg')
 mac_zip=$(eine 'QuadChroma-*-macos-arm64*.zip')
 nvhdr=$(eine 'nv-codec-headers-*.tar.gz')
+ffmpeg=$(eine 'ffmpeg-*.tar.xz')
 base="https://github.com/$repo/releases/download/$tag"
 
 cat <<EOF
@@ -36,7 +37,7 @@ use - download the file for that computer's platform:
 
 | Computer | Download | Then |
 |---|---|---|
-| **Each Windows PC** | [\`$win\`]($base/$win) | Unzip it anywhere and start \`quadchroma.exe\` inside the folder. Keep the two \`.dll\` files next to it. |
+| **Each Windows PC** | [\`$win\`]($base/$win) | Unzip it and start \`quadchroma.exe\` inside the folder; keep the two \`.dll\` files next to it. Windows asks for **administrator rights** (UAC) at every start - confirm with **Yes** (see "First start"). |
 | **Each Mac** | [\`$mac\`]($base/$mac) | Open it, drag **QuadChroma** to **Applications** and start it. So that other computers can control this Mac, allow **Screen Recording** and **Accessibility** in System Settings > Privacy & Security. |
 
 That is all. After a few seconds every computer with QuadChroma shows the others in
@@ -52,14 +53,14 @@ There are no separate host and client downloads. Sharing is on by default; on a
 computer that should only control others, switch off **Share this PC** (**Share this
 Mac**) in the icon's menu or on the start screen.
 
-Requirements: Windows 10 or 11 (64-bit); a Mac with Apple silicon (M1 or newer)
-and macOS 14 or later; all computers in the same network (or connected through a
-VPN).
+Requirements: Windows 10 or 11 (64-bit) with an administrator account; a Mac with
+Apple silicon (M1 or newer) and macOS 14 or later; all computers in the same network
+(or connected through a VPN).
 
 **You do not need any of the other files:**
 
 - \`$mac_zip\` - the same Mac app as a ZIP instead of a DMG
-- \`ffmpeg-9.0.2.tar.xz\`, \`$nvhdr\`, \`build-ffmpeg-windows.sh\` - source code of the FFmpeg libraries in the Windows download (required by their license)
+- \`$ffmpeg\`, \`$nvhdr\`, \`build-ffmpeg-windows.sh\` - source code of the FFmpeg libraries in the Windows download (required by their license)
 - \`SHA256SUMS.txt\` - checksums, only if you want to verify your downloads
 - **Source code** (zip / tar.gz) - QuadChroma's own source code, added automatically by GitHub
 
@@ -68,9 +69,11 @@ VPN).
 EOF
 
 case "$win" in
-    *-unsigned*) echo "**Windows:** the program is not code-signed yet, so Windows warns once. Easiest: before unzipping, right-click the ZIP > Properties > tick **Unblock** > OK. Otherwise SmartScreen shows \"Windows protected your PC\": click **More info** > **Run anyway**.";;
-    *)           echo "**Windows:** \`quadchroma.exe\` is Authenticode-signed (SHA-256, RFC 3161 timestamp).";;
+    *-unsigned*) echo "**Windows:** the program is not code-signed yet, so SmartScreen warns once. Easiest: before unzipping, right-click the ZIP > Properties > tick **Unblock** > OK. Otherwise SmartScreen shows \"Windows protected your PC\": click **More info** > **Run anyway**. Then Windows asks for administrator rights at every start, with \"Unknown publisher\".";;
+    *)           echo "**Windows:** \`quadchroma.exe\` is Authenticode-signed (SHA-256, RFC 3161 timestamp). Windows asks for administrator rights at every start.";;
 esac
+echo
+echo "Why administrator rights: QuadChroma needs them so that a PC can also be controlled while Task Manager, the registry editor or an installer window is in front - without them Windows drops remote mouse and keyboard input there. Every start by hand shows the UAC prompt (confirm with **Yes**), also on a PC that only controls others. **Start with Windows** (icon menu or start screen) installs the app into \`C:\\Program Files\\QuadChroma\`, where only administrators can change it, and from then on starts it at every logon elevated and without a prompt. Command-line switches need a terminal started as administrator. On a Windows standard account every start needs an administrator's password, and **Start with Windows** is not available."
 echo
 case "$mac" in
     *-unsigned*)    echo "**Mac:** the app is ad-hoc signed only and not notarized. macOS refuses the first start: System Settings > Privacy & Security > **Open Anyway**. After every update Screen Recording and Accessibility must be allowed again.";;
@@ -88,17 +91,35 @@ devices, and offers **Change password**, **Change device name**, **Share this Ma
 (**Share this PC**), **Start at login** (**Start with Windows**), **Prevent sleep while
 QuadChroma is running** and **Quit**.
 
-Updating from an earlier test version: each computer now uses one key in both
-directions, so another computer that knew it only by its former client key asks once
-more for the password or **Allow**.
+The complete manual is \`MANUAL.txt\` - in the Windows ZIP, next to the Mac app in the DMG
+and the Mac ZIP, and inside the app; the license texts are next to it.
 
-The complete manual is \`MANUAL.txt\` in the Windows ZIP and in the DMG.
+## Known limitations
+
+- **No access before sign-in.** After a restart or a logout a computer is reachable
+  only once someone has signed in on it: QuadChroma starts at login, not as a system
+  service. The login screen cannot be controlled remotely.
+- **The Windows UAC prompt itself cannot be controlled.** While Windows shows its
+  consent prompt on the secure desktop, remote mouse and keyboard do not reach it; the
+  viewer shows a hint, and someone at the PC has to answer it.
+- **Administrator rights on Windows** at every manual start (see above); a standard
+  account needs an administrator's password and gets no **Start with Windows**.
+EOF
+
+case "$win" in
+    *-unsigned*) echo "- **The Windows program is not code-signed.** SmartScreen warns once, and on Windows 11 Smart App Control can block it entirely (then only building from source helps).";;
+esac
+case "$mac" in
+    *-unsigned*|*-selfsigned*|*-unnotarized*) echo "- **The Mac app is not notarized by Apple** - see **Mac** under First start for the extra step before the first start.";;
+esac
+
+cat <<EOF
 
 ---
 
 The Windows download uses code of [FFmpeg](https://ffmpeg.org) licensed under the
 [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html) and its source
-can be downloaded [here]($base/ffmpeg-9.0.2.tar.xz); the Mac app contains no FFmpeg. The complete corresponding
+can be downloaded [here]($base/$ffmpeg); the Mac app contains no FFmpeg. The complete corresponding
 source of the FFmpeg DLLs is attached to this release (see
 \`THIRD_PARTY_NOTICES.txt\`, section 2).
 
