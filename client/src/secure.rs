@@ -297,7 +297,7 @@ impl Secure {
         let s = noise::handshake_initiator(priv_key, prologue, |b| r.recv(b), |d| r.send(d), |rs| match pruefen(rs) {
             Ok(f) => {
                 flags3 = f;
-                Ok(crate::zugang::nachricht3(eigener_name(), f))
+                Ok(eigene_nachricht3(f))
             }
             Err(f) => {
                 let text = f.to_string();
@@ -483,15 +483,15 @@ impl Secure {
     }
 }
 
-/// Der Name dieses Geraets fuer Nachricht 3 ("QCN1", Spezifikation Pairing
-/// v1, 1.4) - der Host zeigt ihn im Zulassen-Fenster und in seiner
-/// Geraeteliste; unbeglaubigt, nur Anzeige. Einmal je Prozess bestimmt: der
-/// Rechnername aendert sich im Lauf nicht, und jeder Aufbau (auch der des
-/// Eingabekanals) schickt ihn. Die Flags dahinter haengen vom Schluessel
-/// der Gegenstelle ab (connect_pruefend).
-fn eigener_name() -> &'static str {
-    static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    N.get_or_init(crate::zugang::geraetename)
+/// Nachricht 3 ("QCN1", Spezifikation Pairing v1, 1.4) mit dem Namen dieses
+/// Geraets - der Host zeigt ihn im Zulassen-Fenster und in seiner
+/// Geraeteliste; unbeglaubigt, nur Anzeige. Der Name wird bei jedem Aufbau
+/// (auch dem des Eingabekanals) neu gelesen: ein im Fenster "Geraetename"
+/// geaenderter gilt ab der naechsten Verbindung, ohne Neustart
+/// (zugang::geraetename). Die Flags haengen vom Schluessel der Gegenstelle
+/// ab (connect_pruefend).
+fn eigene_nachricht3(flags: u8) -> Vec<u8> {
+    crate::zugang::nachricht3(&crate::zugang::geraetename(), flags)
 }
 
 // ------------------------------------------------------------ Schluesselablage
@@ -754,6 +754,24 @@ mod tests {
         let o = ordner("lauf");
         assert_eq!(o.file_name().unwrap().to_str().unwrap(), format!("{name}-lauf"));
         let _ = std::fs::remove_dir_all(&o);
+    }
+
+    /// Nachricht 3 traegt den Namen, der jetzt gilt: nach einem Wechsel im
+    /// Fenster "Geraetename" sofort den neuen, ohne Einstellung den
+    /// Rechnernamen.
+    #[test]
+    fn nachricht3_mit_eingestelltem_namen() {
+        let _s = crate::zugang::name_test_sperre();
+        let vorher = crate::zugang::geraetename_eingestellt();
+        crate::zugang::geraetename_setzen(Some("Wohnzimmer-PC".into()));
+        let n = eigene_nachricht3(crate::protokoll_konst::NAME_FLAG_HOST_UNBEKANNT);
+        assert_eq!(crate::zugang::nachricht3_name(&n).as_deref(), Some("Wohnzimmer-PC"));
+        assert_eq!(crate::zugang::nachricht3_flags(&n), crate::protokoll_konst::NAME_FLAG_HOST_UNBEKANNT);
+        crate::zugang::geraetename_setzen(Some("Büro".into()));
+        assert_eq!(crate::zugang::nachricht3_name(&eigene_nachricht3(0)).as_deref(), Some("Büro"));
+        crate::zugang::geraetename_setzen(None);
+        assert_eq!(crate::zugang::nachricht3_name(&eigene_nachricht3(0)), Some(crate::zugang::rechnername()));
+        crate::zugang::geraetename_setzen(vorher);
     }
 
     #[test]

@@ -2262,11 +2262,18 @@ fn bekanntgabe_paket(port: u16, name: &str, id: u32, zulassen: bool) -> Vec<u8> 
 fn bekanntgabe(port: u16, marke: Arc<Laufmarke>, ziele: fn() -> Vec<Ipv4Addr>) {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
     sock.set_broadcast(true).ok();
-    let name = zugang::geraetename();
+    let mut name = zugang::geraetename();
     let mut erste = true;
     while marke.gilt() {
-        // Je Runde neu: ob "Zulassen" geht, haengt an der Oberflaeche.
+        // Je Runde neu: ob "Zulassen" geht, haengt an der Oberflaeche; der
+        // Name am Fenster "Geraetename" - ein neuer gilt ab der naechsten
+        // Runde, ohne Neustart.
         let (id, zulassen) = super::einlass::einlass().map(|e| (e.id(), e.zulassen_moeglich())).unwrap_or((0, false));
+        let jetzt = zugang::geraetename();
+        if jetzt != name {
+            log(format!("Bekanntgabe: Name jetzt {jetzt} (vorher {name})"));
+            name = jetzt;
+        }
         let pkt = bekanntgabe_paket(port, &name, id, zulassen);
         let mut ziele = ziele();
         if ziele.is_empty() {
@@ -2825,6 +2832,8 @@ mod tests {
     #[test]
     fn zuschauerwechsel_und_parallele_annahme() {
         let _platz = platz_pruefung();
+        // Unten wird der Name aus Nachricht 3 mit geraetename() verglichen.
+        let _name = zugang::name_test_sperre();
         let (host_priv, host_pub) = noise::keypair().unwrap();
         let marke = Laufmarke::neu(host_priv);
         let (_, client_pub) = secure::test_identitaet();
@@ -4940,6 +4949,61 @@ mod tests {
             }
         }
         false
+    }
+
+    /// Die naechste Bekanntgabe fuer `port` binnen `frist`, gelesen.
+    fn naechste_bekanntgabe(udp: &UdpSocket, port: u16, frist: Duration) -> Option<zugang::Bekanntgabe> {
+        let bis = Instant::now() + frist;
+        let mut b = [0u8; 256];
+        while Instant::now() < bis {
+            udp.set_read_timeout(Some(bis.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).unwrap();
+            match udp.recv_from(&mut b) {
+                Ok((n, _)) => match zugang::bekanntgabe_lesen(&b[..n]) {
+                    Some(g) if g.port == port => return Some(g),
+                    _ => {}
+                },
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Der Name in der Bekanntgabe ist der eingestellte Geraetename, und ein
+    /// neuer gilt ab der naechsten Runde - ohne Neustart des Zuschauerplatzes.
+    #[test]
+    fn bekanntgabe_mit_eingestelltem_namen() {
+        let _platz = platz_pruefung();
+        let _name = zugang::name_test_sperre();
+        let vorher = zugang::geraetename_eingestellt();
+        zugang::geraetename_setzen(Some("Arbeitszimmer".into()));
+        let (host_priv, _) = noise::keypair().unwrap();
+        let (port, udp) = start_auf_loopback(&host_priv);
+        let g = naechste_bekanntgabe(&udp, port, Duration::from_secs(3)).expect("keine Bekanntgabe");
+        assert_eq!(g.name, "Arbeitszimmer");
+        zugang::geraetename_setzen(Some("Küche".into()));
+        // Was schon unterwegs war, zaehlt nicht; binnen zwei Runden der neue.
+        let mut neu = None;
+        let bis = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < bis {
+            match naechste_bekanntgabe(&udp, port, Duration::from_secs(3)) {
+                Some(g) if g.name == "Küche" => {
+                    neu = Some(g);
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(neu.is_some(), "neuer Name nicht in der Bekanntgabe");
+        zugang::geraetename_setzen(None);
+        let bis = Instant::now() + Duration::from_secs(6);
+        let mut system = false;
+        while Instant::now() < bis && !system {
+            system = naechste_bekanntgabe(&udp, port, Duration::from_secs(3)).is_some_and(|g| g.name == zugang::rechnername());
+        }
+        assert!(system, "ohne Einstellung nicht der Rechnername");
+        assert!(stoppen());
+        zugang::geraetename_setzen(vorher);
     }
 
     /// W2: starten -> verbinden -> stoppen -> abgewiesen -> starten ->

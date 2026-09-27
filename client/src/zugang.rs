@@ -24,9 +24,15 @@
 //   NAME_MAX = 40
 //   name_kuerzen(text, max) -> &str           UTF-8-sicher auf max Byte
 //   name_bereinigen(text) -> String           Steuer-/Richtungszeichen -> '?', getrimmt, <= 40 Byte
-//   geraetename() -> String                   Rechnername dieses Geraets, schon bereinigt
-//                                             (Windows: GetComputerNameExW, Mac:
-//                                             SCDynamicStoreCopyComputerName, Rueckfall gethostname)
+//   geraetename() -> String                   Name dieses Geraets fuer Nachricht 3, Bekanntgabe
+//                                             und Nachricht 20: der eingestellte, sonst der
+//                                             Rechnername - beides schon bereinigt
+//   rechnername() -> String                   Rechnername des Systems (Windows: GetComputerNameExW,
+//                                             Mac: SCDynamicStoreCopyComputerName, Rueckfall gethostname)
+//   geraetename_pruefen(eingabe) -> Result<Option<String>, NameFehler>
+//                                             Eingabe im Fenster "Geraetename": getrimmt, leer =
+//                                             Rechnername (None), sonst 1-40 Byte ohne Steuerzeichen
+//   geraetename_setzen(Option<String>)        gilt sofort (einstellungen.txt: geraetename=)
 //
 // 1.4 Handschlag-Nachricht 3 (Client -> Host)
 //   nachricht3(name, flags) -> Vec<u8>        "QCN1" | u8 n | Name | u8 Flags - statt b"client"
@@ -209,9 +215,61 @@ pub fn name_bereinigen(text: &str) -> String {
     name_kuerzen(t.trim(), NAME_MAX).trim_end().to_string()
 }
 
+/// Der eingestellte Geraetename (einstellungen.txt, geraetename=), schon
+/// geprueft; None: es gilt der Rechnername des Systems. Ein Wert fuer den
+/// ganzen Prozess - Client und Host-Rolle nennen sich gleich.
+static EINGESTELLT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Warum ein eingegebener Geraetename nicht gilt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameFehler {
+    /// Mehr als NAME_MAX Byte UTF-8.
+    ZuLang,
+    /// Steuer- oder Richtungszeichen.
+    Zeichen,
+}
+
+/// Eine Eingabe im Fenster "Geraetename" (und ein Wert aus
+/// einstellungen.txt): aussen ohne Leerraum; leer heisst zurueck zum
+/// Rechnernamen (Ok(None)); sonst 1 bis NAME_MAX Byte UTF-8 ohne Steuer-
+/// und Richtungszeichen - dieselben, die name_bereinigen ersetzen wuerde.
+pub fn geraetename_pruefen(eingabe: &str) -> Result<Option<String>, NameFehler> {
+    let t = eingabe.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.chars().any(gefaehrlich) {
+        return Err(NameFehler::Zeichen);
+    }
+    if t.len() > NAME_MAX {
+        return Err(NameFehler::ZuLang);
+    }
+    Ok(Some(t.to_string()))
+}
+
+/// Den Geraetenamen einstellen (None: Rechnername). Gilt sofort: die
+/// Bekanntgabe liest ihn je Runde, Nachricht 3 je Verbindung. Ein Wert, der
+/// die Pruefung nicht besteht, zaehlt wie None.
+pub fn geraetename_setzen(name: Option<String>) {
+    let name = name.and_then(|n| geraetename_pruefen(&n).ok().flatten());
+    *EINGESTELLT.write().unwrap_or_else(|e| e.into_inner()) = name;
+}
+
+/// Der eingestellte Geraetename (None: es gilt der Rechnername).
+pub fn geraetename_eingestellt() -> Option<String> {
+    EINGESTELLT.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Der Name dieses Geraets fuer Nachricht 3, Bekanntgabe und Nachricht 20:
-/// der Rechnername des Systems, bereinigt und auf 40 Byte gekuerzt. Nie leer.
+/// der eingestellte (geraetename_setzen), sonst der Rechnername des
+/// Systems. Nie leer, hoechstens 40 Byte.
 pub fn geraetename() -> String {
+    geraetename_eingestellt().unwrap_or_else(rechnername)
+}
+
+/// Der Rechnername des Systems, bereinigt und auf 40 Byte gekuerzt. Nie
+/// leer.
+pub fn rechnername() -> String {
     let roh = rechnername_system()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -2051,6 +2109,14 @@ pub fn heute() -> String {
     jetzt_lokal().datum()
 }
 
+/// Tests, die den eingestellten Geraetenamen setzen oder sich auf seinen
+/// Wert verlassen, laufen nacheinander - er gilt fuer den ganzen Prozess.
+#[cfg(test)]
+pub fn name_test_sperre() -> std::sync::MutexGuard<'static, ()> {
+    static SPERRE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SPERRE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2183,10 +2249,57 @@ mod tests {
 
     #[test]
     fn eigener_geraetename() {
-        let n = geraetename();
+        let n = rechnername();
         assert!(!n.is_empty() && n.len() <= NAME_MAX, "{n:?}");
         assert!(!n.chars().any(gefaehrlich), "{n:?}");
         assert_eq!(n, name_bereinigen(&n));
+    }
+
+    /// Die Eingabe im Fenster "Geraetename": getrimmt; leer (auch nur
+    /// Leerraum) heisst Rechnername; 1 bis 40 Byte UTF-8 - gezaehlt in Byte,
+    /// nicht in Zeichen; Steuer- und Richtungszeichen nie, auch nicht innen.
+    #[test]
+    fn geraetename_eingabe() {
+        assert_eq!(geraetename_pruefen("  Büro-PC \t"), Ok(Some("Büro-PC".into())));
+        assert_eq!(geraetename_pruefen(""), Ok(None));
+        assert_eq!(geraetename_pruefen(" \t\n "), Ok(None));
+        assert_eq!(geraetename_pruefen("x"), Ok(Some("x".into())));
+        assert_eq!(geraetename_pruefen(&"a".repeat(40)), Ok(Some("a".repeat(40))));
+        assert_eq!(geraetename_pruefen(&"a".repeat(41)), Err(NameFehler::ZuLang));
+        // 20 Zeichen, aber 40 bzw. 42 Byte.
+        assert_eq!(geraetename_pruefen(&"ß".repeat(20)), Ok(Some("ß".repeat(20))));
+        assert_eq!(geraetename_pruefen(&format!("{}ab", "ß".repeat(20))), Err(NameFehler::ZuLang));
+        // Aussen getrimmt zaehlt nicht mit.
+        assert_eq!(geraetename_pruefen(&format!("  {}  ", "a".repeat(40))), Ok(Some("a".repeat(40))));
+        for boese in ["a\u{7}b", "Zeile\nzwei", "Tab\tinnen", "rechts\u{202e}links", "x\u{2066}y", "\u{200f}PC"] {
+            assert_eq!(geraetename_pruefen(boese), Err(NameFehler::Zeichen), "{boese:?}");
+        }
+        // Was angenommen wird, aendert name_bereinigen nicht mehr.
+        for gut in ["Büro-PC", "Roberts Mac mini", "PC {i} {n}", "日本語のパソコン"] {
+            let n = geraetename_pruefen(gut).unwrap().unwrap();
+            assert_eq!(n, name_bereinigen(&n));
+        }
+    }
+
+    /// Der eingestellte Name gilt sofort fuer geraetename(); None und ein
+    /// ungueltiger Wert fuehren zum Rechnernamen zurueck. Haelt die Sperre
+    /// der Namenstests (der Wert gilt fuer den ganzen Prozess).
+    #[test]
+    fn geraetename_eingestellt_gilt_sofort() {
+        let _s = name_test_sperre();
+        let vorher = geraetename_eingestellt();
+        geraetename_setzen(Some("Wohnzimmer".into()));
+        assert_eq!(geraetename(), "Wohnzimmer");
+        geraetename_setzen(Some("  Büro  ".into()));
+        assert_eq!(geraetename(), "Büro");
+        geraetename_setzen(Some("a\u{7}".into()));
+        assert_eq!(geraetename(), rechnername());
+        assert_eq!(geraetename_eingestellt(), None);
+        geraetename_setzen(Some("x".repeat(41)));
+        assert_eq!(geraetename(), rechnername());
+        geraetename_setzen(None);
+        assert_eq!(geraetename(), rechnername());
+        geraetename_setzen(vorher);
     }
 
     // ------------------------------------------------------ Nachricht 3

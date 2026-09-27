@@ -188,8 +188,9 @@ pub struct Einlass {
     passwort: PathBuf,
     host_pub: Vec<u8>,
     id: u32,
-    /// Rechnername fuer Nachricht 20 (zugang::geraetename).
-    hostname: String,
+    /// Name fuer Nachricht 20 (zugang::geraetename); aendert ihn das
+    /// Fenster "Geraetename", setzt der Dienst ihn neu (name_setzen).
+    hostname: Mutex<String>,
     /// Gesamtfrist einer Zugangsphase (zugang::PHASE_FRIST, in Tests kuerzer).
     frist: Duration,
     buch: Mutex<Buch>,
@@ -302,7 +303,7 @@ impl Einlass {
             passwort,
             host_pub: host_pub.to_vec(),
             id: zugang::geraete_id(host_pub),
-            hostname: zugang::name_bereinigen(hostname),
+            hostname: Mutex::new(zugang::name_bereinigen(hostname)),
             frist: zugang::PHASE_FRIST,
             buch: Mutex::new(Buch::default()),
             cache: Mutex::new(zugang::Schluesselcache::default()),
@@ -333,6 +334,17 @@ impl Einlass {
     /// Geraete-ID dieses Hosts.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Der Name in Nachricht 20 ab der naechsten Zugangsphase (Fenster
+    /// "Geraetename" - ohne Neustart).
+    pub fn name_setzen(&self, name: &str) {
+        *sperre(&self.hostname) = zugang::name_bereinigen(name);
+    }
+
+    /// Der Name, den Nachricht 20 gerade traegt.
+    pub fn name(&self) -> String {
+        sperre(&self.hostname).clone()
     }
 
     /// Kann am Host gerade jemand "Zulassen" klicken?
@@ -639,7 +651,7 @@ impl Einlass {
                 if zulassen { " oder \"Zulassen\" am Host" } else { " (kein \"Zulassen\": keine Oberflaeche)" }
             )
         });
-        let noetig = Nachricht::Noetig(ZugangNoetig::neu(zulassen, warten_ms, &self.hostname));
+        let noetig = Nachricht::Noetig(ZugangNoetig::neu(zulassen, warten_ms, &self.name()));
         if let Err(e) = senden(sock, true, &noetig) {
             DROSSEL_ENDE.melden(Some(ip), || format!("Zugang: {wer} - Nachricht 20 nicht gesendet: {e}"));
             return Ausgang::Draussen;
@@ -1134,6 +1146,26 @@ mod tests {
         assert_eq!(h.ausgang(), Ausgang::Zugelassen);
         let g = h.liste().finden(&cpub).cloned().unwrap();
         assert_eq!((g.name.as_str(), g.datum.as_str()), ("Alt", "2026-01-02"));
+    }
+
+    /// Ein neuer Geraetename (Fenster "Geraetename") gilt ab der naechsten
+    /// Zugangsphase in Nachricht 20 - ohne neuen Einlass; bereinigt wie jeder
+    /// Name.
+    #[test]
+    fn neuer_name_in_nachricht_20() {
+        let h = Host::neu("name20", zugang::PHASE_FRIST);
+        let (cp, _) = client();
+        let mut s = Stub::verbinden(&h.addr, &cp, &zugang::nachricht3("Laptop", 0)).unwrap();
+        assert_eq!(noetig(&mut s).hostname, "Testhost");
+        s.senden(&Nachricht::Abbruch).unwrap();
+        let _ = h.ausgang();
+        h.einlass.name_setzen("  Küche\u{7} ");
+        assert_eq!(h.einlass.name(), "Küche?");
+        let (cp2, _) = client();
+        let mut s = Stub::verbinden(&h.addr, &cp2, &zugang::nachricht3("Laptop", 0)).unwrap();
+        assert_eq!(noetig(&mut s).hostname, "Küche?");
+        s.senden(&Nachricht::Abbruch).unwrap();
+        let _ = h.ausgang();
     }
 
     /// Unbekannt + richtiges Passwort: QCA1, 20 (nur Passwort, ohne
