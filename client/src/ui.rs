@@ -369,11 +369,13 @@ pub struct Ui {
     pub bench_tabelle: Option<Rect>,
     pub bench_sichtbar: usize,
     /// Wo eine Geraeteliste (Startbildschirm, Reiter "Computer") zuletzt
-    /// gezeichnet wurde, wie viele Zeilen hineinpassen und wie viele es gibt
-    /// - fuer das Mausrad. None, wenn keine zu sehen war.
+    /// gezeichnet wurde, wie viele Zeilen hineinpassen, wie viele es gibt und
+    /// wie hoch eine Zeile samt Abstand ist (Bildpunkte) - fuer Mausrad und
+    /// Trackpad. None, wenn keine zu sehen war.
     pub geraeteliste: Option<Rect>,
     pub geraete_sichtbar: usize,
     pub geraete_anzahl: usize,
+    pub geraete_zeilenhoehe: i32,
 }
 
 impl Ui {
@@ -388,6 +390,7 @@ impl Ui {
             geraeteliste: None,
             geraete_sichtbar: 0,
             geraete_anzahl: 0,
+            geraete_zeilenhoehe: 34,
         }
     }
 

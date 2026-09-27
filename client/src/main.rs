@@ -6367,8 +6367,12 @@ struct App {
     bench_folgt: bool,
     bench_lief: bool,
     /// Erste sichtbare Zeile der Geraeteliste (Startbildschirm und Reiter
-    /// "Computer" zeigen dieselben Geraete; das Mausrad rollt sie).
+    /// "Computer" zeigen dieselben Geraete; das Mausrad rollt sie). Geklemmt
+    /// nach jeder Zeichnung beider Listen und vor jedem Rollen.
     geraete_scroll: usize,
+    /// Was das Trackpad an Bildpunkten gesammelt hat, das noch keine ganze
+    /// Zeile der Geraeteliste ergab (siehe `geraete_zeilen`).
+    geraete_rest: f32,
     /// Ergebnis der letzten Desktop-Verknuepfung und seit wann es steht -
     /// 6 s im Meldungsbereich des Startbildschirms bzw. im Reiter.
     verknuepfung_meldung: Option<(Meldung, Instant)>,
@@ -6948,7 +6952,7 @@ impl App {
                         let zeilen = ((dy.abs() / 40.0) * 3.0).round().max(1.0) as i32;
                         self.bench_scrollen(if dy > 0.0 { -zeilen } else { zeilen });
                     }
-                    self.geraete_rollen(dy);
+                    self.geraete_rollen(delta);
                     return;
                 }
                 self.input.lock().unwrap().scroll(dx, dy);
@@ -6956,12 +6960,7 @@ impl App {
             // Startbildschirm: das Rad rollt die Geraeteliste, wenn die Maus
             // darueber steht.
             WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Start && !self.sprachwahl => {
-                use winit::event::MouseScrollDelta;
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 40.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
-                };
-                self.geraete_rollen(dy);
+                self.geraete_rollen(delta);
             }
             _ => {}
         }
@@ -7307,20 +7306,25 @@ impl App {
     }
 
     /// Die Geraeteliste (Startbildschirm, Reiter "Computer") rollen, wenn die
-    /// Maus ueber ihr steht: eine Zeile je Raste (40 Punkte), nach oben mit
-    /// positivem `dy`; geklemmt an Laenge und Platz der letzten Zeichnung.
-    fn geraete_rollen(&mut self, dy: f32) {
-        let Some(r) = self.ui.geraeteliste else { return };
-        if dy == 0.0 || !r.hit(self.ui.mouse.0, self.ui.mouse.1) {
+    /// Maus ueber ihr steht - wie weit, sagt `geraete_zeilen` (Mausrad je
+    /// Raste, Trackpad nach gesammelten Bildpunkten). Geklemmt an Laenge und
+    /// Platz der letzten Zeichnung, auch der Stand davor: beide Listen teilen
+    /// ihn, und die eine hat mehr Platz als die andere.
+    fn geraete_rollen(&mut self, delta: winit::event::MouseScrollDelta) {
+        let (mx, my) = self.ui.mouse;
+        if !self.ui.geraeteliste.is_some_and(|r| r.hit(mx, my)) {
+            self.geraete_rest = 0.0;
             return;
         }
-        let zeilen = (dy.abs() / 40.0).round().max(1.0) as usize;
-        let max = self.ui.geraete_anzahl.saturating_sub(self.ui.geraete_sichtbar);
-        self.geraete_scroll = if dy > 0.0 {
-            self.geraete_scroll.saturating_sub(zeilen)
-        } else {
-            (self.geraete_scroll + zeilen).min(max)
-        };
+        let (sichtbar, anzahl) = (self.ui.geraete_sichtbar, self.ui.geraete_anzahl);
+        let zeilen = geraete_zeilen(delta, self.ui.geraete_zeilenhoehe as f32, &mut self.geraete_rest);
+        let neu = gerollt(self.geraete_scroll, zeilen, sichtbar, anzahl);
+        // Am Anfang oder Ende nichts weiter sammeln: sonst muesste man die
+        // Bildpunkte jenseits des Randes erst zurueckrollen.
+        if neu == 0 || neu == erste_zeile(usize::MAX, sichtbar, anzahl) {
+            self.geraete_rest = 0.0;
+        }
+        self.geraete_scroll = neu;
     }
 
     /// Wechsel im Reiter "Computer": die laufende Sitzung endet wie mit
@@ -8838,6 +8842,13 @@ impl App {
                         lat, &lhist, fps_jetzt, &hist, info, stell, secure, &adresse, gespeichert,
                         &stand,
                     ));
+                    // Den geteilten Rollstand an diese Liste klemmen, wie der
+                    // Startbildschirm es mit seiner tut - sonst stuende er nach
+                    // dem Wechsel der Liste jenseits des Endes, und die ersten
+                    // Rasten nach oben bewegten nichts.
+                    if self.ui.geraeteliste.is_some() {
+                        self.geraete_scroll = erste_zeile(self.geraete_scroll, self.ui.geraete_sichtbar, self.ui.geraete_anzahl);
+                    }
                     return n;
                 }
 
@@ -9706,6 +9717,40 @@ fn erste_zeile(scroll: usize, sichtbar: usize, anzahl: usize) -> usize {
     scroll.min(anzahl.saturating_sub(sichtbar))
 }
 
+/// Der Rollstand nach `zeilen` Zeilen (positiv: weiter nach unten): erst an
+/// diese Liste geklemmt (der Stand kann von der anderen Liste mit mehr Platz
+/// stammen), dann gerollt und wieder geklemmt.
+fn gerollt(scroll: usize, zeilen: isize, sichtbar: usize, anzahl: usize) -> usize {
+    let max = anzahl.saturating_sub(sichtbar);
+    scroll.min(max).saturating_add_signed(zeilen).min(max)
+}
+
+/// Um wie viele Zeilen ein Ereignis des Mausrads oder Trackpads die
+/// Geraeteliste rollt (positiv: weiter nach unten in der Liste). Das Rad
+/// (LineDelta) rollt je Raste eine Zeile, mindestens eine. Das Trackpad
+/// (PixelDelta) schickt viele kleine Schritte: die Bildpunkte werden in
+/// `rest` gesammelt, und je volle `zeilenhoehe` rollt eine Zeile - so folgt
+/// die Liste den Fingern, statt je Ereignis eine Zeile zu springen.
+fn geraete_zeilen(delta: winit::event::MouseScrollDelta, zeilenhoehe: f32, rest: &mut f32) -> isize {
+    use winit::event::MouseScrollDelta;
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => {
+            *rest = 0.0;
+            if y == 0.0 {
+                return 0;
+            }
+            let n = y.abs().round().max(1.0) as isize;
+            if y > 0.0 { -n } else { n }
+        }
+        MouseScrollDelta::PixelDelta(p) => {
+            *rest += p.y as f32;
+            let n = (*rest / zeilenhoehe.max(1.0)).trunc();
+            *rest -= n * zeilenhoehe.max(1.0);
+            -(n as isize)
+        }
+    }
+}
+
 /// Eine Zeile im Reiter "Computer": wie im Startbildschirm, dazu ob sie die
 /// laufende Sitzung ist.
 #[derive(Clone, Debug, PartialEq)]
@@ -9912,6 +9957,7 @@ fn start_screen(
         u.geraeteliste = Some(ui::Rect { x: px, y: oben.y, w: panel_w, h: hoehe });
         u.geraete_sichtbar = START_ZEILEN;
         u.geraete_anzahl = hosts.len();
+        u.geraete_zeilenhoehe = 34;
         rollbalken(c, px + panel_w - 8, oben.y, hoehe, erste, START_ZEILEN, hosts.len());
     }
     for (i, h) in hosts.iter().skip(erste).take(START_ZEILEN).enumerate() {
@@ -12156,6 +12202,7 @@ fn main() {
         bench_folgt: true,
         bench_lief: false,
         geraete_scroll: 0,
+        geraete_rest: 0.0,
         verknuepfung_meldung: None,
         symbol: None,
         proxy,
@@ -13208,6 +13255,7 @@ fn hud(
             u.geraeteliste = Some(ui::Rect { x: ix, y: ly, w: iw, h: hoehe.max(rh) });
             u.geraete_sichtbar = sichtbar;
             u.geraete_anzahl = anzahl;
+            u.geraete_zeilenhoehe = zh;
             rollbalken(c, ix + iw - 3, ly, sichtbar as i32 * zh - (zh - rh), erste, sichtbar, anzahl);
             let marke = lang.get(Connected);
             for (i, g) in stand.geraete.iter().skip(erste).take(sichtbar).enumerate() {
@@ -17097,6 +17145,42 @@ mod tests {
                     "h:9001", false, &hud_stand_leer(Vec::new()));
         assert!(matches!(a, HudAktion::Nichts));
         assert_eq!(u.geraete_anzahl, 0);
+    }
+
+    /// Mausrad und Trackpad ueber der Geraeteliste: das Rad eine Zeile je
+    /// Raste (mindestens eine, auch bei einer halben), das Trackpad nach
+    /// gesammelten Bildpunkten - 60 Schritte zu 2 Punkten bei 34 Punkten je
+    /// Zeile sind drei Zeilen, nicht sechzig; Richtungswechsel zehren den
+    /// Rest erst auf, ein Radereignis verwirft ihn.
+    #[test]
+    fn geraeteliste_mit_rad_und_trackpad() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta::{LineDelta, PixelDelta};
+        let px = |y: f64| PixelDelta(PhysicalPosition::new(0.0, y));
+        let mut rest = 0.0f32;
+        assert_eq!(geraete_zeilen(LineDelta(0.0, -1.0), 34.0, &mut rest), 1);
+        assert_eq!(geraete_zeilen(LineDelta(0.0, 1.0), 34.0, &mut rest), -1);
+        assert_eq!(geraete_zeilen(LineDelta(0.0, -0.2), 34.0, &mut rest), 1);
+        assert_eq!(geraete_zeilen(LineDelta(0.0, 3.0), 34.0, &mut rest), -3);
+        assert_eq!(geraete_zeilen(LineDelta(0.0, 0.0), 34.0, &mut rest), 0);
+        let summe: isize = (0..60).map(|_| geraete_zeilen(px(-2.0), 34.0, &mut rest)).sum();
+        assert_eq!(summe, 3);
+        assert!((rest - -18.0).abs() < 1e-3, "{rest}");
+        // Zurueck: erst der Rest (18), dann ganze Zeilen.
+        assert_eq!(geraete_zeilen(px(17.0), 34.0, &mut rest), 0);
+        assert_eq!(geraete_zeilen(px(34.0), 34.0, &mut rest), 0);
+        assert_eq!(geraete_zeilen(px(1.0), 34.0, &mut rest), -1);
+        assert_eq!(geraete_zeilen(LineDelta(0.0, -1.0), 34.0, &mut rest), 1);
+        assert_eq!(rest, 0.0);
+        // Ein grosser Schwung auf einmal: mehrere Zeilen.
+        assert_eq!(geraete_zeilen(px(-140.0), 34.0, &mut rest), 4);
+        // Der geteilte Stand: aus dem Reiter (viel Platz) bei 20 gerollt,
+        // im Startbildschirm (4 von 10) wirkt die erste Raste nach oben sofort.
+        assert_eq!(gerollt(20, -1, 4, 10), 5);
+        assert_eq!(gerollt(20, 1, 4, 10), 6);
+        assert_eq!(gerollt(0, -3, 4, 10), 0);
+        assert_eq!(gerollt(5, 9, 4, 10), 6);
+        assert_eq!(gerollt(3, 1, 12, 10), 0);
     }
 
     /// Startbildschirm mit mehr Geraeten als Zeilen: alle erreichbar - ab
