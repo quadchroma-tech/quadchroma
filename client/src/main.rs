@@ -1735,8 +1735,20 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             datei
         };
         drop(datei);
-        std::thread::sleep(Duration::from_secs(2));
+        // Vor dem naechsten Versuch 2 s Pause - ausser das Ziel hat sich
+        // inzwischen geaendert (Wechsel im Reiter "Computer", ein anderer
+        // Host am Symbol): dann gleich zum neuen, ohne Wartezeit.
+        let bis = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < bis && !ziel_gewechselt(&shared.lock().unwrap(), &addr) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
+}
+
+/// Hat der Nutzer seit dem Durchlauf zu `addr` ein ANDERES Ziel gewaehlt?
+/// Kein Ziel (getrennt) zaehlt nicht - dann wartet der Faden ohnehin.
+fn ziel_gewechselt(s: &Shared, addr: &str) -> bool {
+    s.target.as_deref().is_some_and(|t| t != addr)
 }
 
 #[cfg(windows)]
@@ -6331,6 +6343,9 @@ struct App {
     bench_scroll: usize,
     bench_folgt: bool,
     bench_lief: bool,
+    /// Erste sichtbare Zeile der Geraeteliste (Startbildschirm und Reiter
+    /// "Computer" zeigen dieselben Geraete; das Mausrad rollt sie).
+    geraete_scroll: usize,
     /// Ergebnis der letzten Desktop-Verknuepfung und seit wann es steht -
     /// 6 s im Meldungsbereich des Startbildschirms bzw. im Reiter.
     verknuepfung_meldung: Option<(Meldung, Instant)>,
@@ -6910,9 +6925,20 @@ impl App {
                         let zeilen = ((dy.abs() / 40.0) * 3.0).round().max(1.0) as i32;
                         self.bench_scrollen(if dy > 0.0 { -zeilen } else { zeilen });
                     }
+                    self.geraete_rollen(dy);
                     return;
                 }
                 self.input.lock().unwrap().scroll(dx, dy);
+            }
+            // Startbildschirm: das Rad rollt die Geraeteliste, wenn die Maus
+            // darueber steht.
+            WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Start && !self.sprachwahl => {
+                use winit::event::MouseScrollDelta;
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 40.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                self.geraete_rollen(dy);
             }
             _ => {}
         }
@@ -7257,6 +7283,40 @@ impl App {
         zeilen.saturating_sub(self.ui.bench_sichtbar)
     }
 
+    /// Die Geraeteliste (Startbildschirm, Reiter "Computer") rollen, wenn die
+    /// Maus ueber ihr steht: eine Zeile je Raste (40 Punkte), nach oben mit
+    /// positivem `dy`; geklemmt an Laenge und Platz der letzten Zeichnung.
+    fn geraete_rollen(&mut self, dy: f32) {
+        let Some(r) = self.ui.geraeteliste else { return };
+        if dy == 0.0 || !r.hit(self.ui.mouse.0, self.ui.mouse.1) {
+            return;
+        }
+        let zeilen = (dy.abs() / 40.0).round().max(1.0) as usize;
+        let max = self.ui.geraete_anzahl.saturating_sub(self.ui.geraete_sichtbar);
+        self.geraete_scroll = if dy > 0.0 {
+            self.geraete_scroll.saturating_sub(zeilen)
+        } else {
+            (self.geraete_scroll + zeilen).min(max)
+        };
+    }
+
+    /// Wechsel im Reiter "Computer": die laufende Sitzung endet wie mit
+    /// Trennen (Eingaben losgelassen, Leitung gekappt, Benchmark aus), dann
+    /// verbindet der Client mit dem gewaehlten Geraet - kennt es ihn nicht,
+    /// kommt der Zugangsdialog. Der Empfangsfaden geht ohne die 2 s Pause
+    /// zum neuen Ziel (ziel_gewechselt).
+    fn geraet_wechseln(&mut self, ziel: Ziel) {
+        let name = ziel.name.clone().unwrap_or_else(|| ziel.adresse.clone());
+        protokoll::zeile(format!(
+            "Reiter Computer: trenne {} und verbinde mit {name} ({}{})",
+            self.addr_input,
+            ziel.adresse,
+            ziel.id.map(|i| format!(", ID {}", zugang::id_text(i))).unwrap_or_default()
+        ));
+        self.verbindung_trennen();
+        self.verbinden(ziel);
+    }
+
     /// Die Tabelle um `delta` Zeilen rollen (negativ: nach oben), geklemmt.
     /// Wer rollt, loest das Nachfuehren - bis er wieder ganz unten steht.
     fn bench_scrollen(&mut self, delta: i32) {
@@ -7417,6 +7477,19 @@ impl App {
             .ok()
             .and_then(|p| zugang::Hostliste::laden(&p).ok())
             .unwrap_or_default();
+    }
+
+    /// Die Zeilen des Reiters "Computer" jetzt: die Geraete wie im
+    /// Startbildschirm, die laufende Sitzung markiert - ueber die ID aus dem
+    /// Schluessel ihres Hosts, sonst die gewaehlte, sonst die Adresse.
+    fn geraete_fuer_reiter(&mut self) -> Vec<Geraetezeile> {
+        self.bekannte_nachladen(false);
+        let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
+        let id = {
+            let s = self.shared.lock().unwrap();
+            s.link.as_ref().map(|(_, k)| zugang::geraete_id(k)).or(s.ziel_id)
+        };
+        geraete_im_reiter(hostzeilen(&gefunden, &self.bekannte), &self.addr_input, id)
     }
 
     /// Ein Ziel aus Adresse und/oder ID mit dem, was gerade im Netz und in
@@ -8588,8 +8661,9 @@ impl App {
                     id: self.eigene_id(),
                     ruhe_verhindern: self.cfg.ruhe_verhindern,
                 });
+                self.geraete_scroll = erste_zeile(self.geraete_scroll, START_ZEILEN, zeilen.len());
                 n.act = start_screen(
-                    &mut self.ui, c, self.lang, &zeilen, &self.addr_input, err.as_deref(),
+                    &mut self.ui, c, self.lang, &zeilen, self.geraete_scroll, &self.addr_input, err.as_deref(),
                     hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl, dieser.as_ref(),
                 );
             }
@@ -8732,6 +8806,9 @@ impl App {
                         bench: if reiter == 4 { self.benchmark.as_ref().map(|b| b.stand()) } else { None },
                         bench_scroll,
                         verknuepfung: self.verknuepfung_hinweis(),
+                        // Die Geraete nur, wenn der Reiter offen ist.
+                        geraete: if reiter == 5 { self.geraete_fuer_reiter() } else { Vec::new() },
+                        geraete_scroll: self.geraete_scroll,
                     };
                     n.hud = Some(hud(
                         &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
@@ -8870,6 +8947,7 @@ impl App {
                 self.cfg.sichern();
             }
             HudAktion::Trennen => self.verbindung_trennen(),
+            HudAktion::Wechseln(ziel) => self.geraet_wechseln(ziel),
             HudAktion::Verknuepfung => {
                 // Name aus der Bekanntgabe, falls die Adresse passt, sonst
                 // steht die Adresse im Dateinamen. Die ID ist die des
@@ -9052,7 +9130,7 @@ enum Action {
 /// (Liste, Eingabe, Verknuepfung) die ID, die der Handschlag am Schluessel
 /// prueft (8.2); und der Name aus Bekanntgabe bzw. hosts.txt.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Ziel {
+pub struct Ziel {
     adresse: String,
     id: Option<u32>,
     name: Option<String>,
@@ -9494,10 +9572,10 @@ fn start_zeile(u: &mut ui::Ui, w: i32, h: i32, lang: &'static strings::Lang, i: 
 }
 
 /// Eine Zeile der Hostliste auf dem Startbildschirm (Spezifikation Pairing
-/// v1, 9.1): Name links, rechts die ID (ohne ID "-"), bekannte Hosts mit
-/// Haken, die Adresse im Tooltip.
+/// v1, 9.1) und im Reiter "Computer": Name links, rechts die ID (ohne ID
+/// "-"), bekannte Hosts mit Haken, die Adresse im Tooltip.
 #[derive(Clone, Debug, PartialEq)]
-struct Hostzeile {
+pub struct Hostzeile {
     name: String,
     adresse: String,
     id: Option<u32>,
@@ -9505,11 +9583,31 @@ struct Hostzeile {
     bekannt: bool,
 }
 
-/// Die Zeilen aus den Bekanntgaben und hosts.txt. Der Haken ist nur
-/// Anzeige: vertraut wird im Handschlag dem Schluessel, nie der ID.
+/// Die Zeilen aus den Bekanntgaben und hosts.txt - im Startbildschirm und
+/// im Reiter "Computer" dieselben. Jedes Geraet einmal: meldet es sich unter
+/// mehreren Adressen (zwei Netzkarten, VPN), gilt die aus hosts.txt, sonst
+/// die zuerst gehoerte (discovery::Gefunden::erstmals), bei Gleichstand die
+/// kleinere. Die bekannten zuerst, dann nach Namen (ohne Gross/Klein), bei
+/// gleichem Namen nach ID und Adresse - nie danach, wer zuletzt rief: kommt
+/// oder geht ein Geraet, behalten die anderen ihre Reihenfolge. Den Rechner
+/// selbst blendet schon die Liste aus (discovery, eigene ID). Der Haken ist
+/// nur Anzeige: vertraut wird im Handschlag dem Schluessel, nie der ID.
 fn hostzeilen(gefunden: &[discovery::Gefunden], bekannte: &zugang::Hostliste) -> Vec<Hostzeile> {
-    gefunden
-        .iter()
+    // Rang einer Adresse fuer ein Geraet mit ID: kleiner ist besser.
+    let rang = |g: &discovery::Gefunden| {
+        let hier = g.id.and_then(|id| bekannte.nach_id(id)).is_some_and(|b| b.adresse.eq_ignore_ascii_case(&g.host.addr.to_string()));
+        (!hier, g.erstmals, g.host.addr)
+    };
+    let mut je_geraet: Vec<&discovery::Gefunden> = Vec::new();
+    for g in gefunden {
+        match je_geraet.iter_mut().find(|x| g.id.is_some() && x.id == g.id) {
+            Some(x) if rang(g) < rang(x) => *x = g,
+            Some(_) => {}
+            None => je_geraet.push(g),
+        }
+    }
+    let mut zeilen: Vec<Hostzeile> = je_geraet
+        .into_iter()
         .map(|g| {
             let adresse = g.host.addr.to_string();
             let bekannt = match g.id {
@@ -9519,7 +9617,103 @@ fn hostzeilen(gefunden: &[discovery::Gefunden], bekannte: &zugang::Hostliste) ->
             let name = if g.host.name.trim().is_empty() { adresse.clone() } else { g.host.name.clone() };
             Hostzeile { name, adresse, id: g.id, bekannt }
         })
+        .collect();
+    zeilen.sort_by(|a, b| {
+        b.bekannt
+            .cmp(&a.bekannt)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+            .then(a.id.cmp(&b.id))
+            .then_with(|| a.adresse.cmp(&b.adresse))
+    });
+    zeilen
+}
+
+/// So viele Zeilen zeigt die Hostliste des Startbildschirms auf einmal;
+/// mehr Geraete rollt das Mausrad (Rollbalken rechts).
+const START_ZEILEN: usize = 4;
+
+/// Eine Geraetezeile zeichnen - im Startbildschirm und im Reiter "Computer"
+/// gleich: Name links (gekuerzt, damit er nicht in die ID laeuft), rechts
+/// "ID ...", davor bei bekannten der Haken und - im Reiter bei der laufenden
+/// Sitzung - `marke`. true: in diesem Bild geklickt.
+fn geraetezeile(
+    u: &mut ui::Ui,
+    c: &mut ui::Canvas,
+    lang: &'static strings::Lang,
+    r: ui::Rect,
+    h: &Hostzeile,
+    sel: bool,
+    marke: Option<&str>,
+) -> bool {
+    use strings::Key::*;
+    let rechts = lang.get(StartId).replace("{i}", &h.id.map(zugang::id_text).unwrap_or_else(|| "-".into()));
+    let rw = u.text.width(&rechts, 13, 1);
+    let mw = marke.map(|m| u.text.width(m, 13, 1) + 12).unwrap_or(0);
+    let platz = r.w - 14 - 12 - rw - 12 - mw - if h.bekannt { HAKEN_BREITE } else { 0 };
+    let name = kuerzen(u, &h.name, platz, 15, 1);
+    let geklickt = u.row(c, r, &name, &rechts, sel);
+    let mut x = r.x + r.w - rw - 12;
+    if let Some(m) = marke {
+        x -= mw;
+        u.text.draw(c, x, r.y + r.h / 2 + 4, m, 13, ui::CYAN, 1);
+    }
+    if h.bekannt {
+        haken(c, x - HAKEN_BREITE + 2, r.y + r.h / 2 - 5, ui::CYAN);
+    }
+    geklickt
+}
+
+/// Schmaler Rollbalken rechts neben einer Liste (ab `x`, `y`, Hoehe `h`):
+/// `erste` von `anzahl` Zeilen oben, `sichtbar` passen hinein. Passen alle,
+/// zeichnet er nichts.
+fn rollbalken(c: &mut ui::Canvas, x: i32, y: i32, h: i32, erste: usize, sichtbar: usize, anzahl: usize) {
+    if anzahl <= sichtbar || h <= 0 || sichtbar == 0 {
+        return;
+    }
+    c.rect(x, y, 3, h, ui::DIM, 60);
+    let griff = ((h as usize * sichtbar) / anzahl).max(12).min(h as usize) as i32;
+    let weg = (h - griff) as usize;
+    let oben = (weg * erste.min(anzahl - sichtbar) / (anzahl - sichtbar)) as i32;
+    c.rect(x, y + oben, 3, griff, ui::CYAN, 200);
+}
+
+/// Die erste sichtbare Zeile einer Liste, geklemmt: nie ueber das Ende.
+fn erste_zeile(scroll: usize, sichtbar: usize, anzahl: usize) -> usize {
+    scroll.min(anzahl.saturating_sub(sichtbar))
+}
+
+/// Eine Zeile im Reiter "Computer": wie im Startbildschirm, dazu ob sie die
+/// laufende Sitzung ist.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Geraetezeile {
+    zeile: Hostzeile,
+    aktuell: bool,
+}
+
+/// Die Zeilen des Reiters "Computer": dieselben wie im Startbildschirm (in
+/// derselben Reihenfolge, ohne diesen Rechner), die der laufenden Sitzung
+/// markiert - ueber die ID ihres Hosts (`id`: aus seinem Schluessel, sonst
+/// die gewaehlte), bei einem Host ohne ID ueber die Adresse.
+fn geraete_im_reiter(zeilen: Vec<Hostzeile>, adresse: &str, id: Option<u32>) -> Vec<Geraetezeile> {
+    let adresse = adresse_vollstaendig(adresse);
+    zeilen
+        .into_iter()
+        .map(|z| {
+            let aktuell = match (z.id, id) {
+                (Some(a), Some(b)) => a == b,
+                _ => !adresse.is_empty() && adresse_vollstaendig(&z.adresse).eq_ignore_ascii_case(&adresse),
+            };
+            Geraetezeile { zeile: z, aktuell }
+        })
         .collect()
+}
+
+/// Was ein Klick auf eine Zeile des Reiters bewirkt: auf die laufende
+/// Sitzung nichts (sie bleibt), auf jedes andere Geraet ein Wechsel dorthin -
+/// mit ID und Name wie ein Klick im Startbildschirm.
+fn wechsel_ziel(z: &Geraetezeile) -> Option<Ziel> {
+    (!z.aktuell).then(|| Ziel { adresse: z.zeile.adresse.clone(), id: z.zeile.id, name: Some(z.zeile.name.clone()) })
 }
 
 /// Breite des Haken-Symbols samt Abstand in der Hostzeile.
@@ -9642,6 +9836,7 @@ fn start_screen(
     c: &mut ui::Canvas,
     lang: &'static strings::Lang,
     hosts: &[Hostzeile],
+    scroll: usize,
     addr: &str,
     error: Option<&str>,
     hinweis: Option<(&str, u32)>,
@@ -9685,22 +9880,25 @@ fn start_screen(
     }
 
     let mut action = Action::None;
-    for (i, h) in hosts.iter().take(4).enumerate() {
+    // Alle Geraete des Netzes: vier sichtbar, mehr rollt das Mausrad ueber
+    // der Liste (die App klemmt den Stand, hier nur die Zeichnung).
+    let erste = erste_zeile(scroll, START_ZEILEN, hosts.len());
+    {
+        let (oben, _) = start_zeile(u, c.w as i32, c.h as i32, lang, 0);
+        let hoehe = START_ZEILEN as i32 * 34 - 4;
+        u.geraeteliste = Some(ui::Rect { x: px, y: oben.y, w: panel_w, h: hoehe });
+        u.geraete_sichtbar = START_ZEILEN;
+        u.geraete_anzahl = hosts.len();
+        rollbalken(c, px + panel_w - 8, oben.y, hoehe, erste, START_ZEILEN, hosts.len());
+    }
+    for (i, h) in hosts.iter().skip(erste).take(START_ZEILEN).enumerate() {
         let (r, knopf) = start_zeile(u, c.w as i32, c.h as i32, lang, i);
         let sel = addr == h.adresse || (h.id.is_some() && zugang::id_lesen(addr) == h.id);
         // Rechts die ID statt der Adresse (die steht im Tooltip), davor bei
         // bekannten Hosts der Haken. Die Zeile ist um den Knopf schmaler:
-        // ein langer Name wird gekuerzt, statt in die ID zu laufen (Masse
-        // wie in Ui::row).
-        let rechts = lang.get(StartId).replace("{i}", &h.id.map(zugang::id_text).unwrap_or_else(|| "-".into()));
-        let rw = u.text.width(&rechts, 13, 1);
-        let platz = r.w - 14 - 12 - rw - 12 - if h.bekannt { HAKEN_BREITE } else { 0 };
-        let name = kuerzen(u, &h.name, platz, 15, 1);
-        if u.row(c, r, &name, &rechts, sel) {
+        // ein langer Name wird gekuerzt, statt in die ID zu laufen.
+        if geraetezeile(u, c, lang, r, h, sel, None) {
             action = Action::Host(Ziel { adresse: h.adresse.clone(), id: h.id, name: Some(h.name.clone()) });
-        }
-        if h.bekannt {
-            haken(c, r.x + r.w - rw - 12 - HAKEN_BREITE + 2, r.y + r.h / 2 - 5, ui::CYAN);
         }
         if r.hit(maus.0, maus.1) {
             tip = Some(h.adresse.clone());
@@ -10478,8 +10676,33 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             // 30 Zeilen, rund 16 passen: 7 ist die Mitte des Rollwegs.
             bench_scroll: if view == "hud5" { 7 } else { 0 },
             verknuepfung: None,
+            // "hud6": der Reiter "Computer" - verbunden mit dem Mac mini
+            // (markiert), dazu ein bekannter PC, ein neuer Laptop und ein
+            // aelterer Host ohne ID; die Maus steht ueber dem Laptop.
+            geraete: geraete_im_reiter(
+                vec![
+                    Hostzeile { name: "Buero-PC".into(), adresse: "192.168.178.60:9001".into(), id: Some(305_114_872), bekannt: true },
+                    Hostzeile { name: "Roberts Mac mini".into(), adresse: "192.168.178.194:9001".into(), id: Some(581_729_911), bekannt: true },
+                    Hostzeile { name: "Laptop".into(), adresse: "192.168.178.71:9001".into(), id: Some(12_004_417), bekannt: false },
+                    Hostzeile { name: "studio.local".into(), adresse: "192.168.178.80:9001".into(), id: None, bekannt: false },
+                ],
+                "192.168.178.194:9001",
+                Some(581_729_911),
+            ),
+            geraete_scroll: 0,
         };
-        let reiter = match view { "hud2" | "hud2tip" => 1u8, "hud3" => 2, "hud4" => 3, "hud5" => 4, _ => 0 };
+        let reiter = match view {
+            "hud2" | "hud2tip" => 1u8,
+            "hud3" => 2,
+            "hud4" => 3,
+            "hud5" => 4,
+            "hud6" => REITER_COMPUTER,
+            _ => 0,
+        };
+        if view == "hud6" {
+            // Dritte Zeile der Liste (Masse wie im Reiter bei Massstab 1).
+            u.mouse = (w as i32 / 2, (h as i32 - (h as i32 - 80).min(570)) / 2 + 70 + 18 + 14 + 2 * 34 + 15);
+        }
         // "hud2tip": die Maus steht ueber dem Knopf "Grafikkarte" der
         // Decoderzeile, damit der Tooltip samt Kartennamen im Bild ist und
         // sich ueber SSH pruefen laesst.
@@ -10556,8 +10779,9 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         return;
     }
     // Die Hostliste: ein Host mit ID, schon bekannt (Haken), und ein
-    // aelterer ohne ID ("-").
-    let hosts = vec![
+    // aelterer ohne ID ("-"). "startrollen": sieben Geraete, um zwei
+    // gerollt - mit Rollbalken.
+    let mut hosts = vec![
         Hostzeile {
             name: "Roberts Mac mini".into(),
             adresse: "192.168.178.194:9001".into(),
@@ -10566,6 +10790,12 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         },
         Hostzeile { name: "studio.local".into(), adresse: "192.168.178.60:9001".into(), id: None, bekannt: false },
     ];
+    if view == "startrollen" {
+        for (i, n) in ["Buero-PC", "Keller", "Laptop", "Wohnzimmer", "Werkstatt"].iter().enumerate() {
+            let id = 100_000_000 + i as u32 * 7_654_321;
+            hosts.push(Hostzeile { name: (*n).into(), adresse: format!("192.168.178.{}:9001", 70 + i), id: Some(id), bekannt: false });
+        }
+    }
     // "abgeloest" und "fingerabdruck": der Startbildschirm mit der Meldung,
     // wie sie nach Nachricht 10 bzw. bei einem anderen Geraet unter der
     // gewaehlten ID dasteht (frueher: geaenderter Host-Schluessel) - ueber
@@ -10615,6 +10845,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             &mut c,
             lang,
             &hosts,
+            if view == "startrollen" { 2 } else { 0 },
             "192.168.178.194:9001",
             meldung.as_deref(),
             None,
@@ -11901,6 +12132,7 @@ fn main() {
         bench_scroll: 0,
         bench_folgt: true,
         bench_lief: false,
+        geraete_scroll: 0,
         verknuepfung_meldung: None,
         symbol: None,
         proxy,
@@ -11939,6 +12171,8 @@ pub enum HudAktion {
     Nichts,
     Reiter(u8),
     Trennen,
+    /// Reiter "Computer": die Sitzung zu diesem Geraet wechseln.
+    Wechseln(Ziel),
     /// Desktop-Verknuepfung fuer den verbundenen Host (nur Windows).
     Verknuepfung,
     /// Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton.
@@ -12028,6 +12262,10 @@ pub struct HudStand {
     /// Ergebnis der letzten Desktop-Verknuepfung (Text, Farbe), solange es
     /// stehen soll - im Reiter Verschluesselung unter den Knoepfen.
     pub verknuepfung: Option<(String, u32)>,
+    /// Reiter "Computer": die erkannten Geraete (ohne diesen Rechner, die
+    /// laufende Sitzung markiert) und die erste sichtbare Zeile.
+    pub geraete: Vec<Geraetezeile>,
+    pub geraete_scroll: usize,
 }
 
 /// Ein Rollen-Knopf im Menue - fuer Anzeige und Decoder derselbe Satz,
@@ -12123,18 +12361,30 @@ fn karte_beschreibung(k: &Karte, lang: &'static strings::Lang) -> String {
 }
 
 /// Die Reiter des ESC-Menues, in ihrer Reihenfolge (Index = Reiter).
-fn hud_reiternamen(lang: &'static strings::Lang) -> [&'static str; 5] {
+fn hud_reiternamen(lang: &'static strings::Lang) -> [&'static str; HUD_REITER] {
     use strings::Key::*;
-    [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts), lang.get(TabBenchmark)]
+    [
+        lang.get(TabPicture),
+        lang.get(TabDisplay),
+        lang.get(Encryption),
+        lang.get(TabShortcuts),
+        lang.get(TabBenchmark),
+        lang.get(TabComputers),
+    ]
 }
+
+/// Zahl der Reiter im ESC-Menue; der letzte ist "Computer" (REITER_COMPUTER).
+const HUD_REITER: usize = 6;
+/// Der Reiter "Computer": die erkannten Geraete, ein Klick wechselt dorthin.
+const REITER_COMPUTER: u8 = 5;
 
 /// Lage des Kopfes im ESC-Menue: die Reiter mit ihrer Aufschrift (in der
 /// letzten Stufe gekuerzt) und der Knopf Trennen (fest rechts, auf jedem
 /// Reiter, die Adresse des Hosts darunter). `logo`: ob der Schriftzug
 /// "QUADCHROMA" links vor den Reitern steht.
 struct HudKopf {
-    reiter: [ui::Rect; 5],
-    namen: [String; 5],
+    reiter: [ui::Rect; HUD_REITER],
+    namen: [String; HUD_REITER],
     trennen: ui::Rect,
     logo: bool,
 }
@@ -12164,7 +12414,7 @@ fn hud_kopf(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> H
     for (logo, innen, luecke) in [(true, p(28), p(8)), (true, p(14), p(4)), (false, p(14), p(4))] {
         let tw = trenntext + innen;
         let trennen = ui::Rect { x: rechts - tw, y: y0 + p(12), w: tw, h: p(26) };
-        let mut reiter = [leer; 5];
+        let mut reiter = [leer; HUD_REITER];
         let mut rx = ix + if logo { logo_w } else { 0 };
         for (r, &w) in reiter.iter_mut().zip(textbreiten.iter()) {
             *r = ui::Rect { x: rx, y: y0 + p(12), w: w + innen, h: p(26) };
@@ -12180,8 +12430,9 @@ fn hud_kopf(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> H
     let (innen, luecke) = (p(14), p(4));
     let tw = trenntext + innen;
     let trennen = ui::Rect { x: (rechts - tw).max(ix), y: y0 + p(12), w: tw, h: p(26) };
-    let bw = ((trennen.x - ix - 5 * luecke) / 5).max(0);
-    let mut reiter = [leer; 5];
+    let n = HUD_REITER as i32;
+    let bw = ((trennen.x - ix - n * luecke) / n).max(0);
+    let mut reiter = [leer; HUD_REITER];
     for (i, r) in reiter.iter_mut().enumerate() {
         *r = ui::Rect { x: ix + i as i32 * (bw + luecke), y: y0 + p(12), w: bw, h: p(26) };
     }
@@ -12221,6 +12472,10 @@ fn hud(
     // auf jedem anderen Reiter gibt es nichts zu rollen.
     u.bench_tabelle = None;
     u.bench_sichtbar = 0;
+    // Ebenso die Geraeteliste (nur im Reiter "Computer").
+    u.geraeteliste = None;
+    // Ein freier Tooltip (die Adresse eines Geraets), ohne Schluessel.
+    let mut tip_text: Option<String> = None;
 
     let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
     let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
@@ -12275,8 +12530,10 @@ fn hud(
     // und verzichtet auf die beiden Kacheln.
     let soll = stell.map(|x| x.1 as f32).or_else(|| info.map(|i| i.fps as f32)).unwrap_or(60.0);
     let kw = (iw - p(16)) / 2;
+    // Der Reiter "Computer" braucht den Platz fuer seine Liste.
+    let ohne_kacheln = reiter == 4 || reiter == REITER_COMPUTER;
     for (kx, welche) in [(ix, 0usize), (ix + kw + p(16), 1usize)] {
-        if reiter == 4 {
+        if ohne_kacheln {
             break;
         }
         let (label, zahl, zusatz, farbe, hist, lo, hi) = if welche == 0 {
@@ -12304,7 +12561,7 @@ fn hud(
         u.text.draw(c, kx + p(16) + zw + p(12), y0 + p(116), &zusatz, sz(12), ui::DIM, p(1));
         u.spark_range(c, ui::Rect { x: kx + p(16), y: y0 + p(124), w: kw - p(32), h: p(24) }, hist, lo, hi, farbe);
     }
-    if reiter != 4 {
+    if !ohne_kacheln {
         c.hline(ix, y0 + p(166), iw, ui::DIM, 60);
     }
 
@@ -12900,6 +13157,48 @@ fn hud(
                 }
             }
         }
+        REITER_COMPUTER => {
+            // --- Computer: die erkannten Geraete wie im Startbildschirm
+            // (Name, ID, Haken, ohne diesen Rechner), die laufende Sitzung
+            // markiert. Ein Klick auf ein anderes wechselt dorthin; ESC laesst
+            // alles, wie es ist.
+            let mut ly = y0 + p(70);
+            for z in umbruch(u, lang.get(ComputersHint), iw, sz(12)).iter().take(2) {
+                ly += p(18);
+                u.text.draw(c, ix, ly, z, sz(12), ui::DIM, p(1));
+            }
+            ly += p(14);
+            let (zh, rh) = (p(34), p(30));
+            let unten = fy - p(24) - p(10);
+            let sichtbar = (((unten - ly) + (zh - rh)) / zh).max(1) as usize;
+            let anzahl = stand.geraete.len();
+            if anzahl == 0 {
+                let dots = ".".repeat(((u.tick / 20) % 4) as usize);
+                let t = lang.get(SearchingHosts);
+                u.text.draw(c, ix, ly + p(20), t, sz(13), ui::DIM, p(3));
+                let tw = u.text.width(t, sz(13), p(3));
+                u.text.draw(c, ix + tw + p(8), ly + p(20), &dots, sz(13), ui::CYAN, p(3));
+                u.text.draw(c, ix, ly + p(50), lang.get(NoHostsFound), sz(13), ui::DIM, p(1));
+            }
+            let erste = erste_zeile(stand.geraete_scroll, sichtbar, anzahl);
+            let hoehe = (sichtbar.min(anzahl.max(1)) as i32) * zh - (zh - rh);
+            u.geraeteliste = Some(ui::Rect { x: ix, y: ly, w: iw, h: hoehe.max(rh) });
+            u.geraete_sichtbar = sichtbar;
+            u.geraete_anzahl = anzahl;
+            rollbalken(c, ix + iw - 3, ly, sichtbar as i32 * zh - (zh - rh), erste, sichtbar, anzahl);
+            let marke = lang.get(Connected);
+            for (i, g) in stand.geraete.iter().skip(erste).take(sichtbar).enumerate() {
+                let r = ui::Rect { x: ix, y: ly + i as i32 * zh, w: iw - p(10), h: rh };
+                if geraetezeile(u, c, lang, r, &g.zeile, g.aktuell, g.aktuell.then_some(marke)) {
+                    if let Some(z) = wechsel_ziel(g) {
+                        aktion = HudAktion::Wechseln(z);
+                    }
+                }
+                if r.hit(maus.0, maus.1) {
+                    tip_text = Some(g.zeile.adresse.clone());
+                }
+            }
+        }
         _ => {
             u.text.draw(c, ix, cy, &format!("Noise XX · ChaCha20-Poly1305 · {}", lang.get(EncryptionOn)),
                         sz(14), ui::CYAN, p(1));
@@ -12932,7 +13231,9 @@ fn hud(
 
     c.hline(ix, fy - p(24), iw, ui::DIM, 60);
     u.text.draw(c, ix, fy, &format!("ESC · {}", lang.get(Back)), sz(11), ui::DIM, p(3));
-    if let Some(k) = tip {
+    if let Some(t) = tip_text {
+        tooltip(u, c, &t, maus, ww, wh, sz(11), p(1));
+    } else if let Some(k) = tip {
         let text = match &tip_zusatz {
             Some(z) => format!("{}\n{z}", lang.get(k)),
             None => lang.get(k).to_string(),
@@ -14633,6 +14934,7 @@ mod tests {
             anzeige_name: String::new(),
             bench_konfig: BenchKonfig::vorgabe(5, true), bench: None, bench_scroll: 0,
             verknuepfung: None,
+            geraete: Vec::new(), geraete_scroll: 0,
         }
     }
 
@@ -14657,10 +14959,10 @@ mod tests {
             for lang in strings::all() {
                 let k = hud_kopf(&mut u, lang, ww, wh);
                 let wo = format!("{} {ww}x{wh}", lang.code);
-                for i in 0..4 {
+                for i in 0..HUD_REITER - 1 {
                     assert!(k.reiter[i].x + k.reiter[i].w < k.reiter[i + 1].x, "{wo}: Reiter {i} reicht in den naechsten");
                 }
-                let letzter = k.reiter[4];
+                let letzter = k.reiter[HUD_REITER - 1];
                 assert!(letzter.x + letzter.w < k.trennen.x, "{wo}: Reiter reichen in Trennen");
                 assert!(k.reiter[0].x > 0 && k.trennen.x + k.trennen.w < ww, "{wo}: Kopf ragt aus dem Fenster");
                 for (n, voll) in k.namen.iter().zip(hud_reiternamen(lang)) {
@@ -14679,7 +14981,7 @@ mod tests {
                     hud(u, c, lang, ww, wh, reiter, None, &[], 0.0, &[], None, None, (None, None),
                         "192.168.178.194:9001", false, &stand)
                 };
-                for reiter in 0..5u8 {
+                for reiter in 0..HUD_REITER as u8 {
                     let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
                     let a = klick(&mut u, &mut c, reiter, k.trennen.x + k.trennen.w / 2, k.trennen.y + k.trennen.h / 2);
                     assert!(matches!(a, HudAktion::Trennen), "{wo} Reiter {reiter}");
@@ -16564,6 +16866,7 @@ mod tests {
             host: discovery::Host { name: name.into(), addr: addr.parse().unwrap(), seen: Instant::now() },
             id,
             flags: 0,
+            erstmals: Instant::now(),
         }
     }
 
@@ -16608,8 +16911,195 @@ mod tests {
         ];
         let z = hostzeilen(&netz, &bekannte);
         assert_eq!(z.iter().map(|z| z.bekannt).collect::<Vec<_>>(), vec![true, true, false]);
-        assert_eq!(z[1].name, "10.0.0.6:9001");
+        // Bekannte zuerst, darin nach Namen: die Adresse (Name leer) vor "Mac".
+        assert_eq!(z[0].name, "10.0.0.6:9001");
+        assert_eq!(z[1].name, "Mac");
         assert_eq!(z[2].id, Some(5));
+    }
+
+    /// Die Geraeteliste (Startbildschirm und Reiter "Computer"): jedes
+    /// Geraet genau einmal mit Name und ID - unter mehreren Adressen unter
+    /// der aus hosts.txt, sonst der zuerst gehoerten -, die bekannten zuerst,
+    /// dann nach Namen ohne Gross/Klein. Kommt oder geht ein Geraet oder
+    /// ruft eines erneut, behalten die anderen ihre Reihenfolge.
+    #[test]
+    fn geraeteliste_ein_geraet_eine_zeile_stabil() {
+        let t0 = Instant::now();
+        let g = |name: &str, addr: &str, id: Option<u32>, erst: u64, zuletzt: u64| discovery::Gefunden {
+            host: discovery::Host { name: name.into(), addr: addr.parse().unwrap(), seen: t0 + Duration::from_secs(zuletzt) },
+            id,
+            flags: 0,
+            erstmals: t0 + Duration::from_secs(erst),
+        };
+        let mut bekannte = zugang::Hostliste::default();
+        let k = [0x44u8; 32];
+        let id_k = zugang::geraete_id(&k);
+        bekannte.merken(zugang::BekannterHost::neu(k, "10.0.0.9:9001", "Werkstatt"));
+        let netz = vec![
+            g("zebra", "10.0.0.2:9001", Some(2), 5, 9),
+            // Dasselbe Geraet unter zwei Adressen; die zweite (VPN) hoerte
+            // die Liste zuerst.
+            g("Alpha", "10.0.0.3:9001", Some(3), 4, 9),
+            g("Alpha", "100.64.0.3:9001", Some(3), 1, 9),
+            // Bekannt, unter zwei Adressen - die aus hosts.txt gilt, auch
+            // wenn die andere zuerst kam.
+            g("Werkstatt", "10.0.0.8:9001", Some(id_k), 0, 9),
+            g("Werkstatt", "10.0.0.9:9001", Some(id_k), 3, 9),
+            g("beta", "10.0.0.4:9001", Some(4), 2, 9),
+            g("alt", "10.0.0.5:9001", None, 2, 9),
+        ];
+        let z = hostzeilen(&netz, &bekannte);
+        let kurz = |z: &[Hostzeile]| z.iter().map(|h| (h.name.clone(), h.adresse.clone())).collect::<Vec<_>>();
+        let erwartet = vec![
+            ("Werkstatt".to_string(), "10.0.0.9:9001".to_string()),
+            ("Alpha".into(), "100.64.0.3:9001".into()),
+            ("alt".into(), "10.0.0.5:9001".into()),
+            ("beta".into(), "10.0.0.4:9001".into()),
+            ("zebra".into(), "10.0.0.2:9001".into()),
+        ];
+        assert_eq!(kurz(&z), erwartet);
+        assert!(z[0].bekannt && z[1..].iter().all(|h| !h.bekannt));
+        assert_eq!(z.iter().map(|h| h.id).collect::<Vec<_>>(), vec![Some(id_k), Some(3), None, Some(4), Some(2)]);
+        // Die Reihenfolge der Bekanntgaben spielt keine Rolle.
+        let mut rueckwaerts = netz.clone();
+        rueckwaerts.reverse();
+        assert_eq!(hostzeilen(&rueckwaerts, &bekannte), z);
+        // Eines geht, eines kommt: die anderen bleiben in ihrer Folge.
+        let mut weniger: Vec<_> = netz.iter().filter(|x| x.host.name != "beta").cloned().collect();
+        weniger.push(g("Mitte", "10.0.0.6:9001", Some(6), 8, 9));
+        let n = kurz(&hostzeilen(&weniger, &bekannte));
+        assert_eq!(n.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(), vec!["Werkstatt", "Alpha", "alt", "Mitte", "zebra"]);
+        // Faellt die VPN-Adresse weg, zeigt Alpha die andere - ohne Sprung.
+        let ohne_vpn: Vec<_> = netz.iter().filter(|x| !x.host.addr.to_string().starts_with("100.")).cloned().collect();
+        let n = hostzeilen(&ohne_vpn, &bekannte);
+        assert_eq!((n[1].name.as_str(), n[1].adresse.as_str()), ("Alpha", "10.0.0.3:9001"));
+    }
+
+    /// Reiter "Computer" (Modell): dieselben Zeilen wie im Startbildschirm,
+    /// die laufende Sitzung markiert - ueber die ID, bei einem Host ohne ID
+    /// ueber die Adresse (Port ergaenzt, Schreibweise egal). Ein Klick auf
+    /// die markierte Zeile wechselt nicht, auf jede andere zu ihrem Ziel.
+    #[test]
+    fn reiter_computer_modell() {
+        let zeilen = vec![
+            Hostzeile { name: "A".into(), adresse: "10.0.0.1:9001".into(), id: Some(1), bekannt: true },
+            Hostzeile { name: "B".into(), adresse: "10.0.0.2:9001".into(), id: Some(2), bekannt: false },
+            Hostzeile { name: "C".into(), adresse: "10.0.0.3:9001".into(), id: None, bekannt: false },
+        ];
+        let markiert = |adresse: &str, id: Option<u32>| {
+            geraete_im_reiter(zeilen.clone(), adresse, id).iter().map(|g| g.aktuell).collect::<Vec<_>>()
+        };
+        assert_eq!(markiert("10.0.0.2:9001", Some(2)), vec![false, true, false]);
+        // Ueber die ID, auch unter einer anderen Adresse (neue IP).
+        assert_eq!(markiert("10.0.0.99:9001", Some(1)), vec![true, false, false]);
+        // Host ohne ID: ueber die Adresse, ohne Port geschrieben.
+        assert_eq!(markiert("10.0.0.3", None), vec![false, false, true]);
+        // Eine ID, die keiner hat, markiert keine Zeile mit anderer ID.
+        assert_eq!(markiert("10.0.0.1:9001", Some(7)), vec![false, false, false]);
+        assert_eq!(markiert("", None), vec![false, false, false]);
+        let g = geraete_im_reiter(zeilen.clone(), "10.0.0.2:9001", Some(2));
+        assert_eq!(g.iter().map(|x| x.zeile.clone()).collect::<Vec<_>>(), zeilen);
+        assert_eq!(wechsel_ziel(&g[1]), None);
+        assert_eq!(wechsel_ziel(&g[0]), Some(Ziel { adresse: "10.0.0.1:9001".into(), id: Some(1), name: Some("A".into()) }));
+        assert_eq!(wechsel_ziel(&g[2]), Some(Ziel { adresse: "10.0.0.3:9001".into(), id: None, name: Some("C".into()) }));
+        // Klemmen der ersten Zeile.
+        assert_eq!(erste_zeile(9, 4, 7), 3);
+        assert_eq!(erste_zeile(2, 4, 7), 2);
+        assert_eq!(erste_zeile(5, 4, 3), 0);
+    }
+
+    /// Reiter "Computer" im ESC-Menue (gezeichnet, in jeder Sprache und
+    /// mehreren Groessen): die Geraete stehen unter dem Satz, ein Klick auf
+    /// ein anderes Geraet wechselt dorthin, auf das verbundene nicht. Mit
+    /// mehr Geraeten als Platz zeigt die Liste ab der gerollten Zeile (am
+    /// Ende geklemmt), und das Rad weiss, wie viele passen.
+    #[test]
+    fn reiter_computer_klick_wechselt() {
+        let mut u = ui::Ui::new();
+        let zeilen: Vec<Hostzeile> = (0..30u32)
+            .map(|i| Hostzeile {
+                name: format!("PC {i:02}"),
+                adresse: format!("10.0.1.{i}:9001"),
+                id: Some(1000 + i),
+                bekannt: i < 3,
+            })
+            .collect();
+        for (ww, wh) in [(1280, 720), (1920, 1080), (800, 600), (3840, 2160)] {
+            let mut buf = vec![0u32; (ww * wh) as usize];
+            for lang in [strings::pick("de"), &strings::EN, strings::pick("ja")] {
+                let wo = format!("{} {ww}x{wh}", lang.code);
+                let mut stand = hud_stand_leer(Vec::new());
+                stand.geraete = geraete_im_reiter(zeilen.clone(), "10.0.1.1:9001", Some(1001));
+                let zeichnen = |u: &mut ui::Ui, buf: &mut Vec<u32>, stand: &HudStand, maus: (i32, i32)| {
+                    let mut c = ui::Canvas::neu(buf, ww as usize, wh as usize);
+                    u.mouse = maus;
+                    u.click = maus.0 >= 0;
+                    hud(u, &mut c, lang, ww, wh, REITER_COMPUTER, None, &[], 0.0, &[], None, None, (None, None),
+                        "10.0.1.1:9001", false, stand)
+                };
+                assert!(matches!(zeichnen(&mut u, &mut buf, &stand, (-1, -1)), HudAktion::Nichts));
+                let liste = u.geraeteliste.expect(&wo);
+                let sichtbar = u.geraete_sichtbar;
+                assert!(sichtbar >= 3 && sichtbar < 30, "{wo}: {sichtbar}");
+                assert_eq!(u.geraete_anzahl, 30);
+                let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
+                let zh = (34.0 * s).round() as i32;
+                let zeile = |i: i32| (liste.x + 40, liste.y + i * zh + zh / 3);
+                // Die verbundene Zeile (Nr. 1): kein Wechsel.
+                assert!(matches!(zeichnen(&mut u, &mut buf, &stand, zeile(1)), HudAktion::Nichts), "{wo}");
+                // Eine andere: Wechsel mit ID und Name.
+                match zeichnen(&mut u, &mut buf, &stand, zeile(2)) {
+                    HudAktion::Wechseln(z) => {
+                        assert_eq!(z, Ziel { adresse: "10.0.1.2:9001".into(), id: Some(1002), name: Some("PC 02".into()) }, "{wo}")
+                    }
+                    _ => panic!("{wo}: kein Wechsel"),
+                }
+                // Gerollt bis ueber das Ende: die letzte volle Seite.
+                stand.geraete_scroll = 100;
+                match zeichnen(&mut u, &mut buf, &stand, zeile(0)) {
+                    HudAktion::Wechseln(z) => assert_eq!(z.id, Some(1000 + 30 - sichtbar as u32), "{wo}"),
+                    _ => panic!("{wo}: kein Wechsel nach dem Rollen"),
+                }
+                // Unter der letzten sichtbaren Zeile: nichts.
+                assert!(matches!(zeichnen(&mut u, &mut buf, &stand, zeile(sichtbar as i32)), HudAktion::Nichts), "{wo}");
+            }
+        }
+        // Ohne Geraete: keine Aktion, die Liste meldet null.
+        let (ww, wh) = (1280, 720);
+        let mut buf = vec![0u32; (ww * wh) as usize];
+        let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+        u.mouse = (640, 360);
+        u.click = true;
+        let a = hud(&mut u, &mut c, &strings::EN, ww, wh, REITER_COMPUTER, None, &[], 0.0, &[], None, None, (None, None),
+                    "h:9001", false, &hud_stand_leer(Vec::new()));
+        assert!(matches!(a, HudAktion::Nichts));
+        assert_eq!(u.geraete_anzahl, 0);
+    }
+
+    /// Startbildschirm mit mehr Geraeten als Zeilen: alle erreichbar - ab
+    /// der gerollten Zeile gezeichnet, ein Klick verbindet mit dem Geraet
+    /// dort; die Liste meldet Lage, Platz (vier) und Anzahl fuer das Rad.
+    #[test]
+    fn startbildschirm_rollt_die_geraete() {
+        let mut u = ui::Ui::new();
+        let hosts: Vec<Hostzeile> = (0..7u32)
+            .map(|i| Hostzeile { name: format!("G{i}"), adresse: format!("10.0.2.{i}:9001"), id: Some(500 + i), bekannt: false })
+            .collect();
+        let (w, h) = (1280usize, 800usize);
+        let mut buf = vec![0u32; w * h];
+        for (scroll, erwartet) in [(0usize, 0u32), (2, 2), (9, 3)] {
+            let (r, _) = start_zeile(&mut u, w as i32, h as i32, &strings::EN, 0);
+            u.mouse = (r.x + 30, r.y + r.h / 2);
+            u.click = true;
+            let mut c = ui::Canvas::neu(&mut buf, w, h);
+            let a = start_screen(&mut u, &mut c, &strings::EN, &hosts, scroll, "", None, None, false, None);
+            match a {
+                Action::Host(z) => assert_eq!(z.id, Some(500 + erwartet), "Rollstand {scroll}"),
+                _ => panic!("Rollstand {scroll}: keine Verbindung"),
+            }
+            assert_eq!((u.geraete_sichtbar, u.geraete_anzahl), (START_ZEILEN, 7));
+            assert!(u.geraeteliste.is_some_and(|l| l.hit(r.x + 30, r.y + r.h / 2)));
+        }
     }
 
     /// Der Hinweis auf den einen Geraeteschluessel im Zugangsdialog: nur bei
@@ -16621,6 +17111,91 @@ mod tests {
         assert!(geraeteschluessel_hinweis(0, || true));
         assert!(!geraeteschluessel_hinweis(0, || false));
         assert!(!geraeteschluessel_hinweis(NAME_FLAG_HOST_UNBEKANNT, || panic!("gelesen")));
+    }
+
+    /// Wechsel im Reiter "Computer" (loopback, zwei Schein-Hosts): eine
+    /// Sitzung zu A steht; der Wechsel - wie App::geraet_wechseln: Ziel weg,
+    /// Leitung gekappt, neues Ziel B - beendet sie (A sieht die Leitung
+    /// zugehen), und der Empfangsfaden verbindet gleich mit B, ohne die
+    /// Pause von 2 s. Keine Meldung, kein zweiter Versuch zu A.
+    #[test]
+    fn wechsel_zu_anderem_geraet_ohne_pause() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        secure::test_identitaet();
+        let (host_priv, _) = test_host();
+        let schein = |zu: Arc<Mutex<Option<Instant>>>, zaehler: Arc<AtomicUsize>| {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            let k = host_priv.clone();
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(s) = s else { continue };
+                    zaehler.fetch_add(1, Ordering::SeqCst);
+                    let (zu, k) = (zu.clone(), k.clone());
+                    std::thread::spawn(move || {
+                        let Ok(mut h) = secure::Secure::accept(s, &noise::prologue_video(), &k) else { return };
+                        let _ = h.write_all(MAGIC);
+                        // Lesen, bis der Client die Leitung schliesst.
+                        h.lesefrist(Some(Duration::from_secs(20)));
+                        let mut b = [0u8; 1];
+                        while h.read_exact(&mut b).is_ok() {}
+                        *zu.lock().unwrap() = Some(Instant::now());
+                    });
+                }
+            });
+            addr
+        };
+        let (zu_a, zu_b) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
+        let (n_a, n_b) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let addr_a = schein(zu_a.clone(), n_a.clone());
+        let addr_b = schein(zu_b.clone(), n_b.clone());
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr_a.clone()),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        let warten = |bis: &dyn Fn(&Shared) -> bool| {
+            let t0 = Instant::now();
+            while !bis(&shared.lock().unwrap()) && t0.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        warten(&|s| s.sitzung_nr == 1 && s.abbruch.is_some());
+        assert_eq!(shared.lock().unwrap().sitzung_nr, 1, "keine Sitzung zu A");
+        // Der Wechsel: erst trennen (Ziel weg, Leitung kappen), dann verbinden.
+        let t_wechsel = Instant::now();
+        let griff = {
+            let mut s = shared.lock().unwrap();
+            s.target = None;
+            s.abbruch.take()
+        };
+        input.lock().unwrap().trennen();
+        griff.expect("Griff").shutdown(std::net::Shutdown::Both).unwrap();
+        {
+            let mut s = shared.lock().unwrap();
+            s.target = Some(addr_b.clone());
+            s.ziel_name = Some("B".into());
+        }
+        warten(&|s| s.sitzung_nr == 2);
+        let dauer = t_wechsel.elapsed();
+        assert_eq!(shared.lock().unwrap().sitzung_nr, 2, "keine Sitzung zu B");
+        assert!(dauer < Duration::from_millis(1500), "Wechsel dauerte {dauer:?} (Pause von 2 s?)");
+        let a_zu = zu_a.lock().unwrap().expect("A sah die Leitung nicht zugehen");
+        assert!(a_zu.duration_since(t_wechsel) < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(2500));
+        let s = shared.lock().unwrap();
+        assert_eq!(s.target.as_deref(), Some(addr_b.as_str()));
+        assert!(s.error.is_none() && s.error_key.is_none(), "Meldung nach dem Wechsel: {:?}", s.error);
+        assert_eq!(n_a.load(Ordering::SeqCst), 1, "zweite Verbindung zu A");
+        assert_eq!(n_b.load(Ordering::SeqCst), 1, "mehr als eine Verbindung zu B");
+        assert!(zu_b.lock().unwrap().is_none(), "Sitzung zu B endete");
+        assert_eq!(s.sitzung_nr, 2);
     }
 
     /// Die Texte des Zugangs: Platzhalter gefuellt, Meldungen bleiben (kein

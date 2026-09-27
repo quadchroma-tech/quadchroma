@@ -368,11 +368,27 @@ pub struct Ui {
     /// nicht offen war.
     pub bench_tabelle: Option<Rect>,
     pub bench_sichtbar: usize,
+    /// Wo eine Geraeteliste (Startbildschirm, Reiter "Computer") zuletzt
+    /// gezeichnet wurde, wie viele Zeilen hineinpassen und wie viele es gibt
+    /// - fuer das Mausrad. None, wenn keine zu sehen war.
+    pub geraeteliste: Option<Rect>,
+    pub geraete_sichtbar: usize,
+    pub geraete_anzahl: usize,
 }
 
 impl Ui {
     pub fn new() -> Self {
-        Ui { text: Text::load(), mouse: (-1, -1), click: false, tick: 0, bench_tabelle: None, bench_sichtbar: 0 }
+        Ui {
+            text: Text::load(),
+            mouse: (-1, -1),
+            click: false,
+            tick: 0,
+            bench_tabelle: None,
+            bench_sichtbar: 0,
+            geraeteliste: None,
+            geraete_sichtbar: 0,
+            geraete_anzahl: 0,
+        }
     }
 
     /// Knopf mit Eckklammern. Gibt true zurueck, wenn er in diesem Bild geklickt wurde.

@@ -37,6 +37,10 @@ pub struct Gefunden {
     pub id: Option<u32>,
     /// BEACON_FLAG_* (Bit 0: am Host kann jemand "Zulassen" klicken).
     pub flags: u8,
+    /// Seit wann dieser Eintrag (ip:port) ununterbrochen zu hoeren ist. Ein
+    /// Geraet mit mehreren Adressen zeigt die Liste unter der, die sie zuerst
+    /// hoerte (main.rs, hostzeilen) - so springt seine Zeile nicht hin und her.
+    pub erstmals: Instant,
 }
 
 #[derive(Default)]
@@ -51,6 +55,11 @@ pub struct Hosts {
 /// dem Client starten und ihren Schluessel erst dann anlegen.
 const EIGEN_TAKT: Duration = Duration::from_secs(5);
 
+/// So lange bleibt ein Geraet ohne neue Bekanntgabe in der Liste. Es ruft
+/// alle zwei Sekunden: vier verlorene Pakete am Stueck (WLAN) lassen es
+/// noch nicht verschwinden.
+const STUMM: Duration = Duration::from_secs(10);
+
 impl Hosts {
     /// Gefundene Hosts, nach Namen sortiert, ohne die seit zehn Sekunden stummen.
     pub fn list(&self) -> Vec<Host> {
@@ -63,7 +72,7 @@ impl Hosts {
         let mut v: Vec<Gefunden> = self
             .map
             .values()
-            .filter(|g| g.host.seen.elapsed() < Duration::from_secs(10))
+            .filter(|g| g.host.seen.elapsed() < STUMM)
             .filter(|g| self.eigene_id.is_none() || g.id != self.eigene_id)
             .cloned()
             .collect();
@@ -84,10 +93,21 @@ impl Hosts {
 
     /// Ein Paket einer Gegenstelle eintragen. false: keine Bekanntgabe.
     pub fn eintragen(&mut self, paket: &[u8], von: SocketAddr) -> bool {
+        self.eintragen_um(paket, von, Instant::now())
+    }
+
+    /// Wie `eintragen`, zur Zeit `jetzt` (Tests). War der Eintrag schon da
+    /// und nicht verstummt, bleibt sein `erstmals`; meldet sich unter der
+    /// Adresse ein anderes Geraet (andere ID), beginnt er neu.
+    pub fn eintragen_um(&mut self, paket: &[u8], von: SocketAddr, jetzt: Instant) -> bool {
         let Some(b) = crate::zugang::bekanntgabe_lesen(paket) else { return false };
         let addr = SocketAddr::new(von.ip(), b.port);
-        let host = Host { name: b.name, addr, seen: Instant::now() };
-        self.map.insert(addr.to_string(), Gefunden { host, id: b.id, flags: b.flags });
+        let erstmals = match self.map.get(&addr.to_string()) {
+            Some(alt) if alt.id == b.id && jetzt.saturating_duration_since(alt.host.seen) < STUMM => alt.erstmals,
+            _ => jetzt,
+        };
+        let host = Host { name: b.name, addr, seen: jetzt };
+        self.map.insert(addr.to_string(), Gefunden { host, id: b.id, flags: b.flags, erstmals });
         true
     }
 }
@@ -157,6 +177,30 @@ mod tests {
         assert_eq!(h.mit_id(581_729_911).map(|g| g.host.addr.to_string()).as_deref(), Some("192.168.178.194:9001"));
         assert!(h.mit_id(5).is_none());
         assert_eq!(h.list().len(), 2);
+    }
+
+    /// `erstmals` bleibt, solange ein Eintrag weiter ruft - auch mit neuem
+    /// Namen -, und beginnt neu, wenn er verstummt war oder unter seiner
+    /// Adresse ein anderes Geraet ruft.
+    #[test]
+    fn erstmals_bleibt_solange_er_ruft() {
+        let mut h = Hosts::default();
+        let von: SocketAddr = "192.168.178.194:50000".parse().unwrap();
+        let t0 = Instant::now();
+        let paket = |name: &str, id: u32| crate::zugang::bekanntgabe(9001, name, id, 1);
+        assert!(h.eintragen_um(&paket("Mac mini", 7), von, t0));
+        assert!(h.eintragen_um(&paket("Mac mini", 7), von, t0 + Duration::from_secs(2)));
+        assert!(h.eintragen_um(&paket("Buero-Mac", 7), von, t0 + Duration::from_secs(4)));
+        let g = &h.map["192.168.178.194:9001"];
+        assert_eq!((g.erstmals, g.host.name.as_str()), (t0, "Buero-Mac"));
+        // Ein anderes Geraet unter derselben Adresse: neu.
+        let t1 = t0 + Duration::from_secs(6);
+        assert!(h.eintragen_um(&paket("Studio", 8), von, t1));
+        assert_eq!(h.map["192.168.178.194:9001"].erstmals, t1);
+        // Verstummt (laenger als STUMM) und wieder da: neu.
+        let t2 = t1 + STUMM + Duration::from_secs(1);
+        assert!(h.eintragen_um(&paket("Studio", 8), von, t2));
+        assert_eq!(h.map["192.168.178.194:9001"].erstmals, t2);
     }
 
     /// Selbstschutz: die eigene Bekanntgabe (ID des Hosts auf diesem
