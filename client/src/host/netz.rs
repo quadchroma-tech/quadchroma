@@ -81,11 +81,22 @@
 // Rechner einander nichts aufraeumen.
 // Sperrreihenfolge: EINSPEISEN, AKTUELL, dann entweder Leitung.q oder
 // Leitung.dateien - diese beiden nie ineinander.
+//
+// Starten und Stoppen: `start` bindet beide Ports und startet die beiden
+// Annahmefaeden und die Bekanntgabe - ein Lauf mit eigener Laufmarke
+// (Schluessel, gilt). `stoppen` nimmt der Marke unter AKTUELL die Geltung,
+// weckt die Annahmefaeden mit je einer Verbindung an ihren eigenen Port
+// (ein blockiertes accept laesst sich sonst nicht unterbrechen) und die
+// Bekanntgabe aus ihrer Pause, und wartet, bis alle drei geendet und damit
+// die Ports freigegeben haben. Wer seinen Handschlag erst danach beendet,
+// wird kein Zuschauer mehr. Ein verbundener Zuschauer bleibt verbunden -
+// wer die Freigabe beendet, verabschiedet ihn (abschied_beim_beenden).
+// Danach laesst sich `start` wieder rufen.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1111,7 +1122,6 @@ impl Leitung {
 }
 
 static AKTUELL: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
-static PRIV: OnceLock<Vec<u8>> = OnceLock::new();
 static SEQ: AtomicU32 = AtomicU32::new(0);
 /// Laufende Nummer der Zuschauer (zuschauer_nr). Waechst unter AKTUELL,
 /// zugleich mit dem Eintrag des Neuen.
@@ -1808,17 +1818,23 @@ fn sendepuffer_setzen(s: &TcpStream) {
     }
 }
 
-fn annahme_bild(listener: TcpListener) {
+fn annahme_bild(listener: TcpListener, marke: Arc<Laufmarke>) {
     for stream in listener.incoming() {
+        // Gestoppt: die Verbindung, die hier weckte, faellt mit dem
+        // Listener zu (siehe stoppen).
+        if !marke.gilt() {
+            break;
+        }
         let Ok(stream) = stream else { continue };
         // Der Handschlag laeuft in einem eigenen Faden: wer ihn nicht zu
         // Ende bringt, haelt nur seinen Platz, nicht die Annahme.
         let Some(platz) = PLAETZE_BILD.belegen(absender(&stream), "Bildkanal") else { continue };
-        std::thread::spawn(move || bild_annehmen(stream, platz));
+        let m = marke.clone();
+        std::thread::spawn(move || bild_annehmen(stream, platz, &m));
     }
 }
 
-fn bild_annehmen(stream: TcpStream, platz: Platz) {
+fn bild_annehmen(stream: TcpStream, platz: Platz, marke: &Laufmarke) {
     // Schluessel der Drossel: dieselbe Adresse wie beim Handschlagplatz.
     let absender_ip = platz.ip;
     let von = Some(absender_ip);
@@ -1827,7 +1843,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     sendepuffer_setzen(&stream);
 
     // Zuerst der Handschlag. Vor ihm geht kein einziges Byte Nutzlast raus.
-    let sock = match secure::Secure::accept(stream, &noise::prologue_video(), PRIV.get().unwrap()) {
+    let sock = match secure::Secure::accept(stream, &noise::prologue_video(), &marke.schluessel) {
         Ok(s) => s,
         Err(e) => {
             DROSSEL_HANDSCHLAG_BILD.melden(von, || format!("Handschlag mit {ip} gescheitert ({e})"));
@@ -1883,6 +1899,14 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
     let (alt, nr) = loop {
         let einspeisen = sperre(&EINSPEISEN);
         let mut a = sperre(&AKTUELL);
+        // Die Freigabe endete, waehrend dieser Handschlag lief (stoppen
+        // nimmt der Marke unter AKTUELL die Geltung): kein neuer Zuschauer.
+        if !marke.gilt() {
+            drop(a);
+            drop(einspeisen);
+            log(format!("Zuschauer {name} ({ip}) abgewiesen: die Freigabe endete waehrend des Handschlags"));
+            return;
+        }
         // Wurde seit dem Blick in die Liste ein Geraet entfernt, hat
         // zuschauer_verabschieden dieses hier nicht gesehen (es stand noch nicht
         // in AKTUELL) - vielleicht war es genau seins ("Alle entfernen"
@@ -1963,8 +1987,11 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
 // Dateien vom Client, Quittungen fuer Dateien vom Host). Getrennt vom Bild,
 // damit eine Mausbewegung nie hinter einem Vollbild haengt.
 
-fn annahme_eingabe(listener: TcpListener) {
+fn annahme_eingabe(listener: TcpListener, marke: Arc<Laufmarke>) {
     for stream in listener.incoming() {
+        if !marke.gilt() {
+            break;
+        }
         let Ok(stream) = stream else { continue };
         stream.set_nodelay(true).ok();
 
@@ -1977,14 +2004,15 @@ fn annahme_eingabe(listener: TcpListener) {
             continue;
         };
         let Some(platz) = PLAETZE_EINGABE.belegen(von, "Eingabekanal") else { continue };
-        std::thread::spawn(move || eingabe_annehmen(stream, bild, platz));
+        let m = marke.clone();
+        std::thread::spawn(move || eingabe_annehmen(stream, bild, platz, &m));
     }
 }
 
-fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz) {
+fn eingabe_annehmen(stream: TcpStream, bild: Arc<Leitung>, platz: Platz, marke: &Laufmarke) {
     let ip = platz.ip;
     let von = Some(ip);
-    let mut sock = match secure::Secure::accept(stream, &noise::prologue_input(&bild.hh), PRIV.get().unwrap()) {
+    let mut sock = match secure::Secure::accept(stream, &noise::prologue_input(&bild.hh), &marke.schluessel) {
         Ok(s) => s,
         Err(e) => {
             DROSSEL_HANDSCHLAG_EINGABE.melden(von, || format!("Eingabekanal: Handschlag mit {ip} gescheitert ({e})"));
@@ -2230,18 +2258,18 @@ fn bekanntgabe_paket(port: u16, name: &str, id: u32, zulassen: bool) -> Vec<u8> 
     zugang::bekanntgabe(port, name, id, if zulassen { BEACON_FLAG_ZULASSEN } else { 0 })
 }
 
-fn bekanntgabe(port: u16) {
+fn bekanntgabe(port: u16, marke: Arc<Laufmarke>, ziele: fn() -> Vec<Ipv4Addr>) {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return };
     sock.set_broadcast(true).ok();
     let name = zugang::geraetename();
     let mut erste = true;
-    loop {
+    while marke.gilt() {
         // Je Runde neu: ob "Zulassen" geht, haengt an der Oberflaeche.
         let (id, zulassen) = super::einlass::einlass().map(|e| (e.id(), e.zulassen_moeglich())).unwrap_or((0, false));
         let pkt = bekanntgabe_paket(port, &name, id, zulassen);
-        let mut ziele = rundruf_adressen();
+        let mut ziele = ziele();
         if ziele.is_empty() {
-            ziele.push(std::net::Ipv4Addr::BROADCAST);
+            ziele.push(Ipv4Addr::BROADCAST);
         }
         let mut gesendet = 0;
         for z in &ziele {
@@ -2257,22 +2285,183 @@ fn bekanntgabe(port: u16) {
             ));
             erste = false;
         }
-        std::thread::sleep(Duration::from_secs(2));
+        if marke.pause(Duration::from_secs(2)) {
+            break;
+        }
     }
 }
 
+/// Ein Lauf des Zuschauerplatzes (start bis stoppen): der Schluessel, mit
+/// dem seine Handschlaege laufen, und ob er noch gilt. Annahmefaeden,
+/// Handschlagfaeden und die Bekanntgabe halten ihn.
+struct Laufmarke {
+    schluessel: Vec<u8>,
+    /// Faellt unter AKTUELL auf false (stoppen): wer danach mit seinem
+    /// Handschlag fertig wird, wird kein Zuschauer mehr (bild_annehmen).
+    gilt: AtomicBool,
+    /// Weckt die Bekanntgabe aus ihrer Pause (stoppen).
+    wecker: (Mutex<()>, Condvar),
+}
+
+impl Laufmarke {
+    fn neu(schluessel: Vec<u8>) -> Arc<Laufmarke> {
+        Arc::new(Laufmarke { schluessel, gilt: AtomicBool::new(true), wecker: (Mutex::new(()), Condvar::new()) })
+    }
+
+    fn gilt(&self) -> bool {
+        self.gilt.load(Ordering::SeqCst)
+    }
+
+    /// Unter AKTUELL die Geltung nehmen, dann die Bekanntgabe wecken.
+    fn beenden(&self) {
+        {
+            let _a = sperre(&AKTUELL);
+            self.gilt.store(false, Ordering::SeqCst);
+        }
+        // Unter der Sperre des Weckers: `pause` prueft `gilt` unter ihr,
+        // der Weckruf geht also nie zwischen Pruefen und Warten verloren.
+        let _w = sperre(&self.wecker.0);
+        self.wecker.1.notify_all();
+    }
+
+    /// Bis zu `dauer` warten; true, wenn der Lauf inzwischen beendet ist.
+    fn pause(&self, dauer: Duration) -> bool {
+        let w = sperre(&self.wecker.0);
+        let _ = self.wecker.1.wait_timeout_while(w, dauer, |_| self.gilt());
+        !self.gilt()
+    }
+}
+
+/// Der laufende Zuschauerplatz.
+struct Lauf {
+    marke: Arc<Laufmarke>,
+    port: u16,
+    /// Wohin die Weckverbindungen gehen: die Adressen der beiden Listener
+    /// (an 0.0.0.0 gebunden: 127.0.0.1).
+    wecken: Vec<std::net::SocketAddr>,
+    faeden: Vec<(&'static str, std::thread::JoinHandle<()>)>,
+}
+
+static LAUF: Mutex<Option<Lauf>> = Mutex::new(None);
+
+/// So lange wartet `stoppen` hoechstens darauf, dass die Faeden eines Laufs
+/// enden.
+const STOPP_FRIST: Duration = Duration::from_secs(3);
+
 /// Annahmefaeden und Bekanntgabe starten. Der Einlass (einlass::einrichten)
 /// muss vorher stehen. Scheitert das Binden (Port belegt), laesst sich
-/// `start` spaeter noch einmal rufen.
+/// `start` spaeter noch einmal rufen; ebenso nach `stoppen`.
 pub fn start(port: u16, priv_key: Vec<u8>) -> Result<(), String> {
-    PRIV.set(priv_key).ok();
-    let bild = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("Bild-Port {port} nicht verfuegbar: {e}"))?;
-    let eingabe = TcpListener::bind(("0.0.0.0", port + 1))
+    start_mit(Ipv4Addr::UNSPECIFIED, port, priv_key, rundruf_adressen)
+}
+
+/// `start` an der Adresse `adresse`, die Bekanntgabe an `ziele` (Tests:
+/// Loopback statt aller Netze).
+fn start_mit(adresse: Ipv4Addr, port: u16, priv_key: Vec<u8>, ziele: fn() -> Vec<Ipv4Addr>) -> Result<(), String> {
+    let mut lauf = sperre(&LAUF);
+    if let Some(l) = lauf.as_ref() {
+        return Err(format!("Zuschauerplatz laeuft schon (Port {})", l.port));
+    }
+    let bild = TcpListener::bind((adresse, port)).map_err(|e| format!("Bild-Port {port} nicht verfuegbar: {e}"))?;
+    let eingabe = TcpListener::bind((adresse, port + 1))
         .map_err(|e| format!("Eingabe-Port {} nicht verfuegbar: {e}", port + 1))?;
-    std::thread::spawn(move || annahme_bild(bild));
-    std::thread::spawn(move || annahme_eingabe(eingabe));
-    std::thread::spawn(move || bekanntgabe(port));
+    let weckziel = |l: &TcpListener| {
+        l.local_addr().map(|mut a| {
+            if a.ip().is_unspecified() {
+                a.set_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            }
+            a
+        })
+    };
+    let wecken = vec![
+        weckziel(&bild).map_err(|e| format!("Bild-Port {port}: {e}"))?,
+        weckziel(&eingabe).map_err(|e| format!("Eingabe-Port {}: {e}", port + 1))?,
+    ];
+    let marke = Laufmarke::neu(priv_key);
+    let mut faeden = Vec::new();
+    let mut starten = |name: &'static str, faden: &'static str, f: Box<dyn FnOnce() + Send>| -> Result<(), String> {
+        let h = std::thread::Builder::new().name(faden.into()).spawn(f).map_err(|e| format!("{name}: kein Faden ({e})"))?;
+        faeden.push((name, h));
+        Ok(())
+    };
+    let (m1, m2, m3) = (marke.clone(), marke.clone(), marke.clone());
+    let r = starten("Bildkanal", "qc-annahme-bild", Box::new(move || annahme_bild(bild, m1)))
+        .and_then(|_| starten("Eingabekanal", "qc-annahme-eingabe", Box::new(move || annahme_eingabe(eingabe, m2))))
+        .and_then(|_| starten("Bekanntgabe", "qc-bekanntgabe", Box::new(move || bekanntgabe(port, m3, ziele))));
+    let neu = Lauf { marke, port, wecken, faeden };
+    if let Err(e) = r {
+        // Was schon laeuft, wieder abbauen.
+        lauf_beenden(neu);
+        return Err(e);
+    }
+    *lauf = Some(neu);
     Ok(())
+}
+
+/// Den Zuschauerplatz schliessen: beide Listener zu, die Bekanntgabe aus
+/// (siehe Kopf). Kehrt zurueck, wenn die Ports frei sind (hoechstens
+/// STOPP_FRIST). Ein verbundener Zuschauer bleibt verbunden - wer die
+/// Freigabe beendet, verabschiedet ihn (abschied_beim_beenden). Liefert, ob
+/// ein Lauf lief.
+pub fn stoppen() -> bool {
+    let Some(l) = sperre(&LAUF).take() else { return false };
+    let port = l.port;
+    if lauf_beenden(l) {
+        log(format!("Zuschauerplatz geschlossen: Port {port} und {} zu, Bekanntgabe aus", port + 1));
+    }
+    true
+}
+
+/// Marke beenden, Annahmefaeden wecken und auf alle Faeden warten. true,
+/// wenn alle rechtzeitig endeten.
+fn lauf_beenden(l: Lauf) -> bool {
+    l.marke.beenden();
+    for a in &l.wecken {
+        // Die Weckverbindung selbst nimmt niemand an: der Annahmefaden sieht
+        // die beendete Marke und schliesst den Listener samt ihr.
+        let _ = TcpStream::connect_timeout(a, Duration::from_secs(1));
+    }
+    let bis = Instant::now() + STOPP_FRIST;
+    let mut alle = true;
+    for (name, f) in l.faeden {
+        while !f.is_finished() && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if f.is_finished() {
+            let _ = f.join();
+        } else {
+            alle = false;
+            log(format!("Zuschauerplatz: {name} endet nicht binnen {} s - sein Port bleibt womoeglich belegt", STOPP_FRIST.as_secs()));
+        }
+    }
+    alle
+}
+
+/// Laeuft der Zuschauerplatz (zwischen start und stoppen)?
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn laeuft() -> bool {
+    sperre(&LAUF).is_some()
+}
+
+/// Tests, die den einen Zuschauerplatz des Prozesses anfassen (LAUF, der
+/// Zuschauer in AKTUELL, Abschied an ihn), laufen nacheinander.
+#[cfg(test)]
+pub(super) fn platz_pruefung() -> MutexGuard<'static, ()> {
+    static PLATZ: Mutex<()> = Mutex::new(());
+    sperre(&PLATZ)
+}
+
+/// Fuer Tests: den Zuschauerplatz auf Loopback starten, an freien Ports P
+/// und P+1 (die Bekanntgabe geht an 127.0.0.1:P+2). Liefert P.
+#[cfg(test)]
+pub(super) fn start_loopback(schluessel: &[u8]) -> u16 {
+    for _ in 0..50 {
+        let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        if p <= 65000 && start_mit(Ipv4Addr::LOCALHOST, p, schluessel.to_vec(), || vec![Ipv4Addr::LOCALHOST]).is_ok() {
+            return p;
+        }
+    }
+    panic!("keine freien Ports auf Loopback");
 }
 
 #[cfg(test)]
@@ -2614,8 +2803,9 @@ mod tests {
     /// Geraet in der Zugangsphase stoert den laufenden Zuschauer nicht.
     #[test]
     fn zuschauerwechsel_und_parallele_annahme() {
+        let _platz = platz_pruefung();
         let (host_priv, host_pub) = noise::keypair().unwrap();
-        PRIV.set(host_priv).unwrap();
+        let marke = Laufmarke::neu(host_priv);
         let (_, client_pub) = secure::test_identitaet();
         let geraete = zugang::ablage_pfad(zugang::GERAETE_DATEI).unwrap();
         let passwort = zugang::ablage_pfad(zugang::PASSWORT_DATEI).unwrap();
@@ -2641,8 +2831,9 @@ mod tests {
         let ein_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let bild_addr = bild_l.local_addr().unwrap().to_string();
         let ein_addr = ein_l.local_addr().unwrap().to_string();
-        std::thread::spawn(move || annahme_bild(bild_l));
-        std::thread::spawn(move || annahme_eingabe(ein_l));
+        let m2 = marke.clone();
+        std::thread::spawn(move || annahme_bild(bild_l, m2));
+        std::thread::spawn(move || annahme_eingabe(ein_l, marke));
 
         // Die Bildschirme, die der Aufnahmefaden in Z hinterlegt haette.
         *sperre(&Z.bildschirme) = begruessungsliste();
@@ -3517,7 +3708,7 @@ mod tests {
     }
 
     // -------------------------------------------------------- Dateien
-    // Ohne PRIV und ohne AKTUELL/NR: jeder Test hat seinen eigenen Platz und
+    // Ohne Laufmarke und ohne AKTUELL/NR: jeder Test hat seinen eigenen Platz und
     // Zaehler (statics im Test) und eine eigene DateiUmgebung mit Rekorder
     // statt der Windows-Ablage und eigener Basis unter temp_dir.
 
@@ -4655,5 +4846,127 @@ mod tests {
         a.schliessen();
         b.schliessen();
         let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    // ------------------------------------------------- Starten und Stoppen
+
+    fn loopback() -> Vec<Ipv4Addr> {
+        vec![Ipv4Addr::LOCALHOST]
+    }
+
+    /// Den Zuschauerplatz auf Loopback starten, an freien Ports P und P+1;
+    /// die Bekanntgabe geht an 127.0.0.1:P+2, das der Test selbst belegt.
+    fn start_auf_loopback(schluessel: &[u8]) -> (u16, UdpSocket) {
+        for _ in 0..50 {
+            let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            if p > 65000 {
+                continue;
+            }
+            let Ok(udp) = UdpSocket::bind(("127.0.0.1", p + 2)) else { continue };
+            if start_mit(Ipv4Addr::LOCALHOST, p, schluessel.to_vec(), loopback).is_ok() {
+                return (p, udp);
+            }
+        }
+        panic!("keine freien Ports auf Loopback");
+    }
+
+    /// Handschlag bis Nachricht 2: antwortet der Host mit diesem Schluessel?
+    /// Danach bricht der Test ab (keine Nachricht 3) - der Einlass sieht die
+    /// Verbindung nie, ein laufender Zuschauer anderer Tests auch nicht.
+    fn host_antwortet(port: u16, host_pub: &[u8]) -> Result<(), String> {
+        const ABBRUCH: &str = "Test: nach Nachricht 2 abgebrochen";
+        let gesehen = std::cell::RefCell::new(None);
+        let r = secure::Secure::connect_pruefend(&format!("127.0.0.1:{port}"), &noise::prologue_video(), |k| {
+            *gesehen.borrow_mut() = Some(k.to_vec());
+            Err(secure::Fehler::Handschlag { grund: ABBRUCH.into(), frist: false, system: None })
+        });
+        match (r, gesehen.into_inner()) {
+            (Err(secure::Fehler::Handschlag { grund, .. }), Some(k)) if grund == ABBRUCH && k == host_pub => Ok(()),
+            (Err(e), k) => Err(format!("{e} (Schluessel gesehen: {:?})", k.map(|k| k == host_pub))),
+            (Ok(_), _) => Err("Handschlag trotz Abbruch fertig".into()),
+        }
+    }
+
+    /// Weist der Port Verbindungen ab? (Windows versucht es bei einem
+    /// geschlossenen Port auf Loopback rund 2 s lang, daher die lange Frist.)
+    fn abgewiesen(port: u16) -> Result<(), String> {
+        let ziel = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        match TcpStream::connect_timeout(&ziel, Duration::from_secs(6)) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+            Err(e) => Err(format!("Port {port}: {e}")),
+            Ok(_) => Err(format!("Port {port} nimmt noch an")),
+        }
+    }
+
+    /// Kommt binnen `frist` eine Bekanntgabe fuer `port`?
+    fn bekanntgabe_kommt(udp: &UdpSocket, port: u16, frist: Duration) -> bool {
+        let bis = Instant::now() + frist;
+        let mut b = [0u8; 256];
+        while Instant::now() < bis {
+            udp.set_read_timeout(Some(bis.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).unwrap();
+            match udp.recv_from(&mut b) {
+                Ok((n, _)) if zugang::bekanntgabe_lesen(&b[..n]).is_some_and(|g| g.port == port) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// W2: starten -> verbinden -> stoppen -> abgewiesen -> starten ->
+    /// verbinden, auf Loopback. Gestoppt sind beide Ports zu und die
+    /// Bekanntgabe still, sobald `stoppen` zurueckkehrt; ein zweiter Start
+    /// waehrend eines Laufs scheitert, ein zweites Stoppen tut nichts.
+    #[test]
+    fn starten_stoppen_starten() {
+        let _platz = platz_pruefung();
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (port, udp) = start_auf_loopback(&host_priv);
+        assert!(laeuft());
+        assert!(start_mit(Ipv4Addr::LOCALHOST, port, host_priv.clone(), loopback).is_err(), "zweiter Start waehrend eines Laufs");
+        host_antwortet(port, &host_pub).expect("erster Lauf: Bildkanal");
+        TcpStream::connect(("127.0.0.1", port + 1)).expect("erster Lauf: Eingabekanal");
+        assert!(bekanntgabe_kommt(&udp, port, Duration::from_secs(3)), "erster Lauf: keine Bekanntgabe");
+
+        let t0 = Instant::now();
+        assert!(stoppen());
+        assert!(t0.elapsed() < Duration::from_secs(2), "Stoppen dauerte {:?}", t0.elapsed());
+        assert!(!laeuft());
+        assert!(!stoppen(), "zweites Stoppen");
+        abgewiesen(port).expect("gestoppt: Bildkanal");
+        abgewiesen(port + 1).expect("gestoppt: Eingabekanal");
+        // Was schon unterwegs war, abholen; danach bleibt es still.
+        udp.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 256];
+        while udp.recv_from(&mut b).is_ok() {}
+        udp.set_nonblocking(false).unwrap();
+        assert!(!bekanntgabe_kommt(&udp, port, Duration::from_millis(2500)), "gestoppt: Bekanntgabe laeuft weiter");
+
+        start_mit(Ipv4Addr::LOCALHOST, port, host_priv.clone(), loopback).expect("zweiter Lauf auf demselben Port");
+        host_antwortet(port, &host_pub).expect("zweiter Lauf: Bildkanal");
+        TcpStream::connect(("127.0.0.1", port + 1)).expect("zweiter Lauf: Eingabekanal");
+        assert!(bekanntgabe_kommt(&udp, port, Duration::from_secs(3)), "zweiter Lauf: keine Bekanntgabe");
+        assert!(stoppen());
+        abgewiesen(port).expect("wieder gestoppt: Bildkanal");
+    }
+
+    /// Wer seinen Handschlag erst nach dem Stoppen beendet, wird kein
+    /// Zuschauer: die Marke gilt nicht mehr (Pruefung unter AKTUELL in
+    /// bild_annehmen). Hier die Marke selbst - sie wird unter AKTUELL
+    /// beendet, weckt eine laufende Pause sofort und gilt danach nie wieder.
+    #[test]
+    fn laufmarke_beenden_weckt_und_gilt_nicht_mehr() {
+        let marke = Laufmarke::neu(Vec::new());
+        assert!(marke.gilt());
+        assert!(!marke.pause(Duration::from_millis(20)), "Pause ohne Ende meldet beendet");
+        let m2 = marke.clone();
+        let t0 = Instant::now();
+        let schlaefer = std::thread::spawn(move || m2.pause(Duration::from_secs(10)));
+        std::thread::sleep(Duration::from_millis(100));
+        marke.beenden();
+        assert!(schlaefer.join().unwrap(), "Pause nicht als beendet gemeldet");
+        assert!(t0.elapsed() < Duration::from_secs(2), "Pause nicht geweckt: {:?}", t0.elapsed());
+        assert!(!marke.gilt());
+        assert!(marke.pause(Duration::from_secs(10)), "beendete Marke wartet");
     }
 }
