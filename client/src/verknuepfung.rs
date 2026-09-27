@@ -16,9 +16,7 @@
 // (Tests laufen trotzdem auf beiden Plattformen).
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::path::PathBuf;
-#[cfg(windows)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Vorsatz jedes Dateinamens: "QuadChroma - <Name>.lnk".
 const VORSATZ: &str = "QuadChroma - ";
