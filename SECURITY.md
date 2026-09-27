@@ -58,8 +58,9 @@ beyond what is needed to demonstrate it.
 
 ## What a good report contains
 
-- Which side is affected: Mac host, Windows client, Windows host role, Mac client, the
-  protocol between them, or the build and release scripts.
+- Which side is affected: the Mac app or the Windows app, and whether the problem is
+  on the computer being accessed (sharing) or the one you connect from; the protocol
+  between them; or the build and release scripts.
 - The version (release tag) or the commit hash if you built from source, and the
   operating system and hardware (macOS version and Mac model; Windows version and GPU).
 - Your setup: which host and which client, same local network or not, whether the
@@ -68,10 +69,9 @@ beyond what is needed to demonstrate it.
 - Steps to reproduce, ideally a minimal proof of concept (a script, a captured message
   sequence, a crafted file). A description of the impact: what an attacker can do, from
   where, with what prerequisites.
-- Relevant lines from the log: Windows client `%APPDATA%\QuadChroma\protokoll.txt`,
-  Windows host role `%APPDATA%\QuadChroma\host-protokoll.txt`, Mac host
-  `/tmp/quadchroma-m1.log` (older part in `/tmp/quadchroma-m1.alt.log`), Mac client
-  `~/Library/Application Support/QuadChroma/protokoll.txt`.
+- Relevant lines from the logs: `protokoll.txt` (connecting to others) and
+  `host-protokoll.txt` (sharing) in `%APPDATA%\QuadChroma\` on Windows or in
+  `~/Library/Application Support/QuadChroma/` on the Mac.
 - **Remove secrets before sending:** the host's access password, comparison codes,
   the contents of `host.key`, `client.key`, `host-password.txt`, `host-devices.txt` and
   `hosts.txt`, and any addresses or host names you do not want the maintainer to
@@ -81,8 +81,8 @@ beyond what is needed to demonstrate it.
 
 In scope:
 
-- the Mac host (`host/`), the Windows client and the Windows host role (`client/`), the
-  Mac client, and the release binaries built from them;
+- the QuadChroma app for Windows and for the Mac (`client/`, with the Mac's sharing
+  engine in `host/`), and the release binaries built from them;
 - the protocol: discovery and announcement (port 9003), the Noise handshake and the
   access phase (password proof, "Allow", throttle), key and list storage (`host.key`,
   `client.key`, `host-devices.txt`, `host-password.txt`, `hosts.txt`), the video and

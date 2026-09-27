@@ -246,8 +246,10 @@ its menu, and `--display n` pins entry `n` of the `--list` output for this run (
 without it frames go out only on changes (the client can switch this in its menu and
 stores it per host). `--mbit` is a cap the encoder does use: 150 Mbit/s means
 150 Mbit/s with motion, so outside your own network 25 to 50 is the better choice.
-Log: `/tmp/quadchroma-m1.log`; above 8 MB it moves to `/tmp/quadchroma-m1.alt.log`
-and starts anew. Keys and lists: `~/Library/Application Support/QuadChroma/`
+Logs: `host-protokoll.txt` (sharing) and `protokoll.txt` (connecting to others) in
+`~/Library/Application Support/QuadChroma/`; above 8 MB the host log moves to
+`host-protokoll.alt.txt` and starts anew (a few audio and clipboard lines still go to
+`/tmp/quadchroma-m1.log`). Keys and lists: `~/Library/Application Support/QuadChroma/`
 (`host.key`, `host-devices.txt` with the allowed devices, `host-password.txt` with
 the access password, `bildschirm.txt`).
 

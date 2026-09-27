@@ -19,10 +19,10 @@ body:
       description: Which programs would change? Pick everything that applies.
       multiple: true
       options:
-        - Mac host (QuadChroma.app)
-        - Windows client (quadchroma.exe)
-        - Windows host role (quadchroma.exe --host)
-        - Mac client (built from source)
+        - Mac app, sharing this Mac (being accessed)
+        - Mac app, connecting to another computer
+        - Windows app, sharing this PC (being accessed)
+        - Windows app, connecting to another computer
         - Protocol (all sides)
         - Build, release or documentation only
     validations:

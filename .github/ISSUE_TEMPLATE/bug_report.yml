@@ -21,10 +21,10 @@ body:
       description: Which program shows the problem? Pick every side that is involved.
       multiple: true
       options:
-        - Mac host (QuadChroma.app)
-        - Windows client (quadchroma.exe)
-        - Windows host role (quadchroma.exe --host)
-        - Mac client (built from source)
+        - Mac app, sharing this Mac (being accessed)
+        - Mac app, connecting to another computer
+        - Windows app, sharing this PC (being accessed)
+        - Windows app, connecting to another computer
     validations:
       required: true
   - type: input
@@ -76,10 +76,8 @@ body:
       label: Log excerpt
       description: |
         The lines around the event (20 to 50 lines are usually enough; more is fine). Where the log is:
-        Windows client `%APPDATA%\QuadChroma\protokoll.txt`;
-        Windows host role `%APPDATA%\QuadChroma\host-protokoll.txt`;
-        Mac host `/tmp/quadchroma-m1.log` (older part in `/tmp/quadchroma-m1.alt.log`);
-        Mac client `~/Library/Application Support/QuadChroma/protokoll.txt`.
+        `protokoll.txt` (connecting to others) and `host-protokoll.txt` (sharing),
+        on Windows in `%APPDATA%\QuadChroma\`, on the Mac in `~/Library/Application Support/QuadChroma/`.
         Remove the access password, comparison codes, key material and anything else you do not want public.
       render: text
     validations:
