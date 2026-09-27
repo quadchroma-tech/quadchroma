@@ -4159,12 +4159,22 @@ fn clamp8(v: i32) -> u32 {
 /// Bei 4:2:0 wird der naechstgelegene Farbwert genommen (Wiederholung) -
 /// einfach und schnell. Eine weichere Farbaufwertung ist eine spaetere
 /// Verfeinerung; sie aendert am Vergleich 4:4:4 gegen 4:2:0 nichts Wesentliches.
+///
+/// BEGRENZT = begrenzter Wertebereich (Y 16..235, Cb/Cr 16..240): die acht
+/// Anzeigebits werden vor der Matrix auf den vollen Bereich gedehnt, in
+/// 16.16 mit Rundung (Y: (y - 16) * 255/219, Cb/Cr: c * 255/224 um den
+/// Nullpunkt). Das kommt nur aus VideoToolbox (x444, 444v, x420, 420v -
+/// wenn die Formatbeschreibung keinen vollen Bereich meldet); die Formate
+/// von FFmpeg sind alle voll. Die Metal-Anzeige (anzeige_mac.rs) rechnet
+/// dieselben Schritte mit denselben Konstanten.
 #[inline(always)]
-fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8]) {
+fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool, const BEGRENZT: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8]) {
     const CR_R: i32 = 103206; // 1.5748
     const CB_G: i32 = 12276;  // 0.1873
     const CR_G: i32 = 30681;  // 0.4681
     const CB_B: i32 = 121609; // 1.8556
+    const Y_DEHNEN: i32 = 76309; // 255/219
+    const C_DEHNEN: i32 = 74606; // 255/224
 
     #[inline(always)]
     fn wert<const BITS: u8>(p: &[u8], i: usize) -> i32 {
@@ -4180,9 +4190,14 @@ fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32],
         // Bei Paaren liegt der U-Wert von Farbspalte cx an Stelle 2*cx, der
         // V-Wert direkt dahinter - `vr` ist schon um einen Wert versetzt.
         let ci = if PAAR { cx * 2 } else { cx };
-        let y = wert::<BITS>(yr, x);
-        let cb = wert::<BITS>(ur, ci) - 128;
-        let cr = wert::<BITS>(vr, ci) - 128;
+        let mut y = wert::<BITS>(yr, x);
+        let mut cb = wert::<BITS>(ur, ci) - 128;
+        let mut cr = wert::<BITS>(vr, ci) - 128;
+        if BEGRENZT {
+            y = ((y - 16) * Y_DEHNEN + 32768) >> 16;
+            cb = (cb * C_DEHNEN + 32768) >> 16;
+            cr = (cr * C_DEHNEN + 32768) >> 16;
+        }
         let r = y + ((CR_R * cr) >> 16);
         let g = y - ((CB_G * cb + CR_G * cr) >> 16);
         let b = y + ((CB_B * cb) >> 16);
@@ -4205,6 +4220,9 @@ pub struct EbenenFormat {
     /// U und V als Paare in EINER Ebene (NV12, P010, P012, P016; auf dem
     /// Mac alle Formate von VideoToolbox, auch 4:4:4).
     pub paar: bool,
+    /// Begrenzter Wertebereich (Y 16..235): nur die Formate von VideoToolbox
+    /// ohne "f" (x444, 444v, x420, 420v); FFmpegs Formate sind alle voll.
+    pub begrenzt: bool,
 }
 
 impl EbenenFormat {
@@ -4258,7 +4276,7 @@ pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
         Pixel::P010LE | Pixel::P012LE | Pixel::P016LE => (true, 16, true),
         _ => return None,
     };
-    Some(EbenenFormat { sub, bits, paar })
+    Some(EbenenFormat { sub, bits, paar, begrenzt: false })
 }
 
 /// Decodiertes Bild nach RGB. Das Format kommt aus dem Frame selbst
@@ -4267,13 +4285,14 @@ pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
 /// Hardware-Decoder liefert andere Formate als der Software-Decoder.
 ///
 /// Welche Formate gelesen werden, sagt `Ebenenbild::ebenen`; alles andere
-/// ist ein Fehler mit Meldung, kein Absturz. Alle Stroeme sind Vollbereich
-/// (der Host garantiert das), deshalb keine Bereichsdehnung.
+/// ist ein Fehler mit Meldung, kein Absturz. Die Stroeme der Hosts sind
+/// Vollbereich (der Host garantiert das); gedehnt wird nur, wenn
+/// VideoToolbox ein Format im begrenzten Bereich liefert (`begrenzt`).
 fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
     let Some(fmt) = src.ebenen() else {
         return Err(format!("Unbekanntes Bildformat vom Decoder: {}", src.format_name()));
     };
-    let (sub, bits, paar) = (fmt.sub, fmt.bits, fmt.paar);
+    let (sub, bits, paar, begrenzt) = (fmt.sub, fmt.bits, fmt.paar, fmt.begrenzt);
     let w = src.breite() as usize;
     let h = src.hoehe() as usize;
     if w == 0 || h == 0 {
@@ -4311,19 +4330,25 @@ fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
         // Bei Paaren: dieselbe Zeile, um einen Wert versetzt - der letzte
         // gelesene V-Wert liegt dann genau am Ende der Zeile, nie dahinter.
         let vr = if paar { &up[crow * us + bpp..crow * us + cbreite] } else { &vp[crow * vs..crow * vs + cbreite] };
-        match (sub, bits, paar) {
-            (false, 8, false) => zeile_rgb::<false, 8, false>(out, yr, ur, vr),
-            (false, 10, false) => zeile_rgb::<false, 10, false>(out, yr, ur, vr),
-            (false, _, false) => zeile_rgb::<false, 16, false>(out, yr, ur, vr),
-            (true, 8, false) => zeile_rgb::<true, 8, false>(out, yr, ur, vr),
-            (true, 10, false) => zeile_rgb::<true, 10, false>(out, yr, ur, vr),
-            (true, 8, true) => zeile_rgb::<true, 8, true>(out, yr, ur, vr),
-            (true, _, true) => zeile_rgb::<true, 16, true>(out, yr, ur, vr),
+        match (sub, bits, paar, begrenzt) {
+            (false, 8, false, false) => zeile_rgb::<false, 8, false, false>(out, yr, ur, vr),
+            (false, 10, false, false) => zeile_rgb::<false, 10, false, false>(out, yr, ur, vr),
+            (false, _, false, false) => zeile_rgb::<false, 16, false, false>(out, yr, ur, vr),
+            (true, 8, false, false) => zeile_rgb::<true, 8, false, false>(out, yr, ur, vr),
+            (true, 10, false, false) => zeile_rgb::<true, 10, false, false>(out, yr, ur, vr),
+            (true, 8, true, false) => zeile_rgb::<true, 8, true, false>(out, yr, ur, vr),
+            (true, _, true, false) => zeile_rgb::<true, 16, true, false>(out, yr, ur, vr),
             // 4:4:4 mit Paaren: nur VideoToolbox (444f, xf44).
-            (false, 8, true) => zeile_rgb::<false, 8, true>(out, yr, ur, vr),
-            (false, _, true) => zeile_rgb::<false, 16, true>(out, yr, ur, vr),
-            // 4:2:0 planar 16 Bit erzeugt keine der Tabellen; der Arm steht
-            // nur fuer die Vollstaendigkeit.
+            (false, 8, true, false) => zeile_rgb::<false, 8, true, false>(out, yr, ur, vr),
+            (false, _, true, false) => zeile_rgb::<false, 16, true, false>(out, yr, ur, vr),
+            // Begrenzter Bereich: nur VideoToolbox, immer mit Paaren
+            // (444v, x444, 420v, x420).
+            (false, 8, true, true) => zeile_rgb::<false, 8, true, true>(out, yr, ur, vr),
+            (false, _, true, true) => zeile_rgb::<false, 16, true, true>(out, yr, ur, vr),
+            (true, 8, true, true) => zeile_rgb::<true, 8, true, true>(out, yr, ur, vr),
+            (true, _, true, true) => zeile_rgb::<true, 16, true, true>(out, yr, ur, vr),
+            // 4:2:0 planar 16 Bit und planar im begrenzten Bereich erzeugt
+            // keine der Tabellen; der Arm steht nur fuer die Vollstaendigkeit.
             _ => {}
         }
     });
@@ -16235,5 +16260,71 @@ mod tests {
         assert!(!start_im_hintergrund(true, true, true, true, true), "Start mit Ziel ohne Fenster");
         assert!(!start_im_hintergrund(true, false, false, true, true), "tray=aus ohne Fenster");
         assert!(!start_im_hintergrund(false, false, true, true, true), "ohne die eine App im Hintergrund");
+    }
+
+    /// Ein Decoderbild aus eigenen Ebenen, fuer `to_rgb` ohne Decoder.
+    struct Ebenenprobe {
+        fmt: EbenenFormat,
+        w: u32,
+        h: u32,
+        ebenen: Vec<Vec<u8>>,
+        zeilen: Vec<usize>,
+    }
+
+    impl Ebenenbild for Ebenenprobe {
+        fn breite(&self) -> u32 {
+            self.w
+        }
+        fn hoehe(&self) -> u32 {
+            self.h
+        }
+        fn zeitstempel(&self) -> Option<i64> {
+            None
+        }
+        fn ebenen(&self) -> Option<EbenenFormat> {
+            Some(self.fmt)
+        }
+        fn format_name(&self) -> String {
+            "Probe".into()
+        }
+        fn ebenenzahl(&self) -> usize {
+            self.ebenen.len()
+        }
+        fn daten(&self, ebene: usize) -> &[u8] {
+            &self.ebenen[ebene]
+        }
+        fn zeilenlaenge(&self, ebene: usize) -> usize {
+            self.zeilen[ebene]
+        }
+    }
+
+    /// Begrenzter Wertebereich (nur VideoToolbox: 420v, x420, 444v, x444):
+    /// Y 16 wird Schwarz, 235 Weiss, dazwischen gerundet gedehnt; der volle
+    /// Bereich rechnet wie bisher (16 bleibt 16). 8 und 16 Bit (oben
+    /// buendig) ergeben dasselbe.
+    #[test]
+    fn begrenzter_bereich_wird_gedehnt() {
+        let probe = |begrenzt: bool, bits: u8, y: [u16; 4], uv: [u16; 2]| -> Vec<u32> {
+            let (bpp, sch) = if bits == 8 { (1, 0) } else { (2, 8) };
+            let bytes = |w: &[u16]| -> Vec<u8> {
+                w.iter().flat_map(|&v| if bpp == 1 { vec![v as u8] } else { (v << sch).to_le_bytes().to_vec() }).collect()
+            };
+            let p = Ebenenprobe {
+                fmt: EbenenFormat { sub: true, bits, paar: true, begrenzt },
+                w: 2,
+                h: 2,
+                ebenen: vec![bytes(&y), bytes(&uv)],
+                zeilen: vec![2 * bpp, 2 * bpp],
+            };
+            to_rgb(&p).expect("to_rgb").pixels
+        };
+        for bits in [8u8, 16] {
+            assert_eq!(probe(true, bits, [16, 235, 126, 16], [128, 128]), vec![0, 0xffffff, 0x808080, 0], "{bits} Bit");
+            assert_eq!(probe(false, bits, [16, 235, 126, 16], [128, 128]), vec![0x101010, 0xebebeb, 0x7e7e7e, 0x101010], "{bits} Bit");
+            // Cr 240 ist der Rand des begrenzten Bereichs: gedehnt 128 statt
+            // 112 ueber dem Nullpunkt (Y 81 -> 76; R 76 + 201, abgeschnitten;
+            // G 76 - 59; B 76).
+            assert_eq!(probe(true, bits, [81, 81, 81, 81], [128, 240]), vec![0xff114c; 4], "{bits} Bit");
+        }
     }
 }

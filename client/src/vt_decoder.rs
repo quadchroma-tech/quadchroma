@@ -271,16 +271,22 @@ pub fn ausgabeformat(art: Option<Bildart>, voll: bool) -> u32 {
 
 /// Aufbau der Ebenen eines Ausgabeformats - dieselbe Tabelle wie
 /// `ebenen_format` fuer FFmpegs Formate: alle zweiebenig (Y, dann U/V als
-/// Paare), 10 Bit oben buendig in 16 Bit wie P010.
+/// Paare), 10 Bit oben buendig in 16 Bit wie P010. Die Formate ohne "f"
+/// sind im begrenzten Wertebereich; `zeile_rgb` und die Metal-Anzeige
+/// dehnen sie auf den vollen.
 pub fn ebenen(format: u32) -> Option<crate::EbenenFormat> {
-    let (sub, bits) = match format {
-        XF44 | X444 => (false, 16),
-        F444 | V444 => (false, 8),
-        XF20 | X420 => (true, 16),
-        F420 | V420 => (true, 8),
+    let (sub, bits, begrenzt) = match format {
+        XF44 => (false, 16, false),
+        X444 => (false, 16, true),
+        F444 => (false, 8, false),
+        V444 => (false, 8, true),
+        XF20 => (true, 16, false),
+        X420 => (true, 16, true),
+        F420 => (true, 8, false),
+        V420 => (true, 8, true),
         _ => return None,
     };
-    Some(crate::EbenenFormat { sub, bits, paar: true })
+    Some(crate::EbenenFormat { sub, bits, paar: true, begrenzt })
 }
 
 /// Ein Fehler von CoreMedia oder VideoToolbox: was scheiterte, und der
@@ -1283,16 +1289,16 @@ mod tests {
     fn formate_und_ebenen() {
         use crate::EbenenFormat as E;
         for (chroma, bits, voll, soll, ebenen_soll) in [
-            (3, 10, true, "xf44", E { sub: false, bits: 16, paar: true }),
-            (3, 10, false, "x444", E { sub: false, bits: 16, paar: true }),
-            (3, 8, true, "444f", E { sub: false, bits: 8, paar: true }),
-            (3, 8, false, "444v", E { sub: false, bits: 8, paar: true }),
-            (1, 10, true, "xf20", E { sub: true, bits: 16, paar: true }),
-            (1, 10, false, "x420", E { sub: true, bits: 16, paar: true }),
-            (1, 8, true, "420f", E { sub: true, bits: 8, paar: true }),
-            (1, 8, false, "420v", E { sub: true, bits: 8, paar: true }),
-            (2, 8, true, "420f", E { sub: true, bits: 8, paar: true }),
-            (0, 12, true, "xf20", E { sub: true, bits: 16, paar: true }),
+            (3, 10, true, "xf44", E { sub: false, bits: 16, paar: true, begrenzt: false }),
+            (3, 10, false, "x444", E { sub: false, bits: 16, paar: true, begrenzt: true }),
+            (3, 8, true, "444f", E { sub: false, bits: 8, paar: true, begrenzt: false }),
+            (3, 8, false, "444v", E { sub: false, bits: 8, paar: true, begrenzt: true }),
+            (1, 10, true, "xf20", E { sub: true, bits: 16, paar: true, begrenzt: false }),
+            (1, 10, false, "x420", E { sub: true, bits: 16, paar: true, begrenzt: true }),
+            (1, 8, true, "420f", E { sub: true, bits: 8, paar: true, begrenzt: false }),
+            (1, 8, false, "420v", E { sub: true, bits: 8, paar: true, begrenzt: true }),
+            (2, 8, true, "420f", E { sub: true, bits: 8, paar: true, begrenzt: false }),
+            (0, 12, true, "xf20", E { sub: true, bits: 16, paar: true, begrenzt: false }),
         ] {
             let f = ausgabeformat(Some(Bildart { chroma, bits, profil: 1 }), voll);
             assert_eq!(fourcc_text(f), soll, "chroma {chroma}, {bits} Bit");
@@ -1354,7 +1360,10 @@ mod tests {
         let bild = bilder.last().unwrap();
         assert_eq!((bild.breite(), bild.hoehe()), (b, h));
         assert!(matches!(bild.format(), XF44 | X444), "Format {}", fourcc_text(bild.format()));
-        assert_eq!(ebenen(bild.format()), Some(crate::EbenenFormat { sub: false, bits: 16, paar: true }));
+        assert_eq!(
+            ebenen(bild.format()),
+            Some(crate::EbenenFormat { sub: false, bits: 16, paar: true, begrenzt: bild.format() == X444 })
+        );
         assert_eq!(bild.ebenenzahl(), 2);
         assert_eq!(bild.ebenenbreite(1), b as usize);
         let wert = |ebene: usize, x: u32, y: u32, k: usize| -> u16 {
@@ -1392,7 +1401,11 @@ mod tests {
             for x in (0..b).filter(|x| (4..probe::BLOCK - 4).contains(&(x % probe::BLOCK))) {
                 let (sy, scb, scr) = probe::muster(x, y, h);
                 let (yr, ur, vr) = ((sy << 6).to_le_bytes(), (scb << 6).to_le_bytes(), (scr << 6).to_le_bytes());
-                crate::zeile_rgb::<false, 16, false>(&mut soll, &yr, &ur, &vr);
+                if bild.format() == X444 {
+                    crate::zeile_rgb::<false, 16, false, true>(&mut soll, &yr, &ur, &vr);
+                } else {
+                    crate::zeile_rgb::<false, 16, false, false>(&mut soll, &yr, &ur, &vr);
+                }
                 let ist = rgb.pixels[(y * b + x) as usize];
                 for s in [16, 8, 0] {
                     let d = ((ist >> s) & 0xff) as i32 - ((soll[0] >> s) & 0xff) as i32;
