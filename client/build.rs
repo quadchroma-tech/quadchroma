@@ -1,7 +1,16 @@
-// Bauskript des Clients: bettet beim Bau fuer Windows Versionsinfo,
-// Programmsymbol und Anwendungsmanifest in die exe ein (res/quadchroma.rc,
-// res/quadchroma.manifest, res/quadchroma.ico). Auf anderen Zielen tut es
-// nichts.
+// Bauskript des Clients, je Ziel ein Zweig:
+//
+// Windows: bettet Versionsinfo, Programmsymbol und Anwendungsmanifest in die
+// exe ein (res/quadchroma.rc, res/quadchroma.manifest, res/quadchroma.ico).
+//
+// macOS: baut die Host-Engine des Mac (host/, Objective-C und C) als
+// libqchost.a hinein - dieselben Quellen und Schalter wie QuadChroma.app,
+// aus dem Makefile gelesen, ohne host/start.m (dort steht das main der
+// eigenen App). Siehe host_engine_einbauen und src/host_mac.rs.
+//
+// Andere Ziele: nichts.
+//
+// ------------------------------------------------------------------ Windows
 //
 // Ohne zusaetzliche Crates: der Ressourcen-Compiler des Windows SDK (rc.exe)
 // oder llvm-rc uebersetzt die .rc zu einer .res-Datei, und die geht als
@@ -31,9 +40,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => windows_ressourcen(),
+        Ok("macos") => {
+            if let Err(e) = host_engine_einbauen() {
+                panic!("Host-Engine (host/): {e}");
+            }
+        }
+        _ => {}
     }
+}
+
+fn windows_ressourcen() {
     // Nur diese Eingaben loesen einen neuen Lauf aus (sonst jede Datei im Paket).
     for p in ["build.rs", "Cargo.toml", "res/quadchroma.rc", "res/quadchroma.manifest", "res/quadchroma.ico"] {
         println!("cargo::rerun-if-changed={p}");
@@ -237,4 +255,174 @@ fn versionsschluessel(p: &Path) -> Vec<u32> {
 
 fn im_pfad(name: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|p| env::split_paths(&p).map(|d| d.join(name)).find(|f| f.is_file()))
+}
+
+// -------------------------------------------------------------------- macOS
+//
+// Die Host-Engine kommt Datei fuer Datei durch clang (-c, Schalter FLAGS aus
+// dem Makefile, dazu -arch des Ziels) nach OUT_DIR/qchost, libtool -static
+// packt die Objekte in libqchost.a. Die geht mit -Wl,-force_load in jede
+// Binaerdatei des Pakets (auch in die Test-exe): ohne force_load holte der
+// Linker nur die Objekte, deren Symbole Rust selbst braucht - menue.o etwa
+// kaeme nie hinein, und es blieben die schwachen Standardfassungen
+// (qc_oberflaeche_starten in main.m, qc_ui_* in zugang.c), also ein Host ohne
+// Menueleiste. Was danach niemand erreicht, entfernt -dead_strip (von rustc
+// gesetzt) wie bisher; Objective-C-Klassen bleiben. Die Frameworks stehen
+// ebenfalls im Makefile (FRAMEWORKS).
+//
+// Quellenliste und Schalter werden gelesen, nicht abgeschrieben: was die
+// eigene App baut, baut auch der Client. Ohne weitere Crates (kein cc):
+// clang und libtool aus den Xcode Command Line Tools.
+//
+// Neu gebaut wird, wenn sich build.rs, das Makefile oder etwas unter host/
+// aendert (cargo durchsucht den Ordner).
+
+/// Die Wurzel des Repositorys (eine Ebene ueber client/).
+fn repo_wurzel() -> Result<PathBuf, String> {
+    let paket = PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
+    paket.parent().map(Path::to_path_buf).ok_or_else(|| "CARGO_MANIFEST_DIR ohne Elternordner".to_string())
+}
+
+/// Der Wert einer Variablen `name := ...` aus dem Makefile, in Woerter
+/// zerlegt. Fortsetzungszeilen (`\` am Ende) gelten als eine Zeile, ein `#`
+/// beginnt einen Kommentar. Verweise auf andere Variablen (`$(...)`) liest
+/// dieses Skript nicht - dann bricht es mit Hinweis ab, statt falsch zu bauen.
+fn make_variable(makefile: &str, name: &str) -> Result<Vec<String>, String> {
+    let mut zeile = String::new();
+    for roh in makefile.lines() {
+        if let Some(vorn) = roh.strip_suffix('\\') {
+            zeile.push_str(vorn);
+            zeile.push(' ');
+            continue;
+        }
+        zeile.push_str(roh);
+        let ganz = std::mem::take(&mut zeile);
+        let ohne_kommentar = ganz.split('#').next().unwrap_or("");
+        let Some(rest) = ohne_kommentar.strip_prefix(name) else { continue };
+        if !rest.starts_with([' ', '\t', ':']) {
+            continue; // etwa SRCX := ...
+        }
+        let Some(wert) = rest.trim_start().strip_prefix(":=") else { continue };
+        if wert.contains("$(") {
+            return Err(format!("{name} im Makefile verweist auf eine andere Variable - build.rs liest nur feste Werte"));
+        }
+        return Ok(wert.split_whitespace().map(str::to_string).collect());
+    }
+    Err(format!("keine Zeile \"{name} := ...\" im Makefile"))
+}
+
+fn host_engine_einbauen() -> Result<(), String> {
+    for p in ["build.rs", "../Makefile", "../host"] {
+        println!("cargo::rerun-if-changed={p}");
+    }
+    println!("cargo::rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    let wurzel = repo_wurzel()?;
+    let out = PathBuf::from(env::var("OUT_DIR").map_err(|e| e.to_string())?);
+    let makefile = std::fs::read_to_string(wurzel.join("Makefile")).map_err(|e| format!("Makefile: {e}"))?;
+
+    // start.m traegt das main der eigenen App; im Client ist main das von Rust.
+    let quellen: Vec<String> = make_variable(&makefile, "SRC")?.into_iter().filter(|q| q != "host/start.m").collect();
+    let schalter = make_variable(&makefile, "FLAGS")?;
+    let frameworks = make_variable(&makefile, "FRAMEWORKS")?;
+    if quellen.is_empty() {
+        return Err("SRC im Makefile ist leer".into());
+    }
+
+    // Das Mindestsystem der Engine (-mmacosx-version-min im Makefile) muss
+    // auch das des Clients sein, sonst gaebe die exe vor, auf aelteren
+    // Systemen zu laufen (client/.cargo/config.toml setzt es).
+    if let Some(min) = schalter.iter().find_map(|s| s.strip_prefix("-mmacosx-version-min=")) {
+        let ziel = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_default();
+        if versionsschluessel_text(&ziel) < versionsschluessel_text(min) {
+            println!(
+                "cargo::warning=MACOSX_DEPLOYMENT_TARGET={} liegt unter dem Mindestsystem der Host-Engine ({min}) - der Linker warnt, und die exe liefe auf aelteren Systemen nicht",
+                if ziel.is_empty() { "(nicht gesetzt)" } else { &ziel }
+            );
+        }
+    }
+
+    let arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        Ok(a) => return Err(format!("Zielarchitektur {a} kennt build.rs nicht")),
+        Err(e) => return Err(e.to_string()),
+    };
+
+    let obj_dir = out.join("qchost");
+    std::fs::create_dir_all(&obj_dir).map_err(|e| format!("{}: {e}", obj_dir.display()))?;
+    let mut objekte: Vec<PathBuf> = Vec::new();
+    for q in &quellen {
+        let stamm = Path::new(q).file_stem().and_then(|s| s.to_str()).ok_or_else(|| format!("Quelle ohne Namen: {q}"))?;
+        let obj = obj_dir.join(format!("{stamm}.o"));
+        if objekte.contains(&obj) {
+            return Err(format!("zwei Quellen mit dem Namen {stamm} - die Objekte ueberschrieben sich"));
+        }
+        objekte.push(obj);
+    }
+
+    // Uebersetzen, hoechstens NUM_JOBS clang zugleich (cargo -j).
+    let zugleich = env::var("NUM_JOBS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(4).max(1);
+    let auftraege: Vec<(&String, &PathBuf)> = quellen.iter().zip(objekte.iter()).collect();
+    for gruppe in auftraege.chunks(zugleich) {
+        let mut laufend = Vec::new();
+        for (q, obj) in gruppe {
+            let kind = Command::new("clang")
+                .current_dir(&wurzel)
+                .args(&schalter)
+                .args(["-arch", arch, "-c"])
+                .arg(q.as_str())
+                .arg("-o")
+                .arg(obj)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("clang nicht startbar ({e}) - Xcode Command Line Tools installiert? (xcode-select --install)"))?;
+            laufend.push((q, kind));
+        }
+        for (q, kind) in laufend {
+            let aus = kind.wait_with_output().map_err(|e| format!("clang {q}: {e}"))?;
+            let fehlertext = String::from_utf8_lossy(&aus.stderr);
+            if !aus.status.success() {
+                return Err(format!("clang scheiterte an {q} ({}):\n{}{fehlertext}", aus.status, String::from_utf8_lossy(&aus.stdout)));
+            }
+            // -Wall soll still bleiben; was clang doch meldet, zeigt cargo an.
+            for z in fehlertext.lines().filter(|z| !z.trim().is_empty()) {
+                println!("cargo::warning={z}");
+            }
+        }
+    }
+
+    let bibliothek = out.join("libqchost.a");
+    let _ = std::fs::remove_file(&bibliothek);
+    let aus = Command::new("libtool")
+        .args(["-static", "-no_warning_for_no_symbols", "-o"])
+        .arg(&bibliothek)
+        .args(&objekte)
+        .output()
+        .map_err(|e| format!("libtool nicht startbar: {e}"))?;
+    if !aus.status.success() {
+        return Err(format!("libtool scheiterte ({}):\n{}", aus.status, String::from_utf8_lossy(&aus.stderr)));
+    }
+
+    println!("cargo::rustc-link-arg=-Wl,-force_load,{}", bibliothek.display());
+    let mut fw = frameworks.iter();
+    while let Some(w) = fw.next() {
+        match (w.as_str(), fw.next()) {
+            ("-framework", Some(name)) => println!("cargo::rustc-link-lib=framework={name}"),
+            _ => return Err(format!("FRAMEWORKS im Makefile: \"-framework Name\" erwartet, gefunden \"{w}\"")),
+        }
+    }
+    // Objective-C-Laufzeit (ARC: objc_retain und Verwandte).
+    println!("cargo::rustc-link-lib=dylib=objc");
+    Ok(())
+}
+
+/// "14.0" -> [14, 0, 0] fuer den Vergleich von Systemversionen ("14" wie
+/// "14.0.0"); leer -> [0, 0, 0].
+fn versionsschluessel_text(v: &str) -> [u32; 3] {
+    let mut s = [0u32; 3];
+    for (i, t) in v.split('.').take(3).enumerate() {
+        s[i] = t.trim().parse().unwrap_or(0);
+    }
+    s
 }

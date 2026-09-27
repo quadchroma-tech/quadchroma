@@ -68,6 +68,10 @@ mod ruhezustand;
 mod tray_win;
 #[cfg(target_os = "macos")]
 mod tray_mac;
+/// Die Host-Engine des Mac (host/, von build.rs als libqchost.a
+/// hineingebaut): die C-Schnittstelle des Dienstes aus host/dienst.h.
+#[cfg(target_os = "macos")]
+mod host_mac;
 
 /// Ton und Zwischenablage: je Plattform eine Datei mit derselben
 /// Schnittstelle; der Ringpuffer des Tons ist geteilt (audio_ring.rs). Auf

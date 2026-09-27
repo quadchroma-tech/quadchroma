@@ -789,6 +789,15 @@ desktop shortcut on the Mac. Build it with Rust and the FFmpeg from Homebrew:
     FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
 
+On the Mac, `client/build.rs` also compiles the Mac host engine into the client: the
+`SRC` list of the Makefile without `host/start.m` (that file holds the host app's
+`main`), with the Makefile's `FLAGS`, archived as `libqchost.a` and linked with
+`-force_load` and the Makefile's frameworks. It needs the Xcode Command Line Tools
+(`clang`, `libtool`), and it makes macOS 14 the minimum for the Mac client too
+(`MACOSX_DEPLOYMENT_TARGET` in `client/.cargo/config.toml`). The C interface is
+`host/dienst.h` (`client/src/host_mac.rs`); nothing starts the host service from the
+client yet.
+
 Its files live in `~/Library/Application Support/QuadChroma` (`client.key`,
 `hosts.txt`, `einstellungen.txt`, `protokoll.txt`, `benchmark.txt`, and
 `einzel.sock` and `einzel.lock` for the single instance) - next to the host's

@@ -165,7 +165,9 @@ your own machine, not for distribution):
     FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
     FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo test --release -- --skip clipboard
 
-`--skip clipboard` keeps one test from reading and writing your real clipboard.
+`--skip clipboard` keeps one test from reading and writing your real clipboard. The
+client build also compiles the Mac host engine from `host/` (see `client/build.rs`),
+so a change there is checked by both `make` and `cargo build`.
 
 **Before you open the pull request:** run the test set of every side your change
 touches, locally, and say in the pull request which ones you ran on which machine. CI

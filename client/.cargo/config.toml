@@ -14,3 +14,11 @@
 # of src/main.rs).
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# macOS: the client carries the Mac host engine (host/, compiled by build.rs),
+# which is built for macOS 14 (-mmacosx-version-min=14.0 in the Makefile) and
+# links ScreenCaptureKit. rustc and the linker get the same minimum, so the
+# binary does not claim to run on older systems. A MACOSX_DEPLOYMENT_TARGET
+# already set in the environment wins; build.rs warns if it is lower.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "14.0"
