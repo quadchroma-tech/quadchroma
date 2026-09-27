@@ -120,8 +120,9 @@ graphics card the CPU draws.
 
 ## Design in brief
 
-- One program per side: `QuadChroma.app` on the Mac, `quadchroma.exe` on Windows. The
-  same exe can also act as a host (`--host`); the same Rust source builds a Mac client.
+- One program per side: `QuadChroma.app` on the Mac, `quadchroma.exe` on Windows. On
+  Windows it is one app for both directions - client and host role in one process with
+  one icon; the same Rust source builds a Mac client.
 - Pointer on the client side: the client shows its own local pointer in the shape the
   host reports; the video never contains one.
 - Always encrypted: Noise XX with X25519, ChaCha20-Poly1305 and SHA-256, no switch to
@@ -140,7 +141,7 @@ graphics card the CPU draws.
 |---|---|---|
 | Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; menu-bar icon with device ID, access password, allowed devices and "Start at login". |
 | Client | Windows 10 or 11, 64-bit; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
-| Host role | Windows, the same `quadchroma.exe`, started with "Share this PC" on the start screen (or `--host`) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. Icon in the notification area with device ID, access password, allowed devices and "Start with Windows". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
+| Host role | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
 | Client | Mac (arm64), the same Rust source | Secondary, under construction. Audio via AudioToolbox, clipboard including files via NSPasteboard, display on the CPU (no Metal yet), menu-bar icon, no desktop shortcut. Not distributed as a binary, see "Building from source". |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
@@ -225,10 +226,11 @@ the access password, `bildschirm.txt`).
     quadchroma.exe
     quadchroma.exe 192.168.178.194:9001
 
-Without an address the start screen opens; the Mac appears in the list after a few
-seconds with its name and device ID, and a click connects. The address field also
-takes a device ID. Closing the window does not quit: the client goes to the
-notification area (see "Closing, single instance, desktop shortcut").
+Without an address the very first start opens the start screen; the Mac appears in the
+list after a few seconds with its name and device ID, and a click connects. The address
+field also takes a device ID. Later starts go silently to the notification area - a
+click on the icon, or starting `quadchroma.exe` again, opens the window. Closing the
+window does not quit (see "Closing, single instance, desktop shortcut").
 
 The client's files live in `%APPDATA%\QuadChroma\`: `client.key`, `hosts.txt` (the
 hosts that let this PC in), `einstellungen.txt` (settings), `protokoll.txt` (the log,
@@ -237,15 +239,18 @@ restarted at every start), `benchmark.txt`. The log records what the client deci
 
 ### Sharing a Windows PC
 
-The same `quadchroma.exe` can also be the host. "Share this PC" on the start screen
-starts it a second time in the background as the host role (`quadchroma.exe --host`);
-the button then reads "Sharing is on", and the host role keeps running when the client
-quits. It has an icon in the notification area with the same menu as the Mac host -
-device ID, access password, allowed devices - plus "Start with Windows" (a shortcut in
-the Startup folder) and "Stop sharing". Its files are `host.key`, `host-devices.txt`,
-`host-password.txt` and `host-protokoll.txt` in `%APPDATA%\QuadChroma\`. What it can
-and cannot do yet is under "Platforms and status"; details in `MANUAL.txt`, "Windows
-as host".
+The same `quadchroma.exe` is also the host: the host role runs inside the app, and
+"Share this PC" - on by default, a toggle on the start screen and a check item in the
+icon's menu - decides whether it listens. The one icon in the notification area opens
+the window with a left click; its menu (right click) has the same host items as the Mac
+host - device ID, access password, allowed devices - plus "Change device name ...",
+"Share this PC", "Start with Windows" (one shortcut in the Startup folder, which starts
+the app silently in the notification area), "Prevent sleep while QuadChroma is running"
+and "Quit". `quadchroma.exe --host` starts the app in the background with sharing on
+(shortcuts of earlier versions keep working). The host role's files are `host.key`,
+`host-devices.txt`, `host-password.txt` and `host-protokoll.txt` in
+`%APPDATA%\QuadChroma\`. What it can and cannot do yet is under "Platforms and status";
+details in `MANUAL.txt`, "Windows: one app for both directions" and "Windows as host".
 
 ### Pairing
 
@@ -479,11 +484,11 @@ figures are under "Measurements"; the progress line, the log lines and messages 
 ## Closing, single instance, desktop shortcut
 
 Closing the window disconnects a running session and puts the client away: on Windows
-as an icon in the notification area, on the Mac in the menu bar. The icon brings the
-window back, connects to a found host through its menu, or quits the program;
-`tray=aus` (off) in `einstellungen.txt` restores close-to-quit. Only one client with a
-window runs per user session: a second start hands its address to the running one and
-exits.
+as an icon in the notification area (sharing keeps running), on the Mac in the menu
+bar. The icon brings the window back, connects to a found host through its menu, or
+quits the program; `tray=aus` (off) in `einstellungen.txt` restores close-to-quit. Only
+one client with a window runs per user session: a second start hands its address to
+the running one and exits.
 
 The desktop shortcut (Windows only) builds on this. The "Desktop shortcut" button in
 each host row of the start screen, or in the Encryption tab of the menu, puts
@@ -707,11 +712,12 @@ are in `RELEASING.md`.
   list of entries in parts instead of in one piece (up to 1 MiB, during which
   keystrokes or frames wait briefly).
 - A desktop shortcut on the Mac client.
-- Windows as host: "Share this PC" and `--host` exist (viewer slot, access with
-  password or "Allow", icon in the notification area, announcement, input, clipboard
-  including files, Desktop Duplication, encoder via NVENC or without NVIDIA H.264 in
-  software, frame pacing, codec switch, screen selection with switching, test
-  pattern, audio, pointer shape, load, keep-awake), plus `--list`, `--messen` and the
+- Windows as host: the host role inside the app, "Share this PC", `--host` and
+  `--nur-host` exist (viewer slot, access with password or "Allow", icon in the
+  notification area, announcement, input, clipboard including files, Desktop
+  Duplication, encoder via NVENC or without NVIDIA H.264 in software, frame pacing,
+  codec switch, screen selection with switching, test pattern, audio, pointer shape,
+  load, keep-awake), plus `--list`, `--messen` and the
   recorded stream (`--konserve`) as a test path. Missing are AMF/QSV, HDR outputs,
   scaling and rotation on the GPU (both run on the CPU today). Described in
   `MANUAL.txt`.
