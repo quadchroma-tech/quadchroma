@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Writes the GitHub release notes to stdout. The first thing a visitor sees is
-# which single file to download for each computer; everything else is listed
-# as "not needed" so nobody has to guess.
+# which single file to download for each computer - one app per platform, and
+# every computer running it can both control the others and be controlled;
+# everything else is listed as "not needed" so nobody has to guess.
 #
 # Usage: scripts/release-notes.sh DIST_DIR VERSION REPOSITORY TAG
 #   DIST_DIR    folder with the release files (only their names are used)
@@ -29,25 +30,31 @@ base="https://github.com/$repo/releases/download/$tag"
 cat <<EOF
 ## Which file do I need?
 
-QuadChroma runs on two computers: the **Mac** you want to control and the
-**Windows PC** you control it from. Download **one file for each**:
+QuadChroma is **one app per platform**, and every computer that runs it can both
+control the others and be controlled. Install it on **every computer** you want to
+use - download the file for that computer's platform:
 
 | Computer | Download | Then |
 |---|---|---|
-| **Windows PC** (you sit here) | [\`$win\`]($base/$win) | Unzip it anywhere and start \`quadchroma.exe\` inside the folder. Keep the two \`.dll\` files next to it. |
-| **Mac** (the computer you control) | [\`$mac\`]($base/$mac) | Open it and drag **QuadChroma** to **Applications**. Start it and allow **Screen Recording** and **Accessibility** in System Settings > Privacy & Security. |
+| **Each Windows PC** | [\`$win\`]($base/$win) | Unzip it anywhere and start \`quadchroma.exe\` inside the folder. Keep the two \`.dll\` files next to it. |
+| **Each Mac** | [\`$mac\`]($base/$mac) | Open it, drag **QuadChroma** to **Applications** and start it. So that other computers can control this Mac, allow **Screen Recording** and **Accessibility** in System Settings > Privacy & Security. |
 
-That is all. The Mac appears in the start screen of the Windows program after a
-few seconds; click it to connect. The first time, the Windows program asks for the
-Mac's access password: click the QuadChroma icon in the Mac's menu bar (four small
-squares) to see it. Or someone at the Mac clicks **Allow** in the window that
-appears there. After that this PC connects without asking.
+That is all. After a few seconds every computer with QuadChroma shows the others in
+its start screen, with name and device ID - from whichever computer you sit at, click
+any other one to connect. The first time, the app asks for the other computer's
+access password: click the QuadChroma icon there (menu bar on a Mac, notification
+area on Windows; four small squares) to see it. Or someone at the other computer
+clicks **Allow** in the window that appears there. After that this computer connects
+without asking. During a session, the menu's **Computers** tab (hold Esc for two
+seconds, or press F10) switches to another computer.
 
-The same Windows download can also share a Windows PC: click **Share this PC** on
-the start screen.
+There are no separate host and client downloads. Sharing is on by default; on a
+computer that should only control others, switch off **Share this PC** (**Share this
+Mac**) in the icon's menu or on the start screen.
 
 Requirements: Windows 10 or 11 (64-bit); a Mac with Apple silicon (M1 or newer)
-and macOS 14 or later; both in the same network (or connected through a VPN).
+and macOS 14 or later; all computers in the same network (or connected through a
+VPN).
 
 **You do not need any of the other files:**
 
@@ -74,17 +81,24 @@ esac
 
 cat <<EOF
 
-On the Mac, QuadChroma lives in the menu bar, not in the Dock. Its menu shows the
-device ID and the access password, lists the allowed devices, and offers
-**Change password**, **Start at login** and **Quit QuadChroma**.
+QuadChroma lives in the menu bar (Mac) or the notification area (Windows); the very
+first start opens its window, later starts stay in the background. The icon's menu
+opens the window, shows the device ID and the access password, lists the allowed
+devices, and offers **Change password**, **Change device name**, **Share this Mac**
+(**Share this PC**), **Start at login** (**Start with Windows**), **Prevent sleep while
+QuadChroma is running** and **Quit**.
+
+Updating from an earlier test version: each computer now uses one key in both
+directions, so another computer that knew it only by its former client key asks once
+more for the password or **Allow**.
 
 The complete manual is \`MANUAL.txt\` in the Windows ZIP and in the DMG.
 
 ---
 
-This software uses code of [FFmpeg](https://ffmpeg.org) licensed under the
+The Windows download uses code of [FFmpeg](https://ffmpeg.org) licensed under the
 [LGPLv2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html) and its source
-can be downloaded [here]($base/ffmpeg-9.0.2.tar.xz). The complete corresponding
+can be downloaded [here]($base/ffmpeg-9.0.2.tar.xz); the Mac app contains no FFmpeg. The complete corresponding
 source of the FFmpeg DLLs is attached to this release (see
 \`THIRD_PARTY_NOTICES.txt\`, section 2).
 

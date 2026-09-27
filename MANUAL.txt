@@ -1,7 +1,23 @@
-QuadChroma - Windows client
-===========================
+QuadChroma - manual
+===================
 
-Starting:
+QuadChroma is one app per platform - QuadChroma.app on the Mac,
+quadchroma.exe on Windows - and every copy is client and host at once.
+Run it on every computer you use: each one sits in the menu bar or the
+notification area, lets the other computers in ("Share this Mac" /
+"Share this PC", on by default, switchable off) and lists every other
+QuadChroma computer in the network. From whichever computer you sit at,
+open the window and click any other one in the list; during a session
+the menu's "Computers" tab switches to another computer directly. There
+are no separate host and client programs and no second process for
+sharing. Each computer has one device ID and one name (the computer's
+name until changed with "Change device name ..."), the same in both
+directions; "Prevent sleep while QuadChroma is running" keeps it
+reachable. The Mac app needs no FFmpeg; the Windows download carries the
+two FFmpeg DLLs. Most examples below show a Windows PC connecting to a
+Mac, the main use; every other pairing works the same way.
+
+Starting (Windows):
 
     quadchroma.exe
 
@@ -20,6 +36,13 @@ allowed, otherwise the list stays empty.
 
 Each host in the list shows its name and its device ID, a small check
 mark once the client knows it; hovering over the row shows its address.
+The list holds every QuadChroma computer that announces itself, except
+this one: known ones first, then by name (case does not matter), each
+computer once even when it is heard under several addresses (the one in
+hosts.txt wins, otherwise the one heard first), and the rows keep their
+order while others come and go. A computer that has not been heard for
+10 s leaves the list. Four rows are visible; the mouse wheel over the
+list scrolls the rest (a scroll bar appears on the right).
 The address field also takes a device ID (nine digits, spaces or
 hyphens allowed) and pastes with Ctrl+V. The first time this PC
 connects to a host, the host wants its access password or a click on
@@ -59,8 +82,25 @@ Device ID: every device has a fixed nine-digit ID derived from its key,
 written in groups of three, such as "581 729 911". It is there for
 people and for searching - the host's menu, the client's host list and
 the access windows show it; trust always goes to the full key behind it.
-A Windows PC has two IDs: one as a client (client.key) and one for
-"Share this PC" (host.key).
+A computer has one key and therefore one ID: host.key is the device key
+of the whole app - the host role accepts connections with it, and the
+client calls other computers with it. So the ID in "This computer" on
+the start screen, in the announcement and in another computer's list of
+allowed devices is always the same.
+
+Migration from versions before the one app: those called with a second
+key, client.key. It stays on disk, unused and unchanged (it is never
+deleted or rewritten). A computer that knew this one only by that former
+key does not recognize the device key and asks once more for its
+password or "Allow"; when the client knows that host and a different
+client.key is still there, its access dialog adds "QuadChroma now uses
+one key per computer for both directions. If <name> knew this computer
+before, it asks once more." (log: "Zugang: <Name> ist hier gemerkt und
+fragt trotzdem - dieser Rechner ruft jetzt mit seinem
+Geraeteschluessel (host.key) an, nicht mehr mit client.key; einmal
+Passwort oder Zulassen, dann gilt der neue"). Afterwards the host lists
+the device under its device key; an entry for the former key can be
+removed in its "Allowed devices".
 
 Who gets in: every host keeps a list of allowed devices, and a device on
 it comes straight in. A new device has two ways in:
@@ -316,7 +356,12 @@ selbst"). Both hosts turn away a device that shows their own key, even
 when it is in the list: "QCA1" and at once result 3, as after "Deny"
 ("Abgewiesen: <IP> meldet sich mit dem eigenen Schluessel dieses Hosts
 - Verbindung zu sich selbst", on Windows with the name in front of the
-address; rate-limited like the other lines of unknown devices).
+address; rate-limited like the other lines of unknown devices). Because
+a computer calls with its device key, two computers whose QuadChroma
+folder was copied from one to the other (a cloned virtual machine, a
+restored backup) share host.key and count as one device: they hide each
+other and cannot connect. Delete host.key on one of them while the app
+is not running; it gets a new key and ID at its next start.
 
 Handshake: each handshake has an overall deadline (host 5 s, client 3 s)
 and runs in its own thread on the host, so a peer that stays silent or
@@ -377,15 +422,14 @@ anew at every start and moves it to host-protokoll.alt.txt at 8 MB
 host-protokoll.alt.txt"), and likewise messung.txt to messung.alt.txt.
 
 Where the files are: the names of the host's files begin with "host",
-because host and client share the folder (the Mac host with the Mac
-client, the Windows host role with the Windows client):
+because host and client of the one app share the folder:
 
     Mac       ~/Library/Application Support/QuadChroma/
-              host.key, host-devices.txt, host-password.txt (host);
-              client.key, hosts.txt (Mac client)
     Windows   %APPDATA%\QuadChroma\
-              client.key, hosts.txt (client);
-              host.key, host-devices.txt, host-password.txt (host role)
+              host.key (the device key, both roles),
+              host-devices.txt, host-password.txt (host role),
+              hosts.txt (client); a client.key of an earlier
+              version lies there unused
 
     host-devices.txt   the allowed devices, one line each: 64 hex digits
                        of the key, two spaces, the date it was added
@@ -414,14 +458,15 @@ known_hosts.txt.migriert. A host no longer takes in the first device by
 itself, not even with an empty or missing list.
 
 Broken files never let anyone in and are never replaced silently. A key
-is created only when its file is missing; an existing key file is never
-written again. The Mac host writes host.key with 32 bytes (the private
-key only), the Windows host role and the client write 64 (private, then
-public); the Windows host role and the client read both forms and
-compute the public key from 32 bytes - the same public key and ID the
-Mac host computes. If host.key exists but is unreadable or has the wrong
-length (Mac host: not 32 bytes; Windows: neither 32 nor 64), the host
-does not start ("Schluessel host.key ist vorhanden, aber nicht
+is created only when its file is missing - by whichever role needs it
+first; an existing key file is never written again. The Mac host engine
+writes host.key with 32 bytes (the private key only), the Rust part (the
+client, and on Windows the host role) with 64 (private, then public).
+Both read both forms: from 32 bytes the public key is computed - the same
+public key and ID on both sides -, and the Mac host engine takes 64 bytes
+only when the second half is the public key of the first. If host.key
+exists but is unreadable or in neither form (neither 32 nor 64 bytes, or
+a mismatching public half on the Mac), the host does not start ("Schluessel host.key ist vorhanden, aber nicht
 lesbar oder beschaedigt - Abbruch. ..." or on Windows "Schluessel
 konnte nicht angelegt werden - Abbruch: ..."). Deleting a key file
 gives the device a new identity and a new ID. After a new host.key the
@@ -430,17 +475,18 @@ each of them asks it to prove itself and needs the password (or
 "Allow") once more; a client that connects by the old ID (a desktop
 shortcut, say) stops with "A different device answers at this address."
 - pick the host from the list, which shows its new ID, and create
-shortcuts anew. After a new client.key every host treats the device as
-new.
+shortcuts anew. Since the client calls with the same host.key, a new
+host.key also makes this computer new to every host it connects to:
+each asks once for its password or "Allow".
 
-The client reads client.key and hosts.txt before it opens a connection:
+The client reads host.key and hosts.txt before it opens a connection:
 
     unreadable     (locked by a virus scanner or backup, permissions,
                    or hosts.txt larger than 1 MiB): no connection to the
                    host. The client retries every 2 s for at most about
                    30 s, writes this to the log once and connects by
                    itself as soon as the file is readable.
-    damaged        (client.key has the wrong length or cannot be
+    damaged        (host.key has the wrong length or cannot be
                    written, hosts.txt is not UTF-8, e.g. ANSI): the
                    client does not try again ("Verbindung zu <Adresse>
                    beendet: der Fehler bleibt bis zur Behebung - kein
@@ -925,18 +971,20 @@ window was never visible to AppKit (locked screen, sleep, or a virtual
 display nobody is watching) - run it on an unlocked desktop. Neither
 host, screen capture nor network is started.
 
-Storage: ~/Library/Application Support/QuadChroma/ (client.key,
-hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
-einzel.sock and einzel.lock of the single instance) - the same folder as
-the host, separate files (host.key, bildschirm.txt and the files named
-host-* belong to the host). The client creates a new folder for the
+Storage: ~/Library/Application Support/QuadChroma/ (hosts.txt,
+einstellungen.txt, protokoll.txt, benchmark.txt, plus einzel.sock and
+einzel.lock of the single instance) - the same folder as the host
+engine (bildschirm.txt and the files named host-* belong to it). host.key
+is the device key of both: the client calls with it; a client.key of an
+earlier version stays unused. The client creates a new folder for the
 owner only (0700), new keys and lists with 0600; existing files and
 folders keep their permissions. A host lets it
 in like any client: with the access password or a click on "Allow".
 
 License note: the Mac client contains no FFmpeg - only Apple frameworks
-and the Rust crates listed in THIRD_PARTY_NOTICES.txt. It is not yet
-distributed as a program of its own.
+and the Rust crates listed in THIRD_PARTY_NOTICES.txt. It is distributed
+inside QuadChroma.app (the DMG and ZIP of a release), not as a program
+of its own.
 
 Keys:
 
@@ -1263,7 +1311,7 @@ The menu
 
 Hold ESC for two seconds (that ESC then does not reach the Mac) or press
 F10. "Disconnect" sits in the header at the right, on every tab, with the
-host's address below it. Five tabs:
+host's address below it. Six tabs:
 
     Picture         bitrate, frame rate, gaming mode, fixed frame rate,
                     sound, host display, codec choice
@@ -1275,6 +1323,20 @@ host's address below it. Five tabs:
     Shortcuts       every key that the client intercepts itself
     Benchmark       measures codecs, frame rates and bitrates one after
                     another (see below)
+    Computers       the QuadChroma computers in the network, as on the
+                    start screen; a click switches the session there
+
+Computers: the same list as on the start screen (name, device ID, check
+mark for known computers, this computer left out, same order), under the
+sentence "Click a computer to switch to it. This session ends." The
+current host is marked "Connected"; hovering shows a row's address, and
+the mouse wheel scrolls a long list. A click on another computer ends
+the running session as "Disconnect" does (keys released, connection
+closed, a running benchmark stopped) and connects to that computer at
+once, without the usual 2 s pause; if it does not know this computer
+yet, the access dialog appears ("Reiter Computer: trenne <Adresse> und
+verbinde mit <Name> (<Adresse>, ID <ID>)"). A click on the current host
+or ESC keeps the session.
 
 Hovering the mouse over a switch immediately shows a sentence about what
 it does - in each of the 29 languages.
@@ -2696,10 +2758,10 @@ connecting for up to 5 s until the viewer has reported its capabilities, and
 cleans up its clipboard folder at startup.
 
 Files of the Windows host role, in %APPDATA%\QuadChroma\: host.key (64 bytes:
-private, then public), host-devices.txt and host-password.txt in the same
-format as on the Mac (see "Encryption and access"), bildschirm.txt with the
-requested display and host-protokoll.txt - separate from the client's
-client.key and hosts.txt.
+private, then public; the device key, with which the client calls too),
+host-devices.txt and host-password.txt in the same format as on the Mac (see
+"Encryption and access"), bildschirm.txt with the requested display and
+host-protokoll.txt - next to the client's hosts.txt.
 
 Keys arrive over the connection as positions (macOS key codes) and are
 translated into scancodes on Windows; the client's Command key becomes the
@@ -2725,4 +2787,4 @@ Requirement: Windows 10 or 11, 64-bit. No Visual C++ runtime is needed: the C
 runtime is inside the exe, and the FFmpeg files use only the Universal C
 Runtime, which is part of Windows 10 and 11.
 
-As of: 26 September 2026
+As of: 27 September 2026

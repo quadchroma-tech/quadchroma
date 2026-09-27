@@ -23,11 +23,13 @@ and the codec can be switched while the session runs.
   4:4:4 in software); the statistics panel shows every link of the chain live
   (encoder, network, decoder), and a built-in benchmark recommends codec, bit rate
   and frame rate for your network.
-- **One program per side, nothing else.** No account, no cloud, no relay server, no
-  extra driver or helper service: `QuadChroma.app` on the Mac, `quadchroma.exe` on
-  Windows, connected directly in your network (or through your VPN). Always
-  encrypted (Noise protocol). A new device gets in with the host's access
-  password or a click on "Allow" at the host - no command-line switches.
+- **One app on every computer, nothing else.** `QuadChroma.app` on the Mac,
+  `quadchroma.exe` on Windows - each one is client and host at once. Install it on
+  every computer you use; from whichever one you sit at, pick any other from the
+  list and connect. No separate host program, no account, no cloud, no relay server,
+  no extra driver or helper service - connected directly in your network (or through
+  your VPN). Always encrypted (Noise protocol). A new device gets in with the other
+  computer's access password or a click on "Allow" there - no command-line switches.
 - **Everyday comfort.** Copy files between Mac and PC through the clipboard, like
   with Windows Remote Desktop; choose which of the Mac's screens to show (it follows
   the main screen automatically); audio; a desktop shortcut per host; 29 languages.
@@ -65,8 +67,8 @@ Windows pointer, and the Mac follows it invisibly, so the mouse feels local. To 
 it still look like the Mac's pointer, the host sends only the pointer *shape* (arrow,
 hand, resize arrows, text cursor, spinning wait cursor) whenever it changes.
 
-Status as of 26 September 2026: it runs, but it is still a scaffold, not a finished
-application. Releases: see the Releases page once published. The macOS host will ship
+Status as of 27 September 2026: it runs, but it is still a scaffold, not a finished
+application. Releases: see the Releases page once published. The Mac app will ship
 as a DMG and as a ZIP; unpack the ZIP with the Finder or `ditto -x -k` (it contains no
 AppleDouble `._*` entries, so the command-line `unzip` works as well).
 
@@ -137,12 +139,15 @@ graphics card the CPU draws.
 
 ## Platforms and status
 
-| Side | Platform | State |
+There is one app per platform, and every copy is client and host at once: `QuadChroma.app`
+on the Mac, `quadchroma.exe` on Windows. The table lists the two roles of each.
+
+| Role | Platform | State |
 |---|---|---|
-| Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; menu-bar icon with device ID, access password, allowed devices and "Start at login". |
-| Client | Windows 10 or 11, 64-bit; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
-| Host role | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
-| Client | Mac (arm64), the same Rust source | Secondary, under construction. Audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), menu-bar icon, no desktop shortcut. Not distributed as a binary, see "Building from source". |
+| Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; part of `QuadChroma.app` ("Share this Mac", on by default); host engine in Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; the app's menu-bar icon with device ID, access password, allowed devices, the sharing switch, "Start at login", the device name and "Prevent sleep". |
+| Client | Windows 10 or 11, 64-bit; part of `quadchroma.exe`; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
+| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
+| Client | Mac (arm64), part of the same `QuadChroma.app`; the same Rust source as on Windows | Secondary. Decoding with VideoToolbox (no FFmpeg on the Mac), audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), the app's one menu-bar icon, no desktop shortcut. Ships inside `QuadChroma.app`. |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
 the project's own free certificate "QuadChroma Release" (permissions survive updates,
@@ -152,20 +157,22 @@ Developer ID with notarisation, a Windows code-signing certificate) for later.
 
 ## Requirements
 
-- Mac host: macOS 14 or later. Two permissions in System Settings > Privacy &
+- Mac: macOS 14 or later on Apple silicon; `QuadChroma.app`, nothing else (no
+  FFmpeg). For sharing the Mac, two permissions in System Settings > Privacy &
   Security: Screen Recording (for the picture) and Accessibility (for mouse and
   keyboard).
-- Windows client: Windows 10 or 11, 64-bit, with any graphics hardware (see
-  "Decoding on Windows"). `quadchroma.exe` with two FFmpeg DLLs next to it:
-  `avcodec-63.dll` and `avutil-61.dll`.
+- Windows: Windows 10 or 11, 64-bit, with any graphics hardware (see "Decoding on
+  Windows"). `quadchroma.exe` with two FFmpeg DLLs next to it: `avcodec-63.dll` and
+  `avutil-61.dll`.
   No Visual C++ runtime is needed: the C runtime is linked into the exe, and the DLLs
   use only the Universal C Runtime that is part of Windows 10 and 11. Direct3D, DXGI
   and `d3dcompiler_47.dll` are parts of Windows; none of them is shipped.
-- Network: three ports on the host. 9001 carries video and audio (everything from
-  host to client), 9002 input and clipboard including files (everything from client
-  to host), 9003 the announcement. The host announces itself every two seconds on the
-  local network. On its first start the Windows Firewall asks whether the program may
-  use the network; allow it, otherwise the host list stays empty.
+- Network: three ports on every computer that shares. 9001 carries video and audio
+  (everything from host to client), 9002 input and clipboard including files
+  (everything from client to host), 9003 the announcement. A sharing computer
+  announces itself every two seconds on the local network. On the first start the
+  Windows Firewall asks whether the program may use the network; allow it, otherwise
+  the list stays empty and other computers cannot connect.
 
 ## First start of a downloaded release
 
@@ -204,6 +211,25 @@ later also ask once for access to the local network.
 
 ## Getting started
 
+### One app on every computer
+
+Install QuadChroma on every computer you want to use - the DMG on each Mac, the ZIP on
+each Windows PC. There are no separate host and client programs and no extra process
+for sharing: each copy sits in the menu bar or the notification area, lets the other
+computers in ("Share this Mac" or "Share this PC", on by default, switchable in its menu
+and on the start screen) and lists every other QuadChroma computer in the network. From
+whichever computer you sit at, open the window and click any other one in the list; in a
+session the menu's "Computers" tab (hold ESC for two seconds or press F10) switches to
+another computer directly.
+
+Each computer has one device ID and one name, the same in both directions. The name is
+the computer's name until you change it with "Change device name ..." in the menu or
+"Rename" next to "This computer: <name> · <ID>" on the start screen (1 to 40 bytes,
+effective at once). "Prevent sleep while QuadChroma is running" (menu and start screen,
+off by default) keeps a computer reachable that would otherwise go to sleep; during a
+session a host keeps its display awake anyway. The Mac app contains no FFmpeg; only the
+Windows download carries the two FFmpeg DLLs.
+
 ### Mac
 
     make
@@ -236,14 +262,16 @@ field also takes a device ID. Later starts go silently to the notification area 
 click on the icon, or starting `quadchroma.exe` again, opens the window. Closing the
 window does not quit (see "Closing, single instance, desktop shortcut").
 
-The client's files live in `%APPDATA%\QuadChroma\`: `client.key`, `hosts.txt` (the
-hosts that let this PC in), `einstellungen.txt` (settings), `protokoll.txt` (the log,
-restarted at every start), `benchmark.txt`. The log records what the client decides
+The client's files live in `%APPDATA%\QuadChroma\`: `host.key` (the device key, which
+the client uses as well), `hosts.txt` (the hosts that let this PC in),
+`einstellungen.txt` (settings), `protokoll.txt` (the log, restarted at every start),
+`benchmark.txt`. The log records what the client decides
 (decoder, display, pointer shape) and what FFmpeg reports about it.
 
 ### Sharing a Windows PC
 
-The same `quadchroma.exe` is also the host: the host role runs inside the app, and
+The same `quadchroma.exe` is also the host - there is no second program and no second
+process for it: the host role runs inside the app, and
 "Share this PC" - on by default, a toggle on the start screen and a check item in the
 icon's menu - decides whether it listens. The one icon in the notification area opens
 the window with a left click; its menu (right click) has the same host items as the Mac
@@ -282,9 +310,10 @@ remembered.
 
 Afterwards the host lists the device under "Allowed devices" in its menu, where
 "Remove" takes it out again; the client remembers the host by its key in `hosts.txt`,
-whatever address it has, and marks it with a check mark in the host list. Every device
-has a nine-digit device ID derived from its key, shown in the host's menu and in the
-client's host list; the address field, a desktop shortcut and the command line accept
+whatever address it has, and marks it with a check mark in the host list. Every
+computer has one key, `host.key`, which it uses in both directions, and a nine-digit
+device ID derived from it, shown in the menu, on the start screen ("This computer") and
+in the other computers' host lists; the address field, a desktop shortcut and the command line accept
 it instead of an address. Wrong passwords are throttled (from the third on 5 s,
 doubling up to 300 s), five in one connection end it, and an attempt that is refused,
 fails or gets no answer ends with a message on the start screen instead of an
@@ -294,7 +323,10 @@ log lines, the wire format - is in `MANUAL.txt`, "Encryption and access".
 
 Earlier pairings stay valid: at its first start a host takes over `authorized.txt`
 into `host-devices.txt`, a client `known_hosts.txt` into `hosts.txt`, and the old
-files are renamed to `*.migriert`. A client of an earlier version that a new host does
+files are renamed to `*.migriert`. Versions before the one app called with a second key,
+`client.key`; it stays on disk unused and is never changed. A computer that knew this
+one only by that former key therefore asks once more for its password or "Allow" -
+the access dialog says why - and afterwards knows the device key. A client of an earlier version that a new host does
 not know yet cannot answer its access request, and a new client reports a host of an
 earlier version that does not know it ("… uses an older QuadChroma version"): update
 both sides.
@@ -305,21 +337,26 @@ both sides.
 
 ### Start screen
 
-The list shows every host that announces itself in the network: its name on the left,
-its device ID on the right ("ID -" for a host of an earlier version), and a check mark
-for a host that has let this client in before; hovering shows the address. A click
-connects, and on Windows the "Desktop shortcut" button puts a shortcut to that host on
-the Desktop. The address field takes an IP address, a name or a device ID (nine
-digits, spaces allowed) and pastes with Ctrl+V (Cmd+V on the Mac). On Windows, "Share
-this PC" starts the host role (see "Sharing a Windows PC"). While the access dialog is
-open (see "Pairing"), Enter connects, Esc cancels, and no key reaches the host.
+The list shows every QuadChroma computer that announces itself in the network, except
+this one: its name on the left, its device ID on the right ("ID -" for a host of an
+earlier version), and a check mark for a computer that has let this one in before;
+hovering shows the address. Known computers come first, then the others by name; a
+computer heard under several addresses appears once, and the rows keep their order
+while others come and go. Four rows are visible, the mouse wheel scrolls the rest. A
+click connects, and on Windows the "Desktop shortcut" button puts a shortcut to that
+host on the Desktop. The address field takes an IP address, a name or a device ID (nine
+digits, spaces allowed) and pastes with Ctrl+V (Cmd+V on the Mac). "Share this PC"
+("Share this Mac") switches sharing of this computer on and off, and below the buttons
+stand "This computer: <name> · <ID>" with "Rename" and the check box "Prevent sleep
+while QuadChroma is running". While the access dialog is open (see "Pairing"), Enter
+connects, Esc cancels, and no key reaches the host.
 
 ### Keys
 
 | Key | Effect |
 |---|---|
 | F9 | statistics on and off |
-| F10, or hold ESC for two seconds | menu: Picture, Display, Encryption, Shortcuts, Benchmark |
+| F10, or hold ESC for two seconds | menu: Picture, Display, Encryption, Shortcuts, Benchmark, Computers |
 | F11 | full screen on and off |
 | F12 | pixel-exact rendering instead of scaled |
 | Ctrl+Esc | back to the start screen |
@@ -346,6 +383,11 @@ address below it.
 - **Encryption:** method, comparison code, fingerprint, desktop shortcut.
 - **Shortcuts:** every key the client intercepts.
 - **Benchmark:** see below.
+- **Computers:** the same list as on the start screen - every QuadChroma computer in
+  the network with name, device ID and check mark, this one left out - with the
+  current host marked "Connected". A click on another computer ends this session and
+  connects there, with the access dialog if that computer does not know this one yet;
+  a click on the current one or ESC keeps the session.
 
 Hovering over a switch shows a one-sentence explanation. The host applies a change
 immediately and reports back what is actually in effect; the client stores the values
@@ -698,7 +740,7 @@ open on real devices:
 
 **Publication.** License, notices file, contribution rules and release workflows are
 ready (see "License and publication"). Missing are the certificates (an Apple
-Developer ID for signing and notarising the Mac host, which today uses a local
+Developer ID for signing and notarising the Mac app, which today uses a local
 certificate; a code signature for the exe) and the first release; the one-time steps
 are in `RELEASING.md`.
 
@@ -846,11 +888,13 @@ service while sharing is on (`qc_dienst_starten`; off and on again:
 `qc_dienst_anhalten`, `qc_dienst_fortsetzen`) and then shows the icon
 (`qc_oberflaeche_fertig`).
 
-Its files live in `~/Library/Application Support/QuadChroma` (`client.key`,
-`hosts.txt`, `einstellungen.txt`, `protokoll.txt`, `benchmark.txt`, and
-`einzel.sock` and `einzel.lock` for the single instance) - next to the host's
-`host.key`, `host-devices.txt` and `host-password.txt`, as separate files. A host lets
-it in like every client: with its access password or a click on "Allow".
+Its files live in `~/Library/Application Support/QuadChroma` (`hosts.txt`,
+`einstellungen.txt`, `protokoll.txt`, `benchmark.txt`, and `einzel.sock` and
+`einzel.lock` for the single instance) - next to the host's `host-devices.txt` and
+`host-password.txt`. `host.key` is the device key of the whole app: the host engine
+accepts with it and the client calls with it; a `client.key` of an earlier version stays
+there unused. A host lets it in like every client: with its access password or a click
+on "Allow".
 
 License note: the Mac app contains no FFmpeg, only Apple frameworks, the vendored
 Monocypher and the Rust crates listed in `THIRD_PARTY_NOTICES.txt`.
@@ -1147,9 +1191,9 @@ that contained GPL code through chromaprint and therefore could not be passed on
 The FFmpeg source is attached to every release that contains the Windows package and
 available at https://ffmpeg.org. The start screen of the Windows program names FFmpeg
 in its footer, as the LGPL requires once a program shows copyright notices; the Mac
-client contains no FFmpeg and does not. The exe carries version
-information, icon and manifest (`client/build.rs`, `client/res/`), the Mac host the
-bundle identifier `tech.quadchroma.host`. The Mac host contains Monocypher
+app contains no FFmpeg and does not. The exe carries version
+information, icon and manifest (`client/build.rs`, `client/res/`), the Mac app the
+bundle identifier `tech.quadchroma.host`. The Mac app's host engine contains Monocypher
 (BSD-2-Clause OR CC0-1.0). The licenses of these components and of the Rust crates per
 target, together with the FFmpeg build details, the source references and a written
 offer, are collected in `THIRD_PARTY_NOTICES.txt`.

@@ -1,6 +1,6 @@
 # QuadChroma - Third-Party Notices
 
-**Date:** 26 September 2026  
+**Date:** 27 September 2026  
 **Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as of commit `26ef895` on `main`, static Microsoft C runtime; the release build of 26 September 2026 was 3,930,624 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS app `QuadChroma.app` 0.1.0 (build 2, bundle identifier `tech.quadchroma.host`; the Rust client for `aarch64-apple-darwin` with the Objective-C/C host engine built in).  
 **Maintainer / licensor:** Robert Brandt, <hello@quadchroma.tech>, <https://github.com/quadchroma-tech/quadchroma>
 
@@ -13,7 +13,7 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 ## Contents
 
 1. What QuadChroma distributes, and what it does not
-2. FFmpeg (Windows client)
+2. FFmpeg (Windows download only)
    - 2.1 Notice
    - 2.2 How the FFmpeg DLLs were built
    - 2.3 Source code and written offer
@@ -21,7 +21,7 @@ Conventions: SPDX identifiers are used for license names; where a component offe
    - 2.5 FFmpeg files under other permissive terms
    - 2.6 NVIDIA codec headers
    - 2.7 Compiler runtime linked into the DLLs (libgcc, winpthreads, MinGW-w64)
-3. Rust crates (Windows client, statically linked)
+3. Rust crates (Windows program, statically linked)
 4. macOS app (QuadChroma.app): host engine and system parts
 5. Rust crates in the macOS app (Mac client)
 - Appendix A: GNU General Public License, version 3
@@ -39,9 +39,11 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 
 The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the README) and `MANUAL.txt` (the manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
 
-**The Mac client is the executable of `QuadChroma.app`.** Since the one app on the Mac, the Rust client (the same source as the Windows program) is the app's only executable, with the host engine from `host/` compiled into it. It decodes with Apple's VideoToolbox and contains no FFmpeg (`ffmpeg-next` is a Windows-only dependency); its Rust crates are listed in section 5.
+**One app per platform, each client and host at once.** `quadchroma.exe` is the whole Windows program (client and host role in one process); `QuadChroma.app` is the whole Mac program. The Mac client is the executable of `QuadChroma.app`: the Rust client (the same source as the Windows program) is the app's only executable, with the host engine from `host/` compiled into it. There are no separate host or client downloads and no helper programs.
 
-## 2. FFmpeg (Windows client)
+**FFmpeg is only in the Windows download.** The Mac app decodes and encodes with Apple's VideoToolbox and contains no FFmpeg (`ffmpeg-next` is a Windows-only dependency); its Rust crates are listed in section 5. The FFmpeg source archives attached to a release belong to the Windows package (section 2.3).
+
+## 2. FFmpeg (Windows download only)
 
 `quadchroma.exe` decodes video (and, in the Windows host role, encodes it) with libraries of the FFmpeg project. They are shipped as separate DLLs next to the executable and loaded by Windows when the program starts:
 
@@ -1144,7 +1146,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 Lesser General Public License for more details.
 ```
 
-## 3. Rust crates (Windows client, statically linked)
+## 3. Rust crates (Windows program, statically linked)
 
 `quadchroma.exe` is built for the target `x86_64-pc-windows-msvc` (one binary for the Windows client and the Windows host role, static Microsoft C runtime). The crates below are compiled into it. The list is complete for this binary; it was derived from `client/Cargo.lock` at commit `26ef895` on `main` and `cargo tree --target x86_64-pc-windows-msvc -e normal`.
 
@@ -2908,7 +2910,7 @@ DEALINGS IN THE SOFTWARE.
 
 Applies to (0.6-series releases): objc2 0.6.4, objc2-core-foundation 0.3.2, objc2-core-graphics 0.3.2, objc2-encode 4.1.0, objc2-foundation 0.3.2, objc2-quartz-core 0.3.2.
 
-Note from the upstream `LICENSE.txt` (both tags): the crates are derived from Apple SDKs shipped with Xcode; using them requires the Xcode SDK, whose license (https://www.apple.com/legal/sla/docs/xcode.pdf) the builder has accepted. This affects only builders of the Mac client, not recipients of a binary (none is distributed).
+Note from the upstream `LICENSE.txt` (both tags): the crates are derived from Apple SDKs shipped with Xcode; using them requires the Xcode SDK, whose license (https://www.apple.com/legal/sla/docs/xcode.pdf) the builder has accepted. This affects only builders of the Mac app, not recipients of `QuadChroma.app`.
 
 - **block2 0.5.1**: The crate ships no license file. `license = "MIT"` in Cargo.toml. Copyright line taken from LICENSE.txt at the upstream release tag `block2-0.5.1` (https://github.com/madsmtm/objc2). Authors per Cargo.toml: Steven Sheldon, Mads Marquart <mads@marquart.dk>.
 - **objc-sys 0.3.5**: The crate ships no license file. `license = "MIT"`. Copyright line from LICENSE.txt at the upstream release tag `objc-sys-0.3.5` (https://github.com/madsmtm/objc2). Author per Cargo.toml: Mads Marquart <mads@marquart.dk>.
