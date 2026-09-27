@@ -8794,6 +8794,9 @@ impl App {
                 #[cfg(target_os = "macos")]
                 {
                     host_mac::sprache_setzen(code);
+                    if let Some(s) = self.symbol.as_mut() {
+                        s.neu_zeigen();
+                    }
                     self.symbol_nachfuehren_jetzt();
                 }
             }

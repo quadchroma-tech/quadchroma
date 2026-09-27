@@ -464,6 +464,13 @@ impl Symbol {
         unsafe { qc_app_stand_setzen(&st) };
     }
 
+    /// Den Stand beim naechsten stand_setzen weitergeben, auch wenn er gleich
+    /// ist - etwa nach einem Sprachwechsel: menue.m baut Menue und
+    /// Programmmenue dann in der neuen Sprache.
+    pub fn neu_zeigen(&mut self) {
+        self.zuletzt = None;
+    }
+
     /// Die einmalige Hinweisblase unter dem Symbol; true nur, wenn sie
     /// wirklich zu sehen war.
     pub fn hinweis(&mut self, _titel: &str, text: &str) -> bool {
@@ -607,8 +614,8 @@ mod objc {
 /// Systems. Geprueft: Kopf mit Geraetename, "Freigabe ist aus", die Punkte des
 /// Clients und ihre Rueckrufe (Oeffnen, Verbinden, Freigabe, Ruhezustand,
 /// Beenden - ohne dass der Prozess endet), die ID des Schluessels, das
-/// Programmmenue mit Cmd+Q, die Pruefung des Geraetenamens und die
-/// Hinweisblase. Rueckgabe 0 = bestanden.
+/// Programmmenue mit Cmd+Q, der Sprachwechsel des Clients, die Pruefung des
+/// Geraetenamens und die Hinweisblase. Rueckgabe 0 = bestanden.
 pub fn selbsttest() -> i32 {
     let _pool = objc::Pool::neu();
     let start = std::time::Instant::now();
@@ -726,6 +733,33 @@ pub fn selbsttest() -> i32 {
     };
     if !cmd_q {
         fehler.push("Programmmenue ohne \"QuadChroma beenden\" (Cmd+Q)".into());
+    }
+    // Sprachwechsel im Client: Menue und Programmmenue in der neuen Sprache.
+    sprache_setzen("en");
+    s.neu_zeigen();
+    s.stand_setzen(&Stand {
+        freigabe: false,
+        ruhe: true,
+        sitzung: false,
+        tooltip: "QuadChroma – Selbsttest".into(),
+        hosts: vec![("Selbsttest".into(), "127.0.0.1:9".into())],
+    });
+    let englisch = (0..40).any(|_| {
+        // SAFETY: Hauptfaden; das Menue lebt, solange das Symbol lebt.
+        unsafe {
+            objc::laufen(0.05);
+            let m = qc_menueleiste_menue();
+            (0..objc::int(m, c"numberOfItems")).any(|i| objc::text(objc::id(objc::id_int(m, c"itemAtIndex:", i), c"title")) == "Open QuadChroma")
+        }
+    });
+    // SAFETY: Hauptfaden.
+    let prog_englisch = unsafe {
+        let app = objc::id(objc::klasse(c"NSApplication"), c"sharedApplication");
+        let prog = objc::id(objc::id_int(objc::id(app, c"mainMenu"), c"itemAtIndex:", 0), c"submenu");
+        (0..objc::int(prog, c"numberOfItems")).any(|i| objc::text(objc::id(objc::id_int(prog, c"itemAtIndex:", i), c"title")) == "Quit QuadChroma")
+    };
+    if !englisch || !prog_englisch {
+        fehler.push(format!("nach dem Sprachwechsel: Menue englisch {englisch}, Programmmenue englisch {prog_englisch}"));
     }
     // Pruefung des Geraetenamens: dieselbe wie im Client.
     for (eingabe, soll) in [("Büro-Mac", 0), ("", 0), (&*"x".repeat(41), 1), ("a\u{202e}b", 2)] {

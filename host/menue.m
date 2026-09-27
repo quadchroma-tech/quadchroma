@@ -355,6 +355,7 @@ static _Atomic int g_auffrischen_steht_an = 0;
 static _Atomic int g_app = 0;              // die eine App: cfg.app ist gesetzt
 static NSObject *g_app_sperre;
 static BOOL g_app_freigabe, g_app_ruhe, g_app_sitzung;
+static int g_programm_sprache = -1;        // Sprache des Programmmenues (nur Hauptfaden)
 static NSArray<NSArray<NSString *> *> *g_app_hosts;
 static NSString *g_app_tooltip;
 
@@ -1347,6 +1348,7 @@ void qc_oberflaeche_fertig(void) {
         BOOL sitzung;
         @synchronized (app_sperre()) { sitzung = g_app_sitzung; }
         NSApp.mainMenu = qc_programmmenue_bauen(g_ui, sitzung);
+        g_programm_sprache = qc_texte_aktuell();
     } else if (!g_eingebettet || !NSApp.mainMenu) {
         bearbeiten_menue_setzen();
     }
@@ -1420,8 +1422,12 @@ void qc_app_stand_setzen(const qc_app_stand *s) {
     }
     if (![NSThread isMainThread]) return;
     if (g_item && ![g_item.button.toolTip isEqualToString:tip]) g_item.button.toolTip = tip;
-    // In einer Sitzung gehoeren Cmd+Q und Cmd+H dem Mac drueben.
-    if (sitzung_neu && g_cfg.app && NSApp.mainMenu) NSApp.mainMenu = qc_programmmenue_bauen(g_ui, s->sitzung != 0);
+    // In einer Sitzung gehoeren Cmd+Q und Cmd+H dem Mac drueben; eine neue
+    // Sprache (qc_texte_setzen_code) braucht den neuen Titel von "Beenden".
+    if ((sitzung_neu || g_programm_sprache != qc_texte_aktuell()) && g_cfg.app && NSApp.mainMenu) {
+        NSApp.mainMenu = qc_programmmenue_bauen(g_ui, s->sitzung != 0);
+        g_programm_sprache = qc_texte_aktuell();
+    }
     zustand_auffrischen();
 }
 
