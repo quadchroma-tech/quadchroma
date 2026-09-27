@@ -14,6 +14,10 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <signal.h>
+#include <pwd.h>
+#include <time.h>
+#include <unistd.h>
+#include <utmpx.h>
 
 // Wie in clipboard.m: so markierte Inhalte gehen nicht zum Client und
 // landen (nach der Verabredung unter nspasteboard.org) in keinem Verlauf.
@@ -1484,6 +1488,48 @@ int qc_anmeldung_stand(void) {
 
 void qc_anmeldung_umschalten(void) {
     anmelden_umschalten(anmelden_lesen());
+}
+
+// Wann sich dieser Nutzer zuletzt an der Konsole angemeldet hat (utmpx,
+// USER_PROCESS auf "console" - so zeigt es auch who); 0 = unbekannt.
+static int64_t konsole_anmeldung(void) {
+    struct passwd *pw = getpwuid(getuid());
+    if (!pw || !pw->pw_name) return 0;
+    int64_t zuletzt = 0;
+    setutxent();
+    struct utmpx *u;
+    while ((u = getutxent())) {
+        if (u->ut_type != USER_PROCESS) continue;
+        if (strncmp(u->ut_line, "console", sizeof u->ut_line) != 0) continue;
+        if (strncmp(u->ut_user, pw->pw_name, sizeof u->ut_user) != 0) continue;
+        if (u->ut_tv.tv_sec > zuletzt) zuletzt = u->ut_tv.tv_sec;
+    }
+    endutxent();
+    return zuletzt;
+}
+
+void qc_anmeldestart_lesen(qc_anmeldestart_info *info) {
+    if (!info) return;
+    memset(info, 0, sizeof *info);
+    NSAppleEventDescriptor *e = [[NSAppleEventManager sharedAppleEventManager] currentAppleEvent];
+    if (e) {
+        info->ereignis_klasse = e.eventClass;
+        info->ereignis = e.eventID;
+        info->eigenschaft = [e paramDescriptorForKeyword:keyAEPropData].enumCodeValue;
+    }
+    info->anmeldung = (int)anmelden_lesen();
+    int64_t seit = konsole_anmeldung();
+    info->seit_anmeldung = seit > 0 ? (int64_t)time(NULL) - seit : -1;
+}
+
+int qc_anmeldestart_bewerten(const qc_anmeldestart_info *info) {
+    if (!info) return QC_ANMELDESTART_NEIN;
+    if (info->ereignis_klasse == kCoreEventClass && info->ereignis == kAEOpenApplication &&
+        info->eigenschaft == keyAELaunchedAsLogInItem)
+        return QC_ANMELDESTART_EREIGNIS;
+    if (info->anmeldung == QC_ANMELDUNG_AN && info->seit_anmeldung >= 0 && info->seit_anmeldung <= QC_ANMELDESTART_FRIST)
+        return QC_ANMELDESTART_ZEITNAH;
+    return QC_ANMELDESTART_NEIN;
 }
 
 void *qc_menueleiste_menue(void) {

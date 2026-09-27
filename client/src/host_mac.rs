@@ -84,6 +84,16 @@ struct AppStandC {
     schliessen_titel: *const c_char,
 }
 
+/// qc_anmeldestart_info aus host/dienst.h.
+#[repr(C)]
+struct AnmeldestartC {
+    ereignis_klasse: u32,
+    ereignis: u32,
+    eigenschaft: u32,
+    anmeldung: c_int,
+    seit_anmeldung: i64,
+}
+
 extern "C" {
     /// Startet den Dienst ohne Run-Loop (Hauptfaden). DIENST_OK oder ein Fehler oben.
     pub fn qc_dienst_starten(cfg: *const DienstCfg) -> c_int;
@@ -121,6 +131,10 @@ extern "C" {
     fn qc_anmeldung_stand() -> c_int;
     /// Umschalten wie der Punkt im Menue (Hauptfaden).
     fn qc_anmeldung_umschalten();
+    /// Was der Start ueber sich weiss (Apple-Ereignis, Anmeldeobjekt, Anmeldezeit) - nur in resumed.
+    fn qc_anmeldestart_lesen(info: *mut AnmeldestartC);
+    /// Ob diese Angaben einen Start als Anmeldeobjekt belegen (QC_ANMELDESTART_*).
+    fn qc_anmeldestart_bewerten(info: *const AnmeldestartC) -> c_int;
 }
 
 // ------------------------------------------------------------ Befehlszeile
@@ -510,6 +524,12 @@ pub fn aktivierung(sichtbar: bool) {
     objc::anwendung(sichtbar);
 }
 
+/// Den Fokus abgeben (NSApp deactivate): ein Start als Anmeldeobjekt laeuft
+/// still an - winit hat die App beim Start schon aktiviert.
+pub fn abgeben() {
+    objc::deaktivieren();
+}
+
 // ------------------------------------------------------ Vollbild
 
 /// NSApplicationPresentationOptions (AppKit, NSApplication.h).
@@ -587,6 +607,55 @@ pub fn anmeldung_stand() -> Anmeldung {
 pub fn anmeldung_umschalten() {
     // SAFETY: Hauptfaden (Ereignisschleife), ohne Argumente.
     unsafe { qc_anmeldung_umschalten() };
+}
+
+/// Wie die App gestartet wurde - ob als Anmeldeobjekt, und woran das zu
+/// erkennen war.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anmeldestart {
+    /// Ein gewoehnlicher Start (Finder, Dock, open, Terminal).
+    Nein,
+    /// Das Apple-Ereignis "oapp" traegt keyAEPropData = keyAELaunchedAsLogInItem
+    /// ('lgit', AERegistry.h: "application was launched as a login item").
+    Ereignis,
+    /// Ohne dieses Zeichen: "Beim Anmelden starten" ist an und die Anmeldung
+    /// an der Konsole (utmpx) liegt hoechstens QC_ANMELDESTART_FRIST
+    /// Sekunden zurueck - ob SMAppService.mainApp das Zeichen immer setzt,
+    /// ist nicht belegt.
+    Zeitnah,
+}
+
+/// Aus resumed (winit ruft es aus applicationDidFinishLaunching:, also
+/// waehrend AppKit das Startereignis bearbeitet - nur dann liefert
+/// currentAppleEvent es): wie die App gestartet wurde, und eine Zeile fuers
+/// Protokoll mit dem, was der Start ueber sich weiss.
+pub fn anmeldestart() -> (Anmeldestart, String) {
+    let mut info = AnmeldestartC { ereignis_klasse: 0, ereignis: 0, eigenschaft: 0, anmeldung: 1, seit_anmeldung: -1 };
+    // SAFETY: info lebt waehrend des Aufrufs; Hauptfaden.
+    let art = unsafe {
+        qc_anmeldestart_lesen(&mut info);
+        qc_anmeldestart_bewerten(&info)
+    };
+    let art = match art {
+        1 => Anmeldestart::Ereignis,
+        2 => Anmeldestart::Zeitnah,
+        _ => Anmeldestart::Nein,
+    };
+    let vier = |n: u32| -> String {
+        if n == 0 {
+            return "-".into();
+        }
+        n.to_be_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect()
+    };
+    let text = format!(
+        "Apple-Ereignis {}/{}, Eigenschaft {}, Beim Anmelden starten {:?}, Anmeldung {}",
+        vier(info.ereignis_klasse),
+        vier(info.ereignis),
+        vier(info.eigenschaft),
+        Anmeldung::aus_c(info.anmeldung),
+        if info.seit_anmeldung < 0 { "unbekannt".to_string() } else { format!("vor {} s", info.seit_anmeldung) }
+    );
+    (art, text)
 }
 
 // ------------------------------------------------------------ Objective-C
@@ -686,6 +755,17 @@ mod objc {
             let app = id(klasse(c"NSApplication"), c"sharedApplication");
             if !app.is_null() {
                 senden!(app, sel(c"setActivationPolicy:"), if sichtbar { REGULAR } else { ACCESSORY } => isize; -> u8);
+            }
+        }
+    }
+
+    /// NSApp den Fokus abgeben lassen.
+    pub fn deaktivieren() {
+        let _pool = Pool::neu();
+        unsafe {
+            let app = id(klasse(c"NSApplication"), c"sharedApplication");
+            if !app.is_null() {
+                senden!(app, sel(c"deactivate"); -> ())
             }
         }
     }
@@ -1117,6 +1197,38 @@ mod tests {
         assert_eq!(leisten_optionen(VOLLBILD | AUTO_DOCK | AUTO_MENUELEISTE), None, "auch im Uebergang");
         assert_eq!(leisten_optionen(1 << 9), None, "andere Optionen allein bleiben");
         assert_eq!((OHNE_DOCK, OHNE_MENUELEISTE, VOLLBILD), (2, 8, 1024), "Werte aus NSApplication.h");
+    }
+
+    /// Der Start als Anmeldeobjekt, entschieden in C (menue.m) rein aus den
+    /// Angaben - dieselbe Bewertung, die resumed nutzt.
+    #[test]
+    fn anmeldestart_bewerten() {
+        let v = |t: &[u8; 4]| u32::from_be_bytes(*t);
+        let info = |k: u32, e: u32, p: u32, a: c_int, seit: i64| AnmeldestartC {
+            ereignis_klasse: k,
+            ereignis: e,
+            eigenschaft: p,
+            anmeldung: a,
+            seit_anmeldung: seit,
+        };
+        // SAFETY: rein, liest nur die Angaben.
+        let b = |i: AnmeldestartC| unsafe { qc_anmeldestart_bewerten(&i) };
+        let (aevt, oapp, lgit) = (v(b"aevt"), v(b"oapp"), v(b"lgit"));
+        assert_eq!(b(info(aevt, oapp, lgit, 1, -1)), 1, "Startereignis mit lgit");
+        assert_eq!(b(info(aevt, oapp, 0, 1, 5)), 0, "gewoehnlicher Start");
+        assert_eq!(b(info(aevt, oapp, 0, 2, 5)), 2, "Beim Anmelden starten an, kurz nach der Anmeldung");
+        assert_eq!(b(info(aevt, oapp, 0, 2, 121)), 0, "nach der Frist");
+        assert_eq!(b(info(aevt, oapp, 0, 2, -1)), 0, "Anmeldezeit unbekannt");
+        assert_eq!(b(info(aevt, v(b"odoc"), lgit, 1, -1)), 0, "lgit nur im oapp");
+        assert_eq!(std::mem::size_of::<AnmeldestartC>(), 24);
+        // Ausserhalb des Starts gibt es kein Startereignis; der Test liegt
+        // nicht in /Applications.
+        let (art, text) = anmeldestart();
+        assert_eq!(art, Anmeldestart::Nein, "{text}");
+        assert!(text.contains("Apple-Ereignis -/-") && text.contains("NichtInProgramme"), "{text}");
+        assert_eq!(Anmeldung::aus_c(2), Anmeldung::An);
+        assert_eq!(Anmeldung::aus_c(3), Anmeldung::FreigabeNoetig);
+        assert_eq!(Anmeldung::aus_c(0), Anmeldung::NichtInProgramme);
     }
 
     /// Die Pruefung im Fenster "Geraetename" ist die des Clients.

@@ -6029,14 +6029,30 @@ const MIT_FREIGABE: bool = cfg!(any(windows, target_os = "macos"));
 /// Der Umschalter der Freigabe heisst auf dem Mac "Diesen Mac freigeben".
 const FREIGABE_TEXT: strings::Key = if cfg!(target_os = "macos") { strings::Key::StartShareMac } else { strings::Key::StartShare };
 
-/// Laeuft die App ohne Fenster an (Plan W7)? Nur die eine App;
-/// mit einem Ziel (Adresse, ID, Verknuepfung) nie; ohne Symbol (tray=aus)
-/// nie - es gaebe keinen Weg zur App; sonst bei Autostart und --host immer
-/// und bei jedem Start nach dem allerersten (einstellungen.txt:
-/// fenster_gezeigt).
-fn start_im_hintergrund(eine_app: bool, mit_ziel: bool, tray: bool, hintergrund_start: bool, fenster_gezeigt: bool) -> bool {
-    eine_app && !mit_ziel && tray && (hintergrund_start || fenster_gezeigt)
+/// Laeuft die App ohne Fenster an (Plan W7)? Nur die eine App; mit einem
+/// Ziel (Adresse, ID, Verknuepfung) nie. Ein Start durch die Anmeldung
+/// (`autostart`: --hintergrund der Verknuepfung "Mit Windows starten",
+/// --host frueherer Fassungen, auf dem Mac das Anmeldeobjekt) immer still
+/// ins Symbol - auch wenn das Fenster noch nie zu sehen war -, solange es
+/// ein Symbol gibt: mit tray=an, auf dem Mac auch mit tray=aus
+/// (`symbol_ohne_tray`: dort steht das Symbol der Host-Engine immer). Jeder
+/// andere Start nach dem allerersten (einstellungen.txt: fenster_gezeigt)
+/// nur mit tray=an - mit tray=aus beendet Schliessen, die App ist dann ein
+/// gewoehnliches Programm mit Fenster. Ohne Symbol gaebe es keinen Weg zur
+/// App: dann das Fenster.
+fn start_im_hintergrund(
+    eine_app: bool,
+    mit_ziel: bool,
+    tray: bool,
+    symbol_ohne_tray: bool,
+    autostart: bool,
+    fenster_gezeigt: bool,
+) -> bool {
+    eine_app && !mit_ziel && ((autostart && (tray || symbol_ohne_tray)) || (tray && fenster_gezeigt))
 }
+
+/// Das Symbol steht auch mit tray=aus: auf dem Mac das der Host-Engine.
+const SYMBOL_OHNE_TRAY: bool = cfg!(target_os = "macos");
 
 /// Kommentar der Verknuepfung "Mit Windows starten".
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -6432,6 +6448,9 @@ struct App {
     /// gelesen wurde (hoechstens einmal je AUTOSTART_TAKT; None: neu lesen).
     autostart: Autostart,
     autostart_gelesen: Option<Instant>,
+    /// macOS: resumed hat nachgesehen, ob die App als Anmeldeobjekt startete.
+    #[cfg(target_os = "macos")]
+    anmeldestart_geprueft: bool,
 }
 
 /// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
@@ -6482,8 +6501,37 @@ impl ApplicationHandler<Benutzer> for App {
             host_mac::ziel_setzen(self.proxy.clone());
             symbol_moeglich = r.anlaufen(self.lang.code, self.cfg.geraetename.as_deref());
         }
+        // Mac: startete die App als Anmeldeobjekt ("Beim Anmelden starten",
+        // SMAppService - ohne Argumente, also ohne --hintergrund), laeuft sie
+        // still an wie der Autostart unter Windows. Nur hier zu erkennen:
+        // winit ruft resumed aus applicationDidFinishLaunching:, waehrend
+        // AppKit das Startereignis bearbeitet.
+        #[cfg(target_os = "macos")]
+        if !self.anmeldestart_geprueft {
+            self.anmeldestart_geprueft = true;
+            let (art, text) = host_mac::anmeldestart();
+            protokoll::zeile(format!("Start: {text} - {}", match art {
+                host_mac::Anmeldestart::Nein => "gewoehnlicher Start",
+                host_mac::Anmeldestart::Ereignis => "Anmeldeobjekt (Startereignis)",
+                host_mac::Anmeldestart::Zeitnah => "Anmeldeobjekt (kurz nach der Anmeldung, Beim Anmelden starten an)",
+            }));
+            let mit_ziel = self.screen == Screen::Session || self.id_ausstehend.is_some();
+            if art != host_mac::Anmeldestart::Nein
+                && !self.hintergrund
+                && self.window.is_none()
+                && start_im_hintergrund(MIT_FREIGABE, mit_ziel, self.cfg.tray, SYMBOL_OHNE_TRAY, true, self.cfg.fenster_gezeigt)
+            {
+                self.hintergrund = true;
+                // winit hat die App beim Start aktiviert (der erste Start
+                // oeffnet sonst sein Fenster) - still heisst: niemandem den
+                // Fokus nehmen.
+                host_mac::abgeben();
+                protokoll::zeile("Start im Hintergrund (Anmeldeobjekt) - das Fenster kommt mit \"QuadChroma oeffnen\"".into());
+            }
+        }
         // Im Hintergrund (die eine App nach dem allerersten Start, Autostart,
-        // --host): kein Fenster und kein Renderer, bis "QuadChroma oeffnen".
+        // --host, Anmeldeobjekt): kein Fenster und kein Renderer, bis
+        // "QuadChroma oeffnen".
         if self.window.is_none() && !self.hintergrund {
             self.fenster_anlegen(el);
         }
@@ -12385,6 +12433,7 @@ fn main() {
         MIT_FREIGABE,
         !start_addr.is_empty() || id_ausstehend.is_some(),
         cfg.tray,
+        SYMBOL_OHNE_TRAY,
         hintergrund_start,
         cfg.fenster_gezeigt,
     );
@@ -12568,6 +12617,8 @@ fn main() {
         symbol_seit: None,
         autostart: Autostart::Aus,
         autostart_gelesen: None,
+        #[cfg(target_os = "macos")]
+        anmeldestart_geprueft: false,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,
@@ -17869,13 +17920,25 @@ mod tests {
     /// eine App) immer mit Fenster.
     #[test]
     fn erster_start_mit_fenster_spaetere_im_hintergrund() {
-        assert!(!start_im_hintergrund(true, false, true, false, false), "allererster Start ohne Fenster");
-        assert!(start_im_hintergrund(true, false, true, false, true), "spaeterer Start mit Fenster");
-        assert!(start_im_hintergrund(true, false, true, true, false), "Autostart vor dem ersten Fenster mit Fenster");
-        assert!(start_im_hintergrund(true, false, true, true, true));
-        assert!(!start_im_hintergrund(true, true, true, true, true), "Start mit Ziel ohne Fenster");
-        assert!(!start_im_hintergrund(true, false, false, true, true), "tray=aus ohne Fenster");
-        assert!(!start_im_hintergrund(false, false, true, true, true), "ohne die eine App im Hintergrund");
+        // (eine_app, mit_ziel, tray, symbol_ohne_tray, autostart, fenster_gezeigt)
+        for ohne_tray in [false, true] {
+            assert!(!start_im_hintergrund(true, false, true, ohne_tray, false, false), "allererster Start mit Fenster");
+            assert!(start_im_hintergrund(true, false, true, ohne_tray, false, true), "spaeterer Start ohne Fenster");
+            assert!(start_im_hintergrund(true, false, true, ohne_tray, true, false), "Autostart vor dem ersten Fenster: still");
+            assert!(start_im_hintergrund(true, false, true, ohne_tray, true, true), "Autostart: still");
+            assert!(!start_im_hintergrund(true, true, true, ohne_tray, true, true), "Start mit Ziel mit Fenster");
+            assert!(!start_im_hintergrund(false, false, true, ohne_tray, true, true), "ohne die eine App mit Fenster");
+            // tray=aus: ein gewoehnlicher Start hat immer sein Fenster.
+            assert!(!start_im_hintergrund(true, false, false, ohne_tray, false, true), "tray=aus: spaeterer Start mit Fenster");
+            assert!(!start_im_hintergrund(true, false, false, ohne_tray, false, false));
+        }
+        // Autostart mit tray=aus: auf dem Mac steht das Symbol trotzdem -
+        // still; unter Windows gaebe es kein Symbol - dann das Fenster.
+        assert!(start_im_hintergrund(true, false, false, true, true, false), "Mac, tray=aus: Anmeldeobjekt still");
+        assert!(start_im_hintergrund(true, false, false, true, true, true));
+        assert!(!start_im_hintergrund(true, false, false, false, true, false), "Windows, tray=aus: Autostart mit Fenster");
+        assert!(!start_im_hintergrund(true, false, false, false, true, true));
+        assert_eq!(SYMBOL_OHNE_TRAY, cfg!(target_os = "macos"));
     }
 
     /// Ein Decoderbild aus eigenen Ebenen, fuer `to_rgb` ohne Decoder.

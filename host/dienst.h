@@ -24,6 +24,8 @@
 #ifndef QC_DIENST_H
 #define QC_DIENST_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -175,6 +177,32 @@ void *qc_menueleiste_menue(void);
 #define QC_ANMELDUNG_FREIGABE_NOETIG    3   // eingetragen, in den Systemeinstellungen nicht erlaubt
 int qc_anmeldung_stand(void);
 void qc_anmeldung_umschalten(void);
+
+// Wurde die App als Anmeldeobjekt gestartet? Dann laeuft sie still in der
+// Menueleiste an, auch wenn ihr Fenster noch nie zu sehen war.
+// qc_anmeldestart_lesen sammelt, was der Start ueber sich weiss - nur aus
+// applicationDidFinishLaunching: (eingebettet: aus resumed, das winit dort
+// ruft), denn nur dann liefert currentAppleEvent das Startereignis (geprueft
+// 27.09.2026: dort 'aevt'/'oapp', in applicationWillFinishLaunching: noch
+// keins). qc_anmeldestart_bewerten entscheidet rein aus diesen Angaben:
+// EREIGNIS, wenn das Startereignis keyAEPropData = keyAELaunchedAsLogInItem
+// ('lgit', AERegistry.h) traegt; sonst ZEITNAH, wenn "Beim Anmelden
+// starten" an ist und die Anmeldung an der Konsole (utmpx) hoechstens
+// QC_ANMELDESTART_FRIST Sekunden zurueckliegt - ob SMAppService.mainApp das
+// Zeichen setzt, ist nicht belegt; sonst NEIN.
+typedef struct {
+    uint32_t ereignis_klasse;   // Klasse des Startereignisses ('aevt'), 0 = keins
+    uint32_t ereignis;          // das Ereignis ('oapp'), 0 = keins
+    uint32_t eigenschaft;       // keyAEPropData als Aufzaehlung ('lgit'), 0 = keine
+    int anmeldung;              // QC_ANMELDUNG_*
+    int64_t seit_anmeldung;     // Sekunden seit der Anmeldung an der Konsole, -1 = unbekannt
+} qc_anmeldestart_info;
+#define QC_ANMELDESTART_NEIN     0
+#define QC_ANMELDESTART_EREIGNIS 1
+#define QC_ANMELDESTART_ZEITNAH  2
+#define QC_ANMELDESTART_FRIST    120
+void qc_anmeldestart_lesen(qc_anmeldestart_info *info);
+int qc_anmeldestart_bewerten(const qc_anmeldestart_info *info);
 
 // Werkzeuge der Kommandozeile (--list, --formattest, --capture ohne --serve):
 // laufen zu Ende und liefern den Exit-Code. Ohne Werkzeug-Schalter

@@ -13,7 +13,10 @@
 // genau einmal, ausserhalb des Hauptfadens - und erst danach in
 // applicationWillTerminate: des Nachbaus. Gestartet wird wie in der einen
 // App (mit Rueckruf app): der Stand des Clients (qc_app_stand_setzen) kommt
-// im gelesenen Zustand an, samt Geraetename aus dem Kern. qc_oberflaeche_fertig
+// im gelesenen Zustand an, samt Geraetename aus dem Kern. Das Startereignis
+// ('aevt'/'oapp') ist in applicationDidFinishLaunching: lesbar - so erkennt
+// die App einen Start als Anmeldeobjekt (qc_anmeldestart_lesen); aus dem
+// Terminal gestartet ist es keiner. qc_oberflaeche_fertig
 // bleibt aus: es legte ein Symbol in die Menueleiste (das prueft der
 // Selbsttest des Clients, --menueleiste-selbsttest).
 //
@@ -121,6 +124,15 @@ static OSErr reopen_senden(void) {
     pruefe([self respondsToSelector:@selector(applicationShouldTerminate:)],
            "winits Delegate antwortet auf applicationShouldTerminate:");
     pruefe(qc_ui_vorhanden() == 1, "Zulassen moeglich (qc_ui_vorhanden)");
+    // Wie die App erkennt, ob sie als Anmeldeobjekt startete: hier, in
+    // applicationDidFinishLaunching: (dort ruft winit resumed), ist das
+    // Startereignis lesbar; aus dem Terminal ohne "Anmeldeobjekt".
+    qc_anmeldestart_info start;
+    qc_anmeldestart_lesen(&start);
+    pruefe(start.ereignis_klasse == kCoreEventClass && start.ereignis == kAEOpenApplication,
+           "Startereignis in applicationDidFinishLaunching: lesbar ('aevt'/'oapp')");
+    pruefe(start.eigenschaft != keyAELaunchedAsLogInItem && qc_anmeldestart_bewerten(&start) == QC_ANMELDESTART_NEIN,
+           "ein Start aus dem Terminal ist kein Anmeldeobjekt");
     qc_oberflaeche_cfg zweiter = { .abschied = abschied, .protokoll = protokoll, .eingebettet = 0, .oeffnen = oeffnen_zweiter };
     qc_oberflaeche_starten(&zweiter);
     pruefe(NSApp.delegate == self, "ein zweiter Start (auch nicht eingebettet) setzt kein Delegate");

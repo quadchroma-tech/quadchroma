@@ -771,6 +771,49 @@ static void app_modell_pruefen(void) {
            "in einer Sitzung auch als \"Fenster schließen\" ohne Cmd+Q (geht an den Mac drueben)");
 }
 
+// ------------------------------------------------------------ Anmeldestart
+
+static qc_anmeldestart_info anmeldestart(uint32_t klasse, uint32_t ereignis, uint32_t eigenschaft, int anmeldung, int64_t seit) {
+    qc_anmeldestart_info i = { .ereignis_klasse = klasse, .ereignis = ereignis, .eigenschaft = eigenschaft,
+                               .anmeldung = anmeldung, .seit_anmeldung = seit };
+    return i;
+}
+
+static void anmeldestart_pruefen(void) {
+    printf("\n-- Start als Anmeldeobjekt (rein aus den Angaben)\n");
+    qc_anmeldestart_info i;
+    i = anmeldestart('aevt', 'oapp', 'lgit', QC_ANMELDUNG_AUS, -1);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_EREIGNIS, "oapp mit lgit: Anmeldeobjekt (Ereignis)");
+    i = anmeldestart('aevt', 'oapp', 'lgit', QC_ANMELDUNG_AN, 9999);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_EREIGNIS, "oapp mit lgit auch lange nach der Anmeldung");
+    i = anmeldestart('aevt', 'oapp', 0, QC_ANMELDUNG_AUS, 5);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "oapp ohne lgit, Anmelden aus: gewoehnlicher Start");
+    i = anmeldestart('aevt', 'oapp', 'svit', QC_ANMELDUNG_AUS, 5);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "svit (Dienst) ist kein Anmeldeobjekt");
+    i = anmeldestart('aevt', 'odoc', 'lgit', QC_ANMELDUNG_AUS, 5);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "lgit nur im oapp-Ereignis");
+    i = anmeldestart('aevt', 'oapp', 0, QC_ANMELDUNG_AN, 30);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_ZEITNAH, "ohne lgit: Anmelden an, 30 s nach der Anmeldung - zeitnah");
+    i = anmeldestart(0, 0, 0, QC_ANMELDUNG_AN, QC_ANMELDESTART_FRIST);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_ZEITNAH, "ohne Ereignis, genau an der Frist - zeitnah");
+    i = anmeldestart('aevt', 'oapp', 0, QC_ANMELDUNG_AN, QC_ANMELDESTART_FRIST + 1);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "nach der Frist: gewoehnlicher Start");
+    i = anmeldestart('aevt', 'oapp', 0, QC_ANMELDUNG_AN, -1);
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "Anmeldezeit unbekannt: gewoehnlicher Start");
+    for (int a = QC_ANMELDUNG_NICHT_IN_PROGRAMME; a <= QC_ANMELDUNG_FREIGABE_NOETIG; a++) {
+        if (a == QC_ANMELDUNG_AN) continue;
+        i = anmeldestart('aevt', 'oapp', 0, a, 10);
+        pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "zeitnah nur mit \"Beim Anmelden starten\" an");
+    }
+    pruefe(qc_anmeldestart_bewerten(NULL) == QC_ANMELDESTART_NEIN, "ohne Angaben: gewoehnlicher Start");
+    // Ausserhalb von applicationDidFinishLaunching: gibt es kein Startereignis.
+    qc_anmeldestart_lesen(&i);
+    pruefe(i.ereignis == 0 && i.eigenschaft == 0 && i.anmeldung == QC_ANMELDUNG_NICHT_IN_PROGRAMME,
+           "Pruefstand: kein Startereignis, nicht in /Applications");
+    pruefe(qc_anmeldestart_bewerten(&i) == QC_ANMELDESTART_NEIN, "Pruefstand: kein Anmeldestart");
+    pruefe(qc_anmeldung_stand() == QC_ANMELDUNG_NICHT_IN_PROGRAMME, "Beim Anmelden starten: gesperrt ausserhalb von /Applications");
+}
+
 static void zustand_pruefen(void) {
     printf("\n-- Zustand aus dem Kern (Attrappe)\n");
     f_id = 5;
@@ -895,6 +938,7 @@ int main(void) {
         modell_pruefen();
         app_modell_pruefen();
         zustand_pruefen();
+        anmeldestart_pruefen();
         menue_pruefen();
         anfragen_pruefen();
         printf("\n%s: %d Fehler\n", g_fehler ? "NICHT BESTANDEN" : "bestanden", g_fehler);
