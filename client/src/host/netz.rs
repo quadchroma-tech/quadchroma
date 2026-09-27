@@ -80,7 +80,8 @@
 // Ablagebasis (host_ablage_basis), damit Client und Host-Rolle auf einem
 // Rechner einander nichts aufraeumen.
 // Sperrreihenfolge: EINSPEISEN, AKTUELL, dann entweder Leitung.q oder
-// Leitung.dateien - diese beiden nie ineinander.
+// Leitung.dateien - diese beiden nie ineinander. LAUF (start, stoppen)
+// kommt vor AKTUELL.
 //
 // Starten und Stoppen: `start` bindet beide Ports und startet die beiden
 // Annahmefaeden und die Bekanntgabe - ein Lauf mit eigener Laufmarke
@@ -2404,7 +2405,11 @@ fn start_mit(adresse: Ipv4Addr, port: u16, priv_key: Vec<u8>, ziele: fn() -> Vec
 /// Freigabe beendet, verabschiedet ihn (abschied_beim_beenden). Liefert, ob
 /// ein Lauf lief.
 pub fn stoppen() -> bool {
-    let Some(l) = sperre(&LAUF).take() else { return false };
+    // LAUF bleibt gesperrt, bis die Ports frei sind: ein `start` gleich
+    // danach wartet und bindet dann, statt an den noch offenen Ports zu
+    // scheitern. Reihenfolge: LAUF, dann AKTUELL (Laufmarke::beenden).
+    let mut lauf = sperre(&LAUF);
+    let Some(l) = lauf.take() else { return false };
     let port = l.port;
     if lauf_beenden(l) {
         log(format!("Zuschauerplatz geschlossen: Port {port} und {} zu, Bekanntgabe aus", port + 1));

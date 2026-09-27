@@ -489,6 +489,10 @@ pub enum Lage {
 /// faehrt ihn main_host (--host) in einer Schleife; derselbe Dienst soll
 /// spaeter im Prozess des Clients laufen. `takt` und `aktion` gehoeren in
 /// den Faden, der `starten` rief (Herkunft::Host fuer die Protokollreihe).
+/// `starten` hoechstens einmal je Prozess: der Einlass wird prozessweit
+/// eingerichtet, und Eingabe, Ton und Bildquelle laufen danach, bis der
+/// Prozess endet (ohne Zuschauer tun sie nichts). Nach `beenden` bringt
+/// netz::start die Freigabe wieder an.
 pub struct Dienst {
     port: u16,
     priv_key: Vec<u8>,
@@ -1079,8 +1083,10 @@ pub fn main_host(args: &[String]) -> i32 {
         return 2;
     }
     // FFmpegs Meldungen laufen ueber den Rueckruf des Clients in die Reihe
-    // des Hosts (Herkunft dieses Fadens); der Host holt sie ab und schreibt
-    // sie in sein eigenes Protokoll.
+    // des Hosts; der Host holt sie ab und schreibt sie in sein eigenes
+    // Protokoll. Dieser Prozess spielt nur die Host-Rolle: auch Faeden ohne
+    // eigene Herkunft (Ablagewaechter, Netz, FFmpegs eigene) zaehlen zu ihr.
+    protokoll::standard_setzen(protokoll::Herkunft::Host);
     protokoll::herkunft_setzen(protokoll::Herkunft::Host);
     protokoll::einschalten(false);
 

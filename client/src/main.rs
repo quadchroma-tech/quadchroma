@@ -123,21 +123,22 @@ fn client_us() -> u64 {
 /// Zwei Rollen, zwei Reihen: der Rueckruf von FFmpeg gilt fuer den ganzen
 /// Prozess, Client und Host-Rolle koennen sich aber einen Prozess teilen.
 /// Jede Zeile gehoert deshalb einer Herkunft - der des Fadens, der sie sagt
-/// (`herkunft_setzen`; ungesetzt ist es der Client). Die Faeden der
-/// Host-Rolle, die FFmpeg benutzen (Dienst, Aufnahme mit Encoder, Messung),
-/// setzen Herkunft::Host; ihre Zeilen, Warnungen und Fehler landen in der
-/// Reihe des Hosts, die der Host abholt und in host-protokoll.txt schreibt -
-/// nie in protokoll.txt des Clients und nie in seinen Rueckfallgruenden.
-/// Faeden, die FFmpeg selbst anlegt (etwa die Bildfaeden eines
-/// Software-Decoders), haben keine Herkunft und zaehlen zum Client; die
-/// Encoder der Host-Rolle legen keine an (nvenc, h264_mf). Geteilte Teile, die
-/// fuer beide Rollen sprechen (der Ablagewaechter), nennen die Herkunft
-/// ausdruecklich (`zeile_als`).
+/// (`herkunft_setzen`; ungesetzt die des Prozesses, `standard_setzen`:
+/// der Client, im reinen Host-Prozess --host/--list/--messen der Host). Die
+/// Faeden der Host-Rolle, die FFmpeg benutzen (Dienst, Aufnahme mit
+/// Encoder, Messung), setzen Herkunft::Host; ihre Zeilen, Warnungen und
+/// Fehler landen in der Reihe des Hosts, die der Host abholt und in
+/// host-protokoll.txt schreibt - nie in protokoll.txt des Clients und nie in
+/// seinen Rueckfallgruenden. Faeden ohne eigene Herkunft (etwa die, die
+/// FFmpeg selbst fuer einen Software-Decoder anlegt) zaehlen zur Herkunft
+/// des Prozesses; die Encoder der Host-Rolle legen keine an (nvenc,
+/// h264_mf). Geteilte Teile, die fuer beide Rollen sprechen (der
+/// Ablagewaechter), nennen die Herkunft ausdruecklich (`zeile_als`).
 mod protokoll {
     use ffmpeg_next as ffmpeg;
     use std::cell::Cell;
     use std::io::Write;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::Mutex;
 
     /// Wem eine Zeile gehoert - und wer in der Zwischenablage etwas ablegt
@@ -160,20 +161,40 @@ mod protokoll {
     }
 
     thread_local! {
-        /// Herkunft dieses Fadens (herkunft_setzen); ungesetzt der Client.
-        static FADEN: Cell<Herkunft> = const { Cell::new(Herkunft::Client) };
+        /// Herkunft dieses Fadens (herkunft_setzen); None: die des Prozesses.
+        static FADEN: Cell<Option<Herkunft>> = const { Cell::new(None) };
+    }
+
+    /// Herkunft der Faeden ohne eigene: im reinen Host-Prozess der Host.
+    static PROZESS_HOST: AtomicBool = AtomicBool::new(false);
+
+    fn prozess() -> Herkunft {
+        if PROZESS_HOST.load(Ordering::Relaxed) {
+            Herkunft::Host
+        } else {
+            Herkunft::Client
+        }
+    }
+
+    /// Herkunft der Faeden ohne eigene festlegen - nur ein Prozess, der
+    /// allein die Host-Rolle spielt (--host, --list, --messen), setzt den
+    /// Host: dann gehen auch die Zeilen des Ablagewaechters, der Netzfaeden
+    /// und der Faeden, die FFmpeg selbst anlegt, in die Reihe des Hosts.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn standard_setzen(h: Herkunft) {
+        PROZESS_HOST.store(h == Herkunft::Host, Ordering::Relaxed);
     }
 
     /// Herkunft des aufrufenden Fadens.
     pub fn herkunft() -> Herkunft {
-        FADEN.with(|f| f.get())
+        FADEN.with(|f| f.get()).unwrap_or_else(prozess)
     }
 
     /// Ab jetzt gehoert, was dieser Faden sagt und abholt, zu `h`. Die Faeden
     /// der Host-Rolle setzen Herkunft::Host, bevor sie FFmpeg anfassen.
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub fn herkunft_setzen(h: Herkunft) {
-        FADEN.with(|f| f.set(h));
+        FADEN.with(|f| f.set(Some(h)));
     }
 
     /// Die Reihe einer Herkunft: Stufe, Zeilen, letzte Warnungen, die
@@ -259,7 +280,7 @@ mod protokoll {
     ) {
         // Der Faden, der spricht, bestimmt die Reihe. try_with: auch in
         // einem Faden, der gerade endet, darf FFmpeg noch etwas sagen.
-        let h = FADEN.try_with(|f| f.get()).unwrap_or(Herkunft::Client);
+        let h = FADEN.try_with(|f| f.get()).ok().flatten().unwrap_or_else(prozess);
         let r = reihe(h);
         if stufe > r.stufe.load(Ordering::Relaxed) {
             return;

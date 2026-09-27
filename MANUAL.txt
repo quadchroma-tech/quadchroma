@@ -528,6 +528,11 @@ Log lines of the Windows host role (host-protokoll.txt), where <wer> is
      "Geraet entfernt", "Freigabe beendet" or "Host-Rolle beendet", then
      "Abschied (<Grund>) an <IP> gemeldet" or "... nicht zugestellt:
      <Fehler>" (see "The host says goodbye")
+    "Zuschauerplatz geschlossen: Port 9001 und 9002 zu, Bekanntgabe aus"
+     (when sharing ends or the host role is ended: first the ports close
+     and the announcement stops, then the viewer gets the goodbye)
+    "Zuschauer <Name> (<IP>) abgewiesen: die Freigabe endete waehrend des
+     Handschlags"
     "Zugangspasswort: neues Zufallspasswort angelegt (host-password.txt)"
     "Uebernahme: N Geraete aus authorized.txt nach host-devices.txt, alte
      Liste heisst jetzt authorized.txt.migriert"
@@ -1904,11 +1909,11 @@ file list not readable, file list not put on the clipboard):
     "Zwischenablage: Dateiliste nicht abgelegt (Ablage belegt oder
      Schreiben gescheitert, 40 Versuche in 1950 ms)"      (Windows)
 
-The Windows host role, like the client, writes the "Zwischenablage: ..."
-(clipboard) lines first to protokoll.txt (see "Windows as host") and
-only in the five-second cycle to host-protokoll.txt. There they
-therefore appear up to 5 s later than the "Dateien: ..." (files) lines
-they belong to.
+The Windows host role collects its "Zwischenablage: ..." (clipboard)
+lines in a queue of its own (see "Windows as host") and writes them to
+host-protokoll.txt only in the five-second cycle. There they therefore
+appear up to 5 s later than the "Dateien: ..." (files) lines they belong
+to.
 
 Only in the client (the first line: the capabilities the host reported;
 the last one: a file reference that could not be resolved):
@@ -2228,13 +2233,13 @@ again every 5 s ("Bild-Port 9001 nicht verfuegbar: <Fehler> - neuer Versuch
 alle 5 s, das Menue zeigt es", later "Port 9001 ist frei - Dienst laeuft");
 without an icon it ends with exit code 9 as before.
 
-The host role also writes to protokoll.txt - its card lines at startup,
-FFmpeg's messages and the "Zwischenablage: ..." (clipboard) lines - and in
-doing so starts the file afresh, like the client. So when client and host role
-run under the same user - as after "Share this PC" - both write to the same
-protokoll.txt, and the one that begins writing later empties what the other
-had written so far. host-protokoll.txt contains these lines as well, but while
-running only at the five-second interval.
+The host role keeps these lines apart from the client's: its card lines at
+startup, FFmpeg's messages (from its encoder) and the "Zwischenablage: ..."
+(clipboard) lines go into a queue of its own and from there into
+host-protokoll.txt - the card lines and the encoder check right at startup,
+later ones at the five-second interval. It no longer writes to protokoll.txt,
+so a client and a host role under the same user - as after "Share this PC" -
+no longer empty each other's protokoll.txt.
 
     quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
                    [--konserve datei.hevc]
