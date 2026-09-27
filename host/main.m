@@ -19,15 +19,16 @@
 // folgt der Host dem Hauptbildschirm, mit Wunsch dem gewuenschten, siehe
 // bildschirm.h. --display N pinnt fuer diesen Lauf den Listenplatz N.
 //
-// Ueber "open QuadChroma.app" starten (Argumente fuer Kenner mit
-// "open -n ... --args"), damit die Freigaben am Bundle haengen. Es laeuft
-// hoechstens ein Host je Nutzer (host-instanz.lock). Ausgaben zusaetzlich in
-// /tmp/quadchroma-m1.log.
+// QuadChroma.app ist die eine App (Client und Host, der Rust-Client mit
+// dieser Engine eingebaut); die Freigaben haengen an ihrem Bundle. Es laeuft
+// hoechstens ein Host je Nutzer (host-instanz.lock). Ausgaben der einen App
+// in host-protokoll.txt im Ablageordner, sonst in /tmp/quadchroma-m1.log.
 //
-// Diese Datei ist der Dienst, kein Programm: main steht in start.m (eigene
-// App); der Rust-Client baut die Engine ohne start.m ein und startet den
-// Dienst eingebettet. Die Schnittstelle beider steht in dienst.h
-// (qc_werkzeug, qc_dienst_starten, qc_dienst_beenden).
+// Diese Datei ist der Dienst, kein Programm: der Rust-Client baut die
+// Engine ohne start.m ein und startet sie eingebettet (qc_app_einrichten,
+// qc_dienst_starten, qc_dienst_anhalten/..._fortsetzen); main in start.m
+// ist der fruehere eigene Host (make host-allein, nur fuer Pruefstaende).
+// Die Schnittstelle steht in dienst.h.
 //
 // Im Dienstbetrieb gehoert der Hauptfaden AppKit ([NSApp run] in start.m,
 // eingebettet die Run-Loop von winit): Symbol in der Menueleiste, Zulassen-
@@ -4424,7 +4425,25 @@ static int einrichten(const qc_dienst_cfg *dc) {
     return QC_DIENST_OK;
 }
 
+// Die eine App schreibt das Protokoll des Hosts wie die Host-Rolle unter
+// Windows in ihren Ablageordner: host-protokoll.txt, ueber der Grenze
+// host-protokoll.alt.txt - nicht mehr nach /tmp. Nur solange es noch nicht
+// offen ist.
+static void protokoll_in_ablage(void) {
+    static char pfad[1200], alt[1200];
+    if (qc_config_path("host-protokoll.txt", pfad, sizeof pfad) != 0 ||
+        qc_config_path("host-protokoll.alt.txt", alt, sizeof alt) != 0)
+        return;
+    pthread_mutex_lock(&g_log_mtx);
+    if (!g_log) {
+        g_log_pfad = pfad;
+        g_log_alt_pfad = alt;
+    }
+    pthread_mutex_unlock(&g_log_mtx);
+}
+
 int qc_app_einrichten(const qc_dienst_cfg *cfg) { @autoreleasepool {
+    if (cfg && cfg->app) protokoll_in_ablage();
     protokoll_oeffnen();
     if (![NSThread isMainThread]) {
         logf_(@"Dienst: Einrichten nicht auf dem Hauptfaden - nichts eingerichtet");

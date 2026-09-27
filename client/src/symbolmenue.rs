@@ -30,8 +30,10 @@
 // Host-Rolle steht (id Some); kam sie nicht in Gang, sagt es die
 // Zustandszeile.
 
-// Unter macOS baut noch niemand das Menue (die Menueleiste folgt mit der
-// einen App auf dem Mac); die Tests laufen trotzdem auf beiden Plattformen.
+// Auf dem Mac baut die Host-Engine dasselbe Menue in Objective-C
+// (host/menue.m, qc_menue_modell; geprueft von host/menuetest.m) - dort
+// braucht es von hier nur `Aktion` und `tooltip`; die Tests laufen trotzdem
+// auf beiden Plattformen.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::strings::{Key, Lang};

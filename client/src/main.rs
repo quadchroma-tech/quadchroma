@@ -62,9 +62,11 @@ mod zugang;
 /// Passwortbeweis bzw. "Zulassen", Pinnen in hosts.txt erst nach der Annahme.
 mod zugangsphase;
 /// Schliessen legt die App ab: Symbol im Infobereich (Windows, tray_win.rs)
-/// bzw. in der Menueleiste (macOS, tray_mac.rs); gemeinsame Logik in tray.rs.
+/// bzw. in der Menueleiste (macOS, das Symbol der Host-Engine, host_mac.rs);
+/// gemeinsame Logik in tray.rs.
 mod tray;
-/// Das Menue am Symbol der einen App (Client und Host-Rolle, Windows).
+/// Das Menue am Symbol der einen App (Client und Host-Rolle, Windows; auf
+/// dem Mac baut host/menue.m dasselbe Menue).
 mod symbolmenue;
 /// Die Host-Rolle der einen App, fuer main.rs auf jeder Plattform gleich.
 mod freigabe;
@@ -72,10 +74,9 @@ mod freigabe;
 mod ruhezustand;
 #[cfg(windows)]
 mod tray_win;
-#[cfg(target_os = "macos")]
-mod tray_mac;
 /// Die Host-Engine des Mac (host/, von build.rs als libqchost.a
-/// hineingebaut): die C-Schnittstelle des Dienstes aus host/dienst.h.
+/// hineingebaut): die C-Schnittstelle des Dienstes aus host/dienst.h, das
+/// eine Symbol in der Menueleiste und die Host-Rolle der einen App.
 #[cfg(target_os = "macos")]
 mod host_mac;
 
@@ -5903,11 +5904,8 @@ pub enum Benutzer {
     /// vorn holen), siehe einzel.rs. Die Schleife bestaetigt die Uebernahme;
     /// erst dann endet der zweite Start mit "weitergereicht".
     Einzel(einzel::Weitergabe),
-    /// Wahl am Symbol in der Menueleiste (tray.rs, macOS).
-    #[cfg_attr(windows, allow(dead_code))]
-    Tray(tray::Befehl),
-    /// Wahl am Symbol der einen App (Windows): ein Punkt aus symbolmenue.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Wahl am Symbol der einen App: ein Punkt aus symbolmenue (Windows),
+    /// auf dem Mac der Rueckruf der Menueleiste (host_mac.rs).
     Menue(symbolmenue::Aktion),
     /// Die Host-Rolle will eine Sprechblase am Symbol zeigen.
     Hinweis(String),
@@ -5916,7 +5914,6 @@ pub enum Benutzer {
     RolleBereit,
     /// Das Fenster "Geraetename" meldet einen neuen Namen (None: der
     /// Rechnername des Systems).
-    #[cfg_attr(not(windows), allow(dead_code))]
     Name(Option<String>),
     /// Die App endet von aussen (WM_CLOSE an ihr Symbol, Abmelden,
     /// Herunterfahren); der Abschied an einen Zuschauer ist schon hinaus.
@@ -5962,15 +5959,18 @@ const MIT_VERKNUEPFUNG: bool = cfg!(windows);
 /// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
 const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
 
-/// Die eine App - Client und Host-Rolle in einem Prozess, ein Symbol - gibt
-/// es bisher nur unter Windows (Plan W5-W7): dort der Umschalter "Diesen PC
-/// freigeben" im Startbildschirm, die Zeile "Dieser Computer" mit dem Knopf
-/// "Umbenennen" und das Kaestchen "Ruhezustand verhindern". Als Konstante
-/// statt cfg, damit derselbe Code auf beiden Plattformen gebaut (und
-/// geprueft) wird.
-const MIT_FREIGABE: bool = cfg!(windows);
+/// Die eine App - Client und Host-Rolle in einem Prozess, ein Symbol - unter
+/// Windows (Plan W5-W7) und auf dem Mac (M4): der Umschalter "Diesen PC
+/// freigeben" bzw. "Diesen Mac freigeben" im Startbildschirm, die Zeile
+/// "Dieser Computer" mit dem Knopf "Umbenennen" und das Kaestchen
+/// "Ruhezustand verhindern". Als Konstante statt cfg, damit derselbe Code
+/// auf allen Plattformen gebaut (und geprueft) wird.
+const MIT_FREIGABE: bool = cfg!(any(windows, target_os = "macos"));
 
-/// Laeuft die App ohne Fenster an (Plan W7)? Nur die eine App (Windows);
+/// Der Umschalter der Freigabe heisst auf dem Mac "Diesen Mac freigeben".
+const FREIGABE_TEXT: strings::Key = if cfg!(target_os = "macos") { strings::Key::StartShareMac } else { strings::Key::StartShare };
+
+/// Laeuft die App ohne Fenster an (Plan W7)? Nur die eine App;
 /// mit einem Ziel (Adresse, ID, Verknuepfung) nie; ohne Symbol (tray=aus)
 /// nie - es gaebe keinen Weg zur App; sonst bei Autostart und --host immer
 /// und bei jedem Start nach dem allerersten (einstellungen.txt:
@@ -5996,6 +5996,47 @@ fn ruhe_setzen(r: &mut ruhezustand::Ruhesperre, an: bool, lang: &strings::Lang) 
         Err(e) => protokoll::zeile(format!("Ruhezustand: nicht umgestellt - {e}")),
     }
     r.an()
+}
+
+/// --ruhe-selbsttest (macOS): die Zusicherung "Ruhezustand verhindern" setzen,
+/// in pmset -g assertions nachsehen (Art PreventUserIdleSystemSleep, Name
+/// mit dem Text des Hakens), aufheben und wieder nachsehen. Ohne Fenster,
+/// Host und Aufnahme. Rueckgabe 0 = bestanden; 2 auf anderen Plattformen
+/// (unter Windows zeigt powercfg /requests die Anforderung, als Administrator).
+fn ruhe_selbsttest() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        // Nur ASCII: pmset gibt andere Zeichen im Namen verstuemmelt aus
+        // (die Zusicherung selbst traegt den Text richtig, auch "läuft").
+        let grund = format!("{} - Selbsttest {}", strings::EN.get(strings::Key::PreventSleep), std::process::id());
+        let mut r = ruhezustand::Ruhesperre::neu();
+        if let Err(e) = r.setzen(true, &grund) {
+            eprintln!("Ruhezustand-Selbsttest: nicht gesetzt - {e}");
+            return 1;
+        }
+        let an = ruhezustand::pmset_zeilen(&grund);
+        for z in an.iter().flatten() {
+            println!("pmset: {z}");
+        }
+        let gesetzt = an.as_ref().is_some_and(|z| z.iter().any(|l| l.contains("PreventUserIdleSystemSleep")));
+        let geloest = r.setzen(false, "").is_ok() && !r.an();
+        let weg = ruhezustand::pmset_zeilen(&grund).is_some_and(|z| z.is_empty());
+        println!(
+            "Ruhezustand-Selbsttest: {} - nach dem Aufheben {}",
+            if gesetzt { "in pmset -g assertions (PreventUserIdleSystemSleep)" } else { "NICHT in pmset -g assertions" },
+            if geloest && weg { "weg" } else { "NOCH DA" }
+        );
+        if gesetzt && geloest && weg {
+            0
+        } else {
+            1
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("Den Ruhezustand-Selbsttest (--ruhe-selbsttest) gibt es nur unter macOS; unter Windows zeigt powercfg /requests die Anforderung.");
+        2
+    }
 }
 
 /// Was das Menue am Symbol der einen App aus dem Fensterfaden braucht; der
@@ -6199,7 +6240,8 @@ struct App {
     /// Start ueber eine ID ohne Adresse (Befehlszeile): seit wann auf ihre
     /// Bekanntgabe gewartet wird.
     id_ausstehend: Option<(u32, Instant)>,
-    /// Die Host-Rolle der einen App (Windows; None auf dem Mac).
+    /// Die Host-Rolle der einen App (Windows: eigener Faden; Mac: die
+    /// eingebaute Engine, angelaufen in resumed).
     rolle: Option<freigabe::Freigabe>,
     /// Die App lief ohne Fenster an (Autostart, --host, spaetere Starts):
     /// Fenster und Renderer entstehen erst mit "QuadChroma oeffnen".
@@ -6323,6 +6365,17 @@ impl App {
 
 impl ApplicationHandler<Benutzer> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        // Mac: die Host-Engine jetzt, auf dem Hauptfaden mit laufendem
+        // AppKit - Oberflaeche, Schluessel, Zugang; mit Freigabe der Dienst;
+        // dann das eine Symbol und das Programmmenue. Einmal (anlaufen merkt
+        // es sich). Unter Windows laeuft die Rolle schon.
+        let mut symbol_moeglich = true;
+        if let Some(r) = self.rolle.as_mut() {
+            // Die Wahlen am Symbol kommen als Benutzerereignisse.
+            #[cfg(target_os = "macos")]
+            host_mac::ziel_setzen(self.proxy.clone());
+            symbol_moeglich = r.anlaufen(self.lang.code, self.cfg.geraetename.as_deref());
+        }
         // Im Hintergrund (die eine App nach dem allerersten Start, Autostart,
         // --host): kein Fenster und kein Renderer, bis "QuadChroma oeffnen".
         if self.window.is_none() && !self.hintergrund {
@@ -6331,8 +6384,11 @@ impl ApplicationHandler<Benutzer> for App {
         // Das Symbol im Infobereich bzw. in der Menueleiste: von Anfang an,
         // damit das Schliessen einen Weg zurueck hat (und der Tooltip die
         // Sitzung zeigt). Auf dem Mac verlangt AppKit den Hauptfaden nach
-        // dem Start der Ereignisschleife - also hier.
-        if self.symbol.is_none() && self.cfg.tray {
+        // dem Start der Ereignisschleife - also hier; dort gehoert das
+        // Symbol der Host-Engine und steht auch mit tray=aus (dann beendet
+        // Schliessen trotzdem, tray::beim_schliessen) - es braucht den Stand
+        // des Clients.
+        if self.symbol.is_none() && (self.cfg.tray || cfg!(target_os = "macos")) && symbol_moeglich {
             self.symbol_anlegen();
         }
         // Liess sich kein Symbol anlegen, gaebe es ohne Fenster keinen Weg zur
@@ -6357,7 +6413,6 @@ impl ApplicationHandler<Benutzer> for App {
                 self.einzel_empfangen(el, &w.adresse);
                 w.bestaetigen();
             }
-            Benutzer::Tray(befehl) => self.tray_befehl(el, befehl),
             Benutzer::Menue(a) => self.menue_aktion(el, a),
             Benutzer::Hinweis(text) => {
                 if let Some(s) = self.symbol.as_mut() {
@@ -6506,6 +6561,15 @@ impl App {
         if !self.cfg.fenster_gezeigt {
             self.cfg.fenster_gezeigt = true;
             self.cfg.sichern();
+        }
+        // Mac: die App startet als Accessory (nur das Symbol); mit Fenster
+        // ist sie ein normales Programm (Dock, Programmmenue) und vorn.
+        #[cfg(target_os = "macos")]
+        if !self.verborgen {
+            host_mac::aktivierung(true);
+            if let Some(w) = &self.window {
+                w.focus_window();
+            }
         }
     }
 
@@ -6842,7 +6906,14 @@ impl App {
         // nachsehen - warten, bis ein Benutzerereignis kommt (Symbol,
         // Einzelinstanz, Host-Rolle).
         if self.window.is_none() {
-            el.set_control_flow(ControlFlow::Wait);
+            // Mac: das Menue der Menueleiste baut menue.m aus dem zuletzt
+            // gegebenen Stand - der langsame Takt fuehrt die gefundenen Hosts
+            // nach (symbol_nachfuehren, hoechstens alle 500 ms).
+            if cfg!(target_os = "macos") {
+                el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + TRAY_TAKT));
+            } else {
+                el.set_control_flow(ControlFlow::Wait);
+            }
             return;
         }
         #[cfg(target_os = "macos")]
@@ -6853,7 +6924,7 @@ impl App {
                     if let Some(w) = &self.window {
                         w.set_visible(false);
                     }
-                    tray_mac::aktivierung(false);
+                    host_mac::aktivierung(false);
                 }
             }
         }
@@ -7495,7 +7566,7 @@ impl App {
     /// einen App an bzw. aus, gemerkt in einstellungen.txt. Aus heisst: ein
     /// Zuschauer erfaehrt es (Abschied, Grund 1), die Ports gehen zu.
     fn freigabe_umschalten(&mut self) {
-        let Some(r) = self.rolle.as_ref() else { return };
+        let Some(r) = self.rolle.as_mut() else { return };
         self.cfg.freigabe = !self.cfg.freigabe;
         self.cfg.sichern();
         r.setzen(self.cfg.freigabe);
@@ -7514,6 +7585,7 @@ impl App {
         if let Ok(mut q) = self.menue_quelle.lock() {
             q.ruhe_verhindern = an;
         }
+        self.symbol_nachfuehren_jetzt();
     }
 
     /// "Mit Windows starten" (Menue): die eine Verknuepfung im
@@ -7534,8 +7606,11 @@ impl App {
     }
 
     /// "Geraetename aendern ..." (Menue) bzw. "Umbenennen" (Startbildschirm):
-    /// das Fenster oeffnen; der neue Name kommt als Benutzerereignis zurueck.
+    /// das Fenster oeffnen; der neue Name kommt als Benutzerereignis zurueck
+    /// (auf dem Mac aus dem Fenster der Menueleiste, host/menue.m).
     fn geraetename_fenster(&mut self) {
+        #[cfg(target_os = "macos")]
+        host_mac::geraetename_fenster();
         #[cfg(windows)]
         {
             let proxy = Mutex::new(self.proxy.clone());
@@ -7583,7 +7658,7 @@ impl App {
             .or_else(|| secure::eigener_host_schluessel().map(|k| zugang::geraete_id(&k)))
     }
 
-    /// Ein Punkt am Symbol der einen App (Windows).
+    /// Ein Punkt am Symbol der einen App.
     fn menue_aktion(&mut self, el: &ActiveEventLoop, a: symbolmenue::Aktion) {
         use symbolmenue::Aktion as A;
         match a {
@@ -7618,7 +7693,7 @@ impl App {
             self.verbergen_faellig = None;
             // Erst wieder ein normales Programm (Dock, Menueleiste), dann
             // das Fenster - sonst bekaeme es keinen Fokus.
-            tray_mac::aktivierung(true);
+            host_mac::aktivierung(true);
         }
         if let Some(w) = &self.window {
             w.set_visible(true);
@@ -7655,7 +7730,7 @@ impl App {
         }
         w.set_visible(false);
         #[cfg(target_os = "macos")]
-        tray_mac::aktivierung(false);
+        host_mac::aktivierung(false);
     }
 
     /// Schliessen des Fensters (X, Alt+F4, Cmd+W): ablegen statt beenden,
@@ -7743,17 +7818,31 @@ impl App {
         })
     }
 
-    /// Stand des Symbols jetzt (macOS): Menue aus den gefundenen Hosts,
-    /// Tooltip mit Name bzw. Adresse der Sitzung.
-    #[cfg(not(windows))]
-    fn tray_stand(&self) -> tray::Stand {
-        let hosts = self.hosts.lock().map(|h| h.list()).unwrap_or_default();
-        tray::stand(self.lang, &hosts, self.sitzung_anzeige().as_deref())
+    /// Was der Client zum Menue der Menueleiste beitraegt (macOS): Haken
+    /// der Freigabe und des Ruhezustands, bis zu vier gefundene Hosts (Name
+    /// entschaerft, sonst leer), Tooltip, laufende Sitzung.
+    #[cfg(target_os = "macos")]
+    fn symbol_stand(&self) -> host_mac::Stand {
+        let hosts = self
+            .hosts
+            .lock()
+            .map(|h| h.liste())
+            .unwrap_or_default()
+            .into_iter()
+            .take(tray::HOSTS_MAX)
+            .map(|g| (tray::anzeigename(&g.host.name), g.host.addr.to_string()))
+            .collect();
+        host_mac::Stand {
+            freigabe: self.cfg.freigabe,
+            ruhe: self.cfg.ruhe_verhindern,
+            sitzung: self.screen == Screen::Session,
+            tooltip: self.tooltip_jetzt(),
+            hosts,
+        }
     }
 
-    /// Der Tooltip der einen App jetzt (Windows): in einer Sitzung der Host,
-    /// sonst mit Freigabe die eigene ID.
-    #[cfg(windows)]
+    /// Der Tooltip der einen App jetzt: in einer Sitzung der Host, sonst mit
+    /// Freigabe die eigene ID.
     fn tooltip_jetzt(&self) -> String {
         let an = self.cfg.freigabe && self.rolle.is_some();
         symbolmenue::tooltip(self.lang, self.sitzung_anzeige().as_deref(), an, self.eigene_id())
@@ -7772,21 +7861,20 @@ impl App {
         }
     }
 
-    /// Das Symbol anlegen (macOS); seine Befehle kommen als Benutzerereignisse.
-    #[cfg(not(windows))]
+    /// Das Symbol (macOS): das der Host-Engine, angelegt mit
+    /// qc_oberflaeche_fertig in resumed; hier bekommt es den Stand des
+    /// Clients. Seine Wahlen kommen ueber host_mac als Benutzerereignisse.
+    #[cfg(target_os = "macos")]
     fn symbol_anlegen(&mut self) {
-        let proxy = self.proxy.clone();
-        let befehl: Box<dyn Fn(tray::Befehl) + Send> = Box::new(move |b| {
-            let _ = proxy.send_event(Benutzer::Tray(b));
-        });
-        match tray::Symbol::neu(befehl, &self.tray_stand()) {
-            Ok(s) => {
-                App::symbol_gemeldet(&s);
-                self.symbol = Some(s);
-            }
-            Err(e) => protokoll::zeile(format!("{}: kein Symbol ({e}) - Schliessen beendet das Programm", tray::ORT)),
-        }
+        let mut s = host_mac::Symbol::neu();
+        s.stand_setzen(&self.symbol_stand());
+        App::symbol_gemeldet(&s);
+        self.symbol = Some(s);
     }
+
+    /// Ohne Windows und macOS gibt es kein Symbol.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn symbol_anlegen(&mut self) {}
 
     /// Das eine Symbol der App (Windows): Linksklick oeffnet das Fenster,
     /// Rechtsklick das Menue (symbolmenue, bei jedem Oeffnen frisch gebaut -
@@ -7879,9 +7967,9 @@ impl App {
                 s.takt();
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
-            let stand = self.tray_stand();
+            let stand = self.symbol_stand();
             if let Some(s) = self.symbol.as_mut() {
                 s.stand_setzen(&stand);
                 s.takt();
@@ -8702,6 +8790,12 @@ impl App {
                 self.sprachwahl = false;
                 self.cfg.sprache = Some(code.to_string());
                 self.cfg.sichern();
+                // Die Menueleiste spricht dieselbe Sprache.
+                #[cfg(target_os = "macos")]
+                {
+                    host_mac::sprache_setzen(code);
+                    self.symbol_nachfuehren_jetzt();
+                }
             }
             Action::Website => website_oeffnen(),
             Action::None => {}
@@ -9599,7 +9693,7 @@ fn start_screen(
             // schmalen Fenstern (unter 400 Punkten) auch schmaler als 150,
             // der Text wird gekuerzt. Kein clamp: dessen Untergrenze laege
             // dann ueber der Obergrenze.
-            let breite = u.text.width(lang.get(StartShare), 13, 1) + 14 + 8;
+            let breite = u.text.width(lang.get(FREIGABE_TEXT), 13, 1) + 14 + 8;
             let sw = (breite + 40).max(150).min((panel_w / 2 - 20).max(0));
             ((panel_w - sw - 40) / 2, Some((sw, d.freigabe)))
         }
@@ -9614,7 +9708,7 @@ fn start_screen(
             if r.hit(maus.0, maus.1) {
                 tip = Some(lang.get(if an { StartSharing } else { HostSharingIsOff }).to_string());
             }
-            if umschalter(u, c, r, lang.get(StartShare), an, 13, 1) {
+            if umschalter(u, c, r, lang.get(FREIGABE_TEXT), an, 13, 1) {
                 action = Action::FreigabeUmschalten;
             }
             let x = r.x + sw + 20;
@@ -10537,6 +10631,8 @@ const WERTIG: &[(&str, usize)] = &[
     // Host-Rolle (host/mod.rs liest sie selbst; hier nur, damit ihre
     // Werte nie fuer eine Adresse gehalten werden)
     ("--output", 1), ("--fps", 1), ("--mbit", 1), ("--konserve", 1), ("--sekunden", 1), ("--encoderweg", 1),
+    // Host-Engine des Mac (host_mac::host_schalter reicht sie weiter)
+    ("--out", 1), ("--display", 1), ("--capture", 2),
     // Ziel aus einer Verknuepfung (Pairing v1, 9.4): --verbinden <adresse>
     // --id <id>; --passwort <pw> nur im Pruefmodus.
     ("--verbinden", 1), ("--id", 1), ("--passwort", 1),
@@ -10552,10 +10648,10 @@ fn erstes_argument(args: &[String]) -> Option<&str> {
             i += 1 + n;
             continue;
         }
-        // --benchmark [dauer], --host [port], --nur-host [port]: die Zahl
-        // ist wahlfrei - eine Zahl dahinter gehoert zum Schalter, alles
-        // andere nicht.
-        if a == "--benchmark" || a == "--host" || a == "--nur-host" {
+        // --benchmark [dauer], --host [port], --nur-host [port], --serve
+        // [port]: die Zahl ist wahlfrei - eine Zahl dahinter gehoert zum
+        // Schalter, alles andere nicht.
+        if a == "--benchmark" || a == "--host" || a == "--nur-host" || a == "--serve" {
             i += 1;
             if args.get(i).map(|v| v.parse::<u32>().is_ok()).unwrap_or(false) {
                 i += 1;
@@ -10869,12 +10965,21 @@ fn main() {
         let code = host::main_host(&args);
         std::process::exit(code);
     }
-    // Auf dem Mac gibt es die Host-Rolle nicht (dort ist QuadChroma.app der
-    // Host). Ohne diesen Zweig wuerde "--list" zur Adresse und ein Fenster
+    // Mac: die Werkzeuge der eingebauten Host-Engine (--list, --formattest,
+    // --capture ohne --serve; die Ziele make list/capture/permissions) laufen
+    // zu Ende - wie frueher in QuadChroma.app, vor allem anderen. Sie fragen
+    // nach der Bildschirmaufnahme.
+    #[cfg(target_os = "macos")]
+    if let Some(code) = host_mac::werkzeug(&args) {
+        std::process::exit(code);
+    }
+    // Die reine Host-Rolle ohne Fenster (--nur-host, --messen) gibt es nur
+    // unter Windows; auf dem Mac ist die Host-Rolle Teil der einen App.
+    // Ohne diesen Zweig wuerde der Schalter zur Adresse und ein Fenster
     // aufgehen, das auf eine Verbindung wartet.
     #[cfg(not(windows))]
     if args.iter().any(|a| a == "--host" || a == "--nur-host" || a == "--list" || a == "--messen") {
-        eprintln!("Die Host-Rolle (--host, --nur-host, --list, --messen) gibt es nur auf Windows.");
+        eprintln!("Die reine Host-Rolle (--host, --nur-host, --messen) gibt es nur unter Windows; auf dem Mac gibt die App selbst frei (Menueleiste).");
         std::process::exit(2);
     }
 
@@ -10898,14 +11003,22 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // Mac: das eine Symbol der App mit der eingebauten Host-Engine - ohne
+    // Dienst, ohne Aufnahme, in einem Wegwerf-HOME (host_mac::selbsttest).
     if args.iter().any(|a| a == "--menueleiste-selbsttest") {
         #[cfg(target_os = "macos")]
-        std::process::exit(tray_mac::selbsttest());
+        std::process::exit(host_mac::selbsttest());
         #[cfg(not(target_os = "macos"))]
         {
             eprintln!("Den Menueleisten-Selbsttest (--menueleiste-selbsttest) gibt es nur unter macOS.");
             std::process::exit(2);
         }
+    }
+    // "Ruhezustand verhindern" am System: setzen, im Bericht des Systems
+    // nachsehen (pmset -g assertions bzw. powercfg /requests), aufheben,
+    // wieder nachsehen. Ohne Fenster, ohne Host, ohne Aufnahme.
+    if args.iter().any(|a| a == "--ruhe-selbsttest") {
+        std::process::exit(ruhe_selbsttest());
     }
     // Selbsttest der Metal-Anzeige an einem echten Fenster von winit
     // (anzeige_mac.rs): Bild auf dem Schirm, Schicht passend zur Ansicht,
@@ -11040,7 +11153,7 @@ fn main() {
     // eingestellt ist (die heutige Verknuepfung). Laeuft die App schon, endet
     // ein solcher Start still - er oeffnet kein Fenster.
     let host_start = cfg!(windows) && args.iter().any(|a| a == "--host");
-    let hintergrund_start = cfg!(windows) && (host_start || args.iter().any(|a| a == "--hintergrund"));
+    let hintergrund_start = MIT_FREIGABE && (host_start || args.iter().any(|a| a == "--hintergrund"));
     if hintergrund_start && !headless && einzel::laeuft_schon() {
         println!("QuadChroma laeuft schon - der Start im Hintergrund endet.");
         std::process::exit(0);
@@ -11569,6 +11682,34 @@ fn main() {
     if let Some(g) = einzel_ohne {
         protokoll::zeile(format!("Einzelinstanz: nicht moeglich ({g}) - weiter ohne"));
     }
+    // Die eine App: im Hintergrund anlaufen - ohne Fenster und Renderer, bis
+    // "QuadChroma oeffnen" -, wenn es nicht der allererste Start ist oder
+    // Autostart bzw. --host es so wollen. Mit einem Ziel, mit tray=aus (kein
+    // Symbol, kein Weg zurueck) und beim allerersten Start geht das Fenster
+    // auf.
+    let im_hintergrund = start_im_hintergrund(
+        MIT_FREIGABE,
+        !start_addr.is_empty() || id_ausstehend.is_some(),
+        cfg.tray,
+        hintergrund_start,
+        cfg.fenster_gezeigt,
+    );
+    // Mac: winit ohne sein Standardmenue (das Programmmenue und die Tasten
+    // des Bearbeiten-Menues baut host/menue.m), als Accessory - nur das
+    // Symbol in der Menueleiste, bis ein Fenster aufgeht (dann Regular, siehe
+    // host_mac::aktivierung). Im Hintergrund nimmt die App beim Start auch
+    // niemandem den Fokus.
+    #[cfg(target_os = "macos")]
+    let el = {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        EventLoop::<Benutzer>::with_user_event()
+            .with_default_menu(false)
+            .with_activation_policy(ActivationPolicy::Accessory)
+            .with_activate_ignoring_other_apps(!im_hintergrund)
+            .build()
+            .expect("Ereignisschleife")
+    };
+    #[cfg(not(target_os = "macos"))]
     let el = EventLoop::<Benutzer>::with_user_event().build().expect("Ereignisschleife");
     // Weitergereichte Adressen eines zweiten Starts als Benutzerereignis in
     // die Schleife. Was vor ihrem Anlauf kam, wartet im Kanal. Ist die
@@ -11586,18 +11727,6 @@ fn main() {
     }
     let proxy = el.create_proxy();
 
-    // Die eine App (Windows): im Hintergrund anlaufen - ohne Fenster und
-    // Renderer, bis "QuadChroma oeffnen" -, wenn es nicht der allererste
-    // Start ist oder Autostart bzw. --host es so wollen. Mit einem Ziel, mit
-    // tray=aus (kein Symbol, kein Weg zurueck) und beim allerersten Start geht
-    // das Fenster auf.
-    let im_hintergrund = start_im_hintergrund(
-        cfg!(windows),
-        !start_addr.is_empty() || id_ausstehend.is_some(),
-        cfg.tray,
-        hintergrund_start,
-        cfg.fenster_gezeigt,
-    );
     // Die Verknuepfung "Mit Windows starten" frueherer Fassungen (die
     // Host-Rolle mit --host) weicht der einen (--hintergrund).
     #[cfg(windows)]
@@ -11637,9 +11766,10 @@ fn main() {
     };
     if rolle.is_some() {
         protokoll::zeile(format!(
-            "Freigabe: {}{} - Host-Rolle im eigenen Faden, Protokoll in host-protokoll.txt",
+            "Freigabe: {}{} - {}, Protokoll in host-protokoll.txt",
             if cfg.freigabe { "an" } else { "aus" },
-            if host_start { " (--host)" } else { "" }
+            if host_start { " (--host)" } else { "" },
+            if cfg!(target_os = "macos") { "eingebaute Host-Engine, laeuft mit der Ereignisschleife an" } else { "Host-Rolle im eigenen Faden" }
         ));
     }
     if im_hintergrund {
@@ -14007,13 +14137,25 @@ mod tests {
         assert_eq!(shot_groesse("1920x"), None);
     }
 
+    /// Die Schalter der Host-Engine des Mac (die eine App reicht sie ihr
+    /// weiter) sind nie die Adresse: --serve mit wahlfreiem Port, --out,
+    /// --display und --capture mit ihren Werten.
+    #[test]
+    fn mac_host_schalter_nie_als_adresse() {
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--serve", "9101", "--fps", "120", "--fest"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--serve", "studio.local"])), "studio.local:9001");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--out", "1920x1080", "--display", "1"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--serve", "--capture", "10", "/tmp/x.hevc", "h"])), "h:9001");
+    }
+
     /// Die Selbsttests des Symbols (--tray-selbsttest, --menueleiste-
-    /// selbsttest) haben keinen Wert: nie eine Adresse, und eine Angabe
-    /// dahinter gehoert nicht zu ihnen.
+    /// selbsttest) und des Ruhezustands haben keinen Wert: nie eine
+    /// Adresse, und eine Angabe dahinter gehoert nicht zu ihnen.
     #[test]
     fn symbol_selbsttest_nie_als_adresse() {
         assert_eq!(adresse_aus_argumenten(&argumente(&["--tray-selbsttest"])), "");
         assert_eq!(adresse_aus_argumenten(&argumente(&["--menueleiste-selbsttest"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--ruhe-selbsttest"])), "");
         assert_eq!(adresse_aus_argumenten(&argumente(&["--tray-selbsttest", "h"])), "h:9001");
         assert!(!WERTIG.iter().any(|(s, _)| s.contains("selbsttest")));
     }

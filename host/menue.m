@@ -1425,6 +1425,10 @@ void qc_app_stand_setzen(const qc_app_stand *s) {
     zustand_auffrischen();
 }
 
+void *qc_menueleiste_menue(void) {
+    return (__bridge void *)g_menue;
+}
+
 int qc_menueleiste_steht(void) {
     return g_item && g_item.button.window.screen ? 1 : 0;
 }

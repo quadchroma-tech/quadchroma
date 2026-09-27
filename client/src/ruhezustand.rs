@@ -11,14 +11,21 @@
 // Sitzungen; das Wachhalten waehrend einer Sitzung (host/aufnahme.rs,
 // SetThreadExecutionState samt Bildschirm) bleibt, wie es ist.
 //
-// macOS (IOPMAssertion) folgt mit der einen App auf dem Mac; bis dahin
-// meldet `setzen` dort, dass es das nicht gibt.
+// macOS: eine Zusicherung der Energieverwaltung (IOPMAssertionCreateWithName
+// mit kIOPMAssertPreventUserIdleSystemSleep, Name = der Text des Haken) -
+// der Mac schlaeft nicht von selbst ein, der Bildschirm darf ausgehen. Sie
+// gilt, bis IOPMAssertionRelease oder das Ende des Prozesses sie aufhebt,
+// und steht mit ihrem Namen in "pmset -g assertions". Das Wachhalten
+// waehrend einer Sitzung (host/main.m, PreventUserIdleDisplaySleep) bleibt,
+// wie es ist.
+//
+// Andere Plattformen: `setzen` meldet, dass es das nicht gibt.
 //
 // Die Entscheidung, was ein Wechsel am System tut, ist reine Rechnung
 // (`schritt`) und laeuft auf jeder Plattform im Test.
 
-// Unter macOS ruft das noch niemand auf.
-#![cfg_attr(not(windows), allow(dead_code))]
+// Ohne Windows und macOS ruft das niemand auf.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 
 /// Was ein gewuenschter Zustand am System aendert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +54,9 @@ pub struct Ruhesperre {
     /// Griff der gesetzten Anforderung (Windows).
     #[cfg(windows)]
     griff: Option<isize>,
+    /// Nummer der gesetzten Zusicherung (macOS).
+    #[cfg(target_os = "macos")]
+    zusicherung: Option<u32>,
 }
 
 impl Ruhesperre {
@@ -60,15 +70,20 @@ impl Ruhesperre {
         {
             self.griff.is_some()
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            self.zusicherung.is_some()
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             false
         }
     }
 
     /// Den Ruhezustand verhindern (`soll`) oder wieder zulassen - sofort.
-    /// `grund` steht in powercfg /requests. Liefert, was geschah; Err mit
-    /// dem Wortlaut des Systems (der Zustand bleibt dann, wie er war).
+    /// `grund` steht in powercfg /requests bzw. pmset -g assertions.
+    /// Liefert, was geschah; Err mit dem Wortlaut des Systems (der Zustand
+    /// bleibt dann, wie er war).
     pub fn setzen(&mut self, soll: bool, grund: &str) -> Result<Schritt, String> {
         let s = schritt(self.an(), soll);
         #[cfg(windows)]
@@ -81,11 +96,21 @@ impl Ruhesperre {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        match s {
+            Schritt::Nichts => {}
+            Schritt::Setzen => self.zusicherung = Some(mac::anfordern(grund)?),
+            Schritt::Loesen => {
+                if let Some(z) = self.zusicherung.take() {
+                    mac::aufheben(z)?;
+                }
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = grund;
             if s == Schritt::Setzen {
-                return Err("Ruhezustand verhindern gibt es auf dieser Plattform noch nicht".into());
+                return Err("Ruhezustand verhindern gibt es auf dieser Plattform nicht".into());
             }
         }
         Ok(s)
@@ -98,7 +123,94 @@ impl Drop for Ruhesperre {
         if let Some(h) = self.griff.take() {
             let _ = win::aufheben(h);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(z) = self.zusicherung.take() {
+            let _ = mac::aufheben(z);
+        }
     }
+}
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::ffi::c_void;
+
+    type CFStringRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithBytes(alloc: *const c_void, bytes: *const u8, len: isize, kodierung: u32, extern_: u8) -> CFStringRef;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPMAssertionCreateWithName(typ: CFStringRef, stufe: u32, name: CFStringRef, nummer: *mut u32) -> i32;
+        fn IOPMAssertionRelease(nummer: u32) -> i32;
+    }
+
+    /// kCFStringEncodingUTF8.
+    const UTF8: u32 = 0x0800_0100;
+    /// kIOPMAssertionLevelOn.
+    const AN: u32 = 255;
+    /// kIOPMAssertPreventUserIdleSystemSleep (ein CFSTR im Kopf IOPMLib.h).
+    const TYP: &str = "PreventUserIdleSystemSleep";
+
+    /// Ein CFString, den der Aufrufer freigibt.
+    fn cf_text(t: &str) -> Result<CFStringRef, String> {
+        // SAFETY: Zeiger und Laenge beschreiben gueltiges UTF-8; CoreFoundation kopiert.
+        let s = unsafe { CFStringCreateWithBytes(std::ptr::null(), t.as_ptr(), t.len() as isize, UTF8, 0) };
+        if s.is_null() {
+            Err(format!("CFStringCreateWithBytes: {t:?} nicht anlegbar"))
+        } else {
+            Ok(s)
+        }
+    }
+
+    /// Zusicherung mit Namen anlegen; ihre Nummer.
+    pub fn anfordern(grund: &str) -> Result<u32, String> {
+        let typ = cf_text(TYP)?;
+        let name = match cf_text(grund) {
+            Ok(n) => n,
+            Err(e) => {
+                // SAFETY: eben angelegt.
+                unsafe { CFRelease(typ) };
+                return Err(e);
+            }
+        };
+        let mut nummer = 0u32;
+        // SAFETY: gueltige CFStrings; das System kopiert den Namen.
+        let r = unsafe { IOPMAssertionCreateWithName(typ, AN, name, &mut nummer) };
+        // SAFETY: beide eben angelegt, nur hier benutzt.
+        unsafe {
+            CFRelease(typ);
+            CFRelease(name);
+        }
+        if r != 0 {
+            return Err(format!("IOPMAssertionCreateWithName: 0x{:08x}", r as u32));
+        }
+        Ok(nummer)
+    }
+
+    /// Zusicherung aufheben.
+    pub fn aufheben(nummer: u32) -> Result<(), String> {
+        // SAFETY: nur eine Nummer; eine falsche meldet das System als Fehler.
+        let r = unsafe { IOPMAssertionRelease(nummer) };
+        if r != 0 {
+            return Err(format!("IOPMAssertionRelease: 0x{:08x}", r as u32));
+        }
+        Ok(())
+    }
+}
+
+/// Die Zeilen von "pmset -g assertions", die diesen Namen tragen (macOS;
+/// fuer den Selbsttest und den Test). pmset gibt nur ASCII lesbar aus -
+/// gesucht wird deshalb nach einem Namen ohne andere Zeichen. None: pmset
+/// lief nicht.
+#[cfg(target_os = "macos")]
+pub fn pmset_zeilen(name: &str) -> Option<Vec<String>> {
+    let aus = std::process::Command::new("/usr/bin/pmset").args(["-g", "assertions"]).output().ok()?;
+    let text = String::from_utf8_lossy(&aus.stdout).into_owned();
+    Some(text.lines().filter(|z| z.contains(name)).map(|z| z.trim().to_string()).collect())
 }
 
 #[cfg(windows)]
@@ -179,8 +291,31 @@ mod tests {
         drop(r);
     }
 
-    /// Ohne Windows gibt es (noch) nichts zu setzen; aus bleibt aus.
-    #[cfg(not(windows))]
+    /// macOS: die Zusicherung steht mit ihrem Namen und ihrer Art in pmset
+    /// -g assertions, solange sie gilt - an, noch einmal an (nichts), aus
+    /// (weg), noch einmal aus (nichts), an, und mit dem Fallenlassen weg.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zusicherung_in_pmset() {
+        let name = format!("QuadChroma Test {}", std::process::id());
+        let mut r = Ruhesperre::neu();
+        assert!(!r.an());
+        assert_eq!(r.setzen(true, &name), Ok(Schritt::Setzen));
+        assert!(r.an());
+        let z = pmset_zeilen(&name).expect("pmset");
+        assert!(z.iter().any(|l| l.contains("PreventUserIdleSystemSleep")), "{z:?}");
+        assert_eq!(r.setzen(true, &name), Ok(Schritt::Nichts));
+        assert_eq!(r.setzen(false, ""), Ok(Schritt::Loesen));
+        assert!(!r.an());
+        assert_eq!(pmset_zeilen(&name).expect("pmset"), Vec::<String>::new());
+        assert_eq!(r.setzen(false, ""), Ok(Schritt::Nichts));
+        assert_eq!(r.setzen(true, &name), Ok(Schritt::Setzen));
+        drop(r);
+        assert_eq!(pmset_zeilen(&name).expect("pmset"), Vec::<String>::new());
+    }
+
+    /// Ohne Windows und macOS gibt es nichts zu setzen; aus bleibt aus.
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn ohne_windows_nicht_verfuegbar() {
         let mut r = Ruhesperre::neu();

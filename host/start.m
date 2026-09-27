@@ -1,9 +1,10 @@
-// QuadChroma Host als eigene App (QuadChroma.app, Makefile): der Einstieg.
+// Der fruehere eigene Mac-Host: der Einstieg. Nur noch fuer Pruefstaende
+// und Versuche (make host-allein, build/quadchroma-host) - QuadChroma.app
+// ist die eine App, der Rust-Client mit eingebauter Engine
+// (client/build.rs baut sie ohne diese Datei ein).
 //
 // Werkzeuge (--list, --capture, --formattest) laufen zu Ende; sonst startet
-// der Dienst (main.m, dienst.h), und die Run-Loop gehoert AppKit. Der
-// Rust-Client baut dieselbe Engine ohne diese Datei ein (client/build.rs):
-// dort steht sein eigenes main, und der Dienst startet eingebettet.
+// der Dienst (main.m, dienst.h), und die Run-Loop gehoert AppKit.
 #import <AppKit/AppKit.h>
 #include <stdio.h>
 #include "dienst.h"

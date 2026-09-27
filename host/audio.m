@@ -283,7 +283,10 @@ void qc_audio_configure(SCStreamConfiguration *cfg) {
     cfg.capturesAudio = YES;
     cfg.sampleRate = QC_AUDIO_RATE;
     cfg.channelCount = QC_AUDIO_CHANNELS;
-    // Ohne das hoerte sich der Host selbst zu, sobald er je etwas ausgibt.
+    // Ohne das hoerte sich der Host selbst zu, sobald er je etwas ausgibt -
+    // und in der einen App (eingebettet im Client) ginge der Ton, den der
+    // Mac-Client von einem anderen Rechner abspielt, an dessen Zuschauer
+    // zurueck. Der Prozess ist derselbe: YES schliesst beides aus.
     cfg.excludesCurrentProcessAudio = YES;
     // Freigabe: nur Bildschirmaufnahme, die main.m schon prueft. Kein Mikrofon,
     // kein zusaetzlicher Dialog - deshalb fragt dieses Modul nichts nach.

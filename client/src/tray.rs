@@ -2,39 +2,26 @@
 // dem Mac in die Menueleiste (Spezifikation 3.9).
 //
 // Hier steht, was beide Plattformen teilen und was sich ohne Shell pruefen
-// laesst: die Entscheidung beim Schliessen, das Menue aus der Hostliste und
-// der Text des Tooltips, dazu `Eintrag`, der Baustein eines allgemeinen
-// Menues (Untermenues, Haken, deaktivierte Zeilen, eigene Nummern). Unter
-// Windows baut die eine App (Client und Host-Rolle, ein Symbol) ihr Menue
-// ganz aus Eintraegen (symbolmenue.rs); das Menue aus `Punkt` braucht
-// derzeit nur noch der Mac. Das Symbol selbst bauen tray_win.rs
-// (Shell_NotifyIconW in einem eigenen Faden) und tray_mac.rs (NSStatusBar auf
-// dem Hauptfaden); der Mac bietet diese Schnittstelle `Symbol`:
-//
-//   Symbol::neu(befehl, &stand) -> Result<Symbol, String>
-//   symbol.steht() -> bool          Symbol wirklich sichtbar angemeldet?
-//   symbol.grund() -> Option<String> warum nicht (Protokoll, Selbsttest)
-//   symbol.stand_setzen(&stand)     Menue und Tooltip erneuern
-//   symbol.hinweis(titel, text) -> bool  einmalige Sprechblase bzw. Hinweisblase;
-//                                   true nur, wenn sie wirklich gezeigt wurde
-//   symbol.takt()                   aus der Ereignisschleife, etwa 2 je Sekunde
-//   drop(symbol)                    Symbol entfernen
-//
-// `befehl` wird aufgerufen, wenn der Nutzer am Symbol etwas waehlt; main.rs
-// macht daraus ein Benutzerereignis fuer winit (EventLoopProxy). Unter
-// Windows legt main.rs das Symbol mit `Symbol::neu_app` an (siehe
-// tray_win.rs): Menue aus Eintraegen, bei jedem Oeffnen frisch gebaut.
+// laesst: die Entscheidung beim Schliessen und der Text des Tooltips, dazu
+// `Eintrag`, der Baustein eines allgemeinen Menues (Untermenues, Haken,
+// deaktivierte Zeilen, eigene Nummern). Unter Windows baut die eine App
+// (Client und Host-Rolle, ein Symbol) ihr Menue ganz aus Eintraegen
+// (symbolmenue.rs), und tray_win.rs zeigt es (Shell_NotifyIconW in einem
+// eigenen Faden). Auf dem Mac ist das eine Symbol das der eingebauten
+// Host-Engine (host/menue.m, Menue aus demselben Aufbau wie symbolmenue.rs,
+// Texte in host/texte.m); host_mac::Symbol gibt ihm den Stand des Clients
+// und fragt, ob es steht. Beide melden die Wahl als Benutzerereignis
+// (Benutzer::Menue) an winit.
 //
 // Das Fenster selbst verbirgt und zeigt main.rs (App::schliessen,
 // App::fenster_zeigen); hier wird nur entschieden.
 
-use crate::discovery;
-use crate::strings::{self, Key};
+use crate::strings::Key;
 
 #[cfg(windows)]
 pub use crate::tray_win::Symbol;
 #[cfg(target_os = "macos")]
-pub use crate::tray_mac::Symbol;
+pub use crate::host_mac::Symbol;
 
 /// Wie der Ort heisst, in Protokollzeilen.
 #[cfg(not(target_os = "macos"))]
@@ -98,70 +85,6 @@ pub enum Befehl {
     Verbinden(String),
     /// Programm beenden.
     Beenden,
-}
-
-/// Ein Punkt des Kontextmenues, in dieser Reihenfolge angezeigt (macOS;
-/// unter Windows baut symbolmenue.rs das Menue).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(windows, allow(dead_code))]
-pub enum Punkt {
-    /// "Oeffnen" - unter Windows fett (Vorgabe fuer den Doppelklick).
-    Oeffnen(String),
-    Trenner,
-    /// "Verbinden: <Name>" fuer einen gefundenen Host.
-    Verbinden { text: String, adresse: String },
-    Beenden(String),
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-impl Punkt {
-    /// Was die Wahl dieses Punktes bewirkt (Trenner: nichts).
-    pub fn befehl(&self) -> Option<Befehl> {
-        match self {
-            Punkt::Oeffnen(_) => Some(Befehl::Oeffnen),
-            Punkt::Trenner => None,
-            Punkt::Verbinden { adresse, .. } => Some(Befehl::Verbinden(adresse.clone())),
-            Punkt::Beenden(_) => Some(Befehl::Beenden),
-        }
-    }
-}
-
-/// Alles, was das Symbol zeigt (macOS). main.rs rechnet es regelmaessig neu
-/// aus und gibt es nur bei einer Aenderung weiter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(windows, allow(dead_code))]
-pub struct Stand {
-    pub menue: Vec<Punkt>,
-    pub tooltip: String,
-}
-
-/// Den Stand aus Sprache, gefundenen Hosts und laufender Sitzung (Name oder
-/// Adresse des Hosts; None auf dem Startbildschirm).
-#[cfg_attr(windows, allow(dead_code))]
-pub fn stand(lang: &strings::Lang, hosts: &[discovery::Host], sitzung: Option<&str>) -> Stand {
-    Stand { menue: menue(lang, hosts), tooltip: tooltip(sitzung) }
-}
-
-/// Das Menue: Oeffnen, Trenner, bis zu vier gefundene Hosts, Trenner,
-/// Beenden. Ohne Hosts steht nur ein Trenner zwischen Oeffnen und Beenden.
-/// Die Hosts kommen in der Reihenfolge der Liste (nach Namen sortiert); ohne
-/// Namen steht die Adresse da.
-#[cfg_attr(windows, allow(dead_code))]
-pub fn menue(lang: &strings::Lang, hosts: &[discovery::Host]) -> Vec<Punkt> {
-    let mut m = vec![Punkt::Oeffnen(lang.get(Key::TrayOpen).to_string()), Punkt::Trenner];
-    let mut mit_hosts = false;
-    for h in hosts.iter().take(HOSTS_MAX) {
-        let adresse = h.addr.to_string();
-        let name = anzeigename(&h.name);
-        let name = if name.is_empty() { adresse.clone() } else { name };
-        m.push(Punkt::Verbinden { text: lang.get(Key::TrayConnect).replace("{n}", &name), adresse });
-        mit_hosts = true;
-    }
-    if mit_hosts {
-        m.push(Punkt::Trenner);
-    }
-    m.push(Punkt::Beenden(lang.get(Key::TrayQuit).to_string()));
-    m
 }
 
 /// Der Tooltip: "QuadChroma", in einer Sitzung "QuadChroma – <Name bzw.
@@ -235,16 +158,12 @@ pub struct Symbol;
 
 #[cfg(not(any(windows, target_os = "macos")))]
 impl Symbol {
-    pub fn neu(_befehl: Box<dyn Fn(Befehl) + Send>, _stand: &Stand) -> Result<Symbol, String> {
-        Err("kein Infobereich auf dieser Plattform".into())
-    }
     pub fn steht(&self) -> bool {
         false
     }
     pub fn grund(&self) -> Option<String> {
         None
     }
-    pub fn stand_setzen(&mut self, _stand: &Stand) {}
     pub fn hinweis(&mut self, _titel: &str, _text: &str) -> bool {
         false
     }
@@ -254,11 +173,7 @@ impl Symbol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
-
-    fn host(name: &str, addr: &str) -> discovery::Host {
-        discovery::Host { name: name.into(), addr: addr.parse().unwrap(), seen: Instant::now() }
-    }
+    use crate::strings;
 
     #[test]
     fn entscheidung_beim_schliessen() {
@@ -280,54 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn menue_aus_der_hostliste() {
-        let de = strings::pick("de");
-        // Ohne Hosts: Oeffnen, ein Trenner, Beenden.
-        assert_eq!(
-            menue(de, &[]),
-            vec![Punkt::Oeffnen("Öffnen".into()), Punkt::Trenner, Punkt::Beenden("Beenden".into())]
-        );
-        // Mit Hosts: hoechstens vier, in der Reihenfolge der Liste, ohne Namen
-        // die Adresse, danach ein zweiter Trenner.
-        let hosts = [
-            host("Mac-mini-von-Robert.local", "192.168.178.194:9001"),
-            host("", "192.168.178.60:9001"),
-            host("c", "10.0.0.3:9001"),
-            host("d", "10.0.0.4:9101"),
-            host("e", "10.0.0.5:9001"),
-        ];
-        let m = menue(de, &hosts);
-        assert_eq!(m.len(), 2 + 4 + 2);
-        assert_eq!(m[0], Punkt::Oeffnen("Öffnen".into()));
-        assert_eq!(m[1], Punkt::Trenner);
-        assert_eq!(
-            m[2],
-            Punkt::Verbinden { text: "Verbinden: Mac-mini-von-Robert.local".into(), adresse: "192.168.178.194:9001".into() }
-        );
-        assert_eq!(m[3], Punkt::Verbinden { text: "Verbinden: 192.168.178.60:9001".into(), adresse: "192.168.178.60:9001".into() });
-        assert_eq!(m[5], Punkt::Verbinden { text: "Verbinden: d".into(), adresse: "10.0.0.4:9101".into() });
-        assert_eq!(m[6], Punkt::Trenner);
-        assert_eq!(m[7], Punkt::Beenden("Beenden".into()));
-        assert!(!m.iter().any(|p| matches!(p, Punkt::Verbinden { adresse, .. } if adresse == "10.0.0.5:9001")));
-        // Was die Punkte bewirken.
-        assert_eq!(m[0].befehl(), Some(Befehl::Oeffnen));
-        assert_eq!(m[1].befehl(), None);
-        assert_eq!(m[5].befehl(), Some(Befehl::Verbinden("10.0.0.4:9101".into())));
-        assert_eq!(m[7].befehl(), Some(Befehl::Beenden));
-        // Englisch, und in jeder Sprache steht der Name im Text.
-        let en = menue(strings::pick("en"), &hosts[..1]);
-        assert_eq!(en[0], Punkt::Oeffnen("Open".into()));
-        assert_eq!(en[2], Punkt::Verbinden { text: "Connect: Mac-mini-von-Robert.local".into(), adresse: "192.168.178.194:9001".into() });
-        assert_eq!(en[4], Punkt::Beenden("Quit".into()));
-        for l in strings::all() {
-            match &menue(l, &hosts[..1])[2] {
-                Punkt::Verbinden { text, .. } => assert!(text.contains("Mac-mini-von-Robert.local"), "{}: {text}", l.code),
-                p => panic!("{}: {p:?}", l.code),
-            }
-        }
-    }
-
-    #[test]
     fn fremde_namen_werden_entschaerft() {
         // Steuerzeichen (etwa ein Tabulator, der unter Windows ein Kuerzel
         // einleitet) werden zu Leerzeichen, zu lange Namen gekuerzt.
@@ -337,8 +204,6 @@ mod tests {
         assert_eq!(k.chars().count(), NAME_MAX);
         assert!(k.ends_with('…'));
         assert_eq!(anzeigename(&"y".repeat(NAME_MAX)), "y".repeat(NAME_MAX));
-        let m = menue(strings::pick("de"), &[host("böse\tname", "10.0.0.1:9001")]);
-        assert_eq!(m[2], Punkt::Verbinden { text: "Verbinden: böse name".into(), adresse: "10.0.0.1:9001".into() });
     }
 
     #[test]
@@ -353,10 +218,6 @@ mod tests {
         let t = tooltip(Some(&"n".repeat(500)));
         assert!(t.chars().count() <= "QuadChroma – ".chars().count() + NAME_MAX);
         assert!(utf16_kuerzen(&t, 127).len() == t.encode_utf16().count());
-        // Der ganze Stand in einem.
-        let s = stand(strings::pick("en"), &[], Some("studio.local"));
-        assert_eq!(s.tooltip, "QuadChroma – studio.local");
-        assert_eq!(s.menue.len(), 3);
     }
 
     #[test]

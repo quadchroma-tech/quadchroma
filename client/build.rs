@@ -4,9 +4,11 @@
 // exe ein (res/quadchroma.rc, res/quadchroma.manifest, res/quadchroma.ico).
 //
 // macOS: baut die Host-Engine des Mac (host/, Objective-C und C) als
-// libqchost.a hinein - dieselben Quellen und Schalter wie QuadChroma.app,
-// aus dem Makefile gelesen, ohne host/start.m (dort steht das main der
-// eigenen App). Siehe host_engine_einbauen und src/host_mac.rs.
+// libqchost.a hinein - die Quellen und Schalter aus dem Makefile, ohne
+// host/start.m (dort steht das main des frueheren eigenen Hosts, make
+// host-allein). Das Ergebnis ist die eine App: make kopiert es als
+// QuadChroma.app/Contents/MacOS/quadchroma. Siehe host_engine_einbauen und
+// src/host_mac.rs.
 //
 // Andere Ziele: nichts.
 //
@@ -414,6 +416,22 @@ fn host_engine_einbauen() -> Result<(), String> {
     }
     // Objective-C-Laufzeit (ARC: objc_retain und Verwandte).
     println!("cargo::rustc-link-lib=dylib=objc");
+    // Die Laufzeitbibliothek von clang: @available (etwa fuer
+    // showMouseClicks ab macOS 15) wird zu __isPlatformVersionAtLeast. clang
+    // haengt sie beim eigenen Linken still an; rustc linkt mit
+    // -nodefaultlibs, also hier ausdruecklich - sonst fehlt das Symbol,
+    // sobald der Dienst gestartet wird (vorher warf -dead_strip den Aufruf
+    // weg). Nur, was fehlt, kommt aus dem Archiv.
+    let rt = Command::new("clang")
+        .arg("-print-file-name=libclang_rt.osx.a")
+        .output()
+        .map_err(|e| format!("clang nicht startbar: {e}"))?;
+    let rt = PathBuf::from(String::from_utf8_lossy(&rt.stdout).trim());
+    if rt.is_absolute() && rt.is_file() {
+        println!("cargo::rustc-link-arg={}", rt.display());
+    } else {
+        return Err(format!("libclang_rt.osx.a nicht gefunden (clang -print-file-name: {})", rt.display()));
+    }
     Ok(())
 }
 

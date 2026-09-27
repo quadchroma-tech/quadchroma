@@ -1,10 +1,11 @@
 // Der Mac-Host als startbarer Dienst: die C-Schnittstelle der Host-Engine.
 //
-// Zwei Einstiege nutzen sie. Die eigene App (QuadChroma.app, Makefile) hat
-// ihr main in start.m: Werkzeuge, sonst qc_dienst_starten und [NSApp run].
-// Der Rust-Client baut dieselbe Engine ohne start.m als libqchost.a ein
+// Zwei Einstiege nutzen sie. QuadChroma.app ist die eine App: der
+// Rust-Client baut die Engine ohne start.m als libqchost.a ein
 // (client/build.rs, Deklarationen in client/src/host_mac.rs); dort dreht
-// winit die Run-Loop, und der Dienst startet eingebettet aus resumed.
+// winit die Run-Loop, und die Engine laeuft eingebettet aus resumed an. Der
+// fruehere eigene Host (start.m: Werkzeuge, sonst qc_dienst_starten und
+// [NSApp run]) baut nur noch fuer die Pruefstaende (make host-allein).
 //
 // Die eine App (Client und Host in einem Prozess, Plan M4): der Client
 // richtet in resumed mit qc_app_einrichten Oberflaeche, Schluessel und
@@ -95,7 +96,8 @@ void qc_oberflaeche_fertig(void);
 // Nur die eine App: Oberflaeche (eingebettet, mit den Punkten des Clients),
 // Schluessel und Zugang einrichten, ohne zu lauschen und ohne Rueckfrage
 // des Systems - so zeigt das Menue ID, Passwort und Geraete auch bei
-// ausgeschalteter Freigabe. Danach qc_dienst_starten (Freigabe an) und
+// ausgeschalteter Freigabe. Das Protokoll des Hosts geht dann nach
+// host-protokoll.txt im Ablageordner (statt /tmp/quadchroma-m1.log). Danach qc_dienst_starten (Freigabe an) und
 // qc_oberflaeche_fertig. Rueckgabe QC_DIENST_OK, _FADEN, _DATEI oder
 // _DOPPELT (schon eingerichtet).
 int qc_app_einrichten(const qc_dienst_cfg *cfg);
@@ -149,6 +151,9 @@ int qc_menueleiste_hinweis(const char *text);
 int qc_menueleiste_steht(void);
 // Das Fenster "Geraetename" (auch aus dem Startbildschirm: "Umbenennen").
 void qc_geraetename_fenster(void);
+// Fuer den Selbsttest des Clients (--menueleiste-selbsttest): das NSMenu des
+// Symbols, NULL solange es kein Symbol gibt.
+void *qc_menueleiste_menue(void);
 
 // Werkzeuge der Kommandozeile (--list, --formattest, --capture ohne --serve):
 // laufen zu Ende und liefern den Exit-Code. Ohne Werkzeug-Schalter
