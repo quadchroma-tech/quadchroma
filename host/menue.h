@@ -13,6 +13,7 @@
 // umgesetzt); sie kommen aus Netzfaeden und kehren sofort zurueck.
 #import <AppKit/AppKit.h>
 #include "zugang.h"
+#include "dienst.h"
 
 typedef struct {
     // Vor dem Beenden: Bild- und Eingabekanal des Zuschauers schliessen.
@@ -20,11 +21,19 @@ typedef struct {
     void (*abschied)(void);
     // Eine Protokollzeile (deutsch, ASCII-Umschrift wie das uebrige Protokoll).
     void (*protokoll)(NSString *zeile);
+    // 0: eigene App, die Oberflaeche wird NSApp.delegate. 1: im Rust-Client -
+    // NSApp.delegate gehoert winit und bleibt, wie es ist (siehe menue.m).
+    int eingebettet;
+    // Nur eingebettet: Doppelklick auf die laufende App. NULL = Menue zeigen.
+    void (*oeffnen)(void);
 } qc_oberflaeche_cfg;
 
-// Aus main() auf dem Hauptfaden, vor [NSApp run]: Delegate, Signale
-// (SIGTERM/SIGINT beenden sauber), Warteschlange. Symbol und Menue entstehen
-// in applicationDidFinishLaunching.
+// Aus qc_dienst_starten auf dem Hauptfaden, bevor die Run-Loop die
+// Oberflaeche braucht: Delegate (eigene App) bzw. Doppelklick und Beenden an
+// winits Delegate (eingebettet), Signale (SIGTERM/SIGINT beenden sauber),
+// Warteschlange. Symbol und Menue entstehen erst mit qc_oberflaeche_fertig
+// (dienst.h) - die eigene App ruft es aus applicationDidFinishLaunching:,
+// eingebettet der Client aus resumed. Ein zweiter Aufruf bleibt ohne Wirkung.
 void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg);
 
 // ------------------------------------------------------------------ Modell

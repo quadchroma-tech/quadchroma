@@ -10,6 +10,7 @@
 #import "menue.h"
 #import "texte.h"
 #import <ServiceManagement/ServiceManagement.h>
+#import <objc/runtime.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <signal.h>
@@ -345,9 +346,10 @@ QCMenueZustand *qc_menue_zustand_lesen(void) {
 }
 
 // ======================================================= Laufende Oberflaeche
-// Ab hier: nur im Host (main.m ruft qc_oberflaeche_starten). Der Pruefstand
-// menuetest bindet die Datei ein, startet sie aber nie; hosttest bindet sie
-// gar nicht (main.m bringt schwache Standardfassungen ihrer Einstiege mit).
+// Ab hier: nur im Host (qc_dienst_starten in main.m ruft
+// qc_oberflaeche_starten). Der Pruefstand menuetest bindet die Datei ein,
+// startet sie aber nie; hosttest bindet sie gar nicht (main.m bringt
+// schwache Standardfassungen ihrer Einstiege mit).
 
 static void ui_log(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void ui_log(NSString *fmt, ...) {
@@ -383,6 +385,8 @@ static dispatch_source_t g_signale[2];
 static int g_kopiert_nr;
 static int g_beenden;                       // 0 laeuft, 1 Abschied unterwegs, 2 fertig
 static int g_signal_beenden;                // ein Signal hat terminate: schon angestellt
+static int g_eingebettet;                   // im Rust-Client: NSApp.delegate gehoert winit
+static id g_ende_beobachter;                // eingebettet: NSApplicationWillTerminateNotification
 // Was das Menue zuletzt zeigte: bleibt es gleich, wird nicht neu gebaut -
 // sonst flackerte ein offenes Menue (das Oeffnen liest selbst neu).
 static NSArray<NSString *> *g_titel_zuletzt;
@@ -829,28 +833,14 @@ static void beenden_antworten(void) {
     [NSApp replyToApplicationShouldTerminate:YES];
 }
 
-@implementation QCOberflaeche
-
-- (void)applicationDidFinishLaunching:(NSNotification *)n {
-    (void)n;
-    qc_texte_systemsprache();
-    bearbeiten_menue_setzen();
-    // Vorsorge gegen App Nap: eine Menueleisten-App ohne sichtbares Fenster
-    // koennte das System drosseln (Timer gebuendelt, Faeden niedriger
-    // eingestuft) - fuer einen Host, der jederzeit einen Strom liefern soll,
-    // nicht gewollt. UNGEPRUEFT, ob es ohne dies messbar drosselte; der
-    // Ruhezustand des Macs bleibt erlaubt (dafuer gibt es die eigene
-    // Zusicherung waehrend eines Stroms).
-    g_aktivitaet = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
-                                                                  reason:@"QuadChroma-Host nimmt Verbindungen an"];
-    ui_log(@"Oberflaeche: Menueleiste, Sprache %s", qc_texte_code(qc_texte_aktuell()));
-    zustand_auffrischen();   // das Symbol entsteht mit dem ersten gelesenen Zustand
-}
-
-// Doppelklick auf die laufende App: das Menue zeigen - auch wenn das Symbol
+// Doppelklick auf die laufende App. Eingebettet mit Rueckruf: der Client
+// oeffnet sein Fenster. Sonst das Menue zeigen - auch wenn das Symbol
 // verdraengt ist (volle Menueleiste), dann an der Mausposition.
-- (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)sichtbar {
-    (void)app; (void)sichtbar;
+static BOOL wieder_geoeffnet(void) {
+    if (g_eingebettet && g_cfg.oeffnen) {
+        g_cfg.oeffnen();
+        return NO;
+    }
     if (!g_item || !g_menue) return NO;
     if (g_item.button.window.screen) [g_item.button performClick:nil];
     else [g_menue popUpMenuPositioningItem:nil atLocation:[NSEvent mouseLocation] inView:nil];
@@ -861,8 +851,7 @@ static void beenden_antworten(void) {
 // vorbei: erst schliesst der Kern die Verbindung zum Zuschauer (Abschied),
 // dann endet der Prozess. Der Abschied laeuft nicht auf der Main Queue;
 // haengt er, beendet die Frist trotzdem.
-- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
-    (void)app;
+static NSApplicationTerminateReply beenden_erfragen(void) {
     if (g_beenden == 2) return NSTerminateNow;
     if (g_beenden == 0) {
         g_beenden = 1;
@@ -880,6 +869,23 @@ static void beenden_antworten(void) {
         });
     }
     return NSTerminateLater;
+}
+
+@implementation QCOberflaeche
+
+- (void)applicationDidFinishLaunching:(NSNotification *)n {
+    (void)n;
+    qc_oberflaeche_fertig();
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)sichtbar {
+    (void)app; (void)sichtbar;
+    return wieder_geoeffnet();
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
+    (void)app;
+    return beenden_erfragen();
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
@@ -1009,15 +1015,108 @@ static void signale_einrichten(void) {
     }
 }
 
+// Eingebettet (Rust-Client): NSApp.delegate gehoert winit 0.30.13
+// (WinitApplicationDelegate, gesetzt in EventLoop::new). winit loest resumed
+// nur aus dessen applicationDidFinishLaunching: aus und bricht ab, wenn ein
+// anderes Objekt Delegate ist (ApplicationDelegate::get) - also wird
+// NSApp.delegate hier nie gesetzt. Die beiden Methoden, die die Oberflaeche
+// braucht, kommen per class_addMethod an seine Klasse; winit selbst hat dort
+// nur applicationDidFinishLaunching: und applicationWillTerminate:. AppKit
+// fragt respondsToSelector: erst beim Aufruf, so greifen auch nach
+// setDelegate: angehaengte Methoden (am 27.09.2026 unter macOS 27 mit einem
+// nachgebauten Delegate geprueft, auch aus applicationDidFinishLaunching:
+// heraus). Hat die Klasse eine Methode schon (andere winit-Fassung), bleibt
+// deren und eine Zeile sagt es. Die Typangaben kommen von QCOberflaeche,
+// die dieselben Methoden hat.
+static void an_winits_delegate_haengen(void) {
+    id d = NSApp.delegate;
+    if (!d) {
+        ui_log(@"Oberflaeche: eingebettet, aber ohne Delegate von NSApp - Doppelklick und Beenden ohne Abschied");
+        return;
+    }
+    Class k = [d class];
+    SEL sel_reopen = @selector(applicationShouldHandleReopen:hasVisibleWindows:);
+    SEL sel_ende = @selector(applicationShouldTerminate:);
+    IMP reopen = imp_implementationWithBlock(^BOOL(id selbst, NSApplication *app, BOOL sichtbar) {
+        (void)selbst; (void)app; (void)sichtbar;
+        return wieder_geoeffnet();
+    });
+    IMP ende = imp_implementationWithBlock(^NSApplicationTerminateReply(id selbst, NSApplication *app) {
+        (void)selbst; (void)app;
+        return beenden_erfragen();
+    });
+    SEL sels[2] = { sel_reopen, sel_ende };
+    IMP imps[2] = { reopen, ende };
+    for (int i = 0; i < 2; i++) {
+        const char *typen = method_getTypeEncoding(class_getInstanceMethod([QCOberflaeche class], sels[i]));
+        if (!class_addMethod(k, sels[i], imps[i], typen)) {
+            ui_log(@"Oberflaeche: %@ hat %@ schon - bleibt, wie es ist",
+                   NSStringFromClass(k), NSStringFromSelector(sels[i]));
+            imp_removeBlock(imps[i]);
+        }
+    }
+}
+
+// Eingebettet das Netz unter dem Beenden: kommt NSApplicationWillTerminate-
+// Notification, ohne dass applicationShouldTerminate: den Abschied
+// angestossen hat (etwa weil winits Klasse die Methode schon hatte), laeuft
+// er hier - auf dem Hauptfaden wartend, mit derselben Frist.
+static void ende_beobachten(void) {
+    g_ende_beobachter = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSApplicationWillTerminateNotification object:NSApp queue:nil
+                usingBlock:^(NSNotification *n) {
+        (void)n;
+        if (g_beenden != 0) return;
+        g_beenden = 1;
+        ui_log(@"Oberflaeche: Beenden ohne Rueckfrage - Verbindung zum Zuschauer wird geschlossen");
+        void (*abschied)(void) = g_cfg.abschied;
+        dispatch_semaphore_t fertig = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            if (abschied) abschied();
+            dispatch_semaphore_signal(fertig);
+        });
+        dispatch_semaphore_wait(fertig, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+        g_beenden = 2;
+    }];
+}
+
 void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) {
+    if (atomic_load(&g_ui_da)) return;
     g_cfg = *cfg;
+    g_eingebettet = cfg->eingebettet != 0;
     g_anfragen = [[QCAnfragen alloc] init];
     g_ui = [[QCOberflaeche alloc] init];
-    NSApp.delegate = g_ui;
+    if (g_eingebettet) {
+        an_winits_delegate_haengen();
+        ende_beobachten();
+    } else {
+        NSApp.delegate = g_ui;
+    }
     signale_einrichten();
-    // Ab hier kann jemand am Mac "Zulassen" klicken: Anfragen, die vor
-    // [NSApp run] kommen, warten auf der Main Queue und erscheinen danach.
+    // Ab hier kann jemand am Mac "Zulassen" klicken: Anfragen, bevor die
+    // Run-Loop laeuft, warten auf der Main Queue und erscheinen danach.
     atomic_store(&g_ui_da, 1);
+}
+
+void qc_oberflaeche_fertig(void) {
+    static BOOL gelaufen = NO;          // nur auf dem Hauptfaden
+    if (!atomic_load(&g_ui_da) || gelaufen) return;
+    gelaufen = YES;
+    qc_texte_systemsprache();
+    // Eingebettet bringt der Client sein eigenes Hauptmenue mit (winit) -
+    // das bleibt.
+    if (!g_eingebettet || !NSApp.mainMenu) bearbeiten_menue_setzen();
+    // Vorsorge gegen App Nap: eine Menueleisten-App ohne sichtbares Fenster
+    // koennte das System drosseln (Timer gebuendelt, Faeden niedriger
+    // eingestuft) - fuer einen Host, der jederzeit einen Strom liefern soll,
+    // nicht gewollt. UNGEPRUEFT, ob es ohne dies messbar drosselte; der
+    // Ruhezustand des Macs bleibt erlaubt (dafuer gibt es die eigene
+    // Zusicherung waehrend eines Stroms).
+    g_aktivitaet = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                                                                  reason:@"QuadChroma-Host nimmt Verbindungen an"];
+    ui_log(@"Oberflaeche: Menueleiste, Sprache %s%s", qc_texte_code(qc_texte_aktuell()),
+           g_eingebettet ? " (eingebettet)" : "");
+    zustand_auffrischen();   // das Symbol entsteht mit dem ersten gelesenen Zustand
 }
 
 // ------------------------------------------------ Rueckrufe aus dem Kern

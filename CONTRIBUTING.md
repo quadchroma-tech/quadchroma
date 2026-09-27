@@ -151,8 +151,8 @@ and `make dmg` are described in `RELEASING.md`). Do not start the freshly built 
 (`open build/QuadChroma.app`, `make list`, `make capture`) unless you are prepared for
 macOS to ask for Screen Recording and Accessibility permissions on that machine and
 unless no host is running there. The test harnesses `noisetest`, `annahmetest`,
-`zugangtest`, `dateitest`, `ablagetest` and `menuetest` run without screen capture and
-without touching a running host; their `clang` lines are in
+`zugangtest`, `dateitest`, `ablagetest`, `menuetest` and `einbettungstest` run without
+screen capture and without touching a running host; their `clang` lines are in
 `.github/workflows/ci.yml`, which runs them.
 `hosttest` includes `main.m`, needs the Screen Recording permission granted to your
 terminal, and uses real HEVC encoders for about 100 seconds: run it only on a machine

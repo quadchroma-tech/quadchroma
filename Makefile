@@ -105,7 +105,8 @@ DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 # Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
-SRC     := host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
+# host/start.m holds main and belongs only to this app; the rest is the host service.
+SRC     := host/start.m host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
 # ServiceManagement: "Start at login" (SMAppService); SystemConfiguration: the computer
 # name for the announcement (SCDynamicStoreCopyComputerName).

@@ -27,7 +27,7 @@ Fixes #
 |---|---|---|---|
 | Windows client / host role | `cargo test --release` in `client\` (FFmpeg `bin` in `PATH`) | | |
 | Mac client | `cargo test --release -- --skip clipboard` in `client/` | | |
-| Mac host | `make`; `noisetest`, `annahmetest`, `dateitest`, `ablagetest`; `hosttest` only with the Screen Recording permission | | |
+| Mac host | `make`; `noisetest`, `annahmetest`, `dateitest`, `ablagetest`, `menuetest`, `einbettungstest`; `hosttest` only with the Screen Recording permission | | |
 | By hand | host and client on real hardware - which host, which client, which GPU | | |
 
 ## Checklist

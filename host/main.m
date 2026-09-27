@@ -24,10 +24,16 @@
 // hoechstens ein Host je Nutzer (host-instanz.lock). Ausgaben zusaetzlich in
 // /tmp/quadchroma-m1.log.
 //
-// Im Dienstbetrieb gehoert der Hauptfaden AppKit ([NSApp run]): Symbol in der
-// Menueleiste, Zulassen- und Passwort-Fenster (menue.m, Texte in texte.m).
-// Das Regelmaessige laeuft auf dem Dienst-Takt (dienst_takt_starten) und dem
-// Zustandstakt (zustand_takt_starten), beide auf eigenen Warteschlangen.
+// Diese Datei ist der Dienst, kein Programm: main steht in start.m (eigene
+// App); der Rust-Client baut die Engine ohne start.m ein und startet den
+// Dienst eingebettet. Die Schnittstelle beider steht in dienst.h
+// (qc_werkzeug, qc_dienst_starten, qc_dienst_beenden).
+//
+// Im Dienstbetrieb gehoert der Hauptfaden AppKit ([NSApp run] in start.m,
+// eingebettet die Run-Loop von winit): Symbol in der Menueleiste, Zulassen-
+// und Passwort-Fenster (menue.m, Texte in texte.m). Das Regelmaessige laeuft
+// auf dem Dienst-Takt (dienst_takt_starten) und dem Zustandstakt
+// (zustand_takt_starten), beide auf eigenen Warteschlangen.
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -58,6 +64,7 @@
 #include "qc_annahme.h"
 #import "last.h"
 #import "menue.h"
+#include "dienst.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #include <fcntl.h>
@@ -3109,7 +3116,7 @@ static void fixed_tick(void) {
 // und bei jedem Aufnahmestart. Zwei Monitore am Mac haben das noetig
 // gemacht: ScreenCaptureKit sortiert seine Liste nicht stabil, und die
 // displayID gilt nur je Sitzung - der Schluessel ist die stabile Kennung.
-// Alles hier gehoert der Lebenslauf-Warteschlange g_lifeq (in main vor den
+// Alles hier gehoert der Lebenslauf-Warteschlange g_lifeq (beim Start vor den
 // Warteschlangen: dem Hauptfaden); Encoderarbeit laeuft per dispatch_sync auf
 // g_capq. Nichts davon laeuft auf der Hauptwarteschlange - der Pruefstand
 // dreht keine Run-Loop -, Wiederholungen gehen per dispatch_after auf g_lifeq.
@@ -3410,7 +3417,7 @@ static void bildschirm_wechseln(QCBildschirm *neu, NSString *grund, int anlass) 
 // Bildschirm wechseln, sonst nur die Liste melden, wenn sie sich geaendert
 // hat oder ein Wunsch die Antwort verlangt. Ohne Strom werden nur Ziel und
 // Liste nachgefuehrt; der Strom laeuft erst mit dem naechsten Zuschauer. Auf
-// g_lifeq, oder in main vor den Warteschlangen. Rueckgabe: das Ziel, nil =
+// g_lifeq, oder beim Start vor den Warteschlangen. Rueckgabe: das Ziel, nil =
 // kein Bildschirm. Steht kein Wechsel (mehr) an, endet hier ein etwaiges
 // Warten auf den Codecwechsel.
 static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
@@ -3798,11 +3805,11 @@ static void fest_einlesen(NSArray<NSString *> *args) {
 // Was im Dienstbetrieb regelmaessig anfaellt - nachgetragene Drosselzeilen,
 // Stau-Frist, Statistikzeile, Auslastung (Typ 6) an den Zuschauer -, lief
 // frueher in einer 5-s-Schleife in main, die dazu die Run-Loop drehte. Jetzt
-// dreht [NSApp run] die Run-Loop (Menueleiste, siehe menue.h), und der Takt
-// ist ein Dispatch-Timer auf einer eigenen seriellen Warteschlange - nicht auf
-// der Main Queue: send_small und stau_frist_pruefen nehmen g_send_mtx, und wer
-// das Senden haelt, kann bis zu 2 s haengen (SO_SNDTIMEO); die Oberflaeche
-// stuende so lange. Nur die Namen der Bildschirme (NSScreen, Hauptfaden)
+// dreht [NSApp run] (eingebettet winit) die Run-Loop (Menueleiste, siehe
+// menue.h), und der Takt ist ein Dispatch-Timer auf einer eigenen seriellen
+// Warteschlange - nicht auf der Main Queue: send_small und stau_frist_pruefen
+// nehmen g_send_mtx, und wer das Senden haelt, kann bis zu 2 s haengen
+// (SO_SNDTIMEO); die Oberflaeche stuende so lange. Nur die Namen der Bildschirme (NSScreen, Hauptfaden)
 // werden auf der Main Queue nachgezogen. Zwischenablage und Zeigerform fragen
 // wie bisher ueber ihre eigenen Timer ab. hosttest ruft dienst_takt_starten
 // direkt, mit kurzem Takt und ohne Run-Loop.
@@ -3940,43 +3947,37 @@ static void ui_protokoll(NSString *zeile) {
 // die main.m ohne menue.m einbinden (hosttest), bauen auch so.
 __attribute__((weak)) void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) { (void)cfg; }
 
-int main(int argc, const char *argv[]) { @autoreleasepool {
-    pthread_mutex_lock(&g_log_mtx);
-    log_oeffnen("a");
-    pthread_mutex_unlock(&g_log_mtx);
-    setvbuf(stdout, NULL, _IONBF, 0);
+// ------------------------------------------------------------ Start
+// Die Einstiege (dienst.h): main in start.m fuer die eigene App, der
+// Rust-Client fuer den eingebetteten Dienst. Hier stehen Dienst und
+// Werkzeuge mit ihrem gemeinsamen Vorlauf.
 
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+// Ab hier hat qc_dienst_starten etwas gestartet (Zugang, Warteschlangen,
+// Annahme); jeder weitere Aufruf liefert QC_DIENST_DOPPELT.
+static _Atomic int g_dienst_gestartet = 0;
 
-    NSArray<NSString *> *args = [[NSProcessInfo processInfo] arguments];
-    argumente_pruefen(args);
+// Das Protokoll einmal je Prozess oeffnen (anhaengen).
+static void protokoll_oeffnen(void) {
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{
+        pthread_mutex_lock(&g_log_mtx);
+        if (!g_log) log_oeffnen("a");
+        pthread_mutex_unlock(&g_log_mtx);
+    });
+}
 
-    NSInteger capIdx = [args indexOfObject:@"--capture"];
-    NSInteger srvIdx = [args indexOfObject:@"--serve"];
-    BOOL do_list = [args containsObject:@"--list"];
-    if (!do_list && capIdx == NSNotFound && srvIdx == NSNotFound && ![args containsObject:@"--formattest"]) {
-        // Ohne Modus - so startet der Finder die App per Doppelklick, und so
-        // startet sie beim Anmelden - laeuft der Host wie mit --serve auf dem
-        // Standard-Port; die uebrigen Schalter (--fps ...) gelten wie gewohnt.
-        logf_(@"Host-Modus (ohne Modus-Argument) auf dem Standard-Port");
-        srvIdx = (NSInteger)args.count;   // Host-Modus ohne Portangabe: der Standard-Port bleibt
-    }
+// argv als Liste wie [[NSProcessInfo processInfo] arguments]; ohne argv nur
+// ein Programmname (eingebettet: keine Schalter).
+static NSArray<NSString *> *argumente_aus(int argc, const char *const argv[]) {
+    NSMutableArray<NSString *> *a = [NSMutableArray array];
+    for (int i = 0; argv && i < argc; i++) [a addObject:utf8(argv[i])];
+    if (!a.count) [a addObject:@"quadchroma-host"];
+    return a;
+}
 
-    // Hoechstens ein Host je Nutzer (Spezifikation 7.5): ein zweiter Start -
-    // Doppelklick, Anmeldeobjekt, "open -n" - endet still. Die Werkzeuge
-    // (--list, --capture, --formattest) duerfen daneben laufen.
-    if (srvIdx != NSNotFound) {
-        int instanz = qc_zugang_einzelinstanz();
-        if (instanz == 0) {
-            logf_(@"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start endet");
-            return 0;
-        }
-        if (instanz < 0) logf_(@"Einzelinstanz: host-instanz.lock laesst sich nicht sperren - der Host laeuft trotzdem");
-    }
-
-    // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und bleibt
-    // danach liegen, damit Gegenstellen den Host wiedererkennen.
+// Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und bleibt
+// danach liegen, damit Gegenstellen den Host wiedererkennen. 0 = geladen.
+static int schluessel_laden(void) {
     int schluessel = qc_identity_load(g_id_priv, g_id_pub);
     if (schluessel == -2) {
         // Nie still einen neuen anlegen: das waere ein anderer Host (neue
@@ -3985,159 +3986,78 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         logf_(@"Schluessel host.key ist vorhanden, aber nicht lesbar oder beschaedigt - Abbruch. "
                "Ein neuer Schluessel waere eine neue Identitaet; die Datei erst entfernen, "
                "wenn alle Clients diesen Host mit dem Passwort neu erlauben sollen.");
-        return 5;
+        return QC_DIENST_DATEI;
     }
     if (schluessel != 0) {
         logf_(@"Schluessel konnte nicht angelegt werden - Abbruch.");
-        return 5;
+        return QC_DIENST_DATEI;
     }
-    if (srvIdx != NSNotFound) {
-        // Zugang (zugang.h): Migration aus authorized.txt, Zugangspasswort
-        // anlegen, wenn es fehlt. Vor der Annahme.
-        qc_zugang_protokoll_setzen(zugang_zeile);
-        qc_zugang_entfernt_setzen(zuschauer_entfernt);
-        qc_zugang_start(g_id_pub);
-        char fp[24], id_text[12];
-        qc_fingerprint(g_id_pub, fp);
-        qc_zugang_id_text(qc_zugang_eigene_id(), id_text);
-        int anz = qc_zugang_geraete(NULL, 0);
-        if (anz < 0)
-            logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   Geraeteliste host-devices.txt NICHT LESBAR ODER "
-                   "BESCHAEDIGT - jedes Geraet braucht Passwort oder Zulassen, bis sie im Menue zurueckgesetzt ist", id_text, fp);
-        else
-            logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   erlaubte Geraete: %d", id_text, fp, anz);
-    }
+    return 0;
+}
 
-    // Ohne Freigabe fuer die Bildschirmaufnahme einmal nachfragen. Die
-    // Werkzeuge brauchen sie sofort; der Host laeuft weiter (Spezifikation
-    // 7.4), zeigt den Stand im Menue und nimmt auf, sobald sie erteilt ist.
-    if (!g_tcc_bildschirm()) {
-        logf_(@"Bildschirmaufnahme nicht freigegeben, frage nach.");
-        CGRequestScreenCaptureAccess();
-        if (srvIdx == NSNotFound) return 3;
-        logf_(@"Der Host laeuft ohne Bildschirmaufnahme weiter - sie startet, sobald die Freigabe erteilt ist");
-    }
-    // Die Namen der Bildschirme kommen von AppKit, auf dem Hauptfaden.
-    qc_bildschirm_namen_auffrischen();
-    if (do_list) { list_displays(); codecs_pruefen(); return 0; }
-
-    // Pruefmodus: nimmt die Aufnahme einen Formatwechsel im Betrieb an?
-    // Das ist nirgends dokumentiert und entscheidet, ob die Codecwahl ohne
-    // Neustart des Stroms geht. Also messen statt annehmen.
-    if ([args containsObject:@"--formattest"]) {
-        QCBildschirm *b = qc_bildschirm_wahl(qc_bildschirme_holen(), nil, NULL);
-        SCDisplay *d = b.sc;
-        if (!d) return 4;
-        SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
-        cfg.width = 1920; cfg.height = 1080;
-        cfg.pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
-        cfg.showsCursor = NO;
-        cfg.minimumFrameInterval = CMTimeMake(1, 60);
-        SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
-        Grabber *g = [[Grabber alloc] init];
-        SCStream *st = [[SCStream alloc] initWithFilter:f configuration:cfg delegate:g];
-        dispatch_queue_t q2 = dispatch_queue_create("tech.quadchroma.formattest", DISPATCH_QUEUE_SERIAL);
-        NSError *e2 = nil;
-        [st addStreamOutput:g type:SCStreamOutputTypeScreen sampleHandlerQueue:q2 error:&e2];
-        dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
-        [st startCaptureWithCompletionHandler:^(NSError *x) {
-            logf_(@"Start: %@", x ? x.localizedDescription : @"ok");
-            dispatch_semaphore_signal(sem2);
-        }];
-        dispatch_semaphore_wait(sem2, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
-        atomic_store(&g_formattest, 1);
-        [NSThread sleepForTimeInterval:1.5];
-
-        OSType ziele[] = { kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                           kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-                           kCVPixelFormatType_32BGRA };
-        for (int zi = 0; zi < 3; zi++) {
-            uint32_t be = CFSwapInt32HostToBig(ziele[zi]);
-            logf_(@"--- wechsle auf %.4s ---", (char *)&be);
-            cfg.pixelFormat = ziele[zi];
-            dispatch_semaphore_t s3 = dispatch_semaphore_create(0);
-            [st updateConfiguration:cfg completionHandler:^(NSError *x) {
-                logf_(@"updateConfiguration: %@", x ? x.localizedDescription : @"ohne Fehler");
-                dispatch_semaphore_signal(s3);
-            }];
-            dispatch_semaphore_wait(s3, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
-            atomic_store(&g_formattest, 1);
-            [NSThread sleepForTimeInterval:1.5];
-        }
-        [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
-        [NSThread sleepForTimeInterval:0.5];
-        return 0;
-    }
-    codecs_pruefen();
-
-    int fps = 120, mbit = 150, outW = 0, outH = 0, port = 9001;
-    double seconds = 0;
-    NSString *outPath = nil;
+// Die Schalter fuer Kenner. outPath und seconds nur mit --capture.
+static void optionen_lesen(NSArray<NSString *> *args, int *fps, int *mbit, int *outW, int *outH, int *port,
+                           double *seconds, NSString **outPath) {
+    *fps = 120; *mbit = 150; *outW = 0; *outH = 0; *port = 9001;
+    *seconds = 0;
+    *outPath = nil;
     fest_einlesen(args);
     NSString *w;
-    if (capIdx != NSNotFound) {
+    if ([args containsObject:@"--capture"]) {
         // Wie die Voreinstellungen im Makefile (make capture).
-        seconds = (w = wert_nach(args, @"--capture", 1)) ? w.doubleValue : 10;
-        outPath = wert_nach(args, @"--capture", 2) ?: @"/tmp/qc.hevc";
+        *seconds = (w = wert_nach(args, @"--capture", 1)) ? w.doubleValue : 10;
+        *outPath = wert_nach(args, @"--capture", 2) ?: @"/tmp/qc.hevc";
     }
+    NSInteger srvIdx = [args indexOfObject:@"--serve"];
     if (srvIdx != NSNotFound && srvIdx + 1 < (NSInteger)args.count && ![args[srvIdx + 1] hasPrefix:@"--"])
-        port = [args[srvIdx + 1] intValue];
+        *port = [args[srvIdx + 1] intValue];
     if ((w = wert_nach(args, @"--display", 1))) g_display_pin = w.intValue;
-    if ((w = wert_nach(args, @"--fps", 1))) fps = w.intValue;
-    if ((w = wert_nach(args, @"--mbit", 1))) mbit = w.intValue;
-    if ((w = wert_nach(args, @"--out", 1))) sscanf(w.UTF8String, "%dx%d", &outW, &outH);
-    if (fps <= 0) { logf_(@"--fps %d ungueltig - 120", fps); fps = 120; }
-    if (mbit <= 0) { logf_(@"--mbit %d ungueltig - 150", mbit); mbit = 150; }
-    if (outW > 0 && outH > 0) { g_out_fest_w = outW; g_out_fest_h = outH; }
+    if ((w = wert_nach(args, @"--fps", 1))) *fps = w.intValue;
+    if ((w = wert_nach(args, @"--mbit", 1))) *mbit = w.intValue;
+    if ((w = wert_nach(args, @"--out", 1))) sscanf(w.UTF8String, "%dx%d", outW, outH);
+    if (*fps <= 0) { logf_(@"--fps %d ungueltig - 120", *fps); *fps = 120; }
+    if (*mbit <= 0) { logf_(@"--mbit %d ungueltig - 150", *mbit); *mbit = 150; }
+    if (*outW > 0 && *outH > 0) { g_out_fest_w = *outW; g_out_fest_h = *outH; }
+}
 
-    // Der gemerkte Wunsch (bildschirm.txt), dann die erste Wahl - hier auf
-    // dem Hauptfaden, vor den Warteschlangen. --display N ueberstimmt den
-    // gemerkten Wunsch fuer diesen Lauf, ohne die Datei zu aendern; eine
-    // kaputte Datei wird nie still ersetzt.
-    {
-        NSString *gemerkt = nil;
-        int r = qc_bildschirm_wunsch_laden(&gemerkt);
-        if (r < 0) logf_(@"Bildschirmwahl: bildschirm.txt unlesbar - Automatik");
-        else if (r == 0 && gemerkt) { g_display_wunsch = gemerkt; logf_(@"Bildschirmwahl: Wunsch %@ aus bildschirm.txt", gemerkt); }
-    }
-    QCBildschirm *display = bildschirm_neu_bewerten(QC_ANLASS_START);
-    if (!display && srvIdx == NSNotFound) { logf_(@"Kein Bildschirm - Abbruch"); return 4; }
-    // Der Host wartet ohne Bildschirmliste (keine Freigabe, kein Monitor
-    // beim Anmelden) - die Aufnahme entsteht ohnehin erst mit einem Zuschauer.
-    if (!display) logf_(@"Kein Bildschirm abrufbar (Freigabe fehlt oder kein Monitor) - der Host laeuft und wartet");
-    if (display) stromgroesse_fuer(display, &outW, &outH);
-    else ersatzgroesse(&outW, &outH);
-    size_t pxW = display.w, pxH = display.h;
-    double hz = display.hz;
+// Die Datei fuer --capture. 0 = keine verlangt oder offen.
+static int ausgabe_oeffnen(NSString *outPath) {
+    if (!outPath) return 0;
+    g_stats.out = fopen(outPath.UTF8String, "wb");
+    if (!g_stats.out) { logf_(@"Ausgabedatei nicht schreibbar: %@", outPath); return QC_DIENST_DATEI; }
+    return 0;
+}
 
-    // Start immer mit Kandidat 0 (HEVC 4:4:4 10 Bit); das Aufnahmeformat
-    // gehoert zum Kandidaten, nicht zur Kommandozeile.
-    const int start_idx = 0;
-    OSType pixfmt = pixfmt_fuer(start_idx);
+// Der gemerkte Wunsch (bildschirm.txt), dann die erste Wahl - auf dem
+// Hauptfaden, vor den Warteschlangen. --display N ueberstimmt den gemerkten
+// Wunsch fuer diesen Lauf, ohne die Datei zu aendern; eine kaputte Datei wird
+// nie still ersetzt.
+static QCBildschirm *erste_wahl(void) {
+    NSString *gemerkt = nil;
+    int r = qc_bildschirm_wunsch_laden(&gemerkt);
+    if (r < 0) logf_(@"Bildschirmwahl: bildschirm.txt unlesbar - Automatik");
+    else if (r == 0 && gemerkt) { g_display_wunsch = gemerkt; logf_(@"Bildschirmwahl: Wunsch %@ aus bildschirm.txt", gemerkt); }
+    return bildschirm_neu_bewerten(QC_ANLASS_START);
+}
+
+// Start immer mit Kandidat 0 (HEVC 4:4:4 10 Bit); das Aufnahmeformat gehoert
+// zum Kandidaten, nicht zur Kommandozeile.
+#define QC_START_KANDIDAT 0
+
+// Stand vor dem ersten Bild: Laengenpraefix, Werte der Begruessung, Kandidat.
+static void start_stand(int outW, int outH, int fps) {
     g_stats.nal_len = 4;
-    if (outPath) {
-        g_stats.out = fopen(outPath.UTF8String, "wb");
-        if (!g_stats.out) { logf_(@"Ausgabedatei nicht schreibbar: %@", outPath); return 5; }
-    }
-
     g_info_w = outW; g_info_h = outH; g_info_fps = fps;
-    atomic_store(&g_codec_id, start_idx);
+    atomic_store(&g_codec_id, QC_START_KANDIDAT);
+}
 
-    // Im Dienstbetrieb startet die Annahme erst weiter unten, wenn alles steht.
-    if (srvIdx == NSNotFound) {
-        logf_(@"\n=== Aufnahme %.1f s: %@ (%zux%zu Pixel) -> %dx%d, %d fps ===",
-              seconds, bildschirm_text(display), pxW, pxH, outW, outH, fps);
-    }
-
-    // Im Dienstbetrieb entsteht der Encoder erst mit dem ersten Zuschauer.
-    if (srvIdx == NSNotFound) {
-        if (!encoder_start(start_idx, outW, outH, fps, mbit)) { if (g_stats.out) fclose(g_stats.out); return 6; }
-    }
-
+// Aufnahmeeinstellung, Empfaenger, Warteschlangen und Taktgeber der festen
+// Bildrate - fuer Dienst und --capture gleich.
+static void aufnahme_einrichten(int outW, int outH, int fps, int mbit) {
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = outW;
     cfg.height = outH;
-    cfg.pixelFormat = pixfmt;
+    cfg.pixelFormat = pixfmt_fuer(QC_START_KANDIDAT);
     cfg.showsCursor = NO;
     if (@available(macOS 15.0, *)) cfg.showMouseClicks = NO;
     cfg.colorSpaceName = kCGColorSpaceSRGB;
@@ -4168,98 +4088,127 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         dispatch_source_set_event_handler(g_tick, ^{ fixed_tick(); });
         dispatch_resume(g_tick);
     }
+}
 
-    if (srvIdx != NSNotFound) {
-        // Dienstbetrieb: keine Aufnahme, kein Encoder, bis sich jemand meldet.
-        // Dateien: empfangene gehen als Dateiliste in die Ablage; Reste
-        // frueherer Laeufe, aelter als 24 h, und jede unfertige Uebertragung
-        // (Marke .laeuft, der vorige Lauf endete mitten im Empfang) raeumt die
-        // Empfangswarteschlange weg - vor der Annahme unten, also bevor ein
-        // Empfang beginnen kann.
-        dateien_einrichten();
-        qc_dateien_fertig_setzen(qc_clip_set_dateien);
-        qc_dateien_aufraeumen_beim_start();
-        qc_clip_dateien(clip_dateien_cb);
-        qc_clip_bedingung(zeiger_aktiv);   // Inhalt nur mit Zuschauer lesen
-        qc_clip_start(clip_cb);
-        qc_zeiger_start(zeiger_cb, zeiger_aktiv, zeiger_log);
-        logf_(@"Zeigerform: Abfrage alle 50 ms, nur mit Zuschauer");
-        // Die Annahme zuletzt. Ihre Faeden laufen sofort los; ein Client, der
-        // beim Neustart des Hosts schon wartet und neu verbindet, kann durch
-        // Handschlag und Freigabe sein, bevor main weiter unten ankaeme.
-        // bild_verbindung braucht dann g_lifeq und g_capq
-        // (stream_hochfahren_sync; dispatch_sync auf eine NULL-Warteschlange
-        // endet mit SIGSEGV), g_cfg, g_grab, den Zielbildschirm und die Werte
-        // g_cur_*; apply_settings aus dem Eingabekanal liest g_tick. Frueher
-        // startete die Annahme vor all dem.
-        // Aenderungen der Bildschirmkonfiguration meldet CoreGraphics auf dem
-        // Hauptfaden (die Dienstschleife unten dreht die Run-Loop); der Host
-        // bewertet dann entprellt neu und folgt dem Hauptbildschirm bzw.
-        // kehrt zum gewuenschten zurueck - ohne Neustart, ohne neuen Zuschauer.
-        // Der Wunsch fuer die Zeile unten wird hier gelesen: sobald die
-        // Annahme laeuft, gehoert g_display_wunsch der Lebenslauf-Warteschlange.
-        NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
-                                                 : @" - Automatik (folgt dem Hauptbildschirm)";
-        CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
-        g_dienst_port = port;
-        g_dienst_display = display ? display.displayID : CGMainDisplayID();
-        // Die Oberflaeche vor der Annahme: ab hier ist "Zulassen" moeglich
-        // (qc_ui_vorhanden) - schon in der ersten Bekanntgabe (Flag) und in
-        // Nachricht 20 an einen Client, der gleich beim Start verbindet.
-        // Anfragen vor [NSApp run] warten auf der Main Queue.
-        qc_oberflaeche_cfg ui = { .abschied = host_abschied, .protokoll = ui_protokoll };
-        qc_oberflaeche_starten(&ui);
-        BOOL laeuft = dienst_starten();
-        zustand_takt_starten();
-        BOOL ax = AXIsProcessTrusted();
-        bedienungshilfen_einmal_fragen();
-        if (laeuft) logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-        logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
-        logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
-    } else {
-        // Aufnahme in eine Datei: sofort loslegen.
-        if (!display.sc) { logf_(@"Kein SCDisplay zum Bildschirm"); return 7; }
-        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display.sc excludingWindows:@[]];
-        SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:grab];
-        g_stream = stream;
-        NSError *err = nil;
-        if (![stream addStreamOutput:grab type:SCStreamOutputTypeScreen sampleHandlerQueue:q error:&err]) {
-            logf_(@"Ausgabe konnte nicht angemeldet werden: %@", err.localizedDescription);
-            return 7;
-        }
-        qc_audio_attach(stream, audio_cb);
-        __block BOOL started = NO;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [stream startCaptureWithCompletionHandler:^(NSError *e) {
-            if (e) logf_(@"Start fehlgeschlagen: %@ (Code %ld)", e.localizedDescription, (long)e.code);
-            else started = YES;
-            dispatch_semaphore_signal(sem);
+// Pruefmodus: nimmt die Aufnahme einen Formatwechsel im Betrieb an?
+// Das ist nirgends dokumentiert und entscheidet, ob die Codecwahl ohne
+// Neustart des Stroms geht. Also messen statt annehmen.
+static int formattest_laufen(void) {
+    QCBildschirm *b = qc_bildschirm_wahl(qc_bildschirme_holen(), nil, NULL);
+    SCDisplay *d = b.sc;
+    if (!d) return 4;
+    SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
+    cfg.width = 1920; cfg.height = 1080;
+    cfg.pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    cfg.showsCursor = NO;
+    cfg.minimumFrameInterval = CMTimeMake(1, 60);
+    SCContentFilter *f = [[SCContentFilter alloc] initWithDisplay:d excludingWindows:@[]];
+    Grabber *g = [[Grabber alloc] init];
+    SCStream *st = [[SCStream alloc] initWithFilter:f configuration:cfg delegate:g];
+    dispatch_queue_t q2 = dispatch_queue_create("tech.quadchroma.formattest", DISPATCH_QUEUE_SERIAL);
+    NSError *e2 = nil;
+    [st addStreamOutput:g type:SCStreamOutputTypeScreen sampleHandlerQueue:q2 error:&e2];
+    dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
+    [st startCaptureWithCompletionHandler:^(NSError *x) {
+        logf_(@"Start: %@", x ? x.localizedDescription : @"ok");
+        dispatch_semaphore_signal(sem2);
+    }];
+    dispatch_semaphore_wait(sem2, dispatch_time(DISPATCH_TIME_NOW, 10ull * NSEC_PER_SEC));
+    atomic_store(&g_formattest, 1);
+    [NSThread sleepForTimeInterval:1.5];
+
+    OSType ziele[] = { kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                       kCVPixelFormatType_32BGRA };
+    for (int zi = 0; zi < 3; zi++) {
+        uint32_t be = CFSwapInt32HostToBig(ziele[zi]);
+        logf_(@"--- wechsle auf %.4s ---", (char *)&be);
+        cfg.pixelFormat = ziele[zi];
+        dispatch_semaphore_t s3 = dispatch_semaphore_create(0);
+        [st updateConfiguration:cfg completionHandler:^(NSError *x) {
+            logf_(@"updateConfiguration: %@", x ? x.localizedDescription : @"ohne Fehler");
+            dispatch_semaphore_signal(s3);
         }];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15ull * NSEC_PER_SEC));
-        if (!started) { if (g_stats.out) fclose(g_stats.out); return 8; }
+        dispatch_semaphore_wait(s3, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+        atomic_store(&g_formattest, 1);
+        [NSThread sleepForTimeInterval:1.5];
     }
+    [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
+    [NSThread sleepForTimeInterval:0.5];
+    return 0;
+}
 
-    // Einmal blind messen, damit die erste echte Meldung schon eine Differenz
-    // hat und nicht mit Nullen anfaengt.
+// ------------------------------------------------------------ Werkzeuge
+
+int qc_werkzeug(int argc, const char *const argv[]) { @autoreleasepool {
+    NSArray<NSString *> *args = argumente_aus(argc, argv);
+    BOOL do_list = [args containsObject:@"--list"];
+    BOOL formattest = [args containsObject:@"--formattest"];
+    // --capture neben --serve ist kein Werkzeug: dann schreibt der Dienst den
+    // Strom zusaetzlich in die Datei (qc_dienst_starten).
+    BOOL capture = [args containsObject:@"--capture"] && ![args containsObject:@"--serve"];
+    if (!do_list && !formattest && !capture) return QC_KEIN_WERKZEUG;
+    protokoll_oeffnen();
+    argumente_pruefen(args);
+    int r = schluessel_laden();
+    if (r) return r;
+
+    // Ohne Freigabe fuer die Bildschirmaufnahme einmal nachfragen; die
+    // Werkzeuge brauchen sie sofort.
+    if (!g_tcc_bildschirm()) {
+        logf_(@"Bildschirmaufnahme nicht freigegeben, frage nach.");
+        CGRequestScreenCaptureAccess();
+        return 3;
+    }
+    // Die Namen der Bildschirme kommen von AppKit, auf dem Hauptfaden.
+    qc_bildschirm_namen_auffrischen();
+    if (do_list) { list_displays(); codecs_pruefen(); return 0; }
+    if (formattest) return formattest_laufen();
+    codecs_pruefen();
+
+    int fps, mbit, outW, outH, port;
+    double seconds;
+    NSString *outPath;
+    optionen_lesen(args, &fps, &mbit, &outW, &outH, &port, &seconds, &outPath);
+    QCBildschirm *display = erste_wahl();
+    if (!display) { logf_(@"Kein Bildschirm - Abbruch"); return 4; }
+    stromgroesse_fuer(display, &outW, &outH);
+    size_t pxW = display.w, pxH = display.h;
+    if ((r = ausgabe_oeffnen(outPath))) return r;
+    start_stand(outW, outH, fps);
+    logf_(@"\n=== Aufnahme %.1f s: %@ (%zux%zu Pixel) -> %dx%d, %d fps ===",
+          seconds, bildschirm_text(display), pxW, pxH, outW, outH, fps);
+    if (!encoder_start(QC_START_KANDIDAT, outW, outH, fps, mbit)) { if (g_stats.out) fclose(g_stats.out); return 6; }
+    aufnahme_einrichten(outW, outH, fps, mbit);
+    Grabber *grab = g_grab;
+
+    // Aufnahme in eine Datei: sofort loslegen.
+    if (!display.sc) { logf_(@"Kein SCDisplay zum Bildschirm"); return 7; }
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display.sc excludingWindows:@[]];
+    SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:g_cfg delegate:grab];
+    g_stream = stream;
+    NSError *err = nil;
+    if (![stream addStreamOutput:grab type:SCStreamOutputTypeScreen sampleHandlerQueue:g_capq error:&err]) {
+        logf_(@"Ausgabe konnte nicht angemeldet werden: %@", err.localizedDescription);
+        return 7;
+    }
+    qc_audio_attach(stream, audio_cb);
+    __block BOOL started = NO;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [stream startCaptureWithCompletionHandler:^(NSError *e) {
+        if (e) logf_(@"Start fehlgeschlagen: %@ (Code %ld)", e.localizedDescription, (long)e.code);
+        else started = YES;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 15ull * NSEC_PER_SEC));
+    if (!started) { if (g_stats.out) fclose(g_stats.out); return 8; }
+
+    // Einmal blind messen, wie im Dienst.
     { qc_last vorlauf; qc_last_probe(&vorlauf); }
-
-    if (srvIdx != NSNotFound) {
-        // Dienstbetrieb: der Takt (alle fuenf Sekunden Stand, Auslastung,
-        // Stau-Frist) laeuft auf eigener Warteschlange, der Hauptfaden gehoert
-        // AppKit - Menueleiste, Zulassen-Fenster, Zeigerform, Zwischenablage,
-        // Bildschirmrueckrufe. [NSApp run] kehrt nicht zurueck: Beenden laeuft
-        // ueber [NSApp terminate:] (menue.m), erst nach dem Abschied
-        // (host_abschied schliesst die Verbindung zum Zuschauer).
-        dienst_takt_starten(QC_TAKT_S);
-        [NSApp run];
-        return 0;
-    }
 
     NSDate *t0 = [NSDate date];
     [[NSRunLoop currentRunLoop] runUntilDate:[t0 dateByAddingTimeInterval:seconds]];
     double dt = -[t0 timeIntervalSinceNow];
-    // Nur die Aufnahme in eine Datei kommt hierher; der Dienstbetrieb kehrt
-    // aus [NSApp run] nie zurueck.
     dispatch_semaphore_t ende = dispatch_semaphore_create(0);
     [g_stream stopCaptureWithCompletionHandler:^(NSError *e) { (void)e; dispatch_semaphore_signal(ende); }];
     dispatch_semaphore_wait(ende, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
@@ -4272,3 +4221,166 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     logf_(@"Datenmenge: %.1f MB, entspricht %.1f Mbit/s", g_stats.bytes / 1e6, g_stats.bytes * 8.0 / dt / 1e6);
     return 0;
 }}
+
+// ------------------------------------------------------------ Dienst
+
+// Der Abschied des Dienstes, einmal je Prozess - ob ihn die Oberflaeche
+// (applicationShouldTerminate:, Beobachter des Beendens) oder der Client
+// (qc_dienst_beenden) zuerst anstoesst; wer spaeter kommt, wartet auf den
+// ersten.
+static void dienst_abschied(void) {
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{ host_abschied(); });
+}
+
+int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
+    protokoll_oeffnen();
+    if (![NSThread isMainThread]) {
+        logf_(@"Dienst: Start nicht auf dem Hauptfaden - nicht gestartet");
+        return QC_DIENST_FADEN;
+    }
+    if (atomic_load(&g_dienst_gestartet)) return QC_DIENST_DOPPELT;
+    const int eingebettet = dc && dc->eingebettet;
+    NSArray<NSString *> *args = argumente_aus(dc ? dc->argc : 0, dc ? dc->argv : NULL);
+    argumente_pruefen(args);
+    if (eingebettet)
+        logf_(@"Host-Dienst im Client-Prozess (eingebettet)");
+    else if (![args containsObject:@"--serve"])
+        // Ohne Modus - so startet der Finder die App per Doppelklick, und so
+        // startet sie beim Anmelden - laeuft der Host wie mit --serve auf dem
+        // Standard-Port; die uebrigen Schalter (--fps ...) gelten wie gewohnt.
+        logf_(@"Host-Modus (ohne Modus-Argument) auf dem Standard-Port");
+
+    // Hoechstens ein Host je Nutzer (Spezifikation 7.5): ein zweiter Start -
+    // Doppelklick, Anmeldeobjekt, "open -n" - endet still. Die Werkzeuge
+    // (qc_werkzeug) duerfen daneben laufen.
+    int instanz = qc_zugang_einzelinstanz();
+    if (instanz == 0) {
+        logf_(eingebettet ? @"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - der Dienst im Client startet nicht"
+                          : @"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start endet");
+        return QC_DIENST_LAEUFT_SCHON;
+    }
+    if (instanz < 0) logf_(@"Einzelinstanz: host-instanz.lock laesst sich nicht sperren - der Host laeuft trotzdem");
+
+    int r = schluessel_laden();
+    if (r) return r;
+    int fps, mbit, outW, outH, port;
+    double seconds;
+    NSString *outPath;
+    optionen_lesen(args, &fps, &mbit, &outW, &outH, &port, &seconds, &outPath);
+    (void)seconds;
+    if ((r = ausgabe_oeffnen(outPath))) return r;
+    atomic_store(&g_dienst_gestartet, 1);
+
+    // Zugang (zugang.h): Migration aus authorized.txt, Zugangspasswort
+    // anlegen, wenn es fehlt. Vor der Annahme.
+    qc_zugang_protokoll_setzen(zugang_zeile);
+    qc_zugang_entfernt_setzen(zuschauer_entfernt);
+    qc_zugang_start(g_id_pub);
+    {
+        char fp[24], id_text[12];
+        qc_fingerprint(g_id_pub, fp);
+        qc_zugang_id_text(qc_zugang_eigene_id(), id_text);
+        int anz = qc_zugang_geraete(NULL, 0);
+        if (anz < 0)
+            logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   Geraeteliste host-devices.txt NICHT LESBAR ODER "
+                   "BESCHAEDIGT - jedes Geraet braucht Passwort oder Zulassen, bis sie im Menue zurueckgesetzt ist", id_text, fp);
+        else
+            logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   erlaubte Geraete: %d", id_text, fp, anz);
+    }
+
+    // Ohne Freigabe fuer die Bildschirmaufnahme einmal nachfragen. Der Host
+    // laeuft weiter (Spezifikation 7.4), zeigt den Stand im Menue und nimmt
+    // auf, sobald sie erteilt ist.
+    if (!g_tcc_bildschirm()) {
+        logf_(@"Bildschirmaufnahme nicht freigegeben, frage nach.");
+        CGRequestScreenCaptureAccess();
+        logf_(@"Der Host laeuft ohne Bildschirmaufnahme weiter - sie startet, sobald die Freigabe erteilt ist");
+    }
+    // Die Namen der Bildschirme kommen von AppKit, auf dem Hauptfaden.
+    qc_bildschirm_namen_auffrischen();
+    codecs_pruefen();
+
+    QCBildschirm *display = erste_wahl();
+    // Der Host wartet ohne Bildschirmliste (keine Freigabe, kein Monitor
+    // beim Anmelden) - die Aufnahme entsteht ohnehin erst mit einem Zuschauer.
+    if (!display) logf_(@"Kein Bildschirm abrufbar (Freigabe fehlt oder kein Monitor) - der Host laeuft und wartet");
+    if (display) stromgroesse_fuer(display, &outW, &outH);
+    else ersatzgroesse(&outW, &outH);
+    size_t pxW = display.w, pxH = display.h;
+    double hz = display.hz;
+
+    // Keine Aufnahme, kein Encoder, bis sich jemand meldet.
+    start_stand(outW, outH, fps);
+    aufnahme_einrichten(outW, outH, fps, mbit);
+
+    // Dateien: empfangene gehen als Dateiliste in die Ablage; Reste
+    // frueherer Laeufe, aelter als 24 h, und jede unfertige Uebertragung
+    // (Marke .laeuft, der vorige Lauf endete mitten im Empfang) raeumt die
+    // Empfangswarteschlange weg - vor der Annahme unten, also bevor ein
+    // Empfang beginnen kann.
+    dateien_einrichten();
+    qc_dateien_fertig_setzen(qc_clip_set_dateien);
+    qc_dateien_aufraeumen_beim_start();
+    qc_clip_dateien(clip_dateien_cb);
+    qc_clip_bedingung(zeiger_aktiv);   // Inhalt nur mit Zuschauer lesen
+    qc_clip_start(clip_cb);
+    qc_zeiger_start(zeiger_cb, zeiger_aktiv, zeiger_log);
+    logf_(@"Zeigerform: Abfrage alle 50 ms, nur mit Zuschauer");
+    // Die Annahme zuletzt. Ihre Faeden laufen sofort los; ein Client, der
+    // beim Neustart des Hosts schon wartet und neu verbindet, kann durch
+    // Handschlag und Freigabe sein, bevor dieser Start weiter unten ankaeme.
+    // bild_verbindung braucht dann g_lifeq und g_capq
+    // (stream_hochfahren_sync; dispatch_sync auf eine NULL-Warteschlange
+    // endet mit SIGSEGV), g_cfg, g_grab, den Zielbildschirm und die Werte
+    // g_cur_*; apply_settings aus dem Eingabekanal liest g_tick. Frueher
+    // startete die Annahme vor all dem.
+    // Aenderungen der Bildschirmkonfiguration meldet CoreGraphics auf dem
+    // Hauptfaden (dessen Run-Loop dreht [NSApp run] bzw. winit); der Host
+    // bewertet dann entprellt neu und folgt dem Hauptbildschirm bzw.
+    // kehrt zum gewuenschten zurueck - ohne Neustart, ohne neuen Zuschauer.
+    // Der Wunsch fuer die Zeile unten wird hier gelesen: sobald die
+    // Annahme laeuft, gehoert g_display_wunsch der Lebenslauf-Warteschlange.
+    NSString *wunsch_text = g_display_wunsch ? [NSString stringWithFormat:@" - Wunsch %@", g_display_wunsch]
+                                             : @" - Automatik (folgt dem Hauptbildschirm)";
+    CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
+    g_dienst_port = port;
+    g_dienst_display = display ? display.displayID : CGMainDisplayID();
+    // Die Oberflaeche vor der Annahme: ab hier ist "Zulassen" moeglich
+    // (qc_ui_vorhanden) - schon in der ersten Bekanntgabe (Flag) und in
+    // Nachricht 20 an einen Client, der gleich beim Start verbindet.
+    // Anfragen, bevor die Run-Loop laeuft, warten auf der Main Queue.
+    qc_oberflaeche_cfg ui = { .abschied = dienst_abschied, .protokoll = ui_protokoll,
+                              .eingebettet = eingebettet, .oeffnen = dc ? dc->oeffnen : NULL };
+    qc_oberflaeche_starten(&ui);
+    BOOL laeuft = dienst_starten();
+    zustand_takt_starten();
+    BOOL ax = AXIsProcessTrusted();
+    bedienungshilfen_einmal_fragen();
+    if (laeuft) logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
+    logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
+    logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
+
+    // Einmal blind messen, damit die erste echte Meldung schon eine Differenz
+    // hat und nicht mit Nullen anfaengt.
+    { qc_last vorlauf; qc_last_probe(&vorlauf); }
+
+    // Der Takt (alle fuenf Sekunden Stand, Auslastung, Stau-Frist) laeuft auf
+    // eigener Warteschlange; der Hauptfaden gehoert AppKit - Menueleiste,
+    // Zulassen-Fenster, Zeigerform, Zwischenablage, Bildschirmrueckrufe.
+    dienst_takt_starten(QC_TAKT_S);
+    return QC_DIENST_OK;
+}}
+
+void qc_dienst_beenden(void) {
+    if (!atomic_load(&g_dienst_gestartet)) return;
+    dispatch_semaphore_t fertig = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        dienst_abschied();
+        dispatch_semaphore_signal(fertig);
+    });
+    // Frist wie beim Beenden ueber das Menue: ein haengender Zuschauer
+    // (Sendefrist 2 s) haelt das Ende nicht auf.
+    if (dispatch_semaphore_wait(fertig, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)) != 0)
+        logf_(@"Beenden: der Abschied ist nach 3 s nicht fertig - das Beenden geht weiter");
+}

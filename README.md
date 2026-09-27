@@ -894,6 +894,15 @@ exit code is the number of failures.
   languages (every text in every table, placeholders, no duplicates), the choice of
   language, the menu for various states, the password check of the password window
   and the queue of "Allow" requests, against a stand-in for the access core.
+- `host/einbettungstest.m`: the menu bar layer embedded as in the Rust client, where
+  winit owns the application delegate. A stand-in for winit's delegate (only
+  `applicationDidFinishLaunching:` and `applicationWillTerminate:`) starts it from
+  its launch callback; checked: the delegate stays winit's, its class then answers
+  `applicationShouldHandleReopen:hasVisibleWindows:` and `applicationShouldTerminate:`,
+  a reopen event (as from a double-click on the running app) calls the client's
+  callback, and quitting runs the farewell exactly once, off the main thread, before
+  `applicationWillTerminate:`. Needs a login session with a window server, no
+  permission; the process has no Dock icon and shows nothing.
 
 ```
 clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/annahmetest.c host/qc_annahme.c \
@@ -923,15 +932,20 @@ clang -O2 -Wall -Ihost -Ihost/vendor/monocypher host/zugangtest.c host/zugang.c 
 clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
       -framework Foundation -framework AppKit -framework ServiceManagement \
       host/menuetest.m host/menue.m host/texte.m -o /tmp/menuetest
+
+clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
+      -framework Foundation -framework AppKit -framework ServiceManagement -framework CoreServices \
+      host/einbettungstest.m host/menue.m host/texte.m -o /tmp/einbettungstest
 ```
 
 `noisetest` without an argument is the self-test of the crypto layer ("OK", otherwise
 the place of the failure), including a failed handshake after which no DH result may
 remain on the stack; with a port it waits for the counterpart test of the Rust side
 (`quadchroma --noisetest address:port`). CI (`.github/workflows/ci.yml`) compiles all
-seven and runs `noisetest`, `annahmetest`, `zugangtest`, `dateitest`, `ablagetest` and
-`menuetest` (the menu bar texts in 29 languages and the menu model, nothing shown);
-`hosttest` needs the Screen Recording permission at run time and is only compiled there.
+eight and runs `noisetest`, `annahmetest`, `zugangtest`, `dateitest`, `ablagetest`,
+`menuetest` (the menu bar texts in 29 languages and the menu model, nothing shown) and
+`einbettungstest`; `hosttest` needs the Screen Recording permission at run time and is
+only compiled there.
 
 The Rust side tests itself with `cargo test --release` in `client\` or `client/`;
 several tests need loopback (TCP over 127.0.0.1). On Windows, FFmpeg's `bin` folder
@@ -977,11 +991,12 @@ A self-test without network checks the icon in the notification area or menu bar
 
 ## Repository layout
 
-    host/          Mac host (Objective-C and C): capture, encoder, network, input,
-                   audio, clipboard, files (dateien.m), screen selection
-                   (bildschirm.m), pointer shape, access with password or Allow
-                   (zugang.c), menu bar and its windows (menue.m) with the texts
-                   in 29 languages (texte.m), the test harnesses;
+    host/          Mac host (Objective-C and C): the service (main.m, C interface
+                   in dienst.h) and the app's main (start.m), capture, encoder,
+                   network, input, audio, clipboard, files (dateien.m), screen
+                   selection (bildschirm.m), pointer shape, access with password or
+                   Allow (zugang.c), menu bar and its windows (menue.m) with the
+                   texts in 29 languages (texte.m), the test harnesses;
                    host/vendor/monocypher is the vendored Monocypher
     client/        Rust: receive, decode, display (anzeige.rs: Direct3D 11), input,
                    audio, clipboard; files (dateien.rs) and screen list

@@ -190,6 +190,11 @@ jobs:
           clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
                 -framework Foundation -framework AppKit -framework ServiceManagement \
                 host/menuetest.m host/menue.m host/texte.m -o build/menuetest
+          # einbettungstest: the menu bar layer embedded as in the Rust client (winit owns
+          # the application delegate); needs the runner's window server, no permission.
+          clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
+                -framework Foundation -framework AppKit -framework ServiceManagement -framework CoreServices \
+                host/einbettungstest.m host/menue.m host/texte.m -o build/einbettungstest
           # hosttest needs Screen Recording (a TCC permission) at run time, which a runner
           # does not have - only compile it here; that catches compile errors.
           clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
@@ -201,7 +206,7 @@ jobs:
                 host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
                 host/zugang.c host/vendor/monocypher/monocypher.c -o build/hosttest
 
-      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, zugangtest, dateitest, ablagetest, menuetest)
+      - name: Run the test harnesses that need no TCC permission (noisetest, annahmetest, zugangtest, dateitest, ablagetest, menuetest, einbettungstest)
         run: |
           set -euo pipefail
           # noisetest prints two log lines and "OK" as the last line.
@@ -211,6 +216,7 @@ jobs:
           build/dateitest
           build/ablagetest
           build/menuetest
+          build/einbettungstest
 
       - name: FFmpeg (Homebrew, GPL build - only for building and testing the Mac client)
         run: |

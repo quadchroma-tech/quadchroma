@@ -41,8 +41,9 @@
 //         host/zugang.c host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 //   /tmp/hosttest
 //
-// main.m wird hier eingebunden; sein main heisst dann host_main und laeuft
-// nie. Die Oberflaeche (menue.m) bindet der Pruefstand nicht: main.m bringt
+// main.m wird hier eingebunden (main selbst steht in start.m und gehoert
+// nicht dazu; qc_dienst_starten und qc_werkzeug laufen hier nie). Die
+// Oberflaeche (menue.m) bindet der Pruefstand nicht: main.m bringt
 // schwache Standardfassungen fuer ihre Einstiege mit. Es startet also kein
 // Dienst, keine Aufnahme, keine Oberflaeche, und nichts schreibt in
 // /tmp/quadchroma-m1.log: g_log bleibt leer, alles geht nach stdout - nur die
@@ -63,9 +64,7 @@
 // Zwischenablage des Nutzers bleibt unberuehrt.
 // Dauer rund 110 s. Rueckgabe: Zahl der Fehler.
 
-#define main host_main
 #include "main.m"
-#undef main
 
 #include <fcntl.h>
 #include <poll.h>
