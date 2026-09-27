@@ -169,6 +169,31 @@ static void id_pruefen(void) {
     qc_zugang_id_text(999999999, t);
     pruefe(strcmp(t, "999 999 999") == 0, "groesste ID");
 
+    // Fester Schluessel (RFC 7748, 6.1): host.key mit 32 Byte (nur privat)
+    // ergibt denselben oeffentlichen Schluessel und dieselbe ID wie im
+    // Rust-Kern (secure.rs, schluessel_mit_32_byte_wie_der_mac_host), und
+    // qc_identity_load laesst die Datei, wie sie ist.
+    uint8_t priv[32], soll[32], pk[32], pr[32], gelesen[40];
+    hex_aus("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", priv, 32);
+    hex_aus("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", soll, 32);
+    qc_pubkey(priv, pk);
+    qc_zugang_id_text(qc_zugang_id(pk), t);
+    pruefe(memcmp(pk, soll, 32) == 0 && qc_zugang_id(pk) == 828873450 && strcmp(t, "828 873 450") == 0,
+           "fester Schluessel: oeffentlicher wie RFC 7748, ID 828 873 450 (wie im Rust-Kern)");
+    char kp[1200];
+    snprintf(kp, sizeof kp, "%s/host.key", g_ablage);
+    FILE *kf = fopen(kp, "wb");
+    size_t geschrieben = kf ? fwrite(priv, 1, 32, kf) : 0;
+    if (kf) fclose(kf);
+    memset(pk, 0, 32);
+    int geladen = geschrieben == 32 && qc_identity_load(pr, pk) == 0;
+    kf = fopen(kp, "rb");
+    size_t n = kf ? fread(gelesen, 1, sizeof gelesen, kf) : 0;
+    if (kf) fclose(kf);
+    pruefe(geladen && memcmp(pr, priv, 32) == 0 && memcmp(pk, soll, 32) == 0 && n == 32 && memcmp(gelesen, priv, 32) == 0,
+           "host.key mit 32 Byte: geladen, oeffentlicher errechnet, Datei unveraendert");
+    unlink(kp);
+
     // Der Code ist derselbe wie qc_sas, nur als Zahl.
     int gleich = 1;
     for (int i = 0; i < 50; i++) {

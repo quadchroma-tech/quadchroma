@@ -391,9 +391,14 @@ known_hosts.txt.migriert. A host no longer takes in the first device by
 itself, not even with an empty or missing list.
 
 Broken files never let anyone in and are never replaced silently. A key
-is created only when its file is missing. If host.key exists but is
-unreadable or has the wrong length (Mac host 32 bytes, Windows 64), the
-host does not start ("Schluessel host.key ist vorhanden, aber nicht
+is created only when its file is missing; an existing key file is never
+written again. The Mac host writes host.key with 32 bytes (the private
+key only), the Windows host role and the client write 64 (private, then
+public); the Windows host role and the client read both forms and
+compute the public key from 32 bytes - the same public key and ID the
+Mac host computes. If host.key exists but is unreadable or has the wrong
+length (Mac host: not 32 bytes; Windows: neither 32 nor 64), the host
+does not start ("Schluessel host.key ist vorhanden, aber nicht
 lesbar oder beschaedigt - Abbruch. ..." or on Windows "Schluessel
 konnte nicht angelegt werden - Abbruch: ..."). Deleting a key file
 gives the device a new identity and a new ID. After a new host.key the

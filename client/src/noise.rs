@@ -157,6 +157,20 @@ where
     Ok(Session { transport, handshake_hash, remote_static, nachricht3 })
 }
 
+/// Der oeffentliche Schluessel zu einem privaten (X25519 wie im Handschlag,
+/// mit derselben Klemmung wie qc_pubkey im Mac-Host). None nur, wenn der
+/// private keine 32 Byte hat.
+pub fn oeffentlich(privat: &[u8]) -> Option<Vec<u8>> {
+    use snow::params::DHChoice;
+    use snow::resolvers::{CryptoResolver, DefaultResolver};
+    if privat.len() != 32 {
+        return None;
+    }
+    let mut dh = DefaultResolver.resolve_dh(&DHChoice::Curve25519)?;
+    dh.set(privat);
+    Some(dh.pubkey().to_vec())
+}
+
 /// Erzeugt ein langlebiges Schluesselpaar.
 pub fn keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
     let params = PATTERN.parse().map_err(|e| format!("Muster: {e:?}"))?;

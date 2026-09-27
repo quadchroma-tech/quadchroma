@@ -22,7 +22,8 @@ pub const CHUNK_MAX: usize = 65519;
 pub enum Fehler {
     /// Kein Ablageordner (APPDATA/HOME fehlt, Ordner nicht anzulegen).
     Ablage(String),
-    /// Schluesseldatei vorhanden, aber mit falscher Laenge.
+    /// Schluesseldatei vorhanden, aber mit falscher Laenge (weder 32 noch 64
+    /// Byte).
     SchluesselBeschaedigt { pfad: PathBuf, laenge: usize },
     /// Datei vorhanden, aber nicht lesbar (Rechte, Sperre durch ein
     /// anderes Programm). `grund` ist der Wortlaut des Systems.
@@ -56,7 +57,7 @@ impl std::fmt::Display for Fehler {
             Fehler::Ablage(g) => write!(f, "{g}"),
             Fehler::SchluesselBeschaedigt { pfad, laenge } => write!(
                 f,
-                "{} ist beschaedigt ({laenge} statt 64 Byte) und wird nicht ueberschrieben. \
+                "{} ist beschaedigt ({laenge} Byte statt 32 oder 64) und wird nicht ueberschrieben. \
                  Datei pruefen oder loeschen - dann entsteht ein neuer Schluessel.",
                 pfad.display()
             ),
@@ -556,10 +557,12 @@ pub fn identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("client.key"))
 }
 
-/// Liest einen Schluessel (64 Byte: privat, dann oeffentlich) oder legt ihn
-/// an - aber NUR, wenn die Datei fehlt. Ist sie unlesbar oder hat sie die
-/// falsche Laenge, bleibt sie liegen: ein stilles Ueberschreiben machte aus
-/// einem Dateifehler eine neue Identitaet, und jede Kopplung waere weg.
+/// Liest einen Schluessel (siehe `schluessel_lesen_mit`: 64 Byte privat und
+/// oeffentlich, oder 32 Byte nur privat) oder legt ihn mit 64 Byte an - aber
+/// NUR, wenn die Datei fehlt. Eine vorhandene Datei wird nie neu
+/// geschrieben: ist sie unlesbar oder hat sie die falsche Laenge, bleibt sie
+/// liegen - ein stilles Ueberschreiben machte aus einem Dateifehler eine
+/// neue Identitaet, und jede Kopplung waere weg.
 fn schluessel_laden(path: &Path) -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     schluessel_laden_mit(path, noise::keypair)
 }
@@ -593,11 +596,17 @@ fn schluessel_lesen(path: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>, Fehler> {
     schluessel_lesen_mit(path, || std::thread::sleep(Duration::from_millis(200)))
 }
 
-/// Wie `schluessel_lesen`. Ist die Datei zu KURZ, wird nach `warten` einmal
-/// neu gelesen, bevor sie als beschaedigt gilt: auf einem Dateisystem ohne
-/// harte Verweise legt ein zweiter Prozess sie direkt an (siehe
-/// `geheim_schreiben`), und wer genau dann liest, saehe sie halb. Zu lang
-/// wird sie dabei nie - das ist gleich ein Fehler.
+/// Wie `schluessel_lesen`. Zwei Formen gelten: 64 Byte (privat, dann
+/// oeffentlich - so legt der Client client.key und die Windows-Host-Rolle
+/// host.key an) und 32 Byte (nur privat - so schreibt der Mac-Host host.key,
+/// qc_secure.c); zu 32 Byte wird der oeffentliche errechnet, die Datei
+/// bleibt, wie sie ist. Ist die Datei sonst zu KURZ, wird nach `warten`
+/// einmal neu gelesen, bevor sie als beschaedigt gilt: auf einem
+/// Dateisystem ohne harte Verweise legt ein zweiter Prozess sie direkt an
+/// (siehe `geheim_schreiben`), und wer genau dann liest, saehe sie halb.
+/// Sieht er dabei genau die ersten 32 Byte, ist das schon der ganze private
+/// Schluessel - das Paar stimmt also auch dann. Zu lang wird sie nie - das
+/// ist gleich ein Fehler.
 fn schluessel_lesen_mit(path: &Path, warten: impl FnOnce()) -> Result<Option<(Vec<u8>, Vec<u8>)>, Fehler> {
     let lesen = || match std::fs::read(path) {
         Ok(b) => Ok(Some(b)),
@@ -605,14 +614,19 @@ fn schluessel_lesen_mit(path: &Path, warten: impl FnOnce()) -> Result<Option<(Ve
         Err(e) => Err(Fehler::Unlesbar { pfad: path.to_path_buf(), grund: wortlaut(&e) }),
     };
     let mut b = lesen()?;
-    if b.as_ref().is_some_and(|b| b.len() < 64) {
+    if b.as_ref().is_some_and(|b| b.len() < 64 && b.len() != 32) {
         warten();
         b = lesen()?;
     }
+    let beschaedigt = |laenge| Fehler::SchluesselBeschaedigt { pfad: path.to_path_buf(), laenge };
     match b {
         None => Ok(None),
         Some(b) if b.len() == 64 => Ok(Some((b[..32].to_vec(), b[32..].to_vec()))),
-        Some(b) => Err(Fehler::SchluesselBeschaedigt { pfad: path.to_path_buf(), laenge: b.len() }),
+        Some(b) if b.len() == 32 => match noise::oeffentlich(&b) {
+            Some(oeff) => Ok(Some((b, oeff))),
+            None => Err(beschaedigt(32)),
+        },
+        Some(b) => Err(beschaedigt(b.len())),
     }
 }
 
@@ -662,9 +676,9 @@ fn exklusiv_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
 //
 // Der Windows-Host hat seinen eigenen dauerhaften Schluessel (host.key)
 // unter %APPDATA%\QuadChroma neben client.key - getrennte Dateien, keine
-// Kollision. host.key liegt hier wie client.key mit 64 Byte (privat, dann
-// oeffentlich), damit der eigene Fingerabdruck ohne Nachrechnen im
-// Protokoll stehen kann. Die erlaubten Geraete (host-devices.txt, frueher
+// Kollision. Die Host-Rolle legt host.key wie client.key mit 64 Byte an
+// (privat, dann oeffentlich); gelesen werden auch 32 Byte, wie sie der
+// Mac-Host schreibt (nur privat). Die erlaubten Geraete (host-devices.txt, frueher
 // authorized.txt) und das Zugangspasswort fuehrt zugang.rs.
 
 /// Dauerhafter Schluessel des Hosts. Entsteht beim ersten Start.
@@ -891,6 +905,51 @@ mod tests {
         // Fehlt sie, ist das kein Fehler.
         std::fs::remove_file(&p).unwrap();
         assert_eq!(schluessel_lesen_mit(&p, || panic!("gewartet")), Ok(None));
+    }
+
+    /// Eine Schluesseldatei mit 32 Byte (nur privat), wie sie der Mac-Host als
+    /// host.key schreibt: der oeffentliche Schluessel wird errechnet - mit dem
+    /// Pruefvektor aus RFC 7748 (6.1) derselbe wie im Mac-Host (qc_pubkey,
+    /// zugangtest.c), und damit dieselbe Geraete-ID. Die Datei bleibt Byte
+    /// fuer Byte, wie sie war, und laden legt nichts daneben an. 64 Byte
+    /// gelten weiter wie bisher.
+    #[test]
+    fn schluessel_mit_32_byte_wie_der_mac_host() {
+        let privat = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let oeff = hex32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        assert_eq!(noise::oeffentlich(&privat), Some(oeff.clone()));
+        assert_eq!(noise::oeffentlich(&privat[..31]), None);
+        assert_eq!(crate::zugang::geraete_id(&oeff), 828_873_450);
+        assert_eq!(crate::zugang::id_text(crate::zugang::geraete_id(&oeff)), "828 873 450");
+        let d = ordner("key-32");
+        let p = d.join("host.key");
+        std::fs::write(&p, &privat).unwrap();
+        let vorher = std::fs::metadata(&p).unwrap().modified().unwrap();
+        let k = schluessel_laden_mit(&p, || panic!("neu erzeugt")).unwrap();
+        assert_eq!(k, (privat.clone(), oeff.clone()));
+        assert_eq!(std::fs::read(&p).unwrap(), privat, "Datei veraendert");
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), vorher);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        // Gelesen ohne zu warten - 32 Byte sind kein halber Schluessel.
+        assert_eq!(schluessel_lesen_mit(&p, || panic!("gewartet")), Ok(Some((privat.clone(), oeff.clone()))));
+        // 64 Byte wie bisher: privat, dann oeffentlich, ebenso unveraendert.
+        let mut beide = privat.clone();
+        beide.extend_from_slice(&oeff);
+        std::fs::write(&p, &beide).unwrap();
+        assert_eq!(schluessel_laden_mit(&p, || panic!("neu erzeugt")).unwrap(), (privat, oeff));
+        assert_eq!(std::fs::read(&p).unwrap(), beide);
+        // 33 Byte: beschaedigt, nicht ueberschrieben.
+        std::fs::write(&p, [3u8; 33]).unwrap();
+        assert_eq!(
+            schluessel_laden_mit(&p, || panic!("neu erzeugt")),
+            Err(Fehler::SchluesselBeschaedigt { pfad: p.clone(), laenge: 33 })
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), [3u8; 33]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn hex32(t: &str) -> Vec<u8> {
+        (0..32).map(|i| u8::from_str_radix(&t[2 * i..2 * i + 2], 16).unwrap()).collect()
     }
 
     /// Der Wortlaut des Systems steht in einer Zeile.
