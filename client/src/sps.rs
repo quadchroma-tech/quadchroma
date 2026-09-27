@@ -18,15 +18,16 @@
 //! Skalierungsmatrizen liegen (die lesen wir nicht; VideoToolbox schreibt
 //! keine).
 
-/// Liest Bits aus einer RBSP (Nutzlast OHNE Emulationsschutz).
-struct BitLeser<'a> {
+/// Liest Bits aus einer RBSP (Nutzlast OHNE Emulationsschutz). Auch fuer
+/// die Sequenzparametersaetze in vt_decoder.rs.
+pub(crate) struct BitLeser<'a> {
     daten: &'a [u8],
     /// Position in Bits.
     pos: usize,
 }
 
 impl<'a> BitLeser<'a> {
-    fn neu(daten: &'a [u8]) -> Self {
+    pub(crate) fn neu(daten: &'a [u8]) -> Self {
         BitLeser { daten, pos: 0 }
     }
 
@@ -39,7 +40,7 @@ impl<'a> BitLeser<'a> {
     }
 
     /// n Bits (n <= 32), hoechstwertiges zuerst.
-    fn u(&mut self, n: u32) -> Option<u32> {
+    pub(crate) fn u(&mut self, n: u32) -> Option<u32> {
         let mut w = 0u32;
         for _ in 0..n {
             w = (w << 1) | self.bit()?;
@@ -47,12 +48,12 @@ impl<'a> BitLeser<'a> {
         Some(w)
     }
 
-    fn u1(&mut self) -> Option<bool> {
+    pub(crate) fn u1(&mut self) -> Option<bool> {
         Some(self.bit()? == 1)
     }
 
     /// Vorzeichenloser Exp-Golomb-Wert (ue(v)).
-    fn ue(&mut self) -> Option<u32> {
+    pub(crate) fn ue(&mut self) -> Option<u32> {
         let mut nullen = 0u32;
         while self.bit()? == 0 {
             nullen += 1;
@@ -142,7 +143,7 @@ impl BitSchreiber {
 
 /// Emulationsschutz entfernen: aus 00 00 03 wird 00 00. Die Nutzlast ist
 /// die des NAL ohne das Kopfbyte.
-fn entschuetzen(nutzlast: &[u8]) -> Vec<u8> {
+pub(crate) fn entschuetzen(nutzlast: &[u8]) -> Vec<u8> {
     let mut raus = Vec::with_capacity(nutzlast.len());
     let mut nullen = 0usize;
     for &b in nutzlast {
@@ -320,8 +321,9 @@ fn startcodes(au: &[u8]) -> Vec<usize> {
 }
 
 /// Die NALs einer Annex-B-Einheit als Bereiche (Anfang hinter dem Startcode,
-/// Ende vor den Nullen des naechsten Startcodes).
-fn nal_bereiche(au: &[u8]) -> Vec<(usize, usize)> {
+/// Ende vor den Nullen des naechsten Startcodes). Auch fuer den Decoder des
+/// Mac (vt_decoder.rs), der die Einheit in NALs mit Laengenpraefix umbaut.
+pub(crate) fn nal_bereiche(au: &[u8]) -> Vec<(usize, usize)> {
     let codes = startcodes(au);
     let mut raus = Vec::with_capacity(codes.len());
     for (k, &c) in codes.iter().enumerate() {
@@ -338,7 +340,8 @@ fn nal_bereiche(au: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// Das erste SPS-NAL einer Annex-B-Einheit (ohne Startcode) - fuer die
-/// Protokollzeile.
+/// Protokollzeile. Nur der NVDEC-Pfad (Windows) braucht es.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn erstes_sps(au: &[u8]) -> Option<&[u8]> {
     nal_bereiche(au).into_iter()
         .map(|(a, e)| &au[a..e])
@@ -349,6 +352,7 @@ pub fn erstes_sps(au: &[u8]) -> Option<&[u8]> {
 /// VUI ersetzt ist. Alles andere (PPS, Scheiben, Startcodes) bleibt Byte
 /// fuer Byte. None, wenn nichts umzuschreiben war - kein SPS, oder eines,
 /// das `h264_sps_mit_vui` liegen laesst; dann bleibt die Einheit ohne Kopie.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn h264_au_mit_vui(au: &[u8]) -> Option<Vec<u8>> {
     let bereiche = nal_bereiche(au);
     let mut ersatz: Vec<((usize, usize), Vec<u8>)> = Vec::new();

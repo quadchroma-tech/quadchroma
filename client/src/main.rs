@@ -38,6 +38,10 @@ mod noise;
 mod protokoll_konst;
 mod secure;
 mod sps;
+/// Der Decoder des Mac-Clients: VideoToolbox direkt (Annex B nach
+/// Formatbeschreibung und Laengenpraefix, VTDecompressionSession). Der reine
+/// Teil (Zerlegen, Parametersaetze, Formatwahl) wird ueberall geprueft.
+mod vt_decoder;
 mod strings;
 mod strings_asia;
 mod strings_balt;
@@ -117,7 +121,10 @@ fn client_us() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
-/// Protokoll des Clients: die Decoderzeilen und FFmpegs eigene Meldungen.
+/// Protokoll des Clients: die Decoderzeilen und die eigenen Meldungen der
+/// Decoder-Bibliothek - unter Windows FFmpeg, auf dem Mac VideoToolbox (das
+/// nichts von selbst meldet; was der Decoder dort zu sagen hat, reicht
+/// vt_decoder.rs ueber `bibliothek_sagt` ein).
 ///
 /// FFmpeg schreibt seine Meldungen sonst auf sein eigenes stderr - das
 /// fuehrt in einer Fensteranwendung nirgends hin, und selbst mit
@@ -147,8 +154,10 @@ fn client_us() -> u64 {
 /// h264_mf). Geteilte Teile, die fuer beide Rollen sprechen (der
 /// Ablagewaechter), nennen die Herkunft ausdruecklich (`zeile_als`).
 mod protokoll {
+    #[cfg(windows)]
     use ffmpeg_next as ffmpeg;
     use std::cell::Cell;
+    use std::os::raw::c_int;
     use std::io::Write;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::Mutex;
@@ -209,6 +218,23 @@ mod protokoll {
         FADEN.with(|f| f.set(Some(h)));
     }
 
+    /// Stufen wie FFmpegs AV_LOG_*: Warnung und ausfuehrlich - unter
+    /// Windows die Zahlen aus FFmpeg selbst, auf dem Mac dieselben.
+    #[cfg(windows)]
+    pub const WARNUNG: c_int = ffmpeg::sys::AV_LOG_WARNING;
+    #[cfg(windows)]
+    const AUSFUEHRLICH: c_int = ffmpeg::sys::AV_LOG_VERBOSE;
+    #[cfg(not(windows))]
+    pub const WARNUNG: c_int = 24;
+    #[cfg(not(windows))]
+    const AUSFUEHRLICH: c_int = 40;
+
+    /// Wie die Zeilen der Bibliothek beginnen.
+    #[cfg(windows)]
+    const BIBLIOTHEK: &str = "FFmpeg: ";
+    #[cfg(not(windows))]
+    const BIBLIOTHEK: &str = "VideoToolbox: ";
+
     /// Die Reihe einer Herkunft: Stufe, Zeilen, letzte Warnungen, die
     /// angefangene Zeile.
     struct Reihe {
@@ -217,7 +243,8 @@ mod protokoll {
         /// bleibt die Reihe bei 512 stehen - beim Client hat dann die Datei
         /// alles; der Host holt im Takt ab.
         zeilen: Mutex<Vec<String>>,
-        /// Die letzten Warnungen und Fehler von FFmpeg, fuer Rueckfallgruende.
+        /// Die letzten Warnungen und Fehler der Bibliothek, fuer
+        /// Rueckfallgruende.
         fehler: Mutex<Vec<String>>,
         /// Eine FFmpeg-Meldung kann in Stuecken kommen; der Zeilenumbruch
         /// schliesst sie ab. Der Rest der angefangenen Zeile und FFmpegs
@@ -227,13 +254,14 @@ mod protokoll {
         /// auch aus den Arbeitsfaeden eines Decoders, und genau so haelt es
         /// FFmpegs eigener Rueckruf. Je Herkunft eine, damit die Stuecke der
         /// einen Rolle nie an einer Zeile der anderen kleben.
-        offen: Mutex<(String, std::os::raw::c_int)>,
+        #[cfg_attr(not(windows), allow(dead_code))]
+        offen: Mutex<(String, c_int)>,
     }
 
     impl Reihe {
         const fn neu() -> Reihe {
             Reihe {
-                stufe: AtomicI32::new(ffmpeg::sys::AV_LOG_WARNING),
+                stufe: AtomicI32::new(WARNUNG),
                 zeilen: Mutex::new(Vec::new()),
                 fehler: Mutex::new(Vec::new()),
                 offen: Mutex::new((String::new(), 1)),
@@ -284,9 +312,10 @@ mod protokoll {
         }
     }
 
+    #[cfg(windows)]
     unsafe extern "C" fn rueckruf(
         ptr: *mut std::os::raw::c_void,
-        stufe: std::os::raw::c_int,
+        stufe: c_int,
         fmt: *const std::os::raw::c_char,
         vl: ffmpeg::sys::va_list,
     ) {
@@ -302,7 +331,7 @@ mod protokoll {
             let Ok(mut offen) = r.offen.lock() else { return };
             let (rest, praefix) = &mut *offen;
             let n = ffmpeg::sys::av_log_format_line2(
-                ptr, stufe, fmt, vl, puffer.as_mut_ptr(), puffer.len() as std::os::raw::c_int, praefix,
+                ptr, stufe, fmt, vl, puffer.as_mut_ptr(), puffer.len() as c_int, praefix,
             );
             if n <= 0 {
                 return;
@@ -319,13 +348,19 @@ mod protokoll {
             if *praefix == 0 && !abgeschnitten {
                 return;
             }
-            let t = format!("FFmpeg: {}", rest.trim_end());
+            let t = format!("{BIBLIOTHEK}{}", rest.trim_end());
             rest.clear();
             *praefix = 1;
             t
         };
-        if stufe <= ffmpeg::sys::AV_LOG_WARNING {
-            if let Ok(mut f) = r.fehler.lock() {
+        melden(h, stufe, text);
+    }
+
+    /// Eine fertige Zeile der Bibliothek in die Reihe von `h`; Warnungen und
+    /// Fehler ausserdem in die Liste fuer Rueckfallgruende.
+    fn melden(h: Herkunft, stufe: c_int, text: String) {
+        if stufe <= WARNUNG {
+            if let Ok(mut f) = reihe(h).fehler.lock() {
                 if f.len() >= 6 {
                     f.remove(0);
                 }
@@ -335,18 +370,34 @@ mod protokoll {
         zeile_als(h, text);
     }
 
+    /// Was der Decoder auf dem Mac (VideoToolbox, das selbst nichts meldet)
+    /// zu sagen hat, auf demselben Weg wie FFmpegs Meldungen unter Windows:
+    /// in die Reihe der Herkunft dieses Fadens, soweit ihre Stufe es
+    /// erlaubt, Warnungen und Fehler auch in die Rueckfallgruende.
+    #[cfg(not(windows))]
+    pub fn bibliothek_sagt(stufe: c_int, text: &str) {
+        let h = herkunft();
+        if stufe > reihe(h).stufe.load(Ordering::Relaxed) {
+            return;
+        }
+        melden(h, stufe, format!("{BIBLIOTHEK}{text}"));
+    }
+
     /// Einsammeln einschalten, fuer die Herkunft dieses Fadens. Ausfuehrlich
     /// heisst bis AV_LOG_VERBOSE - da sagt cuvid, welche Formate er gewaehlt
     /// hat und was die Karte kann. FFmpeg selbst laesst durch, was die
     /// gespraechigere der beiden Reihen will; jede Reihe nimmt nur, was ihre
     /// eigene Stufe erlaubt.
     pub fn einschalten(ausfuehrlich: bool) {
-        let stufe = if ausfuehrlich { ffmpeg::sys::AV_LOG_VERBOSE } else { ffmpeg::sys::AV_LOG_WARNING };
+        let stufe = if ausfuehrlich { AUSFUEHRLICH } else { WARNUNG };
         reihe(herkunft()).stufe.store(stufe, Ordering::Relaxed);
-        let hoechste = REIHEN.iter().map(|r| r.stufe.load(Ordering::Relaxed)).max().unwrap_or(stufe);
-        unsafe {
-            ffmpeg::sys::av_log_set_level(hoechste);
-            ffmpeg::sys::av_log_set_callback(Some(rueckruf));
+        #[cfg(windows)]
+        {
+            let hoechste = REIHEN.iter().map(|r| r.stufe.load(Ordering::Relaxed)).max().unwrap_or(stufe);
+            unsafe {
+                ffmpeg::sys::av_log_set_level(hoechste);
+                ffmpeg::sys::av_log_set_callback(Some(rueckruf));
+            }
         }
     }
 
@@ -368,11 +419,12 @@ mod protokoll {
     /// Absender "[hevc_cuvid @ 000001d4...] " - der steht im Grund ohnehin,
     /// und die Adresse sagt niemandem etwas. Gleiche Zeilen in Folge nur
     /// einmal.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     pub fn fehler_abholen() -> Vec<String> {
         let Ok(mut f) = reihe(herkunft()).fehler.lock() else { return Vec::new() };
         let mut aus: Vec<String> = Vec::new();
         for z in f.drain(..) {
-            let z = z.trim_start_matches("FFmpeg: ");
+            let z = z.trim_start_matches(BIBLIOTHEK);
             let kern = match (z.starts_with('['), z.find("] ")) {
                 (true, Some(i)) => &z[i + 2..],
                 _ => z,
@@ -389,11 +441,20 @@ mod protokoll {
         use super::*;
 
         /// Eine Meldung ueber FFmpegs eigenen Weg (av_log), wie sie ein Codec
-        /// macht - im aufrufenden Faden.
-        fn ffmpeg_sagt(stufe: std::os::raw::c_int, text: &str) {
+        /// macht - im aufrufenden Faden. Auf dem Mac der Weg, auf dem der
+        /// Decoder (VideoToolbox) meldet.
+        #[cfg(windows)]
+        fn ffmpeg_sagt(stufe: c_int, text: &str) {
             let t = std::ffi::CString::new(format!("{text}\n")).unwrap();
             unsafe { ffmpeg::sys::av_log(std::ptr::null_mut(), stufe, c"%s".as_ptr(), t.as_ptr()) };
         }
+        #[cfg(not(windows))]
+        fn ffmpeg_sagt(stufe: c_int, text: &str) {
+            bibliothek_sagt(stufe, text);
+        }
+
+        /// AV_LOG_ERROR.
+        const FEHLER: c_int = 16;
 
         fn enthaelt(v: &[String], t: &str) -> bool {
             v.iter().any(|z| z.contains(t))
@@ -420,7 +481,7 @@ mod protokoll {
                 herkunft_setzen(Herkunft::Host);
                 einschalten(false);
                 zeile(format!("Reihentest Host {k2}"));
-                ffmpeg_sagt(ffmpeg::sys::AV_LOG_ERROR, &format!("Reihentest FFmpeg Host {k2}"));
+                ffmpeg_sagt(FEHLER, &format!("Reihentest FFmpeg Host {k2}"));
                 let fehler = fehler_abholen();
                 let reihe = abholen();
                 // Einmal abgeholt ist abgeholt.
@@ -432,7 +493,7 @@ mod protokoll {
             let k2 = k.clone();
             let (client_reihe, client_fehler) = std::thread::spawn(move || {
                 zeile(format!("Reihentest Client {k2}"));
-                ffmpeg_sagt(ffmpeg::sys::AV_LOG_ERROR, &format!("Reihentest FFmpeg Client {k2}"));
+                ffmpeg_sagt(FEHLER, &format!("Reihentest FFmpeg Client {k2}"));
                 zeile_als(Herkunft::Host, format!("Reihentest ausdruecklich Host {k2}"));
                 (abholen(), fehler_abholen())
             })
@@ -446,12 +507,12 @@ mod protokoll {
             .unwrap();
 
             assert!(enthaelt(&host_reihe, &format!("Reihentest Host {k}")), "{host_reihe:?}");
-            assert!(enthaelt(&host_reihe, &format!("FFmpeg: Reihentest FFmpeg Host {k}")), "{host_reihe:?}");
+            assert!(enthaelt(&host_reihe, &format!("{BIBLIOTHEK}Reihentest FFmpeg Host {k}")), "{host_reihe:?}");
             assert!(enthaelt(&host_fehler, &format!("Reihentest FFmpeg Host {k}")), "{host_fehler:?}");
             assert!(!enthaelt(&host_reihe, &format!("Client {k}")), "{host_reihe:?}");
             assert!(!enthaelt(&nachher, &k), "zweimal abgeholt: {nachher:?}");
             assert!(enthaelt(&client_reihe, &format!("Reihentest Client {k}")), "{client_reihe:?}");
-            assert!(enthaelt(&client_reihe, &format!("FFmpeg: Reihentest FFmpeg Client {k}")), "{client_reihe:?}");
+            assert!(enthaelt(&client_reihe, &format!("{BIBLIOTHEK}Reihentest FFmpeg Client {k}")), "{client_reihe:?}");
             assert!(enthaelt(&client_fehler, &format!("Reihentest FFmpeg Client {k}")), "{client_fehler:?}");
             assert!(!enthaelt(&client_reihe, &format!("Host {k}")), "{client_reihe:?}");
             assert!(!enthaelt(&client_fehler, &format!("Host {k}")), "{client_fehler:?}");
@@ -468,10 +529,10 @@ mod protokoll {
             let (h, c) = std::thread::spawn(move || {
                 herkunft_setzen(Herkunft::Host);
                 einschalten(true);
-                ffmpeg_sagt(ffmpeg::sys::AV_LOG_VERBOSE, &format!("Stufentest Host {k}"));
+                ffmpeg_sagt(AUSFUEHRLICH, &format!("Stufentest Host {k}"));
                 let k2 = k.clone();
                 let c = std::thread::spawn(move || {
-                    ffmpeg_sagt(ffmpeg::sys::AV_LOG_VERBOSE, &format!("Stufentest Client {k2}"));
+                    ffmpeg_sagt(AUSFUEHRLICH, &format!("Stufentest Client {k2}"));
                     abholen()
                 })
                 .join()
@@ -500,7 +561,10 @@ const WEBSITE_URL: &str = "https://github.com/quadchroma-tech/quadchroma";
 /// zeigt das Programm im Betrieb Urheberhinweise, gehoert der von FFmpeg
 /// dazu, samt Verweis auf den Lizenztext - THIRD_PARTY_NOTICES.txt liegt
 /// jeder Weitergabe bei. Wie COPYRIGHT ein Rechtshinweis, nicht uebersetzt.
-const FFMPEG_HINWEIS: &str = "Uses libraries from the FFmpeg project under the LGPLv2.1 · THIRD_PARTY_NOTICES.txt";
+/// Nur unter Windows: der Mac-Client decodiert mit VideoToolbox und enthaelt
+/// kein FFmpeg.
+const FFMPEG_HINWEIS: Option<&str> =
+    if cfg!(windows) { Some("Uses libraries from the FFmpeg project under the LGPLv2.1 · THIRD_PARTY_NOTICES.txt") } else { None };
 
 /// Die Projektseite im Standardbrowser oeffnen. Wir starten nichts selbst,
 /// sondern reichen die Adresse an das System weiter - das ist der einzige Weg,
@@ -820,13 +884,22 @@ struct Frame {
     bereit_us: u64,
 }
 
+/// Das Bild, wie es aus dem Decoder kommt: unter Windows ein Frame von
+/// FFmpeg, auf dem Mac ein CVPixelBuffer von VideoToolbox (vt_decoder.rs).
+/// `to_rgb` und die Protokollzeilen lesen beide ueber `Ebenenbild`.
+#[cfg(windows)]
+type Dekoderbild = ffmpeg::frame::Video;
+#[cfg(target_os = "macos")]
+type Dekoderbild = vt_decoder::Bild;
+
 /// Was der Empfangsfaden ablegt: fertig gerechnetes RGB, oder - sobald die
 /// Karte die Umrechnung uebernimmt - das rohe Decoderbild mit seinen Ebenen.
-/// Ein rohes Bild kostet im Empfangsfaden keine Kopie: `ffmpeg::frame::Video`
-/// laesst sich zwischen Faeden verschieben.
+/// Ein rohes Bild kostet im Empfangsfaden keine Kopie: FFmpegs Frame wie der
+/// CVPixelBuffer lassen sich zwischen Faeden verschieben. Auf dem Mac zeichnet
+/// noch die CPU (softbuffer), also kommt dort nur RGB an.
 enum Bild {
     Rgb(Frame),
-    Roh { bild: ffmpeg::frame::Video, bereit_us: u64 },
+    Roh { bild: Dekoderbild, bereit_us: u64 },
 }
 
 impl Bild {
@@ -1552,15 +1625,17 @@ fn neuversuch_buchen(
 /// Netz- und Decodierschleife. Laeuft in einem eigenen Faden und legt immer nur
 /// das neueste Bild ab: lieber eines auslassen als Verzoegerung aufbauen.
 fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
+    // VideoToolbox (Mac) braucht keinen Start.
+    #[cfg(windows)]
     if let Err(e) = ffmpeg::init() {
         let m = Meldung::neu(strings::Key::ErrorFfmpegStart, format!("FFmpeg-Start fehlgeschlagen: {e}")).anhang(e.to_string());
         protokoll::zeile(m.protokoll.clone());
         shared.lock().unwrap().error = Some(m);
         return;
     }
-    // Im Pruefmodus alles einsammeln, was FFmpeg zu sagen hat; im Fenster
-    // nur Warnungen und Fehler - fuer die Datei und fuer den Grund, wenn
-    // ein Hardware-Decoder schon beim Oeffnen scheitert.
+    // Im Pruefmodus alles einsammeln, was die Decoder-Bibliothek zu sagen
+    // hat; im Fenster nur Warnungen und Fehler - fuer die Datei und fuer den
+    // Grund, wenn ein Hardware-Decoder schon beim Oeffnen scheitert.
     protokoll::einschalten(std::env::args().any(|a| a == "--headless"));
 
     // Zuletzt protokollierte Verbindungsmeldung und der Bildzaehler dazu:
@@ -1650,7 +1725,19 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
     }
 }
 
+#[cfg(windows)]
 use ffmpeg_next as ffmpeg;
+
+/// Der Decoder und sein Fehler: unter Windows FFmpeg (NVDEC ueber cuvid,
+/// D3D11VA, Software), auf dem Mac VideoToolbox mit oder ohne Hardware.
+#[cfg(windows)]
+type Dekoder = ffmpeg::decoder::Video;
+#[cfg(windows)]
+type DekoderFehler = ffmpeg::Error;
+#[cfg(target_os = "macos")]
+type Dekoder = vt_decoder::Decoder;
+#[cfg(target_os = "macos")]
+type DekoderFehler = vt_decoder::Fehler;
 
 /// Rolle einer Karte im Menue: die dedizierten Karten in der Reihenfolge
 /// der Aufzaehlung (1 = "Grafikkarte", 2 = "Grafikkarte 2"), oder die
@@ -1731,12 +1818,18 @@ pub enum DecoderPfad {
     /// NVIDIA-Karte ueber die cuvid-Decoder von FFmpeg (hevc_cuvid, h264_cuvid),
     /// mit der LUID der Karte, auf der er laeuft - None, wenn sich das nicht
     /// sagen laesst. Damit unterscheidet `wunsch_passt` zwei NVIDIA-Karten.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Nvdec(Option<i64>),
     /// Direct3D 11 Video (D3D11VA) auf der Karte dieser Rolle - fuer AMD und
     /// Intel, nur 4:2:0 und H.264. Die Bilder kommen von der Karte in den
     /// Hauptspeicher (Kopierstufe).
+    #[cfg_attr(not(windows), allow(dead_code))]
     D3d11va(Rolle),
-    /// Der eingebaute Software-Decoder von FFmpeg auf der CPU.
+    /// Mac: VideoToolbox in der Media-Engine (Hardware, auch HEVC 4:4:4).
+    #[cfg_attr(windows, allow(dead_code))]
+    VideoToolbox,
+    /// Der Decoder auf der CPU: unter Windows der eingebaute von FFmpeg, auf
+    /// dem Mac VideoToolbox ohne Hardware.
     Software,
 }
 
@@ -1745,6 +1838,8 @@ impl DecoderPfad {
         match self {
             DecoderPfad::Nvdec(_) => "NVDEC".into(),
             DecoderPfad::D3d11va(r) => format!("D3D11VA ({})", r.name()),
+            DecoderPfad::VideoToolbox => "VideoToolbox".into(),
+            DecoderPfad::Software if cfg!(target_os = "macos") => "VideoToolbox (Software)".into(),
             DecoderPfad::Software => "Software".into(),
         }
     }
@@ -1757,9 +1852,10 @@ impl DecoderPfad {
 /// Ergebnis von `decoder_bauen`: der Decoder und alles, was man ueber ihn
 /// wissen will, um es anzuzeigen und ins Protokoll zu schreiben.
 struct DecoderBau {
-    decoder: ffmpeg::decoder::Video,
+    decoder: Dekoder,
     pfad: DecoderPfad,
-    /// FFmpeg-Name des Decoders, etwa "hevc_cuvid" oder "hevc".
+    /// FFmpeg-Name des Decoders, etwa "hevc_cuvid" oder "hevc" (auf dem Mac
+    /// "hevc" oder "h264").
     codec: &'static str,
     /// Warum es nicht die Karte wurde, obwohl sie gewuenscht war. None, wenn
     /// sie laeuft oder Software ausdruecklich gewuenscht war.
@@ -1811,7 +1907,7 @@ const DECODER_FORMAT_FEHLER: u8 = 3;
 
 impl DecoderBau {
     /// Frisch gebaut: noch kein Paket gesehen, kein Bild, kein Fehler.
-    fn neu(decoder: ffmpeg::decoder::Video, pfad: DecoderPfad, codec: &'static str, grund: Option<String>) -> Self {
+    fn neu(decoder: Dekoder, pfad: DecoderPfad, codec: &'static str, grund: Option<String>) -> Self {
         DecoderBau {
             decoder,
             pfad,
@@ -1877,6 +1973,7 @@ impl DecoderBau {
 /// Verzoegerung, die niemand sieht, weil die reine Rechenzeit klein bleibt.
 /// Fuer eine Fernsteuerung ist das der falsche Handel, deshalb ist
 /// Scheibenparallelitaet die Voreinstellung.
+#[cfg(windows)]
 fn software_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
     let id = if h264 { ffmpeg::codec::Id::H264 } else { ffmpeg::codec::Id::HEVC };
     let name = if h264 { "H.264" } else { "HEVC" };
@@ -1903,6 +2000,7 @@ fn software_decoder(h264: bool) -> Result<ffmpeg::decoder::Video, String> {
 /// `gpu`: CUDA-Ordnungszahl der Karte (Option "gpu" von cuvid, siehe
 /// `nvdec_ziel`). Ohne sie nimmt cuvid CUDA-Geraet 0 - bei zwei NVIDIA-Karten
 /// also nicht unbedingt die gewaehlte.
+#[cfg(windows)]
 fn nvdec_decoder(h264: bool, gpu: Option<i32>) -> Result<ffmpeg::decoder::Video, String> {
     let name = if h264 { "h264_cuvid" } else { "hevc_cuvid" };
     let codec = ffmpeg::decoder::find_by_name(name)
@@ -1954,11 +2052,6 @@ fn cuda_geraete() -> Result<&'static [Option<i64>], String> {
         Ok(g) => Ok(g.as_slice()),
         Err(e) => Err(e.clone()),
     }
-}
-
-#[cfg(not(windows))]
-fn cuda_geraete() -> Result<&'static [Option<i64>], String> {
-    Err("nur unter Windows".into())
 }
 
 #[cfg(windows)]
@@ -2019,6 +2112,7 @@ fn luid_aus_bytes(bytes: [u8; 8]) -> i64 {
 /// recht, wenn es ohnehin nur EINE NVIDIA-Karte gibt - dann ist sie die, und
 /// scheitert cuvid, sagt es selbst warum (etwa "Cannot load nvcuvid.dll").
 /// Bei zwei Karten gilt: lieber ehrlich auf Software als auf der falschen.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn nvdec_ziel(karte: &Karte, karten: &[Karte], cuda: Result<&[Option<i64>], String>) -> Result<Option<i32>, String> {
     let einzige = karten.iter().filter(|k| k.nvidia()).count() <= 1;
     match cuda {
@@ -2033,11 +2127,13 @@ fn nvdec_ziel(karte: &Karte, karten: &[Karte], cuda: Result<&[Option<i64>], Stri
 }
 
 /// Zuletzt protokollierte Zuordnung Karte (LUID) -> CUDA-Geraet.
+#[cfg(windows)]
 static NVDEC_GEMELDET: Mutex<Option<(i64, i32)>> = Mutex::new(None);
 
 /// Die Zuordnung "Karte ist CUDA-Geraet n" gehoert einmal ins Protokoll,
 /// nicht bei jedem Neubau des Decoders. true, wenn sie sich seit der letzten
 /// Meldung geaendert hat (und merkt sie sich dann).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn zuordnung_neu(gemeldet: &Mutex<Option<(i64, i32)>>, luid: i64, n: i32) -> bool {
     let mut g = gemeldet.lock().unwrap_or_else(|e| e.into_inner());
     if *g == Some((luid, n)) {
@@ -2051,6 +2147,7 @@ fn zuordnung_neu(gemeldet: &Mutex<Option<(i64, i32)>>, luid: i64, n: i32) -> boo
 /// Laesst sich das nicht sagen, aber es gibt nur eine NVIDIA-Karte, ist es
 /// die. So passt ein NVDEC aus der Automatik zum Wunsch nach genau dieser
 /// Karte, und der Wechsel dorthin baut nicht neu.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn nvdec_vorgabe(karten: &[Karte], cuda: Result<&[Option<i64>], String>) -> Option<i64> {
     match cuda {
         Ok(g) if !g.is_empty() => g[0],
@@ -2067,6 +2164,7 @@ fn nvdec_vorgabe(karten: &[Karte], cuda: Result<&[Option<i64>], String>) -> Opti
 /// Fehlercode von FFmpeg als Text - mit FFmpegs eigenen Worten dazu, falls
 /// es welche gab (die erste Warnung oder der erste Fehler seit dem letzten
 /// `fehler_verwerfen`).
+#[cfg(windows)]
 fn ffmpeg_grund(was: &str, code: i32) -> String {
     let worte = protokoll::fehler_abholen();
     match worte.first() {
@@ -2080,6 +2178,7 @@ fn ffmpeg_grund(was: &str, code: i32) -> String {
 /// angeboten, wenn die Karte das Profil nicht kann (4:4:4, oder ein Treiber
 /// ohne HEVC) - der Decoder rechnet dann auf der CPU weiter, und die
 /// Empfangsschleife merkt das am Format des ersten Bildes.
+#[cfg(windows)]
 unsafe extern "C" fn d3d11va_format(_ctx: *mut ffmpeg::sys::AVCodecContext, liste: *const ffmpeg::sys::AVPixelFormat) -> ffmpeg::sys::AVPixelFormat {
     use ffmpeg::sys::*;
     let mut p = liste;
@@ -2117,6 +2216,7 @@ unsafe extern "C" fn d3d11va_format(_ctx: *mut ffmpeg::sys::AVCodecContext, list
 /// WARP) - das ist der Fehlercode von av_hwdevice_ctx_create, samt FFmpegs
 /// Worten dazu. Ob der Treiber das Profil kann, zeigt sich erst am ersten
 /// Paket, ueber `d3d11va_format`.
+#[cfg(windows)]
 fn d3d11va_decoder(h264: bool, karte: &Karte) -> Result<ffmpeg::decoder::Video, String> {
     use ffmpeg::sys::*;
     let id = if h264 { ffmpeg::codec::Id::H264 } else { ffmpeg::codec::Id::HEVC };
@@ -2156,6 +2256,7 @@ fn d3d11va_decoder(h264: bool, karte: &Karte) -> Result<ffmpeg::decoder::Video, 
 /// Profil nicht, und FFmpeg hat auf der CPU weitergerechnet (siehe
 /// `d3d11va_format`) - dann ist der eingebaute Software-Decoder mit seinen
 /// Faeden die bessere Wahl, und der Aufrufer wechselt.
+#[cfg(windows)]
 fn d3d11va_holen(bilder: &mut [ffmpeg::frame::Video], von: usize) -> Result<(), String> {
     use ffmpeg::sys::*;
     for bild in bilder.iter_mut().skip(von) {
@@ -2185,22 +2286,34 @@ fn d3d11va_holen(bilder: &mut [ffmpeg::frame::Video], von: usize) -> Result<(), 
 /// Grund kommt es nicht, der muss in eine Zeile der Statistik passen.
 fn auf_software(bedarf: DecoderBedarf, grund: String) -> Result<DecoderBau, String> {
     protokoll::fehler_verwerfen();
-    let d = software_decoder(bedarf.h264)?;
+    let d = software_dekoder(bedarf.h264)?;
     let mut bau = DecoderBau::neu(d, DecoderPfad::Software, if bedarf.h264 { "h264" } else { "hevc" }, Some(grund));
     bau.chroma444 = bedarf.chroma444;
     Ok(bau)
 }
 
+/// Der Decoder auf der CPU: FFmpegs eingebauter mit seinen Faeden.
+#[cfg(windows)]
+fn software_dekoder(h264: bool) -> Result<Dekoder, String> {
+    software_decoder(h264)
+}
+
+/// Der Decoder auf der CPU: VideoToolbox ohne Hardware.
+#[cfg(target_os = "macos")]
+fn software_dekoder(h264: bool) -> Result<Dekoder, String> {
+    Ok(vt_decoder::Decoder::neu(h264, false))
+}
+
 /// Ein decodiertes Bild fuer das Protokoll beschreiben: Groesse und Format,
 /// so wie der Decoder sie liefert - was to_rgb gleich zu sehen bekommt.
-fn bild_beschreiben(codec: &str, bild: &ffmpeg::frame::Video) -> String {
+fn bild_beschreiben(codec: &str, bild: &impl Ebenenbild) -> String {
     format!(
-        "Erstes Bild aus {}: {}x{} {:?}, Zeilen {}/{}/{} Byte, Ebenen {}",
-        codec, bild.width(), bild.height(), bild.format(),
-        bild.stride(0),
-        if bild.planes() > 1 { bild.stride(1) } else { 0 },
-        if bild.planes() > 2 { bild.stride(2) } else { 0 },
-        bild.planes()
+        "Erstes Bild aus {}: {}x{} {}, Zeilen {}/{}/{} Byte, Ebenen {}",
+        codec, bild.breite(), bild.hoehe(), bild.format_name(),
+        bild.zeilenlaenge(0),
+        if bild.ebenenzahl() > 1 { bild.zeilenlaenge(1) } else { 0 },
+        if bild.ebenenzahl() > 2 { bild.zeilenlaenge(2) } else { 0 },
+        bild.ebenenzahl()
     )
 }
 
@@ -2211,11 +2324,13 @@ fn bild_beschreiben(codec: &str, bild: &ffmpeg::frame::Video) -> String {
 struct DecoderBedarf {
     h264: bool,
     chroma444: Option<bool>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     anzeige_adapter: Option<u32>,
 }
 
 /// D3D11VA auf dieser Karte versuchen - oder gleich Software, wenn der
 /// Strom 4:4:4 ist. Ergebnis: der fertige Bau, oder der Grund, warum nicht.
+#[cfg(windows)]
 fn d3d11va_bau(bedarf: DecoderBedarf, karte: &Karte) -> Result<DecoderBau, String> {
     let sw_name = if bedarf.h264 { "h264" } else { "hevc" };
     let pfad = DecoderPfad::D3d11va(karte.rolle);
@@ -2244,6 +2359,7 @@ fn d3d11va_bau(bedarf: DecoderBedarf, karte: &Karte) -> Result<DecoderBau, Strin
 /// D3D11VA. Software: gleich der eingebaute Decoder. Scheitert die Karte,
 /// wird Software gebaut und der Grund festgehalten - bei ausdruecklichem
 /// Kartenwunsch zeigt `decoder_melden` ihn auch als Fehler.
+#[cfg(windows)]
 fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) -> Result<DecoderBau, String> {
     use einstellungen::DecoderWunsch as W;
     let h264 = bedarf.h264;
@@ -2334,6 +2450,23 @@ fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) ->
     Ok(bau)
 }
 
+/// Decoder auf dem Mac: VideoToolbox in der Media-Engine - bei jedem Wunsch
+/// ausser Prozessor (Karten zum Waehlen gibt es dort nicht). Die Media-Engine
+/// kann HEVC 4:4:4 wie 4:2:0 und H.264, also braucht es keinen Blick auf
+/// den Strom. Ob sie diesen Strom wirklich kann, zeigt erst das erste Paket
+/// mit Parametersaetzen: dann entsteht die Sitzung, und scheitert sie, faellt
+/// die Empfangsschleife wie bei NVDEC auf den Prozessor zurueck
+/// (`auf_software`, VideoToolbox ohne Hardware).
+#[cfg(target_os = "macos")]
+fn decoder_bauen(bedarf: DecoderBedarf, wunsch: einstellungen::DecoderWunsch) -> Result<DecoderBau, String> {
+    let hardware = wunsch != einstellungen::DecoderWunsch::Software;
+    let pfad = if hardware { DecoderPfad::VideoToolbox } else { DecoderPfad::Software };
+    let codec = if bedarf.h264 { "h264" } else { "hevc" };
+    let mut bau = DecoderBau::neu(vt_decoder::Decoder::neu(bedarf.h264, hardware), pfad, codec, None);
+    bau.chroma444 = bedarf.chroma444;
+    Ok(bau)
+}
+
 /// Passt der laufende Decoder zu diesem Wunsch, so dass ein Neubau nichts
 /// aendern wuerde? Ein Neubau haelt das Bild bis zum naechsten
 /// Schluesselbild an - den gibt es nur, wenn er etwas bringen kann.
@@ -2360,7 +2493,7 @@ fn wunsch_passt_mit(wunsch: einstellungen::DecoderWunsch, pfad: DecoderPfad, kar
                     karte_mit(karten, rolle).map(|k| k.nvidia() && luid == Some(k.luid)).unwrap_or(false)
                 }
                 DecoderPfad::D3d11va(r) => r == rolle,
-                DecoderPfad::Software => false,
+                DecoderPfad::VideoToolbox | DecoderPfad::Software => false,
             }
         }
     }
@@ -2369,7 +2502,7 @@ fn wunsch_passt_mit(wunsch: einstellungen::DecoderWunsch, pfad: DecoderPfad, kar
 /// Muss der Decoder neu gebaut werden, weil die Strominfo jetzt sagt, ob
 /// der Strom 4:4:4 ist? Nur, wenn das an der Wahl etwas aendert: D3D11VA
 /// laeuft und der Strom ist 4:4:4 (geht nicht), oder Software laeuft nur
-/// wegen 4:4:4 und der Strom ist es nicht mehr.
+/// wegen 4:4:4 und der Strom ist es nicht mehr. VideoToolbox kann beides.
 fn chroma_erzwingt_neubau(bau: &DecoderBau, chroma444: bool) -> bool {
     if bau.chroma444 == Some(chroma444) {
         return false;
@@ -2377,7 +2510,7 @@ fn chroma_erzwingt_neubau(bau: &DecoderBau, chroma444: bool) -> bool {
     match bau.pfad {
         DecoderPfad::D3d11va(_) => chroma444,
         DecoderPfad::Software => bau.wegen_444 && !chroma444,
-        DecoderPfad::Nvdec(_) => false,
+        DecoderPfad::Nvdec(_) | DecoderPfad::VideoToolbox => false,
     }
 }
 
@@ -2464,6 +2597,7 @@ fn letzter_nal_typ(au: &[u8], h264: bool) -> Option<u8> {
 /// (wie ihn manche Encoder setzen) hilft dem letzten Bild nicht; deshalb
 /// hinten, und nur, wenn die Einheit nicht ohnehin mit einem endet. Fuer
 /// die Software-Decoder ohne Belang, die schliessen scheibenparallel ab.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn mit_aud(au: &[u8], h264: bool) -> std::borrow::Cow<'_, [u8]> {
     let (aud, typ): (&[u8], u8) = if h264 { (&AUD_H264, NAL_AUD_H264) } else { (&AUD_HEVC, NAL_AUD_HEVC) };
     if letzter_nal_typ(au, h264) == Some(typ) {
@@ -2477,8 +2611,15 @@ fn mit_aud(au: &[u8], h264: bool) -> std::borrow::Cow<'_, [u8]> {
 
 /// Ist das ein Fehler, der einen Hardware-Decoder als kaputt ausweist?
 /// EAGAIN heisst nur "gerade nichts da", EOF "fertig" - beides ist normal.
-fn decoder_defekt(e: &ffmpeg::Error) -> bool {
+#[cfg(windows)]
+fn decoder_defekt(e: &DekoderFehler) -> bool {
     !matches!(e, ffmpeg::Error::Other { errno: ffmpeg::util::error::EAGAIN } | ffmpeg::Error::Eof)
+}
+
+/// VideoToolbox kennt kein "gerade nichts da": jeder Fehler ist einer.
+#[cfg(target_os = "macos")]
+fn decoder_defekt(_e: &DekoderFehler) -> bool {
+    true
 }
 
 /// Die Zugangsphase nach "QCA1" (Spezifikation Pairing v1, 3.5): Nachricht
@@ -2880,12 +3021,15 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // Jeder Zugriffseinheit fuer NVDEC einen Begrenzer (AUD) anhaengen,
     // damit cuvids Parser das Bild sofort abschliesst - siehe `mit_aud`.
     // --ohne-aud laesst es zum Vergleich weg.
+    #[cfg(windows)]
     let aud_anhang = aud_gewuenscht();
     // Jedes H.264-SPS fuer NVDEC um ein VUI mit max_num_reorder_frames 0
     // ergaenzen, damit cuvids Parser keine Bilder fuer eine Umsortierung
     // zurueckhaelt, die es nicht gibt - siehe `sps.rs`. --ohne-vui laesst
     // es zum Vergleich weg. Das erste Umschreiben kommt ins Protokoll.
+    #[cfg(windows)]
     let vui_anhang = vui_gewuenscht();
+    #[cfg(windows)]
     let mut vui_gemeldet = false;
     // --mitschnitt datei.hevc (Pruefmodus): die Zugriffseinheiten roh in
     // eine Datei, ohne unsere Koepfe, ab dem ersten Vollbild - als Konserve
@@ -3177,6 +3321,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
                 // Nur auf dem NVDEC-Pfad; D3D11VA und Software bekommen
                 // die Einheit, wie sie kam.
+                #[cfg(windows)]
                 let mut packet = if matches!(bau.pfad, DecoderPfad::Nvdec(_)) {
                     // Erst das SPS (nur H.264, nur wenn eines drin ist -
                     // sonst keine Kopie), dann der AUD hinten dran.
@@ -3198,8 +3343,15 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 } else {
                     ffmpeg::Packet::copy(&payload)
                 };
-                packet.set_pts(Some(seq as i64));
-                packet.set_dts(None);
+                #[cfg(windows)]
+                {
+                    packet.set_pts(Some(seq as i64));
+                    packet.set_dts(None);
+                }
+                // VideoToolbox bekommt die Einheit, wie sie kam; der Umbau
+                // (Parametersaetze, Laengenpraefix) steckt im Decoder.
+                #[cfg(target_os = "macos")]
+                let packet = vt_decoder::Paket { daten: &payload, pts: seq as i64 };
                 // Decodieren, und zwar so, dass ein Hardware-Decoder, der
                 // nichts taugt, stumm durch Software ersetzt wird. Nichts
                 // taugen heisst: er scheitert, bevor er je ein Bild geliefert
@@ -3221,7 +3373,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // wenn dieses Paket ein Schluesselbild ist - alles andere ist
                 // fuer den frischen Decoder ohnehin wertlos. Im zweiten Anlauf
                 // laeuft Software, und die faellt nie zurueck.
-                let mut bilder: Vec<ffmpeg::frame::Video> = Vec::new();
+                let mut bilder: Vec<Dekoderbild> = Vec::new();
                 for _anlauf in 0..2 {
                     bau.paket();
                     let vorher = bilder.len();
@@ -3231,7 +3383,9 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // nicht - oder rechnet der Decoder in Wahrheit auf der
                     // CPU, weil der Treiber das Profil nicht kann -, taugt
                     // er so wenig wie ein cuvid, der Fehler wirft.
+                    #[cfg_attr(not(windows), allow(unused_mut))]
                     let mut holfehler: Option<String> = None;
+                    #[cfg(windows)]
                     if matches!(bau.pfad, DecoderPfad::D3d11va(_)) && bilder.len() > vorher {
                         if let Err(e) = d3d11va_holen(&mut bilder, vorher) {
                             bilder.truncate(vorher);
@@ -3290,25 +3444,25 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
                 // Das Format des letzten Bildes, bevor die Schleife die Bilder
                 // verbraucht - der Rueckfall unten will es nennen.
-                let letztes_format = bilder.last().map(|b| b.format());
+                let letztes_format = bilder.last().map(|b| b.format_name());
                 // Zeichnet die Karte, bleibt das Bild roh; einmal je Paket
                 // nachsehen reicht.
                 let gpu = shared.lock().unwrap().gpu_pfad;
                 for decoded in bilder.drain(..) {
-                    let pts = decoded.pts();
-                    let (w, h) = (decoded.width(), decoded.height());
+                    let pts = decoded.zeitstempel();
+                    let (w, h) = (decoded.breite(), decoded.hoehe());
                     // Das Format entscheidet der decodierte Frame selbst, nicht
                     // die Strominfo. Ein unbekanntes Format ergibt ein dunkles
                     // Bild und eine Meldung - nie einen Absturz.
                     // `bereit_us` ist die Client-Uhr bei der Ablage: ab hier
                     // zaehlt das Glied Anzeige, das der Fensterfaden misst.
-                    let (bild, fehler) = if gpu && ebenen_format(decoded.format()).is_some() {
+                    let (bild, fehler) = if gpu && decoded.ebenen().is_some() {
                         (Bild::Roh { bild: decoded, bereit_us: client_us() }, None)
                     } else {
                         match to_rgb(&decoded) {
                             Ok(f) => (Bild::Rgb(Frame { bereit_us: client_us(), ..f }), None),
                             Err(e) => {
-                                let m = Meldung::neu(strings::Key::ErrorPixelFormat, e).anhang(format!("{:?}", decoded.format()));
+                                let m = Meldung::neu(strings::Key::ErrorPixelFormat, e).anhang(decoded.format_name());
                                 (Bild::Rgb(Frame { bereit_us: client_us(), ..dunkles_bild(w, h) }), Some(m))
                             }
                         }
@@ -3397,7 +3551,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // bessere Wahl - der Grund nennt das Format, damit es in den
                 // Client eingebaut werden kann.
                 if bau.pfad.hardware() && bau.format_fehler >= DECODER_FORMAT_FEHLER {
-                    let format = letztes_format.map(|f| format!("{f:?}")).unwrap_or_default();
+                    let format = letztes_format.unwrap_or_default();
                     let grund = format!("{} ({}) liefert das Format {format}, das der Client nicht wandeln kann", bau.pfad.name(), bau.codec);
                     bau = auf_software(bedarf, grund).map_err(kein_decoder)?;
                     decoder_melden(shared, &bau, wunsch);
@@ -3936,6 +4090,7 @@ fn vormerk_takt(shared: &Mutex<Shared>) -> Option<Duration> {
 ///
 /// Ein EAGAIN beim Senden heisst bei den cuvid-Decodern: erst Bilder
 /// abholen, dann noch einmal senden. Das Paket geht dabei nicht verloren.
+#[cfg(windows)]
 fn decoder_fuettern(
     decoder: &mut ffmpeg::decoder::Video,
     packet: &ffmpeg::Packet,
@@ -3968,6 +4123,13 @@ fn decoder_fuettern(
     fehler
 }
 
+/// Dasselbe mit VideoToolbox: synchron, jedes Paket liefert sein Bild sofort
+/// (siehe vt_decoder.rs).
+#[cfg(target_os = "macos")]
+fn decoder_fuettern(decoder: &mut Dekoder, packet: &vt_decoder::Paket, bilder: &mut Vec<Dekoderbild>) -> Option<DekoderFehler> {
+    decoder.fuettern(packet.daten, packet.pts, bilder).err()
+}
+
 /// YUV nach RGB, BT.709, voller Wertebereich.
 ///
 /// Ganzzahlig in 16.16-Festkomma statt mit Kommazahlen, und zeilenweise auf
@@ -3990,6 +4152,9 @@ fn clamp8(v: i32) -> u32 {
 /// Die Anzeige braucht acht Bit: bei 10 Bit sind das die Bits 9..2, bei den
 /// oben buendigen 16-Bit-Werten die Bits 15..8 - fuer 10-Bit-Inhalt (Wert
 /// << 6) ist das dieselbe Zahl, nur ohne den Umweg ueber >> 6 und >> 2.
+///
+/// VideoToolbox liefert auch 4:4:4 mit Paaren (xf44, 444f: SUB=false,
+/// PAAR=true) - dieselbe Schleife, nur ohne Halbierung der Farbspalte.
 ///
 /// Bei 4:2:0 wird der naechstgelegene Farbwert genommen (Wiederholung) -
 /// einfach und schnell. Eine weichere Farbaufwertung ist eine spaetere
@@ -4027,7 +4192,9 @@ fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool>(out: &mut [u32],
 
 /// Aufbau der Ebenen eines Decoderformats. EINE Tabelle fuer `to_rgb` und -
 /// sobald die Karte umrechnet - fuer deren Texturen, damit beide dasselbe
-/// Format auf dieselbe Weise lesen.
+/// Format auf dieselbe Weise lesen. Unter Windows aus FFmpegs Pixelformat
+/// (`ebenen_format`), auf dem Mac aus dem Format des CVPixelBuffers
+/// (`vt_decoder::ebenen`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct EbenenFormat {
     /// 4:2:0: je zwei Bildpunkte in beiden Richtungen teilen sich einen Farbwert.
@@ -4035,7 +4202,8 @@ pub struct EbenenFormat {
     /// Breite der Werte: 8 (ein Byte), 10 (16 Bit LE, Wert in den unteren
     /// zehn Bit) oder 16 (16 Bit LE, Wert oben buendig).
     pub bits: u8,
-    /// U und V als Paare in EINER Ebene (NV12, P010, P012, P016).
+    /// U und V als Paare in EINER Ebene (NV12, P010, P012, P016; auf dem
+    /// Mac alle Formate von VideoToolbox, auch 4:4:4).
     pub paar: bool,
 }
 
@@ -4065,6 +4233,7 @@ impl EbenenFormat {
 /// meldeten; das bleibt fuer die mit dabei), NV12 (4:2:0 8 Bit, U/V
 /// verschraenkt) und P010LE/P012LE/P016LE (4:2:0 10/12/16 Bit, oben
 /// buendig, verschraenkt). Alles andere: None.
+#[cfg(windows)]
 pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
     use ffmpeg::format::Pixel;
     // (4:2:0, Bits je Wert, U/V als Paare in einer Ebene)
@@ -4097,20 +4266,20 @@ pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
 /// Codecwechsel waere jede Flagge fuer ein paar Bilder falsch, und der
 /// Hardware-Decoder liefert andere Formate als der Software-Decoder.
 ///
-/// Welche Formate gelesen werden, sagt `ebenen_format`; alles andere ist
-/// ein Fehler mit Meldung, kein Absturz. Alle Stroeme sind Vollbereich (der
-/// Host garantiert das), deshalb keine Bereichsdehnung.
-fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
-    let Some(fmt) = ebenen_format(src.format()) else {
-        return Err(format!("Unbekanntes Bildformat vom Decoder: {:?}", src.format()));
+/// Welche Formate gelesen werden, sagt `Ebenenbild::ebenen`; alles andere
+/// ist ein Fehler mit Meldung, kein Absturz. Alle Stroeme sind Vollbereich
+/// (der Host garantiert das), deshalb keine Bereichsdehnung.
+fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
+    let Some(fmt) = src.ebenen() else {
+        return Err(format!("Unbekanntes Bildformat vom Decoder: {}", src.format_name()));
     };
     let (sub, bits, paar) = (fmt.sub, fmt.bits, fmt.paar);
-    let w = src.width() as usize;
-    let h = src.height() as usize;
+    let w = src.breite() as usize;
+    let h = src.hoehe() as usize;
     if w == 0 || h == 0 {
         return Err("Decoder liefert ein leeres Bild".into());
     }
-    if src.planes() < if paar { 2 } else { 3 } {
+    if src.ebenenzahl() < if paar { 2 } else { 3 } {
         return Err("Decoder liefert zu wenige Bildebenen".into());
     }
     // Breite der Farbebenen: bei 4:2:0 die Haelfte, aufgerundet. Bei Paaren
@@ -4119,12 +4288,12 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
     let ch = if sub { (h + 1) / 2 } else { h };
     let bpp = fmt.bpp() as usize;
     let cbreite = if paar { cw * 2 * bpp } else { cw * bpp };
-    let yp = src.data(0);
-    let up = src.data(1);
-    let vp = if paar { up } else { src.data(2) };
-    let ys = src.stride(0);
-    let us = src.stride(1);
-    let vs = if paar { us } else { src.stride(2) };
+    let yp = src.daten(0);
+    let up = src.daten(1);
+    let vp = if paar { up } else { src.daten(2) };
+    let ys = src.zeilenlaenge(0);
+    let us = src.zeilenlaenge(1);
+    let vs = if paar { us } else { src.zeilenlaenge(2) };
     // Reichen die Ebenen fuer das, was gleich gelesen wird? Sonst waere das
     // Zerlegen unten ein Absturz mitten im Empfangsfaden.
     if yp.len() < (h - 1) * ys + w * bpp
@@ -4150,13 +4319,90 @@ fn to_rgb(src: &ffmpeg::frame::Video) -> Result<Frame, String> {
             (true, 10, false) => zeile_rgb::<true, 10, false>(out, yr, ur, vr),
             (true, 8, true) => zeile_rgb::<true, 8, true>(out, yr, ur, vr),
             (true, _, true) => zeile_rgb::<true, 16, true>(out, yr, ur, vr),
-            // 4:4:4 mit Paaren und 4:2:0 planar 16 Bit erzeugt die Tabelle
-            // oben nie; der Arm steht nur fuer die Vollstaendigkeit.
+            // 4:4:4 mit Paaren: nur VideoToolbox (444f, xf44).
+            (false, 8, true) => zeile_rgb::<false, 8, true>(out, yr, ur, vr),
+            (false, _, true) => zeile_rgb::<false, 16, true>(out, yr, ur, vr),
+            // 4:2:0 planar 16 Bit erzeugt keine der Tabellen; der Arm steht
+            // nur fuer die Vollstaendigkeit.
             _ => {}
         }
     });
 
     Ok(Frame { width: w as u32, height: h as u32, pixels, bereit_us: 0 })
+}
+
+/// Was `to_rgb` und die Protokollzeilen von einem decodierten Bild brauchen:
+/// Masse, Bildnummer, Ebenenaufbau und die Ebenen selbst - unter Windows
+/// von FFmpegs Frame, auf dem Mac vom CVPixelBuffer aus VideoToolbox.
+trait Ebenenbild {
+    fn breite(&self) -> u32;
+    fn hoehe(&self) -> u32;
+    /// Die Bildnummer, die mit dem Paket hineinging.
+    fn zeitstempel(&self) -> Option<i64>;
+    /// Der Aufbau der Ebenen; None fuer ein Format, das der Client nicht liest.
+    fn ebenen(&self) -> Option<EbenenFormat>;
+    /// Das Format, wie der Decoder es nennt, fuer Meldungen und Protokoll.
+    fn format_name(&self) -> String;
+    fn ebenenzahl(&self) -> usize;
+    /// Die Bytes einer Ebene (Zeilen im Abstand `zeilenlaenge`).
+    fn daten(&self, ebene: usize) -> &[u8];
+    fn zeilenlaenge(&self, ebene: usize) -> usize;
+}
+
+#[cfg(windows)]
+impl Ebenenbild for ffmpeg::frame::Video {
+    fn breite(&self) -> u32 {
+        self.width()
+    }
+    fn hoehe(&self) -> u32 {
+        self.height()
+    }
+    fn zeitstempel(&self) -> Option<i64> {
+        self.pts()
+    }
+    fn ebenen(&self) -> Option<EbenenFormat> {
+        ebenen_format(self.format())
+    }
+    fn format_name(&self) -> String {
+        format!("{:?}", self.format())
+    }
+    fn ebenenzahl(&self) -> usize {
+        self.planes()
+    }
+    fn daten(&self, ebene: usize) -> &[u8] {
+        self.data(ebene)
+    }
+    fn zeilenlaenge(&self, ebene: usize) -> usize {
+        self.stride(ebene)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Ebenenbild for vt_decoder::Bild {
+    fn breite(&self) -> u32 {
+        vt_decoder::Bild::breite(self)
+    }
+    fn hoehe(&self) -> u32 {
+        vt_decoder::Bild::hoehe(self)
+    }
+    fn zeitstempel(&self) -> Option<i64> {
+        Some(self.pts())
+    }
+    fn ebenen(&self) -> Option<EbenenFormat> {
+        vt_decoder::ebenen(self.format())
+    }
+    fn format_name(&self) -> String {
+        vt_decoder::fourcc_text(self.format())
+    }
+    fn ebenenzahl(&self) -> usize {
+        vt_decoder::Bild::ebenenzahl(self)
+    }
+    fn daten(&self, ebene: usize) -> &[u8] {
+        vt_decoder::Bild::daten(self, ebene)
+    }
+    fn zeilenlaenge(&self, ebene: usize) -> usize {
+        vt_decoder::Bild::zeilenlaenge(self, ebene)
+    }
 }
 
 /// Flaches dunkles Bild in Fenstergrundfarbe - was gezeigt wird, wenn das
@@ -7987,7 +8233,7 @@ impl App {
                 // dann einmal auf dem Fensterfaden wandeln.
                 Bild::Roh { bild, bereit_us } => Frame {
                     bereit_us,
-                    ..to_rgb(&bild).unwrap_or_else(|_| dunkles_bild(bild.width(), bild.height()))
+                    ..to_rgb(&bild).unwrap_or_else(|_| dunkles_bild(bild.breite(), bild.hoehe()))
                 },
             });
             self.fps_count += 1;
@@ -9215,33 +9461,35 @@ fn start_screen(
         }
     }
 
-    // Fussleiste: Oben die Urheberzeile mit Projektseite und FFmpeg-Hinweis,
-    // darunter Version, Tastenhinweise und die Sprache (Klick oeffnet die Wahl).
-    // Passt die Urheberzeile nicht in eine Zeile, steht der FFmpeg-Hinweis
-    // in einer eigenen Zeile darunter, und die Trennlinie rueckt nach oben.
+    // Fussleiste: Oben die Urheberzeile mit Projektseite und FFmpeg-Hinweis
+    // (nur unter Windows), darunter Version, Tastenhinweise und die Sprache
+    // (Klick oeffnet die Wahl). Passt die Urheberzeile nicht in eine Zeile,
+    // steht der FFmpeg-Hinweis in einer eigenen Zeile darunter, und die
+    // Trennlinie rueckt nach oben.
     let fy2 = c.h as i32 - 22;
     {
         let cw = u.text.width(COPYRIGHT, 11, 2);
         let ww_ = u.text.width(WEBSITE, 11, 2);
-        let fw = u.text.width(FFMPEG_HINWEIS, 11, 2);
+        let hinweis = FFMPEG_HINWEIS.unwrap_or("");
+        let fw = if hinweis.is_empty() { 0 } else { u.text.width(hinweis, 11, 2) };
         let luecke = 22;
-        let einzeilig = cw + luecke + ww_ + luecke + fw <= c.w as i32 - 40;
-        let gesamt = cw + luecke + ww_ + if einzeilig { luecke + fw } else { 0 };
+        let einzeilig = hinweis.is_empty() || cw + luecke + ww_ + luecke + fw <= c.w as i32 - 40;
+        let gesamt = cw + luecke + ww_ + if einzeilig && !hinweis.is_empty() { luecke + fw } else { 0 };
         let x0 = cx - gesamt / 2;
         // Eigene Zeile(n): in sehr schmalen Fenstern umgebrochen statt
         // links und rechts abgeschnitten.
         let hinweis_zeilen = if einzeilig {
             Vec::new()
         } else if fw <= c.w as i32 - 40 {
-            vec![FFMPEG_HINWEIS.to_string()]
+            vec![hinweis.to_string()]
         } else {
-            umbruch(u, FFMPEG_HINWEIS, c.w as i32 - 40, 11)
+            umbruch(u, hinweis, c.w as i32 - 40, 11)
         };
         let n = hinweis_zeilen.len() as i32;
         let wy = if einzeilig { fy2 - 16 } else { fy2 - 31 - (n - 1) * 14 };
         c.hline(0, wy - 22, c.w as i32, ui::CYAN, 30);
-        if einzeilig {
-            u.text.draw(c, x0 + cw + luecke + ww_ + luecke, wy, FFMPEG_HINWEIS, 11, ui::DIM, 2);
+        if einzeilig && !hinweis.is_empty() {
+            u.text.draw(c, x0 + cw + luecke + ww_ + luecke, wy, hinweis, 11, ui::DIM, 2);
         }
         let abstand = if n > 1 { 1 } else { 2 };
         for (i, z) in hinweis_zeilen.iter().enumerate() {
@@ -10290,6 +10538,127 @@ fn verknuepfung_befehlszeile(a: Result<verknuepfung::Aufruf, String>) -> i32 {
     }
 }
 
+/// --decodertest unter Windows: die Karten, die CUDA-Geraete, das
+/// D3D11-Geraet je Adapter und je Codec und Wunsch der Decoder, der
+/// herauskommt.
+#[cfg(windows)]
+fn decodertest() {
+    if let Err(e) = ffmpeg::init() {
+        println!("FFmpeg-Start fehlgeschlagen: {e}");
+        return;
+    }
+    protokoll::einschalten(true);
+    use einstellungen::DecoderWunsch as W;
+    // Erst die Erkennung - ihre Zeilen stehen im Protokoll.
+    let anzahl = karten().len();
+    for z in protokoll::abholen() {
+        println!("{z}");
+    }
+    println!("Karten mit Rolle: {anzahl}");
+    // Welche Karte hinter welcher CUDA-Ordnungszahl steht - die Zahl,
+    // die cuvid als "gpu" bekommt (siehe nvdec_ziel).
+    match cuda_geraete() {
+        Ok(g) => {
+            for (n, l) in g.iter().enumerate() {
+                let karte = l.and_then(|l| karten().iter().find(|k| k.luid == l));
+                println!("CUDA-Geraet {n}: {}", karte.map(|k| k.name.as_str()).unwrap_or("ohne Gegenstueck bei DXGI"));
+            }
+        }
+        Err(e) => println!("CUDA-Geraete: {e}"),
+    }
+    // Das D3D11-Geraet von FFmpeg auf jedem Adapter probieren, auch auf
+    // WARP - so sieht man auf einer Maschine ohne Karte, mit welchen
+    // Worten av_hwdevice_ctx_create scheitert.
+    #[cfg(windows)]
+    if let Ok(liste) = anzeige::adapter_liste() {
+        for (i, a) in liste.iter().enumerate() {
+            let geraet = std::ffi::CString::new(i.to_string()).unwrap();
+            protokoll::fehler_verwerfen();
+            let mut hw: *mut ffmpeg::sys::AVBufferRef = std::ptr::null_mut();
+            let r = unsafe {
+                ffmpeg::sys::av_hwdevice_ctx_create(&mut hw, ffmpeg::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, geraet.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            if r < 0 {
+                println!("D3D11VA-Geraet auf Adapter {i} ({}): {}", a.name, ffmpeg_grund("scheitert", r));
+            } else {
+                println!("D3D11VA-Geraet auf Adapter {i} ({}): ok", a.name);
+                unsafe { ffmpeg::sys::av_buffer_unref(&mut hw) };
+            }
+            for z in protokoll::abholen() {
+                println!("    {z}");
+            }
+        }
+    }
+    for (h264, codec) in [(false, "HEVC"), (true, "H.264")] {
+        for chroma444 in [Some(true), Some(false)] {
+            if h264 && chroma444 == Some(true) {
+                continue;
+            }
+            for w in [W::Automatik, W::Software, W::Gpu, W::Gpu2, W::Integriert] {
+                let bedarf = DecoderBedarf { h264, chroma444, anzeige_adapter: None };
+                let was = format!("{codec}{} / Wunsch {}", if chroma444 == Some(true) { " 4:4:4" } else if !h264 { " 4:2:0" } else { "" }, w.schluessel());
+                match decoder_bauen(bedarf, w) {
+                    Ok(bau) => println!("{was}: {}", bau.meldung()),
+                    Err(e) => println!("{was}: Fehler: {e}"),
+                }
+                for z in protokoll::abholen() {
+                    println!("    {z}");
+                }
+            }
+        }
+    }
+}
+
+/// --decodertest auf dem Mac: der Hardware-Encoder codiert eine kurze Probe
+/// (HEVC Main 4:4:4 10, 1920x1080, das Muster aus vt_decoder::probe), und
+/// VideoToolbox decodiert sie mit und ohne Hardware - je Weg die Zeile der
+/// Sitzung, das Format des Ergebnisses und die Zeit je Bild. Startet weder
+/// Host noch Aufnahme.
+#[cfg(target_os = "macos")]
+fn decodertest() {
+    protokoll::einschalten(true);
+    let (breite, hoehe, anzahl) = (1920, 1080, 60);
+    let probe = match vt_decoder::probe::hevc_444_10(breite, hoehe, anzahl) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Probe HEVC 4:4:4 10 {breite}x{hoehe}: {e}");
+            return;
+        }
+    };
+    println!("Probe: {} Bilder HEVC Main 4:4:4 10 {breite}x{hoehe} aus dem Hardware-Encoder", probe.einheiten.len());
+    for (hardware, weg) in [(true, "Hardware"), (false, "Prozessor")] {
+        let mut d = vt_decoder::Decoder::neu(false, hardware);
+        let mut bilder = Vec::new();
+        let mut zahl = 0usize;
+        let t0 = Instant::now();
+        let mut fehler = None;
+        for (i, au) in probe.einheiten.iter().enumerate() {
+            if let Err(e) = d.fuettern(au, i as i64, &mut bilder) {
+                fehler = Some(format!("Paket {i}: {e}"));
+                break;
+            }
+            // Wie im Empfangsfaden bleibt nur das neueste Bild; die anderen
+            // gehen gleich an den Pufferpool des Decoders zurueck.
+            zahl += bilder.len();
+            if bilder.len() > 1 {
+                bilder.drain(..bilder.len() - 1);
+            }
+        }
+        let ms = t0.elapsed().as_secs_f32() * 1000.0 / probe.einheiten.len() as f32;
+        for z in protokoll::abholen() {
+            println!("    {z}");
+        }
+        match (fehler, bilder.last()) {
+            (Some(e), _) => println!("VideoToolbox {weg}: {e}"),
+            (None, Some(b)) => {
+                let umrechnung = to_rgb(b).map(|f| format!("to_rgb {}x{} ok", f.width, f.height)).unwrap_or_else(|e| format!("to_rgb: {e}"));
+                println!("VideoToolbox {weg}: {zahl} Bilder, {ms:.2} ms je Bild, Ausgabe {} ({umrechnung})", b.format_name());
+            }
+            (None, None) => println!("VideoToolbox {weg}: kein Bild"),
+        }
+    }
+}
+
 fn main() {
     // An die Konsole des Aufrufers anhaengen, falls es eine gibt. Beim
     // Doppelklick gibt es keine, dann passiert hier einfach nichts.
@@ -10381,72 +10750,11 @@ fn main() {
     // Decoderwahl ohne Verbindung pruefen: --decodertest baut fuer HEVC und
     // H.264 je einen Decoder mit jedem Wunsch und sagt, was herauskam. So
     // laesst sich der Rueckfall auf Software auch auf einer Maschine ohne
-    // NVIDIA-Karte pruefen, ohne einen Host zu belaestigen.
+    // NVIDIA-Karte pruefen, ohne einen Host zu belaestigen. Auf dem Mac
+    // decodiert VideoToolbox eine Probe des Hardware-Encoders (siehe
+    // `decodertest`).
     if std::env::args().any(|a| a == "--decodertest") {
-        if let Err(e) = ffmpeg::init() {
-            println!("FFmpeg-Start fehlgeschlagen: {e}");
-            return;
-        }
-        protokoll::einschalten(true);
-        use einstellungen::DecoderWunsch as W;
-        // Erst die Erkennung - ihre Zeilen stehen im Protokoll.
-        let anzahl = karten().len();
-        for z in protokoll::abholen() {
-            println!("{z}");
-        }
-        println!("Karten mit Rolle: {anzahl}");
-        // Welche Karte hinter welcher CUDA-Ordnungszahl steht - die Zahl,
-        // die cuvid als "gpu" bekommt (siehe nvdec_ziel).
-        match cuda_geraete() {
-            Ok(g) => {
-                for (n, l) in g.iter().enumerate() {
-                    let karte = l.and_then(|l| karten().iter().find(|k| k.luid == l));
-                    println!("CUDA-Geraet {n}: {}", karte.map(|k| k.name.as_str()).unwrap_or("ohne Gegenstueck bei DXGI"));
-                }
-            }
-            Err(e) => println!("CUDA-Geraete: {e}"),
-        }
-        // Das D3D11-Geraet von FFmpeg auf jedem Adapter probieren, auch auf
-        // WARP - so sieht man auf einer Maschine ohne Karte, mit welchen
-        // Worten av_hwdevice_ctx_create scheitert.
-        #[cfg(windows)]
-        if let Ok(liste) = anzeige::adapter_liste() {
-            for (i, a) in liste.iter().enumerate() {
-                let geraet = std::ffi::CString::new(i.to_string()).unwrap();
-                protokoll::fehler_verwerfen();
-                let mut hw: *mut ffmpeg::sys::AVBufferRef = std::ptr::null_mut();
-                let r = unsafe {
-                    ffmpeg::sys::av_hwdevice_ctx_create(&mut hw, ffmpeg::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, geraet.as_ptr(), std::ptr::null_mut(), 0)
-                };
-                if r < 0 {
-                    println!("D3D11VA-Geraet auf Adapter {i} ({}): {}", a.name, ffmpeg_grund("scheitert", r));
-                } else {
-                    println!("D3D11VA-Geraet auf Adapter {i} ({}): ok", a.name);
-                    unsafe { ffmpeg::sys::av_buffer_unref(&mut hw) };
-                }
-                for z in protokoll::abholen() {
-                    println!("    {z}");
-                }
-            }
-        }
-        for (h264, codec) in [(false, "HEVC"), (true, "H.264")] {
-            for chroma444 in [Some(true), Some(false)] {
-                if h264 && chroma444 == Some(true) {
-                    continue;
-                }
-                for w in [W::Automatik, W::Software, W::Gpu, W::Gpu2, W::Integriert] {
-                    let bedarf = DecoderBedarf { h264, chroma444, anzeige_adapter: None };
-                    let was = format!("{codec}{} / Wunsch {}", if chroma444 == Some(true) { " 4:4:4" } else if !h264 { " 4:2:0" } else { "" }, w.schluessel());
-                    match decoder_bauen(bedarf, w) {
-                        Ok(bau) => println!("{was}: {}", bau.meldung()),
-                        Err(e) => println!("{was}: Fehler: {e}"),
-                    }
-                    for z in protokoll::abholen() {
-                        println!("    {z}");
-                    }
-                }
-            }
-        }
+        decodertest();
         return;
     }
 
@@ -11900,7 +12208,8 @@ fn hud(
                 let tips_decoder: Vec<(strings::Key, Option<String>)> = knoepfe
                     .iter()
                     .map(|(wahl, _, karte)| match wahl {
-                        RollenWahl::Automatik => (TipDecoderAuto, None),
+                        // Auf dem Mac decodiert VideoToolbox (vt_decoder.rs).
+                        RollenWahl::Automatik => (if cfg!(target_os = "macos") { TipDecoderAutoMac } else { TipDecoderAuto }, None),
                         RollenWahl::Gpu | RollenWahl::Gpu2 => {
                             // Nur NVIDIA decodiert 4:4:4 (NVDEC); alle anderen
                             // gehen ueber D3D11VA, und das kann nur 4:2:0.
@@ -12357,6 +12666,33 @@ mod tests {
         assert_eq!(letzter_nal_typ(&[0, 0, 0, 1, 0x09, 0xF0], true), Some(9));
         assert_eq!(letzter_nal_typ(&[0, 0, 0, 1, 0x26, 0x01, 0x11, 0, 0, 1, 0x02, 0x01], false), Some(1));
         assert_eq!(letzter_nal_typ(&[1, 2, 3], false), None);
+    }
+
+    /// Der Decoder-Unterbau fuer die Sitzungstests: FFmpeg unter Windows;
+    /// VideoToolbox (Mac) braucht keinen Start.
+    fn decoder_bereit() {
+        #[cfg(windows)]
+        ffmpeg::init().unwrap();
+    }
+
+    /// Kann dieser Rechner die Bilder der Scheinhosts decodieren? Unter
+    /// Windows immer (FFmpeg). Auf dem Mac nur, wenn VideoToolbox erreichbar
+    /// ist - etwa in einer Sandbox ohne Zugang zu seinen Diensten nicht;
+    /// dann uebergehen die Tests, die Bilder zaehlen, sich selbst.
+    fn decodieren_moeglich() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let mut d = vt_decoder::Decoder::neu(true, false);
+            let mut b = Vec::new();
+            match d.fuettern(&hex(BILD_64X64), 0, &mut b) {
+                Ok(()) if !b.is_empty() => {}
+                r => {
+                    eprintln!("uebersprungen: VideoToolbox decodiert das Probebild nicht ({r:?})");
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Ein gemeinsamer Schluessel fuer die Schein-Hosts auf 127.0.0.1 (aus
@@ -13462,7 +13798,7 @@ mod tests {
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicBool, Ordering};
         secure::test_identitaet();
-        ffmpeg::init().unwrap();
+        decoder_bereit();
         let (host_priv, _) = test_host();
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
@@ -13600,7 +13936,10 @@ mod tests {
     #[test]
     fn strominfo_mit_neuer_groesse_baut_den_decoder_neu() {
         secure::test_identitaet();
-        ffmpeg::init().unwrap();
+        decoder_bereit();
+        if !decodieren_moeglich() {
+            return;
+        }
         let (addr, tx) = scheinhost_bild();
         let (shared, _input, ende) = sitzung_starten(&addr);
         let frist = Duration::from_secs(10);
@@ -13656,7 +13995,7 @@ mod tests {
     #[test]
     fn bildschirme_ueber_die_sitzung() {
         secure::test_identitaet();
-        ffmpeg::init().unwrap();
+        decoder_bereit();
         let (addr, tx) = scheinhost_bild();
         let shared_vor = Shared {
             decoder_wunsch: einstellungen::DecoderWunsch::Software,
@@ -14495,7 +14834,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         secure::test_identitaet();
-        ffmpeg::init().unwrap();
+        decoder_bereit();
         let (host_priv, _) = test_host();
         let bild_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let eingabe_l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -14720,7 +15059,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         secure::test_identitaet();
-        ffmpeg::init().unwrap();
+        decoder_bereit();
         let (host_priv, _) = test_host();
         let bild_l = TcpListener::bind("127.0.0.1:0").unwrap();
         let eingabe_l = TcpListener::bind("127.0.0.1:0").unwrap();

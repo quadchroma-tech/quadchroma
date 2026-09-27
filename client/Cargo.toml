@@ -24,7 +24,6 @@ winit = "0.30"
 softbuffer = "0.4"
 rayon = "1.10"
 fontdue = "0.9"
-ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format"] }
 snow = { version = "0.10", default-features = false, features = [
     "default-resolver",
     "use-curve25519",
@@ -41,6 +40,9 @@ lto = "thin"
 codegen-units = 1
 
 [target.'cfg(windows)'.dependencies]
+# Decoder of the Windows client and encoder of the host role. The Mac client
+# decodes with VideoToolbox (src/vt_decoder.rs) and needs no FFmpeg.
+ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
