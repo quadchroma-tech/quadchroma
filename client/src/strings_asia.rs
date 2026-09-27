@@ -251,6 +251,7 @@ pub static RU: Lang = Lang {
         (MsgHostQuit, "Компьютер {n} закрыл QuadChroma."),
         (MsgHostSharingOff, "Компьютер {n} прекратил предоставлять доступ."),
         (MsgHostRemovedYou, "Компьютер {n} удалил это устройство."),
+        (MsgSelf, "Это и есть этот компьютер."),
     ],
 };
 
@@ -501,6 +502,7 @@ pub static ZH: Lang = Lang {
         (MsgHostQuit, "{n} 已关闭 QuadChroma。"),
         (MsgHostSharingOff, "{n} 已停止共享。"),
         (MsgHostRemovedYou, "{n} 已移除此设备。"),
+        (MsgSelf, "这就是这台电脑。"),
     ],
 };
 
@@ -751,6 +753,7 @@ pub static JA: Lang = Lang {
         (MsgHostQuit, "{n} で QuadChroma が終了しました。"),
         (MsgHostSharingOff, "{n} が共有を停止しました。"),
         (MsgHostRemovedYou, "{n} がこのデバイスを削除しました。"),
+        (MsgSelf, "これはこのコンピューターです。"),
     ],
 };
 
@@ -999,5 +1002,6 @@ pub static TR: Lang = Lang {
         (MsgHostQuit, "{n} QuadChroma'yı kapattı."),
         (MsgHostSharingOff, "{n} paylaşımı durdurdu."),
         (MsgHostRemovedYou, "{n} bu cihazı kaldırdı."),
+        (MsgSelf, "Bu zaten bu bilgisayar."),
     ],
 };

@@ -437,6 +437,9 @@ pub enum Key {
     /// Meldung (MSG_HOST_ENDE, Grund 2): {n} Name des Hosts - er hat dieses
     /// Geraet waehrend der Sitzung aus seiner Liste entfernt; kein Neuversuch.
     MsgHostRemovedYou,
+    /// Meldung: das Ziel ist dieser Rechner selbst (sein Schluessel ist der
+    /// eigene host.key) - kein Verbinden zu sich selbst.
+    MsgSelf,
 }
 
 pub struct Lang {
@@ -708,6 +711,7 @@ pub static EN: Lang = Lang {
         (MsgHostQuit, "{n} was closed."),
         (MsgHostSharingOff, "{n} stopped sharing."),
         (MsgHostRemovedYou, "{n} removed this device."),
+        (MsgSelf, "This is this computer."),
     ],
 };
 
@@ -956,6 +960,7 @@ pub static DE: Lang = Lang {
         (MsgHostQuit, "{n} wurde beendet."),
         (MsgHostSharingOff, "{n} hat die Freigabe beendet."),
         (MsgHostRemovedYou, "{n} hat dieses Gerät entfernt."),
+        (MsgSelf, "Das ist dieser Computer."),
     ],
 };
 
@@ -1001,8 +1006,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > MsgHostRemovedYou as usize);
-        assert_eq!(n, MsgHostRemovedYou as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > MsgSelf as usize);
+        assert_eq!(n, MsgSelf as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die kaputte Schluesseldatei: in jeder Sprache mit genau einem Pfad
@@ -1398,6 +1403,24 @@ mod tests {
             let t = DE.get(k);
             assert!(!t.contains('"') && !t.contains("Geraet"), "{k:?}: {t}");
         }
+    }
+
+    /// "Das ist dieser Computer." (Selbstschutz): gleich hinter den
+    /// Abschiedstexten, in jeder Tabelle ohne Platzhalter, ein Satz mit
+    /// Schlusszeichen, eigene Worte je Sprache.
+    #[test]
+    fn selbst_text() {
+        assert_eq!(MsgSelf as usize, MsgHostRemovedYou as usize + 1);
+        for l in all() {
+            let t = l.get(MsgSelf);
+            assert!(!t.contains('{') && !t.contains('}'), "{}: {t}", l.code);
+            assert!(t.ends_with('.') || t.ends_with('。'), "{}: {t}", l.code);
+            if l.code != "en" {
+                assert_ne!(t, EN.get(MsgSelf), "{}: noch englisch", l.code);
+            }
+        }
+        assert_eq!(EN.get(MsgSelf), "This is this computer.");
+        assert_eq!(DE.get(MsgSelf), "Das ist dieser Computer.");
     }
 
     /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der

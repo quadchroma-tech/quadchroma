@@ -177,13 +177,14 @@ static qc_drossel d_zugang_voll     = QC_DROSSEL("Zugang: kein Platz");
 static qc_drossel d_zugang_falsch   = QC_DROSSEL("Zugang: Passwort falsch");
 static qc_drossel d_zugang_abbruch  = QC_DROSSEL("Zugang: abgebrochen");
 static qc_drossel d_zugang_frist    = QC_DROSSEL("Zugang: Frist abgelaufen");
+static qc_drossel d_selbst          = QC_DROSSEL("Abgewiesen: eigener Schluessel");
 static qc_drossel d_ein_ohne_bild   = QC_DROSSEL("Eingabekanal abgewiesen: kein Bildkanal offen");
 static qc_drossel d_ein_handschlag  = QC_DROSSEL("Eingabekanal: Handschlag gescheitert");
 static qc_drossel d_ein_fremd       = QC_DROSSEL("Eingabekanal abgewiesen: andere Gegenstelle als beim Bild");
 static qc_drossel d_ton_verworfen   = QC_DROSSEL("Ton verworfen: Leitung langsamer als der Ton");
 static qc_drossel *const g_drosseln[] = {
     &d_bild_handschlag, &d_liste_defekt, &d_zugang, &d_zugang_voll, &d_zugang_falsch,
-    &d_zugang_abbruch, &d_zugang_frist,
+    &d_zugang_abbruch, &d_zugang_frist, &d_selbst,
     &d_ein_ohne_bild, &d_ein_handschlag, &d_ein_fremd, &d_ton_verworfen,
 };
 
@@ -1380,6 +1381,21 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     qc_fingerprint(chan->peer, fp);
     qc_sas(chan->hh, sas);
     qc_zugang_id_text(qc_zugang_id(chan->peer), id_text);
+
+    // Selbstschutz: der eigene Schluessel dieses Hosts ist dieser Rechner
+    // selbst - nie herein, auch nicht aus der Liste. "QCA1" und gleich 22/3
+    // wie ein Nein am Host (wie die Windows-Host-Rolle); ein neuer Client
+    // bricht schon nach Nachricht 2 ab ("Das ist dieser Computer.").
+    if (memcmp(chan->peer, g_id_pub, 32) == 0) {
+        uint8_t m[4 + QC_ZUGANG_ERGEBNIS_MAX];
+        memcpy(m, QC_ZUGANG_KENNUNG, 4);
+        size_t n = qc_zugang_ergebnis_kodieren(m + 4, sizeof m - 4, QC_ERGEBNIS_ABGELEHNT, 0, NULL);
+        zugang_senden(chan, m, 4 + n);
+        logf_gedrosselt(&d_selbst, ip, @"Abgewiesen: %s meldet sich mit dem eigenen Schluessel dieses Hosts - Verbindung zu sich selbst", ip);
+        qc_chan_free(chan);
+        close(fd);
+        return;
+    }
 
     // Wer ist das? Der Name kommt aus Nachricht 3 (unbeglaubigt, nur
     // Anzeige; einer, der eine ID vortaeuscht, zaehlt nicht), sonst aus der

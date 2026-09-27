@@ -658,7 +658,8 @@ impl Meldung {
     /// schreibbar - jeder Ausgang des Zugangs (Spezifikation Pairing v1,
     /// 9.6: abgelehnt, zu viele Versuche, keine Antwort, Host veraltet,
     /// Host-Beweis falsch, Host ohne Ausweis, anderes Geraet unter der ID,
-    /// ID nicht gefunden) - und der Abschied des Hosts (MSG_HOST_ENDE).
+    /// ID nicht gefunden) - der Abschied des Hosts (MSG_HOST_ENDE) und das
+    /// Ziel "dieser Rechner selbst".
     /// Dann verbindet der Empfangsfaden nicht alle 2 s neu, sondern nimmt das
     /// Ziel zurueck (wie bei einer Abloesung); der Startbildschirm zeigt die
     /// Meldung, und der Nutzer verbindet selbst wieder.
@@ -693,6 +694,7 @@ impl Meldung {
                     | MsgHostQuit
                     | MsgHostSharingOff
                     | MsgHostRemovedYou
+                    | MsgSelf
             )
     }
 
@@ -731,6 +733,7 @@ impl From<secure::Fehler> for Meldung {
                 Meldung::neu(FileNotWritable, protokoll).mit("{p}", pfad.display().to_string()).anhang(grund)
             }
             F::AnderesGeraet { .. } => Meldung::neu(MsgOtherDevice, protokoll),
+            F::EigenerHost { .. } => Meldung::neu(MsgSelf, protokoll),
             F::Adresse { addr, grund } => {
                 let m = Meldung::neu(ErrorAddress, protokoll).mit("{n}", addr);
                 match grund {
@@ -2427,7 +2430,15 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     let mut vorwissen =
         zugangsphase::Vorwissen::laden(&hosts_pfad, addr, ziel_id).map_err(|f| Meldung::from(secure::Fehler::from(f)))?;
     vorwissen.angenommen = angenommen;
+    // Selbstschutz: antwortet unter der Adresse dieser Rechner selbst (der
+    // Schluessel des Hosts ist unser eigener host.key), bricht der Client
+    // nach Nachricht 2 ab, bevor Nachricht 3 ihn zeigt - "Das ist dieser
+    // Computer.", kein Neuversuch.
+    let eigen = secure::eigener_host_schluessel();
     let mut sock = secure::Secure::connect_pruefend(addr, &noise::prologue_video(), |k| {
+        if eigen.as_deref() == Some(k) {
+            return Err(secure::Fehler::EigenerHost { addr: addr.to_string() });
+        }
         vorwissen.pruefen(k).map(|()| vorwissen.flags3(k))
     })?;
     shared.lock().unwrap().abbruch = sock.abbruchgriff();
@@ -6601,6 +6612,11 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
+        let eigene_id = secure::eigener_host_schluessel().map(|k| zugang::geraete_id(&k));
+        if let Some(m) = eigene_id_eingegeben(text, eigene_id) {
+            self.meldung_zeigen(m);
+            return;
+        }
         self.bekannte_nachladen(true);
         let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
         match ziel_aus_eingabe(text, &gefunden, &self.bekannte) {
@@ -8014,6 +8030,20 @@ fn ziel_bilden(adresse: &str, id: Option<u32>, gefunden: &[discovery::Gefunden],
         )
         .mit("{i}", zugang::id_text(id))),
     }
+}
+
+/// Selbstschutz beim Eintippen: ist die Eingabe die ID des Hosts auf diesem
+/// Rechner (`eigene`), gibt es statt einer Suche die Meldung "Das ist dieser
+/// Computer." - die eigene Bekanntgabe blendet die Liste ohnehin aus, man
+/// saehe sonst "nicht gefunden".
+fn eigene_id_eingegeben(text: &str, eigene: Option<u32>) -> Option<Meldung> {
+    let id = zugang::id_lesen(text)?;
+    (Some(id) == eigene).then(|| {
+        Meldung::neu(
+            strings::Key::MsgSelf,
+            format!("Verbinden: ID {} ist dieser Rechner selbst - kein Verbinden zu sich selbst", zugang::id_text(id)),
+        )
+    })
 }
 
 /// Was im Adressfeld steht: neun Ziffern (mit oder ohne Leerzeichen) sind
@@ -12019,6 +12049,75 @@ mod tests {
         fehler_verbuchen(&mut s, "10.0.0.5:9001", dauer.clone(), &mut gemeldet);
         assert_eq!(s.target, None);
         assert_eq!(s.error, Some(dauer));
+    }
+
+    /// Selbstschutz beim Eintippen: die eigene ID gibt "Das ist dieser
+    /// Computer.", mit oder ohne Leerzeichen; eine andere ID, eine Adresse
+    /// oder gar kein eigener Host nicht.
+    #[test]
+    fn eigene_id_eingetippt() {
+        let m = eigene_id_eingegeben("123 456 789", Some(123_456_789)).unwrap();
+        assert_eq!(m.key, strings::Key::MsgSelf);
+        assert!(m.dauerhaft());
+        assert_eq!(m.text(strings::pick("de")), "Das ist dieser Computer.");
+        assert!(eigene_id_eingegeben("123456789", Some(123_456_789)).is_some());
+        assert!(eigene_id_eingegeben("123 456 780", Some(123_456_789)).is_none());
+        assert!(eigene_id_eingegeben("10.0.0.5", Some(123_456_789)).is_none());
+        assert!(eigene_id_eingegeben("123 456 789", None).is_none());
+    }
+
+    /// Verbinden zu einem Host, dessen Schluessel unser eigener host.key ist
+    /// (dieser Rechner selbst): Abbruch nach Nachricht 2 - der Host sieht
+    /// Nachricht 3 nie, nimmt also niemanden an und loest niemanden ab -,
+    /// "Das ist dieser Computer." bleibt stehen, kein Neuversuch.
+    #[test]
+    fn verbinden_zu_sich_selbst_abgewiesen() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        secure::test_identitaet();
+        // Der eigene Host dieses Testlaufs: sein host.key liegt in der
+        // Testablage (nie der echte).
+        let (host_priv, host_pub) = secure::host_identity().unwrap();
+        assert_eq!(secure::eigener_host_schluessel(), Some(host_pub.clone()));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (verbindungen, nachricht3) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (v, n3) = (verbindungen.clone(), nachricht3.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(s) = s else { continue };
+                v.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut h) = secure::Secure::accept(s, &noise::prologue_video(), &host_priv) {
+                    n3.fetch_add(1, Ordering::SeqCst);
+                    let _ = h.write_all(MAGIC);
+                }
+            }
+        });
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        let t0 = Instant::now();
+        while shared.lock().unwrap().target.is_some() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(2500));
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.target.is_none(), "Ziel nicht zurueckgenommen");
+            let m = s.error.as_ref().expect("keine Meldung");
+            assert_eq!(m.key, strings::Key::MsgSelf, "{}", m.protokoll);
+            assert!(m.dauerhaft());
+            assert_eq!(s.sitzung_nr, 0);
+        }
+        assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden");
+        assert_eq!(nachricht3.load(Ordering::SeqCst), 0, "der Host hat Nachricht 3 gesehen");
     }
 
     /// Die Frist der Neuversuche als reine Buchfuehrung: eine Reihe ohne

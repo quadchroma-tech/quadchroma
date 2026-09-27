@@ -38,6 +38,10 @@ pub enum Fehler {
     /// anderer voller Schluessel gemerkt (`erwartet == gemeldet`: eine
     /// errechnete Kollision). Geprueft nach Nachricht 2, vor Nachricht 3.
     AnderesGeraet { addr: String, erwartet: u32, gemeldet: u32 },
+    /// Unter der Adresse antwortet dieser Rechner selbst: der Schluessel der
+    /// Gegenstelle ist der eigene host.key. Geprueft nach Nachricht 2, vor
+    /// Nachricht 3 - kein Verbinden zu sich selbst.
+    EigenerHost { addr: String },
     /// Die Adresse ergibt kein Ziel; `grund` ist der Wortlaut des Systems,
     /// None: aufgeloest, aber ohne eine einzige Adresse.
     Adresse { addr: String, grund: Option<String> },
@@ -75,6 +79,11 @@ impl std::fmt::Display for Fehler {
                 "An {addr} antwortet ein anderes Geraet (ID {} statt der gewaehlten {}) - Abbruch vor Nachricht 3",
                 crate::zugang::id_text(*gemeldet),
                 crate::zugang::id_text(*erwartet)
+            ),
+            Fehler::EigenerHost { addr } => write!(
+                f,
+                "An {addr} antwortet dieser Rechner selbst (Schluessel = eigener host.key) - Abbruch vor Nachricht 3, \
+                 kein Verbinden zu sich selbst"
             ),
             Fehler::Adresse { addr, grund: Some(g) } => write!(f, "Adresse {addr}: {g}"),
             Fehler::Adresse { addr, grund: None } => write!(f, "Adresse {addr} ergibt kein Ziel"),
@@ -686,6 +695,21 @@ pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("host.key"))
 }
 
+/// Der oeffentliche Schluessel des Hosts auf diesem Rechner, falls es ihn
+/// gibt: host.key im Ablageordner - von der Windows-Host-Rolle (64 Byte)
+/// oder vom Mac-Host (32 Byte) geschrieben. Nur gelesen, nie angelegt; fehlt
+/// die Datei oder taugt sie nicht, None. Fuer den Selbstschutz des Clients
+/// (eigene ID nicht in der Hostliste, kein Verbinden zu sich selbst).
+pub fn eigener_host_schluessel() -> Option<Vec<u8>> {
+    oeffentlich_lesen(&config_dir().ok()?.join("host.key"))
+}
+
+/// Der oeffentliche Teil einer Schluesseldatei, nur gelesen (None: fehlt,
+/// unlesbar, beschaedigt).
+fn oeffentlich_lesen(pfad: &Path) -> Option<Vec<u8>> {
+    schluessel_lesen(pfad).ok().flatten().map(|(_, oeff)| oeff)
+}
+
 /// Eigener Schluessel fuer Tests, einmal je Lauf angelegt. Nebeneinander
 /// laufende Tests legten sonst womoeglich zwei an, und einer hielte einen
 /// Schluessel in der Hand, der nicht mehr in der Datei steht.
@@ -945,6 +969,32 @@ mod tests {
             Err(Fehler::SchluesselBeschaedigt { pfad: p.clone(), laenge: 33 })
         );
         assert_eq!(std::fs::read(&p).unwrap(), [3u8; 33]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Der eigene Host-Schluessel wird nur gelesen (in einem eigenen Ordner
+    /// geprueft - host.key der Testablage gehoert verbinden_zu_sich_selbst):
+    /// fehlt die Datei, None, und nichts wird angelegt; liegt ein Schluessel
+    /// da (32 oder 64 Byte), kommt sein oeffentlicher Teil; ist sie
+    /// beschaedigt, None, und sie bleibt.
+    #[test]
+    fn eigener_host_schluessel_nur_gelesen() {
+        let d = ordner("eigen");
+        let p = d.join("host.key");
+        assert_eq!(oeffentlich_lesen(&p), None);
+        assert!(!p.exists(), "host.key angelegt");
+        let privat = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let oeff = hex32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        std::fs::write(&p, &privat).unwrap();
+        assert_eq!(oeffentlich_lesen(&p), Some(oeff.clone()));
+        assert_eq!(std::fs::read(&p).unwrap(), privat);
+        let mut beide = privat.clone();
+        beide.extend_from_slice(&oeff);
+        std::fs::write(&p, &beide).unwrap();
+        assert_eq!(oeffentlich_lesen(&p), Some(oeff));
+        std::fs::write(&p, [1u8; 40]).unwrap();
+        assert_eq!(oeffentlich_lesen(&p), None);
+        assert_eq!(std::fs::read(&p).unwrap(), [1u8; 40]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

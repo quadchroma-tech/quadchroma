@@ -3618,6 +3618,23 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     warten_bis(zugang_ruht, 2);
     qc_zugang_drossel_leeren();
 
+    printf("\n-- Zugang: eigener Schluessel (Selbstschutz)\n");
+    // Dieser Rechner selbst: auch als eingetragenes Geraet nie herein -
+    // "QCA1" und gleich 22/3, keine Anfrage, kein Zuschauer.
+    qc_zugang_eintragen(g_id_pub, "Ich");
+    stdout_stumm(1);
+    uint8_t se = 9;
+    uint32_t sw = 1;
+    int ok_selbst = zc_verbinden(&z, bild_port, g_id_priv, "Ich") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+                    zc_ergebnis(&z, &se, &sw, NULL, 2000) == 0 && zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    pruefe(ok_selbst && se == QC_ERGEBNIS_ABGELEHNT && atomic_load(&g_client_fd) < 0 &&
+           zeilen_mit(logpfad, "meldet sich mit dem eigenen Schluessel dieses Hosts") == 1,
+           "eigener Schluessel: QCA1 und gleich 22/3, kein Zuschauer, Zeile im Protokoll");
+    qc_zugang_geraet_entfernen(g_id_pub);
+    zc_zu(&z);
+    warten_bis(zugang_ruht, 2);
+
     printf("\n-- Zugang: Passwortdatei unlesbar\n");
     // Dann gibt es nur Zulassen (4.3). Ein Beweis ist kein Fehler des
     // Clients: 22/2 ohne Wartezeit, die Drossel bleibt, wie sie ist.

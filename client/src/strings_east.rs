@@ -248,6 +248,7 @@ pub static PL: Lang = Lang {
         (MsgHostQuit, "Komputer {n} zamknął QuadChroma."),
         (MsgHostSharingOff, "Komputer {n} wyłączył udostępnianie."),
         (MsgHostRemovedYou, "Komputer {n} usunął to urządzenie."),
+        (MsgSelf, "To jest ten komputer."),
     ],
 };
 
@@ -496,6 +497,7 @@ pub static CS: Lang = Lang {
         (MsgHostQuit, "Počítač {n} ukončil QuadChroma."),
         (MsgHostSharingOff, "Počítač {n} ukončil sdílení."),
         (MsgHostRemovedYou, "Počítač {n} odebral toto zařízení."),
+        (MsgSelf, "Toto je tento počítač."),
     ],
 };
 
@@ -744,6 +746,7 @@ pub static SK: Lang = Lang {
         (MsgHostQuit, "Počítač {n} ukončil QuadChroma."),
         (MsgHostSharingOff, "Počítač {n} ukončil zdieľanie."),
         (MsgHostRemovedYou, "Počítač {n} odstránil toto zariadenie."),
+        (MsgSelf, "Toto je tento počítač."),
     ],
 };
 
@@ -992,6 +995,7 @@ pub static HU: Lang = Lang {
         (MsgHostQuit, "{n} bezárta a QuadChromát."),
         (MsgHostSharingOff, "{n} leállította a megosztást."),
         (MsgHostRemovedYou, "{n} eltávolította ezt az eszközt."),
+        (MsgSelf, "Ez az Ön saját számítógépe."),
     ],
 };
 
@@ -1240,6 +1244,7 @@ pub static RO: Lang = Lang {
         (MsgHostQuit, "{n} a închis QuadChroma."),
         (MsgHostSharingOff, "{n} a oprit partajarea."),
         (MsgHostRemovedYou, "{n} a eliminat acest dispozitiv."),
+        (MsgSelf, "Acesta este chiar acest computer."),
     ],
 };
 
@@ -1488,6 +1493,7 @@ pub static BG: Lang = Lang {
         (MsgHostQuit, "{n} затвори QuadChroma."),
         (MsgHostSharingOff, "{n} спря споделянето."),
         (MsgHostRemovedYou, "{n} премахна това устройство."),
+        (MsgSelf, "Това е този компютър."),
     ],
 };
 
@@ -1736,5 +1742,6 @@ pub static EL: Lang = Lang {
         (MsgHostQuit, "Ο υπολογιστής {n} έκλεισε το QuadChroma."),
         (MsgHostSharingOff, "Ο υπολογιστής {n} σταμάτησε την κοινή χρήση."),
         (MsgHostRemovedYou, "Ο υπολογιστής {n} αφαίρεσε αυτή τη συσκευή."),
+        (MsgSelf, "Πρόκειται για αυτόν τον υπολογιστή."),
     ],
 };

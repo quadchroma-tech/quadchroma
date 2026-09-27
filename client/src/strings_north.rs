@@ -248,6 +248,7 @@ pub static SV: Lang = Lang {
         (MsgHostQuit, "{n} avslutade QuadChroma."),
         (MsgHostSharingOff, "{n} har stoppat delningen."),
         (MsgHostRemovedYou, "{n} har tagit bort den här enheten."),
+        (MsgSelf, "Det här är den här datorn."),
     ],
 };
 
@@ -496,6 +497,7 @@ pub static DA: Lang = Lang {
         (MsgHostQuit, "{n} lukkede QuadChroma."),
         (MsgHostSharingOff, "{n} har stoppet delingen."),
         (MsgHostRemovedYou, "{n} har fjernet denne enhed."),
+        (MsgSelf, "Det er denne computer."),
     ],
 };
 
@@ -744,6 +746,7 @@ pub static NB: Lang = Lang {
         (MsgHostQuit, "{n} avsluttet QuadChroma."),
         (MsgHostSharingOff, "{n} har stoppet delingen."),
         (MsgHostRemovedYou, "{n} har fjernet denne enheten."),
+        (MsgSelf, "Dette er denne datamaskinen."),
     ],
 };
 
@@ -992,6 +995,7 @@ pub static FI: Lang = Lang {
         (MsgHostQuit, "{n} sulki QuadChroman."),
         (MsgHostSharingOff, "{n} lopetti jakamisen."),
         (MsgHostRemovedYou, "{n} poisti tämän laitteen."),
+        (MsgSelf, "Tämä on juuri tämä tietokone."),
     ],
 };
 
@@ -1240,5 +1244,6 @@ pub static IS: Lang = Lang {
         (MsgHostQuit, "{n} lokaði QuadChroma."),
         (MsgHostSharingOff, "{n} hætti að deila."),
         (MsgHostRemovedYou, "{n} fjarlægði þetta tæki."),
+        (MsgSelf, "Þetta er þessi tölva."),
     ],
 };

@@ -250,6 +250,7 @@ pub static FR: Lang = Lang {
         (MsgHostQuit, "QuadChroma a été fermé sur {n}."),
         (MsgHostSharingOff, "{n} a arrêté le partage."),
         (MsgHostRemovedYou, "{n} a supprimé cet appareil."),
+        (MsgSelf, "Il s'agit de cet ordinateur."),
     ],
 };
 
@@ -498,6 +499,7 @@ pub static ES: Lang = Lang {
         (MsgHostQuit, "Se ha cerrado QuadChroma en {n}."),
         (MsgHostSharingOff, "{n} ha dejado de compartir."),
         (MsgHostRemovedYou, "{n} ha eliminado este dispositivo."),
+        (MsgSelf, "Se trata de este mismo ordenador."),
     ],
 };
 
@@ -746,6 +748,7 @@ pub static IT: Lang = Lang {
         (MsgHostQuit, "QuadChroma è stato chiuso su {n}."),
         (MsgHostSharingOff, "{n} ha interrotto la condivisione."),
         (MsgHostRemovedYou, "{n} ha rimosso questo dispositivo."),
+        (MsgSelf, "Si tratta di questo computer."),
     ],
 };
 
@@ -994,6 +997,7 @@ pub static PT: Lang = Lang {
         (MsgHostQuit, "O QuadChroma foi fechado em {n}."),
         (MsgHostSharingOff, "{n} deixou de partilhar."),
         (MsgHostRemovedYou, "{n} removeu este dispositivo."),
+        (MsgSelf, "Trata-se deste computador."),
     ],
 };
 
@@ -1242,5 +1246,6 @@ pub static NL: Lang = Lang {
         (MsgHostQuit, "QuadChroma op {n} is afgesloten."),
         (MsgHostSharingOff, "{n} is gestopt met delen."),
         (MsgHostRemovedYou, "{n} heeft dit apparaat verwijderd."),
+        (MsgSelf, "Dit is deze computer."),
     ],
 };

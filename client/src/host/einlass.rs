@@ -84,6 +84,7 @@ static DROSSEL_FALSCH: Drossel = Drossel::neu("Zugang: Passwort falsch");
 static DROSSEL_SCHLUSS: Drossel = Drossel::neu("Zugang: zu viele Fehlversuche");
 static DROSSEL_ENDE: Drossel = Drossel::neu("Zugang: ohne Ergebnis beendet");
 static DROSSEL_BESETZT: Drossel = Drossel::neu("Zugang: kein Platz frei");
+static DROSSEL_SELBST: Drossel = Drossel::neu("Abgewiesen: eigener Schluessel");
 static DROSSEL_LISTE: Drossel = Drossel::neu("Geraeteliste nicht lesbar");
 static DROSSEL_PASSWORT: Drossel = Drossel::neu("Zugangspasswort nicht lesbar");
 /// Zeilen des Zulassen-Fensters (fenster.rs): jede neue Verbindung mit
@@ -567,6 +568,21 @@ impl Einlass {
     /// Geraet: nur so weist sich der Host aus.
     pub fn pruefen(&self, sock: &mut secure::Secure, ip: IpAddr, name: &str) -> Ausgang {
         let peer = sock.peer.clone();
+        // Selbstschutz: der eigene Schluessel dieses Hosts ist dieser Rechner
+        // selbst - nie herein, auch nicht aus der Liste. "QCA1" und gleich
+        // 22/3 wie ein Nein am Host; ein neuer Client bricht schon nach
+        // Nachricht 2 ab ("Das ist dieser Computer.").
+        if peer == self.host_pub {
+            DROSSEL_SELBST.melden(Some(ip), || {
+                format!("Abgewiesen: {name} ({ip}) meldet sich mit dem eigenen Schluessel dieses Hosts - Verbindung zu sich selbst")
+            });
+            sock.socket().set_write_timeout(Some(SCHREIBFRIST)).ok();
+            let mut v = MAGIC_ZUGANG.to_vec();
+            v.extend_from_slice(&Nachricht::Ergebnis(Ergebnis::Abgelehnt).kodieren());
+            let _ = sock.write_all(&v);
+            sock.socket().set_write_timeout(None).ok();
+            return Ausgang::Draussen;
+        }
         let ausweis = zugang::nachricht3_flags(&sock.nachricht3) & NAME_FLAG_HOST_UNBEKANNT != 0;
         let bekannt = self.bekannt(&peer, ip);
         if bekannt && !ausweis {
@@ -918,6 +934,8 @@ mod tests {
         einlass: Arc<Einlass>,
         ausgaenge: mpsc::Receiver<Ausgang>,
         ordner: PathBuf,
+        /// Der eigene private Schluessel des Hosts (Selbstschutz-Test).
+        host_priv: Vec<u8>,
     }
 
     impl Host {
@@ -932,6 +950,7 @@ mod tests {
             let addr = l.local_addr().unwrap().to_string();
             let (tx, ausgaenge) = mpsc::channel();
             let e2 = einlass.clone();
+            let eigen = host_priv.clone();
             std::thread::spawn(move || {
                 for s in l.incoming() {
                     let Ok(s) = s else { continue };
@@ -952,7 +971,7 @@ mod tests {
                     });
                 }
             });
-            Host { addr, einlass, ausgaenge, ordner }
+            Host { addr, einlass, ausgaenge, ordner, host_priv: eigen }
         }
 
         fn ausgang(&self) -> Ausgang {
@@ -1009,6 +1028,29 @@ mod tests {
         let (st, sr) = mpsc::channel();
         e.oberflaeche_setzen(Arc::new(Haken { gezeigt: Mutex::new(gt), geschlossen: Mutex::new(st) }));
         (gr, sr)
+    }
+
+    /// Selbstschutz: ein Client mit dem eigenen Schluessel dieses Hosts (dieser
+    /// Rechner selbst) kommt nie herein - auch nicht, wenn der Schluessel in
+    /// der Liste steht: "QCA1" und gleich 22/3, keine Anfrage an die
+    /// Oberflaeche, kein Eintrag, die Leitung zu.
+    #[test]
+    fn eigener_schluessel_kommt_nie_herein() {
+        let h = Host::neu("selbst", zugang::PHASE_FRIST);
+        let (gezeigt, _) = haken(&h.einlass);
+        let eigen: [u8; 32] = h.einlass.host_pub.clone().try_into().unwrap();
+        for eingetragen in [false, true] {
+            if eingetragen {
+                zugang::geraet_eintragen(&h.ordner.join(zugang::GERAETE_DATEI), &eigen, "Ich", "2026-09-27").unwrap();
+            }
+            let mut s = Stub::verbinden(&h.addr, &h.host_priv, &zugang::nachricht3("Ich", 0)).unwrap();
+            assert_eq!(&s.kennung().unwrap(), MAGIC_ZUGANG);
+            assert_eq!(ergebnis(&mut s), Ergebnis::Abgelehnt);
+            assert!(s.zu(), "Leitung offen ({eingetragen})");
+            assert_eq!(h.ausgang(), Ausgang::Draussen);
+        }
+        assert!(gezeigt.try_recv().is_err(), "Anfrage gezeigt");
+        assert_eq!(h.liste().geraete.len(), 1, "nur der Eintrag des Tests");
     }
 
     /// Bekannt: sofort QCH1, keine Zugangsphase.

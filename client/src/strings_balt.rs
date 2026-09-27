@@ -248,6 +248,7 @@ pub static ET: Lang = Lang {
         (MsgHostQuit, "{n} sulges QuadChroma."),
         (MsgHostSharingOff, "{n} lõpetas jagamise."),
         (MsgHostRemovedYou, "{n} eemaldas selle seadme."),
+        (MsgSelf, "See ongi see arvuti."),
     ],
 };
 
@@ -496,6 +497,7 @@ pub static LV: Lang = Lang {
         (MsgHostQuit, "Dators {n} aizvēra QuadChroma."),
         (MsgHostSharingOff, "Dators {n} pārtrauca koplietošanu."),
         (MsgHostRemovedYou, "Dators {n} noņēma šo ierīci."),
+        (MsgSelf, "Tas ir šis pats dators."),
     ],
 };
 
@@ -744,6 +746,7 @@ pub static LT: Lang = Lang {
         (MsgHostQuit, "Kompiuteris {n} uždarė QuadChroma."),
         (MsgHostSharingOff, "Kompiuteris {n} nutraukė bendrinimą."),
         (MsgHostRemovedYou, "Kompiuteris {n} pašalino šį įrenginį."),
+        (MsgSelf, "Tai šis pats kompiuteris."),
     ],
 };
 
@@ -992,6 +995,7 @@ pub static SL: Lang = Lang {
         (MsgHostQuit, "Računalnik {n} je zaprl QuadChroma."),
         (MsgHostSharingOff, "Računalnik {n} je ustavil deljenje."),
         (MsgHostRemovedYou, "Računalnik {n} je odstranil to napravo."),
+        (MsgSelf, "To je ta računalnik."),
     ],
 };
 
@@ -1240,6 +1244,7 @@ pub static HR: Lang = Lang {
         (MsgHostQuit, "Računalo {n} zatvorilo je QuadChroma."),
         (MsgHostSharingOff, "Računalo {n} zaustavilo je dijeljenje."),
         (MsgHostRemovedYou, "Računalo {n} uklonilo je ovaj uređaj."),
+        (MsgSelf, "To je upravo ovo računalo."),
     ],
 };
 
@@ -1488,5 +1493,6 @@ pub static UK: Lang = Lang {
         (MsgHostQuit, "Комп'ютер {n} закрив QuadChroma."),
         (MsgHostSharingOff, "Комп'ютер {n} припинив надавати доступ."),
         (MsgHostRemovedYou, "Комп'ютер {n} видалив цей пристрій."),
+        (MsgSelf, "Це і є цей комп'ютер."),
     ],
 };

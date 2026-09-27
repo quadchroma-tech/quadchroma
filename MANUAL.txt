@@ -297,6 +297,21 @@ not come about: after about 30 s the start screen shows the last error.
                       message, the host closes the video and input
                       channel right after it.
 
+No connection to itself: a host running on the same computer also
+announces itself to the local client. The client reads that host's
+host.key (only reads it, never creates it) and leaves its ID out of the
+list of found hosts and out of the menu of its icon. Typing that ID
+gives "This is this computer."; so does connecting to an address where
+this computer's own host answers - the client stops right after message
+2 of the handshake, before message 3 would show its own key, and does
+not try again ("An <Adresse> antwortet dieser Rechner selbst (Schluessel
+= eigener host.key) - Abbruch vor Nachricht 3, kein Verbinden zu sich
+selbst"). Both hosts turn away a device that shows their own key, even
+when it is in the list: "QCA1" and at once result 3, as after "Deny"
+("Abgewiesen: <IP> meldet sich mit dem eigenen Schluessel dieses Hosts
+- Verbindung zu sich selbst", on Windows with the name in front of the
+address; rate-limited like the other lines of unknown devices).
+
 Handshake: each handshake has an overall deadline (host 5 s, client 3 s)
 and runs in its own thread on the host, so a peer that stays silent or
 trickles data only holds its own slot. There are 32 slots per port. The
