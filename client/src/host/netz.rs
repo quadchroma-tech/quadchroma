@@ -2456,13 +2456,29 @@ pub(super) fn platz_pruefung() -> MutexGuard<'static, ()> {
     sperre(&PLATZ)
 }
 
+/// Fuer Tests: Kandidaten P fuer den Zuschauerplatz, so dass P, P+1 und
+/// P+2 in 20000..32000 liegen - zufaellig gestreut und ausserhalb der
+/// Bereiche, aus denen Windows, macOS (ab 49152) und Linux (ab 32768)
+/// kurzlebige Ports vergeben. Einen Port mit bind(127.0.0.1:0) zu ziehen
+/// taugt dafuer nicht: Windows vergibt diese der Reihe nach, steht der
+/// Zaehler kurz vor 65535, liegen viele Ziehungen hintereinander so hoch,
+/// dass P+2 nicht mehr passt. Belegte Kandidaten scheitern beim Binden und
+/// werden uebersprungen.
+#[cfg(test)]
+fn testport_kandidaten() -> impl Iterator<Item = u16> {
+    use std::hash::BuildHasher;
+    const ANFANG: u16 = 20000;
+    const ENDE: u16 = 32000;
+    let zufall = std::collections::hash_map::RandomState::new();
+    (0u32..200).map(move |i| ANFANG + (zufall.hash_one(i) % u64::from(ENDE - ANFANG - 2)) as u16)
+}
+
 /// Fuer Tests: den Zuschauerplatz auf Loopback starten, an freien Ports P
 /// und P+1 (die Bekanntgabe geht an 127.0.0.1:P+2). Liefert P.
 #[cfg(test)]
 pub(super) fn start_loopback(schluessel: &[u8]) -> u16 {
-    for _ in 0..50 {
-        let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        if p <= 65000 && start_mit(Ipv4Addr::LOCALHOST, p, schluessel.to_vec(), || vec![Ipv4Addr::LOCALHOST]).is_ok() {
+    for p in testport_kandidaten() {
+        if start_mit(Ipv4Addr::LOCALHOST, p, schluessel.to_vec(), || vec![Ipv4Addr::LOCALHOST]).is_ok() {
             return p;
         }
     }
@@ -4862,17 +4878,25 @@ mod tests {
     /// Den Zuschauerplatz auf Loopback starten, an freien Ports P und P+1;
     /// die Bekanntgabe geht an 127.0.0.1:P+2, das der Test selbst belegt.
     fn start_auf_loopback(schluessel: &[u8]) -> (u16, UdpSocket) {
-        for _ in 0..50 {
-            let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-            if p > 65000 {
-                continue;
-            }
+        for p in testport_kandidaten() {
             let Ok(udp) = UdpSocket::bind(("127.0.0.1", p + 2)) else { continue };
             if start_mit(Ipv4Addr::LOCALHOST, p, schluessel.to_vec(), loopback).is_ok() {
                 return (p, udp);
             }
         }
         panic!("keine freien Ports auf Loopback");
+    }
+
+    /// Die Testports liegen samt P+1 und P+2 unterhalb aller Bereiche fuer
+    /// kurzlebige Ports und sind gestreut, nicht der Reihe nach.
+    #[test]
+    fn testports_ausserhalb_kurzlebiger_bereiche() {
+        let alle: Vec<u16> = testport_kandidaten().collect();
+        assert_eq!(alle.len(), 200);
+        assert!(alle.iter().all(|&p| (20000..32000).contains(&p) && p + 2 < 32000), "{alle:?}");
+        let verschieden: std::collections::HashSet<_> = alle.iter().collect();
+        assert!(verschieden.len() > 150, "kaum gestreut: {alle:?}");
+        assert!(alle.windows(2).any(|w| w[1] != w[0] + 1), "der Reihe nach: {alle:?}");
     }
 
     /// Handschlag bis Nachricht 2: antwortet der Host mit diesem Schluessel?
