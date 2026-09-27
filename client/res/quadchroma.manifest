@@ -6,11 +6,17 @@
        and embeds the file as RT_MANIFEST 1 via res/quadchroma.rc. -->
   <assemblyIdentity type="win32" name="tech.quadchroma.quadchroma" version="@VERSION@" processorArchitecture="@ARCH@"/>
   <description>QuadChroma</description>
-  <!-- No elevation; runs with the privileges of the caller. -->
+  <!-- Requires administrator: Windows asks once via UAC at every start. Only an
+       elevated process reaches windows with higher integrity in the same
+       session (Task Manager, regedit, installers) with SendInput (UIPI); without
+       it the host role cannot control them. The real UAC consent prompt on the
+       secure desktop stays out of reach - that would need a SYSTEM service.
+       uiAccess stays false: no accessibility path, and requireAdministrator does
+       not need a signed exe in a trusted location the way uiAccess=true would. -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

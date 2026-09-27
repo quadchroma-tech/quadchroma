@@ -21,8 +21,8 @@
 // res/quadchroma.ico was generated from it.
 1 ICON "quadchroma.ico"
 
-// Application manifest (asInvoker, per-monitor DPI v2, long paths, UTF-8,
-// Windows 10/11); build.rs fills in the template res/quadchroma.manifest.
+// Application manifest (requireAdministrator, per-monitor DPI v2, long paths,
+// UTF-8, Windows 10/11); build.rs fills in the template res/quadchroma.manifest.
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST QC_MANIFEST_PFAD
 
 VS_VERSION_INFO VERSIONINFO
