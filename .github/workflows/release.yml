@@ -8,10 +8,11 @@
 #   windows            build, test, exe and the two FFmpeg DLLs as artifacts
 #   windows-signieren  Azure Artifact Signing (formerly Trusted Signing) - only with secrets
 #   windows-paket      quadchroma-<version>-windows-x64[-unsigned].zip
-#   macos              build the host, Developer ID signature, notarization, ZIP + DMG through
-#                      the Makefile - without secrets ad-hoc signed with the suffix -unsigned
-#                      (-selfsigned: the project's own certificate; -unnotarized: signed but
-#                      not notarized)
+#   macos              the one Mac app (client and host): make builds the Rust client with
+#                      cargo, the host engine compiled into it, no FFmpeg; Developer ID
+#                      signature, notarization, ZIP + DMG through the Makefile - without
+#                      secrets ad-hoc signed with the suffix -unsigned (-selfsigned: the
+#                      project's own certificate; -unnotarized: signed but not notarized)
 #   release            SHA256SUMS.txt and a release DRAFT with all assets; it is published
 #                      by hand after review (RELEASING.md)
 #
@@ -513,6 +514,20 @@ jobs:
 
       - name: Verify the signature (make verify - codesign --strict, entitlements, Gatekeeper preview)
         run: make verify IDENT="$IDENT"
+
+      - name: Check the app (one executable, the Rust client with the host engine; no FFmpeg)
+        run: |
+          set -euo pipefail
+          macos=build/QuadChroma.app/Contents/MacOS
+          [ "$(ls "$macos")" = "quadchroma" ] || { echo "::error::Contents/MacOS must hold exactly the one executable quadchroma, found: $(ls "$macos" | tr '\n' ' ')"; exit 1; }
+          exe="$macos/quadchroma"
+          otool -L "$exe"
+          if otool -L "$exe" | grep -Ei 'libav|libsw|ffmpeg'; then echo "::error::the Mac app links FFmpeg - it decodes with VideoToolbox and must not"; exit 1; fi
+          # Symbols into a file first: grep -q ending early would break nm's pipe (pipefail).
+          nm "$exe" > "$RUNNER_TEMP/app-symbole.txt"
+          if grep -Eq ' _av(codec|util|format)?_[a-z]' "$RUNNER_TEMP/app-symbole.txt"; then echo "::error::FFmpeg symbols in the Mac app"; exit 1; fi
+          # The host engine is built in (host/dienst.h), not a second program.
+          grep -q ' _qc_dienst_starten$' "$RUNNER_TEMP/app-symbole.txt" || { echo "::error::the host engine (qc_dienst_starten) is missing from the app"; exit 1; }
 
       - name: Helper script for notarization (Apple ID, team ID, app-specific password)
         if: env.NOTARIZE == 'true'

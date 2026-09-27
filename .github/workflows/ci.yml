@@ -4,10 +4,14 @@
 #   (minimal LGPL build, MinGW-w64 from Homebrew) - the same path as for a release.
 # Windows (windows-2025): Rust client including the host role, built against these DLLs.
 #   build.rs finds rc.exe in the runner's Windows SDK (llvm-rc as the fallback).
-# macOS (macos-26): host (Objective-C, ad-hoc signed, never started),
-#   test harnesses without screen capture, ZIP/DMG packaging through the Makefile,
-#   Rust client (decodes with VideoToolbox, needs no FFmpeg; its VideoToolbox tests
-#   skip themselves if the runner has no hardware encoder).
+# macOS (macos-26): the one Mac app - make builds the Rust client with cargo (the
+#   Objective-C/C host engine compiled into it by client/build.rs) and bundles it as
+#   QuadChroma.app (ad-hoc signed, never started with its service); no FFmpeg on the Mac,
+#   the client decodes with VideoToolbox (its VideoToolbox tests skip themselves if the
+#   runner has no hardware encoder). Then the test harnesses without screen capture,
+#   ZIP/DMG packaging through the Makefile, and the client's tests and self-tests.
+# The Windows jobs keep FFmpeg: the ffmpeg job builds the DLLs, the windows job builds
+#   and tests quadchroma.exe (client and host role in one program) against them.
 #
 # Needs no secrets and therefore also runs for pull requests from forks.
 # Actions are pinned by commit SHA (tag as a comment; Dependabot maintains both).
@@ -176,6 +180,20 @@ jobs:
 
       - name: Verify the signature (make verify; Gatekeeper rejects ad-hoc signatures, as expected)
         run: make verify IDENT=-
+
+      - name: Check the app (one executable, the Rust client with the host engine; no FFmpeg)
+        run: |
+          set -euo pipefail
+          macos=build/QuadChroma.app/Contents/MacOS
+          [ "$(ls "$macos")" = "quadchroma" ] || { echo "::error::Contents/MacOS must hold exactly the one executable quadchroma, found: $(ls "$macos" | tr '\n' ' ')"; exit 1; }
+          exe="$macos/quadchroma"
+          otool -L "$exe"
+          if otool -L "$exe" | grep -Ei 'libav|libsw|ffmpeg'; then echo "::error::the Mac app links FFmpeg - it decodes with VideoToolbox and must not"; exit 1; fi
+          # Symbols into a file first: grep -q ending early would break nm's pipe (pipefail).
+          nm "$exe" > "$RUNNER_TEMP/app-symbole.txt"
+          if grep -Eq ' _av(codec|util|format)?_[a-z]' "$RUNNER_TEMP/app-symbole.txt"; then echo "::error::FFmpeg symbols in the Mac app"; exit 1; fi
+          # The host engine is built in (host/dienst.h), not a second program.
+          grep -q ' _qc_dienst_starten$' "$RUNNER_TEMP/app-symbole.txt" || { echo "::error::the host engine (qc_dienst_starten) is missing from the app"; exit 1; }
 
       - name: Package ZIP and DMG (make zip, make dmg)
         run: |
