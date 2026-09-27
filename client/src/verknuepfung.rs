@@ -345,18 +345,66 @@ pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> 
     loeschen(&alt)
 }
 
-/// Beim Start der App: liegt noch die alte Verknuepfung der Host-Rolle da,
-/// tritt die eine an ihre Stelle (die alte wird erst geloescht, wenn die
-/// neue steht). Ok(true): uebernommen; Ok(false): nichts zu tun.
+/// Was `autostart_migrieren` tat.
 #[cfg(windows)]
-pub fn autostart_migrieren(ordner: Option<&Path>, beschreibung: &str) -> Result<bool, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Migration {
+    /// Keine alte Verknuepfung - nichts zu tun.
+    Keine,
+    /// Die alte ist durch die eine ersetzt.
+    Ersetzt,
+    /// Die alte startet ein anderes Programm (Ziel wie gelesen) - sie bleibt,
+    /// und der Autostart zeigt nicht auf diese exe (etwa eine Test- oder
+    /// portable Kopie).
+    AndereExe(String),
+}
+
+/// Beim Start der App: liegt noch die alte Verknuepfung der Host-Rolle da
+/// und startet sie DIESE exe, tritt die eine an ihre Stelle (die alte wird
+/// erst geloescht, wenn die neue steht). Zeigt sie auf ein anderes
+/// Programm, bleibt alles, wie es ist: eine zweite Kopie (Test, portabel)
+/// soll den Autostart der installierten nicht auf sich umbiegen.
+#[cfg(windows)]
+pub fn autostart_migrieren(ordner: Option<&Path>, beschreibung: &str) -> Result<Migration, String> {
     let alt = autostart_alt_pfad(ordner)?;
     if !alt.is_file() {
-        return Ok(false);
+        return Ok(Migration::Keine);
+    }
+    let ziel = lnk_ziel(&alt)?;
+    let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
+    if !dieselbe_datei(Path::new(&ziel), &exe) {
+        return Ok(Migration::AndereExe(ziel));
     }
     autostart_schreiben(&autostart_pfad(ordner)?, beschreibung)?;
     loeschen(&alt)?;
-    Ok(true)
+    Ok(Migration::Ersetzt)
+}
+
+/// Dieselbe Datei? Ueber den kanonischen Pfad (Gross- und Kleinschreibung,
+/// 8.3-Namen, Verweise); laesst er sich nicht bestimmen (Ziel fehlt), nie.
+#[cfg(windows)]
+fn dieselbe_datei(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
+        _ => false,
+    }
+}
+
+/// Das Ziel einer Verknuepfung (IShellLinkW::GetPath).
+#[cfg(windows)]
+fn lnk_ziel(pfad: &Path) -> Result<String, String> {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    im_sta(|| unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.message())?;
+        let datei: IPersistFile = link.cast().map_err(|e| e.message())?;
+        datei.Load(&HSTRING::from(pfad.as_os_str()), STGM_READ).map_err(|e| format!("{}: {}", pfad.display(), e.message()))?;
+        let mut ziel = vec![0u16; 1024];
+        link.GetPath(&mut ziel, std::ptr::null_mut(), 0).map_err(|e| e.message())?;
+        let n = ziel.iter().position(|&c| c == 0).unwrap_or(ziel.len());
+        Ok(String::from_utf16_lossy(&ziel[..n]))
+    })
 }
 
 /// Eine Verknuepfung zuruecklesen (Tests): Ziel, Argumente, Arbeitsordner,
@@ -540,6 +588,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
+    /// Die alte Verknuepfung startet ein anderes Programm (eine andere
+    /// Kopie): sie bleibt, keine neue entsteht - der Autostart zeigt nie auf
+    /// eine Test- oder portable Kopie. Zeigt sie auf diese exe, nur ueber
+    /// einen anderen Schreibweg (Grossbuchstaben), wird sie ersetzt.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_alte_verknuepfung_anderer_exe() {
+        let ordner = std::env::temp_dir().join(format!("{}-autostart-fremd", crate::secure::test_lauf()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let alt = ordner.join(AUTOSTART_ALT);
+        let neu = ordner.join(AUTOSTART_DATEI);
+        let andere = ordner.join("installiert").join("quadchroma.exe");
+        std::fs::create_dir_all(andere.parent().unwrap()).unwrap();
+        std::fs::write(&andere, b"MZ").unwrap();
+        im_sta(|| lnk_speichern(&alt, &andere, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &andere, 0)).unwrap();
+        match autostart_migrieren(Some(&ordner), "x") {
+            Ok(Migration::AndereExe(z)) => assert_eq!(z.to_lowercase(), andere.display().to_string().to_lowercase()),
+            r => panic!("{r:?}"),
+        }
+        assert!(alt.is_file() && !neu.exists(), "die alte bleibt, keine neue");
+        assert!(autostart_an(Some(&ordner)), "die alte zaehlt weiter als an");
+        // Ziel fehlt ganz: ebenso nicht diese exe.
+        std::fs::remove_file(&andere).unwrap();
+        assert!(matches!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::AndereExe(_))));
+        assert!(alt.is_file() && !neu.exists());
+        // Diese exe, in Grossbuchstaben geschrieben: dieselbe Datei.
+        let exe = std::env::current_exe().unwrap();
+        let gross = std::path::PathBuf::from(exe.display().to_string().to_uppercase());
+        assert!(dieselbe_datei(&gross, &exe));
+        std::fs::remove_file(&alt).unwrap();
+        im_sta(|| lnk_speichern(&alt, &gross, "--host", &ordner, "x", &exe, 0)).unwrap();
+        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::Ersetzt));
+        assert!(!alt.exists() && neu.is_file());
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
     /// Die alte Verknuepfung der Host-Rolle ("QuadChroma - Freigabe.lnk",
     /// --host): sie zaehlt als "an"; beim Start der App tritt die eine an
     /// ihre Stelle, ein zweiter Start findet nichts mehr zu tun. "aus"
@@ -554,14 +639,14 @@ mod tests {
         let neu = ordner.join(AUTOSTART_DATEI);
         let exe = std::env::current_exe().unwrap();
         let alte_anlegen = || im_sta(|| lnk_speichern(&alt, &exe, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &exe, 0)).unwrap();
-        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(false), "ohne alte nichts zu tun");
+        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::Keine), "ohne alte nichts zu tun");
         alte_anlegen();
         assert!(autostart_an(Some(&ordner)), "die alte zaehlt als an");
-        assert_eq!(autostart_migrieren(Some(&ordner), "QuadChroma – Fernsteuerung"), Ok(true));
+        assert_eq!(autostart_migrieren(Some(&ordner), "QuadChroma – Fernsteuerung"), Ok(Migration::Ersetzt));
         assert!(!alt.exists() && neu.is_file());
         assert_eq!(lnk_lesen(&neu).unwrap().1, "--hintergrund");
         assert!(autostart_an(Some(&ordner)));
-        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(false), "zweiter Start");
+        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::Keine), "zweiter Start");
         // aus: beide weg.
         alte_anlegen();
         autostart_setzen(Some(&ordner), false, "").unwrap();

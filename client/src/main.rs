@@ -12153,8 +12153,13 @@ fn main() {
     // Host-Rolle mit --host) weicht der einen (--hintergrund).
     #[cfg(windows)]
     match verknuepfung::autostart_migrieren(None, &autostart_beschreibung(sprache)) {
-        Ok(true) => protokoll::zeile("Mit Windows starten: die alte Verknuepfung der Freigabe ist durch die der App ersetzt".into()),
-        Ok(false) => {}
+        Ok(verknuepfung::Migration::Ersetzt) => {
+            protokoll::zeile("Mit Windows starten: die alte Verknuepfung der Freigabe ist durch die der App ersetzt".into())
+        }
+        Ok(verknuepfung::Migration::AndereExe(ziel)) => protokoll::zeile(format!(
+            "Mit Windows starten: die alte Verknuepfung der Freigabe startet {ziel}, nicht diese exe - sie bleibt, wie sie ist"
+        )),
+        Ok(verknuepfung::Migration::Keine) => {}
         Err(e) => protokoll::zeile(format!("Mit Windows starten: alte Verknuepfung nicht ersetzt - {e}")),
     }
     // --host: dieser PC ist freigegeben (die alte Verknuepfung wollte es so).
