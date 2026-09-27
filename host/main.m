@@ -377,6 +377,10 @@ static char g_zuschauer_name[QC_ZUGANG_NAME_MAX + 1] = {0};
 // Bildport, den ein anderes Programm belegt (0 = keiner): der Host wartet
 // dann, statt zu enden, und versucht es alle 3 s erneut.
 static _Atomic int g_port_belegt = 0;
+// Die eine App hat die Freigabe ausgeschaltet (qc_dienst_anhalten): die
+// Ports sind zu, und wer schon im Handschlag war, wird danach nicht mehr
+// Zuschauer. 0 im Pruefstand und in der eigenen App.
+static _Atomic int g_freigabe_aus = 0;
 // Gesamtfrist einer Zugangsphase; der Pruefstand verkuerzt sie.
 static int g_zugang_frist_ms = QC_ZUGANG_FRIST_MS;
 
@@ -1022,10 +1026,13 @@ static int host_ende_senden(int fd, uint8_t grund) {
 
 // ------------------------------------------------------------ Rechnername
 // Der Name dieses Macs, wie ihn die Systemeinstellungen zeigen ("Roberts Mac
-// mini"), sonst der Hostname - UTF-8-sicher auf 40 Byte. Er steht in der
-// Bekanntgabe und in Nachricht 20. Die Bekanntgabe frischt ihn auf.
+// mini"), sonst der Hostname - UTF-8-sicher auf 40 Byte. Die Bekanntgabe
+// frischt ihn auf. Bekanntgabe, Nachricht 20 und Kopf des Menues tragen den
+// Geraetenamen (geraetename): den eingestellten (qc_dienst_name_setzen, die
+// eine App: geraetename= in einstellungen.txt), sonst diesen.
 static pthread_mutex_t g_rechnername_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char g_rechnername[QC_ZUGANG_NAME_MAX + 1] = {0};
+static char g_geraetename[QC_ZUGANG_NAME_MAX + 1] = {0};   // leer = der Rechnername
 
 static void rechnername_auffrischen(void) {
     char roh[1024] = {0};
@@ -1052,6 +1059,34 @@ static void rechnername(char out[QC_ZUGANG_NAME_MAX + 1]) {
     pthread_mutex_unlock(&g_rechnername_mtx);
 }
 
+// Der Name, unter dem andere Geraete diesen Mac sehen.
+static void geraetename(char out[QC_ZUGANG_NAME_MAX + 1]) {
+    pthread_mutex_lock(&g_rechnername_mtx);
+    BOOL eigen = g_geraetename[0] != 0;
+    if (eigen) memcpy(out, g_geraetename, sizeof g_geraetename);
+    pthread_mutex_unlock(&g_rechnername_mtx);
+    if (!eigen) rechnername(out);
+}
+
+// dienst.h. Gilt sofort: die Bekanntgabe liest den Namen je Runde,
+// Nachricht 20 je Zugangsphase, das Menue beim naechsten Lesen (gleich
+// angestossen). Der Client hat den Namen schon geprueft (1-40 Byte UTF-8,
+// ohne Steuer- und Richtungszeichen); hier wird nur noch gesaeubert wie jeder
+// fremde Name.
+void qc_dienst_name_setzen(const char *name) {
+    char n[QC_ZUGANG_NAME_MAX + 1] = {0};
+    if (name && *name) qc_zugang_name_saeubern(name, strlen(name), n, QC_ZUGANG_NAME_MAX);
+    pthread_mutex_lock(&g_rechnername_mtx);
+    BOOL anders = strcmp(n, g_geraetename) != 0;
+    memcpy(g_geraetename, n, sizeof n);
+    pthread_mutex_unlock(&g_rechnername_mtx);
+    if (!anders) return;
+    char jetzt[QC_ZUGANG_NAME_MAX + 1];
+    geraetename(jetzt);
+    logf_(@"Geraetename: \"%@\"%@", utf8(jetzt), n[0] ? @"" : @" (Rechnername)");
+    qc_ui_zustand_geaendert();
+}
+
 // ------------------------------------------------ Zustand fuer die Oberflaeche
 
 int qc_zustand_zuschauer(char *name, size_t groesse) {
@@ -1063,6 +1098,20 @@ int qc_zustand_zuschauer(char *name, size_t groesse) {
     if (name && groesse) snprintf(name, groesse, "%s", g_zuschauer_name);
     pthread_mutex_unlock(&g_zustand_mtx);
     return 1;
+}
+
+int qc_zustand_geraetename(char *name, size_t groesse) {
+    char n[QC_ZUGANG_NAME_MAX + 1];
+    geraetename(n);
+    if (name && groesse) snprintf(name, groesse, "%s", n);
+    return 0;
+}
+
+int qc_zustand_rechnername(char *name, size_t groesse) {
+    char n[QC_ZUGANG_NAME_MAX + 1];
+    rechnername(n);
+    if (name && groesse) snprintf(name, groesse, "%s", n);
+    return 0;
 }
 
 int qc_zustand_bildschirmfreigabe(void) { return g_tcc_bildschirm() ? 1 : 0; }
@@ -1194,7 +1243,7 @@ static BOOL zugang_phase(qc_chan *chan, const struct sockaddr_in *peer, const ch
     int64_t frist = jetzt + g_zugang_frist_ms;
     uint8_t wege = QC_ZUGANG_WEG_PASSWORT | (qc_ui_vorhanden() ? QC_ZUGANG_WEG_ZULASSEN : 0);
     char host[QC_ZUGANG_NAME_MAX + 1];
-    rechnername(host);
+    geraetename(host);
     uint8_t m[4 + QC_ZUGANG_NOETIG_MAX];
     memcpy(m, QC_ZUGANG_KENNUNG, 4);
     size_t n = 4 + qc_zugang_noetig_kodieren(m + 4, sizeof m - 4, wege, warten, host);
@@ -1467,6 +1516,28 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         }
         pthread_mutex_lock(&g_send_mtx);
     }
+    // Die Freigabe ging aus, waehrend er hereinkam: er wird nicht mehr
+    // Zuschauer, sondern bekommt nach der Kennung "QCH1" den Abschied wie ein
+    // laufender (Grund 1) - so zeigt ihn der Client und verbindet sich nicht
+    // von selbst neu. qc_dienst_anhalten setzt den Merker, bevor es unter
+    // derselben Sperre den laufenden verabschiedet - einer von beiden sieht
+    // ihn also.
+    if (atomic_load(&g_freigabe_aus)) {
+        struct timeval kurz = { .tv_sec = 0, .tv_usec = QC_ABLOESUNG_MS * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &kurz, sizeof kurz);
+        uint8_t ende[4 + QC_HOST_ENDE_LAENGE];
+        memcpy(ende, QC_MAGIC, 4);
+        struct iovec iov_ende = { .iov_base = ende, .iov_len = 4 + qc_host_ende_kodieren(ende + 4, QC_HOST_ENDE_FREIGABE_AUS) };
+        int gemeldet = qc_chan_send(chan, &iov_ende, 1) == 0;
+        pthread_mutex_unlock(&g_send_mtx);
+        atomic_fetch_sub(&g_anmeldend, 1);
+        stream_herunterfahren_anstossen();
+        logf_(@"Zuschauer %@ (ID %s, %s) abgewiesen: die Freigabe ist aus%s", utf8(name), id_text, ip,
+              gemeldet ? "" : " - der Abschied kam nicht an");
+        qc_chan_free(chan);
+        close(fd);
+        return;
+    }
 
     uint8_t hello[4 + sizeof(qc_hdr) + 8];
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
@@ -1573,6 +1644,11 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     }
 }
 
+// Die Annahme von Bild- und Eingabeport, zum Anhalten (qc_dienst_anhalten).
+// Nur auf dem Weg des Dienstes (dienst_starten, dienst_lauschen_beenden)
+// angefasst, nacheinander.
+static qc_annahme *g_annahme_bild = NULL, *g_annahme_eingabe = NULL;
+
 // melden: eine Zeile, wenn bind scheitert (der Zustandstakt versucht es
 // wiederholt und meldet nur den Wechsel).
 static int start_server(int port, BOOL melden) {
@@ -1591,7 +1667,9 @@ static int start_server(int port, BOOL melden) {
     }
     if (listen(fd, QC_LISTEN_WARTESCHLANGE) != 0) { logf_(@"listen fehlgeschlagen: %s", strerror(errno)); close(fd); return -1; }
     qc_annahme_cfg cfg = { QC_HANDSCHLAEGE, QC_HANDSCHLAEGE_JE_IP, bild_verbindung, annahme_andrang, (void *)"Bildkanal" };
-    if (qc_annahme_starten(fd, &cfg) != 0) { logf_(@"Annahme fuer Port %d nicht startbar", port); close(fd); return -1; }
+    qc_annahme *an = qc_annahme_neu(fd, &cfg);
+    if (!an) { logf_(@"Annahme fuer Port %d nicht startbar", port); close(fd); return -1; }
+    g_annahme_bild = an;
     return fd;
 }
 
@@ -1603,8 +1681,18 @@ static int start_server(int port, BOOL melden) {
 //          | u8 ext = 1 | u32 Geraete-ID | u8 Flags (Bit 0: Zulassen moeglich)
 // Aeltere Clients lesen nur bis zum Namen (zugang.h, Spezifikation 2).
 
+// Jede Bekanntgabe gehoert zu einer Runde der Freigabe (g_bekanntgabe_gen):
+// qc_dienst_anhalten zaehlt weiter, und der Faden der alten Runde endet vor
+// seinem naechsten Paket - hoechstens zwei Sekunden spaeter, ohne noch etwas
+// zu senden.
+static _Atomic unsigned g_bekanntgabe_gen = 0;
+
+typedef struct { int port; unsigned gen; } qc_bekanntgabe_arg;
+
 static void *beacon_thread(void *arg) {
-    int port = (int)(intptr_t)arg;
+    qc_bekanntgabe_arg ba = *(qc_bekanntgabe_arg *)arg;
+    free(arg);
+    int port = ba.port;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return NULL;
     int on = 1;
@@ -1617,13 +1705,14 @@ static void *beacon_thread(void *arg) {
     // Runde neu: ob jemand "Zulassen" klicken kann, aendert sich mit der
     // Oberflaeche, und den Rechnernamen kann man in den Systemeinstellungen
     // umbenennen (alle 30 s nachgelesen).
-    for (unsigned runde = 0;; runde++) {
+    for (unsigned runde = 0; atomic_load(&g_bekanntgabe_gen) == ba.gen; runde++) {
         if (runde % 15 == 0) rechnername_auffrischen();
         char name[QC_ZUGANG_NAME_MAX + 1];
-        rechnername(name);
+        geraetename(name);
         uint8_t pkt[QC_BEKANNTGABE_MAX];
         size_t len = qc_zugang_bekanntgabe(pkt, sizeof pkt, (uint16_t)port, name, id,
                                            qc_ui_vorhanden() ? QC_BEKANNTGABE_ZULASSEN : 0);
+        if (atomic_load(&g_bekanntgabe_gen) != ba.gen) break;
         struct ifaddrs *list = NULL;
         int gesendet = 0;
         if (getifaddrs(&list) == 0) {
@@ -1647,12 +1736,18 @@ static void *beacon_thread(void *arg) {
         }
         usleep(2000 * 1000);
     }
+    close(fd);
+    logf_(@"Bekanntgabe: beendet (Freigabe aus)");
     return NULL;
 }
 
 static void start_beacon(int port) {
+    qc_bekanntgabe_arg *a = malloc(sizeof *a);
+    if (!a) return;
+    a->port = port;
+    a->gen = atomic_load(&g_bekanntgabe_gen);
     pthread_t t;
-    pthread_create(&t, NULL, beacon_thread, (void *)(intptr_t)port);
+    if (pthread_create(&t, NULL, beacon_thread, a) != 0) { free(a); return; }
     pthread_detach(t);
 }
 
@@ -2148,8 +2243,11 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
 
 static int start_input_server(int port, CGDirectDisplayID display) {
     atomic_store(&g_input_display, display);
-    g_evsrc = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
-    if (g_evsrc) CGEventSourceSetLocalEventsSuppressionInterval(g_evsrc, 0.0);
+    // Einmal je Prozess - auch wenn die Freigabe aus- und wieder angeht.
+    if (!g_evsrc) {
+        g_evsrc = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+        if (g_evsrc) CGEventSourceSetLocalEventsSuppressionInterval(g_evsrc, 0.0);
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -2165,11 +2263,13 @@ static int start_input_server(int port, CGDirectDisplayID display) {
         return -1;
     }
     qc_annahme_cfg cfg = { QC_HANDSCHLAEGE, QC_HANDSCHLAEGE_JE_IP, eingabe_verbindung, annahme_andrang, (void *)"Eingabekanal" };
-    if (qc_annahme_starten(fd, &cfg) != 0) {
+    qc_annahme *an = qc_annahme_neu(fd, &cfg);
+    if (!an) {
         logf_(@"Eingabe-Port %d: Annahme nicht startbar", port);
         close(fd);
         return -1;
     }
+    g_annahme_eingabe = an;
     return fd;
 }
 
@@ -3660,8 +3760,20 @@ static int g_dienst_port = 9001;
 static CGDirectDisplayID g_dienst_display = 0;
 static _Atomic int g_dienst_laeuft = 0;
 
+// Die serielle Warteschlange des Zustandstakts. Auf ihr laufen auch
+// Anhalten und Fortsetzen der Freigabe (qc_dienst_anhalten, ..._fortsetzen):
+// Lauschen, Anhalten und der Wiederholversuch des Takts kommen so nie
+// gleichzeitig.
+static dispatch_queue_t g_zustandq = NULL;
+
+static dispatch_queue_t zustandq(void) {
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{ g_zustandq = dispatch_queue_create("tech.quadchroma.zustand", DISPATCH_QUEUE_SERIAL); });
+    return g_zustandq;
+}
+
 static BOOL dienst_starten(void) {
-    if (atomic_load(&g_dienst_laeuft)) return YES;
+    if (atomic_load(&g_dienst_laeuft) || atomic_load(&g_freigabe_aus)) return YES;
     int belegt = atomic_load(&g_port_belegt);
     if (start_server(g_dienst_port, !belegt) < 0) {
         if (!belegt) {
@@ -3702,7 +3814,7 @@ static void zustand_takt(void) {
         g_zustand_ax = a;
         anders = YES;
     }
-    if (!atomic_load(&g_dienst_laeuft)) dienst_starten();
+    if (!atomic_load(&g_dienst_laeuft) && !atomic_load(&g_freigabe_aus)) dienst_starten();
     if (anders) qc_ui_zustand_geaendert();
 }
 
@@ -3710,8 +3822,7 @@ static dispatch_source_t g_zustand_quelle = NULL;
 
 static void zustand_takt_starten(void) {
     if (g_zustand_quelle) return;
-    dispatch_queue_t q = dispatch_queue_create("tech.quadchroma.zustand", DISPATCH_QUEUE_SERIAL);
-    g_zustand_quelle = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+    g_zustand_quelle = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, zustandq());
     if (!g_zustand_quelle) return;
     dispatch_source_set_timer(g_zustand_quelle, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                               3 * NSEC_PER_SEC, NSEC_PER_SEC / 4);
@@ -3912,16 +4023,21 @@ __attribute__((unused)) static void dienst_takt_anhalten(void) {
 // nicht von selbst neu; ein aelterer sieht nur das Ende der Verbindung und
 // versucht es wie bisher erneut. Bewusst nicht Typ 10: den deutet der Client
 // als "ein anderes Geraet hat die Sitzung uebernommen".
-static void host_abschied(void) {
-    char fp[24] = {0};
+// Den Zuschauer mit dem Abschied (Typ 13, grund) trennen: Bild- und
+// Eingabekanal zu. Rueckgabe -1 = es gab keinen, 1 = gemeldet, 0 = der
+// Abschied kam nicht an; fp bekommt seinen Fingerabdruck. vorher laeuft
+// unter g_send_mtx, bevor der Zuschauer gelesen wird (Anhalten: der Merker
+// fuer alle, die gerade hereinkommen).
+static int zuschauer_verabschieden(uint8_t grund, char fp[24], void (^vorher)(void)) {
     int gemeldet = 0;
     pthread_mutex_lock(&g_send_mtx);
+    if (vorher) vorher();
     int alt = atomic_exchange(&g_client_fd, -1);
     atomic_store(&g_vid_ready, 0);
     if (alt >= 0) {
         if (g_vid) {
             qc_fingerprint(g_vid_peer, fp);
-            gemeldet = host_ende_senden(alt, QC_HOST_ENDE_BEENDET);
+            gemeldet = host_ende_senden(alt, grund);
         }
         // shutdown weckt auch einen Faden, der gerade auf diesem Socket liest;
         // der Abschied liegt schon im Kernel und geht vor dem FIN hinaus.
@@ -3932,10 +4048,38 @@ static void host_abschied(void) {
     qc_chan_free(g_vid);
     g_vid = NULL;
     pthread_mutex_unlock(&g_send_mtx);
-    if (alt >= 0)
+    return alt >= 0 ? gemeldet : -1;
+}
+
+static void host_abschied(void) {
+    char fp[24] = {0};
+    int r = zuschauer_verabschieden(QC_HOST_ENDE_BEENDET, fp, nil);
+    if (r >= 0)
         logf_(@"Beenden: Verbindung zum Zuschauer %s geschlossen%s", fp,
-              gemeldet ? " (Abschied gemeldet)" : " - der Abschied kam nicht an");
+              r ? " (Abschied gemeldet)" : " - der Abschied kam nicht an");
     logf_(@"Host beendet");
+}
+
+// Freigabe aus (qc_dienst_anhalten), auf g_zustandq: der Zuschauer bekommt
+// den Abschied mit Grund 1, Aufnahme und Encoder gehen ab, Bild- und
+// Eingabeport schliessen, die Bekanntgabe verstummt. Alles andere - Zugang,
+// Oberflaeche, Warteschlangen, Waechter - bleibt fuer das Wiedereinschalten.
+static void dienst_lauschen_beenden(void) {
+    char fp[24] = {0};
+    int r = zuschauer_verabschieden(QC_HOST_ENDE_FREIGABE_AUS, fp, ^{ atomic_store(&g_freigabe_aus, 1); });
+    if (r >= 0) {
+        logf_(@"Freigabe aus: Verbindung zum Zuschauer %s geschlossen%s", fp,
+              r ? " (Abschied gemeldet)" : " - der Abschied kam nicht an");
+        stream_herunterfahren_anstossen();
+    }
+    qc_annahme_stoppen(g_annahme_bild);
+    qc_annahme_stoppen(g_annahme_eingabe);
+    g_annahme_bild = g_annahme_eingabe = NULL;
+    atomic_fetch_add(&g_bekanntgabe_gen, 1);
+    atomic_store(&g_dienst_laeuft, 0);
+    atomic_store(&g_port_belegt, 0);
+    logf_(@"Freigabe aus: Bild-, Eingabe- und Bekanntgabeport zu");
+    qc_ui_zustand_geaendert();
 }
 
 static void ui_protokoll(NSString *zeile) {
@@ -4233,47 +4377,27 @@ static void dienst_abschied(void) {
     dispatch_once(&einmal, ^{ host_abschied(); });
 }
 
-int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
-    protokoll_oeffnen();
-    if (![NSThread isMainThread]) {
-        logf_(@"Dienst: Start nicht auf dem Hauptfaden - nicht gestartet");
-        return QC_DIENST_FADEN;
-    }
-    if (atomic_load(&g_dienst_gestartet)) return QC_DIENST_DOPPELT;
+// Was qc_app_einrichten und qc_dienst_starten gemeinsam vorbereiten, einmal
+// je Prozess: Protokoll, Schalter, Schluessel, Zugang, Oberflaeche. Kein
+// Lauschen, keine Rueckfrage des Systems, keine Aufnahme.
+static _Atomic int g_eingerichtet = 0;
+static NSArray<NSString *> *g_dienst_args = nil;   // nur auf dem Hauptfaden
+static int g_dienst_eingebettet = 0;
+
+static int einrichten(const qc_dienst_cfg *dc) {
+    if (atomic_load(&g_eingerichtet)) return QC_DIENST_OK;
     const int eingebettet = dc && dc->eingebettet;
     NSArray<NSString *> *args = argumente_aus(dc ? dc->argc : 0, dc ? dc->argv : NULL);
     argumente_pruefen(args);
-    if (eingebettet)
-        logf_(@"Host-Dienst im Client-Prozess (eingebettet)");
-    else if (![args containsObject:@"--serve"])
-        // Ohne Modus - so startet der Finder die App per Doppelklick, und so
-        // startet sie beim Anmelden - laeuft der Host wie mit --serve auf dem
-        // Standard-Port; die uebrigen Schalter (--fps ...) gelten wie gewohnt.
-        logf_(@"Host-Modus (ohne Modus-Argument) auf dem Standard-Port");
-
-    // Hoechstens ein Host je Nutzer (Spezifikation 7.5): ein zweiter Start -
-    // Doppelklick, Anmeldeobjekt, "open -n" - endet still. Die Werkzeuge
-    // (qc_werkzeug) duerfen daneben laufen.
-    int instanz = qc_zugang_einzelinstanz();
-    if (instanz == 0) {
-        logf_(eingebettet ? @"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - der Dienst im Client startet nicht"
-                          : @"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start endet");
-        return QC_DIENST_LAEUFT_SCHON;
-    }
-    if (instanz < 0) logf_(@"Einzelinstanz: host-instanz.lock laesst sich nicht sperren - der Host laeuft trotzdem");
-
     int r = schluessel_laden();
     if (r) return r;
-    int fps, mbit, outW, outH, port;
-    double seconds;
-    NSString *outPath;
-    optionen_lesen(args, &fps, &mbit, &outW, &outH, &port, &seconds, &outPath);
-    (void)seconds;
-    if ((r = ausgabe_oeffnen(outPath))) return r;
-    atomic_store(&g_dienst_gestartet, 1);
+    g_dienst_args = args;
+    g_dienst_eingebettet = eingebettet;
+    atomic_store(&g_eingerichtet, 1);
 
     // Zugang (zugang.h): Migration aus authorized.txt, Zugangspasswort
-    // anlegen, wenn es fehlt. Vor der Annahme.
+    // anlegen, wenn es fehlt. Vor der Annahme - und in der einen App schon
+    // ohne Freigabe: ihr Menue zeigt ID, Passwort und Geraete immer.
     qc_zugang_protokoll_setzen(zugang_zeile);
     qc_zugang_entfernt_setzen(zuschauer_entfernt);
     qc_zugang_start(g_id_pub);
@@ -4289,6 +4413,81 @@ int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
             logf_(@"Geraete-ID dieses Hosts: %s (Fingerabdruck %s)   erlaubte Geraete: %d", id_text, fp, anz);
     }
 
+    // Die Oberflaeche vor der Annahme: ab hier ist "Zulassen" moeglich
+    // (qc_ui_vorhanden) - schon in der ersten Bekanntgabe (Flag) und in
+    // Nachricht 20 an einen Client, der gleich beim Start verbindet.
+    // Anfragen, bevor die Run-Loop laeuft, warten auf der Main Queue.
+    qc_oberflaeche_cfg ui = { .abschied = dienst_abschied, .protokoll = ui_protokoll,
+                              .eingebettet = eingebettet, .oeffnen = dc ? dc->oeffnen : NULL,
+                              .app = dc ? dc->app : NULL, .name_pruefen = dc ? dc->name_pruefen : NULL };
+    qc_oberflaeche_starten(&ui);
+    return QC_DIENST_OK;
+}
+
+int qc_app_einrichten(const qc_dienst_cfg *cfg) { @autoreleasepool {
+    protokoll_oeffnen();
+    if (![NSThread isMainThread]) {
+        logf_(@"Dienst: Einrichten nicht auf dem Hauptfaden - nichts eingerichtet");
+        return QC_DIENST_FADEN;
+    }
+    if (atomic_load(&g_eingerichtet)) return QC_DIENST_DOPPELT;
+    logf_(@"Die eine App: Oberflaeche, Schluessel und Zugang eingerichtet - lauschen erst mit der Freigabe");
+    return einrichten(cfg);
+}}
+
+int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
+    protokoll_oeffnen();
+    if (![NSThread isMainThread]) {
+        logf_(@"Dienst: Start nicht auf dem Hauptfaden - nicht gestartet");
+        return QC_DIENST_FADEN;
+    }
+    if (atomic_load(&g_dienst_gestartet)) return QC_DIENST_DOPPELT;
+    // Schon eingerichtet (die eine App): deren Schalter und Rueckrufe gelten.
+    const int eingebettet = atomic_load(&g_eingerichtet) ? g_dienst_eingebettet : dc && dc->eingebettet;
+    NSArray<NSString *> *args = atomic_load(&g_eingerichtet) ? g_dienst_args
+                                                              : argumente_aus(dc ? dc->argc : 0, dc ? dc->argv : NULL);
+    if (eingebettet)
+        logf_(@"Host-Dienst im Client-Prozess (eingebettet)");
+    else if (![args containsObject:@"--serve"])
+        // Ohne Modus - so startet der Finder die App per Doppelklick, und so
+        // startet sie beim Anmelden - laeuft der Host wie mit --serve auf dem
+        // Standard-Port; die uebrigen Schalter (--fps ...) gelten wie gewohnt.
+        logf_(@"Host-Modus (ohne Modus-Argument) auf dem Standard-Port");
+
+    // Hoechstens ein Host je Nutzer (Spezifikation 7.5): ein zweiter Start -
+    // Doppelklick, Anmeldeobjekt, "open -n" - endet still. Die Werkzeuge
+    // (qc_werkzeug) duerfen daneben laufen. Die eine App faengt ihren
+    // zweiten Start schon selbst ab (einzel.rs); hier trifft sie nur einen
+    // fremden Host, etwa eine aeltere QuadChroma.app - dann bleibt ihre
+    // Freigabe aus, und das Menue zeigt den Port als belegt.
+    int instanz = qc_zugang_einzelinstanz();
+    if (instanz == 0) {
+        if (eingebettet) {
+            int p = 9001;
+            NSInteger i = [args indexOfObject:@"--serve"];
+            if (i != NSNotFound && i + 1 < (NSInteger)args.count && ![args[i + 1] hasPrefix:@"--"] &&
+                args[i + 1].intValue > 0)
+                p = args[i + 1].intValue;
+            atomic_store(&g_port_belegt, p);
+            qc_ui_zustand_geaendert();
+        }
+        logf_(eingebettet ? @"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - der Dienst im Client startet nicht"
+                          : @"Es laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start endet");
+        return QC_DIENST_LAEUFT_SCHON;
+    }
+    if (instanz < 0) logf_(@"Einzelinstanz: host-instanz.lock laesst sich nicht sperren - der Host laeuft trotzdem");
+
+    int r = einrichten(dc);
+    if (r) return r;
+    int fps, mbit, outW, outH, port;
+    double seconds;
+    NSString *outPath;
+    optionen_lesen(args, &fps, &mbit, &outW, &outH, &port, &seconds, &outPath);
+    (void)seconds;
+    if ((r = ausgabe_oeffnen(outPath))) return r;
+    atomic_store(&g_dienst_gestartet, 1);
+    atomic_store(&g_freigabe_aus, 0);
+
     // Ohne Freigabe fuer die Bildschirmaufnahme einmal nachfragen. Der Host
     // laeuft weiter (Spezifikation 7.4), zeigt den Stand im Menue und nimmt
     // auf, sobald sie erteilt ist.
@@ -4300,7 +4499,6 @@ int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
     // Die Namen der Bildschirme kommen von AppKit, auf dem Hauptfaden.
     qc_bildschirm_namen_auffrischen();
     codecs_pruefen();
-
     QCBildschirm *display = erste_wahl();
     // Der Host wartet ohne Bildschirmliste (keine Freigabe, kein Monitor
     // beim Anmelden) - die Aufnahme entsteht ohnehin erst mit einem Zuschauer.
@@ -4346,14 +4544,9 @@ int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
     CGDisplayRegisterReconfigurationCallback(bildschirm_rueckruf, NULL);
     g_dienst_port = port;
     g_dienst_display = display ? display.displayID : CGMainDisplayID();
-    // Die Oberflaeche vor der Annahme: ab hier ist "Zulassen" moeglich
-    // (qc_ui_vorhanden) - schon in der ersten Bekanntgabe (Flag) und in
-    // Nachricht 20 an einen Client, der gleich beim Start verbindet.
-    // Anfragen, bevor die Run-Loop laeuft, warten auf der Main Queue.
-    qc_oberflaeche_cfg ui = { .abschied = dienst_abschied, .protokoll = ui_protokoll,
-                              .eingebettet = eingebettet, .oeffnen = dc ? dc->oeffnen : NULL };
-    qc_oberflaeche_starten(&ui);
+    // Die Oberflaeche steht schon (einrichten); ab hier lauschen die Ports.
     BOOL laeuft = dienst_starten();
+    qc_ui_zustand_geaendert();
     zustand_takt_starten();
     BOOL ax = AXIsProcessTrusted();
     bedienungshilfen_einmal_fragen();
@@ -4371,6 +4564,27 @@ int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
     dienst_takt_starten(QC_TAKT_S);
     return QC_DIENST_OK;
 }}
+
+// Freigabe aus (die eine App): siehe dienst.h und dienst_lauschen_beenden.
+void qc_dienst_anhalten(void) {
+    if (!atomic_load(&g_dienst_gestartet)) return;
+    logf_(@"Freigabe aus: der Zuschauer bekommt den Abschied (Grund 1), die Ports gehen zu");
+    dispatch_async(zustandq(), ^{ @autoreleasepool { dienst_lauschen_beenden(); } });
+}
+
+// Freigabe wieder an: nur Annahme und Bekanntgabe, alles andere steht noch.
+// Ist der Port inzwischen belegt, versucht es der Zustandstakt wie beim Start.
+void qc_dienst_fortsetzen(void) {
+    if (!atomic_load(&g_dienst_gestartet)) return;
+    dispatch_async(zustandq(), ^{ @autoreleasepool {
+        atomic_store(&g_freigabe_aus, 0);
+        if (dienst_starten())
+            logf_(@"Freigabe an: Bild %d, Eingabe %d, Bekanntgabe %d", g_dienst_port, g_dienst_port + 1, g_dienst_port + 2);
+        qc_ui_zustand_geaendert();
+    }});
+}
+
+int qc_dienst_gestartet(void) { return atomic_load(&g_dienst_gestartet); }
 
 void qc_dienst_beenden(void) {
     if (!atomic_load(&g_dienst_gestartet)) return;

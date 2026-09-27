@@ -1,6 +1,7 @@
 #include "qc_annahme.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -13,8 +14,13 @@
 
 #define QC_ANNAHME_PLAETZE 32       // obere Grenze fuer max_gesamt
 
-typedef struct {
+struct qc_annahme {
     int listen_fd;
+    // Wecker fuers Anhalten: halt setzt qc_annahme_stoppen, dann ein Byte in
+    // weck[1] (das schliesst er selbst); der Annahmefaden wartet in poll auf
+    // den Port UND auf weck[0] und schliesst danach listen_fd und weck[0].
+    int weck[2];
+    _Atomic int halt;
     qc_annahme_cfg cfg;
     pthread_mutex_t mtx;            // schuetzt platz[], nr und idx/verdraengt der Plaetze
     qc_platz *platz[QC_ANNAHME_PLAETZE];    // NULL = frei
@@ -24,7 +30,7 @@ typedef struct {
     long verdraengt, abgewiesen;    // seit der letzten Meldung
     struct sockaddr_in verdraengt_von, abgewiesen_von;
     int64_t gemeldet_s;
-} qc_annahme;
+};
 
 struct qc_platz {
     qc_annahme *a;
@@ -112,12 +118,29 @@ static void *annahme_faden(void *arg) {
     for (;;) {
         // Eine offene Zaehlung kommt spaetestens nach der Sperre heraus,
         // auch wenn danach niemand mehr anklopft.
+        int warte_ms = -1;
         if (a->verdraengt || a->abgewiesen) {
             int64_t rest = a->gemeldet_s + QC_MELDEN_S - jetzt_s();
             if (rest <= 0) { melden(a, jetzt_s()); continue; }
-            struct pollfd pf = { .fd = a->listen_fd, .events = POLLIN, .revents = 0 };
-            if (poll(&pf, 1, (int)rest * 1000) <= 0) continue;
+            warte_ms = (int)rest * 1000;
         }
+        // Gewartet wird immer in poll - auf den Port und auf den Wecker des
+        // Anhaltens. accept selbst blockiert nie (der Socket ist nicht
+        // blockierend): gibt eine Gegenstelle zwischen poll und accept auf,
+        // kommt EAGAIN, und es geht zurueck ins Warten, wo auch das Anhalten
+        // ankommt.
+        struct pollfd pf[2] = {
+            { .fd = a->listen_fd, .events = POLLIN, .revents = 0 },
+            { .fd = a->weck[0], .events = POLLIN, .revents = 0 },
+        };
+        int n = poll(pf, a->weck[0] >= 0 ? 2 : 1, warte_ms);
+        if (atomic_load(&a->halt)) break;
+        if (n <= 0) {
+            if (n < 0 && errno != EINTR) usleep(100 * 1000);
+            continue;
+        }
+        if (pf[0].revents & POLLNVAL) break;
+        if (!(pf[0].revents & (POLLIN | POLLERR | POLLHUP))) continue;
 
         struct sockaddr_in peer; socklen_t plen = sizeof peer;
         memset(&peer, 0, sizeof peer);
@@ -127,9 +150,13 @@ static void *annahme_faden(void *arg) {
             // Alles andere geht vorueber: eine Gegenstelle, die vor dem
             // accept aufgibt, oder kurz keine Dateinummern. Der Port bleibt
             // offen - frueher endete der Faden hier fuer immer.
-            if (errno != EINTR && errno != ECONNABORTED) usleep(100 * 1000);
+            if (errno != EINTR && errno != ECONNABORTED && errno != EAGAIN && errno != EWOULDBLOCK) usleep(100 * 1000);
             continue;
         }
+        // Unter macOS erbt die neue Verbindung O_NONBLOCK vom lauschenden
+        // Socket; Handschlag und Sitzung arbeiten blockierend.
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
 
         qc_platz *p = NULL;
         if (atomic_load(&a->faeden) >= 2 * a->cfg.max_gesamt) {
@@ -159,24 +186,56 @@ static void *annahme_faden(void *arg) {
         if ((a->verdraengt || a->abgewiesen) && t - a->gemeldet_s >= QC_MELDEN_S) melden(a, t);
     }
     pthread_attr_destroy(&attr);
+    // Angehalten: der Port wird frei. Eine offene Zaehlung faellt weg - wer
+    // anhaelt, will vom Port nichts mehr hoeren.
+    if (atomic_load(&a->halt)) {
+        close(a->listen_fd);
+        if (a->weck[0] >= 0) close(a->weck[0]);
+    }
     return NULL;
 }
 
-int qc_annahme_starten(int listen_fd, const qc_annahme_cfg *cfg) {
-    if (!cfg || !cfg->verbindung || cfg->max_gesamt < 1 || cfg->max_je_ip < 1) return -1;
+qc_annahme *qc_annahme_neu(int listen_fd, const qc_annahme_cfg *cfg) {
+    if (!cfg || !cfg->verbindung || cfg->max_gesamt < 1 || cfg->max_je_ip < 1) return NULL;
     qc_annahme *a = calloc(1, sizeof *a);
-    if (!a) return -1;
+    if (!a) return NULL;
     a->listen_fd = listen_fd;
     a->cfg = *cfg;
     if (a->cfg.max_gesamt > QC_ANNAHME_PLAETZE) a->cfg.max_gesamt = QC_ANNAHME_PLAETZE;
     a->gemeldet_s = jetzt_s() - QC_MELDEN_S;    // die erste Meldung kommt sofort
+    if (pipe(a->weck) != 0) {
+        free(a);
+        return NULL;
+    }
+    fcntl(a->weck[0], F_SETFD, FD_CLOEXEC);
+    fcntl(a->weck[1], F_SETFD, FD_CLOEXEC);
+    int fl = fcntl(listen_fd, F_GETFL);
+    if (fl >= 0) fcntl(listen_fd, F_SETFL, fl | O_NONBLOCK);
     pthread_mutex_init(&a->mtx, NULL);
     pthread_t t;
     if (pthread_create(&t, NULL, annahme_faden, a) != 0) {
+        if (fl >= 0) fcntl(listen_fd, F_SETFL, fl);
+        close(a->weck[0]);
+        close(a->weck[1]);
         pthread_mutex_destroy(&a->mtx);
         free(a);
-        return -1;
+        return NULL;
     }
     pthread_detach(t);
-    return 0;
+    return a;
+}
+
+int qc_annahme_starten(int listen_fd, const qc_annahme_cfg *cfg) {
+    return qc_annahme_neu(listen_fd, cfg) ? 0 : -1;
+}
+
+void qc_annahme_stoppen(qc_annahme *a) {
+    if (!a || atomic_exchange(&a->halt, 1)) return;
+    // Erst halt, dann das Byte: der Faden sieht halt spaetestens, wenn poll
+    // wegen des Bytes zurueckkehrt. weck[1] gehoert nur dem Anhalten.
+    char x = 1;
+    ssize_t r;
+    do r = write(a->weck[1], &x, 1); while (r < 0 && errno == EINTR);
+    close(a->weck[1]);
+    a->weck[1] = -1;
 }

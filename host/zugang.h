@@ -330,6 +330,8 @@ int qc_zustand_zuschauer(char *name, size_t groesse);   // 1 verbunden (name gef
 int qc_zustand_bildschirmfreigabe(void);                // 1 erteilt
 int qc_zustand_bedienungshilfen(void);                  // 1 erteilt
 int qc_zustand_port_belegt(void);                       // 0, oder der Bildport, den ein anderes Programm belegt
+int qc_zustand_geraetename(char *name, size_t groesse); // Name in Bekanntgabe und Nachricht 20 (eingestellt oder Rechnername)
+int qc_zustand_rechnername(char *name, size_t groesse); // Rechnername aus den Systemeinstellungen
 
 // Von der Oberflaeche bereitgestellt (P3), vom Kern gerufen. zugang.c
 // liefert schwache Standardfassungen, damit Pruefstaende ohne Oberflaeche

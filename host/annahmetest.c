@@ -115,6 +115,43 @@ static int lauschen(int start, int max_gesamt, int max_je_ip, qc_verbindung_fn f
     return -1;
 }
 
+// Wie lauschen, aber mit Griff zum Anhalten (Freigabe aus). *aus = Griff.
+// SO_REUSEADDR wie start_server in main.m: eine Verbindung vom vorigen
+// Lauschen darf den Port noch tragen.
+static int lauschen_griff(int start, qc_verbindung_fn fn, zaehler *z, qc_annahme **aus) {
+    for (int port = start; port < start + 200; port++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in a = {0};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 32) != 0) { close(fd); continue; }
+        qc_annahme_cfg cfg = { 4, 4, fn, andrang, z };
+        if (!(*aus = qc_annahme_neu(fd, &cfg))) { close(fd); return -1; }
+        return port;
+    }
+    return -1;
+}
+
+// Laesst sich der Port wieder binden (wie beim Wiedereinschalten der
+// Freigabe, mit SO_REUSEADDR wie start_server in main.m)?
+static int bindbar(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((uint16_t)port);
+    int ok = bind(fd, (struct sockaddr *)&a, sizeof a) == 0 && listen(fd, 4) == 0;
+    close(fd);
+    return ok;
+}
+
 // ---------------------------------------------------------- Clientseite
 
 static int verbinden(int port) {
@@ -589,6 +626,38 @@ int main(void) {
            atomic_load(&za.erfolg), atomic_load(&zb.erfolg), 1 + versuche);
     pruefe(atomic_load(&za.erfolg) == 2 && atomic_load(&zb.erfolg) == 1 + versuche,
            "Hostseite: alle echten Handschlaege erfolgreich");
+
+    // 7. Anhalten (Freigabe aus): der Port wird sofort frei, eine laufende
+    // Verbindung bleibt, Wiedereinschalten auf demselben Port geht.
+    printf("\n-- Anhalten\n");
+    static zaehler ze, zf;
+    qc_annahme *h = NULL, *h2 = NULL;
+    int port5 = lauschen_griff(port3 + 50, verbindung, &ze, &h);
+    pruefe(port5 > 0 && h && echter_client(port5) == 0, "Annahme mit Griff: echter Client kommt durch");
+    int laufend = port5 > 0 ? stummer_client(port5) : -1;
+    usleep(100 * 1000);
+    int64_t t_halt = jetzt_ms();
+    qc_annahme_stoppen(h);
+    int zu_ms = -1;
+    while (jetzt_ms() - t_halt < 1000) {
+        int v = verbinden(port5);
+        if (v < 0) { zu_ms = (int)(jetzt_ms() - t_halt); break; }
+        close(v);
+        usleep(10 * 1000);
+    }
+    printf("         (Port nach %d ms zu)\n", zu_ms);
+    pruefe(zu_ms >= 0 && zu_ms < 300, "nach dem Anhalten weist der Port sofort ab (< 300 ms)");
+    pruefe(bindbar(port5), "der Port ist frei (bind und listen gehen)");
+    pruefe(warte_auf_ende(laufend, 300) < 0, "eine Verbindung im Handschlag laeuft weiter (ihr Faden gehoert ihr)");
+    qc_annahme_stoppen(h);
+    qc_annahme_stoppen(NULL);
+    pruefe(1, "zweites Anhalten und NULL sind harmlos");
+    int port6 = port5 > 0 ? lauschen_griff(port5, verbindung, &zf, &h2) : -1;
+    pruefe(port6 == port5 && echter_client(port6) == 0, "wieder eingeschaltet: derselbe Port nimmt wieder an");
+    qc_annahme_stoppen(h2);
+    if (laufend >= 0) close(laufend);
+    usleep(100 * 1000);
+    pruefe(bindbar(port5), "nach dem zweiten Anhalten wieder frei");
 
     static zaehler zd;
     int port4 = lauschen(port3 + 1, 4, 4, frist_verbindung, &zd);

@@ -58,6 +58,21 @@ typedef struct {
 /// Startet den Annahmefaden fuer einen lauschenden Socket. 0 = Erfolg.
 int qc_annahme_starten(int listen_fd, const qc_annahme_cfg *cfg);
 
+/// Dasselbe mit einem Griff zum Anhalten (Freigabe aus). NULL = gescheitert,
+/// dann gehoert listen_fd weiter dem Aufrufer. Sonst gehoert er der Annahme:
+/// der Socket wird nicht blockierend (angenommene Verbindungen sind es
+/// wieder), und nur der Annahmefaden schliesst ihn.
+typedef struct qc_annahme qc_annahme;
+qc_annahme *qc_annahme_neu(int listen_fd, const qc_annahme_cfg *cfg);
+
+/// Anhalten: der Annahmefaden wacht sofort auf, schliesst den lauschenden
+/// Socket (der Port ist danach frei) und endet. Laufende Verbindungen laufen
+/// weiter, ihre Faeden gehoeren ihnen. Aus jedem Faden, einmal wirksam;
+/// NULL und ein zweiter Aufruf sind harmlos. Der Griff bleibt gueltig, bis
+/// der Prozess endet (die Faeden laufender Verbindungen zeigen darauf) - ein
+/// paar hundert Byte je angehaltener Annahme.
+void qc_annahme_stoppen(qc_annahme *a);
+
 /// Handschlag vorbei: Platz zurueckgeben. 1 = die Verbindung wurde inzwischen
 /// verdraengt (der Socket ist abgebrochen, nicht weitermachen; gemeldet wird
 /// das schon ueber andrang), sonst 0. Mehrfacher Aufruf ist harmlos.

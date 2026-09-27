@@ -6,8 +6,18 @@
 // (client/build.rs, Deklarationen in client/src/host_mac.rs); dort dreht
 // winit die Run-Loop, und der Dienst startet eingebettet aus resumed.
 //
-// Faeden: qc_werkzeug, qc_dienst_starten und qc_oberflaeche_fertig nur auf
-// dem Hauptfaden; qc_dienst_beenden aus jedem Faden.
+// Die eine App (Client und Host in einem Prozess, Plan M4): der Client
+// richtet in resumed mit qc_app_einrichten Oberflaeche, Schluessel und
+// Zugang ein - das Symbol in der Menueleiste traegt dann auch seine Punkte
+// (Rueckruf app) -, startet mit eingeschalteter Freigabe qc_dienst_starten
+// und ruft qc_oberflaeche_fertig. Die Freigabe schaltet er mit
+// qc_dienst_anhalten und qc_dienst_fortsetzen (bzw. dem ersten
+// qc_dienst_starten) um.
+//
+// Faeden: qc_werkzeug, qc_app_einrichten, qc_dienst_starten,
+// qc_oberflaeche_fertig und die Funktionen der Menueleiste nur auf dem
+// Hauptfaden; qc_dienst_beenden, qc_dienst_anhalten, qc_dienst_fortsetzen
+// und qc_dienst_name_setzen aus jedem Faden.
 //
 // Nur C-Typen, damit Rust (und C) den Kopf ohne Objective-C lesen koennen.
 #ifndef QC_DIENST_H
@@ -40,7 +50,23 @@ typedef struct {
     // Nur eingebettet: Doppelklick auf die laufende App (das Fenster des
     // Clients oeffnen). NULL: das Menue des Symbols zeigen, wie die eigene App.
     void (*oeffnen)(void);
+    // Nur die eine App: die Punkte des Clients im Menue des Symbols (QC_APP_*
+    // unten, wert nur fuer VERBINDEN und NAME, gilt nur waehrend des
+    // Aufrufs). Auf dem Hauptfaden. NULL: nur das Menue des Hosts.
+    void (*app)(int was, const char *wert);
+    // Nur die eine App: Pruefung im Fenster "Geraetename" (UTF-8), dieselbe
+    // wie im Client: 0 gut (auch leer = Rechnername), 1 zu lang (ueber 40
+    // Byte), 2 unzulaessige Zeichen. NULL: alles gilt als gut.
+    int (*name_pruefen)(const char *eingabe);
 } qc_dienst_cfg;
+
+// Was der Rueckruf app meldet.
+#define QC_APP_OEFFNEN    1   // "QuadChroma oeffnen": das Fenster des Clients
+#define QC_APP_VERBINDEN  2   // "Verbinden: <Host>", wert = Adresse
+#define QC_APP_FREIGABE   3   // Haken "Diesen Mac freigeben" umschalten
+#define QC_APP_RUHE       4   // Haken "Ruhezustand verhindern" umschalten
+#define QC_APP_NAME       5   // neuer Geraetename aus dem Fenster, wert = Eingabe (leer = Rechnername)
+#define QC_APP_BEENDEN    6   // "QuadChroma beenden" (Menue, Cmd+Q)
 
 // Startet den Dienst ohne Run-Loop und kehrt zurueck: Einzelinstanz,
 // Schluessel, Zugang, Oberflaeche (Symbol erst mit qc_oberflaeche_fertig),
@@ -65,6 +91,64 @@ void qc_dienst_beenden(void);
 // ihrem Delegate, eingebettet ruft es der Client aus resumed - nach
 // qc_dienst_starten. Vorher und ein zweites Mal ohne Wirkung.
 void qc_oberflaeche_fertig(void);
+
+// Nur die eine App: Oberflaeche (eingebettet, mit den Punkten des Clients),
+// Schluessel und Zugang einrichten, ohne zu lauschen und ohne Rueckfrage
+// des Systems - so zeigt das Menue ID, Passwort und Geraete auch bei
+// ausgeschalteter Freigabe. Danach qc_dienst_starten (Freigabe an) und
+// qc_oberflaeche_fertig. Rueckgabe QC_DIENST_OK, _FADEN, _DATEI oder
+// _DOPPELT (schon eingerichtet).
+int qc_app_einrichten(const qc_dienst_cfg *cfg);
+
+// Freigabe aus: ein Zuschauer bekommt den Abschied (Typ 13, Grund 1 "Freigabe
+// ausgeschaltet"), Aufnahme und Encoder gehen ab, Bild-, Eingabe- und
+// Bekanntgabeport schliessen. Wer gerade im Handschlag ist, wird nicht mehr
+// Zuschauer. Zugang, Oberflaeche und Waechter bleiben. Kehrt sofort zurueck
+// (die Arbeit laeuft auf einer eigenen Warteschlange). Ohne gestarteten
+// Dienst ohne Wirkung.
+void qc_dienst_anhalten(void);
+// Freigabe wieder an nach qc_dienst_anhalten: die Ports lauschen wieder, die
+// Bekanntgabe laeuft. Kehrt sofort zurueck. Ohne gestarteten Dienst ohne
+// Wirkung - das erste Einschalten ist qc_dienst_starten.
+void qc_dienst_fortsetzen(void);
+// 1, sobald qc_dienst_starten gelungen ist.
+int qc_dienst_gestartet(void);
+
+// Der Geraetename (die eine App: geraetename= in einstellungen.txt) statt
+// des Rechnernamens: in der Bekanntgabe ab ihrer naechsten Runde, in
+// Nachricht 20 ab der naechsten Zugangsphase, im Kopf des Menues sofort.
+// NULL oder leer: wieder der Rechnername aus den Systemeinstellungen.
+void qc_dienst_name_setzen(const char *name);
+
+// ------------------------------------------------ Menueleiste der einen App
+// (menue.m, nur auf dem Hauptfaden)
+
+// Was nur der Client weiss: sein Haken der Freigabe (der Wunsch - die
+// Zustandszeile sagt, was wirklich ist), "Ruhezustand verhindern", die
+// gefundenen Hosts fuer "Verbinden: <Host>" (hoechstens 4, name darf leer
+// sein), der Tooltip und ob eine Sitzung laeuft (dann gehen Cmd+Q und Cmd+H
+// an den Mac drueben statt an das Programmmenue). Die Texte gelten nur
+// waehrend des Aufrufs. Das Menue wird nur neu gebaut, wenn sich etwas
+// aendert.
+typedef struct {
+    int freigabe;
+    int ruhe;
+    int sitzung;
+    const char *tooltip;
+    int hosts;
+    const char *const *host_namen;
+    const char *const *host_adressen;
+} qc_app_stand;
+void qc_app_stand_setzen(const qc_app_stand *s);
+
+// Die einmalige Hinweisblase unter dem Symbol (etwa "QuadChroma laeuft in
+// der Menueleiste weiter."), sechs Sekunden. 1 = gezeigt; 0, wenn das
+// Symbol nicht zu sehen ist (volle Menueleiste) oder es keins gibt.
+int qc_menueleiste_hinweis(const char *text);
+// 1 = das Symbol steht sichtbar in der Menueleiste.
+int qc_menueleiste_steht(void);
+// Das Fenster "Geraetename" (auch aus dem Startbildschirm: "Umbenennen").
+void qc_geraetename_fenster(void);
 
 // Werkzeuge der Kommandozeile (--list, --formattest, --capture ohne --serve):
 // laufen zu Ende und liefern den Exit-Code. Ohne Werkzeug-Schalter

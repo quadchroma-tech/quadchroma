@@ -152,16 +152,26 @@ static NSArray<QCMenuePunkt *> *geraete_untermenue(QCMenueZustand *z) {
     return u;
 }
 
+// So viele gefundene Hosts stehen hoechstens im Menue (wie unter Windows,
+// tray::HOSTS_MAX).
+#define QC_HOSTS_MAX 4
+
 NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z) {
     NSMutableArray<QCMenuePunkt *> *m = [NSMutableArray array];
 
     // Kopf: Name und Zustand. Belegt ein anderes Programm den Bildport, kann
-    // niemand verbinden - dann steht das statt "Bereit" da.
-    QCMenuePunkt *kopf = punkt(@"QuadChroma", QCAktionKeine, NO);
+    // niemand verbinden - dann steht das statt "Bereit" da. Die eine App
+    // nennt im Kopf den Geraetenamen (wie unter Windows) und sagt, wenn die
+    // Freigabe aus ist.
+    NSString *kopftitel = z.app && z.geraetename.length ? [@"QuadChroma – " stringByAppendingString:z.geraetename]
+                                                        : @"QuadChroma";
+    QCMenuePunkt *kopf = punkt(kopftitel, QCAktionKeine, NO);
     kopf.kopf = YES;
     [m addObject:kopf];
     NSString *zustand;
-    if (z.zuschauer)
+    if (z.app && !z.freigabe)
+        zustand = qc_text(QCTextHostSharingIsOff);
+    else if (z.zuschauer)
         zustand = qc_text_mit(QCTextHostConnected, @{ @"n": z.zuschauer });
     else if (z.portBelegt > 0)
         zustand = qc_text_mit(QCTextHostPortBusy, @{ @"p": [NSString stringWithFormat:@"%d", z.portBelegt] });
@@ -169,6 +179,22 @@ NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z) {
         zustand = qc_text(QCTextHostReady);
     [m addObject:punkt(zustand, QCAktionKeine, NO)];
     [m addObject:trennlinie()];
+
+    // Die eine App: ihr Fenster und die gefundenen Hosts (Name, ohne Namen
+    // die Adresse - der Client hat die Namen schon entschaerft).
+    if (z.app) {
+        [m addObject:punkt(qc_text(QCTextTrayOpenApp), QCAktionOeffnen, YES)];
+        NSUInteger n = 0;
+        for (NSArray<NSString *> *h in z.hosts) {
+            if (n >= QC_HOSTS_MAX) break;
+            if (h.count < 2 || !h[1].length) continue;
+            n++;
+            QCMenuePunkt *p = punkt(qc_text_mit(QCTextTrayConnect, @{ @"n": h[0].length ? h[0] : h[1] }), QCAktionVerbinden, YES);
+            p.daten = [h[1] dataUsingEncoding:NSUTF8StringEncoding];
+            [m addObject:p];
+        }
+        [m addObject:trennlinie()];
+    }
 
     // Wer dieser Mac ist und wie man hineinkommt.
     [m addObject:punkt(qc_text_mit(QCTextHostDeviceId, @{ @"i": qc_id_text(z.eigeneId) }), QCAktionIdKopieren, YES)];
@@ -192,7 +218,17 @@ NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z) {
     }
     [m addObject:trennlinie()];
 
-    // Start bei der Anmeldung und fehlende Freigaben (nur wenn sie fehlen).
+    // Die eine App: Geraetename und der Schalter der Freigabe.
+    if (z.app) {
+        [m addObject:punkt(qc_text(QCTextDeviceNameChange), QCAktionNameAendern, YES)];
+        QCMenuePunkt *fr = punkt(qc_text(QCTextStartShareMac), QCAktionFreigabe, YES);
+        fr.haken = z.freigabe;
+        [m addObject:fr];
+    }
+
+    // Start bei der Anmeldung und fehlende Freigaben (nur wenn sie fehlen -
+    // und in der einen App nur, solange sie freigibt: ohne Freigabe braucht
+    // niemand Bildschirmaufnahme und Bedienungshilfen).
     QCMenuePunkt *anm = punkt(qc_text(QCTextHostStartLogin), QCAktionAnmelden,
                               z.anmelden != QCAnmeldenNichtInProgramme);
     anm.haken = z.anmelden == QCAnmeldenAn;
@@ -200,10 +236,17 @@ NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z) {
     [m addObject:anm];
     if (z.anmelden == QCAnmeldenNichtInProgramme)
         [m addObject:punkt(qc_text(QCTextHostMoveToApps), QCAktionKeine, NO)];
-    if (!z.bildschirm)
-        [m addObject:punkt(qc_text(QCTextHostScreenMissing), QCAktionBildschirmFreigabe, YES)];
-    if (!z.bedienung)
-        [m addObject:punkt(qc_text(QCTextHostAccessMissing), QCAktionBedienungshilfen, YES)];
+    if (z.app) {
+        QCMenuePunkt *ruhe = punkt(qc_text(QCTextPreventSleep), QCAktionRuhe, YES);
+        ruhe.haken = z.ruhe;
+        [m addObject:ruhe];
+    }
+    if (!z.app || z.freigabe) {
+        if (!z.bildschirm)
+            [m addObject:punkt(qc_text(QCTextHostScreenMissing), QCAktionBildschirmFreigabe, YES)];
+        if (!z.bedienung)
+            [m addObject:punkt(qc_text(QCTextHostAccessMissing), QCAktionBedienungshilfen, YES)];
+    }
     [m addObject:trennlinie()];
 
     QCMenuePunkt *ende = punkt(qc_text(QCTextHostQuit), QCAktionBeenden, YES);
@@ -306,6 +349,21 @@ static qc_oberflaeche_cfg g_cfg;
 static _Atomic int g_ui_da = 0;            // qc_oberflaeche_starten ist gelaufen
 static _Atomic int g_auffrischen_steht_an = 0;
 
+// Der Stand des Clients in der einen App (qc_app_stand_setzen, Hauptfaden),
+// gelesen auf der Oberflaechen-Warteschlange: unter @synchronized auf
+// g_app_sperre, nur unveraenderliche Objekte.
+static _Atomic int g_app = 0;              // die eine App: cfg.app ist gesetzt
+static NSObject *g_app_sperre;
+static BOOL g_app_freigabe, g_app_ruhe, g_app_sitzung;
+static NSArray<NSArray<NSString *> *> *g_app_hosts;
+static NSString *g_app_tooltip;
+
+static NSObject *app_sperre(void) {
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{ g_app_sperre = [[NSObject alloc] init]; });
+    return g_app_sperre;
+}
+
 static QCAnmelden anmelden_lesen(void) {
     // Ein Anmeldeobjekt zeigt auf den Ort der App. Von der DMG, aus
     // "Downloads" oder verlagert (App Translocation) zeigte es ins Leere.
@@ -342,6 +400,18 @@ QCMenueZustand *qc_menue_zustand_lesen(void) {
     z.bedienung = qc_zustand_bedienungshilfen() != 0;
     z.anmelden = anmelden_lesen();
     z.portBelegt = qc_zustand_port_belegt();
+
+    if (atomic_load(&g_app)) {
+        z.app = YES;
+        char n[128] = {0};
+        qc_zustand_geraetename(n, sizeof n);
+        z.geraetename = feld_text(n, sizeof n);
+        @synchronized (app_sperre()) {
+            z.freigabe = g_app_freigabe;
+            z.ruhe = g_app_ruhe;
+            z.hosts = g_app_hosts ?: @[];
+        }
+    }
     return z;
 }
 
@@ -370,7 +440,7 @@ static dispatch_queue_t ui_q(void) {
 }
 
 // Nur auf dem Hauptfaden:
-@class QCOberflaeche, QCFrage, QCPasswortFenster;
+@class QCOberflaeche, QCFrage, QCPasswortFenster, QCNamenFenster;
 static QCOberflaeche *g_ui;                 // Delegate und Ziel der Menuepunkte
 static NSStatusItem *g_item;
 static NSMenu *g_menue;
@@ -380,6 +450,8 @@ static uint64_t g_anfrage_gezeigt;          // Nummer im Zulassen-Fenster, 0 = k
 static QCFrage *g_anfrage_fenster;
 static QCFrage *g_frage_fenster;            // Rueckfrage "Alle Geraete entfernen"
 static QCPasswortFenster *g_passwort_fenster;
+static QCNamenFenster *g_namen_fenster;
+static NSPopover *g_hinweis;                // die einmalige Hinweisblase (qc_menueleiste_hinweis)
 static id<NSObject> g_aktivitaet;
 static dispatch_source_t g_signale[2];
 static int g_kopiert_nr;
@@ -767,6 +839,106 @@ static void anfrage_abgleichen(void) {
 
 @end
 
+// ------------------------------------------------------------ Geraetename
+// Das Fenster "Geraetename" der einen App (wie host/fenster.rs unter
+// Windows): ein Feld mit dem Namen, der jetzt gilt, der Hinweis mit dem
+// Rechnernamen, Abbrechen und OK. Geprueft wird wie im Client (Rueckruf
+// name_pruefen); ein guter Name geht ueber app (QC_APP_NAME) an den Client,
+// der ihn merkt und dem Dienst gibt (qc_dienst_name_setzen).
+
+QCText qc_geraetename_fehler(NSString *eingabe, int (*pruefen)(const char *)) {
+    int r = pruefen ? pruefen((eingabe ?: @"").UTF8String ?: "") : 0;
+    return r == 1 ? QCTextDeviceNameTooLong : r == 2 ? QCTextDeviceNameInvalid : QCTextAnzahl;
+}
+
+@interface QCNamenFenster : NSObject <NSWindowDelegate>
+@property (nonatomic, strong) NSPanel *panel;
+@property (nonatomic, strong) NSTextField *feld, *hinweis, *fehler, *beschriftung;
+@property (nonatomic, strong) NSButton *ok, *abbrechen;
+@end
+
+@implementation QCNamenFenster
+
+- (void)bauen {
+    NSPanel *p = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 380, 180)
+                                            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                              backing:NSBackingStoreBuffered defer:YES];
+    p.releasedWhenClosed = NO;
+    p.hidesOnDeactivate = NO;
+    p.delegate = self;
+    self.beschriftung = [NSTextField wrappingLabelWithString:@""];
+    self.feld = [[NSTextField alloc] init];
+    self.hinweis = [NSTextField wrappingLabelWithString:@""];
+    self.hinweis.textColor = [NSColor secondaryLabelColor];
+    self.fehler = [NSTextField wrappingLabelWithString:@""];
+    self.fehler.textColor = [NSColor systemRedColor];
+    self.ok = [NSButton buttonWithTitle:@"" target:self action:@selector(okGeklickt:)];
+    self.ok.keyEquivalent = @"\r";
+    self.abbrechen = [NSButton buttonWithTitle:@"" target:self action:@selector(abbrechenGeklickt:)];
+    self.abbrechen.keyEquivalent = @"\033";
+    for (NSTextField *v in @[ self.beschriftung, self.hinweis, self.fehler ]) v.preferredMaxLayoutWidth = 340;
+    for (NSView *v in @[ self.beschriftung, self.feld, self.hinweis, self.fehler ])
+        [v.widthAnchor constraintEqualToConstant:340].active = YES;
+    NSStackView *knoepfe = [[NSStackView alloc] init];
+    knoepfe.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    [knoepfe addView:self.abbrechen inGravity:NSStackViewGravityTrailing];
+    [knoepfe addView:self.ok inGravity:NSStackViewGravityTrailing];
+    [knoepfe.widthAnchor constraintEqualToConstant:340].active = YES;
+    NSStackView *st = [NSStackView stackViewWithViews:@[ self.beschriftung, self.feld, self.hinweis, self.fehler, knoepfe ]];
+    st.orientation = NSUserInterfaceLayoutOrientationVertical;
+    st.alignment = NSLayoutAttributeLeading;
+    st.spacing = 8;
+    st.edgeInsets = NSEdgeInsetsMake(20, 20, 16, 20);
+    p.contentView = st;
+    self.panel = p;
+}
+
+- (void)zeigen {
+    if (!self.panel) [self bauen];
+    char name[128] = {0}, rechner[128] = {0};
+    qc_zustand_geraetename(name, sizeof name);
+    qc_zustand_rechnername(rechner, sizeof rechner);
+    // Texte bei jedem Oeffnen: die Sprache kann sich geaendert haben.
+    self.panel.title = qc_text(QCTextDeviceNameTitle);
+    self.beschriftung.stringValue = qc_text(QCTextDeviceNameLabel);
+    self.hinweis.stringValue = qc_text_mit(QCTextDeviceNameHint, @{ @"n": feld_text(rechner, sizeof rechner) });
+    self.ok.title = qc_text(QCTextHostOk);
+    self.abbrechen.title = qc_text(QCTextAccessCancel);
+    self.feld.stringValue = feld_text(name, sizeof name);
+    self.fehler.stringValue = @"";
+    self.fehler.hidden = YES;
+    [self.panel setContentSize:self.panel.contentView.fittingSize];
+    aktivieren();
+    [self.panel center];
+    [self.panel makeKeyAndOrderFront:nil];
+    [self.panel makeFirstResponder:self.feld];
+}
+
+- (void)okGeklickt:(id)sender {
+    (void)sender;
+    NSString *eingabe = self.feld.stringValue ?: @"";
+    QCText f = qc_geraetename_fehler(eingabe, g_cfg.name_pruefen);
+    if (f != QCTextAnzahl) {
+        self.fehler.stringValue = qc_text(f);
+        self.fehler.hidden = NO;
+        [self.panel setContentSize:self.panel.contentView.fittingSize];
+        return;
+    }
+    [self.panel close];
+    ui_log(@"Oberflaeche: Geraetename eingegeben");
+    if (g_cfg.app) g_cfg.app(QC_APP_NAME, eingabe.UTF8String ?: "");
+}
+
+- (void)abbrechenGeklickt:(id)sender { (void)sender; [self.panel close]; }
+
+@end
+
+void qc_geraetename_fenster(void) {
+    if (!atomic_load(&g_ui_da)) return;
+    if (!g_namen_fenster) g_namen_fenster = [[QCNamenFenster alloc] init];
+    [g_namen_fenster zeigen];
+}
+
 // ------------------------------------------------------------ Aktionen
 
 static void alle_entfernen_fragen(void) {
@@ -820,6 +992,43 @@ static void bearbeiten_menue_setzen(void) {
     NSMenu *haupt = [[NSMenu alloc] initWithTitle:@""];
     [haupt addItem:oben];
     NSApp.mainMenu = haupt;
+}
+
+NSMenu *qc_programmmenue_bauen(id ziel, BOOL sitzung) {
+    NSMenu *programm = [[NSMenu alloc] initWithTitle:@"QuadChroma"];
+    NSMenuItem *ende = [[NSMenuItem alloc] initWithTitle:qc_text(QCTextHostQuit) action:@selector(menueAktion:)
+                                           keyEquivalent:sitzung ? @"" : @"q"];
+    ende.target = ziel;
+    ende.tag = QCAktionBeenden;
+    NSMenuItem *weg = [[NSMenuItem alloc] initWithTitle:@"" action:@selector(hide:) keyEquivalent:sitzung ? @"" : @"h"];
+    weg.hidden = YES;
+    weg.allowsKeyEquivalentWhenHidden = YES;
+    [programm addItem:weg];
+    [programm addItem:ende];
+    // Bearbeiten, verborgen: nur die Tasten. Ohne Ziel gehen sie an den
+    // Ersthelfer - im Fenster des Clients antwortet keiner, der Punkt ist
+    // gesperrt, und die Taste kommt bei winit an (Cmd+V im Adressfeld, im
+    // Pult, an den Mac drueben).
+    struct { SEL s; NSString *k; NSEventModifierFlags f; } b[] = {
+        { @selector(undo:), @"z", NSEventModifierFlagCommand },
+        { @selector(redo:), @"z", NSEventModifierFlagCommand | NSEventModifierFlagShift },
+        { @selector(cut:), @"x", NSEventModifierFlagCommand },
+        { @selector(copy:), @"c", NSEventModifierFlagCommand },
+        { @selector(paste:), @"v", NSEventModifierFlagCommand },
+        { @selector(selectAll:), @"a", NSEventModifierFlagCommand },
+    };
+    for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
+        NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"" action:b[i].s keyEquivalent:b[i].k];
+        it.keyEquivalentModifierMask = b[i].f;
+        it.hidden = YES;
+        it.allowsKeyEquivalentWhenHidden = YES;
+        [programm addItem:it];
+    }
+    NSMenuItem *oben = [[NSMenuItem alloc] initWithTitle:@"QuadChroma" action:NULL keyEquivalent:@""];
+    oben.submenu = programm;
+    NSMenu *haupt = [[NSMenu alloc] initWithTitle:@""];
+    [haupt addItem:oben];
+    return haupt;
 }
 
 // ------------------------------------------------------------ Delegate
@@ -938,7 +1147,29 @@ static NSApplicationTerminateReply beenden_erfragen(void) {
             einstellungen_oeffnen(@"Privacy_Accessibility");
             break;
         case QCAktionBeenden:
-            [NSApp terminate:nil];
+            // Die eine App endet ueber den Client: er verlaesst die
+            // Ereignisschleife und verabschiedet dann den Zuschauer
+            // (qc_dienst_beenden). Die eigene App ueber terminate:.
+            if (g_cfg.app) g_cfg.app(QC_APP_BEENDEN, NULL);
+            else [NSApp terminate:nil];
+            break;
+        case QCAktionOeffnen:
+            if (g_cfg.app) g_cfg.app(QC_APP_OEFFNEN, NULL);
+            break;
+        case QCAktionVerbinden: {
+            NSData *d = m.representedObject;
+            NSString *adresse = [d isKindOfClass:[NSData class]] ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+            if (g_cfg.app && adresse.length) g_cfg.app(QC_APP_VERBINDEN, adresse.UTF8String);
+            break;
+        }
+        case QCAktionNameAendern:
+            qc_geraetename_fenster();
+            break;
+        case QCAktionFreigabe:
+            if (g_cfg.app) g_cfg.app(QC_APP_FREIGABE, NULL);
+            break;
+        case QCAktionRuhe:
+            if (g_cfg.app) g_cfg.app(QC_APP_RUHE, NULL);
             break;
         case QCAktionKeine:
             break;
@@ -953,6 +1184,9 @@ static void menue_anwenden(void) {
         g_item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
         g_item.autosaveName = @"QuadChromaHost";
         g_item.button.toolTip = @"QuadChroma";
+        @synchronized (app_sperre()) {
+            if (g_app_tooltip.length) g_item.button.toolTip = g_app_tooltip;
+        }
         g_item.button.imagePosition = NSImageLeft;
         g_menue = [[NSMenu alloc] initWithTitle:@"QuadChroma"];
         g_menue.autoenablesItems = NO;
@@ -963,7 +1197,8 @@ static void menue_anwenden(void) {
         // wenigstens im Protokoll; ein Doppelklick auf die App zeigt das Menue.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             if (g_item && !g_item.button.window.screen)
-                ui_log(@"Oberflaeche: Symbol in der Menueleiste nicht sichtbar - Doppelklick auf die App zeigt das Menue");
+                ui_log(@"Oberflaeche: Symbol in der Menueleiste nicht sichtbar - Doppelklick auf die App zeigt %@",
+                       g_cfg.oeffnen ? @"das Fenster" : @"das Menue");
         });
     }
     NSArray<QCMenuePunkt *> *modell = qc_menue_modell(g_zustand);
@@ -1084,6 +1319,7 @@ void qc_oberflaeche_starten(const qc_oberflaeche_cfg *cfg) {
     if (atomic_load(&g_ui_da)) return;
     g_cfg = *cfg;
     g_eingebettet = cfg->eingebettet != 0;
+    atomic_store(&g_app, cfg->app != NULL);
     g_anfragen = [[QCAnfragen alloc] init];
     g_ui = [[QCOberflaeche alloc] init];
     if (g_eingebettet) {
@@ -1103,9 +1339,17 @@ void qc_oberflaeche_fertig(void) {
     if (!atomic_load(&g_ui_da) || gelaufen) return;
     gelaufen = YES;
     qc_texte_systemsprache();
-    // Eingebettet bringt der Client sein eigenes Hauptmenue mit (winit) -
-    // das bleibt.
-    if (!g_eingebettet || !NSApp.mainMenu) bearbeiten_menue_setzen();
+    // Die eine App: winit startet ohne sein Standardmenue - das
+    // Programmmenue (Beenden) und die Tasten des Bearbeiten-Menues kommen
+    // von hier. Sonst bringt ein eingebetteter Client sein eigenes
+    // Hauptmenue mit (winit) - das bleibt.
+    if (g_cfg.app) {
+        BOOL sitzung;
+        @synchronized (app_sperre()) { sitzung = g_app_sitzung; }
+        NSApp.mainMenu = qc_programmmenue_bauen(g_ui, sitzung);
+    } else if (!g_eingebettet || !NSApp.mainMenu) {
+        bearbeiten_menue_setzen();
+    }
     // Vorsorge gegen App Nap: eine Menueleisten-App ohne sichtbares Fenster
     // koennte das System drosseln (Timer gebuendelt, Faeden niedriger
     // eingestuft) - fuer einen Host, der jederzeit einen Strom liefern soll,
@@ -1115,7 +1359,7 @@ void qc_oberflaeche_fertig(void) {
     g_aktivitaet = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
                                                                   reason:@"QuadChroma-Host nimmt Verbindungen an"];
     ui_log(@"Oberflaeche: Menueleiste, Sprache %s%s", qc_texte_code(qc_texte_aktuell()),
-           g_eingebettet ? " (eingebettet)" : "");
+           g_cfg.app ? " (die eine App)" : g_eingebettet ? " (eingebettet)" : "");
     zustand_auffrischen();   // das Symbol entsteht mit dem ersten gelesenen Zustand
 }
 
@@ -1151,4 +1395,57 @@ void qc_ui_zustand_geaendert(void) {
 
 int qc_ui_vorhanden(void) {
     return atomic_load(&g_ui_da);
+}
+
+// ------------------------------------------------ Die eine App (dienst.h)
+
+void qc_app_stand_setzen(const qc_app_stand *s) {
+    if (!s) return;
+    NSMutableArray<NSArray<NSString *> *> *hosts = [NSMutableArray array];
+    for (int i = 0; i < s->hosts && i < QC_HOSTS_MAX; i++) {
+        const char *n = s->host_namen ? s->host_namen[i] : NULL, *a = s->host_adressen ? s->host_adressen[i] : NULL;
+        NSString *adresse = a ? [NSString stringWithUTF8String:a] : nil;
+        if (!adresse.length) continue;
+        [hosts addObject:@[ (n ? [NSString stringWithUTF8String:n] : nil) ?: @"", adresse ]];
+    }
+    NSString *tip = (s->tooltip ? [NSString stringWithUTF8String:s->tooltip] : nil) ?: @"QuadChroma";
+    BOOL sitzung_neu;
+    @synchronized (app_sperre()) {
+        sitzung_neu = g_app_sitzung != (s->sitzung != 0);
+        g_app_freigabe = s->freigabe != 0;
+        g_app_ruhe = s->ruhe != 0;
+        g_app_sitzung = s->sitzung != 0;
+        g_app_hosts = [hosts copy];
+        g_app_tooltip = tip;
+    }
+    if (![NSThread isMainThread]) return;
+    if (g_item && ![g_item.button.toolTip isEqualToString:tip]) g_item.button.toolTip = tip;
+    // In einer Sitzung gehoeren Cmd+Q und Cmd+H dem Mac drueben.
+    if (sitzung_neu && g_cfg.app && NSApp.mainMenu) NSApp.mainMenu = qc_programmmenue_bauen(g_ui, s->sitzung != 0);
+    zustand_auffrischen();
+}
+
+int qc_menueleiste_steht(void) {
+    return g_item && g_item.button.window.screen ? 1 : 0;
+}
+
+int qc_menueleiste_hinweis(const char *text) {
+    if (!text || !*text || !qc_menueleiste_steht()) return 0;
+    [g_hinweis close];
+    NSTextField *l = [NSTextField wrappingLabelWithString:[NSString stringWithUTF8String:text] ?: @""];
+    l.preferredMaxLayoutWidth = 260;
+    NSStackView *st = [NSStackView stackViewWithViews:@[ l ]];
+    st.edgeInsets = NSEdgeInsetsMake(12, 14, 12, 14);
+    NSViewController *vc = [[NSViewController alloc] init];
+    vc.view = st;
+    NSPopover *p = [[NSPopover alloc] init];
+    p.behavior = NSPopoverBehaviorTransient;
+    p.contentViewController = vc;
+    p.contentSize = st.fittingSize;
+    [p showRelativeToRect:g_item.button.bounds ofView:g_item.button preferredEdge:NSRectEdgeMinY];
+    g_hinweis = p;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (g_hinweis == p) { [p close]; g_hinweis = nil; }
+    });
+    return 1;
 }

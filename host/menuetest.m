@@ -3,7 +3,9 @@
 // mit jedem Text, dieselben Platzhalter wie Englisch, Englisch und Deutsch
 // wortgleich mit der Spezifikation, keine doppelten Texte), Sprachwahl,
 // Platzhalter in einem Durchgang, Menue-Modell fuer verschiedene Zustaende
-// (als Titelliste), Zustand aus dem Kern (Attrappe), NSMenu aus dem Modell,
+// (als Titelliste) - das des Hosts und das der einen App mit den Punkten
+// des Clients -, Pruefung im Fenster "Geraetename", Programmmenue der einen
+// App, Zustand aus dem Kern (Attrappe), NSMenu aus dem Modell,
 // Symbol der Menueleiste, Pruefung im Passwort-Fenster, Warteschlange der
 // Zulassen-Anfragen.
 //
@@ -63,6 +65,16 @@ int qc_zustand_zuschauer(char *name, size_t groesse) {
 int qc_zustand_bildschirmfreigabe(void) { return f_bildschirm; }
 int qc_zustand_bedienungshilfen(void) { return f_bedienung; }
 int qc_zustand_port_belegt(void) { return f_port; }
+int qc_zustand_geraetename(char *name, size_t groesse) { strlcpy(name, "Büro-Mac", groesse); return 0; }
+int qc_zustand_rechnername(char *name, size_t groesse) { strlcpy(name, "Roberts Mac mini", groesse); return 0; }
+
+// Rueckruf name_pruefen wie vom Client: "lang" ist zu lang, "boese" hat
+// unzulaessige Zeichen.
+static char g_zuletzt_geprueft[64];
+static int pruefen_attrappe(const char *e) {
+    strlcpy(g_zuletzt_geprueft, e, sizeof g_zuletzt_geprueft);
+    return !strcmp(e, "lang") ? 1 : !strcmp(e, "boese") ? 2 : 0;
+}
 
 static qc_geraet geraet(uint8_t schluessel, uint32_t id, const char *name, const char *datum) {
     qc_geraet g;
@@ -535,6 +547,153 @@ static void modell_pruefen(void) {
     pruefe(zeilen == 1, "Anzahl groesser als die Daten: nur die vorhandenen Geraete");
 }
 
+// Die eine App: das eine Symbol mit den Punkten des Clients.
+static QCMenueZustand *zustand_app(void) {
+    QCMenueZustand *z = zustand_grund();
+    z.app = YES;
+    z.geraetename = @"Büro-Mac";
+    z.freigabe = YES;
+    z.anmelden = QCAnmeldenAn;
+    return z;
+}
+
+static void app_modell_pruefen(void) {
+    printf("\n-- Menue-Modell der einen App\n");
+    qc_texte_setzen(1);
+    QCMenueZustand *z = zustand_app();
+    z.hosts = @[ @[ @"Windows-PC", @"192.168.178.60:9001" ], @[ @"", @"10.0.0.3:9001" ] ];
+    NSArray<QCMenuePunkt *> *m = qc_menue_modell(z);
+    pruefe(titel_gleich(qc_menue_titel(m), @[
+        @"# QuadChroma – Büro-Mac",
+        @"(Bereit für Verbindungen)",
+        @"---",
+        @"QuadChroma öffnen",
+        @"Verbinden: Windows-PC",
+        @"Verbinden: 10.0.0.3:9001",
+        @"---",
+        @"Geräte-ID: 581 729 911",
+        @"Passwort: k7m-4wq-9tz",
+        @"Passwort ändern …",
+        @"Neues Zufallspasswort",
+        @"---",
+        @"Erlaubte Geräte",
+        @"  Windows-PC – ID 000 000 005 – seit 26.09.2026",
+        @"    Entfernen",
+        @"  Büro-Laptop – ID 123 456 789 – seit 02.01.2026",
+        @"    Entfernen",
+        @"  ---",
+        @"  Alle Geräte entfernen …",
+        @"---",
+        @"Gerätename ändern …",
+        @"[x] Diesen Mac freigeben",
+        @"[x] Beim Anmelden starten",
+        @"Ruhezustand verhindern, solange QuadChroma läuft",
+        @"---",
+        @"QuadChroma beenden",
+    ]), "de, Freigabe an, zwei gefundene Hosts (einer ohne Namen), Anmelden an, Ruhezustand erlaubt");
+    QCMenuePunkt *v = suche(m, QCAktionVerbinden);
+    pruefe(v && [v.daten isEqualToData:[@"192.168.178.60:9001" dataUsingEncoding:NSUTF8StringEncoding]],
+           "\"Verbinden\" traegt die Adresse seines Hosts");
+    pruefe(suche(m, QCAktionOeffnen).aktiv && suche(m, QCAktionNameAendern).aktiv && suche(m, QCAktionFreigabe).haken &&
+           !suche(m, QCAktionRuhe).haken, "Oeffnen, Name, Freigabe (Haken) und Ruhezustand (ohne) haben ihre Aktionen");
+    pruefe(suche(m, QCAktionBeenden).taste && [suche(m, QCAktionBeenden).taste isEqualToString:@"q"], "Beenden mit Cmd+Q");
+
+    // Freigabe aus: die Zustandszeile sagt es - auch wenn noch jemand
+    // eingetragen waere -, ID und Passwort bleiben (der Zugang laeuft
+    // weiter), und die fehlenden Freigaben des Systems stoeren nicht.
+    qc_texte_setzen(0);
+    z = zustand_app();
+    z.freigabe = NO;
+    z.ruhe = YES;
+    z.zuschauer = @"PC";
+    z.bildschirm = NO;
+    z.bedienung = NO;
+    z.anmelden = QCAnmeldenNichtInProgramme;
+    z.geraeteAnzahl = 0;
+    z.geraete = nil;
+    m = qc_menue_modell(z);
+    pruefe(titel_gleich(qc_menue_titel(m), @[
+        @"# QuadChroma – Büro-Mac",
+        @"(Sharing is off)",
+        @"---",
+        @"Open QuadChroma",
+        @"---",
+        @"Device ID: 581 729 911",
+        @"Password: k7m-4wq-9tz",
+        @"Change password …",
+        @"New random password",
+        @"---",
+        @"Allowed devices",
+        @"  (No devices yet)",
+        @"---",
+        @"Change device name …",
+        @"Share this Mac",
+        @"(Start at login)",
+        @"(Move QuadChroma to Applications first)",
+        @"[x] Prevent sleep while QuadChroma is running",
+        @"---",
+        @"Quit QuadChroma",
+    ]), "en, Freigabe aus, keine Hosts, Ruhezustand verhindert, Freigaben fehlen (ohne Hinweis), nicht in /Applications");
+
+    // Mit Freigabe fehlen sie wieder sichtbar; Port belegt und verbunden wie beim Host.
+    z.freigabe = YES;
+    NSArray<NSString *> *t = qc_menue_titel(qc_menue_modell(z));
+    pruefe([t[1] isEqualToString:@"(Connected: PC)"] && [t containsObject:@"Screen Recording not allowed – open System Settings …"] &&
+           [t containsObject:@"Accessibility not allowed – open System Settings …"] && [t containsObject:@"[x] Share this Mac"],
+           "Freigabe an: verbunden, fehlende Freigaben mit Hinweis");
+    z.zuschauer = nil;
+    z.portBelegt = 9001;
+    t = qc_menue_titel(qc_menue_modell(z));
+    pruefe([t[1] isEqualToString:@"(Port 9001 is used by another program)"], "Freigabe an, Port belegt");
+
+    // Hoechstens vier Hosts; Eintraege ohne Adresse zaehlen nicht.
+    z = zustand_app();
+    NSMutableArray *h = [NSMutableArray arrayWithObject:@[ @"kaputt", @"" ]];
+    for (int i = 1; i <= 6; i++) [h addObject:@[ [NSString stringWithFormat:@"H%d", i], [NSString stringWithFormat:@"10.0.0.%d:9001", i] ]];
+    z.hosts = h;
+    int verbinden = 0;
+    for (QCMenuePunkt *p in qc_menue_modell(z)) if (p.aktion == QCAktionVerbinden) verbinden++;
+    pruefe(verbinden == 4, "hoechstens vier \"Verbinden\", ohne Adresse keiner");
+    // Ohne Namen (etwa vor dem ersten Lesen) bleibt der Kopf "QuadChroma".
+    z.geraetename = nil;
+    pruefe([qc_menue_titel(qc_menue_modell(z))[0] isEqualToString:@"# QuadChroma"], "ohne Geraetenamen: Kopf \"QuadChroma\"");
+
+    printf("\n-- Fenster \"Geraetename\": Pruefung wie im Client\n");
+    pruefe(qc_geraetename_fehler(@"Büro-Mac", NULL) == QCTextAnzahl, "ohne Pruefung: gut");
+    pruefe(qc_geraetename_fehler(@"x", pruefen_attrappe) == QCTextAnzahl, "Pruefung 0: gut");
+    pruefe(qc_geraetename_fehler(@"lang", pruefen_attrappe) == QCTextDeviceNameTooLong, "Pruefung 1: \"zu lang\"");
+    pruefe(qc_geraetename_fehler(@"boese", pruefen_attrappe) == QCTextDeviceNameInvalid, "Pruefung 2: \"unzulaessige Zeichen\"");
+    pruefe(qc_geraetename_fehler(nil, pruefen_attrappe) == QCTextAnzahl && !strcmp(g_zuletzt_geprueft, ""),
+           "nil wird als leerer Text geprueft (leer = Rechnername)");
+
+    printf("\n-- Programmmenue der einen App\n");
+    NSMenu *haupt = qc_programmmenue_bauen(nil, NO);
+    NSMenu *prog = haupt.itemArray.firstObject.submenu;
+    NSMutableArray<NSString *> *tasten = [NSMutableArray array];
+    NSMenuItem *ende = nil;
+    int verborgen_ohne = 0;
+    for (NSMenuItem *it in prog.itemArray) {
+        if (it.keyEquivalent.length)
+            [tasten addObject:[NSString stringWithFormat:@"%@%@ %@", it.keyEquivalentModifierMask & NSEventModifierFlagShift ? @"S-" : @"",
+                               it.keyEquivalent, NSStringFromSelector(it.action)]];
+        if (it.tag == QCAktionBeenden) ende = it;
+        if (it.hidden && !it.allowsKeyEquivalentWhenHidden) verborgen_ohne++;
+    }
+    pruefe(haupt.numberOfItems == 1 && ende && !ende.hidden && [ende.title isEqualToString:@"Quit QuadChroma"] &&
+           [ende.keyEquivalent isEqualToString:@"q"] && ende.action == @selector(menueAktion:),
+           "ein Programmmenue mit \"Quit QuadChroma\" (Cmd+Q, menueAktion:)");
+    pruefe(titel_gleich(tasten, @[ @"h hide:", @"q menueAktion:", @"z undo:", @"S-z redo:", @"x cut:", @"c copy:",
+                                   @"v paste:", @"a selectAll:" ]), "Tasten: Ausblenden, Beenden, Bearbeiten - kein Cmd+W");
+    pruefe(verborgen_ohne == 0, "verborgene Punkte behalten ihre Taste (allowsKeyEquivalentWhenHidden)");
+    prog = qc_programmmenue_bauen(nil, YES).itemArray.firstObject.submenu;
+    int prog_tasten = 0, bearb_tasten = 0;
+    for (NSMenuItem *it in prog.itemArray) {
+        if (it.action == @selector(hide:) || it.tag == QCAktionBeenden) prog_tasten += it.keyEquivalent.length > 0;
+        else bearb_tasten += it.keyEquivalent.length > 0;
+    }
+    pruefe(prog_tasten == 0 && bearb_tasten == 6, "in einer Sitzung: Cmd+Q und Cmd+H gehen an den Mac drueben, Bearbeiten bleibt");
+}
+
 static void zustand_pruefen(void) {
     printf("\n-- Zustand aus dem Kern (Attrappe)\n");
     f_id = 5;
@@ -657,6 +816,7 @@ int main(void) {
         texte_pruefen();
         hilfen_pruefen();
         modell_pruefen();
+        app_modell_pruefen();
         zustand_pruefen();
         menue_pruefen();
         anfragen_pruefen();

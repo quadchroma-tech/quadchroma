@@ -3211,6 +3211,68 @@ static int zc_sitzung(zclient *z) {
 static BOOL test_tcc_ja(void) { return YES; }
 static BOOL test_tcc_nein(void) { return NO; }
 
+// Die eine App (Plan M4): der eingestellte Geraetename gilt sofort in
+// Nachricht 20; Freigabe aus verabschiedet den Zuschauer mit Grund 1, und
+// wer danach noch hereinkommt, bekommt nach "QCH1" denselben Abschied.
+static void name_und_freigabe_pruefen(int bild_port) {
+    printf("\n-- Geraetename (qc_dienst_name_setzen)\n");
+    char gn[QC_ZUGANG_NAME_MAX + 1] = {0}, rn[QC_ZUGANG_NAME_MAX + 1] = {0}, hn[QC_ZUGANG_NAME_MAX + 1] = {0};
+    rechnername(rn);
+    qc_dienst_name_setzen("  Büro-\x01Mac\t ");
+    qc_zustand_geraetename(gn, sizeof gn);
+    pruefe(!strcmp(gn, "Büro-Mac"), "eingestellter Name, gesaeubert wie jeder fremde (Rand, Steuerzeichen)");
+    uint8_t n_priv[32], n_pub[32];
+    qc_keypair(n_priv, n_pub);
+    qc_zugang_drossel_leeren();
+    zclient z;
+    uint8_t wege = 0;
+    uint32_t warten = 0;
+    stdout_stumm(1);
+    int ok = zc_verbinden(&z, bild_port, n_priv, "Namensprobe") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG) &&
+             zc_noetig(&z, &wege, &warten, hn) == 0;
+    zc_abbruch(&z);
+    zc_schliesst(&z, 2000);
+    stdout_stumm(0);
+    zc_zu(&z);
+    warten_bis(zugang_ruht, 2);
+    pruefe(ok && !strcmp(hn, "Büro-Mac"), "Nachricht 20 traegt ihn sofort (ohne Neustart)");
+    qc_dienst_name_setzen(NULL);
+    qc_zustand_geraetename(gn, sizeof gn);
+    char rn2[QC_ZUGANG_NAME_MAX + 1] = {0};
+    qc_zustand_rechnername(rn2, sizeof rn2);
+    pruefe(!strcmp(gn, rn) && !strcmp(rn2, rn), "NULL: wieder der Rechnername");
+
+    printf("\n-- Freigabe aus (qc_dienst_anhalten)\n");
+    uint8_t f_priv[32], f_pub[32];
+    qc_keypair(f_priv, f_pub);
+    qc_zugang_eintragen(f_pub, "Freigabeprobe");
+    strom_attrappe_setzen();
+    stdout_stumm(1);
+    int da = zc_verbinden(&z, bild_port, f_priv, "Freigabeprobe") == 0 && zc_sitzung(&z) && warten_bis(zuschauer_da, 1);
+    dienst_lauschen_beenden();
+    int letzte = -1, grund = -1;
+    int zu = warten_bis(zuschauer_fort, 1) && zc_schliesst_mit(&z, 2000, &letzte, &grund);
+    stdout_stumm(0);
+    zc_zu(&z);
+    pruefe(da && zu && letzte == QC_MSG_HOST_ENDE && grund == QC_HOST_ENDE_FREIGABE_AUS,
+           "der Zuschauer bekommt als letzte Nachricht den Abschied (Typ 13, Grund 1)");
+    pruefe(atomic_load(&g_freigabe_aus) && !atomic_load(&g_dienst_laeuft) && !g_annahme_bild,
+           "Merker gesetzt, Dienst gilt als angehalten");
+    strom_attrappe_setzen();
+    stdout_stumm(1);
+    int nach = zc_verbinden(&z, bild_port, f_priv, "Freigabeprobe") == 0 && zc_kennung(&z, QC_MAGIC);
+    letzte = grund = -1;
+    int zu2 = nach && zc_schliesst_mit(&z, 2000, &letzte, &grund);
+    stdout_stumm(0);
+    zc_zu(&z);
+    pruefe(zu2 && letzte == QC_MSG_HOST_ENDE && grund == QC_HOST_ENDE_FREIGABE_AUS && zuschauer_fort() &&
+               warten_bis(niemand_anmeldend, 1),
+           "wer danach noch hereinkommt: \"QCH1\", dann derselbe Abschied - kein Zuschauer");
+    atomic_store(&g_freigabe_aus, 0);
+    qc_zugang_geraet_entfernen(f_pub);
+    warten_bis(zugang_ruht, 2);
+}
+
 static void zugang_pruefen(int bild_port, int ein_port) {
     printf("\n-- Zugang: unbekanntes Geraet mit Passwort\n");
     static char logpfad[1100];
@@ -3898,6 +3960,7 @@ int main(void) {
         qc_strom_fabrik_setzen(test_fabrik);
         protokoll_pruefen(bild_port, ein_port);
         zugang_pruefen(bild_port, ein_port);
+        name_und_freigabe_pruefen(bild_port);
         abloesen_pruefen();
         wechsel_pruefen(bild_port);
         testbild_rest_pruefen();

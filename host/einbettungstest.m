@@ -11,8 +11,11 @@
 // nichts; ein Reopen (Apple Event an sich selbst, wie ein Doppelklick auf die
 // laufende App) ruft oeffnen; [NSApp terminate:] geht ueber den Abschied -
 // genau einmal, ausserhalb des Hauptfadens - und erst danach in
-// applicationWillTerminate: des Nachbaus. qc_oberflaeche_fertig bleibt aus:
-// es legte ein Symbol in die Menueleiste.
+// applicationWillTerminate: des Nachbaus. Gestartet wird wie in der einen
+// App (mit Rueckruf app): der Stand des Clients (qc_app_stand_setzen) kommt
+// im gelesenen Zustand an, samt Geraetename aus dem Kern. qc_oberflaeche_fertig
+// bleibt aus: es legte ein Symbol in die Menueleiste (das prueft der
+// Selbsttest des Clients, --menueleiste-selbsttest).
 //
 // Braucht eine Anmeldesitzung mit Fensterserver (wie ablagetest), aber keine
 // TCC-Freigabe. Die App ist "Prohibited" (kein Dock-Symbol, kein Menue), es
@@ -58,6 +61,8 @@ int qc_zustand_zuschauer(char *name, size_t groesse) { return 0; }
 int qc_zustand_bildschirmfreigabe(void) { return 1; }
 int qc_zustand_bedienungshilfen(void) { return 1; }
 int qc_zustand_port_belegt(void) { return 0; }
+int qc_zustand_geraetename(char *name, size_t groesse) { strlcpy(name, "Büro-Mac", groesse); return 0; }
+int qc_zustand_rechnername(char *name, size_t groesse) { strlcpy(name, "Roberts Mac mini", groesse); return 0; }
 
 // ------------------------------------------------------------ Rueckrufe
 
@@ -73,6 +78,8 @@ static void abschied(void) {
 }
 static void protokoll(NSString *zeile) { printf("        | %s\n", zeile.UTF8String); }
 static void oeffnen(void) { g_oeffnen++; }
+static int g_app_aufrufe = 0;
+static void app(int was, const char *wert) { g_app_aufrufe++; }
 static void oeffnen_zweiter(void) { g_oeffnen_zweiter++; }
 
 static void ergebnis(void) {
@@ -106,7 +113,7 @@ static OSErr reopen_senden(void) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     printf("\n-- Start der Oberflaeche aus applicationDidFinishLaunching: (dort ruft winit resumed)\n");
-    qc_oberflaeche_cfg cfg = { .abschied = abschied, .protokoll = protokoll, .eingebettet = 1, .oeffnen = oeffnen };
+    qc_oberflaeche_cfg cfg = { .abschied = abschied, .protokoll = protokoll, .eingebettet = 1, .oeffnen = oeffnen, .app = app };
     qc_oberflaeche_starten(&cfg);
     pruefe(NSApp.delegate == self, "NSApp.delegate bleibt winits Delegate");
     pruefe([self respondsToSelector:@selector(applicationShouldHandleReopen:hasVisibleWindows:)],
@@ -117,6 +124,29 @@ static OSErr reopen_senden(void) {
     qc_oberflaeche_cfg zweiter = { .abschied = abschied, .protokoll = protokoll, .eingebettet = 0, .oeffnen = oeffnen_zweiter };
     qc_oberflaeche_starten(&zweiter);
     pruefe(NSApp.delegate == self, "ein zweiter Start (auch nicht eingebettet) setzt kein Delegate");
+
+    // Der Stand des Clients: gesetzt auf dem Hauptfaden, gelesen auf einer
+    // anderen Warteschlange (wie das Menue ihn liest).
+    const char *namen[] = { "Windows-PC", NULL, "ohne Adresse" };
+    const char *adressen[] = { "192.168.178.60:9001", "10.0.0.3:9001", NULL };
+    qc_app_stand s = { .freigabe = 1, .ruhe = 0, .sitzung = 0, .tooltip = "QuadChroma – Test", .hosts = 3,
+                       .host_namen = namen, .host_adressen = adressen };
+    qc_app_stand_setzen(&s);
+    __block QCMenueZustand *z = nil;
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ z = qc_menue_zustand_lesen(); });
+    pruefe(z.app && z.freigabe && !z.ruhe && [z.geraetename isEqualToString:@"Büro-Mac"],
+           "die eine App: Zustand mit Freigabe, Ruhezustand und Geraetename aus dem Kern");
+    pruefe(z.hosts.count == 2 && [z.hosts[0][0] isEqualToString:@"Windows-PC"] && [z.hosts[1][0] isEqualToString:@""] &&
+           [z.hosts[1][1] isEqualToString:@"10.0.0.3:9001"], "Hosts: ohne Namen leer, ohne Adresse weggelassen");
+    NSArray<NSString *> *titel = qc_menue_titel(qc_menue_modell(z));
+    pruefe([titel containsObject:@"Connect: Windows-PC"] && [titel containsObject:@"[x] Share this Mac"],
+           "das Menue der einen App aus diesem Zustand");
+    s.freigabe = 0;
+    s.hosts = 0;
+    qc_app_stand_setzen(&s);
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ z = qc_menue_zustand_lesen(); });
+    pruefe(!z.freigabe && z.hosts.count == 0, "ein neuer Stand ersetzt den alten");
+    pruefe(g_app_aufrufe == 0, "ohne Klick kein Rueckruf an den Client");
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         printf("\n-- Doppelklick auf die laufende App\n");

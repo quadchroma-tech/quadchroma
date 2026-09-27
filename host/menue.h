@@ -1,6 +1,12 @@
 // Oberflaeche des Mac-Hosts (Spezifikation Pairing 7.1-7.6): Symbol in der
 // Menueleiste mit Menue, Zulassen-Fenster, Passwort-Fenster, Rueckfrage
 // "Alle Geraete entfernen", Beenden (Verbindung zum Zuschauer vorher zu).
+// In der einen App (eingebettet mit Rueckruf app, Plan M4) ist es das EINE
+// Symbol von Client und Host: dazu "QuadChroma oeffnen", "Verbinden: <Host>",
+// "Geraetename aendern ..." (eigenes Fenster), "Diesen Mac freigeben" und
+// "Ruhezustand verhindern" - was der Client entscheidet, geht ueber app an
+// ihn; das Programmmenue (Beenden) und das verborgene Bearbeiten-Menue baut
+// diese Datei, weil winit ohne sein Standardmenue startet.
 //
 // Faeden: alles, was AppKit anfasst, laeuft auf dem Hauptfaden. Kernfunktionen
 // (zugang.h) ruft die Oberflaeche nur auf ihrer eigenen seriellen
@@ -14,6 +20,7 @@
 #import <AppKit/AppKit.h>
 #include "zugang.h"
 #include "dienst.h"
+#import "texte.h"
 
 typedef struct {
     // Vor dem Beenden: Bild- und Eingabekanal des Zuschauers schliessen.
@@ -26,6 +33,10 @@ typedef struct {
     int eingebettet;
     // Nur eingebettet: Doppelklick auf die laufende App. NULL = Menue zeigen.
     void (*oeffnen)(void);
+    // Die eine App: Punkte des Clients (QC_APP_* in dienst.h); NULL = nur Host.
+    void (*app)(int was, const char *wert);
+    // Die eine App: Pruefung des Geraetenamens (dienst.h); NULL = alles gut.
+    int (*name_pruefen)(const char *eingabe);
 } qc_oberflaeche_cfg;
 
 // Aus qc_dienst_starten auf dem Hauptfaden, bevor die Run-Loop die
@@ -58,6 +69,12 @@ typedef NS_ENUM(NSInteger, QCAnmelden) {
 @property (nonatomic) BOOL bildschirm, bedienung;      // Freigaben erteilt
 @property (nonatomic) QCAnmelden anmelden;
 @property (nonatomic) int portBelegt;                  // 0 = frei
+// Nur die eine App (app = YES): das Menue traegt auch die Punkte des Clients.
+@property (nonatomic) BOOL app;
+@property (nonatomic, copy) NSString *geraetename;     // Kopfzeile "QuadChroma – <Name>"
+@property (nonatomic) BOOL freigabe;                   // Haken "Diesen Mac freigeben" (Wunsch des Clients)
+@property (nonatomic) BOOL ruhe;                       // Haken "Ruhezustand verhindern"
+@property (nonatomic, copy) NSArray<NSArray<NSString *> *> *hosts;   // je @[Name, Adresse], hoechstens 4
 @end
 
 typedef NS_ENUM(NSInteger, QCAktion) {
@@ -73,6 +90,12 @@ typedef NS_ENUM(NSInteger, QCAktion) {
     QCAktionBildschirmFreigabe,
     QCAktionBedienungshilfen,
     QCAktionBeenden,
+    // Nur die eine App:
+    QCAktionOeffnen,              // Fenster des Clients
+    QCAktionVerbinden,            // daten = Adresse (UTF-8)
+    QCAktionNameAendern,          // Fenster "Geraetename"
+    QCAktionFreigabe,             // Haken "Diesen Mac freigeben"
+    QCAktionRuhe,                 // Haken "Ruhezustand verhindern"
 };
 
 @interface QCMenuePunkt : NSObject
@@ -84,7 +107,8 @@ typedef NS_ENUM(NSInteger, QCAktion) {
 @property (nonatomic, copy) NSArray<QCMenuePunkt *> *unter;
 @end
 
-// Fragt den Kern (und SMAppService). Nicht auf der Main Queue rufen.
+// Fragt den Kern (und SMAppService); in der einen App dazu den Stand des
+// Clients (qc_app_stand_setzen). Nicht auf der Main Queue rufen.
 QCMenueZustand *qc_menue_zustand_lesen(void);
 // Das Menue fuer einen Zustand, in der aktuellen Sprache (texte.h).
 NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z);
@@ -107,6 +131,21 @@ NSString *qc_datum_text(NSString *iso);
 // 3 unzulaessig (ueber QC_ZUGANG_PW_MAX Byte UTF-8 oder mit Zeilenumbruch -
 // so nimmt der Kern es nicht an).
 int qc_passwort_pruefen(NSString *pw, NSString *wiederholt);
+// Pruefung im Fenster "Geraetename" ueber pruefen (NULL: alles gut): der
+// Text, der unter dem Feld steht - QCTextDeviceNameTooLong bzw.
+// QCTextDeviceNameInvalid -, oder QCTextAnzahl, wenn der Name gut ist.
+QCText qc_geraetename_fehler(NSString *eingabe, int (*pruefen)(const char *));
+// Das Hauptmenue der einen App (winit startet ohne sein Standardmenue): im
+// Programmmenue "QuadChroma beenden" (Cmd+Q, Aktion menueAktion: an ziel mit
+// QCAktionBeenden) und verborgen "Ausblenden" (Cmd+H); dazu verborgen die
+// Punkte des Bearbeiten-Menues (Cmd+Z, Shift+Cmd+Z, Cmd+X, Cmd+C, Cmd+V,
+// Cmd+A an den Ersthelfer), damit Einfuegen und Kopieren in den Feldern der
+// Fenster wirken. Verborgen heisst: nicht zu sehen, die Taste gilt trotzdem
+// (allowsKeyEquivalentWhenHidden); im Fenster des Clients sind sie ohne
+// Ziel gesperrt, dort kommt die Taste bei winit an. Kein Cmd+W: in der
+// Sitzung gehoert es dem Mac drueben. sitzung: Cmd+Q und Cmd+H ebenso.
+NSMenu *qc_programmmenue_bauen(id ziel, BOOL sitzung);
+
 // Vorlagenbild fuer die Menueleiste, 18 pt: die vier Felder des Logos, das
 // vierte hohl (unterscheidet den Host vom Mac-Client), mit Punkt, solange
 // jemand zuschaut.
