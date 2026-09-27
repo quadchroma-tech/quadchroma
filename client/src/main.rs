@@ -7845,10 +7845,11 @@ impl App {
     }
 
     /// "Mit Windows starten" (Menue, Kaestchen im Startbildschirm): an
-    /// installiert die App nach %ProgramFiles%\QuadChroma und legt die
-    /// geplante Aufgabe auf die installierte exe an, aus loescht die Aufgabe
-    /// (verknuepfung::autostart_setzen). Wohin installiert wurde bzw. dass es
-    /// scheiterte, steht danach im Startbildschirm und - ohne sichtbares
+    /// installiert die App nach %ProgramFiles%\QuadChroma (nie ueber eine
+    /// neuere Kopie) und legt die geplante Aufgabe dieses Kontos auf die
+    /// installierte exe an, aus loescht sie (verknuepfung::autostart_setzen);
+    /// die Aufgabe eines anderen Kontos bleibt. Wohin installiert wurde bzw.
+    /// dass es scheiterte, steht danach im Startbildschirm und - ohne sichtbares
     /// Fenster - in einer Sprechblase am Symbol. Ohne Administratorkonto
     /// (installation::konto) gesperrt. Mac: "Beim Anmelden starten" (nur das
     /// Kaestchen - den Punkt der Menueleiste schaltet menue.m selbst) ueber
@@ -7869,7 +7870,7 @@ impl App {
                 protokoll::zeile(format!("Mit Windows starten: gesperrt - {grund}"));
                 return;
             }
-            let an = !verknuepfung::autostart_an(None);
+            let an = !verknuepfung::autostart_an(verknuepfung::Ort::STANDARD);
             let m = match verknuepfung::autostart_setzen(verknuepfung::Ort::STANDARD, an) {
                 Ok(u) => {
                     let (zeile, m) = autostart_text(&u);
@@ -7907,7 +7908,7 @@ impl App {
         {
             self.autostart = if installation::konto().gesperrt() {
                 Autostart::KeinAdmin
-            } else if verknuepfung::autostart_an(None) {
+            } else if verknuepfung::autostart_an(verknuepfung::Ort::STANDARD) {
                 Autostart::An
             } else {
                 Autostart::Aus
@@ -8273,7 +8274,7 @@ impl App {
                 passwort: h.passwort,
                 geraete: h.geraete,
                 hosts,
-                autostart: verknuepfung::autostart_an(None),
+                autostart: verknuepfung::autostart_an(verknuepfung::Ort::STANDARD),
                 autostart_gesperrt: installation::konto().gesperrt(),
                 ruhe_verhindern,
                 ruhe_abgelehnt,
@@ -11653,6 +11654,24 @@ fn autostart_text(u: &verknuepfung::Umstellung) -> (String, Option<Meldung>) {
             let m = Meldung::neu(strings::Key::AutostartInstalled, zeile.clone()).mit("{n}", ordner.display().to_string());
             (zeile, Some(m))
         }
+        U::Vorhanden(ordner) => {
+            let zeile = format!(
+                "Mit Windows starten: an - die Kopie in {} stimmt schon mit dieser exe ueberein, nur die geplante Aufgabe angelegt (hoechste Rechte, bei der Anmeldung): {}",
+                ordner.display(),
+                exe(ordner)
+            );
+            let m = Meldung::neu(strings::Key::AutostartInstalled, zeile.clone()).mit("{n}", ordner.display().to_string());
+            (zeile, Some(m))
+        }
+        U::NeuereBleibt { ordner, laufend, installiert } => {
+            let zeile = format!(
+                "Mit Windows starten: an - {}; die geplante Aufgabe (hoechste Rechte, bei der Anmeldung) startet {}",
+                installation::nicht_ersetzt_text(*laufend, *installiert),
+                exe(ordner)
+            );
+            let m = Meldung::neu(strings::Key::AutostartInstalled, zeile.clone()).mit("{n}", ordner.display().to_string());
+            (zeile, Some(m))
+        }
         U::Aus(Some(ordner)) => {
             (format!("Mit Windows starten: aus - die geplante Aufgabe ist geloescht; die installierte Kopie in {} bleibt liegen", ordner.display()), None)
         }
@@ -11661,47 +11680,82 @@ fn autostart_text(u: &verknuepfung::Umstellung) -> (String, Option<Meldung>) {
 }
 
 /// Beim Start der ersten Instanz (Windows): ist "Mit Windows starten" an,
-/// die Aufgabe auf die installierte exe richten bzw. die installierte Kopie
-/// erneuern; alte Verknuepfungen im Autostart-Ordner ersetzen
-/// (verknuepfung::autostart_beim_start). Ohne Administratorkonto nichts
-/// davon, nur der Vermerk. Liefert die Meldung fuer den Startbildschirm,
-/// wenn installiert wurde.
+/// die Aufgabe dieses Kontos auf die installierte exe richten bzw. die
+/// installierte Kopie erneuern (nie mit einer aelteren); eine fruehere
+/// Aufgabe "QuadChroma" dieses Kontos und alte Verknuepfungen im
+/// Autostart-Ordner ersetzen (verknuepfung::autostart_beim_start). Ohne
+/// Administratorkonto wird nichts umgestellt, aber eine Aufgabe dieses
+/// Kontos, die eine exe ausserhalb eines Administratorordners startet,
+/// abgeschaltet. Liefert die Meldung fuer den Startbildschirm: wohin
+/// installiert wurde, oder - wurde eine Aufgabe abgeschaltet -
+/// AutostartFailed.
 #[cfg(windows)]
 fn autostart_beim_start() -> Option<Meldung> {
     use verknuepfung::Start as S;
+    let fehlschlag = |zeile: String, abgeschaltet: &[verknuepfung::Abgeschaltet]| -> Option<Meldung> {
+        for a in abgeschaltet {
+            protokoll::zeile(a.zeile());
+        }
+        let letzte = abgeschaltet.last().map(|a| a.zeile()).unwrap_or(zeile);
+        (!abgeschaltet.is_empty()).then(|| Meldung::neu(strings::Key::AutostartFailed, letzte))
+    };
     if let Some(grund) = installation::konto().grund() {
-        protokoll::zeile(format!("Mit Windows starten: gesperrt - {grund}"));
-        return None;
+        let zeile = format!("Mit Windows starten: gesperrt - {grund}");
+        protokoll::zeile(zeile.clone());
+        return fehlschlag(zeile, &verknuepfung::unsichere_aufgaben_abschalten(verknuepfung::Ort::STANDARD));
     }
-    let (zeile, meldung) = match verknuepfung::autostart_beim_start(None, verknuepfung::Ort::STANDARD) {
-        Ok(S::Aus) | Ok(S::Aktuell) => return None,
+    let b = verknuepfung::autostart_beim_start(None, verknuepfung::Ort::STANDARD);
+    for v in &b.vermerke {
+        protokoll::zeile(v.clone());
+    }
+    let (zeile, meldung) = match b.start {
+        Ok(S::Aus) | Ok(S::Aktuell) => (None, None),
         Ok(S::Erneuert { ordner, bericht }) => {
             let (z, m) = autostart_text(&verknuepfung::Umstellung::Installiert { ordner, bericht });
-            (format!("{z} - die installierte Kopie war eine andere Fassung als diese exe und ist erneuert"), m)
+            (Some(format!("{z} - die installierte Kopie war eine andere, nicht neuere Fassung als diese exe und ist erneuert")), m)
         }
+        Ok(S::NeuereBleibt { ordner, laufend, installiert }) => (
+            Some(format!(
+                "Mit Windows starten: {} ({})",
+                installation::nicht_ersetzt_text(laufend, installiert),
+                ordner.join(installation::EXE).display()
+            )),
+            None,
+        ),
         Ok(S::Umgestellt { vorher, neu }) => {
             let (z, m) = autostart_text(&neu);
-            (format!("{z} - die Aufgabe startete bisher {vorher}"), m)
+            (Some(format!("{z} - die Aufgabe startete bisher {vorher}")), m)
+        }
+        Ok(S::AlteUebernommen { vorher, neu }) => {
+            let (z, m) = autostart_text(&neu);
+            (Some(format!("{z} - sie ersetzt die fruehere Aufgabe \"{}\" fuer den ganzen Rechner (startete {vorher})", verknuepfung::AUTOSTART_TASK)), m)
         }
         Ok(S::VerknuepfungErsetzt(neu)) => {
             let (z, m) = autostart_text(&neu);
-            (format!("{z} - die alte Verknuepfung im Autostart-Ordner ist dadurch ersetzt"), m)
+            (Some(format!("{z} - die alte Verknuepfung im Autostart-Ordner ist dadurch ersetzt")), m)
         }
         Ok(S::AndereExe(ziel)) => {
-            (format!("Mit Windows starten: die alte Verknuepfung startet {ziel}, nicht diese exe - sie bleibt, wie sie ist"), None)
+            (Some(format!("Mit Windows starten: die alte Verknuepfung startet {ziel}, nicht diese exe - sie bleibt, wie sie ist")), None)
         }
-        Err(e) => (format!("Mit Windows starten: beim Start nicht geprueft bzw. nicht umgestellt - {e}"), None),
+        Err(e) => {
+            let zeile = format!("Mit Windows starten: beim Start nicht geprueft bzw. nicht umgestellt - {e}");
+            protokoll::zeile(zeile.clone());
+            return fehlschlag(zeile, &b.abgeschaltet);
+        }
     };
-    protokoll::zeile(zeile);
+    if let Some(z) = zeile {
+        protokoll::zeile(z);
+    }
     meldung
 }
 
 /// `--autostart an|aus` (Windows): "Mit Windows starten" wie im Menue
 /// umstellen - an installiert nach %ProgramFiles%\QuadChroma und legt die
-/// geplante Aufgabe an, aus loescht sie. Fuer Tests und Verwalter; die App
-/// ist ja erhoeht. Laeuft vor allem anderen und ohne Protokolldatei. 0
-/// gelungen, 1 gescheitert, 2 falscher Aufruf (bzw. nicht Windows), 3
-/// gesperrt (kein Administratorkonto).
+/// geplante Aufgabe dieses Kontos an, aus loescht sie. Fuer Tests und
+/// Verwalter; die App ist ja erhoeht. Laeuft vor allem anderen und ohne
+/// Protokolldatei. 0 gelungen, 1 gescheitert, 2 falscher Aufruf (bzw. nicht Windows), 3
+/// gesperrt (kein Administratorkonto; eine Aufgabe dieses Kontos auf einen
+/// fuer Nutzer beschreibbaren Ordner wird dann abgeschaltet).
 fn autostart_befehlszeile(wert: Option<&str>) -> i32 {
     #[cfg(not(windows))]
     {
@@ -11721,6 +11775,9 @@ fn autostart_befehlszeile(wert: Option<&str>) -> i32 {
         };
         if let Some(grund) = installation::konto().grund() {
             eprintln!("Mit Windows starten: gesperrt - {grund}");
+            for a in verknuepfung::unsichere_aufgaben_abschalten(verknuepfung::Ort::STANDARD) {
+                eprintln!("{}", a.zeile());
+            }
             return 3;
         }
         match verknuepfung::autostart_setzen(verknuepfung::Ort::STANDARD, an) {
@@ -11866,6 +11923,12 @@ fn main() {
         use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
+    // "Mit Windows starten": die laufende exe und die FFmpeg-DLLs sperren,
+    // bevor irgendetwas installieren oder erneuern kann - bis der Prozess
+    // endet, laesst sich keine davon umbenennen oder ersetzen
+    // (installation.rs).
+    #[cfg(windows)]
+    installation::quellen_sperren();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -12645,14 +12708,16 @@ fn main() {
     }
     let proxy = el.create_proxy();
 
-    // "Mit Windows starten": die Aufgabe startet nur die nach
+    // "Mit Windows starten": die Aufgabe dieses Kontos startet nur die nach
     // %ProgramFiles%\QuadChroma installierte exe. Zeigt sie noch auf eine
     // andere (fruehere Fassung: der entpackte Ordner), wird installiert und
-    // umgestellt; ist diese exe eine andere Fassung als die installierte,
-    // wird die installierte erneuert; die Verknuepfung frueherer Fassungen im
+    // umgestellt; ist diese exe ein anderer, nicht aelterer Bau als die
+    // installierte, wird die installierte erneuert; die fruehere Aufgabe
+    // "QuadChroma" dieses Kontos und die Verknuepfung frueherer Fassungen im
     // Autostart-Ordner (die eine App mit --hintergrund, die noch aeltere
-    // Host-Rolle mit --host) weicht der Aufgabe - eine erhoehte exe liefe
-    // daraus nicht mehr still an.
+    // Host-Rolle mit --host) weichen der Aufgabe - eine erhoehte exe liefe
+    // daraus nicht mehr still an. Scheitert das, wird eine Aufgabe auf einen
+    // fuer Nutzer beschreibbaren Ordner abgeschaltet.
     #[cfg(windows)]
     let autostart_meldung = autostart_beim_start();
     #[cfg(not(windows))]

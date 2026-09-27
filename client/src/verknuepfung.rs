@@ -257,33 +257,53 @@ fn lnk_speichern(
 // Anmeldung (Desktop Duplication braucht die Sitzung) - kein Dienst vor der
 // Anmeldung. So bietet es auch AnyDesk bzw. RustDesk an.
 //
+// Eine Aufgabe je Konto: sie heisst "QuadChroma (<SID des Kontos>)"
+// (task_fuer_konto), so haben zwei Administratorkonten auf einem PC je ihre
+// eigene, und Haken und Menuepunkt zeigen nur die des Kontos, unter dem die
+// App laeuft. Die fruehere Aufgabe "QuadChroma" fuer den ganzen Rechner wird
+// beim Start uebernommen, wenn sie diesem Konto gehoert (Prinzipal aus
+// schtasks /Query /XML): die Aufgabe dieses Kontos entsteht, die alte wird
+// geloescht. Gehoert sie einem anderen Konto, bleibt sie, wie sie ist (ein
+// Vermerk im Protokoll).
+//
 // Aktion ist die INSTALLIERTE exe in %ProgramFiles%\QuadChroma mit
 // --hintergrund, nie die exe dort, wo der Nutzer das ZIP entpackt hat: dort
 // koennte jedes Programm mit normalen Rechten sie austauschen und liefe dann
 // bei der Anmeldung still als Administrator. Beim Einschalten installiert
-// sich die (erhoehte) App deshalb dorthin (installation.rs), und die Aufgabe
-// zeigt nur auf eine exe auf einem lokalen festen Laufwerk, deren Ordner und
-// Datei nur Administratoren aendern duerfen. Laeuft die App schon von dort,
-// entsteht nur die Aufgabe. Ausschalten loescht die Aufgabe; die
-// installierte Kopie bleibt liegen.
+// sich die (erhoehte) App deshalb dorthin (installation.rs: aus den beim
+// Start gesperrten Dateien, mit dem geladenen Bild verglichen, nie eine
+// aeltere Fassung ueber eine neuere), und die Aufgabe zeigt nur auf eine exe
+// auf einem lokalen festen Laufwerk, deren Ordner und Datei nur
+// Administratoren aendern duerfen. Laeuft die App schon von dort, entsteht
+// nur die Aufgabe. Ausschalten loescht die Aufgabe dieses Kontos (und eine
+// fruehere "QuadChroma" dieses Kontos); die installierte Kopie bleibt liegen.
 //
 // Beim Start der App (autostart_beim_start): zeigt die Aufgabe noch auf eine
 // andere exe (fruehere Fassung), wird installiert und umgestellt; ist die
 // laufende exe eine andere als die installierte (SHA-256), wird die
-// installierte erneuert. Die alten Verknuepfungen im Autostart-Ordner
-// (QuadChroma.lnk der einen App frueherer Fassungen, "QuadChroma -
-// Freigabe.lnk" der noch aelteren Host-Rolle mit --host) weichen ebenso der
-// Aufgabe, wenn sie diese exe starten.
+// installierte erneuert - ausser sie ist neuer. Die alten Verknuepfungen im
+// Autostart-Ordner (QuadChroma.lnk der einen App frueherer Fassungen,
+// "QuadChroma - Freigabe.lnk" der noch aelteren Host-Rolle mit --host)
+// weichen ebenso der Aufgabe, wenn sie diese exe starten.
 //
-// Ob der Punkt einen Haken traegt, sagt allein, ob die Aufgabe da ist
-// (autostart_an -> schtasks /Query).
+// Scheitert das Umstellen, bleibt keine Aufgabe dieses Kontos still aktiv,
+// die eine exe ausserhalb eines Administratorordners startet (eine fruehere
+// Fassung zeigte auf den entpackten Ordner): sie wird abgeschaltet (schtasks
+// /Change /DISABLE), ebenso eine fruehere "QuadChroma" dieses Kontos, deren
+// Uebernahme scheiterte; der Startbildschirm zeigt dann den Hinweis
+// AutostartFailed. Dasselbe, wenn das Konto gesperrt ist
+// (installation::konto): dann wird nichts umgestellt, aber eine solche
+// Aufgabe abgeschaltet (unsichere_aufgaben_abschalten).
 //
-// Reine Logik (Aufgabenname und die Befehlszeilen von schtasks) laeuft auf
-// jeder Plattform und in den Tests; die echten schtasks-Aufrufe und der Name
-// des Nutzers stehen hinter cfg(windows).
+// Ob der Punkt einen Haken traegt, sagt allein, ob die Aufgabe dieses Kontos
+// da und eingeschaltet ist (autostart_an -> schtasks /Query /XML).
+//
+// Reine Logik (Aufgabennamen und die Befehlszeilen von schtasks) laeuft auf
+// jeder Plattform und in den Tests; die echten schtasks-Aufrufe und die
+// Konten stehen hinter cfg(windows).
 
-/// Name der geplanten Aufgabe. Tests geben einen eindeutigen Namen mit (Ort),
-/// damit sie nie die echte Aufgabe anfassen; sonst der Standard.
+/// Vorsatz der Aufgabennamen - und der Name der frueheren Aufgabe fuer den
+/// ganzen Rechner, die beim Start uebernommen wird.
 pub const AUTOSTART_TASK: &str = "QuadChroma";
 /// Dateiname der frueheren Autostart-Verknuepfung der einen App.
 pub const AUTOSTART_DATEI: &str = "QuadChroma.lnk";
@@ -292,24 +312,59 @@ pub const AUTOSTART_ALT: &str = "QuadChroma - Freigabe.lnk";
 /// Argument der Autostart-Aufgabe (und frueher der Verknuepfung).
 pub const AUTOSTART_ARGUMENT: &str = "--hintergrund";
 
-/// Wo "Mit Windows starten" wirkt: Name der Aufgabe und Installationsordner.
-/// Tests geben beides eindeutig mit und fassen so nie die echte Aufgabe oder
+/// Name der Aufgabe eines Kontos: "QuadChroma (<SID>)". Zeichen, die in
+/// Aufgabennamen nicht stehen duerfen (\ / : * ? " < > | und
+/// Steuerzeichen; "\" truege die Aufgabe sonst in einen Unterordner), werden
+/// zu "_" - in einer SID kommen sie nicht vor.
+pub fn task_fuer_konto(sid: &str) -> String {
+    let rein: String = sid
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    format!("{AUTOSTART_TASK} ({rein})")
+}
+
+/// Wo "Mit Windows starten" wirkt: Name der Aufgabe dieses Kontos, Name
+/// der frueheren Aufgabe fuer den ganzen Rechner und Installationsordner.
+/// Tests geben das eindeutig mit und fassen so nie die echten Aufgaben oder
 /// %ProgramFiles%\QuadChroma an; None heisst jeweils der Standard.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ort<'a> {
+    /// Aufgabe dieses Kontos; None: "QuadChroma (<SID>)".
     pub task: Option<&'a str>,
+    /// Fruehere Aufgabe fuer den ganzen Rechner; None: beim Standard
+    /// "QuadChroma", sonst (Tests mit eigener Aufgabe) keine.
+    pub alte: Option<&'a str>,
     pub ordner: Option<&'a Path>,
 }
 
 impl Ort<'static> {
-    /// Die echte Aufgabe "QuadChroma" und %ProgramFiles%\QuadChroma.
-    pub const STANDARD: Ort<'static> = Ort { task: None, ordner: None };
+    /// Die echte Aufgabe dieses Kontos, die fruehere "QuadChroma" und
+    /// %ProgramFiles%\QuadChroma.
+    pub const STANDARD: Ort<'static> = Ort { task: None, alte: None, ordner: None };
+}
+
+impl Ort<'_> {
+    /// Der Name der frueheren Aufgabe fuer den ganzen Rechner, falls sie hier
+    /// zaehlt.
+    fn alte_task(&self) -> Option<&str> {
+        match (self.task, self.alte) {
+            (_, Some(a)) => Some(a),
+            (None, None) => Some(AUTOSTART_TASK),
+            (Some(_), None) => None,
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Ort<'_> {
-    fn task(&self) -> &str {
-        task_name(self.task)
+    /// Der Name der Aufgabe dieses Kontos.
+    fn task(&self) -> Result<String, String> {
+        match self.task {
+            Some(t) => Ok(t.to_string()),
+            None => crate::installation::eigene_sid().map(task_fuer_konto),
+        }
     }
 
     fn ordner(&self) -> Result<PathBuf, String> {
@@ -318,11 +373,6 @@ impl Ort<'_> {
             None => crate::installation::installationsordner(),
         }
     }
-}
-
-/// Der Aufgabenname: der uebergebene (Tests) oder der Standard.
-fn task_name(task: Option<&str>) -> &str {
-    task.unwrap_or(AUTOSTART_TASK)
 }
 
 /// Wert fuer schtasks /TR: die exe in Anfuehrungszeichen (der Pfad kann
@@ -352,13 +402,8 @@ fn erstellen_args(task: &str, benutzer: &str, tr: &str) -> Vec<String> {
     ]
 }
 
-/// Argumente fuer schtasks /Query der Aufgabe.
-fn query_args(task: &str) -> Vec<String> {
-    vec!["/Query".into(), "/TN".into(), task.into()]
-}
-
 /// Argumente fuer schtasks /Query der Aufgabe als XML (Befehl und Argumente
-/// ihrer Aktion, Rechte, Ausloeser).
+/// ihrer Aktion, Prinzipal, eingeschaltet oder nicht).
 fn xml_args(task: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), task.into(), "/XML".into()]
 }
@@ -366,6 +411,12 @@ fn xml_args(task: &str) -> Vec<String> {
 /// Argumente fuer schtasks /Delete der Aufgabe (ohne Rueckfrage, /F).
 fn loeschen_task_args(task: &str) -> Vec<String> {
     vec!["/Delete".into(), "/TN".into(), task.into(), "/F".into()]
+}
+
+/// Argumente fuer schtasks /Change, das die Aufgabe abschaltet (sie bleibt
+/// sichtbar, startet aber nicht mehr).
+fn abschalten_args(task: &str) -> Vec<String> {
+    vec!["/Change".into(), "/TN".into(), task.into(), "/DISABLE".into()]
 }
 
 /// schtasks.exe ausfuehren (voller Pfad %SystemRoot%\System32\schtasks.exe,
@@ -447,23 +498,152 @@ fn autostart_lnk_pfad(ordner: Option<&Path>, datei: &str) -> Result<PathBuf, Str
     .join(datei))
 }
 
-/// Startet QuadChroma mit Windows - liegt die geplante Aufgabe vor?
-/// (schtasks /Query liefert 0, wenn es sie gibt, sonst 1.)
+/// Eine geplante Aufgabe, wie schtasks /Query /XML sie zeigt.
 #[cfg(windows)]
-pub fn autostart_an(task: Option<&str>) -> bool {
-    schtasks(&query_args(task_name(task))).map(|(ok, _)| ok).unwrap_or(false)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Aufgabe {
+    /// Befehl und Argumente ihrer Aktion (leer, wenn keine lesbar ist).
+    pub befehl: String,
+    pub argumente: String,
+    /// Das Konto, als das sie laeuft (Name oder SID); None bei einer Gruppe.
+    pub konto: Option<String>,
+    /// Eingeschaltet (nicht mit /DISABLE abgeschaltet).
+    pub aktiv: bool,
 }
 
-/// Befehl und Argumente der Aufgabe (schtasks /Query /XML); None, wenn es
-/// sie nicht gibt. Eine Aufgabe ohne lesbare Aktion ergibt leere Werte - sie
-/// zeigt dann jedenfalls nicht auf die installierte exe.
 #[cfg(windows)]
-pub fn aufgabe_befehl(task: Option<&str>) -> Option<(String, String)> {
-    let (ok, xml) = schtasks(&xml_args(task_name(task))).ok()?;
+impl Aufgabe {
+    /// "<Befehl> <Argumente>" fuers Protokoll.
+    fn befehlszeile(&self) -> String {
+        format!("{} {}", self.befehl, self.argumente).trim().to_string()
+    }
+}
+
+/// Die Aufgabe `task` lesen (schtasks /Query /XML); None, wenn es sie nicht
+/// gibt.
+#[cfg(windows)]
+pub fn aufgabe(task: &str) -> Option<Aufgabe> {
+    use crate::installation as inst;
+    let (ok, xml) = schtasks(&xml_args(task)).ok()?;
     if !ok {
         return None;
     }
-    Some(crate::installation::aufgabe_aus_xml(&xml).unwrap_or_default())
+    let (befehl, argumente) = inst::aufgabe_aus_xml(&xml).unwrap_or_default();
+    Some(Aufgabe { befehl, argumente, konto: inst::aufgabe_konto(&xml), aktiv: inst::aufgabe_aktiv(&xml) })
+}
+
+/// Startet QuadChroma mit Windows - liegt die Aufgabe dieses Kontos vor und
+/// ist sie eingeschaltet? Die eines anderen Kontos zaehlt nicht.
+#[cfg(windows)]
+pub fn autostart_an(ort: Ort) -> bool {
+    ort.task().ok().and_then(|t| aufgabe(&t)).is_some_and(|a| a.aktiv)
+}
+
+/// Die fruehere Aufgabe fuer den ganzen Rechner ("QuadChroma"), wenn es sie
+/// gibt: ihr Name, sie selbst und ob sie diesem Konto gehoert.
+#[cfg(windows)]
+fn alte_aufgabe(ort: Ort) -> Option<(String, Aufgabe, bool)> {
+    let name = ort.alte_task()?;
+    let a = aufgabe(name)?;
+    let eigen = a.konto.as_deref().is_some_and(crate::installation::ist_eigenes_konto);
+    Some((name.to_string(), a, eigen))
+}
+
+/// Die fruehere Aufgabe dieses Kontos loeschen, wenn es sie gibt (die
+/// Aufgabe dieses Kontos tritt an ihre Stelle). Eine fremde bleibt.
+#[cfg(windows)]
+fn alte_entfernen(ort: Ort) -> Result<(), String> {
+    let Some((name, _, true)) = alte_aufgabe(ort) else { return Ok(()) };
+    let (ok, ausgabe) = schtasks(&loeschen_task_args(&name))?;
+    if !ok && aufgabe(&name).is_some() {
+        return Err(format!("die fruehere Aufgabe \"{name}\" nicht geloescht: schtasks /Delete: {ausgabe}"));
+    }
+    Ok(())
+}
+
+/// Eine Aufgabe, die abgeschaltet wurde (bzw. werden sollte), weil sie nicht
+/// still starten darf.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Abgeschaltet {
+    pub task: String,
+    /// Was sie startete.
+    pub befehl: String,
+    /// Warum sie abgeschaltet ist.
+    pub grund: String,
+    /// Some: schtasks /Change /DISABLE scheiterte - sie ist noch an.
+    pub fehler: Option<String>,
+}
+
+#[cfg(windows)]
+impl Abgeschaltet {
+    /// Die Zeile fuers Protokoll.
+    pub fn zeile(&self) -> String {
+        match &self.fehler {
+            None => format!(
+                "Mit Windows starten: die Aufgabe \"{}\" ({}) ist abgeschaltet (schtasks /Change /DISABLE) - {}",
+                self.task, self.befehl, self.grund
+            ),
+            Some(f) => format!(
+                "Mit Windows starten: die Aufgabe \"{}\" ({}) sollte abgeschaltet werden ({}), schtasks /Change /DISABLE scheiterte: {f}",
+                self.task, self.befehl, self.grund
+            ),
+        }
+    }
+}
+
+/// Die Aufgabe `task` abschalten (schtasks /Change /DISABLE).
+#[cfg(windows)]
+fn abschalten(task: &str, a: &Aufgabe, grund: String) -> Abgeschaltet {
+    let fehler = match schtasks(&abschalten_args(task)) {
+        Ok((true, _)) => None,
+        Ok((false, ausgabe)) => Some(ausgabe),
+        Err(e) => Some(e),
+    };
+    Abgeschaltet { task: task.to_string(), befehl: a.befehlszeile(), grund, fehler }
+}
+
+/// Warum die Aufgabe nicht still starten darf: ihre exe liegt nicht auf
+/// einem lokalen festen Laufwerk in einem Ordner, den nur Administratoren
+/// aendern koennen (oder fehlt). None: sie darf.
+#[cfg(windows)]
+fn unsicher(a: &Aufgabe) -> Option<String> {
+    let exe = a.befehl.trim().trim_matches('"');
+    if exe.is_empty() {
+        return Some("sie hat keinen lesbaren Befehl".into());
+    }
+    crate::installation::ziel_pruefen(Path::new(exe))
+        .err()
+        .map(|e| format!("sie startet eine exe, die nicht nur Administratoren aendern koennen ({e})"))
+}
+
+/// Die Aufgaben dieses Kontos - die eigene und eine fruehere "QuadChroma",
+/// die ihm gehoert -, die eingeschaltet sind und eine exe ausserhalb eines
+/// Administratorordners starten (eine fruehere Fassung zeigte auf den
+/// entpackten Ordner), abschalten: nach einem gescheiterten Umstellen und
+/// wenn das Konto gesperrt ist. Liefert, was abgeschaltet wurde.
+#[cfg(windows)]
+pub fn unsichere_aufgaben_abschalten(ort: Ort) -> Vec<Abgeschaltet> {
+    let mut v = Vec::new();
+    if let Ok(t) = ort.task() {
+        if let Some(a) = aufgabe(&t).filter(|a| a.aktiv) {
+            if let Some(g) = unsicher(&a) {
+                v.push(abschalten(&t, &a, g));
+            }
+        }
+    }
+    if let Some((name, a, true)) = alte_aufgabe(ort) {
+        if let Some(g) = a.aktiv.then(|| unsicher(&a)).flatten() {
+            v.push(abschalten(&name, &a, g));
+        }
+    }
+    v
+}
+
+/// Ein Fehler samt dem, was danach abgeschaltet wurde, als eine Zeile.
+#[cfg(windows)]
+fn mit_abgeschalteten(fehler: String, ab: &[Abgeschaltet]) -> String {
+    ab.iter().fold(fehler, |t, a| format!("{t}; {}", a.zeile()))
 }
 
 /// Eine Datei loeschen; fehlt sie schon, ist das kein Fehler.
@@ -506,60 +686,97 @@ pub enum Umstellung {
     /// An: die App lief schon aus `ordner` - nur die Aufgabe angelegt bzw.
     /// erneuert.
     NurAufgabe(PathBuf),
+    /// An: die Kopie in `ordner` stimmte schon mit dieser exe ueberein - nur
+    /// die Aufgabe angelegt bzw. erneuert.
+    Vorhanden(PathBuf),
+    /// An: die Kopie in `ordner` ist neuer als diese exe (bzw. diese hat
+    /// keine lesbare Version) - sie bleibt, die Aufgabe startet sie.
+    NeuereBleibt { ordner: PathBuf, laufend: Option<crate::installation::Version>, installiert: crate::installation::Version },
     /// Aus: die Aufgabe ist geloescht. Eine installierte Kopie bleibt liegen
     /// (Some: ihr Ordner).
     Aus(Option<PathBuf>),
 }
 
-/// Einschalten: diese exe installieren (bzw. die installierte erneuern) und
-/// die Aufgabe auf die installierte exe richten. Laeuft `exe` schon aus dem
-/// Installationsordner, nur die Aufgabe.
+/// Einschalten: diese exe installieren (bzw. die installierte erneuern -
+/// nie mit einer aelteren) und die Aufgabe dieses Kontos auf die
+/// installierte exe richten; eine fruehere "QuadChroma" dieses Kontos
+/// weicht ihr. Laeuft `exe` schon aus dem Installationsordner, nur die
+/// Aufgabe.
 #[cfg(windows)]
 fn einschalten(ort: Ort, exe: &Path) -> Result<Umstellung, String> {
+    use crate::installation as inst;
+    let task = ort.task()?;
     let ordner = ort.ordner()?;
-    let installiert = ordner.join(crate::installation::EXE);
-    if dieselbe_datei(exe, &installiert) {
-        task_anlegen(ort.task(), &installiert)?;
-        return Ok(Umstellung::NurAufgabe(ordner));
-    }
-    let bericht = crate::installation::installieren(exe, &ordner)?;
-    task_anlegen(ort.task(), &installiert)?;
-    Ok(Umstellung::Installiert { ordner, bericht })
+    let installiert = ordner.join(inst::EXE);
+    let u = if inst::dieselbe_datei(exe, &installiert) {
+        task_anlegen(&task, &installiert)?;
+        Umstellung::NurAufgabe(ordner)
+    } else {
+        match inst::erneuern_entscheiden(&inst::vergleichen(&ordner)?) {
+            inst::Erneuern::Gleich => {
+                task_anlegen(&task, &installiert)?;
+                Umstellung::Vorhanden(ordner)
+            }
+            inst::Erneuern::Ja => {
+                let bericht = inst::installieren(&ordner)?;
+                task_anlegen(&task, &installiert)?;
+                Umstellung::Installiert { ordner, bericht }
+            }
+            inst::Erneuern::Nein { laufend, installiert: v } => {
+                task_anlegen(&task, &installiert)?;
+                Umstellung::NeuereBleibt { ordner, laufend, installiert: v }
+            }
+        }
+    };
+    alte_entfernen(ort)?;
+    Ok(u)
 }
 
-/// "Mit Windows starten" an (installieren und die geplante Aufgabe anlegen
-/// bzw. erneuern) oder aus (die Aufgabe loeschen; fehlt sie schon, ist das
-/// kein Fehler - schtasks /Delete meldet dann einen Fehler, den wir
-/// uebergehen, wenn die Aufgabe danach wirklich weg ist). Die installierte
-/// Kopie bleibt beim Ausschalten liegen.
+/// "Mit Windows starten" an (installieren und die Aufgabe dieses Kontos
+/// anlegen bzw. erneuern) oder aus (sie loeschen, dazu eine fruehere
+/// "QuadChroma" dieses Kontos; fehlt sie schon, ist das kein Fehler -
+/// schtasks /Delete meldet dann einen Fehler, den wir uebergehen, wenn die
+/// Aufgabe danach wirklich weg ist). Die installierte Kopie bleibt beim
+/// Ausschalten liegen. Scheitert das Einschalten, werden unsichere
+/// Aufgaben dieses Kontos abgeschaltet (steht dann im Fehler).
 #[cfg(windows)]
 pub fn autostart_setzen(ort: Ort, an: bool) -> Result<Umstellung, String> {
     if an {
         let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
-        return einschalten(ort, &exe);
+        return einschalten(ort, &exe).map_err(|e| mit_abgeschalteten(e, &unsichere_aufgaben_abschalten(ort)));
     }
-    let (ok, ausgabe) = schtasks(&loeschen_task_args(ort.task()))?;
-    if !ok && autostart_an(ort.task) {
+    let task = ort.task()?;
+    let (ok, ausgabe) = schtasks(&loeschen_task_args(&task))?;
+    if !ok && aufgabe(&task).is_some() {
         return Err(format!("schtasks /Delete: {ausgabe}"));
     }
+    alte_entfernen(ort)?;
     let ordner = ort.ordner().ok().filter(|o| o.join(crate::installation::EXE).is_file());
     Ok(Umstellung::Aus(ordner))
 }
 
-/// Was `autostart_beim_start` tat.
+/// Was `autostart_beim_start` fuer die Aufgabe dieses Kontos tat.
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Start {
-    /// Keine Aufgabe und keine alte Verknuepfung - nichts zu tun.
+    /// Keine (eingeschaltete) Aufgabe und keine alte Verknuepfung - nichts
+    /// zu tun.
     Aus,
     /// Die Aufgabe startet die installierte exe, und die ist dieselbe wie
     /// diese (oder diese laeuft von dort).
     Aktuell,
-    /// Die installierte Kopie war eine andere als diese exe - erneuert.
+    /// Die installierte Kopie war eine andere, nicht neuere Fassung als diese
+    /// exe - erneuert.
     Erneuert { ordner: PathBuf, bericht: crate::installation::Bericht },
+    /// Die installierte Kopie ist neuer als diese exe (bzw. diese hat keine
+    /// lesbare Version) - sie bleibt.
+    NeuereBleibt { ordner: PathBuf, laufend: Option<crate::installation::Version>, installiert: crate::installation::Version },
     /// Die Aufgabe startete `vorher` (fruehere Fassung) - jetzt installiert
     /// und auf die installierte exe umgestellt.
     Umgestellt { vorher: String, neu: Umstellung },
+    /// Die fruehere Aufgabe "QuadChroma" dieses Kontos (sie startete
+    /// `vorher`) ist durch die Aufgabe dieses Kontos ersetzt.
+    AlteUebernommen { vorher: String, neu: Umstellung },
     /// Eine alte Verknuepfung im Autostart-Ordner ist durch Installation und
     /// Aufgabe ersetzt.
     VerknuepfungErsetzt(Umstellung),
@@ -569,6 +786,20 @@ pub enum Start {
     AndereExe(String),
 }
 
+/// Ergebnis von `autostart_beim_start`.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeimStart {
+    /// Was mit der Aufgabe dieses Kontos geschah (Err: gescheitert).
+    pub start: Result<Start, String>,
+    /// Weitere Zeilen fuers Protokoll (eine fruehere Aufgabe eines anderen
+    /// Kontos).
+    pub vermerke: Vec<String>,
+    /// Aufgaben, die nach einem Fehlschlag abgeschaltet wurden - dann gehoert
+    /// der Hinweis AutostartFailed in den Startbildschirm.
+    pub abgeschaltet: Vec<Abgeschaltet>,
+}
+
 /// Beim Start der App (erste Instanz, nur wenn das Konto es erlaubt):
 /// - liegt noch eine alte Autostart-Verknuepfung da (QuadChroma.lnk oder
 ///   "QuadChroma - Freigabe.lnk") und startet sie DIESE exe, tritt die
@@ -576,16 +807,53 @@ pub enum Start {
 ///   die Verknuepfung loeschen). Zeigt die einzige vorhandene auf ein anderes
 ///   Programm, bleibt alles, wie es ist: eine zweite Kopie (Test, portabel)
 ///   soll den Autostart der installierten nicht auf sich umbiegen;
-/// - zeigt die Aufgabe nicht auf die installierte exe mit --hintergrund
-///   (fruehere Fassung: der entpackte Ordner), wird installiert und
-///   umgestellt;
+/// - gibt es die Aufgabe dieses Kontos nicht, aber die fruehere
+///   "QuadChroma" und gehoert sie diesem Konto, wird sie uebernommen
+///   (installieren, Aufgabe dieses Kontos anlegen, die alte loeschen);
+///   gehoert sie einem anderen, bleibt sie (Vermerk);
+/// - zeigt die Aufgabe dieses Kontos nicht auf die installierte exe mit
+///   --hintergrund (fruehere Fassung: der entpackte Ordner), wird
+///   installiert und umgestellt;
 /// - zeigt sie dorthin, ist diese exe aber eine andere (SHA-256 von exe und
-///   DLLs), wird die installierte Kopie erneuert.
+///   DLLs), wird die installierte Kopie erneuert - ausser sie ist neuer.
+///
+/// Scheitert etwas, werden die Aufgaben dieses Kontos abgeschaltet, die
+/// eine exe ausserhalb eines Administratorordners starten, und eine
+/// fruehere "QuadChroma" dieses Kontos, die noch aktiv ist (ihre Uebernahme
+/// ist gescheitert, und Haken und Menue zeigen sie nicht).
 ///
 /// `lnk_ordner`: wo die alten Verknuepfungen liegen (Tests), sonst der
 /// Autostart-Ordner.
 #[cfg(windows)]
-pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> Result<Start, String> {
+pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> BeimStart {
+    let alte = alte_aufgabe(ort);
+    let mut vermerke = Vec::new();
+    if let Some((name, a, false)) = &alte {
+        vermerke.push(format!(
+            "Mit Windows starten: die fruehere Aufgabe \"{name}\" gehoert {}, nicht diesem Konto - sie bleibt, wie sie ist (startet {})",
+            a.konto.as_deref().unwrap_or("keinem einzelnen Konto"),
+            a.befehlszeile()
+        ));
+    }
+    let eigene_alte = alte.filter(|(_, _, eigen)| *eigen).map(|(_, a, _)| a);
+    let start = beim_start_pruefen(lnk_ordner, ort, eigene_alte.as_ref());
+    let mut abgeschaltet = Vec::new();
+    if start.is_err() {
+        abgeschaltet = unsichere_aufgaben_abschalten(ort);
+        if let Some((name, a, true)) = alte_aufgabe(ort) {
+            if a.aktiv && !abgeschaltet.iter().any(|x| x.task == name) {
+                abgeschaltet.push(abschalten(&name, &a, "ihre Uebernahme in die Aufgabe dieses Kontos ist gescheitert".into()));
+            }
+        }
+    }
+    BeimStart { start, vermerke, abgeschaltet }
+}
+
+/// Der Kern von `autostart_beim_start` (ohne Abschalten nach Fehlern).
+/// `eigene_alte`: die fruehere Aufgabe "QuadChroma", wenn sie diesem Konto
+/// gehoert.
+#[cfg(windows)]
+fn beim_start_pruefen(lnk_ordner: Option<&Path>, ort: Ort, eigene_alte: Option<&Aufgabe>) -> Result<Start, String> {
     use crate::installation as inst;
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
     let mut zu_migrieren = Vec::new();
@@ -596,7 +864,7 @@ pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> Result<Start
             continue;
         }
         let ziel = lnk_ziel(&pfad)?;
-        if dieselbe_datei(Path::new(&ziel), &exe) {
+        if inst::dieselbe_datei(Path::new(&ziel), &exe) {
             zu_migrieren.push(pfad);
         } else if fremd.is_none() {
             fremd = Some(ziel);
@@ -611,33 +879,41 @@ pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> Result<Start
         }
         return Ok(Start::VerknuepfungErsetzt(neu));
     }
-    let Some((befehl, argumente)) = aufgabe_befehl(ort.task) else {
+    let task = ort.task()?;
+    let Some(a) = aufgabe(&task) else {
+        // Keine Aufgabe dieses Kontos: die fruehere dieses Kontos uebernehmen -
+        // nur eine eingeschaltete (eine abgeschaltete heisst aus).
+        if let Some(alt) = eigene_alte.filter(|a| a.aktiv) {
+            let neu = einschalten(ort, &exe)?;
+            return Ok(Start::AlteUebernommen { vorher: alt.befehlszeile(), neu });
+        }
         return Ok(match fremd {
             Some(ziel) => Start::AndereExe(ziel),
             None => Start::Aus,
         });
     };
+    // Die Aufgabe dieses Kontos gilt; eine fruehere daneben ist ueberzaehlig.
+    if eigene_alte.is_some() {
+        alte_entfernen(ort)?;
+    }
+    if !a.aktiv {
+        // Abgeschaltet (von Hand oder nach einem Fehlschlag): aus.
+        return Ok(Start::Aus);
+    }
     let ordner = ort.ordner()?;
     let installiert = ordner.join(inst::EXE);
-    if inst::aufgabe_zeigt_auf(&befehl, &argumente, &installiert) {
-        if dieselbe_datei(&exe, &installiert) || inst::stimmt_ueberein(&exe, &ordner)? {
+    if inst::aufgabe_zeigt_auf(&a.befehl, &a.argumente, &installiert) {
+        if inst::dieselbe_datei(&exe, &installiert) {
             return Ok(Start::Aktuell);
         }
-        let bericht = inst::installieren(&exe, &ordner)?;
-        return Ok(Start::Erneuert { ordner, bericht });
+        return Ok(match inst::erneuern_entscheiden(&inst::vergleichen(&ordner)?) {
+            inst::Erneuern::Gleich => Start::Aktuell,
+            inst::Erneuern::Ja => Start::Erneuert { bericht: inst::installieren(&ordner)?, ordner },
+            inst::Erneuern::Nein { laufend, installiert: v } => Start::NeuereBleibt { ordner, laufend, installiert: v },
+        });
     }
     let neu = einschalten(ort, &exe)?;
-    Ok(Start::Umgestellt { vorher: format!("{befehl} {argumente}").trim().to_string(), neu })
-}
-
-/// Dieselbe Datei? Ueber den kanonischen Pfad (Gross- und Kleinschreibung,
-/// 8.3-Namen, Verweise); laesst er sich nicht bestimmen (Ziel fehlt), nie.
-#[cfg(windows)]
-fn dieselbe_datei(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
-        _ => false,
-    }
+    Ok(Start::Umgestellt { vorher: a.befehlszeile(), neu })
 }
 
 /// Das Ziel einer Verknuepfung (IShellLinkW::GetPath).
@@ -807,15 +1083,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
-    /// Reine Logik der geplanten Aufgabe (auf jeder Plattform): der Standard-
-    /// bzw. der uebergebene Name, der /TR-Wert mit der exe in
-    /// Anfuehrungszeichen und die vier Befehlszeilen von schtasks.
+    /// Reine Logik der geplanten Aufgabe (auf jeder Plattform): der Name je
+    /// Konto, welche fruehere Aufgabe zaehlt, der /TR-Wert mit der exe in
+    /// Anfuehrungszeichen und die Befehlszeilen von schtasks.
     #[test]
     fn schtasks_befehlszeilen() {
-        assert_eq!(task_name(None), "QuadChroma");
         assert_eq!(AUTOSTART_TASK, "QuadChroma");
-        assert_eq!(task_name(Some("QC-Test-1")), "QC-Test-1");
-        assert!(Ort::STANDARD.task.is_none() && Ort::STANDARD.ordner.is_none());
+        assert_eq!(task_fuer_konto("S-1-5-21-3623811015-3361044348-30300820-1013"), "QuadChroma (S-1-5-21-3623811015-3361044348-30300820-1013)");
+        assert_eq!(task_fuer_konto(" PC\\a/b:c*d?e\"f<g>h|i\u{1} "), "QuadChroma (PC_a_b_c_d_e_f_g_h_i_)");
+        assert!(Ort::STANDARD.task.is_none() && Ort::STANDARD.alte.is_none() && Ort::STANDARD.ordner.is_none());
+        // Beim Standard zaehlt die fruehere "QuadChroma"; ein Test mit eigener
+        // Aufgabe fasst sie nie an, ausser er nennt eine eigene.
+        assert_eq!(Ort::STANDARD.alte_task(), Some("QuadChroma"));
+        assert_eq!(Ort { task: Some("T"), ..Ort::default() }.alte_task(), None);
+        assert_eq!(Ort { task: Some("T"), alte: Some("A"), ordner: None }.alte_task(), Some("A"));
         assert_eq!(
             tr_wert(Path::new("C:\\Program Files\\QuadChroma\\quadchroma.exe")),
             "\"C:\\Program Files\\QuadChroma\\quadchroma.exe\" --hintergrund"
@@ -827,9 +1108,66 @@ mod tests {
                 "\"c:\\a b\\q.exe\" --hintergrund", "/TN", "QC", "/F"
             ]
         );
-        assert_eq!(query_args("QC"), vec!["/Query", "/TN", "QC"]);
         assert_eq!(xml_args("QC"), vec!["/Query", "/TN", "QC", "/XML"]);
         assert_eq!(loeschen_task_args("QC"), vec!["/Delete", "/TN", "QC", "/F"]);
+        assert_eq!(abschalten_args("QuadChroma (S-1-5-18)"), vec!["/Change", "/TN", "QuadChroma (S-1-5-18)", "/DISABLE"]);
+    }
+
+    /// Ein Ort fuer Tests: eigene Aufgabe, eigener Ordner, keine fruehere
+    /// Aufgabe.
+    #[cfg(windows)]
+    fn test_ort<'a>(task: &'a str, ordner: &'a Path) -> Ort<'a> {
+        Ort { task: Some(task), alte: None, ordner: Some(ordner) }
+    }
+
+    /// Ein leerer Ordner als Autostart-Ordner der Tests (ohne alte
+    /// Verknuepfungen; der echte ist im Test gesperrt).
+    #[cfg(windows)]
+    fn leer() -> PathBuf {
+        let o = std::env::temp_dir().join(format!("{}-lnk-leer", crate::secure::test_lauf()));
+        std::fs::create_dir_all(&o).unwrap();
+        o
+    }
+
+    /// Befehl und Argumente der Aufgabe.
+    #[cfg(windows)]
+    fn befehl(task: &str) -> Option<(String, String)> {
+        aufgabe(task).map(|a| (a.befehl, a.argumente))
+    }
+
+    /// Eine Aufgabe wie frueher anlegen: sie startet `exe` dort, wo sie
+    /// liegt, als `konto` (ohne die Pruefungen von task_anlegen).
+    #[cfg(windows)]
+    fn alte_anlegen(task: &str, konto: &str, exe: &Path) {
+        let (ok, a) = schtasks(&erstellen_args(task, konto, &tr_wert(exe))).unwrap();
+        assert!(ok, "{a}");
+    }
+
+    /// Die Dateiversion einer exe auf der Platte aendern (Versionsressource).
+    #[cfg(windows)]
+    fn version_setzen(pfad: &Path, v: crate::installation::Version) {
+        let mut d = std::fs::read(pfad).unwrap();
+        let (s, _) = crate::installation::pe_version_stelle(&d).unwrap();
+        d[s + 8..s + 12].copy_from_slice(&((u32::from(v[0]) << 16) | u32::from(v[1])).to_le_bytes());
+        d[s + 12..s + 16].copy_from_slice(&((u32::from(v[2]) << 16) | u32::from(v[3])).to_le_bytes());
+        std::fs::write(pfad, d).unwrap();
+        assert_eq!(crate::installation::pe_version(&std::fs::read(pfad).unwrap()), Some(v));
+    }
+
+    /// Die Aufgabe je Konto (Windows): "QuadChroma (<SID dieses Prozesses>)";
+    /// das eigene Konto wird als Name und als SID erkannt, SYSTEM und ein
+    /// unbekanntes Konto nicht.
+    #[cfg(windows)]
+    #[test]
+    fn aufgabe_je_konto() {
+        use crate::installation::{eigene_sid, ist_eigenes_konto, konto_sid};
+        let sid = eigene_sid().unwrap();
+        assert!(sid.starts_with("S-1-5-"), "{sid}");
+        assert_eq!(Ort::STANDARD.task().unwrap(), format!("QuadChroma ({sid})"));
+        assert!(ist_eigenes_konto(&aktueller_benutzer()), "{}", aktueller_benutzer());
+        assert!(ist_eigenes_konto(sid) && ist_eigenes_konto(&sid.to_lowercase()));
+        assert_eq!(konto_sid("SYSTEM").as_deref(), Some("S-1-5-18"));
+        assert!(!ist_eigenes_konto("SYSTEM") && !ist_eigenes_konto("S-1-5-18") && !ist_eigenes_konto("gibt-es-nicht-4711"));
     }
 
     /// Ein eigener Installationsordner unter Program Files - nur dort gelten
@@ -865,19 +1203,20 @@ mod tests {
     /// "Mit Windows starten" an: diese exe und die FFmpeg-DLLs liegen danach
     /// im Installationsordner mit gleichem SHA-256, die Aufgabe startet die
     /// installierte exe mit --hintergrund, hoechsten Rechten, bei der
-    /// Anmeldung, als der aktuelle Nutzer. Zweimal an ist kein Fehler (/F);
-    /// aus loescht die Aufgabe, die Dateien bleiben; zweimal aus ist kein
-    /// Fehler. Eigene Aufgabe und eigener Ordner, nie die echten.
+    /// Anmeldung, als der aktuelle Nutzer. Zweimal an ist kein Fehler (/F),
+    /// die Kopie stimmt dann schon; aus loescht die Aufgabe, die Dateien
+    /// bleiben; zweimal aus ist kein Fehler. Eigene Aufgabe und eigener
+    /// Ordner, nie die echten.
     #[cfg(windows)]
     #[test]
     fn autostart_an_und_aus() {
         use crate::installation::{DLLS, EXE};
         let Some(ordner) = pf_ordner("anaus") else { return };
         let task = format!("{}-anaus", crate::secure::test_lauf());
-        let ort = Ort { task: Some(&task), ordner: Some(&ordner) };
+        let ort = test_ort(&task, &ordner);
         // Vor und nach dem Test aufraeumen, egal wie er ausging.
         let _ = autostart_setzen(ort, false);
-        assert!(!autostart_an(ort.task), "Aufgabe schon da?");
+        assert!(!autostart_an(ort), "Aufgabe schon da?");
         match autostart_setzen(ort, true).unwrap() {
             Umstellung::Installiert { ordner: o, bericht } => {
                 assert_eq!(o, ordner);
@@ -890,7 +1229,7 @@ mod tests {
             }
             u => panic!("{u:?}"),
         }
-        assert!(autostart_an(ort.task), "Aufgabe nach 'an' nicht da");
+        assert!(autostart_an(ort), "Aufgabe nach 'an' nicht da");
         let exe = std::env::current_exe().unwrap();
         let installiert = ordner.join(EXE);
         assert_eq!(sha(&exe), sha(&installiert));
@@ -899,32 +1238,40 @@ mod tests {
         }
         assert!(reste(&ordner).is_empty(), "{:?}", reste(&ordner));
         // Die Aufgabe: die installierte exe mit --hintergrund, hoechste
-        // Rechte, Anmelde-Ausloeser, als der aktuelle Nutzer.
-        let (befehl, argumente) = aufgabe_befehl(ort.task).unwrap();
+        // Rechte, Anmelde-Ausloeser, als der aktuelle Nutzer, eingeschaltet.
+        let (befehl, argumente) = befehl(&task).unwrap();
         assert!(crate::installation::aufgabe_zeigt_auf(&befehl, &argumente, &installiert), "{befehl} {argumente}");
         let (ok, xml) = schtasks(&xml_args(&task)).unwrap();
         assert!(ok, "Query /XML: {xml}");
         assert!(xml.contains("HighestAvailable"), "kein HIGHEST: {xml}");
         assert!(xml.contains("<LogonTrigger>"), "kein Anmelde-Ausloeser: {xml}");
-        let benutzer = aktueller_benutzer();
-        assert!(xml.to_lowercase().contains(&benutzer.to_lowercase()), "nicht als aktueller Nutzer ({benutzer}): {xml}");
-        // Zweimal an: kein Fehler, die Aufgabe bleibt genau eine.
-        assert!(matches!(autostart_setzen(ort, true), Ok(Umstellung::Installiert { .. })));
-        assert!(autostart_an(ort.task));
+        let konto = crate::installation::aufgabe_konto(&xml).unwrap();
+        assert!(crate::installation::ist_eigenes_konto(&konto), "nicht als aktueller Nutzer ({konto}): {xml}");
+        assert!(crate::installation::aufgabe_aktiv(&xml));
+        // Zweimal an: kein Fehler, die Aufgabe bleibt genau eine, die Kopie
+        // stimmt schon.
+        assert_eq!(autostart_setzen(ort, true), Ok(Umstellung::Vorhanden(ordner.clone())));
+        assert!(autostart_an(ort));
+        // Abgeschaltet (schtasks /Change /DISABLE) zaehlt als aus.
+        assert!(schtasks(&abschalten_args(&task)).unwrap().0);
+        assert!(!autostart_an(ort) && aufgabe(&task).is_some());
+        assert_eq!(autostart_setzen(ort, true), Ok(Umstellung::Vorhanden(ordner.clone())));
+        assert!(autostart_an(ort), "an schaltet sie wieder ein");
         // Aus: Aufgabe weg, die installierte Kopie bleibt.
         assert_eq!(autostart_setzen(ort, false), Ok(Umstellung::Aus(Some(ordner.clone()))));
-        assert!(!autostart_an(ort.task), "Aufgabe nach 'aus' noch da");
+        assert!(!autostart_an(ort) && aufgabe(&task).is_none(), "Aufgabe nach 'aus' noch da");
         assert!(installiert.is_file());
         // Zweimal aus: die Aufgabe fehlt schon, das ist kein Fehler.
         assert!(autostart_setzen(ort, false).is_ok());
-        assert!(!autostart_an(ort.task));
+        assert!(!autostart_an(ort));
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
     /// Beim Start: ohne Aufgabe nichts zu tun; eine Aufgabe, die noch auf
     /// eine andere exe zeigt (fruehere Fassung: der entpackte Ordner), wird
-    /// nach der Installation umgestellt; weicht die installierte Kopie von
-    /// dieser exe ab, wird sie erneuert; stimmt alles, nichts.
+    /// nach der Installation umgestellt; weicht die installierte Kopie bei
+    /// gleicher Version von dieser exe ab (ein anderer Bau), wird sie
+    /// erneuert; stimmt alles, nichts.
     #[cfg(windows)]
     #[test]
     fn autostart_beim_start_umstellen_und_erneuern() {
@@ -933,15 +1280,14 @@ mod tests {
         let lnk = std::env::temp_dir().join(format!("{}-start-lnk", crate::secure::test_lauf()));
         std::fs::create_dir_all(&lnk).unwrap();
         let task = format!("{}-start", crate::secure::test_lauf());
-        let ort = Ort { task: Some(&task), ordner: Some(&ordner) };
+        let ort = test_ort(&task, &ordner);
         let _ = autostart_setzen(ort, false);
-        assert_eq!(autostart_beim_start(Some(&lnk), ort), Ok(Start::Aus));
-        // Eine Aufgabe wie frueher: sie startet die exe dort, wo sie liegt
-        // (hier dieses Testprogramm).
+        assert_eq!(autostart_beim_start(Some(&lnk), ort).start, Ok(Start::Aus));
         let exe = std::env::current_exe().unwrap();
-        let (ok, a) = schtasks(&erstellen_args(&task, &aktueller_benutzer(), &tr_wert(&exe))).unwrap();
-        assert!(ok, "{a}");
-        match autostart_beim_start(Some(&lnk), ort).unwrap() {
+        alte_anlegen(&task, &aktueller_benutzer(), &exe);
+        let b = autostart_beim_start(Some(&lnk), ort);
+        assert!(b.abgeschaltet.is_empty() && b.vermerke.is_empty(), "{b:?}");
+        match b.start.unwrap() {
             Start::Umgestellt { vorher, neu: Umstellung::Installiert { ordner: o, .. } } => {
                 let alt = vorher.trim_end_matches(AUTOSTART_ARGUMENT).trim();
                 assert!(crate::installation::gleicher_pfad(alt, &exe.to_string_lossy()), "{vorher}");
@@ -950,21 +1296,169 @@ mod tests {
             s => panic!("{s:?}"),
         }
         let installiert = ordner.join(EXE);
-        let (befehl, argumente) = aufgabe_befehl(ort.task).unwrap();
+        let (befehl, argumente) = befehl(&task).unwrap();
         assert!(crate::installation::aufgabe_zeigt_auf(&befehl, &argumente, &installiert), "{befehl} {argumente}");
         // Stimmt alles: nichts zu tun.
-        assert_eq!(autostart_beim_start(Some(&lnk), ort), Ok(Start::Aktuell));
-        // Die installierte Kopie ist eine andere (eine andere Fassung): erneuert.
+        assert_eq!(autostart_beim_start(Some(&lnk), ort).start, Ok(Start::Aktuell));
+        // Die installierte Kopie ist ein anderer Bau derselben Version: erneuert.
         let mut f = std::fs::OpenOptions::new().append(true).open(&installiert).unwrap();
-        std::io::Write::write_all(&mut f, b"andere Fassung").unwrap();
+        std::io::Write::write_all(&mut f, b"anderer Bau").unwrap();
         drop(f);
         assert_ne!(sha(&installiert), sha(&exe));
-        assert!(matches!(autostart_beim_start(Some(&lnk), ort), Ok(Start::Erneuert { .. })));
+        assert!(matches!(autostart_beim_start(Some(&lnk), ort).start, Ok(Start::Erneuert { .. })));
         assert_eq!(sha(&installiert), sha(&exe));
-        assert_eq!(autostart_beim_start(Some(&lnk), ort), Ok(Start::Aktuell));
+        assert_eq!(autostart_beim_start(Some(&lnk), ort).start, Ok(Start::Aktuell));
         let _ = autostart_setzen(ort, false);
         let _ = std::fs::remove_dir_all(&ordner);
         let _ = std::fs::remove_dir_all(&lnk);
+    }
+
+    /// Keine Rueckstufung: ist die installierte Kopie neuer als diese exe
+    /// (hoehere Dateiversion), bleibt sie - beim Start wie beim Einschalten,
+    /// und die Aufgabe startet sie. Ist sie aelter, wird sie erneuert.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_keine_rueckstufung() {
+        use crate::installation::{pe_version, EXE};
+        let Some(ordner) = pf_ordner("version") else { return };
+        let task = format!("{}-version", crate::secure::test_lauf());
+        let ort = test_ort(&task, &ordner);
+        let _ = autostart_setzen(ort, false);
+        assert!(matches!(autostart_setzen(ort, true), Ok(Umstellung::Installiert { .. })));
+        let exe = std::env::current_exe().unwrap();
+        let laufend = pe_version(&std::fs::read(&exe).unwrap()).expect("Testprogramm ohne Versionsressource");
+        let installiert = ordner.join(EXE);
+        let neuer = [laufend[0] + 1, 0, 0, 0];
+        version_setzen(&installiert, neuer);
+        let vorher = sha(&installiert);
+        let erwartet = Start::NeuereBleibt { ordner: ordner.clone(), laufend: Some(laufend), installiert: neuer };
+        assert_eq!(autostart_beim_start(Some(&leer()), ort).start, Ok(erwartet));
+        assert_eq!(sha(&installiert), vorher, "die neuere Kopie wurde ersetzt");
+        let erwartet = Umstellung::NeuereBleibt { ordner: ordner.clone(), laufend: Some(laufend), installiert: neuer };
+        assert_eq!(autostart_setzen(ort, true), Ok(erwartet));
+        assert_eq!(sha(&installiert), vorher, "die neuere Kopie wurde beim Einschalten ersetzt");
+        let (befehl, argumente) = befehl(&task).unwrap();
+        assert!(crate::installation::aufgabe_zeigt_auf(&befehl, &argumente, &installiert));
+        // Aelter als diese exe: erneuert.
+        version_setzen(&installiert, [0, 0, 1, 0]);
+        assert!(matches!(autostart_beim_start(Some(&leer()), ort).start, Ok(Start::Erneuert { .. })));
+        assert_eq!(sha(&installiert), sha(&exe));
+        let _ = autostart_setzen(ort, false);
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// Die fruehere Aufgabe fuer den ganzen Rechner: gehoert sie diesem
+    /// Konto, wird sie beim Start uebernommen (installiert, die Aufgabe
+    /// dieses Kontos angelegt, die alte geloescht); gehoert sie einem anderen
+    /// Konto (hier SYSTEM), bleibt sie, wie sie ist, mit einem Vermerk, und
+    /// "aus" laesst sie ebenso stehen.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_fruehere_aufgabe_uebernehmen() {
+        use crate::installation::EXE;
+        let Some(ordner) = pf_ordner("uebernahme") else { return };
+        let task = format!("{}-uebernahme", crate::secure::test_lauf());
+        let alte = format!("{}-uebernahme-alt", crate::secure::test_lauf());
+        let ort = Ort { task: Some(&task), alte: Some(&alte), ordner: Some(&ordner) };
+        let _ = schtasks(&loeschen_task_args(&task));
+        let _ = schtasks(&loeschen_task_args(&alte));
+        let exe = std::env::current_exe().unwrap();
+        // 1. Die fruehere gehoert diesem Konto: uebernommen.
+        alte_anlegen(&alte, &aktueller_benutzer(), &exe);
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert!(b.abgeschaltet.is_empty() && b.vermerke.is_empty(), "{b:?}");
+        match b.start.unwrap() {
+            Start::AlteUebernommen { vorher, neu: Umstellung::Installiert { .. } } => {
+                assert!(crate::installation::gleicher_pfad(vorher.trim_end_matches(AUTOSTART_ARGUMENT).trim(), &exe.to_string_lossy()), "{vorher}");
+            }
+            s => panic!("{s:?}"),
+        }
+        assert!(aufgabe(&alte).is_none(), "die fruehere ist noch da");
+        assert!(autostart_an(ort));
+        let (befehl, argumente) = befehl(&task).unwrap();
+        assert!(crate::installation::aufgabe_zeigt_auf(&befehl, &argumente, &ordner.join(EXE)), "{befehl} {argumente}");
+        assert_eq!(autostart_beim_start(Some(&leer()), ort).start, Ok(Start::Aktuell));
+        // 2. Die fruehere gehoert SYSTEM: sie bleibt, eingeschaltet, mit Vermerk.
+        assert!(autostart_setzen(ort, false).is_ok());
+        alte_anlegen(&alte, "SYSTEM", &exe);
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert_eq!(b.start, Ok(Start::Aus));
+        assert!(b.vermerke.len() == 1 && b.vermerke[0].contains("S-1-5-18") && b.vermerke[0].contains("bleibt"), "{:?}", b.vermerke);
+        assert!(b.abgeschaltet.is_empty());
+        assert!(aufgabe(&alte).is_some_and(|a| a.aktiv) && !autostart_an(ort));
+        // Einschalten und ausschalten lassen sie ebenso stehen.
+        assert!(autostart_setzen(ort, true).is_ok() && autostart_an(ort));
+        assert!(autostart_setzen(ort, false).is_ok());
+        assert!(aufgabe(&alte).is_some_and(|a| a.aktiv), "die fremde Aufgabe wurde angefasst");
+        assert!(unsichere_aufgaben_abschalten(ort).is_empty(), "eine fremde Aufgabe wird nicht abgeschaltet");
+        let _ = schtasks(&loeschen_task_args(&alte));
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// Scheitert das Umstellen, bleibt keine Aufgabe dieses Kontos still
+    /// aktiv, die eine exe ausserhalb eines Administratorordners startet:
+    /// hier zeigen die Aufgabe dieses Kontos bzw. die fruehere auf dieses
+    /// Testprogramm (target, fuer Nutzer beschreibbar), und der
+    /// Installationsordner liegt im Temp-Ordner des Nutzers, so dass die
+    /// Installation scheitert. Beide werden abgeschaltet, ein zweiter Start
+    /// laesst sie aus. Ist das Konto gesperrt, schaltet
+    /// unsichere_aufgaben_abschalten dasselbe ab, eine Aufgabe auf die
+    /// installierte Kopie aber nicht.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_abschalten_nach_fehlschlag() {
+        use crate::installation::EXE;
+        let Some(pf) = pf_ordner("abschalten") else { return };
+        let temp = std::env::temp_dir().join(format!("{}-abschalten", crate::secure::test_lauf()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let task = format!("{}-abschalten", crate::secure::test_lauf());
+        let alte = format!("{}-abschalten-alt", crate::secure::test_lauf());
+        let ort = Ort { task: Some(&task), alte: Some(&alte), ordner: Some(&temp) };
+        let _ = schtasks(&loeschen_task_args(&task));
+        let _ = schtasks(&loeschen_task_args(&alte));
+        let exe = std::env::current_exe().unwrap();
+        // 1. Die Aufgabe dieses Kontos zeigt auf den beschreibbaren Ordner.
+        alte_anlegen(&task, &aktueller_benutzer(), &exe);
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert!(b.start.is_err(), "{b:?}");
+        assert_eq!(b.abgeschaltet.len(), 1, "{b:?}");
+        assert_eq!((b.abgeschaltet[0].task.as_str(), &b.abgeschaltet[0].fehler), (task.as_str(), &None));
+        assert!(b.abgeschaltet[0].zeile().contains("abgeschaltet"), "{}", b.abgeschaltet[0].zeile());
+        assert!(aufgabe(&task).is_some_and(|a| !a.aktiv) && !autostart_an(ort));
+        assert!(!temp.join(EXE).exists());
+        // Zweiter Start: abgeschaltet heisst aus - nichts wird wieder an.
+        assert_eq!(autostart_beim_start(Some(&leer()), ort).start, Ok(Start::Aus));
+        assert!(aufgabe(&task).is_some_and(|a| !a.aktiv));
+        // Einschalten scheitert hier ebenso - und laesst nichts an.
+        alte_anlegen(&task, &aktueller_benutzer(), &exe);
+        let e = autostart_setzen(ort, true).unwrap_err();
+        assert!(e.contains("abgeschaltet"), "{e}");
+        assert!(aufgabe(&task).is_some_and(|a| !a.aktiv));
+        let _ = schtasks(&loeschen_task_args(&task));
+        // 2. Nur die fruehere dieses Kontos: ihre Uebernahme scheitert - abgeschaltet.
+        alte_anlegen(&alte, &aktueller_benutzer(), &exe);
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert!(b.start.is_err(), "{b:?}");
+        assert!(b.abgeschaltet.len() == 1 && b.abgeschaltet[0].task == alte, "{b:?}");
+        assert!(aufgabe(&alte).is_some_and(|a| !a.aktiv) && aufgabe(&task).is_none());
+        // Abgeschaltet wird sie beim naechsten Start nicht uebernommen.
+        assert_eq!(autostart_beim_start(Some(&leer()), ort).start, Ok(Start::Aus));
+        assert!(aufgabe(&task).is_none());
+        let _ = schtasks(&loeschen_task_args(&alte));
+        // 3. Gesperrtes Konto: abgeschaltet wird nur, was auf einen
+        // beschreibbaren Ordner zeigt, nicht die Aufgabe auf die installierte
+        // Kopie in Program Files.
+        let sicher = test_ort(&task, &pf);
+        assert!(matches!(autostart_setzen(sicher, true), Ok(Umstellung::Installiert { .. })));
+        assert!(unsichere_aufgaben_abschalten(sicher).is_empty());
+        assert!(autostart_an(sicher));
+        alte_anlegen(&task, &aktueller_benutzer(), &exe);
+        let ab = unsichere_aufgaben_abschalten(sicher);
+        assert!(ab.len() == 1 && ab[0].fehler.is_none(), "{ab:?}");
+        assert!(!autostart_an(sicher));
+        let _ = schtasks(&loeschen_task_args(&task));
+        let _ = std::fs::remove_dir_all(&temp);
+        let _ = std::fs::remove_dir_all(&pf);
     }
 
     /// Nie ein Ordner, den andere als Administratoren aendern koennen, nie
@@ -978,14 +1472,13 @@ mod tests {
         use crate::installation::EXE;
         let Some(pf) = pf_ordner("offen") else { return };
         let task = format!("{}-offen", crate::secure::test_lauf());
-        let t = Some(task.as_str());
         let _ = schtasks(&loeschen_task_args(&task));
         // 1. Ein Ordner im Temp-Verzeichnis (dem Nutzer gehoerend).
         let temp = std::env::temp_dir().join(format!("{}-offen", crate::secure::test_lauf()));
         let _ = std::fs::remove_dir_all(&temp);
-        let e = autostart_setzen(Ort { task: t, ordner: Some(&temp) }, true).unwrap_err();
+        let e = autostart_setzen(test_ort(&task, &temp), true).unwrap_err();
         assert!(e.contains("Besitzer") || e.contains("darf hier schreiben"), "{e}");
-        assert!(!temp.join(EXE).exists() && !autostart_an(t), "{e}");
+        assert!(!temp.join(EXE).exists() && !autostart_an(test_ort(&task, &temp)), "{e}");
         // 2. Unter Program Files, aber "Benutzer" (S-1-5-32-545) duerfen aendern.
         std::fs::create_dir(&pf).unwrap();
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
@@ -995,20 +1488,20 @@ mod tests {
             .output()
             .unwrap();
         assert!(icacls.status.success(), "{}", String::from_utf8_lossy(&icacls.stdout));
-        let e = autostart_setzen(Ort { task: t, ordner: Some(&pf) }, true).unwrap_err();
+        let e = autostart_setzen(test_ort(&task, &pf), true).unwrap_err();
         assert!(e.contains("S-1-5-32-545"), "{e}");
-        assert!(!pf.join(EXE).exists() && !autostart_an(t), "{e}");
+        assert!(!pf.join(EXE).exists() && aufgabe(&task).is_none(), "{e}");
         // 3. Ein UNC-Pfad (derselbe Rechner ueber die Admin-Freigabe).
         let text = pf.to_string_lossy().to_string();
         let unc = PathBuf::from(format!("\\\\localhost\\{}${}", &text[..1], &text[2..]));
-        let e = autostart_setzen(Ort { task: t, ordner: Some(&unc) }, true).unwrap_err();
+        let e = autostart_setzen(test_ort(&task, &unc), true).unwrap_err();
         assert!(e.contains("kein lokaler Pfad"), "{e}");
-        assert!(!autostart_an(t));
+        assert!(aufgabe(&task).is_none());
         // 4. Die Aufgabe direkt auf eine exe im Temp-Ordner: verweigert.
         std::fs::create_dir_all(&temp).unwrap();
         std::fs::write(temp.join(EXE), b"MZ").unwrap();
         assert!(task_anlegen(&task, &temp.join(EXE)).is_err());
-        assert!(!autostart_an(t));
+        assert!(aufgabe(&task).is_none());
         let _ = std::fs::remove_dir_all(&temp);
         let _ = std::fs::remove_dir_all(&pf);
     }
@@ -1023,7 +1516,7 @@ mod tests {
         use crate::installation::{installieren, EXE};
         let Some(ordner) = pf_ordner("laeuft") else { return };
         let exe = std::env::current_exe().unwrap();
-        installieren(&exe, &ordner).unwrap();
+        installieren(&ordner).unwrap();
         let installiert = ordner.join(EXE);
         // Die installierte Kopie (dieses Testprogramm) laufen lassen - nur
         // den wartenden Test unten.
@@ -1037,7 +1530,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(800));
         assert!(kind.try_wait().unwrap().is_none(), "die installierte Kopie laeuft nicht");
         assert!(std::fs::write(&installiert, b"MZ").is_err(), "eine laufende exe liess sich ueberschreiben?");
-        let bericht = installieren(&exe, &ordner);
+        let bericht = installieren(&ordner);
         let _ = kind.kill();
         let _ = kind.wait();
         let bericht = bericht.unwrap();
@@ -1046,7 +1539,7 @@ mod tests {
             "{bericht:?}"
         );
         assert_eq!(sha(&installiert), sha(&exe));
-        installieren(&exe, &ordner).unwrap();
+        installieren(&ordner).unwrap();
         assert!(reste(&ordner).is_empty(), "{:?}", reste(&ordner));
         let _ = std::fs::remove_dir_all(&ordner);
     }
@@ -1070,10 +1563,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn autostart_alte_verknuepfung_anderer_exe() {
+        use crate::installation::dieselbe_datei;
         let Some(pf) = pf_ordner("fremd") else { return };
         let ordner = std::env::temp_dir().join(format!("{}-autostart-fremd", crate::secure::test_lauf()));
         let task = format!("{}-fremd", crate::secure::test_lauf());
-        let ort = Ort { task: Some(&task), ordner: Some(&pf) };
+        let ort = test_ort(&task, &pf);
         let _ = std::fs::remove_dir_all(&ordner);
         let _ = autostart_setzen(ort, false);
         std::fs::create_dir_all(&ordner).unwrap();
@@ -1082,26 +1576,26 @@ mod tests {
         std::fs::create_dir_all(andere.parent().unwrap()).unwrap();
         std::fs::write(&andere, b"MZ").unwrap();
         im_sta(|| lnk_speichern(&alt, &andere, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &andere, 0)).unwrap();
-        match autostart_beim_start(Some(&ordner), ort) {
+        match autostart_beim_start(Some(&ordner), ort).start {
             // Dieselbe Datei, egal ob lang oder als 8.3-Name geschrieben
             // (temp_dir kann "RUNNER~1" liefern, die Verknuepfung den langen Namen).
             Ok(Start::AndereExe(z)) => assert!(dieselbe_datei(Path::new(&z), &andere), "{z} / {}", andere.display()),
             r => panic!("{r:?}"),
         }
         assert!(alt.is_file(), "die alte bleibt");
-        assert!(!autostart_an(ort.task) && !pf.exists(), "keine Aufgabe und keine Installation fuer eine fremde exe");
+        assert!(!autostart_an(ort) && !pf.exists(), "keine Aufgabe und keine Installation fuer eine fremde exe");
         // Ziel fehlt ganz: ebenso nicht diese exe.
         std::fs::remove_file(&andere).unwrap();
-        assert!(matches!(autostart_beim_start(Some(&ordner), ort), Ok(Start::AndereExe(_))));
-        assert!(alt.is_file() && !autostart_an(ort.task));
+        assert!(matches!(autostart_beim_start(Some(&ordner), ort).start, Ok(Start::AndereExe(_))));
+        assert!(alt.is_file() && !autostart_an(ort));
         // Diese exe, in Grossbuchstaben geschrieben: dieselbe Datei.
         let exe = std::env::current_exe().unwrap();
         let gross = std::path::PathBuf::from(exe.display().to_string().to_uppercase());
         assert!(dieselbe_datei(&gross, &exe));
         std::fs::remove_file(&alt).unwrap();
         im_sta(|| lnk_speichern(&alt, &gross, "--host", &ordner, "x", &exe, 0)).unwrap();
-        assert!(matches!(autostart_beim_start(Some(&ordner), ort), Ok(Start::VerknuepfungErsetzt(Umstellung::Installiert { .. }))));
-        assert!(!alt.exists() && autostart_an(ort.task), "Aufgabe angelegt, alte weg");
+        assert!(matches!(autostart_beim_start(Some(&ordner), ort).start, Ok(Start::VerknuepfungErsetzt(Umstellung::Installiert { .. }))));
+        assert!(!alt.exists() && autostart_an(ort), "Aufgabe angelegt, alte weg");
         let _ = autostart_setzen(ort, false);
         let _ = std::fs::remove_dir_all(&ordner);
         let _ = std::fs::remove_dir_all(&pf);
@@ -1118,27 +1612,29 @@ mod tests {
         let Some(pf) = pf_ordner("alt") else { return };
         let ordner = std::env::temp_dir().join(format!("{}-autostart-alt", crate::secure::test_lauf()));
         let task = format!("{}-alt", crate::secure::test_lauf());
-        let ort = Ort { task: Some(&task), ordner: Some(&pf) };
+        let ort = test_ort(&task, &pf);
         let _ = std::fs::remove_dir_all(&ordner);
         let _ = autostart_setzen(ort, false);
         std::fs::create_dir_all(&ordner).unwrap();
         let exe = std::env::current_exe().unwrap();
         // Ohne alte Verknuepfung und ohne Aufgabe nichts zu tun.
-        assert_eq!(autostart_beim_start(Some(&ordner), ort), Ok(Start::Aus), "ohne alte nichts zu tun");
-        assert!(!autostart_an(ort.task));
-        for datei in [AUTOSTART_DATEI, AUTOSTART_ALT] {
+        assert_eq!(autostart_beim_start(Some(&ordner), ort).start, Ok(Start::Aus), "ohne alte nichts zu tun");
+        assert!(!autostart_an(ort));
+        for (i, datei) in [AUTOSTART_DATEI, AUTOSTART_ALT].into_iter().enumerate() {
             let lnk = ordner.join(datei);
             im_sta(|| lnk_speichern(&lnk, &exe, "--hintergrund", &ordner, "QuadChroma", &exe, 0)).unwrap();
-            assert!(
-                matches!(autostart_beim_start(Some(&ordner), ort), Ok(Start::VerknuepfungErsetzt(Umstellung::Installiert { .. }))),
-                "{datei}"
-            );
-            assert!(!lnk.exists() && autostart_an(ort.task), "{datei}: Aufgabe da, .lnk weg");
+            // Beim ersten Mal wird installiert, danach stimmt die Kopie schon.
+            match autostart_beim_start(Some(&ordner), ort).start {
+                Ok(Start::VerknuepfungErsetzt(Umstellung::Installiert { .. })) if i == 0 => {}
+                Ok(Start::VerknuepfungErsetzt(Umstellung::Vorhanden(_))) if i == 1 => {}
+                s => panic!("{datei}: {s:?}"),
+            }
+            assert!(!lnk.exists() && autostart_an(ort), "{datei}: Aufgabe da, .lnk weg");
             // Zweiter Start: keine .lnk mehr, die Aufgabe zeigt auf die
             // installierte exe, und die stimmt.
-            assert_eq!(autostart_beim_start(Some(&ordner), ort), Ok(Start::Aktuell), "{datei}: zweiter Start");
+            assert_eq!(autostart_beim_start(Some(&ordner), ort).start, Ok(Start::Aktuell), "{datei}: zweiter Start");
             assert!(autostart_setzen(ort, false).is_ok());
-            assert!(!autostart_an(ort.task));
+            assert!(!autostart_an(ort));
         }
         let _ = autostart_setzen(ort, false);
         let _ = std::fs::remove_dir_all(&ordner);
