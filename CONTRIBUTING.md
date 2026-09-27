@@ -55,10 +55,11 @@ agreement is given per contribution rather than once for all time.
 These are design decisions of the author, not open questions. Pull requests that break
 them are closed.
 
-1. **One program per side, no helper processes.** The Mac host is one app bundle
-   (`QuadChroma.app`, built from `host/`). Windows is one executable (`quadchroma.exe`,
-   built from `client/`) that contains the client and, started with `--host`, the host
-   role. The Mac client is the same Rust source. No helper tools, daemons, services,
+1. **One program per side, no helper processes.** The Mac has one app bundle
+   (`QuadChroma.app`: the Rust client from `client/` with the host engine from `host/`
+   built in). Windows is one executable (`quadchroma.exe`, built from `client/`) that
+   contains the client and the host role. On both, client and host run in one process
+   with one icon. No helper tools, daemons, services,
    launch agents, background helpers, separate installers, drivers or second processes -
    everything runs inside the one program.
 2. **The mouse pointer is drawn on the client side.** The host sends the pointer shape
@@ -145,12 +146,14 @@ root:
 
     make
 
-builds and signs `build/QuadChroma.app` with the local development identity
-`QuadChroma Dev` (`make IDENT=...` overrides it; `make sign`, `make verify`, `make zip`
-and `make dmg` are described in `RELEASING.md`). Do not start the freshly built app
-(`open build/QuadChroma.app`, `make list`, `make capture`) unless you are prepared for
-macOS to ask for Screen Recording and Accessibility permissions on that machine and
-unless no host is running there. The test harnesses `noisetest`, `annahmetest`,
+builds the Rust client with cargo and from it `build/QuadChroma.app`, signed with the
+local development identity `QuadChroma Dev` (`make IDENT=...` overrides it; `make
+sign`, `make verify`, `make zip` and `make dmg` are described in `RELEASING.md`). Do not
+start the freshly built app (`open build/QuadChroma.app`, `make list`, `make capture`)
+unless you are prepared for macOS to ask for Screen Recording and Accessibility
+permissions on that machine and unless no host is running there - with "Share this
+Mac" on (the default) the app starts listening on port 9001. `quadchroma
+--menueleiste-selbsttest` and `--ruhe-selbsttest` start neither service nor capture. The test harnesses `noisetest`, `annahmetest`,
 `zugangtest`, `dateitest`, `ablagetest`, `menuetest` and `einbettungstest` run without
 screen capture and without touching a running host; their `clang` lines are in
 `.github/workflows/ci.yml`, which runs them.

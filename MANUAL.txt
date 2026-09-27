@@ -39,13 +39,14 @@ a time: a second start hands its address over to it. The desktop
 shortcut per host relies on this. All three are described further
 below, as is copying files between client and host.
 
-On Windows QuadChroma is one app for both directions: it controls other
-computers and, with "Share this PC" switched on (the default), lets
-other devices control this PC - in the same process, with one icon in
-the notification area. The very first start opens the window; every
-later start, including the one at logon, goes silently to the
-notification area; a double-click on quadchroma.exe while it runs opens
-its window (see "Windows: one app for both directions").
+On Windows and on the Mac QuadChroma is one app for both directions: it
+controls other computers and, with "Share this PC" ("Share this Mac")
+switched on (the default), lets other devices control this computer - in
+the same process, with one icon in the notification area or the menu
+bar. The very first start opens the window; every later start, including
+the one at logon, goes silently to the icon; a double-click on the
+running app opens its window (see "Windows: one app for both directions"
+and "Mac: one app for both directions").
 
 Encryption and access
 ---------------------
@@ -361,10 +362,12 @@ only after the password or a click - accepted, allowed, denied, entered
 into the list - and "Zuschauer verbunden" (viewer connected) always
 appear. Neither host ever writes the password into its log.
 
-Both hosts limit their log to 8 MB. The Mac host then moves
-/tmp/quadchroma-m1.log to /tmp/quadchroma-m1.alt.log (an earlier one is
-dropped) and writes as the first new line "Protokoll war ueber 8192 KB -
-die Zeilen davor stehen in /tmp/quadchroma-m1.alt.log"; if the file
+Both hosts limit their log to 8 MB. The Mac host (in the one app
+host-protokoll.txt in the app folder, the stand-alone host
+/tmp/quadchroma-m1.log) then moves it to host-protokoll.alt.txt (or
+/tmp/quadchroma-m1.alt.log; an earlier one is dropped) and writes as the
+first new line "Protokoll war ueber 8192 KB - die Zeilen davor stehen in
+<.alt-Datei>"; if the file
 cannot be renamed, it starts empty ("... - die Zeilen davor sind
 verworfen", the earlier lines are discarded). The file grows across
 restarts; the few lines that audio and clipboard write into it
@@ -464,7 +467,7 @@ writes a new file. A proof that arrives meanwhile is answered with
 result 2 without a wait: the fault lies with the host, so it does not
 feed the throttle.
 
-Log lines of the access phase in the Mac host (/tmp/quadchroma-m1.log);
+Log lines of the access phase in the Mac host (host-protokoll.txt);
 <Name> is the client's name, <ID> its device ID, <IP> its address:
 
     "Geraete-ID dieses Hosts: <ID> (Fingerabdruck <Fingerabdruck>)
@@ -638,18 +641,37 @@ u16 0, u32 length; numbers little endian unless noted):
     the announcement is authenticated; the client uses the ID only to
     show and find a host.
 
-Mac host: the menu bar
-----------------------
+Mac: one app for both directions
+--------------------------------
 
-QuadChroma.app on the Mac is the host. A double-click in the Finder
-starts it; without arguments it runs as a host on port 9001. It has no
-Dock icon and no window, only an icon in the menu bar: four squares like
-the program icon, the lower right one only outlined, with a dot in it
-while a viewer is connected. A click on it opens the menu:
+On the Mac, too, QuadChroma is one app: QuadChroma.app controls other
+computers and, with "Share this Mac" switched on (the default), lets other
+devices control this Mac - in one process, with one icon in the menu bar.
+Its executable is the Rust client with the Mac host engine built in (see
+"Building" below); the bundle identifier (tech.quadchroma.host) and the
+signature stay those of the former host app, so permissions granted to
+it remain valid.
 
-    QuadChroma
-    Ready for connections      or "Connected: <name>", or "Port 9001 is
-                               used by another program"
+Start: the very first start (einstellungen.txt without fenster_gezeigt=1)
+opens the window; every later start - also as a login item - stays in the
+menu bar without a window and without a Dock icon, and takes the focus
+from nobody. A double-click on the running app in the Finder, or a
+second start (for example "open -n"), opens the window; with the window
+open the app has a Dock icon and its own menu ("Quit QuadChroma", Cmd+Q),
+hidden again it is only the icon. A start with an address or a device ID
+opens the window at once. The engine is set up when the app starts
+(key, access, menu); it listens only while sharing is on.
+
+The icon: four squares like the program icon, the lower right one only
+outlined, with a dot in it while a viewer is connected. A click on it
+opens the menu:
+
+    QuadChroma – <device name>
+    Ready for connections      or "Connected: <name>", "Port 9001 is
+                               used by another program", "Sharing is off"
+    Open QuadChroma            the window (start screen)
+    Connect: <host>            up to four hosts found on the network;
+                               opens the window and connects
     Device ID: 581 729 911     a click copies the nine digits
     Password: k7m-4wq-9tz      a click copies it, marked as concealed
     Change password ...
@@ -657,13 +679,52 @@ while a viewer is connected. A click on it opens the menu:
     Allowed devices >          per device "<name> - ID ... - since
                                <date>" > "Remove"; then "Remove all
                                devices ..."; empty: "No devices yet"
+    Change device name ...
+    Share this Mac             check mark: sharing is on
     Start at login             with a check mark when it is on
+    Prevent sleep while QuadChroma is running
     Screen Recording not allowed - open System Settings ...
     Accessibility not allowed - open System Settings ...
-                               both only while that permission is
-                               missing; a click opens its page in
-                               System Settings > Privacy & Security
+                               both only while sharing is on and that
+                               permission is missing; a click opens its
+                               page in System Settings > Privacy & Security
     Quit QuadChroma            also Cmd+Q
+
+Device ID, password and allowed devices stay in the menu and can be
+managed while sharing is off. The menu speaks the language chosen in the
+client (the start screen's language list; without a choice the first of
+the Mac's preferred languages that QuadChroma knows, otherwise English).
+
+Sharing ("Share this Mac" in the menu, the same button on the start
+screen, einstellungen.txt: freigabe=an|aus, default on):
+
+    - on: the ports 9001-9003 are open and the Mac announces itself
+      ("Freigabe: an - der Host lauscht"). The first time in a run the
+      host also asks for its permissions (Screen Recording at once,
+      Accessibility once per Mac) - with sharing off macOS asks for
+      nothing.
+    - off: a connected viewer is told goodbye (message 13, reason 1:
+      "<Name> stopped sharing."), a viewer that is just coming in gets
+      "QCH1" and the same goodbye instead of a session, and image,
+      input and announcement ports close at once ("Freigabe aus:
+      Verbindung zum Zuschauer <Fingerabdruck> geschlossen (Abschied
+      gemeldet)", "Freigabe aus: Bild-, Eingabe- und Bekanntgabeport
+      zu"). Switched on again, it listens on the same ports ("Freigabe
+      an: Bild 9001, Eingabe 9002, Bekanntgabe 9003").
+
+If another QuadChroma host of this user already runs (for example the
+former stand-alone QuadChroma.app, lock file host-instanz.lock), sharing
+stays off and the menu says "Port 9001 is used by another program"; a
+click on "Share this Mac" tries again. If another program holds port
+9001, the host keeps running, the menu says so, and it tries again every
+3 s ("Port 9001 ist belegt (anderes Programm?) - der Host wartet und
+versucht es alle 3 s erneut", later "Port 9001 wieder frei - der Dienst
+laeuft"). It announces itself only once it has the port.
+
+Local network: on macOS 15 and later the system asks once whether
+QuadChroma may find and connect to devices on the local network (the
+announcement and the host list need it). Without it no host is found and
+none finds this Mac.
 
 After a copy, "Copied" appears next to the icon for a moment. "Change
 password ..." opens a small window "Change password" with the fields
@@ -678,66 +739,89 @@ shows "Device list damaged" and "Reset device list" instead of "Allowed
 devices", with an unreadable password file "Password file unreadable -
 new devices only via "Allow"." instead of the password (see "Encryption
 and access"). The date in the list is written the way the menu's
-language writes dates. The menu speaks the first of the Mac's preferred
-languages (System Settings > General > Language & Region) that
-QuadChroma knows - the same 29 as the client -, otherwise English.
+language writes dates. Cmd+C, Cmd+V, Cmd+X, Cmd+A and Cmd+Z work in the
+fields of these windows (the app's menu carries them invisibly).
+
+Device name: the same setting as on Windows (einstellungen.txt:
+geraetename=, default the computer name from System Settings > General >
+About). "Change device name ..." in the menu and "Rename" next to the
+start screen line "This computer: <name> · <device ID>" open a small
+window "Device name" with the same rules and texts as on Windows (1 to
+40 bytes of UTF-8, no control or direction characters; empty means the
+computer name). A new name applies at once: in the menu's first line,
+in the announcement from its next round, in message 20 from the next
+access phase and in message 3 from the next connection (the host's log:
+Geraetename: "<Name>").
+
+Prevent sleep: "Prevent sleep while QuadChroma is running" (a check mark
+in the menu, a check box on the start screen; einstellungen.txt:
+ruhezustand_verhindern=1, default off) keeps the Mac from going to sleep
+by itself while the app runs - sessions or not; the display may still
+turn off. It is a power assertion of the app (IOPMAssertion
+PreventUserIdleSystemSleep) named with the text of the check item, listed
+by "pmset -g assertions" (non-ASCII characters of the name appear
+garbled there, the assertion is fine). Switching it off or quitting
+releases it at once ("Ruhezustand: verhindert, solange QuadChroma
+laeuft", "Ruhezustand: wieder erlaubt"). The host's keep-awake during a
+session (display included) is independent of it.
 
 Start at login registers the app as a login item in System Settings. It
 works only when QuadChroma.app lies in /Applications; elsewhere the
 entry is disabled and "Move QuadChroma to Applications first" appears
 below it. If macOS wants the login item approved first, the check mark
-becomes a dash, and a click opens the Login Items settings.
+becomes a dash, and a click opens the Login Items settings. At login the
+app starts in the menu bar, with sharing as it was left.
 
-Permissions: without Screen Recording the host no longer quits. At start
-it asks for it (macOS shows its dialog), the menu shows the missing
-permission, and the host checks again every 3 s. A viewer who connects
-meanwhile gets in and sees "The host has no display right now" until the
-capture can start - the same happens when the capture cannot start for
-another reason (no display, for example). Whether macOS lets the running
-host use a permission granted later without a restart has not been
-verified on a device yet; if the menu line stays after granting, quit
-QuadChroma and start it again. Accessibility (for mouse and keyboard) is
-asked for only once, at the very first start (remembered by the empty
-file host-bedienungshilfen-gefragt next to host.key); after that only
-the menu shows it. Without it the host ignores mouse and keyboard.
+Permissions: without Screen Recording the host does not quit. When
+sharing goes on, it asks for it (macOS shows its dialog), the menu shows
+the missing permission, and the host checks again every 3 s. A viewer
+who connects meanwhile gets in and sees "The host has no display right
+now" until the capture can start - the same happens when the capture
+cannot start for another reason (no display, for example). Whether
+macOS lets the running host use a permission granted later without a
+restart has not been verified on a device yet; if the menu line stays
+after granting, quit QuadChroma and start it again. Accessibility (for
+mouse and keyboard) is asked for only once, at the first time sharing
+goes on (remembered by the empty file host-bedienungshilfen-gefragt next
+to host.key); after that only the menu shows it. Without it the host
+ignores mouse and keyboard. The audio the host captures never includes
+the app's own playback (the client's sound of another computer).
 
-One host per user: a second start ends at once with exit code 0 ("Es
-laeuft schon ein QuadChroma-Host fuer diesen Nutzer - dieser Start
-endet"; the lock is the file host-instanz.lock next to host.key). A
-double-click on the running app shows its menu, also when macOS hides
-the icon in a full menu bar (the log then says "Oberflaeche: Symbol in
-der Menueleiste nicht sichtbar - Doppelklick auf die App zeigt das
-Menue"). The tools --list, --capture and --formattest may run next to
-a host.
+Quitting - "Quit QuadChroma" in the menu, Cmd+Q, "Quit" on the start
+screen - ends client and host together: a viewer is told goodbye first
+(message 13, reason 0: "<Name> was closed.", waiting at most 3 s). The
+same happens at logout, with SIGTERM or SIGINT ("Oberflaeche: Signal
+SIGTERM - beende"). While the client shows a session, Cmd+Q and Cmd+H go
+to the remote Mac, not to the app.
 
-If another program holds port 9001, the host keeps running: the menu
-says so, and the host tries again every 3 s ("Port 9001 ist belegt
-(anderes Programm?) - der Host wartet und versucht es alle 3 s erneut",
-later "Port 9001 wieder frei - der Dienst laeuft"). It announces itself
-only once it has the port.
-
-Quitting - "Quit QuadChroma", Cmd+Q, logging out, SIGTERM or SIGINT -
-first says goodbye to the viewer (message 13, reason 0) and closes the
-connection (waiting at most 3 s), then the host ends ("Beenden:
-Verbindung zum Zuschauer <Fingerabdruck> geschlossen (Abschied
-gemeldet)" or "... - der Abschied kam nicht an", then "Host beendet").
-The client shows "<Name> was closed." and does not reconnect by itself
-(see "The host says goodbye").
+The host's log: host-protokoll.txt in the app folder
+(~/Library/Application Support/QuadChroma/), appended across starts; at
+8 MB it moves to host-protokoll.alt.txt. (The few lines audio and
+clipboard write themselves still go to /tmp/quadchroma-m1.log.) The
+client's own log stays protokoll.txt next to it.
 
 For experts the switches stay: --serve [port], --fps N, --mbit N,
---fest, --display N, --out <B>x<H>, and the tools --list, --capture
-and --formattest, for example
+--fest, --display N, --out <B>x<H> are passed to the host engine (never
+taken for an address), for example
 
-    open -n build/QuadChroma.app --args --serve 9001 --fps 120 --mbit 50
+    open -n /Applications/QuadChroma.app --args --serve 9001 --fps 120 --mbit 50
 
-A switch without its value keeps the default and says so ("--fps: Wert
-1 fehlt - der Standard gilt"); unknown arguments are only logged
-("Unbekanntes Argument <Argument> - uebergangen").
+(only when the app is not running yet - otherwise the second start just
+opens the window). The tools --list, --capture <seconds> <file> and
+--formattest run and end without window or service; they ask for Screen
+Recording. A switch without its value keeps the default and says so
+("--fps: Wert 1 fehlt - der Standard gilt").
 
-More log lines of the Mac host's menu bar (the access phase: see
-"Encryption and access"):
+Self-tests without service and without capture: --menueleiste-selbsttest
+builds the icon and its menu as the app does, in a throw-away home
+folder, checks the entries and their effect and ends (exit code 0);
+--ruhe-selbsttest sets the power assertion, finds it in pmset -g
+assertions and releases it.
 
-    "Oberflaeche: Menueleiste, Sprache <Code>"
+More log lines of the menu bar (the access phase: see "Encryption and
+access"):
+
+    "Oberflaeche: Menueleiste, Sprache <Code> (die eine App)"
     "Oberflaeche: Beim Anmelden starten eingeschaltet" or
      "... ausgeschaltet"
     "Bildschirmaufnahme-Freigabe jetzt erteilt" or "... entzogen", the
@@ -747,20 +831,33 @@ More log lines of the Mac host's menu bar (the access phase: see
     "Oberflaeche: Beenden - Verbindung zum Zuschauer wird geschlossen"
     "Oberflaeche: Signal SIGTERM - beende"
 
-Mac as client (under construction)
-----------------------------------
+The former stand-alone host (host/start.m) is still built by "make
+host-allein" as build/quadchroma-host, for test harnesses only; it
+keeps /tmp/quadchroma-m1.log and shows the host's menu without the
+client's entries.
 
-The same client also builds on the Mac (arm64): audio via AudioToolbox,
-clipboard via NSPasteboard (text and files), decoding with VideoToolbox,
-display through Metal (no choice of graphics cards in the Display tab).
-Closing hides it in the menu bar, with the client's icon (four
-filled squares - the host's has an outlined fourth one); there is no
-desktop shortcut on the Mac and no "Share this PC". It needs no FFmpeg;
-build it with Rust alone:
+Mac client
+----------
+
+The client of QuadChroma.app is the same Rust client as on Windows
+(arm64): audio via AudioToolbox, clipboard via NSPasteboard (text and
+files), decoding with VideoToolbox, display through Metal (no choice of
+graphics cards in the Display tab). Closing hides it in the menu bar, in
+the one icon of the app (see "Mac: one app for both directions"); there
+is no desktop shortcut on the Mac. It needs no FFmpeg.
+
+Building: "make" in the repository builds the app - cargo build
+--release --locked in client/ (the host engine from host/ is compiled
+into it by client/build.rs), then build/QuadChroma.app with the binary
+as Contents/MacOS/quadchroma, signed (see the Makefile). The binary alone
+also runs from the terminal:
 
     cd client
     cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
+
+Started like that (outside the bundle), macOS attributes the permissions
+to the terminal, not to QuadChroma.app, and "Start at login" is disabled.
 
 Decoding on the Mac: VideoToolbox in the media engine of Apple silicon
 decodes HEVC 4:4:4 and 4:2:0 in 8 and 10 bits and H.264 (measured on the
@@ -932,18 +1029,18 @@ Closing the window: notification area and menu bar
 
 Closing (the X or Alt+F4, on the Mac the red button or Cmd+W on the
 start screen) does not quit the client, it hides it: on Windows as an
-icon in the notification area next to the clock, on the Mac as an icon
-at the top in the menu bar (the program icon in a single color; if that
-is not possible, "QC" appears there). A running session is disconnected
-as with "Disconnect" - the host stops working. While hidden, the client
-neither draws nor decodes; the search for hosts, the single instance
-(see below) and on Windows the host role keep running. On the Mac the
+icon in the notification area next to the clock, on the Mac as the icon
+at the top in the menu bar (four squares, the fourth outlined). A running
+session is disconnected as with "Disconnect" - the host stops working.
+While hidden, the client neither draws nor decodes; the search for
+hosts, the single instance (see below) and the host role keep running.
+On the Mac the
 window leaves full screen first and returns to it when opened again;
 while hidden, the app has no Dock icon there and does not appear in the
 app switcher. On Windows this icon is the one icon of the app, client
-and host role together; the Mac host and the host-only process
-(--nur-host) have icons of their own (see "Mac host: the menu bar" and
-"Windows as host").
+and host role together, and so is the menu bar icon on the Mac; the
+host-only process (--nur-host) has an icon of its own (see "Mac: one app
+for both directions" and "Windows as host").
 
 The icon is there from the start, not only after closing (except with
 tray=aus, see below):
@@ -1616,7 +1713,7 @@ display (see "The menu").
     quadchroma.exe 192.168.178.194:9001 --headless --bildschirm v0-m0-s0
     quadchroma.exe 192.168.178.194:9001 --headless --bildschirm auto
 
-Log lines of the Mac host (/tmp/quadchroma-m1.log); <Text> is
+Log lines of the Mac host (host-protokoll.txt); <Text> is
 'Kennung <n> (<Kennung>) "<Name>"' (<n> is the macOS display ID), for
 example 'Kennung 2 (v1138-m1234-s0) "X27 X1"'. Placeholders: <Kennung>
 identifier, <B>x<H> width x height, <alt>/<neu> old/new, <Grund>
@@ -2053,7 +2150,8 @@ i.e. 28 MB/s, at an unchanged rate of about 114 frames per second and
 30 to 37 ms latency.
 
 Log lines: in the client in protokoll.txt, in the Windows host role in
-host-protokoll.txt, in the Mac host in /tmp/quadchroma-m1.log. These
+host-protokoll.txt, in the Mac host likewise (host-protokoll.txt in the
+app folder; the stand-alone host /tmp/quadchroma-m1.log). These
 read the same on all sides (sending, sent and acknowledged, receiving,
 received and put on the clipboard, rejected, aborted, skipped, nothing
 to send); only the reasons in parentheses differ:

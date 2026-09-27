@@ -15,16 +15,17 @@ change; check before buying.
 
 | | Windows | macOS |
 |---|---|---|
-| Binary | `quadchroma.exe` (client and host role, x86_64, static CRT) plus two FFmpeg DLLs next to it (`avcodec-63.dll`, `avutil-61.dll`) | `QuadChroma.app` (host, Apple silicon, macOS 14 or later) |
+| Binary | `quadchroma.exe` (client and host role, x86_64, static CRT) plus two FFmpeg DLLs next to it (`avcodec-63.dll`, `avutil-61.dll`) | `QuadChroma.app` (client and host in one app: the Rust client with the host engine built in, Apple silicon, macOS 14 or later) |
 | Signature | Authenticode (SHA-256, RFC 3161 timestamp) with a publicly trusted code-signing certificate | Developer ID Application certificate, Hardened Runtime, secure timestamp, then notarized by Apple and the ticket stapled |
 | Tooling | `scripts/sign-windows.ps1` (signtool) locally, or `azure/artifact-signing-action` in CI | `make sign`, `make notarize`, `make staple`, `make dmg` ... locally; most of the same targets in CI (notarization there runs through `notarytool --apple-id` instead of `make notarize`) |
 | What users see afterwards | SmartScreen still warns until the certificate has built reputation, but shows the verified publisher name (section 6) | One "downloaded from the internet" confirmation on first launch, no warning; then the usual Screen Recording and Accessibility prompts |
 | Needs the author | a code-signing certificate on the author's own name (or, only for organizations in the EU, an Azure Artifact Signing account) | Apple Developer Program membership (individual), Developer ID certificate, notarytool credentials |
 
-The Mac *client* (same Rust source as the Windows program, decoding with VideoToolbox,
-no FFmpeg) is not yet released as a binary of its own; it is meant to become part of
-`QuadChroma.app` with the one app on the Mac. The CI builds and tests it, nothing
-more.
+On the Mac the client (same Rust source as the Windows program, decoding with
+VideoToolbox, no FFmpeg) is the executable of `QuadChroma.app`: `make` runs `cargo
+build --release --locked` first, so the release job needs Rust, and the bundle keeps
+the identifier `tech.quadchroma.host`. Before the first release with the one app, run
+the live checklist on a real Mac (TCC permissions, login item, local network).
 
 Two ways to produce a release:
 

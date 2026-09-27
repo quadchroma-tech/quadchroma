@@ -120,9 +120,9 @@ graphics card the CPU draws.
 
 ## Design in brief
 
-- One program per side: `QuadChroma.app` on the Mac, `quadchroma.exe` on Windows. On
-  Windows it is one app for both directions - client and host role in one process with
-  one icon; the same Rust source builds a Mac client.
+- One program per side: `QuadChroma.app` on the Mac, `quadchroma.exe` on Windows. Each
+  is one app for both directions - client and host in one process with one icon; on the
+  Mac the Rust client has the Objective-C host engine built in.
 - Pointer on the client side: the client shows its own local pointer in the shape the
   host reports; the video never contains one.
 - Always encrypted: Noise XX with X25519, ChaCha20-Poly1305 and SHA-256, no switch to
@@ -182,7 +182,7 @@ your PC": choose "More info" > "Run anyway" once. Keep `avcodec-63.dll` and
 switched on, unsigned programs can be blocked without a "Run anyway" option; then
 only building from source helps.
 
-**macOS (host).** Open the DMG and drag `QuadChroma.app` to Applications. On the
+**macOS.** Open the DMG and drag `QuadChroma.app` to Applications. On the
 first start macOS refuses the app because Apple has not notarised it: open System
 Settings > Privacy & Security, scroll down to the message about QuadChroma and click
 "Open Anyway", then confirm. The same in Terminal:
@@ -192,23 +192,27 @@ signed with the project's own free certificate "QuadChroma Release": both permis
 stay granted across updates. Files named `-unsigned` carry only an ad-hoc signature;
 after each update the two permissions must be granted again.
 
-The host then sits as an icon in the menu bar - four squares, the lower right one
-only outlined - not in the Dock. Its menu shows the Mac's device ID and access
-password, the allowed devices and "Start at login" (offered once the app lies in
-Applications). While a permission is missing, the host keeps running; the menu says
-which one and opens its page in System Settings.
+The very first start opens the window (the start screen with the hosts found on the
+network); after that the app sits as an icon in the menu bar - four squares, the lower
+right one only outlined - and in the Dock only while its window is open. Its menu
+opens the window, connects to a host found on the network, shows the Mac's device ID
+and access password and the allowed devices, and switches "Share this Mac" (on by
+default), "Start at login" (offered once the app lies in Applications) and "Prevent
+sleep while QuadChroma is running". While a permission is missing, sharing keeps
+running; the menu says which one and opens its page in System Settings. macOS 15 and
+later also ask once for access to the local network.
 
 ## Getting started
 
-### Mac host
+### Mac
 
     make
     open -n build/QuadChroma.app --args --serve 9001 --fps 120 --mbit 50 --fest
 
-Without arguments - a double-click in the Finder, or as a login item - the app runs
-as a host on port 9001 with the default values. Only one host runs per user: a second
-start ends at once, and a double-click on the running app shows its menu. On the
-first start grant the two permissions listed above. `make` signs the bundle
+Without arguments - a double-click in the Finder, or as a login item - the app shares
+the Mac on port 9001 with the default values (unless "Share this Mac" is off). Only
+one app runs per user: a second start or a double-click on the running app opens its
+window. On the first start grant the two permissions listed above. `make` signs the bundle
 with a local development certificate so that the Screen Recording permission survives
 a rebuild. The host captures its main screen; the client can choose another one in
 its menu, and `--display n` pins entry `n` of the `--list` output for this run (see
@@ -658,8 +662,8 @@ open on real devices:
 - The access with password or "Allow": covered by the same test vectors on both sides,
   `zugangtest`, `menuetest`, the access sections of `hosttest` and loopback tests in
   Rust (the client against a test host, the Windows host role against a test client).
-  Still open on real devices: the Mac host's menu bar, its windows and "Start at
-  login" with the project's own certificate; whether a Screen Recording permission
+  Still open on real devices: the Mac app's menu bar, its windows, the sharing
+  switch and "Start at login" with the project's own certificate; whether a Screen Recording permission
   granted while the host runs takes effect without a restart; the Windows host role's
   icon, windows and "Start with Windows" on an interactive desktop (the VM is driven
   over ssh, without Explorer); and a Windows client against the Mac host through the
@@ -769,23 +773,29 @@ Requirements (from `ffmpeg-windows\bin`) next to the exe. Prebuilt FFmpeg builds
 the internet are not suitable for passing on: most of them include external
 libraries, some of those under the GPL. Tests: see "Test harnesses".
 
-### Mac host
+### Mac app
 
-The Xcode Command Line Tools are enough; a full Xcode installation is not required.
-`make` builds `build/QuadChroma.app` from `host/` and signs it with the local
-development identity named in the Makefile. The host uses only its own code, Apple
-frameworks (Foundation, AppKit, ScreenCaptureKit, VideoToolbox, CoreMedia, CoreVideo,
-CoreGraphics, CoreFoundation, IOKit, ServiceManagement for "Start at login",
-SystemConfiguration for the computer name; CommonCrypto for the access proofs) and the
-vendored Monocypher; no FFmpeg. Its test harnesses run without screen capture, see
-"Test harnesses".
+The Xcode Command Line Tools and Rust are enough; a full Xcode installation is not
+required. `make` runs `cargo build --release --locked` in `client/` and builds
+`build/QuadChroma.app` from the result (the binary becomes `Contents/MacOS/quadchroma`),
+signed with the local development identity named in the Makefile; bundle identifier and
+signature are those of the former host app, so granted permissions stay. The host
+engine uses only its own code, Apple frameworks (Foundation, AppKit, ScreenCaptureKit,
+VideoToolbox, CoreMedia, CoreVideo, CoreGraphics, CoreFoundation, IOKit,
+ServiceManagement for "Start at login", SystemConfiguration for the computer name;
+CommonCrypto for the access proofs) and the vendored Monocypher; no FFmpeg. `make
+host-allein` still builds the former stand-alone host (`host/start.m`) as
+`build/quadchroma-host`, for the test harnesses only. The harnesses run without screen
+capture, see "Test harnesses".
 
 ### Mac client
 
-The same client also builds on the Mac (arm64), with audio via AudioToolbox and the
-clipboard via NSPasteboard (text and files); the display runs through Metal, with the
-CPU (softbuffer) as fallback. Closing puts it into the menu bar; there is no desktop
-shortcut on the Mac. It needs no FFmpeg; build it with Rust alone:
+The client of the app is the same Rust client as on Windows (arm64), with audio via
+AudioToolbox and the clipboard via NSPasteboard (text and files); the display runs
+through Metal, with the CPU (softbuffer) as fallback. Closing puts it into the menu
+bar, into the app's one icon; there is no desktop shortcut on the Mac. It needs no
+FFmpeg; the binary alone also runs from the terminal (the permissions then belong to
+the terminal, not to the app):
 
     cd client
     cargo build --release
@@ -824,13 +834,17 @@ cadence (M1: about 1.8 ms GPU time per frame); it opens no window and starts nei
 host nor screen capture.
 
 On the Mac, `client/build.rs` also compiles the Mac host engine into the client: the
-`SRC` list of the Makefile without `host/start.m` (that file holds the host app's
-`main`), with the Makefile's `FLAGS`, archived as `libqchost.a` and linked with
-`-force_load` and the Makefile's frameworks. It needs the Xcode Command Line Tools
-(`clang`, `libtool`), and it makes macOS 14 the minimum for the Mac client too
-(`MACOSX_DEPLOYMENT_TARGET` in `client/.cargo/config.toml`). The C interface is
-`host/dienst.h` (`client/src/host_mac.rs`); nothing starts the host service from the
-client yet.
+`SRC` list of the Makefile without `host/start.m` (that file holds the stand-alone
+host's `main`), with the Makefile's `FLAGS`, archived as `libqchost.a` and linked with
+`-force_load`, the Makefile's frameworks and clang's `libclang_rt.osx.a` (for
+`@available`). It needs the Xcode Command Line Tools (`clang`, `libtool`), and it makes
+macOS 14 the minimum for the Mac client too (`MACOSX_DEPLOYMENT_TARGET` in
+`client/.cargo/config.toml`). The C interface is `host/dienst.h`
+(`client/src/host_mac.rs`): in `resumed` the app sets up the engine
+(`qc_app_einrichten`: menu bar with the client's entries, key, access), starts the
+service while sharing is on (`qc_dienst_starten`; off and on again:
+`qc_dienst_anhalten`, `qc_dienst_fortsetzen`) and then shows the icon
+(`qc_oberflaeche_fertig`).
 
 Its files live in `~/Library/Application Support/QuadChroma` (`client.key`,
 `hosts.txt`, `einstellungen.txt`, `protokoll.txt`, `benchmark.txt`, and
@@ -838,9 +852,8 @@ Its files live in `~/Library/Application Support/QuadChroma` (`client.key`,
 `host.key`, `host-devices.txt` and `host-password.txt`, as separate files. A host lets
 it in like every client: with its access password or a click on "Allow".
 
-License note: the Mac client contains no FFmpeg, only Apple frameworks and the Rust
-crates listed in `THIRD_PARTY_NOTICES.txt`. It is not yet distributed as a program of
-its own.
+License note: the Mac app contains no FFmpeg, only Apple frameworks, the vendored
+Monocypher and the Rust crates listed in `THIRD_PARTY_NOTICES.txt`.
 
 ## Test harnesses
 
@@ -1040,12 +1053,16 @@ messages.
 
 A self-test without network checks the icon in the notification area or menu bar:
 `quadchroma.exe --tray-selbsttest` (needs a session with Explorer) or
-`quadchroma --menueleiste-selbsttest` on the Mac; exit code 0 or 1.
+`quadchroma --menueleiste-selbsttest` on the Mac - the app's real icon and menu with
+the engine set up in a throw-away home folder, without the service and without
+screen capture; exit code 0 or 1. `quadchroma --ruhe-selbsttest` sets "Prevent sleep",
+finds it in `pmset -g assertions` and releases it.
 
 ## Repository layout
 
-    host/          Mac host (Objective-C and C): the service (main.m, C interface
-                   in dienst.h) and the app's main (start.m), capture, encoder,
+    host/          Mac host engine (Objective-C and C), built into the Mac app: the
+                   service (main.m, C interface in dienst.h) and the stand-alone
+                   host's main (start.m, harnesses only), capture, encoder,
                    network, input, audio, clipboard, files (dateien.m), screen
                    selection (bildschirm.m), pointer shape, access with password or
                    Allow (zugang.c), menu bar and its windows (menue.m) with the
@@ -1056,7 +1073,8 @@ A self-test without network checks the icon in the notification area or menu bar
                    (bildschirm.rs), both shared with the host role; device ID,
                    access proofs, throttle and the lists (zugang.rs, shared with
                    the host role) and the client's access dialog
-                   (zugangsphase.rs); notification area and menu bar (tray*.rs),
+                   (zugangsphase.rs); notification area (tray.rs, tray_win.rs),
+                   the Mac app around the host engine (host_mac.rs),
                    single instance (einzel.rs), desktop shortcut and "Start with
                    Windows" (verknuepfung.rs), program icon (logo.rs); version
                    information, icon and manifest of the exe (build.rs, res/); the

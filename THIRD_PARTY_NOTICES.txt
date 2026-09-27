@@ -1,7 +1,7 @@
 # QuadChroma - Third-Party Notices
 
 **Date:** 26 September 2026  
-**Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as of commit `26ef895` on `main`, static Microsoft C runtime; the release build of 26 September 2026 was 3,930,624 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS host `QuadChroma.app` 0.1.0 (build 2, bundle identifier `tech.quadchroma.host`).  
+**Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as of commit `26ef895` on `main`, static Microsoft C runtime; the release build of 26 September 2026 was 3,930,624 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS app `QuadChroma.app` 0.1.0 (build 2, bundle identifier `tech.quadchroma.host`; the Rust client for `aarch64-apple-darwin` with the Objective-C/C host engine built in).  
 **Maintainer / licensor:** Robert Brandt, <hello@quadchroma.tech>, <https://github.com/quadchroma-tech/quadchroma>
 
 This file accompanies every binary distribution of QuadChroma (the Windows ZIP and the macOS DMG/ZIP) and is kept unchanged in the source repository. It lists every third-party component contained in, or shipped next to, the distributed binaries, states the license each component is under, reproduces the license texts verbatim and records where the exact source code of the FFmpeg libraries comes from.
@@ -22,8 +22,8 @@ Conventions: SPDX identifiers are used for license names; where a component offe
    - 2.6 NVIDIA codec headers
    - 2.7 Compiler runtime linked into the DLLs (libgcc, winpthreads, MinGW-w64)
 3. Rust crates (Windows client, statically linked)
-4. macOS host (QuadChroma.app)
-5. Mac client (source only)
+4. macOS app (QuadChroma.app): host engine and system parts
+5. Rust crates in the macOS app (Mac client)
 - Appendix A: GNU General Public License, version 3
 - Appendix B: GNU Lesser General Public License, version 2.1
 - Appendix C: Apache License, Version 2.0
@@ -35,11 +35,11 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 | `quadchroma.exe` | Windows 10/11, x64 | Rust (client and host role) | Rust crates compiled into the executable, the Rust standard library and the static Microsoft C runtime. FFmpeg is **not** inside the executable; it is loaded from the two DLLs below. | 3 |
 | `avcodec-63.dll`, `avutil-61.dll` | Windows, x64 | none | FFmpeg 9.0.2 (libavcodec, libavutil), built unmodified by the QuadChroma maintainer without any external library; NVIDIA codec headers; compiler runtime. | 2 |
 | `FFMPEG-BUILDINFO.txt` | Windows | - | Sizes and SHA-256 of the two DLLs and the exact build configuration. | 2.2 |
-| `QuadChroma.app` | macOS 14 or later | Objective-C/C (host) | Monocypher (vendored), Apple system frameworks. No FFmpeg, no Rust. | 4 |
+| `QuadChroma.app` | macOS 14 or later | Rust (client) with the Objective-C/C host engine built in | Rust crates compiled into the executable (section 5), Monocypher (vendored), one function of clang's builtins library, Apple system frameworks. No FFmpeg. | 4, 5 |
 
 The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the README) and `MANUAL.txt` (the manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
 
-**Not distributed as a binary: the Mac client.** The Mac client is built from the same Rust source as the Windows program (section 5). It decodes with Apple's VideoToolbox and contains no FFmpeg (`ffmpeg-next` is a Windows-only dependency). It is not yet distributed as a program of its own.
+**The Mac client is the executable of `QuadChroma.app`.** Since the one app on the Mac, the Rust client (the same source as the Windows program) is the app's only executable, with the host engine from `host/` compiled into it. It decodes with Apple's VideoToolbox and contains no FFmpeg (`ffmpeg-next` is a Windows-only dependency); its Rust crates are listed in section 5.
 
 ## 2. FFmpeg (Windows client)
 
@@ -2602,9 +2602,9 @@ to the toolchain as a whole.
 
 `client/.cargo/config.toml` sets `-C target-feature=+crt-static`, so the Microsoft C runtime (libcmt, libvcruntime, libucrt) is linked statically into `quadchroma.exe` and no `VCRUNTIME140.dll` is imported. This runtime is Microsoft code distributed with Visual Studio and the Windows SDK under Microsoft's license terms ("Distributable Code"); it is not open-source software, is not part of the Corresponding Source of anything, and no third-party notice text is reproduced for it. Beyond that the executable imports only Windows system DLLs. Fonts are loaded from the system at run time (for example `C:\Windows\Fonts\meiryo.ttc`); nothing is embedded.
 
-## 4. macOS host (QuadChroma.app)
+## 4. macOS app (QuadChroma.app): host engine and system parts
 
-The host application contains QuadChroma's own Objective-C and C code, the vendored cryptographic library Monocypher, and links only Apple system frameworks. It contains no FFmpeg and no Rust code.
+The app's executable is the Rust client (section 5). Built into it is the host engine: QuadChroma's own Objective-C and C code and the vendored cryptographic library Monocypher (4.1). It links only Apple system frameworks (4.2). It contains no FFmpeg.
 
 ### 4.1 Monocypher
 
@@ -2731,13 +2731,15 @@ The host application contains QuadChroma's own Objective-C and C code, the vendo
 
 ### 4.2 Apple frameworks
 
-`QuadChroma.app` links Foundation, AppKit, ScreenCaptureKit, VideoToolbox, CoreMedia, CoreVideo, CoreGraphics, CoreFoundation, IOKit and CommonCrypto (via libSystem). They are part of macOS (minimum version 14.0), are not distributed with QuadChroma and require no third-party notice. The bundle is code-signed; the signature adds no third-party content.
+`QuadChroma.app` links Foundation, AppKit, ScreenCaptureKit, VideoToolbox, CoreMedia, CoreVideo, CoreGraphics, CoreFoundation, IOKit, ServiceManagement, SystemConfiguration, AudioToolbox, CoreAudio, Metal, QuartzCore, ApplicationServices, Carbon, libobjc, libiconv and CommonCrypto (via libSystem). They are part of macOS (minimum version 14.0), are not distributed with QuadChroma and require no third-party notice. The bundle is code-signed; the signature adds no third-party content.
 
-## 5. Mac client (source only)
+From clang's builtins library (`libclang_rt.osx.a`, LLVM compiler-rt) the executable contains the function `__isPlatformVersionAtLeast`, which clang uses for `@available` checks - the same code clang puts into every program it links itself. compiler-rt is under Apache-2.0 WITH LLVM-exception; the LLVM exception exempts such portions embedded in an object form by compiling from the conditions of sections 4(a), 4(b) and 4(d) of the Apache License, so no notice is required; it is named here for completeness.
 
-The Mac client is built from the same Rust source as the Windows binary, but it is **not distributed as a binary** yet. It decodes with Apple's VideoToolbox and displays through Metal, QuartzCore and CoreVideo (system frameworks, like the ones in section 4.2) and contains no FFmpeg. Anyone who builds it from source gets these notices for completeness.
+## 5. Rust crates in the macOS app (Mac client)
 
-Because no binary is distributed, this section only lists the crates of the `aarch64-apple-darwin` target with their licenses and copyright lines and reproduces the texts that differ from section 3. Everything else - the standard MIT text, the Microsoft MIT wording, the complete libm and dpi texts, the Apache License 2.0 as shipped by winit, the BSD-3-Clause texts of curve25519-dalek and subtle, the ISC and Apache texts of untrusted and ring, the Zlib text of foldhash and the Unicode License v3 - is identical to section 3 (same crate versions).
+The Mac client is built from the same Rust source as the Windows binary and is the executable of `QuadChroma.app` (section 4). It decodes with Apple's VideoToolbox and displays through Metal, QuartzCore and CoreVideo (system frameworks, section 4.2) and contains no FFmpeg.
+
+This section lists the crates of the `aarch64-apple-darwin` target with their licenses and copyright lines and reproduces the texts that differ from section 3. Everything else - the standard MIT text, the Microsoft MIT wording, the complete libm and dpi texts, the Apache License 2.0 as shipped by winit, the BSD-3-Clause texts of curve25519-dalek and subtle, the ISC and Apache texts of untrusted and ring, the Zlib text of foldhash and the Unicode License v3 - is identical to section 3 (same crate versions).
 
 ### 5.1 Scope and method
 
@@ -2749,7 +2751,7 @@ Because no binary is distributed, this section only lists the crates of the `aar
 
 - NOTICE files: none of the crates listed here ships a NOTICE file (checked in the registry sources of every crate), so no Apache-2.0 NOTICE content has to be reproduced.
 
-- Linking evidence: Symbol counts (`nm`, v0-mangled crate segments) in the Mac client binary built from main 26ef895 on 2026-09-26 (`client/target/release/quadchroma`, 4522 symbols): winit 371, snow 78, fontdue 21, curve25519-dalek 13, chacha20poly1305 2, sha2 2; ring 0, untrusted 0, blake2 0, syn 0, quote 0, proc-macro2 0, unicode-ident 0, libloading 0; C symbols with prefix `ring_core_0_17_14_`: 0.
+- Linking evidence: Symbol counts (`nm`, v0-mangled crate segments) in the Mac client binary built from main 26ef895 on 2026-09-26 (not yet recounted for the one app, which links the same crates in the same versions) (`client/target/release/quadchroma`, 4522 symbols): winit 371, snow 78, fontdue 21, curve25519-dalek 13, chacha20poly1305 2, sha2 2; ring 0, untrusted 0, blake2 0, syn 0, quote 0, proc-macro2 0, unicode-ident 0, libloading 0; C symbols with prefix `ring_core_0_17_14_`: 0.
 
 ### 5.2 Summary table
 
