@@ -43,8 +43,10 @@
 // Alle eigenen Texturen liegen privat auf der Karte. Die CPU schreibt ueber
 // einen Zwischenpuffer und einen Blit im Befehlsstrom (Oberflaeche,
 // RGB-Rueckfall); so ueberschreibt ein Upload nie, was ein noch laufendes
-// Bild liest. Ohne Metal-Geraet (etwa in einer virtuellen Maschine ohne
-// Grafik) scheitert schon `neu`, und main.rs zeichnet mit softbuffer.
+// Bild liest. Die Zwischenpuffer kommen aus einem kleinen Vorrat - nur
+// solche, die kein laufender Befehlspuffer mehr liest. Ohne Metal-Geraet
+// (etwa in einer virtuellen Maschine ohne Grafik) scheitert schon `neu`, und
+// main.rs zeichnet mit softbuffer.
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -502,6 +504,14 @@ struct Textur {
     h: u32,
 }
 
+/// Ein Zwischenpuffer fuer Uploads der CPU und der Befehlspuffer, der ihn
+/// zuletzt liest (None: frei).
+struct Zwischenpuffer {
+    puffer: Obj,
+    laenge: usize,
+    belegt: Option<Obj>,
+}
+
 /// Ein abgeschickter Befehlspuffer und was bis zu seinem Ende leben muss:
 /// der CVPixelBuffer und die CVMetalTextures seiner Ebenen (Stufe 1).
 struct Unterwegs {
@@ -527,6 +537,8 @@ pub struct Gpu {
     /// Zielgroesse, die Oberflaeche.
     oberflaeche: Option<Textur>,
     unterwegs: VecDeque<Unterwegs>,
+    /// Zwischenpuffer fuer die Uploads der CPU.
+    vorrat: Vec<Zwischenpuffer>,
     /// Praesentierte Bilder, noch nicht auf dem Schirm, mit der Zeit ihrer
     /// Uebergabe.
     praesentiert: VecDeque<(Obj, Instant)>,
@@ -667,6 +679,7 @@ impl Gpu {
                 zwischen: None,
                 oberflaeche: None,
                 unterwegs: VecDeque::new(),
+                vorrat: Vec::new(),
                 praesentiert: VecDeque::new(),
                 breite: 0,
                 hoehe: 0,
@@ -922,17 +935,16 @@ impl Gpu {
 
     /// Ein Ausschnitt (x, y, Breite, Hoehe) aus `quelle` (Zeilen zu
     /// `zeile` Bildpunkten) an dieselbe Stelle der Textur: ueber einen
-    /// frischen Zwischenpuffer und einen Blit im Befehlsstrom. Der Puffer
-    /// gehoert danach dem Befehlspuffer (der haelt ihn, bis er fertig ist).
+    /// Zwischenpuffer aus dem Vorrat und einen Blit im Befehlsstrom.
     fn hochladen(&mut self, ziel: Id, quelle: &[u32], zeile: usize, (x0, y0, bw, bh): (u32, u32, u32, u32)) -> Result<Obj, String> {
         let (x0, y0, bw, bh) = (x0 as usize, y0 as usize, bw as usize, bh as usize);
         if quelle.len() < (y0 + bh - 1) * zeile + x0 + bw {
             return Err("Quelle kleiner als der Ausschnitt".into());
         }
         let laenge = bw * bh * 4;
+        let i = self.zwischenpuffer(laenge)?;
         unsafe {
-            let puffer = senden!(self.device.0, sel(c"newBufferWithLength:options:"), laenge => usize, PUFFER_GETEILT => usize; -> Id);
-            let puffer = Obj::eigen(puffer).ok_or_else(|| format!("newBufferWithLength {laenge} lieferte nichts"))?;
+            let puffer = self.vorrat[i].puffer.zweiter();
             let p = msg_id(puffer.0, c"contents") as *mut u32;
             if p.is_null() {
                 return Err("Zwischenpuffer ohne Inhalt".into());
@@ -949,8 +961,35 @@ impl Gpu {
                 puffer.0 => Id, 0usize => usize, bw * 4 => usize, laenge => usize, MtlSize { w: bw, h: bh, d: 1 } => MtlSize,
                 ziel => Id, 0usize => usize, 0usize => usize, MtlOrigin { x: x0, y: y0, z: 0 } => MtlOrigin; -> ());
             msg_void(blit, c"endEncoding");
-            Ok(self.abschicken(cb, Vec::new()))
+            let cb = self.abschicken(cb, Vec::new());
+            self.vorrat[i].belegt = Some(cb.zweiter());
+            Ok(cb)
         }
+    }
+
+    /// Ein Zwischenpuffer von mindestens `laenge` Byte, den kein laufender
+    /// Befehlspuffer mehr liest: aus dem Vorrat, sonst neu. Ein frischer
+    /// Puffer kostet bei 1440p Millisekunden (neue Seiten), ein gebrauchter
+    /// nur das Kopieren. Hoechstens drei bleiben liegen.
+    fn zwischenpuffer(&mut self, laenge: usize) -> Result<usize, String> {
+        let frei = |z: &Zwischenpuffer| z.belegt.as_ref().is_none_or(|cb| unsafe { msg_zahl(cb.0, c"status") } >= STATUS_FERTIG);
+        for z in self.vorrat.iter_mut() {
+            if frei(z) {
+                z.belegt = None;
+            }
+        }
+        if let Some(i) = self.vorrat.iter().position(|z| z.belegt.is_none() && z.laenge >= laenge) {
+            return Ok(i);
+        }
+        if self.vorrat.len() >= 3 {
+            if let Some(i) = self.vorrat.iter().position(|z| z.belegt.is_none()) {
+                self.vorrat.remove(i);
+            }
+        }
+        let puffer = unsafe { senden!(self.device.0, sel(c"newBufferWithLength:options:"), laenge => usize, PUFFER_GETEILT => usize; -> Id) };
+        let puffer = unsafe { Obj::eigen(puffer) }.ok_or_else(|| format!("newBufferWithLength {laenge} lieferte nichts"))?;
+        self.vorrat.push(Zwischenpuffer { puffer, laenge, belegt: None });
+        Ok(self.vorrat.len() - 1)
     }
 
     /// Stufe 2 in ein Ziel (ww x wh): Grundfarbe, Bild im Rechteck, darueber
@@ -1479,7 +1518,9 @@ fn bildzeit_messen(gpu: &mut Gpu, u: &mut ui::Ui) -> bool {
     let (c_m, c_p, c_x) = kennzahlen(cpu);
     let (k_m, k_p, k_x) = kennzahlen(karte);
     let (f_m, f_p, f_x) = kennzahlen(fertig);
-    let passt = f_p + c_p <= takt_ms;
+    // "Abgabe bis fertig" beginnt vor der Arbeit im Fensterfaden und
+    // enthaelt sie also schon.
+    let passt = f_p <= takt_ms;
     println!("Bildzeit 1440p: {BILDER} Bilder {B}x{H} ({quelle}) im 120-Hz-Takt ({takt_ms:.2} ms), {:.2} s", gesamt);
     println!("  Fensterfaden (anstossen, hochladen):  Mittel {c_m:.2} ms, 99 % {c_p:.2} ms, hoechstens {c_x:.2} ms");
     println!("  Karte (Stufe 1 + 2):                  Mittel {k_m:.2} ms, 99 % {k_p:.2} ms, hoechstens {k_x:.2} ms");
