@@ -28,7 +28,8 @@
 //                                             und Nachricht 20: der eingestellte, sonst der
 //                                             Rechnername - beides schon bereinigt
 //   rechnername() -> String                   Rechnername des Systems (Windows: GetComputerNameExW,
-//                                             Mac: SCDynamicStoreCopyComputerName, Rueckfall gethostname)
+//                                             Mac: SCDynamicStoreCopyComputerName, Rueckfall gethostname),
+//                                             hoechstens alle 10 s neu erfragt
 //   geraetename_pruefen(eingabe) -> Result<Option<String>, NameFehler>
 //                                             Eingabe im Fenster "Geraetename": getrimmt, leer =
 //                                             Rechnername (None), sonst 1-40 Byte ohne Steuerzeichen
@@ -253,6 +254,9 @@ pub fn geraetename_pruefen(eingabe: &str) -> Result<Option<String>, NameFehler> 
 pub fn geraetename_setzen(name: Option<String>) {
     let name = name.and_then(|n| geraetename_pruefen(&n).ok().flatten());
     *EINGESTELLT.write().unwrap_or_else(|e| e.into_inner()) = name;
+    // Wer den Namen zuruecksetzt, soll gleich den Rechnernamen sehen, wie er
+    // jetzt ist - auch wenn er inzwischen in den Systemeinstellungen neu ist.
+    *RECHNERNAME.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Der eingestellte Geraetename (None: es gilt der Rechnername).
@@ -267,9 +271,38 @@ pub fn geraetename() -> String {
     geraetename_eingestellt().unwrap_or_else(rechnername)
 }
 
+/// Der zuletzt erfragte Rechnername und wann - siehe `rechnername`.
+static RECHNERNAME: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// So lange gilt ein erfragter Rechnername.
+const RECHNERNAME_TAKT: Duration = Duration::from_secs(10);
+
 /// Der Rechnername des Systems, bereinigt und auf 40 Byte gekuerzt. Nie
-/// leer.
+/// leer. Zwischengespeichert und hoechstens alle 10 s neu erfragt: der
+/// Startbildschirm nennt ihn in jedem Bild ("Dieser Computer"), und das
+/// System danach zu fragen (GetComputerNameExW, SCDynamicStore) ist fuer
+/// jedes Bild zu teuer. Ein neuer Name in den Systemeinstellungen gilt so
+/// nach hoechstens 10 s, nach `geraetename_setzen` sofort.
 pub fn rechnername() -> String {
+    let mut c = RECHNERNAME.lock().unwrap_or_else(|e| e.into_inner());
+    gemerkt(&mut c, Instant::now(), RECHNERNAME_TAKT, rechnername_erfragen)
+}
+
+/// Ein gemerkter Wert, solange er juenger als `takt` ist; sonst neu mit
+/// `erfragen` und gemerkt.
+fn gemerkt(c: &mut Option<(String, Instant)>, jetzt: Instant, takt: Duration, erfragen: impl FnOnce() -> String) -> String {
+    if let Some((n, t)) = c.as_ref() {
+        if jetzt.saturating_duration_since(*t) < takt {
+            return n.clone();
+        }
+    }
+    let n = erfragen();
+    *c = Some((n.clone(), jetzt));
+    n
+}
+
+/// Den Rechnernamen beim System erfragen (siehe `rechnername`).
+fn rechnername_erfragen() -> String {
     let roh = rechnername_system()
         .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -2253,6 +2286,30 @@ mod tests {
         assert!(!n.is_empty() && n.len() <= NAME_MAX, "{n:?}");
         assert!(!n.chars().any(gefaehrlich), "{n:?}");
         assert_eq!(n, name_bereinigen(&n));
+        assert_eq!(n, rechnername_erfragen());
+    }
+
+    /// Der Rechnername kommt aus dem Zwischenspeicher, solange er gilt: 1000
+    /// Abfragen (eine je Bild waeren das rund 17 s bei 60 Hz) fragen das
+    /// System einmal. Ein abgelaufener Eintrag wird neu erfragt. Geprueft an
+    /// einem eigenen Speicher - der des Prozesses gehoert allen Tests.
+    #[test]
+    fn rechnername_zwischengespeichert() {
+        let mut c = None;
+        let mut gefragt = 0;
+        let t0 = Instant::now();
+        for i in 0..1000u64 {
+            let jetzt = t0 + Duration::from_millis(i);
+            let n = gemerkt(&mut c, jetzt, RECHNERNAME_TAKT, || {
+                gefragt += 1;
+                format!("PC {gefragt}")
+            });
+            assert_eq!(n, "PC 1");
+        }
+        assert_eq!(gefragt, 1);
+        let n = gemerkt(&mut c, t0 + RECHNERNAME_TAKT, RECHNERNAME_TAKT, || "PC neu".into());
+        assert_eq!(n, "PC neu");
+        assert_eq!(gemerkt(&mut c, t0 + RECHNERNAME_TAKT, RECHNERNAME_TAKT, || panic!("gefragt")), "PC neu");
     }
 
     /// Die Eingabe im Fenster "Geraetename": getrimmt; leer (auch nur

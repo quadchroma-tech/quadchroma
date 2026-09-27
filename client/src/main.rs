@@ -6121,6 +6121,34 @@ fn einfuegen_holen() -> Option<String> {
 /// So oft wird der Stand des Symbols (Menue, Tooltip) neu berechnet.
 const TRAY_TAKT: Duration = Duration::from_millis(500);
 
+/// So lange gilt eine aus host.key gelesene eigene ID (ohne Host-Rolle).
+const EIGENE_ID_TAKT: Duration = Duration::from_secs(10);
+
+/// Die eigene Geraete-ID, gemerkt: meldet die Host-Rolle sie (ein atomarer
+/// Stand, billig), gilt ihre und wird gemerkt. Ohne Rolle (Freigabe aus)
+/// gilt die gemerkte, und host.key wird hoechstens alle EIGENE_ID_TAKT
+/// gelesen - der Schluessel wird nie neu geschrieben, und entsteht er erst
+/// (der Client legt ihn beim ersten Verbinden an), steht die ID nach
+/// hoechstens 10 s da.
+#[derive(Default)]
+struct IdMerker(std::cell::Cell<(Option<u32>, Option<Instant>)>);
+
+impl IdMerker {
+    fn id(&self, rolle: Option<u32>, jetzt: Instant, lesen: impl FnOnce() -> Option<u32>) -> Option<u32> {
+        let (id, gelesen) = self.0.get();
+        if let Some(r) = rolle {
+            self.0.set((Some(r), gelesen));
+            return Some(r);
+        }
+        if gelesen.is_some_and(|t| jetzt.saturating_duration_since(t) < EIGENE_ID_TAKT) {
+            return id;
+        }
+        let neu = lesen().or(id);
+        self.0.set((neu, Some(jetzt)));
+        neu
+    }
+}
+
 /// Takt der Ereignisschleife, solange das Fenster abgelegt ist: nichts zu
 /// zeichnen, nur Symbol und Benutzerereignisse ("kein Zuschauer, keine
 /// Arbeit").
@@ -6373,6 +6401,8 @@ struct App {
     /// Was das Trackpad an Bildpunkten gesammelt hat, das noch keine ganze
     /// Zeile der Geraeteliste ergab (siehe `geraete_zeilen`).
     geraete_rest: f32,
+    /// Die eigene Geraete-ID, gemerkt (siehe `eigene_id`).
+    eigene_id_merker: IdMerker,
     /// Ergebnis der letzten Desktop-Verknuepfung und seit wann es steht -
     /// 6 s im Meldungsbereich des Startbildschirms bzw. im Reiter.
     verknuepfung_meldung: Option<(Meldung, Instant)>,
@@ -7771,11 +7801,11 @@ impl App {
 
     /// Die Geraete-ID, die andere von diesem Computer sehen: die des
     /// Geraeteschluessels (host.key) - als Host wie als Client dieselbe.
+    /// Der Startbildschirm und das Symbol fragen sie in jedem Bild bzw. Takt;
+    /// host.key wird dafuer nie je Bild gelesen (siehe `IdMerker`).
     fn eigene_id(&self) -> Option<u32> {
-        self.rolle
-            .as_ref()
-            .and_then(|r| r.id())
-            .or_else(|| secure::eigener_host_schluessel().map(|k| zugang::geraete_id(&k)))
+        let rolle = self.rolle.as_ref().and_then(|r| r.id());
+        self.eigene_id_merker.id(rolle, Instant::now(), || secure::eigener_host_schluessel().map(|k| zugang::geraete_id(&k)))
     }
 
     /// Ein Punkt am Symbol der einen App.
@@ -12203,6 +12233,7 @@ fn main() {
         bench_lief: false,
         geraete_scroll: 0,
         geraete_rest: 0.0,
+        eigene_id_merker: IdMerker::default(),
         verknuepfung_meldung: None,
         symbol: None,
         proxy,
@@ -17145,6 +17176,33 @@ mod tests {
                     "h:9001", false, &hud_stand_leer(Vec::new()));
         assert!(matches!(a, HudAktion::Nichts));
         assert_eq!(u.geraete_anzahl, 0);
+    }
+
+    /// Die eigene ID fuer Startbildschirm und Symbol: von der Host-Rolle,
+    /// ohne sie aus host.key - aber nicht je Bild: 600 Abfragen lesen die
+    /// Datei einmal, erst nach EIGENE_ID_TAKT wieder. Die Rolle geht vor und
+    /// wird gemerkt, auch ueber ein spaeteres Aus der Freigabe hinweg.
+    #[test]
+    fn eigene_id_gemerkt() {
+        let m = IdMerker::default();
+        let t0 = Instant::now();
+        let mut gelesen = 0;
+        for i in 0..600u64 {
+            let id = m.id(None, t0 + Duration::from_millis(i * 16), || {
+                gelesen += 1;
+                Some(111_222_333)
+            });
+            assert_eq!(id, Some(111_222_333));
+        }
+        assert_eq!(gelesen, 1);
+        assert_eq!(m.id(None, t0 + EIGENE_ID_TAKT, || Some(444_555_666)), Some(444_555_666));
+        assert_eq!(m.id(Some(7), t0 + EIGENE_ID_TAKT, || panic!("gelesen")), Some(7));
+        assert_eq!(m.id(None, t0 + EIGENE_ID_TAKT, || panic!("gelesen")), Some(7));
+        // Noch kein host.key: bleibt None, bis er da ist.
+        let m = IdMerker::default();
+        assert_eq!(m.id(None, t0, || None), None);
+        assert_eq!(m.id(None, t0 + Duration::from_secs(1), || panic!("gelesen")), None);
+        assert_eq!(m.id(None, t0 + EIGENE_ID_TAKT, || Some(9)), Some(9));
     }
 
     /// Mausrad und Trackpad ueber der Geraeteliste: das Rad eine Zeile je
