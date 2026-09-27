@@ -605,7 +605,9 @@ mod tests {
         std::fs::write(&andere, b"MZ").unwrap();
         im_sta(|| lnk_speichern(&alt, &andere, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &andere, 0)).unwrap();
         match autostart_migrieren(Some(&ordner), "x") {
-            Ok(Migration::AndereExe(z)) => assert_eq!(z.to_lowercase(), andere.display().to_string().to_lowercase()),
+            // Dieselbe Datei, egal ob lang oder als 8.3-Name geschrieben
+            // (temp_dir kann "RUNNER~1" liefern, die Verknuepfung den langen Namen).
+            Ok(Migration::AndereExe(z)) => assert!(dieselbe_datei(Path::new(&z), &andere), "{z} / {}", andere.display()),
             r => panic!("{r:?}"),
         }
         assert!(alt.is_file() && !neu.exists(), "die alte bleibt, keine neue");

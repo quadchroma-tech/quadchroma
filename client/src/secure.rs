@@ -897,7 +897,8 @@ mod tests {
         assert_eq!(FRUEHERER_CLIENT_SCHLUESSEL, "client.key");
         assert_ne!(ANRUF_SCHLUESSEL, GERAETESCHLUESSEL);
         assert_ne!(ANRUF_SCHLUESSEL, FRUEHERER_CLIENT_SCHLUESSEL);
-        let quelle = include_str!("secure.rs");
+        // Ein Windows-Checkout kann CRLF liefern (core.autocrlf): auf LF bringen.
+        let quelle = include_str!("secure.rs").replace("\r\n", "\n");
         let betrieb = quelle.split("#[cfg(not(test))]\nconst ANRUF_SCHLUESSEL").nth(1).expect("Betriebswert");
         assert!(betrieb.trim_start().starts_with(": &str = GERAETESCHLUESSEL;"), "{}", &betrieb[..60]);
     }
