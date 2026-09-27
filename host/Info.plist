@@ -31,7 +31,7 @@
     <!-- Build number: increase by one before every distributed build (Apple:
          "increment the build version before you distribute a build"). -->
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSApplicationCategoryType</key>

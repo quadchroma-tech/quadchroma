@@ -1,7 +1,7 @@
 # QuadChroma - Third-Party Notices
 
-**Date:** 27 September 2026  
-**Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as of commit `26ef895` on `main`, static Microsoft C runtime; the release build of 26 September 2026 was 3,930,624 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS app `QuadChroma.app` 0.1.0 (build 2, bundle identifier `tech.quadchroma.host`; the Rust client for `aarch64-apple-darwin` with the Objective-C/C host engine built in).  
+**Date:** 28 September 2026  
+**Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as released with 0.1.0, static Microsoft C runtime; a release build of 28 September 2026 was 4,868,096 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS app `QuadChroma.app` 0.1.0 (build 3, bundle identifier `tech.quadchroma.host`; the Rust client for `aarch64-apple-darwin` with the Objective-C/C host engine built in).  
 **Maintainer / licensor:** Robert Brandt, <hello@quadchroma.tech>, <https://github.com/quadchroma-tech/quadchroma>
 
 This file accompanies every binary distribution of QuadChroma (the Windows ZIP and the macOS DMG/ZIP) and is kept unchanged in the source repository. It lists every third-party component contained in, or shipped next to, the distributed binaries, states the license each component is under, reproduces the license texts verbatim and records where the exact source code of the FFmpeg libraries comes from.
@@ -37,7 +37,7 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 | `FFMPEG-BUILDINFO.txt` | Windows | - | Sizes and SHA-256 of the two DLLs and the exact build configuration. | 2.2 |
 | `QuadChroma.app` | macOS 14 or later | Rust (client) with the Objective-C/C host engine built in | Rust crates compiled into the executable (section 5), Monocypher (vendored), one function of clang's builtins library, Apple system frameworks. No FFmpeg. | 4, 5 |
 
-The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the README) and `MANUAL.txt` (the manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
+The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the README) and `MANUAL.txt` (the manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information); the app also carries them inside, in `QuadChroma.app/Contents/Resources`, so they travel with every copy of it.
 
 **One app per platform, each client and host at once.** `quadchroma.exe` is the whole Windows program (client and host role in one process); `QuadChroma.app` is the whole Mac program. The Mac client is the executable of `QuadChroma.app`: the Rust client (the same source as the Windows program) is the app's only executable, with the host engine from `host/` compiled into it. There are no separate host or client downloads and no helper programs.
 
@@ -1148,11 +1148,11 @@ Lesser General Public License for more details.
 
 ## 3. Rust crates (Windows program, statically linked)
 
-`quadchroma.exe` is built for the target `x86_64-pc-windows-msvc` (one binary for the Windows client and the Windows host role, static Microsoft C runtime). The crates below are compiled into it. The list is complete for this binary; it was derived from `client/Cargo.lock` at commit `26ef895` on `main` and `cargo tree --target x86_64-pc-windows-msvc -e normal`.
+`quadchroma.exe` is built for the target `x86_64-pc-windows-msvc` (one binary for the Windows client and the Windows host role, static Microsoft C runtime). The crates below are compiled into it. The list is complete for this binary; it was derived from `client/Cargo.lock` as released with 0.1.0 and `cargo tree --target x86_64-pc-windows-msvc -e normal`.
 
 ### 3.1 Scope and method
 
-- Source of truth: `client/Cargo.lock` at main 26ef895 and `cargo tree --target x86_64-pc-windows-msvc -e normal` (normal dependency edges only; no build- or dev-dependencies are listed because none resolve for this target: `rust-windows-build.txt` and `rust-windows-dev.txt` are empty).
+- Source of truth: `client/Cargo.lock` as released with 0.1.0 and `cargo tree --target x86_64-pc-windows-msvc -e normal` (normal dependency edges only). The build-dependencies (`cargo tree -e build`; for this target bindgen, cc, cexpr, cfg_aliases, clang-sys, find-msvc-tools, glob, itertools, libloading, memchr, minimal-lexical, nom, num_cpus, pkg-config, regex, regex-automata, regex-syntax, rustc-hash, rustc_version, semver, shlex and version_check) run only in build scripts while the program is built and put no code into it, so they are not listed; the crate has no dev-dependencies.
 
 - 73 crates resolve for this target: 66 are compiled into the binary (or resolved as dependencies), 7 run only at build time (procedural macros and crates reached only through procedural macros). Build-time crates are listed in the last section.
 
@@ -1160,7 +1160,7 @@ Lesser General Public License for more details.
 
 - NOTICE files: none of the crates listed here ships a NOTICE file (checked in the registry sources of every crate), so no Apache-2.0 NOTICE content has to be reproduced.
 
-- Linking evidence: Symbol counts (`nm`, v0-mangled crate segments) in the Mac client binary built from main 26ef895 on 2026-09-26 (`client/target/release/quadchroma`, 4522 symbols): winit 371, snow 78, fontdue 21, curve25519-dalek 13, chacha20poly1305 2, sha2 2; ring 0, untrusted 0, blake2 0, syn 0, quote 0, proc-macro2 0, unicode-ident 0, libloading 0; C symbols with prefix `ring_core_0_17_14_`: 0. The Windows binary is built from the same Cargo features (`snow` with `default-resolver`, `use-curve25519`, `use-chacha20poly1305`, `use-sha2`, `use-getrandom`, `std`; thin LTO, one codegen unit). The release `quadchroma.exe` built on the Windows build VM on 2026-09-26 08:35 (3,930,624 bytes, no debug symbols) was searched for the crate path strings that Rust panics embed: `snow-0.10.0` 6 hits, `curve25519-dalek-4.1.3` 1, `fontdue-0.9.4` 2; `ring-0.17.14` 0, `ring_core_0_17_14_` 0, `untrusted-0.9.0` 0, `blake2-0.10.6` 0, `libloading` 0, `syn-2.0.119` 0, `quote-1.0.47` 0, `proc-macro2-1.0.107` 0, `unicode-ident-1.0.26` 0. ring's Rust code carries many panic sites, so its absence from the string table together with the Mac symbol counts shows it is not linked into the Windows binary either. The notices for ring, untrusted and blake2 are nevertheless included.
+- Linking evidence: Symbol counts (`nm`, symbols whose v0-mangled path contains the crate) in the executable of the one Mac app, built on 2026-09-28 from the 0.1.0 source (`client/target/release/quadchroma`, 7048 symbols including the built-in Objective-C/C host engine): winit 482, snow 86, fontdue 28, curve25519-dalek 14, chacha20poly1305 2, sha2 3; ring 0, untrusted 0, blake2 0, syn 0, quote 0, proc-macro2 0, unicode-ident 0, libloading 0; C symbols with prefix `ring_core_0_17_14_`: 0. The Windows binary is built from the same Cargo features (`snow` with `default-resolver`, `use-curve25519`, `use-chacha20poly1305`, `use-sha2`, `use-getrandom`, `std`; thin LTO, one codegen unit). The release `quadchroma.exe` built on the Windows build VM on 2026-09-28 00:19 from the 0.1.0 source (4,868,096 bytes, no debug symbols) was searched for the crate path strings that Rust panics embed: `snow-0.10.0` 6 hits, `curve25519-dalek-4.1.3` 1, `fontdue-0.9.4` 2; `ring-0.17.14` 0, `ring_core_0_17_14_` 0, `untrusted-0.9.0` 0, `blake2-0.10.6` 0, `libloading` 0, `syn-2.0.119` 0, `quote-1.0.47` 0, `proc-macro2-1.0.107` 0, `unicode-ident-1.0.26` 0. ring's Rust code carries many panic sites, so its absence from the string table together with the Mac symbol counts shows it is not linked into the Windows binary either. The notices for ring, untrusted and blake2 are nevertheless included.
 
 ### 3.2 Summary table
 
@@ -2745,7 +2745,7 @@ This section lists the crates of the `aarch64-apple-darwin` target with their li
 
 ### 5.1 Scope and method
 
-- Source of truth: `client/Cargo.lock` at main 26ef895 and `cargo tree --target aarch64-apple-darwin -e normal` (normal dependency edges only; no build- or dev-dependencies are listed because none resolve for this target: `rust-mac-build.txt` and `rust-mac-dev.txt` are empty). Since then `ffmpeg-next` is a Windows-only dependency (the Mac client decodes with VideoToolbox), so `ffmpeg-next` and `ffmpeg-sys-next` no longer resolve for this target; the other crates and their versions are unchanged.
+- Source of truth: `client/Cargo.lock` as released with 0.1.0 and `cargo tree --target aarch64-apple-darwin -e normal` (normal dependency edges only). `ffmpeg-next` and `ffmpeg-sys-next` are Windows-only dependencies (the Mac client decodes with VideoToolbox) and do not resolve for this target. The build-dependencies (`cargo tree -e build`; for this target cc, cfg_aliases, find-msvc-tools, rustc_version, semver, shlex and version_check) run only in build scripts while the program is built and put no code into it, so they are not listed; the crate has no dev-dependencies.
 
 - 74 crates resolve for this target: 69 are compiled into the binary (or resolved as dependencies), 5 run only at build time (procedural macros and crates reached only through procedural macros). Build-time crates are listed in the last section.
 
@@ -2753,7 +2753,7 @@ This section lists the crates of the `aarch64-apple-darwin` target with their li
 
 - NOTICE files: none of the crates listed here ships a NOTICE file (checked in the registry sources of every crate), so no Apache-2.0 NOTICE content has to be reproduced.
 
-- Linking evidence: Symbol counts (`nm`, v0-mangled crate segments) in the Mac client binary built from main 26ef895 on 2026-09-26 (not yet recounted for the one app, which links the same crates in the same versions) (`client/target/release/quadchroma`, 4522 symbols): winit 371, snow 78, fontdue 21, curve25519-dalek 13, chacha20poly1305 2, sha2 2; ring 0, untrusted 0, blake2 0, syn 0, quote 0, proc-macro2 0, unicode-ident 0, libloading 0; C symbols with prefix `ring_core_0_17_14_`: 0.
+- Linking evidence: Symbol counts (`nm`, symbols whose v0-mangled path contains the crate) in the executable of the one Mac app, built on 2026-09-28 from the 0.1.0 source (`client/target/release/quadchroma`, 7048 symbols including the built-in Objective-C/C host engine): winit 482, snow 86, fontdue 28, curve25519-dalek 14, chacha20poly1305 2, sha2 3; ring 0, untrusted 0, blake2 0, syn 0, quote 0, proc-macro2 0, unicode-ident 0, libloading 0; C symbols with prefix `ring_core_0_17_14_`: 0.
 
 ### 5.2 Summary table
 

@@ -253,7 +253,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Check the exe (crt-static, version resource = tag)
+      - name: Check the exe (crt-static, requireAdministrator, version resource = tag)
         env:
           VERSION: ${{ needs.vorpruefung.outputs.version }}
         run: |
@@ -264,6 +264,10 @@ jobs:
           # any other FFmpeg DLL.
           foreach ($dll in 'avcodec-63.dll', 'avutil-61.dll') { if ($text -notmatch [regex]::Escape($dll)) { throw "quadchroma.exe does not import $dll - check the package contents" } }
           if ($text -match 'avformat-\d+\.dll|swresample-\d+\.dll|swscale-\d+\.dll|avfilter-\d+\.dll|avdevice-\d+\.dll') { throw "quadchroma.exe imports an FFmpeg DLL that is not shipped: $($Matches[0])" }
+          # The embedded manifest (UTF-8) must request administrator rights: without them the
+          # host role cannot reach elevated windows, and the docs and release notes promise
+          # the UAC prompt at every start. QC_RESSOURCEN_PFLICHT only ensures that a manifest exists.
+          if ($text -notmatch 'level="requireAdministrator"') { throw "quadchroma.exe has no manifest with requireAdministrator" }
           $vi = (Get-Item $exe).VersionInfo
           "ProductVersion=$($vi.ProductVersion) FileVersion=$($vi.FileVersion) CompanyName=$($vi.CompanyName) ProductName=$($vi.ProductName)"
           if ($vi.ProductVersion -ne $env:VERSION) { throw "Version resource '$($vi.ProductVersion)' does not match the tag v$env:VERSION" }

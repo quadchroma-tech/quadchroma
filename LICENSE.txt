@@ -404,7 +404,7 @@ with respect to those libraries. The corresponding source code of the FFmpeg
 libraries, the build instructions and a written offer are given in
 `THIRD_PARTY_NOTICES.txt`.
 
-10.3 Monocypher. The Mac host contains Monocypher, licensed under
+10.3 Monocypher. The Mac app contains Monocypher, licensed under
 BSD-2-Clause OR CC0-1.0; see `THIRD_PARTY_NOTICES.txt`.
 
 10.4 Rust crates and other components. The executables are built from Rust

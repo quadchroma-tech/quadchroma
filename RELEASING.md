@@ -4,7 +4,7 @@ How a release is built, signed, notarized and published; what has to be set up
 once (and by whom); and what users still see after everything is signed. The
 license texts are `LICENSE.txt` and `THIRD_PARTY_NOTICES.txt`; the user
 manual is `MANUAL.txt`; the build scripts referenced here are the `Makefile`
-(Mac host), `scripts/sign-windows.ps1` (Windows signing) and the two workflows
+(Mac app), `scripts/sign-windows.ps1` (Windows signing) and the two workflows
 under `.github/workflows/`.
 
 All prices, quotes and tool versions below were checked on 26 September 2026
@@ -44,7 +44,7 @@ be labelled as such in the release notes.
 
 ### 2.0 Free option: the project's own certificate (no Apple account)
 
-Without the Apple Developer Program the host can still be signed with a
+Without the Apple Developer Program the Mac app can still be signed with a
 self-signed code-signing certificate that belongs to the project: "QuadChroma
 Release" (RSA 3072, valid until 26 September 2046, SHA-256 fingerprint
 `3B:6D:5C:A6:EF:08:21:94:88:28:33:74:BC:08:5F:A0:28:FC:9B:9F:E7:66:CA:24:A2:B2:48:67:59:46:20:BA`).
@@ -393,9 +393,12 @@ agree; the `vorpruefung` job refuses the release otherwise.
 ### 4.2 Through CI (`release.yml`)
 
 1. Push the tag. The workflow runs `vorpruefung` (versions, switches),
-   `windows` (build, 300 tests: 299 run, 1 ignored; exe and DLLs), `windows-signieren` (only with
+   `windows` (build and every Rust test - 508 passed and 2 ignored in the CI run of 27
+   September 2026, 521 passed and 3 ignored for the 0.1.0 source on the build VM on 28
+   September; the count grows with new tests, what matters is `0 failed`; exe and
+   DLLs), `windows-signieren` (only with
    Azure secrets), `windows-paket` (ZIP), `macos` (build, `make sign`, notarize,
-   `make staple`, `make dmg`, notarize the DMG, `make staple-dmg`,
+   `make staple`, `make dmg`, notarize the DMG, `make staple-dmg`, `make check-packages`,
    `make gatekeeper`) and `release` (`SHA256SUMS.txt`, draft).
 2. Open the draft under Releases. Check the job summary (which signatures were
    on), the notary logs artefact (`notary-logs`, always read it: Apple says the
@@ -411,18 +414,27 @@ If the Windows exe came out unsigned because the author signs locally (option A
 in section 3.1): download `quadchroma-X.Y.Z-windows-x64-unsigned.zip`, sign the
 exe on the Windows machine with `scripts/sign-windows.ps1`, rebuild the ZIP
 with the same layout (section 7) under the name without `-unsigned`, then
-replace the asset and the checksum file in the draft:
+replace the asset, the checksum file and the notes in the draft. The checksums
+cover every asset (the FFmpeg sources and the script included, as in CI), and the
+notes must be generated again, because they name the Windows file and say whether
+it is signed:
 
 ```sh
-gh release upload vX.Y.Z quadchroma-X.Y.Z-windows-x64.zip --clobber
+mkdir assets && cd assets
+gh release download vX.Y.Z --pattern '*'          # all assets of the draft
+rm quadchroma-X.Y.Z-windows-x64-unsigned.zip SHA256SUMS.txt
+cp ../quadchroma-X.Y.Z-windows-x64.zip .
+sha256sum -- * > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt .
+gh release upload vX.Y.Z quadchroma-X.Y.Z-windows-x64.zip SHA256SUMS.txt --clobber
 gh release delete-asset vX.Y.Z quadchroma-X.Y.Z-windows-x64-unsigned.zip --yes
-sha256sum quadchroma-X.Y.Z-windows-x64.zip QuadChroma-X.Y.Z-macos-arm64.zip QuadChroma-X.Y.Z-macos-arm64.dmg > SHA256SUMS.txt
-gh release upload vX.Y.Z SHA256SUMS.txt --clobber
+../scripts/release-notes.sh . X.Y.Z quadchroma-tech/quadchroma vX.Y.Z > ../notes.md
+gh release edit vX.Y.Z --notes-file ../notes.md
 ```
 
 (`--clobber`: "Delete and re-upload existing assets of the same name"; `--yes`:
 "Skip the confirmation prompt". Needs the GitHub CLI, section 3.3; the web UI
-of the draft release does the same by hand.)
+of the draft release does the same by hand. Run it from a checkout of the tag, so
+that `scripts/release-notes.sh` is the one of the release.)
 
 To rerun after a failure, fix the cause, delete the draft and the tag
 (`gh release delete vX.Y.Z`, `git push --delete origin vX.Y.Z`,
@@ -431,7 +443,7 @@ recommended: tag `v0.1.0`, inspect the draft, delete it again.
 
 ### 4.3 Locally, without CI
 
-macOS host (on the Mac, in a normal terminal - `hdiutil`, `spctl` and the
+macOS app (on the Mac, in a normal terminal - `hdiutil`, `spctl` and the
 notary service do not work inside sandboxes; needs internet for the timestamp,
 the notary upload and the ticket):
 
@@ -478,7 +490,7 @@ FFmpeg LGPL build lives in `FFMPEG_DIR`, `LIBCLANG_PATH` points to LLVM's `bin`,
 cd client
 $env:QC_RESSOURCEN_PFLICHT = "1"   # build.rs: fail instead of warn when no resource compiler is found
 cargo build --release              # build.rs embeds version, icon and manifest
-cargo test --release               # 300 tests (299 run, 1 ignored); FFmpeg bin folder on PATH, APPDATA pointed at a scratch folder
+cargo test --release               # all must pass (521 passed, 3 ignored for 0.1.0 on 28 Sep 2026); FFmpeg bin folder on PATH, APPDATA pointed at a scratch folder
 cd ..
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sign-windows.ps1 -Exe client\target\release\quadchroma.exe -Thumbprint <SHA-1 thumbprint>   # or QC_SIGN_THUMBPRINT
 ```
@@ -518,9 +530,12 @@ page.
 Publish:
 
 ```sh
-sha256sum quadchroma-X.Y.Z-windows-x64.zip QuadChroma-X.Y.Z-macos-arm64.zip QuadChroma-X.Y.Z-macos-arm64.dmg > SHA256SUMS.txt
-gh release create vX.Y.Z --draft --verify-tag --title "QuadChroma X.Y.Z" --notes-file notes.md \
-   quadchroma-X.Y.Z-windows-x64.zip QuadChroma-X.Y.Z-macos-arm64.zip QuadChroma-X.Y.Z-macos-arm64.dmg SHA256SUMS.txt
+# in a folder of the checkout (for example dist/) that holds exactly the release files:
+# the Windows ZIP, the Mac ZIP and DMG, ffmpeg-9.0.2.tar.xz,
+# nv-codec-headers-<commit>.tar.gz and build-ffmpeg-windows.sh
+sha256sum -- * > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt .
+../scripts/release-notes.sh . X.Y.Z quadchroma-tech/quadchroma vX.Y.Z > ../notes.md
+gh release create vX.Y.Z --draft --verify-tag --title "QuadChroma X.Y.Z" --notes-file ../notes.md -- *
 ```
 
 (`--draft`: "Save the release as a draft instead of publishing it";
@@ -605,7 +620,7 @@ first launch ("asks if you're sure that you want to open it"; Apple's text adds
 that Apple checked it for malicious software), but no warning and no detour
 through System Settings. Recommend moving the app to `/Applications` before the
 first start (Gatekeeper otherwise runs it from a randomised path on first
-launch - App Translocation; harmless for the host, but confusing).
+launch - App Translocation; harmless for the app, but confusing).
 
 **macOS, TCC re-grants after the identity change.** macOS stores the Screen
 Recording and Accessibility permissions against the app's designated requirement,
@@ -618,11 +633,11 @@ were changed in one step rather than two. Afterwards a renewed or replaced
 Developer ID certificate of the same Team ID keeps the grants. Leftover entries
 for the previous bundle identifier can be removed with `tccutil reset
 ScreenCapture <old-bundle-id>` and `tccutil reset Accessibility <old-bundle-id>`
-(never without the bundle id: that resets every app). The host no longer quits
+(never without the bundle id: that resets every app). The app no longer quits
 without Screen Recording: it waits, shows the missing permission in its menu bar
-menu and checks again every 3 s. Whether macOS lets the running host use a permission
+menu and checks again every 3 s. Whether macOS lets the running app use a permission
 granted meanwhile without a restart is not verified on a device yet; if the menu
-still shows it as missing, quit the host from its menu and start it again.
+still shows it as missing, quit QuadChroma from its menu and start it again.
 
 **Unsigned releases (until the certificates exist).** macOS refuses an ad-hoc or
 locally signed app; since macOS 15 the Control-click trick no longer works
@@ -644,13 +659,17 @@ at least 30 days old).
 |---|---|
 | `quadchroma-X.Y.Z-windows-x64.zip` (`-unsigned` if not signed) | folder `quadchroma-X.Y.Z/` with `quadchroma.exe`, `avcodec-63.dll`, `avutil-61.dll` (FFmpeg 9.0.2, minimal LGPL build by `scripts/build-ffmpeg-windows.sh`), `FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two DLLs), `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `MANUAL.txt` |
 | `ffmpeg-9.0.2.tar.xz`, `nv-codec-headers-<commit>.tar.gz`, `build-ffmpeg-windows.sh` | the complete corresponding source of the FFmpeg DLLs (LGPL v2.1 section 6); the release notes carry the sentence from the FFmpeg license checklist with a link to the source archive |
-| `QuadChroma-X.Y.Z-macos-arm64.zip` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` as the top-level entry (`ditto --keepParent --norsrc`: no AppleDouble `._*` entries, so the Finder, `ditto -x -k` and the command-line `unzip` all restore a valid bundle), signed, notarized and stapled - the form the notary service accepts |
-| `QuadChroma-X.Y.Z-macos-arm64.dmg` (`-unsigned` / `-unnotarized`) | `QuadChroma.app` (stapled), a link to `/Applications`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `MANUAL.txt`; UDZO image, signed with identifier `tech.quadchroma.host.dmg`, notarized and stapled |
+| `QuadChroma-X.Y.Z-macos-arm64.zip` (`-unsigned` / `-selfsigned` / `-unnotarized`) | folder `QuadChroma-X.Y.Z/` with `QuadChroma.app` and `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `MANUAL.txt` (`ditto --keepParent --norsrc`: no AppleDouble `._*` entries, so the Finder, `ditto -x -k` and the command-line `unzip` all restore a valid bundle); the app signed, notarized and stapled |
+| `QuadChroma-X.Y.Z-macos-arm64.dmg` (`-unsigned` / `-selfsigned` / `-unnotarized`) | `QuadChroma.app` (stapled), a link to `/Applications`, `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`, `MANUAL.txt`; UDZO image, signed with identifier `tech.quadchroma.host.dmg`, notarized and stapled |
 | `SHA256SUMS.txt` | `sha256sum` of every file above (`sha256sum -c SHA256SUMS.txt`) |
 
-Not released: the Mac client, the test harnesses, `.pdb` files, the CI's
-`quadchroma-*-ci` artefacts (unsigned, seven days, for trying out a pull
-request only).
+The app itself carries the same four texts in `QuadChroma.app/Contents/Resources`
+(inside its seal). `make check-packages` checks app, ZIP and DMG for them (and the ZIP
+for AppleDouble entries, the DMG for the `/Applications` link and a verifying app);
+both workflows run it.
+
+Not released: the test harnesses, `.pdb` files, the CI's `quadchroma-*-ci`
+artefacts (unsigned, seven days, for trying out a pull request only).
 
 ## 8. Sources (checked 26 September 2026)
 

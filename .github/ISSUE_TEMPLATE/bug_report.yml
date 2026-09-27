@@ -31,8 +31,8 @@ body:
     id: version
     attributes:
       label: Version or commit
-      description: Release version (tag on the Releases page) or, for a build from source, the output of `git rev-parse --short HEAD`. If host and client differ, give both.
-      placeholder: "v0.1.0 (client) and v0.1.0 (host), or commit 26ef895"
+      description: Release version (tag on the Releases page) or, for a build from source, the output of `git rev-parse --short HEAD`. If the two computers run different versions, give both.
+      placeholder: "v0.1.0 on both computers, or a commit hash such as 1a2b3c4"
     validations:
       required: true
   - type: textarea
