@@ -22,7 +22,14 @@
 // schon das Anlegen der Sitzung am ersten Paket, und die Empfangsschleife
 // faellt wie bei NVDEC auf den Prozessor zurueck - hier VideoToolbox ohne
 // Hardware. Gemessen auf dem M1 (macOS 27): HEVC Main 4:4:4 10 in Hardware,
-// 1080p 3,8 ms je Bild, 1440p 6,2 ms.
+// in der Probe (vt444test) 1080p 3,8 ms je Bild, 1440p 6,2 ms; im Client
+// selbst (Decodierzeit seiner Statistik) rund 5,6 ms je 1080p-Bild.
+//
+// Faellt die Sitzung mitten im Strom aus (Ruhezustand, Aussetzer der
+// Media-Engine, siehe `sitzung_verwerfen`), wird sie verworfen und mit dem
+// naechsten Schluesselbild neu angelegt; der Empfang wartet so lange
+// (`Decoder::schluesselbild_noetig`). Fehler kommen gedrosselt ins
+// Protokoll (`Zeilendrossel`).
 //
 // Heraus kommen CVPixelBuffer mit IOSurface (die Metal-Anzeige nimmt sie ohne
 // Kopie, anzeige_mac.rs) im Format, das zum Strom passt: xf44 fuer 4:4:4 10 Bit,
@@ -194,7 +201,8 @@ pub fn hevc_sps_lesen(nal: &[u8]) -> Option<Bildart> {
             l.ue()?;
         }
     }
-    let bits = l.ue()? + 8;
+    // Geprueft: ein kaputtes SPS kann hier bis 2^32 - 2 tragen.
+    let bits = l.ue()?.checked_add(8)?;
     let _bits_chroma = l.ue()?;
     (chroma <= 3 && bits <= 16).then_some(Bildart { chroma, bits, profil })
 }
@@ -219,7 +227,7 @@ pub fn h264_sps_lesen(nal: &[u8]) -> Option<Bildart> {
     if chroma == 3 {
         let _separate_colour_plane = l.u1()?;
     }
-    let bits = l.ue()? + 8;
+    let bits = l.ue()?.checked_add(8)?;
     (chroma <= 3 && bits <= 16).then_some(Bildart { chroma, bits, profil })
 }
 
@@ -301,6 +309,55 @@ pub struct Fehler {
 /// kVTInvalidSessionErr: die Sitzung ist weg (etwa nach dem Ruhezustand).
 pub const VT_SITZUNG_UNGUELTIG: i32 = -12903;
 
+/// Fehler, nach denen die Sitzung nichts mehr taugt, der Strom aber schon:
+/// die Sitzung ist weg (kVTInvalidSessionErr) oder die Media-Engine hatte
+/// einen Aussetzer - sie hakte (Malfunction, auch der Sitzung), war gerade
+/// nicht zu haben (NotAvailableNow; -12915 meldet VideoToolbox dafuer
+/// mitunter mit dem Code des Encoders), wurde entfernt oder antwortete
+/// nicht (CallbackMessaging, Unknown). Dann wird die Sitzung verworfen und
+/// mit dem naechsten Schluesselbild neu angelegt; bis dahin taugt kein
+/// Paket (die Referenzbilder sind mit der alten Sitzung weg). Ein kaputtes
+/// Paket (BadData) oder ein Format, das die Engine nicht kann, gehoert
+/// nicht dazu - dafuer hilft keine neue Sitzung.
+pub fn sitzung_verwerfen(status: i32) -> bool {
+    matches!(status, VT_SITZUNG_UNGUELTIG | -12911 | -12913 | -12915 | -17690 | -17691 | -17695 | -17696)
+}
+
+/// Drossel fuer Protokollzeilen, die je Bild anfallen koennen (Fehler beim
+/// Decodieren, verworfene Bilder): die erste sofort, danach hoechstens eine
+/// je `abstand`. Was dazwischen anfiel, zaehlt sie und nennt es mit der
+/// naechsten Zeile - so steht ein streikender Decoder im Protokoll, ohne
+/// es mit 120 Zeilen je Sekunde zu fuellen.
+#[derive(Debug)]
+pub struct Zeilendrossel {
+    abstand: std::time::Duration,
+    letzte: Option<std::time::Instant>,
+    still: u32,
+}
+
+impl Zeilendrossel {
+    pub const fn neu(abstand: std::time::Duration) -> Zeilendrossel {
+        Zeilendrossel { abstand, letzte: None, still: 0 }
+    }
+
+    /// Ein Ereignis. Some(n): jetzt eine Zeile schreiben - n Ereignisse seit
+    /// der letzten Zeile blieben ohne eigene. None: still zaehlen.
+    pub fn zulassen(&mut self, jetzt: std::time::Instant) -> Option<u32> {
+        if self.letzte.is_some_and(|l| jetzt.saturating_duration_since(l) < self.abstand) {
+            self.still = self.still.saturating_add(1);
+            return None;
+        }
+        self.letzte = Some(jetzt);
+        Some(std::mem::take(&mut self.still))
+    }
+
+    /// Wie viele Ereignisse seit der letzten Zeile still blieben - danach
+    /// wieder 0 (fuer eine Schlusszeile, wenn keine weiteren mehr kommen).
+    pub fn still_abholen(&mut self) -> u32 {
+        std::mem::take(&mut self.still)
+    }
+}
+
 impl Fehler {
     /// Der Name des Fehlercodes, soweit er einer von VideoToolbox ist.
     pub fn name(&self) -> Option<&'static str> {
@@ -315,8 +372,13 @@ impl Fehler {
             -12910 => "kVTVideoDecoderUnsupportedDataFormatErr",
             -12911 => "kVTVideoDecoderMalfunctionErr",
             -12913 => "kVTVideoDecoderNotAvailableNowErr",
+            -12915 => "kVTVideoEncoderNotAvailableNowErr",
             -12916 => "kVTFormatDescriptionChangeNotSupportedErr",
             -17690 => "kVTVideoDecoderRemovedErr",
+            -17691 => "kVTSessionMalfunctionErr",
+            -17694 => "kVTVideoDecoderReferenceMissingErr",
+            -17695 => "kVTVideoDecoderCallbackMessagingErr",
+            -17696 => "kVTVideoDecoderUnknownErr",
             _ => return None,
         })
     }
@@ -612,6 +674,11 @@ mod mac {
     use super::*;
     use std::ffi::c_void;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Hoechstens eine Protokollzeile je so viel Zeit fuer Decodierfehler und
+    /// fuer verworfene Bilder (je eine Drossel).
+    const MELDEABSTAND: Duration = Duration::from_secs(5);
 
     /// Was der Rueckruf der Sitzung abliefert.
     enum Ausgang {
@@ -681,6 +748,13 @@ mod mac {
         /// Sitzung sagt im Protokoll, was VideoToolbox gewaehlt hat, jede
         /// weitere nur, wenn sich daran etwas aendert.
         gemeldet: Option<String>,
+        /// Die Sitzung wurde nach einem Fehler verworfen (oder liess sich
+        /// nicht anlegen): bis zum naechsten Schluesselbild taugt kein Paket.
+        /// Der Empfang fragt es nach jedem Paket ab (`schluesselbild_noetig`).
+        schluesselbild_noetig: bool,
+        /// Protokollzeilen fuer Decodierfehler und verworfene Bilder.
+        fehlerdrossel: Zeilendrossel,
+        verworfen_drossel: Zeilendrossel,
     }
 
     impl Decoder {
@@ -695,12 +769,65 @@ mod mac {
                 sitzung: None,
                 ablage: Box::new(Mutex::new(Vec::new())),
                 gemeldet: None,
+                schluesselbild_noetig: false,
+                fehlerdrossel: Zeilendrossel::neu(MELDEABSTAND),
+                verworfen_drossel: Zeilendrossel::neu(MELDEABSTAND),
             }
         }
 
         /// Eine Zugriffseinheit (Annex B) decodieren; fertige Bilder haengen
         /// an `bilder`. Ohne Parametersaetze bisher: kein Bild, kein Fehler.
+        /// Jeder Fehler kommt gedrosselt ins Protokoll. Nach einem Aussetzer
+        /// der Media-Engine oder einer ungueltigen Sitzung (`sitzung_verwerfen`)
+        /// ist die Sitzung verworfen; die naechste entsteht mit dem naechsten
+        /// Paket, und das muss ein Schluesselbild sein - siehe
+        /// `schluesselbild_noetig`.
         pub fn fuettern(&mut self, au: &[u8], pts: i64, bilder: &mut Vec<Bild>) -> Result<(), Fehler> {
+            let r = self.fuettern_ungemeldet(au, pts, bilder);
+            match &r {
+                Err(f) => {
+                    let verworfen = sitzung_verwerfen(f.status) && self.sitzung.take().is_some();
+                    // Ohne Sitzung (verworfen, oder sie liess sich gar nicht
+                    // anlegen) ist dieses Paket verloren, und mit ihm die
+                    // Referenzen der folgenden.
+                    if self.sitzung.is_none() {
+                        self.schluesselbild_noetig = true;
+                    }
+                    if let Some(still) = self.fehlerdrossel.zulassen(Instant::now()) {
+                        let mut z = format!("Decodierfehler bei Bild {pts}: {f}");
+                        if still > 0 {
+                            z.push_str(&format!(" (seit der letzten Meldung {still} weitere)"));
+                        }
+                        if verworfen {
+                            z.push_str(" - Sitzung verworfen, neu mit dem naechsten Schluesselbild");
+                        }
+                        crate::protokoll::bibliothek_sagt(crate::protokoll::WARNUNG, &z);
+                    }
+                }
+                Ok(()) => {
+                    // Wieder ein Bild nach Fehlern, die keine eigene Zeile
+                    // bekamen: einmal sagen, wie viele es waren.
+                    let still = self.fehlerdrossel.still_abholen();
+                    if still > 0 && !bilder.is_empty() {
+                        crate::protokoll::bibliothek_sagt(
+                            crate::protokoll::WARNUNG,
+                            &format!("Decodieren geht wieder (seit der letzten Meldung {still} weitere Fehler)"),
+                        );
+                    }
+                }
+            }
+            r
+        }
+
+        /// Hat der Decoder seit der letzten Frage seine Sitzung nach einem
+        /// Fehler verworfen (oder keine anlegen koennen)? Dann darf bis zum
+        /// naechsten Schluesselbild nichts mehr hinein - der Empfang wartet
+        /// darauf, wie nach einem Codecwechsel.
+        pub fn schluesselbild_noetig(&mut self) -> bool {
+            std::mem::take(&mut self.schluesselbild_noetig)
+        }
+
+        fn fuettern_ungemeldet(&mut self, au: &[u8], pts: i64, bilder: &mut Vec<Bild>) -> Result<(), Fehler> {
             let z = zerlegen(au, self.h264);
             if !z.saetze.leer() {
                 let neu = self.saetze.ergaenzt(&z.saetze);
@@ -718,18 +845,7 @@ mod mac {
                 }
                 self.sitzung = Some(self.sitzung_bauen()?);
             }
-            match self.dekodieren(&z.probe, pts, bilder) {
-                // Die Sitzung ist weg (Ruhezustand, Media-Engine neu
-                // gestartet): mit denselben Saetzen neu anlegen und dieses
-                // Paket noch einmal.
-                Err(f) if f.status == VT_SITZUNG_UNGUELTIG => {
-                    crate::protokoll::bibliothek_sagt(crate::protokoll::WARNUNG, &format!("Sitzung ungueltig ({f}) - neu angelegt"));
-                    self.sitzung = None;
-                    self.sitzung = Some(self.sitzung_bauen()?);
-                    self.dekodieren(&z.probe, pts, bilder)
-                }
-                r => r,
-            }
+            self.dekodieren(&z.probe, pts, bilder)
         }
 
         fn sitzung_bauen(&mut self) -> Result<Sitzung, Fehler> {
@@ -881,7 +997,13 @@ mod mac {
                         fehler.get_or_insert(Fehler { was: "Decodieren (Rueckruf)", status: st });
                     }
                     Ausgang::Verworfen => {
-                        crate::protokoll::bibliothek_sagt(crate::protokoll::WARNUNG, &format!("Bild {pts} verworfen (kVTDecodeInfo_FrameDropped)"));
+                        if let Some(still) = self.verworfen_drossel.zulassen(Instant::now()) {
+                            let mehr = if still > 0 { format!(", seit der letzten Meldung {still} weitere") } else { String::new() };
+                            crate::protokoll::bibliothek_sagt(
+                                crate::protokoll::WARNUNG,
+                                &format!("Bild {pts} verworfen (kVTDecodeInfo_FrameDropped{mehr})"),
+                            );
+                        }
                     }
                 }
             }
@@ -1327,6 +1449,78 @@ mod tests {
         assert_eq!(fourcc_text(0x0102_0304), "0x01020304");
     }
 
+    /// Nach welchen Fehlern die Sitzung verworfen wird: ungueltig und die
+    /// Aussetzer der Media-Engine ja, ein kaputtes Paket oder ein Format,
+    /// das die Engine nicht kann, nein. Alle haben einen Namen.
+    #[test]
+    fn sitzung_verwerfen_nach_aussetzern() {
+        for st in [VT_SITZUNG_UNGUELTIG, -12911, -12913, -12915, -17690, -17691, -17695, -17696] {
+            assert!(sitzung_verwerfen(st), "{st}");
+            assert!(Fehler { was: "x", status: st }.name().is_some(), "{st}");
+        }
+        for st in [0, -1, -12902, -12904, -12906, -12909, -12910, -12916, -17694] {
+            assert!(!sitzung_verwerfen(st), "{st}");
+        }
+        assert_eq!(Fehler { was: "x", status: -12911 }.to_string(), "x: OSStatus -12911 (kVTVideoDecoderMalfunctionErr)");
+    }
+
+    /// Die Drossel: die erste Zeile sofort, dann hoechstens eine je Abstand,
+    /// mit der Zahl der stillen dazwischen; `still_abholen` leert die Zahl.
+    #[test]
+    fn zeilendrossel() {
+        use std::time::{Duration, Instant};
+        let t = Instant::now();
+        let s = |ms: u64| t + Duration::from_millis(ms);
+        let mut d = Zeilendrossel::neu(Duration::from_secs(5));
+        assert_eq!(d.zulassen(s(0)), Some(0));
+        assert_eq!(d.zulassen(s(10)), None);
+        assert_eq!(d.zulassen(s(4999)), None);
+        assert_eq!(d.zulassen(s(5000)), Some(2));
+        assert_eq!(d.zulassen(s(5001)), None);
+        assert_eq!(d.still_abholen(), 1);
+        assert_eq!(d.still_abholen(), 0);
+        assert_eq!(d.zulassen(s(9000)), None);
+        assert_eq!(d.zulassen(s(20000)), Some(1));
+        // 120 Fehler je Sekunde ueber 10 s: drei Zeilen, keine geht verloren.
+        let mut d = Zeilendrossel::neu(Duration::from_secs(5));
+        let mut zeilen = 0;
+        let mut gezaehlt = 0;
+        for i in 0..1200u64 {
+            if let Some(n) = d.zulassen(s(i * 1000 / 120)) {
+                zeilen += 1;
+                gezaehlt += 1 + n;
+            }
+        }
+        gezaehlt += d.still_abholen();
+        assert_eq!((zeilen, gezaehlt), (2, 1200));
+    }
+
+    /// Ein kaputtes SPS mit einer riesigen Bittiefe (ue bis 2^32 - 2): kein
+    /// Ueberlauf (in einem Debug-Bau waere das ein Panic, im Release eine
+    /// falsche Bittiefe), sondern "nicht lesbar".
+    #[test]
+    fn sps_mit_riesiger_bittiefe() {
+        // Bits als Text ("0"/"1") zu Bytes, der Rest mit Nullen aufgefuellt.
+        let bytes = |bits: &str| -> Vec<u8> {
+            let b: Vec<u8> = bits.bytes().filter(|c| *c == b'0' || *c == b'1').map(|c| c - b'0').collect();
+            b.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, x)| a | x << (7 - i))).collect()
+        };
+        let riesig = format!("{}1{}", "0".repeat(31), "1".repeat(31));
+        let zehn = "011"; // ue(2): 2 + 8 = 10 Bit
+        // H.264, High 4:4:4 (244): sps_id 0, chroma 3, separate 0, Bittiefe.
+        let h264 = |tiefe: &str| [vec![0x67, 244, 0, 40], bytes(&format!("1 00100 0 {tiefe} 1"))].concat();
+        assert_eq!(h264_sps_lesen(&h264(zehn)), Some(Bildart { chroma: 3, bits: 10, profil: 244 }));
+        assert_eq!(h264_sps_lesen(&h264(&riesig)), None);
+        // HEVC: VPS 0, eine Schicht, Profil 4 (RExt), 80 Bit Flaggen, Level,
+        // sps_id 0, chroma 3, separate 0, Breite und Hoehe 0, kein Fenster.
+        let hevc = |tiefe: &str| {
+            let kopf = format!("0000 000 1 000 00100 {} {} 1 00100 0 1 1 0 {tiefe} 1", "0".repeat(80), "0".repeat(8));
+            [vec![0x42, 0x01], bytes(&kopf)].concat()
+        };
+        assert_eq!(hevc_sps_lesen(&hevc(zehn)), Some(Bildart { chroma: 3, bits: 10, profil: 4 }));
+        assert_eq!(hevc_sps_lesen(&hevc(&riesig)), None);
+    }
+
     #[test]
     fn fehlertext() {
         let f = Fehler { was: "VTDecompressionSessionCreate", status: -12906 };
@@ -1353,6 +1547,34 @@ mod tests {
     #[test]
     fn software_decode_444_10() {
         pruefen(false);
+    }
+
+    /// Laesst sich keine Sitzung anlegen (hier: Parametersaetze, aus denen
+    /// keine Formatbeschreibung wird), ist das Paket verloren: der Decoder
+    /// sagt einmal, dass bis zum naechsten Schluesselbild gewartet werden
+    /// muss. Mit dem naechsten brauchbaren Schluesselbild geht es weiter,
+    /// ohne dass er es noch einmal sagt.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ohne_sitzung_bis_zum_schluesselbild() {
+        let p = match probe::hevc_444_10(256, 128, 2) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("uebersprungen: {e}");
+                return;
+            }
+        };
+        let mut d = Decoder::neu(false, true);
+        let mut bilder = Vec::new();
+        assert!(!d.schluesselbild_noetig());
+        let kaputt: Vec<u8> = [&[0, 0, 0, 1, 0x40, 0x01, 0xff][..], &[0, 0, 0, 1, 0x42, 0x01, 0xff], &[0, 0, 0, 1, 0x44, 0x01, 0xff], &[0, 0, 0, 1, 0x26, 0x01, 0xaf, 0x00]].concat();
+        assert!(d.fuettern(&kaputt, 7, &mut bilder).is_err());
+        assert!(d.schluesselbild_noetig());
+        assert!(!d.schluesselbild_noetig(), "nur einmal");
+        d.fuettern(&p.einheiten[0], 8, &mut bilder).expect("Schluesselbild mit guten Saetzen");
+        d.fuettern(&p.einheiten[1], 9, &mut bilder).expect("Folgebild");
+        assert_eq!(bilder.len(), 2);
+        assert!(!d.schluesselbild_noetig());
     }
 
     #[cfg(target_os = "macos")]

@@ -3488,6 +3488,14 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         break;
                     }
                 }
+                // Hat der Decoder, der jetzt gilt, seine Sitzung verworfen
+                // (VideoToolbox: Sitzung ungueltig, Aussetzer der
+                // Media-Engine), taugt bis zum naechsten Schluesselbild kein
+                // Paket - auch nicht beim Decoder auf dem Prozessor, der
+                // sonst ein kaputtes Paket einfach uebergeht.
+                if decoder_schluesselbild_noetig(&mut bau.decoder) {
+                    warte_auf_schluesselbild = true;
+                }
                 // Das Format des letzten Bildes, bevor die Schleife die Bilder
                 // verbraucht - der Rueckfall unten will es nennen.
                 let letztes_format = bilder.last().map(|b| b.format_name());
@@ -4174,6 +4182,21 @@ fn decoder_fuettern(
 #[cfg(target_os = "macos")]
 fn decoder_fuettern(decoder: &mut Dekoder, packet: &vt_decoder::Paket, bilder: &mut Vec<Dekoderbild>) -> Option<DekoderFehler> {
     decoder.fuettern(packet.daten, packet.pts, bilder).err()
+}
+
+/// Muss nach dem letzten Paket bis zum naechsten Schluesselbild gewartet
+/// werden, weil der Decoder seine Sitzung verworfen hat? FFmpeg behaelt
+/// seinen Zustand: nie.
+#[cfg(windows)]
+fn decoder_schluesselbild_noetig(_decoder: &mut Dekoder) -> bool {
+    false
+}
+
+/// VideoToolbox: nach einem Aussetzer der Media-Engine oder einer
+/// ungueltigen Sitzung (siehe `vt_decoder::sitzung_verwerfen`).
+#[cfg(target_os = "macos")]
+fn decoder_schluesselbild_noetig(decoder: &mut Dekoder) -> bool {
+    decoder.schluesselbild_noetig()
 }
 
 /// YUV nach RGB, BT.709, voller Wertebereich.
