@@ -752,8 +752,8 @@ Mac as client (under construction)
 
 The same client also builds on the Mac (arm64): audio via AudioToolbox,
 clipboard via NSPasteboard (text and files), decoding with VideoToolbox,
-display on the CPU for now (no Metal, no graphics cards in the Display
-tab). Closing hides it in the menu bar, with the client's icon (four
+display through Metal (no choice of graphics cards in the Display tab).
+Closing hides it in the menu bar, with the client's icon (four
 filled squares - the host's has an outlined fourth one); there is no
 desktop shortcut on the Mac and no "Share this PC". It needs no FFmpeg;
 build it with Rust alone:
@@ -779,6 +779,34 @@ names the format VideoToolbox delivers, for 4:4:4 at 10 bits:
 the Mac encodes a short HEVC 4:4:4 sample with the hardware encoder and
 decodes it with and without hardware (neither host nor screen capture is
 started).
+
+Display on the Mac: Metal. The decoded frames go to the GPU without a
+copy, conversion to RGB and scaling run there in shaders - bit-identical
+to the processor path, also when scaled - and the user interface sits on
+top as a separate layer. Frames are shown at the display refresh
+(no tearing), with at most two frames queued; the window thread never
+waits for the display. The Display tab has two buttons there: Automatic
+(Metal) and Processor (softbuffer). If Metal cannot be set up, the client
+draws on the processor by itself. The log says which one it is:
+
+    "Anzeige: Metal Apple M1 (gemeinsamer Speicher ja), 2560x1440 bei
+     Massstab 2, Bildwechsel abwarten, hoechstens 2 Bilder unterwegs"
+
+or "Anzeige: Rueckfall auf Software: <Grund>" followed by "Anzeige:
+Software". Streams in limited range (VideoToolbox then delivers x444,
+444v, x420 or 420v) are stretched to full range on both paths.
+
+    ./target/release/quadchroma --anzeigetest /tmp/anzeigetest
+
+checks Metal without a connection and without a window: every
+VideoToolbox format in two sizes against the processor path (zero
+tolerance for the conversion, the scaled and the 1:1 picture; the
+interface on top may differ by 2 steps, as on Windows), difference images
+into the directory, then 240 frames at 2560x1440 in a 120 Hz cadence
+through both shaders with the frame time of the window thread and of the
+GPU (M1: about 1.8 ms GPU time per frame; decoding and the way from the
+finished frame to the screen are not included). Exit code 0 only if every
+comparison passed. Neither host nor screen capture is started.
 
 Storage: ~/Library/Application Support/QuadChroma/ (client.key,
 hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
@@ -1349,7 +1377,7 @@ checks the card without a connection: compiles the shaders, runs every
 decoder format once through the card and compares the result with the
 processor path (zero tolerance at 1:1), writes difference images to the
 directory. Also runs without a card, on Windows' software rasterizer
-(WARP).
+(WARP). On the Mac the display is Metal, see "Mac as client".
 
 Mouse pointer: the pointer shown is always the Windows pointer - that is
 what makes the mouse feel local. It takes the shape of the Mac pointer,

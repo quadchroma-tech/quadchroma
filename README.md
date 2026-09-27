@@ -142,7 +142,7 @@ graphics card the CPU draws.
 | Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; menu-bar icon with device ID, access password, allowed devices and "Start at login". |
 | Client | Windows 10 or 11, 64-bit; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
 | Host role | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
-| Client | Mac (arm64), the same Rust source | Secondary, under construction. Audio via AudioToolbox, clipboard including files via NSPasteboard, display on the CPU (no Metal yet), menu-bar icon, no desktop shortcut. Not distributed as a binary, see "Building from source". |
+| Client | Mac (arm64), the same Rust source | Secondary, under construction. Audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), menu-bar icon, no desktop shortcut. Not distributed as a binary, see "Building from source". |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
 the project's own free certificate "QuadChroma Release" (permissions survive updates,
@@ -375,8 +375,9 @@ recommendation can be applied with one click; the table is written to
 `quadchroma.exe <address> --headless` runs without a window and prints a status line
 every three seconds; with `--passwort <password>` it answers a host's access request
 once; `--decodertest` tries every decoder choice without a connection, `--anzeigetest
-<dir>` checks the GPU display path against the CPU path, `--shot` writes a BMP of the
-interface. `MANUAL.txt` lists all switches.
+<dir>` checks the GPU display path against the CPU path (Direct3D 11 on Windows; Metal
+on the Mac, where it also measures the frame time at 1440p and 120 Hz), `--shot` writes
+a BMP of the interface. `MANUAL.txt` lists all switches.
 
 ## The host's screen
 
@@ -782,9 +783,9 @@ vendored Monocypher; no FFmpeg. Its test harnesses run without screen capture, s
 ### Mac client
 
 The same client also builds on the Mac (arm64), with audio via AudioToolbox and the
-clipboard via NSPasteboard (text and files); the display still runs on the CPU
-(softbuffer), Metal comes later. Closing puts it into the menu bar; there is no
-desktop shortcut on the Mac. It needs no FFmpeg; build it with Rust alone:
+clipboard via NSPasteboard (text and files); the display runs through Metal, with the
+CPU (softbuffer) as fallback. Closing puts it into the menu bar; there is no desktop
+shortcut on the Mac. It needs no FFmpeg; build it with Rust alone:
 
     cd client
     cargo build --release
@@ -800,6 +801,22 @@ M1, HEVC 4:4:4 at 10 bits takes about 3.8 ms per 1080p frame. Automatic uses the
 engine, Processor uses VideoToolbox without hardware, and a media engine that cannot
 decode the stream falls back to the processor as on Windows. `--decodertest` encodes
 a short HEVC 4:4:4 sample with the hardware encoder and decodes it both ways.
+
+The display on the Mac is Metal (`client/src/anzeige_mac.rs`), called through
+`objc_msgSend` and the C functions of Metal, QuartzCore and CoreVideo like the rest of
+the Mac code, without a new crate. The decoder's pixel buffers go to the GPU without a
+copy (`CVMetalTextureCache` on their IOSurface); a shader compiled at startup converts
+them with the same 16.16 integer arithmetic as the CPU path (4:4:4 and 4:2:0, 8 and 10
+bits, full and limited range), a second one fits the picture into the window with the
+same source points and integer weights as the CPU scaler, and the user interface is a
+second texture on top. A `CAMetalLayer` below winit's view presents in pixels (HiDPI),
+synchronized to the display refresh, with at most two frames queued and never waiting
+on the window thread. If Metal cannot be set up, or with `--anzeige cpu`, the client
+draws with softbuffer. `--anzeigetest <dir>` compares every VideoToolbox format with the
+CPU path (tolerance 0 for the conversion, the scaled and the 1:1 picture; 2 for the
+interface on top, as on Windows) and measures 240 frames at 2560x1440 in a 120 Hz
+cadence (M1: about 1.8 ms GPU time per frame); it opens no window and starts neither
+host nor screen capture.
 
 On the Mac, `client/build.rs` also compiles the Mac host engine into the client: the
 `SRC` list of the Makefile without `host/start.m` (that file holds the host app's
@@ -982,7 +999,11 @@ check the decoded planes and the RGB conversion against the known pattern, with 
 without hardware; the splitting of Annex B, the parameter sets and the choice of the
 output format are checked on Windows too. Where VideoToolbox cannot be reached (a
 virtual machine without a hardware encoder, a sandbox that blocks its services), the
-tests that need it say "uebersprungen" and pass. The tests never touch the data folder:
+tests that need it say "uebersprungen" and pass. The Metal tests (`anzeige_mac`)
+compare the GPU conversion and scaling with the CPU path for `xf44`, `420f` and `x420`
+at tolerance 0 and present into a `CAMetalLayer` without a window; without a Metal
+device (a sandbox that blocks the GPU, a virtual machine) they also say
+"uebersprungen". The tests never touch the data folder:
 keys, settings, `protokoll.txt` and `quadchroma.ico` live per run in
 `qc-test-<pid>-<ms>/QuadChroma` in the temp folder, so `APPDATA` need not be
 redirected. Received files go to `qc-test-<pid>-ablage` or
