@@ -471,6 +471,12 @@ pub enum Key {
     /// Tooltip am Knopf "Automatisch" der Decoderwahl auf dem Mac - dort
     /// decodiert VideoToolbox, NVDEC und D3D11VA gibt es nicht.
     TipDecoderAutoMac,
+    // Metal-Anzeige des Mac-Clients (Schritt F)
+    /// Tooltip am Knopf "Automatisch" der Anzeigewahl auf dem Mac - dort
+    /// zeichnet Metal; Direct3D und eine Wahl der Karte gibt es nicht.
+    TipDisplayAutoMac,
+    /// Tooltip am Knopf "Prozessor" der Anzeigewahl auf dem Mac.
+    TipDisplayCpuMac,
 }
 
 pub struct Lang {
@@ -755,6 +761,8 @@ pub static EN: Lang = Lang {
         (DeviceNameRename, "Rename"),
         (PreventSleep, "Prevent sleep while QuadChroma is running"),
         (TipDecoderAutoMac, "VideoToolbox in the Mac's media engine (HEVC 4:4:4 too); otherwise the processor."),
+        (TipDisplayAutoMac, "Metal on the Mac's graphics chip. Without Metal: the processor. Applies from the next start."),
+        (TipDisplayCpuMac, "Draw on the processor, without Metal. Works everywhere, costs CPU time. Applies from the next start."),
     ],
 };
 
@@ -1016,6 +1024,8 @@ pub static DE: Lang = Lang {
         (DeviceNameRename, "Umbenennen"),
         (PreventSleep, "Ruhezustand verhindern, solange QuadChroma läuft"),
         (TipDecoderAutoMac, "VideoToolbox in der Media-Engine des Mac (auch HEVC 4:4:4); sonst der Prozessor."),
+        (TipDisplayAutoMac, "Metal auf dem Grafikchip des Mac. Ohne Metal: der Prozessor. Gilt ab dem nächsten Start."),
+        (TipDisplayCpuMac, "Zeichnen auf dem Prozessor, ohne Metal. Läuft überall, kostet Rechenzeit. Gilt ab dem nächsten Start."),
     ],
 };
 
@@ -1061,8 +1071,36 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > TipDecoderAutoMac as usize);
-        assert_eq!(n, TipDecoderAutoMac as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > TipDisplayCpuMac as usize);
+        assert_eq!(n, TipDisplayCpuMac as usize + 1, "Tabellen laenger als das Enum");
+    }
+
+    /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
+    /// Direct3D, ein Text ohne Platzhalter, nicht der Text fuer Windows und
+    /// ausser im Englischen nicht englisch. Beide enden mit demselben Satz
+    /// wie ihr Gegenstueck unter Windows ("gilt ab dem naechsten Start").
+    #[test]
+    fn anzeige_texte_mac() {
+        assert_eq!(TipDisplayAutoMac as usize, TipDecoderAutoMac as usize + 1);
+        assert_eq!(TipDisplayCpuMac as usize, TipDecoderAutoMac as usize + 2);
+        let letzter_satz = |t: &str| -> String {
+            let t = t.trim_end_matches(['.', '。']);
+            t.rsplit(['.', '。']).next().unwrap_or("").trim().to_string()
+        };
+        for l in all() {
+            for (mac, win) in [(TipDisplayAutoMac, TipDisplayAuto), (TipDisplayCpuMac, TipDisplayCpu)] {
+                let t = l.get(mac);
+                assert!(t.contains("Metal") && !t.contains("Direct3D") && !t.contains('{'), "{}: {t}", l.code);
+                assert!(t.ends_with('.') || t.ends_with('。'), "{}: {t}", l.code);
+                assert_ne!(t, l.get(win), "{}", l.code);
+                assert_eq!(letzter_satz(t), letzter_satz(l.get(win)), "{}: {t}", l.code);
+                if l.code != "en" {
+                    assert_ne!(t, EN.get(mac), "{}: noch englisch", l.code);
+                }
+            }
+        }
+        assert_eq!(EN.get(TipDisplayAutoMac), "Metal on the Mac's graphics chip. Without Metal: the processor. Applies from the next start.");
+        assert_eq!(DE.get(TipDisplayCpuMac), "Zeichnen auf dem Prozessor, ohne Metal. Läuft überall, kostet Rechenzeit. Gilt ab dem nächsten Start.");
     }
 
     /// Der Tooltip der Decoderwahl auf dem Mac: in jeder Sprache

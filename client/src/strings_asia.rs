@@ -264,6 +264,8 @@ pub static RU: Lang = Lang {
         (DeviceNameRename, "Переименовать"),
         (PreventSleep, "Не допускать спящего режима, пока работает QuadChroma"),
         (TipDecoderAutoMac, "VideoToolbox в медиадвижке Mac (в том числе HEVC 4:4:4); иначе процессор."),
+        (TipDisplayAutoMac, "Metal на графическом чипе Mac. Без Metal: процессор. Действует со следующего запуска."),
+        (TipDisplayCpuMac, "Рисование на процессоре, без Metal. Работает везде, стоит процессорного времени. Действует со следующего запуска."),
     ],
 };
 
@@ -527,6 +529,8 @@ pub static ZH: Lang = Lang {
         (DeviceNameRename, "重命名"),
         (PreventSleep, "QuadChroma 运行时阻止睡眠"),
         (TipDecoderAutoMac, "在 Mac 的媒体引擎上用 VideoToolbox（包括 HEVC 4:4:4）；否则用处理器。"),
+        (TipDisplayAutoMac, "在 Mac 的图形芯片上用 Metal。没有 Metal 时：处理器。下次启动起生效。"),
+        (TipDisplayCpuMac, "在处理器上绘制，不用 Metal。到处都能用，占用 CPU 时间。下次启动起生效。"),
     ],
 };
 
@@ -790,6 +794,8 @@ pub static JA: Lang = Lang {
         (DeviceNameRename, "名前を変更"),
         (PreventSleep, "QuadChroma の実行中はスリープしない"),
         (TipDecoderAutoMac, "Mac のメディアエンジンで VideoToolbox（HEVC 4:4:4 も可）、それができなければ CPU。"),
+        (TipDisplayAutoMac, "Mac のグラフィックチップで Metal。Metal が使えなければ CPU。次回起動時から有効。"),
+        (TipDisplayCpuMac, "Metal を使わず CPU で描画します。どこでも動きますが、処理時間がかかります。次回起動時から有効。"),
     ],
 };
 
@@ -1051,5 +1057,7 @@ pub static TR: Lang = Lang {
         (DeviceNameRename, "Yeniden adlandır"),
         (PreventSleep, "QuadChroma çalışırken uyku modunu engelle"),
         (TipDecoderAutoMac, "Mac'in medya motorunda VideoToolbox (HEVC 4:4:4 dahil); yoksa işlemci."),
+        (TipDisplayAutoMac, "Mac'in grafik yongasında Metal. Metal yoksa: işlemci. Sonraki başlatmadan itibaren geçerli."),
+        (TipDisplayCpuMac, "İşlemcide, Metal olmadan çizim. Her yerde çalışır, işlem süresine mal olur. Sonraki başlatmadan itibaren geçerli."),
     ],
 };

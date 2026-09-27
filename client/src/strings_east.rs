@@ -261,6 +261,8 @@ pub static PL: Lang = Lang {
         (DeviceNameRename, "Zmień nazwę"),
         (PreventSleep, "Zapobiegaj uśpieniu, gdy QuadChroma działa"),
         (TipDecoderAutoMac, "VideoToolbox w silniku multimedialnym Maca (także HEVC 4:4:4); inaczej procesor."),
+        (TipDisplayAutoMac, "Metal na układzie graficznym Maca. Bez Metal: procesor. Obowiązuje od następnego uruchomienia."),
+        (TipDisplayCpuMac, "Rysowanie na procesorze, bez Metal. Działa wszędzie, kosztuje czas obliczeń. Obowiązuje od następnego uruchomienia."),
     ],
 };
 
@@ -522,6 +524,8 @@ pub static CS: Lang = Lang {
         (DeviceNameRename, "Přejmenovat"),
         (PreventSleep, "Zabránit režimu spánku, dokud běží QuadChroma"),
         (TipDecoderAutoMac, "VideoToolbox v multimediálním jádru Macu (i HEVC 4:4:4); jinak procesor."),
+        (TipDisplayAutoMac, "Metal na grafickém čipu Macu. Bez Metalu: procesor. Platí od příštího spuštění."),
+        (TipDisplayCpuMac, "Kreslení na procesoru, bez Metalu. Funguje všude, stojí výpočetní čas. Platí od příštího spuštění."),
     ],
 };
 
@@ -783,6 +787,8 @@ pub static SK: Lang = Lang {
         (DeviceNameRename, "Premenovať"),
         (PreventSleep, "Zabrániť režimu spánku, kým beží QuadChroma"),
         (TipDecoderAutoMac, "VideoToolbox v multimediálnom jadre Macu (aj HEVC 4:4:4); inak procesor."),
+        (TipDisplayAutoMac, "Metal na grafickom čipe Macu. Bez Metalu: procesor. Platí od nasledujúceho spustenia."),
+        (TipDisplayCpuMac, "Kreslenie na procesore, bez Metalu. Funguje všade, stojí výpočtový čas. Platí od nasledujúceho spustenia."),
     ],
 };
 
@@ -1044,6 +1050,8 @@ pub static HU: Lang = Lang {
         (DeviceNameRename, "Átnevezés"),
         (PreventSleep, "Alvó állapot megakadályozása, amíg a QuadChroma fut"),
         (TipDecoderAutoMac, "VideoToolbox a Mac médiamotorján (a HEVC 4:4:4 is); különben a processzor."),
+        (TipDisplayAutoMac, "Metal a Mac grafikus chipjén. Metal nélkül: a processzor. A következő indítástól érvényes."),
+        (TipDisplayCpuMac, "Rajzolás a processzoron, Metal nélkül. Mindenhol működik, számítási időbe kerül. A következő indítástól érvényes."),
     ],
 };
 
@@ -1305,6 +1313,8 @@ pub static RO: Lang = Lang {
         (DeviceNameRename, "Redenumește"),
         (PreventSleep, "Împiedică repausul cât timp rulează QuadChroma"),
         (TipDecoderAutoMac, "VideoToolbox în motorul media al Mac-ului (inclusiv HEVC 4:4:4); altfel procesorul."),
+        (TipDisplayAutoMac, "Metal pe cipul grafic al Mac-ului. Fără Metal: procesorul. Se aplică de la următoarea pornire."),
+        (TipDisplayCpuMac, "Desenare pe procesor, fără Metal. Merge oriunde, costă timp de calcul. Se aplică de la următoarea pornire."),
     ],
 };
 
@@ -1566,6 +1576,8 @@ pub static BG: Lang = Lang {
         (DeviceNameRename, "Преименуване"),
         (PreventSleep, "Предотвратяване на режим на заспиване, докато QuadChroma работи"),
         (TipDecoderAutoMac, "VideoToolbox в медийния двигател на Mac (включително HEVC 4:4:4); иначе процесорът."),
+        (TipDisplayAutoMac, "Metal на графичния чип на Mac. Без Metal: процесорът. Важи от следващото стартиране."),
+        (TipDisplayCpuMac, "Рисуване на процесора, без Metal. Работи навсякъде, струва процесорно време. Важи от следващото стартиране."),
     ],
 };
 
@@ -1827,5 +1839,7 @@ pub static EL: Lang = Lang {
         (DeviceNameRename, "Μετονομασία"),
         (PreventSleep, "Αποτροπή αναστολής λειτουργίας όσο εκτελείται το QuadChroma"),
         (TipDecoderAutoMac, "VideoToolbox στη μηχανή πολυμέσων του Mac (και HEVC 4:4:4)· αλλιώς ο επεξεργαστής."),
+        (TipDisplayAutoMac, "Metal στο γραφικό τσιπ του Mac. Χωρίς Metal: ο επεξεργαστής. Ισχύει από την επόμενη εκκίνηση."),
+        (TipDisplayCpuMac, "Σχεδίαση στον επεξεργαστή, χωρίς Metal. Δουλεύει παντού, κοστίζει χρόνο CPU. Ισχύει από την επόμενη εκκίνηση."),
     ],
 };

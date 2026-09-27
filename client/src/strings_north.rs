@@ -261,6 +261,8 @@ pub static SV: Lang = Lang {
         (DeviceNameRename, "Byt namn"),
         (PreventSleep, "Förhindra viloläge medan QuadChroma körs"),
         (TipDecoderAutoMac, "VideoToolbox i Macens mediemotor (även HEVC 4:4:4); annars processorn."),
+        (TipDisplayAutoMac, "Metal på Macens grafikkrets. Utan Metal: processorn. Gäller från nästa start."),
+        (TipDisplayCpuMac, "Rita på processorn, utan Metal. Fungerar överallt, kostar processortid. Gäller från nästa start."),
     ],
 };
 
@@ -522,6 +524,8 @@ pub static DA: Lang = Lang {
         (DeviceNameRename, "Omdøb"),
         (PreventSleep, "Forhindr dvale, mens QuadChroma kører"),
         (TipDecoderAutoMac, "VideoToolbox i Mac'ens mediemotor (også HEVC 4:4:4); ellers processoren."),
+        (TipDisplayAutoMac, "Metal på Mac'ens grafikchip. Uden Metal: processoren. Gælder fra næste start."),
+        (TipDisplayCpuMac, "Tegn på processoren, uden Metal. Virker overalt, koster regnetid. Gælder fra næste start."),
     ],
 };
 
@@ -783,6 +787,8 @@ pub static NB: Lang = Lang {
         (DeviceNameRename, "Gi nytt navn"),
         (PreventSleep, "Hindre hvilemodus mens QuadChroma kjører"),
         (TipDecoderAutoMac, "VideoToolbox i Mac-ens mediemotor (også HEVC 4:4:4); ellers prosessoren."),
+        (TipDisplayAutoMac, "Metal på Mac-ens grafikkbrikke. Uten Metal: prosessoren. Gjelder fra neste start."),
+        (TipDisplayCpuMac, "Tegn på prosessoren, uten Metal. Virker overalt, koster regnetid. Gjelder fra neste start."),
     ],
 };
 
@@ -1044,6 +1050,8 @@ pub static FI: Lang = Lang {
         (DeviceNameRename, "Nimeä uudelleen"),
         (PreventSleep, "Estä lepotila, kun QuadChroma on käynnissä"),
         (TipDecoderAutoMac, "VideoToolbox Macin mediamoottorissa (myös HEVC 4:4:4); muuten suoritin."),
+        (TipDisplayAutoMac, "Metal Macin grafiikkapiirillä. Ilman Metalia: suoritin. Voimassa seuraavasta käynnistyksestä."),
+        (TipDisplayCpuMac, "Piirto suorittimella, ilman Metalia. Toimii kaikkialla, vie laskenta-aikaa. Voimassa seuraavasta käynnistyksestä."),
     ],
 };
 
@@ -1305,5 +1313,7 @@ pub static IS: Lang = Lang {
         (DeviceNameRename, "Endurnefna"),
         (PreventSleep, "Koma í veg fyrir svefnham á meðan QuadChroma er í gangi"),
         (TipDecoderAutoMac, "VideoToolbox í miðlunarvél Mac-tölvunnar (líka HEVC 4:4:4); annars örgjörvinn."),
+        (TipDisplayAutoMac, "Metal á grafíkkubbi Mac-tölvunnar. Án Metal: örgjörvinn. Gildir frá næstu ræsingu."),
+        (TipDisplayCpuMac, "Teikna á örgjörvanum, án Metal. Virkar alls staðar, kostar reiknitíma. Gildir frá næstu ræsingu."),
     ],
 };

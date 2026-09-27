@@ -12305,10 +12305,14 @@ fn hud(
                 let tips_anzeige: Vec<(strings::Key, Option<String>)> = knoepfe
                     .iter()
                     .map(|(wahl, _, karte)| match wahl {
-                        RollenWahl::Automatik => (TipDisplayAuto, beschreibung(karte_automatik(&stand.karten))),
+                        // Auf dem Mac zeichnet Metal (anzeige_mac.rs).
+                        RollenWahl::Automatik => (
+                            if cfg!(target_os = "macos") { TipDisplayAutoMac } else { TipDisplayAuto },
+                            beschreibung(karte_automatik(&stand.karten)),
+                        ),
                         RollenWahl::Gpu | RollenWahl::Gpu2 => (TipDisplayGpu, beschreibung(*karte)),
                         RollenWahl::Integriert => (TipDisplayIntegrated, beschreibung(*karte)),
-                        RollenWahl::Prozessor => (TipDisplayCpu, None),
+                        RollenWahl::Prozessor => (if cfg!(target_os = "macos") { TipDisplayCpuMac } else { TipDisplayCpu }, None),
                     })
                     .collect();
                 let (klick, unten) = zeile_rollen(u, c, oy + p(10), RollenWahl::von_anzeige(stand.anzeige_aktiv), &tips_anzeige, &mut tip, &mut tip_zusatz);

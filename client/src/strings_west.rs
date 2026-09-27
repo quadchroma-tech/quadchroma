@@ -263,6 +263,8 @@ pub static FR: Lang = Lang {
         (DeviceNameRename, "Renommer"),
         (PreventSleep, "Empêcher la mise en veille tant que QuadChroma est ouvert"),
         (TipDecoderAutoMac, "VideoToolbox dans le moteur multimédia du Mac (HEVC 4:4:4 compris) ; sinon le processeur."),
+        (TipDisplayAutoMac, "Metal sur la puce graphique du Mac. Sans Metal : le processeur. Prend effet au prochain démarrage."),
+        (TipDisplayCpuMac, "Dessiner sur le processeur, sans Metal. Fonctionne partout, coûte du temps de calcul. Prend effet au prochain démarrage."),
     ],
 };
 
@@ -524,6 +526,8 @@ pub static ES: Lang = Lang {
         (DeviceNameRename, "Renombrar"),
         (PreventSleep, "Evitar la suspensión mientras QuadChroma se ejecuta"),
         (TipDecoderAutoMac, "VideoToolbox en el motor multimedia del Mac (también HEVC 4:4:4); si no, el procesador."),
+        (TipDisplayAutoMac, "Metal en el chip gráfico del Mac. Sin Metal: el procesador. Se aplica desde el próximo inicio."),
+        (TipDisplayCpuMac, "Dibujar en el procesador, sin Metal. Funciona en todas partes, cuesta tiempo de CPU. Se aplica desde el próximo inicio."),
     ],
 };
 
@@ -785,6 +789,8 @@ pub static IT: Lang = Lang {
         (DeviceNameRename, "Rinomina"),
         (PreventSleep, "Impedisci la sospensione mentre QuadChroma è in esecuzione"),
         (TipDecoderAutoMac, "VideoToolbox nel motore multimediale del Mac (anche HEVC 4:4:4); altrimenti il processore."),
+        (TipDisplayAutoMac, "Metal sul chip grafico del Mac. Senza Metal: il processore. Vale dal prossimo avvio."),
+        (TipDisplayCpuMac, "Disegnare sul processore, senza Metal. Funziona ovunque, costa tempo di calcolo. Vale dal prossimo avvio."),
     ],
 };
 
@@ -1046,6 +1052,8 @@ pub static PT: Lang = Lang {
         (DeviceNameRename, "Mudar o nome"),
         (PreventSleep, "Impedir a suspensão enquanto o QuadChroma estiver em execução"),
         (TipDecoderAutoMac, "VideoToolbox no motor multimédia do Mac (também HEVC 4:4:4); senão o processador."),
+        (TipDisplayAutoMac, "Metal no chip gráfico do Mac. Sem Metal: o processador. Aplica-se a partir do próximo arranque."),
+        (TipDisplayCpuMac, "Desenhar no processador, sem Metal. Funciona em todo o lado, custa tempo de CPU. Aplica-se a partir do próximo arranque."),
     ],
 };
 
@@ -1307,5 +1315,7 @@ pub static NL: Lang = Lang {
         (DeviceNameRename, "Hernoemen"),
         (PreventSleep, "Slaapstand voorkomen zolang QuadChroma draait"),
         (TipDecoderAutoMac, "VideoToolbox in de media-engine van de Mac (ook HEVC 4:4:4); anders de processor."),
+        (TipDisplayAutoMac, "Metal op de grafische chip van de Mac. Zonder Metal: de processor. Geldt vanaf de volgende start."),
+        (TipDisplayCpuMac, "Tekenen op de processor, zonder Metal. Werkt overal, kost rekentijd. Geldt vanaf de volgende start."),
     ],
 };
