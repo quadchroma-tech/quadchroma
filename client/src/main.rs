@@ -6517,6 +6517,7 @@ impl ApplicationHandler<Benutzer> for App {
             }));
             let mit_ziel = self.screen == Screen::Session || self.id_ausstehend.is_some();
             if art != host_mac::Anmeldestart::Nein
+                && symbol_moeglich
                 && !self.hintergrund
                 && self.window.is_none()
                 && start_im_hintergrund(MIT_FREIGABE, mit_ziel, self.cfg.tray, SYMBOL_OHNE_TRAY, true, self.cfg.fenster_gezeigt)
@@ -6528,6 +6529,13 @@ impl ApplicationHandler<Benutzer> for App {
                 host_mac::abgeben();
                 protokoll::zeile("Start im Hintergrund (Anmeldeobjekt) - das Fenster kommt mit \"QuadChroma oeffnen\"".into());
             }
+        }
+        // Ohne Symbol gaebe es aus dem Hintergrund keinen Weg zurueck (die
+        // Host-Engine lief nicht an): dann doch mit Fenster starten, nie
+        // unsichtbar ohne Fenster und ohne Symbol.
+        if self.hintergrund && !symbol_moeglich {
+            self.hintergrund = false;
+            protokoll::zeile("Start: kein Symbol moeglich (Host-Engine nicht angelaufen) - das Fenster kommt trotz Hintergrundstart".into());
         }
         // Im Hintergrund (die eine App nach dem allerersten Start, Autostart,
         // --host, Anmeldeobjekt): kein Fenster und kein Renderer, bis
