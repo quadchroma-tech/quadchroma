@@ -247,14 +247,22 @@ fn lnk_speichern(
 
 // ------------------------------------------------ Mit Windows starten
 //
-// Die Host-Rolle startet mit der Anmeldung ueber eine Verknuepfung im
+// Die eine App startet mit der Anmeldung ueber EINE Verknuepfung im
 // Autostart-Ordner des Nutzers (FOLDERID_Startup) auf dieselbe exe mit
-// --host (Spezifikation Pairing v1, 10.2) - keine Registry, kein Dienst:
-// Desktop Duplication braucht die Sitzung des Nutzers. Ob der Punkt einen
-// Haken traegt, sagt allein, ob die Datei da ist.
+// --hintergrund: still ins Symbol, die Freigabe wie eingestellt
+// (Spezifikation Pairing v1, 10.2) - keine Registry, kein Dienst: Desktop
+// Duplication braucht die Sitzung des Nutzers. Ob der Punkt einen Haken
+// traegt, sagt allein, ob eine der beiden Dateien da ist. Die alte
+// Verknuepfung der Host-Rolle ("QuadChroma - Freigabe.lnk", --host) laeuft
+// weiter (--host startet die App im Hintergrund mit Freigabe an) und wird
+// beim Start der App durch die neue ersetzt (autostart_migrieren).
 
 /// Dateiname der Autostart-Verknuepfung.
-pub const AUTOSTART_DATEI: &str = "QuadChroma - Freigabe.lnk";
+pub const AUTOSTART_DATEI: &str = "QuadChroma.lnk";
+/// Die Verknuepfung der Host-Rolle vor der einen App.
+pub const AUTOSTART_ALT: &str = "QuadChroma - Freigabe.lnk";
+/// Argument der Autostart-Verknuepfung.
+pub const AUTOSTART_ARGUMENT: &str = "--hintergrund";
 
 /// Der Autostart-Ordner des Nutzers.
 #[cfg(all(windows, not(test)))]
@@ -285,25 +293,33 @@ pub fn autostart_pfad(ordner: Option<&Path>) -> Result<PathBuf, String> {
     .join(AUTOSTART_DATEI))
 }
 
-/// Startet die Freigabe mit Windows (liegt die Verknuepfung da)?
+/// Pfad der alten Autostart-Verknuepfung der Host-Rolle.
 #[cfg(windows)]
-pub fn autostart_an(ordner: Option<&Path>) -> bool {
-    autostart_pfad(ordner).map(|p| p.is_file()).unwrap_or(false)
+fn autostart_alt_pfad(ordner: Option<&Path>) -> Result<PathBuf, String> {
+    Ok(autostart_pfad(ordner)?.with_file_name(AUTOSTART_ALT))
 }
 
-/// "Mit Windows starten" an (Verknuepfung auf die laufende exe mit --host
-/// anlegen bzw. erneuern) oder aus (Verknuepfung loeschen; fehlt sie
-/// schon, ist das kein Fehler). `beschreibung`: Kommentar der Verknuepfung.
+/// Startet QuadChroma mit Windows (liegt die neue oder noch die alte
+/// Verknuepfung da)?
 #[cfg(windows)]
-pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> Result<(), String> {
-    let pfad = autostart_pfad(ordner)?;
-    if !an {
-        return match std::fs::remove_file(&pfad) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("{}: {e}", pfad.display())),
-        };
+pub fn autostart_an(ordner: Option<&Path>) -> bool {
+    let da = |p: Result<PathBuf, String>| p.map(|p| p.is_file()).unwrap_or(false);
+    da(autostart_pfad(ordner)) || da(autostart_alt_pfad(ordner))
+}
+
+/// Eine Datei loeschen; fehlt sie schon, ist das kein Fehler.
+#[cfg(windows)]
+fn loeschen(pfad: &Path) -> Result<(), String> {
+    match std::fs::remove_file(pfad) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", pfad.display())),
     }
+}
+
+/// Die neue Verknuepfung schreiben: die laufende exe mit --hintergrund.
+#[cfg(windows)]
+fn autostart_schreiben(pfad: &Path, beschreibung: &str) -> Result<(), String> {
     let ziel_ordner = pfad.parent().map(Path::to_path_buf).unwrap_or_default();
     if !ziel_ordner.is_dir() {
         std::fs::create_dir_all(&ziel_ordner).map_err(|e| format!("{}: {e}", ziel_ordner.display()))?;
@@ -311,7 +327,36 @@ pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> 
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
     let arbeitsordner = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     let symbol = crate::logo::ico_schreiben().unwrap_or_else(|_| exe.clone());
-    im_sta(|| lnk_speichern(&pfad, &exe, "--host", &arbeitsordner, beschreibung, &symbol, 0))
+    im_sta(|| lnk_speichern(pfad, &exe, AUTOSTART_ARGUMENT, &arbeitsordner, beschreibung, &symbol, 0))
+}
+
+/// "Mit Windows starten" an (die eine Verknuepfung anlegen bzw. erneuern,
+/// eine alte der Host-Rolle weg) oder aus (beide loeschen; fehlen sie
+/// schon, ist das kein Fehler). `beschreibung`: Kommentar der Verknuepfung.
+#[cfg(windows)]
+pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> Result<(), String> {
+    let pfad = autostart_pfad(ordner)?;
+    let alt = autostart_alt_pfad(ordner)?;
+    if !an {
+        let r = loeschen(&pfad);
+        return loeschen(&alt).and(r);
+    }
+    autostart_schreiben(&pfad, beschreibung)?;
+    loeschen(&alt)
+}
+
+/// Beim Start der App: liegt noch die alte Verknuepfung der Host-Rolle da,
+/// tritt die eine an ihre Stelle (die alte wird erst geloescht, wenn die
+/// neue steht). Ok(true): uebernommen; Ok(false): nichts zu tun.
+#[cfg(windows)]
+pub fn autostart_migrieren(ordner: Option<&Path>, beschreibung: &str) -> Result<bool, String> {
+    let alt = autostart_alt_pfad(ordner)?;
+    if !alt.is_file() {
+        return Ok(false);
+    }
+    autostart_schreiben(&autostart_pfad(ordner)?, beschreibung)?;
+    loeschen(&alt)?;
+    Ok(true)
 }
 
 /// Eine Verknuepfung zuruecklesen (Tests): Ziel, Argumente, Arbeitsordner,
@@ -464,24 +509,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
-    /// "Mit Windows starten": an legt die Verknuepfung auf die exe mit
-    /// --host an (zweimal an ist dieselbe Datei), aus loescht sie, zweimal
-    /// aus ist kein Fehler. Im Test nie im echten Autostart-Ordner.
+    /// "Mit Windows starten": an legt die eine Verknuepfung auf die exe mit
+    /// --hintergrund an (zweimal an ist dieselbe Datei), aus loescht sie,
+    /// zweimal aus ist kein Fehler. Im Test nie im echten Autostart-Ordner.
     #[cfg(windows)]
     #[test]
     fn autostart_an_und_aus() {
         let ordner = std::env::temp_dir().join(format!("{}-autostart", crate::secure::test_lauf()));
         let _ = std::fs::remove_dir_all(&ordner);
         assert!(!autostart_an(Some(&ordner)));
-        autostart_setzen(Some(&ordner), true, "QuadChroma: Diesen PC freigeben").unwrap();
+        autostart_setzen(Some(&ordner), true, "QuadChroma – Fernsteuerung").unwrap();
         assert!(autostart_an(Some(&ordner)));
         let pfad = ordner.join(AUTOSTART_DATEI);
+        assert_eq!(AUTOSTART_DATEI, "QuadChroma.lnk");
         let (ziel, arg, arbeit, kommentar, _, _) = lnk_lesen(&pfad).unwrap();
         let exe = std::env::current_exe().unwrap();
         assert_eq!(ziel.to_lowercase(), exe.display().to_string().to_lowercase());
-        assert_eq!(arg, "--host");
+        assert_eq!(arg, "--hintergrund");
         assert_eq!(arbeit.to_lowercase(), exe.parent().unwrap().display().to_string().to_lowercase());
-        assert_eq!(kommentar, "QuadChroma: Diesen PC freigeben");
+        assert_eq!(kommentar, "QuadChroma – Fernsteuerung");
         autostart_setzen(Some(&ordner), true, "x").unwrap();
         assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
         autostart_setzen(Some(&ordner), false, "").unwrap();
@@ -490,6 +536,41 @@ mod tests {
         // Ohne Ordner im Test kein Autostart-Ordner.
         assert!(autostart_pfad(None).is_err());
         assert!(!autostart_an(None));
+        assert!(autostart_migrieren(None, "").is_err());
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// Die alte Verknuepfung der Host-Rolle ("QuadChroma - Freigabe.lnk",
+    /// --host): sie zaehlt als "an"; beim Start der App tritt die eine an
+    /// ihre Stelle, ein zweiter Start findet nichts mehr zu tun. "aus"
+    /// loescht beide, "an" laesst nur die neue stehen.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_alte_verknuepfung() {
+        let ordner = std::env::temp_dir().join(format!("{}-autostart-alt", crate::secure::test_lauf()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let alt = ordner.join(AUTOSTART_ALT);
+        let neu = ordner.join(AUTOSTART_DATEI);
+        let exe = std::env::current_exe().unwrap();
+        let alte_anlegen = || im_sta(|| lnk_speichern(&alt, &exe, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &exe, 0)).unwrap();
+        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(false), "ohne alte nichts zu tun");
+        alte_anlegen();
+        assert!(autostart_an(Some(&ordner)), "die alte zaehlt als an");
+        assert_eq!(autostart_migrieren(Some(&ordner), "QuadChroma – Fernsteuerung"), Ok(true));
+        assert!(!alt.exists() && neu.is_file());
+        assert_eq!(lnk_lesen(&neu).unwrap().1, "--hintergrund");
+        assert!(autostart_an(Some(&ordner)));
+        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(false), "zweiter Start");
+        // aus: beide weg.
+        alte_anlegen();
+        autostart_setzen(Some(&ordner), false, "").unwrap();
+        assert!(!alt.exists() && !neu.exists() && !autostart_an(Some(&ordner)));
+        // an: nur die neue.
+        alte_anlegen();
+        autostart_setzen(Some(&ordner), true, "x").unwrap();
+        assert!(!alt.exists() && neu.is_file());
+        assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&ordner);
     }
 }
