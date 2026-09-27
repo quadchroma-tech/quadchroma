@@ -854,9 +854,9 @@ is created
 
     - on the start screen with the "Desktop shortcut" button at the right
       of each found host's row,
-    - in the menu, "Encryption" tab, with the "Desktop shortcut" button
-      next to "Disconnect", for the connected host (name from the
-      announcement if the address matches, otherwise the address).
+    - in the menu, "Encryption" tab, with the "Desktop shortcut" button,
+      for the connected host (name from the announcement if the address
+      matches, otherwise the address).
 
 The result stays in the message area or below the button for 6 s:
 "Shortcut created on the desktop: <file>", otherwise in amber "Shortcut
@@ -915,15 +915,16 @@ The menu
 --------
 
 Hold ESC for two seconds (that ESC then does not reach the Mac) or press
-F10. Five tabs:
+F10. "Disconnect" sits in the header at the right, on every tab, with the
+host's address below it. Five tabs:
 
     Picture         bitrate, frame rate, gaming mode, fixed frame rate,
                     sound, host display, codec choice
     Display         fullscreen, pixel exact, statistics, nerd mode, which
                     statistics lines, card for display and decoder
                     (Automatic, Graphics card, Integrated, Processor)
-    Encryption      method, comparison code, fingerprint, Disconnect,
-                    desktop shortcut (Windows)
+    Encryption      method, comparison code, fingerprint, desktop
+                    shortcut (Windows)
     Shortcuts       every key that the client intercepts itself
     Benchmark       measures codecs, frame rates and bitrates one after
                     another (see below)

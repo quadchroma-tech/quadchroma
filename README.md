@@ -322,6 +322,9 @@ open, mouse and keyboard belong to the menu, not to the Mac.
 
 ### Menu
 
+"Disconnect" sits in the menu's header at the right, on every tab, with the host's
+address below it.
+
 - **Picture:** bit rate, frame rate, gaming mode, fixed frame rate, sound, the host's
   screen (see "The host's screen") and the codec.
 - **Display:** full screen, pixel-exact, statistics, nerd mode, which statistics
@@ -331,7 +334,7 @@ open, mouse and keyboard belong to the menu, not to the Mac.
   means integrated), shows only the roles for which it found a card (Automatic and
   Processor always) and names the detected card in the tooltip. The decoder switches
   at once, the display from the next start.
-- **Encryption:** method, comparison code, fingerprint, disconnect, desktop shortcut.
+- **Encryption:** method, comparison code, fingerprint, desktop shortcut.
 - **Shortcuts:** every key the client intercepts.
 - **Benchmark:** see below.
 

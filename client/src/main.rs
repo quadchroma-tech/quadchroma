@@ -10562,6 +10562,42 @@ fn karte_beschreibung(k: &Karte, lang: &'static strings::Lang) -> String {
     format!("{} · {speicher} · {}", k.name, lang.get(if k.hat_ausgang { AdapterWithOutput } else { AdapterNoOutput }))
 }
 
+/// Die Reiter des ESC-Menues, in ihrer Reihenfolge (Index = Reiter).
+fn hud_reiternamen(lang: &'static strings::Lang) -> [&'static str; 5] {
+    use strings::Key::*;
+    [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts), lang.get(TabBenchmark)]
+}
+
+/// Lage des Kopfes im ESC-Menue: die Reiter und der Knopf Trennen (fest
+/// rechts, auf jedem Reiter, die Adresse des Hosts darunter).
+struct HudKopf {
+    reiter: [ui::Rect; 5],
+    trennen: ui::Rect,
+}
+
+/// Dieselbe Rechnung wie in `hud` (Tafel, Rand, Massstab), nur die Lage.
+fn hud_kopf(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> HudKopf {
+    let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
+    let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
+    let sz = |v: u32| -> u32 { (v as f32 * s).round() as u32 };
+    let breite = (ww - p(80)).min(p(1100));
+    let hoehe = (wh - p(80)).min(p(570));
+    let x0 = (ww - breite) / 2;
+    let y0 = (wh - hoehe) / 2;
+    let rand = p(20);
+    let ix = x0 + rand;
+    let mut reiter = [ui::Rect { x: 0, y: 0, w: 0, h: 0 }; 5];
+    let mut rx = ix + u.text.width("QUADCHROMA", sz(18), p(8)) + p(40);
+    for (r, n) in reiter.iter_mut().zip(hud_reiternamen(lang)) {
+        let bw = u.text.width(n, sz(12), p(2)) + p(28);
+        *r = ui::Rect { x: rx, y: y0 + p(12), w: bw, h: p(26) };
+        rx += bw + p(8);
+    }
+    let tw = u.text.width(lang.get(strings::Key::Disconnect), sz(12), p(2)) + p(28);
+    let trennen = ui::Rect { x: x0 + breite - rand - tw, y: y0 + p(12), w: tw, h: p(26) };
+    HudKopf { reiter, trennen }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hud(
     u: &mut ui::Ui,
@@ -10612,12 +10648,9 @@ fn hud(
 
     // --- Kopf mit Reitern -------------------------------------------------
     u.text.draw(c, ix, y0 + p(30), "QUADCHROMA", sz(18), ui::CYAN, p(8));
-    u.text.draw_right(c, x0 + breite - rand, y0 + p(30), adresse, sz(12), ui::DIM, p(1));
-    let namen = [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts), lang.get(TabBenchmark)];
-    let mut rx = ix + u.text.width("QUADCHROMA", sz(18), p(8)) + p(40);
-    for (i, n) in namen.iter().enumerate() {
-        let bw = u.text.width(n, sz(12), p(2)) + p(28);
-        let r = ui::Rect { x: rx, y: y0 + p(12), w: bw, h: p(26) };
+    let kopf = hud_kopf(u, lang, ww, wh);
+    let namen = hud_reiternamen(lang);
+    for (i, (n, &r)) in namen.iter().zip(kopf.reiter.iter()).enumerate() {
         let aktiv = reiter == i as u8;
         let heiss = r.hit(u.mouse.0, u.mouse.1);
         if aktiv {
@@ -10631,8 +10664,18 @@ fn hud(
         if heiss && u.click {
             aktion = HudAktion::Reiter(i as u8);
         }
-        rx += bw + p(8);
     }
+    // Trennen steht fest rechts im Kopf, auf jedem Reiter; die Adresse des
+    // Hosts buendig darunter, knapp unter der Kopflinie - neben den Reitern
+    // reicht der Platz in vielen Sprachen nicht fuer beides.
+    if kopf.trennen.hit(maus.0, maus.1) {
+        tip = Some(TipDisconnect);
+    }
+    if u.button_mit(c, kopf.trennen, lang.get(Disconnect), ui::MAGENTA, sz(12), p(2)) {
+        aktion = HudAktion::Trennen;
+    }
+    let a = kuerzen(u, adresse, iw / 3, sz(11), p(1));
+    u.text.draw_right(c, kopf.trennen.x + kopf.trennen.w, y0 + p(62), &a, sz(11), ui::DIM, p(1));
     c.glow_hline(x0, y0 + p(44), breite, ui::MAGENTA);
 
     // --- Befund: die zwei Zahlen, waehrend man dreht ----------------------
@@ -11268,24 +11311,19 @@ fn hud(
                 u.text.draw(c, ix + iw / 2, cy + p(50), lang.get(HostFingerprint), sz(11), ui::DIM, p(3));
                 u.text.draw(c, ix + iw / 2, cy + p(86), fp, sz(15), ui::TEXT, p(2));
             }
-            let r_trennen = ui::Rect { x: ix, y: cy + p(130), w: p(220), h: p(38) };
-            if r_trennen.hit(maus.0, maus.1) { tip = Some(TipDisconnect); }
-            if u.button(c, r_trennen, lang.get(Disconnect), ui::MAGENTA) {
-                aktion = HudAktion::Trennen;
-            }
-            // Daneben: Desktop-Verknuepfung fuer diesen Host (nur Windows).
-            // Das Ergebnis steht 6 s darunter.
+            // Desktop-Verknuepfung fuer diesen Host (nur Windows); Trennen
+            // steht im Kopf. Das Ergebnis steht 6 s darunter.
             if MIT_VERKNUEPFUNG {
                 let t = lang.get(DesktopShortcut);
                 let bw = p(220).max(u.text.width(t, 15, 2) + p(40));
-                let r_verkn = ui::Rect { x: ix + p(220) + p(16), y: r_trennen.y, w: bw, h: p(38) };
+                let r_verkn = ui::Rect { x: ix, y: cy + p(130), w: bw, h: p(38) };
                 if r_verkn.hit(maus.0, maus.1) { tip = Some(TipDesktopShortcut); }
                 if u.button(c, r_verkn, t, ui::CYAN) {
                     aktion = HudAktion::Verknuepfung;
                 }
                 if let Some((text, farbe)) = &stand.verknuepfung {
                     for (i, z) in umbruch(u, text, iw, sz(12)).iter().enumerate() {
-                        u.text.draw(c, ix, r_trennen.y + r_trennen.h + p(34) + i as i32 * p(18), z, sz(12), *farbe, p(1));
+                        u.text.draw(c, ix, r_verkn.y + r_verkn.h + p(34) + i as i32 * p(18), z, sz(12), *farbe, p(1));
                     }
                 }
             }
@@ -12673,6 +12711,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Trennen steht im Kopf des ESC-Menues, auf jedem Reiter, rechts neben
+    /// den Reitern (kein Ueberlappen, in jeder Sprache und Groesse): ein
+    /// Klick darauf trennt. Im Reiter Verschluesselung, wo der Knopf frueher
+    /// stand, trennt ein Klick nicht mehr.
+    #[test]
+    fn trennen_im_kopf_auf_jedem_reiter() {
+        let mut u = ui::Ui::new();
+        let stand = HudStand {
+            vollbild: false, pixelgenau: false, statistik: false, nerd: false,
+            wahl: einstellungen::StatWahl::default(),
+            codecs: Vec::new(), codec_idx: None, wechsel: false,
+            bildschirmwahl: false, bildschirme: Vec::new(), bildschirm_wunsch: None, bildschirm_wechsel: false,
+            decoder: einstellungen::DecoderWunsch::Automatik, decoder_aktiv: None,
+            karten: Vec::new(),
+            anzeige_aktiv: einstellungen::AnzeigeWunsch::Automatik,
+            anzeige_gespeichert: einstellungen::AnzeigeWunsch::Automatik,
+            anzeige_name: String::new(),
+            bench_konfig: BenchKonfig::vorgabe(5, true), bench: None, bench_scroll: 0,
+            verknuepfung: None,
+        };
+        for (ww, wh) in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
+            let mut buf = vec![0u32; (ww * wh) as usize];
+            for lang in strings::all() {
+                let k = hud_kopf(&mut u, lang, ww, wh);
+                let letzter = k.reiter[4];
+                assert!(letzter.x + letzter.w < k.trennen.x, "{} {ww}x{wh}: Reiter reichen in Trennen", lang.code);
+                for reiter in 0..5u8 {
+                    let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+                    u.mouse = (k.trennen.x + k.trennen.w / 2, k.trennen.y + k.trennen.h / 2);
+                    u.click = true;
+                    let a = hud(
+                        &mut u, &mut c, lang, ww, wh, reiter, None, &[], 0.0, &[], None, None, (None, None),
+                        "192.168.178.194:9001", false, &stand,
+                    );
+                    assert!(matches!(a, HudAktion::Trennen), "{} {ww}x{wh} Reiter {reiter}", lang.code);
+                }
+            }
+        }
+        // Wo der Knopf frueher stand (Reiter Verschluesselung, unter dem
+        // Vergleichscode): kein Trennen mehr.
+        let (ww, wh) = (1280, 720);
+        let mut buf = vec![0u32; (ww * wh) as usize];
+        let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+        u.mouse = (110 + 110, 75 + 186 + 130 + 19);
+        u.click = true;
+        let a = hud(&mut u, &mut c, strings::pick("de"), ww, wh, 2, None, &[], 0.0, &[], None, None, (None, None), "h:9001", false, &stand);
+        assert!(!matches!(a, HudAktion::Trennen));
     }
 
     // ------------------------------------------ Dateien (Spezifikation 3.4)
