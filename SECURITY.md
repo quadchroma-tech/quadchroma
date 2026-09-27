@@ -73,21 +73,24 @@ beyond what is needed to demonstrate it.
   `host-protokoll.txt` (sharing) in `%APPDATA%\QuadChroma\` on Windows or in
   `~/Library/Application Support/QuadChroma/` on the Mac.
 - **Remove secrets before sending:** the host's access password, comparison codes,
-  the contents of `host.key`, `client.key`, `host-password.txt`, `host-devices.txt` and
-  `hosts.txt`, and any addresses or host names you do not want the maintainer to
-  see.
+  the contents of `host.key` (and of a `client.key` left over from earlier versions),
+  `host-password.txt`, `host-devices.txt` and `hosts.txt`, and any addresses or host
+  names you do not want the maintainer to see.
 
 ## Scope
 
 In scope:
 
 - the QuadChroma app for Windows and for the Mac (`client/`, with the Mac's sharing
-  engine in `host/`), and the release binaries built from them;
+  engine in `host/`), and the release binaries built from them. The Windows app always
+  runs with administrator rights (`requireAdministrator`), which raises the impact of
+  any flaw in it; "Start with Windows" (the copy in `C:\Program Files\QuadChroma`, its
+  checks and the scheduled task that starts it elevated at logon) is in scope;
 - the protocol: discovery and announcement (port 9003), the Noise handshake and the
   access phase (password proof, "Allow", throttle), key and list storage (`host.key`,
-  `client.key`, `host-devices.txt`, `host-password.txt`, `hosts.txt`), the video and
-  audio channel (port 9001), the input channel with clipboard and file transfer
-  (port 9002);
+  the unused `client.key` of earlier versions, `host-devices.txt`,
+  `host-password.txt`, `hosts.txt`), the video and audio channel (port 9001), the input
+  channel with clipboard and file transfer (port 9002);
 - input injection, clipboard and file handling on all sides (path handling, size
   limits, what is read without a peer);
 - the build, signing and release scripts, the CI workflows and the integrity of the
@@ -110,7 +113,8 @@ Out of scope, or lower priority:
   password;
 - reports from automated scanners without a reproducible impact, best-practice
   suggestions without an attack, and social engineering;
-- the ad-hoc or development-signed builds that are not distributed.
+- local development builds that are not distributed (release files named
+  `-unsigned` or `-selfsigned` are in scope).
 
 ## Rules for testing
 

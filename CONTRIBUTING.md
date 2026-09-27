@@ -46,8 +46,8 @@ What the CLA does, in one paragraph: you keep your copyright; you give the autho
 non-exclusive license to use your contribution in every known way, including under
 other licenses (commercial and proprietary), so that QuadChroma can stay free for private
 users and be licensed to companies for a fee; you confirm that the code is yours and
-free of copyleft; you are credited in the Git history and in `CONTRIBUTORS.md`; there is
-no payment. Read the full text - it is written to be readable, and it explains why the
+free of copyleft; you are credited in the Git history and in `CONTRIBUTORS.md` (created
+with the first accepted contribution); there is no payment. Read the full text - it is written to be readable, and it explains why the
 agreement is given per contribution rather than once for all time.
 
 ## 3. Project rules that apply to every contribution
@@ -61,7 +61,9 @@ them are closed.
    contains the client and the host role. On both, client and host run in one process
    with one icon. No helper tools, daemons, services,
    launch agents, background helpers, separate installers, drivers or second processes -
-   everything runs inside the one program.
+   everything runs inside the one program. Starting that same program at login is not a
+   helper: the scheduled task behind "Start with Windows" (which starts the app's own
+   copy in Program Files) and the login item behind "Start at login" on the Mac.
 2. **The mouse pointer is drawn on the client side.** The host sends the pointer shape
    and position separately from the picture, and the client draws it. Do not encode the
    pointer into the video stream and do not move that work to the host.
@@ -140,6 +142,14 @@ runtime) apply, and an exported `RUSTFLAGS` aborts the build on purpose:
 The tests need loopback TCP; the clipboard tests use the session's real clipboard;
 nothing touches `%APPDATA%\QuadChroma`. Expected: all tests pass. A handful of compiler
 warnings are known; do not add new ones.
+
+The built `quadchroma.exe` requires administrator rights (manifest
+`requireAdministrator`): start it, and every switch below, from a terminal started as
+administrator - from a normal one Windows refuses the start or runs it in a new
+elevated process whose output does not reach your terminal. "Start with Windows"
+installs the app into `C:\Program Files\QuadChroma` and creates the scheduled task
+"QuadChroma"; switch it off again after trying it, and delete that folder, on a
+machine where you do not want a copy there.
 
 `quadchroma.exe` is the whole app, client and host role in one process. Two switches
 matter when you work on the host role: `--host [port]` starts the app in the

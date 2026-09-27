@@ -67,10 +67,11 @@ Windows pointer, and the Mac follows it invisibly, so the mouse feels local. To 
 it still look like the Mac's pointer, the host sends only the pointer *shape* (arrow,
 hand, resize arrows, text cursor, spinning wait cursor) whenever it changes.
 
-Status as of 27 September 2026: it runs, but it is still a scaffold, not a finished
-application. Releases: see the Releases page once published. The Mac app will ship
-as a DMG and as a ZIP; unpack the ZIP with the Finder or `ditto -x -k` (it contains no
-AppleDouble `._*` entries, so the command-line `unzip` works as well).
+Status as of 28 September 2026: it runs, but it is still a scaffold, not a finished
+application. Releases: https://github.com/quadchroma-tech/quadchroma/releases. The Mac
+app ships as a DMG and as a ZIP (a folder with the app and the license texts); unpack
+the ZIP with the Finder or `ditto -x -k` (it contains no AppleDouble `._*` entries, so
+the command-line `unzip` works as well).
 
 This README is the overview. `MANUAL.txt` is the complete manual: every switch, log
 line and protocol message. Code comments and the program's log lines are in German;
@@ -167,6 +168,12 @@ Developer ID with notarisation, a Windows code-signing certificate) for later.
   No Visual C++ runtime is needed: the C runtime is linked into the exe, and the DLLs
   use only the Universal C Runtime that is part of Windows 10 and 11. Direct3D, DXGI
   and `d3dcompiler_47.dll` are parts of Windows; none of them is shipped.
+- Windows: an administrator account. The app requires administrator rights, so that
+  remote mouse and keyboard also reach windows with higher rights (Task Manager,
+  installers), and Windows asks via UAC at every manual start - also on a PC that only
+  controls others. "Start with Windows" starts it elevated at logon without asking (see
+  "Sharing a Windows PC"). On a standard account every start needs an administrator's
+  password, and "Start with Windows" is not available.
 - Network: three ports on every computer that shares. 9001 carries video and audio
   (everything from host to client), 9002 input and clipboard including files
   (everything from client to host), 9003 the announcement. A sharing computer
@@ -177,17 +184,22 @@ Developer ID with notarisation, a Windows code-signing certificate) for later.
 ## First start of a downloaded release
 
 QuadChroma is not signed with a paid certificate (Apple Developer Program, Windows
-code-signing certificate), so Windows and macOS ask once before the first start.
+code-signing certificate), so Windows and macOS warn before the first start.
 Download only from the project's Releases page and compare the SHA-256 of the file
 with `SHA256SUMS.txt` (Windows: `Get-FileHash -Algorithm SHA256 <file>`; macOS:
 `shasum -a 256 <file>`).
 
 **Windows.** Before unpacking, right-click the ZIP > Properties > tick "Unblock" > OK;
-then Windows does not warn at all. Without that, SmartScreen shows "Windows protected
-your PC": choose "More info" > "Run anyway" once. Keep `avcodec-63.dll` and
-`avutil-61.dll` next to `quadchroma.exe`. On Windows 11 with Smart App Control
-switched on, unsigned programs can be blocked without a "Run anyway" option; then
-only building from source helps.
+that avoids the SmartScreen warning. Without it, SmartScreen shows "Windows protected
+your PC": choose "More info" > "Run anyway" once. Either way Windows asks for
+administrator rights (UAC) at every manual start, with "Unknown publisher" as long as
+the exe is not code-signed - confirm with "Yes" (see Requirements for the reason).
+Keep `avcodec-63.dll` and `avutil-61.dll` next to `quadchroma.exe`. Switching on "Start
+with Windows" installs the app into `C:\Program Files\QuadChroma` and starts it from
+there at every logon, elevated and without a prompt; the unpacked folder is then no
+longer needed for it. On Windows 11 with Smart App Control switched on, unsigned
+programs can be blocked without a "Run anyway" option; then only building from source
+helps.
 
 **macOS.** Open the DMG and drag `QuadChroma.app` to Applications. On the
 first start macOS refuses the app because Apple has not notarised it: open System
@@ -257,17 +269,18 @@ Logs: `host-protokoll.txt` (sharing) and `protokoll.txt` (connecting to others) 
 (`host.key`, `host-devices.txt` with the allowed devices, `host-password.txt` with
 the access password, `bildschirm.txt`).
 
-### Windows client
+### Windows
 
     quadchroma.exe
     quadchroma.exe 192.168.178.194:9001
 
-Without an address the very first start opens the start screen; the Mac appears in the
-list after a few seconds with its name and device ID, and a click connects. The address
-field also takes a device ID. Later starts go silently to the notification area, a
-start through "Start with Windows" always - a click on the icon, or starting
-`quadchroma.exe` again, opens the window. Closing the window does not quit (see
-"Closing, single instance, desktop shortcut").
+Every start asks for administrator rights (UAC, see Requirements); from a terminal,
+start it in one opened with "Run as administrator". Without an address the very first
+start opens the start screen; the Mac appears in the list after a few seconds with its
+name and device ID, and a click connects. The address field also takes a device ID.
+Later starts go silently to the notification area, a start through "Start with Windows"
+always - a click on the icon, or starting `quadchroma.exe` again, opens the window.
+Closing the window does not quit (see "Closing, single instance, desktop shortcut").
 
 The client's files live in `%APPDATA%\QuadChroma\`: `host.key` (the device key, which
 the client uses as well), `hosts.txt` (the hosts that let this PC in),
@@ -290,9 +303,28 @@ start; this is required so that the host role can control windows with higher ri
 injected mouse and keyboard events whenever such a window is in front. The one thing
 that stays out of reach is the UAC consent prompt itself, on Windows' secure desktop
 (that would need a system service). A viewer used only as a client still gets the UAC
-prompt at launch. "Start with Windows" is therefore a scheduled task that runs at logon
-with highest privileges (so it starts elevated without a prompt), not a Startup-folder
-shortcut, which Windows would not launch silently for an elevated exe.
+prompt at launch.
+
+"Start with Windows" (menu and start screen) is therefore a scheduled task "QuadChroma"
+that runs at logon with highest privileges, so the app starts elevated without a
+prompt - not a Startup-folder shortcut, which Windows would not launch silently for an
+elevated exe. Because that task runs a program as administrator without asking, it
+never points at the folder you unpacked (Downloads, Desktop, a network share), where
+any program with normal rights could swap the exe or a DLL: switching it on first
+installs the app - exe, the two DLLs and the text files - into `C:\Program
+Files\QuadChroma`, where only administrators can write, checks folder and files, and
+points the task at that copy; the start screen (or, without a window, a balloon at the
+icon) says "Installed to C:\Program Files\QuadChroma – QuadChroma starts from there with
+Windows." Switching it off deletes the task and leaves the installed copy; to remove
+it, delete the folder. When "Start with Windows" is on, every start of a different
+`quadchroma.exe` (a new version) refreshes the installed copy, and a task of an earlier
+version that still points elsewhere is moved to it; to update, quit QuadChroma in the
+icon's menu and start the new `quadchroma.exe` once. On a standard account (the app
+then runs with an administrator's credentials, not as the signed-in user) the check box
+and the menu item are disabled with "Only with an administrator account".
+`quadchroma.exe --autostart on|off` (also `an|aus`) does the same from a terminal
+started as administrator.
+
 `quadchroma.exe --host` starts the app in the background with sharing on
 (shortcuts of earlier versions keep working). The host role's files are `host.key`,
 `host-devices.txt`, `host-password.txt` and `host-protokoll.txt` in
@@ -357,18 +389,19 @@ this one: its name on the left, its device ID on the right ("ID -" for a host of
 earlier version), and a check mark for a computer that has let this one in before;
 hovering shows the address. Known computers come first, then the others by name; a
 computer heard under several addresses appears once, and the rows keep their order
-while others come and go. Four rows are visible, the mouse wheel or trackpad scrolls the rest. A
-click connects, and on Windows the "Desktop shortcut" button puts a shortcut to that
-host on the Desktop. The address field takes an IP address, a name or a device ID (nine
-digits, spaces allowed) and pastes with Ctrl+V (Cmd+V on the Mac). "Share this PC"
-("Share this Mac") switches sharing of this computer on and off, and below the buttons
-stand "This computer: <name> · <ID>" with "Rename", the check box "Prevent sleep
-while QuadChroma is running" and directly below it "Start with Windows" (on the Mac
-"Start at login"; disabled with its reason while the app is not in Applications) -
-the same state as the item in the icon's menu. The button on the right, "Close window",
-hides the window like its close button; quitting is in the icon's menu (without an icon
-the button reads "Quit" and quits). While the access dialog is open (see "Pairing"),
-Enter connects, Esc cancels, and no key reaches the host.
+while others come and go. Four rows are visible, the mouse wheel or trackpad scrolls
+the rest. A click connects, and on Windows the "Desktop shortcut" button puts a
+shortcut to that host on the Desktop. The address field takes an IP address, a name or
+a device ID (nine digits, spaces or hyphens allowed) and pastes with Ctrl+V (Cmd+V on
+the Mac). "Share this PC" ("Share this Mac") switches sharing of this computer on and
+off, and below the buttons stand "This computer: <name> · <ID>" with "Rename", the
+check box "Prevent sleep while QuadChroma is running" and directly below it "Start with
+Windows" (on the Mac "Start at login"; disabled with its reason while the app is not in
+Applications, on Windows on a standard account) - the same state as the item in the
+icon's menu. The button on the right, "Close window", hides the window like its close
+button; quitting is in the icon's menu (without an icon the button reads "Quit" and
+quits). While the access dialog is open (see "Pairing"), Enter connects, Esc cancels,
+and no key reaches the host.
 
 ### Keys
 
@@ -443,6 +476,12 @@ once; `--decodertest` tries every decoder choice without a connection, `--anzeig
 <dir>` checks the GPU display path against the CPU path (Direct3D 11 on Windows; Metal
 on the Mac, where it also measures the frame time at 1440p and 120 Hz), `--shot` writes
 a BMP of the interface. `MANUAL.txt` lists all switches.
+
+On Windows run these - and every other command-line switch - from a terminal started
+as administrator ("Run as administrator"): the exe requires administrator rights, so
+from a normal terminal Windows refuses the start ("The requested operation requires
+elevation") or opens it elevated in a new process whose output does not appear in
+that terminal.
 
 ## The host's screen
 
@@ -705,7 +744,10 @@ not a secret; it serves display and search. The access password lies in plain te
 `host-password.txt`, because the host has to show it, and whoever watches the host's
 screen - a connected viewer included - can read it in the menu. The clipboard is read
 during a session even when the client window has no focus (see "What is missing").
-Report vulnerabilities as described in `SECURITY.md`.
+On Windows the whole app runs with administrator rights (see Requirements), so a flaw
+in it weighs more there; "Start with Windows" therefore starts only the copy in
+`C:\Program Files\QuadChroma` that only administrators can change (see "Sharing a
+Windows PC"). Report vulnerabilities as described in `SECURITY.md`.
 
 ## What is missing
 
@@ -730,8 +772,10 @@ open on real devices:
   switch and "Start at login" with the project's own certificate; whether a Screen Recording permission
   granted while the host runs takes effect without a restart; the Windows host role's
   icon, windows and "Start with Windows" on an interactive desktop (the VM is driven
-  over ssh, without Explorer); and a Windows client against the Mac host through the
-  access phase.
+  over ssh, without Explorer; the install into Program Files and the scheduled task
+  were checked there through `--autostart`), including the lock on a real standard
+  account (only its decision logic is covered by unit tests); and a Windows client
+  against the Mac host through the access phase.
 - Screen selection on the device: for the Windows host role the switch itself (new
   Duplication, SWITCH, INFO, keyframe, list afterwards; with the same size the encoder
   on the CPU path stays) - it needs two real outputs and the VM has one; the pure parts
@@ -761,13 +805,24 @@ open on real devices:
   code's model 20 MB in 4.1 instead of 1.1 s).
 
 **Publication.** License, notices file, contribution rules and release workflows are
-ready (see "License and publication"). Missing are the certificates (an Apple
-Developer ID for signing and notarising the Mac app, which today uses a local
-certificate; a code signature for the exe) and the first release; the one-time steps
-are in `RELEASING.md`.
+ready (see "License and publication"). Missing are the certificates: an Apple
+Developer ID for signing and notarising the Mac app, which is signed with the
+project's own certificate "QuadChroma Release" and not notarised, and a code signature
+for the exe. The one-time steps are in `RELEASING.md`.
 
 **Known limitations.**
 
+- No access before sign-in: after a restart or a logout a computer is reachable only
+  once a user has signed in on it - QuadChroma starts at login ("Start with Windows",
+  "Start at login"), not as a system service. The login screen and the Windows UAC
+  consent prompt on the secure desktop cannot be controlled; while such a prompt is in
+  front, the viewer shows a short hint and has to wait for someone at the PC.
+- Windows: the app runs with administrator rights and asks via UAC at every manual
+  start; on a standard account every start needs an administrator's password and
+  "Start with Windows" is not available (see Requirements).
+- Not code-signed and not notarised: SmartScreen warns once on Windows, and Smart App
+  Control can block the exe entirely; macOS refuses the first start until "Open
+  Anyway" (see "First start of a downloaded release").
 - Connecting by a bare address trusts the answering side more than connecting by
   device ID, and the access password lies in plain text on the host (see
   "Security").
@@ -782,15 +837,8 @@ are in `RELEASING.md`.
   list of entries in parts instead of in one piece (up to 1 MiB, during which
   keystrokes or frames wait briefly).
 - A desktop shortcut on the Mac client.
-- Windows as host: the host role inside the app, "Share this PC", `--host` and
-  `--nur-host` exist (viewer slot, access with password or "Allow", icon in the
-  notification area, announcement, input, clipboard including files, Desktop
-  Duplication, encoder via NVENC or without NVIDIA H.264 in software, frame pacing,
-  codec switch, screen selection with switching, test pattern, audio, pointer shape,
-  load, keep-awake), plus `--list`, `--messen` and the
-  recorded stream (`--konserve`) as a test path. Missing are AMF/QSV, HDR outputs,
-  scaling and rotation on the GPU (both run on the CPU today). Described in
-  `MANUAL.txt`.
+- Windows host role: AMF/QSV encoders, HDR outputs, scaling and rotation on the GPU
+  (both run on the CPU today).
 - AV1: no host offers it until protocol and client support it.
 - Audio compression as an option; uncompressed audio can take more bandwidth than the
   picture.
@@ -1126,7 +1174,9 @@ A self-test without network checks the icon in the notification area or menu bar
 `quadchroma --menueleiste-selbsttest` on the Mac - the app's real icon and menu with
 the engine set up in a throw-away home folder, without the service and without
 screen capture; exit code 0 or 1. `quadchroma --ruhe-selbsttest` sets "Prevent sleep",
-finds it in `pmset -g assertions` and releases it.
+finds it in `pmset -g assertions` and releases it (Mac only; on Windows `powercfg
+/requests` in a terminal started as administrator shows the request). On Windows the
+self-tests, like every switch, need a terminal started as administrator.
 
 ## Repository layout
 
@@ -1143,20 +1193,25 @@ finds it in `pmset -g assertions` and releases it.
                    (bildschirm.rs), both shared with the host role; device ID,
                    access proofs, throttle and the lists (zugang.rs, shared with
                    the host role) and the client's access dialog
-                   (zugangsphase.rs); notification area (tray.rs, tray_win.rs),
-                   the Mac app around the host engine (host_mac.rs),
-                   single instance (einzel.rs), desktop shortcut and "Start with
-                   Windows" (verknuepfung.rs), program icon (logo.rs); version
-                   information, icon and manifest of the exe (build.rs, res/); the
-                   Windows host role in client/src/host/ (capture with screen
-                   selection, encoder, network, access phase (einlass.rs), menu
-                   and windows (oberflaeche.rs, fenster.rs), input, audio, pointer
-                   shape)
+                   (zugangsphase.rs); notification area (tray.rs, tray_win.rs)
+                   and the model of the icon's menu (symbolmenue.rs), the Mac app
+                   around the host engine (host_mac.rs), the sharing switch
+                   (freigabe.rs), "Prevent sleep" (ruhezustand.rs), announcement
+                   and search (discovery.rs), settings (einstellungen.rs), the
+                   texts in 29 languages (strings*.rs), single instance
+                   (einzel.rs), desktop shortcut and "Start with Windows" as a
+                   scheduled task (verknuepfung.rs) with the install into
+                   Program Files and its checks (installation.rs), program icon
+                   (logo.rs); version information, icon and manifest of the exe
+                   (build.rs, res/); the Windows host role in client/src/host/
+                   (capture with screen selection, encoder, network, access phase
+                   (einlass.rs), menu and windows (oberflaeche.rs, fenster.rs),
+                   input, audio, pointer shape)
     Makefile       builds and signs the Mac app bundle; sign, notarize, staple, zip
-                   and dmg for distribution
+                   and dmg for distribution, check-packages to check them
     scripts/       build-ffmpeg-windows.sh (FFmpeg for Windows), sign-windows.ps1
                    (code signature of the exe), package-texts.sh (the text files of
-                   the release packages)
+                   the release packages), release-notes.sh (the release notes)
     .github/       CI and release (workflows/), templates for issues and pull
                    requests, Dependabot
     README.md      this overview
@@ -1205,8 +1260,12 @@ hello@quadchroma.tech.
   `SHA256SUMS.txt` and the FFmpeg source).
 
 Every release package contains `LICENSE.txt`, `THIRD_PARTY_NOTICES.txt`, `README.txt`
-(this README without its images) and `MANUAL.txt`; the Windows ZIP also contains
-`FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two DLLs).
+(this README without its images) and `MANUAL.txt` next to the program; the Windows ZIP
+also contains `FFMPEG-BUILDINFO.txt` (sizes, SHA-256 and configuration of the two
+DLLs). The Mac app carries the same four texts inside as well
+(`QuadChroma.app/Contents/Resources`), so they travel with every copy of it, and "Start
+with Windows" copies them, with `FFMPEG-BUILDINFO.txt`, into `C:\Program
+Files\QuadChroma` together with the exe and the DLLs.
 
 FFmpeg: the Windows client uses libraries from the FFmpeg project under the LGPLv2.1,
 loaded as separate DLLs next to the exe (`avcodec-63.dll`, `avutil-61.dll`). They are

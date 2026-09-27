@@ -15,11 +15,24 @@ name until changed with "Change device name ..."), the same in both
 directions; "Prevent sleep while QuadChroma is running" keeps it
 reachable. The Mac app needs no FFmpeg; the Windows download carries the
 two FFmpeg DLLs. Most examples below show a Windows PC connecting to a
-Mac, the main use; every other pairing works the same way.
+Mac, the main use; every other pairing works the same way. Texts of the
+program are quoted in their English wording; this manual is plain ASCII
+and writes "-" where the program shows an en dash or a middle dot.
 
 Starting (Windows):
 
     quadchroma.exe
+
+The app requires administrator rights (see "Windows: one app for both
+directions"): Windows asks via UAC at every start by hand (confirm with
+"Yes"), also on a PC that only controls others. Only "Start with
+Windows" starts it at logon without asking. On a standard account every
+start needs an administrator's user name and password, and "Start with
+Windows" is not available. All command-line switches in this manual
+need, on Windows, a terminal started as administrator ("Run as
+administrator"): from a normal terminal Windows refuses the start ("The
+requested operation requires elevation") or opens the app elevated in a
+new process whose output does not reach that terminal.
 
 Without an address the start screen opens. The Mac announces itself on
 the network, so it appears in the list after a few seconds; a click is
@@ -51,11 +64,22 @@ connects to a host, the host wants its access password or a click on
 
 First start of a downloaded release: QuadChroma is not signed with a
 paid certificate. Simplest is to do this before unpacking: right-click
-the ZIP, Properties, tick "Unblock", OK - then Windows does not warn.
-Otherwise SmartScreen reports "Windows protected your PC": "More info",
-then "Run anyway". avcodec-63.dll and avutil-61.dll stay next to
-quadchroma.exe. The checksums of the files are in SHA256SUMS.txt on the
-release page.
+the ZIP, Properties, tick "Unblock", OK - that avoids the SmartScreen
+warning. Otherwise SmartScreen reports "Windows protected your PC":
+"More info", then "Run anyway". Either way the UAC prompt comes at every
+start by hand, with "Unknown publisher" while the exe is not code-signed.
+avcodec-63.dll and avutil-61.dll stay next to quadchroma.exe. The
+checksums of the files are in SHA256SUMS.txt on the release page.
+"Start with Windows" installs the app into C:\Program Files\QuadChroma
+and starts it from there at every logon (see "Windows: one app for both
+directions").
+
+No access before sign-in: after a restart or a logout a computer is
+reachable only once a user has signed in on it, because QuadChroma
+starts at login ("Start with Windows", "Start at login" on the Mac), not
+as a system service before it. The login screen and the UAC consent
+prompt on Windows' secure desktop cannot be controlled from another
+computer; someone at the PC has to answer them.
 
 Closing does not quit QuadChroma; it hides the app in the notification
 area (on the Mac, in the menu bar). Only one app with a window runs at
@@ -732,7 +756,7 @@ The icon: four squares like the program icon, the lower right one only
 outlined, with a dot in it while a viewer is connected. A click on it
 opens the menu:
 
-    QuadChroma – <device name>
+    QuadChroma - <device name>
     Ready for connections      or "Connected: <name>", "Port 9001 is
                                used by another program", "Sharing is off"
     Open QuadChroma            the window (start screen)
@@ -812,7 +836,7 @@ fields of these windows (the app's menu carries them invisibly).
 Device name: the same setting as on Windows (einstellungen.txt:
 geraetename=, default the computer name from System Settings > General >
 About). "Change device name ..." in the menu and "Rename" next to the
-start screen line "This computer: <name> · <device ID>" open a small
+start screen line "This computer: <name> - <device ID>" open a small
 window "Device name" with the same rules and texts as on Windows (1 to
 40 bytes of UTF-8, no control or direction characters; empty means the
 computer name). A new name applies at once: in the menu's first line,
@@ -902,7 +926,8 @@ For experts the switches stay: --serve [port], --fps N, --mbit N,
 --fest, --display N, --out <B>x<H> are passed to the host engine (never
 taken for an address), for example
 
-    open -n /Applications/QuadChroma.app --args --serve 9001 --fps 120 --mbit 50
+    open -n /Applications/QuadChroma.app \
+            --args --serve 9001 --fps 120 --mbit 50
 
 (only when the app is not running yet - otherwise the second start just
 opens the window). The tools --list, --capture <seconds> <file> and
@@ -1052,7 +1077,10 @@ in like any client: with the access password or a click on "Allow".
 License note: the Mac client contains no FFmpeg - only Apple frameworks
 and the Rust crates listed in THIRD_PARTY_NOTICES.txt. It is distributed
 inside QuadChroma.app (the DMG and ZIP of a release), not as a program
-of its own.
+of its own. LICENSE.txt, THIRD_PARTY_NOTICES.txt, README.txt and
+MANUAL.txt lie next to the app in the DMG and in the ZIP's folder, and
+inside the app in QuadChroma.app/Contents/Resources, so they travel with
+every copy of it.
 
 Keys:
 
@@ -1076,7 +1104,10 @@ in the user's session - Task Manager, the registry editor, installer
 windows - which Windows otherwise shields from injected input (see "Keys
 arrive over the connection ..." under "Windows as host"). The exe carries
 requireAdministrator in its manifest; the real UAC consent prompt on the
-secure desktop stays out of reach either way.
+secure desktop stays out of reach either way. On a standard account the
+UAC prompt asks for an administrator's user name and password at every
+start; the app then runs as that administrator, not as the signed-in
+user, and "Start with Windows" is not available (see below).
 
 On Windows the client and the host role run in one process with one icon
 in the notification area. The host role is part of the app from the
@@ -1113,17 +1144,89 @@ laeuft schon - der Start im Hintergrund endet.").
 "Start with Windows" is the item in the icon's menu and the check box
 of the same name on the start screen, directly below "Prevent sleep
 while QuadChroma is running"; both show whether the scheduled task
-"QuadChroma" exists, and a click in either creates or deletes it. The
-task runs at the current user's logon with highest privileges (elevated,
-so it starts without a UAC prompt at logon; run level HIGHEST, logon
-type InteractiveToken - it runs in the user's interactive session after
-login, not as a service before it), its action being this exe with
---hintergrund. A Startup-folder shortcut is no longer used: an exe with
-requireAdministrator would not launch silently from there. A shortcut of
-earlier versions in the Startup folder ("QuadChroma.lnk" with
---hintergrund, or the older "QuadChroma - Freigabe.lnk" with --host)
-counts as on and, if it starts this exe, is replaced by the scheduled
-task when the app starts.
+"QuadChroma" exists, and a click in either switches it. The task runs at
+the current user's logon with highest privileges (elevated, so it starts
+without a UAC prompt at logon; run level HIGHEST, logon type
+InteractiveToken - it runs in the user's interactive session after
+login, not as a service before it), its action being the installed exe
+with --hintergrund. A Startup-folder shortcut is no longer used: an exe
+with requireAdministrator would not launch silently from there.
+
+Installed copy: a task that starts a program as administrator without
+asking must not point at a folder that programs with normal rights can
+change (Downloads, the Desktop, a network share) - they could swap the
+exe or a DLL there and be started elevated at the next logon. Switching
+"Start with Windows" on therefore first installs the running app into
+%ProgramFiles%\QuadChroma (normally C:\Program Files\QuadChroma, found
+through the system's known folder, not an environment variable):
+quadchroma.exe, avcodec-63.dll and avutil-61.dll (from next to the exe,
+otherwise the loaded ones) and the text files next to the exe (LICENSE,
+THIRD_PARTY_NOTICES, README, MANUAL, FFMPEG-BUILDINFO). Each file is
+read while others can only read it, written under a temporary name,
+read back and compared by SHA-256, and checked for its rights; only then
+are all renamed into place, the exe last, and a failure rolls everything
+back. A running older copy there is renamed aside and deleted, or at the
+next restart if it is still in use. Folder, parent folder and every file
+must be owned by Administrators, SYSTEM or TrustedInstaller and must not
+let any other account write, delete or change permissions; a network or
+removable drive, a UNC path or a junction is refused. The task is
+created only for an exe that passes these checks. If the app already
+runs from that folder, only the task is created. The start screen says
+"Installed to C:\Program Files\QuadChroma - QuadChroma starts from there
+with Windows." for 6 s (without a visible window a balloon at the icon
+says it); if it fails, a line in amber says that "Start with Windows"
+could not be changed and that the details are in protokoll.txt.
+Switching it off deletes the task and leaves the installed copy (delete
+the folder to remove it).
+
+At every start (of the first instance) the app checks the task: one of
+an earlier version that still starts another exe (the unpacked folder)
+is moved to the installed copy after installing; if the task starts the
+installed copy but the running exe or its DLLs differ from it (SHA-256),
+the installed copy is refreshed. So an update is: quit QuadChroma in the
+icon's menu, start the new quadchroma.exe once. A shortcut of earlier
+versions in the Startup folder ("QuadChroma.lnk" with --hintergrund, or
+the older "QuadChroma - Freigabe.lnk" with --host) counts as on and, if
+it starts this exe, is replaced the same way (install, task, then the
+shortcut is deleted); a shortcut to another copy stays as it is, so a
+test or portable copy never takes over the autostart.
+
+Standard accounts: when the app runs under another account than the one
+signed in to the session (a standard user entered an administrator's
+credentials at UAC), or under an account that is no administrator, the
+check box and the menu item are disabled with "Only with an
+administrator account", and nothing is changed or checked at the start
+(a task at logon with highest privileges could not start the exe for a
+standard user, and it would run for the administrator's logon, not for
+this user's). Without an interactive session (over ssh) only the check
+for an administrator account applies.
+
+Log lines (protokoll.txt):
+
+    "Mit Windows starten: an - nach <folder> installiert (SHA-256: ...);
+     die geplante Aufgabe (hoechste Rechte, bei der Anmeldung) startet
+     <folder>\quadchroma.exe --hintergrund"   (installed, task created;
+                                       with "; die alte Fassung lief
+                                       noch - ... beim naechsten
+                                       Neustart" if an old copy was in use)
+    "Mit Windows starten: an - die App laeuft schon aus <folder>, nur die
+     geplante Aufgabe angelegt ..."   (runs from there already)
+    "Mit Windows starten: aus - die geplante Aufgabe ist geloescht; die
+     installierte Kopie in <folder> bleibt liegen"
+    "... - die installierte Kopie war eine andere Fassung als diese exe
+     und ist erneuert", "... - die Aufgabe startete bisher <command>",
+     "... - die alte Verknuepfung im Autostart-Ordner ist dadurch
+     ersetzt"                          (at the start, see above)
+    "Mit Windows starten: gesperrt - <reason>"   (standard account)
+    "Mit Windows starten nicht umgestellt: <error>"
+
+The same without a window, from a terminal started as administrator:
+
+    quadchroma.exe --autostart on|off      (also an|aus)
+
+prints the line the log would get (it writes no protokoll.txt) and ends
+with exit code 0 (done), 1 (failed), 2 (wrong call, or not Windows) or 3
+(locked: no administrator account).
 
 --host [port] is "start in the background with sharing on": it switches
 sharing on and remembers it, so shortcuts of earlier versions keep
@@ -1143,7 +1246,7 @@ host list (announcement), in the Allow window and the device list of a
 host it connects to (message 3), and in their access dialog when they
 connect to this PC (message 20). By default it is the computer name of
 Windows. "Change device name ..." in the icon's menu and "Rename" next to
-the start screen line "This computer: <name> · <device ID>" open a small
+the start screen line "This computer: <name> - <device ID>" open a small
 window "Device name": the field shows the current name; leading and
 trailing spaces are removed; 1 to 40 bytes of UTF-8 without control
 characters are allowed ("The name is too long (at most 40 bytes)." or
@@ -1213,33 +1316,37 @@ On Windows the menu is built anew each time it opens:
                                 Remove, and "Remove all devices ..."
     Change device name ...
     Share this PC               check mark when sharing is on
-    Start with Windows          check mark when it is on
+    Start with Windows          check mark when it is on; on a standard
+                                account disabled, with the disabled line
+                                "Only with an administrator account" below
     Prevent sleep while QuadChroma is running   check mark when it is on
     Quit
 
-The Mac menu contains "Open", up to four computers as "Connect: <name>" and
-"Quit". The "Connect" entries on both systems are the first four of the start
-screen's list: each computer once, known ones first, then by name, this
-computer left out. "Connect" works like a click on the host row: a session to
-the same host stays, a session to another host is disconnected first. The
-tooltip reads "QuadChroma", during a session "QuadChroma - <name or address>"
-(the program uses an en dash instead of "-"), on Windows with sharing on and
-without a session "QuadChroma - sharing this PC (ID 581 729 911)". Names
-appear in the menu and in the tooltip with at most 40 characters; longer ones
-end in "...". The first time the app is hidden, the hint "QuadChroma is still
-running in the notification area." (Windows, balloon) or "QuadChroma is still
-running in the menu bar." (Mac, bubble below the icon, 6 s) appears once. This
-is recorded in einstellungen.txt as tray_hinweis=1, but only once the hint was
-actually visible; with tray_hinweis=0 it appears once more.
+The Mac menu is listed under "Mac: one app for both directions"; like the
+Windows menu it carries up to four "Connect: <name>" entries. The "Connect"
+entries on both systems are the first four of the start screen's list: each
+computer once, known ones first, then by name, this computer left out.
+"Connect" works like a click on the host row: a session to the same host
+stays, a session to another host is disconnected first. The tooltip reads
+"QuadChroma", during a session "QuadChroma - <name or address>" (the program
+uses an en dash instead of "-"), on Windows with sharing on and without a
+session "QuadChroma - sharing this PC (ID 581 729 911)". Names appear in the
+menu and in the tooltip with at most 40 characters; longer ones end in "...".
+The first time the app is hidden, the hint "QuadChroma is still running in the
+notification area." (Windows, balloon) or "QuadChroma is still running in the
+menu bar." (Mac, bubble below the icon, 6 s) appears once. This is recorded in
+einstellungen.txt as tray_hinweis=1, but only once the hint was actually
+visible; with tray_hinweis=0 it appears once more.
 
 Quitting: only "Quit" in the icon's menu ("Quit QuadChroma" on the Mac).
 The start screen's button "Close window", ESC there and on the Mac Cmd+Q
 and Cmd+W hide the app like the X; the button is called "Quit" and quits
 only when there is no icon (tray=aus, or the icon does not stand, see
-below). A WM_CLOSE to the window only hides the app, like the X. On Windows a WM_CLOSE to the
-hidden window of the icon (class QuadChromaSymbol) quits it with the
-goodbye to a viewer (see "Windows: one app for both directions"); a
-hard end (taskkill /F, Stop-Process -Id) sends no goodbye. taskkill
+below). A WM_CLOSE to the window only hides the app, like the X. On
+Windows a WM_CLOSE to the hidden window of the icon (class
+QuadChromaSymbol) quits it with the goodbye to a viewer (see "Windows:
+one app for both directions"); a hard end (taskkill /F, Stop-Process
+-Id) sends no goodbye. taskkill
 without /F sends WM_CLOSE to the visible windows of the process: the
 window is hidden, and the invisible window of the single instance (see
 below) closes as a result. If the app then keeps running in the
@@ -1298,7 +1405,9 @@ exit code 0 means passed, 1 failed (on Windows for example in a session
 without Explorer, such as over ssh). The Mac test additionally checks
 the image, the menu including its commands and the bubble, shows the
 icon only briefly and reports the duration at the end. The switch of the
-other platform exits with 2.
+other platform exits with 2. On Windows run it from a terminal started as
+administrator, like every switch (see "Starting (Windows)").
+
 Only one app (single instance)
 ------------------------------
 
@@ -1327,9 +1436,10 @@ at once with 0 and leaves the window as it is.
 This does not apply to anything that runs without a window: test mode
 (--headless), the host-only process (--nur-host has a single instance
 of its own, see "Windows as host"; --list, --messen), --verknuepfung,
---shot and the self-tests (--tray-selbsttest, --menueleiste-selbsttest,
---anzeige-selbsttest, --decodertest, --anzeigetest, --noisetest). None of
-them starts the host role of the app.
+--autostart, --shot and the self-tests (--tray-selbsttest,
+--menueleiste-selbsttest, --ruhe-selbsttest, --anzeige-selbsttest,
+--decodertest, --anzeigetest, --noisetest). None of them starts the host
+role of the app.
 
 Limits: an address longer than 508 bytes or containing control characters
 is not handed on by the second start; it only brings the app to the front
@@ -1375,10 +1485,10 @@ characters. Without a name the address is used, with "_" instead of ":"
 ("QuadChroma - 192.168.178.194_9001.lnk"). An existing file of the same
 name is overwritten - it is the same host. The shortcut calls
 
-    <Ordner der exe>\quadchroma.exe --verbinden "192.168.178.194:9001"
-                                    --id 581729911
+    <folder of the exe>\quadchroma.exe --verbinden "192.168.178.194:9001"
+                                       --id 581729911
 
-(<Ordner der exe> is the folder of the exe, which is also the working
+(<folder of the exe> is the folder of the exe, which is also the working
 folder; everything on one line) - the same route as an address given at
 startup. The device ID comes from the host's announcement (start screen)
 or from its key (menu); for a host that announces no ID the shortcut
@@ -1664,7 +1774,7 @@ checks the card without a connection: compiles the shaders, runs every
 decoder format once through the card and compares the result with the
 processor path (zero tolerance at 1:1), writes difference images to the
 directory. Also runs without a card, on Windows' software rasterizer
-(WARP). On the Mac the display is Metal, see "Mac as client".
+(WARP). On the Mac the display is Metal, see "Mac client".
 
 Mouse pointer: the pointer shown is always the Windows pointer - that is
 what makes the mouse feel local. It takes the shape of the Mac pointer,
@@ -2511,8 +2621,12 @@ After every run the table is written to %APPDATA%\QuadChroma\benchmark.txt,
 also after a cancellation. Without a window:
 
     quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5
-    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5 --ohne-testbild
-    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 3 --benchmark-auswahl 0,3:25,50:120
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 5
+                   --ohne-testbild
+    quadchroma.exe 192.168.178.194:9001 --headless --benchmark 3
+                   --benchmark-auswahl 0,3:25,50:120
+
+(each one command line, wrapped here).
 
 The number after --benchmark is the measuring time per step;
 --benchmark-auswahl narrows the run down to candidates:Mbit:frame rates (empty
@@ -2650,29 +2764,25 @@ same way.
 
 "Copied" and "Password saved." appear as a balloon at the icon. "Change
 password ..." opens a small window "Change password" with two password fields,
-"OK" and "Cancel", and the same checks and answers as on the Mac (see "Mac
-host: the menu bar"); "Remove all devices ..." asks in a Yes/No box whose
-default is No. The Allow window is a small window of its own; it stays on top,
-beeps and flashes in the taskbar, but does not take the focus (see "Encryption
-and access"). "Start with Windows" (in the one app's menu) creates the
-scheduled task "QuadChroma" - the exe with --hintergrund, at the current
-user's logon, run level HIGHEST - via schtasks.exe, or deletes it; the check
-mark shows whether the task exists ("Mit Windows starten: an (geplante
-Aufgabe, hoechste Rechte, bei der Anmeldung)" or "... aus"). It replaces the
-Startup-folder shortcut of earlier versions, because an exe with
-requireAdministrator would not launch silently from the Startup folder. A
-shortcut of an earlier version in the Startup folder ("QuadChroma.lnk" with
---hintergrund, or "QuadChroma - Freigabe.lnk" with --host) counts as on and is
-replaced by the task when the app starts, but only if it starts this very exe
-("Mit Windows starten: die alte Verknuepfung ist durch die geplante Aufgabe
-ersetzt"); a shortcut to another copy stays ("... startet <Pfad>, nicht diese
-exe - sie bleibt, wie sie ist"), so a test or portable copy never takes over
-the autostart. Switching off deletes the task.
-"Stop sharing" of the host-only process says goodbye to the viewer (message
-13, reason 1: "<Name> stopped sharing.") and ends it ("Freigabe beendet
-(Infobereich)"). At logoff or shutdown, when an installer closes it (Restart
-Manager) or another program sends WM_CLOSE to its hidden window, it ends the
-same way with reason 0 ("Host-Rolle wird beendet (Abmelden)", "...
+"OK" and "Cancel", and the same checks and answers as on the Mac (see "Mac:
+one app for both directions"); "Remove all devices ..." asks in a Yes/No box
+whose default is No. The Allow window is a small window of its own; it stays
+on top, beeps and flashes in the taskbar, but does not take the focus (see
+"Encryption and access"). "Start with Windows" (in the one app's menu)
+installs the app into %ProgramFiles%\QuadChroma and creates the scheduled task
+"QuadChroma" for that copy - the exe with --hintergrund, at the current user's
+logon, run level HIGHEST, via schtasks.exe - or deletes the task; the check
+mark shows whether the task exists. Install, checks, update, standard accounts
+and log lines: see "Windows: one app for both directions". A shortcut of an
+earlier version in the Startup folder is replaced when the app starts, but
+only if it starts this very exe; a shortcut to another copy stays ("Mit
+Windows starten: die alte Verknuepfung startet <Pfad>, nicht diese exe - sie
+bleibt, wie sie ist"), so a test or portable copy never takes over the
+autostart. "Stop sharing" of the host-only process says goodbye to the viewer
+(message 13, reason 1: "<Name> stopped sharing.") and ends it ("Freigabe
+beendet (Infobereich)"). At logoff or shutdown, when an installer closes it
+(Restart Manager) or another program sends WM_CLOSE to its hidden window, it
+ends the same way with reason 0 ("Host-Rolle wird beendet (Abmelden)", "...
 (Herunterfahren)", "... (ein Installationsprogramm schliesst die App (Restart
 Manager))" or "... (WM_CLOSE von aussen)", then "Host-Rolle beendet"); both
 wait at most 3 s for the viewer to take the goodbye. taskkill without /F does
@@ -2711,6 +2821,9 @@ remains: threads without an origin of their own count as the app's client -
 the worker threads FFmpeg itself creates for the decoder that reads a
 --konserve file write to the client's queue.
 
+The switches below, like every switch of quadchroma.exe, need a terminal
+started as administrator (see "Starting (Windows)" at the beginning).
+
     quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
                    [--konserve datei.hevc]
                    [--encoderweg bgra|yuv444|d3d11|auto]
@@ -2742,7 +2855,9 @@ the worker threads FFmpeg itself creates for the decoder that reads a
                     test path without a card. The capability list then shows
                     exactly one entry, and a codec switch is refused. The
                     client writes such a file itself:
-                        quadchroma.exe 192.168.178.194:9001 --headless --mitschnitt C:\qc\qc.hevc
+                        quadchroma.exe 192.168.178.194:9001 --headless
+                                       --mitschnitt C:\qc\qc.hevc
+                    (one command line, wrapped here).
     --encoderweg    how the picture gets into the encoder: bgra (BGRA directly
                     into NVENC, which converts on the card), yuv444 (own
                     conversion on the CPU), d3d11 (textures without a copy,
@@ -2896,12 +3011,13 @@ window that stays out of reach is the real UAC consent prompt on the secure
 desktop; that would need a SYSTEM service. While such a window is in front,
 SendInput is refused: the host notes it once in the log ("Eingaben: SendInput
 nimmt gerade nichts an ...") and sends the viewer a short status (message 9
-with 2), so the Mac shows "A window on the Windows PC needs Windows' own
-confirmation - control is not possible there for a moment." (at most once every
-few seconds); when input flows again the status is taken back (message 9 with
-3). At the start the host logs the right level once ("Rechte: erhoeht", or
-"Rechte: normal - SendInput erreicht keine Fenster mit hoeheren Rechten" for a
-portable build without the manifest); it never relaunches itself.
+with 2), so the viewer shows "A window on the Windows PC needs Windows' own
+confirmation - control is not possible there for a moment." (at most once
+every few seconds); when input flows again the status is taken back (message
+9 with 3). At the start the host logs the right level once ("Rechte:
+erhoeht", or "Rechte: normal - SendInput erreicht keine Fenster mit hoeheren
+Rechten" for a portable build without the manifest); it never relaunches
+itself.
 
 The client's test mode shows every host that announces itself on the network
 once, as a line "Host gefunden: <Name> (<Adresse>, ID <ID>, Zulassen
@@ -2921,4 +3037,4 @@ Requirement: Windows 10 or 11, 64-bit. No Visual C++ runtime is needed: the C
 runtime is inside the exe, and the FFmpeg files use only the Universal C
 Runtime, which is part of Windows 10 and 11.
 
-As of: 27 September 2026
+As of: 28 September 2026
