@@ -14772,7 +14772,7 @@ mod tests {
         }
         assert_eq!(
             host_ende_meldung(HOST_ENDE_BEENDET, "Studio", "10.0.0.5:9001").text(strings::pick("de")),
-            "Studio wurde beendet."
+            "QuadChroma wurde auf Studio beendet."
         );
         assert_eq!(
             host_ende_meldung(HOST_ENDE_ENTFERNT, "Studio", "10.0.0.5:9001").text(strings::pick("de")),

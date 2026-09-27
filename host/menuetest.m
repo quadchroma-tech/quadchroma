@@ -159,12 +159,12 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostPasswordShort] = "Bitte mindestens 8 Zeichen.",
     [QCTextHostPasswordSaved] = "Passwort gespeichert.",
     [QCTextHostPasswordUnreadable] = "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“.",
-    [QCTextHostDevices] = "Erlaubte Geräte",
+    [QCTextHostDevices] = "Zugelassene Geräte",
     [QCTextHostNoDevices] = "Noch keine Geräte",
     [QCTextHostDeviceLine] = "{n} – ID {i} – seit {d}",
     [QCTextHostRemove] = "Entfernen",
     [QCTextHostRemoveAll] = "Alle Geräte entfernen …",
-    [QCTextHostRemoveAllAsk] = "Alle erlaubten Geräte entfernen? Sie brauchen dann wieder das Passwort.",
+    [QCTextHostRemoveAllAsk] = "Alle zugelassenen Geräte entfernen? Sie brauchen dann wieder das Passwort.",
     [QCTextHostListDamaged] = "Geräteliste beschädigt",
     [QCTextHostListReset] = "Geräteliste zurücksetzen",
     [QCTextHostRequest] = "{n} (ID {i}) möchte diesen Computer steuern.",
@@ -172,7 +172,7 @@ static const char *const SOLL_DE[QCTextAnzahl] = {
     [QCTextHostDeny] = "Ablehnen",
     [QCTextHostStartLogin] = "Beim Anmelden starten",
     [QCTextHostStartWindows] = "Mit Windows starten",
-    [QCTextHostMoveToApps] = "QuadChroma zuerst in den Ordner Programme bewegen",
+    [QCTextHostMoveToApps] = "QuadChroma zuerst in den Ordner „Programme“ verschieben",
     [QCTextHostScreenMissing] = "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen …",
     [QCTextHostAccessMissing] = "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen …",
     [QCTextHostPortBusy] = "Port {p} ist von einem anderen Programm belegt",
@@ -462,7 +462,7 @@ static void modell_pruefen(void) {
         @"Passwort ändern …",
         @"Neues Zufallspasswort",
         @"---",
-        @"Erlaubte Geräte",
+        @"Zugelassene Geräte",
         @"  Windows-PC – ID 000 000 005 – seit 26.09.2026",
         @"    Entfernen",
         @"  Büro-Laptop – ID 123 456 789 – seit 02.01.2026",
@@ -471,7 +471,7 @@ static void modell_pruefen(void) {
         @"  Alle Geräte entfernen …",
         @"---",
         @"(Beim Anmelden starten)",
-        @"(QuadChroma zuerst in den Ordner Programme bewegen)",
+        @"(QuadChroma zuerst in den Ordner „Programme“ verschieben)",
         @"---",
         @"QuadChroma beenden",
     ]), "de, bereit, zwei Geraete, alle Freigaben, App nicht in /Applications");
@@ -594,7 +594,7 @@ static void app_modell_pruefen(void) {
         @"Passwort ändern …",
         @"Neues Zufallspasswort",
         @"---",
-        @"Erlaubte Geräte",
+        @"Zugelassene Geräte",
         @"  Windows-PC – ID 000 000 005 – seit 26.09.2026",
         @"    Entfernen",
         @"  Büro-Laptop – ID 123 456 789 – seit 02.01.2026",
@@ -867,7 +867,7 @@ static void menue_pruefen(void) {
     pruefe(menue.itemArray[2].isSeparatorItem, "Trennlinie");
     NSMenuItem *geraete = nil, *anm = nil, *ende = nil;
     for (NSMenuItem *it in menue.itemArray) {
-        if ([it.title isEqualToString:@"Erlaubte Geräte"]) geraete = it;
+        if ([it.title isEqualToString:@"Zugelassene Geräte"]) geraete = it;
         if (it.tag == QCAktionAnmelden) anm = it;
         if (it.tag == QCAktionBeenden) ende = it;
     }

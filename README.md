@@ -674,8 +674,9 @@ from the old one: a test pattern ends, and it gets a first frame at once, even o
 still screen.
 
 The host says goodbye before it closes a session on purpose (message 13): the client
-goes back to the start screen and shows "<name> was closed.", "<name> stopped
-sharing." or "<name> removed this device." - again without reconnecting by itself.
+goes back to the start screen and shows "QuadChroma was closed on <name>.", "<name>
+stopped sharing." or "<name> removed this device." - again without reconnecting by
+itself.
 If a connection just drops, the client retries for about 30 s and then shows
 "Connection lost" on the start screen.
 

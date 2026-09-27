@@ -800,7 +800,7 @@ pub static EN: Lang = Lang {
         (HostPasswordInvalid, "The password contains characters that are not allowed."),
         (HostPasswordTitle, "Change password"),
         (MsgHostUnverified, "{n} did not prove its identity. The connection was stopped for safety."),
-        (MsgHostQuit, "{n} was closed."),
+        (MsgHostQuit, "QuadChroma was closed on {n}."),
         (MsgHostSharingOff, "{n} stopped sharing."),
         (MsgHostRemovedYou, "{n} removed this device."),
         (MsgSelf, "This is this computer."),
@@ -826,8 +826,8 @@ pub static EN: Lang = Lang {
         (ShareFailedSwitch, "Sharing could not start: {s} is not usable. Turn sharing off and on to retry."),
         (PreventSleepRefused, "Not active: refused by the system ({c})"),
         (CloseWindow, "Close window"),
-        (InputBlocked, "A window on the Windows PC needs Windows' own confirmation - control is not possible there for a moment."),
-        (AutostartInstalled, "Installed to {n} - QuadChroma starts from there with Windows."),
+        (InputBlocked, "A window on the Windows PC needs Windows' own confirmation – control is not possible there for a moment."),
+        (AutostartInstalled, "Installed to {n} – QuadChroma starts from there with Windows."),
         (AutostartFailed, "\"Start with Windows\" could not be changed. Details are in protokoll.txt."),
         (AutostartNeedsAdmin, "Only with an administrator account"),
     ],
@@ -1047,12 +1047,12 @@ pub static DE: Lang = Lang {
         (HostPasswordShort, "Bitte mindestens 8 Zeichen."),
         (HostPasswordSaved, "Passwort gespeichert."),
         (HostPasswordUnreadable, "Passwortdatei unlesbar – neue Geräte nur über „Zulassen“."),
-        (HostDevices, "Erlaubte Geräte"),
+        (HostDevices, "Zugelassene Geräte"),
         (HostNoDevices, "Noch keine Geräte"),
         (HostDeviceLine, "{n} – ID {i} – seit {d}"),
         (HostRemove, "Entfernen"),
         (HostRemoveAll, "Alle Geräte entfernen …"),
-        (HostRemoveAllAsk, "Alle erlaubten Geräte entfernen? Sie brauchen dann wieder das Passwort."),
+        (HostRemoveAllAsk, "Alle zugelassenen Geräte entfernen? Sie brauchen dann wieder das Passwort."),
         (HostListDamaged, "Geräteliste beschädigt"),
         (HostListReset, "Geräteliste zurücksetzen"),
         (HostRequest, "{n} (ID {i}) möchte diesen Computer steuern."),
@@ -1060,7 +1060,7 @@ pub static DE: Lang = Lang {
         (HostDeny, "Ablehnen"),
         (HostStartLogin, "Beim Anmelden starten"),
         (HostStartWindows, "Mit Windows starten"),
-        (HostMoveToApps, "QuadChroma zuerst in den Ordner Programme bewegen"),
+        (HostMoveToApps, "QuadChroma zuerst in den Ordner „Programme“ verschieben"),
         (HostScreenMissing, "Bildschirmaufnahme nicht erlaubt – Systemeinstellungen öffnen …"),
         (HostAccessMissing, "Bedienungshilfen nicht erlaubt – Systemeinstellungen öffnen …"),
         (HostPortBusy, "Port {p} ist von einem anderen Programm belegt"),
@@ -1075,7 +1075,7 @@ pub static DE: Lang = Lang {
         (HostPasswordInvalid, "Das Passwort enthält unzulässige Zeichen."),
         (HostPasswordTitle, "Passwort ändern"),
         (MsgHostUnverified, "{n} hat seine Identität nicht nachgewiesen. Die Verbindung wurde sicherheitshalber beendet."),
-        (MsgHostQuit, "{n} wurde beendet."),
+        (MsgHostQuit, "QuadChroma wurde auf {n} beendet."),
         (MsgHostSharingOff, "{n} hat die Freigabe beendet."),
         (MsgHostRemovedYou, "{n} hat dieses Gerät entfernt."),
         (MsgSelf, "Das ist dieser Computer."),
@@ -1101,8 +1101,8 @@ pub static DE: Lang = Lang {
         (ShareFailedSwitch, "Die Freigabe konnte nicht starten: {s} ist nicht nutzbar. Zum neuen Versuch aus- und wieder einschalten."),
         (PreventSleepRefused, "Nicht aktiv: vom System abgelehnt ({c})"),
         (CloseWindow, "Fenster schließen"),
-        (InputBlocked, "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung - dort ist die Steuerung kurz nicht möglich."),
-        (AutostartInstalled, "Nach {n} installiert - QuadChroma startet von dort mit Windows."),
+        (InputBlocked, "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung – dort ist die Steuerung kurz nicht möglich."),
+        (AutostartInstalled, "Nach {n} installiert – QuadChroma startet von dort mit Windows."),
         (AutostartFailed, "„Mit Windows starten“ ließ sich nicht umstellen. Einzelheiten stehen in protokoll.txt."),
         (AutostartNeedsAdmin, "Nur mit einem Administratorkonto"),
     ],
@@ -1607,10 +1607,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(EN.get(MsgHostQuit), "{n} was closed.");
+        assert_eq!(EN.get(MsgHostQuit), "QuadChroma was closed on {n}.");
         assert_eq!(EN.get(MsgHostSharingOff), "{n} stopped sharing.");
         assert_eq!(EN.get(MsgHostRemovedYou), "{n} removed this device.");
-        assert_eq!(DE.get(MsgHostQuit), "{n} wurde beendet.");
+        assert_eq!(DE.get(MsgHostQuit), "QuadChroma wurde auf {n} beendet.");
         assert_eq!(DE.get(MsgHostSharingOff), "{n} hat die Freigabe beendet.");
         assert_eq!(DE.get(MsgHostRemovedYou), "{n} hat dieses Gerät entfernt.");
         for k in alle {
@@ -1817,14 +1817,16 @@ mod tests {
     }
 
     /// Hinweis "Eingaben blockiert" (nur Windows-Host): am Ende des Enums, in
-    /// jeder Sprache ein Satz ohne Platzhalter, der "Windows" nennt, und ausser
-    /// im Englischen nicht englisch.
+    /// jeder Sprache ein Satz ohne Platzhalter, der "Windows" nennt, mit
+    /// Gedankenstrich statt " - " wie alle anderen Texte, und ausser im
+    /// Englischen nicht englisch.
     #[test]
     fn eingabe_blockiert_text() {
         assert_eq!(InputBlocked as usize, CloseWindow as usize + 1);
         for l in all() {
             let t = l.get(InputBlocked);
             assert!(!t.contains('{'), "{}: {t}", l.code);
+            assert!(!t.contains(" - "), "{}: Bindestrich statt Gedankenstrich: {t}", l.code);
             assert!(t.contains("Windows"), "{}: ohne Windows: {t}", l.code);
             if l.code != "en" {
                 assert_ne!(t, EN.get(InputBlocked), "{}: noch englisch", l.code);
@@ -1832,11 +1834,11 @@ mod tests {
         }
         assert_eq!(
             EN.get(InputBlocked),
-            "A window on the Windows PC needs Windows' own confirmation - control is not possible there for a moment."
+            "A window on the Windows PC needs Windows' own confirmation – control is not possible there for a moment."
         );
         assert_eq!(
             DE.get(InputBlocked),
-            "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung - dort ist die Steuerung kurz nicht möglich."
+            "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung – dort ist die Steuerung kurz nicht möglich."
         );
     }
 
@@ -1856,6 +1858,7 @@ mod tests {
             assert_eq!(i.matches("{n}").count(), 1, "{}: {i}", l.code);
             assert_eq!(i.matches('{').count(), 1, "{}: {i}", l.code);
             assert!(i.contains("Windows") && i.contains("QuadChroma"), "{}: {i}", l.code);
+            assert!(!i.contains(" - "), "{}: Bindestrich statt Gedankenstrich: {i}", l.code);
             let f = l.get(AutostartFailed);
             assert!(f.contains("protokoll.txt") && f.contains("Windows") && !f.contains('{'), "{}: {f}", l.code);
             let g = l.get(AutostartNeedsAdmin);
@@ -1866,7 +1869,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(EN.get(AutostartInstalled).replace("{n}", "C:\\Program Files\\QuadChroma"), "Installed to C:\\Program Files\\QuadChroma - QuadChroma starts from there with Windows.");
+        assert_eq!(EN.get(AutostartInstalled).replace("{n}", "C:\\Program Files\\QuadChroma"), "Installed to C:\\Program Files\\QuadChroma – QuadChroma starts from there with Windows.");
         assert_eq!(DE.get(AutostartNeedsAdmin), "Nur mit einem Administratorkonto");
     }
 

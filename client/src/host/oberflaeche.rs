@@ -221,7 +221,7 @@ mod tests {
             let vorgabe = GetMenuDefaultItem(h, 0, GET_MENU_DEFAULT_ITEM_FLAGS(0));
             assert_eq!(vorgabe, symbolmenue::LINKSKLICK);
             assert_eq!(symbolmenue::aktion_zu(vorgabe, &z), Some(symbolmenue::Aktion::Oeffnen));
-            let geraete = GetSubMenu(h, stelle("Erlaubte Geräte") as i32);
+            let geraete = GetSubMenu(h, stelle("Zugelassene Geräte") as i32);
             assert!(!geraete.is_invalid());
             assert_eq!(GetMenuItemCount(Some(geraete)), 3);
             assert_eq!(GetMenuItemCount(Some(GetSubMenu(geraete, 0))), 1);

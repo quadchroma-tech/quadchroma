@@ -314,14 +314,17 @@ channel, and the client ends the session at once, goes back to the start
 screen and shows the reason there until the next connection - without
 reconnecting by itself (like message 10):
 
-    0  "<Name> was closed."        the host app was quit (Mac: "Quit
+    0  "QuadChroma was closed on <Name>."
+                                   the host app was quit (Mac: "Quit
                                    QuadChroma", Cmd+Q, logging out,
-                                   SIGTERM/SIGINT; Windows host role:
-                                   logging off, shutting down, an
-                                   installer closing it, WM_CLOSE from
-                                   another program)
-    1  "<Name> stopped sharing."   "Stop sharing" in the Windows host
-                                   role's menu
+                                   SIGTERM/SIGINT; Windows: "Quit" in the
+                                   icon's menu, logging off, shutting
+                                   down, an installer closing it,
+                                   WM_CLOSE from another program)
+    1  "<Name> stopped sharing."   "Share this PC" / "Share this Mac"
+                                   switched off (icon menu or start
+                                   screen), or "Stop sharing" of the
+                                   host-only process (--nur-host)
     2  "<Name> removed this device."  this device was removed from the
                                    host's list of allowed devices during
                                    the session ("Remove", "Remove all
@@ -880,8 +883,9 @@ the app's own playback (the client's sound of another computer).
 
 Quitting - "Quit QuadChroma" in the menu bar icon's menu - ends client
 and host together: a viewer is told goodbye first (message 13, reason 0:
-"<Name> was closed.", waiting at most 3 s). The same happens at logout,
-with SIGTERM or SIGINT ("Oberflaeche: Signal SIGTERM - beende"). In the
+"QuadChroma was closed on <Name>.", waiting at most 3 s). The same
+happens at logout, with SIGTERM or SIGINT ("Oberflaeche: Signal
+SIGTERM - beende"). In the
 window nothing quits while the icon stands: "Close window" on the start
 screen, Cmd+Q, Cmd+W, ESC and the red button hide the window (see
 "Closing the window"). Without an icon (tray=aus, or macOS does not show
@@ -1127,7 +1131,8 @@ working. --nur-host [port] is the host role alone, without window and
 client (for a VM and for tests, see "Windows as host").
 
 Quitting ("Quit" in the icon's menu) ends both roles; a connected
-viewer is told goodbye first (reason 0: "<Name> was closed.").
+viewer is told goodbye first (reason 0: "QuadChroma was closed on
+<Name>.").
 The same happens at logoff or shutdown, when an installer closes the app
 (Restart Manager) and when another program sends WM_CLOSE to the hidden
 window of the icon (class QuadChromaSymbol): "Infobereich: QuadChroma

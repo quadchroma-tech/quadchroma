@@ -420,7 +420,7 @@ mod tests {
                 "Passwort ändern …",
                 "Neues Zufallspasswort",
                 "-",
-                "Erlaubte Geräte",
+                "Zugelassene Geräte",
                 "-",
                 "Gerätename ändern …",
                 "Diesen PC freigeben",
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(Startfehler::aus_code(1), Startfehler::Sonst);
         s.freigabe = Freigabe::Fehler(Startfehler::Sonst);
         let (m, z) = menue(de, &s);
-        assert!(!texte(&m).iter().any(|t| t.starts_with("Geräte-ID") || t.starts_with("Passwort") || t == "Erlaubte Geräte"), "{:?}", texte(&m));
+        assert!(!texte(&m).iter().any(|t| t.starts_with("Geräte-ID") || t.starts_with("Passwort") || t == "Zugelassene Geräte"), "{:?}", texte(&m));
         assert!(haken(&m[stelle(&m, "Diesen PC freigeben")]));
         assert_eq!(z, Zuordnung::default());
     }
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(aktion_zu(nummer(&m[d + 1]), &z), Some(Aktion::ListeZuruecksetzen));
         s.geraete = Ok(Vec::new());
         let (m, z) = menue(de, &s);
-        let Eintrag::Unter { eintraege, .. } = &m[stelle(&m, "Erlaubte Geräte")] else { panic!() };
+        let Eintrag::Unter { eintraege, .. } = &m[stelle(&m, "Zugelassene Geräte")] else { panic!() };
         assert_eq!(texte(eintraege), ["Noch keine Geräte"]);
         assert!(matches!(&eintraege[0], Eintrag::Punkt { aktiv: false, .. }));
         assert!(z.geraete.is_empty());
@@ -646,7 +646,7 @@ mod tests {
                 "Passwort ändern …",
                 "Neues Zufallspasswort",
                 "-",
-                "Erlaubte Geräte",
+                "Zugelassene Geräte",
                 "-",
                 "Freigabe beenden",
             ]
@@ -696,7 +696,7 @@ mod tests {
         let mut s = stand(Art::App);
         s.geraete = Ok(vec![geraet(1, "Falle {i} {d} {n}")]);
         let (m, _) = menue(de, &s);
-        let Eintrag::Unter { eintraege, .. } = &m[stelle(&m, "Erlaubte Geräte")] else { panic!() };
+        let Eintrag::Unter { eintraege, .. } = &m[stelle(&m, "Zugelassene Geräte")] else { panic!() };
         let id = zugang::id_text(zugang::geraete_id(&[1u8; 32]));
         assert_eq!(texte(eintraege)[0], format!("Falle {{i}} {{d}} {{n}} – ID {id} – seit 2026-09-26"));
         assert_eq!(einsetzen("{a}{b}{a}x", &[("{a}", "{b}"), ("{b}", "1")]), "{b}1{b}x");
