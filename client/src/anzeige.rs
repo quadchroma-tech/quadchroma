@@ -34,6 +34,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use crate::anzeigeprobe::{fall_pruefen, oberflaeche_probe, probewert};
 use crate::{ebenen_format, protokoll, ui, EbenenFormat, Frame, Karte, Rolle};
 
 /// Ein Adapter, wie er im Protokoll und in der Statistik steht.
@@ -1224,25 +1225,7 @@ fn probebild(p: ffmpeg::format::Pixel, w: u32, h: u32) -> Option<ffmpeg::frame::
     let fmt = ebenen_format(p)?;
     let max = hoechstwert(p, fmt);
     let mut f = ffmpeg::frame::Video::new(p, w, h);
-    let wert = |x: usize, y: usize, bw: usize, bh: usize, ebene: usize| -> u32 {
-        let ecke = 8.min(bw / 4).min(bh / 4);
-        let (links, rechts) = (x < ecke, x + ecke >= bw);
-        let (oben, unten) = (y < ecke, y + ecke >= bh);
-        if (links || rechts) && (oben || unten) {
-            let n = links as usize + 2 * oben as usize + ebene;
-            return if n % 2 == 0 { 0 } else { max };
-        }
-        if y >= bh / 3 && y < bh / 3 + 16.min(bh / 4) {
-            let k = 5 + 2 * ebene;
-            return if ((x / k) + (y / 3)) % 2 == 0 { 0 } else { max };
-        }
-        let (bw1, bh1) = ((bw - 1).max(1) as u64, (bh - 1).max(1) as u64);
-        (match ebene {
-            0 => x as u64 * max as u64 / bw1,
-            1 => y as u64 * max as u64 / bh1,
-            _ => (x * 3 + y * 5) as u64 * max as u64 / (3 * bw1 + 5 * bh1),
-        }) as u32
-    };
+    let wert = |x: usize, y: usize, bw: usize, bh: usize, ebene: usize| -> u32 { probewert(x, y, bw, bh, ebene, max) };
     let (w, h) = (w as usize, h as usize);
     let bpp = fmt.bpp() as usize;
     let cw = if fmt.sub { (w + 1) / 2 } else { w };
@@ -1286,73 +1269,6 @@ fn probebild(p: ffmpeg::format::Pixel, w: u32, h: u32) -> Option<ffmpeg::frame::
     Some(f)
 }
 
-/// Die Oberflaeche des Tests: alles, was die echte zeichnet - Schleier wie
-/// im Menue (auf der oberen Haelfte, damit die andere ohne Oberflaeche
-/// bleibt und der Kasten nicht das ganze Ziel ist), Tafel, Schrift in drei
-/// Groessen, Neonlinie, Knopf, Schalter, Verlauf, Eingabefeld, halbdurchsichtige
-/// Flaeche.
-fn oberflaeche_probe(c: &mut ui::Canvas, u: &mut ui::Ui, zeile: &str) {
-    let (w, h) = (c.w as i32, c.h as i32);
-    c.fill(0, 0, w, h / 2, ui::BG, 205);
-    c.panel(40, 60, 300, 130, ui::CYAN);
-    u.text.draw(c, 56, 92, "QuadChroma Anzeigetest", 15, ui::TEXT, 2);
-    // Format und Groesse im Text: so traegt der Kasten-Upload je Durchlauf
-    // wirklich neuen Inhalt in eine Textur, die es schon gibt.
-    u.text.draw(c, 56, 116, zeile, 13, ui::DIM, 1);
-    u.text.draw_centered(c, 190, 170, "628 306", 30, ui::AMBER, 6);
-    c.glow_hline(40, 210, 300, ui::MAGENTA);
-    c.glow_vline(360, 60, 150, ui::CYAN);
-    let _ = u.button(c, ui::Rect { x: 400, y: 80, w: 140, h: 36 }, "Verbinden", ui::CYAN);
-    let _ = u.toggle(c, ui::Rect { x: 400, y: 140, w: 200, h: 28 }, "Ton", true);
-    let verlauf: Vec<f32> = (0..120).map(|i| 110.0 + 15.0 * ((i as f32) / 9.0).sin()).collect();
-    u.spark_range(c, ui::Rect { x: 400, y: 200, w: 200, h: 50 }, &verlauf, 90.0, 130.0, ui::CYAN);
-    c.rect(60, 300, 200, 60, ui::AMBER, 90);
-    u.field(c, ui::Rect { x: 400, y: 300, w: 240, h: 34 }, "192.168.178.194", "Adresse", true);
-}
-
-/// Ein Vergleich: groesste und mittlere Abweichung ueber alle Kanaele, eine
-/// Zeile, und bei jeder Abweichung ein Differenzbild (Abweichung x 64, damit
-/// eine Stufe sichtbar wird); bei Ueberschreitung dazu beide Bilder.
-#[allow(clippy::too_many_arguments)]
-fn fall_pruefen(
-    name: &str, w: u32, h: u32, fall: &str,
-    cpu: &[u32], karte: &[u32], bw: u32, bh: u32, toleranz: u32,
-    verzeichnis: &str, lang: &'static crate::strings::Lang,
-) -> bool {
-    let n = (bw as usize) * (bh as usize);
-    if cpu.len() < n || karte.len() < n {
-        println!("{name:<15} {w:>4}x{h:<4} {fall:<11} FEHLER: Puffer zu klein ({} / {} statt {n})", cpu.len(), karte.len());
-        return false;
-    }
-    let mut max = 0u32;
-    let mut summe = 0u64;
-    let mut diff = vec![0u32; n];
-    for i in 0..n {
-        let (a, b) = (cpu[i], karte[i]);
-        let d = [16, 8, 0].iter().map(|s| ((a >> s) & 255).abs_diff((b >> s) & 255)).max().unwrap_or(0);
-        max = max.max(d);
-        summe += d as u64;
-        let g = (d * 64).min(255);
-        diff[i] = (g << 16) | (g << 8) | g;
-    }
-    let mittel = summe as f64 / n as f64;
-    let ok = max <= toleranz;
-    println!(
-        "{name:<15} {w:>4}x{h:<4} {fall:<11} max {max:>3}  mittel {mittel:.4}  {}",
-        if ok { "ok".to_string() } else { format!("FEHLER (Toleranz {toleranz})") }
-    );
-    if max > 0 {
-        let basis = std::path::Path::new(verzeichnis).join(format!("{}-{w}x{h}-{fall}", name.to_lowercase()));
-        let basis = basis.to_string_lossy();
-        crate::write_bmp(&format!("{basis}-diff.bmp"), bw as usize, bh as usize, &diff, lang);
-        if !ok {
-            crate::write_bmp(&format!("{basis}-cpu.bmp"), bw as usize, bh as usize, cpu, lang);
-            crate::write_bmp(&format!("{basis}-gpu.bmp"), bw as usize, bh as usize, karte, lang);
-        }
-    }
-    ok
-}
-
 /// Ein Format in einer Groesse: (a) `to_rgb` als Referenz, (b) rohes Bild
 /// ueber Stufe 1 gegen die Referenz (Toleranz 0), dazu der RGB-Upload
 /// (Toleranz 0), (c) skaliert in 700x400 gegen `blit` (Toleranz 2: der
@@ -1378,7 +1294,7 @@ fn format_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, verze
 
     match gpu.bild_roh(&bild).and_then(|_| gpu.zwischen_auslesen()) {
         Ok((aus, zw, zh)) if (zw, zh) == (w, h) => {
-            ok &= fall_pruefen(&name, w, h, "1:1", &referenz.pixels, &aus, w, h, 0, verzeichnis, lang);
+            ok &= fall_pruefen(&name, w, h, "1:1", &referenz.pixels, &aus, w, h, 0, Some(verzeichnis), lang);
         }
         Ok((_, zw, zh)) => {
             println!("{name:<15} {w:>4}x{h:<4} 1:1: Zwischentextur ist {zw}x{zh}");
@@ -1390,7 +1306,7 @@ fn format_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, verze
         }
     }
     match gpu.bild_rgb(&referenz).and_then(|_| gpu.zwischen_auslesen()) {
-        Ok((aus, _, _)) => ok &= fall_pruefen(&name, w, h, "RGB-Upload", &referenz.pixels, &aus, w, h, 0, verzeichnis, lang),
+        Ok((aus, _, _)) => ok &= fall_pruefen(&name, w, h, "RGB-Upload", &referenz.pixels, &aus, w, h, 0, Some(verzeichnis), lang),
         Err(e) => {
             println!("{name:<15} {w:>4}x{h:<4} RGB-Upload: {e}");
             ok = false;
@@ -1403,7 +1319,7 @@ fn format_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, verze
     crate::blit(&mut cpu, bw, bh, &referenz, false);
     let rect = crate::ziel_rechteck(bw, bh, w, h, false);
     match gpu.offscreen(bw, bh, Some(rect), false) {
-        Ok(aus) => ok &= fall_pruefen(&name, w, h, "skaliert", &cpu, &aus, bw, bh, 2, verzeichnis, lang),
+        Ok(aus) => ok &= fall_pruefen(&name, w, h, "skaliert", &cpu, &aus, bw, bh, 2, Some(verzeichnis), lang),
         Err(e) => {
             println!("{name:<15} {w:>4}x{h:<4} skaliert: {e}");
             ok = false;
@@ -1413,7 +1329,7 @@ fn format_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, verze
     crate::blit(&mut genau, bw, bh, &referenz, true);
     let rect_genau = crate::ziel_rechteck(bw, bh, w, h, true);
     match gpu.offscreen(bw, bh, Some(rect_genau), false) {
-        Ok(aus) => ok &= fall_pruefen(&name, w, h, "pixelgenau", &genau, &aus, bw, bh, 0, verzeichnis, lang),
+        Ok(aus) => ok &= fall_pruefen(&name, w, h, "pixelgenau", &genau, &aus, bw, bh, 0, Some(verzeichnis), lang),
         Err(e) => {
             println!("{name:<15} {w:>4}x{h:<4} pixelgenau: {e}");
             ok = false;
@@ -1435,7 +1351,7 @@ fn format_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, verze
         c.kasten_nehmen().unwrap_or(ui::Rect { x: 0, y: 0, w: 0, h: 0 })
     };
     match gpu.oberflaeche_hochladen(&leer, bw, bh, kasten).and_then(|_| gpu.offscreen(bw, bh, Some(rect), true)) {
-        Ok(aus) => ok &= fall_pruefen(&name, w, h, "Oberflaeche", &cpu_ui, &aus, bw, bh, 2, verzeichnis, lang),
+        Ok(aus) => ok &= fall_pruefen(&name, w, h, "Oberflaeche", &cpu_ui, &aus, bw, bh, 2, Some(verzeichnis), lang),
         Err(e) => {
             println!("{name:<15} {w:>4}x{h:<4} Oberflaeche: {e}");
             ok = false;

@@ -100,6 +100,9 @@ use audio_mac as audio;
 use clipboard_mac as clipboard;
 #[cfg(windows)]
 mod anzeige;
+/// Gemeinsame Teile der Goldbildtests beider Anzeigen (--anzeigetest).
+#[cfg(any(windows, target_os = "macos"))]
+mod anzeigeprobe;
 /// Windows als Host: die Host-Rolle in derselben Programmdatei - in der
 /// einen App als eigener Faden (freigabe.rs), allein ohne Fenster mit
 /// --nur-host, --list, --messen.
