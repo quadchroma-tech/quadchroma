@@ -751,15 +751,34 @@ Mac as client (under construction)
 ----------------------------------
 
 The same client also builds on the Mac (arm64): audio via AudioToolbox,
-clipboard via NSPasteboard (text and files), display on the CPU for now
-(no Metal, no graphics cards in the Display tab). Closing hides it in the
-menu bar, with the client's icon (four filled squares - the host's has
-an outlined fourth one); there is no desktop shortcut on the Mac and no
-"Share this PC". Build it with Rust and the FFmpeg from Homebrew:
+clipboard via NSPasteboard (text and files), decoding with VideoToolbox,
+display on the CPU for now (no Metal, no graphics cards in the Display
+tab). Closing hides it in the menu bar, with the client's icon (four
+filled squares - the host's has an outlined fourth one); there is no
+desktop shortcut on the Mac and no "Share this PC". It needs no FFmpeg;
+build it with Rust alone:
 
     cd client
-    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
+    cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
+
+Decoding on the Mac: VideoToolbox in the media engine of Apple silicon
+decodes HEVC 4:4:4 and 4:2:0 in 8 and 10 bits and H.264 (measured on the
+M1: about 3.8 ms per 1080p frame for HEVC 4:4:4 at 10 bits). The decoder
+row of the Display tab has two buttons there: Automatic (the media
+engine) and Processor (VideoToolbox without hardware). If the media
+engine cannot decode the stream, the client falls back to the processor
+as on Windows and names the reason in the statistics. The statistics
+call the decoder "VideoToolbox" or "VideoToolbox (Software)"; the log
+names the format VideoToolbox delivers, for 4:4:4 at 10 bits:
+
+    "VideoToolbox: 1920x1080 HEVC 4:4:4 10 Bit, Hardware ja, Ausgabe xf44
+     (voller Wertebereich)"
+
+(i.e. hardware yes, output format xf44, full range). --decodertest on
+the Mac encodes a short HEVC 4:4:4 sample with the hardware encoder and
+decodes it with and without hardware (neither host nor screen capture is
+started).
 
 Storage: ~/Library/Application Support/QuadChroma/ (client.key,
 hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt, plus
@@ -770,9 +789,9 @@ owner only (0700), new keys and lists with 0600; existing files and
 folders keep their permissions. A host lets it
 in like any client: with the access password or a click on "Allow".
 
-License note: the FFmpeg from Homebrew is a GPL build (libx264, libx265).
-That is fine for personal use; distributing the Mac client requires an
-LGPL build without GPL parts.
+License note: the Mac client contains no FFmpeg - only Apple frameworks
+and the Rust crates listed in THIRD_PARTY_NOTICES.txt. It is not yet
+distributed as a program of its own.
 
 Keys:
 

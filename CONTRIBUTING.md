@@ -158,14 +158,17 @@ screen capture and without touching a running host; their `clang` lines are in
 terminal, and uses real HEVC encoders for about 100 seconds: run it only on a machine
 where you have granted that permission, never during a stream, never in CI.
 
-**Mac client.** FFmpeg from Homebrew (a GPL build - fine for building and testing on
-your own machine, not for distribution):
+**Mac client.** Rust alone - the Mac client decodes with VideoToolbox and needs no
+FFmpeg:
 
     cd client
-    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
-    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo test --release -- --skip clipboard
+    cargo build --release
+    cargo test --release -- --skip clipboard
 
 `--skip clipboard` keeps one test from reading and writing your real clipboard. The
+VideoToolbox tests (`vt_decoder`) need the hardware encoder and skip themselves
+without it (they say "uebersprungen"), for example inside a sandbox that blocks the
+services of VideoToolbox. The
 client build also compiles the Mac host engine from `host/` (see `client/build.rs`),
 so a change there is checked by both `make` and `cargo build`.
 

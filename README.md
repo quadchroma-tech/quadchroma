@@ -536,6 +536,7 @@ Measured on a Mac mini M1 as host:
 | Encoder | hardware, about 8 ms per frame, a few percent of one core |
 | Codecs | HEVC 4:4:4 and 4:2:0 in 8 and 10 bit, H.264, all in hardware, switchable while running |
 | Decoding on Windows | NVDEC in hardware; D3D11VA on AMD and Intel (4:2:0 and H.264); software 8.6 ms per frame, slice-parallel so that no frame is held back (see "Decoding on Windows") |
+| Decoding on the Mac | VideoToolbox in hardware, HEVC 4:4:4 at 10 bits included: 3.8 ms per 1080p frame on the M1 (see "Mac client") |
 | Display on Windows | Direct3D 11: raw decoder planes go to the GPU, conversion and scaling in shaders, bit-identical to the CPU path |
 | Latency | 15 to 20 ms from capture to hand-over to the display, measured with per-frame timestamps |
 | Audio | uncompressed, stereo, 48 kHz, about 3 Mbit/s; can be switched off |
@@ -783,11 +784,22 @@ vendored Monocypher; no FFmpeg. Its test harnesses run without screen capture, s
 The same client also builds on the Mac (arm64), with audio via AudioToolbox and the
 clipboard via NSPasteboard (text and files); the display still runs on the CPU
 (softbuffer), Metal comes later. Closing puts it into the menu bar; there is no
-desktop shortcut on the Mac. Build it with Rust and the FFmpeg from Homebrew:
+desktop shortcut on the Mac. It needs no FFmpeg; build it with Rust alone:
 
     cd client
-    FFMPEG_DIR=/opt/homebrew/opt/ffmpeg cargo build --release
+    cargo build --release
     ./target/release/quadchroma 192.168.178.194:9001
+
+On the Mac the client decodes with VideoToolbox directly (`client/src/vt_decoder.rs`):
+the Annex B stream of the host becomes a format description from VPS, SPS and PPS
+plus length-prefixed samples for a `VTDecompressionSession` in the media engine,
+which outputs IOSurface-backed pixel buffers in the stream's own layout (`xf44` for
+HEVC 4:4:4 at 10 bits, `444f`, `xf20`, `420f`) that the client's YUV-to-RGB path reads
+as they are. HEVC 4:4:4 and 4:2:0 in 8 and 10 bits and H.264 run in hardware; on the
+M1, HEVC 4:4:4 at 10 bits takes about 3.8 ms per 1080p frame. Automatic uses the media
+engine, Processor uses VideoToolbox without hardware, and a media engine that cannot
+decode the stream falls back to the processor as on Windows. `--decodertest` encodes
+a short HEVC 4:4:4 sample with the hardware encoder and decodes it both ways.
 
 On the Mac, `client/build.rs` also compiles the Mac host engine into the client: the
 `SRC` list of the Makefile without `host/start.m` (that file holds the host app's
@@ -804,9 +816,9 @@ Its files live in `~/Library/Application Support/QuadChroma` (`client.key`,
 `host.key`, `host-devices.txt` and `host-password.txt`, as separate files. A host lets
 it in like every client: with its access password or a click on "Allow".
 
-License note: the FFmpeg from Homebrew is a GPL build (libx264, libx265). That is
-fine for your own use, but passing on a Mac client built this way would require an
-LGPL build without the GPL parts. This is why no Mac client binary is distributed.
+License note: the Mac client contains no FFmpeg, only Apple frameworks and the Rust
+crates listed in `THIRD_PARTY_NOTICES.txt`. It is not yet distributed as a program of
+its own.
 
 ## Test harnesses
 
@@ -964,7 +976,13 @@ with Explorer a real notification-area icon appears briefly (without a balloon).
 the Mac run `cargo test --release -- --skip clipboard`, otherwise
 `setzen_zaehlen_lesen` reads and writes the real clipboard; the other clipboard tests
 of the Mac client work on their own pasteboards and run individually by name
-(`-- --exact clipboard_mac::tests::<name>`). The tests never touch the data folder:
+(`-- --exact clipboard_mac::tests::<name>`). The VideoToolbox tests of the Mac client
+(`vt_decoder`) encode a small HEVC 4:4:4 10-bit sample with the hardware encoder and
+check the decoded planes and the RGB conversion against the known pattern, with and
+without hardware; the splitting of Annex B, the parameter sets and the choice of the
+output format are checked on Windows too. Where VideoToolbox cannot be reached (a
+virtual machine without a hardware encoder, a sandbox that blocks its services), the
+tests that need it say "uebersprungen" and pass. The tests never touch the data folder:
 keys, settings, `protokoll.txt` and `quadchroma.ico` live per run in
 `qc-test-<pid>-<ms>/QuadChroma` in the temp folder, so `APPDATA` need not be
 redirected. Received files go to `qc-test-<pid>-ablage` or
@@ -1083,8 +1101,9 @@ any external library; the exe contains no FFmpeg code, and the DLLs can be repla
 another build of the same FFmpeg version. (Before, the project used a prebuilt build
 that contained GPL code through chromaprint and therefore could not be passed on.)
 The FFmpeg source is attached to every release that contains the Windows package and
-available at https://ffmpeg.org. The start screen names FFmpeg in its footer, as the
-LGPL requires once a program shows copyright notices. The exe carries version
+available at https://ffmpeg.org. The start screen of the Windows program names FFmpeg
+in its footer, as the LGPL requires once a program shows copyright notices; the Mac
+client contains no FFmpeg and does not. The exe carries version
 information, icon and manifest (`client/build.rs`, `client/res/`), the Mac host the
 bundle identifier `tech.quadchroma.host`. The Mac host contains Monocypher
 (BSD-2-Clause OR CC0-1.0). The licenses of these components and of the Rust crates per

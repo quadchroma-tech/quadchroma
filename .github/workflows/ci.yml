@@ -6,8 +6,8 @@
 #   build.rs finds rc.exe in the runner's Windows SDK (llvm-rc as the fallback).
 # macOS (macos-26): host (Objective-C, ad-hoc signed, never started),
 #   test harnesses without screen capture, ZIP/DMG packaging through the Makefile,
-#   Rust client against Homebrew FFmpeg (GPL build: only for building and testing,
-#   never distributed).
+#   Rust client (decodes with VideoToolbox, needs no FFmpeg; its VideoToolbox tests
+#   skip themselves if the runner has no hardware encoder).
 #
 # Needs no secrets and therefore also runs for pull requests from forks.
 # Actions are pinned by commit SHA (tag as a comment; Dependabot maintains both).
@@ -217,12 +217,6 @@ jobs:
           build/ablagetest
           build/menuetest
           build/einbettungstest
-
-      - name: FFmpeg (Homebrew, GPL build - only for building and testing the Mac client)
-        run: |
-          set -euo pipefail
-          brew install ffmpeg
-          echo "FFMPEG_DIR=$(brew --prefix ffmpeg)" >> "$GITHUB_ENV"
 
       - name: Rust (stable)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1

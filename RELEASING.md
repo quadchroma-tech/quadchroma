@@ -21,9 +21,10 @@ change; check before buying.
 | What users see afterwards | SmartScreen still warns until the certificate has built reputation, but shows the verified publisher name (section 6) | One "downloaded from the internet" confirmation on first launch, no warning; then the usual Screen Recording and Accessibility prompts |
 | Needs the author | a code-signing certificate on the author's own name (or, only for organizations in the EU, an Azure Artifact Signing account) | Apple Developer Program membership (individual), Developer ID certificate, notarytool credentials |
 
-The Mac *client* (same Rust source as the Windows program) is not released as a
-binary: the Homebrew FFmpeg it links against is a GPL build (`README.md`).
-The CI builds and tests it, nothing more.
+The Mac *client* (same Rust source as the Windows program, decoding with VideoToolbox,
+no FFmpeg) is not yet released as a binary of its own; it is meant to become part of
+`QuadChroma.app` with the one app on the Mac. The CI builds and tests it, nothing
+more.
 
 Two ways to produce a release:
 

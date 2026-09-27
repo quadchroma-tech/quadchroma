@@ -39,7 +39,7 @@ Conventions: SPDX identifiers are used for license names; where a component offe
 
 The Windows package consists of `quadchroma.exe`, the two DLLs, `FFMPEG-BUILDINFO.txt`, `LICENSE.txt`, this file, `README.txt` (the README) and `MANUAL.txt` (the manual) - all text files in the packages are plain `.txt`. The macOS package consists of `QuadChroma.app` and the same text files (without the FFmpeg build information).
 
-**Not distributed as a binary: the Mac client.** The Mac client is built from the same Rust source as the Windows program (section 5), but its binary links the FFmpeg installed by Homebrew (`/opt/homebrew/opt/ffmpeg`), and that FFmpeg is a GPL build (it contains libx264 and libx265). A Mac client binary is therefore not distributed. Distributing one would require an FFmpeg built without GPL parts, in the same way as section 2 describes for Windows.
+**Not distributed as a binary: the Mac client.** The Mac client is built from the same Rust source as the Windows program (section 5). It decodes with Apple's VideoToolbox and contains no FFmpeg (`ffmpeg-next` is a Windows-only dependency). It is not yet distributed as a program of its own.
 
 ## 2. FFmpeg (Windows client)
 
@@ -2735,15 +2735,15 @@ The host application contains QuadChroma's own Objective-C and C code, the vendo
 
 ## 5. Mac client (source only)
 
-The Mac client is built from the same Rust source as the Windows binary, but it is **not distributed as a binary**: it links the Homebrew FFmpeg, which is a GPL build (libx264/libx265). Anyone who builds it from source gets these notices for completeness. Distributing a Mac client binary would additionally require an LGPL-only FFmpeg build (configured without `--enable-gpl`, `--enable-libx264`, `--enable-libx265` and every other GPL-only component) shipped as separate dylibs, plus the LGPL notices, source offer and relink information that the Windows package carries for its FFmpeg DLLs.
+The Mac client is built from the same Rust source as the Windows binary, but it is **not distributed as a binary** yet. It decodes with Apple's VideoToolbox (a system framework, like the ones in section 4.2) and contains no FFmpeg. Anyone who builds it from source gets these notices for completeness.
 
-Because no binary is distributed, this section only lists the crates of the `aarch64-apple-darwin` target with their licenses and copyright lines and reproduces the texts that differ from section 3. Everything else - the standard MIT text, the Microsoft MIT wording, the complete libm and dpi texts, the Apache License 2.0 as shipped by winit, the BSD-3-Clause texts of curve25519-dalek and subtle, the ISC and Apache texts of untrusted and ring, the Zlib text of foldhash, the WTFPL text of ffmpeg-next and the Unicode License v3 - is identical to section 3 (same crate versions). Whoever distributes a Mac client binary must additionally cover the FFmpeg it links against as described in section 1.
+Because no binary is distributed, this section only lists the crates of the `aarch64-apple-darwin` target with their licenses and copyright lines and reproduces the texts that differ from section 3. Everything else - the standard MIT text, the Microsoft MIT wording, the complete libm and dpi texts, the Apache License 2.0 as shipped by winit, the BSD-3-Clause texts of curve25519-dalek and subtle, the ISC and Apache texts of untrusted and ring, the Zlib text of foldhash and the Unicode License v3 - is identical to section 3 (same crate versions).
 
 ### 5.1 Scope and method
 
-- Source of truth: `client/Cargo.lock` at main 26ef895 and `cargo tree --target aarch64-apple-darwin -e normal` (normal dependency edges only; no build- or dev-dependencies are listed because none resolve for this target: `rust-mac-build.txt` and `rust-mac-dev.txt` are empty).
+- Source of truth: `client/Cargo.lock` at main 26ef895 and `cargo tree --target aarch64-apple-darwin -e normal` (normal dependency edges only; no build- or dev-dependencies are listed because none resolve for this target: `rust-mac-build.txt` and `rust-mac-dev.txt` are empty). Since then `ffmpeg-next` is a Windows-only dependency (the Mac client decodes with VideoToolbox), so `ffmpeg-next` and `ffmpeg-sys-next` no longer resolve for this target; the other crates and their versions are unchanged.
 
-- 76 crates resolve for this target: 71 are compiled into the binary (or resolved as dependencies), 5 run only at build time (procedural macros and crates reached only through procedural macros). Build-time crates are listed in the last section.
+- 74 crates resolve for this target: 69 are compiled into the binary (or resolved as dependencies), 5 run only at build time (procedural macros and crates reached only through procedural macros). Build-time crates are listed in the last section.
 
 - License choice: for `MIT OR Apache-2.0` (and any other choice that includes MIT) the MIT license is applied; Apache-2.0-only crates under Apache-2.0; `AND` expressions under all named licenses. Every copyright line below is quoted verbatim from the license file shipped in the crate (Cargo registry cache); where a crate ships no license file or no copyright line, the note says where the attribution comes from.
 
@@ -2783,8 +2783,6 @@ Because no binary is distributed, this section only lists the crates of the `aar
 | dpi | 0.1.2 | Apache-2.0 AND MIT | Apache-2.0 AND MIT | Copyright (c) 2018 Jorge Aparicio; Copyright © 2005-2020 Rich Felker, et al. | linked |
 | either | 1.18.0 | MIT OR Apache-2.0 | MIT | Copyright (c) 2015 | linked |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | MIT | Copyright (c) 2016--2023 | linked |
-| ffmpeg-next | 9.0.0 | WTFPL | WTFPL | (no copyright line; meh., Zhiming Wang) | linked |
-| ffmpeg-sys-next | 9.0.0 | WTFPL | WTFPL | (no copyright line; meh., Zhiming Wang) | linked |
 | foldhash | 0.1.5 | Zlib | Zlib | Copyright (c) 2024 Orson Peters | linked |
 | fontdue | 0.9.4 | MIT OR Apache-2.0 OR Zlib | MIT | Copyright (c) 2019 Joe C (mooman219) | linked |
 | foreign-types | 0.5.0 | MIT/Apache-2.0 | MIT | Copyright (c) 2017 The foreign-types Developers | linked |
