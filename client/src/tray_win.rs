@@ -18,8 +18,9 @@
 // ohne Symbol zurueck. Bei der Host-Rolle (zweite Art) heisst WM_CLOSE von
 // aussen (ein anderes Programm) und WM_ENDSESSION (Abmelden, Herunterfahren,
 // ein Installationsprogramm ueber den Restart Manager) dagegen: beenden -
-// ueber den Rueckruf `ende`, der den Zuschauer verabschiedet und den Prozess
-// beendet. (taskkill ohne /F erreicht die Host-Rolle nicht: sie hat kein
+// ueber den Rueckruf `ende`, der den Zuschauer verabschiedet und dem Dienst
+// der Host-Rolle das Ende meldet (host/mod.rs); den Prozess beendet dann
+// dessen Aufrufer. (taskkill ohne /F erreicht die Host-Rolle nicht: sie hat kein
 // sichtbares Fenster, taskkill verlangt dann /F.)
 //
 // Bedienung (NOTIFYICON_VERSION_4):
@@ -140,7 +141,8 @@ enum Art {
     /// Allgemein (Host-Rolle): Menue bei jedem Oeffnen aus `menue`, die
     /// gewaehlte Nummer an `befehl`; auch der Linksklick oeffnet das Menue.
     /// `ende` bekommt WM_CLOSE von aussen und WM_ENDSESSION (mit einem Wort,
-    /// woher) und kehrt nicht zurueck.
+    /// woher) und kehrt erst zurueck, wenn der Abschied hinaus ist - nach
+    /// WM_ENDSESSION kann der Prozess gleich danach enden.
     Allgemein {
         befehl: Box<dyn Fn(u32) + Send>,
         menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
@@ -192,7 +194,7 @@ impl Symbol {
     /// Zweite Art (Host-Rolle): `menue` liefert bei jedem Oeffnen die
     /// Eintraege (im Symbolfaden gerufen), `befehl` bekommt die gewaehlte
     /// Nummer (ebenfalls im Symbolfaden - lange Arbeit gehoert in einen
-    /// anderen Faden). `ende` beendet den Prozess, wenn Windows oder ein
+    /// anderen Faden). `ende` beendet die Rolle, wenn Windows oder ein
     /// anderes Programm das verlangt (WM_CLOSE von aussen, WM_ENDSESSION);
     /// das Symbol ist dann schon abgemeldet. Sonst wie `neu`.
     pub fn neu_allgemein(

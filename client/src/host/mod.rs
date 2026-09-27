@@ -24,6 +24,14 @@
 // ist das des Mac-Hosts (host/main.m), Byte fuer Byte - ein Client darf den
 // Host nicht erkennen.
 //
+// Die Rolle selbst ist ein Dienst (Dienst: starten, takt, aktion, beenden)
+// ohne process::exit; --host ist eine duenne Huelle darum (main_host), die
+// ihn bis zum Ende taktet und den Exit-Code an main.rs zurueckgibt. Beendet
+// wird er ueber "Freigabe beenden" (Grund 1) oder von aussen (WM_CLOSE,
+// WM_ENDSESSION: Grund 0, der Symbolfaden verabschiedet selbst); beide Wege
+// schliessen erst die Ports (netz::stoppen), dann verabschieden sie den
+// Zuschauer.
+//
 // Stand: Zuschauerplatz (Noise-Responder, Einlass, Bekanntgabe), Eingaben,
 // Zwischenablage (Text und Dateien, netz.rs mit dateien.rs), Aufnahme
 // (Desktop Duplication) mit Schrittmacher und Encoder im Betrieb (nvenc,
@@ -432,6 +440,15 @@ fn sperre<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// (wie der Mac-Host); nimmt er ihn nicht ab, wird gekappt.
 const ABSCHIED_FRIST: Duration = Duration::from_secs(3);
 
+/// Die Freigabe endet: erst keine neuen Zuschauer mehr (netz::stoppen:
+/// Ports zu, Bekanntgabe aus), dann der verbundene mit Abschied (`grund`,
+/// hoechstens ABSCHIED_FRIST). Aus jedem Faden; ein zweiter Aufruf tut
+/// nichts mehr.
+fn abschied(grund: u8) {
+    netz::stoppen();
+    netz::abschied_beim_beenden(grund, ABSCHIED_FRIST);
+}
+
 /// Was das Menue im Infobereich gerade zeigt (bei jedem Oeffnen neu).
 fn menue_stand(e: &einlass::Einlass, port: u16, port_belegt: bool) -> oberflaeche::MenueStand {
     oberflaeche::MenueStand {
@@ -444,85 +461,585 @@ fn menue_stand(e: &einlass::Einlass, port: u16, port_belegt: bool) -> oberflaech
     }
 }
 
-/// Einen Menuepunkt ausfuehren (Hauptfaden der Host-Rolle). "Beenden"
-/// erledigt die Schleife selbst.
-fn aktion_ausfuehren(
-    a: oberflaeche::Aktion,
-    e: &std::sync::Arc<einlass::Einlass>,
+/// Was der Faden des Dienstes abarbeitet (Kanal aus dem Symbolfaden und den
+/// Fenstern).
+enum Nachricht {
+    /// Ein Menuepunkt (oder das Passwortfenster meldet "gespeichert").
+    Aktion(oberflaeche::Aktion),
+    /// Von aussen beendet (WM_CLOSE, WM_ENDSESSION): der Symbolfaden hat den
+    /// Zuschauer schon verabschiedet.
+    VonAussenBeendet,
+}
+
+/// Laeuft der Dienst nach einem Schritt noch?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lage {
+    Laeuft,
+    /// Beendet (Freigabe beendet oder von aussen); der Zuschauer ist
+    /// verabschiedet, die Ports sind zu, das Symbol ist weg.
+    Beendet,
+}
+
+/// Die Host-Rolle als Dienst, ohne eigenen Prozess und ohne
+/// process::exit: `starten` richtet alles ein (Schluessel, Einlass, Symbol,
+/// Zuschauerplatz, Zwischenablage, Eingabe, Ton, Bildquelle), `takt`
+/// arbeitet einen Schritt ab (Menuepunkte, Port-Neuversuch, Taktzeile und
+/// Nachricht 6 alle fuenf Sekunden), `aktion` fuehrt einen Menuepunkt aus,
+/// `beenden` verabschiedet den Zuschauer und schliesst die Ports. Heute
+/// faehrt ihn main_host (--host) in einer Schleife; derselbe Dienst soll
+/// spaeter im Prozess des Clients laufen. `takt` und `aktion` gehoeren in
+/// den Faden, der `starten` rief (Herkunft::Host fuer die Protokollreihe).
+pub struct Dienst {
+    port: u16,
+    priv_key: Vec<u8>,
+    einlass: std::sync::Arc<einlass::Einlass>,
     lang: &'static crate::strings::Lang,
-    symbol: &mut Option<crate::tray_win::Symbol>,
-    tx: &std::sync::mpsc::Sender<oberflaeche::Aktion>,
-) {
-    use crate::strings::Key;
-    use oberflaeche::Aktion;
-    let mut hinweis = |k: Key| {
-        if let Some(s) = symbol.as_mut() {
-            s.hinweis("QuadChroma", lang.get(k));
+    zulassen: std::sync::Arc<fenster::Zulassen>,
+    symbol: Option<crate::tray_win::Symbol>,
+    tx: std::sync::mpsc::Sender<Nachricht>,
+    rx: std::sync::mpsc::Receiver<Nachricht>,
+    port_belegt: std::sync::Arc<AtomicBool>,
+    netz_laeuft: bool,
+    beendet: bool,
+    // Taktzeile und Nachricht 6
+    t0: Instant,
+    vorher: Option<LastProbe>,
+    last_frames: u64,
+    last_bytes: u64,
+    naechster_takt: Instant,
+}
+
+impl Dienst {
+    /// Die Host-Rolle einrichten und starten (Argumente wie --host: Port,
+    /// --output, --fps, --mbit, --fest, --konserve, --encoderweg). FFmpeg
+    /// muss initialisiert sein, das Protokoll offen. Err: Exit-Code, wenn
+    /// die Rolle nicht laufen kann (5 Schluessel oder Ablage, 6 Konserve, 7
+    /// Encoderweg, 9 Port belegt ohne Oberflaeche) - was bis dahin stand,
+    /// ist wieder abgebaut.
+    pub fn starten(args: &[String]) -> Result<Dienst, i32> {
+        // Was dieser Faden ueber FFmpeg sagt, gehoert der Host-Rolle.
+        protokoll::herkunft_setzen(protokoll::Herkunft::Host);
+
+        // --host [port]
+        let port: u16 = args
+            .iter()
+            .position(|a| a == "--host")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9001);
+
+        // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und
+        // bleibt danach liegen, damit Gegenstellen den Host wiedererkennen.
+        let (priv_key, pub_key) = match secure::host_identity() {
+            Ok(k) => k,
+            Err(e) => {
+                log(format!("Schluessel konnte nicht angelegt werden - Abbruch: {e}"));
+                return Err(5);
+            }
+        };
+        // --pair und --forget gibt es nicht mehr (Spezifikation 6).
+        for alt in ["--pair", "--forget"] {
+            if args.iter().any(|a| a == alt) {
+                log(format!("Unbekanntes Argument {alt} - uebergangen (neue Geraete kommen per Passwort oder \"Zulassen\" herein)"));
+            }
         }
-    };
-    match a {
-        Aktion::IdKopieren => {
-            crate::clipboard::set(&zugang::id_ziffern(e.id()));
-            log("Geraete-ID in die Zwischenablage kopiert");
-            hinweis(Key::HostCopied);
+
+        // Einlass (Spezifikation 3, 4): Geraeteliste und Zugangspasswort im
+        // Ablageordner; einmal aus authorized.txt uebernehmen.
+        let ordner = match secure::config_dir() {
+            Ok(o) => o,
+            Err(e) => {
+                log(format!("Kein Ablageordner - Abbruch: {e}"));
+                return Err(5);
+            }
+        };
+        match zugang::geraete_migrieren(&ordner, &zugang::heute()) {
+            zugang::Migration::Keine => {}
+            zugang::Migration::Uebernommen { anzahl, umbenannt } => log(format!(
+                "Uebernahme: {anzahl} Geraete aus {} nach {}{}",
+                zugang::ALTE_FREIGABEN,
+                zugang::GERAETE_DATEI,
+                match umbenannt {
+                    Ok(()) => format!(", alte Liste heisst jetzt {}{}", zugang::ALTE_FREIGABEN, zugang::MIGRIERT),
+                    Err(e) => format!(" - alte Liste nicht umbenannt ({e}), wird aber nicht noch einmal uebernommen"),
+                }
+            )),
+            zugang::Migration::Fehler(e) => log(format!("Uebernahme aus {} gescheitert: {e} - naechster Start versucht es wieder", zugang::ALTE_FREIGABEN)),
         }
-        Aktion::PasswortKopieren => {
-            if let Ok(pw) = e.passwort() {
-                // clipboard::set markiert den Eintrag als verdeckt: kein
-                // Verlauf, keine Cloud, und der Ablagewaechter schickt ihn
-                // nicht an einen Zuschauer.
-                crate::clipboard::set(&pw);
-                log("Zugangspasswort in die Zwischenablage kopiert (verdeckt)");
+        for datei in [zugang::GERAETE_DATEI, zugang::PASSWORT_DATEI] {
+            let n = zugang::zwischendateien_aufraeumen(&ordner.join(datei));
+            if n > 0 {
+                log(format!("{n} Zwischendateien von {datei} aus einem abgebrochenen Lauf entfernt"));
+            }
+        }
+        let rechnername = zugang::geraetename();
+        let einlass = std::sync::Arc::new(einlass::Einlass::neu(
+            ordner.join(zugang::GERAETE_DATEI),
+            ordner.join(zugang::PASSWORT_DATEI),
+            &pub_key,
+            &rechnername,
+        ));
+        let _ = einlass::einrichten(einlass.clone());
+        if let Err(e) = einlass.passwort() {
+            log(format!("Zugangspasswort: {e} - neue Geraete nur ueber \"Zulassen\" (Menue: Neues Zufallspasswort)"));
+        }
+        let erlaubt = match einlass.geraete() {
+            Ok(l) => l.geraete.len().to_string(),
+            Err(e) => format!("keins - {e}; niemand gilt als bekannt"),
+        };
+        log(format!(
+            "Geraete-ID dieses Hosts: {}   Name: {rechnername}   Fingerabdruck: {}   erlaubte Geraete: {erlaubt}",
+            zugang::id_text(einlass.id()),
+            noise::fingerprint(&pub_key)
+        ));
+
+        if let Some(f) = arg_zahl(args, "--fps") {
+            Z.fps.store(f.clamp(10, 240), Ordering::Relaxed);
+        }
+        if let Some(m) = arg_zahl(args, "--mbit") {
+            Z.mbit.store(m.clamp(2, 500), Ordering::Relaxed);
+        }
+        if args.iter().any(|a| a == "--fest" || a == "--fixed") {
+            Z.fest.store(true, Ordering::Relaxed);
+        }
+
+        // Bildschirm (Spezifikation Bildschirm 1.1-1.5): die Ausgaenge mit
+        // Kennung und Name; der Wunsch aus bildschirm.txt, --output n pinnt
+        // fuer diesen Lauf den Bildschirm am Listenplatz n (die Datei bleibt);
+        // Ziel ist der Wunsch, sonst der Hauptbildschirm, sonst der erste.
+        // Gemerkt wird die Kennung, nie der Listenplatz. Ohne DXGI-Ausgang
+        // (WARP, RDP) kommt die Geometrie aus der GDI-Liste - fuer die Maus.
+        let mut ausgaenge = Vec::new();
+        aufnahme::ausgaenge_melden(&mut ausgaenge);
+        let gespeichert = aufnahme::wunsch_laden();
+        let pin = arg_zahl(args, "--output").and_then(|n| match ausgaenge.get(n as usize) {
+            Some(a) => {
+                log(format!("--output {n}: Bildschirm {} gilt fuer diesen Lauf (bildschirm.txt bleibt)", a.bezeichnung()));
+                Some(a.kennung.clone())
+            }
+            None => {
+                log(format!("Ausgang {n} nicht verfuegbar ({} in der Liste) - kein Pin, es gilt bildschirm.txt bzw. der Hauptbildschirm", ausgaenge.len()));
+                None
+            }
+        });
+        let wunsch = pin.or(gespeichert);
+        let ziel = aufnahme::ziel_waehlen(&ausgaenge, wunsch.as_deref());
+        aufnahme::bildschirme_setzen(&ausgaenge, wunsch.as_deref(), ziel.as_ref().map(|(a, _)| a.kennung.as_str()));
+        let ausgang = ziel.as_ref().map(|(a, _)| a.clone());
+        match &ziel {
+            Some((a, wahl)) => {
+                log(format!(
+                    "Ausgang gewaehlt: {} {}x{} bei ({},{}) an Karte {}{}, Kennung {} ({}), {} Hz{}",
+                    a.name, a.breite, a.hoehe, a.links, a.oben, a.karte,
+                    if a.haupt { " (Hauptbildschirm)" } else { "" },
+                    a.kennung, a.anzeigename, a.hz,
+                    match wahl {
+                        aufnahme::Wahl::Wunsch => " - gewuenschter Bildschirm".to_string(),
+                        aufnahme::Wahl::Ausweich => format!(" - Ausweichplatz, {} nicht angeschlossen", wunsch.as_deref().unwrap_or("?")),
+                        aufnahme::Wahl::Automatik => String::new(),
+                    }
+                ));
+                eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
+                let (w, h) = aufnahme::stromgroesse(a);
+                Z.info_w.store(w as u32, Ordering::Relaxed);
+                Z.info_h.store(h as u32, Ordering::Relaxed);
+            }
+            None => {
+                log("Kein DXGI-Ausgang - Maus bezieht sich auf den GDI-Hauptbildschirm, Bild nur aus einer Konserve");
+                if let Some((l, o, w, h)) = aufnahme::gdi_hauptbildschirm() {
+                    eingabe::ausgang_setzen(l, o, w, h);
+                    Z.info_w.store((w & !1) as u32, Ordering::Relaxed);
+                    Z.info_h.store((h & !1) as u32, Ordering::Relaxed);
+                } else {
+                    Z.info_w.store(1920, Ordering::Relaxed);
+                    Z.info_h.store(1080, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Was dieser Rechner codieren kann - gefragt, nicht geraten. Der
+        // Startkandidat ist 0 wie beim Mac, sonst der erste vorhandene. Ein
+        // Codecwechsel (66) gilt danach fuer den Host, auch fuer den naechsten
+        // Zuschauer - wie beim Mac (g_codec_id in main.m setzen nur der Start
+        // und der Wechsel); Begruessung (1) und Koennensliste (8) sagen ihm,
+        // was laeuft.
+        encoder::pruefen();
+        ffmpeg_zeilen();
+        let startkandidat = encoder::startkandidat();
+        if let Some(i) = startkandidat {
+            Z.codec_id.store(i as u32, Ordering::Relaxed);
+        }
+
+        // Konserve: ein Annex-B-Strom als Bildquelle (Pruefweg ohne Karte).
+        let konserve = match arg_wert(args, "--konserve") {
+            Some(p) => match konserve::Konserve::laden(&p) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    log(format!("Konserve {p}: {e}"));
+                    return Err(6);
+                }
+            },
+            None => None,
+        };
+
+        // Eingabeweg des Encoders: --encoderweg bgra|yuv444|d3d11|auto.
+        let weg_cli = match arg_wert(args, "--encoderweg") {
+            Some(t) => match encoder::Weg::aus_text(&t) {
+                Some(w) => w,
+                None => {
+                    log(format!("--encoderweg {t}: unbekannt (bgra, yuv444, d3d11, auto)"));
+                    return Err(7);
+                }
+            },
+            None => encoder::Weg::Auto,
+        };
+
+        // Empfangene Dateien frueherer Laeufe: aelter als 24 h weg (2.9),
+        // dazu halb empfangene eines beendeten Prozesses (verwaiste Marke,
+        // siehe dateien.rs). Die Host-Rolle hat ihre eigene Basis
+        // (netz::host_ablage_basis).
+        let alt = netz::host_ablage_aufraeumen();
+        if alt > 0 {
+            log(format!(
+                "Dateien: {alt} Uebertragungen geloescht, aelter als 24 h oder verwaist ({})",
+                netz::host_ablage_basis().display()
+            ));
+        }
+
+        // Oberflaeche (Spezifikation 10): Zulassen-Fenster, deren Antwort an
+        // den Einlass geht, und das Symbol im Infobereich. Die Sprache wie im
+        // Fenster des Clients.
+        let lang = match &crate::einstellungen::Einstellungen::laden().sprache {
+            Some(c) => crate::strings::pick(c),
+            None => crate::strings::pick(&crate::system_language()),
+        };
+        let zulassen = std::sync::Arc::new(fenster::Zulassen::neu(
+            lang,
+            std::sync::Arc::new(|nr, ja| {
+                if let Some(e) = einlass::einlass() {
+                    e.entscheiden(nr, ja);
+                }
+            }),
+        ));
+        einlass.oberflaeche_setzen(zulassen.clone());
+        let port_belegt = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<Nachricht>();
+        let schluessel: std::sync::Arc<Mutex<Vec<[u8; 32]>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let symbol = {
+            let (tx2, sk) = (tx.clone(), schluessel.clone());
+            let befehl = Box::new(move |nr: u32| {
+                let k = sperre(&sk).clone();
+                if let Some(a) = oberflaeche::aktion_zu(nr, &k) {
+                    let _ = tx2.send(Nachricht::Aktion(a));
+                }
+            });
+            let (e, pb, sk) = (einlass.clone(), port_belegt.clone(), schluessel.clone());
+            let menue = Box::new(move || {
+                let stand = menue_stand(&e, port, pb.load(Ordering::Relaxed));
+                let (m, k) = oberflaeche::menue(lang, &stand);
+                *sperre(&sk) = k;
+                m
+            });
+            // WM_CLOSE von aussen, Abmelden, Herunterfahren, ein
+            // Installationsprogramm (Restart Manager): beenden wie "Freigabe
+            // beenden", aber mit Grund 0 (die Host-Rolle wurde beendet). Laeuft
+            // im Symbolfaden und verabschiedet selbst - nach WM_ENDSESSION
+            // endet der Prozess womoeglich gleich nach der Rueckkehr -, dann
+            // erfaehrt es der Faden des Dienstes und endet ebenfalls.
+            let tx3 = tx.clone();
+            let ende = Box::new(move |wie: &str| {
+                log(format!("Host-Rolle wird beendet ({wie})"));
+                abschied(HOST_ENDE_BEENDET);
+                log("Host-Rolle beendet");
+                let _ = tx3.send(Nachricht::VonAussenBeendet);
+            });
+            match crate::tray_win::Symbol::neu_allgemein(befehl, menue, ende, &oberflaeche::tooltip(lang, einlass.id())) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log(format!("Infobereich: kein Symbol ({e}) - ohne Oberflaeche, neue Geraete nur per Passwort"));
+                    None
+                }
+            }
+        };
+        let steht = symbol.as_ref().is_some_and(|s| s.steht());
+        zulassen.vorhanden_setzen(steht);
+        match &symbol {
+            Some(s) if !steht => log(format!(
+                "Infobereich: Symbol nicht angemeldet ({}) - \"Zulassen\" erst, wenn es steht",
+                s.grund().unwrap_or_default()
+            )),
+            Some(_) => log("Infobereich: Symbol steht - \"Zulassen\" moeglich"),
+            None => {}
+        }
+
+        // Zuschauerplatz: Bild, Eingabe, Bekanntgabe. Ist der Port belegt und
+        // gibt es die Oberflaeche, zeigt sie das, und es wird alle 5 s neu
+        // versucht; ohne Oberflaeche endet die Rolle wie bisher (Exit 9).
+        let netz_laeuft = match netz::start(port, priv_key.clone()) {
+            Ok(()) => true,
+            Err(e) if steht => {
+                log(format!("{e} - neuer Versuch alle 5 s, das Menue zeigt es"));
+                port_belegt.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(e) => {
+                log(format!("{e}"));
+                return Err(9);
+            }
+        };
+        // Zwischenablage: was hier kopiert wird, geht zum Zuschauer - Text als
+        // 48, eine Dateiliste ueber den Sender (50-52), beides auf dem
+        // Bildkanal; neuer Inhalt bricht eine laufende Datei-Sendung ab. Was
+        // von dort kommt, legt der Eingabefaden (Text) bzw. der Empfaenger der
+        // Dateien ab (netz.rs). Der Waechter wartet dabei nie: das Senden der
+        // Dateien laeuft in eigenen Faeden. Angemeldet als Host-Rolle, mit dem
+        // Zuschauer als Gegenueber (ein Client im selben Prozess teilt sich
+        // den Waechter).
+        crate::clipboard::watch(protokoll::Herkunft::Host, netz::zuschauer_sitzung, |inhalt| match inhalt {
+            crate::clipboard::Inhalt::Text(text) => {
+                netz::datei_sendung_abbrechen();
+                netz::send_small(MSG_CLIP, text.as_bytes());
+            }
+            crate::clipboard::Inhalt::Dateien(pfade) => netz::dateien_senden(pfade),
+        });
+        eingabe::start();
+        // Ton: Abgriff nur mit Zuschauer; ohne Tongeraet steht der Grund einmal da.
+        ton::start();
+        // Bildquelle: die Konserve bestimmt die Eckdaten des Stroms - vor der
+        // Zeile dazu. Sonst die Aufnahme des gewaehlten Ausgangs mit dem
+        // Encoder aus der Kandidatentabelle - beides erst, wenn jemand
+        // zuschaut. Ohne Aufnahmefaden (Konserve, keine Bildquelle)
+        // beantwortet der Eingabefaden einen Bildschirmwunsch (70) selbst mit
+        // der unveraenderten Liste - niemand sonst holte ihn ab.
+        if let Some(k) = konserve {
+            aufnahme::ohne_aufnahme("Konserve als Bildquelle");
+            konserve::abspielen(k);
+        } else {
+            match (&ausgang, startkandidat) {
+                (Some(a), Some(_)) => {
+                    let weg = encoder::weg_entscheiden(weg_cli, a.index);
+                    aufnahme::start(wunsch, ausgaenge, weg_cli, weg);
+                }
+                (None, _) => {
+                    aufnahme::ohne_aufnahme("kein DXGI-Ausgang");
+                    log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus");
+                }
+                (_, None) => {
+                    aufnahme::ohne_aufnahme("kein Encoder");
+                    log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus");
+                }
+            }
+        }
+        if netz_laeuft {
+            log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
+        } else {
+            log(format!("\n=== Dienst wartet auf Port {port} (Bild), {} (Eingabe) ===", port + 1));
+        }
+        log(format!(
+            "Strom: {}x{}, {} fps, {} Mbit/s, feste Bildrate {}",
+            Z.info_w.load(Ordering::Relaxed),
+            Z.info_h.load(Ordering::Relaxed),
+            Z.fps.load(Ordering::Relaxed),
+            Z.mbit.load(Ordering::Relaxed),
+            if Z.fest.load(Ordering::Relaxed) { "an" } else { "aus" }
+        ));
+
+        Ok(Dienst {
+            port,
+            priv_key,
+            einlass,
+            lang,
+            zulassen,
+            symbol,
+            tx,
+            rx,
+            port_belegt,
+            netz_laeuft,
+            beendet: false,
+            t0: Instant::now(),
+            vorher: last_probe(),
+            last_frames: 0,
+            last_bytes: 0,
+            naechster_takt: Instant::now() + Duration::from_secs(5),
+        })
+    }
+
+    /// Ein Schritt: wartet hoechstens eine Sekunde (bis zum naechsten
+    /// Fuenf-Sekunden-Takt) auf einen Menuepunkt und fuehrt ihn aus, sieht
+    /// nach, ob das Symbol steht ("Zulassen" moeglich), und erledigt im Takt
+    /// den Neuversuch am belegten Port, die Zeilen von FFmpeg, die Drosseln
+    /// und - nur mit Zuschauer - Taktzeile und Nachricht 6. Die Drosseln
+    /// tragen immer nach, auch ohne Zuschauer: eine Flut kommt gerade dann,
+    /// wenn keiner verbunden ist.
+    pub fn takt(&mut self) -> Lage {
+        if self.beendet {
+            return Lage::Beendet;
+        }
+        let warten = self.naechster_takt.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+        match self.rx.recv_timeout(warten) {
+            Ok(Nachricht::Aktion(a)) => {
+                if self.aktion(a) == Lage::Beendet {
+                    return Lage::Beendet;
+                }
+            }
+            Ok(Nachricht::VonAussenBeendet) => {
+                // Abschied und Ports erledigte schon der Symbolfaden.
+                self.beenden(HOST_ENDE_BEENDET);
+                return Lage::Beendet;
+            }
+            Err(_) => {}
+        }
+        self.zulassen.vorhanden_setzen(self.symbol.as_ref().is_some_and(|s| s.steht()));
+        if Instant::now() < self.naechster_takt {
+            return Lage::Laeuft;
+        }
+        self.naechster_takt = Instant::now() + Duration::from_secs(5);
+        if !self.netz_laeuft && netz::start(self.port, self.priv_key.clone()).is_ok() {
+            self.netz_laeuft = true;
+            self.port_belegt.store(false, Ordering::Relaxed);
+            log(format!("Port {} ist frei - Dienst laeuft", self.port));
+        }
+        ffmpeg_zeilen();
+        netz::drosseln_nachtragen();
+        let f = Z.sent_frames.load(Ordering::Relaxed);
+        let b = Z.sent_bytes.load(Ordering::Relaxed);
+        // Nur, wenn jemand zuschaut; sonst misst sich der Host selbst ohne Zweck.
+        if !netz::zuschauer_da() {
+            self.last_frames = f;
+            self.last_bytes = b;
+            self.vorher = last_probe();
+            return Lage::Laeuft;
+        }
+        log(format!(
+            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | nachgeschoben: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
+            self.t0.elapsed().as_secs_f32(),
+            f,
+            (f - self.last_frames) as f32 / 5.0,
+            (b - self.last_bytes) as f64 * 8.0 / 5.0 / 1e6,
+            Z.audio_packets.load(Ordering::Relaxed),
+            Z.audio_bytes.load(Ordering::Relaxed) as f64 / 1000.0,
+            Z.stau.load(Ordering::Relaxed),
+            Z.enc_verworfen.load(Ordering::Relaxed),
+            Z.repeats.load(Ordering::Relaxed),
+            Z.nachgeschoben.load(Ordering::Relaxed),
+            Z.zu_schnell.load(Ordering::Relaxed),
+            Z.enc_stau.load(Ordering::Relaxed),
+            Z.ton_verworfen.load(Ordering::Relaxed),
+        ));
+        let jetzt = last_probe();
+        if let (Some(v), Some(j)) = (self.vorher.as_ref(), jetzt.as_ref()) {
+            let n = Z.enc_n.swap(0, Ordering::Relaxed);
+            let summe = Z.enc_us.swap(0, Ordering::Relaxed);
+            let enc_zehntel = if n > 0 { ((summe / n) / 100).min(u16::MAX as u64) as u16 } else { 0 };
+            let host_fps_zehntel = (((f - self.last_frames) * 10) / 5).min(u16::MAX as u64) as u16;
+            netz::send_small(MSG_LAST, &last_nachricht(v, j, enc_zehntel, host_fps_zehntel));
+        }
+        self.vorher = jetzt;
+        self.last_frames = f;
+        self.last_bytes = b;
+        Lage::Laeuft
+    }
+
+    /// Einen Menuepunkt ausfuehren. "Freigabe beenden" beendet den Dienst:
+    /// der Zuschauer erfaehrt es (Abschied, Grund 1) und verbindet sich
+    /// nicht von selbst neu.
+    pub fn aktion(&mut self, a: oberflaeche::Aktion) -> Lage {
+        use crate::strings::Key;
+        use oberflaeche::Aktion;
+        if self.beendet {
+            return Lage::Beendet;
+        }
+        let (e, lang) = (&self.einlass, self.lang);
+        let symbol = &mut self.symbol;
+        let mut hinweis = |k: Key| {
+            if let Some(s) = symbol.as_mut() {
+                s.hinweis("QuadChroma", lang.get(k));
+            }
+        };
+        match a {
+            Aktion::IdKopieren => {
+                crate::clipboard::set(&zugang::id_ziffern(e.id()));
+                log("Geraete-ID in die Zwischenablage kopiert");
                 hinweis(Key::HostCopied);
             }
-        }
-        Aktion::PasswortAendern => {
-            let (e2, tx2) = (e.clone(), tx.clone());
-            fenster::passwort_aendern(
-                lang,
-                Box::new(move |pw| e2.passwort_setzen(pw)),
-                Box::new(move || {
-                    let _ = tx2.send(Aktion::PasswortGespeichert);
-                }),
-            );
-        }
-        Aktion::PasswortGespeichert => hinweis(Key::HostPasswordSaved),
-        Aktion::Zufallspasswort => {
-            let _ = e.passwort_zufall();
-        }
-        Aktion::Entfernen(k) => {
-            // Wer entfernt ist, bleibt nicht verbunden - er erfaehrt es
-            // (Abschied, Grund 2) und verbindet sich nicht von selbst neu.
-            if e.geraet_entfernen(&k).is_ok() {
-                netz::zuschauer_verabschieden(Some(&k), HOST_ENDE_ENTFERNT);
+            Aktion::PasswortKopieren => {
+                if let Ok(pw) = e.passwort() {
+                    // clipboard::set markiert den Eintrag als verdeckt: kein
+                    // Verlauf, keine Cloud, und der Ablagewaechter schickt ihn
+                    // an keine Rolle weiter.
+                    crate::clipboard::set(&pw);
+                    log("Zugangspasswort in die Zwischenablage kopiert (verdeckt)");
+                    hinweis(Key::HostCopied);
+                }
+            }
+            Aktion::PasswortAendern => {
+                let (e2, tx2) = (e.clone(), self.tx.clone());
+                fenster::passwort_aendern(
+                    lang,
+                    Box::new(move |pw| e2.passwort_setzen(pw)),
+                    Box::new(move || {
+                        let _ = tx2.send(Nachricht::Aktion(Aktion::PasswortGespeichert));
+                    }),
+                );
+            }
+            Aktion::PasswortGespeichert => hinweis(Key::HostPasswordSaved),
+            Aktion::Zufallspasswort => {
+                let _ = e.passwort_zufall();
+            }
+            Aktion::Entfernen(k) => {
+                // Wer entfernt ist, bleibt nicht verbunden - er erfaehrt es
+                // (Abschied, Grund 2) und verbindet sich nicht von selbst neu.
+                if e.geraet_entfernen(&k).is_ok() {
+                    netz::zuschauer_verabschieden(Some(&k), HOST_ENDE_ENTFERNT);
+                }
+            }
+            Aktion::AlleEntfernen => {
+                let e2 = e.clone();
+                fenster::rueckfrage(
+                    lang.get(Key::HostRemoveAllAsk),
+                    Box::new(move || {
+                        if e2.alle_entfernen().is_ok() {
+                            netz::zuschauer_verabschieden(None, HOST_ENDE_ENTFERNT);
+                        }
+                    }),
+                );
+            }
+            Aktion::ListeZuruecksetzen => {
+                let _ = e.liste_zuruecksetzen();
+            }
+            Aktion::Autostart => {
+                let an = !crate::verknuepfung::autostart_an(None);
+                match crate::verknuepfung::autostart_setzen(None, an, lang.get(Key::StartShare)) {
+                    Ok(()) => log(if an { "Mit Windows starten: an (Verknuepfung im Autostart-Ordner)" } else { "Mit Windows starten: aus" }),
+                    Err(f) => log(format!("Mit Windows starten nicht umgestellt: {f}")),
+                }
+            }
+            Aktion::Beenden => {
+                log("Freigabe beendet (Infobereich)");
+                self.beenden(HOST_ENDE_FREIGABE_AUS);
+                return Lage::Beendet;
             }
         }
-        Aktion::AlleEntfernen => {
-            let e2 = e.clone();
-            fenster::rueckfrage(
-                lang.get(Key::HostRemoveAllAsk),
-                Box::new(move || {
-                    if e2.alle_entfernen().is_ok() {
-                        netz::zuschauer_verabschieden(None, HOST_ENDE_ENTFERNT);
-                    }
-                }),
-            );
+        Lage::Laeuft
+    }
+
+    /// Den Dienst beenden: keine neuen Zuschauer mehr (Ports zu, Bekanntgabe
+    /// aus), der verbundene erfaehrt es mit Abschied (`grund`, hoechstens
+    /// ABSCHIED_FRIST), dann ist das Symbol weg. Ein zweiter Aufruf tut
+    /// nichts. Zwischenablage, Eingabe, Ton und Bildquelle bleiben stehen -
+    /// ohne Zuschauer tun sie nichts.
+    pub fn beenden(&mut self, grund: u8) {
+        if self.beendet {
+            return;
         }
-        Aktion::ListeZuruecksetzen => {
-            let _ = e.liste_zuruecksetzen();
-        }
-        Aktion::Autostart => {
-            let an = !crate::verknuepfung::autostart_an(None);
-            match crate::verknuepfung::autostart_setzen(None, an, lang.get(Key::StartShare)) {
-                Ok(()) => log(if an { "Mit Windows starten: an (Verknuepfung im Autostart-Ordner)" } else { "Mit Windows starten: aus" }),
-                Err(f) => log(format!("Mit Windows starten nicht umgestellt: {f}")),
-            }
-        }
-        Aktion::Beenden => {}
+        self.beendet = true;
+        abschied(grund);
+        drop(self.symbol.take());
     }
 }
 
-/// Rollenwahl: --list, --messen oder --host. Rueckgabe ist der Exit-Code.
+/// Rollenwahl: --list, --messen oder --host. Rueckgabe ist der Exit-Code;
+/// das Beenden des Prozesses bleibt dem Aufrufer (main.rs).
 pub fn main_host(args: &[String]) -> i32 {
     // Einzelinstanz der Freigabe (Spezifikation 10.1) - vor allem anderen,
     // auch vor der Protokolldatei: ein zweiter Start leerte sonst das
@@ -596,400 +1113,13 @@ pub fn main_host(args: &[String]) -> i32 {
         log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
     }
 
-    // --host [port]
-    let port: u16 = args
-        .iter()
-        .position(|a| a == "--host")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(9001);
-
-    // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und
-    // bleibt danach liegen, damit Gegenstellen den Host wiedererkennen.
-    let (priv_key, pub_key) = match secure::host_identity() {
-        Ok(k) => k,
-        Err(e) => {
-            log(format!("Schluessel konnte nicht angelegt werden - Abbruch: {e}"));
-            return 5;
-        }
+    // --host: der Dienst, bis er beendet ist (Menue oder von aussen).
+    let mut dienst = match Dienst::starten(args) {
+        Ok(d) => d,
+        Err(code) => return code,
     };
-    // --pair und --forget gibt es nicht mehr (Spezifikation 6).
-    for alt in ["--pair", "--forget"] {
-        if args.iter().any(|a| a == alt) {
-            log(format!("Unbekanntes Argument {alt} - uebergangen (neue Geraete kommen per Passwort oder \"Zulassen\" herein)"));
-        }
-    }
-
-    // Einlass (Spezifikation 3, 4): Geraeteliste und Zugangspasswort im
-    // Ablageordner; einmal aus authorized.txt uebernehmen.
-    let ordner = match secure::config_dir() {
-        Ok(o) => o,
-        Err(e) => {
-            log(format!("Kein Ablageordner - Abbruch: {e}"));
-            return 5;
-        }
-    };
-    match zugang::geraete_migrieren(&ordner, &zugang::heute()) {
-        zugang::Migration::Keine => {}
-        zugang::Migration::Uebernommen { anzahl, umbenannt } => log(format!(
-            "Uebernahme: {anzahl} Geraete aus {} nach {}{}",
-            zugang::ALTE_FREIGABEN,
-            zugang::GERAETE_DATEI,
-            match umbenannt {
-                Ok(()) => format!(", alte Liste heisst jetzt {}{}", zugang::ALTE_FREIGABEN, zugang::MIGRIERT),
-                Err(e) => format!(" - alte Liste nicht umbenannt ({e}), wird aber nicht noch einmal uebernommen"),
-            }
-        )),
-        zugang::Migration::Fehler(e) => log(format!("Uebernahme aus {} gescheitert: {e} - naechster Start versucht es wieder", zugang::ALTE_FREIGABEN)),
-    }
-    for datei in [zugang::GERAETE_DATEI, zugang::PASSWORT_DATEI] {
-        let n = zugang::zwischendateien_aufraeumen(&ordner.join(datei));
-        if n > 0 {
-            log(format!("{n} Zwischendateien von {datei} aus einem abgebrochenen Lauf entfernt"));
-        }
-    }
-    let rechnername = zugang::geraetename();
-    let einlass = std::sync::Arc::new(einlass::Einlass::neu(
-        ordner.join(zugang::GERAETE_DATEI),
-        ordner.join(zugang::PASSWORT_DATEI),
-        &pub_key,
-        &rechnername,
-    ));
-    let _ = einlass::einrichten(einlass.clone());
-    if let Err(e) = einlass.passwort() {
-        log(format!("Zugangspasswort: {e} - neue Geraete nur ueber \"Zulassen\" (Menue: Neues Zufallspasswort)"));
-    }
-    let erlaubt = match einlass.geraete() {
-        Ok(l) => l.geraete.len().to_string(),
-        Err(e) => format!("keins - {e}; niemand gilt als bekannt"),
-    };
-    log(format!(
-        "Geraete-ID dieses Hosts: {}   Name: {rechnername}   Fingerabdruck: {}   erlaubte Geraete: {erlaubt}",
-        zugang::id_text(einlass.id()),
-        noise::fingerprint(&pub_key)
-    ));
-
-    if let Some(f) = arg_zahl(args, "--fps") {
-        Z.fps.store(f.clamp(10, 240), Ordering::Relaxed);
-    }
-    if let Some(m) = arg_zahl(args, "--mbit") {
-        Z.mbit.store(m.clamp(2, 500), Ordering::Relaxed);
-    }
-    if args.iter().any(|a| a == "--fest" || a == "--fixed") {
-        Z.fest.store(true, Ordering::Relaxed);
-    }
-
-    // Bildschirm (Spezifikation Bildschirm 1.1-1.5): die Ausgaenge mit
-    // Kennung und Name; der Wunsch aus bildschirm.txt, --output n pinnt fuer
-    // diesen Lauf den Bildschirm am Listenplatz n (die Datei bleibt); Ziel
-    // ist der Wunsch, sonst der Hauptbildschirm, sonst der erste. Gemerkt
-    // wird die Kennung, nie der Listenplatz. Ohne DXGI-Ausgang (WARP, RDP)
-    // kommt die Geometrie aus der GDI-Liste - fuer die Maus.
-    let mut ausgaenge = Vec::new();
-    aufnahme::ausgaenge_melden(&mut ausgaenge);
-    let gespeichert = aufnahme::wunsch_laden();
-    let pin = arg_zahl(args, "--output").and_then(|n| match ausgaenge.get(n as usize) {
-        Some(a) => {
-            log(format!("--output {n}: Bildschirm {} gilt fuer diesen Lauf (bildschirm.txt bleibt)", a.bezeichnung()));
-            Some(a.kennung.clone())
-        }
-        None => {
-            log(format!("Ausgang {n} nicht verfuegbar ({} in der Liste) - kein Pin, es gilt bildschirm.txt bzw. der Hauptbildschirm", ausgaenge.len()));
-            None
-        }
-    });
-    let wunsch = pin.or(gespeichert);
-    let ziel = aufnahme::ziel_waehlen(&ausgaenge, wunsch.as_deref());
-    aufnahme::bildschirme_setzen(&ausgaenge, wunsch.as_deref(), ziel.as_ref().map(|(a, _)| a.kennung.as_str()));
-    let ausgang = ziel.as_ref().map(|(a, _)| a.clone());
-    match &ziel {
-        Some((a, wahl)) => {
-            log(format!(
-                "Ausgang gewaehlt: {} {}x{} bei ({},{}) an Karte {}{}, Kennung {} ({}), {} Hz{}",
-                a.name, a.breite, a.hoehe, a.links, a.oben, a.karte,
-                if a.haupt { " (Hauptbildschirm)" } else { "" },
-                a.kennung, a.anzeigename, a.hz,
-                match wahl {
-                    aufnahme::Wahl::Wunsch => " - gewuenschter Bildschirm".to_string(),
-                    aufnahme::Wahl::Ausweich => format!(" - Ausweichplatz, {} nicht angeschlossen", wunsch.as_deref().unwrap_or("?")),
-                    aufnahme::Wahl::Automatik => String::new(),
-                }
-            ));
-            eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
-            let (w, h) = aufnahme::stromgroesse(a);
-            Z.info_w.store(w as u32, Ordering::Relaxed);
-            Z.info_h.store(h as u32, Ordering::Relaxed);
-        }
-        None => {
-            log("Kein DXGI-Ausgang - Maus bezieht sich auf den GDI-Hauptbildschirm, Bild nur aus einer Konserve");
-            if let Some((l, o, w, h)) = aufnahme::gdi_hauptbildschirm() {
-                eingabe::ausgang_setzen(l, o, w, h);
-                Z.info_w.store((w & !1) as u32, Ordering::Relaxed);
-                Z.info_h.store((h & !1) as u32, Ordering::Relaxed);
-            } else {
-                Z.info_w.store(1920, Ordering::Relaxed);
-                Z.info_h.store(1080, Ordering::Relaxed);
-            }
-        }
-    }
-
-    // Was dieser Rechner codieren kann - gefragt, nicht geraten. Der
-    // Startkandidat ist 0 wie beim Mac, sonst der erste vorhandene. Ein
-    // Codecwechsel (66) gilt danach fuer den Host, auch fuer den naechsten
-    // Zuschauer - wie beim Mac (g_codec_id in main.m setzen nur der Start
-    // und der Wechsel); Begruessung (1) und Koennensliste (8) sagen ihm, was
-    // laeuft.
-    encoder::pruefen();
-    ffmpeg_zeilen();
-    let startkandidat = encoder::startkandidat();
-    if let Some(i) = startkandidat {
-        Z.codec_id.store(i as u32, Ordering::Relaxed);
-    }
-
-    // Konserve: ein Annex-B-Strom als Bildquelle (Pruefweg ohne Karte).
-    let konserve = match arg_wert(args, "--konserve") {
-        Some(p) => match konserve::Konserve::laden(&p) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                log(format!("Konserve {p}: {e}"));
-                return 6;
-            }
-        },
-        None => None,
-    };
-
-    // Eingabeweg des Encoders: --encoderweg bgra|yuv444|d3d11|auto.
-    let weg_cli = match arg_wert(args, "--encoderweg") {
-        Some(t) => match encoder::Weg::aus_text(&t) {
-            Some(w) => w,
-            None => {
-                log(format!("--encoderweg {t}: unbekannt (bgra, yuv444, d3d11, auto)"));
-                return 7;
-            }
-        },
-        None => encoder::Weg::Auto,
-    };
-
-    // Empfangene Dateien frueherer Laeufe: aelter als 24 h weg (2.9), dazu
-    // halb empfangene eines beendeten Prozesses (verwaiste Marke, siehe
-    // dateien.rs). Die Host-Rolle hat ihre eigene Basis
-    // (netz::host_ablage_basis).
-    let alt = netz::host_ablage_aufraeumen();
-    if alt > 0 {
-        log(format!(
-            "Dateien: {alt} Uebertragungen geloescht, aelter als 24 h oder verwaist ({})",
-            netz::host_ablage_basis().display()
-        ));
-    }
-
-    // Oberflaeche (Spezifikation 10): Zulassen-Fenster, deren Antwort an
-    // den Einlass geht, und das Symbol im Infobereich. Die Sprache wie im
-    // Fenster des Clients.
-    let lang = match &crate::einstellungen::Einstellungen::laden().sprache {
-        Some(c) => crate::strings::pick(c),
-        None => crate::strings::pick(&crate::system_language()),
-    };
-    let zulassen = std::sync::Arc::new(fenster::Zulassen::neu(
-        lang,
-        std::sync::Arc::new(|nr, ja| {
-            if let Some(e) = einlass::einlass() {
-                e.entscheiden(nr, ja);
-            }
-        }),
-    ));
-    einlass.oberflaeche_setzen(zulassen.clone());
-    let port_belegt = std::sync::Arc::new(AtomicBool::new(false));
-    let (aktionen_tx, aktionen) = std::sync::mpsc::channel::<oberflaeche::Aktion>();
-    let schluessel: std::sync::Arc<Mutex<Vec<[u8; 32]>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let mut symbol = {
-        let (tx, sk) = (aktionen_tx.clone(), schluessel.clone());
-        let befehl = Box::new(move |nr: u32| {
-            let k = sperre(&sk).clone();
-            if let Some(a) = oberflaeche::aktion_zu(nr, &k) {
-                let _ = tx.send(a);
-            }
-        });
-        let (e, pb, sk) = (einlass.clone(), port_belegt.clone(), schluessel.clone());
-        let menue = Box::new(move || {
-            let stand = menue_stand(&e, port, pb.load(Ordering::Relaxed));
-            let (m, k) = oberflaeche::menue(lang, &stand);
-            *sperre(&sk) = k;
-            m
-        });
-        // WM_CLOSE von aussen, Abmelden, Herunterfahren, ein
-        // Installationsprogramm (Restart Manager): beenden wie "Freigabe
-        // beenden", aber mit Grund 0 (die Host-Rolle wurde beendet). Laeuft
-        // im Symbolfaden und kehrt nicht zurueck.
-        let ende = Box::new(|wie: &str| {
-            log(format!("Host-Rolle wird beendet ({wie})"));
-            netz::abschied_beim_beenden(HOST_ENDE_BEENDET, ABSCHIED_FRIST);
-            log("Host-Rolle beendet");
-            std::process::exit(0);
-        });
-        match crate::tray_win::Symbol::neu_allgemein(befehl, menue, ende, &oberflaeche::tooltip(lang, einlass.id())) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log(format!("Infobereich: kein Symbol ({e}) - ohne Oberflaeche, neue Geraete nur per Passwort"));
-                None
-            }
-        }
-    };
-    let steht = symbol.as_ref().is_some_and(|s| s.steht());
-    zulassen.vorhanden_setzen(steht);
-    match &symbol {
-        Some(s) if !steht => log(format!(
-            "Infobereich: Symbol nicht angemeldet ({}) - \"Zulassen\" erst, wenn es steht",
-            s.grund().unwrap_or_default()
-        )),
-        Some(_) => log("Infobereich: Symbol steht - \"Zulassen\" moeglich"),
-        None => {}
-    }
-
-    // Zuschauerplatz: Bild, Eingabe, Bekanntgabe. Ist der Port belegt und
-    // gibt es die Oberflaeche, zeigt sie das, und es wird alle 5 s neu
-    // versucht; ohne Oberflaeche endet die Rolle wie bisher (Exit 9).
-    let mut netz_laeuft = match netz::start(port, priv_key.clone()) {
-        Ok(()) => true,
-        Err(e) if steht => {
-            log(format!("{e} - neuer Versuch alle 5 s, das Menue zeigt es"));
-            port_belegt.store(true, Ordering::Relaxed);
-            false
-        }
-        Err(e) => {
-            log(format!("{e}"));
-            return 9;
-        }
-    };
-    // Zwischenablage: was hier kopiert wird, geht zum Zuschauer - Text als
-    // 48, eine Dateiliste ueber den Sender (50-52), beides auf dem
-    // Bildkanal; neuer Inhalt bricht eine laufende Datei-Sendung ab. Was von
-    // dort kommt, legt der Eingabefaden (Text) bzw. der Empfaenger der
-    // Dateien ab (netz.rs). Der Waechter wartet dabei nie: das Senden der
-    // Dateien laeuft in eigenen Faeden. Angemeldet als Host-Rolle, mit dem
-    // Zuschauer als Gegenueber (ein Client im selben Prozess teilt sich den
-    // Waechter).
-    crate::clipboard::watch(protokoll::Herkunft::Host, netz::zuschauer_sitzung, |inhalt| match inhalt {
-        crate::clipboard::Inhalt::Text(text) => {
-            netz::datei_sendung_abbrechen();
-            netz::send_small(MSG_CLIP, text.as_bytes());
-        }
-        crate::clipboard::Inhalt::Dateien(pfade) => netz::dateien_senden(pfade),
-    });
-    eingabe::start();
-    // Ton: Abgriff nur mit Zuschauer; ohne Tongeraet steht der Grund einmal da.
-    ton::start();
-    // Bildquelle: die Konserve bestimmt die Eckdaten des Stroms - vor der
-    // Zeile dazu. Sonst die Aufnahme des gewaehlten Ausgangs mit dem
-    // Encoder aus der Kandidatentabelle - beides erst, wenn jemand zuschaut.
-    // Ohne Aufnahmefaden (Konserve, keine Bildquelle) beantwortet der
-    // Eingabefaden einen Bildschirmwunsch (70) selbst mit der unveraenderten
-    // Liste - niemand sonst holte ihn ab.
-    if let Some(k) = konserve {
-        aufnahme::ohne_aufnahme("Konserve als Bildquelle");
-        konserve::abspielen(k);
-    } else {
-        match (&ausgang, startkandidat) {
-            (Some(a), Some(_)) => {
-                let weg = encoder::weg_entscheiden(weg_cli, a.index);
-                aufnahme::start(wunsch, ausgaenge, weg_cli, weg);
-            }
-            (None, _) => {
-                aufnahme::ohne_aufnahme("kein DXGI-Ausgang");
-                log("Keine Bildquelle: kein DXGI-Ausgang fuer die Duplication (WARP/RDP) - ohne --konserve geht kein Bild raus");
-            }
-            (_, None) => {
-                aufnahme::ohne_aufnahme("kein Encoder");
-                log("Keine Bildquelle: kein Encoder auf diesem Rechner (weder nvenc noch h264_mf) - ohne --konserve geht kein Bild raus");
-            }
-        }
-    }
-    if netz_laeuft {
-        log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
-    } else {
-        log(format!("\n=== Dienst wartet auf Port {port} (Bild), {} (Eingabe) ===", port + 1));
-    }
-    log(format!(
-        "Strom: {}x{}, {} fps, {} Mbit/s, feste Bildrate {}",
-        Z.info_w.load(Ordering::Relaxed),
-        Z.info_h.load(Ordering::Relaxed),
-        Z.fps.load(Ordering::Relaxed),
-        Z.mbit.load(Ordering::Relaxed),
-        if Z.fest.load(Ordering::Relaxed) { "an" } else { "aus" }
-    ));
-
-    // Alle fuenf Sekunden eine Zeile mit dem Stand und Nachricht 6 - nur,
-    // wenn jemand zuschaut; sonst misst sich der Host selbst ohne Zweck.
-    // Die Drosseln tragen in diesem Takt immer nach, auch ohne Zuschauer:
-    // eine Flut kommt gerade dann, wenn keiner verbunden ist. Dazwischen
-    // laufen die Menuepunkte des Infobereichs (Kanal `aktionen`), und jede
-    // Sekunde wird nachgesehen, ob das Symbol steht ("Zulassen" moeglich).
-    let t0 = Instant::now();
-    let mut vorher = last_probe();
-    let mut last_frames = 0u64;
-    let mut last_bytes = 0u64;
-    let mut takt = Instant::now() + Duration::from_secs(5);
-    loop {
-        let warten = takt.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
-        match aktionen.recv_timeout(warten) {
-            Ok(oberflaeche::Aktion::Beenden) => {
-                // "Freigabe beenden": der Zuschauer erfaehrt es (Abschied,
-                // Grund 1) und verbindet sich nicht von selbst neu.
-                log("Freigabe beendet (Infobereich)");
-                netz::abschied_beim_beenden(HOST_ENDE_FREIGABE_AUS, ABSCHIED_FRIST);
-                drop(symbol.take());
-                std::process::exit(0);
-            }
-            Ok(a) => aktion_ausfuehren(a, &einlass, lang, &mut symbol, &aktionen_tx),
-            Err(_) => {}
-        }
-        zulassen.vorhanden_setzen(symbol.as_ref().is_some_and(|s| s.steht()));
-        if Instant::now() < takt {
-            continue;
-        }
-        takt = Instant::now() + Duration::from_secs(5);
-        if !netz_laeuft && netz::start(port, priv_key.clone()).is_ok() {
-            netz_laeuft = true;
-            port_belegt.store(false, Ordering::Relaxed);
-            log(format!("Port {port} ist frei - Dienst laeuft"));
-        }
-        ffmpeg_zeilen();
-        netz::drosseln_nachtragen();
-        let f = Z.sent_frames.load(Ordering::Relaxed);
-        let b = Z.sent_bytes.load(Ordering::Relaxed);
-        if !netz::zuschauer_da() {
-            last_frames = f;
-            last_bytes = b;
-            vorher = last_probe();
-            continue;
-        }
-        log(format!(
-            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | nachgeschoben: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
-            t0.elapsed().as_secs_f32(),
-            f,
-            (f - last_frames) as f32 / 5.0,
-            (b - last_bytes) as f64 * 8.0 / 5.0 / 1e6,
-            Z.audio_packets.load(Ordering::Relaxed),
-            Z.audio_bytes.load(Ordering::Relaxed) as f64 / 1000.0,
-            Z.stau.load(Ordering::Relaxed),
-            Z.enc_verworfen.load(Ordering::Relaxed),
-            Z.repeats.load(Ordering::Relaxed),
-            Z.nachgeschoben.load(Ordering::Relaxed),
-            Z.zu_schnell.load(Ordering::Relaxed),
-            Z.enc_stau.load(Ordering::Relaxed),
-            Z.ton_verworfen.load(Ordering::Relaxed),
-        ));
-        let jetzt = last_probe();
-        if let (Some(v), Some(j)) = (vorher.as_ref(), jetzt.as_ref()) {
-            let n = Z.enc_n.swap(0, Ordering::Relaxed);
-            let summe = Z.enc_us.swap(0, Ordering::Relaxed);
-            let enc_zehntel = if n > 0 { ((summe / n) / 100).min(u16::MAX as u64) as u16 } else { 0 };
-            let host_fps_zehntel = (((f - last_frames) * 10) / 5).min(u16::MAX as u64) as u16;
-            netz::send_small(MSG_LAST, &last_nachricht(v, j, enc_zehntel, host_fps_zehntel));
-        }
-        vorher = jetzt;
-        last_frames = f;
-        last_bytes = b;
-    }
+    while dienst.takt() == Lage::Laeuft {}
+    0
 }
 
 #[cfg(test)]
@@ -1069,5 +1199,82 @@ mod tests {
         let vorher = std::fs::read_to_string(&alt).unwrap();
         assert!(vorher.lines().count() > 10, "{vorher}");
         std::fs::remove_dir_all(&ordner).ok();
+    }
+
+    /// Ein Dienst ohne starten (kein Symbol, keine Aufnahme): Einlass mit
+    /// eigenem Ordner, Zuschauerplatz auf Loopback.
+    fn test_dienst(name: &str) -> Dienst {
+        let ordner = std::env::temp_dir().join(format!("qc-dienst-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let (priv_key, pub_key) = noise::keypair().unwrap();
+        let einlass = std::sync::Arc::new(einlass::Einlass::neu(
+            ordner.join(zugang::GERAETE_DATEI),
+            ordner.join(zugang::PASSWORT_DATEI),
+            &pub_key,
+            "Testhost",
+        ));
+        let lang = crate::strings::pick("de");
+        let zulassen = std::sync::Arc::new(fenster::Zulassen::neu(lang, std::sync::Arc::new(|_, _| {})));
+        let port = netz::start_loopback(&priv_key);
+        let (tx, rx) = std::sync::mpsc::channel();
+        Dienst {
+            port,
+            priv_key,
+            einlass,
+            lang,
+            zulassen,
+            symbol: None,
+            tx,
+            rx,
+            port_belegt: std::sync::Arc::new(AtomicBool::new(false)),
+            netz_laeuft: true,
+            beendet: false,
+            t0: Instant::now(),
+            vorher: None,
+            last_frames: 0,
+            last_bytes: 0,
+            naechster_takt: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
+    /// W1: der Dienst endet, ohne den Prozess zu beenden. "Freigabe beenden"
+    /// (aktion) schliesst die Ports und meldet Beendet; ein anderer Punkt
+    /// laesst ihn laufen. Das Ende von aussen kommt als Nachricht aus dem
+    /// Symbolfaden, der selbst schon verabschiedet hat - takt meldet dann
+    /// Beendet. Danach bleiben takt und aktion bei Beendet, und ein zweites
+    /// Beenden tut nichts.
+    #[test]
+    fn dienst_endet_ohne_prozessende() {
+        let _platz = netz::platz_pruefung();
+        let mut d = test_dienst("menue");
+        assert!(netz::laeuft());
+        assert_eq!(d.aktion(oberflaeche::Aktion::Zufallspasswort), Lage::Laeuft);
+        assert!(d.einlass.passwort().is_ok(), "Zufallspasswort nicht angelegt");
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!(d.aktion(oberflaeche::Aktion::Beenden), Lage::Beendet);
+        assert!(!netz::laeuft(), "Ports nach \"Freigabe beenden\" noch offen");
+        assert!(std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], d.port).into(), Duration::from_secs(6)).is_err());
+        assert_eq!(d.takt(), Lage::Beendet);
+        assert_eq!(d.aktion(oberflaeche::Aktion::IdKopieren), Lage::Beendet, "Menuepunkt nach dem Ende ausgefuehrt");
+        d.beenden(HOST_ENDE_BEENDET);
+
+        // Von aussen: wie der Rueckruf `ende` im Symbolfaden - erst der
+        // Abschied, dann die Nachricht.
+        let mut d = test_dienst("aussen");
+        assert!(netz::laeuft());
+        let tx = d.tx.clone();
+        let t0 = Instant::now();
+        std::thread::spawn(move || {
+            abschied(HOST_ENDE_BEENDET);
+            let _ = tx.send(Nachricht::VonAussenBeendet);
+        });
+        let mut lage = Lage::Laeuft;
+        while lage == Lage::Laeuft && t0.elapsed() < Duration::from_secs(10) {
+            lage = d.takt();
+        }
+        assert_eq!(lage, Lage::Beendet);
+        assert!(t0.elapsed() < Duration::from_secs(3), "Ende von aussen erst nach {:?}", t0.elapsed());
+        assert!(!netz::laeuft());
     }
 }
