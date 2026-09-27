@@ -143,7 +143,11 @@ pub struct MenueStand {
     /// Gefundene Hosts: (Name, Adresse), in der Reihenfolge der Liste.
     pub hosts: Vec<(String, String)>,
     pub autostart: bool,
+    /// Haken "Ruhezustand verhindern": was gilt (nicht der Wunsch).
     pub ruhe_verhindern: bool,
+    /// Gewuenscht, aber vom System abgelehnt: sein Fehlercode (darunter
+    /// steht eine Zeile PreventSleepRefused).
+    pub ruhe_abgelehnt: Option<String>,
 }
 
 /// Was ein Menuepunkt ausloest.
@@ -292,6 +296,9 @@ pub fn menue(lang: &Lang, s: &MenueStand) -> (Vec<Eintrag>, Zuordnung) {
         m.push(Eintrag::schalter(lang.get(Key::StartShare), NR_FREIGABE, s.freigabe.an()));
         m.push(Eintrag::schalter(lang.get(Key::HostStartWindows), NR_AUTOSTART, s.autostart));
         m.push(Eintrag::schalter(lang.get(Key::PreventSleep), NR_RUHE, s.ruhe_verhindern));
+        if let Some(c) = &s.ruhe_abgelehnt {
+            m.push(Eintrag::anzeige(lang.get(Key::PreventSleepRefused).replace("{c}", c)));
+        }
         m.push(Eintrag::Trenner);
         m.push(Eintrag::punkt(lang.get(Key::TrayQuit), NR_BEENDEN));
     } else {
@@ -347,6 +354,7 @@ mod tests {
             hosts: Vec::new(),
             autostart: true,
             ruhe_verhindern: false,
+            ruhe_abgelehnt: None,
         }
     }
 
@@ -462,6 +470,16 @@ mod tests {
         assert_eq!(aktion_zu(nummer(&m[f]), &z), Some(Aktion::Freigabe));
         assert!(!haken(&m[stelle(&m, "Mit Windows starten")]));
         assert!(haken(&m[stelle(&m, "Ruhezustand verhindern, solange QuadChroma läuft")]));
+        assert!(!texte(&m).iter().any(|t| t.starts_with("Nicht aktiv")), "{:?}", texte(&m));
+        // Lehnt das System ab: kein Haken, darunter der Grund mit dem Code.
+        let mut abgelehnt = s.clone();
+        abgelehnt.ruhe_verhindern = false;
+        abgelehnt.ruhe_abgelehnt = Some("0x80070005".into());
+        let (ma, _) = menue(de, &abgelehnt);
+        let r = stelle(&ma, "Ruhezustand verhindern, solange QuadChroma läuft");
+        assert!(!haken(&ma[r]));
+        assert_eq!(texte(&ma)[r + 1], "Nicht aktiv: vom System abgelehnt (0x80070005)");
+        assert!(matches!(ma[r + 1], Eintrag::Punkt { aktiv: false, .. }));
         stelle(&m, "Geräte-ID: 581 729 911");
         let en = crate::strings::pick("en");
         assert_eq!(texte(&menue(en, &s).0)[1], "Sharing is off");

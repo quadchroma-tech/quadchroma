@@ -21,6 +21,11 @@
 //
 // Andere Plattformen: `setzen` meldet, dass es das nicht gibt.
 //
+// Lehnt das System ab, bleibt der Wunsch (einstellungen.txt), aber Haken und
+// Kaestchen zeigen, was gilt - aus -, und daneben steht der Fehlercode des
+// Systems (`abgelehnt`, Text PreventSleepRefused). Ein neuer Klick versucht es
+// wieder.
+//
 // Die Entscheidung, was ein Wechsel am System tut, ist reine Rechnung
 // (`schritt`) und laeuft auf jeder Plattform im Test.
 
@@ -47,6 +52,14 @@ pub fn schritt(jetzt: bool, soll: bool) -> Schritt {
     }
 }
 
+/// Warum das System ablehnte: der Wortlaut fuers Protokoll und der kurze
+/// Fehlercode fuer die Oberflaeche.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ablehnung {
+    wortlaut: String,
+    code: String,
+}
+
 /// Die Energieanforderung dieses Prozesses (hoechstens eine). Faellt sie
 /// weg, ist sie aufgehoben.
 #[derive(Default)]
@@ -57,6 +70,16 @@ pub struct Ruhesperre {
     /// Nummer der gesetzten Zusicherung (macOS).
     #[cfg(target_os = "macos")]
     zusicherung: Option<u32>,
+    /// Fehlercode des Systems, als es das letzte Setzen ablehnte (bis zum
+    /// naechsten gelungenen Setzen oder bis "aus").
+    abgelehnt: Option<String>,
+}
+
+/// Was Haken und Kaestchen zeigen: an, was gilt (`an`) - nicht, was
+/// gewuenscht ist -, und einen Grund (den Fehlercode), wenn der Wunsch "an"
+/// ist, das System aber ablehnte.
+pub fn anzeige(wunsch: bool, an: bool, abgelehnt: Option<&str>) -> (bool, Option<String>) {
+    (an, abgelehnt.filter(|_| wunsch && !an).map(str::to_string))
 }
 
 impl Ruhesperre {
@@ -80,12 +103,38 @@ impl Ruhesperre {
         }
     }
 
+    /// Der Fehlercode des Systems, wenn es das letzte Setzen ablehnte.
+    pub fn abgelehnt(&self) -> Option<&str> {
+        self.abgelehnt.as_deref()
+    }
+
     /// Den Ruhezustand verhindern (`soll`) oder wieder zulassen - sofort.
     /// `grund` steht in powercfg /requests bzw. pmset -g assertions.
     /// Liefert, was geschah; Err mit dem Wortlaut des Systems (der Zustand
-    /// bleibt dann, wie er war).
+    /// bleibt dann, wie er war). Lehnt das System das Setzen ab, merkt sich
+    /// die Sperre den Fehlercode (`abgelehnt`); "aus" und ein gelungenes
+    /// Setzen vergessen ihn.
     pub fn setzen(&mut self, soll: bool, grund: &str) -> Result<Schritt, String> {
         let s = schritt(self.an(), soll);
+        match self.umstellen(s, grund) {
+            Ok(()) => {
+                if s == Schritt::Setzen || !soll {
+                    self.abgelehnt = None;
+                }
+                Ok(s)
+            }
+            Err(a) => {
+                if s == Schritt::Setzen {
+                    self.abgelehnt = Some(a.code);
+                } else if !soll {
+                    self.abgelehnt = None;
+                }
+                Err(a.wortlaut)
+            }
+        }
+    }
+
+    fn umstellen(&mut self, s: Schritt, grund: &str) -> Result<(), Ablehnung> {
         #[cfg(windows)]
         match s {
             Schritt::Nichts => {}
@@ -110,10 +159,10 @@ impl Ruhesperre {
         {
             let _ = grund;
             if s == Schritt::Setzen {
-                return Err("Ruhezustand verhindern gibt es auf dieser Plattform nicht".into());
+                return Err(Ablehnung { wortlaut: "Ruhezustand verhindern gibt es auf dieser Plattform nicht".into(), code: "-".into() });
             }
         }
-        Ok(s)
+        Ok(())
     }
 }
 
@@ -132,6 +181,7 @@ impl Drop for Ruhesperre {
 
 #[cfg(target_os = "macos")]
 mod mac {
+    use super::Ablehnung;
     use std::ffi::c_void;
 
     type CFStringRef = *const c_void;
@@ -156,18 +206,24 @@ mod mac {
     const TYP: &str = "PreventUserIdleSystemSleep";
 
     /// Ein CFString, den der Aufrufer freigibt.
-    fn cf_text(t: &str) -> Result<CFStringRef, String> {
+    fn cf_text(t: &str) -> Result<CFStringRef, Ablehnung> {
         // SAFETY: Zeiger und Laenge beschreiben gueltiges UTF-8; CoreFoundation kopiert.
         let s = unsafe { CFStringCreateWithBytes(std::ptr::null(), t.as_ptr(), t.len() as isize, UTF8, 0) };
         if s.is_null() {
-            Err(format!("CFStringCreateWithBytes: {t:?} nicht anlegbar"))
+            Err(Ablehnung { wortlaut: format!("CFStringCreateWithBytes: {t:?} nicht anlegbar"), code: "CFString".into() })
         } else {
             Ok(s)
         }
     }
 
+    /// Ein Fehler von IOKit: Wortlaut mit Funktion, Code allein.
+    fn abgelehnt(was: &str, r: i32) -> Ablehnung {
+        let code = format!("0x{:08x}", r as u32);
+        Ablehnung { wortlaut: format!("{was}: {code}"), code }
+    }
+
     /// Zusicherung mit Namen anlegen; ihre Nummer.
-    pub fn anfordern(grund: &str) -> Result<u32, String> {
+    pub fn anfordern(grund: &str) -> Result<u32, Ablehnung> {
         let typ = cf_text(TYP)?;
         let name = match cf_text(grund) {
             Ok(n) => n,
@@ -186,17 +242,17 @@ mod mac {
             CFRelease(name);
         }
         if r != 0 {
-            return Err(format!("IOPMAssertionCreateWithName: 0x{:08x}", r as u32));
+            return Err(abgelehnt("IOPMAssertionCreateWithName", r));
         }
         Ok(nummer)
     }
 
     /// Zusicherung aufheben.
-    pub fn aufheben(nummer: u32) -> Result<(), String> {
+    pub fn aufheben(nummer: u32) -> Result<(), Ablehnung> {
         // SAFETY: nur eine Nummer; eine falsche meldet das System als Fehler.
         let r = unsafe { IOPMAssertionRelease(nummer) };
         if r != 0 {
-            return Err(format!("IOPMAssertionRelease: 0x{:08x}", r as u32));
+            return Err(abgelehnt("IOPMAssertionRelease", r));
         }
         Ok(())
     }
@@ -215,6 +271,7 @@ pub fn pmset_zeilen(name: &str) -> Option<Vec<String>> {
 
 #[cfg(windows)]
 mod win {
+    use super::Ablehnung;
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Power::{PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest};
@@ -224,12 +281,13 @@ mod win {
     /// eingebunden).
     const FASSUNG: u32 = 0;
 
-    fn wortlaut(was: &str, e: windows::core::Error) -> String {
-        format!("{was}: {} (0x{:08x})", e.message().trim(), e.code().0 as u32)
+    fn wortlaut(was: &str, e: windows::core::Error) -> Ablehnung {
+        let code = format!("0x{:08x}", e.code().0 as u32);
+        Ablehnung { wortlaut: format!("{was}: {} ({code})", e.message().trim()), code }
     }
 
     /// Anforderung mit Grund anlegen und setzen; der Griff als Zahl.
-    pub fn anfordern(grund: &str) -> Result<isize, String> {
+    pub fn anfordern(grund: &str) -> Result<isize, Ablehnung> {
         // Das System kopiert den Text beim Anlegen.
         let mut text: Vec<u16> = grund.encode_utf16().chain(std::iter::once(0)).collect();
         let ctx = REASON_CONTEXT {
@@ -249,7 +307,7 @@ mod win {
 
     /// Anforderung aufheben und den Griff schliessen (auch wenn das Aufheben
     /// scheitert - mit dem Griff faellt die Anforderung ohnehin).
-    pub fn aufheben(h: isize) -> Result<(), String> {
+    pub fn aufheben(h: isize) -> Result<(), Ablehnung> {
         let h = HANDLE(h as *mut _);
         let r = unsafe { PowerClearRequest(h, PowerRequestSystemRequired) }.map_err(|e| wortlaut("PowerClearRequest", e));
         unsafe {
@@ -312,6 +370,41 @@ mod tests {
         assert_eq!(r.setzen(true, &name), Ok(Schritt::Setzen));
         drop(r);
         assert_eq!(pmset_zeilen(&name).expect("pmset"), Vec::<String>::new());
+    }
+
+    /// Was Haken und Kaestchen zeigen: was gilt, und einen Grund nur, wenn
+    /// "an" gewuenscht ist, aber nicht gilt.
+    #[test]
+    fn anzeige_zeigt_was_gilt() {
+        assert_eq!(anzeige(true, true, None), (true, None));
+        assert_eq!(anzeige(true, false, Some("0xe00002c2")), (false, Some("0xe00002c2".into())));
+        assert_eq!(anzeige(false, false, Some("0xe00002c2")), (false, None));
+        assert_eq!(anzeige(true, true, Some("alt")), (true, None));
+        assert_eq!(anzeige(true, false, None), (false, None));
+    }
+
+    /// Lehnt das System ab, merkt sich die Sperre den Code; "aus" vergisst
+    /// ihn, und ein gelungenes Setzen ebenso. Geprueft mit einer Sperre,
+    /// deren Setzen scheitern muss: auf den Plattformen mit Energieverwaltung
+    /// direkt am Zustand (das System lehnt im Test nicht ab).
+    #[test]
+    fn abgelehnt_gemerkt_und_vergessen() {
+        let mut r = Ruhesperre::neu();
+        r.abgelehnt = Some("0x1".into());
+        assert_eq!(r.abgelehnt(), Some("0x1"));
+        assert_eq!(r.setzen(false, ""), Ok(Schritt::Nichts));
+        assert_eq!(r.abgelehnt(), None, "aus vergisst den Grund");
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            r.abgelehnt = Some("0x1".into());
+            assert_eq!(r.setzen(true, "QuadChroma Test"), Ok(Schritt::Setzen));
+            assert_eq!(r.abgelehnt(), None, "gelungenes Setzen vergisst den Grund");
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            assert!(r.setzen(true, "x").is_err());
+            assert_eq!(r.abgelehnt(), Some("-"));
+        }
     }
 
     /// Ohne Windows und macOS gibt es nichts zu setzen; aus bleibt aus.

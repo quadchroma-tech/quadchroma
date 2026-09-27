@@ -240,6 +240,9 @@ NSArray<QCMenuePunkt *> *qc_menue_modell(QCMenueZustand *z) {
         QCMenuePunkt *ruhe = punkt(qc_text(QCTextPreventSleep), QCAktionRuhe, YES);
         ruhe.haken = z.ruhe;
         [m addObject:ruhe];
+        // Gewuenscht, aber vom System abgelehnt: der Grund darunter (vom
+        // Client schon uebersetzt), der Haken zeigt, was gilt - aus.
+        if (z.ruheGrund.length) [m addObject:punkt(z.ruheGrund, QCAktionKeine, NO)];
     }
     if (!z.app || z.freigabe) {
         if (!z.bildschirm)
@@ -358,6 +361,7 @@ static BOOL g_app_freigabe, g_app_ruhe, g_app_sitzung;
 static int g_programm_sprache = -1;        // Sprache des Programmmenues (nur Hauptfaden)
 static NSArray<NSArray<NSString *> *> *g_app_hosts;
 static NSString *g_app_tooltip;
+static NSString *g_app_ruhe_grund;               // leer = kein Grund
 
 static NSObject *app_sperre(void) {
     static dispatch_once_t einmal;
@@ -410,6 +414,7 @@ QCMenueZustand *qc_menue_zustand_lesen(void) {
         @synchronized (app_sperre()) {
             z.freigabe = g_app_freigabe;
             z.ruhe = g_app_ruhe;
+            z.ruheGrund = g_app_ruhe_grund.length ? g_app_ruhe_grund : nil;
             z.hosts = g_app_hosts ?: @[];
         }
     }
@@ -1432,11 +1437,13 @@ void qc_app_stand_setzen(const qc_app_stand *s) {
         [hosts addObject:@[ (n ? [NSString stringWithUTF8String:n] : nil) ?: @"", adresse ]];
     }
     NSString *tip = (s->tooltip ? [NSString stringWithUTF8String:s->tooltip] : nil) ?: @"QuadChroma";
+    NSString *ruhe_grund = (s->ruhe_grund ? [NSString stringWithUTF8String:s->ruhe_grund] : nil) ?: @"";
     BOOL sitzung_neu;
     @synchronized (app_sperre()) {
         sitzung_neu = g_app_sitzung != (s->sitzung != 0);
         g_app_freigabe = s->freigabe != 0;
         g_app_ruhe = s->ruhe != 0;
+        g_app_ruhe_grund = ruhe_grund;
         g_app_sitzung = s->sitzung != 0;
         g_app_hosts = [hosts copy];
         g_app_tooltip = tip;

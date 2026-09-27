@@ -197,6 +197,7 @@ mod tests {
             hosts: vec![("Mac".into(), "10.0.0.1:9001".into())],
             autostart: false,
             ruhe_verhindern: true,
+            ruhe_abgelehnt: None,
         };
         let (m, z) = symbolmenue::menue(crate::strings::pick("de"), &s);
         let h = crate::tray_win::menue_fuer_test(&m).expect("Menue");

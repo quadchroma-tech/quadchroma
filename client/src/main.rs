@@ -6100,7 +6100,10 @@ fn ruhe_selbsttest() -> i32 {
 #[cfg_attr(not(windows), allow(dead_code))]
 struct MenueQuelle {
     lang: &'static strings::Lang,
+    /// Haken "Ruhezustand verhindern": was gilt, und der Fehlercode, wenn
+    /// das System den Wunsch ablehnt (siehe ruhezustand::anzeige).
     ruhe_verhindern: bool,
+    ruhe_abgelehnt: Option<String>,
 }
 
 /// Einfuegen in eigene Felder: Strg+V unter Windows, Cmd+V auf dem Mac.
@@ -7725,17 +7728,24 @@ impl App {
     }
 
     /// "Ruhezustand verhindern" (Startbildschirm, Menue): sofort wirksam,
-    /// gemerkt in einstellungen.txt.
+    /// gemerkt in einstellungen.txt. Der Klick gilt dem, was zu sehen ist:
+    /// aus (auch "vom System abgelehnt") heisst einschalten - ein neuer
+    /// Versuch -, an heisst ausschalten. Gemerkt wird der Wunsch; lehnt das
+    /// System ab, bleibt er, und Haken wie Kaestchen zeigen aus samt Grund.
     fn ruhe_umschalten(&mut self) {
-        let an = ruhe_setzen(&mut self.ruhe, !self.cfg.ruhe_verhindern, self.lang);
-        // Gemerkt wird der Wunsch; laesst das System ihn nicht zu, sagt es das
-        // Protokoll, und der Haken folgt dem, was gilt.
-        self.cfg.ruhe_verhindern = an;
+        let soll = !self.ruhe.an();
+        ruhe_setzen(&mut self.ruhe, soll, self.lang);
+        self.cfg.ruhe_verhindern = soll;
         self.cfg.sichern();
-        if let Ok(mut q) = self.menue_quelle.lock() {
-            q.ruhe_verhindern = an;
-        }
         self.symbol_nachfuehren_jetzt();
+    }
+
+    /// "Ruhezustand verhindern", wie Haken und Kaestchen es zeigen: was gilt,
+    /// und - wenn es gewuenscht ist, das System aber ablehnt - der kurze
+    /// Grund in der Sprache der App.
+    fn ruhe_anzeige(&self) -> (bool, Option<String>) {
+        let (an, code) = ruhezustand::anzeige(self.cfg.ruhe_verhindern, self.ruhe.an(), self.ruhe.abgelehnt());
+        (an, code.map(|c| self.lang.get(strings::Key::PreventSleepRefused).replace("{c}", &c)))
     }
 
     /// "Mit Windows starten" (Menue): die eine Verknuepfung im
@@ -7973,18 +7983,13 @@ impl App {
     /// entschaerft, sonst leer), Tooltip, laufende Sitzung.
     #[cfg(target_os = "macos")]
     fn symbol_stand(&self) -> host_mac::Stand {
-        let hosts = self
-            .hosts
-            .lock()
-            .map(|h| h.liste())
-            .unwrap_or_default()
-            .into_iter()
-            .take(tray::HOSTS_MAX)
-            .map(|g| (tray::anzeigename(&g.host.name), g.host.addr.to_string()))
-            .collect();
+        let gefunden = self.hosts.lock().map(|h| h.liste()).unwrap_or_default();
+        let hosts = menue_hosts(&gefunden, &self.bekannte).into_iter().map(|(n, a)| (tray::anzeigename(&n), a)).collect();
+        let (ruhe, ruhe_grund) = self.ruhe_anzeige();
         host_mac::Stand {
             freigabe: self.cfg.freigabe,
-            ruhe: self.cfg.ruhe_verhindern,
+            ruhe,
+            ruhe_grund: ruhe_grund.unwrap_or_default(),
             sitzung: self.screen == Screen::Session,
             tooltip: self.tooltip_jetzt(),
             hosts,
@@ -8045,18 +8050,21 @@ impl App {
         let (quelle, hosts, z) = (self.menue_quelle.clone(), self.hosts.clone(), self.menue_zuordnung.clone());
         let host_teil = self.rolle.as_ref().map(|r| r.menue_abfrage());
         let menue = Box::new(move || {
-            let (lang, ruhe_verhindern) = quelle.lock().map(|q| (q.lang, q.ruhe_verhindern)).unwrap_or((&strings::EN, false));
+            let (lang, ruhe_verhindern, ruhe_abgelehnt) =
+                quelle.lock().map(|q| (q.lang, q.ruhe_verhindern, q.ruhe_abgelehnt.clone())).unwrap_or((&strings::EN, false, None));
             let h = match &host_teil {
                 Some(f) => f(),
                 None => symbolmenue::HostTeil { freigabe: symbolmenue::Freigabe::Aus, id: None, passwort: Err(()), geraete: Err(()) },
             };
-            let hosts = hosts
-                .lock()
-                .map(|h| h.liste())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|g| (g.host.name, g.host.addr.to_string()))
-                .collect();
+            // Dieselbe Liste wie im Startbildschirm: je Geraet einmal,
+            // bekannte zuerst, nach Namen, ohne diesen Rechner. hosts.txt
+            // wird dafuer bei jedem Oeffnen gelesen (klein, und nur dann).
+            let gefunden = hosts.lock().map(|h| h.liste()).unwrap_or_default();
+            let bekannte = zugang::ablage_pfad(zugang::HOSTS_DATEI)
+                .ok()
+                .and_then(|p| zugang::Hostliste::laden(&p).ok())
+                .unwrap_or_default();
+            let hosts = menue_hosts(&gefunden, &bekannte);
             let stand = symbolmenue::MenueStand {
                 art: symbolmenue::Art::App,
                 name: zugang::geraetename(),
@@ -8067,6 +8075,7 @@ impl App {
                 hosts,
                 autostart: verknuepfung::autostart_an(None),
                 ruhe_verhindern,
+                ruhe_abgelehnt,
             };
             let (m, neu) = symbolmenue::menue(lang, &stand);
             if let Ok(mut alt) = z.lock() {
@@ -8107,9 +8116,11 @@ impl App {
         self.tray_takt = Instant::now();
         #[cfg(windows)]
         {
+            let (an, code) = ruhezustand::anzeige(self.cfg.ruhe_verhindern, self.ruhe.an(), self.ruhe.abgelehnt());
             if let Ok(mut q) = self.menue_quelle.lock() {
                 q.lang = self.lang;
-                q.ruhe_verhindern = self.cfg.ruhe_verhindern;
+                q.ruhe_verhindern = an;
+                q.ruhe_abgelehnt = code;
             }
             let t = self.tooltip_jetzt();
             if let Some(s) = self.symbol.as_mut() {
@@ -8119,6 +8130,9 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         {
+            // Die bekannten Hosts fuer "Verbinden: <Host>" (bekannte zuerst)
+            // - nur neu gelesen, wenn hosts.txt sich geaendert hat.
+            self.bekannte_nachladen(false);
             let stand = self.symbol_stand();
             if let Some(s) = self.symbol.as_mut() {
                 s.stand_setzen(&stand);
@@ -8712,11 +8726,13 @@ impl App {
                 };
                 let hinweis = self.verknuepfung_hinweis();
                 let name = zugang::geraetename();
+                let (ruhe_an, ruhe_grund) = self.ruhe_anzeige();
                 let dieser = (MIT_FREIGABE && self.rolle.is_some()).then(|| DieserComputer {
                     freigabe: self.cfg.freigabe,
                     name: &name,
                     id: self.eigene_id(),
-                    ruhe_verhindern: self.cfg.ruhe_verhindern,
+                    ruhe_verhindern: ruhe_an,
+                    ruhe_grund: ruhe_grund.as_deref(),
                 });
                 self.geraete_scroll = erste_zeile(self.geraete_scroll, START_ZEILEN, zeilen.len());
                 n.act = start_screen(
@@ -9751,6 +9767,14 @@ fn rollbalken(c: &mut ui::Canvas, x: i32, y: i32, h: i32, erste: usize, sichtbar
     c.rect(x, y + oben, 3, griff, ui::CYAN, 200);
 }
 
+/// Die Punkte "Verbinden: <Host>" am Symbol (Windows) und in der
+/// Menueleiste (Mac): dieselbe Liste wie im Startbildschirm (`hostzeilen`:
+/// je Geraet einmal, bekannte zuerst, nach Namen, ohne diesen Rechner),
+/// hoechstens tray::HOSTS_MAX, als (Name, Adresse).
+fn menue_hosts(gefunden: &[discovery::Gefunden], bekannte: &zugang::Hostliste) -> Vec<(String, String)> {
+    hostzeilen(gefunden, bekannte).into_iter().take(tray::HOSTS_MAX).map(|z| (z.name, z.adresse)).collect()
+}
+
 /// Die erste sichtbare Zeile einer Liste, geklemmt: nie ueber das Ende.
 fn erste_zeile(scroll: usize, sichtbar: usize, anzahl: usize) -> usize {
     scroll.min(anzahl.saturating_sub(sichtbar))
@@ -9872,7 +9896,11 @@ struct DieserComputer<'a> {
     freigabe: bool,
     name: &'a str,
     id: Option<u32>,
+    /// Kaestchen "Ruhezustand verhindern": was gilt; `ruhe_grund` warum
+    /// nicht, wenn es gewuenscht ist, das System aber ablehnt (Text
+    /// PreventSleepRefused, rechts in Bernstein).
     ruhe_verhindern: bool,
+    ruhe_grund: Option<&'a str>,
 }
 
 /// Die Zeilen der einen App unter den Knoepfen (ab `y`): links "Dieser
@@ -9903,7 +9931,16 @@ fn dieser_computer_zeichnen(
     let zeile = ui::Rect { x: px, y: y + 28, w: panel_w, h: 24 };
     let hot = zeile.hit(u.mouse.0, u.mouse.1);
     kaestchen(c, px + 2, zeile.y + 5, d.ruhe_verhindern, if hot || d.ruhe_verhindern { ui::CYAN } else { ui::DIM });
-    let t = kuerzen(u, lang.get(PreventSleep), panel_w - 28, 13, 1);
+    // Lehnt das System ab: der Grund rechts (hoechstens die halbe Zeile),
+    // der Text des Kaestchens davor gekuerzt.
+    let mut platz = panel_w - 28;
+    if let Some(g) = d.ruhe_grund {
+        let g = kuerzen(u, g, panel_w / 2, 12, 1);
+        let gw = u.text.width(&g, 12, 1);
+        u.text.draw(c, px + panel_w - gw, zeile.y + 17, &g, 12, ui::AMBER, 1);
+        platz -= gw + 12;
+    }
+    let t = kuerzen(u, lang.get(PreventSleep), platz, 13, 1);
     u.text.draw(c, px + 26, zeile.y + 17, &t, 13, if hot { 0xffffff } else { ui::TEXT }, 1);
     if hot && u.click {
         action = Action::RuheUmschalten;
@@ -10945,7 +10982,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // zeigt die Freigabe an und den Ruhezustand verhindert, sonst beides
     // aus.
     let an = view == "startfreigabe";
-    let dieser = MIT_FREIGABE.then_some(DieserComputer { freigabe: an, name: "Büro-PC", id: Some(581_729_911), ruhe_verhindern: an });
+    let dieser = MIT_FREIGABE.then_some(DieserComputer { freigabe: an, name: "Büro-PC", id: Some(581_729_911), ruhe_verhindern: an, ruhe_grund: None });
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
         let _ = start_screen(
@@ -12166,7 +12203,8 @@ fn main() {
     if cfg.ruhe_verhindern {
         ruhe_setzen(&mut ruhe, true, sprache);
     }
-    let menue_quelle = Arc::new(Mutex::new(MenueQuelle { lang: sprache, ruhe_verhindern: cfg.ruhe_verhindern }));
+    let (ruhe_an, ruhe_code) = ruhezustand::anzeige(cfg.ruhe_verhindern, ruhe.an(), ruhe.abgelehnt());
+    let menue_quelle = Arc::new(Mutex::new(MenueQuelle { lang: sprache, ruhe_verhindern: ruhe_an, ruhe_abgelehnt: ruhe_code }));
 
     let mut app = App {
         shared,
@@ -17006,6 +17044,37 @@ mod tests {
         assert_eq!(z.adresse, "10.0.0.5:9001");
         let z = ziel_bilden("10.0.0.1:9001", Some(7), &netz, &bekannte).unwrap();
         assert_eq!((z.adresse.as_str(), z.id), ("10.0.0.1:9001", Some(7)));
+    }
+
+    /// "Verbinden: <Host>" am Symbol und in der Menueleiste: dieselbe Liste
+    /// wie im Startbildschirm - ein Geraet mit zwei Netzkarten einmal,
+    /// bekannte zuerst, dann nach Namen, hoechstens vier. Diesen Rechner
+    /// laesst schon die Liste der Bekanntgabe weg (discovery::liste).
+    #[test]
+    fn menue_hosts_wie_im_startbildschirm() {
+        let mut bekannte = zugang::Hostliste::default();
+        let k = [0x51u8; 32];
+        bekannte.merken(zugang::BekannterHost::neu(k, "10.0.3.9:9001", "Zuhause"));
+        let netz = vec![
+            gefunden("Anton", "10.0.3.1:9001", Some(11)),
+            gefunden("Zuhause", "10.0.3.9:9001", Some(zugang::geraete_id(&k))),
+            gefunden("Zuhause", "10.0.4.9:9001", Some(zugang::geraete_id(&k))),
+            gefunden("Berta", "10.0.3.2:9001", Some(12)),
+            gefunden("Caesar", "10.0.3.3:9001", Some(13)),
+            gefunden("Dora", "10.0.3.4:9001", Some(14)),
+        ];
+        let m = menue_hosts(&netz, &bekannte);
+        assert_eq!(
+            m,
+            vec![
+                ("Zuhause".to_string(), "10.0.3.9:9001".to_string()),
+                ("Anton".into(), "10.0.3.1:9001".into()),
+                ("Berta".into(), "10.0.3.2:9001".into()),
+                ("Caesar".into(), "10.0.3.3:9001".into()),
+            ]
+        );
+        let start: Vec<(String, String)> = hostzeilen(&netz, &bekannte).into_iter().map(|z| (z.name, z.adresse)).collect();
+        assert_eq!(m[..], start[..tray::HOSTS_MAX]);
     }
 
     /// 9.1: je Host Name, ID (ohne Erweiterung keine) und der Haken fuer

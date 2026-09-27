@@ -653,6 +653,20 @@ static void app_modell_pruefen(void) {
         @"Quit QuadChroma",
     ]), "en, Freigabe aus, keine Hosts, Ruhezustand verhindert, Freigaben fehlen (ohne Hinweis), nicht in /Applications");
 
+    // Ruhezustand gewuenscht, aber vom System abgelehnt: kein Haken, darunter
+    // gesperrt der Grund, den der Client schickt.
+    z.ruhe = NO;
+    z.ruheGrund = @"Not active: refused by the system (0xe00002c2)";
+    NSArray<NSString *> *rt = qc_menue_titel(qc_menue_modell(z));
+    NSUInteger ri = [rt indexOfObject:@"Prevent sleep while QuadChroma is running"];
+    pruefe(ri != NSNotFound && ri + 1 < rt.count &&
+           [rt[ri + 1] isEqualToString:@"(Not active: refused by the system (0xe00002c2))"],
+           "Ruhezustand abgelehnt: ohne Haken, der Grund gesperrt darunter");
+    z.ruheGrund = nil;
+    z.ruhe = YES;
+    pruefe(![qc_menue_titel(qc_menue_modell(z)) containsObject:@"(Not active: refused by the system (0xe00002c2))"],
+           "ohne Grund keine Zeile");
+
     // Mit Freigabe fehlen sie wieder sichtbar; Port belegt und verbunden wie beim Host.
     z.freigabe = YES;
     NSArray<NSString *> *t = qc_menue_titel(qc_menue_modell(z));

@@ -73,7 +73,8 @@ typedef NS_ENUM(NSInteger, QCAnmelden) {
 @property (nonatomic) BOOL app;
 @property (nonatomic, copy) NSString *geraetename;     // Kopfzeile "QuadChroma – <Name>"
 @property (nonatomic) BOOL freigabe;                   // Haken "Diesen Mac freigeben" (Wunsch des Clients)
-@property (nonatomic) BOOL ruhe;                       // Haken "Ruhezustand verhindern"
+@property (nonatomic) BOOL ruhe;                       // Haken "Ruhezustand verhindern" (was gilt)
+@property (nonatomic, copy) NSString *ruheGrund;       // gewuenscht, aber abgelehnt: Grund; nil = keiner
 @property (nonatomic, copy) NSArray<NSArray<NSString *> *> *hosts;   // je @[Name, Adresse], hoechstens 4
 @end
 

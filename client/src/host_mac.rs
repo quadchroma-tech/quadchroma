@@ -77,6 +77,7 @@ struct AppStandC {
     hosts: c_int,
     host_namen: *const *const c_char,
     host_adressen: *const *const c_char,
+    ruhe_grund: *const c_char,
 }
 
 extern "C" {
@@ -407,8 +408,11 @@ pub fn geraetename_fenster() {
 pub struct Stand {
     /// Haken "Diesen Mac freigeben" (der Wunsch).
     pub freigabe: bool,
-    /// Haken "Ruhezustand verhindern".
+    /// Haken "Ruhezustand verhindern": was gilt (nicht der Wunsch).
     pub ruhe: bool,
+    /// Gewuenscht, aber vom System abgelehnt: der Grund (schon uebersetzt),
+    /// als gesperrte Zeile unter dem Haken; leer: keiner.
+    pub ruhe_grund: String,
     /// Eine Sitzung laeuft: Cmd+Q und Cmd+H gehen an den Mac drueben.
     pub sitzung: bool,
     pub tooltip: String,
@@ -447,6 +451,7 @@ impl Symbol {
         self.zuletzt = Some(s.clone());
         let c = |t: &str| CString::new(t.replace('\0', " ")).unwrap_or_default();
         let tooltip = c(&s.tooltip);
+        let ruhe_grund = c(&s.ruhe_grund);
         let namen: Vec<CString> = s.hosts.iter().map(|(n, _)| c(n)).collect();
         let adressen: Vec<CString> = s.hosts.iter().map(|(_, a)| c(a)).collect();
         let nz: Vec<*const c_char> = namen.iter().map(|n| n.as_ptr()).collect();
@@ -459,6 +464,7 @@ impl Symbol {
             hosts: nz.len() as c_int,
             host_namen: nz.as_ptr(),
             host_adressen: az.as_ptr(),
+            ruhe_grund: ruhe_grund.as_ptr(),
         };
         // SAFETY: alle Zeiger leben waehrend des Aufrufs; menue.m kopiert.
         unsafe { qc_app_stand_setzen(&st) };
@@ -646,6 +652,7 @@ pub fn selbsttest() -> i32 {
     s.stand_setzen(&Stand {
         freigabe: false,
         ruhe: true,
+        ruhe_grund: String::new(),
         sitzung: false,
         tooltip: "QuadChroma – Selbsttest".into(),
         hosts: vec![("Selbsttest".into(), "127.0.0.1:9".into())],
@@ -765,6 +772,7 @@ pub fn selbsttest() -> i32 {
     s.stand_setzen(&Stand {
         freigabe: false,
         ruhe: true,
+        ruhe_grund: String::new(),
         sitzung: false,
         tooltip: "QuadChroma – Selbsttest".into(),
         hosts: vec![("Selbsttest".into(), "127.0.0.1:9".into())],

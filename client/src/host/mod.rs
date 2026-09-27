@@ -1299,6 +1299,7 @@ fn eigenes_symbol(
             hosts: Vec::new(),
             autostart: false,
             ruhe_verhindern: false,
+            ruhe_abgelehnt: None,
         };
         let (m, zu) = symbolmenue::menue(lang, &stand);
         *sperre(&z) = zu;

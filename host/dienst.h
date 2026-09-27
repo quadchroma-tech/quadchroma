@@ -126,12 +126,13 @@ void qc_dienst_name_setzen(const char *name);
 // (menue.m, nur auf dem Hauptfaden)
 
 // Was nur der Client weiss: sein Haken der Freigabe (der Wunsch - die
-// Zustandszeile sagt, was wirklich ist), "Ruhezustand verhindern", die
-// gefundenen Hosts fuer "Verbinden: <Host>" (hoechstens 4, name darf leer
-// sein), der Tooltip und ob eine Sitzung laeuft (dann gehen Cmd+Q und Cmd+H
-// an den Mac drueben statt an das Programmmenue). Die Texte gelten nur
-// waehrend des Aufrufs. Das Menue wird nur neu gebaut, wenn sich etwas
-// aendert.
+// Zustandszeile sagt, was wirklich ist), "Ruhezustand verhindern" (was gilt;
+// ruhe_grund: warum nicht, wenn gewuenscht und vom System abgelehnt - schon
+// uebersetzt, NULL oder leer = kein Grund), die gefundenen Hosts fuer
+// "Verbinden: <Host>" (hoechstens 4, name darf leer sein), der Tooltip und
+// ob eine Sitzung laeuft (dann gehen Cmd+Q und Cmd+H an den Mac drueben
+// statt an das Programmmenue). Die Texte gelten nur waehrend des Aufrufs.
+// Das Menue wird nur neu gebaut, wenn sich etwas aendert.
 typedef struct {
     int freigabe;
     int ruhe;
@@ -140,6 +141,7 @@ typedef struct {
     int hosts;
     const char *const *host_namen;
     const char *const *host_adressen;
+    const char *ruhe_grund;
 } qc_app_stand;
 void qc_app_stand_setzen(const qc_app_stand *s);
 
