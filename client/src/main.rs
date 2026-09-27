@@ -11753,7 +11753,9 @@ fn autostart_beim_start() -> Option<Meldung> {
 /// umstellen - an installiert nach %ProgramFiles%\QuadChroma und legt die
 /// geplante Aufgabe dieses Kontos an, aus loescht sie. Fuer Tests und
 /// Verwalter; die App ist ja erhoeht. Laeuft vor allem anderen und ohne
-/// Protokolldatei. 0 gelungen, 1 gescheitert, 2 falscher Aufruf (bzw. nicht Windows), 3
+/// Protokolldatei; die Zeilen gehen auf die Konsole bzw. dorthin, wohin der
+/// Aufrufer die Ausgabe umgeleitet hat (main: std_umleitung_behalten). 0
+/// gelungen, 1 gescheitert, 2 falscher Aufruf (bzw. nicht Windows), 3
 /// gesperrt (kein Administratorkonto; eine Aufgabe dieses Kontos auf einen
 /// fuer Nutzer beschreibbaren Ordner wird dann abgeschaltet).
 fn autostart_befehlszeile(wert: Option<&str>) -> i32 {
@@ -11915,14 +11917,39 @@ fn decodertest() {
     }
 }
 
+/// Die Standardausgaben, die der Aufrufer in eine Datei oder Pipe
+/// umgeleitet hat, ueber `f` (AttachConsole) hinweg behalten: das Anhaengen
+/// an die Konsole setzt eine umgeleitete Datei sonst auf die Konsole zurueck,
+/// und `quadchroma.exe --autostart an > datei.txt` schriebe auf den
+/// Bildschirm statt in die Datei. Nicht Umgeleitetes (Doppelklick, Konsole,
+/// NUL) laesst die Funktion, wie AttachConsole es setzt.
+#[cfg(windows)]
+fn std_umleitung_behalten(f: impl FnOnce()) {
+    use windows::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK, FILE_TYPE_PIPE};
+    use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE};
+    let umgeleitet = |art: STD_HANDLE| unsafe {
+        GetStdHandle(art).ok().filter(|h| !h.is_invalid() && [FILE_TYPE_DISK, FILE_TYPE_PIPE].contains(&GetFileType(*h)))
+    };
+    let vorher = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|art| (art, umgeleitet(art)));
+    f();
+    for (art, griff) in vorher {
+        if let Some(griff) = griff {
+            unsafe {
+                let _ = SetStdHandle(art, griff);
+            }
+        }
+    }
+}
+
 fn main() {
     // An die Konsole des Aufrufers anhaengen, falls es eine gibt. Beim
-    // Doppelklick gibt es keine, dann passiert hier einfach nichts.
+    // Doppelklick gibt es keine, dann passiert hier einfach nichts. Eine
+    // Umleitung in eine Datei oder Pipe bleibt, wie sie ist.
     #[cfg(windows)]
-    unsafe {
+    std_umleitung_behalten(|| unsafe {
         use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-    }
+    });
     // "Mit Windows starten": die laufende exe und die FFmpeg-DLLs sperren,
     // bevor irgendetwas installieren oder erneuern kann - bis der Prozess
     // endet, laesst sich keine davon umbenennen oder ersetzen
