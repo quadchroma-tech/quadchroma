@@ -98,4 +98,8 @@ windows = { version = "0.62", features = [
     # Host role: a sound when a device asks to be allowed (MessageBeep, see
     # host/fenster.rs)
     "Win32_System_Diagnostics_Debug",
+    # "Start with Windows": who is signed in to this session
+    # (WTSQuerySessionInformationW) - a standard account that runs the app
+    # with an administrator's credentials gets no autostart (installation.rs)
+    "Win32_System_RemoteDesktop",
 ] }

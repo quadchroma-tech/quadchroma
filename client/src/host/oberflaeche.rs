@@ -203,6 +203,7 @@ mod tests {
             geraete: Ok(vec![crate::zugang::Geraet { schluessel: [1; 32], datum: "2026-09-26".into(), name: "Laptop".into() }]),
             hosts: vec![("Mac".into(), "10.0.0.1:9001".into())],
             autostart: false,
+            autostart_gesperrt: false,
             ruhe_verhindern: true,
             ruhe_abgelehnt: None,
         };

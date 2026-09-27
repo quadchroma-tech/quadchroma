@@ -18,7 +18,10 @@
 //   (beschaedigte Liste: "Geraeteliste beschaedigt" + "... zuruecksetzen")
 //   Geraetename aendern ...
 //   [x] Diesen PC freigeben           Freigabe an/aus (einstellungen.txt)
-//   [x] Mit Windows starten           eine Verknuepfung im Autostart-Ordner
+//   [x] Mit Windows starten           geplante Aufgabe, startet die nach
+//                                     Program Files installierte Kopie;
+//                                     gesperrt ohne Administratorkonto
+//                                     (darunter der Grund)
 //   [ ] Ruhezustand verhindern, solange QuadChroma laeuft
 //   Beenden                           mit Abschied an einen Zuschauer
 //
@@ -143,6 +146,10 @@ pub struct MenueStand {
     /// Gefundene Hosts: (Name, Adresse), in der Reihenfolge der Liste.
     pub hosts: Vec<(String, String)>,
     pub autostart: bool,
+    /// "Mit Windows starten" geht unter diesem Konto nicht (Standardkonto mit
+    /// den Zugangsdaten eines Administrators, installation::konto): der Punkt
+    /// ist gesperrt, darunter steht AutostartNeedsAdmin.
+    pub autostart_gesperrt: bool,
     /// Haken "Ruhezustand verhindern": was gilt (nicht der Wunsch).
     pub ruhe_verhindern: bool,
     /// Gewuenscht, aber vom System abgelehnt: sein Fehlercode (darunter
@@ -298,7 +305,12 @@ pub fn menue(lang: &Lang, s: &MenueStand) -> (Vec<Eintrag>, Zuordnung) {
     if app {
         m.push(Eintrag::punkt(lang.get(Key::DeviceNameChange), NR_NAME));
         m.push(Eintrag::schalter(lang.get(Key::StartShare), NR_FREIGABE, s.freigabe.an()));
-        m.push(Eintrag::schalter(lang.get(Key::HostStartWindows), NR_AUTOSTART, s.autostart));
+        if s.autostart_gesperrt {
+            m.push(Eintrag::Punkt { text: lang.get(Key::HostStartWindows).to_string(), nummer: NR_AUTOSTART, haken: s.autostart, aktiv: false, fett: false });
+            m.push(Eintrag::anzeige(lang.get(Key::AutostartNeedsAdmin)));
+        } else {
+            m.push(Eintrag::schalter(lang.get(Key::HostStartWindows), NR_AUTOSTART, s.autostart));
+        }
         m.push(Eintrag::schalter(lang.get(Key::PreventSleep), NR_RUHE, s.ruhe_verhindern));
         if let Some(c) = &s.ruhe_abgelehnt {
             m.push(Eintrag::anzeige(lang.get(Key::PreventSleepRefused).replace("{c}", c)));
@@ -357,6 +369,7 @@ mod tests {
             geraete: Ok(vec![geraet(1, "Laptop"), geraet(2, "Wohnzimmer")]),
             hosts: Vec::new(),
             autostart: true,
+            autostart_gesperrt: false,
             ruhe_verhindern: false,
             ruhe_abgelehnt: None,
         }
@@ -487,6 +500,28 @@ mod tests {
         stelle(&m, "Geräte-ID: 581 729 911");
         let en = crate::strings::pick("en");
         assert_eq!(texte(&menue(en, &s).0)[1], "Sharing is off");
+    }
+
+    /// Ohne Administratorkonto: "Mit Windows starten" ist gesperrt (nicht
+    /// waehlbar, Haken wie er ist), darunter der Grund als Anzeige; sonst
+    /// bleibt das Menue gleich.
+    #[test]
+    fn app_autostart_gesperrt() {
+        let de = crate::strings::pick("de");
+        let mut s = stand(Art::App);
+        s.autostart = false;
+        s.autostart_gesperrt = true;
+        let (m, z) = menue(de, &s);
+        let a = stelle(&m, "Mit Windows starten");
+        assert!(matches!(&m[a], Eintrag::Punkt { aktiv: false, haken: false, nummer: NR_AUTOSTART, .. }), "{:?}", m[a]);
+        assert_eq!(texte(&m)[a + 1], "Nur mit einem Administratorkonto");
+        assert!(matches!(&m[a + 1], Eintrag::Punkt { aktiv: false, nummer: 0, .. }));
+        assert_eq!(texte(&m)[a + 2], "Ruhezustand verhindern, solange QuadChroma läuft");
+        assert_eq!(m.len(), menue(de, &stand(Art::App)).0.len() + 1);
+        // Die Nummer fuehrt weiter zur Aktion - gesperrt ist der Punkt im Menue.
+        assert_eq!(aktion_zu(NR_AUTOSTART, &z), Some(Aktion::Autostart));
+        let en = crate::strings::pick("en");
+        assert!(texte(&menue(en, &s).0).iter().any(|t| t == "Only with an administrator account"));
     }
 
     /// Port belegt: der Zustand nennt den Port, die Freigabe bleibt an

@@ -52,8 +52,12 @@ mod strings_more;
 mod strings_north;
 mod strings_west;
 mod ui;
-/// Desktop-Verknuepfung je Host (anlegen nur unter Windows).
+/// Desktop-Verknuepfung je Host und "Mit Windows starten" als geplante
+/// Aufgabe (anlegen nur unter Windows).
 mod verknuepfung;
+/// "Mit Windows starten": Installation nach %ProgramFiles%\QuadChroma, Pruefung
+/// von Ordner, Rechten und Konto (nur Windows; die reine Logik ueberall).
+mod installation;
 /// Zugang (Pairing v1): Geraete-ID, Passwortbeweis, Zugangsnachrichten,
 /// Drossel, Geraeteliste, Passwortdatei und hosts.txt - Client und
 /// Windows-Host-Rolle.
@@ -6020,10 +6024,11 @@ fn einzel_folge(sitzung: Option<&str>, adresse: &str) -> EinzelFolge {
 const MIT_VERKNUEPFUNG: bool = cfg!(windows);
 
 /// So oft liest das Kaestchen des Autostarts im Startbildschirm den Stand
-/// (Verknuepfung bzw. SMAppService) neu.
+/// (geplante Aufgabe bzw. SMAppService) neu.
 const AUTOSTART_TAKT: Duration = Duration::from_millis(500);
 
-/// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
+/// So lange steht das Ergebnis einer Verknuepfung bzw. von "Mit Windows
+/// starten" im Meldungsbereich.
 const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
 
 /// Die eine App - Client und Host-Rolle in einem Prozess, ein Symbol - unter
@@ -6428,7 +6433,8 @@ struct App {
     geraete_rest: f32,
     /// Die eigene Geraete-ID, gemerkt (siehe `eigene_id`).
     eigene_id_merker: IdMerker,
-    /// Ergebnis der letzten Desktop-Verknuepfung und seit wann es steht -
+    /// Ergebnis der letzten Desktop-Verknuepfung bzw. von "Mit Windows
+    /// starten" (wohin installiert, oder gescheitert) und seit wann es steht -
     /// 6 s im Meldungsbereich des Startbildschirms bzw. im Reiter.
     verknuepfung_meldung: Option<(Meldung, Instant)>,
     /// Symbol im Infobereich bzw. in der Menueleiste. None bei tray=aus oder
@@ -7838,14 +7844,18 @@ impl App {
         (an, code.map(|c| self.lang.get(strings::Key::PreventSleepRefused).replace("{c}", &c)))
     }
 
-    /// "Mit Windows starten" (Menue, Kaestchen im Startbildschirm): die eine
-    /// Verknuepfung im Autostart-Ordner an bzw. aus. Mac: "Beim Anmelden
-    /// starten" (nur das Kaestchen - den Punkt der Menueleiste schaltet
-    /// menue.m selbst) ueber denselben Weg wie der Menuepunkt: SMAppService
-    /// an bzw. aus, eingetragen aber nicht erlaubt oeffnet die
-    /// Systemeinstellungen, ausserhalb von /Applications nichts. Das Kaestchen
-    /// liest den Stand danach neu - Menue und Kaestchen zeigen immer, was
-    /// gilt.
+    /// "Mit Windows starten" (Menue, Kaestchen im Startbildschirm): an
+    /// installiert die App nach %ProgramFiles%\QuadChroma und legt die
+    /// geplante Aufgabe auf die installierte exe an, aus loescht die Aufgabe
+    /// (verknuepfung::autostart_setzen). Wohin installiert wurde bzw. dass es
+    /// scheiterte, steht danach im Startbildschirm und - ohne sichtbares
+    /// Fenster - in einer Sprechblase am Symbol. Ohne Administratorkonto
+    /// (installation::konto) gesperrt. Mac: "Beim Anmelden starten" (nur das
+    /// Kaestchen - den Punkt der Menueleiste schaltet menue.m selbst) ueber
+    /// denselben Weg wie der Menuepunkt: SMAppService an bzw. aus, eingetragen
+    /// aber nicht erlaubt oeffnet die Systemeinstellungen, ausserhalb von
+    /// /Applications nichts. Das Kaestchen liest den Stand danach neu - Menue
+    /// und Kaestchen zeigen immer, was gilt.
     fn autostart_umschalten(&mut self) {
         self.autostart_gelesen = None;
         #[cfg(target_os = "macos")]
@@ -7855,14 +7865,31 @@ impl App {
         }
         #[cfg(windows)]
         {
+            if let Some(grund) = installation::konto().grund() {
+                protokoll::zeile(format!("Mit Windows starten: gesperrt - {grund}"));
+                return;
+            }
             let an = !verknuepfung::autostart_an(None);
-            match verknuepfung::autostart_setzen(None, an) {
-                Ok(()) => protokoll::zeile(if an {
-                    "Mit Windows starten: an (geplante Aufgabe, hoechste Rechte, bei der Anmeldung)".into()
-                } else {
-                    "Mit Windows starten: aus".into()
-                }),
-                Err(f) => protokoll::zeile(format!("Mit Windows starten nicht umgestellt: {f}")),
+            let m = match verknuepfung::autostart_setzen(verknuepfung::Ort::STANDARD, an) {
+                Ok(u) => {
+                    let (zeile, m) = autostart_text(&u);
+                    protokoll::zeile(zeile);
+                    m
+                }
+                Err(f) => {
+                    let zeile = format!("Mit Windows starten nicht umgestellt: {f}");
+                    protokoll::zeile(zeile.clone());
+                    Some(Meldung::neu(strings::Key::AutostartFailed, zeile))
+                }
+            };
+            if let Some(m) = m {
+                if self.window.is_none() || self.verborgen {
+                    let text = m.text(self.lang);
+                    if let Some(s) = self.symbol.as_mut() {
+                        s.hinweis("QuadChroma", &text);
+                    }
+                }
+                self.verknuepfung_meldung = Some((m, Instant::now()));
             }
         }
     }
@@ -7878,7 +7905,13 @@ impl App {
         self.autostart_gelesen = Some(Instant::now());
         #[cfg(windows)]
         {
-            self.autostart = if verknuepfung::autostart_an(None) { Autostart::An } else { Autostart::Aus };
+            self.autostart = if installation::konto().gesperrt() {
+                Autostart::KeinAdmin
+            } else if verknuepfung::autostart_an(None) {
+                Autostart::An
+            } else {
+                Autostart::Aus
+            };
         }
         #[cfg(target_os = "macos")]
         {
@@ -8241,6 +8274,7 @@ impl App {
                 geraete: h.geraete,
                 hosts,
                 autostart: verknuepfung::autostart_an(None),
+                autostart_gesperrt: installation::konto().gesperrt(),
                 ruhe_verhindern,
                 ruhe_abgelehnt,
             };
@@ -8339,14 +8373,16 @@ impl App {
         self.verknuepfung_meldung = Some((m, Instant::now()));
     }
 
-    /// Das Ergebnis der letzten Verknuepfung als Text und Farbe, solange es
-    /// stehen soll: angelegt in Cyan, gescheitert in Amber.
+    /// Das Ergebnis der letzten Verknuepfung bzw. von "Mit Windows starten"
+    /// als Text und Farbe, solange es stehen soll: gelungen in Cyan,
+    /// gescheitert in Amber.
     fn verknuepfung_hinweis(&self) -> Option<(String, u32)> {
         let (m, seit) = self.verknuepfung_meldung.as_ref()?;
         if seit.elapsed() >= VERKNUEPFUNG_ANZEIGE {
             return None;
         }
-        let farbe = if m.key == strings::Key::DesktopShortcutFailed { ui::AMBER } else { ui::CYAN };
+        let gescheitert = matches!(m.key, strings::Key::DesktopShortcutFailed | strings::Key::AutostartFailed);
+        let farbe = if gescheitert { ui::AMBER } else { ui::CYAN };
         Some((m.text(self.lang), farbe))
     }
 
@@ -10173,7 +10209,7 @@ struct DieserComputer<'a> {
     ruhe_verhindern: bool,
     ruhe_grund: Option<&'a str>,
     /// Kaestchen unter "Ruhezustand verhindern": derselbe Stand wie der
-    /// Punkt am Symbol (Verknuepfung im Autostart-Ordner bzw. SMAppService).
+    /// Punkt am Symbol (geplante Aufgabe bzw. SMAppService).
     autostart: Autostart,
 }
 
@@ -10193,6 +10229,11 @@ enum Autostart {
     /// Mac: die App liegt nicht in /Applications - gesperrt, mit Grund (wie
     /// der Punkt im Menue der Menueleiste).
     NichtInProgramme,
+    /// Windows: die App laeuft nicht unter dem angemeldeten
+    /// Administratorkonto (installation::konto) - gesperrt, mit Grund
+    /// AutostartNeedsAdmin (wie der Punkt am Symbol).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    KeinAdmin,
 }
 
 /// Text des Autostart-Kaestchens: derselbe wie der Punkt am Symbol.
@@ -10253,8 +10294,12 @@ fn dieser_computer_zeichnen(
     if kaestchenzeile(u, c, z.ruhe, lang.get(PreventSleep), d.ruhe_verhindern, false, d.ruhe_grund.map(|g| (g, ui::AMBER)), false) {
         action = Action::RuheUmschalten;
     }
-    let gesperrt = d.autostart == Autostart::NichtInProgramme;
-    let grund = gesperrt.then(|| (lang.get(HostMoveToApps), ui::DIM));
+    let grund = match d.autostart {
+        Autostart::NichtInProgramme => Some((lang.get(HostMoveToApps), ui::DIM)),
+        Autostart::KeinAdmin => Some((lang.get(AutostartNeedsAdmin), ui::DIM)),
+        _ => None,
+    };
+    let gesperrt = grund.is_some();
     let (an, halb) = (d.autostart == Autostart::An, d.autostart == Autostart::FreigabeNoetig);
     if kaestchenzeile(u, c, z.autostart, lang.get(AUTOSTART_TEXT), an, halb, grund, gesperrt) {
         action = Action::AutostartUmschalten;
@@ -11296,10 +11341,12 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // "startfreigabe" zeigt Freigabe, Ruhezustand und Autostart an, sonst
     // alles aus. "startbeenden" zeigt den Knopf ohne Symbol ("Beenden"),
     // sonst steht das Symbol ("Fenster schliessen"); "startgesperrt" den
-    // gesperrten Autostart (Mac: nicht in /Applications).
+    // gesperrten Autostart (Mac: nicht in /Applications, Windows: kein
+    // Administratorkonto).
     let an = view == "startfreigabe";
     let autostart = match view {
         "startfreigabe" => Autostart::An,
+        "startgesperrt" if cfg!(windows) => Autostart::KeinAdmin,
         "startgesperrt" => Autostart::NichtInProgramme,
         _ => Autostart::Aus,
     };
@@ -11575,6 +11622,120 @@ fn verknuepfung_befehlszeile(a: Result<verknuepfung::Aufruf, String>) -> i32 {
     }
 }
 
+/// "Mit Windows starten" umgestellt: die Zeile fuers Protokoll und - beim
+/// Einschalten - die Meldung, wohin installiert wurde (AutostartInstalled).
+#[cfg(windows)]
+fn autostart_text(u: &verknuepfung::Umstellung) -> (String, Option<Meldung>) {
+    use verknuepfung::Umstellung as U;
+    let exe = |o: &std::path::Path| format!("{} {}", o.join(installation::EXE).display(), verknuepfung::AUTOSTART_ARGUMENT);
+    match u {
+        U::Installiert { ordner, bericht } => {
+            let dateien: Vec<String> = bericht.dateien.iter().map(|(n, s)| format!("{n} {}", s.get(..16).unwrap_or(s))).collect();
+            let mut zeile = format!(
+                "Mit Windows starten: an - nach {} installiert (SHA-256: {}); die geplante Aufgabe (hoechste Rechte, bei der Anmeldung) startet {}",
+                ordner.display(),
+                dateien.join(", "),
+                exe(ordner)
+            );
+            if !bericht.beim_neustart.is_empty() {
+                let alt: Vec<String> = bericht.beim_neustart.iter().map(|p| p.display().to_string()).collect();
+                zeile.push_str(&format!("; die alte Fassung lief noch - beiseite gelegt, geloescht beim naechsten Neustart: {}", alt.join(", ")));
+            }
+            let m = Meldung::neu(strings::Key::AutostartInstalled, zeile.clone()).mit("{n}", ordner.display().to_string());
+            (zeile, Some(m))
+        }
+        U::NurAufgabe(ordner) => {
+            let zeile = format!(
+                "Mit Windows starten: an - die App laeuft schon aus {}, nur die geplante Aufgabe angelegt (hoechste Rechte, bei der Anmeldung): {}",
+                ordner.display(),
+                exe(ordner)
+            );
+            let m = Meldung::neu(strings::Key::AutostartInstalled, zeile.clone()).mit("{n}", ordner.display().to_string());
+            (zeile, Some(m))
+        }
+        U::Aus(Some(ordner)) => {
+            (format!("Mit Windows starten: aus - die geplante Aufgabe ist geloescht; die installierte Kopie in {} bleibt liegen", ordner.display()), None)
+        }
+        U::Aus(None) => ("Mit Windows starten: aus - die geplante Aufgabe ist geloescht".into(), None),
+    }
+}
+
+/// Beim Start der ersten Instanz (Windows): ist "Mit Windows starten" an,
+/// die Aufgabe auf die installierte exe richten bzw. die installierte Kopie
+/// erneuern; alte Verknuepfungen im Autostart-Ordner ersetzen
+/// (verknuepfung::autostart_beim_start). Ohne Administratorkonto nichts
+/// davon, nur der Vermerk. Liefert die Meldung fuer den Startbildschirm,
+/// wenn installiert wurde.
+#[cfg(windows)]
+fn autostart_beim_start() -> Option<Meldung> {
+    use verknuepfung::Start as S;
+    if let Some(grund) = installation::konto().grund() {
+        protokoll::zeile(format!("Mit Windows starten: gesperrt - {grund}"));
+        return None;
+    }
+    let (zeile, meldung) = match verknuepfung::autostart_beim_start(None, verknuepfung::Ort::STANDARD) {
+        Ok(S::Aus) | Ok(S::Aktuell) => return None,
+        Ok(S::Erneuert { ordner, bericht }) => {
+            let (z, m) = autostart_text(&verknuepfung::Umstellung::Installiert { ordner, bericht });
+            (format!("{z} - die installierte Kopie war eine andere Fassung als diese exe und ist erneuert"), m)
+        }
+        Ok(S::Umgestellt { vorher, neu }) => {
+            let (z, m) = autostart_text(&neu);
+            (format!("{z} - die Aufgabe startete bisher {vorher}"), m)
+        }
+        Ok(S::VerknuepfungErsetzt(neu)) => {
+            let (z, m) = autostart_text(&neu);
+            (format!("{z} - die alte Verknuepfung im Autostart-Ordner ist dadurch ersetzt"), m)
+        }
+        Ok(S::AndereExe(ziel)) => {
+            (format!("Mit Windows starten: die alte Verknuepfung startet {ziel}, nicht diese exe - sie bleibt, wie sie ist"), None)
+        }
+        Err(e) => (format!("Mit Windows starten: beim Start nicht geprueft bzw. nicht umgestellt - {e}"), None),
+    };
+    protokoll::zeile(zeile);
+    meldung
+}
+
+/// `--autostart an|aus` (Windows): "Mit Windows starten" wie im Menue
+/// umstellen - an installiert nach %ProgramFiles%\QuadChroma und legt die
+/// geplante Aufgabe an, aus loescht sie. Fuer Tests und Verwalter; die App
+/// ist ja erhoeht. Laeuft vor allem anderen und ohne Protokolldatei. 0
+/// gelungen, 1 gescheitert, 2 falscher Aufruf (bzw. nicht Windows), 3
+/// gesperrt (kein Administratorkonto).
+fn autostart_befehlszeile(wert: Option<&str>) -> i32 {
+    #[cfg(not(windows))]
+    {
+        let _ = wert;
+        eprintln!("--autostart gibt es nur unter Windows (auf dem Mac: \"Beim Anmelden starten\" in der Menueleiste).");
+        2
+    }
+    #[cfg(windows)]
+    {
+        let an = match wert {
+            Some("an" | "on") => true,
+            Some("aus" | "off") => false,
+            _ => {
+                eprintln!("Aufruf: quadchroma.exe --autostart an|aus");
+                return 2;
+            }
+        };
+        if let Some(grund) = installation::konto().grund() {
+            eprintln!("Mit Windows starten: gesperrt - {grund}");
+            return 3;
+        }
+        match verknuepfung::autostart_setzen(verknuepfung::Ort::STANDARD, an) {
+            Ok(u) => {
+                println!("{}", autostart_text(&u).0);
+                0
+            }
+            Err(e) => {
+                eprintln!("Mit Windows starten nicht umgestellt: {e}");
+                1
+            }
+        }
+    }
+}
+
 /// --decodertest unter Windows: die Karten, die CUDA-Geraete, das
 /// D3D11-Geraet je Adapter und je Codec und Wunsch der Decoder, der
 /// herauskommt.
@@ -11738,6 +11899,10 @@ fn main() {
     // Desktop-Verknuepfung ohne Fenster und ohne Verbindung.
     if let Some(a) = verknuepfung::aufruf(&args) {
         std::process::exit(verknuepfung_befehlszeile(a));
+    }
+    // "Mit Windows starten" ohne Fenster: --autostart an|aus.
+    if let Some(i) = args.iter().position(|a| a == "--autostart") {
+        std::process::exit(autostart_befehlszeile(args.get(i + 1).map(String::as_str)));
     }
 
     // Selbsttest des Symbols: anlegen, aendern, entfernen, Ende - vor
@@ -12480,21 +12645,18 @@ fn main() {
     }
     let proxy = el.create_proxy();
 
-    // Die Verknuepfung "Mit Windows starten" frueherer Fassungen (die eine App
-    // mit --hintergrund, die noch aeltere Host-Rolle mit --host) weicht der
-    // geplanten Aufgabe: eine erhoehte exe liefe aus dem Autostart-Ordner nicht
-    // mehr still an.
+    // "Mit Windows starten": die Aufgabe startet nur die nach
+    // %ProgramFiles%\QuadChroma installierte exe. Zeigt sie noch auf eine
+    // andere (fruehere Fassung: der entpackte Ordner), wird installiert und
+    // umgestellt; ist diese exe eine andere Fassung als die installierte,
+    // wird die installierte erneuert; die Verknuepfung frueherer Fassungen im
+    // Autostart-Ordner (die eine App mit --hintergrund, die noch aeltere
+    // Host-Rolle mit --host) weicht der Aufgabe - eine erhoehte exe liefe
+    // daraus nicht mehr still an.
     #[cfg(windows)]
-    match verknuepfung::autostart_migrieren(None, None) {
-        Ok(verknuepfung::Migration::Ersetzt) => {
-            protokoll::zeile("Mit Windows starten: die alte Verknuepfung ist durch die geplante Aufgabe ersetzt".into())
-        }
-        Ok(verknuepfung::Migration::AndereExe(ziel)) => protokoll::zeile(format!(
-            "Mit Windows starten: die alte Verknuepfung startet {ziel}, nicht diese exe - sie bleibt, wie sie ist"
-        )),
-        Ok(verknuepfung::Migration::Keine) => {}
-        Err(e) => protokoll::zeile(format!("Mit Windows starten: alte Verknuepfung nicht ersetzt - {e}")),
-    }
+    let autostart_meldung = autostart_beim_start();
+    #[cfg(not(windows))]
+    let autostart_meldung: Option<Meldung> = None;
     // --host: dieser PC ist freigegeben (die alte Verknuepfung wollte es so).
     if host_start && !cfg.freigabe {
         cfg.freigabe = true;
@@ -12619,7 +12781,7 @@ fn main() {
         geraete_scroll: 0,
         geraete_rest: 0.0,
         eigene_id_merker: IdMerker::default(),
-        verknuepfung_meldung: None,
+        verknuepfung_meldung: autostart_meldung.map(|m| (m, Instant::now())),
         symbol: None,
         proxy,
         verborgen: false,
@@ -15498,6 +15660,7 @@ mod tests {
                 (Autostart::An, "autostart"),
                 (Autostart::FreigabeNoetig, "autostart"),
                 (Autostart::NichtInProgramme, "autostart"),
+                (Autostart::KeinAdmin, "autostart"),
                 (Autostart::Aus, "ruhe"),
                 (Autostart::Aus, "ende"),
             ] {
@@ -15515,7 +15678,7 @@ mod tests {
                 let a = start_screen(&mut u, &mut c, lang, &[], 0, "", None, None, false, Some(&d), strings::Key::CloseWindow);
                 let ort = format!("{} {stand:?} {ziel}", lang.code);
                 match (ziel, stand) {
-                    ("autostart", Autostart::NichtInProgramme) => assert!(matches!(a, Action::None), "{ort}: gesperrt"),
+                    ("autostart", Autostart::NichtInProgramme | Autostart::KeinAdmin) => assert!(matches!(a, Action::None), "{ort}: gesperrt"),
                     ("autostart", _) => assert!(matches!(a, Action::AutostartUmschalten), "{ort}"),
                     ("ruhe", _) => assert!(matches!(a, Action::RuheUmschalten), "{ort}"),
                     _ => assert!(matches!(a, Action::Schliessen), "{ort}"),

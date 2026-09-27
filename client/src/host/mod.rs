@@ -1298,6 +1298,7 @@ fn eigenes_symbol(
             geraete: h.geraete,
             hosts: Vec::new(),
             autostart: false,
+            autostart_gesperrt: false,
             ruhe_verhindern: false,
             ruhe_abgelehnt: None,
         };
