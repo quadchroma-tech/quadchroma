@@ -4020,7 +4020,8 @@ __attribute__((unused)) static void dienst_takt_anhalten(void) {
 // Beenden (Menue, Cmd+Q, SIGTERM/SIGINT, Abmelden; menue.m ruft es ausserhalb
 // der Main Queue): der Zuschauer bekommt als letzte Nachricht den Abschied
 // (Typ 13, Grund 0 "App beendet"), dann werden Bild- und Eingabekanal
-// geschlossen. Sein Client zeigt "<Host> wurde beendet." und verbindet sich
+// geschlossen. Sein Client zeigt "QuadChroma wurde auf <Host> beendet."
+// (MsgHostQuit, englisch "QuadChroma was closed on <Host>.") und verbindet sich
 // nicht von selbst neu; ein aelterer sieht nur das Ende der Verbindung und
 // versucht es wie bisher erneut. Bewusst nicht Typ 10: den deutet der Client
 // als "ein anderes Geraet hat die Sitzung uebernommen".

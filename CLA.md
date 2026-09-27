@@ -51,10 +51,10 @@ pull request are enough. Copyright itself cannot be transferred under German law
 - **"Licensor"** means Robert Brandt, hello@quadchroma.tech, and any successor to whom
   the Licensor transfers the Project under Section 4.6.
 - **"Project"** means QuadChroma: the software published in the repository
-  https://github.com/quadchroma-tech/quadchroma (Mac host, Windows client, Windows host role,
-  Mac client), its protocol implementation, documentation, translations, build and
-  release scripts and related material, and any product or service of the Licensor
-  based on it.
+  https://github.com/quadchroma-tech/quadchroma (one app each for macOS and Windows,
+  which both shares its own computer and controls others), its protocol implementation,
+  documentation, translations, build and release scripts and related material, and any
+  product or service of the Licensor based on it.
 - **"Project License"** means the license under which the Licensor publishes the Project
   on the Submission Date: today the PolyForm Strict License 1.0.0 together with the
   Licensor's Additional Terms, as reproduced in `LICENSE.txt`.

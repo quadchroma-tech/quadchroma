@@ -548,14 +548,17 @@ to `make`.
 
 macOS, on a downloaded copy (quarantined; unpack the ZIP with the Finder or
 `ditto -x -k` - the command-line `unzip` works too, because the archive carries
-no AppleDouble `._*` entries):
+no AppleDouble `._*` entries). The ZIP unpacks to a folder `QuadChroma-X.Y.Z` with
+the app and the four texts; DMG and `SHA256SUMS.txt` stay in the download folder:
 
 ```sh
+cd QuadChroma-X.Y.Z                                   # the folder from the ZIP
 xattr -p com.apple.quarantine QuadChroma.app          # attribute present = real download
 codesign --verify --deep --strict -vvv QuadChroma.app
 codesign -dvv QuadChroma.app 2>&1 | grep -E 'Authority|TeamIdentifier|Timestamp'
 spctl --assess --type execute -vv QuadChroma.app      # expected: accepted, source=Notarized Developer ID
 xcrun stapler validate -v QuadChroma.app              # "The validate action worked!"
+cd ..                                                 # back to the download folder
 spctl --assess --type open --context context:primary-signature -vv QuadChroma-X.Y.Z-macos-arm64.dmg
 shasum -a 256 -c SHA256SUMS.txt
 ```
@@ -566,18 +569,22 @@ Authority`, `Authority=Apple Root CA`, a `Timestamp=` line (a `Signed Time=`
 line instead means no secure timestamp), `TeamIdentifier=TEAMID`, and
 `accepted`. An ad-hoc or "QuadChroma Dev" build shows `rejected`.
 
-Windows:
+Windows (the ZIP unpacks to a folder `quadchroma-X.Y.Z` with the exe, the two DLLs
+and the texts; `<checkout>` is a clone of the repository for the script):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sign-windows.ps1 -Exe quadchroma.exe -VerifyOnly   # signtool verify /pa /v + Get-AuthenticodeSignature
-Get-AuthenticodeSignature quadchroma.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
-(Get-Item quadchroma.exe).VersionInfo | Format-List ProductVersion, CompanyName, LegalCopyright
 Get-FileHash -Algorithm SHA256 quadchroma-X.Y.Z-windows-x64.zip
+cd quadchroma-X.Y.Z                                   # the folder from the ZIP
+powershell -NoProfile -ExecutionPolicy Bypass -File <checkout>\scripts\sign-windows.ps1 -Exe quadchroma.exe -VerifyOnly   # signtool verify /pa /v + Get-AuthenticodeSignature
+Get-AuthenticodeSignature quadchroma.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
+(Get-Item quadchroma.exe).VersionInfo | Format-List ProductVersion, FileVersionRaw, CompanyName, LegalCopyright
 ```
 
 Expected: `Status: Valid`, signer subject with the author's name, a timestamp
-certificate, `ProductVersion X.Y.Z`, `CompanyName Robert Brandt`. Right-click >
-Properties > Digital Signatures shows the same to users.
+certificate, `ProductVersion X.Y.Z`, `FileVersionRaw X.Y.Z.0` (the version "Start with
+Windows" compares so that an older exe never replaces a newer installed copy),
+`CompanyName Robert Brandt`. Right-click > Properties > Digital Signatures shows the
+same to users.
 
 ## 5. What the CI does with the credentials
 
