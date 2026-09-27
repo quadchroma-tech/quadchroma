@@ -440,6 +440,33 @@ pub enum Key {
     /// Meldung: das Ziel ist dieser Rechner selbst (sein Schluessel ist der
     /// eigene host.key) - kein Verbinden zu sich selbst.
     MsgSelf,
+    // Die eine App (Windows, Schritt C): ein Symbol fuer Client und
+    // Host-Rolle, Geraetename und Ruhezustand
+    /// Menuepunkt am Symbol: das Fenster oeffnen (fett, wie der Linksklick).
+    TrayOpenApp,
+    /// Symbol und Startbildschirm: die Freigabe ist ausgeschaltet.
+    HostSharingIsOff,
+    /// Menuepunkt: das Fenster "Geraetename" oeffnen.
+    DeviceNameChange,
+    /// Fenster "Geraetename": Titel.
+    DeviceNameTitle,
+    /// Fenster "Geraetename": Beschriftung des Felds.
+    DeviceNameLabel,
+    /// Fenster "Geraetename": leer heisst Rechnername; {n} der Rechnername
+    /// des Systems.
+    DeviceNameHint,
+    /// Fenster "Geraetename": mehr als 40 Byte UTF-8.
+    DeviceNameTooLong,
+    /// Fenster "Geraetename": Steuer- oder Richtungszeichen.
+    DeviceNameInvalid,
+    /// Startbildschirm: {n} Geraetename, {i} Geraete-ID.
+    ThisComputer,
+    /// Startbildschirm: Knopf neben "Dieser Computer", oeffnet das Fenster
+    /// "Geraetename".
+    DeviceNameRename,
+    /// Haken am Symbol und Kaestchen im Startbildschirm; auch der Grund, der
+    /// in powercfg /requests steht.
+    PreventSleep,
 }
 
 pub struct Lang {
@@ -712,6 +739,17 @@ pub static EN: Lang = Lang {
         (MsgHostSharingOff, "{n} stopped sharing."),
         (MsgHostRemovedYou, "{n} removed this device."),
         (MsgSelf, "This is this computer."),
+        (TrayOpenApp, "Open QuadChroma"),
+        (HostSharingIsOff, "Sharing is off"),
+        (DeviceNameChange, "Change device name …"),
+        (DeviceNameTitle, "Device name"),
+        (DeviceNameLabel, "Other devices see this computer under this name:"),
+        (DeviceNameHint, "Leave empty to use the computer name ({n})."),
+        (DeviceNameTooLong, "The name is too long (at most 40 bytes)."),
+        (DeviceNameInvalid, "The name contains characters that are not allowed."),
+        (ThisComputer, "This computer: {n} · {i}"),
+        (DeviceNameRename, "Rename"),
+        (PreventSleep, "Prevent sleep while QuadChroma is running"),
     ],
 };
 
@@ -961,6 +999,17 @@ pub static DE: Lang = Lang {
         (MsgHostSharingOff, "{n} hat die Freigabe beendet."),
         (MsgHostRemovedYou, "{n} hat dieses Gerät entfernt."),
         (MsgSelf, "Das ist dieser Computer."),
+        (TrayOpenApp, "QuadChroma öffnen"),
+        (HostSharingIsOff, "Freigabe ist aus"),
+        (DeviceNameChange, "Gerätename ändern …"),
+        (DeviceNameTitle, "Gerätename"),
+        (DeviceNameLabel, "Unter diesem Namen sehen andere Geräte diesen Computer:"),
+        (DeviceNameHint, "Leer lassen für den Rechnernamen ({n})."),
+        (DeviceNameTooLong, "Der Name ist zu lang (höchstens 40 Byte)."),
+        (DeviceNameInvalid, "Der Name enthält unzulässige Zeichen."),
+        (ThisComputer, "Dieser Computer: {n} · {i}"),
+        (DeviceNameRename, "Umbenennen"),
+        (PreventSleep, "Ruhezustand verhindern, solange QuadChroma läuft"),
     ],
 };
 
@@ -1006,8 +1055,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > MsgSelf as usize);
-        assert_eq!(n, MsgSelf as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > PreventSleep as usize);
+        assert_eq!(n, PreventSleep as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die kaputte Schluesseldatei: in jeder Sprache mit genau einem Pfad
@@ -1421,6 +1470,75 @@ mod tests {
         }
         assert_eq!(EN.get(MsgSelf), "This is this computer.");
         assert_eq!(DE.get(MsgSelf), "Das ist dieser Computer.");
+    }
+
+    /// Die Texte der einen App (Symbol, Geraetename, Ruhezustand): gleich
+    /// hinter MsgSelf, in jeder Tabelle, genau die Platzhalter, die der
+    /// Aufrufer ersetzt; eigene Worte je Sprache (nicht Englisch) und kein
+    /// Text doppelt; genau der Menuepunkt, der ein Fenster oeffnet, endet
+    /// auf " …"; die Meldungen des Fensters und der Hinweis sind Saetze mit
+    /// Schlusszeichen, die Grenze von 40 Byte steht in der Meldung. EN und
+    /// DE wie vorgegeben, DE ohne umschriebene Umlaute.
+    #[test]
+    fn eine_app_texte() {
+        let alle: [(Key, &[&str]); 11] = [
+            (TrayOpenApp, &[]),
+            (HostSharingIsOff, &[]),
+            (DeviceNameChange, &[]),
+            (DeviceNameTitle, &[]),
+            (DeviceNameLabel, &[]),
+            (DeviceNameHint, &["{n}"]),
+            (DeviceNameTooLong, &[]),
+            (DeviceNameInvalid, &[]),
+            (ThisComputer, &["{n}", "{i}"]),
+            (DeviceNameRename, &[]),
+            (PreventSleep, &[]),
+        ];
+        for (nr, (k, _)) in alle.iter().enumerate() {
+            assert_eq!(*k as usize, MsgSelf as usize + 1 + nr, "{k:?}");
+        }
+        let saetze = [DeviceNameHint, DeviceNameTooLong, DeviceNameInvalid];
+        for l in all() {
+            let mut texte = std::collections::HashSet::new();
+            for (k, soll) in &alle {
+                let t = l.get(*k);
+                assert!(!t.is_empty(), "{} {k:?}", l.code);
+                let erwartet: usize = soll.iter().map(|p| t.matches(p).count()).sum();
+                assert_eq!(erwartet, soll.len(), "{} {k:?}: {t}", l.code);
+                assert_eq!(t.matches('{').count(), soll.len(), "{} {k:?}: {t}", l.code);
+                assert_eq!(t.matches('}').count(), soll.len(), "{} {k:?}: {t}", l.code);
+                assert!(texte.insert(t), "{} {k:?}: doppelt ({t})", l.code);
+                assert!(!t.contains("...") && !t.contains(" - "), "{} {k:?}: {t}", l.code);
+                assert_eq!(t.ends_with(" …"), *k == DeviceNameChange, "{} {k:?}: {t}", l.code);
+                if saetze.contains(k) {
+                    assert!(t.ends_with('.') || t.ends_with('。'), "{} {k:?}: {t}", l.code);
+                }
+                if l.code != "en" && *k != ThisComputer {
+                    assert_ne!(t, EN.get(*k), "{} {k:?}: noch englisch", l.code);
+                }
+            }
+            assert!(l.get(DeviceNameTooLong).contains("40"), "{}", l.code);
+            assert!(l.get(TrayOpenApp).contains("QuadChroma"), "{}", l.code);
+            assert!(l.get(PreventSleep).contains("QuadChroma"), "{}", l.code);
+            // Der Punkt im Menue heisst anders als die Kopfzeile "Freigabe
+            // ist aus" und als der Umschalter "Diesen PC freigeben".
+            assert_ne!(l.get(HostSharingIsOff), l.get(StartShare), "{}", l.code);
+        }
+        assert_eq!(EN.get(TrayOpenApp), "Open QuadChroma");
+        assert_eq!(EN.get(ThisComputer), "This computer: {n} · {i}");
+        assert_eq!(EN.get(PreventSleep), "Prevent sleep while QuadChroma is running");
+        assert_eq!(DE.get(TrayOpenApp), "QuadChroma öffnen");
+        assert_eq!(DE.get(HostSharingIsOff), "Freigabe ist aus");
+        assert_eq!(DE.get(DeviceNameChange), "Gerätename ändern …");
+        assert_eq!(DE.get(ThisComputer), "Dieser Computer: {n} · {i}");
+        assert_eq!(DE.get(DeviceNameTooLong), "Der Name ist zu lang (höchstens 40 Byte).");
+        assert_eq!(DE.get(PreventSleep), "Ruhezustand verhindern, solange QuadChroma läuft");
+        for (k, _) in &alle {
+            let t = DE.get(*k);
+            for w in ["Geraet", "aender", "oeffnen", "laeuft", "fuer", "hoechstens", "unzulaess"] {
+                assert!(!t.contains(w), "{k:?}: {t}");
+            }
+        }
     }
 
     /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der
