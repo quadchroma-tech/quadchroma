@@ -1143,9 +1143,14 @@ laeuft schon - der Start im Hintergrund endet.").
 
 "Start with Windows" is the item in the icon's menu and the check box
 of the same name on the start screen, directly below "Prevent sleep
-while QuadChroma is running"; both show whether the scheduled task
-"QuadChroma" exists, and a click in either switches it. The task runs at
-the current user's logon with highest privileges (elevated, so it starts
+while QuadChroma is running"; both show whether the scheduled task of
+the account the app runs under exists and is enabled, and a click in
+either switches it. Every account has a task of its own, named
+"QuadChroma (<SID of the account>)" - for example "QuadChroma
+(S-1-5-21-1413765741-3029102522-1828496402-1002)" -, so two
+administrator accounts on one PC switch their autostart on and off
+independently, and neither sees the other's task ticked. The task runs
+at that account's logon with highest privileges (elevated, so it starts
 without a UAC prompt at logon; run level HIGHEST, logon type
 InteractiveToken - it runs in the user's interactive session after
 login, not as a service before it), its action being the installed exe
@@ -1159,14 +1164,28 @@ exe or a DLL there and be started elevated at the next logon. Switching
 "Start with Windows" on therefore first installs the running app into
 %ProgramFiles%\QuadChroma (normally C:\Program Files\QuadChroma, found
 through the system's known folder, not an environment variable):
-quadchroma.exe, avcodec-63.dll and avutil-61.dll (from next to the exe,
-otherwise the loaded ones) and the text files next to the exe (LICENSE,
-THIRD_PARTY_NOTICES, README, MANUAL, FFMPEG-BUILDINFO). Each file is
-read while others can only read it, written under a temporary name,
-read back and compared by SHA-256, and checked for its rights; only then
-are all renamed into place, the exe last, and a failure rolls everything
-back. A running older copy there is renamed aside and deleted, or at the
-next restart if it is still in use. Folder, parent folder and every file
+quadchroma.exe, the avcodec-63.dll and avutil-61.dll it has loaded and
+the text files next to the exe (LICENSE, THIRD_PARTY_NOTICES, README,
+MANUAL, FFMPEG-BUILDINFO). The exe and the two DLLs are locked from the
+moment quadchroma.exe starts until it quits: it opens them for reading
+and lets other programs only read them, so nobody - not even an
+administrator - can rename, move, replace or delete them, or rename the
+folder they are in, while the app runs. At that start it also checks
+that the locked files are the ones Windows loaded (same path, and the
+file behind the loaded code has not been renamed away and replaced).
+They are copied only through these locked handles, never opened again
+by name, and before writing, each exe and DLL is compared with the code
+loaded in memory (headers, code, constants and resources, with the
+relocations applied; only the places the loader writes itself are left
+out). If a file cannot be locked or does not match, nothing is installed
+or refreshed and the task stays as it is. When the app itself runs from
+C:\Program Files\QuadChroma nothing is locked: nothing is copied from
+there, and a newer version must be able to rename the running one
+aside. Each file is written under a temporary name, read back and
+compared by SHA-256, and checked for its rights; only then are all
+renamed into place, the exe last, and a failure rolls everything back.
+A running older copy there is renamed aside and deleted, or at the next
+restart if it is still in use. Folder, parent folder and every file
 must be owned by Administrators, SYSTEM or TrustedInstaller and must not
 let any other account write, delete or change permissions; a network or
 removable drive, a UNC path or a junction is refused. The task is
@@ -1179,54 +1198,56 @@ could not be changed and that the details are in protokoll.txt.
 Switching it off deletes the task and leaves the installed copy (delete
 the folder to remove it).
 
-At every start (of the first instance) the app checks the task: one of
-an earlier version that still starts another exe (the unpacked folder)
-is moved to the installed copy after installing; if the task starts the
-installed copy but the running exe or its DLLs differ from it (SHA-256),
-the installed copy is replaced with the running one, older or newer (see
-the limits below). So an update is: quit QuadChroma in the icon's menu,
-start the new quadchroma.exe once. A shortcut of earlier versions in the
-Startup folder ("QuadChroma.lnk" with --hintergrund, or the older
-"QuadChroma - Freigabe.lnk" with --host) counts as on and, if it starts
-this exe, is replaced the same way (install, task, then the shortcut is
-deleted); a shortcut to another copy stays as it is, so a test or
-portable copy never takes over the autostart.
+No downgrade: the installed copy is replaced only if the running exe is
+not older. Compared is the file version in the version resource of both
+exe files (File version in the exe's Properties, 0.1.0.0 for 0.1.0). A
+newer running exe replaces the installed copy; the same version with
+different files (another build) replaces it as well; an older one never
+replaces a newer installed copy - switching "Start with Windows" on then
+points the task at the newer installed copy and leaves it as it is, and
+the log says so. A running exe without a readable version does not
+replace an installed copy that has one.
 
-Limits of "Start with Windows":
+At every start (of the first instance) the app checks the task of its
+account: one of an earlier version that still starts another exe (the
+unpacked folder) is moved to the installed copy after installing; if the
+task starts the installed copy but the running exe or its DLLs differ
+from it (SHA-256), the installed copy is refreshed - unless it is newer
+(see above). So an update is: quit QuadChroma in the icon's menu, start
+the new quadchroma.exe once. Earlier versions created one task
+"QuadChroma" for the whole PC; if it belongs to this account (its
+principal, read with schtasks /Query /XML), it is taken over at the
+start - install, the task of this account, then "QuadChroma" is deleted
+-, and switching off deletes it along with this account's task. A task
+"QuadChroma" of another account stays as it is (a line in the log). A
+disabled task counts as off and is not switched on again at the start.
+A shortcut of earlier versions in the Startup folder ("QuadChroma.lnk"
+with --hintergrund, or the older "QuadChroma - Freigabe.lnk" with
+--host) counts as on and, if it starts this exe, is replaced the same
+way (install, task, then the shortcut is deleted); a shortcut to another
+copy stays as it is, so a test or portable copy never takes over the
+autostart.
 
-    - One task per PC: the task "QuadChroma" exists once per computer and
-      starts the app for the account that created it last (schtasks /RU).
-      Check box and menu item show only whether the task exists, so
-      another administrator account sees them ticked as well; unticking
-      there deletes the autostart of the first account, and ticking again
-      moves the task to the second one. Moving a task of an earlier
-      version to the installed copy (see above) likewise creates it for
-      the account whose start does it.
-    - No version check: only the SHA-256 of the files counts. An older
-      quadchroma.exe started from another folder while the task exists
-      replaces a newer installed copy; starting the newer one once puts
-      it back.
-    - The unpacked folder is locked only during the copy: its files are
-      held against changes only while they are read for the install.
-      Between the start of quadchroma.exe and the copy (right at that
-      start when the task exists, otherwise when "Start with Windows" is
-      switched on) a program running with normal rights could rename the
-      exe or a DLL there and put its own file in its place; that file
-      would then be installed and started elevated at every logon. The
-      installed copy is only as trustworthy as the unpacked folder at the
-      moment of the copy: install and update while no hostile program
-      runs under your account - the same assumption as for confirming the
-      UAC prompt of the unpacked exe.
+If this fails - at the start, or when switching on - no task of this
+account stays enabled that starts an exe in a folder others than
+administrators can change (an earlier version pointed at the unpacked
+folder): it is disabled (schtasks /Change /DISABLE), and so is the task
+"QuadChroma" of this account whose takeover failed. The start screen
+then shows in amber that "Start with Windows" could not be changed and
+that the details are in protokoll.txt; switching it on again once the
+cause is fixed creates the task anew.
 
 Standard accounts: when the app runs under another account than the one
 signed in to the session (a standard user entered an administrator's
 credentials at UAC), or under an account that is no administrator, the
 check box and the menu item are disabled with "Only with an
-administrator account", and nothing is changed or checked at the start
+administrator account", and nothing is installed or moved at the start
 (a task at logon with highest privileges could not start the exe for a
 standard user, and it would run for the administrator's logon, not for
-this user's). Without an interactive session (over ssh) only the check
-for an administrator account applies.
+this user's). Only a task of the account the app runs under that still
+starts an exe from a folder others can change is disabled, as above.
+Without an interactive session (over ssh) only the check for an
+administrator account applies.
 
 Log lines (protokoll.txt):
 
@@ -1238,14 +1259,34 @@ Log lines (protokoll.txt):
                                        Neustart" if an old copy was in use)
     "Mit Windows starten: an - die App laeuft schon aus <folder>, nur die
      geplante Aufgabe angelegt ..."   (runs from there already)
+    "Mit Windows starten: an - die Kopie in <folder> stimmt schon mit
+     dieser exe ueberein, nur die geplante Aufgabe angelegt ..."
+    "Mit Windows starten: an - die installierte Kopie (<version>) ist
+     neuer als diese exe (<version>) - sie wird nicht durch die aeltere
+     ersetzt; die geplante Aufgabe ... startet <folder>\quadchroma.exe
+     --hintergrund"                   (no downgrade; at the start without
+                                       "an - " and "die geplante Aufgabe")
     "Mit Windows starten: aus - die geplante Aufgabe ist geloescht; die
      installierte Kopie in <folder> bleibt liegen"
-    "... - die installierte Kopie war eine andere Fassung als diese exe
-     und ist erneuert", "... - die Aufgabe startete bisher <command>",
-     "... - die alte Verknuepfung im Autostart-Ordner ist dadurch
-     ersetzt"                          (at the start, see above)
+    "... - die installierte Kopie war eine andere, nicht neuere Fassung
+     als diese exe und ist erneuert", "... - die Aufgabe startete bisher
+     <command>", "... - sie ersetzt die fruehere Aufgabe "QuadChroma"
+     fuer den ganzen Rechner (startete <command>)", "... - die alte
+     Verknuepfung im Autostart-Ordner ist dadurch ersetzt"
+                                       (at the start, see above)
+    "Mit Windows starten: die fruehere Aufgabe "QuadChroma" gehoert
+     <account>, nicht diesem Konto - sie bleibt, wie sie ist ..."
+    "Mit Windows starten: die Aufgabe "<name>" (<command>) ist
+     abgeschaltet (schtasks /Change /DISABLE) - <reason>"
     "Mit Windows starten: gesperrt - <reason>"   (standard account)
-    "Mit Windows starten nicht umgestellt: <error>"
+    "Mit Windows starten nicht umgestellt: <error>"   (switching; at the
+                                       start "... beim Start nicht
+                                       geprueft bzw. nicht umgestellt -
+                                       <error>")
+    "... exe und DLLs nicht gesperrt: <file>: nicht gesperrt (<error>)",
+    "... - nicht die geladene Datei, nichts kopiert"   (in <error>: a
+                                       file could not be locked, or it
+                                       does not match the loaded code)
 
 The same without a window, from a terminal started as administrator:
 
@@ -1253,7 +1294,12 @@ The same without a window, from a terminal started as administrator:
 
 prints the line the log would get (it writes no protokoll.txt) and ends
 with exit code 0 (done), 1 (failed), 2 (wrong call, or not Windows) or 3
-(locked: no administrator account).
+(locked: no administrator account; a task of this account that still
+starts an exe from a folder others can change is disabled then too).
+The lines go to the terminal, or wherever the output is redirected:
+"quadchroma.exe --autostart on > autostart.txt 2>&1" writes them into
+the file (Start-Process -RedirectStandardOutput/-RedirectStandardError
+and pipes work as well).
 
 --host [port] is "start in the background with sharing on": it switches
 sharing on and remembers it, so shortcuts of earlier versions keep
@@ -2797,12 +2843,13 @@ whose default is No. The Allow window is a small window of its own; it stays
 on top, beeps and flashes in the taskbar, but does not take the focus (see
 "Encryption and access"). "Start with Windows" (in the one app's menu)
 installs the app into %ProgramFiles%\QuadChroma and creates the scheduled task
-"QuadChroma" for that copy - the exe with --hintergrund, at the current user's
-logon, run level HIGHEST, via schtasks.exe - or deletes the task; the check
-mark shows whether the task exists. Install, checks, update, standard accounts
-and log lines: see "Windows: one app for both directions". A shortcut of an
-earlier version in the Startup folder is replaced when the app starts, but
-only if it starts this very exe; a shortcut to another copy stays ("Mit
+of the current account, "QuadChroma (<SID>)", for that copy (the exe with
+--hintergrund, at that account's logon, run level HIGHEST, via schtasks.exe),
+or deletes it; the check mark shows whether this account's task exists and is
+enabled. Install, locking, versions, the earlier task "QuadChroma", standard
+accounts and log lines: see "Windows: one app for both directions". A shortcut
+of an earlier version in the Startup folder is replaced when the app starts,
+but only if it starts this very exe; a shortcut to another copy stays ("Mit
 Windows starten: die alte Verknuepfung startet <Pfad>, nicht diese exe - sie
 bleibt, wie sie ist"), so a test or portable copy never takes over the
 autostart. "Stop sharing" of the host-only process says goodbye to the viewer

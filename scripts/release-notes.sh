@@ -73,7 +73,7 @@ case "$win" in
     *)           echo "**Windows:** \`quadchroma.exe\` is Authenticode-signed (SHA-256, RFC 3161 timestamp). Windows asks for administrator rights at every start.";;
 esac
 echo
-echo "Why administrator rights: QuadChroma needs them so that a PC can also be controlled while Task Manager, the registry editor or an installer window is in front - without them Windows drops remote mouse and keyboard input there. Every start by hand shows the UAC prompt (confirm with **Yes**), also on a PC that only controls others. **Start with Windows** (icon menu or start screen) installs the app into \`C:\\Program Files\\QuadChroma\`, where only administrators can change it, and from then on starts it at every logon elevated and without a prompt. Command-line switches need a terminal started as administrator. On a Windows standard account every start needs an administrator's password, and **Start with Windows** is not available."
+echo "Why administrator rights: QuadChroma needs them so that a PC can also be controlled while Task Manager, the registry editor or an installer window is in front - without them Windows drops remote mouse and keyboard input there. Every start by hand shows the UAC prompt (confirm with **Yes**), also on a PC that only controls others. **Start with Windows** (icon menu or start screen) installs the app into \`C:\\Program Files\\QuadChroma\`, where only administrators can change it, and from then on starts it at every logon of your account elevated and without a prompt (each account has its own task; an older version never replaces a newer installed one). Command-line switches need a terminal started as administrator. On a Windows standard account every start needs an administrator's password, and **Start with Windows** is not available."
 echo
 case "$mac" in
     *-unsigned*)    echo "**Mac:** the app is ad-hoc signed only and not notarized. macOS refuses the first start: System Settings > Privacy & Security > **Open Anyway**. After every update Screen Recording and Accessibility must be allowed again.";;
@@ -104,14 +104,6 @@ and the Mac ZIP, and inside the app; the license texts are next to it.
   viewer shows a hint, and someone at the PC has to answer it.
 - **Administrator rights on Windows** at every manual start (see above); a standard
   account needs an administrator's password and gets no **Start with Windows**.
-- **Start with Windows has three limits.** The task exists once per PC and starts
-  QuadChroma only for the administrator account that switched it on last - another
-  administrator account sees it switched on too, and unticking it there removes it for
-  the first one. Updating the installed copy compares only file contents, not versions,
-  so starting an older \`quadchroma.exe\` replaces a newer installed copy. And the
-  unzipped folder is locked only while its files are being copied into Program Files;
-  a program running with normal rights could swap the exe or a DLL there before that.
-  Details in \`MANUAL.txt\`, "Windows: one app for both directions".
 EOF
 
 case "$win" in

@@ -305,28 +305,36 @@ that stays out of reach is the UAC consent prompt itself, on Windows' secure des
 (that would need a system service). A viewer used only as a client still gets the UAC
 prompt at launch.
 
-"Start with Windows" (menu and start screen) is therefore a scheduled task "QuadChroma"
-that runs at logon with highest privileges, so the app starts elevated without a
-prompt - not a Startup-folder shortcut, which Windows would not launch silently for an
-elevated exe. Because that task runs a program as administrator without asking, it
-never points at the folder you unpacked (Downloads, Desktop, a network share), where
-any program with normal rights could swap the exe or a DLL: switching it on first
-installs the app - exe, the two DLLs and the text files - into `C:\Program
-Files\QuadChroma`, where only administrators can write, checks folder and files, and
-points the task at that copy; the start screen (or, without a window, a balloon at the
-icon) says "Installed to C:\Program Files\QuadChroma – QuadChroma starts from there with
-Windows." Switching it off deletes the task and leaves the installed copy; to remove
+"Start with Windows" (menu and start screen) is therefore a scheduled task that runs
+at logon with highest privileges, so the app starts elevated without a prompt - not a
+Startup-folder shortcut, which Windows would not launch silently for an elevated exe.
+Every account has its own task, "QuadChroma (<the account's SID>)": two administrator
+accounts on one PC switch their autostart independently, and check box and menu item
+show only the task of the account the app runs under. Because that task runs a
+program as administrator without asking, it never points at the folder you unpacked
+(Downloads, Desktop, a network share), where any program with normal rights could swap
+the exe or a DLL: switching it on first installs the app - exe, the two DLLs and the
+text files - into `C:\Program Files\QuadChroma`, where only administrators can write,
+checks folder and files, and points the task at that copy; the start screen (or,
+without a window, a balloon at the icon) says "Installed to C:\Program
+Files\QuadChroma – QuadChroma starts from there with Windows." What gets copied cannot
+be swapped: from the moment `quadchroma.exe` starts until it quits, the exe and the two
+DLLs it loaded are locked - no program can rename, replace or delete them - and each is
+compared with the code actually loaded before it is copied; if that fails, nothing is
+installed. Switching it off deletes the task and leaves the installed copy; to remove
 it, delete the folder. When "Start with Windows" is on, every start of a
-`quadchroma.exe` whose files differ from the installed copy (SHA-256 - an older version
-just as well as a newer one) replaces the installed copy, and a task of an earlier
-version that still points elsewhere is moved to it; to update, quit QuadChroma in the
-icon's menu and start the new `quadchroma.exe` once. The task exists once per PC and
-runs for the administrator account that switched it on last; this and the copying
-have limits (see "Known limitations" under "What is missing"). On a standard account
-(the app then runs with an administrator's credentials, not as the signed-in user) the
-check box and the menu item are disabled with "Only with an administrator account".
-`quadchroma.exe --autostart on|off` (also `an|aus`) does the same from a terminal
-started as administrator.
+`quadchroma.exe` whose files differ from the installed copy replaces it, unless the
+installed copy is a newer version - an older `quadchroma.exe` never replaces a newer
+one; a task of an earlier version that still points elsewhere is moved to it, and the
+single task "QuadChroma" that earlier versions created is taken over if it belongs to
+your account. If that fails, a task that would still start the app from a folder
+others can change is switched off, and the start screen says that "Start with
+Windows" could not be changed. To update, quit QuadChroma in the icon's menu and start
+the new `quadchroma.exe` once. On a standard account (the app then runs with an
+administrator's credentials, not as the signed-in user) the check box and the menu item
+are disabled with "Only with an administrator account". `quadchroma.exe --autostart
+on|off` (also `an|aus`) does the same from a terminal started as administrator; its
+output can be redirected to a file.
 
 `quadchroma.exe --host` starts the app in the background with sharing on
 (shortcuts of earlier versions keep working). The host role's files are `host.key`,
@@ -749,10 +757,10 @@ screen - a connected viewer included - can read it in the menu. The clipboard is
 during a session even when the client window has no focus (see "What is missing").
 On Windows the whole app runs with administrator rights (see Requirements), so a flaw
 in it weighs more there; "Start with Windows" therefore starts only the copy in
-`C:\Program Files\QuadChroma` that only administrators can change (see "Sharing a
-Windows PC"). The unpacked folder it is copied from is locked against changes only
-during the copy itself (see "Known limitations"). Report vulnerabilities as described
-in `SECURITY.md`.
+`C:\Program Files\QuadChroma` that only administrators can change, copied only from
+files that are locked while the app runs and match the code it loaded, and never
+replaced by an older version (see "Sharing a Windows PC"). Report vulnerabilities as
+described in `SECURITY.md`.
 
 ## What is missing
 
@@ -777,9 +785,12 @@ open on real devices:
   switch and "Start at login" with the project's own certificate; whether a Screen Recording permission
   granted while the host runs takes effect without a restart; the Windows host role's
   icon, windows and "Start with Windows" on an interactive desktop (the VM is driven
-  over ssh, without Explorer; the install into Program Files and the scheduled task
-  were checked there through `--autostart`), including the lock on a real standard
-  account (only its decision logic is covered by unit tests); and a Windows client
+  over ssh, without Explorer; the install into Program Files, the locked source files,
+  the version check and the scheduled tasks were checked there through `--autostart`
+  and a start with `--hintergrund`), including the lock on a real standard account
+  (only its decision logic is covered by unit tests) and a second administrator account
+  signed in at the same PC (tasks of other accounts were only simulated, with SYSTEM as
+  their principal); and a Windows client
   against the Mac host through the access phase.
 - Screen selection on the device: for the Windows host role the switch itself (new
   Duplication, SWITCH, INFO, keyframe, list afterwards; with the same size the encoder
@@ -825,24 +836,6 @@ for the exe. The one-time steps are in `RELEASING.md`.
 - Windows: the app runs with administrator rights and asks via UAC at every manual
   start; on a standard account every start needs an administrator's password and
   "Start with Windows" is not available (see Requirements).
-- Windows, "Start with Windows" on a PC with several administrator accounts: there is
-  one task "QuadChroma" per PC, and it starts the app only for the account that
-  switched it on last. Another administrator account sees the check mark as well;
-  unticking it there deletes the autostart of the first account, and ticking it again
-  moves the task to the account that ticked it.
-- Windows, updating the installed copy: only the SHA-256 of the files counts, not the
-  version. Starting an older `quadchroma.exe` from another folder while "Start with
-  Windows" is on replaces a newer copy in `C:\Program Files\QuadChroma`; starting the
-  newer one once puts it back.
-- Windows, the copy into Program Files: the files in the unpacked folder are locked
-  against changes only while they are being copied. Between the start of
-  `quadchroma.exe` and that copy - right at the start when "Start with Windows" is
-  already on, otherwise when you switch it on - a program running with normal rights
-  could rename the exe or a DLL there and put its own file in its place; that file
-  would then be installed and started as administrator at every logon. The installed
-  copy is therefore only as trustworthy as the unpacked folder at the moment of the
-  copy: install and update while no hostile program runs under your account - the same
-  assumption as for confirming the UAC prompt of the unpacked exe.
 - Not code-signed and not notarised: SmartScreen warns once on Windows, and Smart App
   Control can block the exe entirely; macOS refuses the first start until "Open
   Anyway" (see "First start of a downloaded release").
@@ -1223,8 +1216,9 @@ self-tests, like every switch, need a terminal started as administrator.
                    and search (discovery.rs), settings (einstellungen.rs), the
                    texts in 29 languages (strings*.rs), single instance
                    (einzel.rs), desktop shortcut and "Start with Windows" as a
-                   scheduled task (verknuepfung.rs) with the install into
-                   Program Files and its checks (installation.rs), program icon
+                   scheduled task per account (verknuepfung.rs) with the
+                   install into Program Files from locked files, its checks
+                   and the version comparison (installation.rs), program icon
                    (logo.rs); version information, icon and manifest of the exe
                    (build.rs, res/); the Windows host role in client/src/host/
                    (capture with screen selection, encoder, network, access phase
