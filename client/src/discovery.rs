@@ -112,16 +112,38 @@ impl Hosts {
     }
 }
 
-/// Startet das Zuhoeren in einem eigenen Faden. Schlaegt das Binden fehl, etwa
-/// weil schon ein anderer Client laeuft, bleibt die Liste einfach leer.
+/// Wie oft das Binden neu versucht wird, wenn der Port belegt ist.
+const BINDEN_TAKT: Duration = Duration::from_secs(5);
+
+/// Startet das Zuhoeren in einem eigenen Faden. Ist der Port belegt (ein
+/// anderes Programm lauscht dort), steht das einmal im Protokoll, und der
+/// Faden versucht es alle 5 s neu - die Liste fuellt sich, sobald der Port
+/// frei wird, statt fuer die ganze Laufzeit leer zu bleiben.
 pub fn start(port: u16) -> Arc<Mutex<Hosts>> {
     let hosts = Arc::new(Mutex::new(Hosts::default()));
     let out = hosts.clone();
 
     std::thread::spawn(move || {
-        let sock = match bind_reusable(port) {
-            Ok(s) => s,
-            Err(_) => return,
+        let mut gemeldet = false;
+        let sock = loop {
+            match bind_reusable(port) {
+                Ok(s) => {
+                    if gemeldet {
+                        crate::protokoll::zeile(format!("Erkennung: UDP-Port {port} jetzt frei - die Geraeteliste fuellt sich"));
+                    }
+                    break s;
+                }
+                Err(e) => {
+                    if !gemeldet {
+                        gemeldet = true;
+                        crate::protokoll::zeile(format!(
+                            "Erkennung: UDP-Port {port} nicht verfuegbar ({e}) - die Geraeteliste bleibt leer, neuer Versuch alle {} s",
+                            BINDEN_TAKT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(BINDEN_TAKT);
+                }
+            }
         };
         sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut buf = [0u8; crate::zugang::BEKANNTGABE_MAX];
