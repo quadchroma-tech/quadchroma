@@ -599,6 +599,12 @@ over the session." and does not reconnect by itself. The new viewer inherits not
 from the old one: a test pattern ends, and it gets a first frame at once, even on a
 still screen.
 
+The host says goodbye before it closes a session on purpose (message 13): the client
+goes back to the start screen and shows "<name> was closed.", "<name> stopped
+sharing." or "<name> removed this device." - again without reconnecting by itself.
+If a connection just drops, the client retries for about 30 s and then shows
+"Connection lost" on the start screen.
+
 On the Mac the Noise pattern is implemented in-house (about 400 lines of C on
 Monocypher); the Windows side uses the established Rust implementation `snow`. The two
 were checked against each other: same comparison code, same fingerprints, encrypted

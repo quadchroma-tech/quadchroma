@@ -668,7 +668,7 @@ impl Meldung {
     /// Verbinden gelesen - ein neuer Versuch alle 2 s oeffnet also keine
     /// Leitung, solange die Sperre besteht, der Host merkt nichts davon, und
     /// im Protokoll steht es dank der Entdoppelung einmal. Ist die Sperre
-    /// weg, verbindet der Client von selbst.
+    /// binnen NEUVERSUCH_FRIST weg, verbindet der Client von selbst.
     ///
     /// Dazu jede Meldung, die `bleibend` markiert ist (Protokollfehler rund
     /// um die Zugangsphase).
@@ -908,6 +908,9 @@ struct Shared {
     /// Tests setzen einen eigenen Ordner und einen Rekorder, damit weder die
     /// echte Ablage noch die Basis anderer Tests angefasst wird.
     datei_ablage: Option<DateiAblage>,
+    /// Pruefnaht: Frist fuer die Neuversuche (NEUVERSUCH_FRIST); None in der
+    /// Produktion. Tests setzen eine kurze.
+    neuversuch_frist: Option<Duration>,
 }
 
 /// Wohin empfangene Dateien gehen und wie sie in die Ablage kommen.
@@ -1243,6 +1246,77 @@ fn fehler_verbuchen(s: &mut Shared, addr: &str, e: Meldung, gemeldet: &mut Optio
     s.error = Some(e);
 }
 
+/// So lange versucht der Empfangsfaden hoechstens, ein Ziel (wieder) zu
+/// erreichen - nach einem Abbruch ohne Abschied des Hosts, oder wenn die
+/// erste Verbindung nicht zustande kommt. Danach gibt er auf: das Ziel geht
+/// zurueck, der Startbildschirm zeigt "Verbindung verloren" (stand schon eine
+/// Sitzung) bzw. den letzten Fehler. Vorher lief das endlos, und der Client
+/// blieb auf "Verbinde neu" stehen, wenn der Host nie wiederkam.
+const NEUVERSUCH_FRIST: Duration = Duration::from_secs(30);
+
+/// Eine Reihe von Versuchen zu einem Ziel ohne stehende Sitzung.
+#[derive(Clone, Debug, PartialEq)]
+struct Neuversuche {
+    /// Das Ziel, zu dem die Reihe gehoert (eine neue Adresse desselben
+    /// Hosts, die der Empfangsfaden ueber die ID findet, fuehrt sie fort).
+    ziel: String,
+    /// Seit wann: Ende der letzten Sitzung, sonst Beginn des ersten Versuchs.
+    seit: Instant,
+    /// Stand in dieser Reihe schon eine Sitzung (dann heisst Aufgeben
+    /// "Verbindung verloren")?
+    nach_sitzung: bool,
+}
+
+/// Nach einem Durchlauf von run_session: die Reihe der Versuche fortfuehren
+/// und nach `frist` aufgeben. `beginn` ist der Beginn dieses Durchlaufs,
+/// `sitzung`: in ihm stand eine Sitzung (sie ist eben zu Ende gegangen - ab
+/// jetzt zaehlt die Frist neu). Gilt das Ziel nicht mehr (getrennt, anderes
+/// Ziel, eine Meldung, die bleibt), endet die Reihe ohne Zutun. true: eben
+/// aufgegeben - Ziel zurueck, die Meldung bleibt.
+fn neuversuch_buchen(
+    s: &mut Shared,
+    addr: &str,
+    reihe: &mut Option<Neuversuche>,
+    beginn: Instant,
+    sitzung: bool,
+    jetzt: Instant,
+    frist: Duration,
+) -> bool {
+    if s.target.as_deref() != Some(addr) {
+        *reihe = None;
+        return false;
+    }
+    match reihe {
+        Some(r) if !sitzung && r.ziel == addr => {}
+        _ => {
+            *reihe = Some(Neuversuche {
+                ziel: addr.to_string(),
+                seit: if sitzung { jetzt } else { beginn },
+                nach_sitzung: sitzung,
+            })
+        }
+    }
+    let Some(r) = reihe.as_ref() else { return false };
+    let dauer = jetzt.saturating_duration_since(r.seit);
+    if dauer < frist {
+        return false;
+    }
+    let zeile = format!(
+        "Verbindung zu {addr}: seit {} s keine Verbindung - aufgegeben, kein neuer Versuch",
+        dauer.as_secs()
+    );
+    protokoll::zeile(zeile.clone());
+    let m = match s.error.take() {
+        Some(e) if !r.nach_sitzung => e.bleibend(),
+        _ => Meldung::neu(strings::Key::ConnectionLost, zeile).bleibend(),
+    };
+    s.target = None;
+    s.error_key = None;
+    s.error = Some(m);
+    *reihe = None;
+    true
+}
+
 /// Netz- und Decodierschleife. Laeuft in einem eigenen Faden und legt immer nur
 /// das neueste Bild ab: lieber eines auslassen als Verzoegerung aufbauen.
 fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
@@ -1262,6 +1336,8 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
     // Protokoll. `error` taugt dafuer nicht - run_session loescht es schon
     // nach dem Handschlag, also vor der Antwort des Hosts und allem danach.
     let mut gemeldet: Option<(Meldung, u64)> = None;
+    // Die laufende Reihe von Versuchen ohne Sitzung (NEUVERSUCH_FRIST).
+    let mut reihe: Option<Neuversuche> = None;
     loop {
         let (addr, ziel_id, bekanntgaben) = {
             let s = shared.lock().unwrap();
@@ -1269,8 +1345,10 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
         };
         let Some(mut addr) = addr else {
             // Ohne Ziel beginnt die Entdoppelung von vorn: verbindet der
-            // Nutzer neu, steht der erste Fehler wieder im Protokoll.
+            // Nutzer neu, steht der erste Fehler wieder im Protokoll. Ebenso
+            // die Frist der Neuversuche.
             gemeldet = None;
+            reihe = None;
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
@@ -1295,10 +1373,15 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
                     s.target = Some(neu.clone());
                     drop(s);
                     input.lock().unwrap().set_addr(bump_port(&neu, 1));
+                    // Derselbe Host: die Reihe der Versuche laeuft weiter.
+                    if let Some(r) = reihe.as_mut().filter(|r| r.ziel == addr) {
+                        r.ziel = neu.clone();
+                    }
                     addr = neu;
                 }
             }
         }
+        let (beginn, nr_vorher) = (Instant::now(), shared.lock().unwrap().sitzung_nr);
         let ergebnis = run_session(&addr, &shared, &input);
         // Ohne Sitzung liest der Client die Zwischenablage nicht mehr.
         #[cfg(any(windows, target_os = "macos"))]
@@ -1323,7 +1406,12 @@ fn stream_thread(shared: Arc<Mutex<Shared>>, input: Arc<Mutex<InputLink>>) {
             s.bildschirme_zuruecksetzen();
             // Dateien: Sender ab, Faehigkeit zurueck (das tat schon das Ende
             // von run_session; der Empfaenger fiel mit ihr weg).
-            s.dateien_zuruecksetzen()
+            let datei = s.dateien_zuruecksetzen();
+            // Nicht endlos neu versuchen (NEUVERSUCH_FRIST).
+            let frist = s.neuversuch_frist.unwrap_or(NEUVERSUCH_FRIST);
+            let sitzung = s.sitzung_nr != nr_vorher;
+            neuversuch_buchen(&mut s, &addr, &mut reihe, beginn, sitzung, Instant::now(), frist);
+            datei
         };
         drop(datei);
         std::thread::sleep(Duration::from_secs(2));
@@ -11931,6 +12019,110 @@ mod tests {
         fehler_verbuchen(&mut s, "10.0.0.5:9001", dauer.clone(), &mut gemeldet);
         assert_eq!(s.target, None);
         assert_eq!(s.error, Some(dauer));
+    }
+
+    /// Die Frist der Neuversuche als reine Buchfuehrung: eine Reihe ohne
+    /// Sitzung zaehlt ab dem ersten Versuch und endet nach der Frist mit dem
+    /// letzten Fehler, der dann bleibt; eine Sitzung, die eben zu Ende ging,
+    /// beginnt die Frist neu, und Aufgeben heisst dann "Verbindung verloren".
+    /// Ein anderes Ziel oder keins beendet die Reihe ohne Meldung.
+    #[test]
+    fn neuversuche_enden_nach_der_frist() {
+        let frist = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let s_ = |n: u64| t0 + Duration::from_secs(n);
+        let a = "10.0.0.5:9001";
+        let abgelehnt = Meldung::neu(strings::Key::ErrorConnectRefused, "abgelehnt");
+        let mut s = Shared { target: Some(a.into()), error: Some(abgelehnt.clone()), ..Shared::default() };
+        let mut reihe = None;
+        // Erste Verbindung kommt nicht zustande.
+        assert!(!neuversuch_buchen(&mut s, a, &mut reihe, s_(0), false, s_(1), frist));
+        assert_eq!(reihe.as_ref().map(|r| (r.seit, r.nach_sitzung)), Some((s_(0), false)));
+        assert!(!neuversuch_buchen(&mut s, a, &mut reihe, s_(28), false, s_(29), frist));
+        assert_eq!(s.target.as_deref(), Some(a));
+        assert!(neuversuch_buchen(&mut s, a, &mut reihe, s_(30), false, s_(31), frist));
+        assert_eq!(s.target, None);
+        assert!(reihe.is_none());
+        let m = s.error.clone().unwrap();
+        assert_eq!(m.key, strings::Key::ErrorConnectRefused);
+        assert!(m.dauerhaft(), "der letzte Fehler bleibt");
+
+        // Eine Sitzung stand und ging eben zu Ende: die Frist beginnt dann.
+        let mut s = Shared { target: Some(a.into()), ..Shared::default() };
+        let mut reihe = Some(Neuversuche { ziel: a.into(), seit: s_(0), nach_sitzung: false });
+        assert!(!neuversuch_buchen(&mut s, a, &mut reihe, s_(1), true, s_(100), frist));
+        assert_eq!(reihe.as_ref().map(|r| (r.seit, r.nach_sitzung)), Some((s_(100), true)));
+        s.error = Some(Meldung::neu(strings::Key::ConnectionLost, "Kopf: zurueckgesetzt"));
+        assert!(!neuversuch_buchen(&mut s, a, &mut reihe, s_(120), false, s_(125), frist));
+        assert!(neuversuch_buchen(&mut s, a, &mut reihe, s_(128), false, s_(131), frist));
+        let m = s.error.clone().unwrap();
+        assert_eq!((m.key, s.target.clone()), (strings::Key::ConnectionLost, None));
+        assert!(m.dauerhaft());
+        assert!(m.protokoll.contains("seit 31 s keine Verbindung - aufgegeben"), "{}", m.protokoll);
+
+        // Getrennt oder anderes Ziel: die Reihe endet, nichts wird gemeldet.
+        let mut s = Shared { target: Some("10.0.0.6:9001".into()), ..Shared::default() };
+        let mut reihe = Some(Neuversuche { ziel: a.into(), seit: s_(0), nach_sitzung: true });
+        assert!(!neuversuch_buchen(&mut s, a, &mut reihe, s_(40), false, s_(41), frist));
+        assert!(reihe.is_none());
+        assert_eq!((s.target.as_deref(), s.error.is_none()), (Some("10.0.0.6:9001"), true));
+        // Eine neue Adresse desselben Ziels (ueber die ID) beginnt keine neue
+        // Reihe - das fuehrt stream_thread, indem es `ziel` mitzieht.
+        let b = "10.0.0.7:9001";
+        let mut s = Shared { target: Some(b.into()), ..Shared::default() };
+        let mut reihe = Some(Neuversuche { ziel: b.into(), seit: s_(0), nach_sitzung: true });
+        assert!(neuversuch_buchen(&mut s, b, &mut reihe, s_(30), false, s_(31), frist));
+    }
+
+    /// Verbindungsabbruch ohne Abschied, und der Host kommt nicht wieder
+    /// (der Port lehnt ab): der Empfangsfaden versucht es nur bis zur Frist
+    /// (hier 3 s statt 30 s), dann ist das Ziel zurueck und "Verbindung
+    /// verloren" bleibt stehen - kein Endlos-"Verbinde neu".
+    #[test]
+    fn abbruch_ohne_abschied_gibt_nach_der_frist_auf() {
+        use std::net::TcpListener;
+        secure::test_identitaet();
+        let (host_priv, _) = test_host();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            // Danach ist niemand mehr da: jeder neue Versuch wird abgelehnt.
+            drop(l);
+            let Ok(mut h) = secure::Secure::accept(s, &noise::prologue_video(), &host_priv) else { return };
+            let _ = h.write_all(MAGIC);
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let shared = Arc::new(Mutex::new(Shared {
+            decoder_wunsch: einstellungen::DecoderWunsch::Software,
+            target: Some(addr),
+            neuversuch_frist: Some(Duration::from_secs(3)),
+            ..Shared::default()
+        }));
+        let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+        {
+            let (s, i) = (shared.clone(), input.clone());
+            std::thread::spawn(move || stream_thread(s, i));
+        }
+        // Erst steht die Sitzung ...
+        let t0 = Instant::now();
+        while shared.lock().unwrap().sitzung_nr == 0 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(shared.lock().unwrap().sitzung_nr, 1, "keine Sitzung");
+        // ... dann geht sie verloren, und nach Frist plus einem Takt ist Schluss.
+        let t1 = Instant::now();
+        while shared.lock().unwrap().target.is_some() && t1.elapsed() < Duration::from_secs(12) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let dauer = t1.elapsed();
+        let s = shared.lock().unwrap();
+        assert!(s.target.is_none(), "nach {dauer:?} immer noch Neuversuche");
+        assert!(dauer >= Duration::from_secs(3) && dauer < Duration::from_secs(9), "{dauer:?}");
+        let m = s.error.as_ref().expect("keine Meldung");
+        assert_eq!(m.key, strings::Key::ConnectionLost, "{}", m.protokoll);
+        assert!(m.dauerhaft());
+        assert_eq!(s.sitzung_nr, 1);
     }
 
     /// Der Host meldet MSG_ABGELOEST: der Empfangsfaden nimmt das Ziel

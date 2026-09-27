@@ -284,6 +284,13 @@ Neuverbindung" ("... hat die Freigabe ausgeschaltet", "... hat dieses
 Geraet entfernt"); an unknown reason counts as 0. Older clients ignore
 message 13 and only see the connection end.
 
+Without a goodbye - host crashed, network gone, lid closed - the client
+retries for at most about 30 s in total (every 2 s); then it gives up,
+goes back to the start screen and shows "Connection lost" ("Verbindung
+zu <Adresse>: seit N s keine Verbindung - aufgegeben, kein neuer
+Versuch"). The same limit applies when the very first connection does
+not come about: after about 30 s the start screen shows the last error.
+
     13  Goodbye       Host -> client, video channel: u8 reason (0 app
                       quit, 1 sharing switched off, 2 device removed; at
                       least 1 byte, further bytes are ignored). The last
@@ -402,9 +409,9 @@ The client reads client.key and hosts.txt before it opens a connection:
 
     unreadable     (locked by a virus scanner or backup, permissions,
                    or hosts.txt larger than 1 MiB): no connection to the
-                   host. The client retries every 2 s, writes this to
-                   the log once and connects by itself as soon as the
-                   file is readable.
+                   host. The client retries every 2 s for at most about
+                   30 s, writes this to the log once and connects by
+                   itself as soon as the file is readable.
     damaged        (client.key has the wrong length or cannot be
                    written, hosts.txt is not UTF-8, e.g. ANSI): the
                    client does not try again ("Verbindung zu <Adresse>
