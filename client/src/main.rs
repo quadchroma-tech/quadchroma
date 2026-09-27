@@ -6421,6 +6421,9 @@ struct App {
     /// macOS: wann das Fenster nach dem Verlassen des Vollbilds verborgen wird.
     #[cfg(target_os = "macos")]
     verbergen_faellig: Option<Instant>,
+    /// Seit wann das Symbol angelegt ist, bis das Protokoll gesagt hat, ob
+    /// es steht (tray::symbol_meldung); danach None.
+    symbol_seit: Option<Instant>,
 }
 
 /// Die Rolle einer Karte als Anzeigewunsch - fuer den Knopf, der gilt.
@@ -8024,16 +8027,28 @@ impl App {
         symbolmenue::tooltip(self.lang, self.sitzung_anzeige().as_deref(), an, self.eigene_id())
     }
 
-    /// Protokollzeile zum frisch angelegten Symbol.
-    fn symbol_gemeldet(s: &tray::Symbol) {
-        if s.steht() {
-            protokoll::zeile(format!("{}: Symbol angelegt", tray::ORT));
-        } else {
-            protokoll::zeile(format!(
-                "{}: Symbol (noch) nicht angemeldet ({}) - Schliessen beendet, bis es steht",
-                tray::ORT,
-                s.grund().unwrap_or_default()
-            ));
+    /// Protokollzeile zum frisch angelegten Symbol: "angelegt", sobald es
+    /// steht; die Warnung erst, wenn es nach tray::SYMBOL_FRIST noch nicht
+    /// steht (auf dem Mac legt macOS es erst nach den ersten Takten in die
+    /// Menueleiste). Gleich nach dem Anlegen und dann mit jedem Takt des
+    /// Symbols, bis gemeldet ist. Ob Schliessen ablegt, entscheidet
+    /// schliessen() ohnehin beim Schliessen neu.
+    fn symbol_melden(&mut self) {
+        let (Some(seit), Some(s)) = (self.symbol_seit, self.symbol.as_ref()) else { return };
+        match tray::symbol_meldung(s.steht(), seit.elapsed(), tray::SYMBOL_FRIST) {
+            tray::SymbolMeldung::Warten => {}
+            tray::SymbolMeldung::Angelegt => {
+                self.symbol_seit = None;
+                protokoll::zeile(format!("{}: Symbol angelegt", tray::ORT));
+            }
+            tray::SymbolMeldung::Fehlt => {
+                self.symbol_seit = None;
+                protokoll::zeile(format!(
+                    "{}: Symbol (noch) nicht angemeldet ({}) - Schliessen beendet, bis es steht",
+                    tray::ORT,
+                    s.grund().unwrap_or_default()
+                ));
+            }
         }
     }
 
@@ -8044,8 +8059,9 @@ impl App {
     fn symbol_anlegen(&mut self) {
         let mut s = host_mac::Symbol::neu();
         s.stand_setzen(&self.symbol_stand());
-        App::symbol_gemeldet(&s);
         self.symbol = Some(s);
+        self.symbol_seit = Some(Instant::now());
+        self.symbol_melden();
     }
 
     /// Ohne Windows und macOS gibt es kein Symbol.
@@ -8115,9 +8131,10 @@ impl App {
         });
         match tray::Symbol::neu(befehl, menue, ende, Some(symbolmenue::LINKSKLICK), &self.tooltip_jetzt()) {
             Ok(s) => {
-                App::symbol_gemeldet(&s);
                 let _ = self.symbol_steht.set(s.steht_abfrage());
                 self.symbol = Some(s);
+                self.symbol_seit = Some(Instant::now());
+                self.symbol_melden();
             }
             Err(e) => protokoll::zeile(format!("{}: kein Symbol ({e}) - Schliessen beendet das Programm", tray::ORT)),
         }
@@ -8135,6 +8152,7 @@ impl App {
     /// Stand des Symbols sofort erneuern (nach einem Umschalten).
     fn symbol_nachfuehren_jetzt(&mut self) {
         self.tray_takt = Instant::now();
+        self.symbol_melden();
         #[cfg(windows)]
         {
             let (an, code) = ruhezustand::anzeige(self.cfg.ruhe_verhindern, self.ruhe.an(), self.ruhe.abgelehnt());
@@ -12314,6 +12332,7 @@ fn main() {
         tray_takt: Instant::now(),
         #[cfg(target_os = "macos")]
         verbergen_faellig: None,
+        symbol_seit: None,
         fullscreen: cfg.vollbild,
         pixel_exact: cfg.pixelgenau,
         show_overlay: cfg.overlay,

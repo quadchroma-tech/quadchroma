@@ -151,6 +151,39 @@ pub fn beim_schliessen(tray_an: bool, symbol_steht: bool, sitzung: bool, hinweis
     Schliessen::Ablegen { trennen: sitzung, hinweis: !hinweis_gezeigt }
 }
 
+/// So lange darf ein frisch angelegtes Symbol brauchen, bis es steht, ehe
+/// das Protokoll warnt. Auf dem Mac entsteht es erst auf der Main Queue
+/// (menue.m, nach dem ersten gelesenen Zustand) und steht erst, wenn macOS
+/// es in die Menueleiste gelegt hat - gleich nach dem Anlegen war die
+/// Warnung ein Fehlalarm. Unter Windows sagt Shell_NotifyIcon es sofort.
+#[cfg(target_os = "macos")]
+pub const SYMBOL_FRIST: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(not(target_os = "macos"))]
+pub const SYMBOL_FRIST: std::time::Duration = std::time::Duration::ZERO;
+
+/// Was das Protokoll zum frisch angelegten Symbol schreibt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SymbolMeldung {
+    /// Es steht: "Symbol angelegt".
+    Angelegt,
+    /// Nach der Frist steht es noch nicht: die Warnung (Schliessen beendet,
+    /// bis es steht - das entscheidet beim_schliessen beim Schliessen neu).
+    Fehlt,
+    /// Noch in der Frist: spaeter noch einmal fragen.
+    Warten,
+}
+
+/// Steht das Symbol, `seit` es angelegt wurde, und ist die `frist` um?
+pub fn symbol_meldung(steht: bool, seit: std::time::Duration, frist: std::time::Duration) -> SymbolMeldung {
+    if steht {
+        SymbolMeldung::Angelegt
+    } else if seit >= frist {
+        SymbolMeldung::Fehlt
+    } else {
+        SymbolMeldung::Warten
+    }
+}
+
 /// Ohne Windows und macOS gibt es kein Symbol: Schliessen beendet dort wie
 /// bisher (beim_schliessen mit symbol_steht = false).
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -191,6 +224,26 @@ mod tests {
                 assert_eq!(beim_schliessen(true, false, sitzung, hinweis), Schliessen::Beenden);
                 assert_eq!(beim_schliessen(false, false, sitzung, hinweis), Schliessen::Beenden);
             }
+        }
+    }
+
+    /// Das frisch angelegte Symbol: steht es, "angelegt" - auch vor der
+    /// Frist; sonst erst nach der Frist die Warnung, vorher warten.
+    #[test]
+    fn symbol_meldung_erst_nach_der_frist() {
+        use std::time::Duration as D;
+        let frist = D::from_secs(3);
+        assert_eq!(symbol_meldung(true, D::ZERO, frist), SymbolMeldung::Angelegt);
+        assert_eq!(symbol_meldung(true, D::from_secs(9), frist), SymbolMeldung::Angelegt);
+        assert_eq!(symbol_meldung(false, D::ZERO, frist), SymbolMeldung::Warten);
+        assert_eq!(symbol_meldung(false, D::from_millis(2999), frist), SymbolMeldung::Warten);
+        assert_eq!(symbol_meldung(false, frist, frist), SymbolMeldung::Fehlt);
+        // Ohne Frist (Windows): sofort entschieden.
+        assert_eq!(symbol_meldung(false, D::ZERO, D::ZERO), SymbolMeldung::Fehlt);
+        if cfg!(target_os = "macos") {
+            assert_eq!(SYMBOL_FRIST, frist);
+        } else {
+            assert_eq!(SYMBOL_FRIST, D::ZERO);
         }
     }
 
