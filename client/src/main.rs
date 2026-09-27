@@ -10726,14 +10726,22 @@ fn hud_reiternamen(lang: &'static strings::Lang) -> [&'static str; 5] {
     [lang.get(TabPicture), lang.get(TabDisplay), lang.get(Encryption), lang.get(TabShortcuts), lang.get(TabBenchmark)]
 }
 
-/// Lage des Kopfes im ESC-Menue: die Reiter und der Knopf Trennen (fest
-/// rechts, auf jedem Reiter, die Adresse des Hosts darunter).
+/// Lage des Kopfes im ESC-Menue: die Reiter mit ihrer Aufschrift (in der
+/// letzten Stufe gekuerzt) und der Knopf Trennen (fest rechts, auf jedem
+/// Reiter, die Adresse des Hosts darunter). `logo`: ob der Schriftzug
+/// "QUADCHROMA" links vor den Reitern steht.
 struct HudKopf {
     reiter: [ui::Rect; 5],
+    namen: [String; 5],
     trennen: ui::Rect,
+    logo: bool,
 }
 
 /// Dieselbe Rechnung wie in `hud` (Tafel, Rand, Massstab), nur die Lage.
+/// Das Fenster hat keine Mindestgroesse: reicht der Platz nicht, weicht der
+/// Kopf stufenweise aus, bis die Reiter links vor Trennen enden - erst
+/// engere Reiter, dann ohne den Schriftzug, zuletzt gleich breite Reiter mit
+/// gekuerzter Aufschrift. Trennen behaelt immer seinen ganzen Text.
 fn hud_kopf(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> HudKopf {
     let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
     let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
@@ -10744,16 +10752,39 @@ fn hud_kopf(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> H
     let y0 = (wh - hoehe) / 2;
     let rand = p(20);
     let ix = x0 + rand;
-    let mut reiter = [ui::Rect { x: 0, y: 0, w: 0, h: 0 }; 5];
-    let mut rx = ix + u.text.width("QUADCHROMA", sz(18), p(8)) + p(40);
-    for (r, n) in reiter.iter_mut().zip(hud_reiternamen(lang)) {
-        let bw = u.text.width(n, sz(12), p(2)) + p(28);
-        *r = ui::Rect { x: rx, y: y0 + p(12), w: bw, h: p(26) };
-        rx += bw + p(8);
+    let rechts = x0 + breite - rand;
+    let namen = hud_reiternamen(lang);
+    let textbreiten = namen.map(|n| u.text.width(n, sz(12), p(2)));
+    let trenntext = u.text.width(lang.get(strings::Key::Disconnect), sz(12), p(2));
+    let logo_w = u.text.width("QUADCHROMA", sz(18), p(8)) + p(40);
+    let leer = ui::Rect { x: 0, y: 0, w: 0, h: 0 };
+    // Die Stufen: Schriftzug ja/nein, Innenabstand der Knoepfe, Luecke.
+    for (logo, innen, luecke) in [(true, p(28), p(8)), (true, p(14), p(4)), (false, p(14), p(4))] {
+        let tw = trenntext + innen;
+        let trennen = ui::Rect { x: rechts - tw, y: y0 + p(12), w: tw, h: p(26) };
+        let mut reiter = [leer; 5];
+        let mut rx = ix + if logo { logo_w } else { 0 };
+        for (r, &w) in reiter.iter_mut().zip(textbreiten.iter()) {
+            *r = ui::Rect { x: rx, y: y0 + p(12), w: w + innen, h: p(26) };
+            rx += w + innen + luecke;
+        }
+        // rx steht jetzt eine Luecke hinter dem letzten Reiter.
+        if rx <= trennen.x {
+            return HudKopf { reiter, namen: namen.map(str::to_string), trennen, logo };
+        }
     }
-    let tw = u.text.width(lang.get(strings::Key::Disconnect), sz(12), p(2)) + p(28);
-    let trennen = ui::Rect { x: x0 + breite - rand - tw, y: y0 + p(12), w: tw, h: p(26) };
-    HudKopf { reiter, trennen }
+    // Letzte Stufe: die Breite links vor Trennen zu gleichen Teilen, jede
+    // Aufschrift auf ihren Teil gekuerzt (mit Auslassungszeichen).
+    let (innen, luecke) = (p(14), p(4));
+    let tw = trenntext + innen;
+    let trennen = ui::Rect { x: (rechts - tw).max(ix), y: y0 + p(12), w: tw, h: p(26) };
+    let bw = ((trennen.x - ix - 5 * luecke) / 5).max(0);
+    let mut reiter = [leer; 5];
+    for (i, r) in reiter.iter_mut().enumerate() {
+        *r = ui::Rect { x: ix + i as i32 * (bw + luecke), y: y0 + p(12), w: bw, h: p(26) };
+    }
+    let namen = namen.map(|n| kuerzen(u, n, bw - innen, sz(12), p(2)));
+    HudKopf { reiter, namen, trennen, logo: false }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10805,10 +10836,11 @@ fn hud(
     let iw = breite - 2 * rand;
 
     // --- Kopf mit Reitern -------------------------------------------------
-    u.text.draw(c, ix, y0 + p(30), "QUADCHROMA", sz(18), ui::CYAN, p(8));
     let kopf = hud_kopf(u, lang, ww, wh);
-    let namen = hud_reiternamen(lang);
-    for (i, (n, &r)) in namen.iter().zip(kopf.reiter.iter()).enumerate() {
+    if kopf.logo {
+        u.text.draw(c, ix, y0 + p(30), "QUADCHROMA", sz(18), ui::CYAN, p(8));
+    }
+    for (i, (n, &r)) in kopf.namen.iter().zip(kopf.reiter.iter()).enumerate() {
         let aktiv = reiter == i as u8;
         let heiss = r.hit(u.mouse.0, u.mouse.1);
         if aktiv {
@@ -11249,7 +11281,10 @@ fn hud(
                 heiss && u.click
             };
             let zh = p(24);
-            let by = y0 + p(58);
+            // Die erste Zeile beginnt unter der Adresse des Hosts (Grundlinie
+            // y0 + p(62), rechts unter Trennen) - sonst schreibt eine lange
+            // Adresse oder ein schmales Fenster in die Codec-Knoepfe.
+            let by = y0 + p(70);
             // Zeile 1: die Kandidaten des Hosts, nur die verfuegbaren.
             u.text.draw(c, ix, by + p(16), lang.get(Codec), sz(11), ui::DIM, p(3));
             let mut kx = ix + p(96);
@@ -13121,17 +13156,13 @@ mod tests {
         }
     }
 
-    /// Trennen steht im Kopf des ESC-Menues, auf jedem Reiter, rechts neben
-    /// den Reitern (kein Ueberlappen, in jeder Sprache und Groesse): ein
-    /// Klick darauf trennt. Im Reiter Verschluesselung, wo der Knopf frueher
-    /// stand, trennt ein Klick nicht mehr.
-    #[test]
-    fn trennen_im_kopf_auf_jedem_reiter() {
-        let mut u = ui::Ui::new();
-        let stand = HudStand {
+    /// Ein HudStand ohne Sitzungsdaten fuer die Tests des ESC-Menues; die
+    /// Codecs des Hosts nach Wunsch.
+    fn hud_stand_leer(codecs: Vec<CodecEintrag>) -> HudStand {
+        HudStand {
             vollbild: false, pixelgenau: false, statistik: false, nerd: false,
             wahl: einstellungen::StatWahl::default(),
-            codecs: Vec::new(), codec_idx: None, wechsel: false,
+            codecs, codec_idx: None, wechsel: false,
             bildschirmwahl: false, bildschirme: Vec::new(), bildschirm_wunsch: None, bildschirm_wechsel: false,
             decoder: einstellungen::DecoderWunsch::Automatik, decoder_aktiv: None,
             karten: Vec::new(),
@@ -13140,25 +13171,68 @@ mod tests {
             anzeige_name: String::new(),
             bench_konfig: BenchKonfig::vorgabe(5, true), bench: None, bench_scroll: 0,
             verknuepfung: None,
-        };
-        for (ww, wh) in [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)] {
+        }
+    }
+
+    /// Trennen steht im Kopf des ESC-Menues, auf jedem Reiter, rechts neben
+    /// den Reitern - kein Ueberlappen in jeder Sprache und Groesse, auch in
+    /// schmalen und in hohen, schmalen Fenstern (dort weicht der Kopf aus):
+    /// ein Klick auf Trennen trennt, ein Klick auf den rechten Rand eines
+    /// Reiters waehlt den Reiter. Ab 1280 x 720 (16:9) bleibt der Kopf, wie
+    /// er war: Schriftzug, ganze Aufschriften. Im Reiter Verschluesselung, wo
+    /// der Knopf frueher stand, trennt ein Klick nicht mehr.
+    #[test]
+    fn trennen_im_kopf_auf_jedem_reiter() {
+        let mut u = ui::Ui::new();
+        let stand = hud_stand_leer(Vec::new());
+        let groessen = [
+            (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160),
+            (1024, 576), (800, 600), (640, 480), (900, 1100), (1400, 1900),
+        ];
+        let mut ausgewichen = 0;
+        for (ww, wh) in groessen {
             let mut buf = vec![0u32; (ww * wh) as usize];
             for lang in strings::all() {
                 let k = hud_kopf(&mut u, lang, ww, wh);
+                let wo = format!("{} {ww}x{wh}", lang.code);
+                for i in 0..4 {
+                    assert!(k.reiter[i].x + k.reiter[i].w < k.reiter[i + 1].x, "{wo}: Reiter {i} reicht in den naechsten");
+                }
                 let letzter = k.reiter[4];
-                assert!(letzter.x + letzter.w < k.trennen.x, "{} {ww}x{wh}: Reiter reichen in Trennen", lang.code);
+                assert!(letzter.x + letzter.w < k.trennen.x, "{wo}: Reiter reichen in Trennen");
+                assert!(k.reiter[0].x > 0 && k.trennen.x + k.trennen.w < ww, "{wo}: Kopf ragt aus dem Fenster");
+                for (n, voll) in k.namen.iter().zip(hud_reiternamen(lang)) {
+                    assert!(n == voll || n.ends_with('…'), "{wo}: Aufschrift {n:?} statt {voll:?}");
+                }
+                if ww >= 1280 && ww * 9 == wh * 16 {
+                    assert!(k.logo, "{wo}: Schriftzug fehlt");
+                    assert!(k.namen.iter().zip(hud_reiternamen(lang)).all(|(n, v)| n == v), "{wo}: gekuerzt");
+                }
+                if !k.logo {
+                    ausgewichen += 1;
+                }
+                let klick = |u: &mut ui::Ui, c: &mut ui::Canvas, reiter: u8, x: i32, y: i32| -> HudAktion {
+                    u.mouse = (x, y);
+                    u.click = true;
+                    hud(u, c, lang, ww, wh, reiter, None, &[], 0.0, &[], None, None, (None, None),
+                        "192.168.178.194:9001", false, &stand)
+                };
                 for reiter in 0..5u8 {
                     let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
-                    u.mouse = (k.trennen.x + k.trennen.w / 2, k.trennen.y + k.trennen.h / 2);
-                    u.click = true;
-                    let a = hud(
-                        &mut u, &mut c, lang, ww, wh, reiter, None, &[], 0.0, &[], None, None, (None, None),
-                        "192.168.178.194:9001", false, &stand,
-                    );
-                    assert!(matches!(a, HudAktion::Trennen), "{} {ww}x{wh} Reiter {reiter}", lang.code);
+                    let a = klick(&mut u, &mut c, reiter, k.trennen.x + k.trennen.w / 2, k.trennen.y + k.trennen.h / 2);
+                    assert!(matches!(a, HudAktion::Trennen), "{wo} Reiter {reiter}");
+                }
+                // Der rechte Rand jedes Reiters, waehrend Benchmark offen ist.
+                for (i, r) in k.reiter.iter().enumerate() {
+                    let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+                    let a = klick(&mut u, &mut c, 4, r.x + r.w - 1, r.y + r.h / 2);
+                    assert!(matches!(a, HudAktion::Reiter(n) if n as usize == i), "{wo}: Rand von Reiter {i}");
                 }
             }
         }
+        // Die Ausweichstufen kommen in diesen Groessen auch wirklich dran
+        // (ohne geladene Schrift ist jeder Text null breit).
+        assert!(ausgewichen > 0 || !u.text.ok());
         // Wo der Knopf frueher stand (Reiter Verschluesselung, unter dem
         // Vergleichscode): kein Trennen mehr.
         let (ww, wh) = (1280, 720);
@@ -13168,6 +13242,43 @@ mod tests {
         u.click = true;
         let a = hud(&mut u, &mut c, strings::pick("de"), ww, wh, 2, None, &[], 0.0, &[], None, None, (None, None), "h:9001", false, &stand);
         assert!(!matches!(a, HudAktion::Trennen));
+    }
+
+    /// Reiter Benchmark: die Adresse des Hosts unter Trennen und die Reihe der
+    /// Codec-Knoepfe kommen sich nicht in die Quere - das Band der Adresse
+    /// sieht mit und ohne Codecs gleich aus, auch wenn die Knoepfe bis an
+    /// den rechten Rand reichen und die Adresse lang ist.
+    #[test]
+    fn benchmark_codecs_unter_der_adresse() {
+        let mut u = ui::Ui::new();
+        let codecs: Vec<CodecEintrag> = (0..12u8)
+            .map(|i| CodecEintrag {
+                idx: i, available: true, hardware: true, conversion: false, chroma444: true, ten_bit: true,
+                name: format!("HEVC 4:4:4 {i}"),
+            })
+            .collect();
+        let adresse = "arbeitszimmer-rechner-gpu.fritz.box:9001";
+        for (ww, wh) in [(1024, 576), (1280, 720), (1920, 1080)] {
+            let s: f32 = if wh >= 1000 { 1.5 } else { 1.0 };
+            let p = |v: i32| (v as f32 * s).round() as i32;
+            let y0 = (wh - (wh - p(80)).min(p(570))) / 2;
+            let band = |u: &mut ui::Ui, adresse: &str, stand: &HudStand| -> Vec<u32> {
+                let mut buf = vec![0u32; (ww * wh) as usize];
+                let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+                u.mouse = (0, 0);
+                u.click = false;
+                hud(u, &mut c, strings::pick("de"), ww, wh, 4, None, &[], 0.0, &[], None, None, (None, None),
+                    adresse, false, stand);
+                drop(c);
+                buf[((y0 + p(47)) * ww) as usize..((y0 + p(68)) * ww) as usize].to_vec()
+            };
+            let ohne = band(&mut u, adresse, &hud_stand_leer(Vec::new()));
+            let mit = band(&mut u, adresse, &hud_stand_leer(codecs.clone()));
+            assert!(ohne == mit, "{ww}x{wh}: Codec-Knoepfe im Band der Adresse");
+            // Die Adresse steht wirklich in diesem Band.
+            let leer = band(&mut u, "", &hud_stand_leer(Vec::new()));
+            assert!(leer != ohne, "{ww}x{wh}: Adresse nicht im Band");
+        }
     }
 
     // ------------------------------------------ Dateien (Spezifikation 3.4)
