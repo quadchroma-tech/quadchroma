@@ -15224,10 +15224,7 @@ mod tests {
 
     /// Eigener leerer Ordner je Test unter temp_dir, mit der Kennung des Laufs.
     fn test_ordner(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("{}-{name}", secure::test_lauf()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        secure::test_ordner("main", name)
     }
 
     /// Nachrang im Schreiber (Spezifikation 3.4): Datei-Pakete stauen sich,

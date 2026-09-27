@@ -931,10 +931,7 @@ mod tests {
 
     /// Eigener leerer Ordner je Test (die Tests laufen nebeneinander).
     fn ordner(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("{}-einlass-{name}", secure::test_lauf()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        secure::test_ordner("einlass", name)
     }
 
     /// Ein Host im Kleinen: eigener Schluessel, eigener Einlass, eigener

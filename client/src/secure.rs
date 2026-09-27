@@ -554,6 +554,22 @@ pub fn test_lauf() -> &'static str {
     })
 }
 
+/// Ein eigener, frischer Ordner fuer einen Test: "<Lauf>-<bereich>-<name>-<n>"
+/// unter dem Temp-Ordner, mit einer laufenden Nummer je Aufruf. So teilen
+/// nebeneinander laufende Tests nie eine Datei (host-password.txt,
+/// host-devices.txt, host.key) - auch nicht, wenn zwei denselben Namen
+/// waehlten -, und nichts muss vorher geloescht werden: unter Windows bliebe
+/// ein eben geloeschter Ordner sonst mitunter kurz "zum Loeschen vorgemerkt",
+/// und Schreiben darin scheiterte mit "Zugriff verweigert" (os error 5).
+#[cfg(test)]
+pub fn test_ordner(bereich: &str, name: &str) -> PathBuf {
+    static NUMMER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NUMMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("{}-{bereich}-{name}-{n}", test_lauf()));
+    std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
+    d
+}
+
 #[cfg(all(not(test), target_os = "macos"))]
 fn basis_ordner() -> Result<PathBuf, String> {
     let home = std::env::var("HOME")
@@ -797,10 +813,7 @@ mod tests {
     /// der Kennung des Laufs (test_lauf), damit ein Ordner eines frueheren
     /// Laufs mit derselben pid nicht hineinspielt.
     fn ordner(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("{}-{name}", test_lauf()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        test_ordner("secure", name)
     }
 
     /// Die Ablage der Tests ist je Prozess frisch: nicht der Ordner, den ein
@@ -821,8 +834,12 @@ mod tests {
         assert!(config_dir().unwrap().starts_with(&b));
         assert!(!config_dir().unwrap().starts_with(&pid_ordner));
         let o = ordner("lauf");
-        assert_eq!(o.file_name().unwrap().to_str().unwrap(), format!("{name}-lauf"));
+        let o2 = ordner("lauf");
+        assert!(o.file_name().unwrap().to_str().unwrap().starts_with(&format!("{name}-secure-lauf-")), "{}", o.display());
+        assert_ne!(o, o2, "zwei Aufrufe, ein Ordner");
+        assert!(o.is_dir() && o2.is_dir());
         let _ = std::fs::remove_dir_all(&o);
+        let _ = std::fs::remove_dir_all(&o2);
     }
 
     /// Nachricht 3 traegt den Namen, der jetzt gilt: nach einem Wechsel im

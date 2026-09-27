@@ -1386,7 +1386,7 @@ fn neu_schreiben(pfad: &Path, inhalt: &[u8]) -> std::io::Result<()> {
 /// Unter Windows ersetzt das Umbenennen eine vorhandene Datei ebenso.
 fn atomar_schreiben(pfad: &Path, inhalt: &[u8]) -> Result<(), DateiFehler> {
     let tmp = zwischenname(pfad);
-    let r = neu_schreiben(&tmp, inhalt).and_then(|_| std::fs::rename(&tmp, pfad));
+    let r = neu_schreiben(&tmp, inhalt).and_then(|_| umbenennen_ersetzend(&tmp, pfad));
     if let Err(e) = r {
         let _ = std::fs::remove_file(&tmp);
         return Err(DateiFehler::Schreiben { pfad: pfad.to_path_buf(), grund: wortlaut(&e) });
@@ -1400,6 +1400,26 @@ fn atomar_schreiben(pfad: &Path, inhalt: &[u8]) -> Result<(), DateiFehler> {
         }
     }
     Ok(())
+}
+
+/// Umbenennen, das eine vorhandene Datei ersetzt. Unter Windows haelt ein
+/// Virenscanner oder der Indexdienst eine eben geschriebene Datei mitunter
+/// kurz offen, ohne das Loeschen zu teilen; das Ersetzen scheitert dann mit
+/// "Zugriff verweigert" (os error 5) oder einer Freigabeverletzung (32) -
+/// so sah der sporadische Fehler im Test passwortdatei auf der VM aus. Dann
+/// bis zu zehnmal nach 20 ms noch einmal (cargo und rustup halten es
+/// ebenso); jeder andere Fehler gilt sofort.
+fn umbenennen_ersetzend(von: &Path, nach: &Path) -> std::io::Result<()> {
+    let mut versuch = 0;
+    loop {
+        match std::fs::rename(von, nach) {
+            Err(e) if cfg!(windows) && versuch < 10 && matches!(e.raw_os_error(), Some(5) | Some(32)) => {
+                versuch += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            r => return r,
+        }
+    }
 }
 
 /// Legt `pfad` an, aber NUR, wenn es ihn noch nicht gibt: erst in eine
@@ -2169,10 +2189,7 @@ mod tests {
     /// Eigener leerer Ordner je Test (die Tests laufen nebeneinander), mit
     /// der Kennung des Laufs wie in secure.rs.
     fn ordner(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("{}-zugang-{name}", crate::secure::test_lauf()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::secure::test_ordner("zugang", name)
     }
 
     fn lesen(p: &Path) -> String {
@@ -3295,6 +3312,36 @@ mod tests {
         // "Neues Zufallspasswort" repariert sie.
         let z = passwort_zufall_setzen(&pfad).unwrap();
         assert_eq!(passwort_laden(&pfad).unwrap().text, z);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Haelt ein anderer (sonst ein Virenscanner) die Datei kurz offen, ohne
+    /// das Loeschen zu teilen, scheitert das Ersetzen unter Windows erst mit
+    /// "Zugriff verweigert" - der neue Versuch nach 20 ms gelingt, sobald
+    /// sie wieder frei ist, und das Passwort steht in der Datei.
+    #[cfg(windows)]
+    #[test]
+    fn passwort_ersetzen_trotz_kurz_offener_datei() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = ordner("passwort-offen");
+        let pfad = d.join(PASSWORT_DATEI);
+        passwort_setzen(&pfad, "erstes Passwort").unwrap();
+        // FILE_SHARE_READ allein: kein Schreiben, kein Loeschen/Umbenennen.
+        let offen = std::fs::OpenOptions::new().read(true).share_mode(1).open(&pfad).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(offen);
+        });
+        assert_eq!(passwort_setzen(&pfad, "zweites Passwort").unwrap(), "zweites Passwort");
+        t.join().unwrap();
+        assert_eq!(passwort_laden(&pfad).unwrap().text, "zweites Passwort");
+        // Keine Zwischendatei bleibt liegen.
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        // Bleibt sie laenger gesperrt, gilt der Fehler - die alte Datei bleibt.
+        let offen = std::fs::OpenOptions::new().read(true).share_mode(1).open(&pfad).unwrap();
+        assert!(matches!(passwort_setzen(&pfad, "drittes Passwort"), Err(PasswortFehler::Datei(DateiFehler::Schreiben { .. }))));
+        drop(offen);
+        assert_eq!(passwort_laden(&pfad).unwrap().text, "zweites Passwort");
         let _ = std::fs::remove_dir_all(&d);
     }
 

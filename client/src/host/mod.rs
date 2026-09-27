@@ -1698,8 +1698,7 @@ mod tests {
     /// neueste Zeile steht immer in der Datei selbst.
     #[test]
     fn protokoll_hat_eine_obergrenze() {
-        let ordner = std::env::temp_dir().join(format!("qc-protokoll-{}", std::process::id()));
-        std::fs::create_dir_all(&ordner).unwrap();
+        let ordner = secure::test_ordner("protokoll", "obergrenze");
         let pfad = ordner.join("host-protokoll.txt");
         let alt = ordner.join("host-protokoll.alt.txt");
         let mut d = Some(Protokolldatei { datei: std::fs::File::create(&pfad).unwrap(), pfad: pfad.clone(), geschrieben: 0 });
@@ -1730,9 +1729,7 @@ mod tests {
     /// Loopback. `app`: wie in der einen App (eigener Mutex-Name, Freigabe
     /// noch aus); sonst die reine Host-Rolle mit schon offenen Ports.
     fn test_dienst(name: &str, app: bool) -> Dienst {
-        let ordner = std::env::temp_dir().join(format!("qc-dienst-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&ordner);
-        std::fs::create_dir_all(&ordner).unwrap();
+        let ordner = secure::test_ordner("dienst", name);
         let (priv_key, pub_key) = noise::keypair().unwrap();
         let einlass = Arc::new(einlass::Einlass::neu(
             ordner.join(zugang::GERAETE_DATEI),

@@ -880,10 +880,7 @@ mod tests {
     }
 
     fn ordner(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("{}-phase-{name}", crate::secure::test_lauf()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::secure::test_ordner("phase", name)
     }
 
     /// 8.2: ueber eine ID verbunden, aber der Schluessel ergibt eine andere
