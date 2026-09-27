@@ -7733,7 +7733,10 @@ impl App {
     /// Versuch -, an heisst ausschalten. Gemerkt wird der Wunsch; lehnt das
     /// System ab, bleibt er, und Haken wie Kaestchen zeigen aus samt Grund.
     fn ruhe_umschalten(&mut self) {
-        let soll = !self.ruhe.an();
+        // Nach dem Wunsch umschalten, nicht nach dem wirksamen Zustand:
+        // lehnt das System ab, schaltet der naechste Klick den Wunsch aus
+        // (und damit den Hinweis weg), statt erneut anzufordern.
+        let soll = ruhezustand::naechster_wunsch(self.cfg.ruhe_verhindern);
         ruhe_setzen(&mut self.ruhe, soll, self.lang);
         self.cfg.ruhe_verhindern = soll;
         self.cfg.sichern();

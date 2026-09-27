@@ -82,6 +82,13 @@ pub fn anzeige(wunsch: bool, an: bool, abgelehnt: Option<&str>) -> (bool, Option
     (an, abgelehnt.filter(|_| wunsch && !an).map(str::to_string))
 }
 
+/// Was ein Klick auf Haken oder Kaestchen als neuen Wunsch setzt: immer das
+/// Gegenteil des gespeicherten Wunsches. Auch wenn das System die Anforderung
+/// ablehnt (Anzeige "aus" mit Grund), schaltet der Klick den Wunsch aus.
+pub fn naechster_wunsch(wunsch: bool) -> bool {
+    !wunsch
+}
+
 impl Ruhesperre {
     pub fn neu() -> Ruhesperre {
         Ruhesperre::default()
@@ -319,6 +326,17 @@ mod win {
 
 #[cfg(test)]
 mod tests {
+    /// Abgelehnt: Kaestchen zeigt "aus" mit Grund, der Klick nimmt den
+    /// Wunsch weg, danach steht kein Hinweis mehr da.
+    #[test]
+    fn abgelehnt_laesst_sich_ausschalten() {
+        assert_eq!(anzeige(true, false, Some("5")), (false, Some("5".to_string())));
+        let neu = naechster_wunsch(true);
+        assert!(!neu);
+        assert_eq!(anzeige(neu, false, Some("5")), (false, None));
+        assert!(naechster_wunsch(false));
+    }
+
     use super::*;
 
     /// Jeder Wechsel am System genau einmal: setzen nur aus "aus", loesen nur
