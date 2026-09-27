@@ -67,10 +67,13 @@ On Windows and on the Mac QuadChroma is one app for both directions: it
 controls other computers and, with "Share this PC" ("Share this Mac")
 switched on (the default), lets other devices control this computer - in
 the same process, with one icon in the notification area or the menu
-bar. The very first start opens the window; every later start, including
-the one at logon, goes silently to the icon; a double-click on the
-running app opens its window (see "Windows: one app for both directions"
-and "Mac: one app for both directions").
+bar. The very first start opens the window; every later start goes
+silently to the icon, and a start at logon always does - even on a
+computer whose window was never shown; a double-click on the running app
+opens its window (see "Windows: one app for both directions" and "Mac:
+one app for both directions"). Closing the window, its "Close window"
+button and ESC on the start screen only hide it; quitting is in the
+icon's menu.
 
 Encryption and access
 ---------------------
@@ -708,14 +711,19 @@ signature stay those of the former host app, so permissions granted to
 it remain valid.
 
 Start: the very first start (einstellungen.txt without fenster_gezeigt=1)
-opens the window; every later start - also as a login item - stays in the
-menu bar without a window and without a Dock icon, and takes the focus
-from nobody. A double-click on the running app in the Finder, or a
-second start (for example "open -n"), opens the window; with the window
-open the app has a Dock icon and its own menu ("Quit QuadChroma", Cmd+Q),
-hidden again it is only the icon. A start with an address or a device ID
-opens the window at once. The engine is set up when the app starts
-(key, access, menu); it listens only while sharing is on.
+opens the window; every later start stays in the menu bar without a
+window and without a Dock icon, and takes the focus from nobody. A start
+as a login item ("Start at login") always does, also before the window
+was ever shown (see "Start at login" below). A double-click on the
+running app in the Finder, or a second start (for example "open -n"),
+opens the window; with the window open the app has a Dock icon and its
+own menu, hidden again it is only the icon. That menu's one item is
+"Close window" (Cmd+Q) while the menu bar icon stands - it hides the
+window like the red button, quitting is in the icon's menu - and "Quit
+QuadChroma" (Cmd+Q) when there is no icon to return to. A start with an
+address or a device ID opens the window at once. The engine is set up
+when the app starts (key, access, menu); it listens only while sharing
+is on.
 
 The icon: four squares like the program icon, the lower right one only
 outlined, with a dot in it while a viewer is connected. A click on it
@@ -736,14 +744,15 @@ opens the menu:
                                devices ..."; empty: "No devices yet"
     Change device name ...
     Share this Mac             check mark: sharing is on
-    Start at login             with a check mark when it is on
+    Start at login             with a check mark when it is on; the same
+                               as the check box on the start screen
     Prevent sleep while QuadChroma is running
     Screen Recording not allowed - open System Settings ...
     Accessibility not allowed - open System Settings ...
                                both only while sharing is on and that
                                permission is missing; a click opens its
                                page in System Settings > Privacy & Security
-    Quit QuadChroma            also Cmd+Q
+    Quit QuadChroma            the only way to quit the app
 
 Device ID, password and allowed devices stay in the menu and can be
 managed while sharing is off. The menu speaks the language chosen in the
@@ -826,12 +835,33 @@ IOPMAssertionCreateWithName: 0x...". Another click tries again. The
 host's keep-awake during a session (display included) is independent of
 it.
 
-Start at login registers the app as a login item in System Settings. It
-works only when QuadChroma.app lies in /Applications; elsewhere the
-entry is disabled and "Move QuadChroma to Applications first" appears
-below it. If macOS wants the login item approved first, the check mark
-becomes a dash, and a click opens the Login Items settings. At login the
-app starts in the menu bar, with sharing as it was left.
+Start at login registers the app as a login item in System Settings
+(SMAppService). The menu item and the check box "Start at login" on the
+start screen - directly below "Prevent sleep while QuadChroma is
+running" - show the same state and switch the same way; a change in one
+appears in the other (the check box reads the state twice a second). It
+works only when QuadChroma.app lies in /Applications; elsewhere the menu
+item is disabled with "Move QuadChroma to Applications first" below it,
+and the check box is disabled with that reason next to it. If macOS
+wants the login item approved first, check mark and check box show a
+dash, and a click opens the Login Items settings.
+
+At login the app always starts silently in the menu bar, with sharing
+as it was left - also on a Mac where its window was never shown. macOS
+starts a login item without arguments; the app recognizes it by the
+launch event (the "open application" Apple event carries "launched as
+login item", keyAELaunchedAsLogInItem), read while the launch is
+handled. Whether macOS sets that mark for login items registered with
+SMAppService could not be verified without logging in; so a start also
+counts as a login start when "Start at login" is on and the console
+login (utmpx, as shown by "who") is at most 120 s ago. Every start logs
+what it found, for example "Start: Apple-Ereignis aevt/oapp, Eigenschaft
+lgit, Beim Anmelden starten An, Anmeldung vor 8 s - Anmeldeobjekt
+(Startereignis)"; if the window would otherwise have opened, then also
+"Start im Hintergrund (Anmeldeobjekt) - das Fenster kommt mit
+"QuadChroma oeffnen"". A click on the check box logs "Beim Anmelden
+starten: umschalten (war Aus)" (the host's log: "Oberflaeche: Beim
+Anmelden starten eingeschaltet").
 
 Permissions: without Screen Recording the host does not quit. When
 sharing goes on, it asks for it (macOS shows its dialog), the menu shows
@@ -848,12 +878,15 @@ to host.key); after that only the menu shows it. Without it the host
 ignores mouse and keyboard. The audio the host captures never includes
 the app's own playback (the client's sound of another computer).
 
-Quitting - "Quit QuadChroma" in the menu, Cmd+Q, "Quit" on the start
-screen - ends client and host together: a viewer is told goodbye first
-(message 13, reason 0: "<Name> was closed.", waiting at most 3 s). The
-same happens at logout, with SIGTERM or SIGINT ("Oberflaeche: Signal
-SIGTERM - beende"). While the client shows a session, Cmd+Q and Cmd+H go
-to the remote Mac, not to the app.
+Quitting - "Quit QuadChroma" in the menu bar icon's menu - ends client
+and host together: a viewer is told goodbye first (message 13, reason 0:
+"<Name> was closed.", waiting at most 3 s). The same happens at logout,
+with SIGTERM or SIGINT ("Oberflaeche: Signal SIGTERM - beende"). In the
+window nothing quits while the icon stands: "Close window" on the start
+screen, Cmd+Q, Cmd+W, ESC and the red button hide the window (see
+"Closing the window"). Without an icon (tray=aus, or macOS does not show
+it) they quit, and the button is called "Quit". While the client shows a
+session, Cmd+Q, Cmd+W and Cmd+H go to the remote Mac, not to the app.
 
 The host's log: host-protokoll.txt in the app folder
 (~/Library/Application Support/QuadChroma/), appended across starts; at
@@ -906,6 +939,15 @@ files), decoding with VideoToolbox, display through Metal (no choice of
 graphics cards in the Display tab). Closing hides it in the menu bar, in
 the one icon of the app (see "Mac: one app for both directions"); there
 is no desktop shortcut on the Mac. It needs no FFmpeg.
+
+Full screen on the Mac (F11, the default) is borderless and hides the
+menu bar and the Dock completely - moving the mouse to the screen edge
+does not bring them back, the whole screen belongs to the remote
+computer. They return when full screen is left (F11), when the window is
+hidden, and while another app is in front (Cmd+Tab): the setting applies
+only while QuadChroma is the active app. If the menu bar and Dock were
+still hidden after leaving full screen, the app shows them again and
+logs "Vollbild verlassen: Menueleiste und Dock wieder sichtbar".
 
 Building: "make" in the repository builds the app - cargo build
 --release --locked in client/ (the host engine from host/ is compiled
@@ -1012,7 +1054,8 @@ Keys:
 
     F9         statistics on and off (the menu sets which lines)
     F10        menu - or hold ESC for two seconds
-    F11        full screen on and off
+    F11        full screen on and off (on the Mac without menu bar and
+               Dock, see "Mac client")
     F12        pixel-exact rendering instead of stretched
     Ctrl+Esc   back to the start screen
 
@@ -1045,21 +1088,31 @@ the app tries again every 5 s.
 Start: the very first start (einstellungen.txt without fenster_gezeigt=1)
 opens the window. Every later start, "Start with Windows"
 (quadchroma.exe --hintergrund) and quadchroma.exe --host stay in the
-notification area; window and renderer are only created by "Open
-QuadChroma" (or a click on the icon, or a second start of the exe). Until
-then the app waits for events without a timer. A start with an address,
-a device ID or a desktop shortcut always opens the window, and so does a
-start with tray=aus - without an icon there would be no way back. A
-start in the background while the app already runs ends at once
-("QuadChroma laeuft schon - der Start im Hintergrund endet.").
+notification area - the last two always, even before the window was
+ever shown; window and renderer are only created by "Open QuadChroma"
+(or a click on the icon, or a second start of the exe). Until then the
+app waits for events without a timer. A start with an address, a device
+ID or a desktop shortcut always opens the window, and so does a start
+with tray=aus - without an icon there would be no way back. A start in
+the background while the app already runs ends at once ("QuadChroma
+laeuft schon - der Start im Hintergrund endet.").
+
+"Start with Windows" is the item in the icon's menu and the check box
+of the same name on the start screen, directly below "Prevent sleep
+while QuadChroma is running"; both show whether the shortcut
+QuadChroma.lnk (target quadchroma.exe --hintergrund) lies in the user's
+Startup folder, and a click in either writes or deletes it. A shortcut
+of earlier versions ("QuadChroma - Freigabe.lnk", --host) counts as on
+and, if it starts this exe, is replaced by the new one at its next
+start.
 
 --host [port] is "start in the background with sharing on": it switches
 sharing on and remembers it, so shortcuts of earlier versions keep
 working. --nur-host [port] is the host role alone, without window and
 client (for a VM and for tests, see "Windows as host").
 
-Quitting ("Quit" in the menu or on the start screen) ends both roles; a
-connected viewer is told goodbye first (reason 0: "<Name> was closed.").
+Quitting ("Quit" in the icon's menu) ends both roles; a connected
+viewer is told goodbye first (reason 0: "<Name> was closed.").
 The same happens at logoff or shutdown, when an installer closes the app
 (Restart Manager) and when another program sends WM_CLOSE to the hidden
 window of the icon (class QuadChromaSymbol): "Infobereich: QuadChroma
@@ -1101,8 +1154,9 @@ another click tries again. The keep-awake of the host during a session
 Closing the window: notification area and menu bar
 --------------------------------------------------
 
-Closing (the X or Alt+F4, on the Mac the red button or Cmd+W on the
-start screen) does not quit the client, it hides it: on Windows as an
+Closing (the X or Alt+F4, the button "Close window" and ESC on the start
+screen, on the Mac also the red button and Cmd+W or Cmd+Q on the start
+screen) does not quit the client, it hides it: on Windows as an
 icon in the notification area next to the clock, on the Mac as the icon
 at the top in the menu bar (four squares, the fourth outlined). A running
 session is disconnected as with "Disconnect" - the host stops working.
@@ -1158,10 +1212,11 @@ running in the menu bar." (Mac, bubble below the icon, 6 s) appears once. This
 is recorded in einstellungen.txt as tray_hinweis=1, but only once the hint was
 actually visible; with tray_hinweis=0 it appears once more.
 
-Quitting: "Quit" in the icon's menu or the "Quit" button on the start
-screen, on the Mac also ESC on the start screen and Cmd+Q; on Windows
-ESC on the start screen hides the app like the X. A WM_CLOSE to the
-window only hides the app, like the X. On Windows a WM_CLOSE to the
+Quitting: only "Quit" in the icon's menu ("Quit QuadChroma" on the Mac).
+The start screen's button "Close window", ESC there and on the Mac Cmd+Q
+and Cmd+W hide the app like the X; the button is called "Quit" and quits
+only when there is no icon (tray=aus, or the icon does not stand, see
+below). A WM_CLOSE to the window only hides the app, like the X. On Windows a WM_CLOSE to the
 hidden window of the icon (class QuadChromaSymbol) quits it with the
 goodbye to a viewer (see "Windows: one app for both directions"); a
 hard end (taskkill /F, Stop-Process -Id) sends no goodbye. taskkill
@@ -1174,7 +1229,8 @@ laeuft schon, antwortet aber nicht (<Grund>).", i.e. already running
 but not responding) until the app is quit.
 
 tray=aus in einstellungen.txt turns hiding off: no icon, and closing
-quits the program as it used to. The same applies without an icon: if
+quits the program as it used to (the start screen's button then reads
+"Quit"). The same applies without an icon: if
 it cannot be created (for example without Explorer), is not registered
 yet, or macOS does not show it (full menu bar, "Allow in the Menu Bar"
 switched off), closing quits the program. So the app never becomes
@@ -1192,12 +1248,18 @@ The log (protokoll.txt) records what happened; on the Mac the lines
 begin with "Menueleiste:" (menu bar) instead of "Infobereich:"
 (notification area):
 
-    "Infobereich: Symbol angelegt"
+    "Infobereich: Symbol angelegt"   (on the Mac once the icon stands in
+                                      the menu bar, which takes macOS a
+                                      moment after it was created)
     "Infobereich: kein Symbol (<Grund>) - Schliessen beendet das Programm"
     "Infobereich: Symbol (noch) nicht angemeldet (<Grund>) - Schliessen
-     beendet, bis es steht"
+     beendet, bis es steht"          (on the Mac only if the icon still
+                                      does not stand after 3 s; closing
+                                      checks again every time)
     "Infobereich: Fenster geschlossen - trenne <Adresse>"
     "Infobereich: Fenster abgelegt, QuadChroma laeuft weiter"
+    "Infobereich: Fenster geschlossen - ohne Symbol bzw. mit tray=aus
+     endet QuadChroma"
     "Infobereich: Hinweis nicht gezeigt - kommt beim naechsten Ablegen
      noch einmal"
     "Infobereich: Fenster wieder sichtbar"

@@ -201,11 +201,12 @@ after each update the two permissions must be granted again.
 
 The very first start opens the window (the start screen with the hosts found on the
 network); after that the app sits as an icon in the menu bar - four squares, the lower
-right one only outlined - and in the Dock only while its window is open. Its menu
-opens the window, connects to a host found on the network, shows the Mac's device ID
-and access password and the allowed devices, and switches "Share this Mac" (on by
+right one only outlined - and in the Dock only while its window is open. A start at
+login always goes silently to the menu bar, even before the window was ever shown. Its
+menu opens the window, connects to a host found on the network, shows the Mac's device
+ID and access password and the allowed devices, switches "Share this Mac" (on by
 default), "Start at login" (offered once the app lies in Applications) and "Prevent
-sleep while QuadChroma is running". While a permission is missing, sharing keeps
+sleep while QuadChroma is running", and is the one place to quit the app. While a permission is missing, sharing keeps
 running; the menu says which one and opens its page in System Settings. macOS 15 and
 later also ask once for access to the local network.
 
@@ -238,7 +239,10 @@ Windows download carries the two FFmpeg DLLs.
 Without arguments - a double-click in the Finder, or as a login item - the app shares
 the Mac on port 9001 with the default values (unless "Share this Mac" is off). Only
 one app runs per user: a second start or a double-click on the running app opens its
-window. On the first start grant the two permissions listed above. `make` signs the bundle
+window. Full screen (F11, the default) hides the menu bar and the Dock completely, also
+at the top edge; they come back when full screen is left, the window is hidden or
+another app comes to the front (Cmd+Tab). On the first start grant the two permissions
+listed above. `make` signs the bundle
 with a local development certificate so that the Screen Recording permission survives
 a rebuild. The host captures its main screen; the client can choose another one in
 its menu, and `--display n` pins entry `n` of the `--list` output for this run (see
@@ -260,9 +264,10 @@ the access password, `bildschirm.txt`).
 
 Without an address the very first start opens the start screen; the Mac appears in the
 list after a few seconds with its name and device ID, and a click connects. The address
-field also takes a device ID. Later starts go silently to the notification area - a
-click on the icon, or starting `quadchroma.exe` again, opens the window. Closing the
-window does not quit (see "Closing, single instance, desktop shortcut").
+field also takes a device ID. Later starts go silently to the notification area, a
+start through "Start with Windows" always - a click on the icon, or starting
+`quadchroma.exe` again, opens the window. Closing the window does not quit (see
+"Closing, single instance, desktop shortcut").
 
 The client's files live in `%APPDATA%\QuadChroma\`: `host.key` (the device key, which
 the client uses as well), `hosts.txt` (the hosts that let this PC in),
@@ -349,9 +354,13 @@ click connects, and on Windows the "Desktop shortcut" button puts a shortcut to 
 host on the Desktop. The address field takes an IP address, a name or a device ID (nine
 digits, spaces allowed) and pastes with Ctrl+V (Cmd+V on the Mac). "Share this PC"
 ("Share this Mac") switches sharing of this computer on and off, and below the buttons
-stand "This computer: <name> · <ID>" with "Rename" and the check box "Prevent sleep
-while QuadChroma is running". While the access dialog is open (see "Pairing"), Enter
-connects, Esc cancels, and no key reaches the host.
+stand "This computer: <name> · <ID>" with "Rename", the check box "Prevent sleep
+while QuadChroma is running" and directly below it "Start with Windows" (on the Mac
+"Start at login"; disabled with its reason while the app is not in Applications) -
+the same state as the item in the icon's menu. The button on the right, "Close window",
+hides the window like its close button; quitting is in the icon's menu (without an icon
+the button reads "Quit" and quits). While the access dialog is open (see "Pairing"),
+Enter connects, Esc cancels, and no key reaches the host.
 
 ### Keys
 
@@ -359,7 +368,7 @@ connects, Esc cancels, and no key reaches the host.
 |---|---|
 | F9 | statistics on and off |
 | F10, or hold ESC for two seconds | menu: Picture, Display, Encryption, Shortcuts, Benchmark, Computers |
-| F11 | full screen on and off |
+| F11 | full screen on and off (on the Mac without menu bar and Dock) |
 | F12 | pixel-exact rendering instead of scaled |
 | Ctrl+Esc | back to the start screen |
 
@@ -532,10 +541,12 @@ figures are under "Measurements"; the progress line, the log lines and messages 
 
 ## Closing, single instance, desktop shortcut
 
-Closing the window disconnects a running session and puts the client away: on Windows
-as an icon in the notification area (sharing keeps running), on the Mac in the menu
-bar. The icon brings the window back, connects to a found host through its menu, or
-quits the program; `tray=aus` (off) in `einstellungen.txt` restores close-to-quit. Only
+Closing the window - its close button, "Close window" and ESC on the start screen, on
+the Mac also Cmd+W and Cmd+Q there - disconnects a running session and puts the client
+away: on Windows as an icon in the notification area (sharing keeps running), on the
+Mac in the menu bar. The icon brings the window back, connects to a found host through
+its menu, or quits the program - only its menu quits; `tray=aus` (off) in
+`einstellungen.txt` restores close-to-quit. Only
 one client with a window runs per user session: a second start hands its address to
 the running one and exits.
 
