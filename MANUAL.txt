@@ -258,6 +258,38 @@ even when the screen is still. A peer that disappears without saying
 goodbye (lid closed, Wi-Fi gone) is noticed by the Mac host after about
 16 s.
 
+The host says goodbye: before it closes the connection on purpose, the
+viewer gets message 13 with a reason as the last message on the video
+channel, and the client ends the session at once, goes back to the start
+screen and shows the reason there until the next connection - without
+reconnecting by itself (like message 10):
+
+    0  "<Name> was closed."        the host app was quit (Mac: "Quit
+                                   QuadChroma", Cmd+Q, logging out,
+                                   SIGTERM/SIGINT; Windows host role:
+                                   closed from outside, e.g. taskkill
+                                   without /F, logging off, shutting
+                                   down)
+    1  "<Name> stopped sharing."   "Stop sharing" in the Windows host
+                                   role's menu
+    2  "<Name> removed this device."  this device was removed from the
+                                   host's list of allowed devices during
+                                   the session ("Remove", "Remove all
+                                   devices ...")
+
+<Name> is the host's name from its announcement or hosts.txt (otherwise
+the address). The client's log shows "Sitzung mit <Name> (<Adresse>) zu
+Ende: der Host wurde beendet (Abschied, Grund 0) - keine automatische
+Neuverbindung" ("... hat die Freigabe ausgeschaltet", "... hat dieses
+Geraet entfernt"); an unknown reason counts as 0. Older clients ignore
+message 13 and only see the connection end.
+
+    13  Goodbye       Host -> client, video channel: u8 reason (0 app
+                      quit, 1 sharing switched off, 2 device removed; at
+                      least 1 byte, further bytes are ignored). The last
+                      message, the host closes the video and input
+                      channel right after it.
+
 Handshake: each handshake has an overall deadline (host 5 s, client 3 s)
 and runs in its own thread on the host, so a peer that stays silent or
 trickles data only holds its own slot. There are 32 slots per port. The
@@ -428,6 +460,8 @@ Log lines of the access phase in the Mac host (/tmp/quadchroma-m1.log);
      Gegenstelle <Fingerabdruck>, Vergleichscode <Code>"
     "Geraet entfernt: <Name> (ID <ID>)", "Alle Geraete entfernt (N)",
      "Zuschauer getrennt: sein Geraet wurde aus der Liste entfernt"
+     (the viewer got the goodbye with reason 2 first; " - der Abschied
+     kam nicht an" is appended if it did not take it within 100 ms)
     "Geraeteliste host-devices.txt nicht lesbar oder beschaedigt -
      niemand gilt als bekannt, jedes Geraet braucht Passwort oder
      Zulassen; die Datei bleibt unangetastet"
@@ -463,6 +497,10 @@ Log lines of the Windows host role (host-protokoll.txt), where <wer> is
      Gegenstelle <Fingerabdruck>, Vergleichscode <Code>" (plus " - eben
      per Passwort erlaubt" or " - eben am Host zugelassen")
     "Geraet entfernt: ID <ID>", "Alle Geraete entfernt"
+    "Zuschauer <Name> (<IP>) wird verabschiedet: <Grund>" with <Grund>
+     "Geraet entfernt", "Freigabe beendet" or "Host-Rolle beendet", then
+     "Abschied (<Grund>) an <IP> gemeldet" or "... nicht zugestellt:
+     <Fehler>" (see "The host says goodbye")
     "Zugangspasswort: neues Zufallspasswort angelegt (host-password.txt)"
     "Uebernahme: N Geraete aus authorized.txt nach host-devices.txt, alte
      Liste heisst jetzt authorized.txt.migriert"
@@ -642,10 +680,12 @@ later "Port 9001 wieder frei - der Dienst laeuft"). It announces itself
 only once it has the port.
 
 Quitting - "Quit QuadChroma", Cmd+Q, logging out, SIGTERM or SIGINT -
-first closes the connection to the viewer (waiting at most 3 s), then
-the host ends ("Beenden: Verbindung zum Zuschauer <Fingerabdruck>
-geschlossen", "Host beendet"). The client sees the connection end and
-connects again by itself as soon as the host runs again.
+first says goodbye to the viewer (message 13, reason 0) and closes the
+connection (waiting at most 3 s), then the host ends ("Beenden:
+Verbindung zum Zuschauer <Fingerabdruck> geschlossen (Abschied
+gemeldet)" or "... - der Abschied kam nicht an", then "Host beendet").
+The client shows "<Name> was closed." and does not reconnect by itself
+(see "The host says goodbye").
 
 For experts the switches stay: --serve [port], --fps N, --mbit N,
 --fest, --display N, --out <B>x<H>, and the tools --list, --capture
@@ -2135,10 +2175,14 @@ beeps and flashes in the taskbar, but does not take the focus (see "Encryption
 and access"). "Start with Windows" puts the shortcut "QuadChroma -
 Freigabe.lnk" - the exe with --host - into the user's Startup folder, or
 removes it; the check mark shows whether it is there ("Mit Windows starten: an
-(Verknuepfung im Autostart-Ordner)" or "... aus"). "Stop sharing" disconnects
-the viewer and ends the host role ("Freigabe beendet (Infobereich)"). Menu and
-windows speak the language set in the client (einstellungen.txt), otherwise
-the one of Windows.
+(Verknuepfung im Autostart-Ordner)" or "... aus"). "Stop sharing" says goodbye
+to the viewer (message 13, reason 1: "<Name> stopped sharing.") and ends the
+host role ("Freigabe beendet (Infobereich)"). Closed from outside (taskkill
+without /F), at logoff or shutdown the host role ends the same way with reason
+0 ("Host-Rolle wird beendet (WM_CLOSE von aussen)" or "... (Abmelden oder
+Herunterfahren)", then "Host-Rolle beendet"); both wait at most 3 s for the
+viewer to take the goodbye. Menu and windows speak the language set in the
+client (einstellungen.txt), otherwise the one of Windows.
 
 Without an icon - no Explorer, as over ssh or in session 0 - the host role
 runs without a menu, and new devices get in only with the password

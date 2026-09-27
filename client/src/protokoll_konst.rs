@@ -2,8 +2,8 @@
 //
 // Der Client (Empfang) und der Windows-Host (Versand) lesen dieselben
 // Zahlen von hier; auf dem Mac stehen sie als QC_MSG_*/QC_IN_* in
-// host/main.m. Wer hier etwas aendert, aendert das Protokoll - und muss es
-// auf dem Mac ebenso tun.
+// host/main.m (Zugang und Abschied in host/zugang.h). Wer hier etwas
+// aendert, aendert das Protokoll - und muss es auf dem Mac ebenso tun.
 //
 // Kopf jeder Nachricht: u8 Typ, u8 Flags, u16 frei (bei Bild: Bildnummer),
 // u32 Laenge (little endian). Davor beim Verbinden einmal MAGIC.
@@ -105,6 +105,18 @@ pub const MSG_FAEHIGKEITEN: u8 = 11;
 /// Aenderung der Liste und als Antwort auf jeden Wunsch. Ein aelterer
 /// Client uebergeht Typ 12.
 pub const MSG_BILDSCHIRME: u8 = 12;
+/// Abschied des Hosts: u8 Grund (HOST_ENDE_*), mindestens 1 Byte, weitere
+/// Bytes werden uebergangen. Die letzte Nachricht, danach macht der Host
+/// Bild- und Eingabekanal zu - bevor die App endet, die Freigabe ausgeht oder
+/// wenn das Geraet dieses Zuschauers entfernt wird. Der Client beendet die
+/// Sitzung sofort, zeigt den Grund und verbindet sich NICHT von selbst neu
+/// (wie bei MSG_ABGELOEST). Ein aelterer Client uebergeht Typ 13 und sieht
+/// danach nur das Ende der Leitung.
+pub const MSG_HOST_ENDE: u8 = 13;
+/// Gruende in MSG_HOST_ENDE. Ein unbekannter Grund gilt wie HOST_ENDE_BEENDET.
+pub const HOST_ENDE_BEENDET: u8 = 0;
+pub const HOST_ENDE_FREIGABE_AUS: u8 = 1;
+pub const HOST_ENDE_ENTFERNT: u8 = 2;
 /// Tonformat: u32 Rate, u8 Kanaele, u8 1 = float32 verschachtelt, 2 frei.
 pub const MSG_AUDIO_INFO: u8 = 32;
 /// Ton: float32 LE verschachtelt.

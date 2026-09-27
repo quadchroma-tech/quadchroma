@@ -295,6 +295,12 @@ size_t qc_zugang_abbruch_kodieren(uint8_t out[QC_ZUGANG_KOPF]) {
     return QC_ZUGANG_KOPF;
 }
 
+size_t qc_host_ende_kodieren(uint8_t out[QC_HOST_ENDE_LAENGE], uint8_t grund) {
+    qc_zugang_kopf(out, QC_MSG_HOST_ENDE, 1);
+    out[QC_ZUGANG_KOPF] = grund;
+    return QC_HOST_ENDE_LAENGE;
+}
+
 // ------------------------------------------------------------ Kryptografie
 
 size_t qc_zugang_norm(const char *pw, uint8_t *out, size_t cap) {

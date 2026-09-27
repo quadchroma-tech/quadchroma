@@ -655,10 +655,10 @@ impl Meldung {
 
     /// Ein Fehler, der sich mit dem naechsten Versuch nicht von selbst gibt:
     /// Ablage oder Schluesseldatei kaputt, Liste kein UTF-8 oder nicht
-    /// schreibbar - und jeder Ausgang des Zugangs (Spezifikation Pairing v1,
+    /// schreibbar - jeder Ausgang des Zugangs (Spezifikation Pairing v1,
     /// 9.6: abgelehnt, zu viele Versuche, keine Antwort, Host veraltet,
     /// Host-Beweis falsch, Host ohne Ausweis, anderes Geraet unter der ID,
-    /// ID nicht gefunden).
+    /// ID nicht gefunden) - und der Abschied des Hosts (MSG_HOST_ENDE).
     /// Dann verbindet der Empfangsfaden nicht alle 2 s neu, sondern nimmt das
     /// Ziel zurueck (wie bei einer Abloesung); der Startbildschirm zeigt die
     /// Meldung, und der Nutzer verbindet selbst wieder.
@@ -690,6 +690,9 @@ impl Meldung {
                     | MsgOtherDevice
                     | MsgIdNotFound
                     | MsgDeviceRemoved
+                    | MsgHostQuit
+                    | MsgHostSharingOff
+                    | MsgHostRemovedYou
             )
     }
 
@@ -2297,6 +2300,24 @@ fn zugang_meldung(a: zugangsphase::Ausgang, name: &str, addr: &str) -> Meldung {
     }
 }
 
+/// Der Abschied des Hosts (MSG_HOST_ENDE) als Meldung fuer den
+/// Startbildschirm, mit seinem Namen; ein unbekannter Grund gilt wie
+/// "beendet".
+fn host_ende_meldung(grund: u8, name: &str, addr: &str) -> Meldung {
+    use strings::Key::*;
+    let (key, was) = match grund {
+        HOST_ENDE_FREIGABE_AUS => (MsgHostSharingOff, "hat die Freigabe ausgeschaltet".to_string()),
+        HOST_ENDE_ENTFERNT => (MsgHostRemovedYou, "hat dieses Geraet entfernt".to_string()),
+        HOST_ENDE_BEENDET => (MsgHostQuit, "wurde beendet".to_string()),
+        g => (MsgHostQuit, format!("endet (unbekannter Grund {g}, gilt wie beendet)")),
+    };
+    Meldung::neu(
+        key,
+        format!("Sitzung mit {name} ({addr}) zu Ende: der Host {was} (Abschied, Grund {grund}) - keine automatische Neuverbindung"),
+    )
+    .mit("{n}", name)
+}
+
 fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) -> Result<(), Meldung> {
     // Erst der Handschlag, dann erst Nutzdaten. Vorher geht nichts ueber die
     // Leitung, was jemand mitlesen koennte.
@@ -2721,6 +2742,23 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 let mut s = shared.lock().unwrap();
                 s.target = None;
                 s.error_key = Some(strings::Key::SessionTakenOver);
+                return Ok(());
+            }
+            MSG_HOST_ENDE => {
+                // Der Host verabschiedet sich (App beendet, Freigabe aus,
+                // dieses Geraet entfernt) und macht gleich zu. Wie bei der
+                // Abloesung kein Neuversuch: das Ziel geht zurueck, der
+                // Startbildschirm zeigt den Grund, verbunden wird erst wieder
+                // auf Wunsch.
+                let grund = payload.first().copied().unwrap_or(HOST_ENDE_BEENDET);
+                let m = host_ende_meldung(grund, &name, addr);
+                protokoll::zeile(m.protokoll.clone());
+                let mut s = shared.lock().unwrap();
+                if s.target.as_deref() == Some(addr) {
+                    s.target = None;
+                    s.error_key = None;
+                    s.error = Some(m);
+                }
                 return Ok(());
             }
             MSG_CODECS => {
@@ -9248,7 +9286,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // "veraltet", "abgelehnt" und "idfehlt": weitere Meldungen der
     // Zugangsphase (9.6); "entfernt": der Host hat dieses Geraet entfernt
     // (beim Wiederverbinden); "freigabefehler": "Diesen PC freigeben" konnte
-    // die Host-Rolle nicht starten.
+    // die Host-Rolle nicht starten; "beendet": der Host hat sich
+    // verabschiedet (MSG_HOST_ENDE, Grund 0).
     let meldung = match view {
         "abgeloest" => Some(lang.get(strings::Key::SessionTakenOver).to_string()),
         "fingerabdruck" => Some(
@@ -9260,6 +9299,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         "idfehlt" => Some(Meldung::neu(strings::Key::MsgIdNotFound, "").mit("{i}", "123 456 789").text(lang)),
         "entfernt" => Some(Meldung::neu(strings::Key::MsgDeviceRemoved, "").mit("{n}", "Roberts Mac mini").text(lang)),
         "freigabefehler" => Some(lang.get(strings::Key::MsgShareFailed).to_string()),
+        "beendet" => Some(host_ende_meldung(HOST_ENDE_BEENDET, "Roberts Mac mini", "192.168.178.194:9001").text(lang)),
         _ => None,
     };
     // "starttip": die Maus steht ueber dem Knopf "Verknuepfung" der ersten
@@ -11945,6 +11985,83 @@ mod tests {
         assert_eq!(
             strings::pick("de").get(strings::Key::SessionTakenOver),
             "Ein anderes Gerät hat die Sitzung übernommen."
+        );
+    }
+
+    /// Der Host verabschiedet sich (MSG_HOST_ENDE): je Grund die passende
+    /// Meldung mit dem Namen des Hosts, das Ziel geht zurueck, und es gibt
+    /// keine zweite Verbindung - auch nicht nach der Pause von 2 s. Ein
+    /// unbekannter Grund und eine leere Nutzlast gelten wie "beendet".
+    #[test]
+    fn abschied_des_hosts_ohne_neuversuch() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        secure::test_identitaet();
+        let (host_priv, _) = test_host();
+        let faelle: [(&[u8], strings::Key); 5] = [
+            (&[HOST_ENDE_BEENDET], strings::Key::MsgHostQuit),
+            (&[HOST_ENDE_FREIGABE_AUS], strings::Key::MsgHostSharingOff),
+            (&[HOST_ENDE_ENTFERNT, 0xee], strings::Key::MsgHostRemovedYou),
+            (&[9], strings::Key::MsgHostQuit),
+            (&[], strings::Key::MsgHostQuit),
+        ];
+        let mut laeufe = Vec::new();
+        for (nutzlast, soll) in faelle {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            let verbindungen = Arc::new(AtomicUsize::new(0));
+            let (v, hp, n) = (verbindungen.clone(), host_priv.clone(), nutzlast.to_vec());
+            std::thread::spawn(move || {
+                for s in l.incoming() {
+                    let Ok(s) = s else { continue };
+                    v.fetch_add(1, Ordering::SeqCst);
+                    let Ok(mut h) = secure::Secure::accept(s, &noise::prologue_video(), &hp) else { continue };
+                    // Gruss wie beim echten Host, danach gleich der Abschied.
+                    let mut m = MAGIC.to_vec();
+                    m.extend_from_slice(&[MSG_HOST_ENDE, 0, 0, 0, n.len() as u8, 0, 0, 0]);
+                    m.extend_from_slice(&n);
+                    let _ = h.write_all(&m);
+                }
+            });
+            let shared = Arc::new(Mutex::new(Shared {
+                decoder_wunsch: einstellungen::DecoderWunsch::Software,
+                target: Some(addr),
+                ziel_name: Some("Studio".into()),
+                ..Shared::default()
+            }));
+            let input = Arc::new(Mutex::new(InputLink::new(String::new())));
+            {
+                let (s, i) = (shared.clone(), input.clone());
+                std::thread::spawn(move || stream_thread(s, i));
+            }
+            laeufe.push((shared, verbindungen, soll));
+        }
+        let t0 = Instant::now();
+        while laeufe.iter().any(|(s, _, _)| s.lock().unwrap().target.is_some()) && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (shared, _, soll) in &laeufe {
+            let s = shared.lock().unwrap();
+            assert!(s.target.is_none(), "Ziel nicht zurueckgenommen ({soll:?})");
+            assert_eq!(s.error_key, None);
+            let m = s.error.as_ref().expect("keine Meldung");
+            assert_eq!(m.key, *soll, "{}", m.protokoll);
+            assert!(m.dauerhaft());
+            assert_eq!(m.text(strings::pick("en")), strings::EN.get(*soll).replace("{n}", "Studio"));
+        }
+        // Frueher: nach 2 s die naechste Verbindung. Drei Sekunden zusehen.
+        std::thread::sleep(Duration::from_secs(3));
+        for (shared, verbindungen, soll) in &laeufe {
+            assert_eq!(verbindungen.load(Ordering::SeqCst), 1, "neu verbunden ({soll:?})");
+            assert!(!shared.lock().unwrap().connected);
+        }
+        assert_eq!(
+            host_ende_meldung(HOST_ENDE_BEENDET, "Studio", "10.0.0.5:9001").text(strings::pick("de")),
+            "Studio wurde beendet."
+        );
+        assert_eq!(
+            host_ende_meldung(HOST_ENDE_ENTFERNT, "Studio", "10.0.0.5:9001").text(strings::pick("de")),
+            "Studio hat dieses Gerät entfernt."
         );
     }
 

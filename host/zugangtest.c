@@ -1,5 +1,5 @@
 // Pruefprogramm fuer zugang.c: Geraete-ID, Namen, Bekanntgabe, Nachrichten
-// 20-23, norm, HMAC (RFC 4231), PBKDF2 und Beweise mit den Pruefvektoren der
+// 20-23 und 13 (Abschied des Hosts), norm, HMAC (RFC 4231), PBKDF2 und Beweise mit den Pruefvektoren der
 // Spezifikation (3.4, dieselben wie im Rust-Kern), Vergleich in konstanter
 // Zeit, Drossel, Grenzen der Zugangsphasen, Anfragen an die Oberflaeche,
 // host-devices.txt (Format, beschaedigte Dateien, Entfernen, Zuruecksetzen),
@@ -308,6 +308,17 @@ static void nachrichten_pruefen(void) {
     x[0] = 7;
     pruefe(qc_zugang_ergebnis_lesen(x, 8, &erg, &wm, hp) == -1, "unbekanntes Ergebnis: -1");
     pruefe(qc_zugang_abbruch_kodieren(x) == 8 && x[0] == 23 && x[4] == 0, "23 ZUGANG_ABBRUCH: Laenge 0");
+
+    // Abschied des Hosts: dieselben Bytes wie host_ende in netz.rs der
+    // Windows-Host-Rolle und wie sie der Client liest (Typ 13, u8 Grund).
+    uint8_t ab[QC_HOST_ENDE_LAENGE];
+    static const uint8_t soll13[3][9] = {
+        {13, 0, 0, 0, 1, 0, 0, 0, 0}, {13, 0, 0, 0, 1, 0, 0, 0, 1}, {13, 0, 0, 0, 1, 0, 0, 0, 2}};
+    int abschied_gut = 1;
+    for (uint8_t g = 0; g < 3; g++)
+        if (qc_host_ende_kodieren(ab, g) != 9 || memcmp(ab, soll13[g], 9) != 0) abschied_gut = 0;
+    pruefe(abschied_gut && QC_HOST_ENDE_BEENDET == 0 && QC_HOST_ENDE_FREIGABE_AUS == 1 && QC_HOST_ENDE_ENTFERNT == 2,
+           "13 MSG_HOST_ENDE: Kopf, Laenge 1, Grund 0/1/2 (Pruefvektor)");
 }
 
 static void krypto_pruefen(void) {

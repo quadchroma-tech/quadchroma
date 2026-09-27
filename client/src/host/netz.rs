@@ -10,6 +10,10 @@
 // Eingabekanal zu. Vor dem Schlusswort geht noch der Rest des Pakets hinaus,
 // das der Sendefaden gerade schreibt: solange der Alte davon abnimmt, wird
 // gewartet (hoechstens ABLOESUNG_HOECHSTENS), erst ohne Fortschritt gekappt.
+// Genauso verabschiedet der Host einen Zuschauer (zuschauer_verabschieden,
+// abschied_beim_beenden): Schlusswort MSG_HOST_ENDE mit Grund, wenn die
+// Freigabe endet, die Host-Rolle beendet wird oder sein Geraet aus der Liste
+// entfernt wird - auch dann verbindet sich der Client nicht von selbst neu.
 // Der Bildkanal wird nur geschrieben, der Eingabekanal nur gelesen -
 // Antworten (Zeit, Einstellungen) gehen ueber den Bildkanal zurueck.
 //
@@ -117,8 +121,8 @@ const SNDBUF: usize = 256 * 1024;
 /// grosses Paket (Vollbild) schon ist, und ein langsamer, aber lebender
 /// Zuschauer macht auch mitten in einem Vollbild Fortschritt.
 const SCHREIBSTUECK: usize = secure::CHUNK_MAX;
-/// So lange darf die letzte Nachricht an einen abgeloesten Zuschauer
-/// brauchen. Seine Warteschlange ist da schon verworfen; vor ihr liegen
+/// So lange darf die letzte Nachricht an einen abgeloesten (oder
+/// verabschiedeten) Zuschauer brauchen. Seine Warteschlange ist da schon verworfen; vor ihr liegen
 /// hoechstens der Rest des Pakets, das der Sendefaden gerade schreibt, und
 /// der Kernelpuffer. Wer sie in der Frist nicht abnimmt, ist eingefroren oder
 /// weg: seine Leitung wird ohne sie gekappt. Der Rest des Pakets selbst hat
@@ -452,6 +456,53 @@ enum Art {
     Datei,
 }
 
+/// Warum ein Zuschauer geht, ohne selbst zu gehen - danach richtet sich sein
+/// Schlusswort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Schluss {
+    /// Ein neuer Zuschauer ersetzt ihn: MSG_ABGELOEST.
+    Abgeloest,
+    /// Der Host verabschiedet ihn: MSG_HOST_ENDE mit Grund (HOST_ENDE_*).
+    Ende(u8),
+}
+
+impl Schluss {
+    /// Die Nachricht samt Kopf.
+    fn nachricht(self) -> Vec<u8> {
+        match self {
+            Schluss::Abgeloest => kopf(MSG_ABGELOEST, 0, 0, 0).to_vec(),
+            Schluss::Ende(grund) => host_ende(grund).to_vec(),
+        }
+    }
+
+    /// Fuer das Protokoll.
+    fn name(self) -> String {
+        match self {
+            Schluss::Abgeloest => "Abloesung".into(),
+            Schluss::Ende(grund) => format!("Abschied ({})", ende_grund(grund)),
+        }
+    }
+}
+
+/// MSG_HOST_ENDE: Kopf und ein Byte Grund - Byte fuer Byte wie der Mac-Host
+/// (qc_host_ende_kodieren in zugang.c).
+fn host_ende(grund: u8) -> [u8; 9] {
+    let mut m = [0u8; 9];
+    m[..8].copy_from_slice(&kopf(MSG_HOST_ENDE, 0, 0, 1));
+    m[8] = grund;
+    m
+}
+
+/// Ein Grund aus MSG_HOST_ENDE in Worten, fuer das Protokoll.
+fn ende_grund(grund: u8) -> &'static str {
+    match grund {
+        HOST_ENDE_BEENDET => "Host-Rolle beendet",
+        HOST_ENDE_FREIGABE_AUS => "Freigabe beendet",
+        HOST_ENDE_ENTFERNT => "Geraet entfernt",
+        _ => "unbekannter Grund",
+    }
+}
+
 struct Warteschlange {
     pakete: VecDeque<(Art, Vec<u8>)>,
     bytes: usize,
@@ -478,10 +529,11 @@ struct Warteschlange {
     /// eben eingetragenen Griff sicher, und wer eintragen will, sieht sicher,
     /// dass der Zuschauer schon weg ist.
     eingabe: Option<(u64, TcpStream)>,
-    /// Letzte Nachricht an einen abgeloesten Zuschauer (MSG_ABGELOEST). Der
-    /// Sendefaden schreibt sie statt der verworfenen Warteschlange, mit
-    /// Frist, und macht danach die Leitung zu.
-    schlusswort: Option<Vec<u8>>,
+    /// Letzte Nachricht an einen abgeloesten oder verabschiedeten Zuschauer
+    /// (MSG_ABGELOEST, MSG_HOST_ENDE) und welche es ist. Der Sendefaden
+    /// schreibt sie statt der verworfenen Warteschlange, mit Frist, und
+    /// macht danach die Leitung zu.
+    schlusswort: Option<(Vec<u8>, Schluss)>,
     /// Der Sendefaden ist durch (siehe `abloesung_abschliessen`).
     beendet: bool,
 }
@@ -686,9 +738,16 @@ impl Leitung {
         }
     }
 
-    /// Ein neuer Zuschauer ersetzt diesen. Was noch in der Warteschlange
-    /// liegt, wird verworfen; hinaus geht nur noch MSG_ABGELOEST - danach
-    /// schliesst der Sendefaden die Bildleitung selbst. Nur die Begruessung
+    /// Ein neuer Zuschauer ersetzt diesen: `schliessen_mit` mit
+    /// MSG_ABGELOEST.
+    fn abloesen(&self) {
+        self.schliessen_mit(Schluss::Abgeloest);
+    }
+
+    /// Dieser Zuschauer geht mit einem Schlusswort (Abloesung oder Abschied
+    /// des Hosts). Was noch in der Warteschlange liegt, wird verworfen;
+    /// hinaus geht nur noch das Schlusswort - danach schliesst der
+    /// Sendefaden die Bildleitung selbst. Nur die Begruessung
     /// (MAGIC + Strominfo) bleibt, wenn der Sendefaden noch gar nichts
     /// genommen hat: sie geht mit dem Schlusswort hinaus. Ohne sie laese der
     /// Client das Schlusswort als MAGIC, hielte es fuer ein fremdes
@@ -697,7 +756,7 @@ impl Leitung {
     /// Zuschauer, der nichts mehr abnimmt, kappt `abloesung_abschliessen` die
     /// Bildleitung. Seine Dateiuebertragungen brechen ab. Unter EINSPEISEN
     /// und AKTUELL aufrufen; wartet nie.
-    fn abloesen(&self) {
+    fn schliessen_mit(&self, schluss: Schluss) {
         let eingabe = {
             let mut q = sperre(&self.q);
             if q.offen {
@@ -709,9 +768,9 @@ impl Leitung {
                         wort = gruss;
                     }
                 }
-                wort.extend_from_slice(&kopf(MSG_ABGELOEST, 0, 0, 0));
+                wort.extend_from_slice(&schluss.nachricht());
                 q.leeren();
-                q.schlusswort = Some(wort);
+                q.schlusswort = Some((wort, schluss));
                 q.offen = false;
                 self.cv.notify_all();
             }
@@ -732,13 +791,20 @@ impl Leitung {
     /// FRIST_SCHLUSSWORT: waehrend des Schlussworts waechst `geschrieben`
     /// nicht. true: der Sendefaden ist durch.
     fn abloesung_abschliessen(&self, frist: Duration) -> bool {
+        self.schluss_abwarten(frist, ABLOESUNG_HOECHSTENS, "Abgeloester")
+    }
+
+    /// Wie `abloesung_abschliessen`, mit eigener Obergrenze `hoechstens`
+    /// (beim Beenden wartet niemand 15 s); `wer` steht im Protokoll vor
+    /// "Zuschauer".
+    fn schluss_abwarten(&self, frist: Duration, hoechstens: Duration, wer: &str) -> bool {
         let beginn = Instant::now();
         let mut q = sperre(&self.q);
         loop {
             let stand = q.geschrieben;
-            let rest = ABLOESUNG_HOECHSTENS.saturating_sub(beginn.elapsed());
+            let rest = hoechstens.saturating_sub(beginn.elapsed());
             q = self.ende.wait_timeout_while(q, frist.min(rest), |q| !q.beendet).unwrap_or_else(|e| e.into_inner()).0;
-            if q.beendet || q.geschrieben == stand || beginn.elapsed() >= ABLOESUNG_HOECHSTENS {
+            if q.beendet || q.geschrieben == stand || beginn.elapsed() >= hoechstens {
                 break;
             }
         }
@@ -746,7 +812,7 @@ impl Leitung {
         drop(q);
         if !beendet {
             log(format!(
-                "Abgeloester Zuschauer {} nimmt nichts mehr ab (nach {:.1} s) - Bildleitung gekappt",
+                "{wer} Zuschauer {} nimmt nichts mehr ab (nach {:.1} s) - Bildleitung gekappt",
                 self.ip,
                 beginn.elapsed().as_secs_f32()
             ));
@@ -1139,18 +1205,45 @@ pub fn zuschauer_name() -> Option<String> {
     sperre(&AKTUELL).as_ref().map(|l| l.name.clone())
 }
 
-/// Den Zuschauer trennen - nur, wenn er dieses Geraet ist (`peer`; None:
-/// jeden). Etwa wenn sein Geraet aus der Liste entfernt wird oder die
-/// Freigabe endet. Er kann sich neu verbinden und braucht dann, was jedes
-/// unbekannte Geraet braucht. Liefert, ob einer getrennt wurde.
-pub fn zuschauer_trennen(peer: Option<&[u8]>) -> bool {
-    let Some(l) = aktuell() else { return false };
-    if peer.is_some_and(|p| p != l.peer.as_slice()) {
-        return false;
-    }
-    log(format!("Zuschauer {} ({}) wird getrennt", l.name, l.ip));
-    l.schliessen();
+/// Den Zuschauer verabschieden (MSG_HOST_ENDE mit `grund`) - nur, wenn er
+/// dieses Geraet ist (`peer`; None: jeden), etwa wenn sein Geraet aus der
+/// Liste entfernt wird. Wie eine Abloesung: was noch wartet, wird verworfen,
+/// hinaus gehen der Rest des laufenden Pakets und der Abschied, dann ist die
+/// Leitung zu; der Eingabekanal ist sofort gekappt und seine Tasten
+/// losgelassen. Der Client verbindet sich darauf nicht von selbst neu; tut
+/// es der Nutzer, braucht das Geraet, was jedes unbekannte braucht. Kehrt
+/// sofort zurueck - ein eigener Faden wartet auf den Abschied (oder kappt
+/// einen Zuschauer, der nichts mehr abnimmt). Liefert, ob einer
+/// verabschiedet wurde.
+pub fn zuschauer_verabschieden(peer: Option<&[u8]>, grund: u8) -> bool {
+    let Some(l) = verabschieden(peer, grund) else { return false };
+    std::thread::spawn(move || l.schluss_abwarten(FRIST_SCHLUSSWORT * 2, ABLOESUNG_HOECHSTENS, "Verabschiedeter"));
     true
+}
+
+/// Vor dem Ende des Prozesses: den Zuschauer verabschieden und warten, bis
+/// der Abschied beim Kernel liegt und die Leitung zu ist - hoechstens
+/// `hoechstens` (wie der Mac-Host: 3 s), sonst wird gekappt. Wer danach den
+/// Prozess beendet, schneidet den Abschied nicht mehr ab.
+pub fn abschied_beim_beenden(grund: u8, hoechstens: Duration) {
+    if let Some(l) = verabschieden(None, grund) {
+        l.schluss_abwarten(FRIST_SCHLUSSWORT * 2, hoechstens, "Verabschiedeter");
+    }
+}
+
+/// Gemeinsamer Teil: unter EINSPEISEN und AKTUELL das Schlusswort setzen
+/// und die Tasten loslassen. Ausgetragen wird er wie immer vom Sendefaden.
+fn verabschieden(peer: Option<&[u8]>, grund: u8) -> Option<Arc<Leitung>> {
+    let _einspeisen = sperre(&EINSPEISEN);
+    let a = sperre(&AKTUELL);
+    let l = a.as_ref()?.clone();
+    if peer.is_some_and(|p| p != l.peer.as_slice()) {
+        return None;
+    }
+    log(format!("Zuschauer {} ({}) wird verabschiedet: {}", l.name, l.ip, ende_grund(grund)));
+    l.schliessen_mit(Schluss::Ende(grund));
+    eingabe::alle_tasten_loslassen();
+    Some(l)
 }
 
 /// Nummer des aktuellen Zuschauers. Sie aendert sich bei jeder Annahme -
@@ -1635,8 +1728,8 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
                 q.leeren();
                 let schluss = q.schlusswort.take();
                 drop(q);
-                if let Some(s) = schluss {
-                    schlusswort_senden(&mut sock, &s, &l.ip);
+                if let Some((s, art)) = schluss {
+                    schlusswort_senden(&mut sock, &s, art, &l.ip);
                 }
                 break;
             }
@@ -1683,14 +1776,15 @@ fn sendefaden(l: Arc<Leitung>, mut sock: secure::Secure) {
     l.ende.notify_all();
 }
 
-/// Die letzte Nachricht an einen abgeloesten Zuschauer, mit Frist: wer sie
-/// nicht abnimmt, haelt den Faden nicht fest. Danach ist die Leitung zu -
-/// das Schlusswort liegt dann schon im Kernel und geht vor dem FIN hinaus.
-fn schlusswort_senden(sock: &mut secure::Secure, s: &[u8], ip: &str) {
+/// Die letzte Nachricht an einen abgeloesten oder verabschiedeten
+/// Zuschauer, mit Frist: wer sie nicht abnimmt, haelt den Faden nicht fest.
+/// Danach ist die Leitung zu - das Schlusswort liegt dann schon im Kernel
+/// und geht vor dem FIN hinaus.
+fn schlusswort_senden(sock: &mut secure::Secure, s: &[u8], art: Schluss, ip: &str) {
     sock.socket().set_write_timeout(Some(FRIST_SCHLUSSWORT)).ok();
     match sock.write_all(s) {
-        Ok(()) => log(format!("Abloesung an {ip} gemeldet")),
-        Err(e) => log(format!("Abloesung an {ip} nicht zugestellt: {e}")),
+        Ok(()) => log(format!("{} an {ip} gemeldet", art.name())),
+        Err(e) => log(format!("{} an {ip} nicht zugestellt: {e}", art.name())),
     }
     let _ = sock.socket().shutdown(Shutdown::Both);
 }
@@ -1782,7 +1876,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz) {
         let einspeisen = sperre(&EINSPEISEN);
         let mut a = sperre(&AKTUELL);
         // Wurde seit dem Blick in die Liste ein Geraet entfernt, hat
-        // zuschauer_trennen dieses hier nicht gesehen (es stand noch nicht
+        // zuschauer_verabschieden dieses hier nicht gesehen (es stand noch nicht
         // in AKTUELL) - vielleicht war es genau seins ("Alle entfernen"
         // trifft auch ein eben zugelassenes). Dann ausserhalb der Sperren
         // noch einmal nachsehen (Datei). Unter AKTUELL gilt der Stand erst,
@@ -2632,13 +2726,13 @@ mod tests {
         zeitfrage(&mut b_ein, 0xB3).unwrap();
         assert_eq!(zeitantwort(&mut b), Ok(0xB3));
         assert_eq!(zuschauer_nr(), nr_b);
-        // Ein fremdes Geraet trennt zuschauer_trennen nicht, das eigene schon.
-        assert!(!zuschauer_trennen(Some(&[7u8; 32])));
+        // Ein fremdes Geraet verabschiedet zuschauer_verabschieden nicht.
+        assert!(!zuschauer_verabschieden(Some(&[7u8; 32]), HOST_ENDE_ENTFERNT));
         assert_eq!(zuschauer_nr(), nr_b);
 
         // Entfernen, waehrend ein bekanntes Geraet hereinkommt: es stand beim
         // Blick in die Liste noch darin, ist aber noch kein Zuschauer - das
-        // Menue (Entfernen, dann zuschauer_trennen) findet es nicht. Es
+        // Menue (Entfernen, dann zuschauer_verabschieden) findet es nicht. Es
         // bekommt trotzdem kein MAGIC, und B bleibt der Zuschauer. Wird
         // stattdessen ein anderes Geraet entfernt, kommt es herein.
         let einlass = super::super::einlass::einlass().unwrap();
@@ -2664,9 +2758,9 @@ mod tests {
                 s.kennung()
             });
             da_rx.recv_timeout(Duration::from_secs(5)).expect("Einlass nicht erreicht");
-            // Wie das Menue: erst aus der Liste, dann den Zuschauer trennen.
+            // Wie das Menue: erst aus der Liste, dann den Zuschauer verabschieden.
             assert_eq!(einlass.geraet_entfernen(&entfernen).unwrap(), true);
-            assert!(!zuschauer_trennen(Some(&entfernen)), "noch kein Zuschauer");
+            assert!(!zuschauer_verabschieden(Some(&entfernen), HOST_ENDE_ENTFERNT), "noch kein Zuschauer");
             weiter_tx.send(()).unwrap();
             t.join().unwrap()
         };
@@ -2689,7 +2783,60 @@ mod tests {
         // Geben sie auf, ist der Platz wieder frei.
         drop((s1, s2));
         std::thread::sleep(Duration::from_millis(200));
-        let _c = bild_verbinden(&bild_addr);
+        let mut c = bild_verbinden(&bild_addr);
+
+        // "Freigabe beenden": der Zuschauer bekommt den Abschied mit Grund 1
+        // als letzte Nachricht (nach der Begruessung, die schon unterwegs
+        // war), danach ist die Leitung zu, und niemand schaut mehr zu.
+        assert!(warten_bis_da(|| zuschauer_nr() > nr_b + 1));
+        abschied_beim_beenden(HOST_ENDE_FREIGABE_AUS, Duration::from_secs(3));
+        c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut typen = Vec::new();
+        let abschied = loop {
+            match naechste(&mut c) {
+                Ok((MSG_HOST_ENDE, p)) => break p,
+                Ok((t, _)) => typen.push(t),
+                Err(e) => panic!("kein Abschied, Leitung vorher zu ({e}), vorher {typen:?}"),
+            }
+        };
+        assert_eq!(abschied, vec![HOST_ENDE_FREIGABE_AUS]);
+        assert!(c.read_exact(&mut [0u8; 1]).is_err(), "nach dem Abschied kam noch etwas");
+        assert!(warten_bis_da(|| !zuschauer_da()), "Zuschauer nach dem Abschied noch eingetragen");
+    }
+
+    /// Bis die Bedingung gilt, hoechstens 5 s.
+    fn warten_bis_da(f: impl Fn() -> bool) -> bool {
+        let t0 = Instant::now();
+        while !f() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f()
+    }
+
+    /// Der Abschied des Hosts (MSG_HOST_ENDE) verwirft wie die Abloesung, was
+    /// noch wartet, und kommt als letzte Nachricht: Kopf 13 mit einem Byte
+    /// Grund - Byte fuer Byte wie der Mac-Host (zugangtest.c) -, danach ist
+    /// die Leitung zu und einreihen nimmt nichts mehr an.
+    #[test]
+    fn abschied_als_letzte_nachricht() {
+        assert_eq!(host_ende(HOST_ENDE_BEENDET), [13, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(host_ende(HOST_ENDE_ENTFERNT), [13, 0, 0, 0, 1, 0, 0, 0, 2]);
+        let (h, mut c) = paar();
+        let leitung = leitung_zu(&h);
+        // Als haette der Sendefaden die Begruessung schon abgeliefert.
+        sperre(&leitung.q).geschrieben = 20;
+        drei_zeitantworten(&leitung);
+        leitung.schliessen_mit(Schluss::Ende(HOST_ENDE_ENTFERNT));
+        assert_eq!(leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), Art::Klein, None), Err(Abgewiesen::Zu));
+        let l2 = leitung.clone();
+        std::thread::spawn(move || sendefaden(l2, h));
+        assert!(leitung.schluss_abwarten(Duration::from_secs(2), Duration::from_secs(3), "Verabschiedeter"));
+        c.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(kopf_lesen(&mut c), (MSG_HOST_ENDE, 1));
+        let mut grund = [0u8; 1];
+        c.read_exact(&mut grund).unwrap();
+        assert_eq!(grund, [HOST_ENDE_ENTFERNT]);
+        assert!(c.read_exact(&mut [0u8; 1]).is_err());
     }
 
     /// Bekanntgabe (Spezifikation 2): Rechnername, dahinter ID und Flags;

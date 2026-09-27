@@ -425,6 +425,10 @@ fn sperre<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// So lange wartet das Beenden hoechstens auf den Abschied an den Zuschauer
+/// (wie der Mac-Host); nimmt er ihn nicht ab, wird gekappt.
+const ABSCHIED_FRIST: Duration = Duration::from_secs(3);
+
 /// Was das Menue im Infobereich gerade zeigt (bei jedem Oeffnen neu).
 fn menue_stand(e: &einlass::Einlass, port: u16, port_belegt: bool) -> oberflaeche::MenueStand {
     oberflaeche::MenueStand {
@@ -484,9 +488,10 @@ fn aktion_ausfuehren(
             let _ = e.passwort_zufall();
         }
         Aktion::Entfernen(k) => {
-            // Wer entfernt ist, bleibt nicht verbunden.
+            // Wer entfernt ist, bleibt nicht verbunden - er erfaehrt es
+            // (Abschied, Grund 2) und verbindet sich nicht von selbst neu.
             if e.geraet_entfernen(&k).is_ok() {
-                netz::zuschauer_trennen(Some(&k));
+                netz::zuschauer_verabschieden(Some(&k), HOST_ENDE_ENTFERNT);
             }
         }
         Aktion::AlleEntfernen => {
@@ -495,7 +500,7 @@ fn aktion_ausfuehren(
                 lang.get(Key::HostRemoveAllAsk),
                 Box::new(move || {
                     if e2.alle_entfernen().is_ok() {
-                        netz::zuschauer_trennen(None);
+                        netz::zuschauer_verabschieden(None, HOST_ENDE_ENTFERNT);
                     }
                 }),
             );
@@ -806,7 +811,16 @@ pub fn main_host(args: &[String]) -> i32 {
             *sperre(&sk) = k;
             m
         });
-        match crate::tray_win::Symbol::neu_allgemein(befehl, menue, &oberflaeche::tooltip(lang, einlass.id())) {
+        // WM_CLOSE von aussen (taskkill ohne /F), Abmelden, Herunterfahren:
+        // beenden wie "Freigabe beenden", aber mit Grund 0 (die Host-Rolle
+        // wurde beendet). Laeuft im Symbolfaden und kehrt nicht zurueck.
+        let ende = Box::new(|wie: &str| {
+            log(format!("Host-Rolle wird beendet ({wie})"));
+            netz::abschied_beim_beenden(HOST_ENDE_BEENDET, ABSCHIED_FRIST);
+            log("Host-Rolle beendet");
+            std::process::exit(0);
+        });
+        match crate::tray_win::Symbol::neu_allgemein(befehl, menue, ende, &oberflaeche::tooltip(lang, einlass.id())) {
             Ok(s) => Some(s),
             Err(e) => {
                 log(format!("Infobereich: kein Symbol ({e}) - ohne Oberflaeche, neue Geraete nur per Passwort"));
@@ -910,8 +924,10 @@ pub fn main_host(args: &[String]) -> i32 {
         let warten = takt.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
         match aktionen.recv_timeout(warten) {
             Ok(oberflaeche::Aktion::Beenden) => {
+                // "Freigabe beenden": der Zuschauer erfaehrt es (Abschied,
+                // Grund 1) und verbindet sich nicht von selbst neu.
                 log("Freigabe beendet (Infobereich)");
-                netz::zuschauer_trennen(None);
+                netz::abschied_beim_beenden(HOST_ENDE_FREIGABE_AUS, ABSCHIED_FRIST);
                 drop(symbol.take());
                 std::process::exit(0);
             }

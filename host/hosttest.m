@@ -20,14 +20,15 @@
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
 // Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt), Dienst-Takt
 // ohne Run-Loop (Auslastung im Takt, Drosselzeilen nachgetragen), Abschied
-// beim Beenden (Verbindung zu, ohne Typ 10) und Zugang
+// beim Beenden (Typ 13 mit Grund 0 als letzte Nachricht, ohne Typ 10, dann
+// Verbindung zu) und Zugang
 // (zugang.h: ein unbekannter Client wie der Rust-Client bekommt "QCA1" und 20,
 // Passwort richtig mit host_proof und danach "QCH1", falsch mit Drossel und
 // Schluss nach 5 Versuchen, Zulassen und Ablehnen ueber den Test-Haken statt
 // der Oberflaeche, Abbruch, Verbindungsende, nur eine Anfrage zugleich,
 // Grenzen je Adresse und Schluessel, Frist, ein Wartender stoert den
 // laufenden Zuschauer nicht, beschaedigte Liste, Entfernen trennt die
-// Sitzung, ohne Bildschirmfreigabe oder ohne Bildschirm Hoststatus 1 statt
+// Sitzung mit dem Abschied (Typ 13, Grund 2), ohne Bildschirmfreigabe oder ohne Bildschirm Hoststatus 1 statt
 // einer Abweisung, Name mit vorgetaeuschter ID, Argumente ohne Wert).
 //
 //   clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
@@ -3025,13 +3026,23 @@ static void takt_pruefen(void) {
     pruefe(drossel_weitere(&d_ein_fremd) == 0, "zurueckgehaltene Drosselzeile nachgetragen");
     dienst_takt_anhalten();
 
-    // Beenden: der Host schliesst den Bildkanal - ohne Typ 10, den der Client
-    // als "ein anderes Geraet hat uebernommen" anzeigen wuerde.
+    // Beenden: der Host verabschiedet sich (Typ 13, Grund 0) und schliesst den
+    // Bildkanal - ohne Typ 10, den der Client als "ein anderes Geraet hat
+    // uebernommen" anzeigen wuerde.
     host_abschied();
-    int e, typ10 = 0;
+    int e, typ10 = 0, letzte = -1, grund = -1;
+    uint32_t laenge = 0;
     double t_ab = sek();
-    while ((e = nachricht(&l, &m, anf, 2000)) == 1) if (m.type == QC_MSG_ABGELOEST) typ10 = 1;
+    while ((e = nachricht(&l, &m, anf, 2000)) == 1) {
+        if (m.type == QC_MSG_ABGELOEST) typ10 = 1;
+        letzte = m.type;
+        laenge = m.len;
+        grund = anf[0];
+    }
+    printf("         (letzte Nachricht Typ %d, Laenge %u, Grund %d)\n", letzte, laenge, grund);
     pruefe(!typ10, "Abschied: kein Typ 10 (der hiesse beim Client \"anderes Geraet hat uebernommen\")");
+    pruefe(letzte == QC_MSG_HOST_ENDE && laenge == 1 && grund == QC_HOST_ENDE_BEENDET,
+           "Abschied: Typ 13 mit Grund 0 (App beendet) als letzte Nachricht");
     pruefe(e == 0 && sek() - t_ab < 1.0, "der Host schliesst den Bildkanal sofort");
     pruefe(atomic_load(&g_client_fd) == -1 && g_vid == NULL && !atomic_load(&g_vid_ready),
            "Zuschauer ausgetragen");
@@ -3174,13 +3185,22 @@ static int zc_beweis(zclient *z, const char *pw) {
 static int zc_abbruch(zclient *z) { return ein_senden(z->fd, &z->tx, QC_ZUGANG_ABBRUCH, NULL, 0); }
 
 // 1 = der Host schliesst (nach allem, was noch kam), 0 = nicht in der Frist.
-static int zc_schliesst(zclient *z, int frist_ms) {
+// letzte/grund (duerfen NULL sein): Typ und erstes Nutzlastbyte der letzten
+// Nachricht davor, -1 wenn keine kam.
+static int zc_schliesst_mit(zclient *z, int frist_ms, int *letzte, int *grund) {
     qc_hdr h;
     NSData *d = nil;
     int r;
-    while ((r = nachricht_ganz(&z->l, &h, &d, frist_ms)) == 1) {}
+    if (letzte) *letzte = -1;
+    if (grund) *grund = -1;
+    while ((r = nachricht_ganz(&z->l, &h, &d, frist_ms)) == 1) {
+        if (letzte) *letzte = h.type;
+        if (grund) *grund = d.length ? ((const uint8_t *)d.bytes)[0] : -1;
+    }
     return r == 0;
 }
+
+static int zc_schliesst(zclient *z, int frist_ms) { return zc_schliesst_mit(z, frist_ms, NULL, NULL); }
 
 // Bis zur Strominfo: 1 = "QCH1" und INFO kamen.
 static int zc_sitzung(zclient *z) {
@@ -3681,10 +3701,13 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     int ok_m = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_sitzung(&z) && warten_bis(zuschauer_da, 1);
     int zust = atomic_load(&g_test_zustand);
     int entfernt = qc_zugang_geraet_entfernen(a_pub) == 0;
-    int getrennt = warten_bis(zuschauer_fort, 1) && zc_schliesst(&z, 2000);
+    int letzte_m = -1, grund_m = -1;
+    int getrennt = warten_bis(zuschauer_fort, 1) && zc_schliesst_mit(&z, 2000, &letzte_m, &grund_m);
     stdout_stumm(0);
     pruefe(ok_m && entfernt && getrennt && qc_zugang_bekannt(a_pub, NULL) == 0 && atomic_load(&g_test_zustand) > zust,
            "Geraet entfernen: seine laufende Sitzung endet, die Oberflaeche erfaehrt es");
+    pruefe(letzte_m == QC_MSG_HOST_ENDE && grund_m == QC_HOST_ENDE_ENTFERNT,
+           "Geraet entfernen: der Zuschauer bekommt als letzte Nachricht den Abschied (Typ 13, Grund 2)");
     zc_zu(&z);
     stdout_stumm(1);
     int ok_m2 = zc_verbinden(&z, bild_port, a_priv, "Testgeraet A") == 0 && zc_kennung(&z, QC_ZUGANG_KENNUNG);

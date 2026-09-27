@@ -245,6 +245,9 @@ pub static SV: Lang = Lang {
         (HostPasswordInvalid, "Lösenordet innehåller otillåtna tecken."),
         (HostPasswordTitle, "Ändra lösenord"),
         (MsgHostUnverified, "{n} styrkte inte sin identitet. Anslutningen avbröts av säkerhetsskäl."),
+        (MsgHostQuit, "{n} avslutade QuadChroma."),
+        (MsgHostSharingOff, "{n} har stoppat delningen."),
+        (MsgHostRemovedYou, "{n} har tagit bort den här enheten."),
     ],
 };
 
@@ -490,6 +493,9 @@ pub static DA: Lang = Lang {
         (HostPasswordInvalid, "Adgangskoden indeholder tegn, der ikke er tilladt."),
         (HostPasswordTitle, "Skift adgangskode"),
         (MsgHostUnverified, "{n} beviste ikke sin identitet. Forbindelsen blev afbrudt af sikkerhedshensyn."),
+        (MsgHostQuit, "{n} lukkede QuadChroma."),
+        (MsgHostSharingOff, "{n} har stoppet delingen."),
+        (MsgHostRemovedYou, "{n} har fjernet denne enhed."),
     ],
 };
 
@@ -735,6 +741,9 @@ pub static NB: Lang = Lang {
         (HostPasswordInvalid, "Passordet inneholder tegn som ikke er tillatt."),
         (HostPasswordTitle, "Endre passord"),
         (MsgHostUnverified, "{n} beviste ikke identiteten sin. Tilkoblingen ble stoppet av sikkerhetshensyn."),
+        (MsgHostQuit, "{n} avsluttet QuadChroma."),
+        (MsgHostSharingOff, "{n} har stoppet delingen."),
+        (MsgHostRemovedYou, "{n} har fjernet denne enheten."),
     ],
 };
 
@@ -980,6 +989,9 @@ pub static FI: Lang = Lang {
         (HostPasswordInvalid, "Salasana sisältää merkkejä, jotka eivät ole sallittuja."),
         (HostPasswordTitle, "Vaihda salasana"),
         (MsgHostUnverified, "{n} ei todistanut identiteettiään. Yhteys katkaistiin turvallisuussyistä."),
+        (MsgHostQuit, "{n} sulki QuadChroman."),
+        (MsgHostSharingOff, "{n} lopetti jakamisen."),
+        (MsgHostRemovedYou, "{n} poisti tämän laitteen."),
     ],
 };
 
@@ -1225,5 +1237,8 @@ pub static IS: Lang = Lang {
         (HostPasswordInvalid, "Lykilorðið inniheldur stafi sem eru ekki leyfðir."),
         (HostPasswordTitle, "Breyta lykilorði"),
         (MsgHostUnverified, "{n} sannaði ekki auðkenni sitt. Tengingin var rofin af öryggisástæðum."),
+        (MsgHostQuit, "{n} lokaði QuadChroma."),
+        (MsgHostSharingOff, "{n} hætti að deila."),
+        (MsgHostRemovedYou, "{n} fjarlægði þetta tæki."),
     ],
 };

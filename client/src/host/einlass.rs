@@ -204,7 +204,7 @@ pub struct Einlass {
     /// nachdem die Datei geschrieben ist. Wer ein Geraet hereinlaesst,
     /// merkt sich den Stand vor dem Blick in die Liste und sieht beim
     /// Eintragen als Zuschauer nach (netz::bild_annehmen): so entgeht ihm
-    /// kein Entfernen, das zuschauer_trennen nicht treffen konnte, weil das
+    /// kein Entfernen, das zuschauer_verabschieden nicht treffen konnte, weil das
     /// Geraet noch kein Zuschauer war (wie g_entfernt_zaehler im Mac-Host).
     entfernt: AtomicU64,
 }

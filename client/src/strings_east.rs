@@ -245,6 +245,9 @@ pub static PL: Lang = Lang {
         (HostPasswordInvalid, "Hasło zawiera niedozwolone znaki."),
         (HostPasswordTitle, "Zmień hasło"),
         (MsgHostUnverified, "Komputer {n} nie potwierdził swojej tożsamości. Ze względów bezpieczeństwa połączenie zostało przerwane."),
+        (MsgHostQuit, "Komputer {n} zamknął QuadChroma."),
+        (MsgHostSharingOff, "Komputer {n} wyłączył udostępnianie."),
+        (MsgHostRemovedYou, "Komputer {n} usunął to urządzenie."),
     ],
 };
 
@@ -490,6 +493,9 @@ pub static CS: Lang = Lang {
         (HostPasswordInvalid, "Heslo obsahuje nepovolené znaky."),
         (HostPasswordTitle, "Změnit heslo"),
         (MsgHostUnverified, "Počítač {n} neprokázal svou identitu. Připojení bylo z bezpečnostních důvodů ukončeno."),
+        (MsgHostQuit, "Počítač {n} ukončil QuadChroma."),
+        (MsgHostSharingOff, "Počítač {n} ukončil sdílení."),
+        (MsgHostRemovedYou, "Počítač {n} odebral toto zařízení."),
     ],
 };
 
@@ -735,6 +741,9 @@ pub static SK: Lang = Lang {
         (HostPasswordInvalid, "Heslo obsahuje nepovolené znaky."),
         (HostPasswordTitle, "Zmeniť heslo"),
         (MsgHostUnverified, "Počítač {n} nepreukázal svoju identitu. Pripojenie bolo z bezpečnostných dôvodov ukončené."),
+        (MsgHostQuit, "Počítač {n} ukončil QuadChroma."),
+        (MsgHostSharingOff, "Počítač {n} ukončil zdieľanie."),
+        (MsgHostRemovedYou, "Počítač {n} odstránil toto zariadenie."),
     ],
 };
 
@@ -980,6 +989,9 @@ pub static HU: Lang = Lang {
         (HostPasswordInvalid, "A jelszó nem engedélyezett karaktereket tartalmaz."),
         (HostPasswordTitle, "Jelszó módosítása"),
         (MsgHostUnverified, "{n} nem igazolta a kilétét. A kapcsolat biztonsági okból megszakadt."),
+        (MsgHostQuit, "{n} bezárta a QuadChromát."),
+        (MsgHostSharingOff, "{n} leállította a megosztást."),
+        (MsgHostRemovedYou, "{n} eltávolította ezt az eszközt."),
     ],
 };
 
@@ -1225,6 +1237,9 @@ pub static RO: Lang = Lang {
         (HostPasswordInvalid, "Parola conține caractere nepermise."),
         (HostPasswordTitle, "Schimbă parola"),
         (MsgHostUnverified, "{n} nu și-a dovedit identitatea. Din motive de siguranță, conexiunea a fost oprită."),
+        (MsgHostQuit, "{n} a închis QuadChroma."),
+        (MsgHostSharingOff, "{n} a oprit partajarea."),
+        (MsgHostRemovedYou, "{n} a eliminat acest dispozitiv."),
     ],
 };
 
@@ -1470,6 +1485,9 @@ pub static BG: Lang = Lang {
         (HostPasswordInvalid, "Паролата съдържа непозволени знаци."),
         (HostPasswordTitle, "Смяна на паролата"),
         (MsgHostUnverified, "{n} не доказа идентичността си. Връзката беше прекъсната от съображения за сигурност."),
+        (MsgHostQuit, "{n} затвори QuadChroma."),
+        (MsgHostSharingOff, "{n} спря споделянето."),
+        (MsgHostRemovedYou, "{n} премахна това устройство."),
     ],
 };
 
@@ -1715,5 +1733,8 @@ pub static EL: Lang = Lang {
         (HostPasswordInvalid, "Ο κωδικός πρόσβασης περιέχει μη επιτρεπόμενους χαρακτήρες."),
         (HostPasswordTitle, "Αλλαγή κωδικού πρόσβασης"),
         (MsgHostUnverified, "Ο υπολογιστής {n} δεν απέδειξε την ταυτότητά του. Η σύνδεση διακόπηκε για λόγους ασφαλείας."),
+        (MsgHostQuit, "Ο υπολογιστής {n} έκλεισε το QuadChroma."),
+        (MsgHostSharingOff, "Ο υπολογιστής {n} σταμάτησε την κοινή χρήση."),
+        (MsgHostRemovedYou, "Ο υπολογιστής {n} αφαίρεσε αυτή τη συσκευή."),
     ],
 };

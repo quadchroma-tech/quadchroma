@@ -248,6 +248,9 @@ pub static RU: Lang = Lang {
         (HostPasswordInvalid, "Пароль содержит недопустимые символы."),
         (HostPasswordTitle, "Изменить пароль"),
         (MsgHostUnverified, "Компьютер {n} не подтвердил свою подлинность. Подключение прервано в целях безопасности."),
+        (MsgHostQuit, "Компьютер {n} закрыл QuadChroma."),
+        (MsgHostSharingOff, "Компьютер {n} прекратил предоставлять доступ."),
+        (MsgHostRemovedYou, "Компьютер {n} удалил это устройство."),
     ],
 };
 
@@ -495,6 +498,9 @@ pub static ZH: Lang = Lang {
         (HostPasswordInvalid, "密码包含不允许的字符。"),
         (HostPasswordTitle, "更改密码"),
         (MsgHostUnverified, "{n} 未能证明其身份。 为安全起见，连接已中断。"),
+        (MsgHostQuit, "{n} 已关闭 QuadChroma。"),
+        (MsgHostSharingOff, "{n} 已停止共享。"),
+        (MsgHostRemovedYou, "{n} 已移除此设备。"),
     ],
 };
 
@@ -742,6 +748,9 @@ pub static JA: Lang = Lang {
         (HostPasswordInvalid, "パスワードに使用できない文字が含まれています。"),
         (HostPasswordTitle, "パスワードを変更"),
         (MsgHostUnverified, "{n} は身元を証明しませんでした。 安全のため接続を中止しました。"),
+        (MsgHostQuit, "{n} で QuadChroma が終了しました。"),
+        (MsgHostSharingOff, "{n} が共有を停止しました。"),
+        (MsgHostRemovedYou, "{n} がこのデバイスを削除しました。"),
     ],
 };
 
@@ -987,5 +996,8 @@ pub static TR: Lang = Lang {
         (HostPasswordInvalid, "Parola izin verilmeyen karakterler içeriyor."),
         (HostPasswordTitle, "Parolayı değiştir"),
         (MsgHostUnverified, "{n} kimliğini kanıtlamadı. Güvenlik nedeniyle bağlantı kesildi."),
+        (MsgHostQuit, "{n} QuadChroma'yı kapattı."),
+        (MsgHostSharingOff, "{n} paylaşımı durdurdu."),
+        (MsgHostRemovedYou, "{n} bu cihazı kaldırdı."),
     ],
 };

@@ -428,6 +428,15 @@ pub enum Key {
     /// Hosts nicht gepinnt), der Host sagte trotzdem gleich QCH1 - er hat
     /// sich nicht ausgewiesen; {n} Name des Hosts.
     MsgHostUnverified,
+    /// Meldung (MSG_HOST_ENDE, Grund 0): {n} Name des Hosts - dort wurde
+    /// QuadChroma beendet; kein Neuversuch.
+    MsgHostQuit,
+    /// Meldung (MSG_HOST_ENDE, Grund 1): {n} Name des Hosts - er hat die
+    /// Freigabe ausgeschaltet; kein Neuversuch.
+    MsgHostSharingOff,
+    /// Meldung (MSG_HOST_ENDE, Grund 2): {n} Name des Hosts - er hat dieses
+    /// Geraet waehrend der Sitzung aus seiner Liste entfernt; kein Neuversuch.
+    MsgHostRemovedYou,
 }
 
 pub struct Lang {
@@ -696,6 +705,9 @@ pub static EN: Lang = Lang {
         (HostPasswordInvalid, "The password contains characters that are not allowed."),
         (HostPasswordTitle, "Change password"),
         (MsgHostUnverified, "{n} did not prove its identity. The connection was stopped for safety."),
+        (MsgHostQuit, "{n} was closed."),
+        (MsgHostSharingOff, "{n} stopped sharing."),
+        (MsgHostRemovedYou, "{n} removed this device."),
     ],
 };
 
@@ -941,6 +953,9 @@ pub static DE: Lang = Lang {
         (HostPasswordInvalid, "Das Passwort enthält unzulässige Zeichen."),
         (HostPasswordTitle, "Passwort ändern"),
         (MsgHostUnverified, "{n} hat seine Identität nicht nachgewiesen. Die Verbindung wurde sicherheitshalber beendet."),
+        (MsgHostQuit, "{n} wurde beendet."),
+        (MsgHostSharingOff, "{n} hat die Freigabe beendet."),
+        (MsgHostRemovedYou, "{n} hat dieses Gerät entfernt."),
     ],
 };
 
@@ -986,8 +1001,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > MsgHostUnverified as usize);
-        assert_eq!(n, MsgHostUnverified as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > MsgHostRemovedYou as usize);
+        assert_eq!(n, MsgHostRemovedYou as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die kaputte Schluesseldatei: in jeder Sprache mit genau einem Pfad
@@ -1229,7 +1244,8 @@ mod tests {
         for (nr, (k, _)) in alle.iter().enumerate() {
             assert_eq!(*k as usize, AccessTitle as usize + nr, "{k:?}");
         }
-        assert_eq!(MsgHostUnverified as usize + 1, EN.table.len());
+        // Dahinter beginnen die Abschiedstexte (abschied_texte).
+        assert_eq!(MsgHostUnverified as usize + 1, MsgHostQuit as usize);
         let bekannt = ["{n}", "{m}", "{i}", "{c}", "{s}", "{p}", "{d}"];
         for l in all() {
             for (k, soll) in &alle {
@@ -1343,6 +1359,44 @@ mod tests {
             assert_eq!(l.get(AccessCancel), l.get(BenchAbort), "{}", l.code);
             let beenden = l.get(Quit).to_lowercase();
             assert!(l.get(HostQuit).to_lowercase().contains(&beenden), "{}: {}", l.code, l.get(HostQuit));
+        }
+    }
+
+    /// Die Abschiedstexte (MSG_HOST_ENDE, Gruende 0-2): am Ende des Enums
+    /// hinter den Zugangstexten, in jeder Tabelle, mit genau einem {n} und
+    /// keinem weiteren Platzhalter, je Sprache verschieden und eigene Worte
+    /// (nicht Englisch), ein Satz mit Schlusszeichen. EN und DE wie
+    /// vorgegeben, DE mit Umlauten und ohne gerade Anfuehrungszeichen.
+    #[test]
+    fn abschied_texte() {
+        let alle = [MsgHostQuit, MsgHostSharingOff, MsgHostRemovedYou];
+        for (nr, k) in alle.iter().enumerate() {
+            assert_eq!(*k as usize, MsgHostQuit as usize + nr, "{k:?}");
+        }
+        for l in all() {
+            let mut texte = std::collections::HashSet::new();
+            for k in alle {
+                let t = l.get(k);
+                assert_eq!(t.matches("{n}").count(), 1, "{} {k:?}: {t}", l.code);
+                assert_eq!(t.matches('{').count(), 1, "{} {k:?}: {t}", l.code);
+                assert_eq!(t.matches('}').count(), 1, "{} {k:?}: {t}", l.code);
+                assert!(texte.insert(t), "{} {k:?}: doppelt ({t})", l.code);
+                assert!(!t.contains("...") && !t.contains(" - "), "{} {k:?}: {t}", l.code);
+                assert!(t.ends_with('.') || t.ends_with('。'), "{} {k:?}: {t}", l.code);
+                if l.code != "en" {
+                    assert_ne!(t, EN.get(k), "{} {k:?}: noch englisch", l.code);
+                }
+            }
+        }
+        assert_eq!(EN.get(MsgHostQuit), "{n} was closed.");
+        assert_eq!(EN.get(MsgHostSharingOff), "{n} stopped sharing.");
+        assert_eq!(EN.get(MsgHostRemovedYou), "{n} removed this device.");
+        assert_eq!(DE.get(MsgHostQuit), "{n} wurde beendet.");
+        assert_eq!(DE.get(MsgHostSharingOff), "{n} hat die Freigabe beendet.");
+        assert_eq!(DE.get(MsgHostRemovedYou), "{n} hat dieses Gerät entfernt.");
+        for k in alle {
+            let t = DE.get(k);
+            assert!(!t.contains('"') && !t.contains("Geraet"), "{k:?}: {t}");
         }
     }
 

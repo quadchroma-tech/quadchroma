@@ -247,6 +247,9 @@ pub static FR: Lang = Lang {
         (HostPasswordInvalid, "Le mot de passe contient des caractères non autorisés."),
         (HostPasswordTitle, "Changer le mot de passe"),
         (MsgHostUnverified, "{n} n'a pas prouvé son identité. Par sécurité, la connexion a été interrompue."),
+        (MsgHostQuit, "QuadChroma a été fermé sur {n}."),
+        (MsgHostSharingOff, "{n} a arrêté le partage."),
+        (MsgHostRemovedYou, "{n} a supprimé cet appareil."),
     ],
 };
 
@@ -492,6 +495,9 @@ pub static ES: Lang = Lang {
         (HostPasswordInvalid, "La contraseña contiene caracteres no permitidos."),
         (HostPasswordTitle, "Cambiar contraseña"),
         (MsgHostUnverified, "{n} no ha demostrado su identidad. Por seguridad, se ha cortado la conexión."),
+        (MsgHostQuit, "Se ha cerrado QuadChroma en {n}."),
+        (MsgHostSharingOff, "{n} ha dejado de compartir."),
+        (MsgHostRemovedYou, "{n} ha eliminado este dispositivo."),
     ],
 };
 
@@ -737,6 +743,9 @@ pub static IT: Lang = Lang {
         (HostPasswordInvalid, "La password contiene caratteri non consentiti."),
         (HostPasswordTitle, "Cambia password"),
         (MsgHostUnverified, "{n} non ha dimostrato la propria identità. Per sicurezza la connessione è stata interrotta."),
+        (MsgHostQuit, "QuadChroma è stato chiuso su {n}."),
+        (MsgHostSharingOff, "{n} ha interrotto la condivisione."),
+        (MsgHostRemovedYou, "{n} ha rimosso questo dispositivo."),
     ],
 };
 
@@ -982,6 +991,9 @@ pub static PT: Lang = Lang {
         (HostPasswordInvalid, "A palavra-passe contém caracteres não permitidos."),
         (HostPasswordTitle, "Alterar palavra-passe"),
         (MsgHostUnverified, "{n} não comprovou a sua identidade. Por segurança, a ligação foi terminada."),
+        (MsgHostQuit, "O QuadChroma foi fechado em {n}."),
+        (MsgHostSharingOff, "{n} deixou de partilhar."),
+        (MsgHostRemovedYou, "{n} removeu este dispositivo."),
     ],
 };
 
@@ -1227,5 +1239,8 @@ pub static NL: Lang = Lang {
         (HostPasswordInvalid, "Het wachtwoord bevat tekens die niet zijn toegestaan."),
         (HostPasswordTitle, "Wachtwoord wijzigen"),
         (MsgHostUnverified, "{n} heeft zijn identiteit niet aangetoond. Voor de veiligheid is de verbinding verbroken."),
+        (MsgHostQuit, "QuadChroma op {n} is afgesloten."),
+        (MsgHostSharingOff, "{n} is gestopt met delen."),
+        (MsgHostRemovedYou, "{n} heeft dit apparaat verwijderd."),
     ],
 };

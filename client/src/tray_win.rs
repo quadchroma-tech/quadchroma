@@ -15,7 +15,10 @@
 // bei der Sprechblase (hoechstens FRAGEN_HINWEIS) und beim Selbsttest
 // (bewusst synchron). Beendet wird der Faden nur ueber WM_BEENDEN, nie ueber
 // WM_CLOSE: das koennte auch von aussen kommen und liesse die abgelegte App
-// ohne Symbol zurueck.
+// ohne Symbol zurueck. Bei der Host-Rolle (zweite Art) heisst WM_CLOSE von
+// aussen (taskkill ohne /F) und WM_ENDSESSION (Abmelden, Herunterfahren)
+// dagegen: beenden - ueber den Rueckruf `ende`, der den Zuschauer
+// verabschiedet und den Prozess beendet.
 //
 // Bedienung (NOTIFYICON_VERSION_4):
 //   - Linksklick (NIN_SELECT), Eingabe/Leertaste (NIN_KEYSELECT) und
@@ -55,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, TranslateMessage,
     HICON, HMENU, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
     SMTO_ABORTIFHUNG, SM_CXSMICON, SM_MENUDROPALIGNMENT, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW,
     WS_POPUP,
 };
 
@@ -134,7 +137,13 @@ enum Art {
     Client(Box<dyn Fn(Befehl) + Send>),
     /// Allgemein (Host-Rolle): Menue bei jedem Oeffnen aus `menue`, die
     /// gewaehlte Nummer an `befehl`; auch der Linksklick oeffnet das Menue.
-    Allgemein { befehl: Box<dyn Fn(u32) + Send>, menue: Box<dyn Fn() -> Vec<Eintrag> + Send> },
+    /// `ende` bekommt WM_CLOSE von aussen und WM_ENDSESSION (mit einem Wort,
+    /// woher) und kehrt nicht zurueck.
+    Allgemein {
+        befehl: Box<dyn Fn(u32) + Send>,
+        menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
+        ende: Box<dyn Fn(&str) + Send>,
+    },
 }
 
 /// Was nur der Symbolfaden braucht (je Faden einer, siehe FADEN).
@@ -181,14 +190,17 @@ impl Symbol {
     /// Zweite Art (Host-Rolle): `menue` liefert bei jedem Oeffnen die
     /// Eintraege (im Symbolfaden gerufen), `befehl` bekommt die gewaehlte
     /// Nummer (ebenfalls im Symbolfaden - lange Arbeit gehoert in einen
-    /// anderen Faden). Sonst wie `neu`.
+    /// anderen Faden). `ende` beendet den Prozess, wenn Windows oder ein
+    /// anderes Programm das verlangt (WM_CLOSE von aussen, WM_ENDSESSION);
+    /// das Symbol ist dann schon abgemeldet. Sonst wie `neu`.
     pub fn neu_allgemein(
         befehl: Box<dyn Fn(u32) + Send>,
         menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
+        ende: Box<dyn Fn(&str) + Send>,
         tooltip: &str,
     ) -> Result<Symbol, String> {
         let stand = Stand { menue: Vec::new(), tooltip: tooltip.to_string() };
-        Symbol::neu_mit(Art::Allgemein { befehl, menue }, &stand)
+        Symbol::neu_mit(Art::Allgemein { befehl, menue, ende }, &stand)
     }
 
     fn neu_mit(art: Art, stand: &Stand) -> Result<Symbol, String> {
@@ -529,7 +541,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     _ => {}
                 },
-                Art::Allgemein { befehl, menue } => {
+                Art::Allgemein { befehl, menue, .. } => {
                     if matches!(ereignis, NIN_SELECT | NIN_KEYSELECT | WM_CONTEXTMENU) {
                         let eintraege = menue();
                         let nr = nummer_waehlen(hwnd, &eintraege, x, y);
@@ -553,9 +565,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
-        // Von aussen (etwa taskkill ohne /F an ein sichtbares Fenster):
-        // uebergehen - das Symbol ist der Weg zurueck zur abgelegten App.
-        WM_CLOSE => LRESULT(0),
+        // Von aussen (etwa taskkill ohne /F): beim Client uebergehen - das
+        // Symbol ist der Weg zurueck zur abgelegten App. Die Host-Rolle endet
+        // darauf, mit Abschied an ihren Zuschauer; ebenso beim Abmelden und
+        // Herunterfahren (WM_ENDSESSION, erst nach dessen Rueckkehr endete
+        // der Prozess ohnehin - der Abschied muss vorher hinaus).
+        WM_CLOSE | WM_ENDSESSION => {
+            if let Art::Allgemein { ende, .. } = &f.art {
+                if msg == WM_CLOSE || wp.0 != 0 {
+                    if f.geteilt.steht.load(Ordering::SeqCst) {
+                        abmelden(hwnd, &f);
+                    }
+                    ende(if msg == WM_CLOSE { "WM_CLOSE von aussen" } else { "Abmelden oder Herunterfahren" });
+                }
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)

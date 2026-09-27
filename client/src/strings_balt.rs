@@ -245,6 +245,9 @@ pub static ET: Lang = Lang {
         (HostPasswordInvalid, "Parool sisaldab lubamatuid märke."),
         (HostPasswordTitle, "Muuda parooli"),
         (MsgHostUnverified, "{n} ei tõendanud oma identiteeti. Ühendus katkestati turvalisuse huvides."),
+        (MsgHostQuit, "{n} sulges QuadChroma."),
+        (MsgHostSharingOff, "{n} lõpetas jagamise."),
+        (MsgHostRemovedYou, "{n} eemaldas selle seadme."),
     ],
 };
 
@@ -490,6 +493,9 @@ pub static LV: Lang = Lang {
         (HostPasswordInvalid, "Parolē ir neatļautas rakstzīmes."),
         (HostPasswordTitle, "Mainīt paroli"),
         (MsgHostUnverified, "Dators {n} nepierādīja savu identitāti. Drošības nolūkos savienojums tika pārtraukts."),
+        (MsgHostQuit, "Dators {n} aizvēra QuadChroma."),
+        (MsgHostSharingOff, "Dators {n} pārtrauca koplietošanu."),
+        (MsgHostRemovedYou, "Dators {n} noņēma šo ierīci."),
     ],
 };
 
@@ -735,6 +741,9 @@ pub static LT: Lang = Lang {
         (HostPasswordInvalid, "Slaptažodyje yra neleistinų simbolių."),
         (HostPasswordTitle, "Keisti slaptažodį"),
         (MsgHostUnverified, "Kompiuteris {n} neįrodė savo tapatybės. Saugumo sumetimais ryšys nutrauktas."),
+        (MsgHostQuit, "Kompiuteris {n} uždarė QuadChroma."),
+        (MsgHostSharingOff, "Kompiuteris {n} nutraukė bendrinimą."),
+        (MsgHostRemovedYou, "Kompiuteris {n} pašalino šį įrenginį."),
     ],
 };
 
@@ -980,6 +989,9 @@ pub static SL: Lang = Lang {
         (HostPasswordInvalid, "Geslo vsebuje nedovoljene znake."),
         (HostPasswordTitle, "Spremeni geslo"),
         (MsgHostUnverified, "Računalnik {n} ni dokazal svoje identitete. Povezava je bila iz varnostnih razlogov prekinjena."),
+        (MsgHostQuit, "Računalnik {n} je zaprl QuadChroma."),
+        (MsgHostSharingOff, "Računalnik {n} je ustavil deljenje."),
+        (MsgHostRemovedYou, "Računalnik {n} je odstranil to napravo."),
     ],
 };
 
@@ -1225,6 +1237,9 @@ pub static HR: Lang = Lang {
         (HostPasswordInvalid, "Lozinka sadrži nedopuštene znakove."),
         (HostPasswordTitle, "Promijeni lozinku"),
         (MsgHostUnverified, "Računalo {n} nije dokazalo svoj identitet. Veza je prekinuta iz sigurnosnih razloga."),
+        (MsgHostQuit, "Računalo {n} zatvorilo je QuadChroma."),
+        (MsgHostSharingOff, "Računalo {n} zaustavilo je dijeljenje."),
+        (MsgHostRemovedYou, "Računalo {n} uklonilo je ovaj uređaj."),
     ],
 };
 
@@ -1470,5 +1485,8 @@ pub static UK: Lang = Lang {
         (HostPasswordInvalid, "Пароль містить неприпустимі символи."),
         (HostPasswordTitle, "Змінити пароль"),
         (MsgHostUnverified, "Комп'ютер {n} не довів свою ідентичність. З'єднання розірвано з міркувань безпеки."),
+        (MsgHostQuit, "Комп'ютер {n} закрив QuadChroma."),
+        (MsgHostSharingOff, "Комп'ютер {n} припинив надавати доступ."),
+        (MsgHostRemovedYou, "Комп'ютер {n} видалив цей пристрій."),
     ],
 };

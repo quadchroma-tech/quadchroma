@@ -166,6 +166,20 @@ int qc_zugang_ergebnis_lesen(const uint8_t *nutz, size_t n, uint8_t *ergebnis, u
 /// 23 ZUGANG_ABBRUCH (8 Byte).
 size_t qc_zugang_abbruch_kodieren(uint8_t out[QC_ZUGANG_KOPF]);
 
+// Abschied des Hosts (Nachricht 13, MSG_HOST_ENDE in protokoll_konst.rs des
+// Clients): Kopf und ein Byte Grund, die letzte Nachricht auf dem Bildkanal,
+// bevor der Host ihn schliesst - die App endet, die Freigabe geht aus, oder
+// das Geraet des Zuschauers wurde entfernt. Der Client verbindet sich darauf
+// nicht von selbst neu; ein aelterer uebergeht Typ 13.
+#define QC_MSG_HOST_ENDE           13
+#define QC_HOST_ENDE_BEENDET       0
+#define QC_HOST_ENDE_FREIGABE_AUS  1
+#define QC_HOST_ENDE_ENTFERNT      2
+#define QC_HOST_ENDE_LAENGE        (QC_ZUGANG_KOPF + 1)
+
+/// 13 MSG_HOST_ENDE (9 Byte) mit grund (QC_HOST_ENDE_*).
+size_t qc_host_ende_kodieren(uint8_t out[QC_HOST_ENDE_LAENGE], uint8_t grund);
+
 // ---------------------------------------------------------- Kryptografie (3.4)
 
 /// norm(pw): 0x20, 0x09, 0x0A, 0x0D und '-' fallen weg, A-Z wird a-z, sonst

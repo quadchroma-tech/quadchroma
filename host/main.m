@@ -728,6 +728,8 @@ static int rueckstand_sitzung(uint64_t sitzung) {
 static _Atomic int g_testbild = 0;
 #define QC_MSG_HOSTSTATUS 9    // Host -> Client: u8 Lage (0 = in Ordnung, 1 = kein Bildschirm)
 #define QC_MSG_ABGELOEST  10   // Host -> Client: ein anderer Zuschauer hat uebernommen, Laenge 0, letzte Nachricht
+// 13 QC_MSG_HOST_ENDE (Host -> Client): Abschied mit u8 Grund, letzte
+// Nachricht vor dem Schliessen - Kodierung und Gruende in zugang.h.
 #define QC_IN_TIME        65   // Client -> Host: Frage zum Zeitabgleich
 #define QC_IN_SETTINGS    64   // Client -> Host: was gewuenscht wird
 static void hoststatus_senden(uint8_t lage) {
@@ -997,6 +999,19 @@ static int zuschauer_abloesen(int neu_fd, char fp_alt[24]) {
     return gemeldet;
 }
 
+// Der Abschied des Hosts (Typ 13 mit Grund, zugang.h) an den Zuschauer auf
+// fd, mit derselben kurzen Frist wie die Abloese-Nachricht - danach schliesst
+// der Aufrufer. Der Client zeigt den Grund und verbindet sich nicht von
+// selbst neu. Nur unter g_send_mtx rufen, solange g_vid zu fd gehoert.
+// Rueckgabe: 1 = abgeschickt, 0 = kam nicht an.
+static int host_ende_senden(int fd, uint8_t grund) {
+    struct timeval kurz = { .tv_sec = 0, .tv_usec = QC_ABLOESUNG_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &kurz, sizeof kurz);
+    uint8_t m[QC_HOST_ENDE_LAENGE];
+    struct iovec iov = { .iov_base = m, .iov_len = qc_host_ende_kodieren(m, grund) };
+    return qc_chan_send(g_vid, &iov, 1) == 0;
+}
+
 // ------------------------------------------------------------ Rechnername
 // Der Name dieses Macs, wie ihn die Systemeinstellungen zeigen ("Roberts Mac
 // mini"), sonst der Hostname - UTF-8-sicher auf 40 Byte. Er steht in der
@@ -1047,10 +1062,11 @@ int qc_zustand_bedienungshilfen(void) { return AXIsProcessTrusted() ? 1 : 0; }
 int qc_zustand_port_belegt(void) { return atomic_load(&g_port_belegt); }
 
 // Ein Geraet wurde aus der Liste entfernt (zugang.c, pub NULL = alle): eine
-// laufende Sitzung dieses Schluessels endet - wie beim Senden-gescheitert,
-// ohne Abloese-Nachricht. Ein neuer Client verbindet dann von selbst neu und
-// landet in der Zugangsphase. Aus einem Faden der Oberflaeche, nie der Main
-// Queue (g_send_mtx kann bis zu 2 s haengen).
+// laufende Sitzung dieses Schluessels endet mit dem Abschied (Typ 13, Grund
+// 2 "Geraet entfernt"). Der Client zeigt das und verbindet sich nicht von
+// selbst neu; ein aelterer verbindet sich neu und landet in der
+// Zugangsphase. Aus einem Faden der Oberflaeche, nie der Main Queue
+// (g_send_mtx kann bis zu 2 s haengen).
 //
 // Wer gerade hereinkommt, ist hier noch nicht zu sehen: bild_verbindung hat
 // ihn in der Liste gefunden (oder eben eingetragen), faehrt aber noch die
@@ -1065,9 +1081,11 @@ static void zuschauer_entfernt(const uint8_t *pub) {
     atomic_fetch_add(&g_entfernt_zaehler, 1);
     int fd = atomic_load(&g_client_fd);
     BOOL treffer = fd >= 0 && g_vid && (!pub || memcmp(g_vid_peer, pub, 32) == 0);
+    int gemeldet = 0;
     if (treffer) {
         atomic_store(&g_vid_ready, 0);
         atomic_store(&g_client_fd, -1);
+        gemeldet = host_ende_senden(fd, QC_HOST_ENDE_ENTFERNT);
         shutdown(fd, SHUT_RDWR);
         close(fd);
         eingabe_abbrechen();
@@ -1077,7 +1095,8 @@ static void zuschauer_entfernt(const uint8_t *pub) {
     }
     pthread_mutex_unlock(&g_send_mtx);
     if (treffer) {
-        logf_(@"Zuschauer getrennt: sein Geraet wurde aus der Liste entfernt");
+        logf_(@"Zuschauer getrennt: sein Geraet wurde aus der Liste entfernt%s",
+              gemeldet ? "" : " - der Abschied kam nicht an");
         qc_ui_zustand_geaendert();
     }
 }
@@ -3864,21 +3883,25 @@ __attribute__((unused)) static void dienst_takt_anhalten(void) {
 }
 
 // Beenden (Menue, Cmd+Q, SIGTERM/SIGINT, Abmelden; menue.m ruft es ausserhalb
-// der Main Queue): Bild- und Eingabekanal des Zuschauers werden geschlossen,
-// sein Client sieht sofort das Ende der Verbindung - wie heute, wenn der Host
-// endet. Bewusst OHNE Typ 10: den deutet der Client als "ein anderes Geraet
-// hat die Sitzung uebernommen" und zeigte eine falsche, beunruhigende
-// Meldung. Eine eigene Abschiedsnachricht kennt das Protokoll nicht; der
-// Client versucht es also wie bisher von selbst erneut, bis der Host wieder
-// laeuft.
+// der Main Queue): der Zuschauer bekommt als letzte Nachricht den Abschied
+// (Typ 13, Grund 0 "App beendet"), dann werden Bild- und Eingabekanal
+// geschlossen. Sein Client zeigt "<Host> wurde beendet." und verbindet sich
+// nicht von selbst neu; ein aelterer sieht nur das Ende der Verbindung und
+// versucht es wie bisher erneut. Bewusst nicht Typ 10: den deutet der Client
+// als "ein anderes Geraet hat die Sitzung uebernommen".
 static void host_abschied(void) {
     char fp[24] = {0};
+    int gemeldet = 0;
     pthread_mutex_lock(&g_send_mtx);
     int alt = atomic_exchange(&g_client_fd, -1);
     atomic_store(&g_vid_ready, 0);
     if (alt >= 0) {
-        if (g_vid) qc_fingerprint(g_vid_peer, fp);
-        // shutdown weckt auch einen Faden, der gerade auf diesem Socket liest.
+        if (g_vid) {
+            qc_fingerprint(g_vid_peer, fp);
+            gemeldet = host_ende_senden(alt, QC_HOST_ENDE_BEENDET);
+        }
+        // shutdown weckt auch einen Faden, der gerade auf diesem Socket liest;
+        // der Abschied liegt schon im Kernel und geht vor dem FIN hinaus.
         shutdown(alt, SHUT_RDWR);
         close(alt);
     }
@@ -3886,7 +3909,9 @@ static void host_abschied(void) {
     qc_chan_free(g_vid);
     g_vid = NULL;
     pthread_mutex_unlock(&g_send_mtx);
-    if (alt >= 0) logf_(@"Beenden: Verbindung zum Zuschauer %s geschlossen", fp);
+    if (alt >= 0)
+        logf_(@"Beenden: Verbindung zum Zuschauer %s geschlossen%s", fp,
+              gemeldet ? " (Abschied gemeldet)" : " - der Abschied kam nicht an");
     logf_(@"Host beendet");
 }
 
