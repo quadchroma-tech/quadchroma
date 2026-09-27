@@ -318,7 +318,9 @@ struct Offen {
 /// bekommt Nummer und Entscheidung (true = Zulassen) aus dem Fensterfaden;
 /// in der Host-Rolle ist das Einlass::entscheiden.
 pub struct Zulassen {
-    lang: &'static Lang,
+    /// Die Sprache der naechsten Fenster - sie folgt der des Clients
+    /// (`sprache_setzen`), ein schon offenes Fenster behaelt seine.
+    lang: Mutex<&'static Lang>,
     /// Kann jemand klicken? (Das Symbol im Infobereich steht - ohne
     /// angemeldete Sitzung mit Explorer gibt es niemanden.)
     vorhanden: AtomicBool,
@@ -328,7 +330,18 @@ pub struct Zulassen {
 
 impl Zulassen {
     pub fn neu(lang: &'static Lang, antwort: Arc<dyn Fn(u64, bool) + Send + Sync>) -> Zulassen {
-        Zulassen { lang, vorhanden: AtomicBool::new(false), antwort, offen: Arc::new(Mutex::new(HashMap::new())) }
+        Zulassen { lang: Mutex::new(lang), vorhanden: AtomicBool::new(false), antwort, offen: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Die Sprache der naechsten Zulassen-Fenster (der Client hat eine
+    /// andere gewaehlt).
+    pub fn sprache_setzen(&self, lang: &'static Lang) {
+        *sperre(&self.lang) = lang;
+    }
+
+    /// Die Sprache der naechsten Zulassen-Fenster.
+    pub fn sprache(&self) -> &'static Lang {
+        *sperre(&self.lang)
     }
 
     /// Ob "Zulassen" moeglich ist (aus dem Takt der Host-Rolle).
@@ -474,7 +487,7 @@ impl Oberflaeche for Zulassen {
 
     fn zeigen(&self, a: &Anfrage) {
         sperre(&self.offen).insert(a.nr, Offen::default());
-        let (lang, a2, offen, antwort) = (self.lang, a.clone(), self.offen.clone(), self.antwort.clone());
+        let (lang, a2, offen, antwort) = (self.sprache(), a.clone(), self.offen.clone(), self.antwort.clone());
         let r = std::thread::Builder::new().name("zulassen".into()).spawn(move || zulassen_faden(lang, a2, offen, antwort));
         if let Err(e) = r {
             DROSSEL_FENSTER.melden(Some(a.ip), || format!("Zulassen-Fenster: kein Faden ({e})"));

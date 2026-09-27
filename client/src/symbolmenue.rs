@@ -78,9 +78,34 @@ pub enum Freigabe {
     Verbunden(String),
     /// An, aber der Port liess sich nicht binden (neuer Versuch alle 5 s).
     PortBelegt(u16),
-    /// An, aber die Host-Rolle kam nicht in Gang (kein Schluessel, kein
-    /// Ablageordner - Einzelheiten im Protokoll).
-    Fehler,
+    /// An, aber die Host-Rolle kam nicht in Gang - die Zustandszeile sagt,
+    /// woran es lag (Einzelheiten im Protokoll).
+    Fehler(Startfehler),
+}
+
+/// Woran die Host-Rolle scheiterte (Zustandszeile am Symbol).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Startfehler {
+    /// host.key oder der Ablageordner taugt nicht (Code 5).
+    Schluessel,
+    /// Ein Schalter der Befehlszeile taugt nicht (Code 6: --konserve, 7:
+    /// --encoderweg). Aus- und wieder einschalten versucht es neu.
+    Schalter(&'static str),
+    /// Sonst etwas (FFmpeg, kein Faden) - Einzelheiten in host-protokoll.txt.
+    Sonst,
+}
+
+impl Startfehler {
+    /// Aus dem Code der Host-Rolle (host::Dienst, Exit-Codes der reinen
+    /// Host-Rolle).
+    pub fn aus_code(code: u8) -> Startfehler {
+        match code {
+            5 => Startfehler::Schluessel,
+            6 => Startfehler::Schalter("--konserve"),
+            7 => Startfehler::Schalter("--encoderweg"),
+            _ => Startfehler::Sonst,
+        }
+    }
 }
 
 impl Freigabe {
@@ -185,7 +210,9 @@ pub fn zustand(lang: &Lang, f: &Freigabe) -> String {
         Freigabe::Bereit => lang.get(Key::HostReady).to_string(),
         Freigabe::Verbunden(n) => einsetzen(lang.get(Key::HostConnected), &[("{n}", &tray::anzeigename(n))]),
         Freigabe::PortBelegt(p) => lang.get(Key::HostPortBusy).replace("{p}", &p.to_string()),
-        Freigabe::Fehler => lang.get(Key::MsgShareFailed).to_string(),
+        Freigabe::Fehler(Startfehler::Schluessel) => lang.get(Key::ShareFailedKey).to_string(),
+        Freigabe::Fehler(Startfehler::Schalter(s)) => lang.get(Key::ShareFailedSwitch).replace("{s}", s),
+        Freigabe::Fehler(Startfehler::Sonst) => lang.get(Key::MsgShareFailed).to_string(),
     }
 }
 
@@ -452,10 +479,19 @@ mod tests {
         assert_eq!(texte(&menue(de, &s).0)[1], "Port 9001 ist von einem anderen Programm belegt");
         assert_eq!(texte(&menue(en, &s).0)[1], "Port 9001 is used by another program");
         assert!(haken(&menue(de, &s).0[stelle(&menue(de, &s).0, "Diesen PC freigeben")]));
-        s.freigabe = Freigabe::Fehler;
+        s.freigabe = Freigabe::Fehler(Startfehler::Sonst);
         s.id = None;
+        assert_eq!(texte(&menue(de, &s).0)[1], "Die Freigabe dieses PCs konnte nicht gestartet werden.");
+        // Die Zustandszeile sagt, woran es lag.
+        s.freigabe = Freigabe::Fehler(Startfehler::aus_code(5));
+        assert_eq!(texte(&menue(en, &s).0)[1], "Sharing could not start: host.key or its folder cannot be used.");
+        s.freigabe = Freigabe::Fehler(Startfehler::aus_code(6));
+        assert_eq!(texte(&menue(en, &s).0)[1], "Sharing could not start: --konserve is not usable. Turn sharing off and on to retry.");
+        s.freigabe = Freigabe::Fehler(Startfehler::aus_code(7));
+        assert!(texte(&menue(de, &s).0)[1].starts_with("Die Freigabe konnte nicht starten: --encoderweg ist nicht nutzbar."));
+        assert_eq!(Startfehler::aus_code(1), Startfehler::Sonst);
+        s.freigabe = Freigabe::Fehler(Startfehler::Sonst);
         let (m, z) = menue(de, &s);
-        assert_eq!(texte(&m)[1], "Die Freigabe dieses PCs konnte nicht gestartet werden.");
         assert!(!texte(&m).iter().any(|t| t.starts_with("Geräte-ID") || t.starts_with("Passwort") || t == "Erlaubte Geräte"), "{:?}", texte(&m));
         assert!(haken(&m[stelle(&m, "Diesen PC freigeben")]));
         assert_eq!(z, Zuordnung::default());

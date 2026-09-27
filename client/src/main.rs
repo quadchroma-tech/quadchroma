@@ -8951,7 +8951,16 @@ impl App {
                 self.sprachwahl = false;
                 self.cfg.sprache = Some(code.to_string());
                 self.cfg.sichern();
-                // Die Menueleiste spricht dieselbe Sprache.
+                // Die Host-Rolle (Zulassen- und Passwortfenster, Rueckfragen,
+                // Hinweisblasen) spricht dieselbe Sprache - ab sofort, nicht
+                // erst nach einem Neustart. Das Menue am Symbol folgt ueber
+                // symbol_nachfuehren.
+                #[cfg(windows)]
+                if let Some(r) = self.rolle.as_ref() {
+                    r.sprache_setzen(self.lang);
+                }
+                // Die Menueleiste und die Fenster der Host-Engine sprechen
+                // dieselbe Sprache.
                 #[cfg(target_os = "macos")]
                 {
                     host_mac::sprache_setzen(code);

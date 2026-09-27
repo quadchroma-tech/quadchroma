@@ -60,7 +60,7 @@ pub mod testbild;
 pub mod ton;
 pub mod zeiger;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -472,14 +472,14 @@ pub fn abschied_beim_prozessende() {
 
 /// Was das Menue ueber die Host-Rolle zeigt: Zustand der Freigabe, ID,
 /// Passwort, Geraete. `e`: ihr Einlass (None, solange er nicht steht);
-/// `an`: die Freigabe ist eingeschaltet; `fehler`: die Rolle kam nicht in
-/// Gang.
-pub fn menue_teil(e: Option<&einlass::Einlass>, an: bool, port: u16, port_belegt: bool, fehler: bool) -> symbolmenue::HostTeil {
+/// `an`: die Freigabe ist eingeschaltet; `fehler`: warum die Rolle nicht in
+/// Gang kam (Code wie die Exit-Codes der reinen Host-Rolle, 0: kein Fehler).
+pub fn menue_teil(e: Option<&einlass::Einlass>, an: bool, port: u16, port_belegt: bool, fehler: u8) -> symbolmenue::HostTeil {
     use symbolmenue::Freigabe as F;
     let freigabe = if !an {
         F::Aus
-    } else if fehler {
-        F::Fehler
+    } else if fehler != 0 {
+        F::Fehler(symbolmenue::Startfehler::aus_code(fehler))
     } else if port_belegt {
         F::PortBelegt(port)
     } else if let Some(n) = netz::zuschauer_name() {
@@ -513,6 +513,9 @@ enum Nachricht {
     FreigabeAus,
     /// Die eine App: der Geraetename ist neu (Nachricht 20).
     NameGeaendert,
+    /// Die eine App: der Client spricht eine andere Sprache - Zulassen- und
+    /// Passwortfenster, Rueckfragen und Hinweisblasen folgen ihr.
+    Sprache(&'static crate::strings::Lang),
     /// Die eine App endet: Abschied mit Grund 0, dann Schluss.
     Beenden,
 }
@@ -587,9 +590,15 @@ pub struct Dienst {
     tx: std::sync::mpsc::Sender<Nachricht>,
     rx: std::sync::mpsc::Receiver<Nachricht>,
     port_belegt: Arc<AtomicBool>,
+    /// Warum das Schwere beim letzten `freigabe_an` scheiterte (Code 6/7;
+    /// 0: nicht gescheitert) - fuer die Zustandszeile am Symbol.
+    startfehler: Arc<AtomicU8>,
     /// Die Argumente fuer das Schwere beim ersten `freigabe_an` (None:
-    /// schon gestartet).
+    /// schon gestartet). Bleibt stehen, bis das Schwere gelang: ein spaeteres
+    /// Einschalten versucht es dann neu.
     vorrat: Option<Vec<String>>,
+    /// Das Schwere (`schweres_starten`; Tests setzen eine Attrappe).
+    schwer: fn(&mut Dienst, &[String]) -> Result<(), i32>,
     /// Die Freigabe ist eingeschaltet.
     freigabe: bool,
     netz_laeuft: bool,
@@ -618,7 +627,7 @@ impl Dienst {
     /// Konserve, 7 Encoderweg, 9 Port belegt ohne Oberflaeche).
     pub fn starten(args: &[String]) -> Result<Dienst, i32> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut d = Dienst::einrichten(args, Art::NurHost, tx, rx, Arc::new(AtomicBool::new(false)))?;
+        let mut d = Dienst::einrichten(args, Art::NurHost, tx, rx, Arc::new(AtomicBool::new(false)), Arc::new(AtomicU8::new(0)))?;
         d.freigabe_an()?;
         Ok(d)
     }
@@ -633,6 +642,7 @@ impl Dienst {
         tx: std::sync::mpsc::Sender<Nachricht>,
         rx: std::sync::mpsc::Receiver<Nachricht>,
         port_belegt: Arc<AtomicBool>,
+        startfehler: Arc<AtomicU8>,
     ) -> Result<Dienst, i32> {
         // Was dieser Faden ueber FFmpeg sagt, gehoert der Host-Rolle.
         protokoll::herkunft_setzen(protokoll::Herkunft::Host);
@@ -764,7 +774,9 @@ impl Dienst {
             tx,
             rx,
             port_belegt,
+            startfehler,
             vorrat: Some(args.to_vec()),
+            schwer: Dienst::schweres_starten,
             freigabe: false,
             netz_laeuft: false,
             app,
@@ -782,7 +794,9 @@ impl Dienst {
 
     /// Das Schwere, einmal je Prozess beim ersten `freigabe_an`:
     /// Bildschirme, Encoder, Konserve, Zwischenablage, Eingabe, Ton,
-    /// Bildquelle. Err: 6 (Konserve), 7 (Encoderweg).
+    /// Bildquelle. Err: 6 (Konserve), 7 (Encoderweg) - beides, bevor der
+    /// erste Faden startet (Zwischenablage, Eingabe, Ton, Bildquelle): ein
+    /// neuer Versuch faengt sauber von vorn an.
     fn schweres_starten(&mut self, args: &[String]) -> Result<(), i32> {
         // Bildschirm (Spezifikation Bildschirm 1.1-1.5): die Ausgaenge mit
         // Kennung und Name; der Wunsch aus bildschirm.txt, --output n pinnt
@@ -947,7 +961,10 @@ impl Dienst {
     /// dann die Ports oeffnen. Ist der Port belegt und gibt es eine
     /// Oberflaeche (Symbol, oder die App selbst), zeigt sie das, und es wird
     /// alle 5 s neu versucht; ohne endet die reine Host-Rolle wie bisher
-    /// (Err 9). Err 6/7 aus dem Schweren.
+    /// (Err 9). Err 6/7 aus dem Schweren: dann bleibt der Port zu - ohne
+    /// Bildquelle, Eingabe, Ton und Zwischenablage gaebe es sonst einen
+    /// halben Host -, die Freigabe gilt hier als aus (kein Neuversuch im
+    /// Takt), und das naechste Einschalten versucht das Schwere von vorn.
     pub fn freigabe_an(&mut self) -> Result<(), i32> {
         if self.beendet || PROZESS_ENDET.load(Ordering::SeqCst) {
             return Ok(());
@@ -958,9 +975,18 @@ impl Dienst {
                 log("Freigabe: an");
             }
         }
-        if let Some(args) = self.vorrat.take() {
-            self.schweres_starten(&args)?;
+        if let Some(args) = self.vorrat.clone() {
+            if let Err(code) = (self.schwer)(self, &args) {
+                self.freigabe = false;
+                self.startfehler.store(code.clamp(1, 255) as u8, Ordering::SeqCst);
+                log(format!(
+                    "Freigabe: Host-Rolle nicht gestartet (Code {code}) - kein Port offen; aus- und wieder einschalten versucht es neu"
+                ));
+                return Err(code);
+            }
+            self.vorrat = None;
         }
+        self.startfehler.store(0, Ordering::SeqCst);
         self.netz_versuchen(true)
     }
 
@@ -1060,9 +1086,9 @@ impl Dienst {
                 return Lage::Beendet;
             }
             Ok(Nachricht::FreigabeAn) => {
-                if let Err(code) = self.freigabe_an() {
-                    log(format!("Freigabe: Host-Rolle kann nicht laufen (Code {code})"));
-                }
+                // Scheitert das Schwere, sagt es freigabe_an im Protokoll und
+                // in der Zustandszeile.
+                let _ = self.freigabe_an();
             }
             Ok(Nachricht::FreigabeAus) => self.freigabe_aus(HOST_ENDE_FREIGABE_AUS),
             Ok(Nachricht::NameGeaendert) => {
@@ -1070,6 +1096,7 @@ impl Dienst {
                 self.einlass.name_setzen(&n);
                 log(format!("Geraetename: {n} - gilt fuer Bekanntgabe und Zugangsphase ab sofort"));
             }
+            Ok(Nachricht::Sprache(l)) => self.sprache_setzen(l),
             Ok(Nachricht::Beenden) => {
                 self.beenden(HOST_ENDE_BEENDET);
                 return Lage::Beendet;
@@ -1123,6 +1150,17 @@ impl Dienst {
         self.last_frames = f;
         self.last_bytes = b;
         Lage::Laeuft
+    }
+
+    /// Die Sprache der Host-Rolle: Zulassen-Fenster (die naechsten),
+    /// Passwortfenster, Rueckfragen und Hinweisblasen ("kopiert").
+    fn sprache_setzen(&mut self, l: &'static crate::strings::Lang) {
+        if std::ptr::eq(self.lang, l) {
+            return;
+        }
+        self.lang = l;
+        self.zulassen.sprache_setzen(l);
+        log(format!("Sprache der Host-Rolle: {}", l.code));
     }
 
     /// Einen Menuepunkt ausfuehren. "Freigabe beenden" (nur die reine
@@ -1250,7 +1288,7 @@ fn eigenes_symbol(
     });
     let (e, pb, z) = (einlass.clone(), port_belegt.clone(), zuordnung.clone());
     let menue = Box::new(move || {
-        let h = menue_teil(Some(&e), true, port, pb.load(Ordering::Relaxed), false);
+        let h = menue_teil(Some(&e), true, port, pb.load(Ordering::Relaxed), 0);
         let stand = symbolmenue::MenueStand {
             art: symbolmenue::Art::NurHost,
             name: zugang::geraetename(),
@@ -1292,10 +1330,16 @@ struct RollenStand {
     port_belegt: Arc<AtomicBool>,
     /// Die Freigabe ist (vom Nutzer) eingeschaltet.
     freigabe: AtomicBool,
-    /// Die Rolle kam nicht in Gang (Schluessel, Ablage, Konserve,
-    /// Encoderweg) - Einzelheiten in host-protokoll.txt.
-    fehler: AtomicBool,
+    /// Warum die Rolle nicht in Gang kam: 5 Schluessel oder Ablage, 6
+    /// Konserve, 7 Encoderweg, 1 sonst (FFmpeg, kein Faden); 0 kein Fehler.
+    /// Einzelheiten in host-protokoll.txt. Der Dienst setzt 6/7 und loescht
+    /// sie, sobald ein neues Einschalten gelingt.
+    fehler: Arc<AtomicU8>,
 }
+
+/// RollenStand::fehler: die Rolle kam aus einem anderen Grund als
+/// Schluessel, Konserve oder Encoderweg nicht in Gang.
+const FEHLER_SONST: u8 = 1;
 
 /// Die Host-Rolle im Prozess der einen App (Plan W6): ein eigener Faden
 /// richtet den Dienst ein und faehrt ihn, bis die App endet. Die App
@@ -1329,7 +1373,7 @@ impl Rolle {
             einlass: std::sync::OnceLock::new(),
             port_belegt: Arc::new(AtomicBool::new(false)),
             freigabe: AtomicBool::new(freigabe),
-            fehler: AtomicBool::new(false),
+            fehler: Arc::new(AtomicU8::new(0)),
         });
         let (st, tx2) = (stand.clone(), tx.clone());
         let faden = std::thread::Builder::new()
@@ -1337,7 +1381,7 @@ impl Rolle {
             .spawn(move || rolle_laufen(args, st, steht, hinweis, bereit, tx2, rx))
             .map_err(|e| {
                 protokoll::zeile(format!("Host-Rolle: kein Faden ({e}) - dieser PC ist nicht freigegeben"));
-                stand.fehler.store(true, Ordering::SeqCst);
+                stand.fehler.store(FEHLER_SONST, Ordering::SeqCst);
             })
             .ok();
         Rolle { tx, stand, port, faden }
@@ -1358,6 +1402,12 @@ impl Rolle {
     /// geschehen): Nachricht 20 ab der naechsten Zugangsphase.
     pub fn name_geaendert(&self) {
         let _ = self.tx.send(Nachricht::NameGeaendert);
+    }
+
+    /// Der Client spricht jetzt `lang`: die Fenster und Hinweise der
+    /// Host-Rolle ebenso, ab sofort.
+    pub fn sprache_setzen(&self, lang: &'static crate::strings::Lang) {
+        let _ = self.tx.send(Nachricht::Sprache(lang));
     }
 
     /// Geraete-ID der Host-Rolle (None, solange ihr Einlass nicht steht).
@@ -1401,13 +1451,67 @@ impl Rolle {
 /// host-protokoll.txt ist offen (einmal je Prozess geoeffnet).
 static PROTOKOLL_OFFEN: AtomicBool = AtomicBool::new(false);
 
-/// host-protokoll.txt oeffnen, falls noch nicht geschehen. Nur, wenn diese
-/// Rolle den Mutex haelt oder keine andere Host-Rolle der Sitzung ihn
-/// haelt - neu beginnen leerte deren Protokoll.
-fn protokoll_nachholen() {
+// Wer host-protokoll.txt schreibt, haelt den Mutex protokoll_mutex() bis
+// zum Ende seines Prozesses - die App auch mit Freigabe aus (sie oeffnet die
+// Datei beim Start). Werkzeuge (--list) und eine reine Host-Rolle
+// (--nur-host) beginnen die Datei nur neu, wenn niemand ihn haelt.
+/// Tests nehmen einen eigenen Namen je Prozess (ihr Protokoll liegt ohnehin
+/// in der Testablage).
+fn protokoll_mutex() -> String {
+    if cfg!(test) {
+        format!("Local\\QuadChroma-Host-Protokoll-Test-{}", std::process::id())
+    } else {
+        "Local\\QuadChroma-Host-Protokoll".into()
+    }
+}
+
+/// host-protokoll.txt oeffnen (neu beginnen), falls noch nicht geschehen -
+/// aber nur, wenn kein anderer Prozess dieser Sitzung sie schreibt: neu
+/// beginnen leerte sonst dessen Protokoll. true: sie ist (jetzt) offen.
+fn protokoll_nachholen() -> bool {
+    protokoll_nachholen_mit(&protokoll_mutex())
+}
+
+fn protokoll_nachholen_mit(mutex: &str) -> bool {
+    if PROTOKOLL_OFFEN.load(Ordering::SeqCst) {
+        return true;
+    }
+    if !protokoll_mutex_nehmen(mutex) {
+        return false;
+    }
     if !PROTOKOLL_OFFEN.swap(true, Ordering::SeqCst) {
         protokoll_oeffnen("host-protokoll.txt");
     }
+    true
+}
+
+/// Den Mutex des Protokolls nehmen und bis zum Ende des Prozesses halten.
+/// false: ein anderer Prozess haelt ihn (er schreibt host-protokoll.txt).
+/// Geht es gar nicht (kein Mutex anlegbar), zaehlt das als frei - wie
+/// bisher ohne Absprache.
+fn protokoll_mutex_nehmen(mutex: &str) -> bool {
+    match oberflaeche::einzelinstanz(mutex) {
+        // Mit dem Prozess faellt er.
+        Ok(Some(i)) => {
+            std::mem::forget(i);
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            log(format!("{mutex}: {e} - host-protokoll.txt ohne Absprache mit anderen Prozessen"));
+            true
+        }
+    }
+}
+
+/// Fuer die Werkzeuge: host-protokoll.txt, wenn sie frei ist, sonst eine
+/// eigene Datei `eigene` (neu begonnen) - die der App bleibt, wie sie ist.
+fn protokoll_fuer_werkzeug(eigene: &str) {
+    if protokoll_nachholen() {
+        return;
+    }
+    protokoll_oeffnen(eigene);
+    log(format!("host-protokoll.txt schreibt ein anderer Prozess dieser Sitzung (die App) - dieser Lauf schreibt nach {eigene}"));
 }
 
 /// Der Faden der Host-Rolle in der einen App.
@@ -1421,32 +1525,32 @@ fn rolle_laufen(
     rx: std::sync::mpsc::Receiver<Nachricht>,
 ) {
     protokoll::herkunft_setzen(protokoll::Herkunft::Host);
-    if !oberflaeche::laeuft(oberflaeche::MUTEX) {
-        protokoll_nachholen();
-    }
+    // Schreibt noch ein anderer Prozess host-protokoll.txt (eine reine
+    // Host-Rolle, ein Werkzeug), holt die Rolle es nach, sobald sie die
+    // Ports hat (netz_versuchen).
+    protokoll_nachholen();
     if let Err(e) = ffmpeg_next::init() {
         log(format!("FFmpeg-Start fehlgeschlagen: {e} - dieser PC wird nicht freigegeben"));
-        stand.fehler.store(true, Ordering::SeqCst);
+        stand.fehler.store(FEHLER_SONST, Ordering::SeqCst);
         return;
     }
     // Die Reihe der Host-Rolle: Warnungen und Fehler von FFmpeg.
     protokoll::einschalten(false);
     log("Host-Rolle im Prozess der App");
-    let mut d = match Dienst::einrichten(&args, Art::App { steht, hinweis }, tx, rx, stand.port_belegt.clone()) {
+    let mut d = match Dienst::einrichten(&args, Art::App { steht, hinweis }, tx, rx, stand.port_belegt.clone(), stand.fehler.clone()) {
         Ok(d) => d,
         Err(code) => {
             log(format!("Host-Rolle nicht eingerichtet (Code {code}) - dieser PC wird nicht freigegeben"));
-            stand.fehler.store(true, Ordering::SeqCst);
+            stand.fehler.store(code.clamp(1, 255) as u8, Ordering::SeqCst);
             return;
         }
     };
     let _ = stand.einlass.set(d.einlass.clone());
     bereit();
     if stand.freigabe.load(Ordering::SeqCst) {
-        if let Err(code) = d.freigabe_an() {
-            log(format!("Freigabe: Host-Rolle kann nicht laufen (Code {code})"));
-            stand.fehler.store(true, Ordering::SeqCst);
-        }
+        // Scheitert es, steht der Grund schon in stand.fehler (der Dienst
+        // setzt ihn) und im Protokoll.
+        let _ = d.freigabe_an();
     } else {
         log("Freigabe: aus (einstellungen.txt) - kein Port offen");
     }
@@ -1509,14 +1613,10 @@ pub fn main_host(args: &[String]) -> i32 {
     }
 
     if args.iter().any(|a| a == "--list") {
-        // --list laeuft ohne Einzelinstanz (neben einer Freigabe erlaubt).
-        // host-protokoll.txt gehoert dann der laufenden Freigabe: neu
-        // beginnen leerte ihr Protokoll - also nur die Konsole.
-        if oberflaeche::laeuft(oberflaeche::MUTEX) {
-            log("Die Freigabe laeuft in dieser Sitzung - --list schreibt nur auf die Konsole, host-protokoll.txt bleibt ihr");
-        } else {
-            protokoll_nachholen();
-        }
+        // --list laeuft ohne Einzelinstanz (neben der App erlaubt). Schreibt
+        // die App host-protokoll.txt (auch mit Freigabe aus), bekommt --list
+        // eine eigene Datei - neu beginnen leerte sonst ihr Protokoll.
+        protokoll_fuer_werkzeug("host-liste.txt");
         log(&dpi);
         aufnahme::ausgaenge_melden(&mut Vec::new());
         encoder::pruefen();
@@ -1525,7 +1625,10 @@ pub fn main_host(args: &[String]) -> i32 {
         return 0;
     }
 
-    protokoll_nachholen();
+    // --nur-host: laeuft die App (Freigabe aus - sonst haette sie den Mutex
+    // der Host-Rolle, und dieser Start waere oben schon zu Ende), gehoert ihr
+    // host-protokoll.txt.
+    protokoll_fuer_werkzeug("host-protokoll-nur-host.txt");
     log(&dpi);
     if let Some(e) = instanz_fehler {
         log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
@@ -1653,7 +1756,9 @@ mod tests {
             tx,
             rx,
             port_belegt: Arc::new(AtomicBool::new(false)),
+            startfehler: Arc::new(AtomicU8::new(0)),
             vorrat: None,
+            schwer: |_, _| Ok(()),
             freigabe: !app,
             netz_laeuft: !app,
             app,
@@ -1691,12 +1796,12 @@ mod tests {
         assert_eq!(d.takt(), Lage::Laeuft);
         assert!(netz::laeuft() && offen(port), "Freigabe an: Port zu");
         assert!(oberflaeche::laeuft(&mutex), "Freigabe an ohne Mutex");
-        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, d.port_belegt.load(Ordering::Relaxed), false).freigabe, symbolmenue::Freigabe::Bereit);
+        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, d.port_belegt.load(Ordering::Relaxed), 0).freigabe, symbolmenue::Freigabe::Bereit);
         tx.send(Nachricht::FreigabeAus).unwrap();
         assert_eq!(d.takt(), Lage::Laeuft);
         assert!(!netz::laeuft() && !offen(port), "Freigabe aus: Port offen");
         assert!(!oberflaeche::laeuft(&mutex), "Freigabe aus: Mutex gehalten");
-        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, false, false).freigabe, symbolmenue::Freigabe::Aus);
+        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, false, 0).freigabe, symbolmenue::Freigabe::Aus);
         // Ein Menuepunkt wirkt auch ohne Freigabe.
         assert_eq!(d.aktion(oberflaeche::Aktion::Zufallspasswort), Lage::Laeuft);
         assert!(d.einlass.passwort().is_ok());
@@ -1707,7 +1812,7 @@ mod tests {
         assert_eq!(d.takt(), Lage::Laeuft);
         assert!(!netz::laeuft());
         assert!(d.port_belegt.load(Ordering::Relaxed));
-        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, true, false).freigabe, symbolmenue::Freigabe::PortBelegt(port));
+        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, true, 0).freigabe, symbolmenue::Freigabe::PortBelegt(port));
         drop(fremd);
         d.naechster_takt = Instant::now();
         assert_eq!(d.takt(), Lage::Laeuft);
@@ -1718,6 +1823,88 @@ mod tests {
         tx.send(Nachricht::Beenden).unwrap();
         assert_eq!(d.takt(), Lage::Beendet);
         assert!(!netz::laeuft() && !oberflaeche::laeuft(&mutex));
+        assert_eq!(d.takt(), Lage::Beendet);
+    }
+
+    /// host-protokoll.txt gehoert dem, der den Mutex des Protokolls haelt:
+    /// haelt ihn ein anderer (hier dieser Test anstelle der App), bekommen
+    /// Werkzeuge und --nur-host ihn nicht - sie schreiben eine eigene
+    /// Datei; ist er frei, nimmt ihn der Erste und behaelt ihn.
+    #[test]
+    fn protokoll_nur_fuer_den_halter() {
+        let name = format!("Local\\QuadChroma-Host-Protokoll-Probe-{}", std::process::id());
+        let app = oberflaeche::einzelinstanz(&name).unwrap().expect("Mutex frei");
+        assert!(!protokoll_mutex_nehmen(&name), "die App haelt ihn - das Werkzeug darf nicht");
+        drop(app);
+        assert!(protokoll_mutex_nehmen(&name), "frei - das Werkzeug nimmt ihn");
+        assert!(oberflaeche::laeuft(&name), "gehalten bis zum Ende des Prozesses");
+        assert!(!protokoll_mutex_nehmen(&name), "ein zweiter bekommt ihn nicht");
+        assert_ne!(protokoll_mutex(), "Local\\QuadChroma-Host-Protokoll", "Tests teilen den Mutex nicht mit der App");
+    }
+
+    /// Die Sprache des Clients wechselt: die Host-Rolle folgt sofort -
+    /// Hinweise, Rueckfragen, Passwortfenster und die naechsten
+    /// Zulassen-Fenster.
+    #[test]
+    fn sprache_folgt_dem_client() {
+        let _platz = netz::platz_pruefung();
+        let mut d = test_dienst("sprache", true);
+        assert_eq!((d.lang.code, d.zulassen.sprache().code), ("de", "de"));
+        d.tx.send(Nachricht::Sprache(crate::strings::pick("fr"))).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!((d.lang.code, d.zulassen.sprache().code), ("fr", "fr"));
+        d.tx.send(Nachricht::Sprache(crate::strings::pick("en"))).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!((d.lang.code, d.zulassen.sprache().code), ("en", "en"));
+    }
+
+    /// Scheitert das Schwere beim ersten Einschalten (hier eine Attrappe mit
+    /// Code 7), bleibt der Port zu - auch im Takt danach -, die
+    /// Zustandszeile nennt den Grund, und das naechste Einschalten versucht
+    /// das Schwere von vorn: gelingt es, oeffnen die Ports, und der Grund ist
+    /// weg. Ein Ausschalten dazwischen stoert nicht.
+    #[test]
+    fn schweres_scheitert_dann_neuer_versuch() {
+        use symbolmenue::{Freigabe as F, Startfehler};
+        static VERSUCHE: AtomicU32 = AtomicU32::new(0);
+        fn schwer(_: &mut Dienst, args: &[String]) -> Result<(), i32> {
+            assert_eq!(args, ["--encoderweg", "x"]);
+            if VERSUCHE.fetch_add(1, Ordering::SeqCst) == 0 { Err(7) } else { Ok(()) }
+        }
+        let _platz = netz::platz_pruefung();
+        let mut d = test_dienst("schwer", true);
+        d.vorrat = Some(vec!["--encoderweg".into(), "x".into()]);
+        d.schwer = schwer;
+        let port = d.port;
+        let teil = |d: &Dienst| menue_teil(Some(&d.einlass), true, port, d.port_belegt.load(Ordering::Relaxed), d.startfehler.load(Ordering::SeqCst)).freigabe;
+        d.tx.send(Nachricht::FreigabeAn).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!(VERSUCHE.load(Ordering::SeqCst), 1);
+        assert!(!netz::laeuft() && !offen(port), "halber Host: Port offen ohne das Schwere");
+        assert_eq!(teil(&d), F::Fehler(Startfehler::Schalter("--encoderweg")));
+        assert!(d.vorrat.is_some(), "das Schwere gilt als erledigt");
+        // Der Takt oeffnet den Port nicht nachtraeglich (eine Nachricht ohne
+        // Wirkung, sonst wartete der Takt ohne Freigabe eine Minute).
+        d.naechster_takt = Instant::now();
+        d.tx.send(Nachricht::Sprache(d.lang)).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert!(!netz::laeuft(), "Takt oeffnete den Port ohne das Schwere");
+        // Aus und wieder an: neuer Versuch, der gelingt.
+        d.tx.send(Nachricht::FreigabeAus).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        d.tx.send(Nachricht::FreigabeAn).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!(VERSUCHE.load(Ordering::SeqCst), 2);
+        assert!(netz::laeuft() && offen(port), "zweiter Versuch: Port zu");
+        assert!(d.vorrat.is_none());
+        assert_eq!(teil(&d), F::Bereit);
+        // Ein drittes Einschalten startet das Schwere nicht noch einmal.
+        d.tx.send(Nachricht::FreigabeAus).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        d.tx.send(Nachricht::FreigabeAn).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!(VERSUCHE.load(Ordering::SeqCst), 2);
+        d.tx.send(Nachricht::Beenden).unwrap();
         assert_eq!(d.takt(), Lage::Beendet);
     }
 
@@ -1745,17 +1932,19 @@ mod tests {
         let _platz = netz::platz_pruefung();
         let d = test_dienst("menueteil", true);
         let e = Some(d.einlass.as_ref());
-        assert_eq!(menue_teil(e, false, 9001, true, true).freigabe, F::Aus);
-        assert_eq!(menue_teil(e, true, 9001, true, true).freigabe, F::Fehler);
-        assert_eq!(menue_teil(e, true, 9001, true, false).freigabe, F::PortBelegt(9001));
-        let h = menue_teil(e, true, 9001, false, false);
+        assert_eq!(menue_teil(e, false, 9001, true, 5).freigabe, F::Aus);
+        assert_eq!(menue_teil(e, true, 9001, true, 5).freigabe, F::Fehler(symbolmenue::Startfehler::Schluessel));
+        assert_eq!(menue_teil(e, true, 9001, false, 6).freigabe, F::Fehler(symbolmenue::Startfehler::Schalter("--konserve")));
+        assert_eq!(menue_teil(e, true, 9001, false, FEHLER_SONST).freigabe, F::Fehler(symbolmenue::Startfehler::Sonst));
+        assert_eq!(menue_teil(e, true, 9001, true, 0).freigabe, F::PortBelegt(9001));
+        let h = menue_teil(e, true, 9001, false, 0);
         assert!(matches!(h.freigabe, F::Bereit | F::Verbunden(_)));
         assert_eq!(h.id, Some(d.einlass.id()));
         // Fehlt die Datei, entsteht ein Zufallspasswort - und steht im Menue.
         assert_eq!(h.passwort, d.einlass.passwort().map_err(|_| ()));
         assert!(h.passwort.is_ok());
         assert_eq!(h.geraete, Ok(Vec::new()));
-        assert_eq!(menue_teil(None, true, 9001, false, false).id, None);
+        assert_eq!(menue_teil(None, true, 9001, false, 0).id, None);
     }
 
     /// W1: der Dienst endet, ohne den Prozess zu beenden. "Freigabe beenden"

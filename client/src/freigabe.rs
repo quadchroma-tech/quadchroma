@@ -102,6 +102,15 @@ impl Freigabe {
         crate::host_mac::Dienst::name_setzen(crate::zugang::geraetename_eingestellt().as_deref());
     }
 
+    /// Der Client spricht jetzt `lang` (Windows): Zulassen- und
+    /// Passwortfenster, Rueckfragen und Hinweisblasen der Host-Rolle folgen
+    /// sofort. Auf dem Mac stellt main.rs die Texte der Engine selbst um
+    /// (host_mac::sprache_setzen).
+    #[cfg(windows)]
+    pub fn sprache_setzen(&self, lang: &'static crate::strings::Lang) {
+        self.rolle.sprache_setzen(lang);
+    }
+
     /// Geraete-ID der Host-Rolle (None, solange sie nicht eingerichtet ist).
     pub fn id(&self) -> Option<u32> {
         #[cfg(windows)]
