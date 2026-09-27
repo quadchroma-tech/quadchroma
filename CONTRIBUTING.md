@@ -141,6 +141,15 @@ The tests need loopback TCP; the clipboard tests use the session's real clipboar
 nothing touches `%APPDATA%\QuadChroma`. Expected: all tests pass. A handful of compiler
 warnings are known; do not add new ones.
 
+`quadchroma.exe` is the whole app, client and host role in one process. Two switches
+matter when you work on the host role: `--host [port]` starts the app in the
+background with sharing switched on (what the autostart shortcut of earlier versions
+did; it is kept so such shortcuts keep working), and `--nur-host [port]` runs the host
+role alone, headless - no window, no client, an icon of its own - for a VM or for
+tests. Both open the ports 9001 to 9003 (or the given port and the two after it) and
+capture the screen as soon as a viewer connects; do not start them on a machine where
+a host is already sharing, and use a separate `APPDATA` folder for experiments.
+
 **Mac host.** The Xcode Command Line Tools are enough (no Xcode.app). In the repository
 root:
 

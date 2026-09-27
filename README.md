@@ -342,7 +342,7 @@ this one: its name on the left, its device ID on the right ("ID -" for a host of
 earlier version), and a check mark for a computer that has let this one in before;
 hovering shows the address. Known computers come first, then the others by name; a
 computer heard under several addresses appears once, and the rows keep their order
-while others come and go. Four rows are visible, the mouse wheel scrolls the rest. A
+while others come and go. Four rows are visible, the mouse wheel or trackpad scrolls the rest. A
 click connects, and on Windows the "Desktop shortcut" button puts a shortcut to that
 host on the Desktop. The address field takes an IP address, a name or a device ID (nine
 digits, spaces allowed) and pastes with Ctrl+V (Cmd+V on the Mac). "Share this PC"
@@ -583,7 +583,7 @@ Measured on a Mac mini M1 as host:
 | Encoder | hardware, about 8 ms per frame, a few percent of one core |
 | Codecs | HEVC 4:4:4 and 4:2:0 in 8 and 10 bit, H.264, all in hardware, switchable while running |
 | Decoding on Windows | NVDEC in hardware; D3D11VA on AMD and Intel (4:2:0 and H.264); software 8.6 ms per frame, slice-parallel so that no frame is held back (see "Decoding on Windows") |
-| Decoding on the Mac | VideoToolbox in hardware, HEVC 4:4:4 at 10 bits included: 3.8 ms per 1080p frame on the M1 (see "Mac client") |
+| Decoding on the Mac | VideoToolbox in hardware, HEVC 4:4:4 at 10 bits included: about 5.6 ms per 1080p frame on the M1, measured in the client (see "Mac client") |
 | Display on Windows | Direct3D 11: raw decoder planes go to the GPU, conversion and scaling in shaders, bit-identical to the CPU path |
 | Latency | 15 to 20 ms from capture to hand-over to the display, measured with per-frame timestamps |
 | Audio | uncompressed, stereo, 48 kHz, about 3 Mbit/s; can be switched off |
@@ -849,10 +849,14 @@ plus length-prefixed samples for a `VTDecompressionSession` in the media engine,
 which outputs IOSurface-backed pixel buffers in the stream's own layout (`xf44` for
 HEVC 4:4:4 at 10 bits, `444f`, `xf20`, `420f`) that the client's YUV-to-RGB path reads
 as they are. HEVC 4:4:4 and 4:2:0 in 8 and 10 bits and H.264 run in hardware; on the
-M1, HEVC 4:4:4 at 10 bits takes about 3.8 ms per 1080p frame. Automatic uses the media
-engine, Processor uses VideoToolbox without hardware, and a media engine that cannot
-decode the stream falls back to the processor as on Windows. `--decodertest` encodes
-a short HEVC 4:4:4 sample with the hardware encoder and decodes it both ways.
+M1, HEVC 4:4:4 at 10 bits takes about 5.6 ms per 1080p frame (the decode time of the
+client's own statistics). Automatic uses the media engine, Processor uses VideoToolbox
+without hardware, and a media engine that cannot decode the stream falls back to the
+processor as on Windows. If the media engine fails in the middle of a stream (after
+sleep, or a transient decoder error), the client drops the session and starts a new
+one with the next key frame; decode errors go to the log at most once per five
+seconds. `--decodertest` encodes a short HEVC 4:4:4 sample with the hardware encoder
+and decodes it both ways.
 
 The display on the Mac is Metal (`client/src/anzeige_mac.rs`), called through
 `objc_msgSend` and the C functions of Metal, QuartzCore and CoreVideo like the rest of

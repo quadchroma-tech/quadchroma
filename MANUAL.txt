@@ -42,7 +42,8 @@ computer once even when it is heard under several addresses (the one in
 hosts.txt wins, otherwise the one heard first), and the rows keep their
 order while others come and go. A computer that has not been heard for
 10 s leaves the list. Four rows are visible; the mouse wheel over the
-list scrolls the rest (a scroll bar appears on the right).
+list scrolls the rest one row per notch, a trackpad by the distance the
+fingers travel (a scroll bar appears on the right).
 The address field also takes a device ID (nine digits, spaces or
 hyphens allowed) and pastes with Ctrl+V. The first time this PC
 connects to a host, the host wants its access password or a click on
@@ -344,9 +345,12 @@ not come about: after about 30 s the start screen shows the last error.
                       channel right after it.
 
 No connection to itself: a host running on the same computer also
-announces itself to the local client. The client reads that host's
-host.key (only reads it, never creates it) and leaves its ID out of the
-list of found hosts and out of the menu of its icon. Typing that ID
+announces itself to the local client. The client knows this computer's
+ID from host.key, the one device key of both roles (for this check it
+only reads the file; the file itself is created by whichever role needs
+it first - the host role when it starts, or the client at its first
+connection), and leaves that ID out of the list of found hosts and out
+of the menu of its icon. Typing that ID
 gives "This is this computer."; so does connecting to an address where
 this computer's own host answers - the client stops right after message
 2 of the handshake, before message 3 would show its own key, and does
@@ -463,12 +467,16 @@ first; an existing key file is never written again. The Mac host engine
 writes host.key with 32 bytes (the private key only), the Rust part (the
 client, and on Windows the host role) with 64 (private, then public).
 Both read both forms: from 32 bytes the public key is computed - the same
-public key and ID on both sides -, and the Mac host engine takes 64 bytes
-only when the second half is the public key of the first. If host.key
-exists but is unreadable or in neither form (neither 32 nor 64 bytes, or
-a mismatching public half on the Mac), the host does not start ("Schluessel host.key ist vorhanden, aber nicht
-lesbar oder beschaedigt - Abbruch. ..." or on Windows "Schluessel
-konnte nicht angelegt werden - Abbruch: ..."). Deleting a key file
+public key and ID on both sides -, and both take 64 bytes only when the
+second half is the public key of the first. If both roles create the
+missing file at the same moment (the client and the host engine in the
+one Mac app, say), the one that comes second reads the other's file
+instead of writing its own. If host.key exists but is unreadable or in
+neither form (neither 32 nor 64 bytes, or 64 bytes with a mismatching
+public half), it stays as it is and the host does not start
+("Schluessel host.key ist vorhanden, aber nicht lesbar oder beschaedigt
+- Abbruch. ..." or on Windows "Schluessel konnte nicht angelegt werden -
+Abbruch: ..."). Deleting a key file
 gives the device a new identity and a new ID. After a new host.key the
 host still knows its allowed devices, but they do not know its new key:
 each of them asks it to prove itself and needs the password (or
@@ -486,8 +494,9 @@ The client reads host.key and hosts.txt before it opens a connection:
                    host. The client retries every 2 s for at most about
                    30 s, writes this to the log once and connects by
                    itself as soon as the file is readable.
-    damaged        (host.key has the wrong length or cannot be
-                   written, hosts.txt is not UTF-8, e.g. ANSI): the
+    damaged        (host.key has the wrong length or a public half
+                   that does not match, or cannot be written,
+                   hosts.txt is not UTF-8, e.g. ANSI): the
                    client does not try again ("Verbindung zu <Adresse>
                    beendet: der Fehler bleibt bis zur Behebung - kein
                    neuer Versuch"). After fixing the problem, reconnect
@@ -808,8 +817,14 @@ PreventUserIdleSystemSleep) named with the text of the check item, listed
 by "pmset -g assertions" (non-ASCII characters of the name appear
 garbled there, the assertion is fine). Switching it off or quitting
 releases it at once ("Ruhezustand: verhindert, solange QuadChroma
-laeuft", "Ruhezustand: wieder erlaubt"). The host's keep-awake during a
-session (display included) is independent of it.
+laeuft", "Ruhezustand: wieder erlaubt"). If macOS refuses the assertion,
+the setting stays, but check mark and check box show what applies - off
+- and a disabled line under the check mark (in amber next to the check
+box) gives the reason with the system's code, "Not active: refused by
+the system (0x...)"; the log says "Ruhezustand: nicht umgestellt -
+IOPMAssertionCreateWithName: 0x...". Another click tries again. The
+host's keep-awake during a session (display included) is independent of
+it.
 
 Start at login registers the app as a login item in System Settings. It
 works only when QuadChroma.app lies in /Applications; elsewhere the
@@ -906,8 +921,9 @@ Started like that (outside the bundle), macOS attributes the permissions
 to the terminal, not to QuadChroma.app, and "Start at login" is disabled.
 
 Decoding on the Mac: VideoToolbox in the media engine of Apple silicon
-decodes HEVC 4:4:4 and 4:2:0 in 8 and 10 bits and H.264 (measured on the
-M1: about 3.8 ms per 1080p frame for HEVC 4:4:4 at 10 bits). The decoder
+decodes HEVC 4:4:4 and 4:2:0 in 8 and 10 bits and H.264 (measured in the
+client on the M1: about 5.6 ms per 1080p frame for HEVC 4:4:4 at 10
+bits, the decode time of its statistics). The decoder
 row of the Display tab has two buttons there: Automatic (the media
 engine) and Processor (VideoToolbox without hardware). If the media
 engine cannot decode the stream, the client falls back to the processor
@@ -918,7 +934,13 @@ names the format VideoToolbox delivers, for 4:4:4 at 10 bits:
     "VideoToolbox: 1920x1080 HEVC 4:4:4 10 Bit, Hardware ja, Ausgabe xf44
      (voller Wertebereich)"
 
-(i.e. hardware yes, output format xf44, full range). --decodertest on
+(i.e. hardware yes, output format xf44, full range). If the media engine
+fails in the middle of a stream (after sleep, or a transient error such
+as kVTVideoDecoderMalfunctionErr), the client drops the decoder session
+and waits for the next key frame, which creates a new one; decode errors
+are logged at most once per five seconds with the number of errors in
+between ("VideoToolbox: Decodierfehler bei Bild <n>: ... - Sitzung
+verworfen, neu mit dem naechsten Schluesselbild"). --decodertest on
 the Mac encodes a short HEVC 4:4:4 sample with the hardware encoder and
 decodes it with and without hardware (neither host nor screen capture is
 started).
@@ -1069,8 +1091,12 @@ PowerRequestSystemRequired), listed by "powercfg /requests" (as
 administrator) under SYSTEM as "[PROCESS] ...\quadchroma.exe" with the
 text of the check box as the reason. Switching it off or quitting clears
 it at once ("Ruhezustand: verhindert, solange QuadChroma laeuft",
-"Ruhezustand: wieder erlaubt"). The keep-awake of the host during a
-session (display included) is independent of it.
+"Ruhezustand: wieder erlaubt"). If Windows refuses the request, the
+setting stays, but check mark and check box show off with the reason
+and the system's code ("Not active: refused by the system (0x...)", a
+disabled line under the check mark, in amber next to the check box);
+another click tries again. The keep-awake of the host during a session
+(display included) is independent of it.
 
 Closing the window: notification area and menu bar
 --------------------------------------------------
@@ -1103,7 +1129,8 @@ On Windows the menu is built anew each time it opens:
     Ready for connections       or "Connected: <name>", "Port 9001 is used
                                 by another program", "Sharing is off"
     Open QuadChroma             bold: what left-click and double-click do
-    Connect: <name>             up to four found hosts
+    Connect: <name>             up to four computers of the start
+                                screen's list, in its order
     Device ID: 581 729 911      a click copies the nine digits
     Password: k7m-4wq-9tz       a click copies it, marked as concealed
     Change password ...
@@ -1116,20 +1143,20 @@ On Windows the menu is built anew each time it opens:
     Prevent sleep while QuadChroma is running   check mark when it is on
     Quit
 
-The Mac menu contains "Open", up to four found hosts as "Connect:
-<name>" and "Quit". "Connect" works like a click on the host row: a
-session to the same host stays, a session to another host is
-disconnected first. The tooltip reads "QuadChroma", during a session
-"QuadChroma - <name or address>" (the program uses an en dash instead
-of "-"), on Windows with sharing on and without a session "QuadChroma -
-sharing this PC (ID 581 729 911)". Names appear in the menu and in the
-tooltip with at most 40 characters; longer ones end in "...". The first
-time the app is hidden,
-the hint "QuadChroma is still running in the notification area."
-(Windows, balloon) or "QuadChroma is still running in the menu bar."
-(Mac, bubble below the icon, 6 s) appears once. This is recorded in
-einstellungen.txt as tray_hinweis=1, but only once the hint was actually
-visible; with tray_hinweis=0 it appears once more.
+The Mac menu contains "Open", up to four computers as "Connect: <name>" and
+"Quit". The "Connect" entries on both systems are the first four of the start
+screen's list: each computer once, known ones first, then by name, this
+computer left out. "Connect" works like a click on the host row: a session to
+the same host stays, a session to another host is disconnected first. The
+tooltip reads "QuadChroma", during a session "QuadChroma - <name or address>"
+(the program uses an en dash instead of "-"), on Windows with sharing on and
+without a session "QuadChroma - sharing this PC (ID 581 729 911)". Names
+appear in the menu and in the tooltip with at most 40 characters; longer ones
+end in "...". The first time the app is hidden, the hint "QuadChroma is still
+running in the notification area." (Windows, balloon) or "QuadChroma is still
+running in the menu bar." (Mac, bubble below the icon, 6 s) appears once. This
+is recorded in einstellungen.txt as tray_hinweis=1, but only once the hint was
+actually visible; with tray_hinweis=0 it appears once more.
 
 Quitting: "Quit" in the icon's menu or the "Quit" button on the start
 screen, on the Mac also ESC on the start screen and Cmd+Q; on Windows
@@ -1326,17 +1353,16 @@ host's address below it. Six tabs:
     Computers       the QuadChroma computers in the network, as on the
                     start screen; a click switches the session there
 
-Computers: the same list as on the start screen (name, device ID, check
-mark for known computers, this computer left out, same order), under the
-sentence "Click a computer to switch to it. This session ends." The
-current host is marked "Connected"; hovering shows a row's address, and
-the mouse wheel scrolls a long list. A click on another computer ends
-the running session as "Disconnect" does (keys released, connection
-closed, a running benchmark stopped) and connects to that computer at
-once, without the usual 2 s pause; if it does not know this computer
-yet, the access dialog appears ("Reiter Computer: trenne <Adresse> und
-verbinde mit <Name> (<Adresse>, ID <ID>)"). A click on the current host
-or ESC keeps the session.
+Computers: the same list as on the start screen (name, device ID, check mark
+for known computers, this computer left out, same order), under the sentence
+"Click a computer to switch to it. This session ends." The current host is
+marked "Connected"; hovering shows a row's address, and the mouse wheel or
+trackpad scrolls a long list. A click on another computer ends the running
+session as "Disconnect" does (keys released, connection closed, a running
+benchmark stopped) and connects to that computer at once, without the usual
+2 s pause; if it does not know this computer yet, the access dialog appears
+("Reiter Computer: trenne <Adresse> und verbinde mit <Name> (<Adresse>, ID
+<ID>)"). A click on the current host or ESC keeps the session.
 
 Hovering the mouse over a switch immediately shows a sentence about what
 it does - in each of the 29 languages.
@@ -2515,8 +2541,12 @@ uses the app's icon; every line also goes to
 paragraph on the hosts' logs above). Key, access and menu data are set up at
 the start of the app ("Host-Rolle im Prozess der App"); capture, encoder
 check, audio and input only when sharing is switched on for the first time.
-If that fails, the menu says "Could not start sharing this PC." and the
-reason is in host-protokoll.txt.
+If that fails, no port is opened, the status line of the menu says what
+failed ("Sharing could not start: host.key or its folder cannot be
+used.", "Sharing could not start: --konserve is not usable. Turn sharing
+off and on to retry." or "Could not start sharing this PC."), and the
+details are in host-protokoll.txt; switching sharing off and on again
+tries the start once more.
 
 The host-only process quadchroma.exe --nur-host (for a VM and for tests) runs
 the host role alone, without window and client, with an icon of its own; its
@@ -2546,37 +2576,44 @@ and access"). "Start with Windows" (in the one app's menu) puts the shortcut
 "QuadChroma.lnk" - the exe with --hintergrund - into the user's Startup
 folder, or removes it; the check mark shows whether it is there ("Mit Windows
 starten: an (Verknuepfung im Autostart-Ordner)" or "... aus"). A shortcut
-"QuadChroma - Freigabe.lnk" (the exe with --host) of an earlier version
-counts as on and is replaced by the new one when the app starts ("Mit Windows
-starten: die alte Verknuepfung der Freigabe ist durch die der App ersetzt");
-switching off removes both. "Stop sharing" of the host-only process says
-goodbye to the viewer (message 13, reason 1: "<Name> stopped sharing.") and
-ends it ("Freigabe beendet (Infobereich)"). At logoff or shutdown, when an
-installer closes it (Restart Manager) or another program sends WM_CLOSE to its
-hidden window, it ends the same way with reason 0 ("Host-Rolle wird beendet
-(Abmelden)", "... (Herunterfahren)", "... (ein Installationsprogramm schliesst
-die App (Restart Manager))" or "... (WM_CLOSE von aussen)", then "Host-Rolle
-beendet"); both wait at most 3 s for the viewer to take the goodbye. taskkill
-without /F does not reach it (it has no visible window, so taskkill asks for
-/F); a hard end (taskkill /F, Stop-Process) sends no goodbye. Menu and windows
-speak the language set in the client (einstellungen.txt), otherwise the one of
-Windows.
+"QuadChroma - Freigabe.lnk" (the exe with --host) of an earlier version counts
+as on and is replaced by the new one when the app starts, but only if it
+starts this very exe ("Mit Windows starten: die alte Verknuepfung der Freigabe
+ist durch die der App ersetzt"); a shortcut to another copy stays ("...
+startet <Pfad>, nicht diese exe - sie bleibt, wie sie ist"), so a test or
+portable copy never takes over the autostart. Switching off removes both.
+"Stop sharing" of the host-only process says goodbye to the viewer (message
+13, reason 1: "<Name> stopped sharing.") and ends it ("Freigabe beendet
+(Infobereich)"). At logoff or shutdown, when an installer closes it (Restart
+Manager) or another program sends WM_CLOSE to its hidden window, it ends the
+same way with reason 0 ("Host-Rolle wird beendet (Abmelden)", "...
+(Herunterfahren)", "... (ein Installationsprogramm schliesst die App (Restart
+Manager))" or "... (WM_CLOSE von aussen)", then "Host-Rolle beendet"); both
+wait at most 3 s for the viewer to take the goodbye. taskkill without /F does
+not reach it (it has no visible window, so taskkill asks for /F); a hard end
+(taskkill /F, Stop-Process) sends no goodbye. Menu and windows speak the
+language set in the client (einstellungen.txt), otherwise the one of Windows,
+and follow a change of it on the start screen at once ("Sprache der
+Host-Rolle: <code>"; an Allow window already open keeps its language).
 
 Without an icon - no Explorer, as over ssh or in session 0 - the host role
 runs without a menu, and new devices get in only with the password
 ("Infobereich: kein Symbol (<Grund>) - ohne Oberflaeche, neue Geraete nur per
 Passwort", in the one app "Host-Rolle in der App: Symbol der App steht (noch)
-nicht - ..."); announcement and message 20 then do not offer "Allow" until
-the icon is there. Only one host role runs per Windows session (mutex
+nicht - ..."); announcement and message 20 then do not offer "Allow" until the
+icon is there. Only one host role runs per Windows session (mutex
 Local\QuadChroma-Host, held by the one app while sharing is on): a second
---nur-host start ends at once with exit code 0 ("Die Freigabe laeuft in
-dieser Sitzung schon (Local\QuadChroma-Host) - dieser Start endet."), before
-it touches host-protokoll.txt; the one app then shows the port as taken and
-tries again every 5 s. --list may run next to it and then writes only to the
-console. If port 9001 is taken, the menu says so and the host role tries
-again every 5 s ("Bild-Port 9001 nicht verfuegbar: <Fehler> - neuer Versuch
-alle 5 s, das Menue zeigt es", later "Port 9001 ist frei - Dienst laeuft");
---nur-host without an icon ends with exit code 9 as before.
+--nur-host start ends at once with exit code 0 ("Die Freigabe laeuft in dieser
+Sitzung schon (Local\QuadChroma-Host) - dieser Start endet."), before it
+touches host-protokoll.txt; the one app then shows the port as taken and tries
+again every 5 s. --list may run next to it. As long as the one app runs
+(sharing on or off) it holds host-protokoll.txt (mutex
+Local\QuadChroma-Host-Protokoll); --list and --nur-host then never start that
+file afresh but write host-liste.txt or host-protokoll-nur-host.txt. If port
+9001 is taken, the menu says so and the host role tries again every 5 s
+("Bild-Port 9001 nicht verfuegbar: <Fehler> - neuer Versuch alle 5 s, das
+Menue zeigt es", later "Port 9001 ist frei - Dienst laeuft"); --nur-host
+without an icon ends with exit code 9 as before.
 
 The host role keeps these lines apart from the client's: its card lines at
 startup, FFmpeg's messages (from its encoder) and the "Zwischenablage: ..."
