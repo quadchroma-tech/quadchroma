@@ -272,6 +272,9 @@ pub static SV: Lang = Lang {
         (PreventSleepRefused, "Inte aktiv: nekad av systemet ({c})"),
         (CloseWindow, "Stäng fönstret"),
         (InputBlocked, "Ett fönster på Windows-datorn behöver Windows egen bekräftelse - styrning är inte möjlig där för tillfället."),
+        (AutostartInstalled, "Installerat i {n} - QuadChroma startar därifrån med Windows."),
+        (AutostartFailed, "\"Starta med Windows\" kunde inte ändras. Detaljer finns i protokoll.txt."),
+        (AutostartNeedsAdmin, "Endast med ett administratörskonto"),
     ],
 };
 
@@ -544,6 +547,9 @@ pub static DA: Lang = Lang {
         (PreventSleepRefused, "Ikke aktiv: afvist af systemet ({c})"),
         (CloseWindow, "Luk vinduet"),
         (InputBlocked, "Et vindue på Windows-pc'en kræver Windows' egen bekræftelse - styring er ikke mulig der et øjeblik."),
+        (AutostartInstalled, "Installeret i {n} - QuadChroma starter derfra med Windows."),
+        (AutostartFailed, "\"Start med Windows\" kunne ikke ændres. Detaljer står i protokoll.txt."),
+        (AutostartNeedsAdmin, "Kun med en administratorkonto"),
     ],
 };
 
@@ -816,6 +822,9 @@ pub static NB: Lang = Lang {
         (PreventSleepRefused, "Ikke aktiv: avvist av systemet ({c})"),
         (CloseWindow, "Lukk vinduet"),
         (InputBlocked, "Et vindu på Windows-PC-en trenger Windows' egen bekreftelse - styring er ikke mulig der et øyeblikk."),
+        (AutostartInstalled, "Installert i {n} - QuadChroma starter derfra med Windows."),
+        (AutostartFailed, "\"Start med Windows\" kunne ikke endres. Detaljer står i protokoll.txt."),
+        (AutostartNeedsAdmin, "Bare med en administratorkonto"),
     ],
 };
 
@@ -1088,6 +1097,9 @@ pub static FI: Lang = Lang {
         (PreventSleepRefused, "Ei käytössä: järjestelmä kieltäytyi ({c})"),
         (CloseWindow, "Sulje ikkuna"),
         (InputBlocked, "Windows-tietokoneen ikkuna vaatii Windowsin oman vahvistuksen - hallinta ei ole siellä hetkeen mahdollista."),
+        (AutostartInstalled, "Asennettu kohteeseen {n} - QuadChroma käynnistyy sieltä Windowsin mukana."),
+        (AutostartFailed, "Asetusta \"Käynnistä Windowsin mukana\" ei voitu muuttaa. Lisätietoja on tiedostossa protokoll.txt."),
+        (AutostartNeedsAdmin, "Vain järjestelmänvalvojan tilillä"),
     ],
 };
 
@@ -1360,5 +1372,8 @@ pub static IS: Lang = Lang {
         (PreventSleepRefused, "Ekki virkt: kerfið hafnaði ({c})"),
         (CloseWindow, "Loka glugganum"),
         (InputBlocked, "Gluggi á Windows-tölvunni þarf eigin staðfestingu Windows - stjórn er ekki möguleg þar í augnablikinu."),
+        (AutostartInstalled, "Sett upp í {n} - QuadChroma ræsist þaðan með Windows."),
+        (AutostartFailed, "Ekki tókst að breyta \"Ræsa með Windows\". Nánari upplýsingar eru í protokoll.txt."),
+        (AutostartNeedsAdmin, "Aðeins með stjórnandareikningi"),
     ],
 };

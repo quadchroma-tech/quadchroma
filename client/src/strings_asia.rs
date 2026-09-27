@@ -275,6 +275,9 @@ pub static RU: Lang = Lang {
         (PreventSleepRefused, "Не активно: система отклонила ({c})"),
         (CloseWindow, "Закрыть окно"),
         (InputBlocked, "Окну на ПК с Windows нужно собственное подтверждение Windows - управление там сейчас недоступно."),
+        (AutostartInstalled, "Установлено в {n} - QuadChroma запускается оттуда вместе с Windows."),
+        (AutostartFailed, "Не удалось изменить \"Запускать вместе с Windows\". Подробности в protokoll.txt."),
+        (AutostartNeedsAdmin, "Только с учётной записью администратора"),
     ],
 };
 
@@ -549,6 +552,9 @@ pub static ZH: Lang = Lang {
         (PreventSleepRefused, "未生效：被系统拒绝（{c}）"),
         (CloseWindow, "关闭窗口"),
         (InputBlocked, "Windows 电脑上的一个窗口需要 Windows 自己的确认 - 那里暂时无法控制。"),
+        (AutostartInstalled, "已安装到 {n} - QuadChroma 将从那里随 Windows 启动。"),
+        (AutostartFailed, "无法更改 \"随 Windows 启动\"。详细信息见 protokoll.txt。"),
+        (AutostartNeedsAdmin, "仅限管理员帐户"),
     ],
 };
 
@@ -823,6 +829,9 @@ pub static JA: Lang = Lang {
         (PreventSleepRefused, "無効：システムに拒否されました（{c}）"),
         (CloseWindow, "ウィンドウを閉じる"),
         (InputBlocked, "Windows パソコンのあるウィンドウが Windows 自身の確認を求めています - そこは今は操作できません。"),
+        (AutostartInstalled, "{n} にインストールしました - QuadChroma はそこから Windows と同時に起動します。"),
+        (AutostartFailed, "「Windows と同時に起動」を変更できませんでした。詳細は protokoll.txt にあります。"),
+        (AutostartNeedsAdmin, "管理者アカウントでのみ使用できます"),
     ],
 };
 
@@ -1095,5 +1104,8 @@ pub static TR: Lang = Lang {
         (PreventSleepRefused, "Etkin değil: sistem reddetti ({c})"),
         (CloseWindow, "Pencereyi kapat"),
         (InputBlocked, "Windows bilgisayarındaki bir pencere Windows'un kendi onayını istiyor - orada şu an denetim mümkün değil."),
+        (AutostartInstalled, "{n} konumuna yüklendi - QuadChroma oradan Windows ile başlar."),
+        (AutostartFailed, "\"Windows ile başlat\" değiştirilemedi. Ayrıntılar protokoll.txt dosyasında."),
+        (AutostartNeedsAdmin, "Yalnızca yönetici hesabıyla"),
     ],
 };

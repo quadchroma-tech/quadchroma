@@ -517,6 +517,21 @@ pub enum Key {
     /// nimmt dort auch von der erhoehten App keine Eingaben an (MSG_HOSTSTATUS
     /// mit 2, zurueckgenommen mit 3). Nur Windows-Host.
     InputBlocked,
+    // Sicherer Autostart unter Windows (Installation nach Program Files)
+    /// Meldung im Startbildschirm bzw. Sprechblase am Symbol nach dem
+    /// Einschalten von "Mit Windows starten": die App liegt jetzt in {n}
+    /// (%ProgramFiles%\QuadChroma), und die geplante Aufgabe startet sie von
+    /// dort. Nur Windows.
+    AutostartInstalled,
+    /// "Mit Windows starten" liess sich nicht umstellen (Installation oder
+    /// Aufgabe gescheitert); die Einzelheiten stehen in protokoll.txt. Nur
+    /// Windows.
+    AutostartFailed,
+    /// Kurzer Grund neben dem gesperrten Kaestchen "Mit Windows starten" und
+    /// unter dem gesperrten Punkt am Symbol: die App laeuft nicht unter dem
+    /// angemeldeten Administratorkonto (Standardkonto mit den Zugangsdaten
+    /// eines Administrators). Nur Windows.
+    AutostartNeedsAdmin,
 }
 
 pub struct Lang {
@@ -812,6 +827,9 @@ pub static EN: Lang = Lang {
         (PreventSleepRefused, "Not active: refused by the system ({c})"),
         (CloseWindow, "Close window"),
         (InputBlocked, "A window on the Windows PC needs Windows' own confirmation - control is not possible there for a moment."),
+        (AutostartInstalled, "Installed to {n} - QuadChroma starts from there with Windows."),
+        (AutostartFailed, "\"Start with Windows\" could not be changed. Details are in protokoll.txt."),
+        (AutostartNeedsAdmin, "Only with an administrator account"),
     ],
 };
 
@@ -1084,6 +1102,9 @@ pub static DE: Lang = Lang {
         (PreventSleepRefused, "Nicht aktiv: vom System abgelehnt ({c})"),
         (CloseWindow, "Fenster schließen"),
         (InputBlocked, "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung - dort ist die Steuerung kurz nicht möglich."),
+        (AutostartInstalled, "Nach {n} installiert - QuadChroma startet von dort mit Windows."),
+        (AutostartFailed, "„Mit Windows starten“ ließ sich nicht umstellen. Einzelheiten stehen in protokoll.txt."),
+        (AutostartNeedsAdmin, "Nur mit einem Administratorkonto"),
     ],
 };
 
@@ -1129,8 +1150,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > InputBlocked as usize);
-        assert_eq!(n, InputBlocked as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > AutostartNeedsAdmin as usize);
+        assert_eq!(n, AutostartNeedsAdmin as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1817,6 +1838,36 @@ mod tests {
             DE.get(InputBlocked),
             "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung - dort ist die Steuerung kurz nicht möglich."
         );
+    }
+
+    /// Die Texte des sicheren Autostarts (nur Windows): am Ende des Enums, in
+    /// jeder Sprache ohne englische Reste; AutostartInstalled nennt den Ordner
+    /// ({n}) genau einmal und "Windows", AutostartFailed nennt protokoll.txt
+    /// ohne Platzhalter, AutostartNeedsAdmin ist ein kurzer Grund ohne
+    /// Platzhalter und ohne Punkt am Ende (er steht rechts neben dem
+    /// Kaestchen und unter dem Punkt am Symbol).
+    #[test]
+    fn autostart_texte() {
+        assert_eq!(AutostartInstalled as usize, InputBlocked as usize + 1);
+        assert_eq!(AutostartFailed as usize, InputBlocked as usize + 2);
+        assert_eq!(AutostartNeedsAdmin as usize, InputBlocked as usize + 3);
+        for l in all() {
+            let i = l.get(AutostartInstalled);
+            assert_eq!(i.matches("{n}").count(), 1, "{}: {i}", l.code);
+            assert_eq!(i.matches('{').count(), 1, "{}: {i}", l.code);
+            assert!(i.contains("Windows") && i.contains("QuadChroma"), "{}: {i}", l.code);
+            let f = l.get(AutostartFailed);
+            assert!(f.contains("protokoll.txt") && f.contains("Windows") && !f.contains('{'), "{}: {f}", l.code);
+            let g = l.get(AutostartNeedsAdmin);
+            assert!(!g.contains('{') && !g.ends_with('.') && g.chars().count() <= 48, "{}: {g}", l.code);
+            if l.code != "en" {
+                for k in [AutostartInstalled, AutostartFailed, AutostartNeedsAdmin] {
+                    assert_ne!(l.get(k), EN.get(k), "{} {k:?}: noch englisch", l.code);
+                }
+            }
+        }
+        assert_eq!(EN.get(AutostartInstalled).replace("{n}", "C:\\Program Files\\QuadChroma"), "Installed to C:\\Program Files\\QuadChroma - QuadChroma starts from there with Windows.");
+        assert_eq!(DE.get(AutostartNeedsAdmin), "Nur mit einem Administratorkonto");
     }
 
     /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der

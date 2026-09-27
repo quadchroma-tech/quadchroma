@@ -274,6 +274,9 @@ pub static FR: Lang = Lang {
         (PreventSleepRefused, "Inactif : refusé par le système ({c})"),
         (CloseWindow, "Fermer la fenêtre"),
         (InputBlocked, "Une fenêtre sur le PC Windows demande la propre confirmation de Windows - la commande n'y est pas possible pour un instant."),
+        (AutostartInstalled, "Installé dans {n} - QuadChroma démarre depuis cet emplacement avec Windows."),
+        (AutostartFailed, "Impossible de modifier « Démarrer avec Windows ». Les détails figurent dans protokoll.txt."),
+        (AutostartNeedsAdmin, "Uniquement avec un compte administrateur"),
     ],
 };
 
@@ -546,6 +549,9 @@ pub static ES: Lang = Lang {
         (PreventSleepRefused, "No activo: rechazado por el sistema ({c})"),
         (CloseWindow, "Cerrar ventana"),
         (InputBlocked, "Una ventana en el PC con Windows necesita la propia confirmación de Windows - el control no es posible ahí por un momento."),
+        (AutostartInstalled, "Instalado en {n} - QuadChroma se inicia desde allí con Windows."),
+        (AutostartFailed, "No se pudo cambiar \"Iniciar con Windows\". Los detalles están en protokoll.txt."),
+        (AutostartNeedsAdmin, "Solo con una cuenta de administrador"),
     ],
 };
 
@@ -818,6 +824,9 @@ pub static IT: Lang = Lang {
         (PreventSleepRefused, "Non attivo: rifiutato dal sistema ({c})"),
         (CloseWindow, "Chiudi finestra"),
         (InputBlocked, "Una finestra sul PC Windows richiede la conferma di Windows stesso - lì il controllo non è possibile per un momento."),
+        (AutostartInstalled, "Installato in {n} - QuadChroma si avvia da lì con Windows."),
+        (AutostartFailed, "Impossibile modificare \"Avvia con Windows\". I dettagli sono in protokoll.txt."),
+        (AutostartNeedsAdmin, "Solo con un account amministratore"),
     ],
 };
 
@@ -1090,6 +1099,9 @@ pub static PT: Lang = Lang {
         (PreventSleepRefused, "Inativo: recusado pelo sistema ({c})"),
         (CloseWindow, "Fechar janela"),
         (InputBlocked, "Uma janela no PC com Windows precisa da própria confirmação do Windows - o controlo não é possível aí por um momento."),
+        (AutostartInstalled, "Instalado em {n} - o QuadChroma inicia a partir daí com o Windows."),
+        (AutostartFailed, "Não foi possível alterar \"Iniciar com o Windows\". Os detalhes estão em protokoll.txt."),
+        (AutostartNeedsAdmin, "Só com uma conta de administrador"),
     ],
 };
 
@@ -1362,5 +1374,8 @@ pub static NL: Lang = Lang {
         (PreventSleepRefused, "Niet actief: geweigerd door het systeem ({c})"),
         (CloseWindow, "Venster sluiten"),
         (InputBlocked, "Een venster op de Windows-pc vereist Windows' eigen bevestiging - besturing is daar even niet mogelijk."),
+        (AutostartInstalled, "Geïnstalleerd in {n} - QuadChroma start van daaruit met Windows."),
+        (AutostartFailed, "\"Starten met Windows\" kon niet worden gewijzigd. Details staan in protokoll.txt."),
+        (AutostartNeedsAdmin, "Alleen met een beheerdersaccount"),
     ],
 };

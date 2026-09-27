@@ -272,6 +272,9 @@ pub static ET: Lang = Lang {
         (PreventSleepRefused, "Pole aktiivne: süsteem keeldus ({c})"),
         (CloseWindow, "Sulge aken"),
         (InputBlocked, "Windowsi arvutis olev aken vajab Windowsi enda kinnitust - seal pole juhtimine hetkel võimalik."),
+        (AutostartInstalled, "Installitud asukohta {n} - QuadChroma käivitub sealt koos Windowsiga."),
+        (AutostartFailed, "Valikut \"Käivita koos Windowsiga\" ei õnnestunud muuta. Üksikasjad on failis protokoll.txt."),
+        (AutostartNeedsAdmin, "Ainult administraatori kontoga"),
     ],
 };
 
@@ -544,6 +547,9 @@ pub static LV: Lang = Lang {
         (PreventSleepRefused, "Nav aktīvs: sistēma atteica ({c})"),
         (CloseWindow, "Aizvērt logu"),
         (InputBlocked, "Logam Windows datorā nepieciešams paša Windows apstiprinājums - tur vadība pašlaik nav iespējama."),
+        (AutostartInstalled, "Instalēts mapē {n} - QuadChroma no turienes startē kopā ar Windows."),
+        (AutostartFailed, "Iestatījumu \"Palaist kopā ar Windows\" neizdevās mainīt. Sīkāka informācija ir failā protokoll.txt."),
+        (AutostartNeedsAdmin, "Tikai ar administratora kontu"),
     ],
 };
 
@@ -816,6 +822,9 @@ pub static LT: Lang = Lang {
         (PreventSleepRefused, "Neaktyvu: sistema atmetė ({c})"),
         (CloseWindow, "Uždaryti langą"),
         (InputBlocked, "Langas Windows kompiuteryje reikalauja paties Windows patvirtinimo - ten valdymas šiuo metu negalimas."),
+        (AutostartInstalled, "Įdiegta į {n} - QuadChroma iš ten paleidžiama kartu su Windows."),
+        (AutostartFailed, "Nepavyko pakeisti \"Paleisti kartu su Windows\". Išsami informacija yra faile protokoll.txt."),
+        (AutostartNeedsAdmin, "Tik su administratoriaus paskyra"),
     ],
 };
 
@@ -1088,6 +1097,9 @@ pub static SL: Lang = Lang {
         (PreventSleepRefused, "Ni dejavno: sistem je zavrnil ({c})"),
         (CloseWindow, "Zapri okno"),
         (InputBlocked, "Okno na računalniku Windows potrebuje lastno potrditev sistema Windows - tam upravljanje trenutno ni mogoče."),
+        (AutostartInstalled, "Nameščeno v {n} - QuadChroma se od tam zažene s sistemom Windows."),
+        (AutostartFailed, "Možnosti \"Zaženi s sistemom Windows\" ni bilo mogoče spremeniti. Podrobnosti so v protokoll.txt."),
+        (AutostartNeedsAdmin, "Samo s skrbniškim računom"),
     ],
 };
 
@@ -1360,6 +1372,9 @@ pub static HR: Lang = Lang {
         (PreventSleepRefused, "Nije aktivno: sustav je odbio ({c})"),
         (CloseWindow, "Zatvori prozor"),
         (InputBlocked, "Prozor na Windows računalu treba vlastitu potvrdu sustava Windows - ondje upravljanje trenutačno nije moguće."),
+        (AutostartInstalled, "Instalirano u {n} - QuadChroma se odande pokreće sa sustavom Windows."),
+        (AutostartFailed, "Postavku \"Pokreni sa sustavom Windows\" nije moguće promijeniti. Pojedinosti su u protokoll.txt."),
+        (AutostartNeedsAdmin, "Samo s administratorskim računom"),
     ],
 };
 
@@ -1632,5 +1647,8 @@ pub static UK: Lang = Lang {
         (PreventSleepRefused, "Не активно: система відхилила ({c})"),
         (CloseWindow, "Закрити вікно"),
         (InputBlocked, "Вікну на ПК з Windows потрібне власне підтвердження Windows - там керування зараз неможливе."),
+        (AutostartInstalled, "Встановлено в {n} - QuadChroma запускається звідти разом із Windows."),
+        (AutostartFailed, "Не вдалося змінити \"Запускати разом із Windows\". Подробиці в protokoll.txt."),
+        (AutostartNeedsAdmin, "Лише з обліковим записом адміністратора"),
     ],
 };

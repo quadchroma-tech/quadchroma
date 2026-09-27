@@ -272,6 +272,9 @@ pub static PL: Lang = Lang {
         (PreventSleepRefused, "Nieaktywne: odrzucone przez system ({c})"),
         (CloseWindow, "Zamknij okno"),
         (InputBlocked, "Okno na komputerze z Windows wymaga własnego potwierdzenia systemu Windows - sterowanie tam chwilowo nie jest możliwe."),
+        (AutostartInstalled, "Zainstalowano w {n} - QuadChroma uruchamia się stamtąd z systemem Windows."),
+        (AutostartFailed, "Nie udało się zmienić opcji \"Uruchamiaj z systemem Windows\". Szczegóły są w pliku protokoll.txt."),
+        (AutostartNeedsAdmin, "Tylko z kontem administratora"),
     ],
 };
 
@@ -544,6 +547,9 @@ pub static CS: Lang = Lang {
         (PreventSleepRefused, "Neaktivní: systém odmítl ({c})"),
         (CloseWindow, "Zavřít okno"),
         (InputBlocked, "Okno v počítači s Windows vyžaduje vlastní potvrzení systému Windows - ovládání tam právě teď není možné."),
+        (AutostartInstalled, "Nainstalováno do {n} - QuadChroma se odtud spouští se systémem Windows."),
+        (AutostartFailed, "Volbu \"Spouštět se systémem Windows\" nebylo možné změnit. Podrobnosti jsou v souboru protokoll.txt."),
+        (AutostartNeedsAdmin, "Pouze s účtem správce"),
     ],
 };
 
@@ -816,6 +822,9 @@ pub static SK: Lang = Lang {
         (PreventSleepRefused, "Neaktívne: systém odmietol ({c})"),
         (CloseWindow, "Zavrieť okno"),
         (InputBlocked, "Okno v počítači s Windows vyžaduje vlastné potvrdenie systému Windows - ovládanie tam práve teraz nie je možné."),
+        (AutostartInstalled, "Nainštalované do {n} - QuadChroma sa odtiaľ spúšťa so systémom Windows."),
+        (AutostartFailed, "Voľbu \"Spúšťať so systémom Windows\" sa nepodarilo zmeniť. Podrobnosti sú v súbore protokoll.txt."),
+        (AutostartNeedsAdmin, "Iba s účtom správcu"),
     ],
 };
 
@@ -1088,6 +1097,9 @@ pub static HU: Lang = Lang {
         (PreventSleepRefused, "Nem aktív: a rendszer elutasította ({c})"),
         (CloseWindow, "Ablak bezárása"),
         (InputBlocked, "A Windows számítógépen egy ablak a Windows saját megerősítését kéri - ott az irányítás egy pillanatra nem lehetséges."),
+        (AutostartInstalled, "Telepítve ide: {n} - a QuadChroma innen indul a Windows-zal."),
+        (AutostartFailed, "Az \"Indítás a Windows-zal\" beállítást nem sikerült módosítani. A részletek a protokoll.txt fájlban vannak."),
+        (AutostartNeedsAdmin, "Csak rendszergazdai fiókkal"),
     ],
 };
 
@@ -1360,6 +1372,9 @@ pub static RO: Lang = Lang {
         (PreventSleepRefused, "Inactiv: refuzat de sistem ({c})"),
         (CloseWindow, "Închide fereastra"),
         (InputBlocked, "O fereastră de pe PC-ul Windows are nevoie de confirmarea proprie a Windows - controlul nu este posibil acolo pentru moment."),
+        (AutostartInstalled, "Instalat în {n} - QuadChroma pornește de acolo odată cu Windows."),
+        (AutostartFailed, "Opțiunea \"Pornește odată cu Windows\" nu a putut fi modificată. Detaliile sunt în protokoll.txt."),
+        (AutostartNeedsAdmin, "Doar cu un cont de administrator"),
     ],
 };
 
@@ -1632,6 +1647,9 @@ pub static BG: Lang = Lang {
         (PreventSleepRefused, "Неактивно: отказано от системата ({c})"),
         (CloseWindow, "Затвори прозореца"),
         (InputBlocked, "Прозорец на компютъра с Windows изисква собственото потвърждение на Windows - управлението там в момента не е възможно."),
+        (AutostartInstalled, "Инсталирано в {n} - QuadChroma се стартира оттам с Windows."),
+        (AutostartFailed, "\"Стартиране с Windows\" не можа да се промени. Подробности има в protokoll.txt."),
+        (AutostartNeedsAdmin, "Само с администраторски акаунт"),
     ],
 };
 
@@ -1904,5 +1922,8 @@ pub static EL: Lang = Lang {
         (PreventSleepRefused, "Ανενεργό: απορρίφθηκε από το σύστημα ({c})"),
         (CloseWindow, "Κλείσιμο παραθύρου"),
         (InputBlocked, "Ένα παράθυρο στον υπολογιστή Windows χρειάζεται τη δική του επιβεβαίωση των Windows - ο έλεγχος εκεί δεν είναι δυνατός προς το παρόν."),
+        (AutostartInstalled, "Εγκαταστάθηκε στο {n} - το QuadChroma ξεκινά από εκεί με τα Windows."),
+        (AutostartFailed, "Δεν ήταν δυνατή η αλλαγή της επιλογής \"Εκκίνηση με τα Windows\". Λεπτομέρειες στο protokoll.txt."),
+        (AutostartNeedsAdmin, "Μόνο με λογαριασμό διαχειριστή"),
     ],
 };
