@@ -6561,6 +6561,16 @@ impl App {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs = attrs.with_taskbar_icon(logo::fenster_symbol(48));
         }
+        // macOS: im Vollbild (Fullscreen::Borderless) Menueleiste und Dock
+        // ganz aus - auch am oberen Rand: der gehoert dem Rechner drueben.
+        // winit setzt dafuer HideDock|HideMenuBar vor toggleFullScreen;
+        // zurueck nimmt es das nicht - das tut vor_dem_warten
+        // (host_mac::leisten_zurueck), sobald das Vollbild verlassen ist.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs.with_borderless_game(true);
+        }
         let window = Arc::new(el.create_window(attrs).expect("Fenster"));
         // Wer zeichnet: die Karte, wenn sie gewuenscht ist und geht - sonst
         // softbuffer. Nie beides am selben Fenster: erst wenn feststeht, dass
@@ -7016,6 +7026,14 @@ impl App {
                 el.set_control_flow(ControlFlow::Wait);
             }
             return;
+        }
+        // macOS: ausserhalb des Vollbilds Menueleiste und Dock zurueck (nach
+        // F11, beim Ablegen, nach einem gescheiterten Vollbild). Nur wenn
+        // winit kein Vollbild will - beim Betreten setzt es die Optionen,
+        // bevor AppKit das Vollbild traegt. Ein Lesen der Optionen je Takt.
+        #[cfg(target_os = "macos")]
+        if self.window.as_ref().is_some_and(|w| w.fullscreen().is_none()) && host_mac::leisten_zurueck() {
+            protokoll::zeile("Vollbild verlassen: Menueleiste und Dock wieder sichtbar".into());
         }
         #[cfg(target_os = "macos")]
         if let Some(t) = self.verbergen_faellig {

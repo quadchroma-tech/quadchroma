@@ -494,6 +494,44 @@ pub fn aktivierung(sichtbar: bool) {
     objc::anwendung(sichtbar);
 }
 
+// ------------------------------------------------------ Vollbild
+
+/// NSApplicationPresentationOptions (AppKit, NSApplication.h).
+const AUTO_DOCK: usize = 1 << 0;
+const OHNE_DOCK: usize = 1 << 1;
+const AUTO_MENUELEISTE: usize = 1 << 2;
+const OHNE_MENUELEISTE: usize = 1 << 3;
+const VOLLBILD: usize = 1 << 10;
+
+/// Die Praesentationsoptionen ausserhalb des Vollbilds: Menueleiste und
+/// Dock wieder da. Das Vollbild der Sitzung (Fullscreen::Borderless mit
+/// with_borderless_game) blendet beide ganz aus - winit 0.30.13 setzt dafuer
+/// HideDock|HideMenuBar vor toggleFullScreen und nimmt es beim Verlassen
+/// nicht zurueck (window_did_exit_fullscreen stellt nur Stil und Groesse
+/// wieder her). Stellt AppKit beim Verlassen die Optionen von vorher her,
+/// sind es eben diese - Menueleiste und Dock blieben auch ohne Vollbild weg
+/// (am Geraet nicht geprueft; die Pruefung hier kostet nur ein Lesen).
+/// Some(neu), wenn etwas zurueckzunehmen ist: kein Vollbild (im Uebergang
+/// traegt AppKit noch FullScreen) und eine der vier Arten, Dock oder
+/// Menueleiste zu verbergen, gesetzt. Dann gilt die Vorgabe 0 - die App
+/// setzt sonst keine Optionen, und 0 ist immer eine erlaubte Kombination
+/// (eine unerlaubte loeste eine Ausnahme aus).
+pub fn leisten_optionen(jetzt: usize) -> Option<usize> {
+    let verborgen = jetzt & (AUTO_DOCK | OHNE_DOCK | AUTO_MENUELEISTE | OHNE_MENUELEISTE) != 0;
+    (jetzt & VOLLBILD == 0 && verborgen).then_some(0)
+}
+
+/// Ausserhalb des Vollbilds (das Fenster ist keins oder hat es verlassen):
+/// Menueleiste und Dock wieder zeigen, falls das Vollbild sie verborgen
+/// zuruecklaesst (siehe leisten_optionen). Die Optionen gelten ohnehin nur,
+/// solange QuadChroma die aktive App ist - Cmd+Tab zu einer anderen zeigt
+/// deren Menueleiste. true, wenn zurueckgesetzt wurde. Hauptfaden; nur
+/// rufen, wenn winit kein Vollbild will (Window::fullscreen() None) - beim
+/// Betreten setzt winit die Optionen, bevor AppKit FullScreen traegt.
+pub fn leisten_zurueck() -> bool {
+    objc::praesentation_zuruecksetzen(leisten_optionen)
+}
+
 // ------------------------------------------------------------ Objective-C
 // Von Hand ueber objc_msgSend wie in clipboard_mac.rs: keine Kiste.
 
@@ -591,6 +629,26 @@ mod objc {
             let app = id(klasse(c"NSApplication"), c"sharedApplication");
             if !app.is_null() {
                 senden!(app, sel(c"setActivationPolicy:"), if sichtbar { REGULAR } else { ACCESSORY } => isize; -> u8);
+            }
+        }
+    }
+
+    /// NSApp.presentationOptions lesen; liefert `neu` einen Wert, ihn setzen.
+    /// true, wenn gesetzt wurde.
+    pub fn praesentation_zuruecksetzen(neu: impl FnOnce(usize) -> Option<usize>) -> bool {
+        let _pool = Pool::neu();
+        unsafe {
+            let app = id(klasse(c"NSApplication"), c"sharedApplication");
+            if app.is_null() {
+                return false;
+            }
+            let jetzt = senden!(app, sel(c"presentationOptions"); -> usize);
+            match neu(jetzt) {
+                Some(n) => {
+                    senden!(app, sel(c"setPresentationOptions:"), n => usize; -> ());
+                    true
+                }
+                None => false,
             }
         }
     }
@@ -947,6 +1005,20 @@ mod tests {
         assert_eq!(wahl_aus(APP_BEENDEN, None), Some(Wahl::Aktion(Aktion::Beenden)));
         assert_eq!(wahl_aus(0, None), None);
         assert_eq!(wahl_aus(99, Some("x")), None);
+    }
+
+    /// Menueleiste und Dock nach dem Vollbild: zurueck auf 0 nur ohne
+    /// FullScreen und nur, wenn eine Art des Verbergens gesetzt ist.
+    #[test]
+    fn leisten_nach_dem_vollbild() {
+        assert_eq!(leisten_optionen(0), None, "nichts verborgen");
+        assert_eq!(leisten_optionen(OHNE_DOCK | OHNE_MENUELEISTE), Some(0), "von winit zurueckgelassen");
+        assert_eq!(leisten_optionen(AUTO_DOCK | AUTO_MENUELEISTE), Some(0));
+        assert_eq!(leisten_optionen(OHNE_DOCK), Some(0));
+        assert_eq!(leisten_optionen(VOLLBILD | OHNE_DOCK | OHNE_MENUELEISTE), None, "im Vollbild bleiben sie aus");
+        assert_eq!(leisten_optionen(VOLLBILD | AUTO_DOCK | AUTO_MENUELEISTE), None, "auch im Uebergang");
+        assert_eq!(leisten_optionen(1 << 9), None, "andere Optionen allein bleiben");
+        assert_eq!((OHNE_DOCK, OHNE_MENUELEISTE, VOLLBILD), (2, 8, 1024), "Werte aus NSApplication.h");
     }
 
     /// Die Pruefung im Fenster "Geraetename" ist die des Clients.
