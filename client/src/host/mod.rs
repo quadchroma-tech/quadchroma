@@ -1507,8 +1507,12 @@ fn protokoll_mutex_nehmen(mutex: &str) -> bool {
 
 /// Fuer die Werkzeuge: host-protokoll.txt, wenn sie frei ist, sonst eine
 /// eigene Datei `eigene` (neu begonnen) - die der App bleibt, wie sie ist.
-fn protokoll_fuer_werkzeug(eigene: &str) {
-    if protokoll_nachholen() {
+/// `rolle_pruefen`: auch eine laufende Host-Rolle (Mutex der Freigabe)
+/// zaehlt als Schreiber - eine fruehere Fassung haelt den Mutex des
+/// Protokolls noch nicht (--list; --nur-host haelt den der Freigabe selbst).
+fn protokoll_fuer_werkzeug(eigene: &str, rolle_pruefen: bool) {
+    let rolle_fremd = rolle_pruefen && oberflaeche::laeuft(oberflaeche::MUTEX);
+    if !rolle_fremd && protokoll_nachholen() {
         return;
     }
     protokoll_oeffnen(eigene);
@@ -1527,9 +1531,12 @@ fn rolle_laufen(
 ) {
     protokoll::herkunft_setzen(protokoll::Herkunft::Host);
     // Schreibt noch ein anderer Prozess host-protokoll.txt (eine reine
-    // Host-Rolle, ein Werkzeug), holt die Rolle es nach, sobald sie die
+    // Host-Rolle, ein Werkzeug - oder eine fruehere Fassung, die nur den
+    // Mutex der Freigabe haelt), holt die Rolle es nach, sobald sie die
     // Ports hat (netz_versuchen).
-    protokoll_nachholen();
+    if !oberflaeche::laeuft(oberflaeche::MUTEX) {
+        protokoll_nachholen();
+    }
     if let Err(e) = ffmpeg_next::init() {
         log(format!("FFmpeg-Start fehlgeschlagen: {e} - dieser PC wird nicht freigegeben"));
         stand.fehler.store(FEHLER_SONST, Ordering::SeqCst);
@@ -1617,7 +1624,7 @@ pub fn main_host(args: &[String]) -> i32 {
         // --list laeuft ohne Einzelinstanz (neben der App erlaubt). Schreibt
         // die App host-protokoll.txt (auch mit Freigabe aus), bekommt --list
         // eine eigene Datei - neu beginnen leerte sonst ihr Protokoll.
-        protokoll_fuer_werkzeug("host-liste.txt");
+        protokoll_fuer_werkzeug("host-liste.txt", true);
         log(&dpi);
         aufnahme::ausgaenge_melden(&mut Vec::new());
         encoder::pruefen();
@@ -1629,7 +1636,7 @@ pub fn main_host(args: &[String]) -> i32 {
     // --nur-host: laeuft die App (Freigabe aus - sonst haette sie den Mutex
     // der Host-Rolle, und dieser Start waere oben schon zu Ende), gehoert ihr
     // host-protokoll.txt.
-    protokoll_fuer_werkzeug("host-protokoll-nur-host.txt");
+    protokoll_fuer_werkzeug("host-protokoll-nur-host.txt", false);
     log(&dpi);
     if let Some(e) = instanz_fehler {
         log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
