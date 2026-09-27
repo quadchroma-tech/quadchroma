@@ -119,26 +119,101 @@ fn client_us() -> u64 {
 /// (%APPDATA%\QuadChroma, auf dem Mac ~/Library/Application Support/
 /// QuadChroma), das bei jedem Start neu beginnt - ein paar Zeilen je
 /// Sitzung, mehr nicht.
+///
+/// Zwei Rollen, zwei Reihen: der Rueckruf von FFmpeg gilt fuer den ganzen
+/// Prozess, Client und Host-Rolle koennen sich aber einen Prozess teilen.
+/// Jede Zeile gehoert deshalb einer Herkunft - der des Fadens, der sie sagt
+/// (`herkunft_setzen`; ungesetzt ist es der Client). Die Faeden der
+/// Host-Rolle, die FFmpeg benutzen (Dienst, Aufnahme mit Encoder, Messung),
+/// setzen Herkunft::Host; ihre Zeilen, Warnungen und Fehler landen in der
+/// Reihe des Hosts, die der Host abholt und in host-protokoll.txt schreibt -
+/// nie in protokoll.txt des Clients und nie in seinen Rueckfallgruenden.
+/// Faeden, die FFmpeg selbst anlegt (etwa die Bildfaeden eines
+/// Software-Decoders), haben keine Herkunft und zaehlen zum Client; die
+/// Encoder der Host-Rolle legen keine an (nvenc, h264_mf). Geteilte Teile, die
+/// fuer beide Rollen sprechen (der Ablagewaechter), nennen die Herkunft
+/// ausdruecklich (`zeile_als`).
 mod protokoll {
     use ffmpeg_next as ffmpeg;
+    use std::cell::Cell;
     use std::io::Write;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Mutex;
 
-    static STUFE: AtomicI32 = AtomicI32::new(ffmpeg::sys::AV_LOG_WARNING);
-    /// Zeilen seit dem letzten Abholen. Holt niemand ab (Fenstermodus),
-    /// bleibt die Reihe bei 512 stehen - die Datei hat dann alles.
-    static ZEILEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    /// Die letzten Warnungen und Fehler von FFmpeg, fuer Rueckfallgruende.
-    static FEHLER: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    /// Eine FFmpeg-Meldung kann in Stuecken kommen; der Zeilenumbruch
-    /// schliesst sie ab. Der Rest der angefangenen Zeile und FFmpegs
-    /// Praefix-Zustand ("naechstes Stueck bekommt einen Absender") liegen
-    /// unter EINER Sperre, die schon vor dem Formatieren genommen wird -
-    /// FFmpeg ruft den Rueckruf aus jedem Faden, der etwas zu sagen hat,
-    /// auch aus den Arbeitsfaeden eines Decoders, und genau so haelt es
-    /// FFmpegs eigener Rueckruf.
-    static OFFEN: Mutex<(String, std::os::raw::c_int)> = Mutex::new((String::new(), 1));
+    /// Wem eine Zeile gehoert - und wer in der Zwischenablage etwas ablegt
+    /// oder abnimmt (clipboard.rs, ablage_ruhe.rs): der Client oder die
+    /// Host-Rolle.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Herkunft {
+        Client,
+        Host,
+    }
+
+    impl Herkunft {
+        /// Platz der Herkunft in Tabellen je Rolle.
+        pub const fn stelle(self) -> usize {
+            match self {
+                Herkunft::Client => 0,
+                Herkunft::Host => 1,
+            }
+        }
+    }
+
+    thread_local! {
+        /// Herkunft dieses Fadens (herkunft_setzen); ungesetzt der Client.
+        static FADEN: Cell<Herkunft> = const { Cell::new(Herkunft::Client) };
+    }
+
+    /// Herkunft des aufrufenden Fadens.
+    pub fn herkunft() -> Herkunft {
+        FADEN.with(|f| f.get())
+    }
+
+    /// Ab jetzt gehoert, was dieser Faden sagt und abholt, zu `h`. Die Faeden
+    /// der Host-Rolle setzen Herkunft::Host, bevor sie FFmpeg anfassen.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub fn herkunft_setzen(h: Herkunft) {
+        FADEN.with(|f| f.set(h));
+    }
+
+    /// Die Reihe einer Herkunft: Stufe, Zeilen, letzte Warnungen, die
+    /// angefangene Zeile.
+    struct Reihe {
+        stufe: AtomicI32,
+        /// Zeilen seit dem letzten Abholen. Holt niemand ab (Fenstermodus),
+        /// bleibt die Reihe bei 512 stehen - beim Client hat dann die Datei
+        /// alles; der Host holt im Takt ab.
+        zeilen: Mutex<Vec<String>>,
+        /// Die letzten Warnungen und Fehler von FFmpeg, fuer Rueckfallgruende.
+        fehler: Mutex<Vec<String>>,
+        /// Eine FFmpeg-Meldung kann in Stuecken kommen; der Zeilenumbruch
+        /// schliesst sie ab. Der Rest der angefangenen Zeile und FFmpegs
+        /// Praefix-Zustand ("naechstes Stueck bekommt einen Absender") liegen
+        /// unter EINER Sperre, die schon vor dem Formatieren genommen wird -
+        /// FFmpeg ruft den Rueckruf aus jedem Faden, der etwas zu sagen hat,
+        /// auch aus den Arbeitsfaeden eines Decoders, und genau so haelt es
+        /// FFmpegs eigener Rueckruf. Je Herkunft eine, damit die Stuecke der
+        /// einen Rolle nie an einer Zeile der anderen kleben.
+        offen: Mutex<(String, std::os::raw::c_int)>,
+    }
+
+    impl Reihe {
+        const fn neu() -> Reihe {
+            Reihe {
+                stufe: AtomicI32::new(ffmpeg::sys::AV_LOG_WARNING),
+                zeilen: Mutex::new(Vec::new()),
+                fehler: Mutex::new(Vec::new()),
+                offen: Mutex::new((String::new(), 1)),
+            }
+        }
+    }
+
+    static REIHEN: [Reihe; 2] = [Reihe::neu(), Reihe::neu()];
+
+    fn reihe(h: Herkunft) -> &'static Reihe {
+        &REIHEN[h.stelle()]
+    }
+
     /// Die Datei, beim ersten Schreiben geoeffnet und dabei geleert.
     static DATEI: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
@@ -146,8 +221,8 @@ mod protokoll {
         crate::einstellungen::datei_pfad("protokoll.txt")
     }
 
-    /// Nur in die Datei - fuer die Taktzeilen des Pruefmodus, die auf der
-    /// Konsole ohnehin stehen.
+    /// Nur in die Datei des Clients - fuer die Taktzeilen des Pruefmodus,
+    /// die auf der Konsole ohnehin stehen.
     pub fn nur_datei(text: &str) {
         let Ok(mut d) = DATEI.lock() else { return };
         if d.is_none() {
@@ -158,10 +233,18 @@ mod protokoll {
         }
     }
 
-    /// Eine Zeile ins Protokoll: Datei und Reihe.
+    /// Eine Zeile ins Protokoll der Herkunft dieses Fadens.
     pub fn zeile(text: String) {
-        nur_datei(&text);
-        if let Ok(mut z) = ZEILEN.lock() {
+        zeile_als(herkunft(), text);
+    }
+
+    /// Eine Zeile ins Protokoll von `h`: beim Client Datei und Reihe, beim
+    /// Host nur seine Reihe (er schreibt sie beim Abholen in seine Datei).
+    pub fn zeile_als(h: Herkunft, text: String) {
+        if h == Herkunft::Client {
+            nur_datei(&text);
+        }
+        if let Ok(mut z) = reihe(h).zeilen.lock() {
             if z.len() < 512 {
                 z.push(text);
             }
@@ -174,12 +257,16 @@ mod protokoll {
         fmt: *const std::os::raw::c_char,
         vl: ffmpeg::sys::va_list,
     ) {
-        if stufe > STUFE.load(Ordering::Relaxed) {
+        // Der Faden, der spricht, bestimmt die Reihe. try_with: auch in
+        // einem Faden, der gerade endet, darf FFmpeg noch etwas sagen.
+        let h = FADEN.try_with(|f| f.get()).unwrap_or(Herkunft::Client);
+        let r = reihe(h);
+        if stufe > r.stufe.load(Ordering::Relaxed) {
             return;
         }
         let mut puffer = [0 as std::os::raw::c_char; 1024];
         let text = {
-            let Ok(mut offen) = OFFEN.lock() else { return };
+            let Ok(mut offen) = r.offen.lock() else { return };
             let (rest, praefix) = &mut *offen;
             let n = ffmpeg::sys::av_log_format_line2(
                 ptr, stufe, fmt, vl, puffer.as_mut_ptr(), puffer.len() as std::os::raw::c_int, praefix,
@@ -205,45 +292,51 @@ mod protokoll {
             t
         };
         if stufe <= ffmpeg::sys::AV_LOG_WARNING {
-            if let Ok(mut f) = FEHLER.lock() {
+            if let Ok(mut f) = r.fehler.lock() {
                 if f.len() >= 6 {
                     f.remove(0);
                 }
                 f.push(text.clone());
             }
         }
-        zeile(text);
+        zeile_als(h, text);
     }
 
-    /// Einsammeln einschalten. Ausfuehrlich heisst bis AV_LOG_VERBOSE - da
-    /// sagt cuvid, welche Formate er gewaehlt hat und was die Karte kann.
+    /// Einsammeln einschalten, fuer die Herkunft dieses Fadens. Ausfuehrlich
+    /// heisst bis AV_LOG_VERBOSE - da sagt cuvid, welche Formate er gewaehlt
+    /// hat und was die Karte kann. FFmpeg selbst laesst durch, was die
+    /// gespraechigere der beiden Reihen will; jede Reihe nimmt nur, was ihre
+    /// eigene Stufe erlaubt.
     pub fn einschalten(ausfuehrlich: bool) {
         let stufe = if ausfuehrlich { ffmpeg::sys::AV_LOG_VERBOSE } else { ffmpeg::sys::AV_LOG_WARNING };
-        STUFE.store(stufe, Ordering::Relaxed);
+        reihe(herkunft()).stufe.store(stufe, Ordering::Relaxed);
+        let hoechste = REIHEN.iter().map(|r| r.stufe.load(Ordering::Relaxed)).max().unwrap_or(stufe);
         unsafe {
-            ffmpeg::sys::av_log_set_level(stufe);
+            ffmpeg::sys::av_log_set_level(hoechste);
             ffmpeg::sys::av_log_set_callback(Some(rueckruf));
         }
     }
 
-    /// Alle Zeilen seit dem letzten Abholen.
+    /// Alle Zeilen der eigenen Herkunft seit dem letzten Abholen.
     pub fn abholen() -> Vec<String> {
-        ZEILEN.lock().map(|mut z| std::mem::take(&mut *z)).unwrap_or_default()
+        reihe(herkunft()).zeilen.lock().map(|mut z| std::mem::take(&mut *z)).unwrap_or_default()
     }
 
-    /// Angesammelte Warnungen und Fehler verwerfen - vor einem Versuch, damit
-    /// nur das im Grund landet, was dieser Versuch selbst gesagt hat.
+    /// Angesammelte Warnungen und Fehler der eigenen Herkunft verwerfen - vor
+    /// einem Versuch, damit nur das im Grund landet, was dieser Versuch
+    /// selbst gesagt hat.
     pub fn fehler_verwerfen() {
-        if let Ok(mut f) = FEHLER.lock() {
+        if let Ok(mut f) = reihe(herkunft()).fehler.lock() {
             f.clear();
         }
     }
 
-    /// Die letzten Warnungen und Fehler, ohne den Absender "[hevc_cuvid @
-    /// 000001d4...] " - der steht im Grund ohnehin, und die Adresse sagt
-    /// niemandem etwas. Gleiche Zeilen in Folge nur einmal.
+    /// Die letzten Warnungen und Fehler der eigenen Herkunft, ohne den
+    /// Absender "[hevc_cuvid @ 000001d4...] " - der steht im Grund ohnehin,
+    /// und die Adresse sagt niemandem etwas. Gleiche Zeilen in Folge nur
+    /// einmal.
     pub fn fehler_abholen() -> Vec<String> {
-        let Ok(mut f) = FEHLER.lock() else { return Vec::new() };
+        let Ok(mut f) = reihe(herkunft()).fehler.lock() else { return Vec::new() };
         let mut aus: Vec<String> = Vec::new();
         for z in f.drain(..) {
             let z = z.trim_start_matches("FFmpeg: ");
@@ -256,6 +349,109 @@ mod protokoll {
             }
         }
         aus
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Eine Meldung ueber FFmpegs eigenen Weg (av_log), wie sie ein Codec
+        /// macht - im aufrufenden Faden.
+        fn ffmpeg_sagt(stufe: std::os::raw::c_int, text: &str) {
+            let t = std::ffi::CString::new(format!("{text}\n")).unwrap();
+            unsafe { ffmpeg::sys::av_log(std::ptr::null_mut(), stufe, c"%s".as_ptr(), t.as_ptr()) };
+        }
+
+        fn enthaelt(v: &[String], t: &str) -> bool {
+            v.iter().any(|z| z.contains(t))
+        }
+
+        /// Beide Tests stellen Stufen um - nacheinander, sonst stellte der
+        /// eine dem anderen die Stufe des Hosts mitten im Test zurueck.
+        static STUFEN: Mutex<()> = Mutex::new(());
+
+        /// Zwei Rollen in einem Prozess: was ein Faden der Host-Rolle sagt
+        /// (eigene Zeilen wie FFmpegs Meldungen), landet in der Reihe des
+        /// Hosts und bei seinen Rueckfallgruenden - nie beim Client, und
+        /// umgekehrt; zeile_als nennt die Herkunft ausdruecklich. Die Reihen
+        /// teilt sich der ganze Testlauf; deshalb Zeilen mit eigener
+        /// Kennung, und gefragt wird nur nach ihnen.
+        #[test]
+        fn zwei_reihen_je_herkunft() {
+            let _stufen = STUFEN.lock().unwrap_or_else(|e| e.into_inner());
+            let k = format!("{}-{:?}", std::process::id(), std::time::Instant::now());
+            einschalten(false);
+
+            let k2 = k.clone();
+            let (host_reihe, host_fehler, nachher) = std::thread::spawn(move || {
+                herkunft_setzen(Herkunft::Host);
+                einschalten(false);
+                zeile(format!("Reihentest Host {k2}"));
+                ffmpeg_sagt(ffmpeg::sys::AV_LOG_ERROR, &format!("Reihentest FFmpeg Host {k2}"));
+                let fehler = fehler_abholen();
+                let reihe = abholen();
+                // Einmal abgeholt ist abgeholt.
+                (reihe, fehler, abholen())
+            })
+            .join()
+            .unwrap();
+
+            let k2 = k.clone();
+            let (client_reihe, client_fehler) = std::thread::spawn(move || {
+                zeile(format!("Reihentest Client {k2}"));
+                ffmpeg_sagt(ffmpeg::sys::AV_LOG_ERROR, &format!("Reihentest FFmpeg Client {k2}"));
+                zeile_als(Herkunft::Host, format!("Reihentest ausdruecklich Host {k2}"));
+                (abholen(), fehler_abholen())
+            })
+            .join()
+            .unwrap();
+            let host_spaeter = std::thread::spawn(|| {
+                herkunft_setzen(Herkunft::Host);
+                abholen()
+            })
+            .join()
+            .unwrap();
+
+            assert!(enthaelt(&host_reihe, &format!("Reihentest Host {k}")), "{host_reihe:?}");
+            assert!(enthaelt(&host_reihe, &format!("FFmpeg: Reihentest FFmpeg Host {k}")), "{host_reihe:?}");
+            assert!(enthaelt(&host_fehler, &format!("Reihentest FFmpeg Host {k}")), "{host_fehler:?}");
+            assert!(!enthaelt(&host_reihe, &format!("Client {k}")), "{host_reihe:?}");
+            assert!(!enthaelt(&nachher, &k), "zweimal abgeholt: {nachher:?}");
+            assert!(enthaelt(&client_reihe, &format!("Reihentest Client {k}")), "{client_reihe:?}");
+            assert!(enthaelt(&client_reihe, &format!("FFmpeg: Reihentest FFmpeg Client {k}")), "{client_reihe:?}");
+            assert!(enthaelt(&client_fehler, &format!("Reihentest FFmpeg Client {k}")), "{client_fehler:?}");
+            assert!(!enthaelt(&client_reihe, &format!("Host {k}")), "{client_reihe:?}");
+            assert!(!enthaelt(&client_fehler, &format!("Host {k}")), "{client_fehler:?}");
+            assert!(enthaelt(&host_spaeter, &format!("Reihentest ausdruecklich Host {k}")), "{host_spaeter:?}");
+        }
+
+        /// Die Stufe gilt je Reihe: ausfuehrlich nur beim Host - eine
+        /// VERBOSE-Meldung eines Client-Fadens bleibt draussen, die des Hosts
+        /// kommt an. Danach stehen beide wieder auf Warnungen.
+        #[test]
+        fn stufe_je_herkunft() {
+            let _stufen = STUFEN.lock().unwrap_or_else(|e| e.into_inner());
+            let k = format!("{}-{:?}", std::process::id(), std::time::Instant::now());
+            let (h, c) = std::thread::spawn(move || {
+                herkunft_setzen(Herkunft::Host);
+                einschalten(true);
+                ffmpeg_sagt(ffmpeg::sys::AV_LOG_VERBOSE, &format!("Stufentest Host {k}"));
+                let k2 = k.clone();
+                let c = std::thread::spawn(move || {
+                    ffmpeg_sagt(ffmpeg::sys::AV_LOG_VERBOSE, &format!("Stufentest Client {k2}"));
+                    abholen()
+                })
+                .join()
+                .unwrap();
+                let h = abholen();
+                einschalten(false);
+                (h.into_iter().filter(|z| z.contains(&k)).collect::<Vec<_>>(), c.into_iter().filter(|z| z.contains(&k)).collect::<Vec<_>>())
+            })
+            .join()
+            .unwrap();
+            assert_eq!(h.len(), 1, "ausfuehrliche Meldung des Hosts fehlt: {h:?}");
+            assert!(c.is_empty(), "ausfuehrliche Meldung beim Client trotz Stufe Warnung: {c:?}");
+        }
     }
 }
 

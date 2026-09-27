@@ -1143,37 +1143,42 @@ pub fn start(wunsch: Option<String>, liste: Vec<Ausgang>, weg_cli: Weg, weg: Weg
     bildschirme_setzen(&stand.liste, stand.wunsch.as_deref(), stand.ziel.as_ref().map(|a| a.kennung.as_str()));
     std::thread::Builder::new()
         .name("quadchroma-aufnahme".into())
-        .spawn(move || loop {
-            while !netz::zuschauer_da() {
-                std::thread::sleep(Duration::from_millis(100));
-                // Ohne Zuschauer nur den Stand nachfuehren (Wunsch, Liste,
-                // Ziel); der Strom laeuft erst mit dem naechsten (1.2).
-                stand.nachfuehren(false);
-            }
-            // Der naechste Zuschauer ist einer mit anderer Nummer - auch wenn
-            // er den jetzigen ohne Luecke abloest und zuschauer_da() dabei
-            // nie false wird. Gemerkt vor der Sitzung: wer schon waehrend
-            // der abgestuerzten Sitzung abgeloest hat, bekommt gleich einen
-            // neuen Anlauf.
-            let nr = netz::zuschauer_nr();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sitzung(&mut stand)));
-            if r.is_err() {
-                // Wachhalten und Timerperiode hat Drop schon abgebaut.
-                log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
-                // Dem Zuschauer sagen, dass kein Bild kommt - statt eines
-                // stummen, stehenden Bildes. Nur dem, fuer den die Sitzung
-                // lief: hat inzwischen ein anderer abgeloest, bekommt der
-                // gleich einen neuen Anlauf (die Schleife unten endet
-                // sofort), und dessen Sitzung schickt 0 nur nach einem
-                // eigenen Verlust - mit 1 saehe er dauerhaft "kein
-                // Bildschirm" ueber dem laufenden Bild.
-                netz::hoststatus_senden_an(nr, 1);
-                while netz::zuschauer_da() && netz::zuschauer_nr() == nr {
-                    std::thread::sleep(Duration::from_millis(500));
+        .spawn(move || {
+            // Was der Encoder ueber FFmpeg sagt, gehoert der Host-Rolle
+            // (protokoll in main.rs: Herkunft des Fadens).
+            crate::protokoll::herkunft_setzen(crate::protokoll::Herkunft::Host);
+            loop {
+                while !netz::zuschauer_da() {
+                    std::thread::sleep(Duration::from_millis(100));
+                    // Ohne Zuschauer nur den Stand nachfuehren (Wunsch, Liste,
+                    // Ziel); der Strom laeuft erst mit dem naechsten (1.2).
+                    stand.nachfuehren(false);
                 }
-                // Ein Testbild ueberlebt den Zuschauer auch hier nicht.
-                if Z.testbild.swap(false, Ordering::Relaxed) {
-                    log("Testbild aus (Zuschauer weg)");
+                // Der naechste Zuschauer ist einer mit anderer Nummer - auch wenn
+                // er den jetzigen ohne Luecke abloest und zuschauer_da() dabei
+                // nie false wird. Gemerkt vor der Sitzung: wer schon waehrend
+                // der abgestuerzten Sitzung abgeloest hat, bekommt gleich einen
+                // neuen Anlauf.
+                let nr = netz::zuschauer_nr();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sitzung(&mut stand)));
+                if r.is_err() {
+                    // Wachhalten und Timerperiode hat Drop schon abgebaut.
+                    log("Aufnahme: Faden abgestuerzt - neuer Anlauf mit dem naechsten Zuschauer");
+                    // Dem Zuschauer sagen, dass kein Bild kommt - statt eines
+                    // stummen, stehenden Bildes. Nur dem, fuer den die Sitzung
+                    // lief: hat inzwischen ein anderer abgeloest, bekommt der
+                    // gleich einen neuen Anlauf (die Schleife unten endet
+                    // sofort), und dessen Sitzung schickt 0 nur nach einem
+                    // eigenen Verlust - mit 1 saehe er dauerhaft "kein
+                    // Bildschirm" ueber dem laufenden Bild.
+                    netz::hoststatus_senden_an(nr, 1);
+                    while netz::zuschauer_da() && netz::zuschauer_nr() == nr {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    // Ein Testbild ueberlebt den Zuschauer auch hier nicht.
+                    if Z.testbild.swap(false, Ordering::Relaxed) {
+                        log("Testbild aus (Zuschauer weg)");
+                    }
                 }
             }
         })

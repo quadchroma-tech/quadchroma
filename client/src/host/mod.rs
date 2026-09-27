@@ -207,9 +207,12 @@ fn umschichten(p: Protokolldatei, grenze: u64) -> Option<Protokolldatei> {
     Some(neu)
 }
 
-/// Was FFmpeg inzwischen gesagt hat (ueber den Rueckruf des Clients), als
-/// eigene Zeilen ins Hostprotokoll.
+/// Was FFmpeg inzwischen gesagt hat (ueber den Rueckruf des Clients, in der
+/// Reihe des Hosts), als eigene Zeilen ins Hostprotokoll. Nur aus Faeden mit
+/// Herkunft::Host rufen (protokoll::herkunft_setzen) - sonst holte es die
+/// Reihe des Clients ab.
 pub fn ffmpeg_zeilen() {
+    debug_assert_eq!(protokoll::herkunft(), protokoll::Herkunft::Host, "ffmpeg_zeilen aus einem Faden ohne Herkunft Host");
     for z in protokoll::abholen() {
         log(z);
     }
@@ -558,8 +561,10 @@ pub fn main_host(args: &[String]) -> i32 {
         println!("FFmpeg-Start fehlgeschlagen: {e}");
         return 2;
     }
-    // FFmpegs Meldungen laufen ueber den Rueckruf des Clients in eine Reihe;
-    // der Host holt sie ab und schreibt sie in sein eigenes Protokoll.
+    // FFmpegs Meldungen laufen ueber den Rueckruf des Clients in die Reihe
+    // des Hosts (Herkunft dieses Fadens); der Host holt sie ab und schreibt
+    // sie in sein eigenes Protokoll.
+    protokoll::herkunft_setzen(protokoll::Herkunft::Host);
     protokoll::einschalten(false);
 
     if args.iter().any(|a| a == "--messen") {
