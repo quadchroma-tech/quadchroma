@@ -975,7 +975,7 @@ static void anmelden_umschalten(QCAnmelden jetzt) {
 static void bearbeiten_menue_setzen(void) {
     struct { SEL s; NSString *k; NSEventModifierFlags f; } t[] = {
         { @selector(undo:), @"z", NSEventModifierFlagCommand },
-        { @selector(redo:), @"z", NSEventModifierFlagCommand | NSEventModifierFlagShift },
+        { @selector(redo:), @"Z", NSEventModifierFlagCommand },
         { @selector(cut:), @"x", NSEventModifierFlagCommand },
         { @selector(copy:), @"c", NSEventModifierFlagCommand },
         { @selector(paste:), @"v", NSEventModifierFlagCommand },
@@ -995,7 +995,28 @@ static void bearbeiten_menue_setzen(void) {
     NSApp.mainMenu = haupt;
 }
 
-NSMenu *qc_programmmenue_bauen(id ziel, BOOL sitzung) {
+// Hauptmenue der einen App (siehe menue.h). Gemessen 27.09.2026 auf macOS
+// 27: ein Punkt im Baum schluckt seine Taste auch gesperrt und ohne Ziel,
+// und NSWindow antwortet selbst auf undo: - ob es ein Ziel fuer die Aktion
+// gibt, sagt also nichts; es zaehlt, ob ein Textfeld den Fokus hat. Nimmt
+// das Hauptmenue die Taste nicht, gibt NSApp keyDown an das Fenster (winit).
+@interface QCHauptmenue ()
+@property(nonatomic, strong, readwrite) NSMenu *bearbeiten;
+@end
+
+@implementation QCHauptmenue
+- (BOOL)performKeyEquivalent:(NSEvent *)e {
+    if (qc_bearbeiten_taste(self, e, NSApp.keyWindow.firstResponder)) return YES;
+    return [super performKeyEquivalent:e];
+}
+@end
+
+BOOL qc_bearbeiten_taste(NSMenu *haupt, NSEvent *e, NSResponder *ersthelfer) {
+    if (![haupt isKindOfClass:QCHauptmenue.class] || ![ersthelfer isKindOfClass:NSText.class]) return NO;
+    return [((QCHauptmenue *)haupt).bearbeiten performKeyEquivalent:e];
+}
+
+QCHauptmenue *qc_programmmenue_bauen(id ziel, BOOL sitzung) {
     NSMenu *programm = [[NSMenu alloc] initWithTitle:@"QuadChroma"];
     NSMenuItem *ende = [[NSMenuItem alloc] initWithTitle:qc_text(QCTextHostQuit) action:@selector(menueAktion:)
                                            keyEquivalent:sitzung ? @"" : @"q"];
@@ -1006,13 +1027,14 @@ NSMenu *qc_programmmenue_bauen(id ziel, BOOL sitzung) {
     weg.allowsKeyEquivalentWhenHidden = YES;
     [programm addItem:weg];
     [programm addItem:ende];
-    // Bearbeiten, verborgen: nur die Tasten. Ohne Ziel gehen sie an den
-    // Ersthelfer - im Fenster des Clients antwortet keiner, der Punkt ist
-    // gesperrt, und die Taste kommt bei winit an (Cmd+V im Adressfeld, im
-    // Pult, an den Mac drueben).
+    // Bearbeiten: nur die Tasten, ohne Ziel an den Ersthelfer (das Textfeld).
+    // Shift+Cmd+Z als "Z" (wie Apples Vorlage): NSMenu vergleicht mit
+    // charactersIgnoringModifiers, und das ist mit Shift gross - gegen "z"
+    // mit Shift-Maske fand performKeyEquivalent: nichts (Probe 27.09.2026).
+    NSMenu *bearbeiten = [[NSMenu alloc] initWithTitle:@""];
     struct { SEL s; NSString *k; NSEventModifierFlags f; } b[] = {
         { @selector(undo:), @"z", NSEventModifierFlagCommand },
-        { @selector(redo:), @"z", NSEventModifierFlagCommand | NSEventModifierFlagShift },
+        { @selector(redo:), @"Z", NSEventModifierFlagCommand },
         { @selector(cut:), @"x", NSEventModifierFlagCommand },
         { @selector(copy:), @"c", NSEventModifierFlagCommand },
         { @selector(paste:), @"v", NSEventModifierFlagCommand },
@@ -1021,14 +1043,13 @@ NSMenu *qc_programmmenue_bauen(id ziel, BOOL sitzung) {
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
         NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"" action:b[i].s keyEquivalent:b[i].k];
         it.keyEquivalentModifierMask = b[i].f;
-        it.hidden = YES;
-        it.allowsKeyEquivalentWhenHidden = YES;
-        [programm addItem:it];
+        [bearbeiten addItem:it];
     }
     NSMenuItem *oben = [[NSMenuItem alloc] initWithTitle:@"QuadChroma" action:NULL keyEquivalent:@""];
     oben.submenu = programm;
-    NSMenu *haupt = [[NSMenu alloc] initWithTitle:@""];
+    QCHauptmenue *haupt = [[QCHauptmenue alloc] initWithTitle:@""];
     [haupt addItem:oben];
+    haupt.bearbeiten = bearbeiten;
     return haupt;
 }
 

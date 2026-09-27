@@ -421,6 +421,24 @@ static int titel_gleich(NSArray<NSString *> *ist, NSArray<NSString *> *soll) {
     return 0;
 }
 
+// Die Tasten eines Menues als "S-z redo:" (S- fuer Shift).
+static NSArray<NSString *> *tasten_von(NSMenu *m) {
+    NSMutableArray<NSString *> *t = [NSMutableArray array];
+    for (NSMenuItem *it in m.itemArray)
+        if (it.keyEquivalent.length)
+            [t addObject:[NSString stringWithFormat:@"%@%@ %@", it.keyEquivalentModifierMask & NSEventModifierFlagShift ? @"S-" : @"",
+                          it.keyEquivalent, NSStringFromSelector(it.action)]];
+    return t;
+}
+
+// Tastendruck mit Cmd (und weiteren Umschaltern), wie ihn AppKit dem
+// Hauptmenue gibt: mit Shift ist charactersIgnoringModifiers gross.
+static NSEvent *taste(NSString *zeichen, NSEventModifierFlags weitere) {
+    return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+                       modifierFlags:NSEventModifierFlagCommand | weitere timestamp:0 windowNumber:0 context:nil
+                          characters:zeichen charactersIgnoringModifiers:zeichen isARepeat:NO keyCode:0];
+}
+
 static QCMenuePunkt *suche(NSArray<QCMenuePunkt *> *m, QCAktion a) {
     for (QCMenuePunkt *p in m) {
         if (p.aktion == a) return p;
@@ -667,31 +685,52 @@ static void app_modell_pruefen(void) {
            "nil wird als leerer Text geprueft (leer = Rechnername)");
 
     printf("\n-- Programmmenue der einen App\n");
-    NSMenu *haupt = qc_programmmenue_bauen(nil, NO);
+    QCHauptmenue *haupt = qc_programmmenue_bauen(nil, NO);
     NSMenu *prog = haupt.itemArray.firstObject.submenu;
-    NSMutableArray<NSString *> *tasten = [NSMutableArray array];
     NSMenuItem *ende = nil;
     int verborgen_ohne = 0;
     for (NSMenuItem *it in prog.itemArray) {
-        if (it.keyEquivalent.length)
-            [tasten addObject:[NSString stringWithFormat:@"%@%@ %@", it.keyEquivalentModifierMask & NSEventModifierFlagShift ? @"S-" : @"",
-                               it.keyEquivalent, NSStringFromSelector(it.action)]];
         if (it.tag == QCAktionBeenden) ende = it;
         if (it.hidden && !it.allowsKeyEquivalentWhenHidden) verborgen_ohne++;
     }
     pruefe(haupt.numberOfItems == 1 && ende && !ende.hidden && [ende.title isEqualToString:@"Quit QuadChroma"] &&
            [ende.keyEquivalent isEqualToString:@"q"] && ende.action == @selector(menueAktion:),
            "ein Programmmenue mit \"Quit QuadChroma\" (Cmd+Q, menueAktion:)");
-    pruefe(titel_gleich(tasten, @[ @"h hide:", @"q menueAktion:", @"z undo:", @"S-z redo:", @"x cut:", @"c copy:",
-                                   @"v paste:", @"a selectAll:" ]), "Tasten: Ausblenden, Beenden, Bearbeiten - kein Cmd+W");
+    pruefe(titel_gleich(tasten_von(prog), @[ @"h hide:", @"q menueAktion:" ]), "Programmmenue: Ausblenden, Beenden - kein Cmd+W");
     pruefe(verborgen_ohne == 0, "verborgene Punkte behalten ihre Taste (allowsKeyEquivalentWhenHidden)");
-    prog = qc_programmmenue_bauen(nil, YES).itemArray.firstObject.submenu;
-    int prog_tasten = 0, bearb_tasten = 0;
-    for (NSMenuItem *it in prog.itemArray) {
-        if (it.action == @selector(hide:) || it.tag == QCAktionBeenden) prog_tasten += it.keyEquivalent.length > 0;
-        else bearb_tasten += it.keyEquivalent.length > 0;
+    pruefe(titel_gleich(tasten_von(haupt.bearbeiten), @[ @"z undo:", @"Z redo:", @"x cut:", @"c copy:", @"v paste:", @"a selectAll:" ]),
+           "Bearbeiten: Cmd+Z, Shift+Cmd+Z, Cmd+X, Cmd+C, Cmd+V, Cmd+A an den Ersthelfer");
+    pruefe(haupt.bearbeiten.supermenu == nil && prog.supermenu == haupt, "Bearbeiten liegt nicht im Baum des Hauptmenues");
+
+    // Tasten wie im Fenster des Clients (Ersthelfer winits Ansicht, hier ein
+    // NSView oder niemand): das Hauptmenue nimmt keine Bearbeiten-Taste, sie
+    // kommt bei winit an. Nur ein Textfeld (Feldeditor) bekommt sie.
+    NSArray<NSEvent *> *bearb = @[ taste(@"z", 0), taste(@"Z", NSEventModifierFlagShift), taste(@"x", 0), taste(@"c", 0),
+                                   taste(@"v", 0), taste(@"a", 0) ];
+    NSView *ansicht = [[NSView alloc] initWithFrame:NSZeroRect];
+    NSTextView *feld = [[NSTextView alloc] initWithFrame:NSZeroRect];
+    int genommen = 0, fuer_ansicht = 0, fuer_niemand = 0, fuer_feld = 0;
+    for (NSEvent *e in bearb) {
+        genommen += [haupt performKeyEquivalent:e];
+        fuer_ansicht += qc_bearbeiten_taste(haupt, e, ansicht);
+        fuer_niemand += qc_bearbeiten_taste(haupt, e, nil);
+        fuer_feld += qc_bearbeiten_taste(haupt, e, feld);
     }
-    pruefe(prog_tasten == 0 && bearb_tasten == 6, "in einer Sitzung: Cmd+Q und Cmd+H gehen an den Mac drueben, Bearbeiten bleibt");
+    pruefe(genommen == 0 && fuer_ansicht == 0 && fuer_niemand == 0,
+           "ohne Textfeld im Fokus nimmt das Hauptmenue Cmd+Z/X/C/V/A nicht (Cmd+V im Adressfeld, in der Sitzung an den Rechner drueben)");
+    pruefe(fuer_feld == 6, "Textfeld im Fokus: alle sechs Bearbeiten-Tasten gehen an das Feld");
+    pruefe(!qc_bearbeiten_taste(haupt, taste(@"k", 0), feld) && !qc_bearbeiten_taste(haupt, taste(@"w", 0), feld) &&
+           !qc_bearbeiten_taste(haupt, taste(@"q", 0), feld), "Textfeld im Fokus: Cmd+K, Cmd+W, Cmd+Q sind keine Bearbeiten-Tasten");
+    pruefe([haupt performKeyEquivalent:taste(@"q", 0)] && [haupt performKeyEquivalent:taste(@"h", 0)],
+           "Cmd+Q und Cmd+H nimmt das Programmmenue");
+
+    QCHauptmenue *sitzung = qc_programmmenue_bauen(nil, YES);
+    pruefe(tasten_von(sitzung.itemArray.firstObject.submenu).count == 0 && tasten_von(sitzung.bearbeiten).count == 6,
+           "in einer Sitzung: Cmd+Q und Cmd+H gehen an den Mac drueben, Bearbeiten bleibt fuer Textfelder");
+    genommen = 0;
+    for (NSEvent *e in [bearb arrayByAddingObjectsFromArray:@[ taste(@"q", 0), taste(@"h", 0) ]])
+        genommen += [sitzung performKeyEquivalent:e];
+    pruefe(genommen == 0, "in einer Sitzung nimmt das Hauptmenue ohne Textfeld keine dieser Tasten");
 }
 
 static void zustand_pruefen(void) {

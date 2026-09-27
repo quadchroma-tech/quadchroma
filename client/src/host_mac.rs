@@ -614,7 +614,8 @@ mod objc {
 /// Systems. Geprueft: Kopf mit Geraetename, "Freigabe ist aus", die Punkte des
 /// Clients und ihre Rueckrufe (Oeffnen, Verbinden, Freigabe, Ruhezustand,
 /// Beenden - ohne dass der Prozess endet), die ID des Schluessels, das
-/// Programmmenue mit Cmd+Q, der Sprachwechsel des Clients, die Pruefung des
+/// Programmmenue mit Cmd+Q, die Bearbeiten-Tasten nur fuer Textfelder (nicht
+/// im Baum des Hauptmenues), der Sprachwechsel des Clients, die Pruefung des
 /// Geraetenamens und die Hinweisblase. Rueckgabe 0 = bestanden.
 pub fn selbsttest() -> i32 {
     let _pool = objc::Pool::neu();
@@ -733,6 +734,30 @@ pub fn selbsttest() -> i32 {
     };
     if !cmd_q {
         fehler.push("Programmmenue ohne \"QuadChroma beenden\" (Cmd+Q)".into());
+    }
+    // Die Bearbeiten-Tasten (Cmd+Z/X/C/V/A) nicht im Baum des Hauptmenues -
+    // dort schluckte es sie auch im Fenster des Clients und in einer Sitzung
+    // -, sondern im QCHauptmenue, das sie nur Textfeldern gibt.
+    // SAFETY: Hauptfaden; "bearbeiten" nur an einem QCHauptmenue.
+    let (art, tasten, bearbeiten) = unsafe {
+        let app = objc::id(objc::klasse(c"NSApplication"), c"sharedApplication");
+        let haupt = objc::id(app, c"mainMenu");
+        let mut tasten = Vec::new();
+        for i in 0..objc::int(haupt, c"numberOfItems") {
+            let unter = objc::id(objc::id_int(haupt, c"itemAtIndex:", i), c"submenu");
+            for j in 0..objc::int(unter, c"numberOfItems") {
+                let t = objc::text(objc::id(objc::id_int(unter, c"itemAtIndex:", j), c"keyEquivalent"));
+                if !t.is_empty() {
+                    tasten.push(t);
+                }
+            }
+        }
+        let art = objc::text(objc::id(haupt, c"className"));
+        let bearbeiten = if art == "QCHauptmenue" { objc::int(objc::id(haupt, c"bearbeiten"), c"numberOfItems") } else { 0 };
+        (art, tasten, bearbeiten)
+    };
+    if art != "QCHauptmenue" || bearbeiten != 6 || tasten.iter().any(|t| ["z", "Z", "x", "c", "v", "a"].contains(&t.as_str())) {
+        fehler.push(format!("Hauptmenue {art} mit den Tasten {tasten:?} im Baum, {bearbeiten} Bearbeiten-Tasten fuer Textfelder"));
     }
     // Sprachwechsel im Client: Menue und Programmmenue in der neuen Sprache.
     sprache_setzen("en");

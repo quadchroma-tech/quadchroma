@@ -137,14 +137,26 @@ int qc_passwort_pruefen(NSString *pw, NSString *wiederholt);
 QCText qc_geraetename_fehler(NSString *eingabe, int (*pruefen)(const char *));
 // Das Hauptmenue der einen App (winit startet ohne sein Standardmenue): im
 // Programmmenue "QuadChroma beenden" (Cmd+Q, Aktion menueAktion: an ziel mit
-// QCAktionBeenden) und verborgen "Ausblenden" (Cmd+H); dazu verborgen die
-// Punkte des Bearbeiten-Menues (Cmd+Z, Shift+Cmd+Z, Cmd+X, Cmd+C, Cmd+V,
-// Cmd+A an den Ersthelfer), damit Einfuegen und Kopieren in den Feldern der
-// Fenster wirken. Verborgen heisst: nicht zu sehen, die Taste gilt trotzdem
-// (allowsKeyEquivalentWhenHidden); im Fenster des Clients sind sie ohne
-// Ziel gesperrt, dort kommt die Taste bei winit an. Kein Cmd+W: in der
-// Sitzung gehoert es dem Mac drueben. sitzung: Cmd+Q und Cmd+H ebenso.
-NSMenu *qc_programmmenue_bauen(id ziel, BOOL sitzung);
+// QCAktionBeenden) und verborgen "Ausblenden" (Cmd+H; verborgen heisst: nicht
+// zu sehen, die Taste gilt trotzdem - allowsKeyEquivalentWhenHidden). Dazu
+// die Punkte des Bearbeiten-Menues (Cmd+Z, Shift+Cmd+Z, Cmd+X, Cmd+C, Cmd+V,
+// Cmd+A an den Ersthelfer) in bearbeiten, nicht im Baum des Hauptmenues: sie
+// gelten nur, wenn ein Textfeld den Fokus hat (qc_bearbeiten_taste), damit
+// Einfuegen und Kopieren in den Feldern der Fenster dieser Datei wirken. Im
+// Fenster des Clients kommen die Tasten so bei winit an - Cmd+V im
+// Adressfeld, in einer Sitzung alle an den Rechner drueben. Ein Punkt im
+// Baum schluckte seine Taste auch dort: performKeyEquivalent: liefert YES,
+// auch wenn der Punkt ohne Ziel gesperrt ist. Kein Cmd+W: in der Sitzung
+// gehoert es dem Mac drueben. sitzung: Cmd+Q und Cmd+H ebenso.
+@interface QCHauptmenue : NSMenu
+@property(nonatomic, strong, readonly) NSMenu *bearbeiten;
+@end
+QCHauptmenue *qc_programmmenue_bauen(id ziel, BOOL sitzung);
+// Der Teil von performKeyEquivalent: des Hauptmenues fuer die Bearbeiten-
+// Tasten: YES, wenn ersthelfer ein Textfeld ist (Feldeditor, NSText) und
+// bearbeiten die Taste nimmt; sonst NO - dann gilt nur das Programmmenue.
+// Das Hauptmenue fragt mit dem Ersthelfer des Schluesselfensters.
+BOOL qc_bearbeiten_taste(NSMenu *haupt, NSEvent *e, NSResponder *ersthelfer);
 
 // Vorlagenbild fuer die Menueleiste, 18 pt: die vier Felder des Logos, das
 // vierte hohl (unterscheidet den Host vom Mac-Client), mit Punkt, solange
