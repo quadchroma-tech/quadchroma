@@ -259,9 +259,10 @@ impl Secure {
         prologue: &[u8],
         pruefen: impl FnOnce(&[u8]) -> Result<u8, Fehler>,
     ) -> Result<Secure, Fehler> {
-        // Der eigene Schluessel zuerst: ist client.key beschaedigt oder die
-        // Ablage weg, geht gar nicht erst eine Leitung auf - sonst oeffnete
-        // jeder Versuch eine leere Verbindung, und der Host protokollierte sie.
+        // Der eigene Schluessel zuerst: ist der Geraeteschluessel (host.key)
+        // beschaedigt oder die Ablage weg, geht gar nicht erst eine Leitung
+        // auf - sonst oeffnete jeder Versuch eine leere Verbindung, und der
+        // Host protokollierte sie.
         let (priv_key, _pub_key) = identity()?;
         // Mit Frist verbinden. Ohne sie haengt ein Aufruf an einer toten
         // Adresse gut zwanzig Sekunden.
@@ -332,7 +333,7 @@ impl Secure {
 
     /// Nimmt eine angenommene Leitung als Angerufener (Host-Rolle) an: der
     /// Handschlag laeuft mit dem uebergebenen dauerhaften Schluessel des
-    /// Hosts, nicht mit client.key. Rahmen wie bei `wrap`; die Frist
+    /// Hosts (dem Geraeteschluessel). Rahmen wie bei `wrap`; die Frist
     /// (FRIST_ANNAHME) gilt fuer den ganzen Handschlag.
     pub fn accept(sock: TcpStream, prologue: &[u8], priv_key: &[u8]) -> Result<Secure, String> {
         sock.set_nodelay(true).ok();
@@ -496,12 +497,14 @@ fn eigene_nachricht3(flags: u8) -> Vec<u8> {
 
 // ------------------------------------------------------------ Schluesselablage
 
-/// Der Ordner fuer alles, was der Client dauerhaft ablegt: client.key,
-/// hosts.txt, einstellungen.txt, protokoll.txt, benchmark.txt.
+/// Der Ordner fuer alles, was die App dauerhaft ablegt: host.key (der
+/// Geraeteschluessel beider Rollen), hosts.txt, einstellungen.txt,
+/// protokoll.txt, benchmark.txt, dazu die Dateien der Host-Rolle
+/// (host-devices.txt, host-password.txt, host-protokoll.txt). Ein frueherer
+/// client.key bleibt dort unbenutzt liegen.
 /// Windows: %APPDATA%\QuadChroma (ohne APPDATA: unter HOME).
-/// macOS: ~/Library/Application Support/QuadChroma - derselbe Ordner, in dem
-/// der Mac-Host host.key und host-devices.txt haelt; getrennte Dateinamen, keine
-/// Kollision.
+/// macOS: ~/Library/Application Support/QuadChroma - derselbe Ordner fuer
+/// die Host-Engine (qc_secure.c).
 ///
 /// Rechte: Unter Unix wird ein neu angelegter Ordner nur fuer den Eigentuemer
 /// geoeffnet (0700, wie beim Mac-Host); einen schon vorhandenen laesst der
@@ -559,11 +562,57 @@ fn basis_ordner() -> Result<PathBuf, String> {
     Ok(PathBuf::from(base))
 }
 
-/// Dauerhafter eigener Schluessel. Entsteht beim ersten Start.
+/// Der Geraeteschluessel: EIN dauerhafter Schluessel je Rechner fuer beide
+/// Rollen. Mit ihm nimmt die Host-Rolle Verbindungen an, und mit ihm ruft
+/// der Client an - so hat ein Rechner genau eine Geraete-ID, dieselbe in der
+/// Bekanntgabe, in "Dieser Computer" und in der Liste der erlaubten Geraete
+/// eines anderen Rechners. Der Mac-Host (qc_secure.c) schreibt ihn mit 32
+/// Byte, Rust mit 64; beide lesen beide Formen.
+pub const GERAETESCHLUESSEL: &str = "host.key";
+
+/// Der fruehere eigene Schluessel der Client-Rolle (bis zur einen App hatte
+/// ein Rechner zwei Identitaeten). Er bleibt liegen und wird weder benutzt
+/// noch geloescht noch umgeschrieben - nur gelesen, um nach dem Wechsel
+/// einen Hinweis zu geben (`frueherer_client_schluessel_abweichend`).
+pub const FRUEHERER_CLIENT_SCHLUESSEL: &str = "client.key";
+
+/// Die Datei, mit deren Schluessel dieser Prozess als Client anruft. Im
+/// Betrieb der Geraeteschluessel. In Tests eine eigene Datei: Client und
+/// Host-Rolle eines Testlaufs teilen sich die Ablage und sollen zwei Geraete
+/// sein - mit einem Schluessel griffe der Selbstschutz (EigenerHost beim
+/// Anrufer, der Einlass weist den eigenen Schluessel ab).
+#[cfg(not(test))]
+const ANRUF_SCHLUESSEL: &str = GERAETESCHLUESSEL;
+#[cfg(test)]
+const ANRUF_SCHLUESSEL: &str = "test-client.key";
+
+/// Dauerhafter eigener Schluessel, mit dem der Client anruft: der
+/// Geraeteschluessel (host.key). Entsteht beim ersten Start - durch die
+/// Rolle, die ihn zuerst braucht - und wird nie neu geschrieben.
 pub fn identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
     // Im Ablauf stehen privater und oeffentlicher Teil hintereinander, damit
     // beim Start nichts nachgerechnet werden muss.
-    schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("client.key"))
+    schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join(ANRUF_SCHLUESSEL))
+}
+
+/// Liegt noch ein frueherer client.key, dessen Schluessel NICHT der
+/// Geraeteschluessel ist? Dann kannten andere Rechner dieses Geraet unter dem
+/// alten Schluessel und fragen einmal neu nach Passwort oder Zulassen - der
+/// Zugangsdialog sagt es dazu. Fehlt eine der Dateien oder taugt sie nicht:
+/// false. Nur gelesen, nie angelegt.
+pub fn frueherer_client_schluessel_abweichend() -> bool {
+    config_dir().is_ok_and(|d| alter_schluessel_abweichend(&d))
+}
+
+/// Wie `frueherer_client_schluessel_abweichend`, fuer einen Ordner.
+fn alter_schluessel_abweichend(ordner: &Path) -> bool {
+    match (
+        oeffentlich_lesen(&ordner.join(FRUEHERER_CLIENT_SCHLUESSEL)),
+        oeffentlich_lesen(&ordner.join(GERAETESCHLUESSEL)),
+    ) {
+        (Some(alt), Some(geraet)) => alt != geraet,
+        _ => false,
+    }
 }
 
 /// Liest einen Schluessel (siehe `schluessel_lesen_mit`: 64 Byte privat und
@@ -606,8 +655,8 @@ fn schluessel_lesen(path: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>, Fehler> {
 }
 
 /// Wie `schluessel_lesen`. Zwei Formen gelten: 64 Byte (privat, dann
-/// oeffentlich - so legt der Client client.key und die Windows-Host-Rolle
-/// host.key an) und 32 Byte (nur privat - so schreibt der Mac-Host host.key,
+/// oeffentlich - so legt Rust host.key an, und so lag frueher client.key)
+/// und 32 Byte (nur privat - so schreibt der Mac-Host host.key,
 /// qc_secure.c); zu 32 Byte wird der oeffentliche errechnet, die Datei
 /// bleibt, wie sie ist. Ist die Datei sonst zu KURZ, wird nach `warten`
 /// einmal neu gelesen, bevor sie als beschaedigt gilt: auf einem
@@ -683,16 +732,17 @@ fn exklusiv_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
 
 // ------------------------------------------------- Ablage der Host-Rolle
 //
-// Der Windows-Host hat seinen eigenen dauerhaften Schluessel (host.key)
-// unter %APPDATA%\QuadChroma neben client.key - getrennte Dateien, keine
-// Kollision. Die Host-Rolle legt host.key wie client.key mit 64 Byte an
+// Die Host-Rolle nimmt mit dem Geraeteschluessel an (host.key unter
+// %APPDATA%\QuadChroma bzw. ~/Library/Application Support/QuadChroma) -
+// demselben, mit dem der Client anruft. Rust legt ihn mit 64 Byte an
 // (privat, dann oeffentlich); gelesen werden auch 32 Byte, wie sie der
-// Mac-Host schreibt (nur privat). Die erlaubten Geraete (host-devices.txt, frueher
-// authorized.txt) und das Zugangspasswort fuehrt zugang.rs.
+// Mac-Host schreibt (nur privat). Die erlaubten Geraete (host-devices.txt,
+// frueher authorized.txt) und das Zugangspasswort fuehrt zugang.rs.
 
-/// Dauerhafter Schluessel des Hosts. Entsteht beim ersten Start.
+/// Dauerhafter Schluessel des Hosts: der Geraeteschluessel. Entsteht beim
+/// ersten Start.
 pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
-    schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join("host.key"))
+    schluessel_laden(&config_dir().map_err(Fehler::Ablage)?.join(GERAETESCHLUESSEL))
 }
 
 /// Der oeffentliche Schluessel des Hosts auf diesem Rechner, falls es ihn
@@ -701,7 +751,7 @@ pub fn host_identity() -> Result<(Vec<u8>, Vec<u8>), Fehler> {
 /// die Datei oder taugt sie nicht, None. Fuer den Selbstschutz des Clients
 /// (eigene ID nicht in der Hostliste, kein Verbinden zu sich selbst).
 pub fn eigener_host_schluessel() -> Option<Vec<u8>> {
-    oeffentlich_lesen(&config_dir().ok()?.join("host.key"))
+    oeffentlich_lesen(&config_dir().ok()?.join(GERAETESCHLUESSEL))
 }
 
 /// Der oeffentliche Teil einer Schluesseldatei, nur gelesen (None: fehlt,
@@ -798,7 +848,53 @@ mod tests {
         let d = config_dir().unwrap();
         let modus = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(modus(&d), 0o700);
-        assert_eq!(modus(&d.join("client.key")), 0o600);
+        assert_eq!(modus(&d.join(ANRUF_SCHLUESSEL)), 0o600);
+    }
+
+    /// Eine Identitaet je Rechner (X1): im Betrieb ruft der Client mit dem
+    /// Geraeteschluessel an, den auch die Host-Rolle nimmt - nicht mehr mit
+    /// client.key. Nur Tests nehmen fuer den Anrufer eine eigene Datei (zwei
+    /// Geraete in einer Ablage), und die ist weder host.key noch client.key.
+    #[test]
+    fn ein_geraeteschluessel_fuer_beide_rollen() {
+        assert_eq!(GERAETESCHLUESSEL, "host.key");
+        assert_eq!(FRUEHERER_CLIENT_SCHLUESSEL, "client.key");
+        assert_ne!(ANRUF_SCHLUESSEL, GERAETESCHLUESSEL);
+        assert_ne!(ANRUF_SCHLUESSEL, FRUEHERER_CLIENT_SCHLUESSEL);
+        let quelle = include_str!("secure.rs");
+        let betrieb = quelle.split("#[cfg(not(test))]\nconst ANRUF_SCHLUESSEL").nth(1).expect("Betriebswert");
+        assert!(betrieb.trim_start().starts_with(": &str = GERAETESCHLUESSEL;"), "{}", &betrieb[..60]);
+    }
+
+    /// Der Hinweis nach dem Wechsel: nur, wenn ein frueherer client.key
+    /// liegt und einen ANDEREN Schluessel traegt als host.key. Fehlt eine
+    /// der Dateien oder ist sie beschaedigt: kein Hinweis. Nichts wird
+    /// angelegt oder veraendert.
+    #[test]
+    fn frueherer_client_schluessel_nur_gelesen() {
+        let d = ordner("alt-client");
+        let alt = d.join(FRUEHERER_CLIENT_SCHLUESSEL);
+        let geraet = d.join(GERAETESCHLUESSEL);
+        assert!(!alter_schluessel_abweichend(&d));
+        assert!(!alt.exists() && !geraet.exists(), "etwas angelegt");
+        let (p1, o1) = noise::keypair().unwrap();
+        let (p2, _) = noise::keypair().unwrap();
+        std::fs::write(&alt, [p1.clone(), o1.clone()].concat()).unwrap();
+        assert!(!alter_schluessel_abweichend(&d), "ohne host.key");
+        assert!(!geraet.exists());
+        // Derselbe Schluessel (etwa von Hand kopiert, 32 Byte wie beim Mac):
+        // nichts hat sich geaendert.
+        std::fs::write(&geraet, &p1).unwrap();
+        assert!(!alter_schluessel_abweichend(&d));
+        std::fs::remove_file(&geraet).unwrap();
+        std::fs::write(&geraet, &p2).unwrap();
+        assert!(alter_schluessel_abweichend(&d));
+        assert_eq!(std::fs::read(&geraet).unwrap(), p2);
+        assert_eq!(std::fs::read(&alt).unwrap(), [p1, o1].concat());
+        std::fs::write(&alt, [5u8; 20]).unwrap();
+        assert!(!alter_schluessel_abweichend(&d), "beschaedigter client.key");
+        assert_eq!(std::fs::read(&alt).unwrap(), [5u8; 20]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

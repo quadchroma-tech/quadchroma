@@ -260,24 +260,43 @@ static int fehlt(const char *path, int oeffnen_errno) {
     return oeffnen_errno == ENOENT && lstat(path, &st) != 0 && errno == ENOENT;
 }
 
-// Nur wenn host.key fehlt, entsteht ein neuer Schluessel. Ist die Datei da,
-// aber nicht lesbar oder nicht genau 32 Byte lang, bleibt sie unangetastet:
-// ein neuer Schluessel waere eine neue Identitaet, und jeder gekoppelte
-// Client wiese den Host danach als fremd ab.
+// host.key ist der Geraeteschluessel der einen App: mit ihm nimmt der Host
+// an, und mit ihm ruft der Client desselben Rechners an (secure.rs,
+// GERAETESCHLUESSEL). Zwei Formen gelten: 32 Byte (nur privat - so schreibt
+// ihn dieser Lader) und 64 Byte (privat, dann oeffentlich - so legt ihn der
+// Rust-Teil an, wenn er ihn zuerst braucht); bei 64 Byte muss der hintere
+// Teil der oeffentliche zum vorderen sein. Nur wenn host.key fehlt, entsteht
+// ein neuer Schluessel. Ist die Datei da, aber nicht lesbar oder in keiner
+// der beiden Formen, bleibt sie unangetastet: ein neuer Schluessel waere
+// eine neue Identitaet, und jeder gekoppelte Client wiese den Host danach
+// als fremd ab.
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]) {
     char path[1200];
     if (config_path("host.key", path, sizeof path)) return -1;
 
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
-        uint8_t buf[33];                // ein Byte mehr: zu lang ist auch beschaedigt
-        ssize_t r = read(fd, buf, sizeof buf);
+        uint8_t buf[65];                // ein Byte mehr: zu lang ist auch beschaedigt
+        ssize_t r = 0;
+        for (;;) {                      // bis zum Dateiende (read darf kuerzer liefern)
+            ssize_t n = read(fd, buf + r, sizeof buf - (size_t)r);
+            if (n > 0 && (r += n) < (ssize_t)sizeof buf) continue;
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) r = -1;
+            break;
+        }
         close(fd);
-        int ok = r == 32;
-        if (ok) memcpy(priv, buf, 32);
+        int ok = r == 32 || r == 64;
+        if (ok) {
+            memcpy(priv, buf, 32);
+            qc_pubkey(priv, pub);
+            // 64 Byte: der hintere Teil muss zum vorderen passen - sonst ist
+            // die Datei beschaedigt (und bleibt, wie sie ist). Der oeffentliche
+            // Schluessel ist kein Geheimnis: memcmp genuegt.
+            if (r == 64 && memcmp(pub, buf + 32, 32) != 0) ok = 0;
+        }
         qc_wipe(buf, sizeof buf);
-        if (!ok) return -2;
-        qc_pubkey(priv, pub);
+        if (!ok) { qc_wipe(priv, 32); return -2; }
         return 0;
     }
     if (!fehlt(path, errno)) return -2;

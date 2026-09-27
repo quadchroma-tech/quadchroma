@@ -453,6 +453,25 @@ static void schluessel_pruefen(void) {
     pruefe(qc_identity_load(p2, q2) == 0 && memcmp(q1, q2, 32) == 0 && memcmp(p1, p2, 32) == 0,
            "zweites Laden: derselbe Schluessel");
 
+    // Die eine App: legt der Rust-Teil host.key zuerst an, hat er 64 Byte
+    // (privat, dann oeffentlich) - derselbe Schluessel, die Datei bleibt.
+    uint8_t beide[64];
+    memcpy(beide, p1, 32);
+    memcpy(beide + 32, q1, 32);
+    datei_schreiben(key, beide, sizeof beide);
+    memset(p2, 0, 32);
+    memset(q2, 0, 32);
+    pruefe(qc_identity_load(p2, q2) == 0 && memcmp(p1, p2, 32) == 0 && memcmp(q1, q2, 32) == 0 &&
+           datei_gleich(key, beide, sizeof beide), "64 Byte (wie von Rust): derselbe Schluessel, Datei bleibt");
+    beide[40] ^= 1;
+    datei_schreiben(key, beide, sizeof beide);
+    pruefe(qc_identity_load(p2, q2) == -2 && datei_gleich(key, beide, sizeof beide),
+           "64 Byte, oeffentlicher Teil passt nicht: -2, Datei bleibt");
+    uint8_t lang65[65];
+    memset(lang65, 9, sizeof lang65);
+    datei_schreiben(key, lang65, sizeof lang65);
+    pruefe(qc_identity_load(p2, q2) == -2 && datei_gleich(key, lang65, sizeof lang65), "65 Byte: -2, Datei bleibt");
+
     datei_schreiben(key, "kurz", 4);
     pruefe(qc_identity_load(p2, q2) == -2 && datei_gleich(key, "kurz", 4), "4 Byte: -2, Datei bleibt");
 

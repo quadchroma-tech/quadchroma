@@ -981,7 +981,7 @@ impl Meldung {
     /// Meldung, und der Nutzer verbindet selbst wieder.
     ///
     /// "Nicht lesbar" gehoert nicht dazu: das ist oft nur eine kurze Sperre
-    /// (Virenscanner, Sicherung), und client.key wie hosts.txt werden VOR dem
+    /// (Virenscanner, Sicherung), und host.key wie hosts.txt werden VOR dem
     /// Verbinden gelesen - ein neuer Versuch alle 2 s oeffnet also keine
     /// Leitung, solange die Sperre besteht, der Host merkt nichts davon, und
     /// im Protokoll steht es dank der Entdoppelung einmal. Ist die Sperre
@@ -2653,6 +2653,7 @@ fn zugang_durchlaufen(
     use zugangsphase::{Ausgang, Eingabe, Kennung};
     let noetig = zugangsphase::noetig_lesen(sock).map_err(|a| zugang_meldung(a, name, addr))?;
     let neue_identitaet = vorwissen.neue_identitaet(&sock.peer);
+    let schluessel_gewechselt = geraeteschluessel_hinweis(sock.flags3, secure::frueherer_client_schluessel_abweichend);
     let mut automat = zugangsphase::Automat::neu(
         &noetig,
         &sock.peer,
@@ -2661,7 +2662,8 @@ fn zugang_durchlaufen(
         &sock.sas,
         neue_identitaet,
         Instant::now(),
-    );
+    )
+    .mit_schluesselhinweis(schluessel_gewechselt);
     let d = automat.dialog().clone();
     protokoll::zeile(format!(
         "Zugang noetig: {} ({addr}, ID {}, Vergleichscode {}) {} - {}{}{}",
@@ -2677,6 +2679,13 @@ fn zugang_durchlaufen(
         if noetig.warten_ms > 0 { format!(", Beweis fruehestens in {} ms", noetig.warten_ms) } else { String::new() },
         if neue_identitaet { ", neue Identitaet unter bekannter Adresse" } else { "" }
     ));
+    if schluessel_gewechselt {
+        protokoll::zeile(format!(
+            "Zugang: {} ist hier gemerkt und fragt trotzdem - dieser Rechner ruft jetzt mit seinem Geraeteschluessel \
+             (host.key) an, nicht mehr mit client.key; einmal Passwort oder Zulassen, dann gilt der neue",
+            d.name
+        ));
+    }
     let mut zuletzt: Option<(zugangsphase::Lage, u32)> = None;
     let ausgang = zugangsphase::fuehren(
         sock,
@@ -2730,6 +2739,17 @@ fn zugang_durchlaufen(
         Ok(k) => Err(Meldung::neu(strings::Key::ErrorProtocol, format!("Zugang: nach der Annahme {k:?} statt QCH1")).bleibend()),
         Err(a) => Err(zugang_meldung(a, &name, addr)),
     }
+}
+
+/// Soll der Zugangsdialog sagen, dass es jetzt einen Schluessel je Rechner
+/// gibt? Nur, wenn dieser Client den Host kennt (kein Bit 0 in Nachricht 3 -
+/// er hat ihn schon einmal angenommen, also kannte der Host dieses Geraet
+/// wohl auch) und noch ein frueherer client.key mit anderem Schluessel liegt
+/// (`alt_abweichend`, erst dann gelesen). Fragt ein bekannter Host aus einem
+/// anderen Grund (dort entfernt), steht der Satz mit "falls" da und stimmt
+/// trotzdem.
+fn geraeteschluessel_hinweis(flags3: u8, alt_abweichend: impl FnOnce() -> bool) -> bool {
+    flags3 & NAME_FLAG_HOST_UNBEKANNT == 0 && alt_abweichend()
 }
 
 /// Ein Ausgang der Zugangsphase als Meldung fuer den Startbildschirm
@@ -7649,8 +7669,8 @@ impl App {
         ));
     }
 
-    /// Die Geraete-ID, die andere von diesem Computer sehen: die der
-    /// Host-Rolle (host.key).
+    /// Die Geraete-ID, die andere von diesem Computer sehen: die des
+    /// Geraeteschluessels (host.key) - als Host wie als Client dieselbe.
     fn eigene_id(&self) -> Option<u32> {
         self.rolle
             .as_ref()
@@ -9155,6 +9175,11 @@ fn zugang_zeichnen(
     } else {
         Vec::new()
     };
+    let schluessel = if d.schluessel_gewechselt {
+        umbruch(u, &lang.get(AccessDeviceKeyChanged).replace("{n}", &d.name), innen, 13)
+    } else {
+        Vec::new()
+    };
     let bitte = if d.zulassen { umbruch(u, &lang.get(AccessOrAllow).replace("{n}", &d.name), innen, 13) } else { Vec::new() };
     let warten = d.warten_s(jetzt);
     let mut stand: Vec<(String, u32)> = Vec::new();
@@ -9172,6 +9197,9 @@ fn zugang_zeichnen(
     th += text.len() as i32 * zeile;
     if !neu.is_empty() {
         th += 8 + neu.len() as i32 * zeile;
+    }
+    if !schluessel.is_empty() {
+        th += 8 + schluessel.len() as i32 * zeile;
     }
     if d.zulassen {
         th += 10 + bitte.len() as i32 * zeile + 30;
@@ -9196,6 +9224,14 @@ fn zugang_zeichnen(
         for z in &neu {
             y += zeile;
             u.text.draw(c, x, y, z, 13, ui::AMBER, 1);
+        }
+    }
+    // Der Hinweis auf den einen Geraeteschluessel: Auskunft, keine Warnung.
+    if !schluessel.is_empty() {
+        y += 8;
+        for z in &schluessel {
+            y += zeile;
+            u.text.draw(c, x, y, z, 13, ui::CYAN, 1);
         }
     }
     if d.zulassen {
@@ -10474,6 +10510,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             code: "628 306".into(),
             zulassen: true,
             neue_identitaet: false,
+            schluessel_gewechselt: false,
             lage: zugangsphase::Lage::Eingabe,
             frei_ab: None,
             runde: 0,
@@ -10497,6 +10534,12 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                 d.lage = zugangsphase::Lage::Pruefen;
                 pw = "k7m-4wq-9tz";
                 zeigen = true;
+            }
+            // Ein bekannter Host fragt nach dem Wechsel auf den einen
+            // Geraeteschluessel neu: Passwort oder Zulassen, mit Hinweis.
+            "zugangschluessel" => {
+                d.schluessel_gewechselt = true;
+                pw = "";
             }
             _ => {}
         }
@@ -16567,6 +16610,17 @@ mod tests {
         assert_eq!(z.iter().map(|z| z.bekannt).collect::<Vec<_>>(), vec![true, true, false]);
         assert_eq!(z[1].name, "10.0.0.6:9001");
         assert_eq!(z[2].id, Some(5));
+    }
+
+    /// Der Hinweis auf den einen Geraeteschluessel im Zugangsdialog: nur bei
+    /// einem Host, den dieser Client kennt (kein Bit 0), und nur, wenn noch
+    /// ein anderer client.key liegt - der wird bei unbekanntem Host gar
+    /// nicht erst gelesen.
+    #[test]
+    fn schluesselhinweis_nur_bei_bekanntem_host() {
+        assert!(geraeteschluessel_hinweis(0, || true));
+        assert!(!geraeteschluessel_hinweis(0, || false));
+        assert!(!geraeteschluessel_hinweis(NAME_FLAG_HOST_UNBEKANNT, || panic!("gelesen")));
     }
 
     /// Die Texte des Zugangs: Platzhalter gefuellt, Meldungen bleiben (kein

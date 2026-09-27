@@ -112,6 +112,11 @@ pub struct Dialog {
     pub zulassen: bool,
     /// An dieser Adresse war ein anderes Geraet gepinnt (8.3).
     pub neue_identitaet: bool,
+    /// Dieser Client kennt den Host, doch der fragt nach Zugang, und hier
+    /// liegt noch ein frueherer client.key mit anderem Schluessel: der Host
+    /// kannte dieses Geraet wohl unter dem alten - der Dialog sagt dazu, dass
+    /// es jetzt einen Schluessel je Rechner gibt (secure::GERAETESCHLUESSEL).
+    pub schluessel_gewechselt: bool,
     pub lage: Lage,
     /// Vorher geht kein Beweis hinaus (Drossel des Hosts); None: sofort.
     pub frei_ab: Option<Instant>,
@@ -222,6 +227,7 @@ impl Automat {
                 code: code.to_string(),
                 zulassen: noetig.zulassen_moeglich(),
                 neue_identitaet,
+                schluessel_gewechselt: false,
                 lage: Lage::Eingabe,
                 frei_ab,
                 runde: 0,
@@ -236,6 +242,13 @@ impl Automat {
 
     pub fn dialog(&self) -> &Dialog {
         &self.dialog
+    }
+
+    /// Mit dem Hinweis auf den einen Geraeteschluessel (Dialog::
+    /// schluessel_gewechselt).
+    pub fn mit_schluesselhinweis(mut self, ja: bool) -> Automat {
+        self.dialog.schluessel_gewechselt = ja;
+        self
     }
 
     /// Den Beweis fuer dieses Passwort bauen (PBKDF2 - dauert spuerbar,
@@ -698,6 +711,13 @@ mod tests {
         let a = Automat::neu(&n, &host_pub(), &HH, "10.0.0.5:9001", "1", true, Instant::now());
         assert_eq!(a.dialog().name, "10.0.0.5:9001");
         assert!(a.dialog().neue_identitaet);
+        // Der Hinweis auf den einen Geraeteschluessel ist aus, bis ihn der
+        // Aufrufer setzt; er aendert sonst nichts am Dialog.
+        assert!(!a.dialog().schluessel_gewechselt);
+        let vorher = a.dialog().clone();
+        let a = a.mit_schluesselhinweis(true);
+        assert!(a.dialog().schluessel_gewechselt);
+        assert_eq!(Dialog { schluessel_gewechselt: false, ..a.dialog().clone() }, vorher);
     }
 
     /// Eine Leitung nach Drehbuch: was hereinkommt, bestimmt eine Antwort
