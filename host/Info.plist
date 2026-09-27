@@ -12,8 +12,12 @@
     <string>QuadChroma</string>
     <key>CFBundleDisplayName</key>
     <string>QuadChroma</string>
+    <!-- The one app: the Rust client with the host engine built in (make copies
+         client/target/release/quadchroma here). The executable's name is not part
+         of the designated requirement - identifier and certificate stay, so the
+         TCC permissions survive the change from quadchroma-host. -->
     <key>CFBundleExecutable</key>
-    <string>quadchroma-host</string>
+    <string>quadchroma</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -34,12 +38,19 @@
     <string>public.app-category.utilities</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Robert Brandt</string>
-    <!-- The host runs without a Dock icon, as a menu bar app: status item,
-         menu and small windows (approval request, password). LSBackgroundOnly
-         would forbid them. Neither key matters for the signature, Gatekeeper
-         or the TCC permissions (they depend on identifier and certificate). -->
+    <!-- The app starts without a Dock icon, as a menu bar app: status item,
+         menu and small windows (approval request, password, device name). The
+         client's window makes it a regular app while it is open (activation
+         policy at run time). LSBackgroundOnly would forbid all of that. Neither
+         key matters for the signature, Gatekeeper or the TCC permissions (they
+         depend on identifier and certificate). -->
     <key>LSUIElement</key>
     <true/>
+    <!-- Local network privacy (macOS 15 and later): the app announces itself and
+         finds the other computers by UDP broadcast (port 9003) and connects to them
+         over TCP; the system asks once and shows this text. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>QuadChroma finds your other computers on the local network and connects to them, and lets them connect to this Mac while sharing is on.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

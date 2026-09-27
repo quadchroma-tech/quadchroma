@@ -407,7 +407,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: Build, sign, notarize and package the macOS host
+    name: Build, sign, notarize and package the macOS app
     needs: vorpruefung
     runs-on: macos-26
     timeout-minutes: 90
@@ -492,7 +492,14 @@ jobs:
           security list-keychain -d user -s "$keychain"
           echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
 
-      - name: Build the host (make; signed with IDENT, ad-hoc without a certificate)
+      # The app's executable is the Rust client with the host engine built in (make runs
+      # cargo build --release --locked in client/).
+      - name: Rust (stable)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Build the app (make; signed with IDENT, ad-hoc without a certificate)
         run: make IDENT="$IDENT"
 
       - name: Developer ID signature with timestamp and hardened runtime (make sign)

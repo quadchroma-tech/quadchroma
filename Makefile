@@ -1,7 +1,16 @@
-# QuadChroma - Mac host: build, sign, package, notarize
+# QuadChroma - the Mac app: build, sign, package, notarize
+#
+# QuadChroma.app is the one app (client and host in one process): its only
+# executable is the Rust client (client/, cargo build --release), which has
+# the host engine from host/ built in (client/build.rs reads SRC, FLAGS and
+# FRAMEWORKS below). Bundle identifier, LSUIElement and the signature stay
+# as they were for the former host app, so granted TCC permissions survive.
 #
 # Everyday use (local, with the self-signed certificate "QuadChroma Dev"):
-#   make                 builds build/QuadChroma.app and signs it
+#   make                 builds build/QuadChroma.app (cargo, then bundle) and signs it
+#   make host-allein     the former stand-alone Objective-C host (host/start.m) as
+#                        build/quadchroma-host, only for the test harnesses - not signed,
+#                        not part of any package
 #   make verify          checks the signature (codesign --strict, entitlements,
 #                        Gatekeeper preview; the latter may fail locally)
 #   make zip             build/QuadChroma-<version>-macos.zip (ditto --norsrc, app as the top-level entry)
@@ -27,7 +36,7 @@
 #                        SHA-256 of ZIP and DMG for the release notes
 #   make notary-history  login test for the notarytool profile (lists earlier submissions)
 #
-# Developer targets that START the app (they trigger the permission dialogs):
+# Developer targets that START the app's host tools (they trigger the permission dialogs):
 #   make list            lists the displays
 #   make capture         records 10 s and writes them to /tmp/qc.hevc
 #   make check           shows what ffprobe sees in the result
@@ -94,7 +103,10 @@ VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString
 endif
 
 APP      := build/QuadChroma.app
-BIN      := $(APP)/Contents/MacOS/quadchroma-host
+# CFBundleExecutable in host/Info.plist; the name of the cargo binary.
+BIN      := $(APP)/Contents/MacOS/quadchroma
+CARGO_BIN := client/target/release/quadchroma
+HOST_ALLEIN := build/quadchroma-host
 ZIP      ?= build/QuadChroma-$(VERSION)-macos.zip
 DMG      ?= build/QuadChroma-$(VERSION).dmg
 DMG_ROOT := build/dmg-root
@@ -105,8 +117,9 @@ DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 # Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
-# host/start.m holds main and belongs only to this app; client/build.rs compiles the
-# rest of this list into the Rust client (the host engine as libqchost.a).
+# host/start.m holds main and belongs only to the stand-alone host (make host-allein);
+# client/build.rs compiles the rest of this list into the Rust client (the host
+# engine as libqchost.a) - that is what QuadChroma.app runs.
 SRC     := host/start.m host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
 # ServiceManagement: "Start at login" (SMAppService); SystemConfiguration: the computer
@@ -152,15 +165,26 @@ if ! printf '%s\n' "$$ausgabe" | grep -q '^ *status: Accepted'; then echo "ERROR
 endef
 
 .PHONY: all sign sign-if-changed verify zip dmg notarize staple notarize-dmg staple-dmg gatekeeper \
-        release notary-history list capture check permissions clean
+        release notary-history list capture check permissions clean cargo host-allein
 
 all: sign-if-changed
 
-$(BIN): $(SRC) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
+# cargo decides itself whether anything changed (Rust sources, host/, this Makefile via
+# client/build.rs); the binary's time stamp only moves when it links anew. The empty rule
+# lets make compare that time stamp - an unchanged binary keeps the app and its signature
+# (and with it a stapled ticket) as they are.
+cargo:
+	cd client && cargo build --release --locked
+
+$(CARGO_BIN): cargo ;
+
+$(BIN): $(CARGO_BIN) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
 	@$(BUNDLE_CHECK)
 	@mkdir -p $(APP)/Contents/MacOS
+	@# The former host executable (CFBundleExecutable quadchroma-host) must not stay in the seal.
+	rm -f $(APP)/Contents/MacOS/quadchroma-host
 	cp host/Info.plist $(APP)/Contents/Info.plist
-	clang $(FLAGS) $(FRAMEWORKS) $(SRC) -o $(BIN)
+	cp $(CARGO_BIN) $(BIN)
 	$(CODESIGN_APP)
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1
@@ -278,6 +302,15 @@ check:
 permissions:
 	@echo "Screen Recording:  System Settings > Privacy & Security > Screen Recording"
 	@echo "Status reported by the system:"; open -n $(APP) --args --list; sleep 2; tail -5 /tmp/quadchroma-m1.log
+
+# The stand-alone Objective-C host (host/start.m and the engine), only for the test
+# harnesses and experiments: not signed, not in any package. Starting it asks for the
+# permissions like the app.
+host-allein: $(HOST_ALLEIN)
+
+$(HOST_ALLEIN): $(SRC) Makefile
+	@mkdir -p build
+	clang $(FLAGS) $(FRAMEWORKS) $(SRC) -o $(HOST_ALLEIN)
 
 clean:
 	rm -rf build

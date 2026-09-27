@@ -150,7 +150,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS (host, test harnesses, packaging, client)
+    name: macOS (the one app, test harnesses, packaging)
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -159,7 +159,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build the host (ad-hoc signed; the app is not started)
+      # QuadChroma.app runs the Rust client with the host engine built in: make builds it
+      # with cargo, so Rust comes first.
+      - name: Rust (stable)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: client -> target
+
+      - name: Build the app (cargo, bundle, ad-hoc signed; the app is not started)
         run: make IDENT=-
 
       - name: Verify the signature (make verify; Gatekeeper rejects ad-hoc signatures, as expected)
@@ -195,6 +207,8 @@ jobs:
           clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
                 -framework Foundation -framework AppKit -framework ServiceManagement -framework CoreServices \
                 host/einbettungstest.m host/menue.m host/texte.m -o build/einbettungstest
+          # The former stand-alone host (host/start.m), kept for the harnesses: it must still link.
+          make host-allein
           # hosttest needs Screen Recording (a TCC permission) at run time, which a runner
           # does not have - only compile it here; that catches compile errors.
           clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations \
@@ -218,22 +232,16 @@ jobs:
           build/menuetest
           build/einbettungstest
 
-      - name: Rust (stable)
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: client -> target
-
       - name: Build and test the client (without the clipboard tests, as in the documented recipe)
         working-directory: client
         run: |
           set -euo pipefail
           cargo build --release --locked
           cargo test --release --locked -- --skip clipboard
+          # The one app's menu bar icon without the service (no listening, no capture, a
+          # throw-away HOME) and "Prevent sleep" as pmset -g assertions shows it.
+          target/release/quadchroma --menueleiste-selbsttest
+          target/release/quadchroma --ruhe-selbsttest
 
       - name: Upload the host packages as an artifact (7 days, ad-hoc signed - for trying out only)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
