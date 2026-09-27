@@ -10633,13 +10633,14 @@ fn decodertest() {
         let t0 = Instant::now();
         let mut fehler = None;
         for (i, au) in probe.einheiten.iter().enumerate() {
+            let vorher = bilder.len();
             if let Err(e) = d.fuettern(au, i as i64, &mut bilder) {
                 fehler = Some(format!("Paket {i}: {e}"));
                 break;
             }
             // Wie im Empfangsfaden bleibt nur das neueste Bild; die anderen
             // gehen gleich an den Pufferpool des Decoders zurueck.
-            zahl += bilder.len();
+            zahl += bilder.len() - vorher;
             if bilder.len() > 1 {
                 bilder.drain(..bilder.len() - 1);
             }
