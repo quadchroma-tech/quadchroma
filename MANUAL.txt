@@ -1065,6 +1065,15 @@ the keys.
 Windows: one app for both directions
 ------------------------------------
 
+On Windows the app requires administrator rights: Windows asks once via
+UAC at every start (a viewer used only as a client sees the same prompt).
+This is required so the host role can control windows with higher rights
+in the user's session - Task Manager, the registry editor, installer
+windows - which Windows otherwise shields from injected input (see "Keys
+arrive over the connection ..." under "Windows as host"). The exe carries
+requireAdministrator in its manifest; the real UAC consent prompt on the
+secure desktop stays out of reach either way.
+
 On Windows the client and the host role run in one process with one icon
 in the notification area. The host role is part of the app from the
 start (its own thread, its own log host-protokoll.txt); "Share this PC"
@@ -1099,12 +1108,18 @@ laeuft schon - der Start im Hintergrund endet.").
 
 "Start with Windows" is the item in the icon's menu and the check box
 of the same name on the start screen, directly below "Prevent sleep
-while QuadChroma is running"; both show whether the shortcut
-QuadChroma.lnk (target quadchroma.exe --hintergrund) lies in the user's
-Startup folder, and a click in either writes or deletes it. A shortcut
-of earlier versions ("QuadChroma - Freigabe.lnk", --host) counts as on
-and, if it starts this exe, is replaced by the new one at its next
-start.
+while QuadChroma is running"; both show whether the scheduled task
+"QuadChroma" exists, and a click in either creates or deletes it. The
+task runs at the current user's logon with highest privileges (elevated,
+so it starts without a UAC prompt at logon; run level HIGHEST, logon
+type InteractiveToken - it runs in the user's interactive session after
+login, not as a service before it), its action being this exe with
+--hintergrund. A Startup-folder shortcut is no longer used: an exe with
+requireAdministrator would not launch silently from there. A shortcut of
+earlier versions in the Startup folder ("QuadChroma.lnk" with
+--hintergrund, or the older "QuadChroma - Freigabe.lnk" with --host)
+counts as on and, if it starts this exe, is replaced by the scheduled
+task when the app starts.
 
 --host [port] is "start in the background with sharing on": it switches
 sharing on and remembers it, so shortcuts of earlier versions keep
@@ -2634,16 +2649,20 @@ password ..." opens a small window "Change password" with two password fields,
 host: the menu bar"); "Remove all devices ..." asks in a Yes/No box whose
 default is No. The Allow window is a small window of its own; it stays on top,
 beeps and flashes in the taskbar, but does not take the focus (see "Encryption
-and access"). "Start with Windows" (in the one app's menu) puts the shortcut
-"QuadChroma.lnk" - the exe with --hintergrund - into the user's Startup
-folder, or removes it; the check mark shows whether it is there ("Mit Windows
-starten: an (Verknuepfung im Autostart-Ordner)" or "... aus"). A shortcut
-"QuadChroma - Freigabe.lnk" (the exe with --host) of an earlier version counts
-as on and is replaced by the new one when the app starts, but only if it
-starts this very exe ("Mit Windows starten: die alte Verknuepfung der Freigabe
-ist durch die der App ersetzt"); a shortcut to another copy stays ("...
-startet <Pfad>, nicht diese exe - sie bleibt, wie sie ist"), so a test or
-portable copy never takes over the autostart. Switching off removes both.
+and access"). "Start with Windows" (in the one app's menu) creates the
+scheduled task "QuadChroma" - the exe with --hintergrund, at the current
+user's logon, run level HIGHEST - via schtasks.exe, or deletes it; the check
+mark shows whether the task exists ("Mit Windows starten: an (geplante
+Aufgabe, hoechste Rechte, bei der Anmeldung)" or "... aus"). It replaces the
+Startup-folder shortcut of earlier versions, because an exe with
+requireAdministrator would not launch silently from the Startup folder. A
+shortcut of an earlier version in the Startup folder ("QuadChroma.lnk" with
+--hintergrund, or "QuadChroma - Freigabe.lnk" with --host) counts as on and is
+replaced by the task when the app starts, but only if it starts this very exe
+("Mit Windows starten: die alte Verknuepfung ist durch die geplante Aufgabe
+ersetzt"); a shortcut to another copy stays ("... startet <Pfad>, nicht diese
+exe - sie bleibt, wie sie ist"), so a test or portable copy never takes over
+the autostart. Switching off deletes the task.
 "Stop sharing" of the host-only process says goodbye to the viewer (message
 13, reason 1: "<Name> stopped sharing.") and ends it ("Freigabe beendet
 (Infobereich)"). At logoff or shutdown, when an installer closes it (Restart
@@ -2865,8 +2884,19 @@ host-protokoll.txt - next to the client's hosts.txt.
 Keys arrive over the connection as positions (macOS key codes) and are
 translated into scancodes on Windows; the client's Command key becomes the
 Windows key, its Option key Alt. On disconnect the host releases all held
-keys. Application windows with elevated privileges (UAC) get no input - that
-is how Windows works.
+keys. The app runs elevated (requireAdministrator, see "Windows: one app for
+both directions"), so SendInput reaches windows with higher rights in the
+user's session - Task Manager, the registry editor, installer windows. The one
+window that stays out of reach is the real UAC consent prompt on the secure
+desktop; that would need a SYSTEM service. While such a window is in front,
+SendInput is refused: the host notes it once in the log ("Eingaben: SendInput
+nimmt gerade nichts an ...") and sends the viewer a short status (message 9
+with 2), so the Mac shows "A window on the Windows PC needs Windows' own
+confirmation - control is not possible there for a moment." (at most once every
+few seconds); when input flows again the status is taken back (message 9 with
+3). At the start the host logs the right level once ("Rechte: erhoeht", or
+"Rechte: normal - SendInput erreicht keine Fenster mit hoeheren Rechten" for a
+portable build without the manifest); it never relaunches itself.
 
 The client's test mode shows every host that announces itself on the network
 once, as a line "Host gefunden: <Name> (<Adresse>, ID <ID>, Zulassen

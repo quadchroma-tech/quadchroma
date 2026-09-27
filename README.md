@@ -283,9 +283,17 @@ process for it: the host role runs inside the app, and
 icon's menu - decides whether it listens. The one icon in the notification area opens
 the window with a left click; its menu (right click) has the same host items as the Mac
 host - device ID, access password, allowed devices - plus "Change device name ...",
-"Share this PC", "Start with Windows" (one shortcut in the Startup folder, which starts
-the app silently in the notification area), "Prevent sleep while QuadChroma is running"
-and "Quit". `quadchroma.exe --host` starts the app in the background with sharing on
+"Share this PC", "Start with Windows", "Prevent sleep while QuadChroma is running"
+and "Quit". On Windows the app asks for administrator rights once via UAC at every
+start; this is required so that the host role can control windows with higher rights
+(Task Manager, the registry editor, installer windows) - without it Windows drops the
+injected mouse and keyboard events whenever such a window is in front. The one thing
+that stays out of reach is the UAC consent prompt itself, on Windows' secure desktop
+(that would need a system service). A viewer used only as a client still gets the UAC
+prompt at launch. "Start with Windows" is therefore a scheduled task that runs at logon
+with highest privileges (so it starts elevated without a prompt), not a Startup-folder
+shortcut, which Windows would not launch silently for an elevated exe.
+`quadchroma.exe --host` starts the app in the background with sharing on
 (shortcuts of earlier versions keep working). The host role's files are `host.key`,
 `host-devices.txt`, `host-password.txt` and `host-protokoll.txt` in
 `%APPDATA%\QuadChroma\`. What it can and cannot do yet is under "Platforms and status";
