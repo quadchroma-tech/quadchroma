@@ -6054,12 +6054,6 @@ fn start_im_hintergrund(
 /// Das Symbol steht auch mit tray=aus: auf dem Mac das der Host-Engine.
 const SYMBOL_OHNE_TRAY: bool = cfg!(target_os = "macos");
 
-/// Kommentar der Verknuepfung "Mit Windows starten".
-#[cfg_attr(not(windows), allow(dead_code))]
-fn autostart_beschreibung(lang: &strings::Lang) -> String {
-    format!("QuadChroma – {}", lang.get(strings::Key::AppSubtitle))
-}
-
 /// Den Ruhezustand verhindern (`an`) oder wieder zulassen, mit
 /// Protokollzeile; der Grund in powercfg /requests ist der Text des
 /// Kaestchens. Liefert, ob die Anforderung jetzt gilt.
@@ -7854,9 +7848,9 @@ impl App {
         #[cfg(windows)]
         {
             let an = !verknuepfung::autostart_an(None);
-            match verknuepfung::autostart_setzen(None, an, &autostart_beschreibung(self.lang)) {
+            match verknuepfung::autostart_setzen(None, an) {
                 Ok(()) => protokoll::zeile(if an {
-                    "Mit Windows starten: an (Verknuepfung im Autostart-Ordner)".into()
+                    "Mit Windows starten: an (geplante Aufgabe, hoechste Rechte, bei der Anmeldung)".into()
                 } else {
                     "Mit Windows starten: aus".into()
                 }),
@@ -12478,15 +12472,17 @@ fn main() {
     }
     let proxy = el.create_proxy();
 
-    // Die Verknuepfung "Mit Windows starten" frueherer Fassungen (die
-    // Host-Rolle mit --host) weicht der einen (--hintergrund).
+    // Die Verknuepfung "Mit Windows starten" frueherer Fassungen (die eine App
+    // mit --hintergrund, die noch aeltere Host-Rolle mit --host) weicht der
+    // geplanten Aufgabe: eine erhoehte exe liefe aus dem Autostart-Ordner nicht
+    // mehr still an.
     #[cfg(windows)]
-    match verknuepfung::autostart_migrieren(None, &autostart_beschreibung(sprache)) {
+    match verknuepfung::autostart_migrieren(None, None) {
         Ok(verknuepfung::Migration::Ersetzt) => {
-            protokoll::zeile("Mit Windows starten: die alte Verknuepfung der Freigabe ist durch die der App ersetzt".into())
+            protokoll::zeile("Mit Windows starten: die alte Verknuepfung ist durch die geplante Aufgabe ersetzt".into())
         }
         Ok(verknuepfung::Migration::AndereExe(ziel)) => protokoll::zeile(format!(
-            "Mit Windows starten: die alte Verknuepfung der Freigabe startet {ziel}, nicht diese exe - sie bleibt, wie sie ist"
+            "Mit Windows starten: die alte Verknuepfung startet {ziel}, nicht diese exe - sie bleibt, wie sie ist"
         )),
         Ok(verknuepfung::Migration::Keine) => {}
         Err(e) => protokoll::zeile(format!("Mit Windows starten: alte Verknuepfung nicht ersetzt - {e}")),

@@ -59,6 +59,9 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Console",
+    # Host role: SAM name (DOMAIN\user) of the current user for the autostart
+    # scheduled task's /RU (GetUserNameExW, see verknuepfung.rs)
+    "Win32_Security_Authentication_Identity",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_DataExchange",

@@ -247,24 +247,131 @@ fn lnk_speichern(
 
 // ------------------------------------------------ Mit Windows starten
 //
-// Die eine App startet mit der Anmeldung ueber EINE Verknuepfung im
-// Autostart-Ordner des Nutzers (FOLDERID_Startup) auf dieselbe exe mit
-// --hintergrund: still ins Symbol, die Freigabe wie eingestellt
-// (Spezifikation Pairing v1, 10.2) - keine Registry, kein Dienst: Desktop
-// Duplication braucht die Sitzung des Nutzers. Ob der Punkt einen Haken
-// traegt, sagt allein, ob eine der beiden Dateien da ist. Die alte
-// Verknuepfung der Host-Rolle ("QuadChroma - Freigabe.lnk", --host) laeuft
-// weiter (--host startet die App im Hintergrund mit Freigabe an) und wird
-// beim Start der App durch die neue ersetzt (autostart_migrieren).
+// Die eine App startet mit der Anmeldung des Nutzers ueber eine GEPLANTE
+// AUFGABE (Aufgabenplanung, schtasks.exe), nicht mehr ueber eine Verknuepfung
+// im Autostart-Ordner. Grund: mit dem Manifest requireAdministrator ist die
+// exe erhoeht, und eine erhoehte exe startet Windows NICHT still aus dem
+// Autostart-Ordner (sie wird blockiert oder bis zur naechsten Anmeldung mit
+// Abfrage aufgeschoben). Die geplante Aufgabe laeuft "bei der Anmeldung"
+// (/SC ONLOGON) mit hoechsten Rechten (/RL HIGHEST) im Anmeldetoken des
+// Nutzers - erhoeht, aber OHNE UAC-Abfrage (LogonType InteractiveToken, kein
+// gespeichertes Passwort). Sie laeuft in der interaktiven Sitzung NACH der
+// Anmeldung (Desktop Duplication braucht die Sitzung) - kein Dienst vor der
+// Anmeldung. Aktion ist diese exe mit --hintergrund. So bietet es auch AnyDesk
+// bzw. RustDesk an.
+//
+// Ob der Punkt einen Haken traegt, sagt allein, ob die Aufgabe da ist
+// (autostart_an -> schtasks /Query). Die alten Verknuepfungen im
+// Autostart-Ordner (QuadChroma.lnk der einen App frueherer Fassungen,
+// "QuadChroma - Freigabe.lnk" der noch aelteren Host-Rolle mit --host) werden
+// beim Start durch die Aufgabe ersetzt, wenn sie diese exe starten
+// (autostart_migrieren) - eine erhoehte exe liefe daraus ja nicht mehr still an.
+//
+// Reine Logik (Aufgabenname und die Befehlszeilen von schtasks) laeuft auf
+// jeder Plattform und in den Tests; die echten schtasks-Aufrufe und der Name
+// des Nutzers stehen hinter cfg(windows).
 
-/// Dateiname der Autostart-Verknuepfung.
+/// Name der geplanten Aufgabe. Tests geben einen eindeutigen Namen mit (Some),
+/// damit sie nie die echte Aufgabe anfassen; sonst der Standard.
+pub const AUTOSTART_TASK: &str = "QuadChroma";
+/// Dateiname der frueheren Autostart-Verknuepfung der einen App.
 pub const AUTOSTART_DATEI: &str = "QuadChroma.lnk";
 /// Die Verknuepfung der Host-Rolle vor der einen App.
 pub const AUTOSTART_ALT: &str = "QuadChroma - Freigabe.lnk";
-/// Argument der Autostart-Verknuepfung.
+/// Argument der Autostart-Aufgabe (und frueher der Verknuepfung).
 pub const AUTOSTART_ARGUMENT: &str = "--hintergrund";
 
-/// Der Autostart-Ordner des Nutzers.
+/// Der Aufgabenname: der uebergebene (Tests) oder der Standard.
+fn task_name(task: Option<&str>) -> &str {
+    task.unwrap_or(AUTOSTART_TASK)
+}
+
+/// Wert fuer schtasks /TR: die exe in Anfuehrungszeichen (der Pfad kann
+/// Leerzeichen enthalten), dann --hintergrund. schtasks legt das als Command
+/// und Arguments getrennt ab.
+fn tr_wert(exe: &Path) -> String {
+    format!("\"{}\" {AUTOSTART_ARGUMENT}", exe.display())
+}
+
+/// Argumente fuer schtasks /Create: bei der Anmeldung (ONLOGON), hoechste
+/// Rechte (HIGHEST), als der aktuelle Nutzer (`benutzer`), Aktion `tr`,
+/// vorhandene ueberschreiben (/F).
+fn erstellen_args(task: &str, benutzer: &str, tr: &str) -> Vec<String> {
+    vec![
+        "/Create".into(),
+        "/SC".into(),
+        "ONLOGON".into(),
+        "/RL".into(),
+        "HIGHEST".into(),
+        "/RU".into(),
+        benutzer.into(),
+        "/TR".into(),
+        tr.into(),
+        "/TN".into(),
+        task.into(),
+        "/F".into(),
+    ]
+}
+
+/// Argumente fuer schtasks /Query der Aufgabe.
+fn query_args(task: &str) -> Vec<String> {
+    vec!["/Query".into(), "/TN".into(), task.into()]
+}
+
+/// Argumente fuer schtasks /Delete der Aufgabe (ohne Rueckfrage, /F).
+fn loeschen_task_args(task: &str) -> Vec<String> {
+    vec!["/Delete".into(), "/TN".into(), task.into(), "/F".into()]
+}
+
+/// schtasks.exe ausfuehren (voller Pfad %SystemRoot%\System32\schtasks.exe,
+/// damit kein fremdes schtasks im PATH zaehlt), ohne Konsolenfenster und mit
+/// leerer Eingabe (nie eine Rueckfrage abwarten). Liefert (Erfolg, Ausgabe).
+#[cfg(windows)]
+fn schtasks(args: &[String]) -> Result<(bool, String), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    // CREATE_NO_WINDOW: eine erhoehte GUI-App soll fuer schtasks kein
+    // Konsolenfenster aufblitzen lassen.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let exe = format!("{root}\\System32\\schtasks.exe");
+    let ausgabe = Command::new(&exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("schtasks: {e}"))?;
+    let mut text = String::from_utf8_lossy(&ausgabe.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&ausgabe.stderr));
+    Ok((ausgabe.status.success(), text.trim().to_string()))
+}
+
+/// SAM-Name des aktuellen Nutzers (RECHNER\user bzw. DOMAENE\user) fuer /RU.
+/// %USERDOMAIN% taugt nicht: bei einem lokalen Konto steht dort die
+/// Arbeitsgruppe (etwa WORKGROUP), nicht der Rechnername. GetUserNameEx
+/// liefert den richtigen Namen; klappt es nicht, der blosse %USERNAME%
+/// (schtasks loest ihn als lokales Konto auf).
+#[cfg(windows)]
+fn aktueller_benutzer() -> String {
+    use windows::core::PWSTR;
+    use windows::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
+    unsafe {
+        // Erster Aufruf ohne Puffer: er scheitert und legt die noetige Laenge
+        // (in Zeichen, mit Abschluss) in `laenge`.
+        let mut laenge = 0u32;
+        let _ = GetUserNameExW(NameSamCompatible, None, &mut laenge);
+        if laenge > 0 {
+            let mut puffer = vec![0u16; laenge as usize];
+            if GetUserNameExW(NameSamCompatible, Some(PWSTR(puffer.as_mut_ptr())), &mut laenge) {
+                return String::from_utf16_lossy(&puffer[..laenge as usize]);
+            }
+        }
+    }
+    std::env::var("USERNAME").unwrap_or_default()
+}
+
+/// Der Autostart-Ordner des Nutzers (fuer die Migration der alten
+/// Verknuepfungen).
 #[cfg(all(windows, not(test)))]
 fn autostart_ordner() -> Result<PathBuf, String> {
     use windows::Win32::System::Com::CoTaskMemFree;
@@ -283,28 +390,22 @@ fn autostart_ordner() -> Result<PathBuf, String> {
     Err("im Test gibt es keinen Autostart-Ordner - Ordner angeben".into())
 }
 
-/// Pfad der Autostart-Verknuepfung (in `ordner`, sonst im Autostart-Ordner).
+/// Pfad einer alten Autostart-Verknuepfung (in `ordner`, sonst im
+/// Autostart-Ordner).
 #[cfg(windows)]
-pub fn autostart_pfad(ordner: Option<&Path>) -> Result<PathBuf, String> {
+fn autostart_lnk_pfad(ordner: Option<&Path>, datei: &str) -> Result<PathBuf, String> {
     Ok(match ordner {
         Some(o) => o.to_path_buf(),
         None => autostart_ordner()?,
     }
-    .join(AUTOSTART_DATEI))
+    .join(datei))
 }
 
-/// Pfad der alten Autostart-Verknuepfung der Host-Rolle.
+/// Startet QuadChroma mit Windows - liegt die geplante Aufgabe vor?
+/// (schtasks /Query liefert 0, wenn es sie gibt, sonst 1.)
 #[cfg(windows)]
-fn autostart_alt_pfad(ordner: Option<&Path>) -> Result<PathBuf, String> {
-    Ok(autostart_pfad(ordner)?.with_file_name(AUTOSTART_ALT))
-}
-
-/// Startet QuadChroma mit Windows (liegt die neue oder noch die alte
-/// Verknuepfung da)?
-#[cfg(windows)]
-pub fn autostart_an(ordner: Option<&Path>) -> bool {
-    let da = |p: Result<PathBuf, String>| p.map(|p| p.is_file()).unwrap_or(false);
-    da(autostart_pfad(ordner)) || da(autostart_alt_pfad(ordner))
+pub fn autostart_an(task: Option<&str>) -> bool {
+    schtasks(&query_args(task_name(task))).map(|(ok, _)| ok).unwrap_or(false)
 }
 
 /// Eine Datei loeschen; fehlt sie schon, ist das kein Fehler.
@@ -317,32 +418,39 @@ fn loeschen(pfad: &Path) -> Result<(), String> {
     }
 }
 
-/// Die neue Verknuepfung schreiben: die laufende exe mit --hintergrund.
+/// Die geplante Aufgabe anlegen (bzw. mit /F erneuern): diese exe mit
+/// --hintergrund, bei der Anmeldung, hoechste Rechte, als der aktuelle Nutzer.
 #[cfg(windows)]
-fn autostart_schreiben(pfad: &Path, beschreibung: &str) -> Result<(), String> {
-    let ziel_ordner = pfad.parent().map(Path::to_path_buf).unwrap_or_default();
-    if !ziel_ordner.is_dir() {
-        std::fs::create_dir_all(&ziel_ordner).map_err(|e| format!("{}: {e}", ziel_ordner.display()))?;
-    }
+fn task_anlegen(task: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
-    let arbeitsordner = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    let symbol = crate::logo::ico_schreiben().unwrap_or_else(|_| exe.clone());
-    im_sta(|| lnk_speichern(pfad, &exe, AUTOSTART_ARGUMENT, &arbeitsordner, beschreibung, &symbol, 0))
+    let benutzer = aktueller_benutzer();
+    if benutzer.is_empty() {
+        return Err("kein aktueller Nutzer fuer /RU".into());
+    }
+    let (ok, ausgabe) = schtasks(&erstellen_args(task, &benutzer, &tr_wert(&exe)))?;
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("schtasks /Create: {ausgabe}"))
+    }
 }
 
-/// "Mit Windows starten" an (die eine Verknuepfung anlegen bzw. erneuern,
-/// eine alte der Host-Rolle weg) oder aus (beide loeschen; fehlen sie
-/// schon, ist das kein Fehler). `beschreibung`: Kommentar der Verknuepfung.
+/// "Mit Windows starten" an (die geplante Aufgabe anlegen bzw. erneuern) oder
+/// aus (die Aufgabe loeschen; fehlt sie schon, ist das kein Fehler - schtasks
+/// /Delete meldet dann einen Fehler, den wir uebergehen, wenn die Aufgabe
+/// danach wirklich weg ist).
 #[cfg(windows)]
-pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> Result<(), String> {
-    let pfad = autostart_pfad(ordner)?;
-    let alt = autostart_alt_pfad(ordner)?;
-    if !an {
-        let r = loeschen(&pfad);
-        return loeschen(&alt).and(r);
+pub fn autostart_setzen(task: Option<&str>, an: bool) -> Result<(), String> {
+    let name = task_name(task);
+    if an {
+        return task_anlegen(name);
     }
-    autostart_schreiben(&pfad, beschreibung)?;
-    loeschen(&alt)
+    let (ok, ausgabe) = schtasks(&loeschen_task_args(name))?;
+    if ok || !autostart_an(task) {
+        Ok(())
+    } else {
+        Err(format!("schtasks /Delete: {ausgabe}"))
+    }
 }
 
 /// Was `autostart_migrieren` tat.
@@ -351,32 +459,49 @@ pub fn autostart_setzen(ordner: Option<&Path>, an: bool, beschreibung: &str) -> 
 pub enum Migration {
     /// Keine alte Verknuepfung - nichts zu tun.
     Keine,
-    /// Die alte ist durch die eine ersetzt.
+    /// Eine alte Verknuepfung ist durch die geplante Aufgabe ersetzt.
     Ersetzt,
-    /// Die alte startet ein anderes Programm (Ziel wie gelesen) - sie bleibt,
-    /// und der Autostart zeigt nicht auf diese exe (etwa eine Test- oder
-    /// portable Kopie).
+    /// Die einzige alte Verknuepfung startet ein anderes Programm (Ziel wie
+    /// gelesen) - sie bleibt, und der Autostart zeigt nicht auf diese exe
+    /// (etwa eine Test- oder portable Kopie).
     AndereExe(String),
 }
 
-/// Beim Start der App: liegt noch die alte Verknuepfung der Host-Rolle da
-/// und startet sie DIESE exe, tritt die eine an ihre Stelle (die alte wird
-/// erst geloescht, wenn die neue steht). Zeigt sie auf ein anderes
-/// Programm, bleibt alles, wie es ist: eine zweite Kopie (Test, portabel)
-/// soll den Autostart der installierten nicht auf sich umbiegen.
+/// Beim Start der App: liegt noch eine alte Autostart-Verknuepfung da
+/// (QuadChroma.lnk oder "QuadChroma - Freigabe.lnk") und startet sie DIESE
+/// exe, tritt die geplante Aufgabe an ihre Stelle (die Aufgabe wird erst
+/// angelegt, dann die Verknuepfung geloescht). Zeigt die einzige vorhandene
+/// auf ein anderes Programm, bleibt alles, wie es ist: eine zweite Kopie
+/// (Test, portabel) soll den Autostart der installierten nicht auf sich
+/// umbiegen.
 #[cfg(windows)]
-pub fn autostart_migrieren(ordner: Option<&Path>, beschreibung: &str) -> Result<Migration, String> {
-    let alt = autostart_alt_pfad(ordner)?;
-    if !alt.is_file() {
-        return Ok(Migration::Keine);
-    }
-    let ziel = lnk_ziel(&alt)?;
+pub fn autostart_migrieren(ordner: Option<&Path>, task: Option<&str>) -> Result<Migration, String> {
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
-    if !dieselbe_datei(Path::new(&ziel), &exe) {
-        return Ok(Migration::AndereExe(ziel));
+    let mut zu_migrieren = Vec::new();
+    let mut fremd = None;
+    for datei in [AUTOSTART_DATEI, AUTOSTART_ALT] {
+        let pfad = autostart_lnk_pfad(ordner, datei)?;
+        if !pfad.is_file() {
+            continue;
+        }
+        let ziel = lnk_ziel(&pfad)?;
+        if dieselbe_datei(Path::new(&ziel), &exe) {
+            zu_migrieren.push(pfad);
+        } else if fremd.is_none() {
+            fremd = Some(ziel);
+        }
     }
-    autostart_schreiben(&autostart_pfad(ordner)?, beschreibung)?;
-    loeschen(&alt)?;
+    if zu_migrieren.is_empty() {
+        return Ok(match fremd {
+            Some(ziel) => Migration::AndereExe(ziel),
+            None => Migration::Keine,
+        });
+    }
+    // Erst die Aufgabe anlegen, dann die alten Verknuepfungen loeschen.
+    task_anlegen(task_name(task))?;
+    for pfad in zu_migrieren {
+        loeschen(&pfad)?;
+    }
     Ok(Migration::Ersetzt)
 }
 
@@ -557,107 +682,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
-    /// "Mit Windows starten": an legt die eine Verknuepfung auf die exe mit
-    /// --hintergrund an (zweimal an ist dieselbe Datei), aus loescht sie,
-    /// zweimal aus ist kein Fehler. Im Test nie im echten Autostart-Ordner.
+    /// Reine Logik der geplanten Aufgabe (auf jeder Plattform): der Standard-
+    /// bzw. der uebergebene Name, der /TR-Wert mit der exe in
+    /// Anfuehrungszeichen und die drei Befehlszeilen von schtasks.
+    #[test]
+    fn schtasks_befehlszeilen() {
+        assert_eq!(task_name(None), "QuadChroma");
+        assert_eq!(AUTOSTART_TASK, "QuadChroma");
+        assert_eq!(task_name(Some("QC-Test-1")), "QC-Test-1");
+        assert_eq!(
+            tr_wert(Path::new("C:\\Program Files\\QuadChroma\\quadchroma.exe")),
+            "\"C:\\Program Files\\QuadChroma\\quadchroma.exe\" --hintergrund"
+        );
+        assert_eq!(
+            erstellen_args("QC", "PC\\rob", "\"c:\\a b\\q.exe\" --hintergrund"),
+            vec![
+                "/Create", "/SC", "ONLOGON", "/RL", "HIGHEST", "/RU", "PC\\rob", "/TR",
+                "\"c:\\a b\\q.exe\" --hintergrund", "/TN", "QC", "/F"
+            ]
+        );
+        assert_eq!(query_args("QC"), vec!["/Query", "/TN", "QC"]);
+        assert_eq!(loeschen_task_args("QC"), vec!["/Delete", "/TN", "QC", "/F"]);
+    }
+
+    /// "Mit Windows starten": an legt die geplante Aufgabe an (schtasks
+    /// /Create), zweimal an ist kein Fehler (/F), aus loescht sie, zweimal aus
+    /// ist kein Fehler. Der Test nimmt einen eindeutigen Aufgabennamen, nie
+    /// den echten "QuadChroma".
     #[cfg(windows)]
     #[test]
     fn autostart_an_und_aus() {
-        let ordner = std::env::temp_dir().join(format!("{}-autostart", crate::secure::test_lauf()));
-        let _ = std::fs::remove_dir_all(&ordner);
-        assert!(!autostart_an(Some(&ordner)));
-        autostart_setzen(Some(&ordner), true, "QuadChroma – Fernsteuerung").unwrap();
-        assert!(autostart_an(Some(&ordner)));
-        let pfad = ordner.join(AUTOSTART_DATEI);
-        assert_eq!(AUTOSTART_DATEI, "QuadChroma.lnk");
-        let (ziel, arg, arbeit, kommentar, _, _) = lnk_lesen(&pfad).unwrap();
-        let exe = std::env::current_exe().unwrap();
-        assert_eq!(ziel.to_lowercase(), exe.display().to_string().to_lowercase());
-        assert_eq!(arg, "--hintergrund");
-        assert_eq!(arbeit.to_lowercase(), exe.parent().unwrap().display().to_string().to_lowercase());
-        assert_eq!(kommentar, "QuadChroma – Fernsteuerung");
-        autostart_setzen(Some(&ordner), true, "x").unwrap();
-        assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
-        autostart_setzen(Some(&ordner), false, "").unwrap();
-        assert!(!autostart_an(Some(&ordner)));
-        autostart_setzen(Some(&ordner), false, "").unwrap();
-        // Ohne Ordner im Test kein Autostart-Ordner.
-        assert!(autostart_pfad(None).is_err());
-        assert!(!autostart_an(None));
-        assert!(autostart_migrieren(None, "").is_err());
-        let _ = std::fs::remove_dir_all(&ordner);
+        let task = format!("{}-anaus", crate::secure::test_lauf());
+        let t = Some(task.as_str());
+        // Vor und nach dem Test aufraeumen, egal wie er ausging.
+        let _ = autostart_setzen(t, false);
+        assert!(!autostart_an(t), "Aufgabe schon da?");
+        autostart_setzen(t, true).unwrap();
+        assert!(autostart_an(t), "Aufgabe nach 'an' nicht da");
+        // Die angelegte Aufgabe hat hoechste Rechte, einen Anmelde-Ausloeser und
+        // laeuft als der aktuelle Nutzer (schtasks /Query /XML).
+        let (ok, xml) = schtasks(&["/Query".into(), "/TN".into(), task.clone(), "/XML".into()]).unwrap();
+        assert!(ok, "Query /XML: {xml}");
+        assert!(xml.contains("HighestAvailable"), "kein HIGHEST: {xml}");
+        assert!(xml.contains("<LogonTrigger>"), "kein Anmelde-Ausloeser: {xml}");
+        assert!(xml.contains("--hintergrund"), "kein --hintergrund: {xml}");
+        let benutzer = aktueller_benutzer();
+        assert!(
+            xml.to_lowercase().contains(&benutzer.to_lowercase()),
+            "nicht als aktueller Nutzer ({benutzer}): {xml}"
+        );
+        // Zweimal an: mit /F kein Fehler, die Aufgabe bleibt genau eine.
+        autostart_setzen(t, true).unwrap();
+        assert!(autostart_an(t));
+        autostart_setzen(t, false).unwrap();
+        assert!(!autostart_an(t), "Aufgabe nach 'aus' noch da");
+        // Zweimal aus: die Aufgabe fehlt schon, das ist kein Fehler.
+        autostart_setzen(t, false).unwrap();
+        assert!(!autostart_an(t));
     }
 
-    /// Die alte Verknuepfung startet ein anderes Programm (eine andere
-    /// Kopie): sie bleibt, keine neue entsteht - der Autostart zeigt nie auf
-    /// eine Test- oder portable Kopie. Zeigt sie auf diese exe, nur ueber
-    /// einen anderen Schreibweg (Grossbuchstaben), wird sie ersetzt.
+    /// Migration einer alten Verknuepfung, die ein ANDERES Programm startet
+    /// (eine andere Kopie): sie bleibt, keine Aufgabe entsteht - der Autostart
+    /// zeigt nie auf eine Test- oder portable Kopie. Zeigt sie auf diese exe,
+    /// nur ueber einen anderen Schreibweg (Grossbuchstaben), wird sie durch die
+    /// geplante Aufgabe ersetzt.
     #[cfg(windows)]
     #[test]
     fn autostart_alte_verknuepfung_anderer_exe() {
         let ordner = std::env::temp_dir().join(format!("{}-autostart-fremd", crate::secure::test_lauf()));
+        let task = format!("{}-fremd", crate::secure::test_lauf());
+        let t = Some(task.as_str());
         let _ = std::fs::remove_dir_all(&ordner);
+        let _ = autostart_setzen(t, false);
         std::fs::create_dir_all(&ordner).unwrap();
         let alt = ordner.join(AUTOSTART_ALT);
-        let neu = ordner.join(AUTOSTART_DATEI);
         let andere = ordner.join("installiert").join("quadchroma.exe");
         std::fs::create_dir_all(andere.parent().unwrap()).unwrap();
         std::fs::write(&andere, b"MZ").unwrap();
         im_sta(|| lnk_speichern(&alt, &andere, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &andere, 0)).unwrap();
-        match autostart_migrieren(Some(&ordner), "x") {
+        match autostart_migrieren(Some(&ordner), t) {
             // Dieselbe Datei, egal ob lang oder als 8.3-Name geschrieben
             // (temp_dir kann "RUNNER~1" liefern, die Verknuepfung den langen Namen).
             Ok(Migration::AndereExe(z)) => assert!(dieselbe_datei(Path::new(&z), &andere), "{z} / {}", andere.display()),
             r => panic!("{r:?}"),
         }
-        assert!(alt.is_file() && !neu.exists(), "die alte bleibt, keine neue");
-        assert!(autostart_an(Some(&ordner)), "die alte zaehlt weiter als an");
+        assert!(alt.is_file(), "die alte bleibt");
+        assert!(!autostart_an(t), "keine Aufgabe fuer eine fremde exe");
         // Ziel fehlt ganz: ebenso nicht diese exe.
         std::fs::remove_file(&andere).unwrap();
-        assert!(matches!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::AndereExe(_))));
-        assert!(alt.is_file() && !neu.exists());
+        assert!(matches!(autostart_migrieren(Some(&ordner), t), Ok(Migration::AndereExe(_))));
+        assert!(alt.is_file() && !autostart_an(t));
         // Diese exe, in Grossbuchstaben geschrieben: dieselbe Datei.
         let exe = std::env::current_exe().unwrap();
         let gross = std::path::PathBuf::from(exe.display().to_string().to_uppercase());
         assert!(dieselbe_datei(&gross, &exe));
         std::fs::remove_file(&alt).unwrap();
         im_sta(|| lnk_speichern(&alt, &gross, "--host", &ordner, "x", &exe, 0)).unwrap();
-        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::Ersetzt));
-        assert!(!alt.exists() && neu.is_file());
+        assert_eq!(autostart_migrieren(Some(&ordner), t), Ok(Migration::Ersetzt));
+        assert!(!alt.exists() && autostart_an(t), "Aufgabe angelegt, alte weg");
+        let _ = autostart_setzen(t, false);
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
-    /// Die alte Verknuepfung der Host-Rolle ("QuadChroma - Freigabe.lnk",
-    /// --host): sie zaehlt als "an"; beim Start der App tritt die eine an
-    /// ihre Stelle, ein zweiter Start findet nichts mehr zu tun. "aus"
-    /// loescht beide, "an" laesst nur die neue stehen.
+    /// Migration beider alter Verknuepfungen (QuadChroma.lnk der einen App,
+    /// "QuadChroma - Freigabe.lnk" der Host-Rolle mit --host): zeigen sie auf
+    /// diese exe, tritt beim Start die geplante Aufgabe an ihre Stelle und die
+    /// .lnk verschwindet; ein zweiter Start findet nichts mehr zu tun. "aus"
+    /// loescht die Aufgabe.
     #[cfg(windows)]
     #[test]
     fn autostart_alte_verknuepfung() {
         let ordner = std::env::temp_dir().join(format!("{}-autostart-alt", crate::secure::test_lauf()));
+        let task = format!("{}-alt", crate::secure::test_lauf());
+        let t = Some(task.as_str());
         let _ = std::fs::remove_dir_all(&ordner);
+        let _ = autostart_setzen(t, false);
         std::fs::create_dir_all(&ordner).unwrap();
-        let alt = ordner.join(AUTOSTART_ALT);
-        let neu = ordner.join(AUTOSTART_DATEI);
         let exe = std::env::current_exe().unwrap();
-        let alte_anlegen = || im_sta(|| lnk_speichern(&alt, &exe, "--host", &ordner, "QuadChroma: Diesen PC freigeben", &exe, 0)).unwrap();
-        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::Keine), "ohne alte nichts zu tun");
-        alte_anlegen();
-        assert!(autostart_an(Some(&ordner)), "die alte zaehlt als an");
-        assert_eq!(autostart_migrieren(Some(&ordner), "QuadChroma – Fernsteuerung"), Ok(Migration::Ersetzt));
-        assert!(!alt.exists() && neu.is_file());
-        assert_eq!(lnk_lesen(&neu).unwrap().1, "--hintergrund");
-        assert!(autostart_an(Some(&ordner)));
-        assert_eq!(autostart_migrieren(Some(&ordner), "x"), Ok(Migration::Keine), "zweiter Start");
-        // aus: beide weg.
-        alte_anlegen();
-        autostart_setzen(Some(&ordner), false, "").unwrap();
-        assert!(!alt.exists() && !neu.exists() && !autostart_an(Some(&ordner)));
-        // an: nur die neue.
-        alte_anlegen();
-        autostart_setzen(Some(&ordner), true, "x").unwrap();
-        assert!(!alt.exists() && neu.is_file());
-        assert_eq!(std::fs::read_dir(&ordner).unwrap().count(), 1);
+        // Ohne alte Verknuepfung nichts zu tun.
+        assert_eq!(autostart_migrieren(Some(&ordner), t), Ok(Migration::Keine), "ohne alte nichts zu tun");
+        assert!(!autostart_an(t));
+        // Die alte Verknuepfung der einen App (QuadChroma.lnk, --hintergrund).
+        for datei in [AUTOSTART_DATEI, AUTOSTART_ALT] {
+            let lnk = ordner.join(datei);
+            im_sta(|| lnk_speichern(&lnk, &exe, "--hintergrund", &ordner, "QuadChroma", &exe, 0)).unwrap();
+            assert_eq!(autostart_migrieren(Some(&ordner), t), Ok(Migration::Ersetzt), "{datei}");
+            assert!(!lnk.exists() && autostart_an(t), "{datei}: Aufgabe da, .lnk weg");
+            // Zweiter Start: keine .lnk mehr, nichts zu tun (die Aufgabe zaehlt).
+            assert_eq!(autostart_migrieren(Some(&ordner), t), Ok(Migration::Keine), "{datei}: zweiter Start");
+            autostart_setzen(t, false).unwrap();
+            assert!(!autostart_an(t));
+        }
+        let _ = autostart_setzen(t, false);
         let _ = std::fs::remove_dir_all(&ordner);
     }
 }
