@@ -195,12 +195,15 @@ jobs:
           # The host engine is built in (host/dienst.h), not a second program.
           grep -q ' _qc_dienst_starten$' "$RUNNER_TEMP/app-symbole.txt" || { echo "::error::the host engine (qc_dienst_starten) is missing from the app"; exit 1; }
 
-      - name: Package ZIP and DMG (make zip, make dmg)
+      - name: Package ZIP and DMG (make zip, make dmg) and check their contents (make check-packages)
         run: |
           set -euo pipefail
           make zip IDENT=-
           make dmg IDENT=-
           ls -l build/*.zip build/*.dmg
+          # The four companion texts in the app (Contents/Resources, sealed), next to it in the
+          # ZIP folder and in the DMG; no AppleDouble entries; the app in the DMG verifies.
+          make check-packages IDENT=-
 
       - name: Compile the test harnesses
         run: |

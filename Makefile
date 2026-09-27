@@ -13,8 +13,12 @@
 #                        not part of any package
 #   make verify          checks the signature (codesign --strict, entitlements,
 #                        Gatekeeper preview; the latter may fail locally)
-#   make zip             build/QuadChroma-<version>-macos.zip (ditto --norsrc, app as the top-level entry)
-#   make dmg             build/QuadChroma-<version>.dmg (UDZO, link to /Applications, signed)
+#   make zip             build/QuadChroma-<version>-macos.zip (ditto --norsrc): a folder
+#                        QuadChroma-<version>/ with QuadChroma.app and the four companion texts
+#   make dmg             build/QuadChroma-<version>.dmg (UDZO, link to /Applications, companion
+#                        texts, signed)
+#   make check-packages  checks that the app, the ZIP and the DMG hold the companion texts
+#                        (and the ZIP no AppleDouble entries); builds nothing
 #   make clean
 #
 # Publishing - needs the Developer ID certificate and a notarytool profile
@@ -69,11 +73,13 @@
 #   VERSION         read from CFBundleShortVersionString in host/Info.plist; determines
 #                   the package names. Increase CFBundleVersion there before every distributed build.
 #   Companion files (not a variable)
-#                   license and notice texts for the DMG, all as .txt (LICENSE.txt,
-#                   THIRD_PARTY_NOTICES.txt, README.txt made from README.md, MANUAL.txt) -
-#                   scripts/package-texts.sh puts them in place. If a source is missing, make dmg
-#                   stops when signing with a Developer ID (or when DMG_EXTRA_REQUIRED=1 is set,
-#                   as in release.yml); a non-release build only prints a WARNING.
+#                   license and notice texts, all as .txt (LICENSE.txt, THIRD_PARTY_NOTICES.txt,
+#                   README.txt made from README.md, MANUAL.txt) - scripts/package-texts.sh puts
+#                   them in place: inside the app in Contents/Resources (within the seal, so they
+#                   travel with every copy of the app), and next to the app in the ZIP and the
+#                   DMG. If a source is missing, the build stops when signing with a Developer ID
+#                   (or when DMG_EXTRA_REQUIRED=1 is set, as in release.yml); a non-release build
+#                   only prints a WARNING.
 #
 # Why the app is always signed: TCC remembers permissions by the app's designated requirement
 # (identifier + certificate). With the self-signed certificate, a Screen Recording permission
@@ -110,10 +116,16 @@ HOST_ALLEIN := build/quadchroma-host
 ZIP      ?= build/QuadChroma-$(VERSION)-macos.zip
 DMG      ?= build/QuadChroma-$(VERSION).dmg
 DMG_ROOT := build/dmg-root
-# Companion files for the DMG (outside the app's seal, but covered by the DMG signature), put
-# in place by scripts/package-texts.sh. Mandatory as soon as the signing identity is a
-# Developer ID or DMG_EXTRA_REQUIRED is set.
+# The ZIP holds one folder QuadChroma-<version>/ with the app and the companion files.
+ZIP_ROOT := build/zip-root
+ZIP_DIR  := QuadChroma-$(VERSION)
+# The companion files, put in place by scripts/package-texts.sh: in the app (Contents/Resources,
+# within the seal) and next to it in the ZIP and the DMG (outside the app's seal, but covered by
+# the DMG signature). Mandatory as soon as the signing identity is a Developer ID or
+# DMG_EXTRA_REQUIRED is set (the name is historical: it covers the app and the ZIP as well).
 DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
+TEXTS := LICENSE.txt THIRD_PARTY_NOTICES.txt README.txt MANUAL.txt
+TEXT_SOURCES := LICENSE.txt THIRD_PARTY_NOTICES.txt README.md MANUAL.txt scripts/package-texts.sh
 # Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
@@ -142,13 +154,18 @@ WRITE_STAMP   = printf '%s\n' '$(SIGN_PARAMS)' > $(IDENT_STAMP)
 BUNDLE_CHECK  = id=$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' host/Info.plist); \
                 if [ "$$id" != "$(BUNDLE)" ]; then echo "ERROR: BUNDLE=$(BUNDLE), but CFBundleIdentifier in host/Info.plist=$$id - the signature and Info.plist must carry the same identifier"; exit 1; fi
 CODESIGN_APP  = codesign --force --sign "$(IDENT)" --identifier $(BUNDLE) --options runtime $(TIMESTAMP) $(ENT_OPT) $(APP)
-# ZIP for notarization and distribution: --keepParent stores QuadChroma.app as the top-level entry.
+# ZIP for notarization and distribution: a folder QuadChroma-<version>/ with the app and the
+# companion files (like the DMG); --keepParent stores that folder as the top-level entry.
 # --norsrc leaves out extended attributes (e.g. com.apple.provenance) that ditto would otherwise
 # pack as AppleDouble entries (._*); the command-line unzip turns those into real files inside
 # the bundle and thereby breaks the seal. The bundle has neither resource forks nor Finder info;
 # the signature and the notarization ticket live in files, not in attributes. To be safe, the
 # finished ZIP is checked for ._ entries.
-MAKE_ZIP      = rm -f $(ZIP) && ditto -c -k --keepParent --norsrc $(APP) $(ZIP) \
+MAKE_ZIP      = rm -rf $(ZIP) $(ZIP_ROOT) && mkdir -p $(ZIP_ROOT)/$(ZIP_DIR) \
+                && ditto $(APP) $(ZIP_ROOT)/$(ZIP_DIR)/QuadChroma.app \
+                && scripts/package-texts.sh $(ZIP_ROOT)/$(ZIP_DIR) $(if $(DMG_EXTRA_REQUIRED),1,0) \
+                && ditto -c -k --keepParent --norsrc $(ZIP_ROOT)/$(ZIP_DIR) $(ZIP) \
+                && rm -rf $(ZIP_ROOT) \
                 && if unzip -Z1 $(ZIP) | grep -qE '(^|/)\._'; then echo "ERROR: $(ZIP) contains AppleDouble entries (._*)"; exit 1; fi \
                 && ls -l $(ZIP)
 
@@ -164,8 +181,8 @@ cat "$(2)"; echo; \
 if ! printf '%s\n' "$$ausgabe" | grep -q '^ *status: Accepted'; then echo "ERROR: notarization not accepted - log: $(2)"; exit 1; fi
 endef
 
-.PHONY: all sign sign-if-changed verify zip dmg notarize staple notarize-dmg staple-dmg gatekeeper \
-        release notary-history list capture check permissions clean cargo host-allein
+.PHONY: all sign sign-if-changed verify zip dmg check-packages notarize staple notarize-dmg staple-dmg \
+        gatekeeper release notary-history list capture check permissions clean cargo host-allein
 
 all: sign-if-changed
 
@@ -178,13 +195,17 @@ cargo:
 
 $(CARGO_BIN): cargo ;
 
-$(BIN): $(CARGO_BIN) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS))
+$(BIN): $(CARGO_BIN) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS)) $(TEXT_SOURCES)
 	@$(BUNDLE_CHECK)
 	@mkdir -p $(APP)/Contents/MacOS
 	@# The former host executable (CFBundleExecutable quadchroma-host) must not stay in the seal.
 	rm -f $(APP)/Contents/MacOS/quadchroma-host
 	cp host/Info.plist $(APP)/Contents/Info.plist
 	cp $(CARGO_BIN) $(BIN)
+	@# License and notice texts inside the app (sealed by the signature below): they travel with
+	@# every copy of the app - ZIP, DMG, or dragged to /Applications.
+	rm -rf $(APP)/Contents/Resources
+	scripts/package-texts.sh $(APP)/Contents/Resources $(if $(DMG_EXTRA_REQUIRED),1,0)
 	$(CODESIGN_APP)
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1
@@ -236,6 +257,34 @@ dmg: sign-if-changed
 	hdiutil verify $(DMG)
 	codesign --force --sign "$(IDENT)" $(TIMESTAMP) --identifier $(BUNDLE).dmg $(DMG)
 	@ls -l $(DMG)
+
+# The packages as they go out: the app holds the four companion texts in Contents/Resources,
+# the ZIP holds QuadChroma-<version>/ with the app (texts inside it too) and the four texts next
+# to it, and no AppleDouble entries; the DMG holds the app, the Applications link and the four
+# texts (mounted read-only for the check), and the app in it verifies. Checks the existing files
+# only - builds nothing, so it also runs after stapling; a missing ZIP or DMG is an error.
+check-packages:
+	@set -e; fehler=0; \
+	 for f in $(TEXTS); do [ -s "$(APP)/Contents/Resources/$$f" ] || { echo "ERROR: $(APP)/Contents/Resources/$$f is missing"; fehler=1; }; done; \
+	 if [ -f "$(ZIP)" ]; then \
+	   liste=$$(unzip -Z1 "$(ZIP)"); \
+	   for f in $(TEXTS) QuadChroma.app/Contents/MacOS/quadchroma $(addprefix QuadChroma.app/Contents/Resources/,$(TEXTS)); do \
+	     printf '%s\n' "$$liste" | grep -qx "$(ZIP_DIR)/$$f" || { echo "ERROR: $(ZIP) lacks $(ZIP_DIR)/$$f"; fehler=1; }; done; \
+	   if printf '%s\n' "$$liste" | grep -qE '(^|/)\._'; then echo "ERROR: $(ZIP) contains AppleDouble entries (._*)"; fehler=1; fi; \
+	   if printf '%s\n' "$$liste" | grep -v "^$(ZIP_DIR)/" | grep -q .; then echo "ERROR: $(ZIP) has entries outside $(ZIP_DIR)/"; fehler=1; fi; \
+	   echo "ZIP $(ZIP):"; printf '%s\n' "$$liste" | grep -vE '^$(ZIP_DIR)/QuadChroma.app/.+/' | sed 's/^/  /'; \
+	 else echo "ERROR: $(ZIP) is missing (make zip)"; fehler=1; fi; \
+	 if [ -f "$(DMG)" ]; then \
+	   ziel=$$(mktemp -d "$${TMPDIR:-/tmp}/qc-dmg.XXXXXX"); \
+	   hdiutil attach -readonly -nobrowse -noverify -mountpoint "$$ziel" "$(DMG)" > /dev/null; \
+	   for f in $(TEXTS) QuadChroma.app/Contents/MacOS/quadchroma $(addprefix QuadChroma.app/Contents/Resources/,$(TEXTS)); do \
+	     [ -s "$$ziel/$$f" ] || { echo "ERROR: $(DMG) lacks $$f"; fehler=1; }; done; \
+	   [ -L "$$ziel/Applications" ] || { echo "ERROR: $(DMG) lacks the Applications link"; fehler=1; }; \
+	   codesign --verify --deep --strict "$$ziel/QuadChroma.app" || { echo "ERROR: the app in $(DMG) does not verify"; fehler=1; }; \
+	   echo "DMG $(DMG):"; ls -1 "$$ziel" | sed 's/^/  /'; \
+	   hdiutil detach "$$ziel" > /dev/null; rmdir "$$ziel" 2>/dev/null || true; \
+	 else echo "ERROR: $(DMG) is missing (make dmg)"; fehler=1; fi; \
+	 exit $$fehler
 
 # Notarization: first the ZIP (the notary service does not accept a bare .app), then staple
 # the app. Without a Developer ID signature this deliberately ends with "The binary is not

@@ -422,6 +422,9 @@ jobs:
       # The Makefile adds --timestamp automatically as soon as IDENT contains "Developer ID"
       # or is a 40-character SHA-1 hash from `security find-identity`.
       IDENT: ${{ needs.vorpruefung.outputs.mac_sign == 'true' && secrets.APPLE_SIGNING_IDENTITY || (needs.vorpruefung.outputs.mac_selbst == 'true' && 'QuadChroma Release' || '-') }}
+      # Every make call of this job: the companion texts (in the app, next to it in the ZIP and
+      # the DMG) are mandatory - a missing source stops the build, whatever IDENT is.
+      DMG_EXTRA_REQUIRED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -586,6 +589,9 @@ jobs:
           set -euo pipefail
           "$RUNNER_TEMP/notarize.sh" "dist/$NAME.dmg" "$RUNNER_TEMP/notary-log-dmg.json"
           make staple-dmg DMG="dist/$NAME.dmg"
+
+      - name: Check the packages (make check-packages - the four companion texts in the app, next to it in the ZIP and in the DMG)
+        run: make check-packages ZIP="dist/$NAME.zip" DMG="dist/$NAME.dmg"
 
       - name: Final Gatekeeper check (make gatekeeper - spctl must accept)
         if: env.NOTARIZE == 'true'
