@@ -13,10 +13,16 @@
 // Tasten). Gehaltene Tasten werden mitgeschrieben und beim Trennen
 // losgelassen - sonst haelt Windows sie fuer immer gedrueckt.
 //
-// UIPI: SendInput erreicht keine Fenster mit hoeheren Rechten (UAC-
-// Abfragen, Programme "als Administrator"). Das wird vermerkt, nicht umgangen.
+// UIPI: SendInput erreicht keine Fenster mit hoeheren Rechten als der eigene
+// Prozess. Die App laeuft jetzt erhoeht (Manifest requireAdministrator), also
+// erreicht sie den Task-Manager, den Registrierungs-Editor und Installer im
+// Sitzungskontext des Nutzers. Ausser Reichweite bleibt allein die echte
+// UAC-Bestaetigung auf dem sicheren Desktop (dafuer braeuchte es einen
+// SYSTEM-Dienst). Lehnt SendInput ab (sicherer Desktop oder gesperrter
+// Bildschirm), wird das vermerkt und der Zuschauer bekommt einen kurzen
+// Hinweis (Hoststatus 2/3) - umgangen wird nichts.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -61,6 +67,15 @@ static STAND: Mutex<Stand> = Mutex::new(Stand {
 });
 static UIPI_GEMELDET: AtomicBool = AtomicBool::new(false);
 static UNBEKANNT_GEMELDET: AtomicBool = AtomicBool::new(false);
+/// Liegt gerade ein Fenster mit hoeheren Rechten vorn, das die Eingaben
+/// schluckt? Dann wurde dem Zuschauer der Hinweis geschickt (Hoststatus 2);
+/// kommt eine Eingabe wieder durch, wird er zurueckgenommen (Hoststatus 3).
+static EINGABE_BLOCKIERT: AtomicBool = AtomicBool::new(false);
+/// Wann der Hinweis zuletzt hinausging (Hostuhr, us) - zur Drosselung.
+static BLOCK_ZULETZT_US: AtomicU64 = AtomicU64::new(0);
+/// Hoechstens alle drei Sekunden geht der Hinweis erneut hinaus, damit die
+/// Leitung bei anhaltender Blockade nicht mit Statusnachrichten volllaeuft.
+const BLOCK_MELDE_ABSTAND_US: u64 = 3_000_000;
 
 /// Bild und Maus gehoeren auf denselben Ausgang - hier seine Geometrie.
 pub fn ausgang_setzen(links: i32, oben: i32, breite: i32, hoehe: i32) {
@@ -70,6 +85,68 @@ pub fn ausgang_setzen(links: i32, oben: i32, breite: i32, hoehe: i32) {
 
 pub fn start() {
     log("Eingaben: SendInput; Fenster mit hoeheren Rechten (UAC) bekommen keine Eingaben - das ist Windows so");
+    rechte_melden();
+}
+
+/// Einmal beim Start: laeuft die App mit erhoehten Rechten? Mit dem Manifest
+/// requireAdministrator ist sie es immer (Windows fragt beim Start ueber UAC).
+/// Startet eine portable Kopie ohne dieses Manifest ohne Erhoehung, laeuft die
+/// Host-Rolle trotzdem weiter - nur erreicht SendInput dann keine Fenster mit
+/// hoeheren Rechten. Kein Selbst-Neustart, nur der Vermerk.
+fn rechte_melden() {
+    if erhoeht() {
+        log("Rechte: erhoeht");
+    } else {
+        log("Rechte: normal - SendInput erreicht keine Fenster mit hoeheren Rechten");
+    }
+}
+
+/// Ist der Prozess erhoeht (Token-Elevation)? Ohne lesbares Token: als nicht
+/// erhoeht behandelt.
+fn erhoeht() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE(std::ptr::null_mut());
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut info = TOKEN_ELEVATION::default();
+        let mut laenge = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut info as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut laenge,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && info.TokenIsElevated != 0
+    }
+}
+
+/// Windows nimmt gerade keine Eingaben an (SendInput abgelehnt): dem Zuschauer
+/// sagen, dass ein Fenster mit hoeheren Rechten (die echte UAC-Bestaetigung
+/// auf dem sicheren Desktop) vorn liegt - hoechstens alle paar Sekunden.
+fn eingabe_blockiert_melden() {
+    let erstmals = !EINGABE_BLOCKIERT.swap(true, Ordering::Relaxed);
+    let jetzt = super::now_us();
+    let zuletzt = BLOCK_ZULETZT_US.load(Ordering::Relaxed);
+    if erstmals || jetzt.saturating_sub(zuletzt) >= BLOCK_MELDE_ABSTAND_US {
+        BLOCK_ZULETZT_US.store(jetzt, Ordering::Relaxed);
+        // Hoststatus 2: ein Fenster mit hoeheren Rechten liegt vorn.
+        super::netz::hoststatus_senden(2);
+    }
+}
+
+/// Eine Eingabe kam wieder durch: einen zuvor gesendeten Hinweis zuruecknehmen
+/// (Hoststatus 3). Im Normalfall (nie blockiert) nur ein billiger Atomtausch.
+fn eingabe_wieder_frei() {
+    if EINGABE_BLOCKIERT.swap(false, Ordering::Relaxed) {
+        super::netz::hoststatus_senden(3);
+    }
 }
 
 // ------------------------------------------------------- Scancode-Tabelle
@@ -189,8 +266,12 @@ fn senden(eingaben: &[INPUT]) {
         if !UIPI_GEMELDET.swap(true, Ordering::Relaxed) {
             log("Eingaben: SendInput nimmt gerade nichts an (Fenster mit hoeheren Rechten im Vordergrund oder gesperrter Bildschirm)");
         }
+        // Auch der erhoehten App bleibt der sichere Desktop (UAC-Bestaetigung)
+        // verwehrt - dem Zuschauer sagen, dass die Steuerung dort kurz nicht geht.
+        eingabe_blockiert_melden();
     } else {
         Z.input_events.fetch_add(1, Ordering::Relaxed);
+        eingabe_wieder_frei();
     }
 }
 

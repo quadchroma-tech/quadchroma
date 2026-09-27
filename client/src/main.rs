@@ -3235,15 +3235,23 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
             }
             MSG_HOSTSTATUS => {
-                // Der Host sagt selbst, ob er gerade ein Bild liefern kann -
-                // etwa wenn sein Bildschirm weg ist. Sonst saehe das aus wie
-                // eine tote Verbindung.
+                // Der Host sagt selbst, ob er gerade ein Bild liefern kann
+                // (1 kein Bildschirm, 0 wieder da - sonst saehe das aus wie eine
+                // tote Verbindung) oder ob Windows dort gerade keine Eingaben
+                // annimmt (2 blockiert, 3 wieder frei; ein Fenster mit hoeheren
+                // Rechten wie die UAC-Bestaetigung liegt vorn). Beide zeigen den
+                // Hinweis ueber dem Bild; "kein Bildschirm" hat Vorrang und wird
+                // vom Eingabe-Hinweis nicht ueberschrieben.
                 if len >= 1 {
                     let mut s = shared.lock().unwrap();
-                    if payload[0] == 1 {
-                        s.error_key = Some(strings::Key::NoDisplay);
-                    } else if s.error_key == Some(strings::Key::NoDisplay) {
-                        s.error_key = None;
+                    match payload[0] {
+                        1 => s.error_key = Some(strings::Key::NoDisplay),
+                        0 if s.error_key == Some(strings::Key::NoDisplay) => s.error_key = None,
+                        2 if s.error_key != Some(strings::Key::NoDisplay) => {
+                            s.error_key = Some(strings::Key::InputBlocked)
+                        }
+                        3 if s.error_key == Some(strings::Key::InputBlocked) => s.error_key = None,
+                        _ => {}
                     }
                 }
             }
