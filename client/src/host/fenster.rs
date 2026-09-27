@@ -1,7 +1,7 @@
 // Kleine Fenster der Host-Rolle, Win32 ueber das windows-Crate (keine
 // weitere Abhaengigkeit): die Zulassen-Anfrage (Spezifikation Pairing v1,
-// 10.3), "Passwort aendern" (10.4) und die Rueckfrage vor "Alle Geraete
-// entfernen".
+// 10.3), "Passwort aendern" (10.4), die Rueckfrage vor "Alle Geraete
+// entfernen" und - fuer die eine App - "Geraetename aendern".
 //
 // Jedes Fenster hat seinen eigenen Faden mit Nachrichtenschleife
 // (IsDialogMessageW: Tab zwischen den Feldern, Eingabe = OK bzw.
@@ -59,6 +59,7 @@ use crate::zugang;
 
 const KLASSE_ZULASSEN: PCWSTR = w!("QuadChromaZulassen");
 const KLASSE_PASSWORT: PCWSTR = w!("QuadChromaPasswort");
+const KLASSE_NAME: PCWSTR = w!("QuadChromaName");
 /// Die Anfrage hat sich zurueckgezogen: schliessen, ohne zu antworten.
 const WM_ZURUECK: u32 = WM_APP + 20;
 /// So lange nach dem Erscheinen ist "Zulassen" gesperrt (siehe Kopf).
@@ -72,10 +73,13 @@ const ID_ABBRECHEN: i32 = IDCANCEL.0;
 const ID_NEU: i32 = 10;
 const ID_WIEDERHOLEN: i32 = 11;
 const ID_MELDUNG: i32 = 12;
+const ID_NAME: i32 = 13;
 /// SS_NOPREFIX: "&" in Namen ist kein Tastenkuerzel.
 const SS_NOPREFIX: u32 = 0x80;
 /// EM_SETLIMITTEXT (Win32_UI_Controls ist nicht eingebunden).
 const EM_SETLIMITTEXT: u32 = 0x00C5;
+/// EM_SETSEL: im Feld markieren.
+const EM_SETSEL: u32 = 0x00B1;
 /// Hoechstens so viele UTF-16-Einheiten je Passwortfeld: 42 * 3 Byte bleibt
 /// unter zugang::PASSWORT_MAX (128 Byte UTF-8).
 const PASSWORT_ZEICHEN: usize = 42;
@@ -730,6 +734,183 @@ pub fn passwort_aendern(
     }
 }
 
+// --------------------------------------------------- Geraetename aendern
+
+/// Die Pruefung im Fenster "Geraetename": Ok(None) heisst Rechnername des
+/// Systems - leer, oder genau der Rechnername (so folgt der Name weiter dem
+/// System, auch wenn der Nutzer nur OK drueckt); Ok(Some) der eingestellte
+/// Name; Err der Text, der im Fenster erscheint.
+pub fn geraetename_eingabe(text: &str, rechnername: &str) -> Result<Option<String>, Key> {
+    match zugang::geraetename_pruefen(text) {
+        Ok(Some(n)) if n == rechnername => Ok(None),
+        Ok(n) => Ok(n),
+        Err(zugang::NameFehler::ZuLang) => Err(Key::DeviceNameTooLong),
+        Err(zugang::NameFehler::Zeichen) => Err(Key::DeviceNameInvalid),
+    }
+}
+
+/// Was das Fenster "Geraetename" in seinem Faden weiss.
+struct NameDaten {
+    lang: &'static Lang,
+    rechnername: String,
+    setzen: Box<dyn Fn(Option<String>)>,
+}
+
+thread_local! {
+    static NAME: RefCell<Option<NameDaten>> = const { RefCell::new(None) };
+}
+
+/// Das offene Fenster "Geraetename" (0: keins, NAME_ENTSTEHT: sein Faden
+/// baut es gerade) - es gibt hoechstens eines.
+static NAME_FENSTER: AtomicIsize = AtomicIsize::new(0);
+const NAME_ENTSTEHT: isize = -1;
+
+unsafe extern "system" fn name_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            match befehl(wp) {
+                ID_OK => {
+                    let text = feldtext(hwnd, ID_NAME);
+                    let fertig = NAME.with(|n| {
+                        let n = n.borrow();
+                        let Some(d) = n.as_ref() else { return true };
+                        match geraetename_eingabe(&text, &d.rechnername) {
+                            Ok(name) => {
+                                (d.setzen)(name);
+                                true
+                            }
+                            Err(k) => {
+                                feldtext_setzen(hwnd, ID_MELDUNG, d.lang.get(k));
+                                false
+                            }
+                        }
+                    });
+                    if fertig {
+                        unsafe {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
+                }
+                ID_ABBRECHEN => unsafe {
+                    let _ = DestroyWindow(hwnd);
+                },
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+fn name_bauen(lang: &Lang, aktuell: &str, rechnername: &str) -> Result<(HWND, HFONT, bool), String> {
+    let m = Mass::neu();
+    let (font, eigen) = schrift(&m);
+    let rand = m.px(16);
+    let breite = m.px(340);
+    let zeile = m.px(20);
+    let feld_h = m.px(24);
+    let knopf_b = m.px(100);
+    let knopf_h = m.px(28);
+    let hinweis = einsetzen(lang.get(Key::DeviceNameHint), &[("{n}", rechnername)]);
+    let h_label = text_hoehe(font, lang.get(Key::DeviceNameLabel), breite).max(zeile);
+    let h_hinweis = text_hoehe(font, &hinweis, breite).max(zeile);
+    let h_meldung = 2 * zeile;
+    let innen = (
+        breite + 2 * rand,
+        rand + h_label + m.px(4) + feld_h + m.px(8) + h_hinweis + m.px(8) + h_meldung + m.px(8) + knopf_h + rand,
+    );
+    let hwnd = rahmen(KLASSE_NAME, Some(name_proc), lang.get(Key::DeviceNameTitle), innen, WINDOW_EX_STYLE(0))?;
+    let mut y = rand;
+    feld(hwnd, w!("STATIC"), lang.get(Key::DeviceNameLabel), SS_NOPREFIX, WINDOW_EX_STYLE(0), (rand, y, breite, h_label), -1, font);
+    y += h_label + m.px(4);
+    let name = feld(hwnd, w!("EDIT"), aktuell, WS_TABSTOP.0 | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, (rand, y, breite, feld_h), ID_NAME, font);
+    y += feld_h + m.px(8);
+    feld(hwnd, w!("STATIC"), &hinweis, SS_NOPREFIX, WINDOW_EX_STYLE(0), (rand, y, breite, h_hinweis), -1, font);
+    y += h_hinweis + m.px(8);
+    feld(hwnd, w!("STATIC"), "", SS_NOPREFIX, WINDOW_EX_STYLE(0), (rand, y, breite, h_meldung), ID_MELDUNG, font);
+    y += h_meldung + m.px(8);
+    let x_ab = innen.0 - rand - knopf_b;
+    let x_ok = x_ab - m.px(8) - knopf_b;
+    feld(hwnd, w!("BUTTON"), lang.get(Key::HostOk), WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_ok, y, knopf_b, knopf_h), ID_OK, font);
+    feld(hwnd, w!("BUTTON"), lang.get(Key::AccessCancel), WS_TABSTOP.0 | BS_PUSHBUTTON as u32, WINDOW_EX_STYLE(0), (x_ab, y, knopf_b, knopf_h), ID_ABBRECHEN, font);
+    if let Some(f) = name {
+        unsafe {
+            // Hoechstens NAME_MAX UTF-16-Einheiten: mehr als 40 Byte gehen
+            // so nur noch mit Zeichen jenseits von ASCII (dann sagt es die
+            // Meldung).
+            SendMessageW(f, EM_SETLIMITTEXT, Some(WPARAM(zugang::NAME_MAX)), Some(LPARAM(0)));
+            // Alles markiert: Tippen ersetzt den Namen.
+            SendMessageW(f, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+            let _ = SetFocus(Some(f));
+        }
+    }
+    Ok((hwnd, font, eigen))
+}
+
+/// "Geraetename aendern ...": das Fenster in einem eigenen Faden oeffnen
+/// (ist es schon offen, nach vorn holen). `aktuell` steht im Feld,
+/// `rechnername` im Hinweis ("leer = Rechnername"). `setzen` bekommt nach OK
+/// den neuen Namen (None: Rechnername) - im Faden des Fensters; wer ihn
+/// uebernimmt (einstellungen.txt, zugang::geraetename_setzen), gehoert in den
+/// Faden, der die Einstellungen haelt (main.rs: Benutzerereignis).
+pub fn geraetename_aendern(lang: &'static Lang, aktuell: &str, rechnername: &str, setzen: Box<dyn Fn(Option<String>) + Send>) {
+    let mut offen = NAME_FENSTER.load(Ordering::SeqCst);
+    loop {
+        if offen == NAME_ENTSTEHT {
+            return;
+        }
+        if offen != 0 && unsafe { IsWindow(Some(HWND(offen as *mut _))) }.as_bool() {
+            unsafe {
+                let _ = SetForegroundWindow(HWND(offen as *mut _));
+            }
+            return;
+        }
+        match NAME_FENSTER.compare_exchange(offen, NAME_ENTSTEHT, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(jetzt) => offen = jetzt,
+        }
+    }
+    let (aktuell, rechnername) = (aktuell.to_string(), rechnername.to_string());
+    let r = std::thread::Builder::new().name("namensfenster".into()).spawn(move || {
+        let (hwnd, font, eigen) = match name_bauen(lang, &aktuell, &rechnername) {
+            Ok(x) => x,
+            Err(e) => {
+                NAME_FENSTER.store(0, Ordering::SeqCst);
+                crate::protokoll::zeile(format!("Fenster Geraetename nicht angelegt: {e}"));
+                return;
+            }
+        };
+        NAME.with(|n| *n.borrow_mut() = Some(NameDaten { lang, rechnername, setzen }));
+        NAME_FENSTER.store(hwnd.0 as isize, Ordering::SeqCst);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        schleife(hwnd);
+        let _ = NAME_FENSTER.compare_exchange(hwnd.0 as isize, 0, Ordering::SeqCst, Ordering::SeqCst);
+        if eigen {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(font.0));
+            }
+        }
+        NAME.with(|n| *n.borrow_mut() = None);
+    });
+    if let Err(e) = r {
+        NAME_FENSTER.store(0, Ordering::SeqCst);
+        crate::protokoll::zeile(format!("Fenster Geraetename: kein Faden ({e})"));
+    }
+}
+
 // ---------------------------------------------------------- Rueckfrage
 
 /// Steht gerade eine Rueckfrage offen? Es gibt hoechstens eine - ein
@@ -1076,6 +1257,50 @@ mod tests {
 
     fn fenster_der_klasse(klasse: PCWSTR) -> usize {
         eigene_fenster(klasse, PCWSTR::null()).len()
+    }
+
+    /// Die Pruefung im Fenster "Geraetename": getrimmt, leer und genau der
+    /// Rechnername heissen "Rechnername" (None), zu lang und Steuerzeichen
+    /// haben je ihren Text.
+    #[test]
+    fn geraetename_eingabe_regeln() {
+        assert_eq!(geraetename_eingabe("  Wohnzimmer ", "DESKTOP-4F7K2Q9"), Ok(Some("Wohnzimmer".into())));
+        assert_eq!(geraetename_eingabe("", "DESKTOP-4F7K2Q9"), Ok(None));
+        assert_eq!(geraetename_eingabe(" DESKTOP-4F7K2Q9 ", "DESKTOP-4F7K2Q9"), Ok(None));
+        assert_eq!(geraetename_eingabe(&"x".repeat(41), "PC"), Err(Key::DeviceNameTooLong));
+        assert_eq!(geraetename_eingabe("a\tb", "PC"), Err(Key::DeviceNameInvalid));
+        assert_eq!(geraetename_eingabe("a\u{202e}b", "PC"), Err(Key::DeviceNameInvalid));
+    }
+
+    /// Das echte Fenster "Geraetename": das Feld zeigt den jetzigen Namen,
+    /// der Hinweis den Rechnernamen; ein zu langer Name zeigt den Text und
+    /// setzt nichts; ein guter setzt ihn und schliesst das Fenster; ein
+    /// zweites Oeffnen, waehrend es offen ist, legt kein zweites an.
+    #[test]
+    fn geraetename_fenster_prueft_und_setzt() {
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let tx = Mutex::new(tx);
+        let de = crate::strings::pick("de");
+        geraetename_aendern(de, "Büro-PC", "DESKTOP-4F7K2Q9", Box::new(move |n| {
+            let _ = sperre(&tx).send(n);
+        }));
+        let frei = |w: isize| w != 0 && w != NAME_ENTSTEHT;
+        assert!(warten_bis(|| frei(NAME_FENSTER.load(Ordering::SeqCst))), "Fenster Geraetename entstand nicht");
+        let h = HWND(NAME_FENSTER.load(Ordering::SeqCst) as *mut _);
+        geraetename_aendern(de, "x", "y", Box::new(|_| panic!("zweites Fenster")));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(fenster_der_klasse(KLASSE_NAME), 1, "zwei Fenster Geraetename");
+        assert_eq!(fenstertitel(h), "Gerätename");
+        assert_eq!(feldtext(h, ID_NAME), "Büro-PC");
+        feldtext_setzen(h, ID_NAME, &"ß".repeat(21));
+        unsafe { SendMessageW(h, WM_COMMAND, Some(WPARAM(ID_OK as usize)), Some(LPARAM(0))) };
+        assert_eq!(feldtext(h, ID_MELDUNG), "Der Name ist zu lang (höchstens 40 Byte).");
+        assert!(rx.try_recv().is_err());
+        feldtext_setzen(h, ID_NAME, "  Küche ");
+        unsafe { PostMessageW(Some(h), WM_COMMAND, WPARAM(ID_OK as usize), LPARAM(0)).unwrap() };
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Some("Küche".into())));
+        assert!(warten_bis(|| !unsafe { IsWindow(Some(h)) }.as_bool()));
+        assert!(warten_bis(|| NAME_FENSTER.load(Ordering::SeqCst) == 0));
     }
 
     /// Hoechstens eine Rueckfrage zugleich: ein zweiter Klick stapelt keine.

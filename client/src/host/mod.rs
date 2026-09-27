@@ -1,36 +1,42 @@
 // Windows als Host - Rolle in derselben Programmdatei wie der Client.
 //
+//   quadchroma.exe                    die eine App (Client und Host-Rolle, ein
+//                                     Symbol; main.rs), Freigabe wie eingestellt
 //   quadchroma.exe --host [port] [--output n] [--fps N] [--mbit N] [--fest]
-//                  [--konserve datei.hevc]
-//                  [--encoderweg bgra|yuv444|d3d11|auto]
+//                  [--konserve datei.hevc] [--encoderweg bgra|yuv444|d3d11|auto]
+//                                     die eine App im Hintergrund, Freigabe an
+//   quadchroma.exe --nur-host [port] [dieselben Schalter]
+//                                     nur die Host-Rolle, ohne Fenster (VM, Tests)
 //   quadchroma.exe --list
 //   quadchroma.exe --messen [--output n] [--sekunden 10]
 //
-// Fuer Nutzer startet der Knopf "Diesen PC freigeben" im Client die Rolle
-// als zweiten Prozess derselben exe mit --host (Ausgaben ins Leere,
-// DETACHED_PROCESS), ebenso die Verknuepfung "Mit Windows starten". Eine so
-// gestartete Rolle laesst eine geerbte Konsole los (ausgabe_ins_leere).
-// Hoechstens eine Host-Rolle je Sitzung (Mutex Local\QuadChroma-Host); ein
+// Die eine App (Plan W6) faehrt die Rolle in ihrem eigenen Prozess: `Rolle`
+// startet einen Faden, der den Dienst einrichtet und taktet; die App
+// schaltet die Freigabe hierueber an und aus (einstellungen.txt: freigabe),
+// reicht die Menuepunkte der Host-Rolle weiter und beendet sie mit
+// Abschied. Solange die Freigabe an ist, haelt sie den Mutex
+// Local\QuadChroma-Host (hoechstens eine Host-Rolle je Sitzung); die reine
+// Host-Rolle (--nur-host, main_host) haelt ihn, solange sie laeuft - ein
 // zweiter Start endet still, bevor er das Protokoll anfasst, und --list
 // schreibt nur dann in host-protokoll.txt, wenn keine Freigabe laeuft.
 //
-// Oberflaeche (Spezifikation Pairing v1, 10): Symbol im Infobereich mit
-// Geraete-ID, Zugangspasswort, erlaubten Geraeten, Autostart und "Freigabe
-// beenden" (oberflaeche.rs), Zulassen-Anfragen und Passwortfenster
-// (fenster.rs). Wer herein darf, entscheidet der Einlass (einlass.rs:
-// host-devices.txt, host-password.txt, Passwortbeweis oder "Zulassen").
-// Konsole ueber AttachConsole wie der Client, jede Zeile ausserdem in
-// %APPDATA%\QuadChroma\host-protokoll.txt. Das Protokoll auf der Leitung
-// ist das des Mac-Hosts (host/main.m), Byte fuer Byte - ein Client darf den
-// Host nicht erkennen.
+// Oberflaeche (Spezifikation Pairing v1, 10): das Symbol im Infobereich
+// (das der App oder das eigene der reinen Host-Rolle; Menue aus
+// symbolmenue.rs, Aktionen in oberflaeche.rs), Zulassen-Anfragen und
+// Passwortfenster (fenster.rs). Wer herein darf, entscheidet der Einlass
+// (einlass.rs: host-devices.txt, host-password.txt, Passwortbeweis oder
+// "Zulassen"). Konsole ueber AttachConsole wie der Client, jede Zeile
+// ausserdem in %APPDATA%\QuadChroma\host-protokoll.txt. Das Protokoll auf
+// der Leitung ist das des Mac-Hosts (host/main.m), Byte fuer Byte - ein
+// Client darf den Host nicht erkennen.
 //
-// Die Rolle selbst ist ein Dienst (Dienst: starten, takt, aktion, beenden)
-// ohne process::exit; --host ist eine duenne Huelle darum (main_host), die
-// ihn bis zum Ende taktet und den Exit-Code an main.rs zurueckgibt. Beendet
-// wird er ueber "Freigabe beenden" (Grund 1) oder von aussen (WM_CLOSE,
-// WM_ENDSESSION: Grund 0, der Symbolfaden verabschiedet selbst); beide Wege
-// schliessen erst die Ports (netz::stoppen), dann verabschieden sie den
-// Zuschauer.
+// Die Rolle selbst ist ein Dienst (Dienst: einrichten, freigabe_an,
+// freigabe_aus, takt, aktion, beenden) ohne process::exit. Beendet wird er
+// ueber "Freigabe beenden" der reinen Host-Rolle (Grund 1), mit der App
+// (Grund 0) oder von aussen (WM_CLOSE, WM_ENDSESSION am Symbol: Grund 0,
+// der Symbolfaden verabschiedet selbst); "Freigabe aus" der App schliesst
+// nur die Ports (Grund 1). Alle Wege schliessen erst die Ports
+// (netz::stoppen), dann verabschieden sie den Zuschauer.
 //
 // Stand: Zuschauerplatz (Noise-Responder, Einlass, Bekanntgabe), Eingaben,
 // Zwischenablage (Text und Dateien, netz.rs mit dateien.rs), Aufnahme
@@ -55,11 +61,11 @@ pub mod ton;
 pub mod zeiger;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::protokoll_konst::*;
-use crate::{noise, protokoll, secure, zugang};
+use crate::{noise, protokoll, secure, symbolmenue, zugang};
 
 // ------------------------------------------------------------------ Zustand
 //
@@ -440,35 +446,75 @@ fn sperre<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// (wie der Mac-Host); nimmt er ihn nicht ab, wird gekappt.
 const ABSCHIED_FRIST: Duration = Duration::from_secs(3);
 
+/// Der Prozess endet (das Symbol bekam WM_CLOSE von aussen oder
+/// WM_ENDSESSION): danach oeffnet der Dienst keinen Port mehr - auch nicht
+/// mit einem Neuversuch am belegten Port, der gerade faellig waere.
+static PROZESS_ENDET: AtomicBool = AtomicBool::new(false);
+
 /// Die Freigabe endet: erst keine neuen Zuschauer mehr (netz::stoppen:
 /// Ports zu, Bekanntgabe aus), dann der verbundene mit Abschied (`grund`,
-/// hoechstens ABSCHIED_FRIST). Aus jedem Faden; ein zweiter Aufruf tut
-/// nichts mehr.
+/// hoechstens ABSCHIED_FRIST). Aus jedem Faden; ohne Lauf und ohne
+/// Zuschauer tut es nichts.
 fn abschied(grund: u8) {
     netz::stoppen();
     netz::abschied_beim_beenden(grund, ABSCHIED_FRIST);
 }
 
-/// Was das Menue im Infobereich gerade zeigt (bei jedem Oeffnen neu).
-fn menue_stand(e: &einlass::Einlass, port: u16, port_belegt: bool) -> oberflaeche::MenueStand {
-    oberflaeche::MenueStand {
-        zuschauer: netz::zuschauer_name(),
-        port_belegt: port_belegt.then_some(port),
-        id: e.id(),
-        passwort: e.passwort().map_err(|_| ()),
-        geraete: e.geraete().map(|l| l.geraete).map_err(|_| ()),
-        autostart: crate::verknuepfung::autostart_an(None),
+/// Die eine App endet von aussen (WM_CLOSE an ihr Symbol, Abmelden,
+/// Herunterfahren, Restart Manager): Ports zu, ein Zuschauer erfaehrt es
+/// (Abschied, Grund 0) - im aufrufenden Faden (dem des Symbols), bevor er
+/// zurueckkehrt: nach WM_ENDSESSION endet der Prozess womoeglich gleich
+/// danach. Ohne laufende Host-Rolle tut es nichts.
+pub fn abschied_beim_prozessende() {
+    PROZESS_ENDET.store(true, Ordering::SeqCst);
+    abschied(HOST_ENDE_BEENDET);
+}
+
+/// Was das Menue ueber die Host-Rolle zeigt: Zustand der Freigabe, ID,
+/// Passwort, Geraete. `e`: ihr Einlass (None, solange er nicht steht);
+/// `an`: die Freigabe ist eingeschaltet; `fehler`: die Rolle kam nicht in
+/// Gang.
+pub fn menue_teil(e: Option<&einlass::Einlass>, an: bool, port: u16, port_belegt: bool, fehler: bool) -> symbolmenue::HostTeil {
+    use symbolmenue::Freigabe as F;
+    let freigabe = if !an {
+        F::Aus
+    } else if fehler {
+        F::Fehler
+    } else if port_belegt {
+        F::PortBelegt(port)
+    } else if let Some(n) = netz::zuschauer_name() {
+        F::Verbunden(n)
+    } else {
+        F::Bereit
+    };
+    match e {
+        Some(e) => symbolmenue::HostTeil {
+            freigabe,
+            id: Some(e.id()),
+            passwort: e.passwort().map_err(|_| ()),
+            geraete: e.geraete().map(|l| l.geraete).map_err(|_| ()),
+        },
+        None => symbolmenue::HostTeil { freigabe, id: None, passwort: Err(()), geraete: Err(()) },
     }
 }
 
-/// Was der Faden des Dienstes abarbeitet (Kanal aus dem Symbolfaden und den
-/// Fenstern).
+/// Was der Faden des Dienstes abarbeitet (Kanal aus dem Symbol, den
+/// Fenstern und - in der einen App - aus main.rs).
 enum Nachricht {
-    /// Ein Menuepunkt (oder das Passwortfenster meldet "gespeichert").
+    /// Ein Menuepunkt der Host-Rolle (oder das Passwortfenster meldet
+    /// "gespeichert").
     Aktion(oberflaeche::Aktion),
-    /// Von aussen beendet (WM_CLOSE, WM_ENDSESSION): der Symbolfaden hat den
-    /// Zuschauer schon verabschiedet.
+    /// Von aussen beendet (WM_CLOSE, WM_ENDSESSION am eigenen Symbol der
+    /// reinen Host-Rolle): der Symbolfaden hat den Zuschauer schon
+    /// verabschiedet.
     VonAussenBeendet,
+    /// Die eine App: Freigabe an bzw. aus (Menue, Startbildschirm).
+    FreigabeAn,
+    FreigabeAus,
+    /// Die eine App: der Geraetename ist neu (Nachricht 20).
+    NameGeaendert,
+    /// Die eine App endet: Abschied mit Grund 0, dann Schluss.
+    Beenden,
 }
 
 /// Laeuft der Dienst nach einem Schritt noch?
@@ -480,30 +526,81 @@ pub enum Lage {
     Beendet,
 }
 
-/// Die Host-Rolle als Dienst, ohne eigenen Prozess und ohne
-/// process::exit: `starten` richtet alles ein (Schluessel, Einlass, Symbol,
-/// Zuschauerplatz, Zwischenablage, Eingabe, Ton, Bildquelle), `takt`
-/// arbeitet einen Schritt ab (Menuepunkte, Port-Neuversuch, Taktzeile und
-/// Nachricht 6 alle fuenf Sekunden), `aktion` fuehrt einen Menuepunkt aus,
-/// `beenden` verabschiedet den Zuschauer und schliesst die Ports. Heute
-/// faehrt ihn main_host (--host) in einer Schleife; derselbe Dienst soll
-/// spaeter im Prozess des Clients laufen. `takt` und `aktion` gehoeren in
-/// den Faden, der `starten` rief (Herkunft::Host fuer die Protokollreihe).
-/// `starten` hoechstens einmal je Prozess: der Einlass wird prozessweit
-/// eingerichtet, und Eingabe, Ton und Bildquelle laufen danach, bis der
-/// Prozess endet (ohne Zuschauer tun sie nichts). Nach `beenden` bringt
-/// netz::start die Freigabe wieder an.
+/// Das Symbol, an dem der Dienst haengt.
+enum Symbolweg {
+    /// Die reine Host-Rolle hat ihr eigenes (None: liess sich nicht anlegen).
+    Eigenes(Option<crate::tray_win::Symbol>),
+    /// Die eine App: ihr Symbol (main.rs) - ob es steht ("Zulassen" nur
+    /// dann) und eine Sprechblase daran.
+    App { steht: Arc<dyn Fn() -> bool + Send + Sync>, hinweis: Arc<dyn Fn(&str) + Send + Sync> },
+}
+
+impl Symbolweg {
+    fn steht(&self) -> bool {
+        match self {
+            Symbolweg::Eigenes(s) => s.as_ref().is_some_and(|s| s.steht()),
+            Symbolweg::App { steht, .. } => steht(),
+        }
+    }
+
+    fn hinweis(&mut self, text: &str) {
+        match self {
+            Symbolweg::Eigenes(Some(s)) => {
+                s.hinweis("QuadChroma", text);
+            }
+            Symbolweg::Eigenes(None) => {}
+            Symbolweg::App { hinweis, .. } => hinweis(text),
+        }
+    }
+}
+
+/// Wie der Dienst eingerichtet wird: als reine Host-Rolle mit eigenem
+/// Symbol (--nur-host) oder in der einen App an deren Symbol.
+pub enum Art {
+    NurHost,
+    App { steht: Arc<dyn Fn() -> bool + Send + Sync>, hinweis: Arc<dyn Fn(&str) + Send + Sync> },
+}
+
+/// Die Host-Rolle als Dienst, ohne eigenen Prozess und ohne process::exit.
+/// `einrichten` legt das Leichte an (Schluessel, Einlass, Symbol der reinen
+/// Host-Rolle) - danach kennt das Menue ID, Passwort und Geraete;
+/// `freigabe_an` bringt beim ersten Mal das Schwere in Gang (Bildschirme,
+/// Encoder, Zwischenablage, Eingabe, Ton, Bildquelle) und oeffnet die Ports,
+/// `freigabe_aus` schliesst sie wieder (mit Abschied an einen Zuschauer);
+/// `takt` arbeitet einen Schritt ab (Nachrichten, Port-Neuversuch,
+/// Taktzeile und Nachricht 6 alle fuenf Sekunden), `aktion` fuehrt einen
+/// Menuepunkt aus, `beenden` verabschiedet den Zuschauer und schliesst die
+/// Ports. Die reine Host-Rolle (main_host, --nur-host) faehrt ihn in einer
+/// Schleife; die eine App in einem eigenen Faden (Rolle). `takt` und
+/// `aktion` gehoeren in den Faden, der `einrichten` rief (Herkunft::Host
+/// fuer die Protokollreihe). Hoechstens ein Dienst je Prozess: der Einlass
+/// wird prozessweit eingerichtet, und Eingabe, Ton und Bildquelle laufen
+/// nach dem ersten `freigabe_an`, bis der Prozess endet (ohne Zuschauer tun
+/// sie nichts).
 pub struct Dienst {
     port: u16,
     priv_key: Vec<u8>,
-    einlass: std::sync::Arc<einlass::Einlass>,
+    einlass: Arc<einlass::Einlass>,
     lang: &'static crate::strings::Lang,
-    zulassen: std::sync::Arc<fenster::Zulassen>,
-    symbol: Option<crate::tray_win::Symbol>,
+    zulassen: Arc<fenster::Zulassen>,
+    symbol: Symbolweg,
     tx: std::sync::mpsc::Sender<Nachricht>,
     rx: std::sync::mpsc::Receiver<Nachricht>,
-    port_belegt: std::sync::Arc<AtomicBool>,
+    port_belegt: Arc<AtomicBool>,
+    /// Die Argumente fuer das Schwere beim ersten `freigabe_an` (None:
+    /// schon gestartet).
+    vorrat: Option<Vec<String>>,
+    /// Die Freigabe ist eingeschaltet.
+    freigabe: bool,
     netz_laeuft: bool,
+    /// Die eine App haelt den Mutex der Host-Rolle, solange die Freigabe an
+    /// ist (die reine Host-Rolle haelt ihn in main_host).
+    app: bool,
+    instanz: Option<oberflaeche::Instanz>,
+    /// Name dieses Mutex (Tests nehmen einen eigenen) und wie die Ports
+    /// geoeffnet werden (Tests: auf Loopback).
+    mutex: String,
+    netz_starten: fn(u16, Vec<u8>) -> Result<(), String>,
     beendet: bool,
     // Taktzeile und Nachricht 6
     t0: Instant,
@@ -514,23 +611,33 @@ pub struct Dienst {
 }
 
 impl Dienst {
-    /// Die Host-Rolle einrichten und starten (Argumente wie --host: Port,
-    /// --output, --fps, --mbit, --fest, --konserve, --encoderweg). FFmpeg
-    /// muss initialisiert sein, das Protokoll offen. Err: Exit-Code, wenn
-    /// die Rolle nicht laufen kann (5 Schluessel oder Ablage, 6 Konserve, 7
-    /// Encoderweg, 9 Port belegt ohne Oberflaeche) - was bis dahin stand,
-    /// ist wieder abgebaut.
+    /// Die reine Host-Rolle einrichten und starten (Argumente wie --host:
+    /// Port, --output, --fps, --mbit, --fest, --konserve, --encoderweg).
+    /// FFmpeg muss initialisiert sein, das Protokoll offen. Err: Exit-Code,
+    /// wenn die Rolle nicht laufen kann (5 Schluessel oder Ablage, 6
+    /// Konserve, 7 Encoderweg, 9 Port belegt ohne Oberflaeche).
     pub fn starten(args: &[String]) -> Result<Dienst, i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut d = Dienst::einrichten(args, Art::NurHost, tx, rx, Arc::new(AtomicBool::new(false)))?;
+        d.freigabe_an()?;
+        Ok(d)
+    }
+
+    /// Das Leichte einrichten: Port, Schluessel, Einlass (samt Uebernahme
+    /// aus authorized.txt), Werte von der Befehlszeile, Zulassen-Fenster und
+    /// bei der reinen Host-Rolle ihr Symbol. Oeffnet keinen Port und faengt
+    /// keinen Bildschirm ab. Err: 5 (Schluessel oder Ablage).
+    fn einrichten(
+        args: &[String],
+        art: Art,
+        tx: std::sync::mpsc::Sender<Nachricht>,
+        rx: std::sync::mpsc::Receiver<Nachricht>,
+        port_belegt: Arc<AtomicBool>,
+    ) -> Result<Dienst, i32> {
         // Was dieser Faden ueber FFmpeg sagt, gehoert der Host-Rolle.
         protokoll::herkunft_setzen(protokoll::Herkunft::Host);
 
-        // --host [port]
-        let port: u16 = args
-            .iter()
-            .position(|a| a == "--host")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(9001);
+        let port = host_port(args);
 
         // Eigener dauerhafter Schluessel. Er entsteht beim ersten Start und
         // bleibt danach liegen, damit Gegenstellen den Host wiedererkennen.
@@ -576,12 +683,14 @@ impl Dienst {
                 log(format!("{n} Zwischendateien von {datei} aus einem abgebrochenen Lauf entfernt"));
             }
         }
-        let rechnername = zugang::geraetename();
-        let einlass = std::sync::Arc::new(einlass::Einlass::neu(
+        // Der Name, den andere sehen: der eingestellte Geraetename
+        // (einstellungen.txt), sonst der Rechnername.
+        let name = zugang::geraetename();
+        let einlass = Arc::new(einlass::Einlass::neu(
             ordner.join(zugang::GERAETE_DATEI),
             ordner.join(zugang::PASSWORT_DATEI),
             &pub_key,
-            &rechnername,
+            &name,
         ));
         let _ = einlass::einrichten(einlass.clone());
         if let Err(e) = einlass.passwort() {
@@ -592,8 +701,9 @@ impl Dienst {
             Err(e) => format!("keins - {e}; niemand gilt als bekannt"),
         };
         log(format!(
-            "Geraete-ID dieses Hosts: {}   Name: {rechnername}   Fingerabdruck: {}   erlaubte Geraete: {erlaubt}",
+            "Geraete-ID dieses Hosts: {}   Name: {name}{}   Fingerabdruck: {}   erlaubte Geraete: {erlaubt}",
             zugang::id_text(einlass.id()),
+            if zugang::geraetename_eingestellt().is_some() { " (eingestellt)" } else { "" },
             noise::fingerprint(&pub_key)
         ));
 
@@ -607,6 +717,73 @@ impl Dienst {
             Z.fest.store(true, Ordering::Relaxed);
         }
 
+        // Oberflaeche (Spezifikation 10): Zulassen-Fenster, deren Antwort an
+        // den Einlass geht, und das Symbol im Infobereich - das eigene der
+        // reinen Host-Rolle oder das der einen App. Die Sprache wie im
+        // Fenster des Clients.
+        let lang = match &crate::einstellungen::Einstellungen::laden().sprache {
+            Some(c) => crate::strings::pick(c),
+            None => crate::strings::pick(&crate::system_language()),
+        };
+        let zulassen = Arc::new(fenster::Zulassen::neu(
+            lang,
+            Arc::new(|nr, ja| {
+                if let Some(e) = einlass::einlass() {
+                    e.entscheiden(nr, ja);
+                }
+            }),
+        ));
+        einlass.oberflaeche_setzen(zulassen.clone());
+        let app = matches!(art, Art::App { .. });
+        let symbol = match art {
+            Art::App { steht, hinweis } => Symbolweg::App { steht, hinweis },
+            Art::NurHost => Symbolweg::Eigenes(eigenes_symbol(lang, port, &einlass, &port_belegt, &tx)),
+        };
+        let steht = symbol.steht();
+        zulassen.vorhanden_setzen(steht);
+        match &symbol {
+            Symbolweg::Eigenes(Some(s)) if !steht => log(format!(
+                "Infobereich: Symbol nicht angemeldet ({}) - \"Zulassen\" erst, wenn es steht",
+                s.grund().unwrap_or_default()
+            )),
+            Symbolweg::Eigenes(Some(_)) => log("Infobereich: Symbol steht - \"Zulassen\" moeglich"),
+            Symbolweg::Eigenes(None) => {}
+            Symbolweg::App { .. } => log(format!(
+                "Host-Rolle in der App: Symbol der App {}",
+                if steht { "steht - \"Zulassen\" moeglich" } else { "steht (noch) nicht - \"Zulassen\" erst, wenn es steht" }
+            )),
+        }
+
+        Ok(Dienst {
+            port,
+            priv_key,
+            einlass,
+            lang,
+            zulassen,
+            symbol,
+            tx,
+            rx,
+            port_belegt,
+            vorrat: Some(args.to_vec()),
+            freigabe: false,
+            netz_laeuft: false,
+            app,
+            instanz: None,
+            mutex: oberflaeche::MUTEX.to_string(),
+            netz_starten: netz::start,
+            beendet: false,
+            t0: Instant::now(),
+            vorher: last_probe(),
+            last_frames: 0,
+            last_bytes: 0,
+            naechster_takt: Instant::now() + Duration::from_secs(5),
+        })
+    }
+
+    /// Das Schwere, einmal je Prozess beim ersten `freigabe_an`:
+    /// Bildschirme, Encoder, Konserve, Zwischenablage, Eingabe, Ton,
+    /// Bildquelle. Err: 6 (Konserve), 7 (Encoderweg).
+    fn schweres_starten(&mut self, args: &[String]) -> Result<(), i32> {
         // Bildschirm (Spezifikation Bildschirm 1.1-1.5): die Ausgaenge mit
         // Kennung und Name; der Wunsch aus bildschirm.txt, --output n pinnt
         // fuer diesen Lauf den Bildschirm am Listenplatz n (die Datei bleibt);
@@ -710,95 +887,14 @@ impl Dienst {
             ));
         }
 
-        // Oberflaeche (Spezifikation 10): Zulassen-Fenster, deren Antwort an
-        // den Einlass geht, und das Symbol im Infobereich. Die Sprache wie im
-        // Fenster des Clients.
-        let lang = match &crate::einstellungen::Einstellungen::laden().sprache {
-            Some(c) => crate::strings::pick(c),
-            None => crate::strings::pick(&crate::system_language()),
-        };
-        let zulassen = std::sync::Arc::new(fenster::Zulassen::neu(
-            lang,
-            std::sync::Arc::new(|nr, ja| {
-                if let Some(e) = einlass::einlass() {
-                    e.entscheiden(nr, ja);
-                }
-            }),
-        ));
-        einlass.oberflaeche_setzen(zulassen.clone());
-        let port_belegt = std::sync::Arc::new(AtomicBool::new(false));
-        let (tx, rx) = std::sync::mpsc::channel::<Nachricht>();
-        let schluessel: std::sync::Arc<Mutex<Vec<[u8; 32]>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let symbol = {
-            let (tx2, sk) = (tx.clone(), schluessel.clone());
-            let befehl = Box::new(move |nr: u32| {
-                let k = sperre(&sk).clone();
-                if let Some(a) = oberflaeche::aktion_zu(nr, &k) {
-                    let _ = tx2.send(Nachricht::Aktion(a));
-                }
-            });
-            let (e, pb, sk) = (einlass.clone(), port_belegt.clone(), schluessel.clone());
-            let menue = Box::new(move || {
-                let stand = menue_stand(&e, port, pb.load(Ordering::Relaxed));
-                let (m, k) = oberflaeche::menue(lang, &stand);
-                *sperre(&sk) = k;
-                m
-            });
-            // WM_CLOSE von aussen, Abmelden, Herunterfahren, ein
-            // Installationsprogramm (Restart Manager): beenden wie "Freigabe
-            // beenden", aber mit Grund 0 (die Host-Rolle wurde beendet). Laeuft
-            // im Symbolfaden und verabschiedet selbst - nach WM_ENDSESSION
-            // endet der Prozess womoeglich gleich nach der Rueckkehr -, dann
-            // erfaehrt es der Faden des Dienstes und endet ebenfalls.
-            let tx3 = tx.clone();
-            let ende = Box::new(move |wie: &str| {
-                log(format!("Host-Rolle wird beendet ({wie})"));
-                abschied(HOST_ENDE_BEENDET);
-                log("Host-Rolle beendet");
-                let _ = tx3.send(Nachricht::VonAussenBeendet);
-            });
-            match crate::tray_win::Symbol::neu_allgemein(befehl, menue, ende, &oberflaeche::tooltip(lang, einlass.id())) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log(format!("Infobereich: kein Symbol ({e}) - ohne Oberflaeche, neue Geraete nur per Passwort"));
-                    None
-                }
-            }
-        };
-        let steht = symbol.as_ref().is_some_and(|s| s.steht());
-        zulassen.vorhanden_setzen(steht);
-        match &symbol {
-            Some(s) if !steht => log(format!(
-                "Infobereich: Symbol nicht angemeldet ({}) - \"Zulassen\" erst, wenn es steht",
-                s.grund().unwrap_or_default()
-            )),
-            Some(_) => log("Infobereich: Symbol steht - \"Zulassen\" moeglich"),
-            None => {}
-        }
-
-        // Zuschauerplatz: Bild, Eingabe, Bekanntgabe. Ist der Port belegt und
-        // gibt es die Oberflaeche, zeigt sie das, und es wird alle 5 s neu
-        // versucht; ohne Oberflaeche endet die Rolle wie bisher (Exit 9).
-        let netz_laeuft = match netz::start(port, priv_key.clone()) {
-            Ok(()) => true,
-            Err(e) if steht => {
-                log(format!("{e} - neuer Versuch alle 5 s, das Menue zeigt es"));
-                port_belegt.store(true, Ordering::Relaxed);
-                false
-            }
-            Err(e) => {
-                log(format!("{e}"));
-                return Err(9);
-            }
-        };
         // Zwischenablage: was hier kopiert wird, geht zum Zuschauer - Text als
         // 48, eine Dateiliste ueber den Sender (50-52), beides auf dem
         // Bildkanal; neuer Inhalt bricht eine laufende Datei-Sendung ab. Was
         // von dort kommt, legt der Eingabefaden (Text) bzw. der Empfaenger der
         // Dateien ab (netz.rs). Der Waechter wartet dabei nie: das Senden der
         // Dateien laeuft in eigenen Faeden. Angemeldet als Host-Rolle, mit dem
-        // Zuschauer als Gegenueber (ein Client im selben Prozess teilt sich
-        // den Waechter).
+        // Zuschauer als Gegenueber (der Client der App teilt sich den
+        // Waechter).
         crate::clipboard::watch(protokoll::Herkunft::Host, netz::zuschauer_sitzung, |inhalt| match inhalt {
             crate::clipboard::Inhalt::Text(text) => {
                 netz::datei_sendung_abbrechen();
@@ -834,11 +930,6 @@ impl Dienst {
                 }
             }
         }
-        if netz_laeuft {
-            log(format!("\n=== Dienst laeuft: Bild {port}, Eingabe {}, Bekanntgabe {} ===", port + 1, port + 2));
-        } else {
-            log(format!("\n=== Dienst wartet auf Port {port} (Bild), {} (Eingabe) ===", port + 1));
-        }
         log(format!(
             "Strom: {}x{}, {} fps, {} Mbit/s, feste Bildrate {}",
             Z.info_w.load(Ordering::Relaxed),
@@ -847,39 +938,116 @@ impl Dienst {
             Z.mbit.load(Ordering::Relaxed),
             if Z.fest.load(Ordering::Relaxed) { "an" } else { "aus" }
         ));
-
-        Ok(Dienst {
-            port,
-            priv_key,
-            einlass,
-            lang,
-            zulassen,
-            symbol,
-            tx,
-            rx,
-            port_belegt,
-            netz_laeuft,
-            beendet: false,
-            t0: Instant::now(),
-            vorher: last_probe(),
-            last_frames: 0,
-            last_bytes: 0,
-            naechster_takt: Instant::now() + Duration::from_secs(5),
-        })
+        Ok(())
     }
 
-    /// Ein Schritt: wartet hoechstens eine Sekunde (bis zum naechsten
-    /// Fuenf-Sekunden-Takt) auf einen Menuepunkt und fuehrt ihn aus, sieht
-    /// nach, ob das Symbol steht ("Zulassen" moeglich), und erledigt im Takt
-    /// den Neuversuch am belegten Port, die Zeilen von FFmpeg, die Drosseln
-    /// und - nur mit Zuschauer - Taktzeile und Nachricht 6. Die Drosseln
-    /// tragen immer nach, auch ohne Zuschauer: eine Flut kommt gerade dann,
-    /// wenn keiner verbunden ist.
+    /// Freigabe an: beim ersten Mal das Schwere starten; in der einen App den
+    /// Mutex der Host-Rolle nehmen (haelt ihn schon ein anderer Prozess
+    /// dieser Sitzung, wird wie am belegten Port alle 5 s neu versucht);
+    /// dann die Ports oeffnen. Ist der Port belegt und gibt es eine
+    /// Oberflaeche (Symbol, oder die App selbst), zeigt sie das, und es wird
+    /// alle 5 s neu versucht; ohne endet die reine Host-Rolle wie bisher
+    /// (Err 9). Err 6/7 aus dem Schweren.
+    pub fn freigabe_an(&mut self) -> Result<(), i32> {
+        if self.beendet || PROZESS_ENDET.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if !self.freigabe {
+            self.freigabe = true;
+            if self.app {
+                log("Freigabe: an");
+            }
+        }
+        if let Some(args) = self.vorrat.take() {
+            self.schweres_starten(&args)?;
+        }
+        self.netz_versuchen(true)
+    }
+
+    /// Mutex (eine App) und Ports; `erster`: die Zeilen zum Anlauf.
+    fn netz_versuchen(&mut self, erster: bool) -> Result<(), i32> {
+        if self.netz_laeuft || PROZESS_ENDET.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.app && self.instanz.is_none() {
+            match oberflaeche::einzelinstanz(&self.mutex) {
+                Ok(Some(i)) => {
+                    self.instanz = Some(i);
+                    protokoll_nachholen();
+                }
+                Ok(None) => {
+                    if erster {
+                        log(format!(
+                            "Freigabe: in dieser Sitzung laeuft schon eine Host-Rolle ({}) - neuer Versuch alle 5 s, das Menue zeigt Port {} belegt",
+                            self.mutex, self.port
+                        ));
+                    }
+                    self.port_belegt.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(e) => log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne")),
+            }
+        }
+        match (self.netz_starten)(self.port, self.priv_key.clone()) {
+            Ok(()) => {
+                self.netz_laeuft = true;
+                self.port_belegt.store(false, Ordering::Relaxed);
+                let p = self.port;
+                log(format!("\n=== Dienst laeuft: Bild {p}, Eingabe {}, Bekanntgabe {} ===", p + 1, p + 2));
+                Ok(())
+            }
+            Err(e) if self.app || self.symbol.steht() => {
+                if erster {
+                    log(format!("{e} - neuer Versuch alle 5 s, das Menue zeigt es"));
+                }
+                self.port_belegt.store(true, Ordering::Relaxed);
+                // Den Mutex nicht halten, solange die Ports nicht offen sind:
+                // eine andere Rolle darf sie haben.
+                drop(self.instanz.take());
+                Ok(())
+            }
+            Err(e) => {
+                log(format!("{e}"));
+                Err(9)
+            }
+        }
+    }
+
+    /// Freigabe aus (die eine App): keine neuen Zuschauer mehr, ein
+    /// verbundener erfaehrt es (Abschied, `grund`), der Mutex ist frei.
+    /// Eingabe, Ton und Bildquelle bleiben stehen - ohne Zuschauer tun sie
+    /// nichts.
+    pub fn freigabe_aus(&mut self, grund: u8) {
+        if !self.freigabe {
+            return;
+        }
+        self.freigabe = false;
+        self.port_belegt.store(false, Ordering::Relaxed);
+        if self.netz_laeuft {
+            abschied(grund);
+            self.netz_laeuft = false;
+        }
+        drop(self.instanz.take());
+        log("Freigabe: aus");
+    }
+
+    /// Ein Schritt: wartet auf eine Nachricht - mit Freigabe hoechstens eine
+    /// Sekunde (bis zum naechsten Fuenf-Sekunden-Takt), ohne bis zu einer
+    /// Minute - und fuehrt sie aus, sieht nach, ob das Symbol steht
+    /// ("Zulassen" moeglich), und erledigt im Takt den Neuversuch am
+    /// belegten Port, die Zeilen von FFmpeg, die Drosseln und - nur mit
+    /// Zuschauer - Taktzeile und Nachricht 6. Die Drosseln tragen immer
+    /// nach, auch ohne Zuschauer: eine Flut kommt gerade dann, wenn keiner
+    /// verbunden ist.
     pub fn takt(&mut self) -> Lage {
         if self.beendet {
             return Lage::Beendet;
         }
-        let warten = self.naechster_takt.saturating_duration_since(Instant::now()).min(Duration::from_secs(1));
+        let warten = if self.freigabe {
+            self.naechster_takt.saturating_duration_since(Instant::now()).min(Duration::from_secs(1))
+        } else {
+            Duration::from_secs(60)
+        };
         match self.rx.recv_timeout(warten) {
             Ok(Nachricht::Aktion(a)) => {
                 if self.aktion(a) == Lage::Beendet {
@@ -891,16 +1059,29 @@ impl Dienst {
                 self.beenden(HOST_ENDE_BEENDET);
                 return Lage::Beendet;
             }
+            Ok(Nachricht::FreigabeAn) => {
+                if let Err(code) = self.freigabe_an() {
+                    log(format!("Freigabe: Host-Rolle kann nicht laufen (Code {code})"));
+                }
+            }
+            Ok(Nachricht::FreigabeAus) => self.freigabe_aus(HOST_ENDE_FREIGABE_AUS),
+            Ok(Nachricht::NameGeaendert) => {
+                let n = zugang::geraetename();
+                self.einlass.name_setzen(&n);
+                log(format!("Geraetename: {n} - gilt fuer Bekanntgabe und Zugangsphase ab sofort"));
+            }
+            Ok(Nachricht::Beenden) => {
+                self.beenden(HOST_ENDE_BEENDET);
+                return Lage::Beendet;
+            }
             Err(_) => {}
         }
-        self.zulassen.vorhanden_setzen(self.symbol.as_ref().is_some_and(|s| s.steht()));
-        if Instant::now() < self.naechster_takt {
+        self.zulassen.vorhanden_setzen(self.symbol.steht());
+        if !self.freigabe || Instant::now() < self.naechster_takt {
             return Lage::Laeuft;
         }
         self.naechster_takt = Instant::now() + Duration::from_secs(5);
-        if !self.netz_laeuft && netz::start(self.port, self.priv_key.clone()).is_ok() {
-            self.netz_laeuft = true;
-            self.port_belegt.store(false, Ordering::Relaxed);
+        if !self.netz_laeuft && self.netz_versuchen(false).is_ok() && self.netz_laeuft {
             log(format!("Port {} ist frei - Dienst laeuft", self.port));
         }
         ffmpeg_zeilen();
@@ -944,9 +1125,9 @@ impl Dienst {
         Lage::Laeuft
     }
 
-    /// Einen Menuepunkt ausfuehren. "Freigabe beenden" beendet den Dienst:
-    /// der Zuschauer erfaehrt es (Abschied, Grund 1) und verbindet sich
-    /// nicht von selbst neu.
+    /// Einen Menuepunkt ausfuehren. "Freigabe beenden" (nur die reine
+    /// Host-Rolle) beendet den Dienst: der Zuschauer erfaehrt es (Abschied,
+    /// Grund 1) und verbindet sich nicht von selbst neu.
     pub fn aktion(&mut self, a: oberflaeche::Aktion) -> Lage {
         use crate::strings::Key;
         use oberflaeche::Aktion;
@@ -955,11 +1136,7 @@ impl Dienst {
         }
         let (e, lang) = (&self.einlass, self.lang);
         let symbol = &mut self.symbol;
-        let mut hinweis = |k: Key| {
-            if let Some(s) = symbol.as_mut() {
-                s.hinweis("QuadChroma", lang.get(k));
-            }
-        };
+        let mut hinweis = |k: Key| symbol.hinweis(lang.get(k));
         match a {
             Aktion::IdKopieren => {
                 crate::clipboard::set(&zugang::id_ziffern(e.id()));
@@ -1011,13 +1188,6 @@ impl Dienst {
             Aktion::ListeZuruecksetzen => {
                 let _ = e.liste_zuruecksetzen();
             }
-            Aktion::Autostart => {
-                let an = !crate::verknuepfung::autostart_an(None);
-                match crate::verknuepfung::autostart_setzen(None, an, lang.get(Key::StartShare)) {
-                    Ok(()) => log(if an { "Mit Windows starten: an (Verknuepfung im Autostart-Ordner)" } else { "Mit Windows starten: aus" }),
-                    Err(f) => log(format!("Mit Windows starten nicht umgestellt: {f}")),
-                }
-            }
             Aktion::Beenden => {
                 log("Freigabe beendet (Infobereich)");
                 self.beenden(HOST_ENDE_FREIGABE_AUS);
@@ -1029,21 +1199,264 @@ impl Dienst {
 
     /// Den Dienst beenden: keine neuen Zuschauer mehr (Ports zu, Bekanntgabe
     /// aus), der verbundene erfaehrt es mit Abschied (`grund`, hoechstens
-    /// ABSCHIED_FRIST), dann ist das Symbol weg. Ein zweiter Aufruf tut
-    /// nichts. Zwischenablage, Eingabe, Ton und Bildquelle bleiben stehen -
-    /// ohne Zuschauer tun sie nichts.
+    /// ABSCHIED_FRIST), dann ist das eigene Symbol weg. Ein zweiter Aufruf
+    /// tut nichts. Zwischenablage, Eingabe, Ton und Bildquelle bleiben
+    /// stehen - ohne Zuschauer tun sie nichts.
     pub fn beenden(&mut self, grund: u8) {
         if self.beendet {
             return;
         }
         self.beendet = true;
         abschied(grund);
-        drop(self.symbol.take());
+        self.netz_laeuft = false;
+        drop(self.instanz.take());
+        if let Symbolweg::Eigenes(s) = &mut self.symbol {
+            drop(s.take());
+        }
     }
 }
 
-/// Rollenwahl: --list, --messen oder --host. Rueckgabe ist der Exit-Code;
-/// das Beenden des Prozesses bleibt dem Aufrufer (main.rs).
+/// Der Port von --host bzw. --nur-host (Vorgabe 9001).
+pub fn host_port(args: &[String]) -> u16 {
+    args.iter()
+        .position(|a| a == "--host" || a == "--nur-host")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9001)
+}
+
+/// Das eigene Symbol der reinen Host-Rolle: Menue nach symbolmenue
+/// (Art::NurHost), bei jedem Oeffnen frisch gebaut; die Wahl geht als
+/// Nachricht an den Dienst. WM_CLOSE von aussen, Abmelden, Herunterfahren,
+/// ein Installationsprogramm (Restart Manager): beenden wie "Freigabe
+/// beenden", aber mit Grund 0 (die Host-Rolle wurde beendet). Das laeuft im
+/// Symbolfaden und verabschiedet selbst - nach WM_ENDSESSION endet der
+/// Prozess womoeglich gleich nach der Rueckkehr -, dann erfaehrt es der
+/// Faden des Dienstes und endet ebenfalls.
+fn eigenes_symbol(
+    lang: &'static crate::strings::Lang,
+    port: u16,
+    einlass: &Arc<einlass::Einlass>,
+    port_belegt: &Arc<AtomicBool>,
+    tx: &std::sync::mpsc::Sender<Nachricht>,
+) -> Option<crate::tray_win::Symbol> {
+    let zuordnung: Arc<Mutex<symbolmenue::Zuordnung>> = Arc::new(Mutex::new(symbolmenue::Zuordnung::default()));
+    let (tx2, z) = (tx.clone(), zuordnung.clone());
+    let befehl = Box::new(move |nr: u32| {
+        let a = symbolmenue::aktion_zu(nr, &sperre(&z));
+        if let Some(a) = a.as_ref().and_then(oberflaeche::Aktion::aus_menue) {
+            let _ = tx2.send(Nachricht::Aktion(a));
+        }
+    });
+    let (e, pb, z) = (einlass.clone(), port_belegt.clone(), zuordnung.clone());
+    let menue = Box::new(move || {
+        let h = menue_teil(Some(&e), true, port, pb.load(Ordering::Relaxed), false);
+        let stand = symbolmenue::MenueStand {
+            art: symbolmenue::Art::NurHost,
+            name: zugang::geraetename(),
+            freigabe: h.freigabe,
+            id: h.id,
+            passwort: h.passwort,
+            geraete: h.geraete,
+            hosts: Vec::new(),
+            autostart: false,
+            ruhe_verhindern: false,
+        };
+        let (m, zu) = symbolmenue::menue(lang, &stand);
+        *sperre(&z) = zu;
+        m
+    });
+    let tx3 = tx.clone();
+    let ende = Box::new(move |wie: &str| {
+        log(format!("Host-Rolle wird beendet ({wie})"));
+        abschied(HOST_ENDE_BEENDET);
+        log("Host-Rolle beendet");
+        let _ = tx3.send(Nachricht::VonAussenBeendet);
+    });
+    let tooltip = symbolmenue::tooltip(lang, None, true, Some(einlass.id()));
+    match crate::tray_win::Symbol::neu(befehl, menue, ende, None, &tooltip) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log(format!("Infobereich: kein Symbol ({e}) - ohne Oberflaeche, neue Geraete nur per Passwort"));
+            None
+        }
+    }
+}
+
+// ------------------------------------------------------ Die Rolle in der App
+
+/// Was die eine App ueber ihre Host-Rolle weiss, ohne auf deren Faden zu
+/// warten (Menue, Startbildschirm).
+struct RollenStand {
+    einlass: std::sync::OnceLock<Arc<einlass::Einlass>>,
+    port_belegt: Arc<AtomicBool>,
+    /// Die Freigabe ist (vom Nutzer) eingeschaltet.
+    freigabe: AtomicBool,
+    /// Die Rolle kam nicht in Gang (Schluessel, Ablage, Konserve,
+    /// Encoderweg) - Einzelheiten in host-protokoll.txt.
+    fehler: AtomicBool,
+}
+
+/// Die Host-Rolle im Prozess der einen App (Plan W6): ein eigener Faden
+/// richtet den Dienst ein und faehrt ihn, bis die App endet. Die App
+/// schaltet die Freigabe hierueber an und aus (einstellungen.txt: freigabe),
+/// reicht die Menuepunkte der Host-Rolle weiter, meldet einen neuen
+/// Geraetenamen und beendet die Rolle beim Beenden (Abschied, Grund 0).
+pub struct Rolle {
+    tx: std::sync::mpsc::Sender<Nachricht>,
+    stand: Arc<RollenStand>,
+    port: u16,
+    faden: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Rolle {
+    /// Den Faden der Host-Rolle starten. `args`: die Befehlszeile (Port
+    /// hinter --host, --konserve, --output, ...); `freigabe`: gleich
+    /// freigeben; `steht`/`hinweis`: das Symbol der App; `bereit` kommt,
+    /// sobald der Einlass steht (ID bekannt - der Tooltip kann sie zeigen).
+    /// Kehrt sofort zurueck - Schluessel, Einlass und Protokoll richtet der
+    /// Faden ein.
+    pub fn starten(
+        args: Vec<String>,
+        freigabe: bool,
+        steht: Arc<dyn Fn() -> bool + Send + Sync>,
+        hinweis: Arc<dyn Fn(&str) + Send + Sync>,
+        bereit: Arc<dyn Fn() + Send + Sync>,
+    ) -> Rolle {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let port = host_port(&args);
+        let stand = Arc::new(RollenStand {
+            einlass: std::sync::OnceLock::new(),
+            port_belegt: Arc::new(AtomicBool::new(false)),
+            freigabe: AtomicBool::new(freigabe),
+            fehler: AtomicBool::new(false),
+        });
+        let (st, tx2) = (stand.clone(), tx.clone());
+        let faden = std::thread::Builder::new()
+            .name("qc-host-rolle".into())
+            .spawn(move || rolle_laufen(args, st, steht, hinweis, bereit, tx2, rx))
+            .map_err(|e| {
+                protokoll::zeile(format!("Host-Rolle: kein Faden ({e}) - dieser PC ist nicht freigegeben"));
+                stand.fehler.store(true, Ordering::SeqCst);
+            })
+            .ok();
+        Rolle { tx, stand, port, faden }
+    }
+
+    /// Freigabe an oder aus (aus: ein Zuschauer erfaehrt es mit Grund 1).
+    pub fn freigabe_setzen(&self, an: bool) {
+        self.stand.freigabe.store(an, Ordering::SeqCst);
+        let _ = self.tx.send(if an { Nachricht::FreigabeAn } else { Nachricht::FreigabeAus });
+    }
+
+    /// Ein Menuepunkt der Host-Rolle.
+    pub fn aktion(&self, a: oberflaeche::Aktion) {
+        let _ = self.tx.send(Nachricht::Aktion(a));
+    }
+
+    /// Der Geraetename ist neu (zugang::geraetename_setzen ist schon
+    /// geschehen): Nachricht 20 ab der naechsten Zugangsphase.
+    pub fn name_geaendert(&self) {
+        let _ = self.tx.send(Nachricht::NameGeaendert);
+    }
+
+    /// Geraete-ID der Host-Rolle (None, solange ihr Einlass nicht steht).
+    pub fn id(&self) -> Option<u32> {
+        self.stand.einlass.get().map(|e| e.id())
+    }
+
+    /// Was das Menue ueber die Host-Rolle zeigt (siehe menue_teil) - als
+    /// Abfrage fuer den Faden des Symbols, der das Menue bei jedem Oeffnen
+    /// baut.
+    pub fn menue_abfrage(&self) -> Arc<dyn Fn() -> symbolmenue::HostTeil + Send + Sync> {
+        let (s, port) = (self.stand.clone(), self.port);
+        Arc::new(move || {
+            menue_teil(
+                s.einlass.get().map(|e| e.as_ref()),
+                s.freigabe.load(Ordering::SeqCst),
+                port,
+                s.port_belegt.load(Ordering::Relaxed),
+                s.fehler.load(Ordering::SeqCst),
+            )
+        })
+    }
+
+    /// Die Rolle beenden: Ports zu, ein Zuschauer erfaehrt es (Abschied,
+    /// Grund 0). Wartet hoechstens `frist` auf den Faden.
+    pub fn beenden(&mut self, frist: Duration) {
+        let _ = self.tx.send(Nachricht::Beenden);
+        let Some(f) = self.faden.take() else { return };
+        let bis = Instant::now() + frist;
+        while !f.is_finished() && Instant::now() < bis {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if f.is_finished() {
+            let _ = f.join();
+        } else {
+            protokoll::zeile(format!("Host-Rolle endet nicht binnen {} s - die App endet trotzdem", frist.as_secs()));
+        }
+    }
+}
+
+/// host-protokoll.txt ist offen (einmal je Prozess geoeffnet).
+static PROTOKOLL_OFFEN: AtomicBool = AtomicBool::new(false);
+
+/// host-protokoll.txt oeffnen, falls noch nicht geschehen. Nur, wenn diese
+/// Rolle den Mutex haelt oder keine andere Host-Rolle der Sitzung ihn
+/// haelt - neu beginnen leerte deren Protokoll.
+fn protokoll_nachholen() {
+    if !PROTOKOLL_OFFEN.swap(true, Ordering::SeqCst) {
+        protokoll_oeffnen("host-protokoll.txt");
+    }
+}
+
+/// Der Faden der Host-Rolle in der einen App.
+fn rolle_laufen(
+    args: Vec<String>,
+    stand: Arc<RollenStand>,
+    steht: Arc<dyn Fn() -> bool + Send + Sync>,
+    hinweis: Arc<dyn Fn(&str) + Send + Sync>,
+    bereit: Arc<dyn Fn() + Send + Sync>,
+    tx: std::sync::mpsc::Sender<Nachricht>,
+    rx: std::sync::mpsc::Receiver<Nachricht>,
+) {
+    protokoll::herkunft_setzen(protokoll::Herkunft::Host);
+    if !oberflaeche::laeuft(oberflaeche::MUTEX) {
+        protokoll_nachholen();
+    }
+    if let Err(e) = ffmpeg_next::init() {
+        log(format!("FFmpeg-Start fehlgeschlagen: {e} - dieser PC wird nicht freigegeben"));
+        stand.fehler.store(true, Ordering::SeqCst);
+        return;
+    }
+    // Die Reihe der Host-Rolle: Warnungen und Fehler von FFmpeg.
+    protokoll::einschalten(false);
+    log("Host-Rolle im Prozess der App");
+    let mut d = match Dienst::einrichten(&args, Art::App { steht, hinweis }, tx, rx, stand.port_belegt.clone()) {
+        Ok(d) => d,
+        Err(code) => {
+            log(format!("Host-Rolle nicht eingerichtet (Code {code}) - dieser PC wird nicht freigegeben"));
+            stand.fehler.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let _ = stand.einlass.set(d.einlass.clone());
+    bereit();
+    if stand.freigabe.load(Ordering::SeqCst) {
+        if let Err(code) = d.freigabe_an() {
+            log(format!("Freigabe: Host-Rolle kann nicht laufen (Code {code})"));
+            stand.fehler.store(true, Ordering::SeqCst);
+        }
+    } else {
+        log("Freigabe: aus (einstellungen.txt) - kein Port offen");
+    }
+    while d.takt() == Lage::Laeuft {}
+    log("Host-Rolle beendet");
+}
+
+/// Rollenwahl der reinen Host-Prozesse: --list, --messen oder --nur-host.
+/// Rueckgabe ist der Exit-Code; das Beenden des Prozesses bleibt dem
+/// Aufrufer (main.rs).
 pub fn main_host(args: &[String]) -> i32 {
     // Einzelinstanz der Freigabe (Spezifikation 10.1) - vor allem anderen,
     // auch vor der Protokolldatei: ein zweiter Start leerte sonst das
@@ -1066,11 +1479,10 @@ pub fn main_host(args: &[String]) -> i32 {
         None
     };
     if freigabe && ausgabe_ins_leere() {
-        // Vom Knopf des Clients gestartet: niemand liest die Ausgaben. Kam
-        // der Client aus einer Eingabeaufforderung, haengt dieser Prozess
-        // trotzdem an ihrer Konsole (AttachConsole in main.rs) - schloesse
-        // jemand das Fenster, endete die Freigabe mit. Also loslassen; das
-        // Protokoll steht in host-protokoll.txt.
+        // Ohne Leser gestartet (Ausgaben nach NUL): haengt dieser Prozess
+        // trotzdem an einer geerbten Konsole (AttachConsole in main.rs),
+        // endete er mit ihr. Also loslassen; das Protokoll steht in
+        // host-protokoll.txt.
         unsafe {
             let _ = windows::Win32::System::Console::FreeConsole();
         }
@@ -1103,7 +1515,7 @@ pub fn main_host(args: &[String]) -> i32 {
         if oberflaeche::laeuft(oberflaeche::MUTEX) {
             log("Die Freigabe laeuft in dieser Sitzung - --list schreibt nur auf die Konsole, host-protokoll.txt bleibt ihr");
         } else {
-            protokoll_oeffnen("host-protokoll.txt");
+            protokoll_nachholen();
         }
         log(&dpi);
         aufnahme::ausgaenge_melden(&mut Vec::new());
@@ -1113,13 +1525,15 @@ pub fn main_host(args: &[String]) -> i32 {
         return 0;
     }
 
-    protokoll_oeffnen("host-protokoll.txt");
+    protokoll_nachholen();
     log(&dpi);
     if let Some(e) = instanz_fehler {
         log(format!("Einzelinstanz nicht moeglich ({e}) - weiter ohne"));
     }
+    // Der Geraetename, den andere sehen, gilt auch fuer die reine Host-Rolle.
+    zugang::geraetename_setzen(crate::einstellungen::Einstellungen::laden().geraetename);
 
-    // --host: der Dienst, bis er beendet ist (Menue oder von aussen).
+    // --nur-host: der Dienst, bis er beendet ist (Menue oder von aussen).
     let mut dienst = match Dienst::starten(args) {
         Ok(d) => d,
         Err(code) => return code,
@@ -1207,22 +1621,27 @@ mod tests {
         std::fs::remove_dir_all(&ordner).ok();
     }
 
-    /// Ein Dienst ohne starten (kein Symbol, keine Aufnahme): Einlass mit
-    /// eigenem Ordner, Zuschauerplatz auf Loopback.
-    fn test_dienst(name: &str) -> Dienst {
+    /// Ein Dienst ohne einrichten (kein Symbol, keine Aufnahme, nicht der
+    /// prozessweite Einlass): Einlass mit eigenem Ordner, Zuschauerplatz auf
+    /// Loopback. `app`: wie in der einen App (eigener Mutex-Name, Freigabe
+    /// noch aus); sonst die reine Host-Rolle mit schon offenen Ports.
+    fn test_dienst(name: &str, app: bool) -> Dienst {
         let ordner = std::env::temp_dir().join(format!("qc-dienst-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ordner);
         std::fs::create_dir_all(&ordner).unwrap();
         let (priv_key, pub_key) = noise::keypair().unwrap();
-        let einlass = std::sync::Arc::new(einlass::Einlass::neu(
+        let einlass = Arc::new(einlass::Einlass::neu(
             ordner.join(zugang::GERAETE_DATEI),
             ordner.join(zugang::PASSWORT_DATEI),
             &pub_key,
             "Testhost",
         ));
         let lang = crate::strings::pick("de");
-        let zulassen = std::sync::Arc::new(fenster::Zulassen::neu(lang, std::sync::Arc::new(|_, _| {})));
+        let zulassen = Arc::new(fenster::Zulassen::neu(lang, Arc::new(|_, _| {})));
         let port = netz::start_loopback(&priv_key);
+        if app {
+            netz::stoppen();
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         Dienst {
             port,
@@ -1230,11 +1649,17 @@ mod tests {
             einlass,
             lang,
             zulassen,
-            symbol: None,
+            symbol: Symbolweg::Eigenes(None),
             tx,
             rx,
-            port_belegt: std::sync::Arc::new(AtomicBool::new(false)),
-            netz_laeuft: true,
+            port_belegt: Arc::new(AtomicBool::new(false)),
+            vorrat: None,
+            freigabe: !app,
+            netz_laeuft: !app,
+            app,
+            instanz: None,
+            mutex: format!("Local\\QuadChroma-Host-Test-Dienst-{}-{name}", std::process::id()),
+            netz_starten: netz::start_loopback_an,
             beendet: false,
             t0: Instant::now(),
             vorher: None,
@@ -1242,6 +1667,95 @@ mod tests {
             last_bytes: 0,
             naechster_takt: Instant::now() + Duration::from_secs(5),
         }
+    }
+
+    /// Nimmt der Port Verbindungen an?
+    fn offen(port: u16) -> bool {
+        std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(6)).is_ok()
+    }
+
+    /// W6: die Freigabe der einen App an, aus, wieder an - ueber Nachrichten
+    /// wie aus dem Menue. An: Ports offen, der Mutex der Host-Rolle gehalten;
+    /// aus: Ports zu, Mutex frei, der Dienst laeuft weiter. Haelt ein anderer
+    /// den Mutex (eine zweite Host-Rolle der Sitzung), bleiben die Ports zu,
+    /// das Menue zeigt "belegt", und im Takt wird neu versucht, bis er frei
+    /// ist. Beenden (die App endet) schliesst alles.
+    #[test]
+    fn freigabe_an_aus_an() {
+        let _platz = netz::platz_pruefung();
+        let mut d = test_dienst("freigabe", true);
+        let (port, mutex) = (d.port, d.mutex.clone());
+        assert!(!netz::laeuft() && !oberflaeche::laeuft(&mutex));
+        let tx = d.tx.clone();
+        tx.send(Nachricht::FreigabeAn).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert!(netz::laeuft() && offen(port), "Freigabe an: Port zu");
+        assert!(oberflaeche::laeuft(&mutex), "Freigabe an ohne Mutex");
+        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, d.port_belegt.load(Ordering::Relaxed), false).freigabe, symbolmenue::Freigabe::Bereit);
+        tx.send(Nachricht::FreigabeAus).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert!(!netz::laeuft() && !offen(port), "Freigabe aus: Port offen");
+        assert!(!oberflaeche::laeuft(&mutex), "Freigabe aus: Mutex gehalten");
+        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, false, false).freigabe, symbolmenue::Freigabe::Aus);
+        // Ein Menuepunkt wirkt auch ohne Freigabe.
+        assert_eq!(d.aktion(oberflaeche::Aktion::Zufallspasswort), Lage::Laeuft);
+        assert!(d.einlass.passwort().is_ok());
+
+        // Eine andere Host-Rolle haelt den Mutex: kein Port, "belegt".
+        let fremd = oberflaeche::einzelinstanz(&mutex).unwrap().expect("Mutex");
+        tx.send(Nachricht::FreigabeAn).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert!(!netz::laeuft());
+        assert!(d.port_belegt.load(Ordering::Relaxed));
+        assert_eq!(menue_teil(Some(&d.einlass), d.freigabe, port, true, false).freigabe, symbolmenue::Freigabe::PortBelegt(port));
+        drop(fremd);
+        d.naechster_takt = Instant::now();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert!(netz::laeuft() && offen(port), "Neuversuch im Takt: Port zu");
+        assert!(!d.port_belegt.load(Ordering::Relaxed));
+        assert!(oberflaeche::laeuft(&mutex));
+
+        tx.send(Nachricht::Beenden).unwrap();
+        assert_eq!(d.takt(), Lage::Beendet);
+        assert!(!netz::laeuft() && !oberflaeche::laeuft(&mutex));
+        assert_eq!(d.takt(), Lage::Beendet);
+    }
+
+    /// Ein neuer Geraetename (die App meldet ihn) gilt ab der naechsten
+    /// Zugangsphase - der Einlass traegt ihn sofort, ohne neuen Dienst.
+    #[test]
+    fn neuer_geraetename_im_dienst() {
+        let _platz = netz::platz_pruefung();
+        let _name = zugang::name_test_sperre();
+        let vorher = zugang::geraetename_eingestellt();
+        let mut d = test_dienst("name", true);
+        assert_eq!(d.einlass.name(), "Testhost");
+        zugang::geraetename_setzen(Some("Neuer Name".into()));
+        d.tx.send(Nachricht::NameGeaendert).unwrap();
+        assert_eq!(d.takt(), Lage::Laeuft);
+        assert_eq!(d.einlass.name(), "Neuer Name");
+        zugang::geraetename_setzen(vorher);
+    }
+
+    /// Was das Menue ueber die Host-Rolle zeigt: aus, Fehler, belegt, bereit;
+    /// ohne Einlass weder ID noch Passwort noch Geraete.
+    #[test]
+    fn menue_teil_je_zustand() {
+        use symbolmenue::Freigabe as F;
+        let _platz = netz::platz_pruefung();
+        let d = test_dienst("menueteil", true);
+        let e = Some(d.einlass.as_ref());
+        assert_eq!(menue_teil(e, false, 9001, true, true).freigabe, F::Aus);
+        assert_eq!(menue_teil(e, true, 9001, true, true).freigabe, F::Fehler);
+        assert_eq!(menue_teil(e, true, 9001, true, false).freigabe, F::PortBelegt(9001));
+        let h = menue_teil(e, true, 9001, false, false);
+        assert!(matches!(h.freigabe, F::Bereit | F::Verbunden(_)));
+        assert_eq!(h.id, Some(d.einlass.id()));
+        // Fehlt die Datei, entsteht ein Zufallspasswort - und steht im Menue.
+        assert_eq!(h.passwort, d.einlass.passwort().map_err(|_| ()));
+        assert!(h.passwort.is_ok());
+        assert_eq!(h.geraete, Ok(Vec::new()));
+        assert_eq!(menue_teil(None, true, 9001, false, false).id, None);
     }
 
     /// W1: der Dienst endet, ohne den Prozess zu beenden. "Freigabe beenden"
@@ -1253,7 +1767,7 @@ mod tests {
     #[test]
     fn dienst_endet_ohne_prozessende() {
         let _platz = netz::platz_pruefung();
-        let mut d = test_dienst("menue");
+        let mut d = test_dienst("menue", false);
         assert!(netz::laeuft());
         assert_eq!(d.aktion(oberflaeche::Aktion::Zufallspasswort), Lage::Laeuft);
         assert!(d.einlass.passwort().is_ok(), "Zufallspasswort nicht angelegt");
@@ -1267,7 +1781,7 @@ mod tests {
 
         // Von aussen: wie der Rueckruf `ende` im Symbolfaden - erst der
         // Abschied, dann die Nachricht.
-        let mut d = test_dienst("aussen");
+        let mut d = test_dienst("aussen", false);
         assert!(netz::laeuft());
         let tx = d.tx.clone();
         let t0 = Instant::now();

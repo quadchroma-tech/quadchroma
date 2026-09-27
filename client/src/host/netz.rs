@@ -2492,6 +2492,13 @@ pub(super) fn start_loopback(schluessel: &[u8]) -> u16 {
     panic!("keine freien Ports auf Loopback");
 }
 
+/// Fuer Tests: den Zuschauerplatz auf Loopback an Port P starten (wie
+/// `start`, fuer den Dienst in host/mod.rs).
+#[cfg(test)]
+pub(super) fn start_loopback_an(port: u16, schluessel: Vec<u8>) -> Result<(), String> {
+    start_mit(Ipv4Addr::LOCALHOST, port, schluessel, || vec![Ipv4Addr::LOCALHOST])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

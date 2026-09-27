@@ -58,6 +58,12 @@ mod zugangsphase;
 /// Schliessen legt die App ab: Symbol im Infobereich (Windows, tray_win.rs)
 /// bzw. in der Menueleiste (macOS, tray_mac.rs); gemeinsame Logik in tray.rs.
 mod tray;
+/// Das Menue am Symbol der einen App (Client und Host-Rolle, Windows).
+mod symbolmenue;
+/// Die Host-Rolle der einen App, fuer main.rs auf jeder Plattform gleich.
+mod freigabe;
+/// "Ruhezustand verhindern, solange QuadChroma laeuft".
+mod ruhezustand;
 #[cfg(windows)]
 mod tray_win;
 #[cfg(target_os = "macos")]
@@ -86,8 +92,9 @@ use audio_mac as audio;
 use clipboard_mac as clipboard;
 #[cfg(windows)]
 mod anzeige;
-/// Windows als Host: eigene Rolle in derselben Programmdatei (--host,
-/// --list, --messen), ohne Fenster.
+/// Windows als Host: die Host-Rolle in derselben Programmdatei - in der
+/// einen App als eigener Faden (freigabe.rs), allein ohne Fenster mit
+/// --nur-host, --list, --messen.
 #[cfg(windows)]
 mod host;
 // Die Nachrichtenkennungen der Leitung liegen in EINEM Modul, das Client-
@@ -124,7 +131,8 @@ fn client_us() -> u64 {
 /// Prozess, Client und Host-Rolle koennen sich aber einen Prozess teilen.
 /// Jede Zeile gehoert deshalb einer Herkunft - der des Fadens, der sie sagt
 /// (`herkunft_setzen`; ungesetzt die des Prozesses, `standard_setzen`:
-/// der Client, im reinen Host-Prozess --host/--list/--messen der Host). Die
+/// der Client - auch in der einen App -, im reinen Host-Prozess
+/// --nur-host/--list/--messen der Host). Die
 /// Faeden der Host-Rolle, die FFmpeg benutzen (Dienst, Aufnahme mit
 /// Encoder, Messung), setzen Herkunft::Host; ihre Zeilen, Warnungen und
 /// Fehler landen in der Reihe des Hosts, die der Host abholt und in
@@ -177,7 +185,7 @@ mod protokoll {
     }
 
     /// Herkunft der Faeden ohne eigene festlegen - nur ein Prozess, der
-    /// allein die Host-Rolle spielt (--host, --list, --messen), setzt den
+    /// allein die Host-Rolle spielt (--nur-host, --list, --messen), setzt den
     /// Host: dann gehen auch die Zeilen des Ablagewaechters, der Netzfaeden
     /// und der Faeden, die FFmpeg selbst anlegt, in die Reihe des Hosts.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -5607,8 +5615,25 @@ pub enum Benutzer {
     /// vorn holen), siehe einzel.rs. Die Schleife bestaetigt die Uebernahme;
     /// erst dann endet der zweite Start mit "weitergereicht".
     Einzel(einzel::Weitergabe),
-    /// Wahl am Symbol im Infobereich bzw. in der Menueleiste (tray.rs).
+    /// Wahl am Symbol in der Menueleiste (tray.rs, macOS).
+    #[cfg_attr(windows, allow(dead_code))]
     Tray(tray::Befehl),
+    /// Wahl am Symbol der einen App (Windows): ein Punkt aus symbolmenue.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Menue(symbolmenue::Aktion),
+    /// Die Host-Rolle will eine Sprechblase am Symbol zeigen.
+    Hinweis(String),
+    /// Die Host-Rolle steht (ihre ID ist bekannt): Tooltip erneuern.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    RolleBereit,
+    /// Das Fenster "Geraetename" meldet einen neuen Namen (None: der
+    /// Rechnername des Systems).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Name(Option<String>),
+    /// Die App endet von aussen (WM_CLOSE an ihr Symbol, Abmelden,
+    /// Herunterfahren); der Abschied an einen Zuschauer ist schon hinaus.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Ende(String),
 }
 
 /// Was ein weitergereichter Start bewirkt (siehe `einzel_folge`).
@@ -5649,58 +5674,49 @@ const MIT_VERKNUEPFUNG: bool = cfg!(windows);
 /// So lange steht das Ergebnis einer Verknuepfung im Meldungsbereich.
 const VERKNUEPFUNG_ANZEIGE: Duration = Duration::from_secs(6);
 
-/// Den Knopf "Diesen PC freigeben" gibt es nur unter Windows: dort ist die
-/// Host-Rolle dieselbe exe (Spezifikation Pairing v1, 9.5 und 10.1).
+/// Die eine App - Client und Host-Rolle in einem Prozess, ein Symbol - gibt
+/// es bisher nur unter Windows (Plan W5-W7): dort der Umschalter "Diesen PC
+/// freigeben" im Startbildschirm, die Zeile "Dieser Computer" mit dem Knopf
+/// "Umbenennen" und das Kaestchen "Ruhezustand verhindern". Als Konstante
+/// statt cfg, damit derselbe Code auf beiden Plattformen gebaut (und
+/// geprueft) wird.
 const MIT_FREIGABE: bool = cfg!(windows);
-/// So oft sieht der Startbildschirm nach, ob eine Host-Rolle laeuft.
-const FREIGABE_TAKT: Duration = Duration::from_secs(1);
-/// So lange nach dem Klick gilt die Freigabe als laufend, auch bevor die
-/// neue Host-Rolle ihren Mutex angelegt hat - kein zweiter Start.
-const FREIGABE_ANLAUF: Duration = Duration::from_secs(5);
-/// Laeuft in dieser Nutzersitzung eine Host-Rolle? Sie haelt ihren
-/// Einzelinstanz-Mutex (Spezifikation 10.1), solange sie laeuft - derselbe
-/// Name und dieselbe Pruefung wie in der Host-Rolle selbst
-/// (host::oberflaeche::MUTEX, "Local\\QuadChroma-Host"; verweigert das
-/// System den Zugriff, etwa bei einer Host-Rolle mit erhoehten Rechten,
-/// laeuft sie ebenfalls).
-#[cfg(windows)]
-fn host_rolle_laeuft() -> bool {
-    host::oberflaeche::laeuft(host::oberflaeche::MUTEX)
+
+/// Laeuft die App ohne Fenster an (Plan W7)? Nur die eine App (Windows);
+/// mit einem Ziel (Adresse, ID, Verknuepfung) nie; ohne Symbol (tray=aus)
+/// nie - es gaebe keinen Weg zur App; sonst bei Autostart und --host immer
+/// und bei jedem Start nach dem allerersten (einstellungen.txt:
+/// fenster_gezeigt).
+fn start_im_hintergrund(eine_app: bool, mit_ziel: bool, tray: bool, hintergrund_start: bool, fenster_gezeigt: bool) -> bool {
+    eine_app && !mit_ziel && tray && (hintergrund_start || fenster_gezeigt)
 }
 
-#[cfg(not(windows))]
-fn host_rolle_laeuft() -> bool {
-    false
+/// Kommentar der Verknuepfung "Mit Windows starten".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn autostart_beschreibung(lang: &strings::Lang) -> String {
+    format!("QuadChroma – {}", lang.get(strings::Key::AppSubtitle))
 }
 
-/// Startet die Host-Rolle: dieselbe exe mit --host als eigener Prozess
-/// (erlaubt: ein zweiter Prozess derselben exe im Host-Modus). Die exe ist
-/// ein GUI-Programm, ein Konsolenfenster entsteht ohnehin nicht;
-/// DETACHED_PROCESS trennt sie zudem von einer Konsole, an der der Client
-/// haengt, eine eigene Prozessgruppe von dessen Strg+C. Ein- und Ausgaben
-/// gehen ins Leere - die Host-Rolle schreibt host-protokoll.txt. Liefert
-/// die Prozessnummer.
-#[cfg(windows)]
-fn host_rolle_starten() -> Result<u32, String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
-    let kind = Command::new(exe)
-        .arg("--host")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(kind.id())
+/// Den Ruhezustand verhindern (`an`) oder wieder zulassen, mit
+/// Protokollzeile; der Grund in powercfg /requests ist der Text des
+/// Kaestchens. Liefert, ob die Anforderung jetzt gilt.
+fn ruhe_setzen(r: &mut ruhezustand::Ruhesperre, an: bool, lang: &strings::Lang) -> bool {
+    match r.setzen(an, lang.get(strings::Key::PreventSleep)) {
+        Ok(ruhezustand::Schritt::Setzen) => protokoll::zeile("Ruhezustand: verhindert, solange QuadChroma laeuft".into()),
+        Ok(ruhezustand::Schritt::Loesen) => protokoll::zeile("Ruhezustand: wieder erlaubt".into()),
+        Ok(ruhezustand::Schritt::Nichts) => {}
+        Err(e) => protokoll::zeile(format!("Ruhezustand: nicht umgestellt - {e}")),
+    }
+    r.an()
 }
 
-#[cfg(not(windows))]
-fn host_rolle_starten() -> Result<u32, String> {
-    Err("die Host-Rolle gibt es nur unter Windows".into())
+/// Was das Menue am Symbol der einen App aus dem Fensterfaden braucht; der
+/// Symbolfaden baut es bei jedem Oeffnen daraus (samt Hostliste,
+/// Geraetename, Autostart und dem Teil der Host-Rolle, die er selbst liest).
+#[cfg_attr(not(windows), allow(dead_code))]
+struct MenueQuelle {
+    lang: &'static strings::Lang,
+    ruhe_verhindern: bool,
 }
 
 /// Einfuegen in eigene Felder: Strg+V unter Windows, Cmd+V auf dem Mac.
@@ -5863,11 +5879,22 @@ struct App {
     /// Start ueber eine ID ohne Adresse (Befehlszeile): seit wann auf ihre
     /// Bekanntgabe gewartet wird.
     id_ausstehend: Option<(u32, Instant)>,
-    /// "Diesen PC freigeben" (nur Windows, 9.5): laeuft eine Host-Rolle, wann
-    /// zuletzt nachgesehen, und wann der Knopf sie gestartet hat.
-    freigabe: bool,
-    freigabe_geprueft: Option<Instant>,
-    freigabe_gestartet: Option<Instant>,
+    /// Die Host-Rolle der einen App (Windows; None auf dem Mac).
+    rolle: Option<freigabe::Freigabe>,
+    /// Die App lief ohne Fenster an (Autostart, --host, spaetere Starts):
+    /// Fenster und Renderer entstehen erst mit "QuadChroma oeffnen".
+    hintergrund: bool,
+    /// Ob das Symbol steht - die Host-Rolle fragt hierueber ("Zulassen").
+    #[cfg_attr(not(windows), allow(dead_code))]
+    symbol_steht: Arc<std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// Was der Symbolfaden fuer das Menue braucht, und die Zuordnung der
+    /// Nummern des zuletzt gezeigten Menues.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    menue_quelle: Arc<Mutex<MenueQuelle>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    menue_zuordnung: Arc<Mutex<symbolmenue::Zuordnung>>,
+    /// "Ruhezustand verhindern, solange QuadChroma laeuft".
+    ruhe: ruhezustand::Ruhesperre,
     /// Gespeicherte Einstellungen. Was hier steht, ueberlebt den Neustart.
     cfg: einstellungen::Einstellungen,
     /// Fuer welchen Host die gespeicherten Werte schon geschickt wurden.
@@ -5976,6 +6003,75 @@ impl App {
 
 impl ApplicationHandler<Benutzer> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
+        // Im Hintergrund (die eine App nach dem allerersten Start, Autostart,
+        // --host): kein Fenster und kein Renderer, bis "QuadChroma oeffnen".
+        if self.window.is_none() && !self.hintergrund {
+            self.fenster_anlegen(el);
+        }
+        // Das Symbol im Infobereich bzw. in der Menueleiste: von Anfang an,
+        // damit das Schliessen einen Weg zurueck hat (und der Tooltip die
+        // Sitzung zeigt). Auf dem Mac verlangt AppKit den Hauptfaden nach
+        // dem Start der Ereignisschleife - also hier.
+        if self.symbol.is_none() && self.cfg.tray {
+            self.symbol_anlegen();
+        }
+        // Liess sich kein Symbol anlegen, gaebe es ohne Fenster keinen Weg zur
+        // App: dann doch das Fenster (steht es nur noch nicht, weil Explorer
+        // fehlt, kommt es mit "TaskbarCreated").
+        if self.window.is_none() && self.symbol.is_none() {
+            protokoll::zeile(format!("{}: kein Symbol - das Fenster geht auf", tray::ORT));
+            self.fenster_anlegen(el);
+        }
+    }
+
+    /// Benutzerereignisse (siehe `Benutzer`). Eine Weitergabe, die kommt,
+    /// waehrend das Programm schon endet, bleibt unbestaetigt: der zweite
+    /// Start bekommt 0 und wird selbst erste Instanz, sobald diese weg ist
+    /// (einzel.rs) - die Adresse geht nicht verloren.
+    fn user_event(&mut self, el: &ActiveEventLoop, ereignis: Benutzer) {
+        match ereignis {
+            Benutzer::Einzel(w) if self.quit => {
+                protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {:?} waehrend des Beendens - nicht uebernommen", w.adresse));
+            }
+            Benutzer::Einzel(w) => {
+                self.einzel_empfangen(el, &w.adresse);
+                w.bestaetigen();
+            }
+            Benutzer::Tray(befehl) => self.tray_befehl(el, befehl),
+            Benutzer::Menue(a) => self.menue_aktion(el, a),
+            Benutzer::Hinweis(text) => {
+                if let Some(s) = self.symbol.as_mut() {
+                    s.hinweis("QuadChroma", &text);
+                }
+            }
+            Benutzer::Name(n) => self.geraetename_setzen(n),
+            Benutzer::RolleBereit => {
+                if self.symbol.is_some() {
+                    self.symbol_nachfuehren_jetzt();
+                }
+            }
+            Benutzer::Ende(wie) => {
+                protokoll::zeile(format!("{}: QuadChroma wird beendet ({wie})", tray::ORT));
+                self.quit = true;
+                el.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.fenster_ereignis(el, event);
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.vor_dem_warten(el);
+    }
+}
+
+impl App {
+    /// Fenster und Renderer anlegen - beim Start, oder im Hintergrund erst
+    /// mit "QuadChroma oeffnen" (bzw. einem zweiten Start der exe).
+    fn fenster_anlegen(&mut self, el: &ActiveEventLoop) {
+        self.hintergrund = false;
         // Vollbild ist die Voreinstellung; F11 schaltet um und merkt sich das.
         // Das Symbol zeichnet logo.rs; die Titelleiste nimmt 32 px (Windows
         // rechnet herunter), die Taskleiste 48 px. Auf dem Mac setzt winit
@@ -6054,33 +6150,16 @@ impl ApplicationHandler<Benutzer> for App {
             protokoll::zeile("Anzeige: Software".into());
         }
         self.window = Some(window);
-        // Das Symbol im Infobereich bzw. in der Menueleiste: von Anfang an,
-        // damit das Schliessen einen Weg zurueck hat (und der Tooltip die
-        // Sitzung zeigt). Auf dem Mac verlangt AppKit den Hauptfaden nach
-        // dem Start der Ereignisschleife - also hier.
-        if self.symbol.is_none() && self.cfg.tray {
-            self.symbol_anlegen();
+        self.ui_kasten_alt = None;
+        // Nur der allererste Start oeffnet das Fenster von selbst; ab jetzt
+        // bleibt jeder Start im Infobereich.
+        if !self.cfg.fenster_gezeigt {
+            self.cfg.fenster_gezeigt = true;
+            self.cfg.sichern();
         }
     }
 
-    /// Benutzerereignisse (siehe `Benutzer`). Eine Weitergabe, die kommt,
-    /// waehrend das Programm schon endet, bleibt unbestaetigt: der zweite
-    /// Start bekommt 0 und wird selbst erste Instanz, sobald diese weg ist
-    /// (einzel.rs) - die Adresse geht nicht verloren.
-    fn user_event(&mut self, _el: &ActiveEventLoop, ereignis: Benutzer) {
-        match ereignis {
-            Benutzer::Einzel(w) if self.quit => {
-                protokoll::zeile(format!("Einzelinstanz: zweiter Start mit {:?} waehrend des Beendens - nicht uebernommen", w.adresse));
-            }
-            Benutzer::Einzel(w) => {
-                self.einzel_empfangen(&w.adresse);
-                w.bestaetigen();
-            }
-            Benutzer::Tray(befehl) => self.tray_befehl(befehl),
-        }
-    }
-
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn fenster_ereignis(&mut self, el: &ActiveEventLoop, event: WindowEvent) {
         match event {
             // Schliessen legt die App ab (Infobereich bzw. Menueleiste);
             // ohne Symbol oder mit tray=aus beendet es wie bisher.
@@ -6181,6 +6260,10 @@ impl ApplicationHandler<Benutzer> for App {
                             }
                             // Esc schliesst zuerst eine offene Sprachwahl.
                             KC::Escape if self.sprachwahl => { self.sprachwahl = false; return; }
+                            // Esc: in der einen App ablegen wie das Schliessen -
+                            // die Freigabe laeuft weiter (ohne Symbol: Ende);
+                            // sonst beenden wie bisher.
+                            KC::Escape if MIT_FREIGABE => { self.schliessen(el); return; }
                             KC::Escape => { self.quit = true; return; }
                             // Cmd+W schliesst auf dem Startbildschirm wie das
                             // rote Knoepfchen (winit legt dafuer keinen
@@ -6381,10 +6464,17 @@ impl ApplicationHandler<Benutzer> for App {
         }
     }
 
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+    fn vor_dem_warten(&mut self, el: &ActiveEventLoop) {
         if self.quit { el.exit(); return; }
         // Symbol: Menue (gefundene Hosts, Sprache) und Tooltip (Sitzung).
         self.symbol_nachfuehren();
+        // Ohne Fenster (die eine App im Hintergrund): nichts zeichnen, nichts
+        // nachsehen - warten, bis ein Benutzerereignis kommt (Symbol,
+        // Einzelinstanz, Host-Rolle).
+        if self.window.is_none() {
+            el.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(t) = self.verbergen_faellig {
             if Instant::now() >= t {
@@ -6397,11 +6487,18 @@ impl ApplicationHandler<Benutzer> for App {
                 }
             }
         }
-        // Abgelegt: nichts zeichnen, nichts nachsehen - nur langsam auf
+        // Abgelegt: nichts zeichnen, nichts nachsehen - nur auf
         // Benutzerereignisse (Symbol, Einzelinstanz) warten. Eine Sitzung
-        // gibt es dann nicht (Schliessen hat getrennt).
+        // gibt es dann nicht (Schliessen hat getrennt). Unter Windows baut
+        // der Symbolfaden das Menue selbst - es gibt nichts nachzufuehren; auf
+        // dem Mac fuehrt der langsame Takt das Menue der Menueleiste nach
+        // (gefundene Hosts).
         if self.verborgen {
-            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + VERBORGEN_TAKT));
+            if cfg!(windows) {
+                el.set_control_flow(ControlFlow::Wait);
+            } else {
+                el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + VERBORGEN_TAKT));
+            }
             return;
         }
         // Nicht mehr in Dauerschleife: alle zwei Millisekunden nachsehen (das
@@ -6460,9 +6557,6 @@ impl ApplicationHandler<Benutzer> for App {
                 );
             }
         }
-        // Windows: laeuft eine Host-Rolle? (Knopf "Diesen PC freigeben")
-        self.freigabe_nachsehen();
-
         // Nachgereichtes ESC-Loslassen.
         if let Some(t) = self.esc_up_faellig {
             if Instant::now() >= t {
@@ -6877,8 +6971,8 @@ impl App {
     /// ein Klick auf "Verbinden". Eine Sitzung zu einem anderen Host wird
     /// vorher getrennt, eine zum selben bleibt bestehen - der Doppelklick auf
     /// die Verknuepfung soll sie nicht abloesen.
-    fn einzel_empfangen(&mut self, text: &str) {
-        self.fenster_zeigen();
+    fn einzel_empfangen(&mut self, el: &ActiveEventLoop, text: &str) {
+        self.fenster_zeigen(el);
         let (adresse, id) = ziel_lesen(text);
         if adresse.is_empty() && id.is_none() {
             protokoll::zeile("Einzelinstanz: zweiter Start ohne Adresse - Fenster nach vorn".into());
@@ -7027,54 +7121,126 @@ impl App {
         }
     }
 
-    /// "Diesen PC freigeben": Stand des Knopfs - None ausser unter Windows,
-    /// Some(true), solange eine Host-Rolle laeuft oder gerade gestartet wurde.
-    fn freigabe_anzeige(&self) -> Option<bool> {
-        MIT_FREIGABE.then(|| self.freigabe || self.freigabe_gestartet.is_some_and(|t| t.elapsed() < FREIGABE_ANLAUF))
+    /// "Diesen PC freigeben" (Startbildschirm, Menue): die Freigabe der
+    /// einen App an bzw. aus, gemerkt in einstellungen.txt. Aus heisst: ein
+    /// Zuschauer erfaehrt es (Abschied, Grund 1), die Ports gehen zu.
+    fn freigabe_umschalten(&mut self) {
+        let Some(r) = self.rolle.as_ref() else { return };
+        self.cfg.freigabe = !self.cfg.freigabe;
+        self.cfg.sichern();
+        r.setzen(self.cfg.freigabe);
+        protokoll::zeile(format!("Freigabe: {}", if self.cfg.freigabe { "an" } else { "aus" }));
+        self.symbol_nachfuehren_jetzt();
     }
 
-    /// Etwa einmal je Sekunde, nur auf dem sichtbaren Startbildschirm:
-    /// laeuft eine Host-Rolle (Mutex der Host-Rolle, Paket P5)?
-    fn freigabe_nachsehen(&mut self) {
-        if !MIT_FREIGABE || self.screen != Screen::Start || self.verborgen {
-            return;
+    /// "Ruhezustand verhindern" (Startbildschirm, Menue): sofort wirksam,
+    /// gemerkt in einstellungen.txt.
+    fn ruhe_umschalten(&mut self) {
+        let an = ruhe_setzen(&mut self.ruhe, !self.cfg.ruhe_verhindern, self.lang);
+        // Gemerkt wird der Wunsch; laesst das System ihn nicht zu, sagt es das
+        // Protokoll, und der Haken folgt dem, was gilt.
+        self.cfg.ruhe_verhindern = an;
+        self.cfg.sichern();
+        if let Ok(mut q) = self.menue_quelle.lock() {
+            q.ruhe_verhindern = an;
         }
-        if self.freigabe_geprueft.is_some_and(|t| t.elapsed() < FREIGABE_TAKT) {
-            return;
-        }
-        self.freigabe_geprueft = Some(Instant::now());
-        let laeuft = host_rolle_laeuft();
-        if laeuft != self.freigabe {
-            protokoll::zeile(format!("Freigabe: Host-Rolle {}", if laeuft { "laeuft" } else { "laeuft nicht (mehr)" }));
-        }
-        self.freigabe = laeuft;
     }
 
-    /// Knopf "Diesen PC freigeben" (9.5): dieselbe exe als zweiter Prozess
-    /// mit --host, ohne Konsolenfenster. Sie laeuft unabhaengig weiter, auch
-    /// wenn der Client endet; ihre Oberflaeche ist das Symbol im Infobereich.
-    fn freigabe_starten(&mut self) {
-        if self.freigabe_anzeige() != Some(false) {
-            return;
-        }
-        match host_rolle_starten() {
-            Ok(pid) => {
-                protokoll::zeile(format!("Freigabe: Host-Rolle gestartet (Prozess {pid})"));
-                self.freigabe_gestartet = Some(Instant::now());
-                self.freigabe_geprueft = None;
+    /// "Mit Windows starten" (Menue): die eine Verknuepfung im
+    /// Autostart-Ordner an bzw. aus.
+    fn autostart_umschalten(&mut self) {
+        #[cfg(windows)]
+        {
+            let an = !verknuepfung::autostart_an(None);
+            match verknuepfung::autostart_setzen(None, an, &autostart_beschreibung(self.lang)) {
+                Ok(()) => protokoll::zeile(if an {
+                    "Mit Windows starten: an (Verknuepfung im Autostart-Ordner)".into()
+                } else {
+                    "Mit Windows starten: aus".into()
+                }),
+                Err(f) => protokoll::zeile(format!("Mit Windows starten nicht umgestellt: {f}")),
             }
-            // Meldung auf dem Startbildschirm; meldung_zeigen schreibt die
-            // Protokollzeile mit dem Grund.
-            Err(e) => self.meldung_zeigen(Meldung::neu(
-                strings::Key::MsgShareFailed,
-                format!("Freigabe: Host-Rolle nicht gestartet - {e}"),
-            )),
+        }
+    }
+
+    /// "Geraetename aendern ..." (Menue) bzw. "Umbenennen" (Startbildschirm):
+    /// das Fenster oeffnen; der neue Name kommt als Benutzerereignis zurueck.
+    fn geraetename_fenster(&mut self) {
+        #[cfg(windows)]
+        {
+            let proxy = Mutex::new(self.proxy.clone());
+            host::fenster::geraetename_aendern(
+                self.lang,
+                &zugang::geraetename(),
+                &zugang::rechnername(),
+                Box::new(move |n| {
+                    if let Ok(p) = proxy.lock() {
+                        let _ = p.send_event(Benutzer::Name(n));
+                    }
+                }),
+            );
+        }
+    }
+
+    /// Ein neuer Geraetename (None: der Rechnername): gemerkt, und er gilt
+    /// sofort - Bekanntgabe ab der naechsten Runde, Nachricht 3 ab der
+    /// naechsten Verbindung, Nachricht 20 ab der naechsten Zugangsphase,
+    /// Menue und Startbildschirm gleich.
+    fn geraetename_setzen(&mut self, name: Option<String>) {
+        let name = name.and_then(|n| zugang::geraetename_pruefen(&n).ok().flatten());
+        if name == self.cfg.geraetename {
+            return;
+        }
+        self.cfg.geraetename = name.clone();
+        self.cfg.sichern();
+        zugang::geraetename_setzen(name);
+        if let Some(r) = self.rolle.as_ref() {
+            r.name_geaendert();
+        }
+        protokoll::zeile(format!(
+            "Geraetename: {}{}",
+            zugang::geraetename(),
+            if self.cfg.geraetename.is_none() { " (Rechnername)" } else { "" }
+        ));
+    }
+
+    /// Die Geraete-ID, die andere von diesem Computer sehen: die der
+    /// Host-Rolle (host.key).
+    fn eigene_id(&self) -> Option<u32> {
+        self.rolle
+            .as_ref()
+            .and_then(|r| r.id())
+            .or_else(|| secure::eigener_host_schluessel().map(|k| zugang::geraete_id(&k)))
+    }
+
+    /// Ein Punkt am Symbol der einen App (Windows).
+    fn menue_aktion(&mut self, el: &ActiveEventLoop, a: symbolmenue::Aktion) {
+        use symbolmenue::Aktion as A;
+        match a {
+            A::Oeffnen => self.tray_befehl(el, tray::Befehl::Oeffnen),
+            A::Verbinden(adresse) => self.tray_befehl(el, tray::Befehl::Verbinden(adresse)),
+            A::Beenden => self.tray_befehl(el, tray::Befehl::Beenden),
+            A::Freigabe => self.freigabe_umschalten(),
+            A::Autostart => self.autostart_umschalten(),
+            A::RuheVerhindern => self.ruhe_umschalten(),
+            A::NameAendern => self.geraetename_fenster(),
+            a => {
+                let erledigt = self.rolle.as_ref().is_some_and(|r| r.aktion(&a));
+                if !erledigt {
+                    protokoll::zeile(format!("{}: {a:?} ohne Host-Rolle - uebergangen", tray::ORT));
+                }
+            }
         }
     }
 
     /// Das Fenster sichtbar und nach vorn - auch aus dem Infobereich bzw.
-    /// der Menueleiste. Derselbe Weg fuer Einzelinstanz und Symbol.
-    fn fenster_zeigen(&mut self) {
+    /// der Menueleiste. Derselbe Weg fuer Einzelinstanz und Symbol. Lief die
+    /// App im Hintergrund an, entstehen Fenster und Renderer erst jetzt.
+    fn fenster_zeigen(&mut self, el: &ActiveEventLoop) {
+        if self.window.is_none() {
+            self.fenster_anlegen(el);
+            protokoll::zeile(format!("{}: Fenster geoeffnet", tray::ORT));
+        }
         let war_verborgen = self.verborgen;
         self.verborgen = false;
         #[cfg(target_os = "macos")]
@@ -7157,14 +7323,14 @@ impl App {
     }
 
     /// Eine Wahl am Symbol.
-    fn tray_befehl(&mut self, befehl: tray::Befehl) {
+    fn tray_befehl(&mut self, el: &ActiveEventLoop, befehl: tray::Befehl) {
         match befehl {
-            tray::Befehl::Oeffnen => self.fenster_zeigen(),
+            tray::Befehl::Oeffnen => self.fenster_zeigen(el),
             tray::Befehl::Verbinden(adresse) => {
                 // Wie ein Klick auf die Hostzeile (mit der ID, die der Host
                 // unter dieser Adresse meldet): eine Sitzung zum selben Host
                 // bleibt, eine zu einem anderen wird vorher getrennt.
-                self.fenster_zeigen();
+                self.fenster_zeigen(el);
                 let id = self
                     .hosts
                     .lock()
@@ -7198,18 +7364,46 @@ impl App {
         }
     }
 
-    /// Stand des Symbols jetzt: Menue aus den gefundenen Hosts, Tooltip mit
-    /// Name bzw. Adresse der Sitzung.
-    fn tray_stand(&self) -> tray::Stand {
-        let hosts = self.hosts.lock().map(|h| h.list()).unwrap_or_default();
-        let sitzung = (self.screen == Screen::Session).then(|| {
+    /// Name bzw. Adresse der laufenden Sitzung fuer den Tooltip (None auf
+    /// dem Startbildschirm).
+    fn sitzung_anzeige(&self) -> Option<String> {
+        (self.screen == Screen::Session).then(|| {
             let name = self.host_name(&self.addr_input);
             if name.is_empty() { self.addr_input.clone() } else { name }
-        });
-        tray::stand(self.lang, &hosts, sitzung.as_deref())
+        })
     }
 
-    /// Das Symbol anlegen; seine Befehle kommen als Benutzerereignisse.
+    /// Stand des Symbols jetzt (macOS): Menue aus den gefundenen Hosts,
+    /// Tooltip mit Name bzw. Adresse der Sitzung.
+    #[cfg(not(windows))]
+    fn tray_stand(&self) -> tray::Stand {
+        let hosts = self.hosts.lock().map(|h| h.list()).unwrap_or_default();
+        tray::stand(self.lang, &hosts, self.sitzung_anzeige().as_deref())
+    }
+
+    /// Der Tooltip der einen App jetzt (Windows): in einer Sitzung der Host,
+    /// sonst mit Freigabe die eigene ID.
+    #[cfg(windows)]
+    fn tooltip_jetzt(&self) -> String {
+        let an = self.cfg.freigabe && self.rolle.is_some();
+        symbolmenue::tooltip(self.lang, self.sitzung_anzeige().as_deref(), an, self.eigene_id())
+    }
+
+    /// Protokollzeile zum frisch angelegten Symbol.
+    fn symbol_gemeldet(s: &tray::Symbol) {
+        if s.steht() {
+            protokoll::zeile(format!("{}: Symbol angelegt", tray::ORT));
+        } else {
+            protokoll::zeile(format!(
+                "{}: Symbol (noch) nicht angemeldet ({}) - Schliessen beendet, bis es steht",
+                tray::ORT,
+                s.grund().unwrap_or_default()
+            ));
+        }
+    }
+
+    /// Das Symbol anlegen (macOS); seine Befehle kommen als Benutzerereignisse.
+    #[cfg(not(windows))]
     fn symbol_anlegen(&mut self) {
         let proxy = self.proxy.clone();
         let befehl: Box<dyn Fn(tray::Befehl) + Send> = Box::new(move |b| {
@@ -7217,15 +7411,74 @@ impl App {
         });
         match tray::Symbol::neu(befehl, &self.tray_stand()) {
             Ok(s) => {
-                if s.steht() {
-                    protokoll::zeile(format!("{}: Symbol angelegt", tray::ORT));
-                } else {
-                    protokoll::zeile(format!(
-                        "{}: Symbol (noch) nicht angemeldet ({}) - Schliessen beendet, bis es steht",
-                        tray::ORT,
-                        s.grund().unwrap_or_default()
-                    ));
-                }
+                App::symbol_gemeldet(&s);
+                self.symbol = Some(s);
+            }
+            Err(e) => protokoll::zeile(format!("{}: kein Symbol ({e}) - Schliessen beendet das Programm", tray::ORT)),
+        }
+    }
+
+    /// Das eine Symbol der App (Windows): Linksklick oeffnet das Fenster,
+    /// Rechtsklick das Menue (symbolmenue, bei jedem Oeffnen frisch gebaut -
+    /// auch ohne Fenster, waehrend der Fensterfaden wartet). Die Wahl kommt
+    /// als Benutzerereignis; WM_CLOSE von aussen und WM_ENDSESSION beenden
+    /// die App, der Abschied an einen Zuschauer geht vorher im Symbolfaden
+    /// hinaus.
+    #[cfg(windows)]
+    fn symbol_anlegen(&mut self) {
+        let sperre = |m: &Mutex<symbolmenue::Zuordnung>| m.lock().map(|z| z.clone()).unwrap_or_default();
+        let (proxy, z) = (Mutex::new(self.proxy.clone()), self.menue_zuordnung.clone());
+        let befehl = Box::new(move |nr: u32| {
+            let a = symbolmenue::aktion_zu(nr, &sperre(&z));
+            if let (Some(a), Ok(p)) = (a, proxy.lock()) {
+                let _ = p.send_event(Benutzer::Menue(a));
+            }
+        });
+        let (quelle, hosts, z) = (self.menue_quelle.clone(), self.hosts.clone(), self.menue_zuordnung.clone());
+        let host_teil = self.rolle.as_ref().map(|r| r.menue_abfrage());
+        let menue = Box::new(move || {
+            let (lang, ruhe_verhindern) = quelle.lock().map(|q| (q.lang, q.ruhe_verhindern)).unwrap_or((&strings::EN, false));
+            let h = match &host_teil {
+                Some(f) => f(),
+                None => symbolmenue::HostTeil { freigabe: symbolmenue::Freigabe::Aus, id: None, passwort: Err(()), geraete: Err(()) },
+            };
+            let hosts = hosts
+                .lock()
+                .map(|h| h.liste())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|g| (g.host.name, g.host.addr.to_string()))
+                .collect();
+            let stand = symbolmenue::MenueStand {
+                art: symbolmenue::Art::App,
+                name: zugang::geraetename(),
+                freigabe: h.freigabe,
+                id: h.id,
+                passwort: h.passwort,
+                geraete: h.geraete,
+                hosts,
+                autostart: verknuepfung::autostart_an(None),
+                ruhe_verhindern,
+            };
+            let (m, neu) = symbolmenue::menue(lang, &stand);
+            if let Ok(mut alt) = z.lock() {
+                *alt = neu;
+            }
+            m
+        });
+        let ende_proxy = Mutex::new(self.proxy.clone());
+        let ende = Box::new(move |wie: &str| {
+            // Nach WM_ENDSESSION endet der Prozess womoeglich gleich nach der
+            // Rueckkehr: der Abschied muss vorher hinaus.
+            freigabe::abschied_beim_prozessende();
+            if let Ok(p) = ende_proxy.lock() {
+                let _ = p.send_event(Benutzer::Ende(wie.to_string()));
+            }
+        });
+        match tray::Symbol::neu(befehl, menue, ende, Some(symbolmenue::LINKSKLICK), &self.tooltip_jetzt()) {
+            Ok(s) => {
+                App::symbol_gemeldet(&s);
+                let _ = self.symbol_steht.set(s.steht_abfrage());
                 self.symbol = Some(s);
             }
             Err(e) => protokoll::zeile(format!("{}: kein Symbol ({e}) - Schliessen beendet das Programm", tray::ORT)),
@@ -7238,11 +7491,31 @@ impl App {
         if self.symbol.is_none() || self.tray_takt.elapsed() < TRAY_TAKT {
             return;
         }
+        self.symbol_nachfuehren_jetzt();
+    }
+
+    /// Stand des Symbols sofort erneuern (nach einem Umschalten).
+    fn symbol_nachfuehren_jetzt(&mut self) {
         self.tray_takt = Instant::now();
-        let stand = self.tray_stand();
-        if let Some(s) = self.symbol.as_mut() {
-            s.stand_setzen(&stand);
-            s.takt();
+        #[cfg(windows)]
+        {
+            if let Ok(mut q) = self.menue_quelle.lock() {
+                q.lang = self.lang;
+                q.ruhe_verhindern = self.cfg.ruhe_verhindern;
+            }
+            let t = self.tooltip_jetzt();
+            if let Some(s) = self.symbol.as_mut() {
+                s.tooltip_setzen(&t);
+                s.takt();
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let stand = self.tray_stand();
+            if let Some(s) = self.symbol.as_mut() {
+                s.stand_setzen(&stand);
+                s.takt();
+            }
         }
     }
 
@@ -7761,10 +8034,16 @@ impl App {
                     }
                 };
                 let hinweis = self.verknuepfung_hinweis();
-                let freigabe = self.freigabe_anzeige();
+                let name = zugang::geraetename();
+                let dieser = (MIT_FREIGABE && self.rolle.is_some()).then(|| DieserComputer {
+                    freigabe: self.cfg.freigabe,
+                    name: &name,
+                    id: self.eigene_id(),
+                    ruhe_verhindern: self.cfg.ruhe_verhindern,
+                });
                 n.act = start_screen(
                     &mut self.ui, c, self.lang, &zeilen, &self.addr_input, err.as_deref(),
-                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl, freigabe,
+                    hinweis.as_ref().map(|(t, f)| (t.as_str(), *f)), self.sprachwahl, dieser.as_ref(),
                 );
             }
             Screen::Session => {
@@ -7972,7 +8251,9 @@ impl App {
             Action::Connect(text) => self.eingabe_verbinden(&text),
             Action::Host(ziel) => self.verbinden(ziel),
             Action::Verknuepfung { adresse, id, name } => self.verknuepfung_anlegen(&adresse, id, &name),
-            Action::Freigeben => self.freigabe_starten(),
+            Action::FreigabeUmschalten => self.freigabe_umschalten(),
+            Action::NameAendern => self.geraetename_fenster(),
+            Action::RuheUmschalten => self.ruhe_umschalten(),
             Action::Quit => self.quit = true,
             Action::Sprachwahl => self.sprachwahl = !self.sprachwahl,
             Action::Sprache(code) => {
@@ -8197,8 +8478,12 @@ enum Action {
     Host(Ziel),
     /// Desktop-Verknuepfung fuer diesen Host anlegen (nur Windows).
     Verknuepfung { adresse: String, id: Option<u32>, name: String },
-    /// "Diesen PC freigeben" (nur Windows): die Host-Rolle starten.
-    Freigeben,
+    /// "Diesen PC freigeben" (die eine App): die Freigabe umschalten.
+    FreigabeUmschalten,
+    /// "Umbenennen" neben "Dieser Computer": das Fenster "Geraetename".
+    NameAendern,
+    /// Das Kaestchen "Ruhezustand verhindern".
+    RuheUmschalten,
     Quit,
     /// Sprachwahl oeffnen bzw. schliessen.
     Sprachwahl,
@@ -8603,12 +8888,16 @@ fn mische(a: u32, b: u32, c: u32, d: u32, wx: u32, wy: u32) -> u32 {
 /// Hoehe der Hostliste auf dem Startbildschirm (vier Zeilen und Kopf).
 const START_LISTE_H: i32 = 34 * 4 + 52;
 
+/// Hoehe der zwei Zeilen der einen App unter den Knoepfen: "Dieser
+/// Computer" mit "Umbenennen" und "Ruhezustand verhindern".
+const EINE_APP_H: i32 = 52;
+
 /// Lage der Hostliste auf dem Startbildschirm: (links, Breite, oben der
 /// Tafel). Alles als Block mittig, damit unten kein totes Feld bleibt.
 fn start_rahmen(w: i32, h: i32) -> (i32, i32, i32) {
     let cx = w / 2;
     let panel_w = 560.min(w - 60);
-    let block_h = 150 + START_LISTE_H + 40 + 66 + 44;
+    let block_h = 150 + START_LISTE_H + 40 + 66 + 44 + if MIT_FREIGABE { EINE_APP_H } else { 0 };
     let top = ((h - block_h) / 2).max(24);
     (cx - panel_w / 2, panel_w, top + 130)
 }
@@ -8677,6 +8966,78 @@ fn haken(c: &mut ui::Canvas, x: i32, y: i32, farbe: u32) {
     }
 }
 
+/// Ein Kaestchen (14 x 14) links oben bei (x, y), mit Haken, wenn `an`.
+fn kaestchen(c: &mut ui::Canvas, x: i32, y: i32, an: bool, farbe: u32) {
+    c.rect(x, y, 14, 14, farbe, if an { 40 } else { 12 });
+    c.hline(x, y, 14, farbe, 200);
+    c.hline(x, y + 13, 14, farbe, 200);
+    c.vline(x, y, 14, farbe, 200);
+    c.vline(x + 13, y, 14, farbe, 200);
+    if an {
+        haken(c, x + 2, y + 2, farbe);
+    }
+}
+
+/// Ein Knopf, der einen Zustand umschaltet (die Freigabe): dieselbe Form wie
+/// `Ui::button_mit`, darin ein Kaestchen - mit Haken, wenn an - und der Text.
+/// true, wenn er in diesem Bild geklickt wurde.
+fn umschalter(u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, label: &str, an: bool, size: u32, spacing: i32) -> bool {
+    let geklickt = u.button_mit(c, r, "", ui::CYAN, size, spacing);
+    let hot = r.hit(u.mouse.0, u.mouse.1);
+    let t = kuerzen(u, label, r.w - 16 - 14 - 8, size, spacing);
+    let tw = u.text.width(&t, size, spacing);
+    let x0 = r.x + ((r.w - (14 + 8 + tw)) / 2).max(8);
+    kaestchen(c, x0, r.y + r.h / 2 - 7, an, ui::CYAN);
+    u.text.draw(c, x0 + 14 + 8, r.y + r.h / 2 + size as i32 / 3, &t, size, if hot { 0xffffff } else { ui::TEXT }, spacing);
+    geklickt
+}
+
+/// Was der Startbildschirm der einen App zusaetzlich zeigt (Windows): den
+/// Umschalter "Diesen PC freigeben", die Zeile "Dieser Computer" und das
+/// Kaestchen "Ruhezustand verhindern".
+struct DieserComputer<'a> {
+    freigabe: bool,
+    name: &'a str,
+    id: Option<u32>,
+    ruhe_verhindern: bool,
+}
+
+/// Die Zeilen der einen App unter den Knoepfen (ab `y`): links "Dieser
+/// Computer: <Name> · <ID>", rechts "Umbenennen"; darunter das Kaestchen
+/// "Ruhezustand verhindern" - die ganze Zeile ist klickbar.
+fn dieser_computer_zeichnen(
+    u: &mut ui::Ui,
+    c: &mut ui::Canvas,
+    lang: &'static strings::Lang,
+    d: &DieserComputer,
+    px: i32,
+    panel_w: i32,
+    y: i32,
+) -> Action {
+    use strings::Key::*;
+    let mut action = Action::None;
+    let (g, lw) = ZEILENKNOPF_SCHRIFT;
+    let kw = (u.text.width(lang.get(DeviceNameRename), g, lw) + 28).clamp(84, 160).min(panel_w / 3);
+    let knopf = ui::Rect { x: px + panel_w - kw, y, w: kw, h: 24 };
+    let id = d.id.map(zugang::id_text).unwrap_or_else(|| "-".into());
+    let text = symbolmenue::einsetzen(lang.get(ThisComputer), &[("{n}", &tray::anzeigename(d.name)), ("{i}", &id)]);
+    let text = kuerzen(u, &text, knopf.x - px - 12, 13, 1);
+    u.text.draw(c, px + 2, y + 17, &text, 13, ui::TEXT, 1);
+    let t = kuerzen(u, lang.get(DeviceNameRename), kw - 16, g, lw);
+    if u.button_mit(c, knopf, &t, ui::CYAN, g, lw) {
+        action = Action::NameAendern;
+    }
+    let zeile = ui::Rect { x: px, y: y + 28, w: panel_w, h: 24 };
+    let hot = zeile.hit(u.mouse.0, u.mouse.1);
+    kaestchen(c, px + 2, zeile.y + 5, d.ruhe_verhindern, if hot || d.ruhe_verhindern { ui::CYAN } else { ui::DIM });
+    let t = kuerzen(u, lang.get(PreventSleep), panel_w - 28, 13, 1);
+    u.text.draw(c, px + 26, zeile.y + 17, &t, 13, if hot { 0xffffff } else { ui::TEXT }, 1);
+    if hot && u.click {
+        action = Action::RuheUmschalten;
+    }
+    action
+}
+
 /// Ein Knopf, der gerade nicht geht: dieselbe Form wie `Ui::button_mit`,
 /// aber blass (Klammern und Schrift) und ohne Reaktion auf Maus und Klick.
 fn knopf_aus(u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, label: &str, size: u32, spacing: i32) {
@@ -8699,10 +9060,10 @@ fn knopf_aus(u: &mut ui::Ui, c: &mut ui::Canvas, r: ui::Rect, label: &str, size:
 
 /// Startbildschirm: Titel, gefundene Hosts, Adresse, Knoepfe. `hinweis` ist
 /// das Ergebnis einer Desktop-Verknuepfung (Text, Farbe); es steht, solange
-/// es gilt, im Meldungsbereich statt einer Fehlermeldung. `freigabe`: nur
-/// unter Windows Some - der Knopf "Diesen PC freigeben" neben "Beenden",
-/// Some(true) heisst, eine Host-Rolle laeuft schon (Knopf aus, "Freigabe
-/// laeuft").
+/// es gilt, im Meldungsbereich statt einer Fehlermeldung. `dieser`: nur in
+/// der einen App (Windows) Some - der Umschalter "Diesen PC freigeben"
+/// zwischen Verbinden und Beenden, darunter "Dieser Computer" mit
+/// "Umbenennen" und das Kaestchen "Ruhezustand verhindern".
 #[allow(clippy::too_many_arguments)]
 fn start_screen(
     u: &mut ui::Ui,
@@ -8713,7 +9074,7 @@ fn start_screen(
     error: Option<&str>,
     hinweis: Option<(&str, u32)>,
     sprachwahl: bool,
-    freigabe: Option<bool>,
+    dieser: Option<&DieserComputer>,
 ) -> Action {
     use strings::Key::*;
     c.backdrop(u.tick);
@@ -8788,21 +9149,20 @@ fn start_screen(
     let fy = py + list_h + 36;
     u.field(c, ui::Rect { x: px, y: fy, w: panel_w, h: 40 }, addr, lang.get(HostAddress), true);
 
-    // Knoepfe; unter Windows dazu "Diesen PC freigeben" zwischen Verbinden
-    // und Beenden (9.5), in kleinerer Schrift - der Text ist laenger.
+    // Knoepfe; in der einen App dazu der Umschalter "Diesen PC freigeben"
+    // zwischen Verbinden und Beenden (9.5), in kleinerer Schrift - der Text
+    // ist laenger.
     let by = fy + 62;
-    let (bw, freigabe_knopf) = match freigabe {
+    let (bw, freigabe_knopf) = match dieser {
         None => ((panel_w - 20) / 2, None),
-        Some(laeuft) => {
-            let t = lang.get(if laeuft { StartSharing } else { StartShare });
-            // Breit genug fuer beide Texte: der Knopf springt nicht, wenn die
-            // Freigabe anlaeuft.
-            let breite = u.text.width(lang.get(StartShare), 13, 1).max(u.text.width(lang.get(StartSharing), 13, 1));
-            // Hoechstens die halbe Leiste - in schmalen Fenstern (unter
-            // 400 Punkten) auch schmaler als 150; der Text wird gekuerzt.
-            // Kein clamp: dessen Untergrenze laege dann ueber der Obergrenze.
+        Some(d) => {
+            // Platz fuer Kaestchen und Text; hoechstens die halbe Leiste - in
+            // schmalen Fenstern (unter 400 Punkten) auch schmaler als 150,
+            // der Text wird gekuerzt. Kein clamp: dessen Untergrenze laege
+            // dann ueber der Obergrenze.
+            let breite = u.text.width(lang.get(StartShare), 13, 1) + 14 + 8;
             let sw = (breite + 40).max(150).min((panel_w / 2 - 20).max(0));
-            ((panel_w - sw - 40) / 2, Some((t, sw, laeuft)))
+            ((panel_w - sw - 40) / 2, Some((sw, d.freigabe)))
         }
     };
     if u.button(c, ui::Rect { x: px, y: by, w: bw, h: 44 }, lang.get(Connect), ui::CYAN) && !addr.is_empty() {
@@ -8810,13 +9170,13 @@ fn start_screen(
     }
     let (quit_x, quit_w) = match freigabe_knopf {
         None => (px + bw + 20, bw),
-        Some((t, sw, laeuft)) => {
+        Some((sw, an)) => {
             let r = ui::Rect { x: px + bw + 20, y: by, w: sw, h: 44 };
-            let t = kuerzen(u, t, sw - 16, 13, 1);
-            if laeuft {
-                knopf_aus(u, c, r, &t, 13, 1);
-            } else if u.button_mit(c, r, &t, ui::CYAN, 13, 1) {
-                action = Action::Freigeben;
+            if r.hit(maus.0, maus.1) {
+                tip = Some(lang.get(if an { StartSharing } else { HostSharingIsOff }).to_string());
+            }
+            if umschalter(u, c, r, lang.get(StartShare), an, 13, 1) {
+                action = Action::FreigabeUmschalten;
             }
             let x = r.x + sw + 20;
             (x, px + panel_w - x)
@@ -8825,6 +9185,17 @@ fn start_screen(
     if u.button(c, ui::Rect { x: quit_x, y: by, w: quit_w, h: 44 }, lang.get(Quit), ui::MAGENTA) {
         action = Action::Quit;
     }
+    // Die eine App: "Dieser Computer" und "Ruhezustand verhindern".
+    let meldung_y = match dieser {
+        Some(d) => {
+            let a = dieser_computer_zeichnen(u, c, lang, d, px, panel_w, by + 44 + 10);
+            if !matches!(a, Action::None) {
+                action = a;
+            }
+            by + 76 + EINE_APP_H
+        }
+        None => by + 76,
+    };
 
     // Meldungen mit Pfad oder Fingerabdruck sind laenger als eine Zeile -
     // umbrechen statt am Fensterrand abschneiden. Das Ergebnis einer
@@ -8836,7 +9207,7 @@ fn start_screen(
     };
     if let Some((e, farbe)) = meldung {
         for (i, z) in umbruch(u, e, c.w as i32 - 60, 13).iter().enumerate() {
-            u.text.draw_centered(c, cx, by + 76 + i as i32 * 18, z, 13, farbe, 1);
+            u.text.draw_centered(c, cx, meldung_y + i as i32 * 18, z, 13, farbe, 1);
         }
     }
 
@@ -9650,9 +10021,12 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         let (r, _) = start_zeile(&mut u, w as i32, h as i32, lang, 0);
         u.mouse = (r.x + 60, r.y + r.h / 2);
     }
-    // Unter Windows der Knopf "Diesen PC freigeben"; "startfreigabe" zeigt
-    // ihn, waehrend eine Host-Rolle laeuft.
-    let freigabe = MIT_FREIGABE.then_some(view == "startfreigabe");
+    // In der einen App (Windows) der Umschalter "Diesen PC freigeben", die
+    // Zeile "Dieser Computer" und "Ruhezustand verhindern"; "startfreigabe"
+    // zeigt die Freigabe an und den Ruhezustand verhindert, sonst beides
+    // aus.
+    let an = view == "startfreigabe";
+    let dieser = MIT_FREIGABE.then_some(DieserComputer { freigabe: an, name: "Büro-PC", id: Some(581_729_911), ruhe_verhindern: an });
     {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
         let _ = start_screen(
@@ -9664,7 +10038,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             meldung.as_deref(),
             None,
             view == "sprachwahl",
-            freigabe,
+            dieser.as_ref(),
         );
     }
 
@@ -9737,9 +10111,10 @@ fn erstes_argument(args: &[String]) -> Option<&str> {
             i += 1 + n;
             continue;
         }
-        // --benchmark [dauer]: die Dauer ist wahlfrei - eine Zahl dahinter
-        // gehoert zum Schalter, alles andere nicht.
-        if a == "--benchmark" {
+        // --benchmark [dauer], --host [port], --nur-host [port]: die Zahl
+        // ist wahlfrei - eine Zahl dahinter gehoert zum Schalter, alles
+        // andere nicht.
+        if a == "--benchmark" || a == "--host" || a == "--nur-host" {
             i += 1;
             if args.get(i).map(|v| v.parse::<u32>().is_ok()).unwrap_or(false) {
                 i += 1;
@@ -9922,10 +10297,12 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Windows als Host: --host [port], --list, --messen - ohne Fenster,
-    // Abzweig VOR allem, was ein Fenster oder einen Client braucht.
+    // Windows, nur die Host-Rolle: --nur-host [port] (VM und Tests), --list,
+    // --messen - ohne Fenster und ohne Client, Abzweig VOR allem, was ein
+    // Fenster oder einen Client braucht. --host ist dagegen die eine App im
+    // Hintergrund mit Freigabe an (weiter unten).
     #[cfg(windows)]
-    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
+    if args.iter().any(|a| a == "--nur-host" || a == "--list" || a == "--messen") {
         let code = host::main_host(&args);
         std::process::exit(code);
     }
@@ -9933,8 +10310,8 @@ fn main() {
     // Host). Ohne diesen Zweig wuerde "--list" zur Adresse und ein Fenster
     // aufgehen, das auf eine Verbindung wartet.
     #[cfg(not(windows))]
-    if args.iter().any(|a| a == "--host" || a == "--list" || a == "--messen") {
-        eprintln!("Die Host-Rolle (--host, --list, --messen) gibt es nur auf Windows.");
+    if args.iter().any(|a| a == "--host" || a == "--nur-host" || a == "--list" || a == "--messen") {
+        eprintln!("Die Host-Rolle (--host, --nur-host, --list, --messen) gibt es nur auf Windows.");
         std::process::exit(2);
     }
 
@@ -10119,6 +10496,18 @@ fn main() {
     // vor allem anderen: vor Ablagewaechter, Bekanntgabe-Port und
     // protokoll.txt (das der erste Schreiber leert). Der Pruefmodus
     // (--headless) und alle Wege ohne Fenster oben sind ausgenommen.
+    //
+    // Die eine App (Windows): --host startet sie im Hintergrund mit Freigabe
+    // an (so ruft sie die Verknuepfung "Mit Windows starten" frueherer
+    // Fassungen), --hintergrund im Hintergrund mit der Freigabe, wie sie
+    // eingestellt ist (die heutige Verknuepfung). Laeuft die App schon, endet
+    // ein solcher Start still - er oeffnet kein Fenster.
+    let host_start = cfg!(windows) && args.iter().any(|a| a == "--host");
+    let hintergrund_start = cfg!(windows) && (host_start || args.iter().any(|a| a == "--hintergrund"));
+    if hintergrund_start && !headless && einzel::laeuft_schon() {
+        println!("QuadChroma laeuft schon - der Start im Hintergrund endet.");
+        std::process::exit(0);
+    }
     let mut einzel_waechter = None;
     let mut einzel_eingang = None;
     let mut einzel_ohne = None;
@@ -10210,7 +10599,11 @@ fn main() {
     // Gespeicherte Einstellungen. Sie bestimmen unter anderem, ob wir im
     // Vollbild starten - das ist die Voreinstellung. Schon hier geladen,
     // weil der Empfangsfaden den Decoderwunsch vom ersten Bild an kennen soll.
-    let cfg = einstellungen::Einstellungen::laden();
+    let mut cfg = einstellungen::Einstellungen::laden();
+    // Der Name, unter dem andere dieses Geraet sehen (Nachricht 3,
+    // Bekanntgabe): der eingestellte, sonst der Rechnername - vor dem
+    // ersten Verbindungsaufbau.
+    zugang::geraetename_setzen(cfg.geraetename.clone());
     // Die Karten einmal erkennen, bevor irgendein Faden sie braucht: je
     // Adapter eine Zeile im Protokoll (Rolle, Name, Speicher, Ausgang).
     karten();
@@ -10655,6 +11048,74 @@ fn main() {
         });
     }
     let proxy = el.create_proxy();
+
+    // Die eine App (Windows): im Hintergrund anlaufen - ohne Fenster und
+    // Renderer, bis "QuadChroma oeffnen" -, wenn es nicht der allererste
+    // Start ist oder Autostart bzw. --host es so wollen. Mit einem Ziel, mit
+    // tray=aus (kein Symbol, kein Weg zurueck) und beim allerersten Start geht
+    // das Fenster auf.
+    let im_hintergrund = start_im_hintergrund(
+        cfg!(windows),
+        !start_addr.is_empty() || id_ausstehend.is_some(),
+        cfg.tray,
+        hintergrund_start,
+        cfg.fenster_gezeigt,
+    );
+    // Die Verknuepfung "Mit Windows starten" frueherer Fassungen (die
+    // Host-Rolle mit --host) weicht der einen (--hintergrund).
+    #[cfg(windows)]
+    match verknuepfung::autostart_migrieren(None, &autostart_beschreibung(sprache)) {
+        Ok(true) => protokoll::zeile("Mit Windows starten: die alte Verknuepfung der Freigabe ist durch die der App ersetzt".into()),
+        Ok(false) => {}
+        Err(e) => protokoll::zeile(format!("Mit Windows starten: alte Verknuepfung nicht ersetzt - {e}")),
+    }
+    // --host: dieser PC ist freigegeben (die alte Verknuepfung wollte es so).
+    if host_start && !cfg.freigabe {
+        cfg.freigabe = true;
+        cfg.sichern();
+    }
+    // Die Host-Rolle im eigenen Faden. Das Symbol der App entsteht erst in
+    // `resumed`; die Rolle fragt ueber symbol_steht, ob es steht ("Zulassen"
+    // nur dann), und laesst Sprechblasen ueber ein Benutzerereignis zeigen.
+    let symbol_steht: Arc<std::sync::OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>> = Arc::new(std::sync::OnceLock::new());
+    let rolle = {
+        let st = symbol_steht.clone();
+        let hp = Mutex::new(el.create_proxy());
+        let bp = Mutex::new(el.create_proxy());
+        freigabe::Freigabe::starten(
+            args.clone(),
+            cfg.freigabe,
+            Arc::new(move || st.get().is_some_and(|f| f())),
+            Arc::new(move |text: &str| {
+                if let Ok(p) = hp.lock() {
+                    let _ = p.send_event(Benutzer::Hinweis(text.to_string()));
+                }
+            }),
+            Arc::new(move || {
+                if let Ok(p) = bp.lock() {
+                    let _ = p.send_event(Benutzer::RolleBereit);
+                }
+            }),
+        )
+    };
+    if rolle.is_some() {
+        protokoll::zeile(format!(
+            "Freigabe: {}{} - Host-Rolle im eigenen Faden, Protokoll in host-protokoll.txt",
+            if cfg.freigabe { "an" } else { "aus" },
+            if host_start { " (--host)" } else { "" }
+        ));
+    }
+    if im_hintergrund {
+        protokoll::zeile(format!("Start im Hintergrund{} - das Fenster kommt mit \"QuadChroma oeffnen\"", if hintergrund_start { " (Autostart bzw. --host)" } else { "" }));
+    }
+    // Ruhezustand verhindern, wenn eingestellt - bis zum Ende oder bis zum
+    // Ausschalten.
+    let mut ruhe = ruhezustand::Ruhesperre::neu();
+    if cfg.ruhe_verhindern {
+        ruhe_setzen(&mut ruhe, true, sprache);
+    }
+    let menue_quelle = Arc::new(Mutex::new(MenueQuelle { lang: sprache, ruhe_verhindern: cfg.ruhe_verhindern }));
+
     let mut app = App {
         shared,
         input: input.clone(),
@@ -10697,9 +11158,12 @@ fn main() {
         bekannte: zugang::Hostliste::default(),
         bekannte_stand: None,
         id_ausstehend,
-        freigabe: false,
-        freigabe_geprueft: None,
-        freigabe_gestartet: None,
+        rolle,
+        hintergrund: im_hintergrund,
+        symbol_steht,
+        menue_quelle,
+        menue_zuordnung: Arc::new(Mutex::new(symbolmenue::Zuordnung::default())),
+        ruhe,
         angewandt_fuer: None,
         letzte_zeichnung: Instant::now(),
         oberflaeche_vorher: false,
@@ -10737,8 +11201,14 @@ fn main() {
         cfg,
     };
     el.run_app(&mut app).expect("Fenster");
+    // Die Host-Rolle verabschiedet einen Zuschauer (Grund 0) und schliesst
+    // die Ports - vor allem anderen, solange er noch zuhoert.
+    if let Some(r) = app.rolle.as_mut() {
+        r.beenden();
+    }
     // Das Symbol vor dem Prozessende entfernen (sonst bliebe es unter
-    // Windows bis zur naechsten Mausbewegung darueber stehen).
+    // Windows bis zur naechsten Mausbewegung darueber stehen); mit der App
+    // faellt auch die Energieanforderung (Ruhezustand verhindern).
     drop(app);
     // Erst jetzt: bis hierher ist dies die erste Instanz.
     drop(einzel_waechter);
@@ -12936,6 +13406,19 @@ mod tests {
         assert_eq!(adresse_aus_argumenten(&argumente(&["--benchmark", "h"])), "h:9001");
         assert_eq!(adresse_aus_argumenten(&argumente(&["--shot", "a.bmp", "de", "start"])), "");
         assert_eq!(adresse_aus_argumenten(&argumente(&[])), "");
+    }
+
+    /// Der Port hinter --host bzw. --nur-host ist nie die Adresse: die eine
+    /// App mit --host 9111 verbindet sich nicht mit "9111:9001". Ohne Zahl
+    /// dahinter bleibt die naechste Angabe, was sie ist.
+    #[test]
+    fn host_port_nie_als_adresse() {
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--host", "9111"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--host", "9111", "--konserve", "p.hevc"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--nur-host", "9101", "--output", "1"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--host"])), "");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--host", "h"])), "h:9001");
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--hintergrund"])), "");
     }
 
     /// --bildschirm und sein Wert (Kennung oder "auto") sind nie die
@@ -15395,28 +15878,18 @@ mod tests {
         assert_eq!(strings::pick("de").get(MsgHostOutdated).replace("{n}", "Mac"), "Mac verwendet eine ältere QuadChroma-Version. Bitte dort aktualisieren.");
     }
 
-    /// Die Host-Rolle haelt ihren Mutex; der Knopf sieht nur nach, ob es ihn
-    /// gibt (mit einem eigenen Namen - eine echte Host-Rolle auf derselben
-    /// Maschine stoert so nicht).
-    #[cfg(windows)]
+    /// W7: der allererste Start oeffnet das Fenster, jeder spaetere bleibt im
+    /// Infobereich; Autostart und --host immer im Hintergrund; mit einem Ziel
+    /// oder ohne Symbol (tray=aus) immer mit Fenster; auf dem Mac (noch keine
+    /// eine App) immer mit Fenster.
     #[test]
-    fn freigabe_am_mutex_erkannt() {
-        use windows::core::HSTRING;
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::CreateMutexW;
-        // Der Knopf fragt genau den Mutex ab, den die Host-Rolle anlegt.
-        assert_eq!(host::oberflaeche::MUTEX, "Local\\QuadChroma-Host");
-        // Ein eigener Name: nicht der der Einzelinstanz-Tests (einzel.rs)
-        // und nicht der der Host-Rolle (host::oberflaeche), die im selben
-        // Lauf nebenher ihre Mutexe halten.
-        let name = format!("Local\\QuadChroma-Host-Test-Knopf-{}", std::process::id());
-        let da = |n: &str| host::oberflaeche::laeuft(n);
-        assert!(!da(&name));
-        let h = unsafe { CreateMutexW(None, false, &HSTRING::from(name.as_str())) }.unwrap();
-        assert!(da(&name));
-        unsafe {
-            let _ = CloseHandle(h);
-        }
-        assert!(!da(&name));
+    fn erster_start_mit_fenster_spaetere_im_hintergrund() {
+        assert!(!start_im_hintergrund(true, false, true, false, false), "allererster Start ohne Fenster");
+        assert!(start_im_hintergrund(true, false, true, false, true), "spaeterer Start mit Fenster");
+        assert!(start_im_hintergrund(true, false, true, true, false), "Autostart vor dem ersten Fenster mit Fenster");
+        assert!(start_im_hintergrund(true, false, true, true, true));
+        assert!(!start_im_hintergrund(true, true, true, true, true), "Start mit Ziel ohne Fenster");
+        assert!(!start_im_hintergrund(true, false, false, true, true), "tray=aus ohne Fenster");
+        assert!(!start_im_hintergrund(false, false, true, true, true), "ohne die eine App im Hintergrund");
     }
 }

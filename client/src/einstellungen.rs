@@ -177,6 +177,20 @@ pub struct Einstellungen {
     /// Die einmalige Sprechblase beim ersten Ablegen ist gezeigt worden
     /// (Datei: tray_hinweis=1).
     pub tray_hinweis: bool,
+    /// Die eine App (Windows): dieser PC ist freigegeben - die Host-Rolle
+    /// lauscht (Datei: freigabe=an|aus, Voreinstellung an).
+    pub freigabe: bool,
+    /// Der Name, unter dem andere Geraete diesen Computer sehen (Datei:
+    /// geraetename=...); None: der Rechnername des Systems. Nur, was
+    /// zugang::geraetename_pruefen annimmt.
+    pub geraetename: Option<String>,
+    /// Den Ruhezustand verhindern, solange QuadChroma laeuft (Datei:
+    /// ruhezustand_verhindern=1, Voreinstellung aus).
+    pub ruhe_verhindern: bool,
+    /// Das Fenster war schon einmal offen (Datei: fenster_gezeigt=1): nur
+    /// der allererste Start oeffnet es von selbst, jeder spaetere bleibt im
+    /// Infobereich.
+    pub fenster_gezeigt: bool,
     /// Fingerabdruck des Hosts -> seine Werte.
     pub hosts: HashMap<String, HostWerte>,
 }
@@ -194,6 +208,10 @@ impl Default for Einstellungen {
             anzeige: AnzeigeWunsch::Automatik,
             tray: true,
             tray_hinweis: false,
+            freigabe: true,
+            geraetename: None,
+            ruhe_verhindern: false,
+            fenster_gezeigt: false,
             hosts: HashMap::new(),
         }
     }
@@ -261,6 +279,10 @@ impl Einstellungen {
                 (None, "anzeige") => e.anzeige = AnzeigeWunsch::aus(v).unwrap_or(e.anzeige),
                 (None, "tray") => e.tray = schalter(v).unwrap_or(e.tray),
                 (None, "tray_hinweis") => e.tray_hinweis = v == "1",
+                (None, "freigabe") => e.freigabe = schalter(v).unwrap_or(e.freigabe),
+                (None, "geraetename") => e.geraetename = crate::zugang::geraetename_pruefen(v).ok().flatten(),
+                (None, "ruhezustand_verhindern") => e.ruhe_verhindern = schalter(v).unwrap_or(e.ruhe_verhindern),
+                (None, "fenster_gezeigt") => e.fenster_gezeigt = v == "1",
                 (Some(fp), _) => {
                     if let Some(h) = e.hosts.get_mut(fp) {
                         match k {
@@ -304,6 +326,12 @@ impl Einstellungen {
         t.push_str(&format!("anzeige={}\n", self.anzeige.schluessel()));
         t.push_str(&format!("tray={}\n", if self.tray { "an" } else { "aus" }));
         t.push_str(&format!("tray_hinweis={}\n", self.tray_hinweis as u8));
+        t.push_str(&format!("freigabe={}\n", if self.freigabe { "an" } else { "aus" }));
+        if let Some(n) = &self.geraetename {
+            t.push_str(&format!("geraetename={n}\n"));
+        }
+        t.push_str(&format!("ruhezustand_verhindern={}\n", self.ruhe_verhindern as u8));
+        t.push_str(&format!("fenster_gezeigt={}\n", self.fenster_gezeigt as u8));
         // Sortiert schreiben, damit die Datei zwischen zwei Laeufen gleich
         // aussieht und man Aenderungen erkennt.
         let mut fps: Vec<&String> = self.hosts.keys().collect();
@@ -384,5 +412,50 @@ mod tests {
         let zurueck = Einstellungen::aus_text(&t);
         assert!(!zurueck.tray && zurueck.tray_hinweis);
         assert_eq!(zurueck.fuer_host("AAAA-BBBB-CCCC-DDDD"), e.fuer_host("AAAA-BBBB-CCCC-DDDD"));
+    }
+
+    /// Die eine App: Freigabe (Voreinstellung an), Geraetename (Voreinstellung
+    /// keiner, dann gilt der Rechnername), Ruhezustand verhindern
+    /// (Voreinstellung aus) und der erste Start. Lesen, schreiben, wieder
+    /// lesen; was nicht gilt, laesst die Voreinstellung stehen.
+    #[test]
+    fn eine_app_lesen_und_schreiben() {
+        let e = Einstellungen::default();
+        assert!(e.freigabe && e.geraetename.is_none() && !e.ruhe_verhindern && !e.fenster_gezeigt);
+        // Eine alte Datei ohne die Zeilen: wie die Voreinstellung - das Fenster
+        // geht einmal auf.
+        let alt = Einstellungen::aus_text("vollbild=1\ntray=an\ntray_hinweis=1\n");
+        assert!(alt.freigabe && alt.geraetename.is_none() && !alt.ruhe_verhindern && !alt.fenster_gezeigt);
+
+        let t = "freigabe=aus\ngeraetename=  Büro-PC  \nruhezustand_verhindern=1\nfenster_gezeigt=1\n";
+        let e = Einstellungen::aus_text(t);
+        assert!(!e.freigabe && e.ruhe_verhindern && e.fenster_gezeigt);
+        assert_eq!(e.geraetename.as_deref(), Some("Büro-PC"));
+        for (v, soll) in [("an", true), ("AUS", false), ("0", false), ("ja", true), ("quatsch", true)] {
+            assert_eq!(Einstellungen::aus_text(&format!("freigabe={v}\n")).freigabe, soll, "freigabe={v}");
+        }
+        assert!(!Einstellungen::aus_text("ruhezustand_verhindern=quatsch\n").ruhe_verhindern);
+        // Ein Name, der die Pruefung nicht besteht, zaehlt nicht; leer auch nicht.
+        assert_eq!(Einstellungen::aus_text(&format!("geraetename={}\n", "x".repeat(41))).geraetename, None);
+        assert_eq!(Einstellungen::aus_text("geraetename=\n").geraetename, None);
+        assert_eq!(Einstellungen::aus_text("geraetename=a=b #1\n").geraetename.as_deref(), Some("a=b #1"));
+        // Unter einem Host-Block gehoeren die Zeilen dem Host.
+        let h = Einstellungen::aus_text("host AAAA\nfreigabe=aus\ngeraetename=X\n");
+        assert!(h.freigabe && h.geraetename.is_none());
+
+        let mut e = Einstellungen::default();
+        let t = e.als_text();
+        assert!(t.contains("\nfreigabe=an\n") && t.contains("\nruhezustand_verhindern=0\n") && t.contains("\nfenster_gezeigt=0\n"), "{t}");
+        assert!(!t.contains("geraetename="), "{t}");
+        e.freigabe = false;
+        e.geraetename = Some("Wohnzimmer".into());
+        e.ruhe_verhindern = true;
+        e.fenster_gezeigt = true;
+        e.hosts.insert("AAAA".into(), HostWerte { mbit: 80, fps: 60, gaming: false, fest: false, ton: true });
+        let t = e.als_text();
+        assert!(t.find("geraetename=").unwrap() < t.find("host ").unwrap(), "{t}");
+        let z = Einstellungen::aus_text(&t);
+        assert!(!z.freigabe && z.ruhe_verhindern && z.fenster_gezeigt);
+        assert_eq!(z.geraetename.as_deref(), Some("Wohnzimmer"));
     }
 }

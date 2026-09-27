@@ -144,6 +144,21 @@ pub fn beanspruchen(adresse: &str) -> Start {
     }
 }
 
+/// Laeuft in dieser Sitzung schon eine erste Instanz? Fragt nur, schickt
+/// ihr nichts - fuer Starts im Hintergrund (Autostart, --host): sie enden
+/// dann still, statt das Fenster der laufenden zu oeffnen. Auf dem Mac gibt
+/// es diese Starts nicht (false).
+pub fn laeuft_schon() -> bool {
+    #[cfg(windows)]
+    {
+        win::laeuft(&Namen::vorgabe())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 // ------------------------------------------------------------------ Windows
 
 #[cfg(windows)]
@@ -316,6 +331,23 @@ mod win {
     /// Den Mutex anlegen. Some(Erste bzw. Ohne), wenn dieser Start die erste
     /// Instanz ist (oder die Einzelinstanz nicht geht); None, wenn eine andere
     /// den Mutex haelt.
+    /// Haelt jemand den Mutex dieser Namen (die erste Instanz)? Verweigert
+    /// das System den Zugriff (erste Instanz mit erhoehten Rechten), besteht
+    /// er ebenfalls.
+    pub fn laeuft(namen: &Namen) -> bool {
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(namen.mutex.as_str())) } {
+            Ok(h) => {
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+                true
+            }
+            Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        }
+    }
+
     fn erste_werden(namen: &Namen) -> Option<Start> {
         let mutex = match unsafe { CreateMutexW(None, false, &HSTRING::from(namen.mutex.as_str())) } {
             Ok(h) => h,
@@ -662,7 +694,13 @@ mod tests {
         });
         // Alles weg: Mutex frei, der naechste Start ist wieder der erste.
         std::thread::sleep(Duration::from_millis(200));
-        assert!(matches!(beanspruchen_mit(&namen, "", Duration::from_secs(1)), Start::Erste { .. }));
+        assert!(!win::laeuft(&namen), "Mutex nach dem Ende noch da");
+        let erste = beanspruchen_mit(&namen, "", Duration::from_secs(1));
+        assert!(matches!(erste, Start::Erste { .. }));
+        // Ein Start im Hintergrund fragt nur - und sieht die erste Instanz.
+        assert!(win::laeuft(&namen));
+        drop(erste);
+        assert!(!win::laeuft(&namen));
     }
 
     /// Unter macOS: Socket und Sperre unter einem Temp-Ordner, eine

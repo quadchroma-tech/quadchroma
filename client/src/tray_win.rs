@@ -1,4 +1,6 @@
-// Symbol im Infobereich (Windows), Spezifikation 3.9.
+// Symbol im Infobereich (Windows), Spezifikation 3.9 - das eine Symbol der
+// einen App (Client und Host-Rolle in einem Prozess) bzw. der reinen
+// Host-Rolle (--nur-host).
 //
 // Ein eigener Faden betreibt ein nie sichtbares Fenster oberster Ebene mit
 // Nachrichtenschleife; an ihm haengt das Symbol (Shell_NotifyIconW). Ein
@@ -6,43 +8,40 @@
 // nur jene die Rundnachricht "TaskbarCreated" bekommen: startet Explorer neu,
 // meldet der Faden das Symbol neu an.
 //
-// Der Fensterfaden (winit) spricht mit diesem Faden nur ueber
-// PostMessageW/SendMessageTimeoutW an dessen Fenster und ueber einen
-// geteilten Stand; zurueck geht es ueber den Rueckruf `befehl`, den main.rs
-// mit einem EventLoopProxy belegt. Keiner wartet je auf den anderen, ausser
-// beim Anlegen (auf das Fenster ohne Frist - es haengt nicht am Explorer -,
-// auf die Anmeldung hoechstens WARTEN), beim Entfernen (hoechstens WARTEN),
-// bei der Sprechblase (hoechstens FRAGEN_HINWEIS) und beim Selbsttest
-// (bewusst synchron). Beendet wird der Faden nur ueber WM_BEENDEN, nie ueber
-// WM_CLOSE: das koennte auch von aussen kommen und liesse die abgelegte App
-// ohne Symbol zurueck. Bei der Host-Rolle (zweite Art) heisst WM_CLOSE von
-// aussen (ein anderes Programm) und WM_ENDSESSION (Abmelden, Herunterfahren,
-// ein Installationsprogramm ueber den Restart Manager) dagegen: beenden -
-// ueber den Rueckruf `ende`, der den Zuschauer verabschiedet und dem Dienst
-// der Host-Rolle das Ende meldet (host/mod.rs); den Prozess beendet dann
-// dessen Aufrufer. (taskkill ohne /F erreicht die Host-Rolle nicht: sie hat kein
-// sichtbares Fenster, taskkill verlangt dann /F.)
+// Der Fensterfaden (winit) bzw. der Faden des Dienstes spricht mit diesem
+// Faden nur ueber PostMessageW/SendMessageTimeoutW an dessen Fenster und
+// ueber einen geteilten Stand; zurueck geht es ueber die Rueckrufe `befehl`
+// (gewaehlte Nummer), `menue` (Eintraege bei jedem Oeffnen) und `ende`. Keiner
+// wartet je auf den anderen, ausser beim Anlegen (auf das Fenster ohne Frist
+// - es haengt nicht am Explorer -, auf die Anmeldung hoechstens WARTEN), beim
+// Entfernen (hoechstens WARTEN), bei der Sprechblase (hoechstens
+// FRAGEN_HINWEIS) und beim Selbsttest (bewusst synchron). Beendet wird der
+// Faden nur ueber WM_BEENDEN (Drop). WM_CLOSE von aussen (ein anderes
+// Programm, ein Test) und WM_ENDSESSION (Abmelden, Herunterfahren, ein
+// Installationsprogramm ueber den Restart Manager) heissen dagegen: die App
+// bzw. die Host-Rolle endet - ueber den Rueckruf `ende`, der einen Zuschauer
+// verabschiedet und dem Rest des Programms das Ende meldet (main.rs bzw.
+// host/mod.rs). (taskkill ohne /F erreicht das Symbolfenster nicht: es ist
+// unsichtbar; mit sichtbarem Fenster legt WM_CLOSE die App nur ab.)
 //
 // Bedienung (NOTIFYICON_VERSION_4):
-//   - Linksklick (NIN_SELECT), Eingabe/Leertaste (NIN_KEYSELECT) und
-//     Doppelklick: Fenster zeigen.
-//   - Rechtsklick bzw. Umschalt+F10 (WM_CONTEXTMENU): Kontextmenue nach
-//     tray::menue, "Oeffnen" fett als Vorgabe. Vorher SetForegroundWindow,
-//     sonst schliesst das Menue nicht beim Klick daneben; danach WM_NULL
-//     (bekannte Eigenheit von TrackPopupMenu).
+//   - Die eine App (`linksklick` gesetzt): Linksklick (NIN_SELECT),
+//     Eingabe/Leertaste (NIN_KEYSELECT) und Doppelklick waehlen die Nummer
+//     `linksklick` ("QuadChroma oeffnen"); Rechtsklick bzw. Umschalt+F10
+//     (WM_CONTEXTMENU) oeffnet das Menue, "QuadChroma oeffnen" fett als
+//     Vorgabe. Die reine Host-Rolle hat kein Fenster: dort oeffnet auch der
+//     Linksklick das Menue.
+//   - Vor dem Menue SetForegroundWindow, sonst schliesst es nicht beim Klick
+//     daneben; danach WM_NULL (bekannte Eigenheit von TrackPopupMenu).
+//   - Das Menue wird bei jedem Oeffnen frisch gebaut (Rueckruf `menue` im
+//     Symbolfaden, aus tray::Eintrag: Untermenues, Haken, deaktivierte
+//     Eintraege, eigene Nummern), damit Geraeteliste, Passwort und Zustand
+//     stimmen; die gewaehlte Nummer geht an `befehl`.
 //   - Tooltip ueber NIF_TIP mit NIF_SHOWTIP (Fassung 4 blendet ihn sonst aus).
-//   - Die einmalige Sprechblase ueber NIF_INFO, ebenfalls mit NIF_SHOWTIP
-//     (jedes NIM_MODIFY ohne das Kennzeichen blendet den Tooltip aus).
-//
-// Zweite Art (Host-Rolle, Pairing v1 Abschnitt 10.2, `Symbol::neu_allgemein`):
-// ein allgemeines Menue aus `Eintrag` - Untermenues, Haken, deaktivierte
-// Eintraege, eigene Befehlsnummern. Es wird bei jedem Oeffnen frisch
-// gebaut (Rueckruf `menue` im Symbolfaden), damit Geraeteliste, Passwort und
-// Zustand stimmen; Links- und Rechtsklick oeffnen es gleichermassen (die
-// Host-Rolle hat kein Fenster). Die gewaehlte Nummer geht an `befehl`. Der
-// Client (erste Art) baut sein Menue ebenso aus Eintraegen (client_eintraege).
+//   - Die Sprechblase ueber NIF_INFO, ebenfalls mit NIF_SHOWTIP (jedes
+//     NIM_MODIFY ohne das Kennzeichen blendet den Tooltip aus).
 
-use crate::tray::{self, Befehl, Punkt, Stand};
+use crate::tray::{self, Eintrag};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,10 +81,6 @@ const WM_BEENDEN: u32 = WM_APP + 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 /// Kennung des Symbols an unserem Fenster.
 const SYMBOL_ID: u32 = 1;
-/// Befehlsnummern im Kontextmenue; Hosts ab ID_HOST + Index im Menue.
-const ID_OEFFNEN: u32 = 1;
-const ID_BEENDEN: u32 = 2;
-const ID_HOST: u32 = 100;
 /// So lange wartet der Fensterfaden hoechstens auf die erste Anmeldung
 /// bzw. auf das Ende des Fadens.
 const WARTEN: Duration = Duration::from_secs(2);
@@ -98,8 +93,8 @@ const FRAGEN_SELBSTTEST: u32 = 3000;
 
 /// Was beide Faeden teilen.
 struct Geteilt {
-    /// Menue und Tooltip, wie main.rs sie zuletzt gesetzt hat.
-    stand: Mutex<Stand>,
+    /// Der Tooltip, wie er zuletzt gesetzt wurde.
+    tooltip: Mutex<String>,
     /// Titel und Text der naechsten Sprechblase.
     hinweis: Mutex<(String, String)>,
     /// Ist das Symbol gerade angemeldet? Nur dann darf Schliessen ablegen.
@@ -110,44 +105,17 @@ struct Geteilt {
     versucht: AtomicBool,
 }
 
-/// Ein Eintrag eines allgemeinen Menues (zweite Art, Host-Rolle).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Eintrag {
-    /// Waehlbarer (oder deaktivierter) Punkt mit eigener Befehlsnummer
-    /// (nicht 0). `haken`: mit Haken davor; `fett`: Vorgabe des Menues.
-    Punkt { text: String, nummer: u32, haken: bool, aktiv: bool, fett: bool },
-    /// Untermenue.
-    Unter { text: String, eintraege: Vec<Eintrag>, aktiv: bool },
-    Trenner,
-}
-
-impl Eintrag {
-    /// Ein gewoehnlicher, waehlbarer Punkt.
-    pub fn punkt(text: impl Into<String>, nummer: u32) -> Eintrag {
-        Eintrag::Punkt { text: text.into(), nummer, haken: false, aktiv: true, fett: false }
-    }
-
-    /// Eine Zeile, die nur etwas anzeigt (deaktiviert, ohne Befehl).
-    pub fn anzeige(text: impl Into<String>) -> Eintrag {
-        Eintrag::Punkt { text: text.into(), nummer: 0, haken: false, aktiv: false, fett: false }
-    }
-}
-
-/// Wie der Symbolfaden Wahlen weitergibt.
-enum Art {
-    /// Der Client: Menue aus dem geteilten Stand (tray::Punkt), Linksklick
-    /// oeffnet das Fenster.
-    Client(Box<dyn Fn(Befehl) + Send>),
-    /// Allgemein (Host-Rolle): Menue bei jedem Oeffnen aus `menue`, die
-    /// gewaehlte Nummer an `befehl`; auch der Linksklick oeffnet das Menue.
-    /// `ende` bekommt WM_CLOSE von aussen und WM_ENDSESSION (mit einem Wort,
-    /// woher) und kehrt erst zurueck, wenn der Abschied hinaus ist - nach
-    /// WM_ENDSESSION kann der Prozess gleich danach enden.
-    Allgemein {
-        befehl: Box<dyn Fn(u32) + Send>,
-        menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
-        ende: Box<dyn Fn(&str) + Send>,
-    },
+/// Wie der Symbolfaden Wahlen weitergibt: `menue` liefert bei jedem
+/// Oeffnen die Eintraege, `befehl` bekommt die gewaehlte Nummer, `linksklick`
+/// ist die Nummer des Linksklicks (None: auch er oeffnet das Menue). `ende`
+/// bekommt WM_CLOSE von aussen und WM_ENDSESSION (mit einem Wort, woher) und
+/// kehrt erst zurueck, wenn der Abschied hinaus ist - nach WM_ENDSESSION
+/// kann der Prozess gleich danach enden.
+struct Art {
+    befehl: Box<dyn Fn(u32) + Send>,
+    menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
+    ende: Box<dyn Fn(&str) + Send>,
+    linksklick: Option<u32>,
 }
 
 /// Was nur der Symbolfaden braucht (je Faden einer, siehe FADEN).
@@ -175,41 +143,38 @@ pub struct Symbol {
     fenster: isize,
     geteilt: Arc<Geteilt>,
     ende: mpsc::Receiver<()>,
-    /// Zuletzt gesetzter Stand - nur Aenderungen gehen an den Faden.
-    zuletzt: Stand,
+    /// Zuletzt gesetzter Tooltip - nur Aenderungen gehen an den Faden.
+    zuletzt: String,
 }
 
 impl Symbol {
-    /// Faden und Fenster anlegen und das Symbol anmelden. Err nur, wenn es
-    /// weder Faden noch Fenster gibt; scheitert nur die Anmeldung (kein
-    /// Explorer), steht `steht()` auf false und `grund()` sagt warum - der
-    /// Faden wartet dann auf "TaskbarCreated". Auf das Fenster wird ohne Frist
-    /// gewartet: sein Anlegen haengt nicht am Explorer, und mit einer Frist
-    /// liefe bei Ueberlast ein Faden ohne Besitzer weiter, dessen Symbol nie
-    /// mehr entfernt wuerde (Durchsicht [4]).
-    pub fn neu(befehl: Box<dyn Fn(Befehl) + Send>, stand: &Stand) -> Result<Symbol, String> {
-        Symbol::neu_mit(Art::Client(befehl), stand)
-    }
-
-    /// Zweite Art (Host-Rolle): `menue` liefert bei jedem Oeffnen die
-    /// Eintraege (im Symbolfaden gerufen), `befehl` bekommt die gewaehlte
-    /// Nummer (ebenfalls im Symbolfaden - lange Arbeit gehoert in einen
-    /// anderen Faden). `ende` beendet die Rolle, wenn Windows oder ein
-    /// anderes Programm das verlangt (WM_CLOSE von aussen, WM_ENDSESSION);
-    /// das Symbol ist dann schon abgemeldet. Sonst wie `neu`.
-    pub fn neu_allgemein(
+    /// Faden und Fenster anlegen und das Symbol anmelden. `menue` liefert bei
+    /// jedem Oeffnen die Eintraege (im Symbolfaden gerufen), `befehl` bekommt
+    /// die gewaehlte Nummer (ebenfalls im Symbolfaden - lange Arbeit gehoert
+    /// in einen anderen Faden), `linksklick` die Nummer des Linksklicks (None:
+    /// er oeffnet das Menue). `ende` beendet App bzw. Host-Rolle, wenn Windows
+    /// oder ein anderes Programm das verlangt (WM_CLOSE von aussen,
+    /// WM_ENDSESSION); das Symbol ist dann schon abgemeldet.
+    ///
+    /// Err nur, wenn es weder Faden noch Fenster gibt; scheitert nur die
+    /// Anmeldung (kein Explorer), steht `steht()` auf false und `grund()` sagt
+    /// warum - der Faden wartet dann auf "TaskbarCreated". Auf das Fenster wird
+    /// ohne Frist gewartet: sein Anlegen haengt nicht am Explorer, und mit
+    /// einer Frist liefe bei Ueberlast ein Faden ohne Besitzer weiter, dessen
+    /// Symbol nie mehr entfernt wuerde (Durchsicht [4]).
+    pub fn neu(
         befehl: Box<dyn Fn(u32) + Send>,
         menue: Box<dyn Fn() -> Vec<Eintrag> + Send>,
         ende: Box<dyn Fn(&str) + Send>,
+        linksklick: Option<u32>,
         tooltip: &str,
     ) -> Result<Symbol, String> {
-        let stand = Stand { menue: Vec::new(), tooltip: tooltip.to_string() };
-        Symbol::neu_mit(Art::Allgemein { befehl, menue, ende }, &stand)
+        Symbol::neu_mit(Art { befehl, menue, ende, linksklick }, tooltip)
     }
 
-    fn neu_mit(art: Art, stand: &Stand) -> Result<Symbol, String> {
+    fn neu_mit(art: Art, tooltip: &str) -> Result<Symbol, String> {
         let geteilt = Arc::new(Geteilt {
-            stand: Mutex::new(stand.clone()),
+            tooltip: Mutex::new(tooltip.to_string()),
             hinweis: Mutex::new((String::new(), String::new())),
             steht: AtomicBool::new(false),
             grund: Mutex::new(None),
@@ -242,7 +207,7 @@ impl Symbol {
                 *g = Some(format!("Anmeldung beim Infobereich dauert laenger als {} s", WARTEN.as_secs()));
             }
         }
-        Ok(Symbol { fenster, geteilt, ende: ende_rx, zuletzt: stand.clone() })
+        Ok(Symbol { fenster, geteilt, ende: ende_rx, zuletzt: tooltip.to_string() })
     }
 
     pub fn steht(&self) -> bool {
@@ -253,20 +218,24 @@ impl Symbol {
         self.geteilt.grund.lock().ok().and_then(|g| g.clone())
     }
 
-    /// Neuer Stand: das Menue gilt ab dem naechsten Rechtsklick, der Tooltip
-    /// wird sofort angewandt, wenn er sich geaendert hat.
-    pub fn stand_setzen(&mut self, stand: &Stand) {
-        if *stand == self.zuletzt {
+    /// Wer sonst wissen will, ob das Symbol steht (der Dienst der Host-Rolle:
+    /// "Zulassen" nur mit Symbol), fragt hierueber - auch aus einem anderen
+    /// Faden und nachdem es erst spaeter angemeldet wurde.
+    pub fn steht_abfrage(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let g = self.geteilt.clone();
+        Arc::new(move || g.steht.load(Ordering::SeqCst))
+    }
+
+    /// Neuer Tooltip, sofort angewandt, wenn er sich geaendert hat.
+    pub fn tooltip_setzen(&mut self, tooltip: &str) {
+        if tooltip == self.zuletzt {
             return;
         }
-        let tooltip_neu = stand.tooltip != self.zuletzt.tooltip;
-        if let Ok(mut s) = self.geteilt.stand.lock() {
-            *s = stand.clone();
+        if let Ok(mut s) = self.geteilt.tooltip.lock() {
+            *s = tooltip.to_string();
         }
-        self.zuletzt = stand.clone();
-        if tooltip_neu {
-            self.posten(WM_TOOLTIP);
-        }
+        self.zuletzt = tooltip.to_string();
+        self.posten(WM_TOOLTIP);
     }
 
     /// Die Sprechblase (NIF_INFO) einmal zeigen. true nur, wenn das Symbol
@@ -339,7 +308,7 @@ fn anmelden(hwnd: HWND, f: &Faden) -> Result<(), String> {
     d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     d.uCallbackMessage = WM_SYMBOL;
     d.hIcon = f.symbol;
-    let tooltip = f.geteilt.stand.lock().map(|s| s.tooltip.clone()).unwrap_or_else(|_| "QuadChroma".into());
+    let tooltip = f.geteilt.tooltip.lock().map(|s| s.clone()).unwrap_or_else(|_| "QuadChroma".into());
     feld_setzen(&mut d.szTip, &tooltip);
     let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &d) }.as_bool();
     if !ok {
@@ -377,7 +346,7 @@ fn abmelden(hwnd: HWND, f: &Faden) -> bool {
 fn tooltip_anwenden(hwnd: HWND, f: &Faden) -> bool {
     let mut d = daten(hwnd);
     d.uFlags = NIF_TIP | NIF_SHOWTIP;
-    let tooltip = f.geteilt.stand.lock().map(|s| s.tooltip.clone()).unwrap_or_default();
+    let tooltip = f.geteilt.tooltip.lock().map(|s| s.clone()).unwrap_or_default();
     feld_setzen(&mut d.szTip, &tooltip);
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &d) }.as_bool()
 }
@@ -388,7 +357,7 @@ fn hinweis_zeigen(hwnd: HWND, f: &Faden) -> bool {
     // NIF_SHOWTIP bei jedem NIM_MODIFY (Fassung 4), dazu der geltende
     // Tooltip - sonst bleibt er nach der Sprechblase aus, bis er sich aendert.
     d.uFlags = NIF_INFO | NIF_TIP | NIF_SHOWTIP;
-    let tooltip = f.geteilt.stand.lock().map(|s| s.tooltip.clone()).unwrap_or_default();
+    let tooltip = f.geteilt.tooltip.lock().map(|s| s.clone()).unwrap_or_default();
     feld_setzen(&mut d.szTip, &tooltip);
     feld_setzen(&mut d.szInfoTitle, &titel);
     feld_setzen(&mut d.szInfo, &text);
@@ -399,59 +368,6 @@ fn hinweis_zeigen(hwnd: HWND, f: &Faden) -> bool {
 /// Menuetext fuer Windows: "&" leitet sonst ein Tastenkuerzel ein.
 fn menuetext(t: &str) -> HSTRING {
     HSTRING::from(t.replace('&', "&&"))
-}
-
-/// Befehlsnummer des Menuepunkts an Stelle `i` (None: Trenner). Hosts
-/// tragen ID_HOST plus ihre Stelle im Menue; befehl_zu loest genau so auf.
-fn menue_nummer(i: usize, p: &Punkt) -> Option<u32> {
-    match p {
-        Punkt::Oeffnen(_) => Some(ID_OEFFNEN),
-        Punkt::Trenner => None,
-        Punkt::Verbinden { .. } => Some(ID_HOST + i as u32),
-        Punkt::Beenden(_) => Some(ID_BEENDEN),
-    }
-}
-
-/// Der Befehl zur gewaehlten Nummer (TrackPopupMenu mit TPM_RETURNCMD),
-/// aufgeloest gegen genau die Liste, aus der das Menue gebaut war. 0 (nichts
-/// gewaehlt) und fremde Nummern ergeben nichts.
-fn befehl_zu(punkte: &[Punkt], gewaehlt: u32) -> Option<Befehl> {
-    match gewaehlt {
-        0 => None,
-        ID_OEFFNEN => Some(Befehl::Oeffnen),
-        ID_BEENDEN => Some(Befehl::Beenden),
-        n if n >= ID_HOST => punkte
-            .get((n - ID_HOST) as usize)
-            .filter(|p| matches!(p, Punkt::Verbinden { .. }))
-            .and_then(|p| p.befehl()),
-        _ => None,
-    }
-}
-
-/// Die Punkte des Clients als allgemeine Eintraege: Nummern nach
-/// menue_nummer, "Oeffnen" fett (die Vorgabe, die auch der Doppelklick
-/// ausloest).
-fn client_eintraege(punkte: &[Punkt]) -> Vec<Eintrag> {
-    punkte
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let nummer = menue_nummer(i, p).unwrap_or(0);
-            match p {
-                Punkt::Oeffnen(t) => Eintrag::Punkt { text: t.clone(), nummer, haken: false, aktiv: true, fett: true },
-                Punkt::Beenden(t) => Eintrag::punkt(t.clone(), nummer),
-                Punkt::Verbinden { text, .. } => Eintrag::punkt(text.clone(), nummer),
-                Punkt::Trenner => Eintrag::Trenner,
-            }
-        })
-        .collect()
-}
-
-/// Das Kontextmenue des Clients aus den Punkten bauen (Tests; gezeigt wird
-/// es ueber menue_zeigen). Der Aufrufer gibt es mit DestroyMenu frei.
-#[cfg(test)]
-fn menue_bauen(punkte: &[Punkt]) -> Option<HMENU> {
-    eintraege_bauen(&client_eintraege(punkte))
 }
 
 /// Ein Menue aus allgemeinen Eintraegen bauen, Untermenues eingeschlossen
@@ -512,15 +428,6 @@ fn nummer_waehlen(hwnd: HWND, eintraege: &[Eintrag], x: i32, y: i32) -> u32 {
     }
 }
 
-/// Das Kontextmenue des Clients an der Stelle (x, y) zeigen und den
-/// gewaehlten Befehl liefern. Gebaut aus dem Stand dieses Augenblicks; die
-/// Wahl wird gegen genau diese Liste aufgeloest.
-fn menue_zeigen(hwnd: HWND, f: &Faden, x: i32, y: i32) -> Option<Befehl> {
-    let punkte = f.geteilt.stand.lock().map(|s| s.menue.clone()).unwrap_or_default();
-    let gewaehlt = nummer_waehlen(hwnd, &client_eintraege(&punkte), x, y);
-    befehl_zu(&punkte, gewaehlt)
-}
-
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let Some(f) = faden() else { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) } };
     if msg == f.taskbar_created && f.taskbar_created != 0 {
@@ -535,25 +442,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let ereignis = (lp.0 as u32) & 0xffff;
             let x = (wp.0 & 0xffff) as u16 as i16 as i32;
             let y = ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32;
-            match &f.art {
-                Art::Client(befehl) => match ereignis {
-                    NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => befehl(Befehl::Oeffnen),
-                    WM_CONTEXTMENU => {
-                        if let Some(b) = menue_zeigen(hwnd, &f, x, y) {
-                            befehl(b);
-                        }
-                    }
-                    _ => {}
-                },
-                Art::Allgemein { befehl, menue, .. } => {
-                    if matches!(ereignis, NIN_SELECT | NIN_KEYSELECT | WM_CONTEXTMENU) {
-                        let eintraege = menue();
+            let art = &f.art;
+            let linksklick = matches!(ereignis, NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK);
+            match art.linksklick {
+                Some(nr) if linksklick => (art.befehl)(nr),
+                _ if linksklick || ereignis == WM_CONTEXTMENU => {
+                    // WM_LBUTTONDBLCLK ohne eigene Nummer: das Menue kam schon
+                    // mit dem ersten Klick (NIN_SELECT).
+                    if ereignis != WM_LBUTTONDBLCLK {
+                        let eintraege = (art.menue)();
                         let nr = nummer_waehlen(hwnd, &eintraege, x, y);
                         if nr != 0 {
-                            befehl(nr);
+                            (art.befehl)(nr);
                         }
                     }
                 }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -569,22 +473,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
-        // Von aussen (etwa taskkill ohne /F, das mit einem sichtbaren Fenster
-        // an alle Fenster des Prozesses WM_CLOSE schickt): beim Client
-        // uebergehen - das Symbol ist der Weg zurueck zur abgelegten App. Die
-        // Host-Rolle endet darauf, mit Abschied an ihren Zuschauer; ebenso
-        // beim Abmelden, Herunterfahren oder wenn ein Installationsprogramm
-        // sie ueber den Restart Manager schliesst (WM_ENDSESSION - nach
-        // dessen Rueckkehr endete der Prozess ohnehin, der Abschied muss
-        // vorher hinaus).
+        // Von aussen (ein anderes Programm, ein Test): App bzw. Host-Rolle
+        // enden darauf, mit Abschied an einen Zuschauer; ebenso beim
+        // Abmelden, Herunterfahren oder wenn ein Installationsprogramm sie
+        // ueber den Restart Manager schliesst (WM_ENDSESSION - nach dessen
+        // Rueckkehr endete der Prozess ohnehin, der Abschied muss vorher
+        // hinaus). Der Faden selbst endet erst mit WM_BEENDEN.
         WM_CLOSE | WM_ENDSESSION => {
-            if let Art::Allgemein { ende, .. } = &f.art {
-                if msg == WM_CLOSE || wp.0 != 0 {
-                    if f.geteilt.steht.load(Ordering::SeqCst) {
-                        abmelden(hwnd, &f);
-                    }
-                    ende(if msg == WM_CLOSE { "WM_CLOSE von aussen" } else { sitzungsende(lp) });
+            if msg == WM_CLOSE || wp.0 != 0 {
+                if f.geteilt.steht.load(Ordering::SeqCst) {
+                    abmelden(hwnd, &f);
                 }
+                (f.art.ende)(if msg == WM_CLOSE { "WM_CLOSE von aussen" } else { sitzungsende(lp) });
             }
             LRESULT(0)
         }
@@ -675,9 +575,7 @@ fn faden_laufen(geteilt: Arc<Geteilt>, art: Art, bereit: mpsc::SyncSender<Result
 /// alles gelungen, 1 = nicht. Lauscht nicht im Netz und startet keine Bekanntgabe; ohne
 /// Explorer (etwa in Sitzung 0 ueber ssh) endet er sauber mit 1.
 pub fn selbsttest() -> i32 {
-    let lang = crate::strings::pick("de");
-    let stand = tray::stand(lang, &[], None);
-    let mut s = match Symbol::neu(Box::new(|_| {}), &stand) {
+    let mut s = match Symbol::neu(Box::new(|_| {}), Box::new(Vec::new), Box::new(|_| {}), Some(1), "QuadChroma") {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Infobereich-Selbsttest: kein Symbolfenster ({e})");
@@ -693,8 +591,8 @@ pub fn selbsttest() -> i32 {
     }
     println!("Infobereich-Selbsttest: Symbol angelegt");
     // Aendern: Tooltip einer Sitzung, synchron gefragt.
-    let neu = tray::stand(lang, &[], Some("Selbsttest"));
-    if let Ok(mut st) = s.geteilt.stand.lock() {
+    let neu = tray::tooltip(Some("Selbsttest"));
+    if let Ok(mut st) = s.geteilt.tooltip.lock() {
         *st = neu.clone();
     }
     s.zuletzt = neu;
@@ -718,37 +616,6 @@ pub fn selbsttest() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::UI::WindowsAndMessaging::{GetMenuDefaultItem, GetMenuItemCount, GetMenuItemID, GET_MENU_DEFAULT_ITEM_FLAGS};
-
-    fn host(name: &str, addr: &str) -> crate::discovery::Host {
-        crate::discovery::Host { name: name.into(), addr: addr.parse().unwrap(), seen: std::time::Instant::now() }
-    }
-
-    /// Menuenummer -> Befehl als reine Logik: jeder waehlbare Punkt liefert
-    /// genau seinen Befehl - bei mehreren Hosts der richtige Host.
-    #[test]
-    fn menuenummer_fuehrt_zum_befehl() {
-        let hosts = [host("A", "10.0.0.1:9001"), host("B", "10.0.0.2:9001"), host("C", "10.0.0.3:9101")];
-        for n in 0..=hosts.len() {
-            let punkte = tray::menue(crate::strings::pick("de"), &hosts[..n]);
-            let mut waehlbar = 0;
-            for (i, p) in punkte.iter().enumerate() {
-                match menue_nummer(i, p) {
-                    Some(nr) => {
-                        waehlbar += 1;
-                        assert_eq!(befehl_zu(&punkte, nr), p.befehl(), "{n} Hosts, Punkt {i}: {p:?}");
-                    }
-                    None => assert_eq!(*p, Punkt::Trenner),
-                }
-            }
-            assert_eq!(waehlbar, n + 2);
-            // Nichts gewaehlt, fremde Nummern, ein Trenner: nichts.
-            assert_eq!(befehl_zu(&punkte, 0), None);
-            assert_eq!(befehl_zu(&punkte, 99), None);
-            assert_eq!(befehl_zu(&punkte, ID_HOST + punkte.len() as u32), None);
-            assert_eq!(befehl_zu(&punkte, ID_HOST + 1), None, "Trenner als Host aufgeloest");
-        }
-    }
 
     /// Der Grund von WM_ENDSESSION fuers Protokoll: Restart Manager
     /// (ENDSESSION_CLOSEAPP), Abmelden (ENDSESSION_LOGOFF), sonst
@@ -760,22 +627,61 @@ mod tests {
         assert_eq!(sitzungsende(LPARAM(0)), "Herunterfahren");
     }
 
-    /// Der Symbolfaden endet nur ueber WM_BEENDEN (Drop), nicht ueber ein
-    /// WM_CLOSE von aussen - die abgelegte App behielte sonst kein Symbol.
-    /// Ohne Infobereich (Sitzung 0 ueber ssh) gilt die Sprechblase nicht als
-    /// gezeigt, tray_hinweis bliebe also offen. Mit Infobereich (Sitzung mit
-    /// Explorer) erscheint das Symbol kurz, die Sprechblase wird ausgelassen.
+    /// Ein Symbol mit Kanaelen fuer gewaehlte Nummern und das Ende von aussen.
+    fn test_symbol(linksklick: Option<u32>) -> (Symbol, mpsc::Receiver<u32>, mpsc::Receiver<String>) {
+        let (nr_tx, nr_rx) = mpsc::channel();
+        let (ende_tx, ende_rx) = mpsc::channel();
+        let nr_tx = Mutex::new(nr_tx);
+        let ende_tx = Mutex::new(ende_tx);
+        let s = Symbol::neu(
+            Box::new(move |nr| {
+                let _ = nr_tx.lock().unwrap().send(nr);
+            }),
+            Box::new(Vec::new),
+            Box::new(move |wie| {
+                let _ = ende_tx.lock().unwrap().send(wie.to_string());
+            }),
+            linksklick,
+            "QuadChroma",
+        )
+        .expect("Symbolfenster");
+        (s, nr_rx, ende_rx)
+    }
+
+    /// Die eine App: Linksklick, Eingabe/Leertaste und Doppelklick auf das
+    /// Symbol waehlen "QuadChroma oeffnen" (die Nummer `linksklick`), ohne
+    /// ein Menue zu zeigen. Geht auch ohne Infobereich (Sitzung 0 ueber ssh):
+    /// es zaehlt die Nachricht an das Fenster.
     #[test]
-    fn symbolfaden_endet_nur_ueber_beenden() {
-        let stand = tray::stand(crate::strings::pick("de"), &[], None);
-        let mut s = Symbol::neu(Box::new(|_| {}), &stand).expect("Symbolfenster");
-        unsafe {
-            let _ = PostMessageW(Some(HWND(s.fenster as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+    fn linksklick_oeffnet() {
+        let (s, nr, _) = test_symbol(Some(crate::symbolmenue::LINKSKLICK));
+        for ereignis in [NIN_SELECT, NIN_KEYSELECT, WM_LBUTTONDBLCLK] {
+            unsafe {
+                let _ = PostMessageW(Some(HWND(s.fenster as *mut _)), WM_SYMBOL, WPARAM(0), LPARAM(ereignis as isize));
+            }
+            assert_eq!(nr.recv_timeout(WARTEN), Ok(crate::symbolmenue::LINKSKLICK), "Ereignis 0x{ereignis:x}");
         }
-        assert!(
-            s.ende.recv_timeout(Duration::from_millis(300)).is_err(),
-            "WM_CLOSE von aussen hat den Symbolfaden beendet"
-        );
+        drop(s);
+    }
+
+    /// WM_CLOSE von aussen und WM_ENDSESSION (wParam 1) melden das Ende ueber
+    /// `ende` - mit dem Grund fuers Protokoll -, beenden den Symbolfaden aber
+    /// nicht: das tut erst WM_BEENDEN (Drop). WM_ENDSESSION mit wParam 0 (die
+    /// Sitzung endet doch nicht) meldet nichts. Ohne Infobereich gilt die
+    /// Sprechblase nicht als gezeigt, tray_hinweis bliebe also offen.
+    #[test]
+    fn ende_von_aussen_und_beenden() {
+        let (mut s, _, ende) = test_symbol(Some(1));
+        let posten = |msg: u32, wp: usize, lp: isize| unsafe {
+            let _ = PostMessageW(Some(HWND(s.fenster as *mut _)), msg, WPARAM(wp), LPARAM(lp));
+        };
+        posten(WM_CLOSE, 0, 0);
+        assert_eq!(ende.recv_timeout(WARTEN).as_deref(), Ok("WM_CLOSE von aussen"));
+        posten(WM_ENDSESSION, 0, 0);
+        posten(WM_ENDSESSION, 1, 1);
+        assert_eq!(ende.recv_timeout(WARTEN).as_deref(), Ok("ein Installationsprogramm schliesst die App (Restart Manager)"));
+        assert!(ende.recv_timeout(Duration::from_millis(200)).is_err(), "WM_ENDSESSION mit wParam 0 als Ende gemeldet");
+        assert!(s.ende.recv_timeout(Duration::from_millis(300)).is_err(), "WM_CLOSE von aussen hat den Symbolfaden beendet");
         if !s.steht() {
             assert!(!s.hinweis("QuadChroma", "Test"), "Sprechblase ohne Symbol als gezeigt gemeldet");
         }
@@ -783,25 +689,13 @@ mod tests {
         assert!(s.ende.recv_timeout(WARTEN).is_ok(), "WM_BEENDEN hat den Symbolfaden nicht beendet");
     }
 
-    /// Das echte Menue (CreatePopupMenu, ohne Shell - geht auch in Sitzung 0):
-    /// jede Stelle traegt die Nummer, die zu ihrem Befehl fuehrt; "Oeffnen"
-    /// ist die Vorgabe.
+    /// Wer wissen will, ob das Symbol steht, fragt ueber steht_abfrage - das
+    /// ist derselbe Stand wie steht(), auch aus einem anderen Faden.
     #[test]
-    fn echtes_menue_nummern() {
-        let hosts = [host("A", "10.0.0.1:9001"), host("B", "10.0.0.2:9001"), host("C", "10.0.0.3:9101"), host("D", "10.0.0.4:9001")];
-        let punkte = tray::menue(crate::strings::pick("de"), &hosts);
-        let menue = menue_bauen(&punkte).expect("Menue");
-        unsafe {
-            assert_eq!(GetMenuItemCount(Some(menue)), punkte.len() as i32);
-            for (i, p) in punkte.iter().enumerate() {
-                let id = GetMenuItemID(menue, i as i32);
-                match p {
-                    Punkt::Trenner => assert_eq!(id, 0, "Stelle {i}"),
-                    _ => assert_eq!(befehl_zu(&punkte, id), p.befehl(), "Stelle {i}: {p:?}"),
-                }
-            }
-            assert_eq!(GetMenuDefaultItem(menue, 0, GET_MENU_DEFAULT_ITEM_FLAGS(0)), ID_OEFFNEN);
-            let _ = DestroyMenu(menue);
-        }
+    fn steht_abfrage_wie_steht() {
+        let (s, _, _) = test_symbol(None);
+        let abfrage = s.steht_abfrage();
+        let steht = s.steht();
+        assert_eq!(std::thread::spawn(move || abfrage()).join().unwrap(), steht);
     }
 }

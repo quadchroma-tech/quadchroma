@@ -3,9 +3,13 @@
 //
 // Hier steht, was beide Plattformen teilen und was sich ohne Shell pruefen
 // laesst: die Entscheidung beim Schliessen, das Menue aus der Hostliste und
-// der Text des Tooltips. Das Symbol selbst bauen tray_win.rs
+// der Text des Tooltips, dazu `Eintrag`, der Baustein eines allgemeinen
+// Menues (Untermenues, Haken, deaktivierte Zeilen, eigene Nummern). Unter
+// Windows baut die eine App (Client und Host-Rolle, ein Symbol) ihr Menue
+// ganz aus Eintraegen (symbolmenue.rs); das Menue aus `Punkt` braucht
+// derzeit nur noch der Mac. Das Symbol selbst bauen tray_win.rs
 // (Shell_NotifyIconW in einem eigenen Faden) und tray_mac.rs (NSStatusBar auf
-// dem Hauptfaden); beide bieten dieselbe Schnittstelle `Symbol`:
+// dem Hauptfaden); der Mac bietet diese Schnittstelle `Symbol`:
 //
 //   Symbol::neu(befehl, &stand) -> Result<Symbol, String>
 //   symbol.steht() -> bool          Symbol wirklich sichtbar angemeldet?
@@ -17,7 +21,9 @@
 //   drop(symbol)                    Symbol entfernen
 //
 // `befehl` wird aufgerufen, wenn der Nutzer am Symbol etwas waehlt; main.rs
-// macht daraus ein Benutzerereignis fuer winit (EventLoopProxy).
+// macht daraus ein Benutzerereignis fuer winit (EventLoopProxy). Unter
+// Windows legt main.rs das Symbol mit `Symbol::neu_app` an (siehe
+// tray_win.rs): Menue aus Eintraegen, bei jedem Oeffnen frisch gebaut.
 //
 // Das Fenster selbst verbirgt und zeigt main.rs (App::schliessen,
 // App::fenster_zeigen); hier wird nur entschieden.
@@ -51,6 +57,37 @@ pub const HOSTS_MAX: usize = 4;
 /// Bekanntgabe (bis 255 Byte) und damit von fremder Hand.
 pub const NAME_MAX: usize = 40;
 
+/// Ein Eintrag eines allgemeinen Menues (Symbol der einen App unter
+/// Windows, symbolmenue.rs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum Eintrag {
+    /// Waehlbarer (oder deaktivierter) Punkt mit eigener Befehlsnummer
+    /// (nicht 0). `haken`: mit Haken davor; `fett`: Vorgabe des Menues.
+    Punkt { text: String, nummer: u32, haken: bool, aktiv: bool, fett: bool },
+    /// Untermenue.
+    Unter { text: String, eintraege: Vec<Eintrag>, aktiv: bool },
+    Trenner,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Eintrag {
+    /// Ein gewoehnlicher, waehlbarer Punkt.
+    pub fn punkt(text: impl Into<String>, nummer: u32) -> Eintrag {
+        Eintrag::Punkt { text: text.into(), nummer, haken: false, aktiv: true, fett: false }
+    }
+
+    /// Ein waehlbarer Punkt mit Haken (gesetzt oder nicht).
+    pub fn schalter(text: impl Into<String>, nummer: u32, an: bool) -> Eintrag {
+        Eintrag::Punkt { text: text.into(), nummer, haken: an, aktiv: true, fett: false }
+    }
+
+    /// Eine Zeile, die nur etwas anzeigt (deaktiviert, ohne Befehl).
+    pub fn anzeige(text: impl Into<String>) -> Eintrag {
+        Eintrag::Punkt { text: text.into(), nummer: 0, haken: false, aktiv: false, fett: false }
+    }
+}
+
 /// Was der Nutzer am Symbol gewaehlt hat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Befehl {
@@ -63,8 +100,10 @@ pub enum Befehl {
     Beenden,
 }
 
-/// Ein Punkt des Kontextmenues, in dieser Reihenfolge angezeigt.
+/// Ein Punkt des Kontextmenues, in dieser Reihenfolge angezeigt (macOS;
+/// unter Windows baut symbolmenue.rs das Menue).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
 pub enum Punkt {
     /// "Oeffnen" - unter Windows fett (Vorgabe fuer den Doppelklick).
     Oeffnen(String),
@@ -74,6 +113,7 @@ pub enum Punkt {
     Beenden(String),
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl Punkt {
     /// Was die Wahl dieses Punktes bewirkt (Trenner: nichts).
     pub fn befehl(&self) -> Option<Befehl> {
@@ -86,9 +126,10 @@ impl Punkt {
     }
 }
 
-/// Alles, was das Symbol zeigt. main.rs rechnet es regelmaessig neu aus und
-/// gibt es nur bei einer Aenderung weiter.
+/// Alles, was das Symbol zeigt (macOS). main.rs rechnet es regelmaessig neu
+/// aus und gibt es nur bei einer Aenderung weiter.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
 pub struct Stand {
     pub menue: Vec<Punkt>,
     pub tooltip: String,
@@ -96,6 +137,7 @@ pub struct Stand {
 
 /// Den Stand aus Sprache, gefundenen Hosts und laufender Sitzung (Name oder
 /// Adresse des Hosts; None auf dem Startbildschirm).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn stand(lang: &strings::Lang, hosts: &[discovery::Host], sitzung: Option<&str>) -> Stand {
     Stand { menue: menue(lang, hosts), tooltip: tooltip(sitzung) }
 }
@@ -104,6 +146,7 @@ pub fn stand(lang: &strings::Lang, hosts: &[discovery::Host], sitzung: Option<&s
 /// Beenden. Ohne Hosts steht nur ein Trenner zwischen Oeffnen und Beenden.
 /// Die Hosts kommen in der Reihenfolge der Liste (nach Namen sortiert); ohne
 /// Namen steht die Adresse da.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn menue(lang: &strings::Lang, hosts: &[discovery::Host]) -> Vec<Punkt> {
     let mut m = vec![Punkt::Oeffnen(lang.get(Key::TrayOpen).to_string()), Punkt::Trenner];
     let mut mit_hosts = false;
