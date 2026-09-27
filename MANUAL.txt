@@ -1183,13 +1183,40 @@ At every start (of the first instance) the app checks the task: one of
 an earlier version that still starts another exe (the unpacked folder)
 is moved to the installed copy after installing; if the task starts the
 installed copy but the running exe or its DLLs differ from it (SHA-256),
-the installed copy is refreshed. So an update is: quit QuadChroma in the
-icon's menu, start the new quadchroma.exe once. A shortcut of earlier
-versions in the Startup folder ("QuadChroma.lnk" with --hintergrund, or
-the older "QuadChroma - Freigabe.lnk" with --host) counts as on and, if
-it starts this exe, is replaced the same way (install, task, then the
-shortcut is deleted); a shortcut to another copy stays as it is, so a
-test or portable copy never takes over the autostart.
+the installed copy is replaced with the running one, older or newer (see
+the limits below). So an update is: quit QuadChroma in the icon's menu,
+start the new quadchroma.exe once. A shortcut of earlier versions in the
+Startup folder ("QuadChroma.lnk" with --hintergrund, or the older
+"QuadChroma - Freigabe.lnk" with --host) counts as on and, if it starts
+this exe, is replaced the same way (install, task, then the shortcut is
+deleted); a shortcut to another copy stays as it is, so a test or
+portable copy never takes over the autostart.
+
+Limits of "Start with Windows":
+
+    - One task per PC: the task "QuadChroma" exists once per computer and
+      starts the app for the account that created it last (schtasks /RU).
+      Check box and menu item show only whether the task exists, so
+      another administrator account sees them ticked as well; unticking
+      there deletes the autostart of the first account, and ticking again
+      moves the task to the second one. Moving a task of an earlier
+      version to the installed copy (see above) likewise creates it for
+      the account whose start does it.
+    - No version check: only the SHA-256 of the files counts. An older
+      quadchroma.exe started from another folder while the task exists
+      replaces a newer installed copy; starting the newer one once puts
+      it back.
+    - The unpacked folder is locked only during the copy: its files are
+      held against changes only while they are read for the install.
+      Between the start of quadchroma.exe and the copy (right at that
+      start when the task exists, otherwise when "Start with Windows" is
+      switched on) a program running with normal rights could rename the
+      exe or a DLL there and put its own file in its place; that file
+      would then be installed and started elevated at every logon. The
+      installed copy is only as trustworthy as the unpacked folder at the
+      moment of the copy: install and update while no hostile program
+      runs under your account - the same assumption as for confirming the
+      UAC prompt of the unpacked exe.
 
 Standard accounts: when the app runs under another account than the one
 signed in to the session (a standard user entered an administrator's

@@ -316,12 +316,15 @@ Files\QuadChroma`, where only administrators can write, checks folder and files,
 points the task at that copy; the start screen (or, without a window, a balloon at the
 icon) says "Installed to C:\Program Files\QuadChroma – QuadChroma starts from there with
 Windows." Switching it off deletes the task and leaves the installed copy; to remove
-it, delete the folder. When "Start with Windows" is on, every start of a different
-`quadchroma.exe` (a new version) refreshes the installed copy, and a task of an earlier
+it, delete the folder. When "Start with Windows" is on, every start of a
+`quadchroma.exe` whose files differ from the installed copy (SHA-256 - an older version
+just as well as a newer one) replaces the installed copy, and a task of an earlier
 version that still points elsewhere is moved to it; to update, quit QuadChroma in the
-icon's menu and start the new `quadchroma.exe` once. On a standard account (the app
-then runs with an administrator's credentials, not as the signed-in user) the check box
-and the menu item are disabled with "Only with an administrator account".
+icon's menu and start the new `quadchroma.exe` once. The task exists once per PC and
+runs for the administrator account that switched it on last; this and the copying
+have limits (see "Known limitations" under "What is missing"). On a standard account
+(the app then runs with an administrator's credentials, not as the signed-in user) the
+check box and the menu item are disabled with "Only with an administrator account".
 `quadchroma.exe --autostart on|off` (also `an|aus`) does the same from a terminal
 started as administrator.
 
@@ -747,7 +750,9 @@ during a session even when the client window has no focus (see "What is missing"
 On Windows the whole app runs with administrator rights (see Requirements), so a flaw
 in it weighs more there; "Start with Windows" therefore starts only the copy in
 `C:\Program Files\QuadChroma` that only administrators can change (see "Sharing a
-Windows PC"). Report vulnerabilities as described in `SECURITY.md`.
+Windows PC"). The unpacked folder it is copied from is locked against changes only
+during the copy itself (see "Known limitations"). Report vulnerabilities as described
+in `SECURITY.md`.
 
 ## What is missing
 
@@ -820,6 +825,24 @@ for the exe. The one-time steps are in `RELEASING.md`.
 - Windows: the app runs with administrator rights and asks via UAC at every manual
   start; on a standard account every start needs an administrator's password and
   "Start with Windows" is not available (see Requirements).
+- Windows, "Start with Windows" on a PC with several administrator accounts: there is
+  one task "QuadChroma" per PC, and it starts the app only for the account that
+  switched it on last. Another administrator account sees the check mark as well;
+  unticking it there deletes the autostart of the first account, and ticking it again
+  moves the task to the account that ticked it.
+- Windows, updating the installed copy: only the SHA-256 of the files counts, not the
+  version. Starting an older `quadchroma.exe` from another folder while "Start with
+  Windows" is on replaces a newer copy in `C:\Program Files\QuadChroma`; starting the
+  newer one once puts it back.
+- Windows, the copy into Program Files: the files in the unpacked folder are locked
+  against changes only while they are being copied. Between the start of
+  `quadchroma.exe` and that copy - right at the start when "Start with Windows" is
+  already on, otherwise when you switch it on - a program running with normal rights
+  could rename the exe or a DLL there and put its own file in its place; that file
+  would then be installed and started as administrator at every logon. The installed
+  copy is therefore only as trustworthy as the unpacked folder at the moment of the
+  copy: install and update while no hostile program runs under your account - the same
+  assumption as for confirming the UAC prompt of the unpacked exe.
 - Not code-signed and not notarised: SmartScreen warns once on Windows, and Smart App
   Control can block the exe entirely; macOS refuses the first start until "Open
   Anyway" (see "First start of a downloaded release").

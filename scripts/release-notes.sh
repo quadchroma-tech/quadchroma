@@ -104,6 +104,14 @@ and the Mac ZIP, and inside the app; the license texts are next to it.
   viewer shows a hint, and someone at the PC has to answer it.
 - **Administrator rights on Windows** at every manual start (see above); a standard
   account needs an administrator's password and gets no **Start with Windows**.
+- **Start with Windows has three limits.** The task exists once per PC and starts
+  QuadChroma only for the administrator account that switched it on last - another
+  administrator account sees it switched on too, and unticking it there removes it for
+  the first one. Updating the installed copy compares only file contents, not versions,
+  so starting an older \`quadchroma.exe\` replaces a newer installed copy. And the
+  unzipped folder is locked only while its files are being copied into Program Files;
+  a program running with normal rights could swap the exe or a DLL there before that.
+  Details in \`MANUAL.txt\`, "Windows: one app for both directions".
 EOF
 
 case "$win" in
