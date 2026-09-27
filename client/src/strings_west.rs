@@ -269,6 +269,9 @@ pub static FR: Lang = Lang {
         (TabComputers, "Ordinateurs"),
         (ComputersHint, "Cliquez sur un ordinateur pour y passer. Cette session se termine alors."),
         (AccessDeviceKeyChanged, "QuadChroma utilise désormais une seule clé par ordinateur dans les deux sens. Si {n} connaissait déjà cet ordinateur, l'accès est redemandé une fois."),
+        (ShareFailedKey, "Le partage n'a pas pu démarrer : host.key ou son dossier est inutilisable."),
+        (ShareFailedSwitch, "Le partage n'a pas pu démarrer : {s} est inutilisable. Désactivez puis réactivez le partage pour réessayer."),
+        (PreventSleepRefused, "Inactif : refusé par le système ({c})"),
     ],
 };
 
@@ -536,6 +539,9 @@ pub static ES: Lang = Lang {
         (TabComputers, "Ordenadores"),
         (ComputersHint, "Haz clic en un ordenador para cambiar a él. Esta sesión termina."),
         (AccessDeviceKeyChanged, "QuadChroma usa ahora una sola clave por ordenador en ambas direcciones. Si {n} ya conocía este ordenador, vuelve a pedir acceso una vez."),
+        (ShareFailedKey, "No se pudo iniciar el uso compartido: host.key o su carpeta no se pueden usar."),
+        (ShareFailedSwitch, "No se pudo iniciar el uso compartido: {s} no se puede usar. Desactívalo y vuelve a activarlo para reintentarlo."),
+        (PreventSleepRefused, "No activo: rechazado por el sistema ({c})"),
     ],
 };
 
@@ -803,6 +809,9 @@ pub static IT: Lang = Lang {
         (TabComputers, "Computer"),
         (ComputersHint, "Fai clic su un computer per passare a quello. Questa sessione termina."),
         (AccessDeviceKeyChanged, "QuadChroma ora usa una sola chiave per computer in entrambe le direzioni. Se {n} conosceva già questo computer, chiede di nuovo l'accesso una volta."),
+        (ShareFailedKey, "Impossibile avviare la condivisione: host.key o la sua cartella non sono utilizzabili."),
+        (ShareFailedSwitch, "Impossibile avviare la condivisione: {s} non è utilizzabile. Disattivala e riattivala per riprovare."),
+        (PreventSleepRefused, "Non attivo: rifiutato dal sistema ({c})"),
     ],
 };
 
@@ -1070,6 +1079,9 @@ pub static PT: Lang = Lang {
         (TabComputers, "Computadores"),
         (ComputersHint, "Clique num computador para mudar para ele. Esta sessão termina."),
         (AccessDeviceKeyChanged, "O QuadChroma usa agora uma única chave por computador nos dois sentidos. Se {n} já conhecia este computador, volta a pedir acesso uma vez."),
+        (ShareFailedKey, "Não foi possível iniciar a partilha: host.key ou a sua pasta não pode ser usado."),
+        (ShareFailedSwitch, "Não foi possível iniciar a partilha: {s} não pode ser usado. Desative e volte a ativar a partilha para tentar de novo."),
+        (PreventSleepRefused, "Inativo: recusado pelo sistema ({c})"),
     ],
 };
 
@@ -1337,5 +1349,8 @@ pub static NL: Lang = Lang {
         (TabComputers, "Computers"),
         (ComputersHint, "Klik op een computer om ernaar over te schakelen. Deze sessie eindigt dan."),
         (AccessDeviceKeyChanged, "QuadChroma gebruikt nu één sleutel per computer voor beide richtingen. Als {n} deze computer al kende, vraagt het nog één keer om toegang."),
+        (ShareFailedKey, "Delen kon niet starten: host.key of de map ervan is niet bruikbaar."),
+        (ShareFailedSwitch, "Delen kon niet starten: {s} is niet bruikbaar. Zet delen uit en weer aan om het opnieuw te proberen."),
+        (PreventSleepRefused, "Niet actief: geweigerd door het systeem ({c})"),
     ],
 };

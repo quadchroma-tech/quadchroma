@@ -267,6 +267,9 @@ pub static ET: Lang = Lang {
         (TabComputers, "Arvutid"),
         (ComputersHint, "Klõpsa arvutil, et sellele lülituda. See seanss lõpeb."),
         (AccessDeviceKeyChanged, "QuadChroma kasutab nüüd iga arvuti kohta mõlemas suunas ühte võtit. Kui {n} seda arvutit juba tundis, küsib see veel korra."),
+        (ShareFailedKey, "Jagamist ei õnnestunud käivitada: host.key või selle kausta ei saa kasutada."),
+        (ShareFailedSwitch, "Jagamist ei õnnestunud käivitada: {s} pole kasutatav. Uueks katseks lülita jagamine välja ja uuesti sisse."),
+        (PreventSleepRefused, "Pole aktiivne: süsteem keeldus ({c})"),
     ],
 };
 
@@ -534,6 +537,9 @@ pub static LV: Lang = Lang {
         (TabComputers, "Datori"),
         (ComputersHint, "Noklikšķiniet uz datora, lai pārslēgtos uz to. Šī sesija beigsies."),
         (AccessDeviceKeyChanged, "QuadChroma tagad izmanto vienu atslēgu katram datoram abos virzienos. Ja {n} jau pazina šo datoru, tas vaicās vēlreiz."),
+        (ShareFailedKey, "Koplietošanu neizdevās sākt: host.key vai tā mapi nevar izmantot."),
+        (ShareFailedSwitch, "Koplietošanu neizdevās sākt: {s} nav izmantojams. Lai mēģinātu vēlreiz, izslēdziet un atkal ieslēdziet koplietošanu."),
+        (PreventSleepRefused, "Nav aktīvs: sistēma atteica ({c})"),
     ],
 };
 
@@ -801,6 +807,9 @@ pub static LT: Lang = Lang {
         (TabComputers, "Kompiuteriai"),
         (ComputersHint, "Spustelėkite kompiuterį, kad persijungtumėte į jį. Šis seansas baigsis."),
         (AccessDeviceKeyChanged, "QuadChroma dabar naudoja vieną raktą kiekvienam kompiuteriui abiem kryptimis. Jei {n} jau pažinojo šį kompiuterį, jis paklaus dar kartą."),
+        (ShareFailedKey, "Nepavyko pradėti bendrinimo: host.key arba jo aplanko negalima naudoti."),
+        (ShareFailedSwitch, "Nepavyko pradėti bendrinimo: {s} negalima naudoti. Norėdami bandyti dar kartą, išjunkite ir vėl įjunkite bendrinimą."),
+        (PreventSleepRefused, "Neaktyvu: sistema atmetė ({c})"),
     ],
 };
 
@@ -1068,6 +1077,9 @@ pub static SL: Lang = Lang {
         (TabComputers, "Računalniki"),
         (ComputersHint, "Kliknite računalnik, da preklopite nanj. Ta seja se konča."),
         (AccessDeviceKeyChanged, "QuadChroma zdaj uporablja en ključ na računalnik za obe smeri. Če je {n} ta računalnik že poznal, bo vprašal še enkrat."),
+        (ShareFailedKey, "Deljenja ni bilo mogoče zagnati: host.key ali njegove mape ni mogoče uporabiti."),
+        (ShareFailedSwitch, "Deljenja ni bilo mogoče zagnati: {s} ni uporaben. Za nov poskus deljenje izklopite in znova vklopite."),
+        (PreventSleepRefused, "Ni dejavno: sistem je zavrnil ({c})"),
     ],
 };
 
@@ -1335,6 +1347,9 @@ pub static HR: Lang = Lang {
         (TabComputers, "Računala"),
         (ComputersHint, "Kliknite računalo da biste se prebacili na njega. Ova sesija tada završava."),
         (AccessDeviceKeyChanged, "QuadChroma sada koristi jedan ključ po računalu za oba smjera. Ako je {n} već poznavao ovo računalo, pitat će još jednom."),
+        (ShareFailedKey, "Dijeljenje se nije moglo pokrenuti: host.key ili njegova mapa ne mogu se koristiti."),
+        (ShareFailedSwitch, "Dijeljenje se nije moglo pokrenuti: {s} nije upotrebljiv. Za novi pokušaj isključite i ponovno uključite dijeljenje."),
+        (PreventSleepRefused, "Nije aktivno: sustav je odbio ({c})"),
     ],
 };
 
@@ -1602,5 +1617,8 @@ pub static UK: Lang = Lang {
         (TabComputers, "Комп'ютери"),
         (ComputersHint, "Клацніть комп'ютер, щоб перемкнутися на нього. Поточний сеанс завершиться."),
         (AccessDeviceKeyChanged, "QuadChroma тепер використовує один ключ на комп'ютер для обох напрямків. Якщо {n} уже знав цей комп'ютер, він запитає ще раз."),
+        (ShareFailedKey, "Не вдалося запустити спільний доступ: host.key або його папку не можна використати."),
+        (ShareFailedSwitch, "Не вдалося запустити спільний доступ: {s} не можна використати. Вимкніть і знову ввімкніть спільний доступ, щоб спробувати ще раз."),
+        (PreventSleepRefused, "Не активно: система відхилила ({c})"),
     ],
 };

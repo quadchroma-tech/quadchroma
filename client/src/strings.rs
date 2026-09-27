@@ -493,6 +493,18 @@ pub enum Key {
     /// Schluessel - die eine Identitaet je Rechner (host.key) ist fuer ihn
     /// neu; {n} Name des Hosts.
     AccessDeviceKeyChanged,
+    // Aufraeumen nach der einen App
+    /// Zustandszeile am Symbol (Windows): die Host-Rolle kam nicht in Gang,
+    /// weil host.key oder der Ablageordner nicht taugt.
+    ShareFailedKey,
+    /// Zustandszeile am Symbol (Windows): ein Schalter der Befehlszeile ({s},
+    /// etwa --konserve) taugt nicht; aus- und wieder einschalten versucht es
+    /// neu.
+    ShareFailedSwitch,
+    /// "Ruhezustand verhindern" ist gewuenscht, aber das System lehnt ab -
+    /// neben dem Kaestchen und unter dem Haken im Menue; {c} Fehlercode des
+    /// Systems.
+    PreventSleepRefused,
 }
 
 pub struct Lang {
@@ -783,6 +795,9 @@ pub static EN: Lang = Lang {
         (TabComputers, "Computers"),
         (ComputersHint, "Click a computer to switch to it. This session ends."),
         (AccessDeviceKeyChanged, "QuadChroma now uses one key per computer for both directions. If {n} knew this computer before, it asks once more."),
+        (ShareFailedKey, "Sharing could not start: host.key or its folder cannot be used."),
+        (ShareFailedSwitch, "Sharing could not start: {s} is not usable. Turn sharing off and on to retry."),
+        (PreventSleepRefused, "Not active: refused by the system ({c})"),
     ],
 };
 
@@ -1050,6 +1065,9 @@ pub static DE: Lang = Lang {
         (TabComputers, "Computer"),
         (ComputersHint, "Ein Klick auf einen Computer wechselt dorthin. Diese Sitzung endet dabei."),
         (AccessDeviceKeyChanged, "QuadChroma nutzt jetzt einen Schlüssel je Computer für beide Richtungen. Kannte {n} diesen Computer schon, ist der Zugang deshalb einmal neu nötig."),
+        (ShareFailedKey, "Die Freigabe konnte nicht starten: host.key oder sein Ordner ist nicht nutzbar."),
+        (ShareFailedSwitch, "Die Freigabe konnte nicht starten: {s} ist nicht nutzbar. Zum neuen Versuch aus- und wieder einschalten."),
+        (PreventSleepRefused, "Nicht aktiv: vom System abgelehnt ({c})"),
     ],
 };
 
@@ -1095,8 +1113,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > AccessDeviceKeyChanged as usize);
-        assert_eq!(n, AccessDeviceKeyChanged as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > PreventSleepRefused as usize);
+        assert_eq!(n, PreventSleepRefused as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1694,6 +1712,46 @@ mod tests {
         for k in [TabComputers, ComputersHint, AccessDeviceKeyChanged] {
             let t = DE.get(k);
             for w in ["Schluessel", "fuer", "noetig", "Geraet"] {
+                assert!(!t.contains(w), "{k:?}: {t}");
+            }
+        }
+    }
+
+    /// Warum die Freigabe nicht startet und warum "Ruhezustand verhindern"
+    /// nicht gilt: am Ende des Enums, in jeder Sprache, ausser im Englischen
+    /// nicht englisch; {s} genau einmal im Text zum Schalter, {c} genau
+    /// einmal im Grund zum Ruhezustand, sonst keine Platzhalter; der Text zu
+    /// host.key nennt die Datei; der Grund zum Ruhezustand ist kurz (er
+    /// steht neben dem Kaestchen) und kein Satz. DE ohne umschriebene
+    /// Umlaute.
+    #[test]
+    fn freigabe_und_ruhe_gruende() {
+        assert_eq!(ShareFailedKey as usize, AccessDeviceKeyChanged as usize + 1);
+        assert_eq!(ShareFailedSwitch as usize, ShareFailedKey as usize + 1);
+        assert_eq!(PreventSleepRefused as usize, ShareFailedSwitch as usize + 1);
+        for l in all() {
+            let schluessel = l.get(ShareFailedKey);
+            assert!(schluessel.contains("host.key") && !schluessel.contains('{'), "{}: {schluessel}", l.code);
+            let schalter = l.get(ShareFailedSwitch);
+            assert_eq!(schalter.matches("{s}").count(), 1, "{}: {schalter}", l.code);
+            assert_eq!(schalter.matches('{').count(), 1, "{}: {schalter}", l.code);
+            let ruhe = l.get(PreventSleepRefused);
+            assert_eq!(ruhe.matches("{c}").count(), 1, "{}: {ruhe}", l.code);
+            assert_eq!(ruhe.matches('{').count(), 1, "{}: {ruhe}", l.code);
+            assert!(ruhe.chars().count() <= 48 && !ruhe.ends_with('.'), "{}: {ruhe}", l.code);
+            for t in [schluessel, schalter] {
+                assert!(t.ends_with('.') || t.ends_with('。'), "{}: {t}", l.code);
+            }
+            if l.code != "en" {
+                for k in [ShareFailedKey, ShareFailedSwitch, PreventSleepRefused] {
+                    assert_ne!(l.get(k), EN.get(k), "{}: {k:?} noch englisch", l.code);
+                }
+            }
+        }
+        assert_eq!(EN.get(PreventSleepRefused).replace("{c}", "0xe00002c2"), "Not active: refused by the system (0xe00002c2)");
+        for k in [ShareFailedKey, ShareFailedSwitch, PreventSleepRefused] {
+            let t = DE.get(k);
+            for w in ["Schluessel", "fuer", "moeglich", "abgelehnt."] {
                 assert!(!t.contains(w), "{k:?}: {t}");
             }
         }

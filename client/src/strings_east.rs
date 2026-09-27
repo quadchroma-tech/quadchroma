@@ -267,6 +267,9 @@ pub static PL: Lang = Lang {
         (TabComputers, "Komputery"),
         (ComputersHint, "Kliknij komputer, aby się na niego przełączyć. Ta sesja się zakończy."),
         (AccessDeviceKeyChanged, "QuadChroma używa teraz jednego klucza na komputer w obu kierunkach. Jeśli {n} znał już ten komputer, zapyta jeszcze raz."),
+        (ShareFailedKey, "Nie udało się uruchomić udostępniania: nie można użyć pliku host.key lub jego folderu."),
+        (ShareFailedSwitch, "Nie udało się uruchomić udostępniania: nie można użyć {s}. Wyłącz i ponownie włącz udostępnianie, aby spróbować jeszcze raz."),
+        (PreventSleepRefused, "Nieaktywne: odrzucone przez system ({c})"),
     ],
 };
 
@@ -534,6 +537,9 @@ pub static CS: Lang = Lang {
         (TabComputers, "Počítače"),
         (ComputersHint, "Kliknutím na počítač se na něj přepnete. Tato relace skončí."),
         (AccessDeviceKeyChanged, "QuadChroma nyní používá jeden klíč na počítač pro oba směry. Pokud {n} tento počítač už znal, zeptá se ještě jednou."),
+        (ShareFailedKey, "Sdílení se nepodařilo spustit: soubor host.key nebo jeho složku nelze použít."),
+        (ShareFailedSwitch, "Sdílení se nepodařilo spustit: {s} nelze použít. Pro nový pokus sdílení vypněte a znovu zapněte."),
+        (PreventSleepRefused, "Neaktivní: systém odmítl ({c})"),
     ],
 };
 
@@ -801,6 +807,9 @@ pub static SK: Lang = Lang {
         (TabComputers, "Počítače"),
         (ComputersHint, "Kliknutím na počítač sa naň prepnete. Táto relácia sa skončí."),
         (AccessDeviceKeyChanged, "QuadChroma teraz používa jeden kľúč na počítač pre oba smery. Ak {n} tento počítač už poznal, opýta sa ešte raz."),
+        (ShareFailedKey, "Zdieľanie sa nepodarilo spustiť: súbor host.key alebo jeho priečinok nemožno použiť."),
+        (ShareFailedSwitch, "Zdieľanie sa nepodarilo spustiť: {s} nemožno použiť. Pre nový pokus zdieľanie vypnite a znova zapnite."),
+        (PreventSleepRefused, "Neaktívne: systém odmietol ({c})"),
     ],
 };
 
@@ -1068,6 +1077,9 @@ pub static HU: Lang = Lang {
         (TabComputers, "Számítógépek"),
         (ComputersHint, "Kattintson egy számítógépre az átváltáshoz. Ez a munkamenet véget ér."),
         (AccessDeviceKeyChanged, "A QuadChroma mostantól számítógépenként egyetlen kulcsot használ mindkét irányban. Ha {n} már ismerte ezt a számítógépet, még egyszer rákérdez."),
+        (ShareFailedKey, "A megosztás nem indult el: a host.key vagy a mappája nem használható."),
+        (ShareFailedSwitch, "A megosztás nem indult el: a(z) {s} nem használható. Az újrapróbáláshoz kapcsolja ki, majd be a megosztást."),
+        (PreventSleepRefused, "Nem aktív: a rendszer elutasította ({c})"),
     ],
 };
 
@@ -1335,6 +1347,9 @@ pub static RO: Lang = Lang {
         (TabComputers, "Computere"),
         (ComputersHint, "Faceți clic pe un computer pentru a trece la el. Această sesiune se încheie."),
         (AccessDeviceKeyChanged, "QuadChroma folosește acum o singură cheie per computer, în ambele direcții. Dacă {n} cunoștea deja acest computer, va întreba încă o dată."),
+        (ShareFailedKey, "Partajarea nu a putut porni: host.key sau dosarul său nu poate fi folosit."),
+        (ShareFailedSwitch, "Partajarea nu a putut porni: {s} nu poate fi folosit. Dezactivați și reactivați partajarea pentru a reîncerca."),
+        (PreventSleepRefused, "Inactiv: refuzat de sistem ({c})"),
     ],
 };
 
@@ -1602,6 +1617,9 @@ pub static BG: Lang = Lang {
         (TabComputers, "Компютри"),
         (ComputersHint, "Щракнете върху компютър, за да превключите към него. Тази сесия ще приключи."),
         (AccessDeviceKeyChanged, "QuadChroma вече използва един ключ за компютър и в двете посоки. Ако {n} вече е познавал този компютър, ще попита още веднъж."),
+        (ShareFailedKey, "Споделянето не можа да стартира: host.key или папката му не може да се използва."),
+        (ShareFailedSwitch, "Споделянето не можа да стартира: {s} не може да се използва. Изключете и включете отново споделянето, за да опитате пак."),
+        (PreventSleepRefused, "Неактивно: отказано от системата ({c})"),
     ],
 };
 
@@ -1869,5 +1887,8 @@ pub static EL: Lang = Lang {
         (TabComputers, "Υπολογιστές"),
         (ComputersHint, "Κάντε κλικ σε έναν υπολογιστή για να μεταβείτε σε αυτόν. Αυτή η συνεδρία τερματίζεται."),
         (AccessDeviceKeyChanged, "Το QuadChroma χρησιμοποιεί πλέον ένα κλειδί ανά υπολογιστή και για τις δύο κατευθύνσεις. Αν ο υπολογιστής {n} γνώριζε ήδη αυτόν τον υπολογιστή, θα ρωτήσει ξανά μία φορά."),
+        (ShareFailedKey, "Η κοινή χρήση δεν ξεκίνησε: το host.key ή ο φάκελός του δεν μπορεί να χρησιμοποιηθεί."),
+        (ShareFailedSwitch, "Η κοινή χρήση δεν ξεκίνησε: το {s} δεν μπορεί να χρησιμοποιηθεί. Απενεργοποιήστε και ενεργοποιήστε ξανά την κοινή χρήση για νέα προσπάθεια."),
+        (PreventSleepRefused, "Ανενεργό: απορρίφθηκε από το σύστημα ({c})"),
     ],
 };

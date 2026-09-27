@@ -267,6 +267,9 @@ pub static SV: Lang = Lang {
         (TabComputers, "Datorer"),
         (ComputersHint, "Klicka på en dator för att byta till den. Den här sessionen avslutas."),
         (AccessDeviceKeyChanged, "QuadChroma använder nu en nyckel per dator åt båda hållen. Om {n} redan kände till den här datorn frågar den en gång till."),
+        (ShareFailedKey, "Delningen kunde inte starta: host.key eller dess mapp går inte att använda."),
+        (ShareFailedSwitch, "Delningen kunde inte starta: {s} går inte att använda. Stäng av och slå på delningen för att försöka igen."),
+        (PreventSleepRefused, "Inte aktiv: nekad av systemet ({c})"),
     ],
 };
 
@@ -534,6 +537,9 @@ pub static DA: Lang = Lang {
         (TabComputers, "Computere"),
         (ComputersHint, "Klik på en computer for at skifte til den. Denne session afsluttes."),
         (AccessDeviceKeyChanged, "QuadChroma bruger nu én nøgle pr. computer i begge retninger. Hvis {n} allerede kendte denne computer, spørger den én gang til."),
+        (ShareFailedKey, "Delingen kunne ikke starte: host.key eller dens mappe kan ikke bruges."),
+        (ShareFailedSwitch, "Delingen kunne ikke starte: {s} kan ikke bruges. Slå deling fra og til igen for at prøve igen."),
+        (PreventSleepRefused, "Ikke aktiv: afvist af systemet ({c})"),
     ],
 };
 
@@ -801,6 +807,9 @@ pub static NB: Lang = Lang {
         (TabComputers, "Datamaskiner"),
         (ComputersHint, "Klikk på en datamaskin for å bytte til den. Denne økten avsluttes."),
         (AccessDeviceKeyChanged, "QuadChroma bruker nå én nøkkel per datamaskin i begge retninger. Hvis {n} allerede kjente denne datamaskinen, spør den én gang til."),
+        (ShareFailedKey, "Delingen kunne ikke starte: host.key eller mappen kan ikke brukes."),
+        (ShareFailedSwitch, "Delingen kunne ikke starte: {s} kan ikke brukes. Slå delingen av og på igjen for å prøve på nytt."),
+        (PreventSleepRefused, "Ikke aktiv: avvist av systemet ({c})"),
     ],
 };
 
@@ -1068,6 +1077,9 @@ pub static FI: Lang = Lang {
         (TabComputers, "Tietokoneet"),
         (ComputersHint, "Vaihda tietokoneeseen napsauttamalla sitä. Tämä istunto päättyy."),
         (AccessDeviceKeyChanged, "QuadChroma käyttää nyt yhtä avainta tietokonetta kohden molempiin suuntiin. Jos {n} tunsi tämän tietokoneen jo ennestään, se kysyy vielä kerran."),
+        (ShareFailedKey, "Jakamista ei voitu käynnistää: host.key tai sen kansio ei ole käytettävissä."),
+        (ShareFailedSwitch, "Jakamista ei voitu käynnistää: {s} ei ole käytettävissä. Yritä uudelleen kytkemällä jakaminen pois ja takaisin päälle."),
+        (PreventSleepRefused, "Ei käytössä: järjestelmä kieltäytyi ({c})"),
     ],
 };
 
@@ -1335,5 +1347,8 @@ pub static IS: Lang = Lang {
         (TabComputers, "Tölvur"),
         (ComputersHint, "Smelltu á tölvu til að skipta yfir á hana. Þessari lotu lýkur þá."),
         (AccessDeviceKeyChanged, "QuadChroma notar nú einn lykil á hverja tölvu í báðar áttir. Ef {n} þekkti þessa tölvu áður spyr það einu sinni enn."),
+        (ShareFailedKey, "Ekki tókst að hefja deilingu: ekki er hægt að nota host.key eða möppu hennar."),
+        (ShareFailedSwitch, "Ekki tókst að hefja deilingu: ekki er hægt að nota {s}. Slökktu á deilingu og kveiktu aftur til að reyna aftur."),
+        (PreventSleepRefused, "Ekki virkt: kerfið hafnaði ({c})"),
     ],
 };

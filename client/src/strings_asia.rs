@@ -270,6 +270,9 @@ pub static RU: Lang = Lang {
         (TabComputers, "Компьютеры"),
         (ComputersHint, "Щёлкните по компьютеру, чтобы переключиться на него. Текущий сеанс завершится."),
         (AccessDeviceKeyChanged, "QuadChroma теперь использует один ключ на компьютер для обоих направлений. Если {n} уже знал этот компьютер, он спросит ещё раз."),
+        (ShareFailedKey, "Не удалось запустить общий доступ: host.key или его папку нельзя использовать."),
+        (ShareFailedSwitch, "Не удалось запустить общий доступ: {s} нельзя использовать. Выключите и снова включите общий доступ, чтобы повторить попытку."),
+        (PreventSleepRefused, "Не активно: система отклонила ({c})"),
     ],
 };
 
@@ -539,6 +542,9 @@ pub static ZH: Lang = Lang {
         (TabComputers, "电脑"),
         (ComputersHint, "点击一台电脑即可切换到它。 当前会话随之结束。"),
         (AccessDeviceKeyChanged, "QuadChroma 现在每台电脑只用一个密钥，双向通用。 如果 {n} 以前已知道这台电脑，它会再询问一次。"),
+        (ShareFailedKey, "无法开始共享：host.key 或其文件夹无法使用。"),
+        (ShareFailedSwitch, "无法开始共享：{s} 无法使用。关闭后重新打开共享即可重试。"),
+        (PreventSleepRefused, "未生效：被系统拒绝（{c}）"),
     ],
 };
 
@@ -808,6 +814,9 @@ pub static JA: Lang = Lang {
         (TabComputers, "コンピューター"),
         (ComputersHint, "コンピューターをクリックすると切り替わります。 現在のセッションは終了します。"),
         (AccessDeviceKeyChanged, "QuadChroma は現在、コンピューターごとに双方向で 1 つの鍵を使います。 {n} がこのコンピューターを以前から知っていた場合も、もう一度確認されます。"),
+        (ShareFailedKey, "共有を開始できませんでした：host.key またはそのフォルダーを使用できません。"),
+        (ShareFailedSwitch, "共有を開始できませんでした：{s} を使用できません。共有をオフにしてからオンにすると再試行します。"),
+        (PreventSleepRefused, "無効：システムに拒否されました（{c}）"),
     ],
 };
 
@@ -1075,5 +1084,8 @@ pub static TR: Lang = Lang {
         (TabComputers, "Bilgisayarlar"),
         (ComputersHint, "Geçmek için bir bilgisayara tıklayın. Bu oturum sona erer."),
         (AccessDeviceKeyChanged, "QuadChroma artık her bilgisayar için iki yönde de tek bir anahtar kullanıyor. {n} bu bilgisayarı daha önce tanıyorsa bir kez daha sorar."),
+        (ShareFailedKey, "Paylaşım başlatılamadı: host.key veya klasörü kullanılamıyor."),
+        (ShareFailedSwitch, "Paylaşım başlatılamadı: {s} kullanılamıyor. Yeniden denemek için paylaşımı kapatıp açın."),
+        (PreventSleepRefused, "Etkin değil: sistem reddetti ({c})"),
     ],
 };
