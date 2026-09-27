@@ -3,8 +3,10 @@
 //   quadchroma <host>[:port]
 //
 // Das Bild kommt als HEVC 4:4:4 (8 oder 10 Bit, voller Wertebereich) an. Die
-// Umwandlung nach RGB laeuft vorerst auf der CPU und ueber mehrere Kerne; das
-// reicht fuer 1080p und laeuft auch auf Maschinen ohne brauchbare Grafik.
+// Umwandlung nach RGB und das Einpassen ins Fenster laufen auf der Karte -
+// Direct3D 11 unter Windows (anzeige.rs), Metal auf dem Mac (anzeige_mac.rs) -
+// oder ohne sie auf der CPU ueber mehrere Kerne (softbuffer); die Umrechnung
+// ist auf beiden Wegen bitgleich.
 
 // Kein Konsolenfenster beim Doppelklick. Wird das Programm aus einer
 // Eingabeaufforderung gestartet, haengen wir uns unten an deren Konsole -
@@ -98,8 +100,15 @@ mod clipboard_mac;
 use audio_mac as audio;
 #[cfg(target_os = "macos")]
 use clipboard_mac as clipboard;
+/// Anzeige ueber die Grafikkarte: Direct3D 11 unter Windows (anzeige.rs),
+/// Metal auf dem Mac (anzeige_mac.rs) - dieselbe Schnittstelle unter
+/// demselben Namen, wie bei Ton und Zwischenablage.
 #[cfg(windows)]
 mod anzeige;
+#[cfg(target_os = "macos")]
+mod anzeige_mac;
+#[cfg(target_os = "macos")]
+use anzeige_mac as anzeige;
 /// Gemeinsame Teile der Goldbildtests beider Anzeigen (--anzeigetest).
 #[cfg(any(windows, target_os = "macos"))]
 mod anzeigeprobe;
@@ -898,8 +907,9 @@ type Dekoderbild = vt_decoder::Bild;
 /// Was der Empfangsfaden ablegt: fertig gerechnetes RGB, oder - sobald die
 /// Karte die Umrechnung uebernimmt - das rohe Decoderbild mit seinen Ebenen.
 /// Ein rohes Bild kostet im Empfangsfaden keine Kopie: FFmpegs Frame wie der
-/// CVPixelBuffer lassen sich zwischen Faeden verschieben. Auf dem Mac zeichnet
-/// noch die CPU (softbuffer), also kommt dort nur RGB an.
+/// CVPixelBuffer lassen sich zwischen Faeden verschieben. Unter Windows
+/// zeichnet dann Direct3D 11, auf dem Mac Metal (der CVPixelBuffer geht als
+/// IOSurface ohne Kopie auf die Karte); zeichnet softbuffer, kommt nur RGB an.
 enum Bild {
     Rgb(Frame),
     Roh { bild: Dekoderbild, bereit_us: u64 },
@@ -6027,12 +6037,13 @@ const VERBORGEN_TAKT: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const VOLLBILD_VERLASSEN: Duration = Duration::from_millis(1200);
 
-/// Wer ins Fenster zeichnet: die Karte ueber eine Flip-Swapchain, oder
-/// softbuffer (GDI) - nie beides am selben Fenster, das ist von DXGI nicht
-/// gedeckt. Entschieden wird beim Start; `Keine` bleibt nach einem
+/// Wer ins Fenster zeichnet: die Karte - unter Windows ueber eine
+/// Flip-Swapchain, auf dem Mac ueber einen CAMetalLayer - oder softbuffer
+/// (GDI bzw. CoreGraphics) - nie beides am selben Fenster, das ist von DXGI
+/// nicht gedeckt. Entschieden wird beim Start; `Keine` bleibt nach einem
 /// Geraeteverlust, den der Neubau nicht heilen konnte.
 enum Anzeige {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     Gpu(anzeige::Gpu),
     Cpu {
         /// Wird nach dem Anlegen der Flaeche nicht mehr angefasst, muss
@@ -6046,7 +6057,7 @@ enum Anzeige {
 
 /// Was auf dem Weg ueber die Karte schiefgehen kann: ein Aufruf (die Karte
 /// lebt, der Fehler steht im Protokoll) oder das Geraet selbst.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 enum Ausfall {
     Fehler(String),
     GeraetWeg(String),
@@ -6062,10 +6073,41 @@ fn fenster_hwnd(window: &Window) -> Option<isize> {
     }
 }
 
+/// Die NSView des Fensters, an die Metal seine Schicht haengt.
+#[cfg(target_os = "macos")]
+fn fenster_ansicht(window: &Window) -> Option<*mut std::ffi::c_void> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
+        _ => None,
+    }
+}
+
+/// Die Karte am Fenster anlegen: unter Windows Direct3D 11 am HWND (`warp`:
+/// Software-Rasterizer, `adapter`: --adapter bzw. die Karte der Rolle), auf
+/// dem Mac Metal an der NSView.
+#[cfg(any(windows, target_os = "macos"))]
+fn gpu_am_fenster(window: &Window, warp: bool, adapter: Option<u32>) -> Result<anzeige::Gpu, String> {
+    let s = window.inner_size();
+    #[cfg(windows)]
+    {
+        fenster_hwnd(window)
+            .ok_or_else(|| "kein Win32-Fenster".to_string())
+            .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, warp, adapter))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (warp, adapter);
+        fenster_ansicht(window)
+            .ok_or_else(|| "keine AppKit-Ansicht".to_string())
+            .and_then(|v| anzeige::Gpu::neu(v, s.width, s.height))
+    }
+}
+
 /// Zwei Kaesten zu einem: der Ausschnitt der Oberflaeche, der in die Textur
 /// muss - was beim letzten Mal dort stand (zu loeschen) und was jetzt neu
 /// gezeichnet ist.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn kasten_vereinigen(a: Option<ui::Rect>, b: Option<ui::Rect>) -> Option<ui::Rect> {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -6420,6 +6462,36 @@ impl App {
                 }
             }
         }
+        // Mac: Metal, ausser der Prozessor ist ausdruecklich gewuenscht. Eine
+        // Wahl zwischen Karten gibt es dort nicht (ein Geraet); jeder andere
+        // Wunsch heisst Metal, und der Knopf Automatik gilt.
+        #[cfg(target_os = "macos")]
+        {
+            use einstellungen::AnzeigeWunsch as W;
+            if self.anzeige_wunsch != W::Cpu {
+                match gpu_am_fenster(&window, false, None) {
+                    Ok(g) => {
+                        self.anzeige_name = format!("Metal · {}", g.adapter.name);
+                        self.sofort = g.tearing;
+                        self.anzeige_aktiv = W::Automatik;
+                        // Ab jetzt legt der Empfangsfaden rohe Bilder ab; die
+                        // Umrechnung nach RGB macht Stufe 1 auf der Karte.
+                        self.shared.lock().unwrap().gpu_pfad = true;
+                        self.anzeige = Anzeige::Gpu(g);
+                    }
+                    Err(e) => {
+                        protokoll::zeile(format!("Anzeige: Rueckfall auf Software: {e}"));
+                        if !matches!(self.anzeige_wunsch, W::Automatik | W::Warp) {
+                            let m = Meldung::neu(
+                                strings::Key::ErrorGpuDisplay,
+                                format!("Metal nicht nutzbar, Anzeige ueber Software: {e}"),
+                            );
+                            self.shared.lock().unwrap().error = Some(m);
+                        }
+                    }
+                }
+            }
+        }
         if matches!(self.anzeige, Anzeige::Keine) {
             let context = softbuffer::Context::new(window.clone()).expect("Kontext");
             let surface = softbuffer::Surface::new(&context, window.clone()).expect("Flaeche");
@@ -6446,6 +6518,14 @@ impl App {
             WindowEvent::RedrawRequested => {
                 if !self.verborgen {
                     self.draw();
+                }
+            }
+            // Verdeckt praesentiert Metal nicht: CoreAnimation zeigt dort
+            // nichts, und nextDrawable koennte warten (anzeige_mac.rs).
+            #[cfg(target_os = "macos")]
+            WindowEvent::Occluded(verdeckt) => {
+                if let Anzeige::Gpu(g) = &mut self.anzeige {
+                    g.verdeckt(verdeckt);
                 }
             }
 
@@ -7955,7 +8035,7 @@ impl App {
     fn draw(&mut self) {
         match self.anzeige {
             Anzeige::Cpu { .. } => self.draw_cpu(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Anzeige::Gpu(_) => self.draw_gpu(),
             Anzeige::Keine => {}
         }
@@ -7980,7 +8060,7 @@ impl App {
     /// aus dem Zustand genommen (wie die Flaeche beim CPU-Weg); geht dabei
     /// das Geraet verloren, kommt sie nicht zurueck, sondern wird neu gebaut
     /// oder aufgegeben.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn draw_gpu(&mut self) {
         let Some(window) = self.window.clone() else { return };
         let Anzeige::Gpu(mut g) = std::mem::replace(&mut self.anzeige, Anzeige::Keine) else { return };
@@ -7996,7 +8076,7 @@ impl App {
 
     /// Einen Fehler der Karte ins Protokoll - denselben nur einmal, nicht
     /// je Bild.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn gpu_fehler_melden(&mut self, e: String) {
         if self.letzter_gpu_fehler.as_deref() != Some(e.as_str()) {
             protokoll::zeile(format!("Anzeige: {e}"));
@@ -8006,7 +8086,7 @@ impl App {
 
     /// Ein Fehler eines Aufrufs: war es das Geraet? Dann ist Schluss mit
     /// dieser Karte; sonst nur eine Protokollzeile, und es geht weiter.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn gpu_fehler(&mut self, g: &anzeige::Gpu, e: String) -> Result<(), Ausfall> {
         match g.geraet_weg() {
             Some(grund) => Err(Ausfall::GeraetWeg(grund)),
@@ -8024,7 +8104,7 @@ impl App {
     /// `ui.click` faellt nur, wenn die Oberflaeche in diesem Durchlauf
     /// gezeichnet wurde - sonst gingen Klicks zwischen zwei Zeichnungen
     /// verloren.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn draw_gpu_auf(&mut self, window: &Window, g: &mut anzeige::Gpu) -> Result<(), Ausfall> {
         let size = window.inner_size();
         let (ww, wh) = (size.width, size.height);
@@ -8036,7 +8116,10 @@ impl App {
             self.sekundentakt(window);
             return Ok(());
         }
-        if (ww, wh) != (g.breite, g.hoehe) {
+        // Unter Windows nur bei neuer Groesse; auf dem Mac jedes Mal, denn
+        // dort zaehlt auch der Massstab des Bildschirms (billig, wenn sich
+        // nichts geaendert hat).
+        if cfg!(target_os = "macos") || (ww, wh) != (g.breite, g.hoehe) {
             if let Err(e) = g.groesse(ww, wh) {
                 return Err(match g.geraet_weg() {
                     Some(grund) => Ausfall::GeraetWeg(grund),
@@ -8070,7 +8153,7 @@ impl App {
             let bereit_us = b.bereit_us();
             let r = match b {
                 Bild::Rgb(f) => g.bild_rgb(&f).map(|_| (f.width, f.height)),
-                Bild::Roh { bild, .. } => g.bild_roh(&bild).map(|_| (bild.width(), bild.height())),
+                Bild::Roh { bild, .. } => g.bild_roh(&bild).map(|_| (Ebenenbild::breite(&bild), Ebenenbild::hoehe(&bild))),
             };
             match r {
                 Ok(groesse) => {
@@ -8186,7 +8269,7 @@ impl App {
     /// Sekunden wieder oder scheitert der Neubau, bleibt das Fenster stehen
     /// und der Nutzer bekommt gesagt, wie es weitergeht. Auf softbuffer am
     /// selben Fenster wird nicht gewechselt: das ist von DXGI nicht gedeckt.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn geraet_verloren_behandeln(&mut self, alt: anzeige::Gpu, grund: String) {
         protokoll::zeile(format!("Anzeige: Grafikkarte verloren: {grund}"));
         drop(alt);
@@ -8200,11 +8283,11 @@ impl App {
         if !schon {
             if let Some(w) = self.window.clone() {
                 use einstellungen::AnzeigeWunsch as W;
-                let s = w.inner_size();
+                #[cfg(windows)]
                 let adapter = self.adapter_index();
-                let bau = fenster_hwnd(&w)
-                    .ok_or_else(|| "kein Win32-Fenster".to_string())
-                    .and_then(|h| anzeige::Gpu::neu(h, s.width, s.height, self.anzeige_wunsch == W::Warp, adapter));
+                #[cfg(not(windows))]
+                let adapter = None;
+                let bau = gpu_am_fenster(&w, self.anzeige_wunsch == W::Warp, adapter);
                 match bau {
                     Ok(g) => {
                         protokoll::zeile("Anzeige: Karte neu aufgebaut".into());
@@ -10802,6 +10885,21 @@ fn main() {
                 println!("FFmpeg-Start fehlgeschlagen: {e}");
                 std::process::exit(2);
             }
+            protokoll::einschalten(false);
+            let bestanden = anzeige::anzeigetest(&verzeichnis);
+            std::io::stdout().flush().ok();
+            std::process::exit(if bestanden { 0 } else { 1 });
+        }
+    }
+    // Auf dem Mac dasselbe ueber Metal: jedes Format von VideoToolbox gegen
+    // den CPU-Weg, dann die Bildzeit bei 1440p und 120 Hz. Ohne Fenster,
+    // ohne Host und ohne Aufnahme.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(i) = std::env::args().position(|a| a == "--anzeigetest") {
+            use std::io::Write;
+            let args: Vec<String> = std::env::args().collect();
+            let verzeichnis = args.get(i + 1).cloned().unwrap_or_else(|| ".".into());
             protokoll::einschalten(false);
             let bestanden = anzeige::anzeigetest(&verzeichnis);
             std::io::stdout().flush().ok();

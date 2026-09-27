@@ -24,14 +24,15 @@
 // Hardware. Gemessen auf dem M1 (macOS 27): HEVC Main 4:4:4 10 in Hardware,
 // 1080p 3,8 ms je Bild, 1440p 6,2 ms.
 //
-// Heraus kommen CVPixelBuffer mit IOSurface (fuer eine spaetere Anzeige ueber
-// Metal ohne Kopie) im Format, das zum Strom passt: xf44 fuer 4:4:4 10 Bit,
+// Heraus kommen CVPixelBuffer mit IOSurface (die Metal-Anzeige nimmt sie ohne
+// Kopie, anzeige_mac.rs) im Format, das zum Strom passt: xf44 fuer 4:4:4 10 Bit,
 // 444f fuer 4:4:4 8 Bit, xf20 (wie P010) und 420f (NV12) fuer 4:2:0 - alle
 // zweiebenig mit U/V als Paaren, 10 Bit oben buendig in 16. Das liest
 // `zeile_rgb` in main.rs ohne eigenen Pfad (xf44: sub=false, 16, paar=true).
 // Der Wertebereich der Ausgabe folgt dem, was die Formatbeschreibung sagt:
 // so rechnet VideoToolbox nichts um, und die Werte kommen roh an wie aus
-// FFmpeg unter Windows.
+// FFmpeg unter Windows. Den begrenzten Bereich (x444, 444v, x420, 420v)
+// dehnen `zeile_rgb` und die Metal-Anzeige selbst.
 
 // Unter Windows laufen nur die Tests des reinen Teils.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -341,10 +342,11 @@ pub struct Paket<'a> {
 pub use mac::{Bild, Decoder};
 
 /// Die Schnittstellen von CoreFoundation, CoreMedia, CoreVideo und
-/// VideoToolbox, soweit Decoder und Probe sie brauchen.
+/// VideoToolbox, soweit Decoder und Probe sie brauchen - und die Metal-
+/// Anzeige (anzeige_mac.rs), die die CVPixelBuffer uebernimmt.
 #[cfg(target_os = "macos")]
 #[allow(non_upper_case_globals, non_snake_case)]
-mod ffi {
+pub(crate) mod ffi {
     use std::ffi::{c_char, c_void};
 
     pub type OSStatus = i32;
@@ -488,6 +490,7 @@ mod ffi {
     extern "C" {
         pub static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
         pub static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
+        pub static kCVPixelBufferMetalCompatibilityKey: CFStringRef;
         pub fn CVPixelBufferGetPixelFormatType(pb: CVPixelBufferRef) -> u32;
         pub fn CVPixelBufferGetWidth(pb: CVPixelBufferRef) -> usize;
         pub fn CVPixelBufferGetHeight(pb: CVPixelBufferRef) -> usize;
@@ -495,7 +498,6 @@ mod ffi {
         pub fn CVPixelBufferGetBaseAddressOfPlane(pb: CVPixelBufferRef, ebene: usize) -> *mut c_void;
         pub fn CVPixelBufferGetBytesPerRowOfPlane(pb: CVPixelBufferRef, ebene: usize) -> usize;
         pub fn CVPixelBufferGetHeightOfPlane(pb: CVPixelBufferRef, ebene: usize) -> usize;
-        #[cfg(test)]
         pub fn CVPixelBufferGetWidthOfPlane(pb: CVPixelBufferRef, ebene: usize) -> usize;
         pub fn CVPixelBufferLockBaseAddress(pb: CVPixelBufferRef, flags: u64) -> i32;
         pub fn CVPixelBufferUnlockBaseAddress(pb: CVPixelBufferRef, flags: u64) -> i32;
@@ -764,6 +766,10 @@ mod mac {
                 let bildpuffer = woerterbuch();
                 setzen_und_freigeben(bildpuffer, kCVPixelBufferPixelFormatTypeKey, zahl(format as i32));
                 setzen_und_freigeben(bildpuffer, kCVPixelBufferIOSurfacePropertiesKey, woerterbuch() as CFTypeRef);
+                // Die Metal-Anzeige nimmt die Ebenen ueber CVMetalTextureCache
+                // ohne Kopie; dafuer muessen sie so ausgerichtet sein, wie
+                // Metal es verlangt.
+                CFDictionarySetValue(bildpuffer, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
                 let rueckruf = VTDecompressionOutputCallbackRecord {
                     callback: ausgabe,
                     refcon: &*self.ablage as *const Ablage as *mut c_void,
@@ -887,8 +893,9 @@ mod mac {
     }
 
     /// Ein decodiertes Bild: ein CVPixelBuffer, zum Lesen gesperrt, solange
-    /// es lebt. Laesst sich zwischen Faeden reichen (der Fensterfaden gibt
-    /// es frei, wenn die Anzeige einmal roh zeichnet).
+    /// es lebt. Laesst sich zwischen Faeden reichen: zeichnet Metal, gibt der
+    /// Fensterfaden es frei, nachdem die Anzeige einen eigenen Griff auf den
+    /// Puffer genommen hat (anzeige_mac.rs).
     pub struct Bild {
         puffer: CVPixelBufferRef,
         pts: i64,
@@ -907,6 +914,18 @@ mod mac {
                 return Err(Fehler { was: "CVPixelBufferLockBaseAddress", status: st });
             }
             Ok(Bild { puffer, pts, format: CVPixelBufferGetPixelFormatType(puffer) })
+        }
+
+        /// Wie `neu`, fuer Puffer, die nicht aus dem Decoder kommen (die
+        /// Probebilder des Anzeigetests). Uebernimmt den Griff `puffer`.
+        pub unsafe fn aus_puffer(puffer: CVPixelBufferRef, pts: i64) -> Result<Bild, Fehler> {
+            Bild::neu(puffer, pts)
+        }
+
+        /// Der CVPixelBuffer selbst (ohne eigenen Griff) - fuer die
+        /// Metal-Anzeige, die ihn mit CFRetain haelt, solange die Karte liest.
+        pub fn puffer(&self) -> CVPixelBufferRef {
+            self.puffer
         }
 
         pub fn breite(&self) -> u32 {
