@@ -511,6 +511,12 @@ pub enum Key {
     /// zu wie mit dem X bzw. dem roten Knoepfchen, QuadChroma laeuft beim
     /// Symbol weiter - beendet wird nur im Menue des Symbols.
     CloseWindow,
+    /// Hinweis ueber dem stehenden Bild, wenn der Windows-Host gerade keine
+    /// Eingaben durchbringt: ein Fenster mit hoeheren Rechten (die echte
+    /// UAC-Bestaetigung auf dem sicheren Desktop) liegt vorn, und Windows
+    /// nimmt dort auch von der erhoehten App keine Eingaben an (MSG_HOSTSTATUS
+    /// mit 2, zurueckgenommen mit 3). Nur Windows-Host.
+    InputBlocked,
 }
 
 pub struct Lang {
@@ -805,6 +811,7 @@ pub static EN: Lang = Lang {
         (ShareFailedSwitch, "Sharing could not start: {s} is not usable. Turn sharing off and on to retry."),
         (PreventSleepRefused, "Not active: refused by the system ({c})"),
         (CloseWindow, "Close window"),
+        (InputBlocked, "A window on the Windows PC needs Windows' own confirmation - control is not possible there for a moment."),
     ],
 };
 
@@ -1076,6 +1083,7 @@ pub static DE: Lang = Lang {
         (ShareFailedSwitch, "Die Freigabe konnte nicht starten: {s} ist nicht nutzbar. Zum neuen Versuch aus- und wieder einschalten."),
         (PreventSleepRefused, "Nicht aktiv: vom System abgelehnt ({c})"),
         (CloseWindow, "Fenster schließen"),
+        (InputBlocked, "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung - dort ist die Steuerung kurz nicht möglich."),
     ],
 };
 
@@ -1121,8 +1129,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > CloseWindow as usize);
-        assert_eq!(n, CloseWindow as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > InputBlocked as usize);
+        assert_eq!(n, InputBlocked as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1785,6 +1793,30 @@ mod tests {
         }
         assert_eq!(EN.get(CloseWindow), "Close window");
         assert_eq!(DE.get(CloseWindow), "Fenster schließen");
+    }
+
+    /// Hinweis "Eingaben blockiert" (nur Windows-Host): am Ende des Enums, in
+    /// jeder Sprache ein Satz ohne Platzhalter, der "Windows" nennt, und ausser
+    /// im Englischen nicht englisch.
+    #[test]
+    fn eingabe_blockiert_text() {
+        assert_eq!(InputBlocked as usize, CloseWindow as usize + 1);
+        for l in all() {
+            let t = l.get(InputBlocked);
+            assert!(!t.contains('{'), "{}: {t}", l.code);
+            assert!(t.contains("Windows"), "{}: ohne Windows: {t}", l.code);
+            if l.code != "en" {
+                assert_ne!(t, EN.get(InputBlocked), "{}: noch englisch", l.code);
+            }
+        }
+        assert_eq!(
+            EN.get(InputBlocked),
+            "A window on the Windows PC needs Windows' own confirmation - control is not possible there for a moment."
+        );
+        assert_eq!(
+            DE.get(InputBlocked),
+            "Ein Fenster am Windows-PC verlangt Windows' eigene Bestätigung - dort ist die Steuerung kurz nicht möglich."
+        );
     }
 
     /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der

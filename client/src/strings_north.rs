@@ -271,6 +271,7 @@ pub static SV: Lang = Lang {
         (ShareFailedSwitch, "Delningen kunde inte starta: {s} går inte att använda. Stäng av och slå på delningen för att försöka igen."),
         (PreventSleepRefused, "Inte aktiv: nekad av systemet ({c})"),
         (CloseWindow, "Stäng fönstret"),
+        (InputBlocked, "Ett fönster på Windows-datorn behöver Windows egen bekräftelse - styrning är inte möjlig där för tillfället."),
     ],
 };
 
@@ -542,6 +543,7 @@ pub static DA: Lang = Lang {
         (ShareFailedSwitch, "Delingen kunne ikke starte: {s} kan ikke bruges. Slå deling fra og til igen for at prøve igen."),
         (PreventSleepRefused, "Ikke aktiv: afvist af systemet ({c})"),
         (CloseWindow, "Luk vinduet"),
+        (InputBlocked, "Et vindue på Windows-pc'en kræver Windows' egen bekræftelse - styring er ikke mulig der et øjeblik."),
     ],
 };
 
@@ -813,6 +815,7 @@ pub static NB: Lang = Lang {
         (ShareFailedSwitch, "Delingen kunne ikke starte: {s} kan ikke brukes. Slå delingen av og på igjen for å prøve på nytt."),
         (PreventSleepRefused, "Ikke aktiv: avvist av systemet ({c})"),
         (CloseWindow, "Lukk vinduet"),
+        (InputBlocked, "Et vindu på Windows-PC-en trenger Windows' egen bekreftelse - styring er ikke mulig der et øyeblikk."),
     ],
 };
 
@@ -1084,6 +1087,7 @@ pub static FI: Lang = Lang {
         (ShareFailedSwitch, "Jakamista ei voitu käynnistää: {s} ei ole käytettävissä. Yritä uudelleen kytkemällä jakaminen pois ja takaisin päälle."),
         (PreventSleepRefused, "Ei käytössä: järjestelmä kieltäytyi ({c})"),
         (CloseWindow, "Sulje ikkuna"),
+        (InputBlocked, "Windows-tietokoneen ikkuna vaatii Windowsin oman vahvistuksen - hallinta ei ole siellä hetkeen mahdollista."),
     ],
 };
 
@@ -1355,5 +1359,6 @@ pub static IS: Lang = Lang {
         (ShareFailedSwitch, "Ekki tókst að hefja deilingu: ekki er hægt að nota {s}. Slökktu á deilingu og kveiktu aftur til að reyna aftur."),
         (PreventSleepRefused, "Ekki virkt: kerfið hafnaði ({c})"),
         (CloseWindow, "Loka glugganum"),
+        (InputBlocked, "Gluggi á Windows-tölvunni þarf eigin staðfestingu Windows - stjórn er ekki möguleg þar í augnablikinu."),
     ],
 };

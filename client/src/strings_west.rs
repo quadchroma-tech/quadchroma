@@ -273,6 +273,7 @@ pub static FR: Lang = Lang {
         (ShareFailedSwitch, "Le partage n'a pas pu démarrer : {s} est inutilisable. Désactivez puis réactivez le partage pour réessayer."),
         (PreventSleepRefused, "Inactif : refusé par le système ({c})"),
         (CloseWindow, "Fermer la fenêtre"),
+        (InputBlocked, "Une fenêtre sur le PC Windows demande la propre confirmation de Windows - la commande n'y est pas possible pour un instant."),
     ],
 };
 
@@ -544,6 +545,7 @@ pub static ES: Lang = Lang {
         (ShareFailedSwitch, "No se pudo iniciar el uso compartido: {s} no se puede usar. Desactívalo y vuelve a activarlo para reintentarlo."),
         (PreventSleepRefused, "No activo: rechazado por el sistema ({c})"),
         (CloseWindow, "Cerrar ventana"),
+        (InputBlocked, "Una ventana en el PC con Windows necesita la propia confirmación de Windows - el control no es posible ahí por un momento."),
     ],
 };
 
@@ -815,6 +817,7 @@ pub static IT: Lang = Lang {
         (ShareFailedSwitch, "Impossibile avviare la condivisione: {s} non è utilizzabile. Disattivala e riattivala per riprovare."),
         (PreventSleepRefused, "Non attivo: rifiutato dal sistema ({c})"),
         (CloseWindow, "Chiudi finestra"),
+        (InputBlocked, "Una finestra sul PC Windows richiede la conferma di Windows stesso - lì il controllo non è possibile per un momento."),
     ],
 };
 
@@ -1086,6 +1089,7 @@ pub static PT: Lang = Lang {
         (ShareFailedSwitch, "Não foi possível iniciar a partilha: {s} não pode ser usado. Desative e volte a ativar a partilha para tentar de novo."),
         (PreventSleepRefused, "Inativo: recusado pelo sistema ({c})"),
         (CloseWindow, "Fechar janela"),
+        (InputBlocked, "Uma janela no PC com Windows precisa da própria confirmação do Windows - o controlo não é possível aí por um momento."),
     ],
 };
 
@@ -1357,5 +1361,6 @@ pub static NL: Lang = Lang {
         (ShareFailedSwitch, "Delen kon niet starten: {s} is niet bruikbaar. Zet delen uit en weer aan om het opnieuw te proberen."),
         (PreventSleepRefused, "Niet actief: geweigerd door het systeem ({c})"),
         (CloseWindow, "Venster sluiten"),
+        (InputBlocked, "Een venster op de Windows-pc vereist Windows' eigen bevestiging - besturing is daar even niet mogelijk."),
     ],
 };

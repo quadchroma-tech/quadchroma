@@ -274,6 +274,7 @@ pub static RU: Lang = Lang {
         (ShareFailedSwitch, "Не удалось запустить общий доступ: {s} нельзя использовать. Выключите и снова включите общий доступ, чтобы повторить попытку."),
         (PreventSleepRefused, "Не активно: система отклонила ({c})"),
         (CloseWindow, "Закрыть окно"),
+        (InputBlocked, "Окну на ПК с Windows нужно собственное подтверждение Windows - управление там сейчас недоступно."),
     ],
 };
 
@@ -547,6 +548,7 @@ pub static ZH: Lang = Lang {
         (ShareFailedSwitch, "无法开始共享：{s} 无法使用。关闭后重新打开共享即可重试。"),
         (PreventSleepRefused, "未生效：被系统拒绝（{c}）"),
         (CloseWindow, "关闭窗口"),
+        (InputBlocked, "Windows 电脑上的一个窗口需要 Windows 自己的确认 - 那里暂时无法控制。"),
     ],
 };
 
@@ -820,6 +822,7 @@ pub static JA: Lang = Lang {
         (ShareFailedSwitch, "共有を開始できませんでした：{s} を使用できません。共有をオフにしてからオンにすると再試行します。"),
         (PreventSleepRefused, "無効：システムに拒否されました（{c}）"),
         (CloseWindow, "ウィンドウを閉じる"),
+        (InputBlocked, "Windows パソコンのあるウィンドウが Windows 自身の確認を求めています - そこは今は操作できません。"),
     ],
 };
 
@@ -1091,5 +1094,6 @@ pub static TR: Lang = Lang {
         (ShareFailedSwitch, "Paylaşım başlatılamadı: {s} kullanılamıyor. Yeniden denemek için paylaşımı kapatıp açın."),
         (PreventSleepRefused, "Etkin değil: sistem reddetti ({c})"),
         (CloseWindow, "Pencereyi kapat"),
+        (InputBlocked, "Windows bilgisayarındaki bir pencere Windows'un kendi onayını istiyor - orada şu an denetim mümkün değil."),
     ],
 };

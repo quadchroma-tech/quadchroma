@@ -271,6 +271,7 @@ pub static PL: Lang = Lang {
         (ShareFailedSwitch, "Nie udało się uruchomić udostępniania: nie można użyć {s}. Wyłącz i ponownie włącz udostępnianie, aby spróbować jeszcze raz."),
         (PreventSleepRefused, "Nieaktywne: odrzucone przez system ({c})"),
         (CloseWindow, "Zamknij okno"),
+        (InputBlocked, "Okno na komputerze z Windows wymaga własnego potwierdzenia systemu Windows - sterowanie tam chwilowo nie jest możliwe."),
     ],
 };
 
@@ -542,6 +543,7 @@ pub static CS: Lang = Lang {
         (ShareFailedSwitch, "Sdílení se nepodařilo spustit: {s} nelze použít. Pro nový pokus sdílení vypněte a znovu zapněte."),
         (PreventSleepRefused, "Neaktivní: systém odmítl ({c})"),
         (CloseWindow, "Zavřít okno"),
+        (InputBlocked, "Okno v počítači s Windows vyžaduje vlastní potvrzení systému Windows - ovládání tam právě teď není možné."),
     ],
 };
 
@@ -813,6 +815,7 @@ pub static SK: Lang = Lang {
         (ShareFailedSwitch, "Zdieľanie sa nepodarilo spustiť: {s} nemožno použiť. Pre nový pokus zdieľanie vypnite a znova zapnite."),
         (PreventSleepRefused, "Neaktívne: systém odmietol ({c})"),
         (CloseWindow, "Zavrieť okno"),
+        (InputBlocked, "Okno v počítači s Windows vyžaduje vlastné potvrdenie systému Windows - ovládanie tam práve teraz nie je možné."),
     ],
 };
 
@@ -1084,6 +1087,7 @@ pub static HU: Lang = Lang {
         (ShareFailedSwitch, "A megosztás nem indult el: a(z) {s} nem használható. Az újrapróbáláshoz kapcsolja ki, majd be a megosztást."),
         (PreventSleepRefused, "Nem aktív: a rendszer elutasította ({c})"),
         (CloseWindow, "Ablak bezárása"),
+        (InputBlocked, "A Windows számítógépen egy ablak a Windows saját megerősítését kéri - ott az irányítás egy pillanatra nem lehetséges."),
     ],
 };
 
@@ -1355,6 +1359,7 @@ pub static RO: Lang = Lang {
         (ShareFailedSwitch, "Partajarea nu a putut porni: {s} nu poate fi folosit. Dezactivați și reactivați partajarea pentru a reîncerca."),
         (PreventSleepRefused, "Inactiv: refuzat de sistem ({c})"),
         (CloseWindow, "Închide fereastra"),
+        (InputBlocked, "O fereastră de pe PC-ul Windows are nevoie de confirmarea proprie a Windows - controlul nu este posibil acolo pentru moment."),
     ],
 };
 
@@ -1626,6 +1631,7 @@ pub static BG: Lang = Lang {
         (ShareFailedSwitch, "Споделянето не можа да стартира: {s} не може да се използва. Изключете и включете отново споделянето, за да опитате пак."),
         (PreventSleepRefused, "Неактивно: отказано от системата ({c})"),
         (CloseWindow, "Затвори прозореца"),
+        (InputBlocked, "Прозорец на компютъра с Windows изисква собственото потвърждение на Windows - управлението там в момента не е възможно."),
     ],
 };
 
@@ -1897,5 +1903,6 @@ pub static EL: Lang = Lang {
         (ShareFailedSwitch, "Η κοινή χρήση δεν ξεκίνησε: το {s} δεν μπορεί να χρησιμοποιηθεί. Απενεργοποιήστε και ενεργοποιήστε ξανά την κοινή χρήση για νέα προσπάθεια."),
         (PreventSleepRefused, "Ανενεργό: απορρίφθηκε από το σύστημα ({c})"),
         (CloseWindow, "Κλείσιμο παραθύρου"),
+        (InputBlocked, "Ένα παράθυρο στον υπολογιστή Windows χρειάζεται τη δική του επιβεβαίωση των Windows - ο έλεγχος εκεί δεν είναι δυνατός προς το παρόν."),
     ],
 };

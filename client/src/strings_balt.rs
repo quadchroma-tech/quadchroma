@@ -271,6 +271,7 @@ pub static ET: Lang = Lang {
         (ShareFailedSwitch, "Jagamist ei õnnestunud käivitada: {s} pole kasutatav. Uueks katseks lülita jagamine välja ja uuesti sisse."),
         (PreventSleepRefused, "Pole aktiivne: süsteem keeldus ({c})"),
         (CloseWindow, "Sulge aken"),
+        (InputBlocked, "Windowsi arvutis olev aken vajab Windowsi enda kinnitust - seal pole juhtimine hetkel võimalik."),
     ],
 };
 
@@ -542,6 +543,7 @@ pub static LV: Lang = Lang {
         (ShareFailedSwitch, "Koplietošanu neizdevās sākt: {s} nav izmantojams. Lai mēģinātu vēlreiz, izslēdziet un atkal ieslēdziet koplietošanu."),
         (PreventSleepRefused, "Nav aktīvs: sistēma atteica ({c})"),
         (CloseWindow, "Aizvērt logu"),
+        (InputBlocked, "Logam Windows datorā nepieciešams paša Windows apstiprinājums - tur vadība pašlaik nav iespējama."),
     ],
 };
 
@@ -813,6 +815,7 @@ pub static LT: Lang = Lang {
         (ShareFailedSwitch, "Nepavyko pradėti bendrinimo: {s} negalima naudoti. Norėdami bandyti dar kartą, išjunkite ir vėl įjunkite bendrinimą."),
         (PreventSleepRefused, "Neaktyvu: sistema atmetė ({c})"),
         (CloseWindow, "Uždaryti langą"),
+        (InputBlocked, "Langas Windows kompiuteryje reikalauja paties Windows patvirtinimo - ten valdymas šiuo metu negalimas."),
     ],
 };
 
@@ -1084,6 +1087,7 @@ pub static SL: Lang = Lang {
         (ShareFailedSwitch, "Deljenja ni bilo mogoče zagnati: {s} ni uporaben. Za nov poskus deljenje izklopite in znova vklopite."),
         (PreventSleepRefused, "Ni dejavno: sistem je zavrnil ({c})"),
         (CloseWindow, "Zapri okno"),
+        (InputBlocked, "Okno na računalniku Windows potrebuje lastno potrditev sistema Windows - tam upravljanje trenutno ni mogoče."),
     ],
 };
 
@@ -1355,6 +1359,7 @@ pub static HR: Lang = Lang {
         (ShareFailedSwitch, "Dijeljenje se nije moglo pokrenuti: {s} nije upotrebljiv. Za novi pokušaj isključite i ponovno uključite dijeljenje."),
         (PreventSleepRefused, "Nije aktivno: sustav je odbio ({c})"),
         (CloseWindow, "Zatvori prozor"),
+        (InputBlocked, "Prozor na Windows računalu treba vlastitu potvrdu sustava Windows - ondje upravljanje trenutačno nije moguće."),
     ],
 };
 
@@ -1626,5 +1631,6 @@ pub static UK: Lang = Lang {
         (ShareFailedSwitch, "Не вдалося запустити спільний доступ: {s} не можна використати. Вимкніть і знову ввімкніть спільний доступ, щоб спробувати ще раз."),
         (PreventSleepRefused, "Не активно: система відхилила ({c})"),
         (CloseWindow, "Закрити вікно"),
+        (InputBlocked, "Вікну на ПК з Windows потрібне власне підтвердження Windows - там керування зараз неможливе."),
     ],
 };
