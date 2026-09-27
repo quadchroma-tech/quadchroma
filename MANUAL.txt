@@ -267,9 +267,9 @@ reconnecting by itself (like message 10):
     0  "<Name> was closed."        the host app was quit (Mac: "Quit
                                    QuadChroma", Cmd+Q, logging out,
                                    SIGTERM/SIGINT; Windows host role:
-                                   closed from outside, e.g. taskkill
-                                   without /F, logging off, shutting
-                                   down)
+                                   logging off, shutting down, an
+                                   installer closing it, WM_CLOSE from
+                                   another program)
     1  "<Name> stopped sharing."   "Stop sharing" in the Windows host
                                    role's menu
     2  "<Name> removed this device."  this device was removed from the
@@ -2204,11 +2204,15 @@ Freigabe.lnk" - the exe with --host - into the user's Startup folder, or
 removes it; the check mark shows whether it is there ("Mit Windows starten: an
 (Verknuepfung im Autostart-Ordner)" or "... aus"). "Stop sharing" says goodbye
 to the viewer (message 13, reason 1: "<Name> stopped sharing.") and ends the
-host role ("Freigabe beendet (Infobereich)"). Closed from outside (taskkill
-without /F), at logoff or shutdown the host role ends the same way with reason
-0 ("Host-Rolle wird beendet (WM_CLOSE von aussen)" or "... (Abmelden oder
-Herunterfahren)", then "Host-Rolle beendet"); both wait at most 3 s for the
-viewer to take the goodbye. Menu and windows speak the language set in the
+host role ("Freigabe beendet (Infobereich)"). At logoff or shutdown, when an
+installer closes it (Restart Manager) or another program sends WM_CLOSE to its
+hidden window, the host role ends the same way with reason 0 ("Host-Rolle wird
+beendet (Abmelden)", "... (Herunterfahren)", "... (ein Installationsprogramm
+schliesst die App (Restart Manager))" or "... (WM_CLOSE von aussen)", then
+"Host-Rolle beendet"); both wait at most 3 s for the viewer to take the
+goodbye. taskkill without /F does not reach the host role (it has no visible
+window, so taskkill asks for /F); a hard end (taskkill /F, Stop-Process) sends
+no goodbye. Menu and windows speak the language set in the
 client (einstellungen.txt), otherwise the one of Windows.
 
 Without an icon - no Explorer, as over ssh or in session 0 - the host role

@@ -811,9 +811,10 @@ pub fn main_host(args: &[String]) -> i32 {
             *sperre(&sk) = k;
             m
         });
-        // WM_CLOSE von aussen (taskkill ohne /F), Abmelden, Herunterfahren:
-        // beenden wie "Freigabe beenden", aber mit Grund 0 (die Host-Rolle
-        // wurde beendet). Laeuft im Symbolfaden und kehrt nicht zurueck.
+        // WM_CLOSE von aussen, Abmelden, Herunterfahren, ein
+        // Installationsprogramm (Restart Manager): beenden wie "Freigabe
+        // beenden", aber mit Grund 0 (die Host-Rolle wurde beendet). Laeuft
+        // im Symbolfaden und kehrt nicht zurueck.
         let ende = Box::new(|wie: &str| {
             log(format!("Host-Rolle wird beendet ({wie})"));
             netz::abschied_beim_beenden(HOST_ENDE_BEENDET, ABSCHIED_FRIST);

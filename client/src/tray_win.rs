@@ -16,9 +16,11 @@
 // (bewusst synchron). Beendet wird der Faden nur ueber WM_BEENDEN, nie ueber
 // WM_CLOSE: das koennte auch von aussen kommen und liesse die abgelegte App
 // ohne Symbol zurueck. Bei der Host-Rolle (zweite Art) heisst WM_CLOSE von
-// aussen (taskkill ohne /F) und WM_ENDSESSION (Abmelden, Herunterfahren)
-// dagegen: beenden - ueber den Rueckruf `ende`, der den Zuschauer
-// verabschiedet und den Prozess beendet.
+// aussen (ein anderes Programm) und WM_ENDSESSION (Abmelden, Herunterfahren,
+// ein Installationsprogramm ueber den Restart Manager) dagegen: beenden -
+// ueber den Rueckruf `ende`, der den Zuschauer verabschiedet und den Prozess
+// beendet. (taskkill ohne /F erreicht die Host-Rolle nicht: sie hat kein
+// sichtbares Fenster, taskkill verlangt dann /F.)
 //
 // Bedienung (NOTIFYICON_VERSION_4):
 //   - Linksklick (NIN_SELECT), Eingabe/Leertaste (NIN_KEYSELECT) und
@@ -565,18 +567,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
-        // Von aussen (etwa taskkill ohne /F): beim Client uebergehen - das
-        // Symbol ist der Weg zurueck zur abgelegten App. Die Host-Rolle endet
-        // darauf, mit Abschied an ihren Zuschauer; ebenso beim Abmelden und
-        // Herunterfahren (WM_ENDSESSION, erst nach dessen Rueckkehr endete
-        // der Prozess ohnehin - der Abschied muss vorher hinaus).
+        // Von aussen (etwa taskkill ohne /F, das mit einem sichtbaren Fenster
+        // an alle Fenster des Prozesses WM_CLOSE schickt): beim Client
+        // uebergehen - das Symbol ist der Weg zurueck zur abgelegten App. Die
+        // Host-Rolle endet darauf, mit Abschied an ihren Zuschauer; ebenso
+        // beim Abmelden, Herunterfahren oder wenn ein Installationsprogramm
+        // sie ueber den Restart Manager schliesst (WM_ENDSESSION - nach
+        // dessen Rueckkehr endete der Prozess ohnehin, der Abschied muss
+        // vorher hinaus).
         WM_CLOSE | WM_ENDSESSION => {
             if let Art::Allgemein { ende, .. } = &f.art {
                 if msg == WM_CLOSE || wp.0 != 0 {
                     if f.geteilt.steht.load(Ordering::SeqCst) {
                         abmelden(hwnd, &f);
                     }
-                    ende(if msg == WM_CLOSE { "WM_CLOSE von aussen" } else { "Abmelden oder Herunterfahren" });
+                    ende(if msg == WM_CLOSE { "WM_CLOSE von aussen" } else { sitzungsende(lp) });
                 }
             }
             LRESULT(0)
@@ -586,6 +591,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+/// Warum WM_ENDSESSION kommt, fuer das Protokoll: lParam traegt
+/// ENDSESSION_CLOSEAPP (0x1, ein Installationsprogramm ueber den Restart
+/// Manager) oder ENDSESSION_LOGOFF (0x80000000); ohne beides faehrt Windows
+/// herunter.
+fn sitzungsende(lp: LPARAM) -> &'static str {
+    let bits = lp.0 as u32;
+    if bits & 0x1 != 0 {
+        "ein Installationsprogramm schliesst die App (Restart Manager)"
+    } else if bits & 0x8000_0000 != 0 {
+        "Abmelden"
+    } else {
+        "Herunterfahren"
     }
 }
 
@@ -726,6 +746,16 @@ mod tests {
             assert_eq!(befehl_zu(&punkte, ID_HOST + punkte.len() as u32), None);
             assert_eq!(befehl_zu(&punkte, ID_HOST + 1), None, "Trenner als Host aufgeloest");
         }
+    }
+
+    /// Der Grund von WM_ENDSESSION fuers Protokoll: Restart Manager
+    /// (ENDSESSION_CLOSEAPP), Abmelden (ENDSESSION_LOGOFF), sonst
+    /// Herunterfahren.
+    #[test]
+    fn sitzungsende_nach_lparam() {
+        assert_eq!(sitzungsende(LPARAM(1)), "ein Installationsprogramm schliesst die App (Restart Manager)");
+        assert_eq!(sitzungsende(LPARAM(0x8000_0000)), "Abmelden");
+        assert_eq!(sitzungsende(LPARAM(0)), "Herunterfahren");
     }
 
     /// Der Symbolfaden endet nur ueber WM_BEENDEN (Drop), nicht ueber ein
