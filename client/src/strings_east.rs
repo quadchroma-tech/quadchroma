@@ -264,6 +264,9 @@ pub static PL: Lang = Lang {
         (TipDisplayAutoMac, "Metal na układzie graficznym Maca. Bez Metal: procesor. Obowiązuje od następnego uruchomienia."),
         (TipDisplayCpuMac, "Rysowanie na procesorze, bez Metal. Działa wszędzie, kosztuje czas obliczeń. Obowiązuje od następnego uruchomienia."),
         (StartShareMac, "Udostępnij tego Maca"),
+        (TabComputers, "Komputery"),
+        (ComputersHint, "Kliknij komputer, aby się na niego przełączyć. Ta sesja się zakończy."),
+        (AccessDeviceKeyChanged, "QuadChroma używa teraz jednego klucza na komputer w obu kierunkach. Jeśli {n} znał już ten komputer, zapyta jeszcze raz."),
     ],
 };
 
@@ -528,6 +531,9 @@ pub static CS: Lang = Lang {
         (TipDisplayAutoMac, "Metal na grafickém čipu Macu. Bez Metalu: procesor. Platí od příštího spuštění."),
         (TipDisplayCpuMac, "Kreslení na procesoru, bez Metalu. Funguje všude, stojí výpočetní čas. Platí od příštího spuštění."),
         (StartShareMac, "Sdílet tento Mac"),
+        (TabComputers, "Počítače"),
+        (ComputersHint, "Kliknutím na počítač se na něj přepnete. Tato relace skončí."),
+        (AccessDeviceKeyChanged, "QuadChroma nyní používá jeden klíč na počítač pro oba směry. Pokud {n} tento počítač už znal, zeptá se ještě jednou."),
     ],
 };
 
@@ -792,6 +798,9 @@ pub static SK: Lang = Lang {
         (TipDisplayAutoMac, "Metal na grafickom čipe Macu. Bez Metalu: procesor. Platí od nasledujúceho spustenia."),
         (TipDisplayCpuMac, "Kreslenie na procesore, bez Metalu. Funguje všade, stojí výpočtový čas. Platí od nasledujúceho spustenia."),
         (StartShareMac, "Zdieľať tento Mac"),
+        (TabComputers, "Počítače"),
+        (ComputersHint, "Kliknutím na počítač sa naň prepnete. Táto relácia sa skončí."),
+        (AccessDeviceKeyChanged, "QuadChroma teraz používa jeden kľúč na počítač pre oba smery. Ak {n} tento počítač už poznal, opýta sa ešte raz."),
     ],
 };
 
@@ -1056,6 +1065,9 @@ pub static HU: Lang = Lang {
         (TipDisplayAutoMac, "Metal a Mac grafikus chipjén. Metal nélkül: a processzor. A következő indítástól érvényes."),
         (TipDisplayCpuMac, "Rajzolás a processzoron, Metal nélkül. Mindenhol működik, számítási időbe kerül. A következő indítástól érvényes."),
         (StartShareMac, "A Mac megosztása"),
+        (TabComputers, "Számítógépek"),
+        (ComputersHint, "Kattintson egy számítógépre az átváltáshoz. Ez a munkamenet véget ér."),
+        (AccessDeviceKeyChanged, "A QuadChroma mostantól számítógépenként egyetlen kulcsot használ mindkét irányban. Ha {n} már ismerte ezt a számítógépet, még egyszer rákérdez."),
     ],
 };
 
@@ -1320,6 +1332,9 @@ pub static RO: Lang = Lang {
         (TipDisplayAutoMac, "Metal pe cipul grafic al Mac-ului. Fără Metal: procesorul. Se aplică de la următoarea pornire."),
         (TipDisplayCpuMac, "Desenare pe procesor, fără Metal. Merge oriunde, costă timp de calcul. Se aplică de la următoarea pornire."),
         (StartShareMac, "Partajează acest Mac"),
+        (TabComputers, "Computere"),
+        (ComputersHint, "Faceți clic pe un computer pentru a trece la el. Această sesiune se încheie."),
+        (AccessDeviceKeyChanged, "QuadChroma folosește acum o singură cheie per computer, în ambele direcții. Dacă {n} cunoștea deja acest computer, va întreba încă o dată."),
     ],
 };
 
@@ -1584,6 +1599,9 @@ pub static BG: Lang = Lang {
         (TipDisplayAutoMac, "Metal на графичния чип на Mac. Без Metal: процесорът. Важи от следващото стартиране."),
         (TipDisplayCpuMac, "Рисуване на процесора, без Metal. Работи навсякъде, струва процесорно време. Важи от следващото стартиране."),
         (StartShareMac, "Споделяне на този Mac"),
+        (TabComputers, "Компютри"),
+        (ComputersHint, "Щракнете върху компютър, за да превключите към него. Тази сесия ще приключи."),
+        (AccessDeviceKeyChanged, "QuadChroma вече използва един ключ за компютър и в двете посоки. Ако {n} вече е познавал този компютър, ще попита още веднъж."),
     ],
 };
 
@@ -1848,5 +1866,8 @@ pub static EL: Lang = Lang {
         (TipDisplayAutoMac, "Metal στο γραφικό τσιπ του Mac. Χωρίς Metal: ο επεξεργαστής. Ισχύει από την επόμενη εκκίνηση."),
         (TipDisplayCpuMac, "Σχεδίαση στον επεξεργαστή, χωρίς Metal. Δουλεύει παντού, κοστίζει χρόνο CPU. Ισχύει από την επόμενη εκκίνηση."),
         (StartShareMac, "Κοινή χρήση αυτού του Mac"),
+        (TabComputers, "Υπολογιστές"),
+        (ComputersHint, "Κάντε κλικ σε έναν υπολογιστή για να μεταβείτε σε αυτόν. Αυτή η συνεδρία τερματίζεται."),
+        (AccessDeviceKeyChanged, "Το QuadChroma χρησιμοποιεί πλέον ένα κλειδί ανά υπολογιστή και για τις δύο κατευθύνσεις. Αν ο υπολογιστής {n} γνώριζε ήδη αυτόν τον υπολογιστή, θα ρωτήσει ξανά μία φορά."),
     ],
 };

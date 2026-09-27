@@ -481,6 +481,18 @@ pub enum Key {
     /// Umschalter im Startbildschirm und Haken im Menue der Menueleiste auf
     /// dem Mac (unter Windows StartShare, "Diesen PC freigeben").
     StartShareMac,
+    // Geraete wechseln und eine Identitaet je Rechner (Schritt H)
+    /// Reiter im ESC-Menue: die erkannten QuadChroma-Geraete, ein Klick
+    /// wechselt die Sitzung dorthin.
+    TabComputers,
+    /// Reiter "Computer": ein Satz ueber der Liste - Klick wechselt, die
+    /// laufende Sitzung endet.
+    ComputersHint,
+    /// Zugangsdialog: ein Host, den dieser Client kennt, fragt trotzdem nach
+    /// Zugang, und hier liegt noch ein frueherer client.key mit anderem
+    /// Schluessel - die eine Identitaet je Rechner (host.key) ist fuer ihn
+    /// neu; {n} Name des Hosts.
+    AccessDeviceKeyChanged,
 }
 
 pub struct Lang {
@@ -768,6 +780,9 @@ pub static EN: Lang = Lang {
         (TipDisplayAutoMac, "Metal on the Mac's graphics chip. Without Metal: the processor. Applies from the next start."),
         (TipDisplayCpuMac, "Draw on the processor, without Metal. Works everywhere, costs CPU time. Applies from the next start."),
         (StartShareMac, "Share this Mac"),
+        (TabComputers, "Computers"),
+        (ComputersHint, "Click a computer to switch to it. This session ends."),
+        (AccessDeviceKeyChanged, "QuadChroma now uses one key per computer for both directions. If {n} knew this computer before, it asks once more."),
     ],
 };
 
@@ -1032,6 +1047,9 @@ pub static DE: Lang = Lang {
         (TipDisplayAutoMac, "Metal auf dem Grafikchip des Mac. Ohne Metal: der Prozessor. Gilt ab dem nächsten Start."),
         (TipDisplayCpuMac, "Zeichnen auf dem Prozessor, ohne Metal. Läuft überall, kostet Rechenzeit. Gilt ab dem nächsten Start."),
         (StartShareMac, "Diesen Mac freigeben"),
+        (TabComputers, "Computer"),
+        (ComputersHint, "Ein Klick auf einen Computer wechselt dorthin. Diese Sitzung endet dabei."),
+        (AccessDeviceKeyChanged, "QuadChroma nutzt jetzt einen Schlüssel je Computer für beide Richtungen. Kannte {n} diesen Computer schon, ist der Zugang deshalb einmal neu nötig."),
     ],
 };
 
@@ -1077,8 +1095,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > StartShareMac as usize);
-        assert_eq!(n, StartShareMac as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > AccessDeviceKeyChanged as usize);
+        assert_eq!(n, AccessDeviceKeyChanged as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1628,6 +1646,54 @@ mod tests {
         for (k, _) in &alle {
             let t = DE.get(*k);
             for w in ["Geraet", "aender", "oeffnen", "laeuft", "fuer", "hoechstens", "unzulaess"] {
+                assert!(!t.contains(w), "{k:?}: {t}");
+            }
+        }
+    }
+
+    /// Die Texte des Reiters "Computer" und der Hinweis zum einen
+    /// Geraeteschluessel: am Ende des Enums, in jeder Sprache vorhanden,
+    /// ausser im Englischen (und dem Reiternamen im Niederlaendischen, wo
+    /// "Computers" richtig ist) nicht englisch, ohne andere Platzhalter als
+    /// {n} (genau einmal, nur im Hinweis), Hinweis und Satz ueber der Liste
+    /// sind Saetze. Der Reitername ist kurz (Kopf des Menues) und keiner der
+    /// anderen Reiter; DE ohne umschriebene Umlaute.
+    #[test]
+    fn computer_texte() {
+        assert_eq!(TabComputers as usize, StartShareMac as usize + 1);
+        assert_eq!(ComputersHint as usize, TabComputers as usize + 1);
+        assert_eq!(AccessDeviceKeyChanged as usize, ComputersHint as usize + 1);
+        for l in all() {
+            let reiter = l.get(TabComputers);
+            assert!(!reiter.is_empty() && reiter.chars().count() <= 16, "{}: {reiter}", l.code);
+            assert!(!reiter.contains(['{', '}', '.']), "{}: {reiter}", l.code);
+            for andere in [TabPicture, TabDisplay, Encryption, TabShortcuts, TabBenchmark] {
+                assert_ne!(reiter, l.get(andere), "{}", l.code);
+            }
+            let satz = l.get(ComputersHint);
+            assert!(!satz.contains(['{', '}']), "{}: {satz}", l.code);
+            let hinweis = l.get(AccessDeviceKeyChanged);
+            assert_eq!(hinweis.matches("{n}").count(), 1, "{}: {hinweis}", l.code);
+            assert_eq!(hinweis.matches('{').count(), 1, "{}: {hinweis}", l.code);
+            assert!(hinweis.contains("QuadChroma"), "{}: {hinweis}", l.code);
+            for t in [satz, hinweis] {
+                assert!(t.ends_with('.') || t.ends_with('。'), "{}: {t}", l.code);
+                assert!(!t.contains("...") && !t.contains(" - "), "{}: {t}", l.code);
+            }
+            if l.code != "en" {
+                if l.code != "nl" {
+                    assert_ne!(reiter, EN.get(TabComputers), "{}: noch englisch", l.code);
+                }
+                assert_ne!(satz, EN.get(ComputersHint), "{}: noch englisch", l.code);
+                assert_ne!(hinweis, EN.get(AccessDeviceKeyChanged), "{}: noch englisch", l.code);
+            }
+        }
+        assert_eq!(EN.get(TabComputers), "Computers");
+        assert_eq!(DE.get(TabComputers), "Computer");
+        assert_eq!(DE.get(ComputersHint), "Ein Klick auf einen Computer wechselt dorthin. Diese Sitzung endet dabei.");
+        for k in [TabComputers, ComputersHint, AccessDeviceKeyChanged] {
+            let t = DE.get(k);
+            for w in ["Schluessel", "fuer", "noetig", "Geraet"] {
                 assert!(!t.contains(w), "{k:?}: {t}");
             }
         }

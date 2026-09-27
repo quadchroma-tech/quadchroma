@@ -264,6 +264,9 @@ pub static SV: Lang = Lang {
         (TipDisplayAutoMac, "Metal på Macens grafikkrets. Utan Metal: processorn. Gäller från nästa start."),
         (TipDisplayCpuMac, "Rita på processorn, utan Metal. Fungerar överallt, kostar processortid. Gäller från nästa start."),
         (StartShareMac, "Dela den här Macen"),
+        (TabComputers, "Datorer"),
+        (ComputersHint, "Klicka på en dator för att byta till den. Den här sessionen avslutas."),
+        (AccessDeviceKeyChanged, "QuadChroma använder nu en nyckel per dator åt båda hållen. Om {n} redan kände till den här datorn frågar den en gång till."),
     ],
 };
 
@@ -528,6 +531,9 @@ pub static DA: Lang = Lang {
         (TipDisplayAutoMac, "Metal på Mac'ens grafikchip. Uden Metal: processoren. Gælder fra næste start."),
         (TipDisplayCpuMac, "Tegn på processoren, uden Metal. Virker overalt, koster regnetid. Gælder fra næste start."),
         (StartShareMac, "Del denne Mac"),
+        (TabComputers, "Computere"),
+        (ComputersHint, "Klik på en computer for at skifte til den. Denne session afsluttes."),
+        (AccessDeviceKeyChanged, "QuadChroma bruger nu én nøgle pr. computer i begge retninger. Hvis {n} allerede kendte denne computer, spørger den én gang til."),
     ],
 };
 
@@ -792,6 +798,9 @@ pub static NB: Lang = Lang {
         (TipDisplayAutoMac, "Metal på Mac-ens grafikkbrikke. Uten Metal: prosessoren. Gjelder fra neste start."),
         (TipDisplayCpuMac, "Tegn på prosessoren, uten Metal. Virker overalt, koster regnetid. Gjelder fra neste start."),
         (StartShareMac, "Del denne Mac-en"),
+        (TabComputers, "Datamaskiner"),
+        (ComputersHint, "Klikk på en datamaskin for å bytte til den. Denne økten avsluttes."),
+        (AccessDeviceKeyChanged, "QuadChroma bruker nå én nøkkel per datamaskin i begge retninger. Hvis {n} allerede kjente denne datamaskinen, spør den én gang til."),
     ],
 };
 
@@ -1056,6 +1065,9 @@ pub static FI: Lang = Lang {
         (TipDisplayAutoMac, "Metal Macin grafiikkapiirillä. Ilman Metalia: suoritin. Voimassa seuraavasta käynnistyksestä."),
         (TipDisplayCpuMac, "Piirto suorittimella, ilman Metalia. Toimii kaikkialla, vie laskenta-aikaa. Voimassa seuraavasta käynnistyksestä."),
         (StartShareMac, "Jaa tämä Mac"),
+        (TabComputers, "Tietokoneet"),
+        (ComputersHint, "Vaihda tietokoneeseen napsauttamalla sitä. Tämä istunto päättyy."),
+        (AccessDeviceKeyChanged, "QuadChroma käyttää nyt yhtä avainta tietokonetta kohden molempiin suuntiin. Jos {n} tunsi tämän tietokoneen jo ennestään, se kysyy vielä kerran."),
     ],
 };
 
@@ -1320,5 +1332,8 @@ pub static IS: Lang = Lang {
         (TipDisplayAutoMac, "Metal á grafíkkubbi Mac-tölvunnar. Án Metal: örgjörvinn. Gildir frá næstu ræsingu."),
         (TipDisplayCpuMac, "Teikna á örgjörvanum, án Metal. Virkar alls staðar, kostar reiknitíma. Gildir frá næstu ræsingu."),
         (StartShareMac, "Deila þessum Mac"),
+        (TabComputers, "Tölvur"),
+        (ComputersHint, "Smelltu á tölvu til að skipta yfir á hana. Þessari lotu lýkur þá."),
+        (AccessDeviceKeyChanged, "QuadChroma notar nú einn lykil á hverja tölvu í báðar áttir. Ef {n} þekkti þessa tölvu áður spyr það einu sinni enn."),
     ],
 };

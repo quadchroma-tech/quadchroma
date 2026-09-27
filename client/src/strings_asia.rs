@@ -267,6 +267,9 @@ pub static RU: Lang = Lang {
         (TipDisplayAutoMac, "Metal на графическом чипе Mac. Без Metal: процессор. Действует со следующего запуска."),
         (TipDisplayCpuMac, "Рисование на процессоре, без Metal. Работает везде, стоит процессорного времени. Действует со следующего запуска."),
         (StartShareMac, "Открыть доступ к этому Mac"),
+        (TabComputers, "Компьютеры"),
+        (ComputersHint, "Щёлкните по компьютеру, чтобы переключиться на него. Текущий сеанс завершится."),
+        (AccessDeviceKeyChanged, "QuadChroma теперь использует один ключ на компьютер для обоих направлений. Если {n} уже знал этот компьютер, он спросит ещё раз."),
     ],
 };
 
@@ -533,6 +536,9 @@ pub static ZH: Lang = Lang {
         (TipDisplayAutoMac, "在 Mac 的图形芯片上用 Metal。没有 Metal 时：处理器。下次启动起生效。"),
         (TipDisplayCpuMac, "在处理器上绘制，不用 Metal。到处都能用，占用 CPU 时间。下次启动起生效。"),
         (StartShareMac, "共享此 Mac"),
+        (TabComputers, "电脑"),
+        (ComputersHint, "点击一台电脑即可切换到它。 当前会话随之结束。"),
+        (AccessDeviceKeyChanged, "QuadChroma 现在每台电脑只用一个密钥，双向通用。 如果 {n} 以前已知道这台电脑，它会再询问一次。"),
     ],
 };
 
@@ -799,6 +805,9 @@ pub static JA: Lang = Lang {
         (TipDisplayAutoMac, "Mac のグラフィックチップで Metal。Metal が使えなければ CPU。次回起動時から有効。"),
         (TipDisplayCpuMac, "Metal を使わず CPU で描画します。どこでも動きますが、処理時間がかかります。次回起動時から有効。"),
         (StartShareMac, "この Mac を共有"),
+        (TabComputers, "コンピューター"),
+        (ComputersHint, "コンピューターをクリックすると切り替わります。 現在のセッションは終了します。"),
+        (AccessDeviceKeyChanged, "QuadChroma は現在、コンピューターごとに双方向で 1 つの鍵を使います。 {n} がこのコンピューターを以前から知っていた場合も、もう一度確認されます。"),
     ],
 };
 
@@ -1063,5 +1072,8 @@ pub static TR: Lang = Lang {
         (TipDisplayAutoMac, "Mac'in grafik yongasında Metal. Metal yoksa: işlemci. Sonraki başlatmadan itibaren geçerli."),
         (TipDisplayCpuMac, "İşlemcide, Metal olmadan çizim. Her yerde çalışır, işlem süresine mal olur. Sonraki başlatmadan itibaren geçerli."),
         (StartShareMac, "Bu Mac'i paylaş"),
+        (TabComputers, "Bilgisayarlar"),
+        (ComputersHint, "Geçmek için bir bilgisayara tıklayın. Bu oturum sona erer."),
+        (AccessDeviceKeyChanged, "QuadChroma artık her bilgisayar için iki yönde de tek bir anahtar kullanıyor. {n} bu bilgisayarı daha önce tanıyorsa bir kez daha sorar."),
     ],
 };

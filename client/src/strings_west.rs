@@ -266,6 +266,9 @@ pub static FR: Lang = Lang {
         (TipDisplayAutoMac, "Metal sur la puce graphique du Mac. Sans Metal : le processeur. Prend effet au prochain démarrage."),
         (TipDisplayCpuMac, "Dessiner sur le processeur, sans Metal. Fonctionne partout, coûte du temps de calcul. Prend effet au prochain démarrage."),
         (StartShareMac, "Partager ce Mac"),
+        (TabComputers, "Ordinateurs"),
+        (ComputersHint, "Cliquez sur un ordinateur pour y passer. Cette session se termine alors."),
+        (AccessDeviceKeyChanged, "QuadChroma utilise désormais une seule clé par ordinateur dans les deux sens. Si {n} connaissait déjà cet ordinateur, l'accès est redemandé une fois."),
     ],
 };
 
@@ -530,6 +533,9 @@ pub static ES: Lang = Lang {
         (TipDisplayAutoMac, "Metal en el chip gráfico del Mac. Sin Metal: el procesador. Se aplica desde el próximo inicio."),
         (TipDisplayCpuMac, "Dibujar en el procesador, sin Metal. Funciona en todas partes, cuesta tiempo de CPU. Se aplica desde el próximo inicio."),
         (StartShareMac, "Compartir este Mac"),
+        (TabComputers, "Ordenadores"),
+        (ComputersHint, "Haz clic en un ordenador para cambiar a él. Esta sesión termina."),
+        (AccessDeviceKeyChanged, "QuadChroma usa ahora una sola clave por ordenador en ambas direcciones. Si {n} ya conocía este ordenador, vuelve a pedir acceso una vez."),
     ],
 };
 
@@ -794,6 +800,9 @@ pub static IT: Lang = Lang {
         (TipDisplayAutoMac, "Metal sul chip grafico del Mac. Senza Metal: il processore. Vale dal prossimo avvio."),
         (TipDisplayCpuMac, "Disegnare sul processore, senza Metal. Funziona ovunque, costa tempo di calcolo. Vale dal prossimo avvio."),
         (StartShareMac, "Condividi questo Mac"),
+        (TabComputers, "Computer"),
+        (ComputersHint, "Fai clic su un computer per passare a quello. Questa sessione termina."),
+        (AccessDeviceKeyChanged, "QuadChroma ora usa una sola chiave per computer in entrambe le direzioni. Se {n} conosceva già questo computer, chiede di nuovo l'accesso una volta."),
     ],
 };
 
@@ -1058,6 +1067,9 @@ pub static PT: Lang = Lang {
         (TipDisplayAutoMac, "Metal no chip gráfico do Mac. Sem Metal: o processador. Aplica-se a partir do próximo arranque."),
         (TipDisplayCpuMac, "Desenhar no processador, sem Metal. Funciona em todo o lado, custa tempo de CPU. Aplica-se a partir do próximo arranque."),
         (StartShareMac, "Partilhar este Mac"),
+        (TabComputers, "Computadores"),
+        (ComputersHint, "Clique num computador para mudar para ele. Esta sessão termina."),
+        (AccessDeviceKeyChanged, "O QuadChroma usa agora uma única chave por computador nos dois sentidos. Se {n} já conhecia este computador, volta a pedir acesso uma vez."),
     ],
 };
 
@@ -1322,5 +1334,8 @@ pub static NL: Lang = Lang {
         (TipDisplayAutoMac, "Metal op de grafische chip van de Mac. Zonder Metal: de processor. Geldt vanaf de volgende start."),
         (TipDisplayCpuMac, "Tekenen op de processor, zonder Metal. Werkt overal, kost rekentijd. Geldt vanaf de volgende start."),
         (StartShareMac, "Deze Mac delen"),
+        (TabComputers, "Computers"),
+        (ComputersHint, "Klik op een computer om ernaar over te schakelen. Deze sessie eindigt dan."),
+        (AccessDeviceKeyChanged, "QuadChroma gebruikt nu één sleutel per computer voor beide richtingen. Als {n} deze computer al kende, vraagt het nog één keer om toegang."),
     ],
 };

@@ -264,6 +264,9 @@ pub static ET: Lang = Lang {
         (TipDisplayAutoMac, "Metal Maci graafikakiibil. Ilma Metalita: protsessor. Kehtib alates järgmisest käivitusest."),
         (TipDisplayCpuMac, "Joonistamine protsessoril, ilma Metalita. Töötab kõikjal, maksab arvutusaega. Kehtib alates järgmisest käivitusest."),
         (StartShareMac, "Jaga seda Maci"),
+        (TabComputers, "Arvutid"),
+        (ComputersHint, "Klõpsa arvutil, et sellele lülituda. See seanss lõpeb."),
+        (AccessDeviceKeyChanged, "QuadChroma kasutab nüüd iga arvuti kohta mõlemas suunas ühte võtit. Kui {n} seda arvutit juba tundis, küsib see veel korra."),
     ],
 };
 
@@ -528,6 +531,9 @@ pub static LV: Lang = Lang {
         (TipDisplayAutoMac, "Metal uz Mac grafikas mikroshēmas. Bez Metal: procesors. Stājas spēkā no nākamās palaišanas."),
         (TipDisplayCpuMac, "Zīmēšana uz procesora, bez Metal. Darbojas visur, maksā skaitļošanas laiku. Stājas spēkā no nākamās palaišanas."),
         (StartShareMac, "Koplietot šo Mac datoru"),
+        (TabComputers, "Datori"),
+        (ComputersHint, "Noklikšķiniet uz datora, lai pārslēgtos uz to. Šī sesija beigsies."),
+        (AccessDeviceKeyChanged, "QuadChroma tagad izmanto vienu atslēgu katram datoram abos virzienos. Ja {n} jau pazina šo datoru, tas vaicās vēlreiz."),
     ],
 };
 
@@ -792,6 +798,9 @@ pub static LT: Lang = Lang {
         (TipDisplayAutoMac, "Metal Mac grafikos luste. Be Metal: procesorius. Galioja nuo kito paleidimo."),
         (TipDisplayCpuMac, "Piešimas procesoriuje, be Metal. Veikia visur, kainuoja skaičiavimo laiko. Galioja nuo kito paleidimo."),
         (StartShareMac, "Bendrinti šį Mac kompiuterį"),
+        (TabComputers, "Kompiuteriai"),
+        (ComputersHint, "Spustelėkite kompiuterį, kad persijungtumėte į jį. Šis seansas baigsis."),
+        (AccessDeviceKeyChanged, "QuadChroma dabar naudoja vieną raktą kiekvienam kompiuteriui abiem kryptimis. Jei {n} jau pažinojo šį kompiuterį, jis paklaus dar kartą."),
     ],
 };
 
@@ -1056,6 +1065,9 @@ pub static SL: Lang = Lang {
         (TipDisplayAutoMac, "Metal na grafičnem čipu Maca. Brez Metal: procesor. Velja od naslednjega zagona."),
         (TipDisplayCpuMac, "Risanje na procesorju, brez Metal. Deluje povsod, stane računski čas. Velja od naslednjega zagona."),
         (StartShareMac, "Deli ta Mac"),
+        (TabComputers, "Računalniki"),
+        (ComputersHint, "Kliknite računalnik, da preklopite nanj. Ta seja se konča."),
+        (AccessDeviceKeyChanged, "QuadChroma zdaj uporablja en ključ na računalnik za obe smeri. Če je {n} ta računalnik že poznal, bo vprašal še enkrat."),
     ],
 };
 
@@ -1320,6 +1332,9 @@ pub static HR: Lang = Lang {
         (TipDisplayAutoMac, "Metal na grafičkom čipu Maca. Bez Metala: procesor. Vrijedi od sljedećeg pokretanja."),
         (TipDisplayCpuMac, "Crtanje na procesoru, bez Metala. Radi svugdje, košta računsko vrijeme. Vrijedi od sljedećeg pokretanja."),
         (StartShareMac, "Dijeli ovaj Mac"),
+        (TabComputers, "Računala"),
+        (ComputersHint, "Kliknite računalo da biste se prebacili na njega. Ova sesija tada završava."),
+        (AccessDeviceKeyChanged, "QuadChroma sada koristi jedan ključ po računalu za oba smjera. Ako je {n} već poznavao ovo računalo, pitat će još jednom."),
     ],
 };
 
@@ -1584,5 +1599,8 @@ pub static UK: Lang = Lang {
         (TipDisplayAutoMac, "Metal на графічному чипі Mac. Без Metal: процесор. Діє з наступного запуску."),
         (TipDisplayCpuMac, "Малювання на процесорі, без Metal. Працює всюди, коштує процесорного часу. Діє з наступного запуску."),
         (StartShareMac, "Надати доступ до цього Mac"),
+        (TabComputers, "Комп'ютери"),
+        (ComputersHint, "Клацніть комп'ютер, щоб перемкнутися на нього. Поточний сеанс завершиться."),
+        (AccessDeviceKeyChanged, "QuadChroma тепер використовує один ключ на комп'ютер для обох напрямків. Якщо {n} уже знав цей комп'ютер, він запитає ще раз."),
     ],
 };
