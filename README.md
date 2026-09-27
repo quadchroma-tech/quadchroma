@@ -34,7 +34,7 @@ and the codec can be switched while the session runs.
   with Windows Remote Desktop; choose which of the Mac's screens to show (it follows
   the main screen automatically); audio; a desktop shortcut per host; 29 languages.
 
-![Start screen of the Windows client: two hosts found on the network - one already known (check mark) with its device ID, one older host without an ID - each with a Desktop shortcut button, the address field, and the buttons Connect, Share this PC and Quit. The interface is available in 29 languages.](oberflaeche.png)
+![The start screen of the app on a Mac: two computers found on the network - one already known (check mark) with its device ID, one older host without an ID - the address field, the buttons Connect, Share this Mac (with its check box) and Close window, below them the line "This computer: Office PC · 305 114 872" with Rename and the check boxes "Prevent sleep while QuadChroma is running" and "Start at login". On Windows the same screen says Share this PC and Start with Windows and has a Desktop shortcut button in every row. The interface is available in 29 languages.](start-screen.png)
 
 ## How it compares
 
@@ -346,7 +346,7 @@ not know yet cannot answer its access request, and a new client reports a host o
 earlier version that does not know it ("… uses an older QuadChroma version"): update
 both sides.
 
-![Statistics panel (F9) during a session with HEVC 4:4:4 at 10 bits, 1920x1080, decoded by NVDEC; the last line shows the six-digit comparison code.](oberflaeche-sitzung.png)
+![Statistics panel (F9) during a session with HEVC 4:4:4 at 10 bits, 1920x1080, decoded by NVDEC; the last line shows the six-digit comparison code.](session-stats.png)
 
 ## Using the client
 
@@ -413,7 +413,7 @@ immediately and reports back what is actually in effect; the client stores the v
 per host (by fingerprint) and restores them on the next connection. The choice of
 screen is stored by the host itself.
 
-![The menu, Picture tab: latency and frame rate, maximum bit rate and frame rate, gaming mode, fixed frame rate, sound, the host's screens (Automatic and two screens) and the codecs the host offers.](hud.png)
+![The menu (F10, or hold ESC) with its six tabs - Picture, Display, Encryption, Shortcuts, Benchmark, Computers - and Disconnect at the right of the header, above the host's address. The Picture tab is open: latency and frame rate, maximum bit rate and frame rate, gaming mode, fixed frame rate, sound, the host's screens (Automatic and two screens) and the codecs the host offers.](hud.png)
 
 ### Codecs
 

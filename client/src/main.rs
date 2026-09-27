@@ -11156,7 +11156,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                 kennung: "v1138-m1234-s0".into(), name: "X27 X1".into(), breite: 1920, hoehe: 1080, hz: 120, haupt: true, gestreamt: true,
             },
             bildschirm::BildschirmEintrag {
-                kennung: "v0-m0-s0".into(), name: "Virtuell 16:9".into(), breite: 1920, hoehe: 1080, hz: 240, haupt: false, gestreamt: false,
+                kennung: "v0-m0-s0".into(), name: "Virtual 16:9".into(), breite: 1920, hoehe: 1080, hz: 240, haupt: false, gestreamt: false,
             },
         ];
         let stand = HudStand {
@@ -11185,8 +11185,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             // aelterer Host ohne ID; die Maus steht ueber dem Laptop.
             geraete: geraete_im_reiter(
                 vec![
-                    Hostzeile { name: "Buero-PC".into(), adresse: "192.168.178.60:9001".into(), id: Some(305_114_872), bekannt: true },
-                    Hostzeile { name: "Roberts Mac mini".into(), adresse: "192.168.178.194:9001".into(), id: Some(581_729_911), bekannt: true },
+                    Hostzeile { name: "Office PC".into(), adresse: "192.168.178.60:9001".into(), id: Some(305_114_872), bekannt: true },
+                    Hostzeile { name: "Robert's Mac mini".into(), adresse: "192.168.178.194:9001".into(), id: Some(581_729_911), bekannt: true },
                     Hostzeile { name: "Laptop".into(), adresse: "192.168.178.71:9001".into(), id: Some(12_004_417), bekannt: false },
                     Hostzeile { name: "studio.local".into(), adresse: "192.168.178.80:9001".into(), id: None, bekannt: false },
                 ],
@@ -11232,7 +11232,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         // Die Schreibmarke blinkt: in diesem Takt steht sie.
         u.tick = 70;
         let mut d = zugangsphase::Dialog {
-            name: "Roberts Mac mini".into(),
+            name: "Robert's Mac mini".into(),
             id: 581_729_911,
             code: "628 306".into(),
             zulassen: true,
@@ -11287,7 +11287,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // gerollt - mit Rollbalken.
     let mut hosts = vec![
         Hostzeile {
-            name: "Roberts Mac mini".into(),
+            name: "Robert's Mac mini".into(),
             adresse: "192.168.178.194:9001".into(),
             id: Some(581_729_911),
             bekannt: true,
@@ -11295,7 +11295,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         Hostzeile { name: "studio.local".into(), adresse: "192.168.178.60:9001".into(), id: None, bekannt: false },
     ];
     if view == "startrollen" {
-        for (i, n) in ["Buero-PC", "Keller", "Laptop", "Wohnzimmer", "Werkstatt"].iter().enumerate() {
+        for (i, n) in ["Office PC", "Basement", "Laptop", "Living room", "Workshop"].iter().enumerate() {
             let id = 100_000_000 + i as u32 * 7_654_321;
             hosts.push(Hostzeile { name: (*n).into(), adresse: format!("192.168.178.{}:9001", 70 + i), id: Some(id), bekannt: false });
         }
@@ -11316,11 +11316,11 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                 .text(lang),
         ),
         "veraltet" => Some(Meldung::neu(strings::Key::MsgHostOutdated, "").mit("{n}", "studio.local").text(lang)),
-        "abgelehnt" => Some(Meldung::neu(strings::Key::MsgRefused, "").mit("{n}", "Roberts Mac mini").text(lang)),
+        "abgelehnt" => Some(Meldung::neu(strings::Key::MsgRefused, "").mit("{n}", "Robert's Mac mini").text(lang)),
         "idfehlt" => Some(Meldung::neu(strings::Key::MsgIdNotFound, "").mit("{i}", "123 456 789").text(lang)),
-        "entfernt" => Some(Meldung::neu(strings::Key::MsgDeviceRemoved, "").mit("{n}", "Roberts Mac mini").text(lang)),
+        "entfernt" => Some(Meldung::neu(strings::Key::MsgDeviceRemoved, "").mit("{n}", "Robert's Mac mini").text(lang)),
         "freigabefehler" => Some(lang.get(strings::Key::MsgShareFailed).to_string()),
-        "beendet" => Some(host_ende_meldung(HOST_ENDE_BEENDET, "Roberts Mac mini", "192.168.178.194:9001").text(lang)),
+        "beendet" => Some(host_ende_meldung(HOST_ENDE_BEENDET, "Robert's Mac mini", "192.168.178.194:9001").text(lang)),
         _ => None,
     };
     // "starttip": die Maus steht ueber dem Knopf "Verknuepfung" der ersten
@@ -11352,8 +11352,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     };
     let dieser = MIT_FREIGABE.then_some(DieserComputer {
         freigabe: an,
-        name: "Büro-PC",
-        id: Some(581_729_911),
+        name: "Office PC",
+        id: Some(305_114_872),
         ruhe_verhindern: an,
         ruhe_grund: None,
         autostart,
