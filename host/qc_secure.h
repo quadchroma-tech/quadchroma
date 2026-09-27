@@ -78,6 +78,11 @@ size_t qc_chan_gepuffert(const qc_chan *c);
 /// -2 = vorhanden, aber nicht lesbar oder beschaedigt (bleibt unangetastet).
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]);
 
+/// Wie qc_identity_load, fuer eine beliebige Datei (Tests). Legt ein anderer
+/// die Datei an, waehrend dieser Lader erzeugt (EEXIST beim Anlegen), gilt
+/// dessen Schluessel: sie wird neu gelesen, nie ueberschrieben.
+int qc_identity_load_pfad(const char *path, uint8_t priv[32], uint8_t pub[32]);
+
 // Die Liste der erlaubten Geraete (frueher authorized.txt, hier) steht jetzt
 // in zugang.h (host-devices.txt, samt Migration).
 

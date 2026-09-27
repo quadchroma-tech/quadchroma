@@ -440,6 +440,51 @@ static void frist_pruefen(int port) {
 
 // ------------------------------------------------ eigener Schluessel
 
+// Zwei Erzeuger zugleich (in der einen App: der Rust-Teil und dieser Lader
+// in einem Prozess, oder ein zweiter Start): beide starten auf ein Zeichen
+// und legen dieselbe fehlende Datei an. Wer beim Anlegen EEXIST bekommt,
+// liest die Datei des anderen - beide halten danach denselben Schluessel,
+// und er steht in der Datei.
+typedef struct {
+    const char *pfad;
+    atomic_int *los;
+    uint8_t priv[32], pub[32];
+    int r;
+} erzeuger;
+
+static void *erzeuger_faden(void *arg) {
+    erzeuger *e = arg;
+    while (!atomic_load(e->los)) {}
+    e->r = qc_identity_load_pfad(e->pfad, e->priv, e->pub);
+    return NULL;
+}
+
+static void wettlauf_pruefen(void) {
+    char key[1200];
+    snprintf(key, sizeof key, "%s/wettlauf.key", g_ablage);
+    int runden = 300, gleich = 0;
+    for (int i = 0; i < runden; i++) {
+        unlink(key);
+        atomic_int los = 0;
+        erzeuger a = {key, &los, {0}, {0}, 99}, b = {key, &los, {0}, {0}, 99};
+        pthread_t ta, tb;
+        pthread_create(&ta, NULL, erzeuger_faden, &a);
+        pthread_create(&tb, NULL, erzeuger_faden, &b);
+        atomic_store(&los, 1);
+        pthread_join(ta, NULL);
+        pthread_join(tb, NULL);
+        struct stat st;
+        if (a.r == 0 && b.r == 0 && memcmp(a.priv, b.priv, 32) == 0 && memcmp(a.pub, b.pub, 32) == 0 &&
+            stat(key, &st) == 0 && st.st_size == 32 && datei_gleich(key, a.priv, 32))
+            gleich++;
+        else
+            printf("         (Runde %d: Rueckgaben %d und %d)\n", i, a.r, b.r);
+    }
+    unlink(key);
+    printf("         (%d von %d Runden mit demselben Schluessel)\n", gleich, runden);
+    pruefe(gleich == runden, "zwei Erzeuger zugleich: beide 0, derselbe Schluessel, er steht in der Datei");
+}
+
 static void schluessel_pruefen(void) {
     printf("\n-- eigener Schluessel (host.key)\n");
     char key[1200];
@@ -495,6 +540,7 @@ static void schluessel_pruefen(void) {
     symlink(ziel, key);
     pruefe(qc_identity_load(p2, q2) == -2 && !gibt_es(ziel), "haengender Verweis: -2, kein Ziel angelegt");
     unlink(key);
+    wettlauf_pruefen();
 }
 
 // ----------------------------------------------------------------- Ablauf

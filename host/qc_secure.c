@@ -260,6 +260,51 @@ static int fehlt(const char *path, int oeffnen_errno) {
     return oeffnen_errno == ENOENT && lstat(path, &st) != 0 && errno == ENOENT;
 }
 
+// Liest eine Schluesseldatei einmal. 0 = geladen, 1 = fehlt, 2 = zu kurz
+// (vielleicht gerade im Entstehen), -2 = nicht lesbar oder beschaedigt.
+static int schluessel_einmal_lesen(const char *path, uint8_t priv[32], uint8_t pub[32]) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return fehlt(path, errno) ? 1 : -2;
+    uint8_t buf[65];                    // ein Byte mehr: zu lang ist auch beschaedigt
+    ssize_t r = 0;
+    for (;;) {                          // bis zum Dateiende (read darf kuerzer liefern)
+        ssize_t n = read(fd, buf + r, sizeof buf - (size_t)r);
+        if (n > 0 && (r += n) < (ssize_t)sizeof buf) continue;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) r = -1;
+        break;
+    }
+    close(fd);
+    int ergebnis = -2;
+    if (r == 32 || r == 64) {
+        memcpy(priv, buf, 32);
+        qc_pubkey(priv, pub);
+        // 64 Byte: der hintere Teil muss zum vorderen passen - sonst ist
+        // die Datei beschaedigt (und bleibt, wie sie ist). Der oeffentliche
+        // Schluessel ist kein Geheimnis: memcmp genuegt.
+        ergebnis = r == 64 && memcmp(pub, buf + 32, 32) != 0 ? -2 : 0;
+    } else if (r >= 0 && r < 64) {
+        ergebnis = 2;
+    }
+    qc_wipe(buf, sizeof buf);
+    if (ergebnis != 0) qc_wipe(priv, 32);
+    return ergebnis;
+}
+
+// Wie schluessel_einmal_lesen, aber eine zu kurze Datei wird nach 200 ms
+// einmal neu gelesen, bevor sie als beschaedigt gilt: legt ein anderer sie
+// gerade direkt an (ein zweiter Start, oder der Rust-Teil auf einem
+// Dateisystem ohne harte Verweise), saehe man sie sonst halb - wie
+// schluessel_lesen in secure.rs. 0 = geladen, 1 = fehlt, -2 = beschaedigt.
+static int schluessel_lesen(const char *path, uint8_t priv[32], uint8_t pub[32]) {
+    int r = schluessel_einmal_lesen(path, priv, pub);
+    if (r == 2) {
+        usleep(200 * 1000);
+        r = schluessel_einmal_lesen(path, priv, pub);
+    }
+    return r == 2 ? -2 : r;
+}
+
 // host.key ist der Geraeteschluessel der einen App: mit ihm nimmt der Host
 // an, und mit ihm ruft der Client desselben Rechners an (secure.rs,
 // GERAETESCHLUESSEL). Zwei Formen gelten: 32 Byte (nur privat - so schreibt
@@ -273,40 +318,29 @@ static int fehlt(const char *path, int oeffnen_errno) {
 int qc_identity_load(uint8_t priv[32], uint8_t pub[32]) {
     char path[1200];
     if (config_path("host.key", path, sizeof path)) return -1;
+    return qc_identity_load_pfad(path, priv, pub);
+}
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        uint8_t buf[65];                // ein Byte mehr: zu lang ist auch beschaedigt
-        ssize_t r = 0;
-        for (;;) {                      // bis zum Dateiende (read darf kuerzer liefern)
-            ssize_t n = read(fd, buf + r, sizeof buf - (size_t)r);
-            if (n > 0 && (r += n) < (ssize_t)sizeof buf) continue;
-            if (n < 0 && errno == EINTR) continue;
-            if (n < 0) r = -1;
-            break;
-        }
-        close(fd);
-        int ok = r == 32 || r == 64;
-        if (ok) {
-            memcpy(priv, buf, 32);
-            qc_pubkey(priv, pub);
-            // 64 Byte: der hintere Teil muss zum vorderen passen - sonst ist
-            // die Datei beschaedigt (und bleibt, wie sie ist). Der oeffentliche
-            // Schluessel ist kein Geheimnis: memcmp genuegt.
-            if (r == 64 && memcmp(pub, buf + 32, 32) != 0) ok = 0;
-        }
-        qc_wipe(buf, sizeof buf);
-        if (!ok) { qc_wipe(priv, 32); return -2; }
-        return 0;
-    }
-    if (!fehlt(path, errno)) return -2;
+int qc_identity_load_pfad(const char *path, uint8_t priv[32], uint8_t pub[32]) {
+    int r = schluessel_lesen(path, priv, pub);
+    if (r != 1) return r;
 
     qc_keypair(priv, pub);
     // O_EXCL: nie eine Datei ueberschreiben, die inzwischen doch da ist.
-    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        int e = errno;
+        qc_wipe(priv, 32);
+        if (e != EEXIST) return -1;
+        // Inzwischen angelegt - vom Rust-Teil desselben Prozesses (der Client
+        // braucht den Geraeteschluessel womoeglich zuerst) oder von einem
+        // zweiten Start: dessen Schluessel gilt. Der eigene stuende nirgends,
+        // und eine Kopplung damit waere beim naechsten Start weg.
+        r = schluessel_lesen(path, priv, pub);
+        return r == 1 ? -1 : r;
+    }
     int ok = write(fd, priv, 32) == 32 && fsync(fd) == 0;
     if (close(fd) != 0) ok = 0;
-    if (!ok) { unlink(path); return -1; }
+    if (!ok) { unlink(path); qc_wipe(priv, 32); return -1; }
     return 0;
 }

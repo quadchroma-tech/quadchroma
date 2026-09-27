@@ -23,7 +23,8 @@ pub enum Fehler {
     /// Kein Ablageordner (APPDATA/HOME fehlt, Ordner nicht anzulegen).
     Ablage(String),
     /// Schluesseldatei vorhanden, aber mit falscher Laenge (weder 32 noch 64
-    /// Byte).
+    /// Byte) - oder mit 64 Byte, deren hinterer Teil nicht der oeffentliche
+    /// Schluessel zum vorderen ist.
     SchluesselBeschaedigt { pfad: PathBuf, laenge: usize },
     /// Datei vorhanden, aber nicht lesbar (Rechte, Sperre durch ein
     /// anderes Programm). `grund` ist der Wortlaut des Systems.
@@ -59,6 +60,12 @@ impl std::fmt::Display for Fehler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Fehler::Ablage(g) => write!(f, "{g}"),
+            Fehler::SchluesselBeschaedigt { pfad, laenge: 64 } => write!(
+                f,
+                "{} ist beschaedigt (64 Byte, aber der oeffentliche Teil passt nicht zum privaten) und wird \
+                 nicht ueberschrieben. Datei pruefen oder loeschen - dann entsteht ein neuer Schluessel.",
+                pfad.display()
+            ),
             Fehler::SchluesselBeschaedigt { pfad, laenge } => write!(
                 f,
                 "{} ist beschaedigt ({laenge} Byte statt 32 oder 64) und wird nicht ueberschrieben. \
@@ -658,7 +665,9 @@ fn schluessel_lesen(path: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>, Fehler> {
 /// oeffentlich - so legt Rust host.key an, und so lag frueher client.key)
 /// und 32 Byte (nur privat - so schreibt der Mac-Host host.key,
 /// qc_secure.c); zu 32 Byte wird der oeffentliche errechnet, die Datei
-/// bleibt, wie sie ist. Ist die Datei sonst zu KURZ, wird nach `warten`
+/// bleibt, wie sie ist. Bei 64 Byte muss der hintere Teil der oeffentliche
+/// zum vorderen sein (wie im Lader des Mac-Hosts) - sonst ist die Datei
+/// beschaedigt und bleibt liegen. Ist die Datei sonst zu KURZ, wird nach `warten`
 /// einmal neu gelesen, bevor sie als beschaedigt gilt: auf einem
 /// Dateisystem ohne harte Verweise legt ein zweiter Prozess sie direkt an
 /// (siehe `geheim_schreiben`), und wer genau dann liest, saehe sie halb.
@@ -679,7 +688,10 @@ fn schluessel_lesen_mit(path: &Path, warten: impl FnOnce()) -> Result<Option<(Ve
     let beschaedigt = |laenge| Fehler::SchluesselBeschaedigt { pfad: path.to_path_buf(), laenge };
     match b {
         None => Ok(None),
-        Some(b) if b.len() == 64 => Ok(Some((b[..32].to_vec(), b[32..].to_vec()))),
+        Some(b) if b.len() == 64 => match noise::oeffentlich(&b[..32]) {
+            Some(oeff) if oeff == b[32..] => Ok(Some((b[..32].to_vec(), oeff))),
+            _ => Err(beschaedigt(64)),
+        },
         Some(b) if b.len() == 32 => match noise::oeffentlich(&b) {
             Some(oeff) => Ok(Some((b, oeff))),
             None => Err(beschaedigt(32)),
@@ -695,10 +707,17 @@ fn schluessel_lesen_mit(path: &Path, warten: impl FnOnce()) -> Result<Option<(Ve
 /// beim Mac-Host). Ein Umbenennen ersetzte eine Datei, die ein zweiter
 /// Prozess inzwischen angelegt hat. Unter Unix nur fuer den Eigentuemer
 /// lesbar (0600, wie host.key des Mac-Hosts); unter Windows gilt die geerbte
-/// Liste (siehe config_dir).
+/// Liste (siehe config_dir). Der Zwischenname ist je Aufruf eigen (pid und
+/// laufende Nummer): in der einen App brauchen Client und Host-Rolle den
+/// Geraeteschluessel womoeglich zugleich - mit einem Namen je Prozess
+/// loeschte der eine Faden die Zwischendatei des anderen, und der harte
+/// Verweis zeigte auf einen Schluessel, den keiner der beiden in der Hand
+/// haelt.
 fn geheim_schreiben(path: &Path, inhalt: &[u8]) -> std::io::Result<()> {
+    static NUMMER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.{}.neu", std::process::id()));
+    let nr = NUMMER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{name}.{}-{nr}.neu", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let r = exklusiv_schreiben(&tmp, inhalt).and_then(|_| match std::fs::hard_link(&tmp, path) {
         // Dateisystem ohne harte Verweise (FAT, manche Freigaben): direkt
@@ -1003,16 +1022,27 @@ mod tests {
     fn schluessel_wettlauf_beim_erststart() {
         let d = ordner("key-wettlauf");
         let p = d.join("client.key");
-        let fremd = [9u8; 64];
+        let fremd = paar64();
         let k = schluessel_laden_mit(&p, || {
-            std::fs::write(&p, fremd).unwrap();
+            std::fs::write(&p, &fremd).unwrap();
             noise::keypair()
         })
         .unwrap();
         assert_eq!((k.0.as_slice(), k.1.as_slice()), (&fremd[..32], &fremd[32..]));
         assert_eq!(std::fs::read(&p).unwrap(), fremd);
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        // Legt ihn der andere mit 32 Byte an (wie der Mac-Host), gilt ebenso
+        // dessen Schluessel.
+        std::fs::remove_file(&p).unwrap();
+        let k = schluessel_laden_mit(&p, || {
+            std::fs::write(&p, &fremd[..32]).unwrap();
+            noise::keypair()
+        })
+        .unwrap();
+        assert_eq!((k.0.as_slice(), k.1.as_slice()), (&fremd[..32], &fremd[32..]));
+        assert_eq!(std::fs::read(&p).unwrap(), &fremd[..32]);
         // Direkt: vorhandenes Ziel heisst AlreadyExists, Inhalt bleibt.
+        std::fs::write(&p, &fremd).unwrap();
         let e = geheim_schreiben(&p, &[1u8; 64]).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&p).unwrap(), fremd);
@@ -1026,7 +1056,7 @@ mod tests {
     fn halber_schluessel_wird_nachgelesen() {
         let d = ordner("key-halb");
         let p = d.join("client.key");
-        let ganz: Vec<u8> = (0..64u8).collect();
+        let ganz = paar64();
         std::fs::write(&p, &ganz[..20]).unwrap();
         let k = schluessel_lesen_mit(&p, || std::fs::write(&p, &ganz).unwrap()).unwrap();
         assert_eq!(k, Some((ganz[..32].to_vec(), ganz[32..].to_vec())));
@@ -1043,6 +1073,126 @@ mod tests {
         // Fehlt sie, ist das kein Fehler.
         std::fs::remove_file(&p).unwrap();
         assert_eq!(schluessel_lesen_mit(&p, || panic!("gewartet")), Ok(None));
+    }
+
+    /// Ein gueltiges Paar in der Form, wie Rust es schreibt: privat, dann
+    /// oeffentlich (64 Byte).
+    fn paar64() -> Vec<u8> {
+        let (p, o) = noise::keypair().unwrap();
+        [p, o].concat()
+    }
+
+    /// 64 Byte, deren hinterer Teil nicht der oeffentliche Schluessel zum
+    /// vorderen ist: beschaedigt wie im Lader des Mac-Hosts (qc_secure.c) -
+    /// die Datei bleibt Byte fuer Byte, nichts wird neu erzeugt, und fuer den
+    /// Selbstschutz gibt es keinen oeffentlichen Schluessel.
+    #[test]
+    fn schluessel_mit_64_byte_passt_zusammen() {
+        let d = ordner("key-64");
+        let p = d.join("host.key");
+        let mut b = paar64();
+        std::fs::write(&p, &b).unwrap();
+        assert_eq!(schluessel_laden_mit(&p, || panic!("neu erzeugt")).unwrap(), (b[..32].to_vec(), b[32..].to_vec()));
+        b[40] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        let e = schluessel_laden_mit(&p, || panic!("neu erzeugt")).unwrap_err();
+        assert_eq!(e, Fehler::SchluesselBeschaedigt { pfad: p.clone(), laenge: 64 });
+        assert!(e.to_string().contains("passt nicht zum privaten"), "{e}");
+        assert_eq!(std::fs::read(&p).unwrap(), b, "Datei veraendert");
+        assert_eq!(schluessel_lesen_mit(&p, || panic!("gewartet")), Err(e));
+        assert_eq!(oeffentlich_lesen(&p), None);
+        // Ein anderer oeffentlicher Schluessel dahinter (etwa zwei Dateien
+        // zusammengesetzt): ebenso beschaedigt.
+        let fremd = paar64();
+        std::fs::write(&p, [&b[..32], &fremd[32..]].concat()).unwrap();
+        assert!(matches!(schluessel_laden_mit(&p, || panic!("neu erzeugt")), Err(Fehler::SchluesselBeschaedigt { laenge: 64, .. })));
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Mehrere Erzeuger zugleich in EINEM Prozess (die eine App: Client und
+    /// Host-Rolle brauchen den Geraeteschluessel womoeglich im selben
+    /// Augenblick zum ersten Mal): alle halten danach denselben Schluessel,
+    /// er steht in der Datei, und kein Zwischenname bleibt liegen.
+    #[test]
+    fn schluessel_wettlauf_in_einem_prozess() {
+        let d = ordner("key-faeden");
+        let p = d.join("host.key");
+        for runde in 0..40 {
+            let _ = std::fs::remove_file(&p);
+            let los = std::sync::Barrier::new(4);
+            let k: Vec<_> = std::thread::scope(|s| {
+                let h: Vec<_> = (0..4)
+                    .map(|_| {
+                        s.spawn(|| {
+                            los.wait();
+                            schluessel_laden(&p)
+                        })
+                    })
+                    .collect();
+                h.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let datei = std::fs::read(&p).unwrap();
+            for r in &k {
+                let (privat, oeff) = r.as_ref().unwrap_or_else(|e| panic!("Runde {runde}: {e}"));
+                assert_eq!([privat.clone(), oeff.clone()].concat(), datei, "Runde {runde}");
+            }
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "Runde {runde}: Zwischenname liegt");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Die eine App auf dem Mac: der Rust-Teil (64 Byte) und der Lader der
+    /// Host-Engine (qc_secure.c, 32 Byte) legen dieselbe fehlende Datei
+    /// zugleich an. Wer verliert, liest die Datei des anderen (EEXIST bzw.
+    /// AlreadyExists) - beide halten denselben Schluessel, und nichts wird
+    /// ueberschrieben.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schluessel_wettlauf_rust_und_mac_host() {
+        extern "C" {
+            fn qc_identity_load_pfad(path: *const std::os::raw::c_char, privat: *mut u8, oeff: *mut u8) -> std::os::raw::c_int;
+        }
+        let d = ordner("key-rust-c");
+        let p = d.join("host.key");
+        let c_pfad = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        let (mut rust_zuerst, mut c_zuerst) = (0, 0);
+        for runde in 0..60u64 {
+            let _ = std::fs::remove_file(&p);
+            let los = std::sync::Barrier::new(2);
+            let (rust, c) = std::thread::scope(|s| {
+                let rust = s.spawn(|| {
+                    los.wait();
+                    schluessel_laden(&p)
+                });
+                let c = s.spawn(|| {
+                    let (mut privat, mut oeff) = ([0u8; 32], [0u8; 32]);
+                    los.wait();
+                    // Jede zweite Runde spaeter: sonst legt C fast immer
+                    // zuerst an (der Rust-Teil wartet auf sync_all). So
+                    // liest mal der eine, mal der andere die Datei des anderen.
+                    std::thread::sleep(Duration::from_micros((runde % 2) * (runde % 7 + 1) * 8000));
+                    // SAFETY: Pfad mit Nullbyte; der Lader schreibt je genau 32 Byte.
+                    let r = unsafe { qc_identity_load_pfad(c_pfad.as_ptr(), privat.as_mut_ptr(), oeff.as_mut_ptr()) };
+                    (r, privat, oeff)
+                });
+                (rust.join().unwrap(), c.join().unwrap())
+            });
+            let (privat, oeff) = rust.unwrap_or_else(|e| panic!("Runde {runde}: Rust {e}"));
+            assert_eq!(c.0, 0, "Runde {runde}: C-Lader");
+            assert_eq!((privat.as_slice(), oeff.as_slice()), (&c.1[..], &c.2[..]), "Runde {runde}");
+            let datei = std::fs::read(&p).unwrap();
+            match datei.len() {
+                64 => rust_zuerst += 1,
+                32 => c_zuerst += 1,
+                n => panic!("Runde {runde}: {n} Byte"),
+            }
+            assert_eq!(&datei[..32], &privat[..], "Runde {runde}");
+            assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1, "Runde {runde}: Zwischenname liegt");
+        }
+        println!("Rust zuerst: {rust_zuerst}, C zuerst: {c_zuerst}");
+        assert!(rust_zuerst > 0 && c_zuerst > 0, "nur eine Seite legte an: Rust {rust_zuerst}, C {c_zuerst}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Eine Schluesseldatei mit 32 Byte (nur privat), wie sie der Mac-Host als
