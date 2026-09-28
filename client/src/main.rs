@@ -1197,6 +1197,14 @@ struct Shared {
     /// MSG_FAEHIGKEITEN DIESER Sitzung. Ohne das Bit zeigt das Menue keine
     /// Bildschirmzeile, und kein IN_BILDSCHIRM geht hinaus.
     host_bildschirmwahl: bool,
+    /// Der Host versteht IN_ANZEIGE und sendet die Strominfo Fassung 1: Bit 2
+    /// (FAEHIG_HDR) in MSG_FAEHIGKEITEN DIESER Sitzung. Ohne das Bit geht
+    /// kein IN_ANZEIGE hinaus. Zurueck mit den anderen Faehigkeiten
+    /// (dateien_zuruecksetzen).
+    host_hdr: bool,
+    /// Der HDR-Schalter ist fuer diesen Host aus (immer SDR, Wunsch Aus in
+    /// IN_ANZEIGE). Aus den gespeicherten Werten des Hosts; Voreinstellung an.
+    hdr_aus: bool,
     /// Ein Bildschirmwunsch ist unterwegs: seit wann, und welcher (None =
     /// Automatik). Geloescht, sobald eine Liste kommt, deren gestreamter
     /// Eintrag zu diesem Wunsch passt (oder die ihn als nicht angeschlossen
@@ -1452,11 +1460,13 @@ fn datei_zeilen_zeichnen(u: &mut ui::Ui, c: &mut ui::Canvas, ww: u32, wh: u32, z
 }
 
 impl Shared {
-    /// Sitzungsende fuer Dateien: die Faehigkeit des Hosts gilt nicht mehr,
-    /// eine vorgemerkte Kopie faellt weg, die laufende Sendung kommt heraus -
-    /// fallen lassen (ausserhalb der Sperre) bricht sie ab.
+    /// Sitzungsende fuer Dateien: die Faehigkeiten des Hosts (Dateien, HDR)
+    /// gelten nicht mehr, eine vorgemerkte Kopie faellt weg, die laufende
+    /// Sendung kommt heraus - fallen lassen (ausserhalb der Sperre) bricht
+    /// sie ab.
     fn dateien_zuruecksetzen(&mut self) -> Option<DateiSendung> {
         self.host_dateien = false;
+        self.host_hdr = false;
         self.faehigkeiten_da = false;
         self.datei_vorgemerkt = None;
         self.datei_senden.take()
@@ -3789,16 +3799,21 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // Bildschirmwahl 2.1). Erst damit zeigt das Menue die
                     // Zeile, und erst damit geht ein Wunsch hinaus.
                     let bildschirmwahl = bits & FAEHIG_BILDSCHIRM != 0;
+                    // Bit 2: der Host versteht IN_ANZEIGE (ab 0.2.0); erst
+                    // damit meldet der Fensterfaden die Lage der Anzeige.
+                    let hdr_faehig = bits & FAEHIG_HDR != 0;
                     {
                         let mut s = shared.lock().unwrap();
                         s.host_dateien = kann;
                         s.host_bildschirmwahl = bildschirmwahl;
+                        s.host_hdr = hdr_faehig;
                         s.faehigkeiten_da = true;
                     }
                     protokoll::zeile(format!(
-                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}, Bildschirmwahl {}",
+                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}, Bildschirmwahl {}, HDR-Aushandlung {}",
                         if kann { "ja" } else { "nein" },
-                        if bildschirmwahl { "ja" } else { "nein" }
+                        if bildschirmwahl { "ja" } else { "nein" },
+                        if hdr_faehig { "ja" } else { "nein" }
                     ));
                 }
             }
@@ -4648,7 +4663,7 @@ type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
 
 /// Nachrichten, die einen Zustand setzen statt ein Ereignis zu melden:
 /// Faehigkeiten, Einstellungen, Codec, Testbild, Zwischenablage,
-/// Bildschirmwunsch. Steht der
+/// Bildschirmwunsch, Lage der Anzeige (IN_ANZEIGE). Steht der
 /// Kanal gerade nicht (Aufbau im Hintergrund, Schreibfaden gescheitert),
 /// wird je Art die letzte gemerkt und nachgereicht, sobald er steht -
 /// frueher baute das naechste `send` den Kanal selbst auf und lieferte sie
@@ -4660,7 +4675,7 @@ type Aufbau = (Result<secure::Secure, secure::Fehler>, Option<String>);
 /// haengen. IN_FAEHIGKEITEN geht ohnehin als erste Nachricht auf jedem neu
 /// stehenden Kanal hinaus (siehe ensure); gemerkt wird sie trotzdem, falls
 /// sie jemand ohne Kanal sendet.
-const NACHREICHEN: [u8; 6] = [IN_FAEHIGKEITEN, IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP, IN_BILDSCHIRM];
+const NACHREICHEN: [u8; 7] = [IN_FAEHIGKEITEN, IN_SETTINGS, IN_CODEC, IN_TESTBILD, IN_CLIP, IN_BILDSCHIRM, IN_ANZEIGE];
 
 /// Was dieser Client kann (Spezifikation 2.2), als erste Nachricht auf
 /// jedem Eingabekanal: Dateien Fassung 1. Ein aelterer Host uebergeht sie
@@ -5180,6 +5195,13 @@ impl InputLink {
         self.send(IN_BILDSCHIRM, &bildschirm::wunsch_kodieren(wunsch));
     }
 
+    /// Lage der Anzeige an den Host (IN_ANZEIGE, 14 Byte aus hdr.rs): Schirm,
+    /// Darstellung, HDR-Wunsch. Nur fuer einen Host mit FAEHIG_HDR - das
+    /// prueft der Aufrufer (anzeige_melden).
+    fn anzeige(&mut self, a: &hdr::Anzeige) {
+        self.send(IN_ANZEIGE, &a.kodieren());
+    }
+
     /// Wunsch an den Host: Testbild an oder aus. Ein Host, der die
     /// Nachricht nicht kennt, uebergeht sie - dann laeuft der Benchmark
     /// eben auf dem Bildschirminhalt.
@@ -5279,6 +5301,63 @@ fn bildschirm_wunsch_senden(shared: &Mutex<Shared>, input: &Mutex<InputLink>, wu
     true
 }
 
+/// Was zuletzt als IN_ANZEIGE hinausging: in welcher Sitzung, was und wann.
+#[derive(Clone, Copy, Debug)]
+struct AnzeigeGemeldet {
+    sitzung: u64,
+    anzeige: hdr::Anzeige,
+    wann: Instant,
+}
+
+/// Hoechstens ein IN_ANZEIGE je Sekunde, solange sich die Lage aendert
+/// (etwa ein Fenster, das zwischen zwei Bildschirmen hin- und hergeschoben
+/// wird) - der Host baut bei einem anderen Ergebnis den Strom um.
+const ANZEIGE_ENTPRELLUNG: Duration = Duration::from_secs(1);
+
+/// So oft liest der Fensterfaden den Bildschirm des Fensters neu, auch ohne
+/// Verschieben: "HDR verwenden" oder der SDR-Schieber aendern sich, ohne dass
+/// das Fenster es merkt.
+const SCHIRM_TAKT: Duration = Duration::from_secs(2);
+
+/// Die Lage der Anzeige an den Host (IN_ANZEIGE, Spezifikation im Kopf von
+/// hdr.rs), je Durchlauf des Fensterfadens gefragt. Nur an einen Host, der
+/// FAEHIG_HDR in DIESER Sitzung gemeldet hat - ein aelterer bekommt nie Typ
+/// 71. Gesendet wird die erste Lage jeder Sitzung sofort, danach nur, wenn
+/// sich Flags oder Wunsch aendern (Helligkeit und Kopfraum allein nie), und
+/// hoechstens eine je ANZEIGE_ENTPRELLUNG - ausser `sofort` (ein Klick auf
+/// den HDR-Schalter). Ohne stehenden Eingabekanal wird sie gemerkt und
+/// nachgereicht (NACHREICHEN). `shared` und `input` werden nacheinander
+/// genommen, nie ineinander. Liefert, ob eine hinausging.
+fn anzeige_melden(
+    shared: &Mutex<Shared>,
+    input: &Mutex<InputLink>,
+    a: &hdr::Anzeige,
+    gemeldet: &mut Option<AnzeigeGemeldet>,
+    sofort: bool,
+    jetzt: Instant,
+) -> bool {
+    let sitzung = {
+        let s = shared.lock().unwrap();
+        if !s.host_hdr || s.link.is_none() {
+            return false;
+        }
+        s.sitzung_nr
+    };
+    let faellig = match gemeldet {
+        Some(g) if g.sitzung == sitzung => {
+            a.entscheidend_anders(&g.anzeige) && (sofort || jetzt.duration_since(g.wann) >= ANZEIGE_ENTPRELLUNG)
+        }
+        _ => true,
+    };
+    if !faellig {
+        return false;
+    }
+    input.lock().unwrap().anzeige(a);
+    *gemeldet = Some(AnzeigeGemeldet { sitzung, anzeige: *a, wann: jetzt });
+    protokoll::zeile(format!("IN_ANZEIGE an den Host: {}", a.text()));
+    true
+}
+
 /// Je Durchlauf des Fensterfadens (about_to_wait): Der Eingabekanal haengt am
 /// Bildkanal. Sobald dessen Handschlag steht, reichen wir die Bindung
 /// weiter; faellt er weg, trennt sich auch die Eingabe - niemand soll
@@ -5317,7 +5396,13 @@ fn gespeicherte_werte_anwenden(
     match (&fp, &*angewandt_fuer) {
         (Some(f), keiner) if bildkanal && keiner.as_deref() != Some(f.as_str()) => {
             let werte = cfg.fuer_host(f);
-            shared.lock().unwrap().ton = werte.map_or(true, |w| w.ton);
+            {
+                let mut s = shared.lock().unwrap();
+                s.ton = werte.map_or(true, |w| w.ton);
+                // Der HDR-Schalter geht mit IN_ANZEIGE hinaus (anzeige_melden),
+                // nicht mit den Einstellungen.
+                s.hdr_aus = werte.is_some_and(|w| !w.hdr);
+            }
             if let Some(w) = werte {
                 input.lock().unwrap().settings(w.mbit, w.fps, w.gaming, w.fest, w.ton);
             }
@@ -6409,6 +6494,19 @@ struct App {
     /// Fuer welchen Host die gespeicherten Werte schon geschickt wurden.
     /// Verhindert, dass wir sie in jedem Bild erneut senden.
     angewandt_fuer: Option<String>,
+    /// Der Bildschirm des Fensters fuer IN_ANZEIGE (anzeige_takt), wann er
+    /// zuletzt gelesen wurde, und ob er gleich neu gelesen werden soll
+    /// (Fenster verschoben, anderer Massstab).
+    schirm: Option<hdr::Schirm>,
+    schirm_geprueft: Option<Instant>,
+    schirm_pruefen: bool,
+    /// Das zuletzt gesendete IN_ANZEIGE (Sitzung, Inhalt, Zeit).
+    anzeige_gemeldet: Option<AnzeigeGemeldet>,
+    /// Seit wann HDR auf beiden Seiten laeuft - das goldene Abzeichen ueber
+    /// dem Bild steht HDR_ABZEICHEN_MS lang; und ob es beim letzten Takt
+    /// schon lief (nur das Aktivwerden zeigt es).
+    hdr_abzeichen: Option<Instant>,
+    hdr_beidseitig_vorher: bool,
     /// Wann zuletzt gezeichnet wurde - Oberflaechen ohne neues Bild werden
     /// nur alle 33 ms neu gezeichnet.
     letzte_zeichnung: Instant,
@@ -6819,6 +6917,12 @@ impl App {
                 }
             }
 
+            // Auf einen anderen Bildschirm geschoben oder anderer Massstab:
+            // den Bildschirm des Fensters beim naechsten Takt neu lesen
+            // (IN_ANZEIGE), nicht erst nach zwei Sekunden.
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.schirm_pruefen = true;
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as i32, position.y as i32);
                 // Eine Bewegung im Fenster ist der sicherste Beleg dafuer,
@@ -7251,6 +7355,8 @@ impl App {
         }
         // Bindung des Eingabekanals und die fuer diesen Host gespeicherten Werte.
         gespeicherte_werte_anwenden(&self.cfg, &self.shared, &self.input, &mut self.angewandt_fuer);
+        // Lage der Anzeige (IN_ANZEIGE) und das HDR-Abzeichen.
+        self.anzeige_takt(false);
         // Der Benchmark arbeitet im selben Takt: nie blockierend, das Bild
         // laeuft weiter, das Menue zeigt den Fortschritt.
         if let Some(b) = self.benchmark.as_mut() {
@@ -7531,11 +7637,131 @@ impl App {
     /// an den Host, und die Werte fuer diesen Host merken.
     fn stellen(&mut self, m: u32, f: u16, g: bool, fx: bool, ton: bool) {
         self.input.lock().unwrap().settings(m, f, g, fx, ton);
-        self.shared.lock().unwrap().ton = ton;
+        let hdr = {
+            let mut s = self.shared.lock().unwrap();
+            s.ton = ton;
+            !s.hdr_aus
+        };
         if let Some(fp) = &self.angewandt_fuer {
             let fp = fp.clone();
-            self.cfg.host_merken(&fp, einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton });
+            self.cfg.host_merken(&fp, einstellungen::HostWerte { mbit: m, fps: f, gaming: g, fest: fx, ton, hdr });
         }
+    }
+
+    /// Der HDR-Schalter im Reiter Bild: an = HDR, sobald beide Seiten es
+    /// koennen, aus = immer SDR. Gilt sofort (IN_ANZEIGE mit dem neuen
+    /// Wunsch, ohne Entprellung) und wird fuer diesen Host gespeichert wie
+    /// die anderen Werte des Reiters - die uebrigen aus dem Gespeicherten,
+    /// sonst aus dem, was der Host gerade meldet.
+    fn hdr_stellen(&mut self, an: bool) {
+        let gemeldet = {
+            let mut s = self.shared.lock().unwrap();
+            s.hdr_aus = !an;
+            s.settings
+        };
+        protokoll::zeile(format!("HDR-Schalter {}", if an { "an (Automatisch)" } else { "aus (immer SDR)" }));
+        if let Some(fp) = self.angewandt_fuer.clone() {
+            let basis = self.cfg.fuer_host(&fp).or_else(|| {
+                gemeldet.map(|(mbit, fps, gaming, fest, ton)| einstellungen::HostWerte { mbit, fps, gaming, fest, ton, hdr: true })
+            });
+            if let Some(w) = basis {
+                self.cfg.host_merken(&fp, einstellungen::HostWerte { hdr: an, ..w });
+            }
+        }
+        self.anzeige_takt(true);
+    }
+
+    /// Kann diese Anzeige HDR darstellen (Bit 1 in IN_ANZEIGE)? Nur der Weg
+    /// ueber die Karte, und nur, wenn er HDR-Bilder auch zeigen kann
+    /// (HDR_DARSTELLUNG der Anzeige - bis Schritt 5a/5b nein).
+    fn hdr_darstellung(&self) -> bool {
+        match &self.anzeige {
+            #[cfg(any(windows, target_os = "macos"))]
+            Anzeige::Gpu(_) => anzeige::HDR_DARSTELLUNG,
+            _ => false,
+        }
+    }
+
+    /// Praesentiert die Anzeige gerade in HDR bzw. EDR? Der softbuffer-Weg nie.
+    fn hdr_praesentiert(&self) -> bool {
+        match &self.anzeige {
+            #[cfg(any(windows, target_os = "macos"))]
+            Anzeige::Gpu(g) => g.hdr_praesentiert(),
+            _ => false,
+        }
+    }
+
+    /// Was die Oberflaeche gerade zu HDR zeigt: aus der Strominfo des Hosts
+    /// und der Praesentation dieser Anzeige (hdr::lage).
+    fn hdr_lage(&self) -> hdr::HdrLage {
+        let info = self.shared.lock().unwrap().info.and_then(|i| i.hdr);
+        hdr::lage(info.as_ref(), self.hdr_praesentiert())
+    }
+
+    /// Der Bildschirm, auf dem das Fenster steht (IN_ANZEIGE): unter Windows
+    /// aus DXGI und DisplayConfig, auf dem Mac aus NSScreen. None ohne
+    /// Fenster oder wenn das System nichts sagt - dann gilt SDR.
+    fn schirm_lesen(&self) -> Option<hdr::Schirm> {
+        let w = self.window.as_ref()?;
+        #[cfg(windows)]
+        {
+            anzeige::schirm_lage(fenster_hwnd(w)?)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            anzeige::schirm_lage(fenster_ansicht(w)?)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = w;
+            None
+        }
+    }
+
+    /// IN_ANZEIGE und das HDR-Abzeichen, je Durchlauf des Fensterfadens
+    /// (nur in der Sitzung): den Bildschirm des Fensters alle SCHIRM_TAKT neu
+    /// lesen - gleich nach einem Verschieben oder Massstabswechsel -, die
+    /// Lage melden (anzeige_melden) und das Aktivwerden von HDR auf beiden
+    /// Seiten erkennen: dann steht fuer HDR_ABZEICHEN_MS das goldene
+    /// Abzeichen ueber dem Bild. `sofort`: ein Klick auf den Schalter.
+    fn anzeige_takt(&mut self, sofort: bool) {
+        if self.screen != Screen::Session {
+            self.hdr_beidseitig_vorher = false;
+            self.hdr_abzeichen = None;
+            return;
+        }
+        let jetzt = Instant::now();
+        if sofort || self.schirm_pruefen || self.schirm_geprueft.map_or(true, |t| jetzt.duration_since(t) >= SCHIRM_TAKT) {
+            self.schirm_pruefen = false;
+            self.schirm_geprueft = Some(jetzt);
+            let neu = self.schirm_lesen();
+            // Ins Protokoll nur, was die Aushandlung angeht - nicht jede
+            // Helligkeitsaenderung eines EDR-Schirms.
+            let ht = |s: &Option<hdr::Schirm>| s.map(|s| (s.hdr, s.kopfraum_potentiell));
+            if ht(&neu) != ht(&self.schirm) || neu.is_some() != self.schirm.is_some() {
+                protokoll::zeile(match &neu {
+                    Some(s) => format!(
+                        "Bildschirm des Fensters: {}, SDR-Weiss {:.0} nit, Spitze {:.0} nit, Kopfraum {:.2} (jetzt {:.2})",
+                        if s.hdr { "HDR" } else { "SDR" },
+                        s.sdr_weiss_nit,
+                        s.spitze_nit,
+                        s.kopfraum_potentiell,
+                        s.kopfraum_aktuell
+                    ),
+                    None => "Bildschirm des Fensters: unbekannt (gilt als SDR)".into(),
+                });
+            }
+            self.schirm = neu;
+        }
+        let an = !self.shared.lock().unwrap().hdr_aus;
+        let a = hdr::Anzeige::fuer_client(self.schirm.as_ref(), self.hdr_darstellung(), an);
+        anzeige_melden(&self.shared, &self.input, &a, &mut self.anzeige_gemeldet, sofort, jetzt);
+        let beidseitig = self.hdr_lage() == hdr::HdrLage::Beidseitig;
+        if beidseitig && !self.hdr_beidseitig_vorher {
+            protokoll::zeile("HDR auf beiden Seiten aktiv (Host PQ, Anzeige HDR)".into());
+            self.hdr_abzeichen = Some(jetzt);
+        }
+        self.hdr_beidseitig_vorher = beidseitig;
     }
 
     /// Wunsch nach einem Kandidaten der Koennensliste. Erst den Hinweis
@@ -12893,6 +13119,12 @@ fn main() {
         menue_zuordnung: Arc::new(Mutex::new(symbolmenue::Zuordnung::default())),
         ruhe,
         angewandt_fuer: None,
+        schirm: None,
+        schirm_geprueft: None,
+        schirm_pruefen: false,
+        anzeige_gemeldet: None,
+        hdr_abzeichen: None,
+        hdr_beidseitig_vorher: false,
         letzte_zeichnung: Instant::now(),
         oberflaeche_vorher: false,
         esc_seit: None,
@@ -14482,17 +14714,24 @@ mod tests {
         l.mouse_move(0.3, 0.3);
         l.key(7, true, 0);
         l.codec(2);
+        // Die Lage der Anzeige (IN_ANZEIGE) ebenso: die letzte gilt.
+        let sdr = hdr::Anzeige::fuer_client(None, false, true);
+        let hdr_schirm = hdr::Schirm { hdr: true, sdr_weiss_nit: 240.0, spitze_nit: 1000.0, kopfraum_potentiell: 4.17, kopfraum_aktuell: 4.17, ..hdr::Schirm::default() };
+        let schirm_hdr = hdr::Anzeige::fuer_client(Some(&hdr_schirm), false, true);
+        l.anzeige(&sdr);
         l.settings(20, 120, true, true, false);
         // Der Bildschirmwunsch ist ebenfalls ein Zustand (Spezifikation
         // Bildschirmwahl 2.3): der letzte je Art wird gemerkt.
         l.bildschirm(Some("v1138-m1234-s0"));
         l.bildschirm(Some("v0-m0-s0"));
+        l.anzeige(&schirm_hdr);
         assert!(!l.steht());
         assert_eq!(l.sent, 0);
+        assert_eq!(l.nachreichen.len(), 5);
         eingabe_abwarten(&mut l);
         assert!(l.steht());
-        // Die Faehigkeiten vorweg, dann die vier gemerkten Zustaende.
-        assert_eq!(l.sent, 5);
+        // Die Faehigkeiten vorweg, dann die fuenf gemerkten Zustaende.
+        assert_eq!(l.sent, 6);
         l.key(9, true, 0);
         let _ = los.send(());
         let (gelesen, _) = host.join().unwrap();
@@ -14509,6 +14748,7 @@ mod tests {
                 (IN_CODEC, vec![2]),
                 (IN_SETTINGS, einst),
                 (IN_BILDSCHIRM, bildschirm::wunsch_kodieren(Some("v0-m0-s0"))),
+                (IN_ANZEIGE, schirm_hdr.kodieren().to_vec()),
                 (IN_KEY, taste)
             ]
         );
@@ -14533,7 +14773,7 @@ mod tests {
     #[test]
     fn gespeicherte_werte_gelten_ohne_eingabekanal() {
         let mut cfg = einstellungen::Einstellungen::default();
-        let w = einstellungen::HostWerte { mbit: 30, fps: 60, gaming: false, fest: true, ton: false };
+        let w = einstellungen::HostWerte { mbit: 30, fps: 60, gaming: false, fest: true, ton: false, hdr: false };
         cfg.hosts.insert("fp-a".into(), w);
         let shared = Mutex::new(Shared { ton: true, ..Shared::default() });
         // Ohne Adresse baut sich der Eingabekanal nie auf.
@@ -14555,6 +14795,9 @@ mod tests {
         gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
         assert!(!input.lock().unwrap().steht());
         assert!(!shared.lock().unwrap().ton, "gespeichertes Ton aus gilt lokal nicht");
+        // Der HDR-Schalter geht nicht mit den Einstellungen, er gilt lokal
+        // (IN_ANZEIGE traegt ihn als Wunsch).
+        assert!(shared.lock().unwrap().hdr_aus, "gespeichertes HDR aus gilt lokal nicht");
         assert_eq!(angewandt.as_deref(), Some("fp-a"));
         assert_eq!(input.lock().unwrap().nachreichen, vec![einst.clone()]);
         // Einmal je Host: der naechste Durchlauf schickt nichts dazu, und
@@ -14586,7 +14829,66 @@ mod tests {
         gespeicherte_werte_anwenden(&cfg, &shared, &input, &mut angewandt);
         assert_eq!(angewandt.as_deref(), Some("fp-b"));
         assert!(shared.lock().unwrap().ton);
+        assert!(!shared.lock().unwrap().hdr_aus, "ohne gespeicherte Werte ist HDR an (E5)");
         assert!(input.lock().unwrap().nachreichen.is_empty());
+    }
+
+    /// IN_ANZEIGE (Typ 71) geht nur an einen Host mit FAEHIG_HDR in dieser
+    /// Sitzung und nur mit Bildkanal; die erste Lage der Sitzung sofort,
+    /// danach nur andere Flags oder ein anderer Wunsch, hoechstens eine je
+    /// Sekunde - ausser mit `sofort` (Klick auf den Schalter). Helligkeit und
+    /// Kopfraum allein loesen nichts aus. Eine neue Sitzung meldet wieder.
+    #[test]
+    fn anzeige_nur_an_hdr_host_und_entprellt() {
+        let shared = Mutex::new(Shared::default());
+        // Ohne Adresse baut sich der Eingabekanal nie auf: alles landet im
+        // Nachreichen, dort steht je Art die letzte.
+        let input = Mutex::new(InputLink::new(String::new()));
+        let gemerkt = || {
+            let l = input.lock().unwrap();
+            l.nachreichen.iter().find(|b| b.first() == Some(&IN_ANZEIGE)).map(|b| b[8..].to_vec())
+        };
+        let schirm = hdr::Schirm { hdr: true, sdr_weiss_nit: 240.0, spitze_nit: 1000.0, kopfraum_potentiell: 4.17, kopfraum_aktuell: 4.17, ..hdr::Schirm::default() };
+        let a = hdr::Anzeige::fuer_client(Some(&schirm), false, true);
+        let t0 = Instant::now();
+        let mut gemeldet = None;
+
+        // Kein Bildkanal, dann kein FAEHIG_HDR: nichts.
+        assert!(!anzeige_melden(&shared, &input, &a, &mut gemeldet, false, t0));
+        shared.lock().unwrap().link = Some((vec![1; 32], vec![2; 32]));
+        assert!(!anzeige_melden(&shared, &input, &a, &mut gemeldet, true, t0));
+        assert_eq!(gemerkt(), None, "ein Host ohne FAEHIG_HDR bekam Typ 71");
+
+        // FAEHIG_HDR: die erste Lage geht gleich.
+        {
+            let mut s = shared.lock().unwrap();
+            s.host_hdr = true;
+            s.sitzung_nr = 1;
+        }
+        assert!(anzeige_melden(&shared, &input, &a, &mut gemeldet, false, t0));
+        assert_eq!(gemerkt(), Some(a.kodieren().to_vec()));
+        // Dieselbe Lage, oder nur heller: nichts.
+        assert!(!anzeige_melden(&shared, &input, &a, &mut gemeldet, false, t0 + Duration::from_secs(5)));
+        let heller = hdr::Anzeige { sdr_weiss_nit: 300, kopfraum_aktuell: 250, ..a };
+        assert!(!anzeige_melden(&shared, &input, &heller, &mut gemeldet, false, t0 + Duration::from_secs(5)));
+        // Fenster auf einen SDR-Schirm: erst nach der Entprellung.
+        let sdr = hdr::Anzeige::fuer_client(None, false, true);
+        assert!(!anzeige_melden(&shared, &input, &sdr, &mut gemeldet, false, t0 + Duration::from_millis(400)));
+        assert_eq!(gemerkt(), Some(a.kodieren().to_vec()));
+        assert!(anzeige_melden(&shared, &input, &sdr, &mut gemeldet, false, t0 + Duration::from_millis(1000)));
+        assert_eq!(gemerkt(), Some(sdr.kodieren().to_vec()));
+        // Der Schalter wartet nicht.
+        let aus = hdr::Anzeige::fuer_client(None, false, false);
+        assert!(anzeige_melden(&shared, &input, &aus, &mut gemeldet, true, t0 + Duration::from_millis(1100)));
+        assert_eq!(gemerkt().map(|b| b[2]), Some(hdr::WUNSCH_AUS));
+        // Neue Sitzung: wieder gleich, auch mit derselben Lage.
+        shared.lock().unwrap().sitzung_nr = 2;
+        assert!(anzeige_melden(&shared, &input, &aus, &mut gemeldet, false, t0 + Duration::from_millis(1150)));
+        // Sitzungsende: die Faehigkeit ist weg, nichts geht mehr hinaus.
+        let _ = shared.lock().unwrap().dateien_zuruecksetzen();
+        assert!(!shared.lock().unwrap().host_hdr);
+        shared.lock().unwrap().sitzung_nr = 3;
+        assert!(!anzeige_melden(&shared, &input, &a, &mut gemeldet, false, t0 + Duration::from_secs(9)));
     }
 
     /// Ein Fehler zaehlt nur fuer das Ziel, zu dem er gehoert: hat der
@@ -15630,6 +15932,10 @@ mod tests {
         tx.send(eingabe_rahmen(MSG_FAEHIGKEITEN, &[3, 0, 0, 0])).unwrap();
         assert!(warten_bis(frist, || shared.lock().unwrap().host_bildschirmwahl), "Bit 1 kam nicht an");
         assert!(shared.lock().unwrap().host_dateien);
+        // Ohne Bit 2 keine HDR-Aushandlung; mit Bit 2 (Host ab 0.2.0) schon.
+        assert!(!shared.lock().unwrap().host_hdr);
+        tx.send(eingabe_rahmen(MSG_FAEHIGKEITEN, &[7, 0, 0, 0])).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().host_hdr), "Bit 2 kam nicht an");
         // Die Liste der Pruefvektoren, byte-genau wie der Mac-Host sie schickt.
         tx.send(eingabe_rahmen(MSG_BILDSCHIRME, &hex(BILDSCHIRME_2_4))).unwrap();
         assert!(warten_bis(frist, || shared.lock().unwrap().bildschirme.len() == 2), "Liste kam nicht an");
@@ -15703,6 +16009,7 @@ mod tests {
             let s = shared.lock().unwrap();
             assert!(!s.host_bildschirmwahl && s.bildschirme.is_empty() && s.bildschirm_wunsch.is_none());
             assert!(s.bildschirm_wechsel.is_none());
+            assert!(!s.host_hdr, "FAEHIG_HDR ueberlebte das Sitzungsende");
         }
         assert!(!bildschirm_wunsch_senden(&shared, &input, None));
     }

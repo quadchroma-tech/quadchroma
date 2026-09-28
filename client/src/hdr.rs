@@ -263,6 +263,24 @@ impl InfoV1 {
 
 // ----------------------------------------------------------- IN_ANZEIGE
 
+/// Was ein Client ueber den Bildschirm seines Fensters weiss - Windows aus
+/// IDXGIOutput6::GetDesc1 und DisplayConfig, der Mac aus NSScreen (EDR).
+/// Daraus entsteht IN_ANZEIGE (Anzeige::fuer_client).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Schirm {
+    /// HDR-faehig: Windows "HDR verwenden" an (G2084/P2020), Mac potentieller
+    /// EDR-Kopfraum ueber 1.
+    pub hdr: bool,
+    /// SDR-Weiss in nit (Windows SDRWhiteLevel * 80 / 1000), 0 = unbekannt.
+    pub sdr_weiss_nit: f32,
+    /// Spitze und Vollbild-Spitze in nit, 0 = unbekannt.
+    pub spitze_nit: f32,
+    pub vollbild_spitze_nit: f32,
+    /// Kopfraum ueber dem SDR-Weiss (1.0 = SDR): moeglich und gerade.
+    pub kopfraum_potentiell: f32,
+    pub kopfraum_aktuell: f32,
+}
+
 /// Die Lage der Anzeige des Clients (IN_ANZEIGE).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Anzeige {
@@ -299,6 +317,58 @@ impl Anzeige {
             p[4 + 2 * i..6 + 2 * i].copy_from_slice(&v.to_le_bytes());
         }
         p
+    }
+
+    /// IN_ANZEIGE eines Clients: der Bildschirm seines Fensters (None =
+    /// unbekannt, gilt als SDR), ob er HDR darstellen kann (Bit 1), und der
+    /// HDR-Schalter (an = Automatisch, aus = immer SDR). Pegel auf ganze nit
+    /// gerundet, Kopfraum x100, beides in u16 geklemmt.
+    pub fn fuer_client(schirm: Option<&Schirm>, darstellung: bool, an: bool) -> Anzeige {
+        let s = schirm.copied().unwrap_or_default();
+        let u16_aus = |v: f32| -> u16 { if v.is_finite() { v.round().clamp(0.0, u16::MAX as f32) as u16 } else { 0 } };
+        let mut flags = 0;
+        if s.hdr {
+            flags |= ANZEIGE_SCHIRM_HDR;
+        }
+        if darstellung {
+            flags |= ANZEIGE_DARSTELLUNG;
+        }
+        Anzeige {
+            flags,
+            wunsch: if an { WUNSCH_AUTOMATISCH } else { WUNSCH_AUS },
+            sdr_weiss_nit: u16_aus(s.sdr_weiss_nit),
+            spitze_nit: u16_aus(s.spitze_nit),
+            vollbild_spitze_nit: u16_aus(s.vollbild_spitze_nit),
+            kopfraum_potentiell: u16_aus(s.kopfraum_potentiell * 100.0),
+            kopfraum_aktuell: u16_aus(s.kopfraum_aktuell * 100.0),
+        }
+    }
+
+    /// Muss der Host neu entscheiden? Nur, wenn sich Flags oder Wunsch
+    /// aendern - Pegel und Kopfraum allein (Helligkeit, Energiesparen) nie.
+    pub fn entscheidend_anders(&self, alt: &Anzeige) -> bool {
+        self.flags != alt.flags || self.wunsch != alt.wunsch
+    }
+
+    /// Fuers Protokoll: "Schirm HDR, Darstellung nein, Wunsch Automatisch,
+    /// Weiss 240 nit, Spitze 1000 nit, Kopfraum 4.17/4.17".
+    pub fn text(&self) -> String {
+        let wunsch = match self.wunsch {
+            WUNSCH_AUTOMATISCH => "Automatisch".to_string(),
+            WUNSCH_AUS => "Aus".to_string(),
+            WUNSCH_IMMER => "Immer".to_string(),
+            w => format!("unbekannt ({w})"),
+        };
+        format!(
+            "Schirm {}, Darstellung {}, Wunsch {wunsch}, Weiss {} nit, Spitze {} nit, Vollbild {} nit, Kopfraum {:.2}/{:.2}",
+            if self.schirm_hdr() { "HDR" } else { "SDR" },
+            if self.darstellung() { "ja" } else { "nein" },
+            self.sdr_weiss_nit,
+            self.spitze_nit,
+            self.vollbild_spitze_nit,
+            self.kopfraum_potentiell as f32 / 100.0,
+            self.kopfraum_aktuell as f32 / 100.0
+        )
     }
 
     /// None bei weniger als 14 Byte oder einer anderen Fassung als 1 - dann
@@ -380,6 +450,45 @@ pub fn grund_text(grund: u8) -> &'static str {
         GRUND_WECHSEL_GESCHEITERT => "Wechsel nach HDR gescheitert",
         GRUND_KEIN_IN_ANZEIGE => "kein IN_ANZEIGE vom Client",
         _ => "unbekannter Grund",
+    }
+}
+
+// ------------------------------------------------------------ Oberflaeche
+
+/// Was der Client zu HDR zeigt (Reiter Bild, F9-Zeile, Abzeichen in der
+/// Sitzung). Gold gibt es nur bei `Beidseitig`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdrLage {
+    /// HDR auf beiden Seiten: der Host sendet PQ, und der Client praesentiert
+    /// tatsaechlich in HDR bzw. EDR.
+    Beidseitig,
+    /// Der Host sendet PQ, der Client bildet es auf SDR ab ("HDR -> SDR").
+    Abgebildet,
+    /// SDR. Der Grund aus der Strominfo (GRUND_*); None bei einem Host ohne
+    /// Strominfo Fassung 1 (vor 0.2.0) - der kennt kein HDR.
+    Sdr(Option<u8>),
+}
+
+/// Beidseitig HDR: der Host sendet PQ (Transfer der Strominfo bzw. des
+/// Bildes) UND der Client praesentiert in HDR/EDR. Eine Seite allein reicht
+/// nie - eine HDR-Quelle auf einem SDR-Schirm ist nur abgebildet.
+pub fn beidseitig(host_transfer: u8, client_hdr: bool) -> bool {
+    host_transfer == TRANSFER_PQ && client_hdr
+}
+
+/// Die Lage fuer die Oberflaeche aus der Strominfo Fassung 1 des Hosts
+/// (None: Host vor 0.2.0) und ob der Client gerade in HDR/EDR praesentiert.
+pub fn lage(info: Option<&InfoV1>, client_hdr: bool) -> HdrLage {
+    match info {
+        Some(i) if i.farbe.ist_pq() => {
+            if beidseitig(i.farbe.transfer, client_hdr) {
+                HdrLage::Beidseitig
+            } else {
+                HdrLage::Abgebildet
+            }
+        }
+        Some(i) => HdrLage::Sdr(Some(i.grund)),
+        None => HdrLage::Sdr(None),
     }
 }
 
@@ -755,6 +864,62 @@ mod tests {
             kopfraum_potentiell: zahl(f[5]),
             kopfraum_aktuell: zahl(f[6]),
         }
+    }
+
+    /// IN_ANZEIGE eines Clients: Flags aus Schirm und Darstellung, Wunsch aus
+    /// dem Schalter, Pegel gerundet und geklemmt; ohne Schirm SDR mit Nullen.
+    /// Neu entscheiden muss der Host nur bei anderen Flags oder anderem
+    /// Wunsch, nie wegen Helligkeit oder Kopfraum.
+    #[test]
+    fn anzeige_fuer_client() {
+        let win = Schirm { hdr: true, sdr_weiss_nit: 240.0, spitze_nit: 1015.4, vollbild_spitze_nit: 600.6, kopfraum_potentiell: 4.23, kopfraum_aktuell: 4.23 };
+        let a = Anzeige::fuer_client(Some(&win), false, true);
+        assert_eq!(a, Anzeige { flags: ANZEIGE_SCHIRM_HDR, wunsch: WUNSCH_AUTOMATISCH, sdr_weiss_nit: 240, spitze_nit: 1015, vollbild_spitze_nit: 601, kopfraum_potentiell: 423, kopfraum_aktuell: 423 });
+        assert_eq!(Anzeige::lesen(&a.kodieren()), Some(a));
+        let aus = Anzeige::fuer_client(Some(&win), true, false);
+        assert_eq!((aus.flags, aus.wunsch), (ANZEIGE_SCHIRM_HDR | ANZEIGE_DARSTELLUNG, WUNSCH_AUS));
+        // Ohne Schirm: SDR, alles 0; Darstellung zaehlt trotzdem.
+        let leer = Anzeige::fuer_client(None, true, true);
+        assert_eq!(leer, Anzeige { flags: ANZEIGE_DARSTELLUNG, wunsch: WUNSCH_AUTOMATISCH, ..Anzeige::default() });
+        // Mac: nur Kopfraum, Pegel unbekannt; Unsinn wird 0 bzw. geklemmt.
+        let mac = Schirm { hdr: true, kopfraum_potentiell: 16.0, kopfraum_aktuell: f32::NAN, spitze_nit: 1e9, sdr_weiss_nit: -5.0, ..Schirm::default() };
+        let m = Anzeige::fuer_client(Some(&mac), false, true);
+        assert_eq!((m.kopfraum_potentiell, m.kopfraum_aktuell, m.spitze_nit, m.sdr_weiss_nit), (1600, 0, u16::MAX, 0));
+        // Nur Flags und Wunsch loesen eine neue Entscheidung aus.
+        let heller = Anzeige { sdr_weiss_nit: 300, kopfraum_aktuell: 200, ..a };
+        assert!(!heller.entscheidend_anders(&a));
+        assert!(aus.entscheidend_anders(&a));
+        assert!(Anzeige { flags: 0, ..a }.entscheidend_anders(&a));
+        assert_eq!(a.text(), "Schirm HDR, Darstellung nein, Wunsch Automatisch, Weiss 240 nit, Spitze 1015 nit, Vollbild 601 nit, Kopfraum 4.23/4.23");
+    }
+
+    /// Beidseitig nur mit PQ vom Host UND HDR-Praesentation beim Client;
+    /// eine Seite allein ist "abgebildet" bzw. SDR, nie Gold.
+    #[test]
+    fn beidseitig_nur_wenn_beide_seiten_hdr() {
+        assert!(beidseitig(TRANSFER_PQ, true));
+        assert!(!beidseitig(TRANSFER_PQ, false));
+        for t in [0, TRANSFER_SDR, TRANSFER_HLG, 2, 255] {
+            assert!(!beidseitig(t, true), "Transfer {t}");
+            assert!(!beidseitig(t, false), "Transfer {t}");
+        }
+        let pq = InfoV1 { farbe: Farbe::PQ, grund: GRUND_AKTIV, sdr_weiss_nit: 203, master_max_nit: 1000, master_min_zehntausendstel: 50, max_cll: 0, max_fall: 0 };
+        assert_eq!(lage(Some(&pq), true), HdrLage::Beidseitig);
+        assert_eq!(lage(Some(&pq), false), HdrLage::Abgebildet);
+        for g in [GRUND_CLIENT_SDR, GRUND_CODEC, GRUND_HOST_SCHIRM_SDR, GRUND_HOST_KANN_NICHT, GRUND_KEIN_IN_ANZEIGE] {
+            let sdr = InfoV1::sdr(g);
+            assert_eq!(lage(Some(&sdr), true), HdrLage::Sdr(Some(g)));
+            assert_eq!(lage(Some(&sdr), false), HdrLage::Sdr(Some(g)));
+        }
+        // HLG ist nicht PQ: bleibt SDR mit dem gemeldeten Grund.
+        let hlg = InfoV1 { farbe: Farbe { transfer: TRANSFER_HLG, ..Farbe::PQ }, ..pq };
+        assert_eq!(lage(Some(&hlg), true), HdrLage::Sdr(Some(GRUND_AKTIV)));
+        // Host vor 0.2.0: keine Strominfo Fassung 1.
+        assert_eq!(lage(None, true), HdrLage::Sdr(None));
+        // Ueber die Bytes der Leitung wie im Client.
+        let mut p = vec![0u8; INFO_LAENGE_ALT];
+        p.extend_from_slice(&pq.kodieren());
+        assert_eq!(lage(InfoV1::lesen(&p).as_ref(), true), HdrLage::Beidseitig);
     }
 
     /// PQ: die Pegel der Tabelle (80/100/203/240/1000/10000 nit =

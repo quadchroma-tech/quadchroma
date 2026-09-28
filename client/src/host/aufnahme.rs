@@ -255,7 +255,7 @@ fn anzeigenamen() -> Vec<(String, String)> {
 /// Weiss, mit dem Windows SDR-Inhalt in einen HDR-Desktop legt (Schieber
 /// "SDR-Inhaltshelligkeit"). DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)
 /// am Ziel des Pfads; None, wenn Windows ihn nicht nennt.
-fn sdr_weiss_lesen(name: &str) -> Option<u32> {
+pub(crate) fn sdr_weiss_lesen(name: &str) -> Option<u32> {
     anzeigepfade().into_iter().filter(|(quelle, _)| quelle == name).find_map(|(_, p)| {
         let mut weiss = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
         weiss.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {

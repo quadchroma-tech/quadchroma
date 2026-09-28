@@ -20,6 +20,10 @@ pub struct HostWerte {
     pub fest: bool,
     /// Ton uebertragen. Aus spart die rund 3 Mbit/s des unverdichteten Tons.
     pub ton: bool,
+    /// Der HDR-Schalter im Reiter Bild: an = HDR, sobald beide Seiten es
+    /// koennen (Wunsch Automatisch in IN_ANZEIGE), aus = immer SDR (Datei:
+    /// hdr=an|aus, Voreinstellung an - Entscheidung E5).
+    pub hdr: bool,
 }
 
 /// Welche Zeilen die Statistik zeigt. Nicht jeder will alles sehen - manchem
@@ -257,6 +261,7 @@ impl Einstellungen {
                     gaming: false,
                     fest: false,
                     ton: true,
+                    hdr: true,
                 });
                 continue;
             }
@@ -291,6 +296,7 @@ impl Einstellungen {
                             "gaming" => h.gaming = v == "1",
                             "fest" => h.fest = v == "1",
                             "ton" => h.ton = v == "1",
+                            "hdr" => h.hdr = schalter(v).unwrap_or(h.hdr),
                             _ => {}
                         }
                     }
@@ -339,8 +345,8 @@ impl Einstellungen {
         for fp in fps {
             let h = &self.hosts[fp];
             t.push_str(&format!(
-                "\nhost {fp}\nmbit={}\nfps={}\ngaming={}\nfest={}\nton={}\n",
-                h.mbit, h.fps, h.gaming as u8, h.fest as u8, h.ton as u8
+                "\nhost {fp}\nmbit={}\nfps={}\ngaming={}\nfest={}\nton={}\nhdr={}\n",
+                h.mbit, h.fps, h.gaming as u8, h.fest as u8, h.ton as u8, if h.hdr { "an" } else { "aus" }
             ));
         }
         t
@@ -403,7 +409,7 @@ mod tests {
         assert!(t.contains("\ntray_hinweis=0\n"), "{t}");
         e.tray = false;
         e.tray_hinweis = true;
-        e.hosts.insert("AAAA-BBBB-CCCC-DDDD".into(), HostWerte { mbit: 80, fps: 60, gaming: true, fest: false, ton: true });
+        e.hosts.insert("AAAA-BBBB-CCCC-DDDD".into(), HostWerte { mbit: 80, fps: 60, gaming: true, fest: false, ton: true, hdr: true });
         let t = e.als_text();
         assert!(t.contains("\ntray=aus\n"), "{t}");
         assert!(t.contains("\ntray_hinweis=1\n"), "{t}");
@@ -412,6 +418,28 @@ mod tests {
         let zurueck = Einstellungen::aus_text(&t);
         assert!(!zurueck.tray && zurueck.tray_hinweis);
         assert_eq!(zurueck.fuer_host("AAAA-BBBB-CCCC-DDDD"), e.fuer_host("AAAA-BBBB-CCCC-DDDD"));
+    }
+
+    /// Der HDR-Schalter je Host: ein alter Host-Block ohne die Zeile hat HDR
+    /// an (E5), "hdr=aus" gilt nur fuer seinen Host, Unlesbares laesst die
+    /// Voreinstellung stehen, und Schreiben und Lesen ergeben dasselbe.
+    #[test]
+    fn hdr_je_host() {
+        let alt = Einstellungen::aus_text("host AAAA\nmbit=80\nton=0\n");
+        assert!(alt.fuer_host("AAAA").unwrap().hdr);
+        let e = Einstellungen::aus_text("hdr=aus\nhost AAAA\nhdr=aus\n\nhost BBBB\nhdr=quatsch\n\nhost CCCC\nhdr=1\n");
+        assert!(!e.fuer_host("AAAA").unwrap().hdr);
+        assert!(e.fuer_host("BBBB").unwrap().hdr);
+        assert!(e.fuer_host("CCCC").unwrap().hdr);
+        let t = e.als_text();
+        assert!(t.contains("\nhost AAAA\nmbit=50\nfps=120\ngaming=0\nfest=0\nton=1\nhdr=aus\n"), "{t}");
+        assert!(t.contains("\nhost BBBB\nmbit=50\nfps=120\ngaming=0\nfest=0\nton=1\nhdr=an\n"), "{t}");
+        let z = Einstellungen::aus_text(&t);
+        for fp in ["AAAA", "BBBB", "CCCC"] {
+            assert_eq!(z.fuer_host(fp), e.fuer_host(fp), "{fp}");
+        }
+        // Vor dem ersten Host-Block gehoert die Zeile niemandem.
+        assert!(!Einstellungen::aus_text("hdr=aus\n").als_text().contains("hdr="));
     }
 
     /// Die eine App: Freigabe (Voreinstellung an), Geraetename (Voreinstellung
@@ -451,7 +479,7 @@ mod tests {
         e.geraetename = Some("Wohnzimmer".into());
         e.ruhe_verhindern = true;
         e.fenster_gezeigt = true;
-        e.hosts.insert("AAAA".into(), HostWerte { mbit: 80, fps: 60, gaming: false, fest: false, ton: true });
+        e.hosts.insert("AAAA".into(), HostWerte { mbit: 80, fps: 60, gaming: false, fest: false, ton: true, hdr: false });
         let t = e.als_text();
         assert!(t.find("geraetename=").unwrap() < t.find("host ").unwrap(), "{t}");
         let z = Einstellungen::aus_text(&t);

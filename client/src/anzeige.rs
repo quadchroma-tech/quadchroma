@@ -401,6 +401,59 @@ pub fn tearing_moeglich() -> bool {
     }
 }
 
+// ------------------------------------------------------------------- HDR
+
+/// Kann dieser Weg HDR-Bilder zeigen (Bit 1 in IN_ANZEIGE)? Noch nicht: die
+/// Swapchain in R10G10B10A2/G2084 und die PQ-Shader kommen mit Schritt 5b
+/// des HDR-Plans. Bis dahin meldet der Windows-Client ehrlich "nein" - ein
+/// Host sendet ihm dann nie PQ (Grund 5).
+pub const HDR_DARSTELLUNG: bool = false;
+
+/// Der Bildschirm des Fensters fuer IN_ANZEIGE: der Ausgang, auf dem der
+/// groesste Teil des Fensters liegt (MonitorFromWindow - nicht
+/// GetContainingOutput der Swapchain, die der softbuffer-Weg nicht hat),
+/// seine Farblage aus IDXGIOutput6::GetDesc1 ("HDR verwenden" = G2084/P2020,
+/// Spitzen) und das SDR-Weiss aus DisplayConfig (dieselbe Hilfe wie der
+/// Host). Eine frische Factory je Aufruf: eine alte kennt neu angesteckte
+/// Bildschirme nicht, und alle zwei Sekunden kostet das nichts. None, wenn
+/// kein Ausgang passt.
+pub fn schirm_lage(hwnd: isize) -> Option<crate::hdr::Schirm> {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    let monitor = unsafe { MonitorFromWindow(HWND(hwnd as *mut c_void), MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return None;
+    }
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let mut i = 0;
+    while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
+        i += 1;
+        let mut j = 0;
+        while let Ok(o) = unsafe { a.EnumOutputs(j) } {
+            j += 1;
+            let Ok(d) = (unsafe { o.GetDesc() }) else { continue };
+            if d.Monitor != monitor {
+                continue;
+            }
+            let ende = d.DeviceName.iter().position(|&c| c == 0).unwrap_or(d.DeviceName.len());
+            let name = String::from_utf16_lossy(&d.DeviceName[..ende]);
+            let d1 = o.cast::<IDXGIOutput6>().ok().and_then(|o6| unsafe { o6.GetDesc1() }.ok());
+            let hdr = d1.is_some_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            let weiss = crate::host::aufnahme::sdr_weiss_lesen(&name).map(crate::host::wandler::sdr_weiss_nit).unwrap_or(0.0);
+            let spitze = d1.map(|d| d.MaxLuminance).unwrap_or(0.0);
+            let kopfraum = if hdr && weiss > 0.0 && spitze > weiss { spitze / weiss } else { 1.0 };
+            return Some(crate::hdr::Schirm {
+                hdr,
+                sdr_weiss_nit: weiss,
+                spitze_nit: spitze,
+                vollbild_spitze_nit: d1.map(|d| d.MaxFullFrameLuminance).unwrap_or(0.0),
+                kopfraum_potentiell: kopfraum,
+                kopfraum_aktuell: kopfraum,
+            });
+        }
+    }
+    None
+}
+
 /// Geraet und Kontext. Mit Adapter: genau der (--adapter n); ohne: der
 /// Hardware-Adapter, den D3D waehlt, oder WARP fuer den Test.
 pub(crate) fn geraet_bauen(
@@ -648,6 +701,12 @@ impl Gpu {
         self.breite = ww;
         self.hoehe = wh;
         Ok(())
+    }
+
+    /// Praesentiert die Swapchain gerade in HDR (G2084)? Noch nie: sie ist
+    /// immer B8G8R8A8/SDR, siehe HDR_DARSTELLUNG.
+    pub fn hdr_praesentiert(&self) -> bool {
+        false
     }
 
     /// Ist DXGI bereit fuer ein weiteres Bild? Fragt das Warteobjekt mit

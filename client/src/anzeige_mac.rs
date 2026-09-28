@@ -333,6 +333,40 @@ impl Drop for Pool {
     }
 }
 
+// ------------------------------------------------------------------- HDR
+
+/// Kann dieser Weg HDR-Bilder zeigen (Bit 1 in IN_ANZEIGE)? Noch nicht: die
+/// EDR-Schicht und die PQ-Shader kommen mit Schritt 5a des HDR-Plans. Bis
+/// dahin meldet der Mac-Client ehrlich "nein" - ein Host sendet ihm dann
+/// nie PQ (Grund 5).
+pub const HDR_DARSTELLUNG: bool = false;
+
+/// Der Bildschirm des Fensters fuer IN_ANZEIGE, aus NSScreen: der
+/// EDR-Kopfraum, den er kann (maximumPotentialExtendedDynamicRange-
+/// ColorComponentValue; ueber 1 heisst HDR-faehig, etwa ein XDR-Schirm oder
+/// ein virtueller Bildschirm mit HDR), und der, der gerade geht
+/// (maximumExtendedDynamicRangeColorComponentValue - Helligkeit,
+/// Energiesparen). Pegel in nit nennt macOS nicht (0 = unbekannt). None ohne
+/// Fenster oder Bildschirm. Nur auf dem Hauptfaden.
+pub fn schirm_lage(ansicht: *mut c_void) -> Option<crate::hdr::Schirm> {
+    let _pool = Pool::neu();
+    unsafe {
+        let fenster = msg_id(ansicht as Id, c"window");
+        let schirm = msg_id(fenster, c"screen");
+        if schirm.is_null() {
+            return None;
+        }
+        let potentiell = msg_f64(schirm, c"maximumPotentialExtendedDynamicRangeColorComponentValue") as f32;
+        let aktuell = msg_f64(schirm, c"maximumExtendedDynamicRangeColorComponentValue") as f32;
+        Some(crate::hdr::Schirm {
+            hdr: potentiell > 1.0,
+            kopfraum_potentiell: potentiell.max(1.0),
+            kopfraum_aktuell: aktuell.max(1.0),
+            ..crate::hdr::Schirm::default()
+        })
+    }
+}
+
 /// Ein eigener Griff auf ein Objective-C-Objekt; Drop gibt ihn ab.
 struct Obj(Id);
 
@@ -828,6 +862,12 @@ impl Gpu {
             let fenster = msg_id(ansicht.0, c"window");
             !fenster.is_null() && msg_zahl(fenster, c"occlusionState") & FENSTER_SICHTBAR != 0
         }
+    }
+
+    /// Praesentiert die Schicht gerade in EDR? Noch nie: sie ist immer SDR
+    /// (BGRA8), siehe HDR_DARSTELLUNG.
+    pub fn hdr_praesentiert(&self) -> bool {
+        false
     }
 
     /// Wie viele praesentierte Bilder kamen auf dem Schirm an? Gezaehlt in
