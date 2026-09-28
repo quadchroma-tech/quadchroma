@@ -1,8 +1,9 @@
 # QuadChroma
 
-**Your Mac on a Windows screen, pixel-sharp: HEVC 4:4:4 with 10 bits, encoded by the
-Mac's hardware and decoded on any Windows 10 or 11 PC - in hardware by an NVIDIA GPU,
-otherwise in software. Free for personal use.**
+**Remote desktop between Macs and Windows PCs, pixel-sharp: HEVC 4:4:4 with 10 bits,
+encoded in hardware by Apple silicon or an NVIDIA GPU and shown on any Mac or Windows
+10/11 PC - decoded in hardware where the GPU can, otherwise in software. Free for
+personal use.**
 
 As far as we know, QuadChroma is the only free remote desktop that streams a Mac to a
 Windows PC in 4:4:4 at 10 bits with the Mac's hardware encoder, the Media Engine of
@@ -11,6 +12,11 @@ NVIDIA GPU decodes it in hardware (NVDEC); on AMD or Intel graphics, or without 
 suitable GPU, the PC decodes 4:4:4 in software, in about 8.6 ms per 1080p frame and
 slice-parallel. AMD and Intel GPUs decode HEVC 4:2:0 and H.264 in hardware (D3D11VA),
 and the codec can be switched while the session runs.
+
+Windows PCs send the same picture quality: a PC with an NVIDIA GPU encodes 4:4:4 at
+10 bits with NVENC - tested from PC to PC with an RTX 3080 Ti laptop GPU as the
+host. Without an NVIDIA GPU a Windows PC can still be controlled, but it only sends
+H.264 in software for now.
 
 - **Sharp text, clean color edges.** 4:4:4 keeps a color value for every pixel;
   the usual 4:2:0 shares one between four, which makes red text and thin coloured
@@ -147,7 +153,7 @@ on the Mac, `quadchroma.exe` on Windows. The table lists the two roles of each.
 |---|---|---|
 | Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; part of `QuadChroma.app` ("Share this Mac", on by default); host engine in Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; the app's menu-bar icon with device ID, access password, allowed devices, the sharing switch, "Start at login", the device name and "Prevent sleep". |
 | Client | Windows 10 or 11, 64-bit; part of `quadchroma.exe`; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
-| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). Not yet verified on real NVIDIA hardware. |
+| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
 | Client | Mac (arm64), part of the same `QuadChroma.app`; the same Rust source as on Windows | Secondary. Decoding with VideoToolbox (no FFmpeg on the Mac), audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), the app's one menu-bar icon, no desktop shortcut. Ships inside `QuadChroma.app`. |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
