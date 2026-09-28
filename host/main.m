@@ -3133,20 +3133,29 @@ static void codec_ohne_zuschauer_abbauen(void) {
     if (atomic_load(&g_client_fd) < 0) stream_herunterfahren_anstossen();
 }
 
+// Der Weg von SDR nach HDR10 scheiterte (die Aufnahme lehnte ab, oder der
+// Encoder ging in HDR10 nicht auf): ab jetzt SDR mit Grund 6, bis sich die
+// Lage aendert. Das gilt sofort, nicht erst, wenn der alte Codec wieder
+// laeuft - laesst auch der sich nicht oeffnen, faende der vorgemerkte
+// Codecwunsch sonst wieder HDR10 und versuchte denselben Weg ohne Ende. Galt
+// der Wechsel einem anderen Kandidaten, gilt der Codecwunsch weiter - danach
+// in SDR, ohne erneuten Versuch in HDR10. Nur auf g_capq.
+static void hdr_wechsel_gescheitert(int idx, int pq, int alt, int alt_pq) {
+    if (!pq || alt_pq) return;
+    atomic_store(&g_hdr_gescheitert, 1);
+    logf_(@"Wechsel nach HDR10 gescheitert - nur noch SDR (Grund 6), bis sich die Lage aendert");
+    if (idx != alt && g_wechsel_wunsch < 0) g_wechsel_wunsch = idx;
+}
+
 // Schritt h: der neue Kandidat liess sich nicht oeffnen, der alte kommt zurueck
 // - in seiner alten Farbe. Ein SWITCH gab es nicht, der Client decodiert
-// weiter mit dem alten Codec - nur die Strominfo geht noch einmal raus. Wollte
-// der Wechsel nach HDR (neu_pq) und laeuft es jetzt in SDR: Grund 6, bis sich
-// die Lage aendert.
-static void codec_alt_aufbauen(int alt, int alt_pq, int neu_pq) {
+// weiter mit dem alten Codec - nur die Strominfo geht noch einmal raus (nach
+// einem gescheiterten Weg nach HDR10 mit Grund 6).
+static void codec_alt_aufbauen(int alt, int alt_pq) {
     if (codec_wechsel_ueberholt(alt)) return;
     if (encoder_start(alt, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit), alt_pq)) {
         encoder_einstellungen_nachziehen();
         atomic_store(&g_force_key, 1);
-        if (neu_pq && !alt_pq) {
-            atomic_store(&g_hdr_gescheitert, 1);
-            logf_(@"Wechsel nach HDR10 gescheitert - es bleibt bei SDR (Grund 6), bis sich die Lage aendert");
-        }
         strominfo_senden();
         logf_(@"Alter Codec laeuft wieder: %s, %s", g_kandidaten[alt].name, farbe_text(alt_pq));
         codec_ohne_zuschauer_abbauen();
@@ -3186,9 +3195,7 @@ static void codec_wechsel_abschliessen(int idx, int pq, int alt, int alt_pq, OST
 
     logf_(@"Codecwechsel auf %s (%s) fehlgeschlagen - baue %s (%s) wieder auf", g_kandidaten[idx].name, farbe_text(pq),
           g_kandidaten[alt].name, farbe_text(alt_pq));
-    // Scheiterte HDR mit einem anderen Kandidaten, gilt der Codecwunsch
-    // weiter - danach in SDR (g_hdr_gescheitert), ohne erneuten Versuch.
-    if (pq && !alt_pq && idx != alt && g_wechsel_wunsch < 0) g_wechsel_wunsch = idx;
+    hdr_wechsel_gescheitert(idx, pq, alt, alt_pq);
     // Kein SWITCH: der Client hat noch seinen alten Decoder und behaelt ihn.
     // Ohne Strom (inzwischen abgebaut) kaeme der Abschluss von
     // updateConfiguration nie - eine Nachricht an nil tut nichts -, und der
@@ -3202,10 +3209,10 @@ static void codec_wechsel_abschliessen(int idx, int pq, int alt, int alt_pq, OST
     if (aufnahme_geaendert && g_stream) {
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
             if (e) logf_(@"Aufnahmeformat liess sich nicht zuruecksetzen: %@", e.localizedDescription);
-            dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt, alt_pq, pq); });
+            dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt, alt_pq); });
         }];
     } else {
-        codec_alt_aufbauen(alt, alt_pq, pq);
+        codec_alt_aufbauen(alt, alt_pq);
     }
 }
 
@@ -3284,8 +3291,8 @@ static void wechsel_ausfuehren(int idx, int pq) {
                 dispatch_async(g_capq, ^{
                     g_cfg.pixelFormat = alt_fmt;
                     aufnahme_farbe_setzen(g_cfg, alt_aufnahme_pq);
-                    if (pq && !alt_pq && idx != alt && g_wechsel_wunsch < 0) g_wechsel_wunsch = idx;
-                    codec_alt_aufbauen(alt, alt_pq, pq);
+                    hdr_wechsel_gescheitert(idx, pq, alt, alt_pq);
+                    codec_alt_aufbauen(alt, alt_pq);
                 });
                 return;
             }

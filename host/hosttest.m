@@ -24,7 +24,8 @@
 // Eingabekanal: neue Strominfo in SDR mit dem Grund des Hosts, nichts bei
 // gleicher Lage, Unlesbares uebergangen; dann bis HDR10 und zurueck: HDR am
 // Bildschirm des Hosts an/aus, Codecwechsel mit Farbe, Sperre 2 s, Grund 6,
-// wenn die Aufnahme HDR ablehnt, Abloesung mitten in HDR10), HDR10 mit echtem
+// wenn die Aufnahme HDR ablehnt, Abloesung mitten in HDR10, doppelter
+// Fehlschlag nach HDR10 ohne Schleife), HDR10 mit echtem
 // Encoder und Decoder (SEI 137/144 byte-genau hinter PPS jedes Vollbilds,
 // VUI und Anhaenge 2020/PQ/2020, HDR-Testbild, P3 -> BT.2020), Dienst-Takt
 // ohne Run-Loop (Auslastung im Takt, Drosselzeilen nachgetragen), Abschied
@@ -3440,7 +3441,8 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     printf("\n-- HDR: Aushandlung bis HDR10 und zurueck (Attrappen fuer Liste und Strom, echter Encoder 1920x1080)\n");
     // Der Weg des Mac-Hosts (HDR-Plan 5.1): HDR am Bildschirm an/aus,
     // IN_ANZEIGE, Codecwechsel mit Farbe, Sperre 2 s, Grund 6 bei einer
-    // Aufnahme, die HDR ablehnt, und eine Abloesung mitten in HDR10.
+    // Aufnahme, die HDR ablehnt, eine Abloesung mitten in HDR10 und ein
+    // doppelter Fehlschlag (HDR10 und der alte Codec gehen nicht auf).
     schein H2;
     memset(&H2, 0, sizeof H2);
     H2.bild = H2.ein = -1;
@@ -3659,6 +3661,69 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
                g.wechsel_transfer == QC_HDR_TRANSFER_SDR && g.info[13] == QC_HDR_GRUND_KEIN_IN_ANZEIGE && !atomic_load(&g_farbe_pq) &&
                zeilen_mit(logpfad, "HDR-Entscheidung (neuer Zuschauer): SDR, Grund 7") == 1,
                "Abloesung in HDR10: Begruessung mit PQ, dann SWITCH nach SDR und Strominfo Grund 7 fuer den Neuen");
+
+        // 9. Doppelter Fehlschlag: der Wechsel nach HDR10 auf einen anderen
+        //    Kandidaten scheitert (die Aufnahme lehnt HDR ab), und auch der
+        //    alte Codec laesst sich nicht wieder oeffnen (Groesse 0 - dafuer
+        //    baut VideoToolbox keine Sitzung). Der Codecwunsch gilt weiter,
+        //    aber in SDR (Grund 6) und genau einmal: keine Schleife.
+        stdout_stumm(1);
+        ein_senden(H2.ein, &H2.tx, QC_IN_CODEC, &c3, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        ein_daten(H2.ein, &H2.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_AUTOMATISCH, 400));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H2, 300, &g);
+        int vorbereitet = g.wechsel == 1 && g.wechsel_codec == 3 && g.info[13] == QC_HDR_GRUND_CODEC &&
+                          atomic_load(&g_codec_id) == 3 && !atomic_load(&g_farbe_pq);
+        const char *z_hdr = "Codecwechsel: HEVC 4:2:0 8 Bit -> HEVC 4:4:4 10 Bit, Farbe SDR -> HDR10";
+        const char *z_alle = "Codecwechsel: HEVC 4:2:0 8 Bit -> HEVC 4:4:4 10 Bit";
+        const char *z_alt = "Auch der alte Codec HEVC 4:2:0 8 Bit laesst sich nicht mehr oeffnen";
+        const char *z_gesch = "Wechsel nach HDR10 gescheitert";
+        int v_hdr = zeilen_mit(logpfad, z_hdr), v_alle = zeilen_mit(logpfad, z_alle);
+        int v_alt = zeilen_mit(logpfad, z_alt), v_gesch = zeilen_mit(logpfad, z_gesch);
+        __block int w9 = 0, h9 = 0;
+        dispatch_sync(g_capq, ^{ w9 = g_info_w; h9 = g_info_h; g_info_w = 0; g_info_h = 0; });
+        atomic_store(&g_fake_umstellen_fehler, 1);
+        ein_senden(H2.ein, &H2.tx, QC_IN_CODEC, &c0, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        usleep(300 * 1000);                              // eine Schleife haette jetzt viele Runden gedreht
+        dispatch_sync(g_capq, ^{});
+        __block VTCompressionSessionRef s9 = NULL;
+        __block int aktiv9 = -1, wunsch9 = 0;
+        dispatch_sync(g_capq, ^{ s9 = g_session; aktiv9 = g_wechsel_aktiv; wunsch9 = g_wechsel_wunsch; });
+        int gesch9 = atomic_load(&g_hdr_gescheitert);
+        alles_lesen(&H2, 300, &g);
+        int n_hdr = zeilen_mit(logpfad, z_hdr) - v_hdr, n_alle = zeilen_mit(logpfad, z_alle) - v_alle;
+        int n_alt = zeilen_mit(logpfad, z_alt) - v_alt, n_gesch = zeilen_mit(logpfad, z_gesch) - v_gesch;
+        // Aufraeumen; danach geht es wieder: der naechste Codecwunsch baut
+        // 4:4:4 10 Bit auf - dieselbe Lage, also SDR mit Grund 6.
+        atomic_store(&g_fake_umstellen_fehler, 0);
+        dispatch_sync(g_capq, ^{ g_info_w = w9; g_info_h = h9; });
+        gelesen g9 = g;
+        ein_senden(H2.ein, &H2.tx, QC_IN_CODEC, &c0, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H2, 300, &g);
+        __block VTCompressionSessionRef s9b = NULL;
+        dispatch_sync(g_capq, ^{ s9b = g_session; });
+        stdout_stumm(0);
+        printf("         (doppelter Fehlschlag: %d Versuch(e) in HDR10, %d insgesamt, alter Codec %d-mal nicht zu oeffnen, "
+               "danach %s, Grund %d)\n", n_hdr, n_alle, n_alt, g.folge, g.info[13]);
+        pruefe(vorbereitet, "vorher: HEVC 4:2:0 8 Bit in SDR (Grund 2), der Zuschauer meldet HDR-Schirm und Darstellung");
+        pruefe(n_hdr == 1 && n_alle == 2 && n_alt == 2 && n_gesch == 1 && gesch9 == 1 && !s9 && aktiv9 == 0 && wunsch9 < 0 &&
+               g9.wechsel == 0,
+               "doppelter Fehlschlag nach HDR10 (Aufnahme lehnt ab, alter Codec geht nicht auf): ein Versuch in HDR10, "
+               "dann der Codecwunsch einmal in SDR (Grund 6) - keine Schleife, kein SWITCH");
+        pruefe(s9b && g.wechsel == 1 && g.wechsel_codec == 0 && g.wechsel_transfer == QC_HDR_TRANSFER_SDR &&
+               g.info[13] == QC_HDR_GRUND_WECHSEL_GESCHEITERT && !atomic_load(&g_farbe_pq),
+               "danach baut der naechste Codecwunsch wieder auf: SWITCH Codec 0 in SDR, Strominfo Grund 6 (dieselbe Lage)");
 
         CVPixelBufferRelease(pb_sdr);
         CVPixelBufferRelease(pb_pq);
