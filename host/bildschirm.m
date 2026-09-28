@@ -29,6 +29,7 @@
            [(self.name ?: @"") isEqualToString:(o.name ?: @"")];
 }
 - (NSUInteger)hash { return self.kennung.hash ^ (NSUInteger)self.displayID; }
+- (BOOL)hdr { return self.edr_potentiell > 1.0; }
 - (NSString *)description {
     return [NSString stringWithFormat:@"Kennung %u (%@) \"%@\"", self.displayID, self.kennung, self.name ?: @""];
 }
@@ -36,22 +37,40 @@
 
 // ------------------------------------------------------------ Namensvorrat
 
-// displayID -> localizedName. Gefuellt auf dem Hauptfaden, gelesen auf der
-// Lebenslauf-Warteschlange; die Sperre ist ein Blatt, darunter nichts.
+// displayID -> localizedName, displayID -> EDR-Kopfraum (potentiell, aktuell
+// als NSArray aus zwei NSNumber). Gefuellt auf dem Hauptfaden, gelesen auf
+// der Lebenslauf-Warteschlange; die Sperre ist ein Blatt, darunter nichts.
 static pthread_mutex_t g_namen_mtx = PTHREAD_MUTEX_INITIALIZER;
 static NSDictionary<NSNumber *, NSString *> *g_namen = nil;
+static NSDictionary<NSNumber *, NSArray<NSNumber *> *> *g_edr = nil;
 
 void qc_bildschirm_namen_auffrischen(void) {
     NSMutableDictionary<NSNumber *, NSString *> *neu = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, NSArray<NSNumber *> *> *edr = [NSMutableDictionary dictionary];
     for (NSScreen *s in [NSScreen screens]) {
         NSNumber *nr = s.deviceDescription[@"NSScreenNumber"];
         if (![nr isKindOfClass:[NSNumber class]]) continue;
         NSString *name = s.localizedName;
         if (name.length) neu[@(nr.unsignedIntValue)] = name;
+        // EDR: potentiell ist, was der Bildschirm ueberhaupt kann (ueber 1.0
+        // bei einem HDR-Schirm oder eingeschaltetem HDR), aktuell, was er
+        // gerade hergibt (Helligkeit, Energiesparen).
+        edr[@(nr.unsignedIntValue)] = @[ @(s.maximumPotentialExtendedDynamicRangeColorComponentValue),
+                                        @(s.maximumExtendedDynamicRangeColorComponentValue) ];
     }
     pthread_mutex_lock(&g_namen_mtx);
     g_namen = neu;
+    g_edr = edr;
     pthread_mutex_unlock(&g_namen_mtx);
+}
+
+int qc_bildschirm_edr(CGDirectDisplayID d, double *potentiell, double *aktuell) {
+    pthread_mutex_lock(&g_namen_mtx);
+    NSArray<NSNumber *> *e = g_edr[@(d)];
+    pthread_mutex_unlock(&g_namen_mtx);
+    if (potentiell) *potentiell = e ? e[0].doubleValue : 0;
+    if (aktuell) *aktuell = e ? e[1].doubleValue : 0;
+    return e != nil;
 }
 
 static NSString *name_fuer(CGDirectDisplayID d) {
@@ -94,6 +113,10 @@ static NSArray<QCBildschirm *> *bildschirme_sck(void) {
         [kennungen addObject:k];
         QCBildschirm *b = [QCBildschirm kennung:k name:name_fuer(id_) displayID:id_ w:pw h:ph hz:hz haupt:id_ == haupt];
         b.sc = d;
+        double ep = 0, ea = 0;
+        qc_bildschirm_edr(id_, &ep, &ea);
+        b.edr_potentiell = ep;
+        b.edr_aktuell = ea;
         [liste addObject:b];
     }
     for (QCBildschirm *b in liste)

@@ -1234,7 +1234,7 @@ static void nachreichen_pruefen(int bild_port) {
     atomic_store(&g_testbild, 0);
     __block BOOL enc = NO;
     stdout_stumm(1);
-    dispatch_sync(g_capq, ^{ enc = encoder_start(3, 640, 360, 60, 10); });
+    dispatch_sync(g_capq, ^{ enc = encoder_start(3, 640, 360, 60, 10, 0); });
     stdout_stumm(0);
     CVPixelBufferRef pb = testpuffer(640, 360);
     if (!enc || !pb) { pruefe(0, "Encoder und Bildpuffer"); return; }
@@ -1397,10 +1397,10 @@ static void codec_abschluss_pruefen(void) {
     __block VTCompressionSessionRef vorher = NULL, nachher = NULL;
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
-        encoder_start(3, 640, 360, 60, 10);
+        encoder_start(3, 640, 360, 60, 10, 0);
         vorher = g_session;
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(4, 3, f420, NO);
+        codec_wechsel_abschliessen(4, 0, 3, 0, f420, 0, NO);
         nachher = g_session;
     });
     stdout_stumm(0);
@@ -1417,7 +1417,7 @@ static void codec_abschluss_pruefen(void) {
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(3, 4, f420, NO);
+        codec_wechsel_abschliessen(3, 0, 4, 0, f420, 0, NO);
     });
     SCStream *st = strom_jetzt();                    // der angestossene Abbau ist durch
     __block VTCompressionSessionRef rest = NULL;
@@ -1432,7 +1432,7 @@ static void codec_abschluss_pruefen(void) {
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(5, 3, f420, YES);
+        codec_wechsel_abschliessen(5, 0, 3, 0, f420, 0, YES);
     });
     st = strom_jetzt();
     dispatch_sync(g_capq, ^{ rest = g_session; });
@@ -1561,7 +1561,7 @@ static void formatwechsel_pruefen(int bild_port) {
     g_cfg.pixelFormat = pixfmt_fuer(von);
     __block BOOL enc = NO;
     stdout_stumm(1);
-    dispatch_sync(g_capq, ^{ enc = encoder_start(von, 640, 360, 60, 10); });
+    dispatch_sync(g_capq, ^{ enc = encoder_start(von, 640, 360, 60, 10, 0); });
     stdout_stumm(0);
     CVPixelBufferRef still = formatpuffer(640, 360, f444, 600, 400, 620);
     CVPixelBufferRef nachz = formatpuffer(640, 360, f420, 600, 400, 620);
