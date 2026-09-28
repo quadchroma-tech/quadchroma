@@ -367,7 +367,8 @@ pub struct Gpu {
     /// Zeitpunkt der letzten Umschaltung (Sperre UMSCHALT_SPERRE).
     umgeschaltet: Option<Instant>,
     /// DXGI hat HDR10 an diesem Schirm abgelehnt: kein neuer Versuch, bis
-    /// sich der Schirm aendert.
+    /// sich der Schirm aendert; bis dahin meldet die Anzeige dem Host keine
+    /// HDR-Darstellung (hdr_darstellung), er sendet dann SDR.
     hdr10_abgelehnt: bool,
     /// Der Bildschirm des Fensters (schirm_lage) und wann er gelesen wurde;
     /// der Monitor, auf dem das Fenster zuletzt stand, und wann das geprueft wurde.
@@ -838,9 +839,15 @@ pub fn tearing_moeglich() -> bool {
 
 /// Kann dieser Weg HDR-Bilder zeigen (Bit 1 in IN_ANZEIGE)? Ja: PQ-Bilder
 /// gehen ueber Stufe 1 PQ - auf einem HDR-Schirm in eine HDR10-Swapchain
-/// (R10G10B10A2, G2084/P2020), auf einem SDR-Schirm abgebildet. Ob der
-/// Schirm HDR kann, sagt Bit 0 (schirm_lage); der softbuffer-Weg meldet nein.
-pub const HDR_DARSTELLUNG: bool = true;
+/// (R10G10B10A2, G2084/P2020), auf einem SDR-Schirm abgebildet. Nein, sobald
+/// DXGI HDR10 an diesem Schirm abgelehnt hat (`abgelehnt`): dann soll der Host
+/// SDR senden (Unsicherheit ergibt SDR), statt die ganze Sitzung PQ zu
+/// liefern, das hier nur abgebildet wird - bis sich der Schirm aendert
+/// (lage_pruefen). Ob der Schirm HDR kann, sagt Bit 0 (schirm_lage); der
+/// softbuffer-Weg meldet nein.
+fn hdr_darstellung_moeglich(abgelehnt: bool) -> bool {
+    !abgelehnt
+}
 
 /// Der Bildschirm des Fensters fuer IN_ANZEIGE: der Ausgang, auf dem der
 /// groesste Teil des Fensters liegt (MonitorFromWindow - nicht
@@ -1165,6 +1172,12 @@ impl Gpu {
         self.ausgabe == Ausgabe::Hdr10
     }
 
+    /// Bit 1 in IN_ANZEIGE: kann diese Anzeige HDR-Bilder zeigen? Nein, solange
+    /// DXGI HDR10 an diesem Schirm abgelehnt hat (hdr_darstellung_moeglich).
+    pub fn hdr_darstellung(&self) -> bool {
+        hdr_darstellung_moeglich(self.hdr10_abgelehnt)
+    }
+
     /// Die Strominfo Fassung 1 des Stroms, zu dem das naechste rohe Bild
     /// gehoert (None: Host vor 0.2.0 - dann gelten die Vorgaben 203 / 1000
     /// nit). Der Empfangsfaden gibt sie jedem Bild mit.
@@ -1288,13 +1301,16 @@ impl Gpu {
                 }
                 Err(e) => {
                     // HDR10 geht hier nicht (DXGI lehnt ab, Windows vor 10):
-                    // nicht wieder versuchen, bis sich der Schirm aendert.
+                    // nicht wieder versuchen, bis sich der Schirm aendert, und
+                    // bis dahin dem Host keine HDR-Darstellung melden
+                    // (IN_ANZEIGE Bit 1 = 0 beim naechsten anzeige_takt) - er
+                    // stellt dann auf SDR um.
                     let hdr10 = soll == Ausgabe::Hdr10;
                     self.hdr10_abgelehnt |= hdr10;
                     protokoll::zeile(format!(
                         "Anzeige: Umschalten auf {} gescheitert: {e}{}",
                         if hdr10 { "HDR10" } else { "SDR" },
-                        if hdr10 { " - HDR-Bilder werden auf SDR abgebildet, bis sich der Bildschirm aendert" } else { "" }
+                        if hdr10 { " - bis sich der Bildschirm aendert: keine HDR-Darstellung an den Host (er sendet SDR), HDR-Bilder bis dahin auf SDR abgebildet" } else { "" }
                     ));
                 }
             }
@@ -2698,6 +2714,20 @@ mod tests {
             }
             assert_eq!(ist, danach, "bei {t} ms");
         }
+    }
+
+    /// Lehnt DXGI HDR10 ab, meldet die Anzeige keine HDR-Darstellung (Bit 1),
+    /// und der Host entscheidet SDR (Grund 5) - auch auf einem HDR-Schirm mit
+    /// HDR an. Ohne Ablehnung bleibt es HDR.
+    #[test]
+    fn abgelehntes_hdr10_ergibt_sdr_beim_host() {
+        let s = schirm(203.0, 1000.0);
+        let a = hdr::Anzeige::fuer_client(Some(&s), hdr_darstellung_moeglich(true), true);
+        assert!(!a.darstellung() && a.schirm_hdr());
+        assert_eq!(hdr::hdr_entscheiden(true, true, 0, Some(&a)), hdr::GRUND_CLIENT_OHNE_DARSTELLUNG);
+        let a = hdr::Anzeige::fuer_client(Some(&s), hdr_darstellung_moeglich(false), true);
+        assert!(a.darstellung());
+        assert_eq!(hdr::hdr_entscheiden(true, true, 0, Some(&a)), hdr::GRUND_AKTIV);
     }
 
     /// Die Metadaten: BT.2020 und D65, als Spitze die abgebildete Spitze am

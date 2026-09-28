@@ -7735,11 +7735,14 @@ impl App {
     }
 
     /// Kann diese Anzeige HDR darstellen (Bit 1 in IN_ANZEIGE)? Nur der Weg
-    /// ueber die Karte, und nur, wenn er HDR-Bilder auch zeigen kann
-    /// (HDR_DARSTELLUNG der Anzeige - bis Schritt 5a/5b nein).
+    /// ueber die Karte, und nur, wenn er HDR-Bilder auch zeigen kann: unter
+    /// Windows nicht, solange DXGI HDR10 an diesem Schirm abgelehnt hat (dann
+    /// sendet der Host SDR), auf dem Mac HDR_DARSTELLUNG der Anzeige.
     fn hdr_darstellung(&self) -> bool {
         match &self.anzeige {
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(windows)]
+            Anzeige::Gpu(g) => g.hdr_darstellung(),
+            #[cfg(target_os = "macos")]
             Anzeige::Gpu(_) => anzeige::HDR_DARSTELLUNG,
             _ => false,
         }
