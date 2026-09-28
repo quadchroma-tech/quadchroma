@@ -22,7 +22,12 @@
 // Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt),
 // HDR-Aushandlung (Faehigkeiten mit Bit 2, IN_ANZEIGE ueber den echten
 // Eingabekanal: neue Strominfo in SDR mit dem Grund des Hosts, nichts bei
-// gleicher Lage, Unlesbares uebergangen), Dienst-Takt
+// gleicher Lage, Unlesbares uebergangen; dann bis HDR10 und zurueck: HDR am
+// Bildschirm des Hosts an/aus, Codecwechsel mit Farbe, Sperre 2 s, Grund 6,
+// wenn die Aufnahme HDR ablehnt, Abloesung mitten in HDR10, doppelter
+// Fehlschlag nach HDR10 ohne Schleife), HDR10 mit echtem
+// Encoder und Decoder (SEI 137/144 byte-genau hinter PPS jedes Vollbilds,
+// VUI und Anhaenge 2020/PQ/2020, HDR-Testbild, P3 -> BT.2020), Dienst-Takt
 // ohne Run-Loop (Auslastung im Takt, Drosselzeilen nachgetragen), Abschied
 // beim Beenden (Typ 13 mit Grund 0 als letzte Nachricht, ohne Typ 10, dann
 // Verbindung zu) und Zugang
@@ -66,7 +71,7 @@
 // Dateien: die Ablagebasis liegt im eigenen HOME, und statt
 // qc_clip_set_dateien bekommt ein Rekorder die fertigen Pfade - die
 // Zwischenablage des Nutzers bleibt unberuehrt.
-// Dauer rund 110 s. Rueckgabe: Zahl der Fehler.
+// Dauer rund 125 s. Rueckgabe: Zahl der Fehler.
 
 #include "main.m"
 
@@ -958,13 +963,22 @@ static void protokoll_pruefen(int bild_port, int ein_port) {
 // --------------------------------------------- Zuschauerwechsel, Abbau
 
 // Attrappe fuer einen laufenden Strom: ScreenCaptureKit gehoert nicht in den
-// Pruefstand. Starten, Anhalten und Umstellen melden sofort Erfolg.
+// Pruefstand. Starten, Anhalten und Umstellen melden sofort Erfolg - das
+// Umstellen nur, solange g_fake_umstellen_fehler nicht gesetzt ist (HDR:
+// ScreenCaptureKit lehnt die HDR-Aufnahme ab).
+static _Atomic int g_fake_umstellen_fehler = 0;
 @interface FakeStrom : SCStream
 @end
 @implementation FakeStrom
 - (void)startCaptureWithCompletionHandler:(void (^)(NSError *))h { if (h) h(nil); }
 - (void)stopCaptureWithCompletionHandler:(void (^)(NSError *))h { if (h) h(nil); }
-- (void)updateConfiguration:(SCStreamConfiguration *)c completionHandler:(void (^)(NSError *))h { if (h) h(nil); }
+- (void)updateConfiguration:(SCStreamConfiguration *)c completionHandler:(void (^)(NSError *))h {
+    (void)c;
+    NSError *e = atomic_load(&g_fake_umstellen_fehler)
+        ? [NSError errorWithDomain:@"hosttest" code:1 userInfo:@{ NSLocalizedDescriptionKey: @"Attrappe lehnt das Umstellen ab" }]
+        : nil;
+    if (h) h(e);
+}
 @end
 
 // Nie freigeben: eine nie initialisierte Attrappe darf nicht in dealloc laufen.
@@ -1234,7 +1248,7 @@ static void nachreichen_pruefen(int bild_port) {
     atomic_store(&g_testbild, 0);
     __block BOOL enc = NO;
     stdout_stumm(1);
-    dispatch_sync(g_capq, ^{ enc = encoder_start(3, 640, 360, 60, 10); });
+    dispatch_sync(g_capq, ^{ enc = encoder_start(3, 640, 360, 60, 10, 0); });
     stdout_stumm(0);
     CVPixelBufferRef pb = testpuffer(640, 360);
     if (!enc || !pb) { pruefe(0, "Encoder und Bildpuffer"); return; }
@@ -1397,10 +1411,10 @@ static void codec_abschluss_pruefen(void) {
     __block VTCompressionSessionRef vorher = NULL, nachher = NULL;
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
-        encoder_start(3, 640, 360, 60, 10);
+        encoder_start(3, 640, 360, 60, 10, 0);
         vorher = g_session;
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(4, 3, f420, NO);
+        codec_wechsel_abschliessen(4, 0, 3, 0, f420, 0, NO);
         nachher = g_session;
     });
     stdout_stumm(0);
@@ -1417,7 +1431,7 @@ static void codec_abschluss_pruefen(void) {
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(3, 4, f420, NO);
+        codec_wechsel_abschliessen(3, 0, 4, 0, f420, 0, NO);
     });
     SCStream *st = strom_jetzt();                    // der angestossene Abbau ist durch
     __block VTCompressionSessionRef rest = NULL;
@@ -1432,7 +1446,7 @@ static void codec_abschluss_pruefen(void) {
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(5, 3, f420, YES);
+        codec_wechsel_abschliessen(5, 0, 3, 0, f420, 0, YES);
     });
     st = strom_jetzt();
     dispatch_sync(g_capq, ^{ rest = g_session; });
@@ -1561,7 +1575,7 @@ static void formatwechsel_pruefen(int bild_port) {
     g_cfg.pixelFormat = pixfmt_fuer(von);
     __block BOOL enc = NO;
     stdout_stumm(1);
-    dispatch_sync(g_capq, ^{ enc = encoder_start(von, 640, 360, 60, 10); });
+    dispatch_sync(g_capq, ^{ enc = encoder_start(von, 640, 360, 60, 10, 0); });
     stdout_stumm(0);
     CVPixelBufferRef still = formatpuffer(640, 360, f444, 600, 400, 620);
     CVPixelBufferRef nachz = formatpuffer(640, 360, f420, 600, 400, 620);
@@ -1812,6 +1826,7 @@ static int sender_ruht(void) { return !qc_senden_laeuft(); }
 typedef struct {
     int bild, ein; leser l; qc_cipher tx; uint8_t hh[QC_HASHLEN]; char folge[64];
     uint8_t liste[QC_BILDSCHIRM_LISTE_MAX]; size_t liste_n;
+    uint8_t info[QC_HDR_INFO_LAENGE]; size_t info_n;      // Strominfo der Begruessung
 } schein;
 
 // Vor dem Verbinden einen Strom vortaeuschen (dann laeuft stream_hochfahren_sync
@@ -1837,6 +1852,10 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
     size_t n = 0;
     while (nachricht_ganz(&s->l, &h, &d, 1000) == 1 && n + 4 < sizeof s->folge) {
         n += (size_t)snprintf(s->folge + n, sizeof s->folge - n, "%s%d", n ? " " : "", h.type);
+        if (h.type == QC_MSG_INFO && d.length <= sizeof s->info) {
+            memcpy(s->info, d.bytes, d.length);
+            s->info_n = d.length;
+        }
         if (h.type == QC_MSG_FAEHIGKEITEN) {
             uint32_t bits = 0;
             if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 ||
@@ -2275,6 +2294,365 @@ static NSString *zeichen_mal(NSString *s, int n) {
     return [@"" stringByPaddingToLength:(NSUInteger)n * s.length withString:s startingAtIndex:0];
 }
 
+// ----------------------------------------------- HDR10: Encoder (echt, VT)
+//
+// Synthetische PQ-Bilder durch den Encoder des Hosts (encoder_start,
+// encode_buffer, emit_access_unit mit --capture-Datei als Ausgang) und mit
+// VideoToolbox zurueck, wie der Mac-Client: VUI und Anhaenge 2020/PQ/2020,
+// die eigene SEI 137/144 byte-genau hinter VPS/SPS/PPS jedes Vollbilds (und
+// nur dort), die Codes des HDR-Testbilds, P3 -> BT.2020 durch VideoToolbox.
+// Braucht den Hardware-Encoder: ausserhalb der Seatbelt-Sandbox laufen.
+
+// Die SEI fuer Display P3, 1000 nit, 0,005 nit, MaxCLL/MaxFALL 0 - die Zeile
+// "sei p3 10000000 50 0 0" aus client/src/hdr_vektoren.txt.
+static const char *QC_SEI_P3_1000 = "4e 01 89 18 33 c2 86 c4 1d 4c 0b b8 84 d0 3e 80 3d 13 40 42 00 98 96 80 00 00 03 00 32 90 04 00 00 03 00 00 80";
+
+typedef struct { const uint8_t *p; size_t n; } nal_t;
+
+// Annex B in NAL-Einheiten (ohne Startcodes; Nullen vor einem Startcode
+// gehoeren zu ihm).
+static size_t nals_zerlegen(const uint8_t *b, size_t n, nal_t *aus, size_t max) {
+    size_t k = 0, anfang = SIZE_MAX;
+    for (size_t i = 0; i + 3 <= n;) {
+        if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
+            if (anfang != SIZE_MAX && k < max) {
+                size_t e = i;
+                while (e > anfang && b[e - 1] == 0) e--;
+                aus[k++] = (nal_t){ b + anfang, e - anfang };
+            }
+            i += 3;
+            anfang = i;
+            continue;
+        }
+        i++;
+    }
+    if (anfang != SIZE_MAX && anfang < n && k < max) aus[k++] = (nal_t){ b + anfang, n - anfang };
+    return k;
+}
+
+static int nal_typ(nal_t x) { return x.n ? (x.p[0] >> 1) & 0x3f : -1; }
+static int nal_vcl(nal_t x) { return x.n && nal_typ(x) < 32; }
+static int nal_ist(nal_t x, NSData *d) { return x.n == d.length && memcmp(x.p, d.bytes, x.n) == 0; }
+
+// Eine Praefix-SEI, deren erste Nachricht Typ 137 ist (unsere).
+static int nal_sei137(nal_t x) { return nal_typ(x) == 39 && x.n > 2 && x.p[2] == 137; }
+
+typedef struct {
+    int vollbilder;          // Zugriffseinheiten mit VPS
+    int sei_richtig;         // davon: VPS, SPS, PPS, dann genau unsere SEI, dann erst Bilddaten
+    int sei_sonst;           // unsere SEI an anderer Stelle (Zwischenbild, doppelt)
+    int bilder;              // Zugriffseinheiten
+} strom_befund;
+
+static void strom_pruefen(nal_t *nals, size_t k, NSData *sei, strom_befund *b) {
+    memset(b, 0, sizeof *b);
+    int sei_zaehler = 0;
+    for (size_t i = 0; i < k; i++) {
+        if (nal_sei137(nals[i])) sei_zaehler++;
+        if (nal_vcl(nals[i]) && nals[i].n > 2 && (nals[i].p[2] & 0x80)) b->bilder++;   // first_slice_segment_in_pic_flag
+        if (nal_typ(nals[i]) != 32) continue;
+        b->vollbilder++;
+        if (i + 4 < k && nal_typ(nals[i + 1]) == 33 && nal_typ(nals[i + 2]) == 34 && sei && nal_ist(nals[i + 3], sei) &&
+            !nal_sei137(nals[i + 4]))
+            b->sei_richtig++;
+    }
+    b->sei_sonst = sei_zaehler - b->sei_richtig;
+}
+
+// Die erste Zugriffseinheit (ab dem ersten VPS bis vor das zweite Bild): VPS,
+// SPS, PPS fuer die Formatbeschreibung, der Rest als Probe mit
+// Laengenpraefix - wie der Client decodiert.
+static CVPixelBufferRef g_dec_bild = NULL;
+static void dec_rueckruf(void *r, void *s, OSStatus st, VTDecodeInfoFlags f, CVImageBufferRef pb, CMTime a, CMTime b) {
+    (void)r; (void)s; (void)f; (void)a; (void)b;
+    if (st != noErr || !pb) return;
+    if (g_dec_bild) CVPixelBufferRelease(g_dec_bild);
+    g_dec_bild = CVPixelBufferRetain(pb);
+}
+
+static CVPixelBufferRef erstes_bild_decodieren(nal_t *nals, size_t k, OSType aus, CMFormatDescriptionRef *fd_aus) {
+    const uint8_t *ps[3] = {0};
+    size_t pz[3] = {0};
+    size_t i = 0;
+    while (i < k && nal_typ(nals[i]) != 32) i++;
+    if (i + 3 > k) return NULL;
+    for (int j = 0; j < 3; j++) { ps[j] = nals[i + j].p; pz[j] = nals[i + j].n; }
+    CMFormatDescriptionRef fd = NULL;
+    if (CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, pz, 4, NULL, &fd) != noErr || !fd) return NULL;
+    NSMutableData *probe = [NSMutableData data];
+    int bild = 0;
+    for (size_t j = i + 3; j < k; j++) {
+        if (nal_typ(nals[j]) == 32) break;
+        if (nal_vcl(nals[j]) && nals[j].n > 2 && (nals[j].p[2] & 0x80) && bild++) break;
+        uint8_t l[4] = { (uint8_t)(nals[j].n >> 24), (uint8_t)(nals[j].n >> 16), (uint8_t)(nals[j].n >> 8), (uint8_t)nals[j].n };
+        [probe appendBytes:l length:4];
+        [probe appendBytes:nals[j].p length:nals[j].n];
+    }
+    CMBlockBufferRef bb = NULL;
+    CMBlockBufferCreateWithMemoryBlock(NULL, NULL, probe.length, NULL, NULL, 0, probe.length, 0, &bb);
+    CMBlockBufferReplaceDataBytes(probe.bytes, bb, 0, probe.length);
+    CMSampleBufferRef sb = NULL;
+    size_t groesse = probe.length;
+    CMSampleBufferCreateReady(NULL, bb, fd, 1, 0, NULL, 1, &groesse, &sb);
+    NSDictionary *ziel = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(aus) };
+    VTDecompressionOutputCallbackRecord cb = { dec_rueckruf, NULL };
+    VTDecompressionSessionRef d = NULL;
+    if (g_dec_bild) { CVPixelBufferRelease(g_dec_bild); g_dec_bild = NULL; }
+    if (VTDecompressionSessionCreate(NULL, fd, NULL, (__bridge CFDictionaryRef)ziel, &cb, &d) == noErr && d) {
+        VTDecompressionSessionDecodeFrame(d, sb, 0, NULL, NULL);
+        VTDecompressionSessionWaitForAsynchronousFrames(d);
+        VTDecompressionSessionInvalidate(d);
+        CFRelease(d);
+    }
+    if (sb) CFRelease(sb);
+    if (bb) CFRelease(bb);
+    if (fd_aus) *fd_aus = fd; else CFRelease(fd);
+    CVPixelBufferRef pb = g_dec_bild;
+    g_dec_bild = NULL;
+    return pb;
+}
+
+// Ein Bildpunkt (10 Bit) eines decodierten xf44/xf20: ebene 0 Y, 1 Cb, 2 Cr.
+static int dec_punkt(CVPixelBufferRef pb, int x, int y, int k) {
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    int v;
+    if (k == 0) {
+        const uint8_t *b = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        v = ((const uint16_t *)(b + (size_t)y * CVPixelBufferGetBytesPerRowOfPlane(pb, 0)))[x] >> 6;
+    } else {
+        int sub = CVPixelBufferGetWidthOfPlane(pb, 1) < CVPixelBufferGetWidth(pb);
+        int cx = sub ? x / 2 : x, cy = sub ? y / 2 : y;
+        const uint8_t *b = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+        v = ((const uint16_t *)(b + (size_t)cy * CVPixelBufferGetBytesPerRowOfPlane(pb, 1)))[2 * cx + (k - 1)] >> 6;
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return v;
+}
+
+static int anhang_ist(CVBufferRef pb, CFStringRef key, CFStringRef soll) {
+    CFTypeRef v = CVBufferCopyAttachment(pb, key, NULL);
+    int ok = v && CFEqual(v, soll);
+    if (v) CFRelease(v);
+    return ok;
+}
+
+static int fd_ist(CMFormatDescriptionRef fd, CFStringRef key, CFTypeRef soll) {
+    CFTypeRef v = CMFormatDescriptionGetExtension(fd, key);
+    return v && CFEqual(v, soll);
+}
+
+// Bilder durch den Encoder des Hosts: n Stueck, bei vollbild_bei ein
+// erzwungenes Vollbild; der Strom landet in einer Datei (wie --capture) und
+// kommt als NSData zurueck. NULL, wenn der Encoder nicht aufgeht.
+static NSData *host_codieren(int idx, int w, int h, int pq, CVPixelBufferRef (^bild)(int i), int n, int vollbild_bei) {
+    char pfad[1100];
+    snprintf(pfad, sizeof pfad, "%s/hdr-strom.hevc", g_home);
+    __block BOOL ok = NO;
+    dispatch_sync(g_capq, ^{
+        atomic_store(&g_codec_id, idx);
+        ok = encoder_start(idx, w, h, 60, 20, pq);
+    });
+    if (!ok) return nil;
+    g_stats.out = fopen(pfad, "wb");
+    for (int i = 0; i < n; i++) {
+        CVPixelBufferRef pb = bild(i);
+        if (i == vollbild_bei) atomic_store(&g_force_key, 1);
+        dispatch_sync(g_capq, ^{ encode_buffer(pb, CMTimeMake(i, 60), 0, 0); });
+        dispatch_sync(g_capq, ^{ VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid); });
+    }
+    dispatch_sync(g_capq, ^{
+        VTCompressionSessionRef s = g_session;
+        g_session = NULL;
+        if (s) { VTCompressionSessionCompleteFrames(s, kCMTimeInvalid); VTCompressionSessionInvalidate(s); CFRelease(s); }
+    });
+    fclose(g_stats.out);
+    g_stats.out = NULL;
+    NSData *d = [NSData dataWithContentsOfFile:@(pfad)];
+    unlink(pfad);
+    return d;
+}
+
+// 10-Bit-Codes Y'CbCr (voll) aus R'G'B' mit den Gewichten kr, kb.
+static void codes_aus_rgb(const double rgb[3], double kr, double kb, int c[3]) {
+    double y = kr * rgb[0] + (1 - kr - kb) * rgb[1] + kb * rgb[2];
+    double cb = (rgb[2] - y) / (2 * (1 - kb)), cr = (rgb[0] - y) / (2 * (1 - kr));
+    c[0] = (int)lround(y * 1023);
+    c[1] = (int)lround(cb * 1023 + 512);
+    c[2] = (int)lround(cr * 1023 + 512);
+}
+
+static void hdr_encoder_pruefen(void) {
+    printf("\n-- HDR10: Encoder, SEI und Rueckweg (echter Encoder und Decoder, 640x360)\n");
+    stdout_stumm(1);
+    codecs_pruefen();
+    stdout_stumm(0);
+    int system = hdr_system_kann();
+    printf("         (macOS 15 und Apple Silicon: %s; HDR10 je Kandidat: %d %d %d %d %d %d)\n", system ? "ja" : "nein",
+           g_befund[0].hdr, g_befund[1].hdr, g_befund[2].hdr, g_befund[3].hdr, g_befund[4].hdr, g_befund[5].hdr);
+    pruefe(!g_befund[1].hdr && !g_befund[3].hdr && !g_befund[4].hdr && !g_befund[5].hdr,
+           "Koennensliste: HDR10 nie fuer 8 Bit, H.264 oder AV1");
+    if (!system || !g_befund[0].hdr) {
+        printf("         (dieser Mac kann kein HDR10 - der Rest des Abschnitts entfaellt)\n");
+        pruefe(!g_befund[0].hdr && !g_befund[2].hdr, "ohne macOS 15 und Apple Silicon auch fuer HEVC 10 Bit kein HDR10");
+        return;
+    }
+    pruefe(g_befund[0].hdr && g_befund[2].hdr, "Koennensliste: HDR10 mit HEVC 4:4:4 10 Bit und 4:2:0 10 Bit (Probesitzung nimmt BT.2020/PQ und Mastering)");
+
+    // a) Das HDR-Testbild: Anhaenge, Codes wie qc_testbild_punkt_pq, Grau
+    //    unabhaengig nachgerechnet (SDR-Grau mal 203 nit in PQ), die Rampe.
+    const int W = 640, H = 360;
+    OSType xf44 = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+    qc_testbild_start(W, H, xf44, 1);
+    CVPixelBufferRef t0 = qc_testbild_naechstes();
+    int ok_anh = t0 && anhang_ist(t0, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020) &&
+                 anhang_ist(t0, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) &&
+                 anhang_ist(t0, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020);
+    int py[3], pr[3], pm[3];
+    qc_testbild_punkt_pq(40, 60, W, H, 0, &py[0], &py[1], &py[2]);           // Balken Weiss (Y 235)
+    qc_testbild_punkt_pq(W - 1, 300, W, H, 0, &pr[0], &pr[1], &pr[2]);       // Rampe rechts: 1000 nit
+    qc_testbild_punkt_pq(480, 300, W, H, 0, &pm[0], &pm[1], &pm[2]);         // Quadrat (4 x SDR)
+    double s = 235 / 255.0, lin = s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4);
+    int weiss = qc_hdr_pq_code10(QC_TESTBILD_PQ_WEISS_NIT * lin);
+    int im_puffer = t0 ? dec_punkt(t0, 40, 60, 0) : -1;
+    printf("         (Testbild HDR: Balken Weiss Y %d (soll %d, im Puffer %d), Rampe rechts Y %d, Quadrat Y/Cb/Cr %d/%d/%d)\n",
+           py[0], weiss, im_puffer, pr[0], pm[0], pm[1], pm[2]);
+    pruefe(ok_anh && py[0] == weiss && py[1] == 512 && py[2] == 512 && im_puffer == weiss && pr[0] == 769 && pm[0] > py[0],
+           "HDR-Testbild: Anhaenge 2020/PQ/2020, SDR-Weiss bei 203 nit, Rampe bis 1000 nit (Code 769), Quadrat heller als SDR-Weiss");
+
+    // b) HEVC 4:4:4 10 Bit in HDR10: Parametersaetze, unsere SEI hinter PPS
+    //    jedes Vollbilds (zwei: das erste und ein erzwungenes), Rueckweg.
+    NSData *sei_soll = hex(QC_SEI_P3_1000);
+    qc_hdr_sei_werte sw;
+    hdr_sei_werte(&sw);
+    uint8_t sei_c[64];
+    size_t sei_n = qc_hdr_sei_bauen(&sw, sei_c, sizeof sei_c);
+    pruefe(sei_n == sei_soll.length && memcmp(sei_c, sei_soll.bytes, sei_n) == 0,
+           "SEI des Hosts (P3, 1000 nit, 0,005 nit, 0/0) = Pruefvektor aus hdr_vektoren.txt");
+    // Die Schleife von vorn: das erste codierte Bild ist Bild 0.
+    qc_testbild_stop();
+    qc_testbild_start(W, H, xf44, 1);
+    stdout_stumm(1);
+    NSData *strom = host_codieren(0, W, H, 1, ^CVPixelBufferRef(int i) { (void)i; return qc_testbild_naechstes(); }, 6, 3);
+    stdout_stumm(0);
+    nal_t nals[256];
+    size_t k = strom ? nals_zerlegen(strom.bytes, strom.length, nals, 256) : 0;
+    strom_befund b;
+    strom_pruefen(nals, k, sei_soll, &b);
+    printf("         (4:4:4 HDR10: %zu Byte, %zu NAL, %d Bilder, %d Vollbilder, SEI richtig %d, anderswo %d)\n",
+           strom ? strom.length : 0, k, b.bilder, b.vollbilder, b.sei_richtig, b.sei_sonst);
+    pruefe(strom && b.bilder == 6 && b.vollbilder == 2 && b.sei_richtig == 2 && b.sei_sonst == 0,
+           "HDR10-Strom: vor jedem Vollbild VPS, SPS, PPS und dann unsere SEI 137/144 (byte-genau), sonst nirgends");
+    CMFormatDescriptionRef fd = NULL;
+    CVPixelBufferRef dec = strom ? erstes_bild_decodieren(nals, k, xf44, &fd) : NULL;
+    int ok_vui = fd && fd_ist(fd, kCMFormatDescriptionExtension_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_2020) &&
+                 fd_ist(fd, kCMFormatDescriptionExtension_TransferFunction, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) &&
+                 fd_ist(fd, kCMFormatDescriptionExtension_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_2020) &&
+                 fd_ist(fd, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanTrue);
+    pruefe(ok_vui, "VUI aus den Parametersaetzen (wie der Client sie liest): BT.2020, PQ, BT.2020-NCL, voller Bereich");
+    int ok_dec_anh = dec && anhang_ist(dec, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020) &&
+                     anhang_ist(dec, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) &&
+                     anhang_ist(dec, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020);
+    // Flaechen und die Rampe: codiert und zurueck auf wenige Codes genau.
+    int punkte[][2] = { { 40, 60 }, { 440, 60 }, { 600, 60 }, { 100, 300 }, { 320, 300 }, { 600, 300 }, { 480, 300 } };
+    int abw = 0;
+    for (size_t p = 0; dec && p < sizeof punkte / sizeof punkte[0]; p++) {
+        int soll[3];
+        qc_testbild_punkt_pq(punkte[p][0], punkte[p][1], W, H, 0, &soll[0], &soll[1], &soll[2]);
+        for (int c = 0; c < 3; c++) {
+            int d = abs(dec_punkt(dec, punkte[p][0], punkte[p][1], c) - soll[c]);
+            if (d > abw) abw = d;
+        }
+    }
+    printf("         (Rueckweg 4:4:4: Anhaenge %s, groesste Abweichung %d Codes an 7 Stellen)\n", ok_dec_anh ? "2020/PQ/2020" : "FALSCH", abw);
+    pruefe(dec && ok_dec_anh && abw <= 4,
+           "decodiert (Hardware, wie der Mac-Client): Anhaenge 2020/PQ/2020, Balken, Rampe und Quadrat auf 4 Codes genau");
+    if (dec) CVPixelBufferRelease(dec);
+    if (fd) CFRelease(fd);
+
+    // c) Die Aufnahme kommt als Display P3 PQ mit Matrix BT.709 (wie
+    //    ScreenCaptureKit, HDRStream...): VideoToolbox rechnet nach BT.2020 um.
+    //    Eine Flaeche mit 300/150/40 nit in P3 muss als dieselben nit in
+    //    BT.2020 herauskommen.
+    static const double p3_2020[3][3] = {
+        { 0.75383303, 0.19859737, 0.0475696 },
+        { 0.04574385, 0.9417772, 0.012478931 },
+        { -0.00121034, 0.017601717, 0.9836086 },
+    };
+    double nit_p3[3] = { 300, 150, 40 }, rgb_p3[3], rgb_2020[3];
+    for (int c = 0; c < 3; c++) rgb_p3[c] = qc_hdr_pq_aus_nit(nit_p3[c]);
+    for (int c = 0; c < 3; c++)
+        rgb_2020[c] = qc_hdr_pq_aus_nit(p3_2020[c][0] * nit_p3[0] + p3_2020[c][1] * nit_p3[1] + p3_2020[c][2] * nit_p3[2]);
+    int ein[3], soll2020[3];
+    codes_aus_rgb(rgb_p3, 0.2126, 0.0722, ein);
+    codes_aus_rgb(rgb_2020, 0.2627, 0.0593, soll2020);
+    CVPixelBufferRef p3 = formatpuffer(W, H, xf44, ein[0], ein[1], ein[2]);
+    CVBufferSetAttachment(p3, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_P3_D65, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(p3, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(p3, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    stdout_stumm(1);
+    strom = host_codieren(0, W, H, 1, ^CVPixelBufferRef(int i) { (void)i; return p3; }, 2, -1);
+    stdout_stumm(0);
+    k = strom ? nals_zerlegen(strom.bytes, strom.length, nals, 256) : 0;
+    dec = strom ? erstes_bild_decodieren(nals, k, xf44, NULL) : NULL;
+    int got[3] = { -1, -1, -1 };
+    for (int c = 0; dec && c < 3; c++) got[c] = dec_punkt(dec, W / 2, H / 2, c);
+    printf("         (P3 PQ 300/150/40 nit, Matrix 709: ein %d/%d/%d -> BT.2020 %d/%d/%d, soll %d/%d/%d)\n",
+           ein[0], ein[1], ein[2], got[0], got[1], got[2], soll2020[0], soll2020[1], soll2020[2]);
+    pruefe(dec && abs(got[0] - soll2020[0]) <= 4 && abs(got[1] - soll2020[1]) <= 4 && abs(got[2] - soll2020[2]) <= 4,
+           "Aufnahme in Display P3 PQ (Matrix 709): VideoToolbox rechnet nach BT.2020 um, auf 4 Codes genau");
+    if (dec) CVPixelBufferRelease(dec);
+    CVPixelBufferRelease(p3);
+
+    // d) HEVC 4:2:0 10 Bit in HDR10 (Eingang xf44, VideoToolbox unterabtastet).
+    qc_testbild_stop();
+    qc_testbild_start(W, H, xf44, 1);
+    stdout_stumm(1);
+    strom = host_codieren(2, W, H, 1, ^CVPixelBufferRef(int i) { (void)i; return qc_testbild_naechstes(); }, 3, -1);
+    stdout_stumm(0);
+    k = strom ? nals_zerlegen(strom.bytes, strom.length, nals, 256) : 0;
+    strom_pruefen(nals, k, sei_soll, &b);
+    fd = NULL;
+    dec = strom ? erstes_bild_decodieren(nals, k, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, &fd) : NULL;
+    int soll_w[3];
+    qc_testbild_punkt_pq(40, 60, W, H, 0, &soll_w[0], &soll_w[1], &soll_w[2]);
+    int y420 = dec ? dec_punkt(dec, 40, 60, 0) : -1;
+    printf("         (4:2:0 HDR10: %d Vollbild(er), SEI richtig %d, Weiss Y %d soll %d)\n", b.vollbilder, b.sei_richtig, y420, soll_w[0]);
+    pruefe(b.vollbilder == 1 && b.sei_richtig == 1 && b.sei_sonst == 0 && fd &&
+           fd_ist(fd, kCMFormatDescriptionExtension_TransferFunction, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) &&
+           dec && abs(y420 - soll_w[0]) <= 4,
+           "HEVC 4:2:0 10 Bit in HDR10: SEI hinter PPS, VUI PQ, Weiss zurueck auf 4 Codes genau");
+    if (dec) CVPixelBufferRelease(dec);
+    if (fd) CFRelease(fd);
+
+    // e) SDR bleibt SDR: kein SEI 137, VUI BT.709.
+    qc_testbild_start(W, H, xf44, 0);
+    stdout_stumm(1);
+    strom = host_codieren(0, W, H, 0, ^CVPixelBufferRef(int i) { (void)i; return qc_testbild_naechstes(); }, 3, -1);
+    stdout_stumm(0);
+    k = strom ? nals_zerlegen(strom.bytes, strom.length, nals, 256) : 0;
+    strom_pruefen(nals, k, sei_soll, &b);
+    fd = NULL;
+    dec = strom ? erstes_bild_decodieren(nals, k, xf44, &fd) : NULL;
+    pruefe(b.vollbilder == 1 && b.sei_richtig == 0 && b.sei_sonst == 0 && fd &&
+           fd_ist(fd, kCMFormatDescriptionExtension_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2) &&
+           fd_ist(fd, kCMFormatDescriptionExtension_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
+           "SDR wie bisher: keine SEI 137/144, VUI BT.709");
+    if (dec) CVPixelBufferRelease(dec);
+    if (fd) CFRelease(fd);
+    qc_testbild_stop();
+
+    // f) HDR10 nur mit HEVC 10 Bit: 8 Bit und H.264 lehnen ab, ohne Sitzung.
+    __block BOOL acht = YES, h264 = YES;
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{
+        acht = encoder_start(3, W, H, 60, 10, 1);
+        h264 = encoder_start(4, W, H, 60, 10, 1);
+    });
+    stdout_stumm(0);
+    pruefe(!acht && !h264 && !g_session && !atomic_load(&g_farbe_pq), "HDR10 mit HEVC 8 Bit oder H.264: abgelehnt, keine Sitzung, Farbe SDR");
+    atomic_store(&g_codec_id, 0);
+}
+
 // Ein Eintrag der Liste (12), wie der Client ihn liest.
 typedef struct { char kennung[65]; char name[49]; uint16_t w, h, hz; uint8_t flags; } eintrag;
 
@@ -2306,8 +2684,11 @@ static int liste_lesen(const uint8_t *p, size_t n, char *wunsch, int idx, eintra
 typedef struct {
     char folge[256]; uint8_t liste[QC_BILDSCHIRM_LISTE_MAX]; size_t liste_n;
     uint8_t info[QC_HDR_INFO_LAENGE]; size_t info_n; int infos;
-    int wechsel; uint8_t wechsel_codec, wechsel_transfer; int bilder, voll, erstes_voll; int status, statusse;
+    int wechsel; uint8_t wechsel_codec, wechsel_transfer, wechsel_umrechnung; int bilder, voll, erstes_voll; int status, statusse;
 } gelesen;
+
+// Das letzte Vollbild, das alles_lesen sah (Annex B mit Startcodes).
+static NSData *g_letztes_vollbild = nil;
 
 static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
     memset(g, 0, sizeof *g);
@@ -2333,9 +2714,11 @@ static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
                 g->wechsel++;
                 if (d.length) g->wechsel_codec = ((const uint8_t *)d.bytes)[0];
                 if (d.length >= 8) g->wechsel_transfer = ((const uint8_t *)d.bytes)[6];
+                if (d.length >= 8) g->wechsel_umrechnung = ((const uint8_t *)d.bytes)[5];
                 break;
             case QC_MSG_VIDEO: {
                 int key = (h.flags & QC_FLAG_KEY) ? 1 : 0;
+                if (key) g_letztes_vollbild = d;
                 if (g->bilder == 0) g->erstes_voll = key;
                 g->bilder++;
                 g->voll += key;
@@ -3054,8 +3437,303 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
            g.infos == 1 && g.info[13] == grund_auto,
            "zu kurz und fremde Fassung: uebergangen und protokolliert, der Kanal lebt (SDR-Schirm, Automatisch: wieder der Grund des Hosts)");
 
+
+    printf("\n-- HDR: Aushandlung bis HDR10 und zurueck (Attrappen fuer Liste und Strom, echter Encoder 1920x1080)\n");
+    // Der Weg des Mac-Hosts (HDR-Plan 5.1): HDR am Bildschirm an/aus,
+    // IN_ANZEIGE, Codecwechsel mit Farbe, Sperre 2 s, Grund 6 bei einer
+    // Aufnahme, die HDR ablehnt, eine Abloesung mitten in HDR10 und ein
+    // doppelter Fehlschlag (HDR10 und der alte Codec gehen nicht auf).
+    schein H2;
+    memset(&H2, 0, sizeof H2);
+    H2.bild = H2.ein = -1;
+    if (!hdr_system_kann() || !g_befund[0].hdr) {
+        printf("         (dieser Mac kann kein HDR10 - Abschnitt uebersprungen)\n");
+    } else {
+        OSType xf44 = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+        CVPixelBufferRef pb_sdr = formatpuffer(1920, 1080, xf44, 800, 512, 512);
+        // Wie ScreenCaptureKit in HDR (HDRStream...): Display P3 PQ, Matrix BT.709.
+        CVPixelBufferRef pb_pq = formatpuffer(1920, 1080, xf44, 594, 512, 512);
+        CVBufferSetAttachment(pb_pq, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_P3_D65, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb_pq, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pb_pq, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        NSData *sei_soll = hex(QC_SEI_P3_1000);
+        uint8_t info_pq_soll[QC_HDR_INFO_LAENGE - QC_HDR_INFO_ALT];
+        { qc_hdr_info i; hdr_info_pq(&i); qc_hdr_info_kodieren(&i, info_pq_soll); }
+        nal_t nals[64];
+        strom_befund sb;
+        uint8_t hdr_an = QC_HDR_ANZEIGE_SCHIRM_HDR | QC_HDR_ANZEIGE_DARSTELLUNG;
+
+        // 1. HDR am Bildschirm des Hosts an (EDR-Kopfraum 4): erkannt; mit
+        //    HEVC 4:2:0 8 Bit bleibt es SDR, Grund 2 wie zuvor.
+        QCBildschirm *B3 = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 1920, 1080, 240, YES);
+        B3.edr_potentiell = 4.0;
+        B3.edr_aktuell = 4.0;
+        stdout_stumm(1);
+        liste_setzen(@[ B3, A2, C ]);
+        bildschirm_konfiguration_geaendert();
+        usleep(450 * 1000);
+        dispatch_sync(g_lifeq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        pruefe(atomic_load(&g_quelle_hdr) == 1 && g.wechsel == 0 && g.infos == 0 &&
+               zeilen_mit(logpfad, "Bildschirm des Hosts: HDR an (EDR-Kopfraum 4.00) - Bildschirmkonfiguration") == 1,
+               "HDR am Bildschirm des Hosts an: erkannt und protokolliert; HEVC 4:2:0 8 Bit bleibt SDR (Grund 2), keine neue Strominfo");
+
+        // 2. Codecwunsch HEVC 4:4:4 10 Bit: der Client hat keine
+        //    HDR-Darstellung gemeldet - SDR, Grund 5.
+        uint8_t c0 = 0, c3 = 3;
+        stdout_stumm(1);
+        ein_senden(H.ein, &H.tx, QC_IN_CODEC, &c0, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        bild_einspeisen(pb_sdr);
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        size_t k = g_letztes_vollbild ? nals_zerlegen(g_letztes_vollbild.bytes, g_letztes_vollbild.length, nals, 64) : 0;
+        strom_pruefen(nals, k, sei_soll, &sb);
+        printf("         (Codec 0 ohne Darstellung: %s, Grund %d, Vollbild mit %d SEI 137)\n", g.folge, g.info[13], sb.sei_richtig + sb.sei_sonst);
+        pruefe(g.wechsel == 1 && g.wechsel_codec == 0 && g.wechsel_transfer == QC_HDR_TRANSFER_SDR && g.infos == 1 &&
+               g.info[9] == QC_HDR_TRANSFER_SDR && g.info[13] == QC_HDR_GRUND_CLIENT_OHNE_DARSTELLUNG && !atomic_load(&g_farbe_pq) &&
+               g_cfg.pixelFormat == xf44 && !aufnahme_ist_pq(g_cfg) && g.voll == 1 && sb.vollbilder == 1 && sb.sei_richtig + sb.sei_sonst == 0,
+               "Codecwunsch 4:4:4 10 Bit ohne HDR-Darstellung beim Client: SWITCH mit Transfer 1, Strominfo SDR Grund 5, Vollbild ohne SEI 137");
+
+        // 3. IN_ANZEIGE: HDR-Schirm und Darstellung, Automatisch -> HDR10.
+        stdout_stumm(1);
+        ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_AUTOMATISCH, 400));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        uint64_t t_hdr = now_us();
+        bild_einspeisen(pb_pq);
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        k = g_letztes_vollbild ? nals_zerlegen(g_letztes_vollbild.bytes, g_letztes_vollbild.length, nals, 64) : 0;
+        strom_pruefen(nals, k, sei_soll, &sb);
+        int dr_ok = 1;
+        if (@available(macOS 15.0, *)) dr_ok = g_cfg.captureDynamicRange == SCCaptureDynamicRangeHDRCanonicalDisplay;
+        printf("         (HDR10: %s, SWITCH Codec %d Transfer %d Umrechnung %d, Grund %d, Vollbild: SEI richtig %d)\n", g.folge,
+               g.wechsel_codec, g.wechsel_transfer, g.wechsel_umrechnung, g.info[13], sb.sei_richtig);
+        pruefe(g.wechsel == 1 && g.wechsel_codec == 0 && g.wechsel_transfer == QC_HDR_TRANSFER_PQ && g.wechsel_umrechnung == 1 &&
+               g.infos == 1 && g.info_n == QC_HDR_INFO_LAENGE && memcmp(g.info + QC_HDR_INFO_ALT, info_pq_soll, sizeof info_pq_soll) == 0 &&
+               atomic_load(&g_farbe_pq) == 1,
+               "IN_ANZEIGE (HDR-Schirm, Darstellung, Automatisch): SWITCH Transfer 16 (P3 -> BT.2020 als Umrechnung), Strominfo PQ/2020/2020 voll, Grund 0, Weiss 203, Mastering 1000/0,005");
+        pruefe(aufnahme_ist_pq(g_cfg) && CFEqual(g_cfg.colorSpaceName, kCGColorSpaceDisplayP3_PQ) &&
+               g_cfg.colorMatrix && CFEqual(g_cfg.colorMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) && dr_ok && g_cfg.pixelFormat == xf44,
+               "Aufnahme in HDR: kanonisch, Display P3 PQ, Matrix BT.709, xf44 (Apples HDRStreamCanonicalDisplay)");
+        pruefe(g.voll == 1 && sb.vollbilder == 1 && sb.sei_richtig == 1 && sb.sei_sonst == 0,
+               "das Vollbild beim Zuschauer: VPS, SPS, PPS, dann unsere SEI 137/144 (byte-genau)");
+        pruefe(zeilen_mit(logpfad, "HDR-Entscheidung (IN_ANZEIGE): HDR10, Grund 0 (HDR aktiv) - Farbwechsel SDR -> HDR10") == 1 &&
+               zeilen_mit(logpfad, "Aufnahme: SDR -> HDR10 - kanonisch, Display P3 PQ, Matrix BT.709") == 1 &&
+               zeilen_mit(logpfad, "Aufnahme: erstes Bild xf44 1920x1080, P3_D65 / SMPTE_ST_2084_PQ / ITU_R_709_2 (Encoder HDR10)") >= 1,
+               "Protokoll: Entscheidung, Umstellen der Aufnahme, Anhaenge des ersten Bildes");
+
+        // 4. Gleich danach Wunsch Aus: keine 2 s seit dem letzten Farbwechsel -
+        //    der Wechsel nach SDR kommt, wenn die Sperre ablaeuft.
+        stdout_stumm(1);
+        ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_AUS, 400));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 200, &g);
+        int sofort = g.wechsel, sofort_infos = g.infos;
+        uint64_t bis = t_hdr + 2300000ull;
+        while (now_us() < bis) usleep(50 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        printf("         (Wunsch Aus: sofort %d SWITCH, %d Strominfo; nach der Sperre %s, Grund %d)\n", sofort, sofort_infos, g.folge, g.info[13]);
+        pruefe(sofort == 0 && sofort_infos == 0 && zeilen_mit(logpfad, "der letzte Farbwechsel ist keine 2 s her") == 1,
+               "Farbwechsel binnen 2 s: nicht sofort, sondern vorgemerkt (Zeile)");
+        pruefe(g.wechsel == 1 && g.wechsel_transfer == QC_HDR_TRANSFER_SDR && g.infos == 1 && g.info[9] == QC_HDR_TRANSFER_SDR &&
+               g.info[13] == QC_HDR_GRUND_CLIENT_SDR && !atomic_load(&g_farbe_pq) && !aufnahme_ist_pq(g_cfg) &&
+               g_cfg.colorMatrix && CFEqual(g_cfg.colorMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+               "nach Ablauf der Sperre: SWITCH Transfer 1, Strominfo SDR Grund 1, Aufnahme sRGB mit Matrix BT.709");
+
+        // 5. Die Aufnahme lehnt HDR ab: SDR bleibt, Grund 6, kein SWITCH;
+        //    dieselbe Lage versucht es nicht noch einmal, eine neue schon.
+        dispatch_sync(g_capq, ^{ g_farbe_gewechselt_us = 0; });
+        atomic_store(&g_fake_umstellen_fehler, 1);
+        int versuche_vorher = zeilen_mit(logpfad, "Farbwechsel: SDR -> HDR10");
+        stdout_stumm(1);
+        ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_AUTOMATISCH, 400));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        __block VTCompressionSessionRef s6 = NULL;
+        dispatch_sync(g_capq, ^{ s6 = g_session; });
+        pruefe(g.wechsel == 0 && g.infos == 1 && g.info[13] == QC_HDR_GRUND_WECHSEL_GESCHEITERT && !atomic_load(&g_farbe_pq) &&
+               !aufnahme_ist_pq(g_cfg) && s6 != NULL && zeilen_mit(logpfad, "Wechsel nach HDR10 gescheitert") == 1,
+               "Aufnahme lehnt HDR ab: kein SWITCH, SDR laeuft weiter (neuer Encoder), Strominfo Grund 6, Aufnahme zurueck auf sRGB");
+        stdout_stumm(1);
+        ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_AUTOMATISCH, 300));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 200, &g);
+        stdout_stumm(0);
+        pruefe(g.wechsel == 0 && g.infos == 0 && zeilen_mit(logpfad, "Farbwechsel: SDR -> HDR10") == versuche_vorher + 1,
+               "dieselbe Lage (nur ein anderer Kopfraum): kein neuer Versuch, keine neue Strominfo");
+        atomic_store(&g_fake_umstellen_fehler, 0);
+        stdout_stumm(1);
+        ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_IMMER, 300));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        pruefe(g.wechsel == 1 && g.wechsel_transfer == QC_HDR_TRANSFER_PQ && g.info[13] == QC_HDR_GRUND_AKTIV && atomic_load(&g_farbe_pq),
+               "eine neue Lage (Wunsch Immer): neuer Versuch, jetzt HDR10");
+
+        // 6. HDR am Bildschirm des Hosts aus: SDR, Grund 3.
+        dispatch_sync(g_capq, ^{ g_farbe_gewechselt_us = 0; });
+        QCBildschirm *B4 = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 1920, 1080, 240, YES);
+        B4.edr_potentiell = 1.0;
+        B4.edr_aktuell = 1.0;
+        stdout_stumm(1);
+        liste_setzen(@[ B4, A2, C ]);
+        bildschirm_konfiguration_geaendert();
+        usleep(450 * 1000);
+        dispatch_sync(g_lifeq, ^{});
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        pruefe(atomic_load(&g_quelle_hdr) == 0 && g.wechsel == 1 && g.wechsel_transfer == QC_HDR_TRANSFER_SDR &&
+               g.info[13] == QC_HDR_GRUND_HOST_SCHIRM_SDR && !atomic_load(&g_farbe_pq) &&
+               zeilen_mit(logpfad, "Bildschirm des Hosts: HDR aus (EDR-Kopfraum 1.00) - Bildschirmkonfiguration") == 1,
+               "HDR am Bildschirm des Hosts aus: SWITCH Transfer 1, Strominfo Grund 3, Zeile");
+
+        // 7. Wieder an, dann Codecwechsel mit Farbe: 4:2:0 8 Bit wird SDR
+        //    (Grund 2), zurueck auf 4:4:4 10 Bit wieder HDR10 - ohne Sperre.
+        dispatch_sync(g_capq, ^{ g_farbe_gewechselt_us = 0; });
+        stdout_stumm(1);
+        liste_setzen(@[ B3, A2, C ]);
+        bildschirm_konfiguration_geaendert();
+        usleep(450 * 1000);
+        dispatch_sync(g_lifeq, ^{});
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        int wieder_an = g.wechsel == 1 && g.wechsel_transfer == QC_HDR_TRANSFER_PQ && atomic_load(&g_farbe_pq);
+        ein_senden(H.ein, &H.tx, QC_IN_CODEC, &c3, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        gelesen g3 = g;
+        OSType fmt3 = g_cfg.pixelFormat;
+        int pq3 = aufnahme_ist_pq(g_cfg);
+        ein_senden(H.ein, &H.tx, QC_IN_CODEC, &c0, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H, 300, &g);
+        stdout_stumm(0);
+        pruefe(wieder_an, "HDR am Host wieder an: HDR10");
+        pruefe(g3.wechsel == 1 && g3.wechsel_codec == 3 && g3.wechsel_transfer == QC_HDR_TRANSFER_SDR && g3.info[13] == QC_HDR_GRUND_CODEC &&
+               fmt3 == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && !pq3 &&
+               zeilen_mit(logpfad, "Codecwechsel: HEVC 4:4:4 10 Bit -> HEVC 4:2:0 8 Bit, Farbe HDR10 -> SDR") == 1,
+               "Codecwunsch 4:2:0 8 Bit in HDR10: ein Wechsel mit Farbe - SWITCH Codec 3 Transfer 1, Grund 2, Aufnahme 420f sRGB");
+        pruefe(g.wechsel == 1 && g.wechsel_codec == 0 && g.wechsel_transfer == QC_HDR_TRANSFER_PQ && g.info[13] == QC_HDR_GRUND_AKTIV &&
+               aufnahme_ist_pq(g_cfg) && g_cfg.pixelFormat == xf44 &&
+               zeilen_mit(logpfad, "Codecwechsel: HEVC 4:2:0 8 Bit -> HEVC 4:4:4 10 Bit, Farbe SDR -> HDR10") == 1,
+               "zurueck auf 4:4:4 10 Bit: gleich wieder HDR10 (Codecwuensche kennen keine Sperre)");
+
+        // 8. Ein anderer Zuschauer loest mitten in HDR10 ab: die Begruessung
+        //    sagt, was laeuft (PQ), dann SDR fuer ihn - Grund 7, bis er sein
+        //    IN_ANZEIGE schickt.
+        dispatch_sync(g_capq, ^{ g_farbe_gewechselt_us = 0; });
+        uint8_t h2_priv[32], h2_pub[32];
+        qc_keypair(h2_priv, h2_pub);
+        qc_zugang_eintragen(h2_pub, "hosttest H2");
+        stdout_stumm(1);
+        int ok2 = schein_verbinden(&H2, bild_port, ein_port, h2_priv) == 0;
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H2, 300, &g);
+        stdout_stumm(0);
+        printf("         (Abloesung in HDR10: Begruessung Transfer %d, danach %s, Grund %d)\n", H2.info_n >= 10 ? H2.info[9] : -1, g.folge, g.info[13]);
+        pruefe(ok2 && H2.info_n == QC_HDR_INFO_LAENGE && H2.info[9] == QC_HDR_TRANSFER_PQ && g.wechsel == 1 &&
+               g.wechsel_transfer == QC_HDR_TRANSFER_SDR && g.info[13] == QC_HDR_GRUND_KEIN_IN_ANZEIGE && !atomic_load(&g_farbe_pq) &&
+               zeilen_mit(logpfad, "HDR-Entscheidung (neuer Zuschauer): SDR, Grund 7") == 1,
+               "Abloesung in HDR10: Begruessung mit PQ, dann SWITCH nach SDR und Strominfo Grund 7 fuer den Neuen");
+
+        // 9. Doppelter Fehlschlag: der Wechsel nach HDR10 auf einen anderen
+        //    Kandidaten scheitert (die Aufnahme lehnt HDR ab), und auch der
+        //    alte Codec laesst sich nicht wieder oeffnen (Groesse 0 - dafuer
+        //    baut VideoToolbox keine Sitzung). Der Codecwunsch gilt weiter,
+        //    aber in SDR (Grund 6) und genau einmal: keine Schleife.
+        stdout_stumm(1);
+        ein_senden(H2.ein, &H2.tx, QC_IN_CODEC, &c3, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        ein_daten(H2.ein, &H2.tx, QC_IN_ANZEIGE, anzeige_daten(hdr_an, QC_HDR_WUNSCH_AUTOMATISCH, 400));
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H2, 300, &g);
+        int vorbereitet = g.wechsel == 1 && g.wechsel_codec == 3 && g.info[13] == QC_HDR_GRUND_CODEC &&
+                          atomic_load(&g_codec_id) == 3 && !atomic_load(&g_farbe_pq);
+        const char *z_hdr = "Codecwechsel: HEVC 4:2:0 8 Bit -> HEVC 4:4:4 10 Bit, Farbe SDR -> HDR10";
+        const char *z_alle = "Codecwechsel: HEVC 4:2:0 8 Bit -> HEVC 4:4:4 10 Bit";
+        const char *z_alt = "Auch der alte Codec HEVC 4:2:0 8 Bit laesst sich nicht mehr oeffnen";
+        const char *z_gesch = "Wechsel nach HDR10 gescheitert";
+        int v_hdr = zeilen_mit(logpfad, z_hdr), v_alle = zeilen_mit(logpfad, z_alle);
+        int v_alt = zeilen_mit(logpfad, z_alt), v_gesch = zeilen_mit(logpfad, z_gesch);
+        __block int w9 = 0, h9 = 0;
+        dispatch_sync(g_capq, ^{ w9 = g_info_w; h9 = g_info_h; g_info_w = 0; g_info_h = 0; });
+        atomic_store(&g_fake_umstellen_fehler, 1);
+        ein_senden(H2.ein, &H2.tx, QC_IN_CODEC, &c0, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        usleep(300 * 1000);                              // eine Schleife haette jetzt viele Runden gedreht
+        dispatch_sync(g_capq, ^{});
+        __block VTCompressionSessionRef s9 = NULL;
+        __block int aktiv9 = -1, wunsch9 = 0;
+        dispatch_sync(g_capq, ^{ s9 = g_session; aktiv9 = g_wechsel_aktiv; wunsch9 = g_wechsel_wunsch; });
+        int gesch9 = atomic_load(&g_hdr_gescheitert);
+        alles_lesen(&H2, 300, &g);
+        int n_hdr = zeilen_mit(logpfad, z_hdr) - v_hdr, n_alle = zeilen_mit(logpfad, z_alle) - v_alle;
+        int n_alt = zeilen_mit(logpfad, z_alt) - v_alt, n_gesch = zeilen_mit(logpfad, z_gesch) - v_gesch;
+        // Aufraeumen; danach geht es wieder: der naechste Codecwunsch baut
+        // 4:4:4 10 Bit auf - dieselbe Lage, also SDR mit Grund 6.
+        atomic_store(&g_fake_umstellen_fehler, 0);
+        dispatch_sync(g_capq, ^{ g_info_w = w9; g_info_h = h9; });
+        gelesen g9 = g;
+        ein_senden(H2.ein, &H2.tx, QC_IN_CODEC, &c0, 1);
+        usleep(300 * 1000);
+        dispatch_sync(g_capq, ^{});
+        dispatch_sync(g_capq, ^{});
+        alles_lesen(&H2, 300, &g);
+        __block VTCompressionSessionRef s9b = NULL;
+        dispatch_sync(g_capq, ^{ s9b = g_session; });
+        stdout_stumm(0);
+        printf("         (doppelter Fehlschlag: %d Versuch(e) in HDR10, %d insgesamt, alter Codec %d-mal nicht zu oeffnen, "
+               "danach %s, Grund %d)\n", n_hdr, n_alle, n_alt, g.folge, g.info[13]);
+        pruefe(vorbereitet, "vorher: HEVC 4:2:0 8 Bit in SDR (Grund 2), der Zuschauer meldet HDR-Schirm und Darstellung");
+        pruefe(n_hdr == 1 && n_alle == 2 && n_alt == 2 && n_gesch == 1 && gesch9 == 1 && !s9 && aktiv9 == 0 && wunsch9 < 0 &&
+               g9.wechsel == 0,
+               "doppelter Fehlschlag nach HDR10 (Aufnahme lehnt ab, alter Codec geht nicht auf): ein Versuch in HDR10, "
+               "dann der Codecwunsch einmal in SDR (Grund 6) - keine Schleife, kein SWITCH");
+        pruefe(s9b && g.wechsel == 1 && g.wechsel_codec == 0 && g.wechsel_transfer == QC_HDR_TRANSFER_SDR &&
+               g.info[13] == QC_HDR_GRUND_WECHSEL_GESCHEITERT && !atomic_load(&g_farbe_pq),
+               "danach baut der naechste Codecwunsch wieder auf: SWITCH Codec 0 in SDR, Strominfo Grund 6 (dieselbe Lage)");
+
+        CVPixelBufferRelease(pb_sdr);
+        CVPixelBufferRelease(pb_pq);
+        dispatch_sync(g_capq, ^{ g_farbe_gewechselt_us = 0; });
+        atomic_store(&g_hdr_gescheitert, 0);
+    }
+
     zuschauer_weg();
     schein_schliessen(&H);
+    schein_schliessen(&H2);
     stdout_stumm(1);
     stream_herunterfahren_anstossen();
     SCStream *st = strom_jetzt();
@@ -4067,6 +4745,7 @@ int main(void) {
         stau_pruefen();
         takt_pruefen();
         codecs_pruefen_pruefen();
+        hdr_encoder_pruefen();
         // Das eigene HOME bleibt nur liegen, wenn etwas fehlschlug (zum Nachsehen).
         if (!g_fehler) [[NSFileManager defaultManager] removeItemAtPath:@(g_home) error:nil];
         printf("\n%s: %d Fehler\n", g_fehler ? "NICHT BESTANDEN" : "bestanden", g_fehler);

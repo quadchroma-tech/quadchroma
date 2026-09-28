@@ -54,6 +54,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #import "audio.h"
 #import "clipboard.h"
@@ -496,9 +497,12 @@ static const qc_codec_kandidat g_kandidaten[] = {
 
 #define QC_KANDIDATEN (sizeof g_kandidaten / sizeof g_kandidaten[0])
 
+// hdr: dieser Kandidat kann HDR10 (BT.2020, PQ) - macOS 15, Apple Silicon,
+// HEVC 10 Bit, und der Encoder nimmt die PQ-Eigenschaften (codecs_pruefen).
 typedef struct {
     int vorhanden;
     int hardware;
+    int hdr;
 } qc_codec_befund;
 
 static qc_codec_befund g_befund[QC_KANDIDATEN];
@@ -507,6 +511,24 @@ static qc_codec_befund g_befund[QC_KANDIDATEN];
 // Welcher Kandidat gerade codiert. Alles, was der Client ueber den Strom
 // wissen muss, leitet sich hieraus ab - nicht aus dem Zustand beim Start.
 static _Atomic int g_codec_id = 0;
+
+// --- HDR (HDR-Plan 5.1) ----------------------------------------------------
+// Die Farbe ist die zweite Dimension des Codecwechsels: Kandidat und Farbe
+// zusammen bestimmen Aufnahme, Encoder, SWITCH und Strominfo.
+// Farbe des laufenden Encoders: 1 = HDR10 (BT.2020, PQ, SEI 137/144 vor jedem
+// Vollbild), 0 = SDR (BT.709). Gesetzt von encoder_start zusammen mit
+// g_session - was auf der Leitung ist, nicht was gewuenscht ist.
+static _Atomic int g_farbe_pq = 0;
+// Der aufgenommene Bildschirm kann HDR (EDR-Kopfraum potentiell ueber 1.0).
+// Gesetzt auf g_lifeq (quelle_setzen).
+static _Atomic int g_quelle_hdr = 0;
+// Der letzte Wechsel nach HDR scheiterte: SDR mit Grund 6, bis sich die Lage
+// aendert (neuer Zuschauer, anderes IN_ANZEIGE, HDR am Bildschirm an/aus,
+// anderer Bildschirm) - sonst versuchte der Host es bei jeder Gelegenheit neu.
+static _Atomic int g_hdr_gescheitert = 0;
+// Das erste Bild nach dem Start oder einem Farbwechsel: Format und Anhaenge
+// ins Protokoll (was ScreenCaptureKit wirklich liefert).
+static _Atomic int g_anhaenge_loggen = 0;
 
 // --- Aufnahme wiederherstellen ----------------------------------------
 // Faellt der Bildschirm weg (Monitor aus, Displayschlaf, Neuerkennung),
@@ -563,6 +585,139 @@ static OSType pixfmt_fuer(int idx) {
 }
 static int umrechnung_fuer(int idx) { return idx == 1 || idx == 2; }
 static int ist_h264(int idx) { return g_kandidaten[idx].codec == kCMVideoCodecType_H264; }
+
+// --- HDR: Aufnahme, Metadaten, Faehigkeit -----------------------------------
+//
+// Wie ScreenCaptureKit HDR liefert, misst scripts/hdrprobe.m (HDR-Plan G0).
+// Vorgabe wie Apples Voreinstellung HDRStreamCanonicalDisplay: Dynamikumfang
+// kanonisch (unabhaengig vom Bildschirm des Hosts), xf44, Display P3 mit PQ und
+// Matrix BT.709 - VideoToolbox rechnet dann P3 nach BT.2020 um (steht in
+// SWITCH p[5] und im Protokoll). Fuer die Abnahme umstellbar ueber die
+// Umgebungsvariable QC_HDR_AUFNAHME: kanonisch-p3 (Vorgabe), lokal-p3,
+// kanonisch-2100, lokal-2100 (BT.2100 PQ mit Matrix BT.2020: ohne Umrechnung).
+typedef struct { int lokal, bt2100; } qc_hdr_aufnahme_art;
+
+static qc_hdr_aufnahme_art hdr_aufnahme_art(void) {
+    static qc_hdr_aufnahme_art art;
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{
+        const char *e = getenv("QC_HDR_AUFNAHME");
+        if (e && *e) {
+            art.lokal = strstr(e, "lokal") != NULL;
+            art.bt2100 = strstr(e, "2100") != NULL;
+        }
+    });
+    return art;
+}
+
+static const char *hdr_aufnahme_text(void) {
+    qc_hdr_aufnahme_art a = hdr_aufnahme_art();
+    return a.lokal ? (a.bt2100 ? "lokal, BT.2100 PQ, Matrix BT.2020" : "lokal, Display P3 PQ, Matrix BT.709")
+                   : (a.bt2100 ? "kanonisch, BT.2100 PQ, Matrix BT.2020" : "kanonisch, Display P3 PQ, Matrix BT.709");
+}
+
+// Rechnet VideoToolbox die HDR-Aufnahme um (Display P3 -> BT.2020)?
+static int hdr_p3_umrechnung(void) { return !hdr_aufnahme_art().bt2100; }
+
+// SDR-Weiss der HDR-Aufnahme in nit - wohin ScreenCaptureKit das Weiss eines
+// SDR-Fensters im PQ-Signal legt. BT.2408 und VideoToolbox (SDR -> PQ, im
+// Versuch gemessen: Code 594) nehmen 203; G0 misst es fuer ScreenCaptureKit.
+// Bis dahin 203, fuer die Abnahme ueber QC_HDR_SDR_WEISS (50..1000) umstellbar.
+static uint16_t hdr_sdr_weiss_nit(void) {
+    static uint16_t weiss = 203;
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{
+        const char *e = getenv("QC_HDR_SDR_WEISS");
+        long v = e ? strtol(e, NULL, 10) : 0;
+        if (v >= 50 && v <= 1000) weiss = (uint16_t)v;
+    });
+    return weiss;
+}
+
+// Mastering-Angaben des Stroms (SEI 137, VideoToolbox, Strominfo): der
+// Bildschirm eines Macs, Display P3 mit D65, 1000 nit Spitze, 0,005 nit
+// Schwarz. MaxCLL und MaxFALL sind bei einem Bildschirmstrom unbekannt: 0.
+#define QC_HDR_MASTER_MAX_NIT 1000u
+#define QC_HDR_MASTER_MIN     50u          // 0,005 nit in 0,0001 nit
+
+static void hdr_sei_werte(qc_hdr_sei_werte *w) {
+    memset(w, 0, sizeof *w);
+    qc_hdr_sei_primaer(w, 0);
+    w->max_lum = QC_HDR_MASTER_MAX_NIT * 10000u;
+    w->min_lum = QC_HDR_MASTER_MIN;
+    w->max_cll = 0;
+    w->max_fall = 0;
+}
+
+// Die Strominfo-Farbe fuer HDR10, wie sie auf der Leitung ist.
+static void hdr_info_pq(qc_hdr_info *i) {
+    memset(i, 0, sizeof *i);
+    i->transfer = QC_HDR_TRANSFER_PQ;
+    i->primaer = QC_HDR_PRIMAER_2020;
+    i->matrix = QC_HDR_MATRIX_2020_NCL;
+    i->voll = 1;
+    i->grund = QC_HDR_GRUND_AKTIV;
+    i->sdr_weiss_nit = hdr_sdr_weiss_nit();
+    i->master_max_nit = QC_HDR_MASTER_MAX_NIT;
+    i->master_min_zehntausendstel = QC_HDR_MASTER_MIN;
+}
+
+// Aufnahme fuer SDR oder HDR einstellen: Dynamikumfang, Farbraum, Matrix.
+// Das Pixelformat bleibt Sache von pixfmt_fuer (xf44 auch bei HDR - 4:4:4
+// 10 Bit ohne Kopie). SDR ist der Stand von frueher: sRGB, Matrix nach
+// Vorgabe von ScreenCaptureKit.
+static void aufnahme_farbe_setzen(SCStreamConfiguration *cfg, int pq) {
+    if (!cfg) return;
+    if (pq) {
+        qc_hdr_aufnahme_art a = hdr_aufnahme_art();
+        if (@available(macOS 15.0, *))
+            cfg.captureDynamicRange = a.lokal ? SCCaptureDynamicRangeHDRLocalDisplay : SCCaptureDynamicRangeHDRCanonicalDisplay;
+        cfg.colorSpaceName = a.bt2100 ? kCGColorSpaceITUR_2100_PQ : kCGColorSpaceDisplayP3_PQ;
+        cfg.colorMatrix = a.bt2100 ? kCVImageBufferYCbCrMatrix_ITU_R_2020 : kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+    } else {
+        if (@available(macOS 15.0, *)) cfg.captureDynamicRange = SCCaptureDynamicRangeSDR;
+        cfg.colorSpaceName = kCGColorSpaceSRGB;
+        // Die Matrix bleibt, wie immer schon, bei der Vorgabe von
+        // ScreenCaptureKit (nicht gesetzt); nur nach HDR wird sie ausdruecklich
+        // BT.709 - das, was der Strom im VUI sagt.
+        if (cfg.colorMatrix) cfg.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+    }
+}
+
+// Ist die Aufnahme auf HDR eingestellt? (Am Farbraum abgelesen.)
+static int aufnahme_ist_pq(SCStreamConfiguration *cfg) {
+    CFStringRef cs = cfg ? cfg.colorSpaceName : NULL;
+    return cs && (CFEqual(cs, kCGColorSpaceDisplayP3_PQ) || CFEqual(cs, kCGColorSpaceITUR_2100_PQ));
+}
+
+// Kann dieser Mac ueberhaupt HDR aufnehmen? ScreenCaptureKit liefert HDR ab
+// macOS 15 und nur auf Apple Silicon (auch unter Rosetta: hw.optional.arm64).
+static int hdr_system_kann(void) {
+    if (@available(macOS 15.0, *)) {
+        int arm = 0;
+        size_t n = sizeof arm;
+        if (sysctlbyname("hw.optional.arm64", &arm, &n, NULL, 0) != 0) arm = 0;
+        return arm != 0;
+    }
+    return 0;
+}
+
+// Format und Farbangaben eines Bildes, fuers Protokoll:
+// "xf44 1920x1080, P3_D65 / SMPTE_ST_2084_PQ / ITU_R_709_2".
+static NSString *anhaenge_text(CVPixelBufferRef pb) {
+    if (!pb) return @"(kein Bild)";
+    OSType t = CVPixelBufferGetPixelFormatType(pb);
+    uint32_t be = CFSwapInt32HostToBig(t);
+    CFTypeRef keys[3] = { kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey };
+    NSMutableArray<NSString *> *w = [NSMutableArray array];
+    for (int i = 0; i < 3; i++) {
+        CFTypeRef v = CVBufferCopyAttachment(pb, (CFStringRef)keys[i], NULL);
+        [w addObject:v && CFGetTypeID(v) == CFStringGetTypeID() ? (__bridge NSString *)v : @"-"];
+        if (v) CFRelease(v);
+    }
+    return [NSString stringWithFormat:@"%.4s %zux%zu, %@ / %@ / %@", (char *)&be, CVPixelBufferGetWidth(pb),
+            CVPixelBufferGetHeight(pb), w[0], w[1], w[2]];
+}
 
 static int g_info_w = 0, g_info_h = 0, g_info_fps = 0;
 
@@ -926,18 +1081,28 @@ static void zeiger_log(const char *text) {
 }
 
 // Die HDR-Entscheidung dieses Hosts (qc_hdr_entscheiden) fuer den
-// laufenden Kandidaten und das IN_ANZEIGE des Zuschauers (NULL: noch keins -
-// Grund 7). HDR10 codieren und den Bildschirm als HDR aufnehmen kann dieser
-// Host noch nicht (das kommt mit Schritt 4a des HDR-Plans): bis dahin immer
-// SDR mit Grund, bei Kandidat 0 und 2 Grund 4.
+// Kandidaten idx und das IN_ANZEIGE des Zuschauers (NULL: noch keins -
+// Grund 7). Die Quelle ist HDR, wenn der aufgenommene Bildschirm es kann
+// (g_quelle_hdr); der Host kann es, wenn der Kandidat es kann (g_befund,
+// darin macOS 15 und Apple Silicon). Scheiterte der letzte Wechsel nach HDR,
+// bleibt es bei SDR mit Grund 6.
+static int hdr_grund_fuer_idx(int idx, const qc_hdr_anzeige *a) {
+    int host_kann = idx >= 0 && idx < (int)QC_KANDIDATEN && g_befund[idx].hdr;
+    int g = qc_hdr_entscheiden(atomic_load(&g_quelle_hdr), host_kann, idx, a);
+    if (g == QC_HDR_GRUND_AKTIV && atomic_load(&g_hdr_gescheitert)) g = QC_HDR_GRUND_WECHSEL_GESCHEITERT;
+    return g;
+}
+
 static int hdr_grund_fuer(const qc_hdr_anzeige *a) {
-    int quelle_hdr = 0, host_kann = 0;
-    return qc_hdr_entscheiden(quelle_hdr, host_kann, atomic_load(&g_codec_id), a);
+    return hdr_grund_fuer_idx(atomic_load(&g_codec_id), a);
 }
 
 // Eckdaten des Stroms, immer aus dem AKTUELLEN Codec abgeleitet: die alten
-// acht Byte, dahinter Fassung 1 (hdr.h) mit Farbe und HDR-Grund fuer dieses
-// IN_ANZEIGE (NULL: die Begruessung - der Neue hat noch nichts gemeldet).
+// acht Byte, dahinter Fassung 1 (hdr.h) mit der Farbe, die gerade auf der
+// Leitung ist. In HDR10 mit den Metadaten (SDR-Weiss, Mastering) und Grund 0;
+// in SDR mit dem Grund aus der Entscheidung fuer dieses IN_ANZEIGE (NULL: die
+// Begruessung - der Neue hat noch nichts gemeldet). Ergaebe die Entscheidung
+// HDR, waehrend noch SDR laeuft, steht der Wechsel aus oder scheiterte: Grund 6.
 static void strominfo_fuellen(uint8_t p[QC_HDR_INFO_LAENGE], const qc_hdr_anzeige *a) {
     int idx = atomic_load(&g_codec_id);
     uint16_t w16 = (uint16_t)g_info_w, h16 = (uint16_t)g_info_h, f16 = (uint16_t)g_info_fps;
@@ -947,7 +1112,12 @@ static void strominfo_fuellen(uint8_t p[QC_HDR_INFO_LAENGE], const qc_hdr_anzeig
     // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
     p[7] = k->chroma444 ? (k->zehn_bit ? 2 : 1) : (k->zehn_bit ? 4 : 3);
     qc_hdr_info farbe;
-    qc_hdr_info_sdr(&farbe, (uint8_t)hdr_grund_fuer(a));
+    if (atomic_load(&g_farbe_pq)) {
+        hdr_info_pq(&farbe);
+    } else {
+        int g = hdr_grund_fuer(a);
+        qc_hdr_info_sdr(&farbe, (uint8_t)(g == QC_HDR_GRUND_AKTIV ? QC_HDR_GRUND_WECHSEL_GESCHEITERT : g));
+    }
     qc_hdr_info_kodieren(&farbe, p + QC_HDR_INFO_ALT);
 }
 
@@ -1587,9 +1757,13 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     memcpy(hello, QC_MAGIC, 4);
     qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = QC_HDR_INFO_LAENGE };
     memcpy(hello + 4, &h, sizeof h);
-    // Der Neue hat noch kein IN_ANZEIGE geschickt: Grund 7.
+    // Der Neue hat noch kein IN_ANZEIGE geschickt: Grund 7. Ein gescheiterter
+    // Wechsel nach HDR galt dem Vorgaenger - der Neue faengt frisch an. Laeuft
+    // der Strom (Abloesung) noch in HDR10, sagt die Begruessung das; der
+    // Wechsel nach SDR folgt unten (hdr_neu_entscheiden).
+    atomic_store(&g_hdr_gescheitert, 0);
     strominfo_fuellen(hello + 4 + sizeof h, NULL);
-    atomic_store(&g_hdr_grund_gesendet, QC_HDR_GRUND_KEIN_IN_ANZEIGE);
+    atomic_store(&g_hdr_grund_gesendet, hello[4 + sizeof h + 13]);
     char fp_alt[24] = {0};
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
@@ -1648,6 +1822,10 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         dispatch_async(g_capq, ^{ atomic_store(&g_testbild, 0); qc_testbild_stop(); });
         logf_(@"Testbild aus (neuer Zuschauer)");
     }
+    // Uebernimmt er einen Strom in HDR10 (Abloesung), entscheidet der Host fuer
+    // ihn neu: ohne sein IN_ANZEIGE ist das SDR (Grund 7), mit SWITCH und
+    // Strominfo - jede Sitzung beginnt in SDR.
+    if (atomic_load(&g_farbe_pq) && g_capq) dispatch_async(g_capq, ^{ hdr_neu_entscheiden("neuer Zuschauer"); });
 
     qc_zeiger_neu_senden();
     {
@@ -2232,9 +2410,12 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                             BOOL gilt = sitzung == g_sitzung;
                             pthread_mutex_unlock(&g_send_mtx);
                             if (!gilt) return;
-                            qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)));
+                            // In der Farbe des laufenden Encoders: in HDR10 die
+                            // PQ-Fassung (testbild.h).
+                            int pq = atomic_load(&g_farbe_pq);
+                            qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(atomic_load(&g_codec_id)), pq);
                             atomic_store(&g_testbild, 1);
-                            logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark", g_info_w, g_info_h);
+                            logf_(@"Testbild an: %dx%d, Schleife fuer den Benchmark%s", g_info_w, g_info_h, pq ? ", HDR10" : "");
                         } else {
                             atomic_store(&g_testbild, 0);
                             qc_testbild_stop();
@@ -2279,6 +2460,11 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                 pthread_mutex_lock(&g_send_mtx);
                 int gilt = sitzung == g_sitzung;
                 if (gilt) {
+                    // Eine neue Lage (Flags oder Wunsch; Pegel und Kopfraum
+                    // allein nicht) darf HDR noch einmal versuchen.
+                    int vorher = g_anzeige_da && g_anzeige_sitzung == sitzung;
+                    if (!vorher || g_anzeige.flags != a.flags || g_anzeige.wunsch != a.wunsch)
+                        atomic_store(&g_hdr_gescheitert, 0);
                     g_anzeige = a;
                     g_anzeige_sitzung = sitzung;
                     g_anzeige_da = 1;
@@ -2363,6 +2549,15 @@ static _Atomic int g_enc_fehler = 0;
 
 static const uint8_t kStartCode[4] = {0, 0, 0, 1};
 
+// HDR10: die Praefix-SEI mit MDCV (137) und CLL (144), gebaut in
+// encoder_start (hdr.c, mit Emulationsschutz). VideoToolbox schreibt diese
+// Angaben nicht in den Strom (gemessen: nur eine SEI vom Typ 5); fuer
+// --capture-Dateien und fremde Spieler steht sie deshalb hinter den
+// Parametersaetzen jedes Vollbilds. Geschrieben nur, solange keine Sitzung
+// laeuft (encoder_start); gelesen im Rueckruf des Encoders.
+static uint8_t g_sei[64];
+static size_t g_sei_n = 0;
+
 // Sammelt Parametersaetze und Bilddaten in eine Zugriffseinheit und schickt sie
 // in EINEM Aufruf weg: weniger Systemaufrufe, keine halben Bilder auf der Leitung.
 #define QC_MAX_IOV 256
@@ -2431,6 +2626,13 @@ static void emit_access_unit(CMSampleBufferRef sb, BOOL keyframe, uint64_t t_cap
                     total += 4 + psz;
                 }
             }
+        }
+        // HDR10: hinter VPS/SPS/PPS die eigene Praefix-SEI (137 + 144), vor
+        // den Daten des Bildes.
+        if (!h264 && atomic_load(&g_farbe_pq) && g_sei_n && cnt + 2 < QC_MAX_IOV) {
+            iov[cnt].iov_base = (void *)kStartCode; iov[cnt].iov_len = 4; cnt++;
+            iov[cnt].iov_base = g_sei;              iov[cnt].iov_len = g_sei_n; cnt++;
+            total += 4 + g_sei_n;
         }
     }
 
@@ -2577,10 +2779,62 @@ static int kandidat_pruefen(const qc_codec_kandidat *k, int hw_pflicht, int *ist
     return ok;
 }
 
+// Die HDR10-Eigenschaften einer Sitzung: BT.2020, PQ, BT.2020-NCL, dazu
+// Mastering (ST 2086) und Lichtpegel (MaxCLL/MaxFALL) als Bytes. noErr nur,
+// wenn der Encoder alles nimmt.
+static OSStatus hdr_eigenschaften_setzen(VTCompressionSessionRef s) {
+    OSStatus st = VTSessionSetProperty(s, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_2020);
+    if (st == noErr) st = VTSessionSetProperty(s, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ);
+    if (st == noErr) st = VTSessionSetProperty(s, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_2020);
+    if (st != noErr) return st;
+    // ST 2086 wie in der SEI: G, B, R, Weiss (x, y in 0,00002), dann max und
+    // min Leuchtdichte in 0,0001 nit - alles big endian.
+    qc_hdr_sei_werte w;
+    hdr_sei_werte(&w);
+    uint8_t m[24], c[4];
+    size_t o = 0;
+    for (int i = 0; i < 3; i++) {
+        m[o++] = (uint8_t)(w.x[i] >> 8); m[o++] = (uint8_t)w.x[i];
+        m[o++] = (uint8_t)(w.y[i] >> 8); m[o++] = (uint8_t)w.y[i];
+    }
+    m[o++] = (uint8_t)(w.weiss_x >> 8); m[o++] = (uint8_t)w.weiss_x;
+    m[o++] = (uint8_t)(w.weiss_y >> 8); m[o++] = (uint8_t)w.weiss_y;
+    for (int k = 3; k >= 0; k--) m[o++] = (uint8_t)(w.max_lum >> (8 * k));
+    for (int k = 3; k >= 0; k--) m[o++] = (uint8_t)(w.min_lum >> (8 * k));
+    c[0] = (uint8_t)(w.max_cll >> 8); c[1] = (uint8_t)w.max_cll;
+    c[2] = (uint8_t)(w.max_fall >> 8); c[3] = (uint8_t)w.max_fall;
+    CFDataRef dm = CFDataCreate(NULL, m, sizeof m), dc = CFDataCreate(NULL, c, sizeof c);
+    st = VTSessionSetProperty(s, kVTCompressionPropertyKey_MasteringDisplayColorVolume, dm);
+    if (st == noErr) st = VTSessionSetProperty(s, kVTCompressionPropertyKey_ContentLightLevelInfo, dc);
+    CFRelease(dm);
+    CFRelease(dc);
+    return st;
+}
+
+// Kann dieser Kandidat HDR10? Eine Probesitzung (wie beim Codecwechsel mit
+// oder ohne Hardware-Pflicht) muss Profil und HDR-Eigenschaften nehmen.
+static int kandidat_hdr_pruefen(const qc_codec_kandidat *k, int hw_pflicht) {
+    CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (hw_pflicht)
+        CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
+    VTCompressionSessionRef s = NULL;
+    OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080, k->codec, spec, NULL, NULL, NULL, NULL, &s);
+    CFRelease(spec);
+    if (st != noErr || !s) return 0;
+    CFStringRef profil = vt_sym(k->profil);
+    int ok = profil && VTSessionSetProperty(s, kVTCompressionPropertyKey_ProfileLevel, profil) == noErr &&
+             hdr_eigenschaften_setzen(s) == noErr;
+    VTCompressionSessionInvalidate(s);
+    CFRelease(s);
+    return ok;
+}
+
 static void codecs_pruefen(void) {
     logf_(@"--- Was dieser Mac codieren kann ---");
+    int system_hdr = hdr_system_kann();
     for (size_t i = 0; i < QC_KANDIDATEN; i++) {
         const qc_codec_kandidat *k = &g_kandidaten[i];
+        g_befund[i].hdr = 0;
         // AV1 nie anbieten, egal was der Encoder kann: Strominfo und
         // Codecwechsel kennen nur HEVC und H.264 - der Host saehe AV1 als
         // HEVC an und laese HEVC-Parametersaetze -, und der Client hat
@@ -2602,10 +2856,16 @@ static void codecs_pruefen(void) {
             g_befund[i].vorhanden = da;
             g_befund[i].hardware = da ? hw : 0;
         }
-        logf_(@"  %-18s %@%@", k->name,
+        // HDR10 nur mit HEVC 10 Bit (Kandidat 0 und 2), und nur, wenn auch
+        // die Aufnahme HDR liefern kann.
+        if (g_befund[i].vorhanden && system_hdr && qc_hdr_codec_kann((int)i))
+            g_befund[i].hdr = kandidat_hdr_pruefen(k, g_befund[i].hardware);
+        logf_(@"  %-18s %@%@%@", k->name,
               g_befund[i].vorhanden ? @"ja " : @"nein",
-              g_befund[i].vorhanden ? (g_befund[i].hardware ? @"(Hardware)" : @"(Software)") : @"");
+              g_befund[i].vorhanden ? (g_befund[i].hardware ? @"(Hardware)" : @"(Software)") : @"",
+              g_befund[i].hdr ? @", HDR10 (BT.2020/PQ)" : @"");
     }
+    if (!system_hdr) logf_(@"  HDR10: nein - die Aufnahme in HDR braucht macOS 15 und Apple Silicon");
 }
 
 // Encoder fuer einen Kandidaten aus g_kandidaten oeffnen. Codec, Profil und
@@ -2613,8 +2873,15 @@ static void codecs_pruefen(void) {
 // anbieten, sonst brechen wir ab statt still etwas anderes zu liefern.
 // g_session wird erst gesetzt, wenn die Sitzung vollstaendig steht - bei einem
 // Fehlschlag bleibt sie so, wie sie war (beim Codecwechsel: NULL).
-static BOOL encoder_start(int idx, int w, int h, int fps, int mbit) {
+// pq: HDR10 - BT.2020/PQ/BT.2020 im VUI, Mastering und Lichtpegel, dazu die
+// eigene SEI vor jedem Vollbild. Nimmt der Encoder das nicht: NO, kein
+// stilles SDR. g_farbe_pq folgt der Sitzung.
+static BOOL encoder_start(int idx, int w, int h, int fps, int mbit, int pq) {
     if (idx < 0 || idx >= (int)QC_KANDIDATEN) return NO;
+    if (pq && (ist_h264(idx) || !qc_hdr_codec_kann(idx))) {
+        logf_(@"HDR10 mit %s nicht moeglich - nur HEVC 10 Bit", g_kandidaten[idx].name);
+        return NO;
+    }
     const qc_codec_kandidat *k = &g_kandidaten[idx];
     OSType pixfmt = pixfmt_fuer(idx);
     // Eine neue Sitzung faengt leer an; Rueckrufe der alten kommen nicht mehr.
@@ -2649,9 +2916,22 @@ static BOOL encoder_start(int idx, int w, int h, int fps, int mbit) {
     VTSessionSetProperty(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     VTSessionSetProperty(s, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_ColorPrimaries,   kCVImageBufferColorPrimaries_ITU_R_709_2);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
-    VTSessionSetProperty(s, kVTCompressionPropertyKey_YCbCrMatrix,      kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    if (pq) {
+        // HDR10. Die Bilder der Aufnahme tragen ihre Farbe als Anhaenge
+        // (Display P3 PQ, Matrix BT.709) - VideoToolbox rechnet sie nach
+        // BT.2020 um; das Testbild kommt schon in BT.2020.
+        st = hdr_eigenschaften_setzen(s);
+        if (st != noErr) {
+            logf_(@"HDR10-Eigenschaften fuer %s abgelehnt (%d) - kein HDR", k->name, (int)st);
+            VTCompressionSessionInvalidate(s);
+            CFRelease(s);
+            return NO;
+        }
+    } else {
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_ColorPrimaries,   kCVImageBufferColorPrimaries_ITU_R_709_2);
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+        VTSessionSetProperty(s, kVTCompressionPropertyKey_YCbCrMatrix,      kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    }
     set_i32(s, kVTCompressionPropertyKey_MaxFrameDelayCount, 1);
     set_i32(s, kVTCompressionPropertyKey_AverageBitRate, mbit * 1000000);
     set_i32(s, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
@@ -2664,11 +2944,24 @@ static BOOL encoder_start(int idx, int w, int h, int fps, int mbit) {
     if (hw) CFRelease(hw);
 
     atomic_store(&g_enc_fehler, 0);   // neue Sitzung, neue Meldung erlaubt
+    // Die SEI fuer HDR10 steht, bevor die Sitzung ihr erstes Bild liefern kann.
+    if (pq) {
+        qc_hdr_sei_werte sw;
+        hdr_sei_werte(&sw);
+        g_sei_n = qc_hdr_sei_bauen(&sw, g_sei, sizeof g_sei);
+    } else {
+        g_sei_n = 0;
+    }
+    atomic_store(&g_farbe_pq, pq ? 1 : 0);
     g_session = s;
-    logf_(@"Encoder: Kandidat %d %s, %dx%d, Hardware: %@, %d Mbit/s, Eingabe %.4s%@",
+    logf_(@"Encoder: Kandidat %d %s, %dx%d, Hardware: %@, %d Mbit/s, Eingabe %.4s%@%@",
           idx, k->name, w, h, is_hw ? @"ja" : @"NEIN", mbit,
           (char *)&(uint32_t){CFSwapInt32HostToBig(pixfmt)},
-          umrechnung_fuer(idx) ? @" (Umrechnung durch VideoToolbox)" : @"");
+          umrechnung_fuer(idx) ? @" (Umrechnung durch VideoToolbox)" : @"",
+          !pq ? @", SDR (BT.709)"
+              : [NSString stringWithFormat:@", HDR10 (BT.2020/PQ, Mastering P3 %u nit, SDR-Weiss %u nit, SEI 137/144 %zu Byte)%@",
+                 QC_HDR_MASTER_MAX_NIT, (unsigned)hdr_sdr_weiss_nit(), g_sei_n,
+                 hdr_p3_umrechnung() ? @", Aufnahme Display P3 -> BT.2020 durch VideoToolbox" : @""]);
     return YES;
 }
 
@@ -2691,8 +2984,23 @@ static BOOL encoder_start(int idx, int w, int h, int fps, int mbit) {
 // laeuft selbst auf g_capq, sendet SWITCH also, bevor dort das naechste Bild
 // drankommt. send_small nimmt dieselbe Sperre wie der Bildversand.
 
+// Die Farbe (SDR oder HDR10) ist die zweite Dimension desselben Wechsels:
+// Aufnahme umstellen (Pixelformat und/oder Farbraum per updateConfiguration),
+// neue Encoder-Sitzung, SWITCH mit dem Transfer in p[6], Strominfo, Vollbild.
+// Ein Farbwechsel ohne anderen Kandidaten ist ein Wechsel auf denselben
+// Kandidaten in der anderen Farbe. Scheitert der Weg nach HDR, laeuft es in
+// SDR weiter (g_hdr_gescheitert, Grund 6).
+
 static int g_wechsel_aktiv = 0;      // nur auf g_capq: ein Wechsel ist unterwegs
 static int g_wechsel_wunsch = -1;    // nur auf g_capq: waehrenddessen eingegangener naechster Wunsch
+// Nur auf g_capq: waehrend eines Wechsels aenderte sich die HDR-Lage - danach
+// neu entscheiden. Dazu die Sperre fuer Farbwechsel (HDR-Plan 3: hoechstens
+// einer je 2 s; jeder kostet ein Vollbild und beim Client den Umbau der
+// Anzeige), und ob die Entscheidung nach der Sperre schon eingereiht ist.
+static int g_farbe_offen = 0;
+static uint64_t g_farbe_gewechselt_us = 0;
+static int g_farbe_nachher = 0;
+#define QC_FARBE_SPERRE_US (2ull * 1000000ull)
 
 static void strominfo_senden(void) {
     uint8_t p[QC_HDR_INFO_LAENGE];
@@ -2703,36 +3011,80 @@ static void strominfo_senden(void) {
     send_small(QC_MSG_INFO, p, sizeof p);
 }
 
-// Nach einem IN_ANZEIGE: neu entscheiden. Ergibt das einen anderen
-// HDR-Grund als die zuletzt gesendete Strominfo, bekommt der Zuschauer eine
-// neue - dieselbe Groesse, derselbe Codec, der Client baut dafuer nichts um.
-// Einen Wechsel nach HDR (neue Encoder-Sitzung, SWITCH mit PQ) gibt es erst
-// mit Schritt 4a. Auf g_capq, wie Codecwechsel: so landet die Strominfo nie
-// zwischen einem SWITCH und dessen eigener Strominfo.
-static void hdr_neu_entscheiden(const char *anlass) {
-    if (atomic_load(&g_client_fd) < 0) return;
+static const char *farbe_text(int pq) { return pq ? "HDR10" : "SDR"; }
+
+// Soll Kandidat idx jetzt in HDR10 laufen? Die Entscheidung fuer das
+// IN_ANZEIGE der laufenden Sitzung. Nimmt g_send_mtx (anzeige_jetzt) - nie
+// unter g_send_mtx rufen.
+static int hdr_soll(int idx) {
     qc_hdr_anzeige a;
     int da = anzeige_jetzt(&a);
-    int grund = hdr_grund_fuer(da ? &a : NULL);
+    return hdr_grund_fuer_idx(idx, da ? &a : NULL) == QC_HDR_GRUND_AKTIV;
+}
+
+static void wechsel_ausfuehren(int idx, int pq);
+
+// Neu entscheiden: nach einem IN_ANZEIGE, fuer einen neuen Zuschauer, wenn
+// am Bildschirm des Hosts HDR an- oder ausging, nach einem Wechsel, der
+// dabei im Weg war. Ergibt das eine andere Farbe als die laufende, folgt der
+// Farbwechsel (hoechstens einer je 2 s, sonst danach). Sonst bekommt der
+// Zuschauer nur dann eine neue Strominfo, wenn sich ihr HDR-Grund aendert -
+// dieselbe Groesse, derselbe Codec, der Client baut dafuer nichts um. Auf
+// g_capq, wie Codecwechsel: so landet die Strominfo nie zwischen einem SWITCH
+// und dessen eigener Strominfo.
+static void hdr_neu_entscheiden(const char *anlass) {
+    if (atomic_load(&g_client_fd) < 0) return;
+    if (g_wechsel_aktiv) { g_farbe_offen = 1; return; }
+    qc_hdr_anzeige a;
+    int da = anzeige_jetzt(&a);
+    int idx = atomic_load(&g_codec_id);
+    int grund = hdr_grund_fuer_idx(idx, da ? &a : NULL);
+    int soll = grund == QC_HDR_GRUND_AKTIV;
+    int ist = atomic_load(&g_farbe_pq);
+    if (soll != ist && g_session && g_stream && g_cfg) {
+        uint64_t jetzt = now_us();
+        if (g_farbe_gewechselt_us && jetzt - g_farbe_gewechselt_us < QC_FARBE_SPERRE_US) {
+            if (!g_farbe_nachher) {
+                g_farbe_nachher = 1;
+                uint64_t rest = QC_FARBE_SPERRE_US - (jetzt - g_farbe_gewechselt_us);
+                logf_(@"HDR-Entscheidung (%s): %s, Grund %d (%s) - der letzte Farbwechsel ist keine 2 s her, in %.1f s",
+                      anlass, farbe_text(soll), grund, qc_hdr_grund_text(grund), rest / 1e6);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(rest * NSEC_PER_USEC)), g_capq, ^{
+                    g_farbe_nachher = 0;
+                    hdr_neu_entscheiden("nach der Sperre");
+                });
+            }
+            return;
+        }
+        logf_(@"HDR-Entscheidung (%s): %s, Grund %d (%s) - Farbwechsel %s -> %s", anlass, farbe_text(soll), grund,
+              qc_hdr_grund_text(grund), farbe_text(ist), farbe_text(soll));
+        wechsel_ausfuehren(idx, soll);
+        return;
+    }
+    // Was die Strominfo jetzt sagen wuerde (wie strominfo_fuellen).
+    int neu = ist ? QC_HDR_GRUND_AKTIV : (soll ? QC_HDR_GRUND_WECHSEL_GESCHEITERT : grund);
     int alt = atomic_load(&g_hdr_grund_gesendet);
-    if (grund == alt) return;
-    logf_(@"HDR-Entscheidung (%s): SDR, Grund %d (%s) - vorher Grund %d (%s), neue Strominfo", anlass, grund,
-          qc_hdr_grund_text(grund), alt, qc_hdr_grund_text(alt));
+    if (neu == alt) return;
+    logf_(@"HDR-Entscheidung (%s): %s, Grund %d (%s) - vorher Grund %d (%s), neue Strominfo", anlass, farbe_text(ist), neu,
+          qc_hdr_grund_text(neu), alt, qc_hdr_grund_text(alt));
     strominfo_senden();
 }
 
 // Typ 7: u8 idx, u8 h264, u8 chroma444, u8 zehn_bit, u8 vollbereich (immer 1),
-// u8 umrechnung, u8 Transfer nach H.273 (noch immer SDR), u8 frei.
+// u8 umrechnung, u8 Transfer nach H.273 (1 SDR, 16 PQ), u8 frei. Umrechnung
+// heisst: VideoToolbox rechnet das Aufnahmeformat um (4:4:4 10 Bit nach 8 Bit
+// oder 4:2:0) - oder in HDR10 die Farbe der Aufnahme (Display P3 nach BT.2020).
 static void switch_senden(int idx) {
     const qc_codec_kandidat *k = &g_kandidaten[idx];
+    int pq = atomic_load(&g_farbe_pq);
     uint8_t p[8] = {0};
     p[0] = (uint8_t)idx;
     p[1] = (uint8_t)ist_h264(idx);
     p[2] = (uint8_t)k->chroma444;
     p[3] = (uint8_t)k->zehn_bit;
     p[4] = 1;
-    p[5] = (uint8_t)umrechnung_fuer(idx);
-    p[6] = QC_HDR_TRANSFER_SDR;
+    p[5] = (uint8_t)(umrechnung_fuer(idx) || (pq && hdr_p3_umrechnung()));
+    p[6] = pq ? QC_HDR_TRANSFER_PQ : QC_HDR_TRANSFER_SDR;
     send_small(QC_MSG_SWITCH, p, sizeof p);
 }
 
@@ -2748,12 +3100,16 @@ static void encoder_einstellungen_nachziehen(void) {
 }
 
 // Wechsel beendet - ob gelungen oder nicht. Kam waehrenddessen ein weiterer
-// Wunsch herein, wird er jetzt angestossen, statt verloren zu gehen.
+// Wunsch herein, wird er jetzt angestossen, statt verloren zu gehen; sonst
+// eine HDR-Lage, die waehrenddessen kam.
 static void codec_wechsel_fertig(void) {
     g_wechsel_aktiv = 0;
     int n = g_wechsel_wunsch;
     g_wechsel_wunsch = -1;
+    int farbe = g_farbe_offen;
+    g_farbe_offen = 0;
     if (n >= 0) dispatch_async(g_capq, ^{ codec_wechseln(n); });
+    else if (farbe) dispatch_async(g_capq, ^{ hdr_neu_entscheiden("nach dem Wechsel"); });
 }
 
 // Der Abschluss eines Wechsels kommt spaeter auf g_capq an (nach
@@ -2777,16 +3133,31 @@ static void codec_ohne_zuschauer_abbauen(void) {
     if (atomic_load(&g_client_fd) < 0) stream_herunterfahren_anstossen();
 }
 
-// Schritt h: der neue Kandidat liess sich nicht oeffnen, der alte kommt zurueck.
-// Ein SWITCH gab es nicht, der Client decodiert weiter mit dem alten Codec -
-// nur die Strominfo geht noch einmal raus.
-static void codec_alt_aufbauen(int alt) {
+// Der Weg von SDR nach HDR10 scheiterte (die Aufnahme lehnte ab, oder der
+// Encoder ging in HDR10 nicht auf): ab jetzt SDR mit Grund 6, bis sich die
+// Lage aendert. Das gilt sofort, nicht erst, wenn der alte Codec wieder
+// laeuft - laesst auch der sich nicht oeffnen, faende der vorgemerkte
+// Codecwunsch sonst wieder HDR10 und versuchte denselben Weg ohne Ende. Galt
+// der Wechsel einem anderen Kandidaten, gilt der Codecwunsch weiter - danach
+// in SDR, ohne erneuten Versuch in HDR10. Nur auf g_capq.
+static void hdr_wechsel_gescheitert(int idx, int pq, int alt, int alt_pq) {
+    if (!pq || alt_pq) return;
+    atomic_store(&g_hdr_gescheitert, 1);
+    logf_(@"Wechsel nach HDR10 gescheitert - nur noch SDR (Grund 6), bis sich die Lage aendert");
+    if (idx != alt && g_wechsel_wunsch < 0) g_wechsel_wunsch = idx;
+}
+
+// Schritt h: der neue Kandidat liess sich nicht oeffnen, der alte kommt zurueck
+// - in seiner alten Farbe. Ein SWITCH gab es nicht, der Client decodiert
+// weiter mit dem alten Codec - nur die Strominfo geht noch einmal raus (nach
+// einem gescheiterten Weg nach HDR10 mit Grund 6).
+static void codec_alt_aufbauen(int alt, int alt_pq) {
     if (codec_wechsel_ueberholt(alt)) return;
-    if (encoder_start(alt, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
+    if (encoder_start(alt, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit), alt_pq)) {
         encoder_einstellungen_nachziehen();
         atomic_store(&g_force_key, 1);
         strominfo_senden();
-        logf_(@"Alter Codec laeuft wieder: %s", g_kandidaten[alt].name);
+        logf_(@"Alter Codec laeuft wieder: %s, %s", g_kandidaten[alt].name, farbe_text(alt_pq));
         codec_ohne_zuschauer_abbauen();
     } else {
         logf_(@"Auch der alte Codec %s laesst sich nicht mehr oeffnen - es kommt kein Bild mehr", g_kandidaten[alt].name);
@@ -2799,72 +3170,64 @@ static void codec_alt_aufbauen(int alt) {
 // emit_access_unit die Parametersaetze des neuen Codecs abfragt; dann SWITCH -
 // noch kann kein Bild in der neuen Sitzung sein, weil Bilder nur ueber g_capq
 // hineingehen und wir gerade darauf laufen; dann Vollbild erzwingen und die
-// Strominfo hinterher.
-static void codec_wechsel_abschliessen(int idx, int alt, OSType alt_fmt, BOOL fmt_geaendert) {
+// Strominfo hinterher. alt_fmt und alt_aufnahme_pq: wie die Aufnahme vor dem
+// Wechsel eingestellt war (fuer den Rueckweg).
+static void codec_wechsel_abschliessen(int idx, int pq, int alt, int alt_pq, OSType alt_fmt, int alt_aufnahme_pq,
+                                       BOOL aufnahme_geaendert) {
     if (codec_wechsel_ueberholt(idx)) return;
-    if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit))) {
+    if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit), pq)) {
         atomic_store(&g_codec_id, idx);
-        // Das Testbild folgt dem Aufnahmeformat des neuen Codecs.
-        if (atomic_load(&g_testbild)) qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(idx));
+        if (pq != alt_pq) {
+            g_farbe_gewechselt_us = now_us();
+            atomic_store(&g_anhaenge_loggen, 1);
+        }
+        // Das Testbild folgt dem Aufnahmeformat und der Farbe des neuen Codecs.
+        if (atomic_load(&g_testbild)) qc_testbild_start(g_info_w, g_info_h, pixfmt_fuer(idx), pq);
         switch_senden(idx);
         encoder_einstellungen_nachziehen();
         atomic_store(&g_force_key, 1);
         strominfo_senden();
-        logf_(@"Codec gewechselt: %s", g_kandidaten[idx].name);
+        logf_(@"Codec gewechselt: %s, %s", g_kandidaten[idx].name, farbe_text(pq));
         codec_ohne_zuschauer_abbauen();
         codec_wechsel_fertig();
         return;
     }
 
-    logf_(@"Codecwechsel auf %s fehlgeschlagen - baue %s wieder auf", g_kandidaten[idx].name, g_kandidaten[alt].name);
+    logf_(@"Codecwechsel auf %s (%s) fehlgeschlagen - baue %s (%s) wieder auf", g_kandidaten[idx].name, farbe_text(pq),
+          g_kandidaten[alt].name, farbe_text(alt_pq));
+    hdr_wechsel_gescheitert(idx, pq, alt, alt_pq);
     // Kein SWITCH: der Client hat noch seinen alten Decoder und behaelt ihn.
     // Ohne Strom (inzwischen abgebaut) kaeme der Abschluss von
     // updateConfiguration nie - eine Nachricht an nil tut nichts -, und der
     // Wechsel bliebe fuer immer unterwegs; jeder weitere Wunsch wuerde nur
     // noch vorgemerkt. Dann gleich zurueck, das Format baut der naechste
     // Zuschauer ohnehin aus g_codec_id.
-    if (fmt_geaendert) g_cfg.pixelFormat = alt_fmt;
-    if (fmt_geaendert && g_stream) {
+    if (aufnahme_geaendert) {
+        g_cfg.pixelFormat = alt_fmt;
+        aufnahme_farbe_setzen(g_cfg, alt_aufnahme_pq);
+    }
+    if (aufnahme_geaendert && g_stream) {
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
             if (e) logf_(@"Aufnahmeformat liess sich nicht zuruecksetzen: %@", e.localizedDescription);
-            dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt); });
+            dispatch_async(g_capq, ^{ codec_alt_aufbauen(alt, alt_pq); });
         }];
     } else {
-        codec_alt_aufbauen(alt);
+        codec_alt_aufbauen(alt, alt_pq);
     }
 }
 
-static void codec_wechseln(int idx) {
-    // a) Nur, was die Pruefung beim Start als vorhanden gemeldet hat.
-    if (idx < 0 || idx >= (int)QC_KANDIDATEN || !g_befund[idx].vorhanden) {
-        logf_(@"Codecwunsch %d abgelehnt: %@", idx,
-              (idx < 0 || idx >= (int)QC_KANDIDATEN) ? @"kein solcher Kandidat" : @"auf diesem Mac nicht vorhanden");
-        return;
-    }
+// Der Wechsel auf (idx, pq) selbst - Kandidat, Farbe oder beides. Nur auf
+// g_capq, kein Wechsel unterwegs, Aufnahme und g_cfg da (codec_wechseln und
+// hdr_neu_entscheiden pruefen das).
+static void wechsel_ausfuehren(int idx, int pq) {
     int alt = atomic_load(&g_codec_id);
-    if (g_wechsel_aktiv) {
-        // Ein Wechsel laeuft schon (die Aufnahme stellt gerade um). Den Wunsch
-        // merken und danach ausfuehren - nie zwei Wechsel ineinander.
-        g_wechsel_wunsch = idx;
-        logf_(@"Codecwunsch %s vorgemerkt, ein Wechsel laeuft noch", g_kandidaten[idx].name);
-        return;
-    }
-    // "Laeuft bereits" gilt nur, wenn wirklich eine Sitzung laeuft. Nach einem
-    // doppelten Fehlschlag (neuer Codec kaputt, alter liess sich nicht wieder
-    // oeffnen) steht g_codec_id noch auf dem alten - der darf dann neu versucht werden.
-    if (idx == alt && g_session) {
-        logf_(@"Codecwunsch %s: laeuft bereits", g_kandidaten[idx].name);
-        return;
-    }
-    // Ohne Aufnahme geht nichts. Eine fehlende Encoder-Sitzung ist dagegen kein
-    // Hinderungsgrund: genau dann (nach dem doppelten Fehlschlag) muss der
-    // Zuschauer noch auf einen dritten Kandidaten ausweichen koennen.
-    if (!g_stream || !g_cfg) {
-        logf_(@"Codecwunsch %s abgelehnt: keine laufende Aufnahme", g_kandidaten[idx].name);
-        return;
-    }
+    int alt_pq = atomic_load(&g_farbe_pq);
     g_wechsel_aktiv = 1;
-    logf_(@"Codecwechsel: %s -> %s", g_kandidaten[alt].name, g_kandidaten[idx].name);
+    if (idx != alt)
+        logf_(@"Codecwechsel: %s -> %s%@", g_kandidaten[alt].name, g_kandidaten[idx].name,
+              pq != alt_pq ? [NSString stringWithFormat:@", Farbe %s -> %s", farbe_text(alt_pq), farbe_text(pq)] : @"");
+    else
+        logf_(@"Farbwechsel: %s -> %s (%s)", farbe_text(alt_pq), farbe_text(pq), g_kandidaten[idx].name);
 
     // b) Das letzte Bild bleibt liegen, auch wenn sich das Aufnahmeformat
     //    aendert: bei stillem Bildschirm ist es womoeglich das einzige, das
@@ -2876,10 +3239,13 @@ static void codec_wechseln(int idx) {
     //    fremde Formate ab. Frueher wurde es hier freigegeben; dann wartete
     //    der Zuschauer bis zur naechsten Aenderung, und ein Bild, das waehrend
     //    des Umstellens noch im alten Format kam, lag danach fest und wurde
-    //    bei jedem Taktschlag abgewiesen.
+    //    bei jedem Taktschlag abgewiesen. Ein Bild in der alten Farbe rechnet
+    //    VideoToolbox selbst um (Anhaenge; SDR-Weiss landet bei 203 nit).
     OSType alt_fmt = g_cfg.pixelFormat;
     OSType neu_fmt = pixfmt_fuer(idx);
+    int alt_aufnahme_pq = aufnahme_ist_pq(g_cfg);
     BOOL fmt_geaendert = (alt_fmt != neu_fmt);
+    BOOL aufnahme_geaendert = fmt_geaendert || alt_aufnahme_pq != pq;
 
     if (g_session) {
         // c) Alles, was der alte Encoder noch hat, abliefern lassen. Danach feuert
@@ -2902,29 +3268,76 @@ static void codec_wechseln(int idx) {
     atomic_store(&g_force_key, 1);
     g_stats.nal_len = 4;
 
-    // f) Aufnahmeformat umstellen, falls noetig. Das geht im Betrieb (gemessen
-    //    mit --formattest); weiter geht es erst, wenn die Aufnahme umgestellt hat.
-    if (fmt_geaendert) {
-        uint32_t a = CFSwapInt32HostToBig(alt_fmt), n = CFSwapInt32HostToBig(neu_fmt);
-        logf_(@"Aufnahmeformat: %.4s -> %.4s", (char *)&a, (char *)&n);
+    // f) Aufnahme umstellen, falls noetig (Pixelformat, Farbe). Das geht im
+    //    Betrieb (gemessen mit --formattest); weiter geht es erst, wenn die
+    //    Aufnahme umgestellt hat.
+    if (aufnahme_geaendert) {
+        if (fmt_geaendert) {
+            uint32_t a = CFSwapInt32HostToBig(alt_fmt), n = CFSwapInt32HostToBig(neu_fmt);
+            logf_(@"Aufnahmeformat: %.4s -> %.4s", (char *)&a, (char *)&n);
+        }
+        if (alt_aufnahme_pq != pq)
+            logf_(@"Aufnahme: %s -> %s%s%s", farbe_text(alt_aufnahme_pq), farbe_text(pq), pq ? " - " : "", pq ? hdr_aufnahme_text() : "");
         g_cfg.pixelFormat = neu_fmt;
+        aufnahme_farbe_setzen(g_cfg, pq);
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
             if (e) {
                 // Die Aufnahme liefert weiter das alte Format - dann bleibt es
-                // beim alten Codec. Der Client hat kein SWITCH bekommen und
-                // muss von nichts erfahren.
-                logf_(@"Aufnahmeformat liess sich nicht umstellen: %@ - bleibe bei %s", e.localizedDescription, g_kandidaten[alt].name);
+                // beim alten Codec in der alten Farbe. Der Client hat kein
+                // SWITCH bekommen und muss von nichts erfahren (ausser Grund 6,
+                // wenn es HDR werden sollte).
+                logf_(@"Aufnahmeformat liess sich nicht umstellen: %@ - bleibe bei %s, %s", e.localizedDescription,
+                      g_kandidaten[alt].name, farbe_text(alt_pq));
                 dispatch_async(g_capq, ^{
                     g_cfg.pixelFormat = alt_fmt;
-                    codec_alt_aufbauen(alt);
+                    aufnahme_farbe_setzen(g_cfg, alt_aufnahme_pq);
+                    hdr_wechsel_gescheitert(idx, pq, alt, alt_pq);
+                    codec_alt_aufbauen(alt, alt_pq);
                 });
                 return;
             }
-            dispatch_async(g_capq, ^{ codec_wechsel_abschliessen(idx, alt, alt_fmt, fmt_geaendert); });
+            dispatch_async(g_capq, ^{
+                codec_wechsel_abschliessen(idx, pq, alt, alt_pq, alt_fmt, alt_aufnahme_pq, aufnahme_geaendert);
+            });
         }];
     } else {
-        codec_wechsel_abschliessen(idx, alt, alt_fmt, fmt_geaendert);
+        codec_wechsel_abschliessen(idx, pq, alt, alt_pq, alt_fmt, alt_aufnahme_pq, aufnahme_geaendert);
     }
+}
+
+// Ein Codecwunsch (Nachricht 66). Die Farbe entscheidet der Host fuer den
+// neuen Kandidaten selbst (hdr_soll): HDR10 nur mit HEVC 10 Bit.
+static void codec_wechseln(int idx) {
+    // a) Nur, was die Pruefung beim Start als vorhanden gemeldet hat.
+    if (idx < 0 || idx >= (int)QC_KANDIDATEN || !g_befund[idx].vorhanden) {
+        logf_(@"Codecwunsch %d abgelehnt: %@", idx,
+              (idx < 0 || idx >= (int)QC_KANDIDATEN) ? @"kein solcher Kandidat" : @"auf diesem Mac nicht vorhanden");
+        return;
+    }
+    int alt = atomic_load(&g_codec_id);
+    if (g_wechsel_aktiv) {
+        // Ein Wechsel laeuft schon (die Aufnahme stellt gerade um). Den Wunsch
+        // merken und danach ausfuehren - nie zwei Wechsel ineinander.
+        g_wechsel_wunsch = idx;
+        logf_(@"Codecwunsch %s vorgemerkt, ein Wechsel laeuft noch", g_kandidaten[idx].name);
+        return;
+    }
+    int pq = hdr_soll(idx);
+    // "Laeuft bereits" gilt nur, wenn wirklich eine Sitzung laeuft. Nach einem
+    // doppelten Fehlschlag (neuer Codec kaputt, alter liess sich nicht wieder
+    // oeffnen) steht g_codec_id noch auf dem alten - der darf dann neu versucht werden.
+    if (idx == alt && pq == atomic_load(&g_farbe_pq) && g_session) {
+        logf_(@"Codecwunsch %s: laeuft bereits", g_kandidaten[idx].name);
+        return;
+    }
+    // Ohne Aufnahme geht nichts. Eine fehlende Encoder-Sitzung ist dagegen kein
+    // Hinderungsgrund: genau dann (nach dem doppelten Fehlschlag) muss der
+    // Zuschauer noch auf einen dritten Kandidaten ausweichen koennen.
+    if (!g_stream || !g_cfg) {
+        logf_(@"Codecwunsch %s abgelehnt: keine laufende Aufnahme", g_kandidaten[idx].name);
+        return;
+    }
+    wechsel_ausfuehren(idx, pq);
 }
 
 // ------------------------------------------------------------ Aufnahme-Teil
@@ -3203,13 +3616,12 @@ static void fixed_tick(void) {
         if (v != SCFrameStatusComplete) { self.framesSkipped++; return; }
     }
     CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-    if (atomic_exchange(&g_formattest, 0)) {
-        OSType t = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
-        uint32_t be = CFSwapInt32HostToBig(t);
-        logf_(@"   angekommen: %.4s  (%zux%zu)", (char *)&be,
-              pb ? CVPixelBufferGetWidth(pb) : 0, pb ? CVPixelBufferGetHeight(pb) : 0);
-    }
+    if (atomic_exchange(&g_formattest, 0)) logf_(@"   angekommen: %@", anhaenge_text(pb));
     if (!pb) return;
+    // Nach dem Start und nach jedem Farbwechsel: was die Aufnahme wirklich
+    // liefert (Format, Primaerfarben, Transfer, Matrix).
+    if (atomic_exchange(&g_anhaenge_loggen, 0))
+        logf_(@"Aufnahme: erstes Bild %@ (Encoder %s)", anhaenge_text(pb), farbe_text(atomic_load(&g_farbe_pq)));
     // Ohne Encoder nur waehrend eines Codecwechsels festhalten. Sonst ist der
     // Strom abgebaut, und ein Nachzuegler der anhaltenden Aufnahme (stopCapture
     // mit Frist) laege nach dem Aufraeumen wieder in g_last_pb - bis zur
@@ -3400,6 +3812,30 @@ static void bildschirm_zustand_nachfuehren(void) {
     pthread_mutex_unlock(&g_bildschirm_mtx);
 }
 
+// Kann der aufgenommene Bildschirm HDR (EDR-Kopfraum potentiell ueber 1.0)?
+// Auf g_lifeq. Eine Aenderung - anderer Bildschirm, HDR am Bildschirm an
+// oder aus - gibt einem gescheiterten HDR-Wechsel eine neue Chance. anlass:
+// im laufenden Strom (sonst NULL) - dann eine Zeile und neu entscheiden.
+static void quelle_setzen(BOOL hdr, double edr, const char *anlass) {
+    int neu = hdr ? 1 : 0;
+    int alt = atomic_exchange(&g_quelle_hdr, neu);
+    if (alt == neu) return;
+    atomic_store(&g_hdr_gescheitert, 0);
+    if (!anlass) return;
+    logf_(@"Bildschirm des Hosts: HDR %s (EDR-Kopfraum %.2f) - %s", neu ? "an" : "aus", edr, anlass);
+    if (g_capq && atomic_load(&g_client_fd) >= 0) dispatch_async(g_capq, ^{ hdr_neu_entscheiden("HDR am Host"); });
+}
+
+// Der EDR-Vorrat (bildschirm.m, im 5-s-Takt auf dem Hauptfaden aufgefrischt)
+// fuer den gestreamten Bildschirm: so faellt HDR an/aus am Host auch dann
+// auf, wenn CoreGraphics keine Konfigurationsaenderung meldet. Auf g_lifeq.
+static void quelle_pruefen(void) {
+    if (!g_stream || !g_display_id) return;
+    double p = 0, a = 0;
+    if (!qc_bildschirm_edr(g_display_id, &p, &a)) return;
+    quelle_setzen(p > 1.0, p, "EDR-Kopfraum geaendert");
+}
+
 // Die Liste an den Zuschauer. Aus jedem Faden, nie unter g_send_mtx.
 static void bildschirme_senden(void) {
     pthread_mutex_lock(&g_bildschirm_mtx);
@@ -3428,18 +3864,25 @@ static void bildschirme_senden(void) {
 static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
     int w = 0, h = 0;
     stromgroesse_fuer(ziel, &w, &h);
+    // Kann der neue Bildschirm HDR? Davon haengt die Farbe des Stroms ab.
+    quelle_setzen(ziel.hdr, ziel.edr_potentiell, NULL);
     __block BOOL enc = YES;
     dispatch_sync(g_capq, ^{
         int codec = atomic_load(&g_codec_id);
         int fps = atomic_load(&g_cur_fps), mbit = atomic_load(&g_cur_mbit);
         BOOL neue_groesse = (w != g_info_w || h != g_info_h);
-        BOOL ansagen = wechsel || (neue_groesse && g_session != NULL);
+        // Die Farbe fuer diesen Bildschirm und den laufenden Zuschauer: ohne
+        // dessen IN_ANZEIGE (neuer Zuschauer) immer SDR. Weicht sie von der
+        // laufenden ab, entsteht der Encoder neu und der Zuschauer erfaehrt es.
+        int pq = hdr_soll(codec);
+        BOOL farbe_neu = pq != atomic_load(&g_farbe_pq);
+        BOOL ansagen = wechsel || ((neue_groesse || farbe_neu) && g_session != NULL);
         if (neue_groesse || wechsel) {
             if (g_last_pb) { CVPixelBufferRelease(g_last_pb); g_last_pb = NULL; }
             g_behelf = 0;
             atomic_store(&g_bild_offen, 0);
         }
-        if (neue_groesse || !g_session) {
+        if (neue_groesse || !g_session || farbe_neu) {
             if (g_session) {
                 VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
                 VTCompressionSessionRef s = g_session;
@@ -3449,9 +3892,17 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
             }
             g_info_w = w;
             g_info_h = h;
-            enc = encoder_start(codec, w, h, fps, mbit);
-            // Das Testbild folgt der Stromgroesse.
-            if (enc && atomic_load(&g_testbild)) qc_testbild_start(w, h, pixfmt_fuer(codec));
+            enc = encoder_start(codec, w, h, fps, mbit, pq);
+            if (!enc && pq) {
+                // HDR10 geht nicht: in SDR weiter, Grund 6.
+                atomic_store(&g_hdr_gescheitert, 1);
+                logf_(@"HDR10 laesst sich nicht starten - SDR (Grund 6), bis sich die Lage aendert");
+                pq = 0;
+                enc = encoder_start(codec, w, h, fps, mbit, 0);
+            }
+            if (enc && farbe_neu && ansagen) g_farbe_gewechselt_us = now_us();
+            // Das Testbild folgt der Stromgroesse und der Farbe.
+            if (enc && atomic_load(&g_testbild)) qc_testbild_start(w, h, pixfmt_fuer(codec), pq);
         } else if (ansagen) {
             VTCompressionSessionCompleteFrames(g_session, kCMTimeInvalid);
         }
@@ -3459,8 +3910,10 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
             g_cfg.width = (size_t)w;
             g_cfg.height = (size_t)h;
             g_cfg.pixelFormat = pixfmt_fuer(codec);
+            aufnahme_farbe_setzen(g_cfg, atomic_load(&g_farbe_pq));
             if (fps > 0) g_cfg.minimumFrameInterval = CMTimeMake(100, (int32_t)(fps * 100 * 0.9));
         }
+        atomic_store(&g_anhaenge_loggen, 1);
         // Ohne Encoder keine Ansage: der Client baute sonst den Decoder um
         // und bekaeme kein Bild, bis die Wiederherstellung greift.
         if (ansagen && enc) {
@@ -3689,6 +4142,8 @@ static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
     bildschirm_warten_beenden();
     if (!g_stream) g_display_id = ziel.displayID;       // Ziel des naechsten Starts
     g_display_aktuell = ziel;
+    // Derselbe Bildschirm, aber vielleicht HDR an oder aus.
+    if (g_stream && ziel.displayID == g_display_id) quelle_setzen(ziel.hdr, ziel.edr_potentiell, "Bildschirmkonfiguration");
     bildschirm_zustand_nachfuehren();
     if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
     return ziel;
@@ -3734,8 +4189,9 @@ static void list_displays(void) {
     if (!liste) { logf_(@"Inhalte nicht abrufbar"); return; }
     int i = 0;
     for (QCBildschirm *b in liste)
-        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %zu x %zu Pixel, %.0f Hz%@",
-              i++, b.displayID, b.kennung, b.name, b.w, b.h, b.hz, b.haupt ? @"  (Hauptbildschirm)" : @"");
+        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %zu x %zu Pixel, %.0f Hz%@, EDR-Kopfraum %.2f (jetzt %.2f)%@",
+              i++, b.displayID, b.kennung, b.name, b.w, b.h, b.hz, b.haupt ? @"  (Hauptbildschirm)" : @"",
+              b.edr_potentiell, b.edr_aktuell, b.hdr ? @" - HDR" : @"");
 }
 
 // Aufnahme nach einem Bildschirmverlust neu aufbauen. Auf g_lifeq; kommt
@@ -3788,8 +4244,9 @@ static BOOL stream_hochfahren_sync(void) {
         if (!ziel) { logf_(@"Kein Bildschirm - Aufnahme kann nicht starten"); return; }
         if (!strom_fuer_bildschirm_starten(ziel, NO)) return;
         bildschirm_zustand_nachfuehren();
-        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz, %@ -> %dx%d",
-              ziel.w, ziel.h, ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h);
+        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz, %@ -> %dx%d%@",
+              ziel.w, ziel.h, ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h,
+              ziel.hdr ? [NSString stringWithFormat:@", Bildschirm HDR-faehig (EDR-Kopfraum %.2f)", ziel.edr_potentiell] : @"");
         ok = YES;
     });
     return ok;
@@ -3827,6 +4284,9 @@ static void stream_herunterfahren_anstossen(void) {
                 VTCompressionSessionInvalidate(alt);
                 CFRelease(alt);
             }
+            // Ohne Encoder ist nichts auf der Leitung: die naechste
+            // Begruessung sagt SDR, bis ein Encoder anderes meldet.
+            atomic_store(&g_farbe_pq, 0);
         });
         atomic_store(&g_cur_fixed, 0);
         if (g_wach != kIOPMNullAssertionID) { IOPMAssertionRelease(g_wach); g_wach = kIOPMNullAssertionID; }
@@ -3978,7 +4438,8 @@ static NSString *wert_nach(NSArray<NSString *> *args, NSString *schalter, NSInte
 // "Zulassen" herein, entfernt wird im Menue.
 static void argumente_pruefen(NSArray<NSString *> *args) {
     NSSet<NSString *> *bekannt = [NSSet setWithArray:@[ @"--serve", @"--list", @"--capture", @"--formattest",
-                                                        @"--display", @"--fps", @"--mbit", @"--out", @"--fest", @"--fixed" ]];
+                                                        @"--display", @"--fps", @"--mbit", @"--out", @"--fest", @"--fixed",
+                                                        @"--hdr" ]];
     for (NSUInteger i = 1; i < args.count; i++) {
         NSString *a = args[i];
         // Werte, und was macOS selbst anhaengt (-psn_..., -NSDocumentRevisions...).
@@ -4094,7 +4555,12 @@ static void dienst_takt_starten(double sekunden) {
     g_takt_namen = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     if (g_takt_namen) {
         dispatch_source_set_timer(g_takt_namen, dispatch_time(DISPATCH_TIME_NOW, (int64_t)iv), iv, iv / 20);
-        dispatch_source_set_event_handler(g_takt_namen, ^{ @autoreleasepool { qc_bildschirm_namen_auffrischen(); } });
+        // Dabei auch der EDR-Kopfraum: HDR am gestreamten Bildschirm an oder
+        // aus faellt so spaetestens nach einem Takt auf (quelle_pruefen).
+        dispatch_source_set_event_handler(g_takt_namen, ^{ @autoreleasepool {
+            qc_bildschirm_namen_auffrischen();
+            if (g_lifeq) dispatch_async(g_lifeq, ^{ quelle_pruefen(); });
+        } });
         dispatch_resume(g_takt_namen);
     }
 }
@@ -4369,6 +4835,34 @@ static int formattest_laufen(void) {
         atomic_store(&g_formattest, 1);
         [NSThread sleepForTimeInterval:1.5];
     }
+    // HDR im Betrieb an und aus (HDR-Plan 5.1): nimmt die Aufnahme den
+    // Wechsel des Dynamikumfangs per updateConfiguration an, und welche
+    // Anhaenge tragen die Bilder danach - in beiden Richtungen.
+    if (@available(macOS 15.0, *)) {
+        struct { const char *name; SCCaptureDynamicRange dr; CFStringRef cs, cm; } hdr_ziele[] = {
+            { "HDR kanonisch, Display P3 PQ, Matrix BT.709", SCCaptureDynamicRangeHDRCanonicalDisplay, kCGColorSpaceDisplayP3_PQ, kCVImageBufferYCbCrMatrix_ITU_R_709_2 },
+            { "HDR lokal, Display P3 PQ, Matrix BT.709", SCCaptureDynamicRangeHDRLocalDisplay, kCGColorSpaceDisplayP3_PQ, kCVImageBufferYCbCrMatrix_ITU_R_709_2 },
+            { "HDR kanonisch, BT.2100 PQ, Matrix BT.2020", SCCaptureDynamicRangeHDRCanonicalDisplay, kCGColorSpaceITUR_2100_PQ, kCVImageBufferYCbCrMatrix_ITU_R_2020 },
+            { "SDR, sRGB, Matrix BT.709 (zurueck)", SCCaptureDynamicRangeSDR, kCGColorSpaceSRGB, kCVImageBufferYCbCrMatrix_ITU_R_709_2 },
+        };
+        cfg.pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
+        for (size_t zi = 0; zi < sizeof hdr_ziele / sizeof hdr_ziele[0]; zi++) {
+            logf_(@"--- wechsle auf xf44, %s ---", hdr_ziele[zi].name);
+            cfg.captureDynamicRange = hdr_ziele[zi].dr;
+            cfg.colorSpaceName = hdr_ziele[zi].cs;
+            cfg.colorMatrix = hdr_ziele[zi].cm;
+            dispatch_semaphore_t s3 = dispatch_semaphore_create(0);
+            [st updateConfiguration:cfg completionHandler:^(NSError *x) {
+                logf_(@"updateConfiguration: %@", x ? x.localizedDescription : @"ohne Fehler");
+                dispatch_semaphore_signal(s3);
+            }];
+            dispatch_semaphore_wait(s3, dispatch_time(DISPATCH_TIME_NOW, 5ull * NSEC_PER_SEC));
+            atomic_store(&g_formattest, 1);
+            [NSThread sleepForTimeInterval:1.5];
+        }
+    } else {
+        logf_(@"--- HDR: braucht macOS 15 - uebersprungen ---");
+    }
     [st stopCaptureWithCompletionHandler:^(NSError *x) { (void)x; }];
     [NSThread sleepForTimeInterval:0.5];
     return 0;
@@ -4412,10 +4906,19 @@ int qc_werkzeug(int argc, const char *const argv[]) { @autoreleasepool {
     size_t pxW = display.w, pxH = display.h;
     if ((r = ausgabe_oeffnen(outPath))) return r;
     start_stand(outW, outH, fps);
-    logf_(@"\n=== Aufnahme %.1f s: %@ (%zux%zu Pixel) -> %dx%d, %d fps ===",
-          seconds, bildschirm_text(display), pxW, pxH, outW, outH, fps);
-    if (!encoder_start(QC_START_KANDIDAT, outW, outH, fps, mbit)) { if (g_stats.out) fclose(g_stats.out); return 6; }
+    // --hdr: die Datei in HDR10 (BT.2020/PQ, SEI 137/144) - nur wenn Mac und
+    // Encoder es koennen; der Bildschirm muss es nicht (dann SDR-Inhalt in PQ).
+    int pq = [args containsObject:@"--hdr"];
+    if (pq && !g_befund[QC_START_KANDIDAT].hdr) {
+        logf_(@"--hdr: dieser Mac kann kein HDR10 (macOS 15, Apple Silicon, Encoder) - Aufnahme in SDR");
+        pq = 0;
+    }
+    logf_(@"\n=== Aufnahme %.1f s: %@ (%zux%zu Pixel) -> %dx%d, %d fps%s ===",
+          seconds, bildschirm_text(display), pxW, pxH, outW, outH, fps, pq ? ", HDR10" : "");
+    if (!encoder_start(QC_START_KANDIDAT, outW, outH, fps, mbit, pq)) { if (g_stats.out) fclose(g_stats.out); return 6; }
     aufnahme_einrichten(outW, outH, fps, mbit);
+    aufnahme_farbe_setzen(g_cfg, pq);
+    atomic_store(&g_anhaenge_loggen, 1);
     Grabber *grab = g_grab;
 
     // Aufnahme in eine Datei: sofort loslegen.

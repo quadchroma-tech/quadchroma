@@ -62,6 +62,10 @@
 // ScreenCaptureKit, CGDisplayBounds und die Protokollzeilen), kennung die
 // stabile fuer Client und bildschirm.txt. w, h in Pixeln. sc ist der
 // SCDisplay, aus dem der Strom gebaut wird - im Pruefstand nil.
+// edr_potentiell und edr_aktuell: der EDR-Kopfraum des Bildschirms (NSScreen
+// maximumPotential... bzw. maximumExtendedDynamicRangeColorComponentValue;
+// 1.0 = SDR, 0 = unbekannt). Ueber 1.0 potentiell gilt der Bildschirm als
+// HDR-faehig - dann darf der Host ihn als HDR aufnehmen (HDR-Plan 5.1).
 @interface QCBildschirm : NSObject
 @property (nonatomic) CGDirectDisplayID displayID;
 @property (nonatomic, copy) NSString *kennung;
@@ -70,11 +74,16 @@
 @property (nonatomic) double hz;
 @property (nonatomic) BOOL haupt;
 @property (nonatomic, strong) SCDisplay *sc;
+@property (nonatomic) double edr_potentiell, edr_aktuell;
 + (instancetype)kennung:(NSString *)kennung name:(NSString *)name displayID:(CGDirectDisplayID)displayID
                       w:(size_t)w h:(size_t)h hz:(double)hz haupt:(BOOL)haupt;
 // Gleich, wenn Kennung, Name, Groesse, Hz, Hauptbildschirm und displayID
-// gleich sind - so erkennt der Host, ob sich die Liste geaendert hat.
+// gleich sind - so erkennt der Host, ob sich die Liste geaendert hat. Der
+// EDR-Kopfraum zaehlt nicht mit: er steht nicht in Nachricht 12, und sein
+// Wechsel (HDR am Host an/aus) ist Sache der HDR-Entscheidung (main.m).
 - (BOOL)isEqual:(id)other;
+// Kann dieser Bildschirm HDR zeigen? Potentieller EDR-Kopfraum ueber 1.0.
+- (BOOL)hdr;
 @end
 
 // ------------------------------------------------------------------ Liste
@@ -87,10 +96,15 @@ typedef NSArray<QCBildschirm *> *(*qc_bildschirm_lieferant)(void);
 void qc_bildschirm_liste_setzen(qc_bildschirm_lieferant lieferant);
 NSArray<QCBildschirm *> *qc_bildschirme_holen(void);
 
-// Namen der Bildschirme (NSScreen.localizedName) in einen Vorrat lesen. Nur
-// auf dem Hauptfaden - AppKit gehoert dorthin -, beim Start und nach jeder
-// Aenderung der Bildschirmkonfiguration; der Lieferant liest aus dem Vorrat.
+// Namen der Bildschirme (NSScreen.localizedName) und ihren EDR-Kopfraum in
+// einen Vorrat lesen. Nur auf dem Hauptfaden - AppKit gehoert dorthin -,
+// beim Start und nach jeder Aenderung der Bildschirmkonfiguration; der
+// Lieferant liest aus dem Vorrat.
 void qc_bildschirm_namen_auffrischen(void);
+
+// Der EDR-Kopfraum aus dem Vorrat (potentiell, aktuell; 0 = unbekannt).
+// Rueckgabe 1, wenn der Bildschirm im Vorrat steht.
+int qc_bildschirm_edr(CGDirectDisplayID d, double *potentiell, double *aktuell);
 
 // Stabile Kennung aus den drei Nummern; die Unit haengt der Lieferant nur
 // bei Gleichheit an.
