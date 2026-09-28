@@ -12,7 +12,10 @@
 //     .ico im Ablageordner - das geht unabhaengig vom Symbol in der exe,
 //   - als Symbol im Infobereich (Windows, tray_win.rs) und - einfarbig als
 //     Vorlagenbild, siehe `vorlage` - in der Menueleiste des Macs
-//     (tray_mac.rs).
+//     (tray_mac.rs),
+//   - als Programmsymbol der Mac-App (Finder, Dock, Cmd+Tab) in eigener
+//     Form nach Apples Raster, siehe `mac_symbol`: res/AppIcon.icns im
+//     Repository, das Makefile legt es ins Bundle.
 //
 // Das ICO-Format wird hier von Hand geschrieben: kleine Groessen als
 // 32-Bit-BMP (so liest sie jede Windows-Fassung), 256 px als PNG. Das PNG
@@ -158,6 +161,223 @@ fn in_rundem_rechteck(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) 
     let cy = py.clamp(y + r, y + h - r);
     let (dx, dy) = (px - cx, py - cy);
     dx * dx + dy * dy <= r * r
+}
+
+// ------------------------------------------------------------- Mac-Symbol
+//
+// Das Programmsymbol der Mac-App (Finder, Dock, Cmd+Tab) im Stil von macOS 26:
+// Apples Raster fuer Programmsymbole, 1024er Leinwand, darauf eine Kachel
+// 824 x 824 ab (100, 100) mit "stetig" gerundeten Ecken, darunter ein weicher
+// Schatten; auf der dunklen Kachel die vier Felder des Logos. Im Bundle liegt
+// es als res/AppIcon.icns (iconutil); icns_schreiben_res erzeugt die Datei
+// neu, icns_res_gleich_logo wacht darueber, dass sie zum Code hier passt.
+// Im Programm selbst wird nichts davon gebraucht - daher nur in den Tests.
+//
+// Gerechnet wird nur mit + - * / und sqrt (IEEE-genau): die Bildpunkte sind
+// auf jeder Plattform bitgleich, sonst liefe die Pruefsumme in
+// icns_res_gleich_logo unter Windows auseinander. Kein powf, kein exp.
+
+#[cfg(test)]
+pub use mac::{mac_symbol, MAC_GROESSEN};
+
+#[cfg(test)]
+mod mac {
+    use super::{in_rundem_rechteck, FELDER};
+    use crate::ui;
+
+    /// Kantenlaenge der Vorlage, auf die sich alle MAC_*-Masse beziehen.
+    const MAC_RASTER: f32 = 1024.0;
+    /// Die Kachel: Rand bis zur Kachel, Kantenlaenge.
+    const MAC_KACHEL_RAND: f32 = 100.0;
+    const MAC_KACHEL: f32 = 824.0;
+    /// Ausdehnung einer Ecke ab der Kante. Die Ecke ist ein Superellipsen-
+    /// Viertel mit Exponent 2,5 (u^2,5 + v^2,5 <= 1, x^2,5 = x*x*sqrt(x)): so
+    /// laeuft sie wie Apples Maske ohne Knick in die Gerade ueber. An einem
+    /// Systemsymbol unter macOS 27 nachgemessen: gerade Kante ab 350, halbe
+    /// Deckung auf der Diagonale bei 162; dieses Viertel trifft beides auf 2 px.
+    const MAC_ECKE: f32 = 258.0;
+    /// Die vier Felder: Kante und Luecke (zusammen 512, mittig auf der Kachel),
+    /// Eckradius als Anteil der Feldkante.
+    const MAC_FELD: f32 = 232.0;
+    const MAC_LUECKE: f32 = 48.0;
+    const MAC_FELD_RUNDUNG: f32 = 0.12;
+    /// Glanz der Felder: oben zu diesem Anteil nach Weiss gemischt, bis zur
+    /// Feldmitte auslaufend; die untere Haelfte hat genau die Feldfarbe.
+    const MAC_FELD_GLANZ: f32 = 0.22;
+    /// Grund der Kachel: oben etwas heller, unten der Grund der Oberflaeche.
+    const MAC_GRUND_OBEN: u32 = 0x161b28;
+    /// Lichtkante (Glas): Breite in Rasterpunkten (mindestens ein halber
+    /// Bildpunkt, damit auch 16 und 32 px auf dunklem Grund eine Kante haben),
+    /// Deckung des Weiss ringsum und zusaetzlich zu den Ecken oben rechts und
+    /// unten links hin.
+    const MAC_KANTE: f32 = 5.0;
+    const MAC_KANTE_GRUND: f32 = 0.10;
+    const MAC_KANTE_GLANZ: f32 = 0.45;
+    /// Schatten der Kachel (wie am Systemsymbol gemessen): Versatz nach unten,
+    /// Radius je Kastenfilter (drei Durchgaenge je Richtung, etwa Gauss mit
+    /// sigma 15), Deckung.
+    const MAC_SCHATTEN_DY: f32 = 8.0;
+    const MAC_SCHATTEN_WEICH: f32 = 15.0;
+    const MAC_SCHATTEN_DECKUNG: f32 = 0.25;
+
+    /// Die Groessen des Mac-Symbols in der .iconset-Mappe (je einmal).
+    pub const MAC_GROESSEN: [u32; 7] = [16, 32, 64, 128, 256, 512, 1024];
+
+    /// Liegt der Punkt in der Kachel (links oben bei `rand`, Kante `kante`,
+    /// Eckausdehnung `ecke`)?
+    fn in_mac_kachel(px: f32, py: f32, rand: f32, kante: f32, ecke: f32) -> bool {
+        if px < rand || py < rand || px >= rand + kante || py >= rand + kante {
+            return false;
+        }
+        // Wie weit der Punkt in einem Eckfeld liegt, als Anteil der Ecke.
+        let u = (rand + ecke - px).max(px - (rand + kante - ecke)).max(0.0) / ecke;
+        let v = (rand + ecke - py).max(py - (rand + kante - ecke)).max(0.0) / ecke;
+        u * u * u.sqrt() + v * v * v.sqrt() <= 1.0
+    }
+
+    /// `a` nach `b` gemischt, Anteil `t` (0..1), je Kanal 0..255.
+    fn mischen(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    }
+
+    fn kanaele(farbe: u32) -> [f32; 3] {
+        [((farbe >> 16) & 255) as f32, ((farbe >> 8) & 255) as f32, (farbe & 255) as f32]
+    }
+
+    /// Das Mac-Symbol als RGBA wie `rgba` (nicht vormultipliziert, Zeilen von
+    /// oben), `groesse` mal `groesse` Bildpunkte. Die Felder liegen wie in
+    /// `rgba` auf ganzen Bildpunkten (16 px bleiben scharf), Kachel und
+    /// Feldecken sind geglaettet (4x4 Abtastungen je Bildpunkt).
+    pub fn mac_symbol(groesse: u32) -> Vec<u8> {
+        let g = groesse.max(1);
+        let n = g as usize;
+        let s = g as f32 / MAC_RASTER;
+        let rand = MAC_KACHEL_RAND * s;
+        let kante = MAC_KACHEL * s;
+        let ecke = MAC_ECKE * s;
+        let licht = (MAC_KANTE * s).max(0.5);
+        let mitte = g as f32 / 2.0;
+        // Felder und Luecke in ganzen Bildpunkten; die Luecke waechst um einen,
+        // wenn sonst kein ganzzahliger Rand bliebe (wie in `rgba`).
+        let gi = g as i64;
+        let feld = ((MAC_FELD * s).round() as i64).max(1);
+        let mut luecke = ((MAC_LUECKE * s).round() as i64).max(1);
+        if (gi - 2 * feld - luecke) % 2 != 0 {
+            luecke += 1;
+        }
+        let links0 = (gi - 2 * feld - luecke) / 2;
+        let links = [links0 as f32, (links0 + feld + luecke) as f32];
+        let feld = feld as f32;
+        let r_feld = feld * MAC_FELD_RUNDUNG;
+        let (oben, unten) = (kanaele(MAC_GRUND_OBEN), kanaele(ui::BG));
+        let weiss = [255.0; 3];
+
+        // Farbe eines Abtastpunkts in der Kachel.
+        let farbe_bei = |px: f32, py: f32| -> [f32; 3] {
+            let mut c = mischen(oben, unten, ((py - rand) / kante).clamp(0.0, 1.0));
+            for (i, f) in FELDER.iter().enumerate() {
+                // 0 oben links, 1 oben rechts, 2 unten rechts, 3 unten links
+                let (fx, fy) = match i {
+                    0 => (links[0], links[0]),
+                    1 => (links[1], links[0]),
+                    2 => (links[1], links[1]),
+                    _ => (links[0], links[1]),
+                };
+                if in_rundem_rechteck(px, py, fx, fy, feld, feld, r_feld) {
+                    let t = (py - fy) / feld;
+                    let rest = (1.0 - 2.0 * t).max(0.0);
+                    let glanz = rest * rest * MAC_FELD_GLANZ;
+                    c = mischen(kanaele(*f), weiss, glanz);
+                }
+            }
+            if !in_mac_kachel(px, py, rand + licht, kante - 2.0 * licht, ecke - licht) {
+                // Lichtkante; am hellsten zu den Ecken oben rechts und unten
+                // links hin (p = +-1 auf der Diagonale dorthin, 0 quer dazu).
+                let (dx, dy) = (px - mitte, py - mitte);
+                let r2 = dx * dx + dy * dy;
+                let p2 = if r2 > 0.0 { (dx - dy) * (dx - dy) / (2.0 * r2) } else { 0.0 };
+                c = mischen(c, weiss, MAC_KANTE_GRUND + MAC_KANTE_GLANZ * p2 * p2);
+            }
+            c
+        };
+
+        // Kachel: vormultiplizierte Farbe und Deckung je Bildpunkt; Schatten:
+        // Treffer der nach unten versetzten Kachel (ganzzahlig, fuer den Filter).
+        const STUFEN: u32 = 4;
+        const PROBEN: u32 = STUFEN * STUFEN;
+        let dy_schatten = MAC_SCHATTEN_DY * s;
+        let mut kachel = vec![[0f32; 4]; n * n];
+        let mut schatten = vec![0u64; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let mut summe = [0f32; 4];
+                let mut treffer_schatten = 0u64;
+                for sy in 0..STUFEN {
+                    for sx in 0..STUFEN {
+                        let px = x as f32 + (sx as f32 + 0.5) / STUFEN as f32;
+                        let py = y as f32 + (sy as f32 + 0.5) / STUFEN as f32;
+                        if in_mac_kachel(px, py - dy_schatten, rand, kante, ecke) {
+                            treffer_schatten += 1;
+                        }
+                        if in_mac_kachel(px, py, rand, kante, ecke) {
+                            let c = farbe_bei(px, py);
+                            summe = [summe[0] + c[0], summe[1] + c[1], summe[2] + c[2], summe[3] + 1.0];
+                        }
+                    }
+                }
+                kachel[y * n + x] = summe.map(|v| v / PROBEN as f32);
+                schatten[y * n + x] = treffer_schatten;
+            }
+        }
+
+        // Schatten weich: je Richtung dreimal ein Kastenfilter, ganzzahlig und
+        // ohne Zwischenteilung (genau), am Ende einmal geteilt.
+        let radius = (MAC_SCHATTEN_WEICH * s).round() as usize;
+        let mut teiler = PROBEN as u64;
+        if radius > 0 {
+            let mut hilfe = vec![0u64; n * n];
+            for _ in 0..3 {
+                kasten(&schatten, &mut hilfe, n, radius, 1, n);
+                kasten(&hilfe, &mut schatten, n, radius, n, 1);
+                teiler *= ((2 * radius + 1) * (2 * radius + 1)) as u64;
+            }
+        }
+
+        // Kachel ueber dem (schwarzen) Schatten.
+        let mut out = vec![0u8; n * n * 4];
+        let byte = |v: f32| (v.clamp(0.0, 255.0) + 0.5) as u8;
+        for i in 0..n * n {
+            let [r, gr, b, a_kachel] = kachel[i];
+            let a_schatten = schatten[i] as f32 / teiler as f32 * MAC_SCHATTEN_DECKUNG;
+            let a = a_kachel + a_schatten * (1.0 - a_kachel);
+            if a > 0.0 {
+                out[i * 4] = byte(r / a);
+                out[i * 4 + 1] = byte(gr / a);
+                out[i * 4 + 2] = byte(b / a);
+                out[i * 4 + 3] = byte(a * 255.0);
+            }
+        }
+        out
+    }
+
+    /// Ein Kastenfilter (Summe ueber 2*radius+1 Nachbarn, ausserhalb 0) ueber
+    /// `n` Zeilen bzw. Spalten: `schritt` ist der Abstand zweier Nachbarn,
+    /// `zeile` der zweier Zeilen (waagrecht: 1 und n, senkrecht: n und 1).
+    fn kasten(ein: &[u64], aus: &mut [u64], n: usize, radius: usize, schritt: usize, zeile: usize) {
+        for z in 0..n {
+            let basis = z * zeile;
+            let mut summe: u64 = (0..=radius.min(n - 1)).map(|k| ein[basis + k * schritt]).sum();
+            for k in 0..n {
+                aus[basis + k * schritt] = summe;
+                if k + radius + 1 < n {
+                    summe += ein[basis + (k + radius + 1) * schritt];
+                }
+                if k >= radius {
+                    summe -= ein[basis + (k - radius) * schritt];
+                }
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------- PNG
@@ -629,5 +849,185 @@ mod tests {
         let daten = ico(&ICO_GROESSEN);
         std::fs::write(&pfad, &daten).unwrap_or_else(|e| panic!("{}: {e}", pfad.display()));
         println!("{} Byte -> {}", daten.len(), pfad.display());
+    }
+
+    /// Die Dateien der .iconset-Mappe fuer iconutil (Apples Namen) mit ihrer
+    /// Kantenlaenge, dazu die Art, unter der iconutil sie in die .icns legt.
+    const ICONSET: [(&str, u32, &[u8; 4]); 10] = [
+        ("icon_16x16", 16, b"ic04"),
+        ("icon_16x16@2x", 32, b"ic11"),
+        ("icon_32x32", 32, b"ic05"),
+        ("icon_32x32@2x", 64, b"ic12"),
+        ("icon_128x128", 128, b"ic07"),
+        ("icon_128x128@2x", 256, b"ic13"),
+        ("icon_256x256", 256, b"ic08"),
+        ("icon_256x256@2x", 512, b"ic14"),
+        ("icon_512x512", 512, b"ic09"),
+        ("icon_512x512@2x", 1024, b"ic10"),
+    ];
+
+    /// CRC-32 ueber die Bildpunkte des Mac-Symbols in allen MAC_GROESSEN.
+    fn mac_symbol_pruefsumme() -> u32 {
+        MAC_GROESSEN.iter().fold(0xffff_ffff, |crc, &g| crc32_weiter(crc, &mac_symbol(g))) ^ 0xffff_ffff
+    }
+
+    /// Die Eintraege einer .icns-Datei: Art und Daten, in Dateireihenfolge.
+    fn icns_eintraege(d: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        assert_eq!(&d[..4], b"icns");
+        assert_eq!(u32_be(d, 4) as usize, d.len(), "Laenge im Kopf");
+        let mut out = Vec::new();
+        let mut o = 8;
+        while o < d.len() {
+            let len = u32_be(d, o + 4) as usize;
+            assert!(len >= 8 && o + len <= d.len(), "Eintrag bei {o}");
+            out.push(([d[o], d[o + 1], d[o + 2], d[o + 3]], &d[o + 8..o + len]));
+            o += len;
+        }
+        out
+    }
+
+    /// Das Mac-Symbol: Ecken und Rand durchsichtig, die Kachelmitte deckend,
+    /// die vier Felder in ihren Farben (untere Haelfte ohne Glanz: genau die
+    /// Farbe), zwischen ihnen der Grund; der Schatten liegt unter der
+    /// Kachel, nicht darueber.
+    #[test]
+    fn mac_symbol_motiv() {
+        for g in MAC_GROESSEN {
+            let b = mac_symbol(g);
+            assert_eq!(b.len(), (g * g * 4) as usize);
+            let px = |x: u32, y: u32| {
+                let o = ((y * g + x) * 4) as usize;
+                ((b[o] as u32) << 16 | (b[o + 1] as u32) << 8 | b[o + 2] as u32, b[o + 3])
+            };
+            assert_eq!(px(0, 0).1, 0, "Ecke bei {g}");
+            assert_eq!(px(g - 1, 0).1, 0, "Ecke bei {g}");
+            // Knapp innerhalb der Kachelecke (Rand 100/1024) ist noch nichts.
+            let r = g * 100 / 1024;
+            assert!(px(r, r).1 < 64, "Kachelecke bei {g}: {}", px(r, r).1);
+            // Unter der Kachel mehr Schatten als darueber.
+            if g >= 64 {
+                let unter = px(g / 2, g - r + g / 128).1;
+                let ueber = px(g / 2, r - 1 - g / 128).1;
+                assert!(unter > ueber && ueber > 0, "Schatten bei {g}: unter {unter}, ueber {ueber}");
+            }
+            assert_eq!(px(g / 2, g / 2).1, 255, "Mitte bei {g}");
+            // Felder, je bei etwa 3/4 ihrer Hoehe: dort ohne Glanz.
+            let (v, d) = (g * 9 / 32, g - 1 - g * 9 / 32);
+            let (vu, du) = (g * 27 / 64, g * 89 / 128);
+            assert_eq!(px(v, vu), (ui::CYAN, 255), "oben links bei {g}");
+            assert_eq!(px(d, vu), (ui::MAGENTA, 255), "oben rechts bei {g}");
+            assert_eq!(px(d, du), (ui::TEXT, 255), "unten rechts bei {g}");
+            assert_eq!(px(v, du), (ui::AMBER, 255), "unten links bei {g}");
+            // Oben im Feld glaenzt es: Cyan bekommt Rot dazu (ab 64 px
+            // liegt die Probe sicher in der oberen Feldhaelfte).
+            if g >= 64 {
+                assert!(px(v, g / 4 + 1).0 >> 16 > 0, "Glanz bei {g}");
+            }
+        }
+    }
+
+    /// Kleine Groessen bleiben scharf: die Felder beginnen und enden auf
+    /// ganzen Bildpunkten, links und rechts gleich weit vom Rand.
+    #[test]
+    fn mac_symbol_felder_auf_ganzen_punkten() {
+        for g in [16u32, 32] {
+            let b = mac_symbol(g);
+            let zeile = g * 89 / 128; // durch die unteren Felder, ohne Glanz
+            let farben: Vec<u32> = (0..g)
+                .map(|x| {
+                    let o = ((zeile * g + x) * 4) as usize;
+                    (b[o] as u32) << 16 | (b[o + 1] as u32) << 8 | b[o + 2] as u32
+                })
+                .collect();
+            let amber: Vec<u32> = (0..g).filter(|&x| farben[x as usize] == ui::AMBER).collect();
+            let text: Vec<u32> = (0..g).filter(|&x| farben[x as usize] == ui::TEXT).collect();
+            assert!(!amber.is_empty() && amber.len() == text.len(), "{g}: {amber:?} {text:?}");
+            assert_eq!(amber[0], g - 1 - text[text.len() - 1], "symmetrisch bei {g}");
+            // Keine Mischfarbe an den Feldkanten.
+            for x in [amber[0] - 1, amber[amber.len() - 1] + 1, text[0] - 1] {
+                let c = farben[x as usize];
+                assert!(c != ui::AMBER && c != ui::TEXT, "Kante bei {g}, x {x}");
+            }
+        }
+    }
+
+    /// res/AppIcon.icns - das Symbol im Bundle der Mac-App (Makefile) -
+    /// passt zum Code: alle zehn Eintraege der .iconset-Mappe sind darin, und
+    /// res/AppIcon.icns.crc, den icns_schreiben_res mit der Datei schreibt,
+    /// nennt die Pruefsummen der Bildpunkte von heute und der Datei selbst.
+    /// Laeuft auf beiden Plattformen (die Pixel sind bitgleich).
+    #[test]
+    fn icns_res_gleich_logo() {
+        let icns = include_bytes!("../res/AppIcon.icns");
+        let arten: Vec<[u8; 4]> = icns_eintraege(icns).iter().map(|(a, _)| *a).collect();
+        for (name, _, art) in ICONSET {
+            assert!(arten.contains(art), "{name} ({}) fehlt in res/AppIcon.icns", String::from_utf8_lossy(art));
+        }
+        let stempel = include_str!("../res/AppIcon.icns.crc");
+        let wert = |schluessel: &str| {
+            stempel
+                .lines()
+                .find_map(|z| z.trim().strip_prefix(schluessel).map(|w| w.trim().to_string()))
+                .unwrap_or_else(|| panic!("res/AppIcon.icns.crc ohne '{schluessel}'"))
+        };
+        assert_eq!(wert("icns "), format!("{:08x}", crc32(icns)), "res/AppIcon.icns passt nicht zu res/AppIcon.icns.crc");
+        assert_eq!(
+            wert("logo "),
+            format!("{:08x}", mac_symbol_pruefsumme()),
+            "das Mac-Symbol (logo.rs, ui.rs) hat sich geaendert - res/AppIcon.icns neu erzeugen (Mac, ausserhalb \
+             der Seatbelt-Sandbox, im Ordner client/): \
+             QC_ICNS_PFAD=res/AppIcon.icns cargo test --release icns_schreiben_res -- --ignored"
+        );
+    }
+
+    /// res/AppIcon.icns neu erzeugen (nur auf dem Mac, nur auf Wunsch wie
+    /// ico_schreiben_res): die .iconset-Mappe aus mac_symbol in einen
+    /// Ordner unter temp_dir, daraus mit iconutil die .icns nach
+    /// QC_ICNS_PFAD, daneben <Pfad>.crc mit den Pruefsummen. iconutil
+    /// scheitert in einer Seatbelt-Sandbox ("Failed to generate ICNS").
+    /// Aufruf im Ordner client/:
+    ///   QC_ICNS_PFAD=res/AppIcon.icns cargo test --release icns_schreiben_res -- --ignored
+    /// Beide Dateien danach mit ins Repository nehmen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "schreibt die .icns nach QC_ICNS_PFAD; nur ausdruecklich aufrufen"]
+    fn icns_schreiben_res() {
+        let pfad = std::path::PathBuf::from(
+            std::env::var_os("QC_ICNS_PFAD").expect("QC_ICNS_PFAD (Zielpfad der .icns) ist nicht gesetzt"),
+        );
+        let ordner = std::env::temp_dir().join(format!("qc-test-{}-icns", std::process::id()));
+        let mappe = ordner.join("AppIcon.iconset");
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&mappe).unwrap();
+        for (name, g, _) in ICONSET {
+            std::fs::write(mappe.join(format!("{name}.png")), png(g, g, &mac_symbol(g))).unwrap();
+        }
+        let ergebnis = std::process::Command::new("/usr/bin/iconutil")
+            .args(["-c", "icns", "-o"])
+            .arg(&pfad)
+            .arg(&mappe)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&ordner);
+        assert!(
+            ergebnis.status.success(),
+            "iconutil: {}{}",
+            String::from_utf8_lossy(&ergebnis.stdout),
+            String::from_utf8_lossy(&ergebnis.stderr)
+        );
+        let icns = std::fs::read(&pfad).unwrap();
+        let arten: Vec<[u8; 4]> = icns_eintraege(&icns).iter().map(|(a, _)| *a).collect();
+        for (name, _, art) in ICONSET {
+            assert!(arten.contains(art), "iconutil hat {name} nicht als {} abgelegt", String::from_utf8_lossy(art));
+        }
+        let stempel = format!(
+            "# Pruefsummen zu AppIcon.icns (logo.rs, Test icns_schreiben_res) - nicht von Hand aendern\n\
+             logo {:08x}\nicns {:08x}\n",
+            mac_symbol_pruefsumme(),
+            crc32(&icns)
+        );
+        let crc = std::path::PathBuf::from(format!("{}.crc", pfad.display()));
+        std::fs::write(&crc, stempel).unwrap();
+        println!("{} Byte -> {}, {}", icns.len(), pfad.display(), crc.display());
     }
 }
