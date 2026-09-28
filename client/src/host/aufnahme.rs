@@ -853,8 +853,9 @@ impl Drehung {
         if self.vertauscht() { (h, w) } else { (w, h) }
     }
 
-    /// Woher der Desktoppunkt (x, y) in der Oberflaeche sw x sh kommt.
-    fn quelle(self, sw: usize, sh: usize, x: usize, y: usize) -> (usize, usize) {
+    /// Woher der Desktoppunkt (x, y) in der Oberflaeche sw x sh kommt
+    /// (dasselbe rechnet der Wandler im Modus PQ auf der Karte).
+    pub(crate) fn quelle(self, sw: usize, sh: usize, x: usize, y: usize) -> (usize, usize) {
         match self {
             Drehung::Keine => (x, y),
             Drehung::Grad90 => (y, sh - 1 - x),
