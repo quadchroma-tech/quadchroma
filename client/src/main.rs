@@ -932,9 +932,12 @@ type Dekoderbild = vt_decoder::Bild;
 /// CVPixelBuffer lassen sich zwischen Faeden verschieben. Unter Windows
 /// zeichnet dann Direct3D 11, auf dem Mac Metal (der CVPixelBuffer geht als
 /// IOSurface ohne Kopie auf die Karte); zeichnet softbuffer, kommt nur RGB an.
+/// Ein rohes Bild traegt die Strominfo Fassung 1, die beim Decodieren galt:
+/// fuer ein PQ-Bild SDR-Weiss und Spitze des Hosts (None: Host vor 0.2.0,
+/// dann die Vorgaben) - die Farbe selbst steht im Bild (Ebenenbild::farbe).
 enum Bild {
     Rgb(Frame),
-    Roh { bild: Dekoderbild, bereit_us: u64 },
+    Roh { bild: Dekoderbild, bereit_us: u64, quelle: Option<hdr::InfoV1> },
 }
 
 impl Bild {
@@ -3551,18 +3554,23 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // Zeichnet die Karte, bleibt das Bild roh; einmal je Paket
                 // nachsehen reicht.
                 let gpu = shared.lock().unwrap().gpu_pfad;
+                // SDR-Weiss und Spitze des Hosts fuer PQ-Bilder: die Strominfo,
+                // die gerade gilt (SWITCH -> INFO -> Schluesselbild, sie ist
+                // also vor dem ersten Bild des neuen Stroms da).
+                let quelle = info.and_then(|i| i.hdr);
                 for decoded in bilder.drain(..) {
                     let pts = decoded.zeitstempel();
                     let (w, h) = (decoded.breite(), decoded.hoehe());
                     // Das Format entscheidet der decodierte Frame selbst, nicht
-                    // die Strominfo. Ein unbekanntes Format ergibt ein dunkles
-                    // Bild und eine Meldung - nie einen Absturz.
+                    // die Strominfo - ebenso die Farbe (VUI des Bildes). Ein
+                    // unbekanntes Format ergibt ein dunkles Bild und eine
+                    // Meldung - nie einen Absturz.
                     // `bereit_us` ist die Client-Uhr bei der Ablage: ab hier
                     // zaehlt das Glied Anzeige, das der Fensterfaden misst.
                     let (bild, fehler) = if gpu && decoded.ebenen().is_some() {
-                        (Bild::Roh { bild: decoded, bereit_us: client_us() }, None)
+                        (Bild::Roh { bild: decoded, bereit_us: client_us(), quelle }, None)
                     } else {
-                        match to_rgb(&decoded) {
+                        match to_rgb_mit(&decoded, quelle.as_ref()) {
                             Ok(f) => (Bild::Rgb(Frame { bereit_us: client_us(), ..f }), None),
                             Err(e) => {
                                 let m = Meldung::neu(strings::Key::ErrorPixelFormat, e).anhang(decoded.format_name());
@@ -4411,7 +4419,21 @@ pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
 /// ist ein Fehler mit Meldung, kein Absturz. Die Stroeme der Hosts sind
 /// Vollbereich (der Host garantiert das); gedehnt wird nur, wenn
 /// VideoToolbox ein Format im begrenzten Bereich liefert (`begrenzt`).
+///
+/// Ein PQ-Bild ohne Strominfo: SDR-Weiss und Spitze nach Vorgabe (203 / 1000
+/// nit), siehe `to_rgb_mit`.
 fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
+    to_rgb_mit(src, None)
+}
+
+/// Wie `to_rgb`, dazu die Strominfo Fassung 1 des Hosts (None: Host vor
+/// 0.2.0). Ein PQ-Bild (Transfer aus dem VUI, `Ebenenbild::farbe`) geht ueber
+/// `hdr::zeile_rgb_pq`: relativ zum SDR-Weiss des Hosts, farbtontreu beim
+/// SDR-Weiss abgeschnitten (E4), BT.2020 -> BT.709, sRGB - der CPU-Weg auf
+/// einem SDR-Schirm, wie die Karte es auf einem SDR-Schirm rechnet. Bei PQ
+/// zaehlt der begrenzte Bereich auch aus dem VUI. Ein SDR-Bild rechnet wie
+/// seit jeher, bitgleich.
+fn to_rgb_mit(src: &impl Ebenenbild, quelle: Option<&hdr::InfoV1>) -> Result<Frame, String> {
     let Some(fmt) = src.ebenen() else {
         return Err(format!("Unbekanntes Bildformat vom Decoder: {}", src.format_name()));
     };
@@ -4445,6 +4467,10 @@ fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
         return Err("Bildebenen des Decoders sind zu klein".into());
     }
 
+    let farbe = src.farbe();
+    let pq = farbe.ist_pq().then(|| hdr::Abbildung::sdr(quelle));
+    let pq_begrenzt = begrenzt || !farbe.voll;
+
     let mut pixels = vec![0u32; w * h];
     pixels.par_chunks_mut(w).enumerate().for_each(|(row, out)| {
         let crow = if sub { row >> 1 } else { row };
@@ -4453,6 +4479,15 @@ fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
         // Bei Paaren: dieselbe Zeile, um einen Wert versetzt - der letzte
         // gelesene V-Wert liegt dann genau am Ende der Zeile, nie dahinter.
         let vr = if paar { &up[crow * us + bpp..crow * us + cbreite] } else { &vp[crow * vs..crow * vs + cbreite] };
+        if let Some(ab) = &pq {
+            match (sub, paar) {
+                (false, false) => zeile_pq::<false, false>(bits, pq_begrenzt, out, yr, ur, vr, ab),
+                (false, true) => zeile_pq::<false, true>(bits, pq_begrenzt, out, yr, ur, vr, ab),
+                (true, false) => zeile_pq::<true, false>(bits, pq_begrenzt, out, yr, ur, vr, ab),
+                (true, true) => zeile_pq::<true, true>(bits, pq_begrenzt, out, yr, ur, vr, ab),
+            }
+            return;
+        }
         match (sub, bits, paar, begrenzt) {
             (false, 8, false, false) => zeile_rgb::<false, 8, false, false>(out, yr, ur, vr),
             (false, 10, false, false) => zeile_rgb::<false, 10, false, false>(out, yr, ur, vr),
@@ -4477,6 +4512,23 @@ fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
     });
 
     Ok(Frame { width: w as u32, height: h as u32, pixels, bereit_us: 0 })
+}
+
+/// Eine Zeile eines PQ-Bildes fuer `to_rgb_mit`: waehlt nach Bits und Bereich
+/// die passende Fassung von `hdr::zeile_rgb_pq` (4:2:0 und Paare als
+/// Parameter). Anders als bei SDR kann jedes Format begrenzt sein - das sagt
+/// bei PQ das VUI.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn zeile_pq<const SUB: bool, const PAAR: bool>(bits: u8, begrenzt: bool, out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8], ab: &hdr::Abbildung) {
+    match (bits, begrenzt) {
+        (8, false) => hdr::zeile_rgb_pq::<SUB, 8, PAAR, false>(out, yr, ur, vr, ab),
+        (8, true) => hdr::zeile_rgb_pq::<SUB, 8, PAAR, true>(out, yr, ur, vr, ab),
+        (10, false) => hdr::zeile_rgb_pq::<SUB, 10, PAAR, false>(out, yr, ur, vr, ab),
+        (10, true) => hdr::zeile_rgb_pq::<SUB, 10, PAAR, true>(out, yr, ur, vr, ab),
+        (_, false) => hdr::zeile_rgb_pq::<SUB, 16, PAAR, false>(out, yr, ur, vr, ab),
+        (_, true) => hdr::zeile_rgb_pq::<SUB, 16, PAAR, true>(out, yr, ur, vr, ab),
+    }
 }
 
 /// Was `to_rgb` und die Protokollzeilen von einem decodierten Bild brauchen:
@@ -4529,6 +4581,17 @@ impl Ebenenbild for ffmpeg::frame::Video {
     }
     fn zeilenlaenge(&self, ebene: usize) -> usize {
         self.stride(ebene)
+    }
+    /// Aus dem Bild, wie der Decoder es aus dem VUI des Stroms gefuellt hat -
+    /// Software-HEVC, cuvid (ff_decode_frame_props) und D3D11VA (Kopie mit
+    /// av_frame_copy_props) gleichermassen. FFmpegs Codes sind die aus H.273
+    /// (AVCOL_TRC_SMPTE2084 = 16, AVCOL_PRI_BT2020 = 9, AVCOL_SPC_BT2020_NCL
+    /// = 9). Bereich: nur MPEG heisst begrenzt - ein PQ-Strom traegt das Flag
+    /// immer, und unser Protokoll ist voll.
+    fn farbe(&self) -> hdr::Farbe {
+        use ffmpeg::sys::AVColorRange;
+        let f = unsafe { &*self.as_ptr() };
+        hdr::Farbe::aus_vui(f.color_trc as u8, f.color_primaries as u8, f.colorspace as u8, f.color_range != AVColorRange::AVCOL_RANGE_MPEG)
     }
 }
 
@@ -7679,11 +7742,14 @@ impl App {
     }
 
     /// Kann diese Anzeige HDR darstellen (Bit 1 in IN_ANZEIGE)? Nur der Weg
-    /// ueber die Karte, und nur, wenn er HDR-Bilder auch zeigen kann
-    /// (HDR_DARSTELLUNG der Anzeige - bis Schritt 5a/5b nein).
+    /// ueber die Karte, und nur, wenn er HDR-Bilder auch zeigen kann: unter
+    /// Windows nicht, solange DXGI HDR10 an diesem Schirm abgelehnt hat (dann
+    /// sendet der Host SDR), auf dem Mac HDR_DARSTELLUNG der Anzeige.
     fn hdr_darstellung(&self) -> bool {
         match &self.anzeige {
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(windows)]
+            Anzeige::Gpu(g) => g.hdr_darstellung(),
+            #[cfg(target_os = "macos")]
             Anzeige::Gpu(_) => anzeige::HDR_DARSTELLUNG,
             _ => false,
         }
@@ -8919,7 +8985,14 @@ impl App {
             let bereit_us = b.bereit_us();
             let r = match b {
                 Bild::Rgb(f) => g.bild_rgb(&f).map(|_| (f.width, f.height)),
-                Bild::Roh { bild, .. } => g.bild_roh(&bild).map(|_| (Ebenenbild::breite(&bild), Ebenenbild::hoehe(&bild))),
+                Bild::Roh { bild, quelle, .. } => {
+                    // Windows: SDR-Weiss und Spitze des Hosts fuer ein PQ-Bild.
+                    #[cfg(windows)]
+                    g.quelle_setzen(quelle.as_ref());
+                    #[cfg(not(windows))]
+                    let _ = quelle;
+                    g.bild_roh(&bild).map(|_| (Ebenenbild::breite(&bild), Ebenenbild::hoehe(&bild)))
+                }
             };
             match r {
                 Ok(groesse) => {
@@ -9166,9 +9239,9 @@ impl App {
                 // Ein rohes Bild kommt hier nur an, wenn die Anzeige im
                 // laufenden Betrieb von der Karte auf die CPU zurueckfaellt:
                 // dann einmal auf dem Fensterfaden wandeln.
-                Bild::Roh { bild, bereit_us } => Frame {
+                Bild::Roh { bild, bereit_us, quelle } => Frame {
                     bereit_us,
-                    ..to_rgb(&bild).unwrap_or_else(|_| dunkles_bild(bild.breite(), bild.hoehe()))
+                    ..to_rgb_mit(&bild, quelle.as_ref()).unwrap_or_else(|_| dunkles_bild(bild.breite(), bild.hoehe()))
                 },
             });
             self.fps_count += 1;
@@ -18992,5 +19065,104 @@ mod tests {
             // G 76 - 59; B 76).
             assert_eq!(probe(true, bits, [81, 81, 81, 81], [128, 240]), vec![0xff114c; 4], "{bits} Bit");
         }
+    }
+
+    /// Ein Probebild mit einer Farbe aus dem VUI - fuer den PQ-Weg von `to_rgb_mit`.
+    struct Farbprobe(Ebenenprobe, hdr::Farbe);
+
+    impl Ebenenbild for Farbprobe {
+        fn breite(&self) -> u32 {
+            self.0.breite()
+        }
+        fn hoehe(&self) -> u32 {
+            self.0.hoehe()
+        }
+        fn zeitstempel(&self) -> Option<i64> {
+            None
+        }
+        fn ebenen(&self) -> Option<EbenenFormat> {
+            self.0.ebenen()
+        }
+        fn format_name(&self) -> String {
+            "Farbprobe".into()
+        }
+        fn ebenenzahl(&self) -> usize {
+            self.0.ebenenzahl()
+        }
+        fn daten(&self, ebene: usize) -> &[u8] {
+            self.0.daten(ebene)
+        }
+        fn zeilenlaenge(&self, ebene: usize) -> usize {
+            self.0.zeilenlaenge(ebene)
+        }
+        fn farbe(&self) -> hdr::Farbe {
+            self.1
+        }
+    }
+
+    /// Der CPU-Weg fuer PQ-Bilder: to_rgb_mit rechnet wie hdr::pq_nach_srgb8
+    /// (hoechstens ein Wert daneben, Tabellen) mit dem SDR-Weiss aus der
+    /// Strominfo - ohne Strominfo 203 nit; begrenzt, wenn das VUI es sagt.
+    /// Dieselben Ebenen als SDR-Bild rechnen wie to_rgb, bitgleich.
+    #[test]
+    fn to_rgb_mit_pq_bild() {
+        let (w, h) = (64usize, 3usize);
+        // 4:4:4, 10 Bit LE, planar: Y-Rampe ueber die Breite, Farbe je Zeile anders.
+        let ebene = |f: &dyn Fn(usize, usize) -> u16| -> Vec<u8> {
+            (0..h).flat_map(|y| (0..w).flat_map(move |x| f(x, y).to_le_bytes())).collect()
+        };
+        let y = ebene(&|x, _| (x * 1023 / (w - 1)) as u16);
+        let u = ebene(&|x, z| [512, 300, 800][z] + (x as u16 % 7));
+        let v = ebene(&|x, z| [512, 900, 200][z] - (x as u16 % 5));
+        let probe = |farbe| Farbprobe(
+            Ebenenprobe { fmt: EbenenFormat { sub: false, bits: 10, paar: false, begrenzt: false }, w: w as u32, h: h as u32, ebenen: vec![y.clone(), u.clone(), v.clone()], zeilen: vec![w * 2; 3] },
+            farbe,
+        );
+        let wert = |p: &[u8], i: usize| u16::from_le_bytes([p[2 * i], p[2 * i + 1]]) as i32;
+        let pruefen = |farbe: hdr::Farbe, info: Option<&hdr::InfoV1>| {
+            let aus = to_rgb_mit(&probe(farbe), info).expect("to_rgb_mit").pixels;
+            let ab = hdr::Abbildung::sdr(info);
+            let mut max = 0;
+            for i in 0..w * h {
+                let (yn, cb, cr) = hdr::normieren10(wert(&y, i), wert(&u, i), wert(&v, i), !farbe.voll);
+                let s = hdr::pq_nach_srgb8(yn, cb, cr, &ab);
+                let ist = [(aus[i] >> 16) & 255, (aus[i] >> 8) & 255, aus[i] & 255];
+                for c in 0..3 {
+                    max = max.max(ist[c].abs_diff(s[c] as u32));
+                }
+            }
+            assert!(max <= 1, "{} Weiss {:?}: {max} daneben", farbe.text(), info.map(|i| i.sdr_weiss_nit));
+            aus
+        };
+        let info = |weiss| hdr::InfoV1 { sdr_weiss_nit: weiss, master_max_nit: 1000, ..hdr::InfoV1::sdr(hdr::GRUND_AKTIV) };
+        let mit_203 = pruefen(hdr::Farbe::PQ, Some(&info(203)));
+        assert_eq!(pruefen(hdr::Farbe::PQ, None), mit_203, "ohne Strominfo gilt 203 nit");
+        // Ein dunkleres SDR-Weiss des Hosts macht das Bild heller.
+        let mit_100 = pruefen(hdr::Farbe::PQ, Some(&info(100)));
+        assert!(mit_100.iter().zip(&mit_203).all(|(a, b)| (a >> 8) & 255 >= (b >> 8) & 255) && mit_100 != mit_203);
+        pruefen(hdr::Farbe { voll: false, ..hdr::Farbe::PQ }, Some(&info(203)));
+        // SDR: der alte Weg, bitgleich.
+        assert_eq!(to_rgb_mit(&probe(hdr::Farbe::SDR), Some(&info(203))).expect("SDR").pixels, to_rgb(&probe(hdr::Farbe::SDR)).expect("SDR").pixels);
+    }
+
+    /// Die Farbe eines FFmpeg-Bildes kommt aus seinem VUI: PQ/BT.2020 mit
+    /// Bereich; alles andere - auch das irrefuehrende BT.601 begrenzt des
+    /// bgra-Wegs - ist SDR BT.709 voll.
+    #[cfg(windows)]
+    #[test]
+    fn farbe_aus_dem_ffmpeg_bild() {
+        use ffmpeg::color;
+        let mut f = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV444P10LE, 4, 4);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR);
+        f.set_color_transfer_characteristic(color::TransferCharacteristic::SMPTE2084);
+        f.set_color_primaries(color::Primaries::BT2020);
+        f.set_color_space(color::Space::BT2020NCL);
+        f.set_color_range(color::Range::JPEG);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::PQ);
+        f.set_color_range(color::Range::MPEG);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe { voll: false, ..hdr::Farbe::PQ });
+        f.set_color_transfer_characteristic(color::TransferCharacteristic::BT709);
+        f.set_color_space(color::Space::BT470BG);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR);
     }
 }

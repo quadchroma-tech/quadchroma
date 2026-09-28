@@ -21,8 +21,21 @@
 // das Bild uebersprungen, nie gewartet: Maus und Tastatur laufen auf
 // demselben Faden. `ohne_fenster` (--anzeigetest) laesst die Swapchain weg
 // und zeichnet in eine eigene Zieltextur.
+//
+// HDR10 (HDR-Plan, Abschnitt 5.4): Ein PQ-Bild - das sagt das VUI des
+// decodierten Bildes, nicht eine Nachricht - geht in Stufe 1 ganzzahlig nach
+// PQ-R'G'B' (BT.2020) in eine R16G16B16A16_UNORM-Zwischentextur. Stufe 2 je
+// nach Ausgabe: auf einem HDR-Schirm ("HDR verwenden" an) wird die Swapchain
+// R10G10B10A2 mit G2084/P2020 und HDR10-Metadaten; die Codes gehen
+// unveraendert durch, wenn das SDR-Weiss beider Seiten gleich ist und die
+// Quelle in den Kopfraum passt, sonst mit der Abbildung aus hdr.rs. Auf einem
+// SDR-Schirm bleibt sie B8G8R8A8, und das PQ-Bild wird farbtontreu
+// abgeschnitten wie in `to_rgb_mit`. Umgeschaltet wird hoechstens alle 0,5 s
+// und nur, wenn Bild und Schirm es verlangen; ein SDR-Strom nimmt den
+// heutigen Weg, bitgleich.
 
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use ffmpeg_next as ffmpeg;
 use windows::core::{Interface, BOOL, PCSTR};
@@ -35,7 +48,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::anzeigeprobe::{fall_pruefen, oberflaeche_probe, probewert};
-use crate::{ebenen_format, protokoll, ui, EbenenFormat, Frame, Karte, Rolle};
+use crate::{ebenen_format, hdr, protokoll, ui, EbenenFormat, Frame, Karte, Rolle};
 
 /// Ein Adapter, wie er im Protokoll und in der Statistik steht.
 pub struct AdapterInfo {
@@ -68,6 +81,9 @@ struct Zwischen {
     rtv: ID3D11RenderTargetView,
     w: u32,
     h: u32,
+    /// PQ-Bild: R16G16B16A16_UNORM mit PQ-R'G'B' (s / 65535, s = Code x 64,
+    /// siehe ps_umrechnen_pq); sonst B8G8R8A8 mit sRGB wie seit jeher.
+    pq: bool,
 }
 
 /// Die Eingangstexturen des laufenden Decoderformats. Der Schluessel sagt,
@@ -109,6 +125,206 @@ struct KonstAnzeige {
     grund: [f32; 4],
 }
 
+/// Konstanten von Stufe 1 fuer PQ-Bilder (cbuffer FormatPq, 32 Byte): Y'CbCr
+/// BT.2020-NCL als Festkomma mit 12 Bit Nachkomma, Ergebnis in Einheiten von
+/// 1/64 10-Bit-Code (siehe `pq_stufe1`, das dasselbe auf der CPU rechnet).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KonstPq {
+    /// Y-Faktor: 65472 / 1023 (voll) oder 65472 / 876 (begrenzt), x 4096.
+    ky: i32,
+    /// Y-Nullpunkt: 0 voll, 64 begrenzt.
+    y0: i32,
+    /// Ebenenwert -> 10-Bit-Code: erst << links (8 Bit: 2), dann >> rechts
+    /// (oben buendig: 6; 10 Bit LE: beides 0).
+    links: u32,
+    rechts: u32,
+    /// Cr -> R', Cb -> G', Cr -> G', Cb -> B', je x 65472 / Nenner x 4096.
+    c: [i32; 4],
+}
+
+/// Konstanten von Stufe 2 fuer PQ-Bilder und die HDR10-Ausgabe (cbuffer Hdr,
+/// 32 Byte). Aus der Strominfo des Hosts und dem Bildschirm (`hdr_zahlen`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KonstHdr {
+    /// SDR-Weiss der Quelle in nit (W_h).
+    weiss_quelle: f32,
+    /// Spitze der Quelle relativ zu W_h (Hs).
+    hs: f32,
+    /// Kopfraum des Ziels (Hd; 1 = SDR-Schirm).
+    hd: f32,
+    /// SDR-Weiss des Client-Schirms in nit (Ausgabe HDR10).
+    weiss_ziel: f32,
+    /// Die Zwischentextur haelt PQ-R'G'B' (1) oder sRGB (0).
+    quelle_pq: u32,
+    /// Die PQ-Codes unveraendert auf den HDR-Schirm (1).
+    durchreichen: u32,
+    _h: [u32; 2],
+}
+
+/// Was die Swapchain ausgibt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ausgabe {
+    /// B8G8R8A8, G22/P709 - der heutige Weg, und jedes Bild auf einem SDR-Schirm.
+    Sdr,
+    /// R10G10B10A2, G2084/P2020 (HDR10) mit Metadaten - ein PQ-Bild auf einem
+    /// HDR-Schirm.
+    Hdr10,
+}
+
+impl Ausgabe {
+    fn format(self) -> DXGI_FORMAT {
+        match self {
+            Ausgabe::Sdr => DXGI_FORMAT_B8G8R8A8_UNORM,
+            Ausgabe::Hdr10 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        }
+    }
+
+    fn farbraum(self) -> DXGI_COLOR_SPACE_TYPE {
+        match self {
+            Ausgabe::Sdr => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            Ausgabe::Hdr10 => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        }
+    }
+}
+
+/// Hoechstens so oft wechselt die Swapchain zwischen SDR und HDR10: jeder
+/// Wechsel kann ein Bild schwarz zeigen (Plan, Risiko 6).
+const UMSCHALT_SPERRE: Duration = Duration::from_millis(500);
+/// So oft liest die Anzeige den Bildschirm des Fensters neu ("HDR verwenden",
+/// SDR-Schieber, Spitze) - wie der Fensterfaden fuer IN_ANZEIGE.
+const SCHIRM_TAKT: Duration = Duration::from_secs(2);
+/// So oft sieht sie nach, ob das Fenster auf einem anderen Monitor steht -
+/// dann gleich, ohne die zwei Sekunden abzuwarten.
+const MONITOR_TAKT: Duration = Duration::from_millis(250);
+/// SDR-Weiss eines HDR-Schirms, wenn DisplayConfig nichts sagt: die Vorgabe
+/// von Windows (SDRWhiteLevel 1000 = 80 nit).
+const WEISS_WINDOWS_VORGABE_NIT: f32 = 80.0;
+/// Groesster Wert von s in der PQ-Zwischentextur: Code 1023 x 64.
+const PQ_S_MAX: i32 = 65472;
+
+/// Welche Ausgabe die Swapchain haben soll: HDR10 nur, wenn ein PQ-Bild zu
+/// sehen ist, der Schirm im HDR-Modus laeuft und DXGI HDR10 nicht schon
+/// abgelehnt hat. Alles andere - auch der Startbildschirm und ein SDR-Strom -
+/// ist SDR.
+fn ausgabe_soll(bild_pq: bool, schirm_hdr: bool, abgelehnt: bool) -> Ausgabe {
+    if bild_pq && schirm_hdr && !abgelehnt {
+        Ausgabe::Hdr10
+    } else {
+        Ausgabe::Sdr
+    }
+}
+
+/// Jetzt umschalten? Nur bei anderem Soll, und hoechstens alle
+/// UMSCHALT_SPERRE (`seit`: Zeit seit der letzten Umschaltung, None = noch
+/// keine). Bis dahin zeigt die laufende Ausgabe, was kommt: ein SDR-Bild auf
+/// HDR10 umgerechnet, ein PQ-Bild auf SDR abgebildet.
+fn umschalten_jetzt(ist: Ausgabe, soll: Ausgabe, seit: Option<Duration>) -> bool {
+    ist != soll && seit.map_or(true, |d| d >= UMSCHALT_SPERRE)
+}
+
+/// Die Entscheidung vor jedem Present: None = bleiben, Some(a) = jetzt auf
+/// `a` umschalten (ausgabe_soll, dann umschalten_jetzt).
+fn ausgabe_wechsel(ist: Ausgabe, bild_pq: bool, schirm_hdr: bool, abgelehnt: bool, seit: Option<Duration>) -> Option<Ausgabe> {
+    let soll = ausgabe_soll(bild_pq, schirm_hdr, abgelehnt);
+    umschalten_jetzt(ist, soll, seit).then_some(soll)
+}
+
+/// Die Zahlen von Stufe 2 aus der Strominfo (None: Vorgaben 203 / 1000 nit)
+/// und dem Bildschirm (None: unbekannt). HDR10: das SDR-Weiss des Schirms
+/// (unbekannt: 80 nit wie Windows) wird das SDR-Weiss der Quelle (E3), der
+/// Kopfraum ist Spitze / Weiss (Spitze unbekannt: 1000 nit); durchgereicht wird,
+/// wenn beide Weiss hoechstens 1 nit auseinanderliegen und die Quelle in den
+/// Kopfraum passt. SDR: Kopfraum 1, farbtontreu abgeschnitten (E4).
+fn hdr_zahlen(quelle: Option<&hdr::InfoV1>, schirm: Option<&hdr::Schirm>, ausgabe: Ausgabe, quelle_pq: bool) -> KonstHdr {
+    let ab = hdr::Abbildung::neu(quelle, 1.0);
+    let (weiss_ziel, hd) = match ausgabe {
+        Ausgabe::Sdr => (ab.weiss_nit, 1.0),
+        Ausgabe::Hdr10 => {
+            let s = schirm.copied().unwrap_or_default();
+            let weiss = if s.sdr_weiss_nit > 0.0 { s.sdr_weiss_nit } else { WEISS_WINDOWS_VORGABE_NIT };
+            let spitze = if s.spitze_nit > 0.0 { s.spitze_nit } else { hdr::SPITZE_VORGABE_NIT };
+            (weiss, (spitze / weiss).max(1.0))
+        }
+    };
+    let durchreichen = ausgabe == Ausgabe::Hdr10 && quelle_pq && (ab.weiss_nit - weiss_ziel).abs() <= 1.0 && ab.hs <= hd;
+    KonstHdr {
+        weiss_quelle: ab.weiss_nit,
+        hs: ab.hs,
+        hd,
+        weiss_ziel,
+        quelle_pq: quelle_pq as u32,
+        durchreichen: durchreichen as u32,
+        _h: [0; 2],
+    }
+}
+
+/// Die HDR10-Metadaten der Swapchain: Primaerfarben BT.2020 und D65 (in
+/// 0,00002), als Spitze die abgebildete Spitze auf diesem Schirm
+/// (min(Hs, Hd) x SDR-Weiss des Schirms, in nit), das Minimum aus der
+/// Strominfo (sonst 0,005 nit), MaxFALL aus der Strominfo, hoechstens die Spitze.
+fn hdr10_metadaten(k: &KonstHdr, quelle: Option<&hdr::InfoV1>) -> DXGI_HDR_METADATA_HDR10 {
+    let spitze = (k.hs.min(k.hd) * k.weiss_ziel).round().clamp(1.0, 10000.0);
+    let min = quelle.map(|q| q.master_min_zehntausendstel).filter(|&m| m != 0).unwrap_or(50);
+    let fall = quelle.map(|q| q.max_fall as f32).unwrap_or(0.0).min(spitze);
+    DXGI_HDR_METADATA_HDR10 {
+        RedPrimary: [35400, 14600],
+        GreenPrimary: [8500, 39850],
+        BluePrimary: [6550, 2300],
+        WhitePoint: [15635, 16450],
+        MaxMasteringLuminance: spitze as u32,
+        MinMasteringLuminance: min as u32,
+        MaxContentLightLevel: spitze as u16,
+        MaxFrameAverageLightLevel: fall as u16,
+    }
+}
+
+/// Die Konstanten von Stufe 1 fuer ein PQ-Bild: Aufbau der Ebenen und Bereich
+/// (begrenzt, wenn das Format oder das VUI es sagt). Gerechnet wird immer mit
+/// BT.2020-NCL (Plan, Abschnitt 2; `zeile_rgb_pq` ebenso).
+fn konst_pq(fmt: EbenenFormat, farbe: hdr::Farbe) -> KonstPq {
+    let begrenzt = fmt.begrenzt || !farbe.voll;
+    let (y_nenner, c_nenner, y0) = if begrenzt { (876.0, 896.0, 64) } else { (1023.0, 1023.0, 0) };
+    let s = PQ_S_MAX as f64;
+    let q = |x: f64| (x * 4096.0).round() as i32;
+    let (links, rechts) = match fmt.bits {
+        8 => (2, 0),
+        10 => (0, 0),
+        _ => (0, 6),
+    };
+    KonstPq {
+        ky: q(s / y_nenner),
+        y0,
+        links,
+        rechts,
+        c: [
+            q(s * hdr::CR_R_2020 as f64 / c_nenner),
+            q(s * hdr::CB_G_2020 as f64 / c_nenner),
+            q(s * hdr::CR_G_2020 as f64 / c_nenner),
+            q(s * hdr::CB_B_2020 as f64 / c_nenner),
+        ],
+    }
+}
+
+/// Stufe 1 fuer PQ auf der CPU, Schritt fuer Schritt wie ps_umrechnen_pq:
+/// drei 10-Bit-Codes -> s = R'G'B' x 65472, geklemmt auf 0..65472. Referenz
+/// des Goldbildtests (Durchreichen: Code = (s + 32) >> 6, Toleranz 0).
+fn pq_stufe1(k: &KonstPq, y: i32, cb: i32, cr: i32) -> [i32; 3] {
+    let (cb, cr) = (cb - 512, cr - 512);
+    let yy = k.ky * (y - k.y0);
+    let r = (yy + k.c[0] * cr + 2048) >> 12;
+    let g = (yy - k.c[1] * cb - k.c[2] * cr + 2048) >> 12;
+    let b = (yy + k.c[3] * cb + 2048) >> 12;
+    [r, g, b].map(|v| v.clamp(0, PQ_S_MAX))
+}
+
+/// Der 10-Bit-Code, den ein HDR-Schirm beim Durchreichen bekommt: s / 64,
+/// gerundet (wie ps_anzeigen_hdr).
+fn pq_durch(s: i32) -> u16 {
+    ((s + 32) >> 6).min(1023) as u16
+}
+
 /// Ergebnis eines Praesentierversuchs.
 pub enum Praesentiert {
     Ok,
@@ -144,9 +360,36 @@ pub struct Gpu {
     pub hoehe: u32,
     /// Darf Present ohne Warten auf den Bildwechsel (ALLOW_TEARING)?
     pub tearing: bool,
+    /// Das Fenster (MonitorFromWindow, schirm_lage); null ohne Fenster.
+    hwnd: HWND,
+    /// Was die Swapchain gerade ausgibt; ohne Fenster immer SDR.
+    ausgabe: Ausgabe,
+    /// Zeitpunkt der letzten Umschaltung (Sperre UMSCHALT_SPERRE).
+    umgeschaltet: Option<Instant>,
+    /// DXGI hat HDR10 an diesem Schirm abgelehnt: kein neuer Versuch, bis
+    /// sich der Schirm aendert; bis dahin meldet die Anzeige dem Host keine
+    /// HDR-Darstellung (hdr_darstellung), er sendet dann SDR.
+    hdr10_abgelehnt: bool,
+    /// Der Bildschirm des Fensters (schirm_lage) und wann er gelesen wurde;
+    /// der Monitor, auf dem das Fenster zuletzt stand, und wann das geprueft wurde.
+    schirm: Option<hdr::Schirm>,
+    schirm_zeit: Option<Instant>,
+    monitor: isize,
+    monitor_zeit: Option<Instant>,
+    /// Strominfo Fassung 1 des laufenden Stroms (SDR-Weiss und Spitze des
+    /// Hosts); kommt mit jedem rohen Bild (`quelle_setzen`).
+    quelle: Option<hdr::InfoV1>,
+    /// Die zuletzt gesetzten HDR10-Metadaten - gesetzt wird nur, was sich aendert.
+    metadaten: Option<DXGI_HDR_METADATA_HDR10>,
+    /// Ein PQ-Bild mit einer anderen Matrix als BT.2020-NCL steht schon im Protokoll.
+    matrix_gemeldet: bool,
     vs: ID3D11VertexShader,
     ps_umrechnen: ID3D11PixelShader,
     ps_anzeigen: ID3D11PixelShader,
+    /// Stufe 1 fuer PQ-Bilder, Stufe 2 fuer PQ auf SDR und fuer HDR10.
+    ps_umrechnen_pq: ID3D11PixelShader,
+    ps_anzeigen_pq_sdr: ID3D11PixelShader,
+    ps_anzeigen_hdr: ID3D11PixelShader,
     /// MIN_MAG_MIP_LINEAR, CLAMP.
     sampler: ID3D11SamplerState,
     /// CULL_NONE.
@@ -155,9 +398,12 @@ pub struct Gpu {
     konst_format: ID3D11Buffer,
     /// 64 Byte, DYNAMIC.
     konst_anzeige: ID3D11Buffer,
+    /// 32 Byte je, DYNAMIC: Stufe 1 PQ (b2) und Stufe 2 HDR (b3).
+    konst_pq: ID3D11Buffer,
+    konst_hdr: ID3D11Buffer,
     /// Eingangstexturen des laufenden Formats.
     ebenen: Option<Ebenen>,
-    /// B8G8R8A8_UNORM, Bildgroesse, RT + SRV.
+    /// Bildgroesse, RT + SRV: B8G8R8A8_UNORM, bei PQ-Bildern R16G16B16A16_UNORM.
     zwischen: Option<Zwischen>,
     /// B8G8R8A8_UNORM, Zielgroesse, DEFAULT, nur SRV.
     oberflaeche: Option<Textur>,
@@ -169,7 +415,8 @@ pub struct Gpu {
 /// den Konstanten aus `zeile_rgb`; Stufe 2 nimmt dieselben Quellpunkte wie
 /// `blit`. Register: Stufe 1 auf b0 und t0..t3, Stufe 2 auf b1 und t4..t5 -
 /// getrennt, damit sich die Deklarationen in EINER Quelle nicht in die Quere
-/// kommen.
+/// kommen. Die HDR-Einstiege dahinter nehmen dazu b2 (Stufe 1 PQ) und b3
+/// (Stufe 2 HDR); ihre Zahlen sind die aus hdr.rs (Test pq_zahlen_wie_in_hdr_rs).
 const SHADER: &str = r#"
 // ---------- gemeinsam: ein Dreieck ueber das ganze Ziel, ohne Vertexpuffer ----------
 // (0,0) (2,0) (0,2) im Bildraum, nach Clip-Koordinaten gespiegelt (y nach unten).
@@ -238,6 +485,193 @@ float4 ps_anzeigen(float4 pos : SV_Position) : SV_Target {
         farbe = farbe * o.a + o.rgb;             // "over" mit vormultiplizierter Farbe und Durchsicht
     }
     return float4(farbe, 1);
+}
+
+// ================= HDR10 (PQ, BT.2020): dieselbe Rechnung wie hdr.rs =================
+
+// ---------- Stufe 1 fuer PQ-Bilder: Ebenen -> PQ-R'G'B', ganzzahlig wie pq_stufe1 ----------
+// Gespeichert wird s = R'G'B' x 65472 (10-Bit-Code x 64, sechs Bit Nachkomma)
+// als s / 65535 in R16G16B16A16_UNORM: UNORM16 trifft s genau, und
+// (s + 32) >> 6 ist der Code, den ein HDR-Schirm beim Durchreichen bekommt.
+cbuffer FormatPq : register(b2) {
+    int  pq_ky;      // Y-Faktor, Festkomma 12 Bit: 65472 / 1023 (voll) oder / 876 (begrenzt)
+    int  pq_y0;      // Y-Nullpunkt: 0 voll, 64 begrenzt
+    uint pq_links;   // Ebenenwert -> 10-Bit-Code: << links (8 Bit: 2) ...
+    uint pq_rechts;  // ... >> rechts (oben buendig: 6)
+    int4 pq_c;       // Cr->R', Cb->G', Cr->G', Cb->B' (BT.2020-NCL), Festkomma 12 Bit
+};
+uint pq_code(uint v) { return (v << pq_links) >> pq_rechts; }
+float4 ps_umrechnen_pq(float4 pos : SV_Position) : SV_Target {
+    int2 xy = int2(pos.xy);
+    int2 c  = (sub != 0) ? (xy >> 1) : xy;
+    int y = int(pq_code(ebene_y.Load(int3(xy, 0))));
+    int cb, cr;
+    if (paar != 0) {
+        uint2 uv = ebene_uv.Load(int3(c, 0));
+        cb = int(pq_code(uv.x));
+        cr = int(pq_code(uv.y));
+    } else {
+        cb = int(pq_code(ebene_u.Load(int3(c, 0))));
+        cr = int(pq_code(ebene_v.Load(int3(c, 0))));
+    }
+    cb -= 512; cr -= 512;
+    int yy = pq_ky * (y - pq_y0);
+    int r = (yy + pq_c.x * cr + 2048) >> 12;
+    int g = (yy - pq_c.y * cb - pq_c.z * cr + 2048) >> 12;
+    int b = (yy + pq_c.w * cb + 2048) >> 12;
+    int3 s = clamp(int3(r, g, b), 0, 65472);
+    return float4(float3(s) * (1.0 / 65535.0), 1.0);
+}
+
+// ---------- Stufe 2 fuer PQ-Bilder und die HDR10-Ausgabe ----------
+cbuffer Hdr : register(b3) {
+    float h_weiss_quelle;   // SDR-Weiss des Hosts (W_h) in nit
+    float h_hs;             // Spitze der Quelle / W_h
+    float h_hd;             // Kopfraum des Ziels (1 = SDR-Schirm)
+    float h_weiss_ziel;     // SDR-Weiss des Client-Schirms in nit (HDR10)
+    uint  h_quelle_pq;      // Zwischentextur: 1 = PQ-R'G'B' (Stufe 1 PQ), 0 = sRGB
+    uint  h_durchreichen;   // 1 = PQ-Codes unveraendert auf den HDR-Schirm
+    uint2 _h;
+};
+
+// Lineares RGB BT.709 <-> BT.2020, zeilenweise wie hdr.rs (mul(M, v) = M v).
+static const float3x3 M_709_NACH_2020 = {
+    0.6274039, 0.32928303, 0.043313067,
+    0.06909729, 0.9195404, 0.011362316,
+    0.01639144, 0.08801331, 0.89559525
+};
+static const float3x3 M_2020_NACH_709 = {
+    1.660491, -0.5876411, -0.07284986,
+    -0.12455048, 1.1328999, -0.008349423,
+    -0.018150764, -0.1005789, 1.1187297
+};
+
+// PQ (SMPTE ST 2084): Signal 0..1 <-> nit. exp2(log2()) statt pow: ohne die
+// Warnung zu negativen Basen; log2(0) = -inf, exp2(-inf) = 0.
+float3 pq_eotf(float3 e) {
+    e = saturate(e);
+    float3 p = exp2(log2(e) * (1.0 / 78.84375));
+    float3 z = max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p);
+    return exp2(log2(z) * (1.0 / 0.1593017578125)) * 10000.0;
+}
+float3 pq_oetf(float3 nit) {
+    float3 y  = saturate(nit * (1.0 / 10000.0));
+    float3 ym = exp2(log2(y) * 0.1593017578125);
+    return exp2(log2((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym)) * 78.84375);
+}
+
+// sRGB, stueckweise (IEC 61966-2-1).
+float3 srgb_eotf(float3 v) {
+    v = saturate(v);
+    return (v <= 0.04045) ? v / 12.92 : exp2(log2((v + 0.055) / 1.055) * 2.4);
+}
+float3 srgb_oetf(float3 l) {
+    l = saturate(l);
+    float3 tief = l * 12.92;
+    float3 hoch = 1.055 * exp2(log2(l) * (1.0 / 2.4)) - 0.055;
+    return (l <= 0.0031308) ? tief : hoch;
+}
+
+// Selbst runden und den exakten Bruch k/255 bzw. k/1023 ausgeben - die
+// UNORM-Wandlung des Ziels trifft dann genau k.
+float3 acht_bit(float3 v) { return floor(saturate(v) * 255.0 + 0.5) * (1.0 / 255.0); }
+float3 zehn_bit(float3 v) { return floor(saturate(v) * 1023.0 + 0.5) * (1.0 / 1023.0); }
+
+// Die Abbildung aus hdr.rs (abbilden, rgb_abbilden): Knie beim SDR-Weiss (1),
+// C1-stetig, bildet Hs genau auf Hd ab; Hs <= Hd oder Hd <= 1: bei Hd
+// abgeschnitten. Farbtreu ueber das groesste Glied.
+float abbilden(float m, float hs, float hd) {
+    if (hs <= hd) return min(m, hd);
+    float d = hd - 1.0;
+    if (d <= 0.0) return min(m, hd);
+    if (m <= 1.0) return m;
+    float e = m - 1.0;
+    float s = hs - 1.0;
+    return min(1.0 + e * (1.0 + e * d / (s * s)) / (1.0 + e / d), hd);
+}
+float3 rgb_abbilden(float3 rgb, float hs, float hd) {
+    float m = max(rgb.r, max(rgb.g, rgb.b));
+    return (m > 0.0) ? rgb * (abbilden(m, hs, hd) / m) : rgb;
+}
+
+// Der Wert der Zwischentextur an diesem Zielpunkt, mit denselben Quellpunkten
+// wie ps_anzeigen (blit); false ausserhalb des Bildes.
+bool bild_lesen(float4 pos, out float3 v) {
+    v = float3(0, 0, 0);
+    int2 p = int2(pos.xy) - rect.xy;
+    if ((modus & 1) == 0 || any(p < 0) || any(p >= rect.zw)) return false;
+    uint2 f = uint2(p) * schritt;
+    if (all(schritt == 65536)) {
+        v = video.Load(int3(int2(f >> 16), 0)).rgb;
+    } else {
+        float2 t = float2(f >> 16) + float2(f & 0xffff) * (1.0 / 65536.0);
+        v = video.SampleLevel(weich, (t + 0.5) / float2(bild), 0).rgb;
+    }
+    return true;
+}
+
+// Zwischentextur PQ (s / 65535) -> PQ-Signal 0..1 (s / 65472).
+float3 pq_signal(float3 v) { return saturate(v * (65535.0 / 65472.0)); }
+
+// PQ-Bild -> lineares Licht BT.2020 relativ zum SDR-Weiss des Hosts.
+float3 pq_relativ(float3 v) { return max(pq_eotf(pq_signal(v)) / h_weiss_quelle, 0.0); }
+
+// SDR-Inhalt (sRGB) auf dem HDR10-Ziel: SDR-Weiss = SDR-Weiss des Schirms.
+float3 sdr_nach_nit(float3 v) { return mul(M_709_NACH_2020, srgb_eotf(v)) * h_weiss_ziel; }
+
+// PQ-Bild auf einem SDR-Ziel (B8G8R8A8): farbtontreu beim SDR-Weiss
+// abgeschnitten (E4), BT.2020 -> BT.709, sRGB - wie pq_nach_srgb8. Die
+// Oberflaeche liegt darueber wie in ps_anzeigen.
+float4 ps_anzeigen_pq_sdr(float4 pos : SV_Position) : SV_Target {
+    float3 farbe = grund.rgb;
+    float3 v;
+    if (bild_lesen(pos, v)) {
+        float3 rel = rgb_abbilden(pq_relativ(v), h_hs, 1.0);
+        farbe = acht_bit(srgb_oetf(mul(M_2020_NACH_709, rel)));
+    }
+    if ((modus & 2) != 0) {
+        float4 o = oberflaeche.Load(int3(pos.xy, 0));
+        farbe = farbe * o.a + o.rgb;
+    }
+    return float4(farbe, 1);
+}
+
+// Ausgabe HDR10 (R10G10B10A2, G2084/P2020). Ein PQ-Bild geht beim
+// Durchreichen mit seinen Codes durch, sonst: relativ zum SDR-Weiss des
+// Hosts, abgebildet auf den Kopfraum des Schirms, mal dessen SDR-Weiss (E3).
+// Ein SDR-Bild (nur waehrend der Umschaltsperre) und die Oberflaeche: sRGB ->
+// linear, SDR-Weiss des Schirms, BT.709 -> BT.2020; die Oberflaeche "over" in
+// linearem Licht. Dann PQ, zehn Bit.
+float4 ps_anzeigen_hdr(float4 pos : SV_Position) : SV_Target {
+    float3 nit = sdr_nach_nit(grund.rgb);
+    float3 v;
+    bool roh = false;
+    float3 code = float3(0, 0, 0);
+    if (bild_lesen(pos, v)) {
+        if (h_quelle_pq == 0) {
+            nit = sdr_nach_nit(v);
+        } else if (h_durchreichen != 0) {
+            float3 s = floor(v * 65535.0 + 0.5);            // s genau zurueck (UNORM16)
+            code = min(floor((s + 32.0) * (1.0 / 64.0)), 1023.0);
+            roh = true;
+        } else {
+            nit = rgb_abbilden(pq_relativ(v), h_hs, h_hd) * h_weiss_ziel;
+        }
+    }
+    if ((modus & 2) != 0) {
+        float4 o = oberflaeche.Load(int3(pos.xy, 0));
+        float deckung = 1.0 - o.a;
+        if (deckung > 0.0 || any(o.rgb > 0.0)) {
+            if (roh) {
+                nit = pq_eotf(code * (1.0 / 1023.0));      // beim Durchreichen: nit der Quelle = nit am Schirm
+                roh = false;
+            }
+            float3 farbe = (deckung > 0.0) ? o.rgb / deckung : float3(0, 0, 0);
+            nit = nit * o.a + sdr_nach_nit(farbe) * deckung;
+        }
+    }
+    if (roh) return float4(code * (1.0 / 1023.0), 1);
+    return float4(zehn_bit(pq_oetf(nit)), 1);
 }
 "#;
 
@@ -403,11 +837,17 @@ pub fn tearing_moeglich() -> bool {
 
 // ------------------------------------------------------------------- HDR
 
-/// Kann dieser Weg HDR-Bilder zeigen (Bit 1 in IN_ANZEIGE)? Noch nicht: die
-/// Swapchain in R10G10B10A2/G2084 und die PQ-Shader kommen mit Schritt 5b
-/// des HDR-Plans. Bis dahin meldet der Windows-Client ehrlich "nein" - ein
-/// Host sendet ihm dann nie PQ (Grund 5).
-pub const HDR_DARSTELLUNG: bool = false;
+/// Kann dieser Weg HDR-Bilder zeigen (Bit 1 in IN_ANZEIGE)? Ja: PQ-Bilder
+/// gehen ueber Stufe 1 PQ - auf einem HDR-Schirm in eine HDR10-Swapchain
+/// (R10G10B10A2, G2084/P2020), auf einem SDR-Schirm abgebildet. Nein, sobald
+/// DXGI HDR10 an diesem Schirm abgelehnt hat (`abgelehnt`): dann soll der Host
+/// SDR senden (Unsicherheit ergibt SDR), statt die ganze Sitzung PQ zu
+/// liefern, das hier nur abgebildet wird - bis sich der Schirm aendert
+/// (lage_pruefen). Ob der Schirm HDR kann, sagt Bit 0 (schirm_lage); der
+/// softbuffer-Weg meldet nein.
+fn hdr_darstellung_moeglich(abgelehnt: bool) -> bool {
+    !abgelehnt
+}
 
 /// Der Bildschirm des Fensters fuer IN_ANZEIGE: der Ausgang, auf dem der
 /// groesste Teil des Fensters liegt (MonitorFromWindow - nicht
@@ -416,7 +856,8 @@ pub const HDR_DARSTELLUNG: bool = false;
 /// Spitzen) und das SDR-Weiss aus DisplayConfig (dieselbe Hilfe wie der
 /// Host). Die Factory bleibt, solange sie gilt (IsCurrent - eine alte kennt
 /// neu angesteckte Bildschirme und einen umgeschalteten HDR-Modus nicht);
-/// der Fensterfaden fragt alle zwei Sekunden. None, wenn kein Ausgang passt.
+/// der Fensterfaden fragt alle zwei Sekunden, die Anzeige selbst ebenso (fuer
+/// ihre Ausgabe, `lage_pruefen`). None, wenn kein Ausgang passt.
 pub fn schirm_lage(hwnd: isize) -> Option<crate::hdr::Schirm> {
     use std::cell::RefCell;
     use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
@@ -664,6 +1105,7 @@ impl Gpu {
         gpu.warte = warte;
         gpu.breite = ww;
         gpu.hoehe = wh;
+        gpu.hwnd = hwnd;
         gpu.backbuffer_sicht()?;
         protokoll::zeile(format!(
             "Anzeige: D3D11 {}{}, FL {}, Tearing {}, Ausgang {}, Latenz 1",
@@ -707,16 +1149,195 @@ impl Gpu {
             sc.ResizeBuffers(0, ww, wh, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(self.flags as i32))
         }
         .map_err(|e| fehler(&format!("ResizeBuffers {ww}x{wh}"), e))?;
+        // Das Format bleibt (DXGI_FORMAT_UNKNOWN); den Farbraum der
+        // HDR10-Ausgabe sicherheitshalber neu setzen, wie Microsofts Beispiel
+        // es nach jedem ResizeBuffers tut.
+        if self.ausgabe == Ausgabe::Hdr10 {
+            if let Ok(sc3) = sc.cast::<IDXGISwapChain3>() {
+                if let Err(e) = unsafe { sc3.SetColorSpace1(Ausgabe::Hdr10.farbraum()) } {
+                    protokoll::zeile(fehler("Anzeige: SetColorSpace1 G2084 nach ResizeBuffers", e));
+                }
+            }
+        }
         self.backbuffer_sicht()?;
         self.breite = ww;
         self.hoehe = wh;
         Ok(())
     }
 
-    /// Praesentiert die Swapchain gerade in HDR (G2084)? Noch nie: sie ist
-    /// immer B8G8R8A8/SDR, siehe HDR_DARSTELLUNG.
+    /// Praesentiert die Swapchain gerade in HDR (HDR10: R10G10B10A2 mit
+    /// G2084/P2020)? Das ist die Seite des Clients fuer das goldene "HDR"
+    /// (hdr::lage) - eine HDR-Quelle auf einem SDR-Schirm ist nur abgebildet.
     pub fn hdr_praesentiert(&self) -> bool {
-        false
+        self.ausgabe == Ausgabe::Hdr10
+    }
+
+    /// Bit 1 in IN_ANZEIGE: kann diese Anzeige HDR-Bilder zeigen? Nein, solange
+    /// DXGI HDR10 an diesem Schirm abgelehnt hat (hdr_darstellung_moeglich).
+    pub fn hdr_darstellung(&self) -> bool {
+        hdr_darstellung_moeglich(self.hdr10_abgelehnt)
+    }
+
+    /// Die Strominfo Fassung 1 des Stroms, zu dem das naechste rohe Bild
+    /// gehoert (None: Host vor 0.2.0 - dann gelten die Vorgaben 203 / 1000
+    /// nit). Der Empfangsfaden gibt sie jedem Bild mit.
+    pub fn quelle_setzen(&mut self, quelle: Option<&hdr::InfoV1>) {
+        self.quelle = quelle.copied();
+    }
+
+    /// Den Bildschirm des Fensters neu lesen, wenn es Zeit ist: alle
+    /// SCHIRM_TAKT, und sofort, wenn das Fenster auf einem anderen Monitor
+    /// steht (alle MONITOR_TAKT nachgesehen - MonitorFromWindow ist billig).
+    /// Ein anderer Monitor oder ein umgeschaltetes "HDR verwenden": HDR10 darf
+    /// wieder versucht werden.
+    fn lage_pruefen(&mut self) {
+        use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        let jetzt = Instant::now();
+        let mut lesen = self.schirm_zeit.map_or(true, |t| jetzt.duration_since(t) >= SCHIRM_TAKT);
+        if lesen || self.monitor_zeit.map_or(true, |t| jetzt.duration_since(t) >= MONITOR_TAKT) {
+            self.monitor_zeit = Some(jetzt);
+            let m = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+            if m != self.monitor {
+                self.monitor = m;
+                self.hdr10_abgelehnt = false;
+                lesen = true;
+            }
+        }
+        if !lesen {
+            return;
+        }
+        self.schirm_zeit = Some(jetzt);
+        let neu = schirm_lage(self.hwnd.0 as isize);
+        if neu.map(|s| s.hdr) != self.schirm.map(|s| s.hdr) {
+            protokoll::zeile(format!(
+                "Anzeige: Bildschirm {}",
+                match &neu {
+                    Some(s) if s.hdr => format!("HDR (SDR-Weiss {:.0} nit, Spitze {:.0} nit)", s.sdr_weiss_nit, s.spitze_nit),
+                    Some(_) => "SDR".into(),
+                    None => "unbekannt (gilt als SDR)".into(),
+                }
+            ));
+            self.hdr10_abgelehnt = false;
+        }
+        self.schirm = neu;
+    }
+
+    /// Die Swapchain auf eine andere Ausgabe umstellen: Sicht fallen lassen,
+    /// ResizeBuffers mit dem Format (gleiche Groesse, gleiche Flags),
+    /// CheckColorSpaceSupport und SetColorSpace1, bei HDR10 die Metadaten,
+    /// bei SDR keine. Lehnt DXGI HDR10 ab, geht es zurueck auf SDR, und bis
+    /// sich der Schirm aendert, wird es nicht wieder versucht.
+    fn ausgabe_setzen(&mut self, neu: Ausgabe) -> Result<(), String> {
+        // Auch ein gescheiterter Versuch zaehlt fuer die Sperre.
+        self.umgeschaltet = Some(Instant::now());
+        let Some(sc) = self.swapchain.clone() else { return Err("keine Swapchain".into()) };
+        let (ww, wh, flags) = (self.breite, self.hoehe, DXGI_SWAP_CHAIN_FLAG(self.flags as i32));
+        if ww == 0 || wh == 0 {
+            return Err("Swapchain ohne Groesse".into());
+        }
+        let sc3: IDXGISwapChain3 = sc.cast().map_err(|e| fehler("IDXGISwapChain3", e))?;
+        self.sichten_loesen();
+        self.rtv = None;
+        unsafe { self.ctx.Flush() };
+        let stellen = |a: Ausgabe| -> Result<(), String> {
+            unsafe { sc.ResizeBuffers(0, ww, wh, a.format(), flags) }.map_err(|e| fehler("ResizeBuffers", e))?;
+            let geht = unsafe { sc3.CheckColorSpaceSupport(a.farbraum()) }.map_err(|e| fehler("CheckColorSpaceSupport", e))?;
+            if geht & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 == 0 {
+                return Err(format!("CheckColorSpaceSupport: Farbraum {} nicht praesentierbar (0x{geht:x})", a.farbraum().0));
+            }
+            unsafe { sc3.SetColorSpace1(a.farbraum()) }.map_err(|e| fehler("SetColorSpace1", e))
+        };
+        let ergebnis = stellen(neu);
+        match &ergebnis {
+            Ok(()) => {
+                self.ausgabe = neu;
+                self.metadaten = None;
+                if neu == Ausgabe::Sdr {
+                    if let Ok(sc4) = sc.cast::<IDXGISwapChain4>() {
+                        let _ = unsafe { sc4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, None) };
+                    }
+                }
+            }
+            Err(_) => {
+                if let Err(e) = stellen(Ausgabe::Sdr) {
+                    protokoll::zeile(format!("Anzeige: zurueck auf SDR gescheitert: {e}"));
+                }
+                self.ausgabe = Ausgabe::Sdr;
+                self.metadaten = None;
+            }
+        }
+        if let Err(e) = self.backbuffer_sicht() {
+            // Ohne Sicht kein Bild: keine Groesse gilt als eingestellt, dann
+            // baut `groesse` beim naechsten Takt Puffer und Sicht neu (wie
+            // nach einem gescheiterten ResizeBuffers dort).
+            self.breite = 0;
+            self.hoehe = 0;
+            return Err(e);
+        }
+        ergebnis
+    }
+
+    /// Vor jedem Present: Schirm pruefen, Ausgabe waehlen (umschalten, wenn
+    /// noetig und erlaubt), bei HDR10 die Metadaten nachfuehren. Gibt die
+    /// Zahlen fuer Stufe 2 zurueck.
+    fn ausgabe_fuehren(&mut self, bild_da: bool) -> KonstHdr {
+        self.lage_pruefen();
+        let pq = bild_da && self.zwischen.as_ref().is_some_and(|z| z.pq);
+        let schirm_hdr = self.schirm.is_some_and(|s| s.hdr);
+        if let Some(soll) = ausgabe_wechsel(self.ausgabe, pq, schirm_hdr, self.hdr10_abgelehnt, self.umgeschaltet.map(|t| t.elapsed())) {
+            match self.ausgabe_setzen(soll) {
+                Ok(()) => {
+                    let k = hdr_zahlen(self.quelle.as_ref(), self.schirm.as_ref(), soll, pq);
+                    protokoll::zeile(match soll {
+                        Ausgabe::Hdr10 => format!(
+                            "Anzeige: Swapchain HDR10 (R10G10B10A2, G2084/P2020), Weiss Quelle {:.0} nit, Schirm {:.0} nit, Kopfraum Quelle {:.2}, Schirm {:.2}, Durchreichen {}",
+                            k.weiss_quelle, k.weiss_ziel, k.hs, k.hd, if k.durchreichen != 0 { "ja" } else { "nein" }
+                        ),
+                        Ausgabe::Sdr => "Anzeige: Swapchain SDR (B8G8R8A8, G22/P709)".into(),
+                    });
+                }
+                Err(e) => {
+                    // HDR10 geht hier nicht (DXGI lehnt ab, Windows vor 10):
+                    // nicht wieder versuchen, bis sich der Schirm aendert, und
+                    // bis dahin dem Host keine HDR-Darstellung melden
+                    // (IN_ANZEIGE Bit 1 = 0 beim naechsten anzeige_takt) - er
+                    // stellt dann auf SDR um.
+                    let hdr10 = soll == Ausgabe::Hdr10;
+                    self.hdr10_abgelehnt |= hdr10;
+                    protokoll::zeile(format!(
+                        "Anzeige: Umschalten auf {} gescheitert: {e}{}",
+                        if hdr10 { "HDR10" } else { "SDR" },
+                        if hdr10 { " - bis sich der Bildschirm aendert: keine HDR-Darstellung an den Host (er sendet SDR), HDR-Bilder bis dahin auf SDR abgebildet" } else { "" }
+                    ));
+                }
+            }
+        }
+        let k = hdr_zahlen(self.quelle.as_ref(), self.schirm.as_ref(), self.ausgabe, self.zwischen.as_ref().is_some_and(|z| z.pq));
+        if self.ausgabe == Ausgabe::Hdr10 {
+            let m = hdr10_metadaten(&k, self.quelle.as_ref());
+            if self.metadaten != Some(m) {
+                if let Some(sc4) = self.swapchain.as_ref().and_then(|s| s.cast::<IDXGISwapChain4>().ok()) {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(&m as *const DXGI_HDR_METADATA_HDR10 as *const u8, std::mem::size_of::<DXGI_HDR_METADATA_HDR10>())
+                    };
+                    match unsafe { sc4.SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, Some(bytes)) } {
+                        Ok(()) => protokoll::zeile(format!(
+                            "Anzeige: HDR10-Metadaten: Spitze {} nit, Minimum {:.4} nit, MaxCLL {}, MaxFALL {}",
+                            m.MaxMasteringLuminance,
+                            m.MinMasteringLuminance as f32 / 10000.0,
+                            m.MaxContentLightLevel,
+                            m.MaxFrameAverageLightLevel
+                        )),
+                        Err(e) => protokoll::zeile(fehler("Anzeige: SetHDRMetaData", e)),
+                    }
+                }
+                self.metadaten = Some(m);
+            }
+        }
+        k
     }
 
     /// Ist DXGI bereit fuer ein weiteres Bild? Fragt das Warteobjekt mit
@@ -757,8 +1378,10 @@ impl Gpu {
     /// dieses Geraets.
     pub fn zeichnen(&mut self, rect: Option<(i32, i32, u32, u32)>, ui_an: bool, sofort: bool) -> Praesentiert {
         let Some(sc) = self.swapchain.clone() else { return Praesentiert::Fehler("keine Swapchain".into()) };
+        // Vor der Sicht auf den Backbuffer: eine Umschaltung legt sie neu an.
+        let k = self.ausgabe_fuehren(rect.is_some_and(|r| r.2 > 0 && r.3 > 0));
         let Some(rtv) = self.rtv.clone() else { return Praesentiert::Fehler("keine Sicht auf den Backbuffer".into()) };
-        if let Err(e) = self.stufe2(&rtv, self.breite, self.hoehe, rect, ui_an) {
+        if let Err(e) = self.stufe2(&rtv, self.breite, self.hoehe, rect, ui_an, self.ausgabe, &k) {
             return self.einordnen(e);
         }
         let reissen = sofort && self.tearing;
@@ -790,15 +1413,26 @@ impl Gpu {
         let vs_code = uebersetzen(b"vs_main\0", b"vs_4_0\0")?;
         let ps1_code = uebersetzen(b"ps_umrechnen\0", b"ps_4_0\0")?;
         let ps2_code = uebersetzen(b"ps_anzeigen\0", b"ps_4_0\0")?;
+        let ps1_pq_code = uebersetzen(b"ps_umrechnen_pq\0", b"ps_4_0\0")?;
+        let ps2_pq_sdr_code = uebersetzen(b"ps_anzeigen_pq_sdr\0", b"ps_4_0\0")?;
+        let ps2_hdr_code = uebersetzen(b"ps_anzeigen_hdr\0", b"ps_4_0\0")?;
         let mut vs = None;
         let mut ps_umrechnen = None;
         let mut ps_anzeigen = None;
+        let mut ps_umrechnen_pq = None;
+        let mut ps_anzeigen_pq_sdr = None;
+        let mut ps_anzeigen_hdr = None;
         let mut sampler = None;
         let mut raster = None;
         unsafe {
             device.CreateVertexShader(&vs_code, None, Some(&mut vs)).map_err(|e| fehler("CreateVertexShader", e))?;
             device.CreatePixelShader(&ps1_code, None, Some(&mut ps_umrechnen)).map_err(|e| fehler("CreatePixelShader umrechnen", e))?;
             device.CreatePixelShader(&ps2_code, None, Some(&mut ps_anzeigen)).map_err(|e| fehler("CreatePixelShader anzeigen", e))?;
+            device.CreatePixelShader(&ps1_pq_code, None, Some(&mut ps_umrechnen_pq)).map_err(|e| fehler("CreatePixelShader umrechnen_pq", e))?;
+            device
+                .CreatePixelShader(&ps2_pq_sdr_code, None, Some(&mut ps_anzeigen_pq_sdr))
+                .map_err(|e| fehler("CreatePixelShader anzeigen_pq_sdr", e))?;
+            device.CreatePixelShader(&ps2_hdr_code, None, Some(&mut ps_anzeigen_hdr)).map_err(|e| fehler("CreatePixelShader anzeigen_hdr", e))?;
             let sd = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -828,6 +1462,8 @@ impl Gpu {
         }
         let konst_format = konstpuffer(&device, std::mem::size_of::<KonstFormat>() as u32)?;
         let konst_anzeige = konstpuffer(&device, std::mem::size_of::<KonstAnzeige>() as u32)?;
+        let konst_pq = konstpuffer(&device, std::mem::size_of::<KonstPq>() as u32)?;
+        let konst_hdr = konstpuffer(&device, std::mem::size_of::<KonstHdr>() as u32)?;
         let adapter = adapter_des_geraets(&device);
         let gpu = Gpu {
             device,
@@ -840,13 +1476,29 @@ impl Gpu {
             breite: 0,
             hoehe: 0,
             tearing: false,
+            hwnd: HWND(std::ptr::null_mut()),
+            ausgabe: Ausgabe::Sdr,
+            umgeschaltet: None,
+            hdr10_abgelehnt: false,
+            schirm: None,
+            schirm_zeit: None,
+            monitor: 0,
+            monitor_zeit: None,
+            quelle: None,
+            metadaten: None,
+            matrix_gemeldet: false,
             vs: vs.ok_or("CreateVertexShader lieferte nichts")?,
             ps_umrechnen: ps_umrechnen.ok_or("CreatePixelShader lieferte nichts")?,
             ps_anzeigen: ps_anzeigen.ok_or("CreatePixelShader lieferte nichts")?,
+            ps_umrechnen_pq: ps_umrechnen_pq.ok_or("CreatePixelShader lieferte nichts")?,
+            ps_anzeigen_pq_sdr: ps_anzeigen_pq_sdr.ok_or("CreatePixelShader lieferte nichts")?,
+            ps_anzeigen_hdr: ps_anzeigen_hdr.ok_or("CreatePixelShader lieferte nichts")?,
             sampler: sampler.ok_or("CreateSamplerState lieferte nichts")?,
             raster: raster.ok_or("CreateRasterizerState lieferte nichts")?,
             konst_format,
             konst_anzeige,
+            konst_pq,
+            konst_hdr,
             ebenen: None,
             zwischen: None,
             oberflaeche: None,
@@ -924,21 +1576,32 @@ impl Gpu {
         }
     }
 
-    /// Zwischentextur in Bildgroesse, neu nur wenn die Groesse nicht stimmt.
-    fn zwischen_sichern(&mut self, w: u32, h: u32) -> Result<(), String> {
-        if self.zwischen.as_ref().map(|z| (z.w, z.h)) == Some((w, h)) {
+    /// Zwischentextur in Bildgroesse, neu nur wenn Groesse oder Art nicht
+    /// stimmen: B8G8R8A8 fuer SDR, R16G16B16A16_UNORM fuer PQ-Bilder.
+    fn zwischen_sichern(&mut self, w: u32, h: u32, pq: bool) -> Result<(), String> {
+        let alt = self.zwischen.as_ref().map(|z| (z.w, z.h, z.pq));
+        if alt == Some((w, h, pq)) {
             return Ok(());
         }
         self.sichten_loesen();
         self.zwischen = None;
+        let format = if pq { DXGI_FORMAT_R16G16B16A16_UNORM } else { DXGI_FORMAT_B8G8R8A8_UNORM };
         let tex = self.textur_anlegen(
-            w, h, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT,
+            w, h, format, D3D11_USAGE_DEFAULT,
             (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             0,
         )?;
         let srv = self.srv_anlegen(&tex)?;
         let rtv = self.rtv_anlegen(&tex)?;
-        self.zwischen = Some(Zwischen { tex, srv, rtv, w, h });
+        self.zwischen = Some(Zwischen { tex, srv, rtv, w, h, pq });
+        // Nur der Wechsel der Art geht ins Protokoll, nicht jede neue Groesse.
+        if alt.map(|a| a.2) != Some(pq) && (alt.is_some() || pq) {
+            protokoll::zeile(format!(
+                "Anzeige: Bild {} - Zwischentextur {w}x{h} {}",
+                if pq { "PQ/BT.2020 (HDR10)" } else { "SDR" },
+                if pq { "R16G16B16A16" } else { "B8G8R8A8" }
+            ));
+        }
         Ok(())
     }
 
@@ -961,7 +1624,6 @@ impl Gpu {
             (Some(self.ebene_textur(cw, ch, einzeln)?), Some(self.ebene_textur(cw, ch, einzeln)?), None)
         };
         self.ebenen = Some(Ebenen { schluessel, fmt, y, u, v, uv });
-        self.zwischen_sichern(w, h)?;
         protokoll::zeile(format!(
             "Ebenen neu: {:?} {w}x{h}, Farbebenen {cw}x{ch}, {} Bit{}",
             schluessel.0, fmt.bits,
@@ -997,8 +1659,10 @@ impl Gpu {
     }
 
     /// Ein rohes Decoderbild: Ebenen (bei Bedarf neu) anlegen, hochladen,
-    /// Stufe 1 in die Zwischentextur. Das Bild darf danach fallen.
+    /// Stufe 1 in die Zwischentextur - fuer ein PQ-Bild (Transfer aus dem VUI
+    /// des Bildes) Stufe 1 PQ. Das Bild darf danach fallen.
     pub fn bild_roh(&mut self, f: &ffmpeg::frame::Video) -> Result<(), String> {
+        let farbe = crate::Ebenenbild::farbe(f);
         let Some(fmt) = ebenen_format(f.format()) else {
             return Err(format!("Unbekanntes Bildformat vom Decoder: {:?}", f.format()));
         };
@@ -1039,7 +1703,17 @@ impl Gpu {
                 f.stride(0), f.stride(1), if fmt.paar { 0 } else { f.stride(2) }, ry, r1, r2
             ));
         }
-        self.stufe1()
+        let pq = farbe.ist_pq();
+        self.zwischen_sichern(w, h, pq)?;
+        if pq {
+            if farbe.matrix != hdr::MATRIX_2020_NCL && !self.matrix_gemeldet {
+                self.matrix_gemeldet = true;
+                protokoll::zeile(format!("Anzeige: PQ-Bild mit Matrix {} - gerechnet wird BT.2020-NCL", farbe.matrix));
+            }
+            self.stufe1(Some(konst_pq(fmt, farbe)))
+        } else {
+            self.stufe1(None)
+        }
     }
 
     /// Ein fertiges RGB-Bild (Rueckfall, dunkles Bild): direkt in die
@@ -1050,7 +1724,7 @@ impl Gpu {
         if w == 0 || h == 0 || f.pixels.len() < (w as usize) * (h as usize) {
             return Err("RGB-Bild ist leer oder zu klein".into());
         }
-        self.zwischen_sichern(w, h)?;
+        self.zwischen_sichern(w, h, false)?;
         let z = self.zwischen.as_ref().ok_or("Zwischentextur fehlt")?;
         unsafe {
             self.ctx.UpdateSubresource(&z.tex, 0, None, f.pixels.as_ptr() as *const c_void, w * 4, 0);
@@ -1108,8 +1782,10 @@ impl Gpu {
         Ok(())
     }
 
-    /// Stufe 1: Ebenen -> Zwischentextur.
-    fn stufe1(&self) -> Result<(), String> {
+    /// Stufe 1: Ebenen -> Zwischentextur. Mit `pq` (ein PQ-Bild) ueber
+    /// ps_umrechnen_pq in die R16G16B16A16-Zwischentextur, ganzzahlig wie
+    /// `pq_stufe1`; sonst der heutige Weg (ps_umrechnen, bitidentisch zu to_rgb).
+    fn stufe1(&self, pq: Option<KonstPq>) -> Result<(), String> {
         let e = self.ebenen.as_ref().ok_or("Ebenen fehlen")?;
         let z = self.zwischen.as_ref().ok_or("Zwischentextur fehlt")?;
         self.sichten_loesen();
@@ -1117,13 +1793,19 @@ impl Gpu {
             &self.konst_format,
             &KonstFormat { sub: e.fmt.sub as u32, paar: e.fmt.paar as u32, schieb: e.fmt.schieb(), _f: 0 },
         )?;
+        if let Some(k) = &pq {
+            self.konstanten_schreiben(&self.konst_pq, k)?;
+        }
         unsafe {
             self.ctx.OMSetRenderTargets(Some(&[Some(z.rtv.clone())]), None);
             self.ctx.RSSetViewports(Some(&[viewport(z.w, z.h)]));
             self.ctx.RSSetState(&self.raster);
             self.ctx.VSSetShader(&self.vs, None);
-            self.ctx.PSSetShader(&self.ps_umrechnen, None);
+            self.ctx.PSSetShader(if pq.is_some() { &self.ps_umrechnen_pq } else { &self.ps_umrechnen }, None);
             self.ctx.PSSetConstantBuffers(0, Some(&[Some(self.konst_format.clone())]));
+            if pq.is_some() {
+                self.ctx.PSSetConstantBuffers(2, Some(&[Some(self.konst_pq.clone())]));
+            }
             self.ctx.PSSetShaderResources(
                 0,
                 Some(&[
@@ -1142,8 +1824,20 @@ impl Gpu {
 
     /// Stufe 2 in ein Ziel (ww x wh): Grundfarbe, Bild im Rechteck, darueber
     /// die Oberflaeche. Das Ziel ist der Backbuffer der Swapchain (`zeichnen`)
-    /// oder die Testtextur (`offscreen`).
-    fn stufe2(&self, ziel: &ID3D11RenderTargetView, ww: u32, wh: u32, rect: Option<(i32, i32, u32, u32)>, ui_an: bool) -> Result<(), String> {
+    /// oder die Testtextur (`offscreen`, `offscreen_hdr`). Der Shader folgt
+    /// Ausgabe und Bild: SDR-Bild auf SDR der heutige (bitgleich), PQ-Bild auf
+    /// SDR abgebildet, alles auf HDR10 ueber ps_anzeigen_hdr mit den Zahlen `k`.
+    #[allow(clippy::too_many_arguments)]
+    fn stufe2(
+        &self,
+        ziel: &ID3D11RenderTargetView,
+        ww: u32,
+        wh: u32,
+        rect: Option<(i32, i32, u32, u32)>,
+        ui_an: bool,
+        ausgabe: Ausgabe,
+        k: &KonstHdr,
+    ) -> Result<(), String> {
         let bild = self.zwischen.as_ref();
         let (rect, bild_da) = match (rect, bild) {
             (Some(r), Some(_)) if r.2 > 0 && r.3 > 0 => (r, true),
@@ -1160,7 +1854,7 @@ impl Gpu {
         };
         let ui_da = ui_an && self.oberflaeche.is_some();
         let bg = ui::BG;
-        let k = KonstAnzeige {
+        let ka = KonstAnzeige {
             rect: [rect.0, rect.1, rect.2 as i32, rect.3 as i32],
             bild: [fw, fh],
             schritt,
@@ -1168,15 +1862,25 @@ impl Gpu {
             _a: [0; 3],
             grund: [((bg >> 16) & 255) as f32 / 255.0, ((bg >> 8) & 255) as f32 / 255.0, (bg & 255) as f32 / 255.0, 1.0],
         };
+        let pq = bild_da && bild.is_some_and(|z| z.pq);
+        let ps = match (ausgabe, pq) {
+            (Ausgabe::Sdr, false) => &self.ps_anzeigen,
+            (Ausgabe::Sdr, true) => &self.ps_anzeigen_pq_sdr,
+            (Ausgabe::Hdr10, _) => &self.ps_anzeigen_hdr,
+        };
         self.sichten_loesen();
-        self.konstanten_schreiben(&self.konst_anzeige, &k)?;
+        self.konstanten_schreiben(&self.konst_anzeige, &ka)?;
+        if ausgabe == Ausgabe::Hdr10 || pq {
+            self.konstanten_schreiben(&self.konst_hdr, k)?;
+        }
         unsafe {
             self.ctx.OMSetRenderTargets(Some(&[Some(ziel.clone())]), None);
             self.ctx.RSSetViewports(Some(&[viewport(ww, wh)]));
             self.ctx.RSSetState(&self.raster);
             self.ctx.VSSetShader(&self.vs, None);
-            self.ctx.PSSetShader(&self.ps_anzeigen, None);
+            self.ctx.PSSetShader(ps, None);
             self.ctx.PSSetConstantBuffers(1, Some(&[Some(self.konst_anzeige.clone())]));
+            self.ctx.PSSetConstantBuffers(3, Some(&[Some(self.konst_hdr.clone())]));
             self.ctx.PSSetShaderResources(
                 4,
                 Some(&[bild.map(|z| z.srv.clone()), self.oberflaeche.as_ref().map(|t| t.srv.clone())]),
@@ -1193,7 +1897,17 @@ impl Gpu {
     /// 0x00RRGGBB (Alphabyte maskiert). Nur fuer den Test - das wartet auf
     /// die Karte.
     fn auslesen(&self, tex: &ID3D11Texture2D, w: u32, h: u32) -> Result<Vec<u32>, String> {
-        let staging = self.textur_anlegen(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?;
+        let mut aus = self.auslesen_roh(tex, w, h, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+        for p in aus.iter_mut() {
+            *p &= 0x00ff_ffff;
+        }
+        Ok(aus)
+    }
+
+    /// Wie `auslesen`, fuer jedes Format mit vier Byte je Punkt, ohne Maske
+    /// (R10G10B10A2: R in Bit 0-9, G 10-19, B 20-29).
+    fn auslesen_roh(&self, tex: &ID3D11Texture2D, w: u32, h: u32, format: DXGI_FORMAT) -> Result<Vec<u32>, String> {
+        let staging = self.textur_anlegen(w, h, format, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ.0 as u32)?;
         let mut aus = vec![0u32; (w as usize) * (h as usize)];
         let mut m = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
@@ -1207,27 +1921,46 @@ impl Gpu {
             }
             self.ctx.Unmap(&staging, 0);
         }
-        for p in aus.iter_mut() {
-            *p &= 0x00ff_ffff;
-        }
         Ok(aus)
     }
 
-    /// Nur Test: Stufe 2 in eine eigene Zieltextur, dann zurueck in den
-    /// Hauptspeicher.
+    /// Nur Test: Stufe 2 in eine eigene B8G8R8A8-Zieltextur (Ausgabe SDR),
+    /// dann zurueck in den Hauptspeicher. Ein PQ-Bild wird dabei abgebildet
+    /// wie auf einem SDR-Schirm.
     pub fn offscreen(&mut self, ww: u32, wh: u32, rect: Option<(i32, i32, u32, u32)>, ui_an: bool) -> Result<Vec<u32>, String> {
         if ww == 0 || wh == 0 {
             return Err("Zielgroesse null".into());
         }
         let ziel = self.textur_anlegen(ww, wh, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET.0 as u32, 0)?;
         let rtv = self.rtv_anlegen(&ziel)?;
-        self.stufe2(&rtv, ww, wh, rect, ui_an)?;
+        let pq = self.zwischen.as_ref().is_some_and(|z| z.pq);
+        let k = hdr_zahlen(self.quelle.as_ref(), None, Ausgabe::Sdr, pq);
+        self.stufe2(&rtv, ww, wh, rect, ui_an, Ausgabe::Sdr, &k)?;
         self.auslesen(&ziel, ww, wh)
     }
 
-    /// Nur Test: das Ergebnis von Stufe 1, 1:1.
+    /// Nur Test: Stufe 2 in eine eigene R10G10B10A2-Zieltextur, wie auf einem
+    /// HDR-Schirm mit dieser Lage (Ausgabe HDR10), zurueck als rohe Worte.
+    pub fn offscreen_hdr(&mut self, ww: u32, wh: u32, rect: Option<(i32, i32, u32, u32)>, ui_an: bool, schirm: &hdr::Schirm) -> Result<Vec<u32>, String> {
+        if ww == 0 || wh == 0 {
+            return Err("Zielgroesse null".into());
+        }
+        let format = Ausgabe::Hdr10.format();
+        let ziel = self.textur_anlegen(ww, wh, format, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET.0 as u32, 0)?;
+        let rtv = self.rtv_anlegen(&ziel)?;
+        let pq = self.zwischen.as_ref().is_some_and(|z| z.pq);
+        let k = hdr_zahlen(self.quelle.as_ref(), Some(schirm), Ausgabe::Hdr10, pq);
+        self.stufe2(&rtv, ww, wh, rect, ui_an, Ausgabe::Hdr10, &k)?;
+        self.auslesen_roh(&ziel, ww, wh, format)
+    }
+
+    /// Nur Test: das Ergebnis von Stufe 1, 1:1 (nur SDR - die PQ-Zwischentextur
+    /// hat acht Byte je Punkt und wird ueber Stufe 2 geprueft).
     pub fn zwischen_auslesen(&mut self) -> Result<(Vec<u32>, u32, u32), String> {
         let z = self.zwischen.as_ref().ok_or("Zwischentextur fehlt")?;
+        if z.pq {
+            return Err("PQ-Zwischentextur laesst sich nicht als BGRA lesen".into());
+        }
         Ok((self.auslesen(&z.tex, z.w, z.h)?, z.w, z.h))
     }
 }
@@ -1517,6 +2250,497 @@ pub fn anzeigetest(verzeichnis: &str) -> bool {
             }
         }
     }
+
+    // HDR10: die Formate, in denen PQ ankommt (Software-Decoder 4:4:4 und
+    // 4:2:0, cuvid oben buendig und P010), dazu zweimal begrenzter Bereich.
+    println!("HDR10: PQ-Ebenen gegen hdr.rs - Durchreichen exakt, sonst +-1 (CPU-Tabellen +-2)");
+    let pq_formate = [Pixel::YUV444P10LE, Pixel::YUV444P10MSBLE, Pixel::YUV444P16LE, Pixel::YUV420P10LE, Pixel::P010LE];
+    for p in pq_formate {
+        for (w, h) in [(257u32, 131u32), (1920, 1080)] {
+            ok &= pq_pruefen(&mut gpu, p, w, h, true, verzeichnis, lang, &mut u);
+            for z in protokoll::abholen() {
+                println!("    {z}");
+            }
+        }
+    }
+    for p in [Pixel::YUV444P10LE, Pixel::P010LE] {
+        ok &= pq_pruefen(&mut gpu, p, 257, 131, false, verzeichnis, lang, &mut u);
+    }
+    ok &= sdr_auf_hdr10_pruefen(&mut gpu, 257, 131);
+    for z in protokoll::abholen() {
+        println!("    {z}");
+    }
     println!("{}", if ok { "Anzeigetest bestanden" } else { "Anzeigetest NICHT bestanden" });
     ok
+}
+
+// ------------------------------------------------ --anzeigetest: HDR10
+
+/// Das VUI eines HDR10-Stroms an einem Probebild: PQ, BT.2020, BT.2020-NCL,
+/// voller oder begrenzter Bereich.
+fn als_pq(mut f: ffmpeg::frame::Video, voll: bool) -> ffmpeg::frame::Video {
+    use ffmpeg::color;
+    f.set_color_transfer_characteristic(color::TransferCharacteristic::SMPTE2084);
+    f.set_color_primaries(color::Primaries::BT2020);
+    f.set_color_space(color::Space::BT2020NCL);
+    f.set_color_range(if voll { color::Range::JPEG } else { color::Range::MPEG });
+    f
+}
+
+/// Die drei 10-Bit-Codes eines Bildpunkts, so gelesen wie Stufe 1 PQ sie liest
+/// (8 Bit << 2, 10 Bit LE wie sie sind, oben buendig >> 6).
+fn codes10(f: &ffmpeg::frame::Video, fmt: EbenenFormat, x: usize, y: usize) -> (i32, i32, i32) {
+    let wert = |ebene: usize, i: usize, zeile: usize| -> i32 {
+        let (d, s) = (f.data(ebene), f.stride(ebene));
+        let v = if fmt.bits == 8 { d[zeile * s + i] as u32 } else { u16::from_le_bytes([d[zeile * s + 2 * i], d[zeile * s + 2 * i + 1]]) as u32 };
+        match fmt.bits {
+            8 => (v << 2) as i32,
+            10 => v as i32,
+            _ => (v >> 6) as i32,
+        }
+    };
+    let (cx, cy) = if fmt.sub { (x / 2, y / 2) } else { (x, y) };
+    let (cb, cr) = if fmt.paar { (wert(1, 2 * cx, cy), wert(1, 2 * cx + 1, cy)) } else { (wert(1, cx, cy), wert(2, cx, cy)) };
+    (wert(0, x, y), cb, cr)
+}
+
+/// Soll einer HDR10-Ausgabe mit Abbildung (nicht durchgereicht), in f64 aus
+/// hdr.rs: Codes -> Y'CbCr -> R'G'B' -> nit -> relativ zu W_h -> Abbildung Hs
+/// auf Hd -> mal SDR-Weiss des Schirms -> PQ-Code.
+fn soll_hdr(c: (i32, i32, i32), begrenzt: bool, k: &KonstHdr) -> [u16; 3] {
+    let (y, cb, cr) = hdr::normieren10(c.0, c.1, c.2, begrenzt);
+    let e = hdr::ycbcr_nach_rgb_2020(y, cb, cr);
+    let rel = e.map(|v| (hdr::pq_eotf(v as f64) / k.weiss_quelle as f64) as f32);
+    hdr::rgb_abbilden(rel, k.hs, k.hd).map(|v| hdr::pq_code10(v as f64 * k.weiss_ziel as f64))
+}
+
+/// Soll der Oberflaeche ueber einem HDR10-Punkt (Code `video`): wie
+/// ps_anzeigen_hdr - Farbe aus der vormultiplizierten Oberflaeche
+/// zurueckgewonnen, sRGB -> linear, BT.709 -> BT.2020, mal SDR-Weiss des
+/// Schirms, "over" in linearem Licht, PQ. Ganz durchsichtig: `video` unberuehrt.
+fn soll_ui_hdr(video: [u16; 3], o: u32, weiss_ziel: f64) -> [u16; 3] {
+    let a = ((o >> 24) & 255) as f64 / 255.0;
+    let rgb = [(o >> 16) & 255, (o >> 8) & 255, o & 255].map(|c| c as f64 / 255.0);
+    let deckung = 1.0 - a;
+    if deckung <= 0.0 && rgb.iter().all(|&c| c <= 0.0) {
+        return video;
+    }
+    let farbe = if deckung > 0.0 { rgb.map(|c| (c / deckung).min(1.0)) } else { [0.0; 3] };
+    let ui = hdr::mal(&hdr::M_709_NACH_2020, farbe.map(|c| hdr::srgb_eotf(c) as f32));
+    [0, 1, 2].map(|i| hdr::pq_code10(hdr::pq_eotf(video[i] as f64 / 1023.0) * a + ui[i] as f64 * weiss_ziel * deckung))
+}
+
+/// Ein Vergleich in zehn Bit (R10G10B10A2 aus der Karte gegen das Soll):
+/// groesste und mittlere Abweichung ueber alle Kanaele, eine Zeile; bei
+/// Ueberschreitung der erste Punkt mit der groessten Abweichung.
+fn fall_pruefen10(name: &str, w: u32, h: u32, fall: &str, soll: &[[u16; 3]], karte: &[u32], toleranz: u32) -> bool {
+    if karte.len() < soll.len() {
+        println!("{name:<15} {w:>4}x{h:<4} {fall:<11} FEHLER: Puffer zu klein ({} statt {})", karte.len(), soll.len());
+        return false;
+    }
+    let mut max = 0u32;
+    let mut summe = 0u64;
+    let mut stelle = None;
+    for (i, (s, &k)) in soll.iter().zip(karte).enumerate() {
+        let ist = [k & 0x3ff, (k >> 10) & 0x3ff, (k >> 20) & 0x3ff];
+        let d = (0..3).map(|c| ist[c].abs_diff(s[c] as u32)).max().unwrap_or(0);
+        if d > max {
+            max = d;
+            stelle = Some((i, ist, *s));
+        }
+        summe += d as u64;
+    }
+    let ok = max <= toleranz;
+    println!(
+        "{name:<15} {w:>4}x{h:<4} {fall:<11} max {max:>3}  mittel {:.4}  {}",
+        summe as f64 / soll.len().max(1) as f64,
+        if ok { "ok".to_string() } else { format!("FEHLER (Toleranz {toleranz}, zehn Bit)") }
+    );
+    if let (false, Some((i, ist, s))) = (ok, stelle) {
+        println!("    groesste Abweichung bei ({}, {}): Karte {ist:?}, Soll {s:?}", i % w as usize, i / w as usize);
+    }
+    ok
+}
+
+/// Ein PQ-Format in einer Groesse (Strominfo: SDR-Weiss 203 nit, Mastering
+/// 1000 nit): (1) HDR-Schirm mit demselben Weiss - durchgereicht, Codes exakt
+/// wie `pq_stufe1`; (2) Schirm-Weiss 1,25-fach (253,75 nit, Spitze 1000 nit) -
+/// abgebildet, +-1 gegen hdr.rs; (3) SDR-Schirm - B8G8R8A8 gegen
+/// pq_nach_srgb8 +-1 und gegen den CPU-Weg (to_rgb_mit, Tabellen) +-2;
+/// (4) skaliert auf beide Ausgaben, nur dass es laeuft; (5) ab 700x400 die
+/// Oberflaeche ueber dem durchgereichten Bild, linear ueberblendet, +-1.
+#[allow(clippy::too_many_arguments)]
+fn pq_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, voll: bool, verzeichnis: &str, lang: &'static crate::strings::Lang, u: &mut ui::Ui) -> bool {
+    let name = format!("{p:?}{}", if voll { "" } else { " begr." });
+    let (Some(fmt), Some(roh)) = (ebenen_format(p), probebild(p, w, h)) else {
+        println!("{name:<15} {w:>4}x{h:<4} kein Probebild: Format unbekannt");
+        return false;
+    };
+    let bild = als_pq(roh, voll);
+    let farbe = crate::Ebenenbild::farbe(&bild);
+    if !farbe.ist_pq() || farbe.voll != voll {
+        println!("{name:<15} {w:>4}x{h:<4} VUI falsch gelesen: {}", farbe.text());
+        return false;
+    }
+    let quelle = hdr::InfoV1 {
+        farbe: hdr::Farbe::PQ,
+        grund: hdr::GRUND_AKTIV,
+        sdr_weiss_nit: 203,
+        master_max_nit: 1000,
+        master_min_zehntausendstel: 50,
+        max_cll: 0,
+        max_fall: 0,
+    };
+    gpu.quelle_setzen(Some(&quelle));
+    if let Err(e) = gpu.bild_roh(&bild) {
+        println!("{name:<15} {w:>4}x{h:<4} Stufe 1 PQ: {e}");
+        return false;
+    }
+    let k = konst_pq(fmt, farbe);
+    let (wu, hu) = (w as usize, h as usize);
+    let codes: Vec<(i32, i32, i32)> = (0..hu).flat_map(|y| (0..wu).map(move |x| (x, y))).map(|(x, y)| codes10(&bild, fmt, x, y)).collect();
+    let rect = Some((0, 0, w, h));
+    let mut ok = true;
+
+    // (1) Durchreichen.
+    let schirm_gleich = hdr::Schirm { hdr: true, sdr_weiss_nit: 203.0, spitze_nit: 1000.0, vollbild_spitze_nit: 600.0, kopfraum_potentiell: 4.93, kopfraum_aktuell: 4.93 };
+    let durch: Vec<[u16; 3]> = codes.iter().map(|c| pq_stufe1(&k, c.0, c.1, c.2).map(pq_durch)).collect();
+    if hdr_zahlen(Some(&quelle), Some(&schirm_gleich), Ausgabe::Hdr10, true).durchreichen == 0 {
+        println!("{name:<15} {w:>4}x{h:<4} FEHLER: gleiches Weiss, und doch nicht durchgereicht");
+        ok = false;
+    }
+    match gpu.offscreen_hdr(w, h, rect, false, &schirm_gleich) {
+        Ok(aus) => ok &= fall_pruefen10(&name, w, h, "PQ durch", &durch, &aus, 0),
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} PQ durch: {e}");
+            ok = false;
+        }
+    }
+
+    // (2) Weiss-Angleichung 1,25 mit Abbildung (Kopfraum 3,94 < Hs 4,93).
+    let schirm_hell = hdr::Schirm { sdr_weiss_nit: 253.75, ..schirm_gleich };
+    let kh = hdr_zahlen(Some(&quelle), Some(&schirm_hell), Ausgabe::Hdr10, true);
+    let soll: Vec<[u16; 3]> = codes.iter().map(|&c| soll_hdr(c, !voll, &kh)).collect();
+    match gpu.offscreen_hdr(w, h, rect, false, &schirm_hell) {
+        Ok(aus) => ok &= fall_pruefen10(&name, w, h, "PQ Weiss", &soll, &aus, 1),
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} PQ Weiss: {e}");
+            ok = false;
+        }
+    }
+
+    // (3) SDR-Schirm.
+    let ab = hdr::Abbildung::sdr(Some(&quelle));
+    let referenz: Vec<u32> = codes
+        .iter()
+        .map(|&(y, cb, cr)| {
+            let (yn, cbn, crn) = hdr::normieren10(y, cb, cr, !voll);
+            let v = hdr::pq_nach_srgb8(yn, cbn, crn, &ab);
+            ((v[0] as u32) << 16) | ((v[1] as u32) << 8) | v[2] as u32
+        })
+        .collect();
+    match gpu.offscreen(w, h, rect, false) {
+        Ok(aus) => {
+            ok &= fall_pruefen(&name, w, h, "PQ->SDR", &referenz, &aus, w, h, 1, Some(verzeichnis), lang);
+            match crate::to_rgb_mit(&bild, Some(&quelle)) {
+                Ok(cpu) => ok &= fall_pruefen(&name, w, h, "PQ CPU", &cpu.pixels, &aus, w, h, 2, Some(verzeichnis), lang),
+                Err(e) => {
+                    println!("{name:<15} {w:>4}x{h:<4} to_rgb_mit: {e}");
+                    ok = false;
+                }
+            }
+        }
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} PQ->SDR: {e}");
+            ok = false;
+        }
+    }
+
+    // (4) Skaliert: der Weg ueber den Filter, auf beide Ausgaben.
+    let (bw, bh) = (700u32, 400u32);
+    let r = crate::ziel_rechteck(bw, bh, w, h, false);
+    match gpu.offscreen(bw, bh, Some(r), false).and_then(|_| gpu.offscreen_hdr(bw, bh, Some(r), false, &schirm_hell)) {
+        Ok(_) => println!("{name:<15} {w:>4}x{h:<4} {:<11} ok (laeuft, ohne Vergleich)", "PQ skal."),
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} PQ skaliert: {e}");
+            ok = false;
+        }
+    }
+
+    // (5) Oberflaeche ueber dem durchgereichten Bild.
+    if w >= 700 && h >= 400 {
+        let mut leer = vec![0xff00_0000u32; wu * hu];
+        let kasten = {
+            let mut c = ui::Canvas::neu(&mut leer, wu, hu);
+            oberflaeche_probe(&mut c, u, &format!("{name} {w}x{h} HDR10"));
+            c.kasten_nehmen().unwrap_or(ui::Rect { x: 0, y: 0, w: 0, h: 0 })
+        };
+        let soll: Vec<[u16; 3]> = durch.iter().zip(&leer).map(|(&v, &o)| soll_ui_hdr(v, o, 203.0)).collect();
+        match gpu.oberflaeche_hochladen(&leer, w, h, kasten).and_then(|_| gpu.offscreen_hdr(w, h, rect, true, &schirm_gleich)) {
+            Ok(aus) => ok &= fall_pruefen10(&name, w, h, "PQ UI HDR", &soll, &aus, 1),
+            Err(e) => {
+                println!("{name:<15} {w:>4}x{h:<4} PQ UI HDR: {e}");
+                ok = false;
+            }
+        }
+    }
+    gpu.quelle_setzen(None);
+    ok
+}
+
+/// Ein SDR-Bild auf der HDR10-Ausgabe (so zeigt die Anzeige SDR waehrend der
+/// Umschaltsperre): sRGB -> linear, BT.709 -> BT.2020, mal SDR-Weiss des
+/// Schirms (240 nit), PQ - gegen to_rgb und hdr.rs, +-1.
+fn sdr_auf_hdr10_pruefen(gpu: &mut Gpu, w: u32, h: u32) -> bool {
+    let p = ffmpeg::format::Pixel::YUV444P10LE;
+    let name = format!("{p:?}");
+    let Some(bild) = probebild(p, w, h) else { return false };
+    let referenz = match crate::to_rgb(&bild) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} to_rgb: {e}");
+            return false;
+        }
+    };
+    gpu.quelle_setzen(None);
+    if let Err(e) = gpu.bild_roh(&bild) {
+        println!("{name:<15} {w:>4}x{h:<4} SDR->HDR10: {e}");
+        return false;
+    }
+    let schirm = hdr::Schirm { hdr: true, sdr_weiss_nit: 240.0, spitze_nit: 1000.0, vollbild_spitze_nit: 600.0, kopfraum_potentiell: 4.17, kopfraum_aktuell: 4.17 };
+    let soll: Vec<[u16; 3]> = referenz
+        .pixels
+        .iter()
+        .map(|&px| {
+            let lin = [(px >> 16) & 255, (px >> 8) & 255, px & 255].map(|c| hdr::srgb_eotf(c as f64 / 255.0) as f32);
+            hdr::mal(&hdr::M_709_NACH_2020, lin).map(|c| hdr::pq_code10(c as f64 * 240.0))
+        })
+        .collect();
+    match gpu.offscreen_hdr(w, h, Some((0, 0, w, h)), false, &schirm) {
+        Ok(aus) => fall_pruefen10(&name, w, h, "SDR->HDR10", &soll, &aus, 1),
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} SDR->HDR10: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quelle(weiss: u16, cll: u16) -> hdr::InfoV1 {
+        hdr::InfoV1 {
+            farbe: hdr::Farbe::PQ,
+            grund: hdr::GRUND_AKTIV,
+            sdr_weiss_nit: weiss,
+            master_max_nit: 1000,
+            master_min_zehntausendstel: 0,
+            max_cll: cll,
+            max_fall: 0,
+        }
+    }
+
+    fn schirm(weiss: f32, spitze: f32) -> hdr::Schirm {
+        hdr::Schirm { hdr: true, sdr_weiss_nit: weiss, spitze_nit: spitze, ..hdr::Schirm::default() }
+    }
+
+    /// Die Konstanten liegen so, wie der Shader sie liest: Groessen, Lage und
+    /// Reihenfolge in den cbuffern FormatPq (b2) und Hdr (b3).
+    #[test]
+    fn konstanten_wie_im_shader() {
+        assert_eq!(std::mem::size_of::<KonstPq>(), 32);
+        assert_eq!(std::mem::offset_of!(KonstPq, c), 16);
+        assert_eq!(std::mem::size_of::<KonstHdr>(), 32);
+        assert_eq!(std::mem::offset_of!(KonstHdr, quelle_pq), 16);
+        let reihenfolge = |cb: &str, namen: &[&str]| {
+            let t = &SHADER[SHADER.find(cb).unwrap_or_else(|| panic!("{cb} fehlt"))..];
+            let t = &t[..t.find("};").expect("Ende des cbuffer")];
+            let lage: Vec<usize> = namen.iter().map(|n| t.find(n).unwrap_or_else(|| panic!("{n} fehlt in {cb}"))).collect();
+            assert!(lage.windows(2).all(|w| w[0] < w[1]), "{cb}: Reihenfolge {namen:?}");
+        };
+        reihenfolge("cbuffer FormatPq : register(b2)", &["pq_ky", "pq_y0", "pq_links", "pq_rechts", "pq_c"]);
+        reihenfolge("cbuffer Hdr : register(b3)", &["h_weiss_quelle", "h_hs", "h_hd", "h_weiss_ziel", "h_quelle_pq", "h_durchreichen", "uint2 _h"]);
+        for e in ["float4 ps_umrechnen_pq(", "float4 ps_anzeigen_pq_sdr(", "float4 ps_anzeigen_hdr("] {
+            assert_eq!(SHADER.matches(e).count(), 1, "{e}");
+        }
+    }
+
+    /// Die Zahlen im HLSL sind die aus hdr.rs: PQ, sRGB, beide Matrizen
+    /// zeilenweise, das Knie, die Skala der PQ-Zwischentextur.
+    #[test]
+    fn pq_zahlen_wie_in_hdr_rs() {
+        for z in [hdr::PQ_M1, hdr::PQ_M2, hdr::PQ_C1, hdr::PQ_C2, hdr::PQ_C3] {
+            assert!(SHADER.contains(&format!("{z}")), "PQ-Konstante {z} fehlt");
+        }
+        assert_eq!(hdr::PQ_SPITZE_NIT, 10000.0);
+        assert!(SHADER.contains("* 10000.0") && SHADER.contains("(1.0 / 10000.0)"));
+        for (name, m) in [("M_709_NACH_2020", hdr::M_709_NACH_2020), ("M_2020_NACH_709", hdr::M_2020_NACH_709)] {
+            let t = &SHADER[SHADER.find(&format!("float3x3 {name}")).unwrap_or_else(|| panic!("{name} fehlt"))..];
+            let t = &t[..t.find("};").expect("Ende der Matrix")];
+            for r in m {
+                let zeile = format!("{}, {}, {}", r[0], r[1], r[2]);
+                assert!(t.contains(&zeile), "{name}: Zeile {zeile} fehlt");
+            }
+        }
+        for z in ["0.04045", "12.92", "1.055", "0.055", "2.4", "0.0031308"] {
+            assert!(SHADER.contains(z), "sRGB {z}");
+        }
+        assert_eq!(hdr::KNIE, 1.0);
+        assert!(SHADER.contains("float d = hd - 1.0;") && SHADER.contains("if (m <= 1.0) return m;"));
+        assert_eq!(PQ_S_MAX, 1023 * 64);
+        assert!(SHADER.contains("clamp(int3(r, g, b), 0, 65472)") && SHADER.contains("(65535.0 / 65472.0)"));
+    }
+
+    /// Stufe 1 PQ rechnet ganzzahlig, was hdr.rs in Gleitkomma rechnet:
+    /// hoechstens 1/64 Code daneben, voll wie begrenzt. Dazu die Lesart der
+    /// Ebenen und das Runden beim Durchreichen.
+    #[test]
+    fn stufe1_pq_wie_hdr_rs() {
+        let fmt = |bits: u8| EbenenFormat { sub: false, bits, paar: false, begrenzt: false };
+        for voll in [true, false] {
+            let k = konst_pq(fmt(10), hdr::Farbe { voll, ..hdr::Farbe::PQ });
+            let mut max = 0f32;
+            for y in (0..1024).step_by(31).chain([1023]) {
+                for cb in (0..1024).step_by(17).chain([1023]) {
+                    for cr in (0..1024).step_by(13).chain([1023]) {
+                        let s = pq_stufe1(&k, y, cb, cr);
+                        let (yn, cbn, crn) = hdr::normieren10(y, cb, cr, !voll);
+                        let e = hdr::ycbcr_nach_rgb_2020(yn, cbn, crn);
+                        for c in 0..3 {
+                            max = max.max((s[c] as f32 - e[c].clamp(0.0, 1.0) * PQ_S_MAX as f32).abs());
+                        }
+                    }
+                }
+            }
+            assert!(max <= 1.0, "voll {voll}: {max} x 1/64 Code daneben");
+        }
+        // Begrenzt auch, wenn nur das Format es sagt (VideoToolbox x444).
+        assert_eq!(konst_pq(EbenenFormat { begrenzt: true, ..fmt(10) }, hdr::Farbe::PQ).y0, 64);
+        assert_eq!(konst_pq(fmt(10), hdr::Farbe::PQ).y0, 0);
+        assert_eq!(konst_pq(fmt(10), hdr::Farbe::PQ).ky, 64 * 4096);
+        let lesart = |bits| {
+            let k = konst_pq(fmt(bits), hdr::Farbe::PQ);
+            (k.links, k.rechts)
+        };
+        assert_eq!((lesart(8), lesart(10), lesart(16)), ((2, 0), (0, 0), (0, 6)));
+        // Schwarz, Weiss, Grau 520 (100 nit) und die Grenzen.
+        let k = konst_pq(fmt(10), hdr::Farbe::PQ);
+        assert_eq!(pq_stufe1(&k, 0, 512, 512), [0; 3]);
+        assert_eq!(pq_stufe1(&k, 1023, 512, 512), [PQ_S_MAX; 3]);
+        assert_eq!(pq_stufe1(&k, 520, 512, 512).map(pq_durch), [520; 3]);
+        assert_eq!((pq_durch(31), pq_durch(32), pq_durch(PQ_S_MAX)), (0, 1, 1023));
+    }
+
+    /// Durchgereicht wird nur bei gleichem SDR-Weiss (+-1 nit) und wenn die
+    /// Quelle in den Kopfraum passt; sonst abgebildet. Vorgaben ohne Angaben:
+    /// Quelle 203 / 1000 nit, Schirm 80 nit Weiss (Windows), 1000 nit Spitze.
+    #[test]
+    fn durchreichen_nur_bei_gleichem_weiss_und_genug_kopfraum() {
+        let q = quelle(203, 0);
+        let k = hdr_zahlen(Some(&q), Some(&schirm(203.0, 1000.0)), Ausgabe::Hdr10, true);
+        assert_eq!((k.durchreichen, k.quelle_pq), (1, 1));
+        assert!((k.hs - 1000.0 / 203.0).abs() < 1e-6 && (k.hd - 1000.0 / 203.0).abs() < 1e-6);
+        // 1 nit daneben reicht noch durch (Spitze mit Luft: Hs <= Hd bleibt), 2 nit nicht mehr.
+        assert_eq!(hdr_zahlen(Some(&q), Some(&schirm(204.0, 1100.0)), Ausgabe::Hdr10, true).durchreichen, 1);
+        assert_eq!(hdr_zahlen(Some(&q), Some(&schirm(202.0, 1100.0)), Ausgabe::Hdr10, true).durchreichen, 1);
+        assert_eq!(hdr_zahlen(Some(&q), Some(&schirm(205.0, 1100.0)), Ausgabe::Hdr10, true).durchreichen, 0);
+        // Weiss 1 nit daneben, Spitze genau 1000 nit: Hs 4,93 > Hd 4,90 - abbilden.
+        assert_eq!(hdr_zahlen(Some(&q), Some(&schirm(204.0, 1000.0)), Ausgabe::Hdr10, true).durchreichen, 0);
+        // Der Schirm ist dunkler als die Quelle: abbilden.
+        let k = hdr_zahlen(Some(&q), Some(&schirm(203.0, 600.0)), Ausgabe::Hdr10, true);
+        assert_eq!(k.durchreichen, 0);
+        assert!((k.hd - 600.0 / 203.0).abs() < 1e-6);
+        // MaxCLL geht vor Mastering: 400 nit passen auf 600.
+        assert_eq!(hdr_zahlen(Some(&quelle(203, 400)), Some(&schirm(203.0, 600.0)), Ausgabe::Hdr10, true).durchreichen, 1);
+        // Schirm ohne Angaben.
+        let k = hdr_zahlen(Some(&q), Some(&hdr::Schirm { hdr: true, ..hdr::Schirm::default() }), Ausgabe::Hdr10, true);
+        assert_eq!((k.weiss_ziel, k.hd, k.durchreichen), (80.0, 12.5, 0));
+        // Ohne Strominfo: 203 / 1000 nit.
+        let k = hdr_zahlen(None, Some(&schirm(203.0, 1000.0)), Ausgabe::Hdr10, true);
+        assert_eq!((k.weiss_quelle, k.durchreichen), (203.0, 1));
+        // SDR-Ausgabe: Kopfraum 1, nie durch; ein SDR-Bild nie durch.
+        let k = hdr_zahlen(Some(&q), Some(&schirm(203.0, 1000.0)), Ausgabe::Sdr, true);
+        assert_eq!((k.hd, k.durchreichen), (1.0, 0));
+        assert_eq!(hdr_zahlen(Some(&q), Some(&schirm(203.0, 1000.0)), Ausgabe::Hdr10, false).durchreichen, 0);
+    }
+
+    /// HDR10 nur fuer ein PQ-Bild auf einem HDR-Schirm, den DXGI nicht
+    /// abgelehnt hat; umgeschaltet hoechstens alle 0,5 s.
+    #[test]
+    fn hdr10_nur_fuer_pq_auf_hdr_schirm() {
+        for pq in [false, true] {
+            for schirm_hdr in [false, true] {
+                for abgelehnt in [false, true] {
+                    let soll = if pq && schirm_hdr && !abgelehnt { Ausgabe::Hdr10 } else { Ausgabe::Sdr };
+                    assert_eq!(ausgabe_soll(pq, schirm_hdr, abgelehnt), soll, "{pq} {schirm_hdr} {abgelehnt}");
+                }
+            }
+        }
+        assert!(umschalten_jetzt(Ausgabe::Sdr, Ausgabe::Hdr10, None));
+        assert!(!umschalten_jetzt(Ausgabe::Sdr, Ausgabe::Hdr10, Some(Duration::from_millis(499))));
+        assert!(umschalten_jetzt(Ausgabe::Hdr10, Ausgabe::Sdr, Some(Duration::from_millis(500))));
+        assert!(!umschalten_jetzt(Ausgabe::Hdr10, Ausgabe::Hdr10, None));
+        assert!(!umschalten_jetzt(Ausgabe::Sdr, Ausgabe::Sdr, Some(Duration::from_secs(9))));
+        assert_eq!((Ausgabe::Hdr10.format(), Ausgabe::Hdr10.farbraum()), (DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020));
+        assert_eq!((Ausgabe::Sdr.format(), Ausgabe::Sdr.farbraum()), (DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709));
+    }
+
+    /// Ein Ablauf wie in der Sitzung, Present fuer Present: das erste PQ-Bild
+    /// auf dem HDR-Schirm schaltet sofort; ein SDR-Bild 0,1 s danach wartet
+    /// die Sperre ab (bis dahin rechnet ps_anzeigen_hdr es um); zurueck zu PQ
+    /// ebenso; "HDR verwenden" aus schaltet auf SDR; lehnt DXGI ab, bleibt SDR.
+    #[test]
+    fn umschalten_im_ablauf() {
+        // (Zeit in ms, Bild PQ, Schirm HDR, abgelehnt, Ausgabe danach)
+        let ablauf = [
+            (0, false, true, false, Ausgabe::Sdr),
+            (10, true, true, false, Ausgabe::Hdr10),
+            (110, false, true, false, Ausgabe::Hdr10),
+            (509, false, true, false, Ausgabe::Hdr10),
+            (510, false, true, false, Ausgabe::Sdr),
+            (700, true, true, false, Ausgabe::Sdr),
+            (1010, true, true, false, Ausgabe::Hdr10),
+            (5000, true, false, false, Ausgabe::Sdr),
+            (9000, true, true, true, Ausgabe::Sdr),
+            (9500, true, true, false, Ausgabe::Hdr10),
+        ];
+        let (mut ist, mut zuletzt): (Ausgabe, Option<u64>) = (Ausgabe::Sdr, None);
+        for (t, pq, schirm_hdr, abgelehnt, danach) in ablauf {
+            let seit = zuletzt.map(|z| Duration::from_millis(t - z));
+            if let Some(a) = ausgabe_wechsel(ist, pq, schirm_hdr, abgelehnt, seit) {
+                ist = a;
+                zuletzt = Some(t);
+            }
+            assert_eq!(ist, danach, "bei {t} ms");
+        }
+    }
+
+    /// Lehnt DXGI HDR10 ab, meldet die Anzeige keine HDR-Darstellung (Bit 1),
+    /// und der Host entscheidet SDR (Grund 5) - auch auf einem HDR-Schirm mit
+    /// HDR an. Ohne Ablehnung bleibt es HDR.
+    #[test]
+    fn abgelehntes_hdr10_ergibt_sdr_beim_host() {
+        let s = schirm(203.0, 1000.0);
+        let a = hdr::Anzeige::fuer_client(Some(&s), hdr_darstellung_moeglich(true), true);
+        assert!(!a.darstellung() && a.schirm_hdr());
+        assert_eq!(hdr::hdr_entscheiden(true, true, 0, Some(&a)), hdr::GRUND_CLIENT_OHNE_DARSTELLUNG);
+        let a = hdr::Anzeige::fuer_client(Some(&s), hdr_darstellung_moeglich(false), true);
+        assert!(a.darstellung());
+        assert_eq!(hdr::hdr_entscheiden(true, true, 0, Some(&a)), hdr::GRUND_AKTIV);
+    }
+
+    /// Die Metadaten: BT.2020 und D65, als Spitze die abgebildete Spitze am
+    /// Schirm, Minimum aus der Strominfo oder 0,005 nit.
+    #[test]
+    fn metadaten_mit_abgebildeter_spitze() {
+        let q = quelle(203, 0);
+        let k = hdr_zahlen(Some(&q), Some(&schirm(240.0, 600.0)), Ausgabe::Hdr10, true);
+        let m = hdr10_metadaten(&k, Some(&q));
+        assert_eq!((m.MaxMasteringLuminance, m.MaxContentLightLevel, m.MinMasteringLuminance), (600, 600, 50));
+        assert_eq!((m.RedPrimary, m.GreenPrimary, m.BluePrimary, m.WhitePoint), ([35400, 14600], [8500, 39850], [6550, 2300], [15635, 16450]));
+        let k = hdr_zahlen(Some(&q), Some(&schirm(203.0, 1000.0)), Ausgabe::Hdr10, true);
+        let m = hdr10_metadaten(&k, Some(&hdr::InfoV1 { master_min_zehntausendstel: 10, max_fall: 2000, ..q }));
+        assert_eq!((m.MaxMasteringLuminance, m.MinMasteringLuminance, m.MaxFrameAverageLightLevel), (1000, 10, 1000));
+    }
 }
