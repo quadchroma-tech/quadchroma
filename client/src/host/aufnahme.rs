@@ -1906,8 +1906,9 @@ fn sitzung(stand: &mut Bildschirmstand) {
     let (mut w, mut h) = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
     let mut zuschauer = netz::zuschauer_nr();
     // HDR (Plan 3): ob die Farbe des Stroms neu zu entscheiden ist (Anstoss
-    // vom Netzfaden ueber Z.hdr_neu, neuer Zuschauer, andere Farblage), und
-    // wann der naechste Farbwechsel fruehestens darf (einer je 2 s).
+    // vom Netzfaden ueber Z.hdr_neu, neuer Zuschauer, andere Farblage, nach
+    // jedem Oeffnen eines Encoders), und wann der naechste Farbwechsel
+    // fruehestens darf (einer je 2 s).
     let mut farbe_faellig = false;
     let mut naechster_farbwechsel = Instant::now();
     Z.hdr_gescheitert.store(-1, Ordering::Relaxed);
@@ -2110,7 +2111,11 @@ fn sitzung(stand: &mut Bildschirmstand) {
                     enc = Some(b);
                     enc_fehler_gemeldet.clear();
                     testbilder = None;
-                    farbe_faellig = false;
+                    // Das Ziel galt beim Anstoss. Was waehrend des Oeffnens
+                    // kam (IN_ANZEIGE, "HDR aus"), hat der Netzfaden noch
+                    // gegen die alte Farbe in Z.farbe verglichen und darum
+                    // keinen Wechsel angefordert - Schritt 3b vergleicht neu.
+                    farbe_faellig = true;
                     if Z.farbe.swap(t, Ordering::Relaxed) != t {
                         encoder::switch_senden(idx, t);
                         netz::strominfo_senden();
@@ -2132,6 +2137,8 @@ fn sitzung(stand: &mut Bildschirmstand) {
         if let Some(idx) = encoder::codec_wunsch_abholen() {
             strom_wechseln(idx, super::hdr_ziel_pq(idx), &mut enc, auf.as_ref(), w, h, weg);
             testbilder = None;
+            // Wie nach Schritt 2: was waehrend des Oeffnens kam, vergleicht 3b.
+            farbe_faellig = true;
         }
 
         // 3b. HDR: die Farbe neu entscheiden, wenn es angestossen wurde
@@ -2149,11 +2156,19 @@ fn sitzung(stand: &mut Bildschirmstand) {
                     let ziel_pq = super::hdr_ziel_pq(idx);
                     if ziel_pq == laeuft_pq {
                         farbe_faellig = false;
-                    } else if Instant::now() >= naechster_farbwechsel {
+                    } else if auf.is_some() && Instant::now() >= naechster_farbwechsel {
                         naechster_farbwechsel = Instant::now() + Duration::from_secs(2);
-                        farbe_faellig = false;
                         strom_wechseln(idx, ziel_pq, &mut enc, auf.as_ref(), w, h, weg);
                         testbilder = None;
+                        // Steht der Wechsel, bleibt es faellig: was waehrend
+                        // des Oeffnens kam, hat der Netzfaden noch gegen die
+                        // alte Farbe verglichen - die naechste Runde
+                        // vergleicht neu (ein Zurueck wartet die 2 s ab). Ging
+                        // er nicht (Rueckfall in SDR mit Grund 6, oder die
+                        // alte Sitzung kam zurueck), laeuft schon die einzige
+                        // andere Farbe - kein neuer Versuch alle 2 s; ohne
+                        // Sitzung entscheidet das Oeffnen in Schritt 2.
+                        farbe_faellig = enc.as_ref().is_some_and(|e| e.farbe().ist_pq() == ziel_pq);
                     }
                 }
             }

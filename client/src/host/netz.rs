@@ -1649,7 +1649,10 @@ pub fn anzeige_aktuell() -> Option<crate::hdr::Anzeige> {
 /// ergibt die Entscheidung einen anderen HDR-Grund als die zuletzt
 /// gesendete Strominfo, bekommt der Zuschauer eine neue - dieselbe Groesse
 /// und derselbe Codec, der Client baut dafuer nichts um. Eine Konserve
-/// wechselt nie (sie sendet, was ihr Clip ist).
+/// wechselt nie (sie sendet, was ihr Clip ist). Oeffnet der Aufnahmefaden
+/// gerade einen Encoder, steht in Z.farbe noch die alte Farbe; er vergleicht
+/// darum nach jedem Oeffnen selbst neu (Schritt 3b) - ein hier verpasster
+/// Wechsel geht so nicht verloren.
 pub fn hdr_neu_entscheiden(anlass: &str) {
     if !zuschauer_da() {
         return;
