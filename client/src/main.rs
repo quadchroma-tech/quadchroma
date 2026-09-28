@@ -8960,7 +8960,14 @@ impl App {
             let bereit_us = b.bereit_us();
             let r = match b {
                 Bild::Rgb(f) => g.bild_rgb(&f).map(|_| (f.width, f.height)),
-                Bild::Roh { bild, .. } => g.bild_roh(&bild).map(|_| (Ebenenbild::breite(&bild), Ebenenbild::hoehe(&bild))),
+                Bild::Roh { bild, quelle, .. } => {
+                    // Windows: SDR-Weiss und Spitze des Hosts fuer ein PQ-Bild.
+                    #[cfg(windows)]
+                    g.quelle_setzen(quelle.as_ref());
+                    #[cfg(not(windows))]
+                    let _ = quelle;
+                    g.bild_roh(&bild).map(|_| (Ebenenbild::breite(&bild), Ebenenbild::hoehe(&bild)))
+                }
             };
             match r {
                 Ok(groesse) => {
