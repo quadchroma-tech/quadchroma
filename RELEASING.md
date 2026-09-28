@@ -676,9 +676,11 @@ at least 30 days old).
 | `SHA256SUMS.txt` | `sha256sum` of every file above (`sha256sum -c SHA256SUMS.txt`) |
 
 The app itself carries the same four texts in `QuadChroma.app/Contents/Resources`
-(inside its seal). `make check-packages` checks app, ZIP and DMG for them (and the ZIP
-for AppleDouble entries, the DMG for the `/Applications` link and a verifying app);
-both workflows run it.
+(inside its seal), next to its icon `AppIcon.icns` (a copy of `client/res/AppIcon.icns`,
+made from `client/src/logo.rs`; `CFBundleIconFile` in `host/Info.plist`). `make
+check-packages` checks app, ZIP and DMG for them (the icon in the app byte for byte
+against `client/res/AppIcon.icns`, and the ZIP for AppleDouble entries, the DMG for the
+`/Applications` link and a verifying app); both workflows run it.
 
 Not released: the test harnesses, `.pdb` files, the CI's `quadchroma-*-ci`
 artefacts (unsigned, seven days, for trying out a pull request only).

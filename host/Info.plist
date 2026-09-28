@@ -18,6 +18,10 @@
          TCC permissions survive the change from quadchroma-host. -->
     <key>CFBundleExecutable</key>
     <string>quadchroma</string>
+    <!-- The app icon in Contents/Resources (AppIcon.icns, the Makefile copies it from
+         client/res). Without it Finder, Dock and Cmd+Tab show the generic icon. -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>

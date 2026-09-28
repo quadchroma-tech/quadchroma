@@ -18,7 +18,7 @@
 #   make dmg             build/QuadChroma-<version>.dmg (UDZO, link to /Applications, companion
 #                        texts, signed)
 #   make check-packages  checks that the app, the ZIP and the DMG hold the companion texts
-#                        (and the ZIP no AppleDouble entries); builds nothing
+#                        and the app icon (and the ZIP no AppleDouble entries); builds nothing
 #   make clean
 #
 # Publishing - needs the Developer ID certificate and a notarytool profile
@@ -126,6 +126,11 @@ ZIP_DIR  := QuadChroma-$(VERSION)
 DMG_EXTRA_REQUIRED ?= $(RELEASE_IDENT)
 TEXTS := LICENSE.txt THIRD_PARTY_NOTICES.txt README.txt MANUAL.txt
 TEXT_SOURCES := LICENSE.txt THIRD_PARTY_NOTICES.txt README.md MANUAL.txt scripts/package-texts.sh
+# The app icon (Finder, Dock, Cmd+Tab): made from client/src/logo.rs (mac_symbol) with iconutil and
+# kept in the repository - the test icns_res_gleich_logo checks that it still matches the code and
+# names the command that makes it anew. Copied to Contents/Resources before signing (in the seal);
+# host/Info.plist names it (CFBundleIconFile AppIcon).
+ICON := client/res/AppIcon.icns
 # Stamp: what the last signature was made with (identity, identifier, timestamp, entitlements).
 IDENT_STAMP := build/.ident
 
@@ -195,7 +200,7 @@ cargo:
 
 $(CARGO_BIN): cargo ;
 
-$(BIN): $(CARGO_BIN) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS)) $(TEXT_SOURCES)
+$(BIN): $(CARGO_BIN) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS)) $(TEXT_SOURCES) $(ICON)
 	@$(BUNDLE_CHECK)
 	@mkdir -p $(APP)/Contents/MacOS
 	@# The former host executable (CFBundleExecutable quadchroma-host) must not stay in the seal.
@@ -206,6 +211,7 @@ $(BIN): $(CARGO_BIN) host/Info.plist Makefile $(wildcard $(ENTITLEMENTS)) $(TEXT
 	@# every copy of the app - ZIP, DMG, or dragged to /Applications.
 	rm -rf $(APP)/Contents/Resources
 	scripts/package-texts.sh $(APP)/Contents/Resources $(if $(DMG_EXTRA_REQUIRED),1,0)
+	cp $(ICON) $(APP)/Contents/Resources/AppIcon.icns
 	$(CODESIGN_APP)
 	@$(WRITE_STAMP)
 	@codesign -d -r- $(APP) 2>&1 | tail -1
@@ -258,17 +264,21 @@ dmg: sign-if-changed
 	codesign --force --sign "$(IDENT)" $(TIMESTAMP) --identifier $(BUNDLE).dmg $(DMG)
 	@ls -l $(DMG)
 
-# The packages as they go out: the app holds the four companion texts in Contents/Resources,
-# the ZIP holds QuadChroma-<version>/ with the app (texts inside it too) and the four texts next
-# to it, and no AppleDouble entries; the DMG holds the app, the Applications link and the four
-# texts (mounted read-only for the check), and the app in it verifies. Checks the existing files
+# The packages as they go out: the app holds the four companion texts and the app icon in
+# Contents/Resources (the icon the same bytes as $(ICON), named by CFBundleIconFile), the ZIP holds
+# QuadChroma-<version>/ with the app (texts and icon inside it too) and the four texts next to it,
+# and no AppleDouble entries; the DMG holds the app, the Applications link and the four texts
+# (mounted read-only for the check), and the app in it verifies. Checks the existing files
 # only - builds nothing, so it also runs after stapling; a missing ZIP or DMG is an error.
 check-packages:
 	@set -e; fehler=0; \
 	 for f in $(TEXTS); do [ -s "$(APP)/Contents/Resources/$$f" ] || { echo "ERROR: $(APP)/Contents/Resources/$$f is missing"; fehler=1; }; done; \
+	 cmp -s "$(ICON)" "$(APP)/Contents/Resources/AppIcon.icns" || { echo "ERROR: $(APP)/Contents/Resources/AppIcon.icns is missing or differs from $(ICON)"; fehler=1; }; \
+	 symbol=$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$(APP)/Contents/Info.plist" 2>/dev/null || true); \
+	 [ "$$symbol" = "AppIcon" ] || { echo "ERROR: CFBundleIconFile in $(APP) is \"$$symbol\", expected AppIcon"; fehler=1; }; \
 	 if [ -f "$(ZIP)" ]; then \
 	   liste=$$(unzip -Z1 "$(ZIP)"); \
-	   for f in $(TEXTS) QuadChroma.app/Contents/MacOS/quadchroma $(addprefix QuadChroma.app/Contents/Resources/,$(TEXTS)); do \
+	   for f in $(TEXTS) QuadChroma.app/Contents/MacOS/quadchroma $(addprefix QuadChroma.app/Contents/Resources/,$(TEXTS) AppIcon.icns); do \
 	     printf '%s\n' "$$liste" | grep -qx "$(ZIP_DIR)/$$f" || { echo "ERROR: $(ZIP) lacks $(ZIP_DIR)/$$f"; fehler=1; }; done; \
 	   if printf '%s\n' "$$liste" | grep -qE '(^|/)\._'; then echo "ERROR: $(ZIP) contains AppleDouble entries (._*)"; fehler=1; fi; \
 	   if printf '%s\n' "$$liste" | grep -v "^$(ZIP_DIR)/" | grep -q .; then echo "ERROR: $(ZIP) has entries outside $(ZIP_DIR)/"; fehler=1; fi; \
@@ -277,7 +287,7 @@ check-packages:
 	 if [ -f "$(DMG)" ]; then \
 	   ziel=$$(mktemp -d "$${TMPDIR:-/tmp}/qc-dmg.XXXXXX"); \
 	   hdiutil attach -readonly -nobrowse -noverify -mountpoint "$$ziel" "$(DMG)" > /dev/null; \
-	   for f in $(TEXTS) QuadChroma.app/Contents/MacOS/quadchroma $(addprefix QuadChroma.app/Contents/Resources/,$(TEXTS)); do \
+	   for f in $(TEXTS) QuadChroma.app/Contents/MacOS/quadchroma $(addprefix QuadChroma.app/Contents/Resources/,$(TEXTS) AppIcon.icns); do \
 	     [ -s "$$ziel/$$f" ] || { echo "ERROR: $(DMG) lacks $$f"; fehler=1; }; done; \
 	   [ -L "$$ziel/Applications" ] || { echo "ERROR: $(DMG) lacks the Applications link"; fehler=1; }; \
 	   codesign --verify --deep --strict "$$ziel/QuadChroma.app" || { echo "ERROR: the app in $(DMG) does not verify"; fehler=1; }; \
