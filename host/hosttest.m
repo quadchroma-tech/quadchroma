@@ -13,7 +13,7 @@
 // aelterer Client ohne IN_FAEHIGKEITEN, Faehigkeit nur fuer den Eingabekanal,
 // der sie gemeldet hat), Bildschirmwahl (Pruefvektoren der Nachrichten 12 und
 // 70, Kuerzen, reine Wahl, Stromgroesse, bildschirm.txt, --display als Pin,
-// Begruessung mit Faehigkeiten 3 und Liste, Automatik folgt dem
+// Begruessung mit Faehigkeiten 7 und Liste, Automatik folgt dem
 // Hauptbildschirm entprellt (INFO als Fassung 1 in SDR, SWITCH mit Transfer
 // SDR), Wunsch ueber den echten Eingabekanal, fehlender
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,

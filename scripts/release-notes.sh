@@ -94,6 +94,19 @@ QuadChroma is running** and **Quit**.
 The complete manual is \`MANUAL.txt\` - in the Windows ZIP, next to the Mac app in the DMG
 and the Mac ZIP, and inside the app; the license texts are next to it.
 
+## HDR
+
+Since 0.2.0 QuadChroma streams **HDR10** (BT.2020, PQ, 10 bits) in HEVC 4:4:4 or 4:2:0,
+in both directions between Mac and Windows, whenever both sides can: the host's streamed
+screen shows HDR (a Mac from macOS 15 on with an HDR or XDR screen, or a Windows PC with
+**Use HDR** and an NVIDIA GPU), and the viewer's window is on an HDR screen. The
+**HDR** switch in the menu's Picture tab (on by default, stored per computer) turns it
+off. When HDR is active on both sides, the switch glows golden with sparkles, a golden
+**HDR** badge shows for a few seconds and the statistics (F9) say **HDR10 · PQ** in gold.
+If only one side can, the picture stays SDR - an HDR source on an SDR screen shows
+**HDR → SDR** and its SDR content looks exactly as before. A Windows desktop with **Use
+HDR** can now be streamed at all (as SDR to a viewer without HDR).
+
 ## Known limitations
 
 - **No access before sign-in.** After a restart or a logout a computer is reachable
@@ -104,6 +117,10 @@ and the Mac ZIP, and inside the app; the license texts are next to it.
   viewer shows a hint, and someone at the PC has to answer it.
 - **Administrator rights on Windows** at every manual start (see above); a standard
   account needs an administrator's password and gets no **Start with Windows**.
+- **HDR is HDR10 only** - no HLG, no HDR10+ or Dolby Vision; 8-bit codecs and H.264
+  stay SDR, the mouse pointer is always SDR, and a computer with QuadChroma 0.1.0 on
+  either side gets SDR. HDR has been tested with test harnesses and recorded HDR10
+  clips, not yet on every kind of real HDR screen.
 EOF
 
 case "$win" in

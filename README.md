@@ -36,6 +36,11 @@ H.264 in software for now.
   no extra driver or helper service - connected directly in your network (or through
   your VPN). Always encrypted (Noise protocol). A new device gets in with the other
   computer's access password or a click on "Allow" there - no command-line switches.
+- **HDR10 when both sides can.** New in 0.2.0: an HDR screen on the host and an HDR
+  screen on the viewer give HDR10 (BT.2020, PQ, 10 bits) in HEVC 4:4:4 or 4:2:0, in
+  both directions between Mac and Windows; the HDR switch in the menu then glows
+  golden. When only one side can, the picture stays SDR - and an HDR source on an SDR
+  screen is mapped so that its SDR content looks exactly as before (see "HDR").
 - **Everyday comfort.** Copy files between Mac and PC through the clipboard, like
   with Windows Remote Desktop; choose which of the Mac's screens to show (it follows
   the main screen automatically); audio; a desktop shortcut per host; 29 languages.
@@ -151,10 +156,10 @@ on the Mac, `quadchroma.exe` on Windows. The table lists the two roles of each.
 
 | Role | Platform | State |
 |---|---|---|
-| Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; part of `QuadChroma.app` ("Share this Mac", on by default); host engine in Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; audio; clipboard including files; choice of the streamed screen; the app's menu-bar icon with device ID, access password, allowed devices, the sharing switch, "Start at login", the device name and "Prevent sleep". |
-| Client | Windows 10 or 11, 64-bit; part of `quadchroma.exe`; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display; notification-area icon, single instance, desktop shortcut per host. |
-| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, HDR outputs, scaling and rotation on the GPU (both run on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
-| Client | Mac (arm64), part of the same `QuadChroma.app`; the same Rust source as on Windows | Secondary. Decoding with VideoToolbox (no FFmpeg on the Mac), audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), the app's one menu-bar icon, no desktop shortcut. Ships inside `QuadChroma.app`. |
+| Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; part of `QuadChroma.app` ("Share this Mac", on by default); host engine in Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; HDR10 in the 10-bit HEVC modes from macOS 15 on, when the streamed screen shows HDR; audio; clipboard including files; choice of the streamed screen; the app's menu-bar icon with device ID, access password, allowed devices, the sharing switch, "Start at login", the device name and "Prevent sleep". |
+| Client | Windows 10 or 11, 64-bit; part of `quadchroma.exe`; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display, HDR10 output on a screen with "Use HDR"; notification-area icon, single instance, desktop shortcut per host. |
+| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. A desktop with "Use HDR" is streamed as HDR10 through NVENC when the viewer can show it, otherwise converted to SDR on the GPU. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, scaling and rotation on the GPU for SDR (both run on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
+| Client | Mac (arm64), part of the same `QuadChroma.app`; the same Rust source as on Windows | Secondary. Decoding with VideoToolbox (no FFmpeg on the Mac), audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), HDR10 through EDR on a screen with headroom, the app's one menu-bar icon, no desktop shortcut. Ships inside `QuadChroma.app`. |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
 the project's own free certificate "QuadChroma Release" (permissions survive updates,
@@ -180,6 +185,8 @@ Developer ID with notarisation, a Windows code-signing certificate) for later.
   controls others. "Start with Windows" starts it elevated at logon without asking (see
   "Sharing a Windows PC"). On a standard account every start needs an administrator's
   password, and "Start with Windows" is not available.
+- HDR (optional, see "HDR"): an HDR screen on both sides; a Mac as the host needs
+  macOS 15 or later, a Windows PC as the host an NVIDIA card.
 - Network: three ports on every computer that shares. 9001 carries video and audio
   (everything from host to client), 9002 input and clipboard including files
   (everything from client to host), 9003 the announcement. A sharing computer
@@ -493,7 +500,9 @@ recommendation can be applied with one click; the table is written to
 
 `quadchroma.exe <address> --headless` runs without a window and prints a status line
 every three seconds; with `--passwort <password>` it answers a host's access request
-once; `--decodertest` tries every decoder choice without a connection, `--anzeigetest
+once, with `--hdr-schirm hdr|sdr` it reports an imagined HDR or SDR screen to the host
+and names the HDR state the window would show; `--decodertest` tries every decoder
+choice without a connection, `--anzeigetest
 <dir>` checks the GPU display path against the CPU path (Direct3D 11 on Windows; Metal
 on the Mac, where it also measures the frame time at 1440p and 120 Hz), `--shot` writes
 a BMP of the interface. `MANUAL.txt` lists all switches.
@@ -571,6 +580,56 @@ switch") with one of the reasons `Wunsch des Zuschauers` (the viewer's request),
 `zurueck zum gewuenschten Bildschirm` (back to the requested screen). All log lines,
 messages 12 and 70 in detail and the test mode (`--bildschirm <identifier|auto>`, the
 field `Strom` in the status line) are in `MANUAL.txt`.
+
+## HDR
+
+New in 0.2.0: HDR10 in both directions - Mac to Windows, Windows to Mac, and between
+two computers of the same kind. The stream is then HEVC with BT.2020 primaries, the PQ
+curve (SMPTE ST 2084) and 10 bits, in the full range like every QuadChroma stream, as
+HEVC 4:4:4 or 4:2:0 at 10 bits; the host sends the mastering values along. Everything
+else stays as it is: when either side cannot do HDR, the picture is the same SDR as
+before.
+
+HDR runs when all of this holds, and the host decides alone:
+
+- The host's streamed screen shows HDR: on the Mac a screen with HDR headroom (an XDR
+  display, an HDR monitor with HDR switched on, or a virtual display with HDR), from
+  macOS 15 on; on Windows a screen with "Use HDR" switched on.
+- The host's encoder can do HDR10: the Media Engine of Apple silicon on the Mac, NVENC
+  on an NVIDIA card on Windows (the host checks this at start).
+- The codec is HEVC 10-bit (4:4:4 or 4:2:0). 8-bit HEVC and H.264 stay SDR.
+- The viewer's window is on an HDR screen ("Use HDR" on Windows, a screen with EDR
+  headroom on the Mac), drawn through the graphics card, and its HDR switch is on.
+
+The **HDR switch** sits in the menu, Picture tab: on (the default) uses HDR whenever
+both sides can, off always sends SDR. The client stores it per host, like the other
+values of the tab. Next to the switch stands what is happening: "active on both
+sides", "HDR → SDR" (the host sends HDR, this screen shows it as SDR), or "SDR" with
+the reason (this screen is SDR, needs HEVC 10-bit, the host's screen is SDR, the host
+cannot send HDR, ...). When HDR is active on both sides, the switch glows golden with
+moving sparkles, a golden sparkling "HDR" badge appears over the picture for about
+three seconds, and the statistics (F9) show "HDR10 · PQ" in gold. One side alone is
+never golden.
+
+Brightness is relative: the host's SDR white becomes the viewer's SDR white, so a
+desktop looks as bright as locally; everything brighter is mapped onto the headroom of
+the viewer's screen with a smooth knee above SDR white, and passed through unchanged
+where it fits (on Windows bit-exact when both sides use the same SDR white). On an SDR
+screen, everything above SDR white is clipped without changing its hue, so SDR content
+of an HDR source comes out exactly as before. The client reports its screen to the host
+(message 71) when the session starts and whenever the window moves to another screen
+or the switch changes; the host then switches between HDR and SDR like a codec switch
+(the picture stands still for a blink, at most once every 2 s), and in between the
+client maps whatever arrives. A Windows desktop with "Use HDR" that is streamed to an
+SDR viewer is converted to SDR on the host's GPU - before 0.2.0 such a desktop could
+not be streamed at all.
+
+Limits: no HLG, no dynamic metadata (HDR10+, Dolby Vision); the mouse pointer stays
+SDR; a computer with QuadChroma 0.1.0 on either side gets SDR. HDR has been checked in
+test harnesses, offscreen golden-image tests and across Mac and Windows with recorded
+HDR10 clips, not yet on real HDR screens (see "What is missing"). `MANUAL.txt` has the
+details: every log line, messages 1, 7, 11 and 71, the test mode `--hdr-schirm
+hdr|sdr` and the Mac tool `scripts/hdrprobe.sh`.
 
 ## Files via the clipboard
 
@@ -781,6 +840,14 @@ open on real devices:
   pattern and codec switch on d3d11, an AV1-capable card), at 125 and 150 % scaling,
   on rotated outputs and handhelds with a portrait panel, and with a real audio
   device.
+- HDR (new in 0.2.0) on real HDR screens: the Mac host's HDR capture (the tool
+  `scripts/hdrprobe.sh` measures what ScreenCaptureKit delivers - HDR values, the
+  level of SDR white), NVENC in HDR10 and the Windows host role on an HDR desktop, the
+  HDR10 swapchain of the Windows client and the EDR layer of the Mac client, moving the
+  window between HDR and SDR screens, cost and banding. Covered so far by unit tests,
+  `hosttest` (HDR10 with the real VideoToolbox encoder and decoder), offscreen golden
+  images on both clients, the converter on WARP, and recorded HDR10 clips streamed by
+  the Windows host role to a Mac and a Windows client in test mode.
 - The congestion rule of both hosts on a real link that is too slow (also below the
   audio rate) and in gaming mode at a high bit rate.
 - On the running Mac host - where picture, input channel, audio and the conversion
@@ -863,8 +930,9 @@ for the exe. The one-time steps are in `RELEASING.md`.
   list of entries in parts instead of in one piece (up to 1 MiB, during which
   keystrokes or frames wait briefly).
 - A desktop shortcut on the Mac client.
-- Windows host role: AMF/QSV encoders, HDR outputs, scaling and rotation on the GPU
-  (both run on the CPU today).
+- Windows host role: AMF/QSV encoders, scaling and rotation on the GPU for SDR (both
+  run on the CPU today; in HDR the GPU does them already).
+- HDR: HLG, dynamic metadata (HDR10+, Dolby Vision), an HDR pointer.
 - AV1: no host offers it until protocol and client support it.
 - Audio compression as an option; uncompressed audio can take more bandwidth than the
   picture.
@@ -921,7 +989,12 @@ signature are those of the former host app, so granted permissions stay. The hos
 engine uses only its own code, Apple frameworks (Foundation, AppKit, ScreenCaptureKit,
 VideoToolbox, CoreMedia, CoreVideo, CoreGraphics, CoreFoundation, IOKit,
 ServiceManagement for "Start at login", SystemConfiguration for the computer name;
-CommonCrypto for the access proofs) and the vendored Monocypher; no FFmpeg. `make
+CommonCrypto for the access proofs) and the vendored Monocypher; no FFmpeg. The app
+icon for Finder, Dock and Cmd+Tab is `client/res/AppIcon.icns` (made from the logo in
+`client/src/logo.rs` in Apple's icon grid, all sizes from 16 to 1024 pixels);
+`make` copies it into `Contents/Resources` before signing, `host/Info.plist` names it
+(`CFBundleIconFile`), `make check-packages` checks it in the app, the ZIP and the DMG,
+and the test `icns_res_gleich_logo` fails if it no longer matches the code. `make
 host-allein` still builds the former stand-alone host (`host/start.m`) as
 `build/quadchroma-host`, for the test harnesses only. The harnesses run without screen
 capture, see "Test harnesses".
@@ -1035,13 +1108,21 @@ exit code is the number of failures.
   - Screen selection (`host/bildschirm.m`): test vectors of messages 12 and 70;
     truncation at character boundaries; the pure selection logic; stream size;
     `bildschirm.txt` (also broken); `--display` as a pin for the run; the greeting
-    with capabilities 3 and the list; Automatic follows the main screen (debounced);
+    with capabilities 7 and the list; Automatic follows the main screen (debounced);
     a request via the real input channel; a missing requested screen with fallback
     and return; a different size with a new encoder and keyframe; waiting for a
     running codec switch (every request gets its answer, the waiting ends as soon as
     no switch is pending, after 5 s the switch happens anyway); an empty list with a
     running stream; screen loss and recovery. List and stream come from mocks, the
     encoders are real.
+  - HDR negotiation: capabilities with bit 2, message 71 over the real input channel
+    (a new stream info in SDR with the host's reason, nothing on an unchanged state,
+    unreadable data skipped), then up to HDR10 and back - HDR on the host's screen on
+    and off, the codec switch with color, the 2-second lock, reason 6 when the capture
+    refuses HDR, a takeover in the middle of HDR10, a double failure without a loop;
+    and HDR10 with the real VideoToolbox encoder and decoder (SEI 137/144 byte-exact
+    after the PPS of every keyframe, VUI and attachments BT.2020/PQ, the HDR test
+    pattern, Display P3 to BT.2020).
   - Access, with real handshakes and a client that behaves like the Rust client: an
     unknown client gets "QCA1" and message 20; the right password gives result 0 with
     a correct host proof and then "QCH1"; a known client with bit 0 in message 3 goes
@@ -1178,7 +1259,7 @@ decoder, reset at the end of the session) and the texts in all 29 languages; in 
 Windows host role the pure selection (Automatic follows the main screen, request,
 fallback, return, reasons), identifier and name from the device ID, `bildschirm.txt`
 including leftovers, message 12 only after setup, the Win32 paths of the list, the
-request over the real input channel and the greeting with capabilities 3 and list 12.
+request over the real input channel and the greeting with capabilities 7 and list 12.
 
 For the access the Rust tests check the test vectors (device ID, norm, K, both proofs,
 HMAC after RFC 4231, PBKDF2), messages 20 to 23 including truncated ones and a wrong

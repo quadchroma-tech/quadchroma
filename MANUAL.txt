@@ -1614,7 +1614,7 @@ F10. "Disconnect" sits in the header at the right, on every tab, with the
 host's address below it. Six tabs:
 
     Picture         bitrate, frame rate, gaming mode, fixed frame rate,
-                    sound, host display, codec choice
+                    sound, HDR (see "HDR"), host display, codec choice
     Display         fullscreen, pixel exact, statistics, nerd mode, which
                     statistics lines, card for display and decoder
                     (Automatic, Graphics card, Integrated, Processor)
@@ -2194,8 +2194,9 @@ Wire messages (header as everywhere else):
                       that has reported bit 1 in this session.
 
 Bit 1 in the capabilities (11) is called "Bildschirmwahl" (display
-selection); both hosts report 3 (files and display selection). In its
-own capabilities (69) the client still reports only bit 0.
+selection); both hosts report 7 (files, display selection and, from 0.2.0
+on, HDR negotiation - see "HDR"). In its own capabilities (69) the client
+still reports only bit 0.
 
 Test vector: the list with Automatic, "X27 X1" (v1138-m1234-s0,
 1920x1080, 120 Hz, main and streamed) and "Virtuell 16:9" (v0-m0-s0,
@@ -2225,6 +2226,283 @@ afterwards; at the same size the encoder on the processor path stays in
 place) - it needs two real outputs, and the VM has one -, and there also
 identifier, name and refresh rate from real monitors; for the Mac host
 the main display switch live, including names from AppKit.
+
+HDR
+---
+
+From 0.2.0 on the stream can be HDR10: HEVC with BT.2020 primaries, the PQ
+curve (SMPTE ST 2084) and the BT.2020 matrix (non-constant luminance), 10
+bits, in the full range like every QuadChroma stream - in HEVC 4:4:4 10 bit
+(candidate 0) and HEVC 4:2:0 10 bit (candidate 2). Mastering values travel in
+the stream information (message 1) and as prefix SEI 137 and 144 before every
+keyframe (for recordings and other players). Everything else is the SDR
+stream as before; with HLG, dynamic metadata (HDR10+, Dolby Vision), 8 bit
+and H.264 the stream stays SDR, and the mouse pointer is always SDR.
+
+The host decides alone, per viewer and anew on every change; the client only
+reports its screen and its wish. HDR runs only if all of this holds (in this
+order, the first failing point is the reason in message 1, byte 13):
+
+    7  no message 71 from the client (a client before 0.2.0, or not yet)
+    1  the HDR switch is off
+    2  the codec is not HEVC 10 bit
+    4  the host cannot: Mac before macOS 15 or its encoder refuses the
+       HDR10 properties; Windows without an NVENC that opens HDR10
+    3  the host's streamed screen is SDR: Mac without EDR headroom on that
+       screen (an XDR display, an HDR monitor with HDR on, a virtual
+       display with HDR); Windows without "Use HDR" on that output
+    5  the client cannot show HDR (drawing on the CPU, or DXGI refused HDR10
+       on that screen)
+    1  the client's screen is SDR
+    0  HDR active
+
+and 6 when the switch to HDR failed (the host then stays with the same
+candidate in SDR until the situation changes). Every session starts in SDR;
+the switch to HDR10 is a codec switch with color as a second dimension:
+capture in the new mode, new encoder session, message 7 (SWITCH, byte 6 the
+transfer), message 1 (stream info), keyframe. The picture stands still for a
+blink. At most one color switch every 2 s; a later reason waits for the end
+of that lock.
+
+HDR switch. In the menu, "Picture" tab, to the right of "Sound": "HDR", on
+(the default) or off. On means HDR whenever both sides can, off always SDR.
+It is stored per host (by fingerprint) with the other values of the tab and
+acts at once (message 71 with the new wish, without debouncing). Next to it
+the client shows its state:
+
+    active on both sides          the host sends PQ and this window really
+                                  shows HDR (Windows: HDR10 swapchain; Mac:
+                                  EDR with headroom above SDR white)
+    HDR -> SDR - this screen shows it as SDR
+                                  the host sends PQ, this screen maps it
+    SDR - <reason>                "this screen is SDR", "needs HEVC 10-bit",
+                                  "the host's screen is SDR", "the host
+                                  cannot send HDR", "this display cannot
+                                  show HDR", "switching to HDR failed",
+                                  "negotiating ...", "the host has no HDR
+                                  (older version)"
+    off - always SDR              the switch is off
+
+(in the program with an arrow, a middle dot and an en dash). Only "active on
+both sides" is golden: the switch glows golden with moving sparkles, a
+golden sparkling "HDR" badge with "HDR10 - PQ" below it stands over the
+picture for about three seconds when HDR becomes active, and the statistics
+(F9) show the line "Color" (below "Codec") as "HDR10 - PQ" in gold (nerd
+mode: "HDR10 - PQ - <peak> nit" with the peak of the source). One side alone is never golden;
+the color line then reads "HDR -> SDR", otherwise "SDR" (nerd mode with the
+reason). The golden state is the same on both clients - the interface is
+drawn by QuadChroma itself. Hovering over the switch shows: "HDR10 whenever
+both sides can: the host's screen and this screen show HDR. Off: always SDR.
+Saved for this host."
+
+Brightness. The working space is linear light relative to the host's SDR
+white: the host's SDR white becomes the SDR white of the client's screen, so
+desktop text looks as bright as locally. Everything brighter is mapped onto
+the headroom of the client's screen (headroom = peak / SDR white of the
+screen, on the Mac the current EDR headroom) with a smooth knee at SDR white;
+if the source fits the headroom, nothing is mapped. On an SDR screen
+everything above SDR white is clipped, keeping the hue (the largest of R, G,
+B becomes white, the others keep their ratio); SDR content of an HDR source
+therefore comes out exactly as in SDR. The host's SDR white: Mac 203 nit
+(the level BT.2408 gives and VideoToolbox uses; overridable with
+QC_HDR_SDR_WEISS, see below), Windows the SDR content brightness slider
+(SDRWhiteLevel, followed every 2 s). The peak: MaxCLL, otherwise the
+mastering peak, otherwise 1000 nit.
+
+The client's side:
+
+    Windows   The screen of the window counts as HDR when "Use HDR" is on
+              there (DXGI reports G2084/P2020); read at start of the
+              session, every 2 s, and at once when the window moves to
+              another monitor. A PQ picture on an HDR screen: the swapchain
+              becomes R10G10B10A2 with G2084/P2020 and HDR10 metadata; the
+              codes go through unchanged when the SDR white of both sides
+              differs by at most 1 nit and the source fits the headroom,
+              otherwise they are mapped as above. On an SDR screen the
+              swapchain stays B8G8R8A8 and the picture is mapped to SDR.
+              The swapchain switches at most every 0.5 s. If DXGI refuses
+              HDR10 on a screen, the client reports "cannot show HDR" until
+              the screen changes (the host then sends SDR).
+    Mac       The screen of the window counts as HDR when its potential EDR
+              headroom is above 1 (an XDR display, an HDR monitor with HDR
+              on). A PQ picture there switches the Metal layer to EDR
+              (RGBA16Float, extended linear Display P3; from macOS 26 with
+              preferredDynamicRange High and contentsHeadroom), and the
+              picture follows the current headroom - also without a new
+              frame, after EDR switched on, a brightness change or a move to
+              another screen. EDR is on only while a PQ stream is shown.
+              Elsewhere the picture is mapped to SDR in the existing 8-bit
+              path.
+    Both      The decision per frame comes from the frame itself (the VUI of
+              the decoded picture), not from a message - there is no race
+              with message 7. Drawing on the CPU maps PQ pictures to SDR too
+              and reports "cannot show HDR".
+
+The host's side:
+
+    Mac       macOS 15 or later: at start the host opens a test session of
+              candidates 0 and 2 with the HDR10 properties ("HDR10 (BT.2020/
+              PQ)" in the capability lines). With HDR the capture is
+              ScreenCaptureKit in HDR (canonical dynamic range, Display P3
+              with PQ, matrix BT.709 - VideoToolbox converts P3 to BT.2020,
+              byte 5 of message 7 and the log say so); 4:4:4 at 10 bits stays
+              copy-free. The encoder writes BT.2020/PQ/BT.2020 into the VUI,
+              the host adds SEI 137 (mastering: Display P3 D65, 1000 nit,
+              0.005 nit) and 144 (MaxCLL/MaxFALL 0: unknown for a screen)
+              after the PPS of every keyframe. HDR on or off at the streamed
+              screen is noticed via the display callbacks, at the latest
+              after 5 s through the EDR headroom.
+    Windows   On a desktop with "Use HDR" the Desktop Duplication delivers
+              FP16 (scRGB). For an HDR10 stream the converter on the GPU
+              turns it into PQ planes (4:4:4 YUV444P16LE or 4:2:0 P010,
+              rotation and halving included) for NVENC, with the mastering
+              values from the output (GetDesc1) as side data, so that NVENC
+              writes SEI 137/144 itself. For an SDR stream the same converter
+              maps it to SDR (BGRA8, clipped at SDR white keeping the hue)
+              - before 0.2.0 such a desktop could not be streamed at all.
+              "HDR10: ja" or "HDR10: nein (<reason>)" per candidate in the
+              encoder lines at start.
+
+Environment variables of the Mac host (for the acceptance tests of step G0,
+not needed in normal use):
+
+    QC_HDR_AUFNAHME    kanonisch-p3 (default), lokal-p3, kanonisch-2100,
+                       lokal-2100: dynamic range canonical or local, color
+                       space Display P3 PQ with matrix BT.709 or BT.2100 PQ
+                       with matrix BT.2020 (then without conversion)
+    QC_HDR_SDR_WEISS   SDR white of the capture in nit (50 to 1000, default
+                       203), sent in message 1
+
+scripts/hdrprobe.sh (with scripts/hdrprobe.m) measures on a Mac host what
+ScreenCaptureKit delivers in HDR, outside the app: "messen" (the four capture
+modes, attachments, the code of a white SDR window - that is SDR white in
+nit), "spitze" (the maximum with an HDR video on screen) and "beobachten"
+(what happens when HDR is switched on and off). It needs the Screen
+Recording permission for the terminal and writes its report to
+build/hdrprobe-*.txt. The host itself still has --capture <s> <file> --hdr:
+a recording in HDR10 if the Mac can, otherwise in SDR with a line.
+
+Wire messages (header as everywhere else):
+
+    1   INFO      Host -> Client, version 1 is 24 bytes. Bytes 0 to 7 as
+                  before (u16 width, u16 height, u16 fps, u8 codec, u8
+                  format), then u8 version (1), u8 transfer after H.273 (1
+                  SDR, 16 PQ, 18 HLG reserved), u8 primaries (1 BT.709, 9
+                  BT.2020), u8 matrix (1 BT.709, 9 BT.2020 NCL), u8 full
+                  range (1), u8 reason (see above), u16 SDR white of the host
+                  in nit, u16 mastering peak in nit, u16 mastering minimum in
+                  0.0001 nit, u16 MaxCLL, u16 MaxFALL (little endian, 0 =
+                  unknown). A host before 0.2.0 sends only the 8 bytes; a
+                  client reads another version like 8 bytes (color from the
+                  stream, SDR white 203 nit, peak 1000 nit). Sent at the
+                  start, after every switch, and when only the reason
+                  changes ("neue Strominfo" in the host log).
+    7   SWITCH    byte 6 is the transfer (1 SDR, 16 PQ; hosts before 0.2.0
+                  send 0 = SDR), for the log only.
+    11  capabilities: bit 2 (value 4) "HDR-Aushandlung" (HDR negotiation):
+                  the host understands message 71 and sends version 1 of
+                  message 1. Both hosts report 7.
+    71  Display   Client -> Host, input channel, 14 bytes, a state message
+                  (sent again when the input channel comes up), only to a
+                  host with bit 2 in this session: u8 version (1), u8 flags
+                  (bit 0 the screen of the window is HDR, bit 1 the client
+                  can show HDR), u8 wish (0 Automatic, 1 Off, 2 Always), u8
+                  0, u16 SDR white of the screen in nit, u16 peak, u16
+                  full-frame peak, u16 potential headroom x 100, u16 current
+                  headroom x 100 (0 = unknown). Sent at the start of every
+                  session, and when flags or wish change (at most once per
+                  second; the HDR switch at once) - brightness and headroom
+                  alone do not trigger it. The hosts skip invalid lengths.
+
+Test vectors (bytes 8 to 23 of message 1, and message 71):
+
+    PQ, reason 0, white 203, mastering 1000 / 0.005 nit:
+        01 10 09 09 01 00 cb 00 e8 03 32 00 00 00 00 00
+    SDR, reason 7:
+        01 01 01 01 01 07 00 00 00 00 00 00 00 00 00 00
+    71, HDR and can show, Automatic, 240 / 1015 / 600 nit, headroom 4.23:
+        01 03 00 00 f0 00 f7 03 58 02 a7 01 a7 01
+
+client/src/hdr_vektoren.txt holds these and the whole truth table of the
+decision; the Rust tests and host/hdr.c (the C mirror of the Mac host) check
+against the same file.
+
+Log lines of the client (protokoll.txt; in test mode on the console):
+
+    "Strominfo Fassung 1: PQ/BT.2020, Weiss <n> nit, Mastering <min>-<max>
+     nit, MaxCLL <n>, MaxFALL <n>" or "Strominfo Fassung 1: SDR/BT.709,
+     Grund <n> (<Grund>)"                          (on every change)
+    "Strominfo ohne Farbangabe (Host vor 0.2.0 oder fremde Fassung): Farbe
+     aus dem Strom"
+    "IN_ANZEIGE an den Host: Schirm HDR|SDR, Darstellung ja|nein, Wunsch
+     Automatisch|Aus, Weiss <n> nit, Spitze <n> nit, Vollbild <n> nit,
+     Kopfraum <p>/<a>"
+    "Bildschirm des Fensters: HDR|SDR, SDR-Weiss <n> nit, Spitze <n> nit,
+     Kopfraum <p> (jetzt <a>)"
+    "HDR-Schalter an (Automatisch)" or "HDR-Schalter aus (immer SDR)"
+    "HDR auf beiden Seiten aktiv (Host PQ, Anzeige HDR)"
+    "Erstes Bild aus hevc: ... Farbe PQ/BT.2020"
+    "VideoToolbox: <B>x<H> HEVC 4:4:4 10 Bit, PQ/BT.2020, Hardware ja, ..."
+                                                                     (Mac)
+    "Anzeige: Swapchain HDR10 (R10G10B10A2, G2084/P2020), Weiss Quelle <n>
+     nit, Schirm <n> nit, Kopfraum Quelle <h>, Schirm <h>, Durchreichen
+     ja|nein" and "Anzeige: HDR10-Metadaten: Spitze <n> nit, ..."
+                                                                 (Windows)
+    "Anzeige: Umschalten auf HDR10|SDR gescheitert: <Fehler>"   (Windows)
+    "Anzeige: Schicht auf EDR umgestellt (RGBA16Float, erweitert linear
+     Display P3, ...)" and "Anzeige: HDR-Strom (...) auf einem EDR-Schirm:
+     ..., abgebildet auf den Kopfraum <h>; ..."                     (Mac)
+
+Log lines of both hosts (host-protokoll.txt):
+
+    "IN_ANZEIGE: Schirm ..., Darstellung ..., Wunsch ..." (as above; Mac:
+     "IN_ANZEIGE: Schirm HDR|SDR, Darstellung ja|nein, Wunsch <n>, ...")
+    "IN_ANZEIGE: ungueltig (<n> Byte) - uebergangen"
+    "HDR-Entscheidung (<Anlass>): ..." with the occasion (IN_ANZEIGE, HDR
+     am Host, Desktop jetzt HDR|SDR, Codecwechsel, nach der Sperre, ...):
+     a switch "Farbwechsel SDR -> HDR10" (Mac) or "Wechsel nach HDR10 (PQ)
+     angefordert" (Windows), "der letzte Farbwechsel ist keine 2 s her, in
+     <s> s", or only a new reason "- vorher Grund <n> (<Grund>), neue
+     Strominfo"
+    "Wechsel nach HDR10 gescheitert - nur noch SDR (Grund 6), bis sich die
+     Lage aendert" (Mac), "HDR10-Sitzung fuer <Kandidat> scheitert
+     (<Fehler>) - derselbe Kandidat in SDR (Grund 6)" (Windows)
+    "Bildschirm des Hosts: HDR an|aus (EDR-Kopfraum <h>) - <Anlass>" (Mac)
+    "HDR-Desktop <Name>: SDR-Weiss <a> -> <b> nit" (Windows, the slider)
+    "Aufnahme <Name>: HDR-Desktop, aber die Duplication liefert kein FP16 -
+     kein HDR10 (Windows bildet selbst nach SDR ab)" (Windows)
+
+Test mode: the status line every three seconds carries, after the stream,
+the field "| Farbe <state>" with the text of the color line in the
+statistics (English, nerd mode) and "(gold)" when the window would glow
+golden - for example "Farbe HDR10 - PQ - 1000 nit (gold)", "Farbe HDR -> SDR"
+or "Farbe SDR - the host cannot send HDR". Without a window the client shows
+nothing in HDR and reports no screen, so a host sends SDR with reason 7.
+--hdr-schirm hdr|sdr imagines a screen: the client reports it in message 71
+as a window would (hdr: HDR screen, SDR white 203 nit, peak 1000 nit; sdr:
+SDR screen; both "can show HDR", wish Automatic), and with "hdr" it counts
+as showing every PQ frame in HDR. That checks the negotiation and the golden
+state end to end without HDR hardware:
+
+    quadchroma.exe 192.168.178.194:9001 --headless --hdr-schirm hdr
+
+The Windows host role with --konserve <file> and an HDR10 clip (HEVC with
+PQ/BT.2020 in the VUI, MDCV and CLL as SEI) sends it as PQ with the stream
+information version 1 from the clip, without negotiation - the only place
+that does so, a test path for the clients without an HDR encoder.
+
+Verified in test harnesses and on the build VM, not yet on real HDR
+screens: the decision and the bytes in Rust and C (hdr_vektoren.txt), the
+Mac host up to HDR10 and back in hosttest with the real VideoToolbox encoder
+and decoder, the converter of the Windows host role on WARP (PQ planes
+against hdr.rs, all rotations, halving), both clients' displays offscreen
+against the CPU reference (Windows: passed-through codes exact, mapped
++-1; Mac: EDR path against hdr.rs), and HDR10 clips (4:4:4 and 4:2:0) from
+the Windows host role to a Mac client (VideoToolbox) and a Windows client
+(software decoder) in test mode, with no screen, an SDR screen and an HDR
+screen imagined. Still open: HDR capture on a real Mac with an HDR screen,
+NVENC in HDR10 on an NVIDIA card, the HDR10 swapchain and the EDR layer on
+real screens, moving the window between screens, cost and banding.
 
 Clipboard
 ---------
@@ -2555,7 +2833,8 @@ to.
 Only in the client (the first line: the capabilities the host reported;
 the last one: a file reference that could not be resolved):
 
-    "Host meldet Faehigkeiten 0x3: Dateien ja, Bildschirmwahl ja"
+    "Host meldet Faehigkeiten 0x7: Dateien ja, Bildschirmwahl ja,
+     HDR-Aushandlung ja"
     "Dateien: N Eintraege vorgemerkt - die Faehigkeiten des Hosts stehen
      noch aus (hoechstens 5 s)"
     "Dateien: Host kann keine Dateien empfangen (aelterer Host)"
@@ -2606,7 +2885,8 @@ u32 length; all numbers little endian):
     11  Capabilities  Host -> client, video channel: u32 bits (at least
                       4 bytes, further ones are ignored), bit 0 means
                       "files, version 1", bit 1 "display selection" (see
-                      "Host display"; both hosts report 3). Goes to
+                      "Host display"), bit 2 "HDR negotiation" (see "HDR";
+                      both hosts report 7). Goes to
                       every new viewer after the greeting, settings and
                       codec list; the display list (12) follows right
                       after it.
@@ -2720,8 +3000,9 @@ Test mode without a window, in case something is stuck:
     quadchroma.exe 192.168.178.194:9001 --headless
 
 Prints a line every three seconds: frames received, frame rate, codec, stream
-(width x height @ the host's frame rate, "?" without stream info), decoder,
-delay, host load, error. Without a connection the delay is replaced by "nicht
+(width x height @ the host's frame rate, "?" without stream info), color (the
+HDR state, see "HDR"; --hdr-schirm imagines a screen), decoder, delay, host
+load, error. Without a connection the delay is replaced by "nicht
 verbunden" (not connected); the error appears as the interface shows it, in
 English with its key in front, for example 'Fehler Some("SessionTakenOver:
 Another device has taken over the session.")', with the German details in the
