@@ -8892,6 +8892,10 @@ impl App {
         self.ui.tick = client_us() / 8000;
         self.letzte_zeichnung = jetzt;
 
+        // HDR: SDR-Weiss und Spitze der Quelle aus der Strominfo - damit
+        // bildet die Metal-Anzeige PQ-Bilder ab (anzeige_mac.rs).
+        #[cfg(target_os = "macos")]
+        g.quelle_setzen(self.shared.lock().unwrap().info.and_then(|i| i.hdr).as_ref());
         // Neues Bild abholen: roh ueber Stufe 1, oder fertig als RGB
         // (dunkles Bild, unbekanntes Format). Ein rohes Bild faellt gleich
         // nach dem Upload - der Pufferpool des Decoders will es zurueck.
