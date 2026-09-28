@@ -33,7 +33,17 @@
 // quer betreibt): die Oberflaeche kommt ungedreht, gedreht wird beim
 // Einlesen auf dem Prozessor (Drehung, bgra_drehen); der Strom hat die
 // Groesse des Desktops, die Maus bleibt beim Desktop (DesktopCoordinates).
+//
+// HDR-Desktop ("HDR verwenden"): IDXGIOutput6::GetDesc1 meldet ColorSpace
+// G2084/P2020; die Duplication (IDXGIOutput5::DuplicateOutput1 mit FP16 und
+// BGRA 8 Bit) liefert dann FP16 in scRGB. Der Wandler (wandler.rs) bildet
+// jedes solche Bild auf der Karte nach SDR ab - relativ zum SDR-Weiss aus
+// DisplayConfig, alle 2 s nachgefuehrt - und ersetzt damit die Textur der
+// Duplication; ab da laeuft alles wie auf einem SDR-Desktop. Das Format wird
+// je Bild geprueft (ein Vollbildprogramm kann auch BGRA liefern), ein
+// fremdes ist ein Verlust wie ein Modewechsel.
 
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -42,9 +52,10 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use windows::core::{Interface, BOOL, PCWSTR};
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -60,6 +71,7 @@ use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 use super::encoder::{self, Betrieb, Bild, Quelle, Weg};
 use super::takt::{Schrittmacher, INFLIGHT_AUFNAHME, INFLIGHT_TAKT};
+use super::wandler::{self, Eingang, Wandler};
 use super::zeiger::Zeiger;
 use super::{log, netz, Z};
 use crate::bildschirm::{self, BildschirmEintrag, Bildschirme};
@@ -187,9 +199,11 @@ fn monitor_geraet(name: &str) -> (Option<String>, Option<String>) {
     erster.unwrap_or((None, None))
 }
 
-/// Die Monitornamen aus QueryDisplayConfig: je aktivem Pfad (Geraetename
-/// der Quelle, Anzeigename des Ziels). Leer, wenn Windows nichts liefert.
-fn anzeigenamen() -> Vec<(String, String)> {
+/// Die aktiven Anzeigepfade aus QueryDisplayConfig, je Pfad mit dem
+/// Geraetenamen seiner Quelle (\\.\DISPLAYn - der Schluessel zu DXGI und
+/// GDI). Leer, wenn Windows nichts liefert. Grundlage fuer Monitornamen und
+/// SDR-Weiss.
+fn anzeigepfade() -> Vec<(String, DISPLAYCONFIG_PATH_INFO)> {
     let mut out = Vec::new();
     unsafe {
         let (mut np, mut nm) = (0u32, 0u32);
@@ -202,7 +216,7 @@ fn anzeigenamen() -> Vec<(String, String)> {
             return out;
         }
         pfade.truncate(np as usize);
-        for p in &pfade {
+        for p in pfade {
             let mut quelle = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
             quelle.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
                 r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
@@ -213,6 +227,18 @@ fn anzeigenamen() -> Vec<(String, String)> {
             if DisplayConfigGetDeviceInfo(&mut quelle.header) != 0 {
                 continue;
             }
+            out.push((utf16_text(&quelle.viewGdiDeviceName), p));
+        }
+    }
+    out
+}
+
+/// Die Monitornamen aus QueryDisplayConfig: je aktivem Pfad (Geraetename
+/// der Quelle, Anzeigename des Ziels). Leer, wenn Windows nichts liefert.
+fn anzeigenamen() -> Vec<(String, String)> {
+    anzeigepfade()
+        .into_iter()
+        .filter_map(|(quelle, p)| {
             let mut ziel = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
             ziel.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
                 r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
@@ -220,13 +246,26 @@ fn anzeigenamen() -> Vec<(String, String)> {
                 adapterId: p.targetInfo.adapterId,
                 id: p.targetInfo.id,
             };
-            if DisplayConfigGetDeviceInfo(&mut ziel.header) != 0 {
-                continue;
-            }
-            out.push((utf16_text(&quelle.viewGdiDeviceName), utf16_text(&ziel.monitorFriendlyDeviceName)));
-        }
-    }
-    out
+            (unsafe { DisplayConfigGetDeviceInfo(&mut ziel.header) } == 0).then(|| (quelle, utf16_text(&ziel.monitorFriendlyDeviceName)))
+        })
+        .collect()
+}
+
+/// SDRWhiteLevel des Bildschirms an diesem Ausgang (1000 = 80 nit): das
+/// Weiss, mit dem Windows SDR-Inhalt in einen HDR-Desktop legt (Schieber
+/// "SDR-Inhaltshelligkeit"). DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)
+/// am Ziel des Pfads; None, wenn Windows ihn nicht nennt.
+fn sdr_weiss_lesen(name: &str) -> Option<u32> {
+    anzeigepfade().into_iter().filter(|(quelle, _)| quelle == name).find_map(|(_, p)| {
+        let mut weiss = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+        weiss.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+            size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+            adapterId: p.targetInfo.adapterId,
+            id: p.targetInfo.id,
+        };
+        (unsafe { DisplayConfigGetDeviceInfo(&mut weiss.header) } == 0).then_some(weiss.SDRWhiteLevel)
+    })
 }
 
 /// Bildwiederholrate des laufenden Anzeigemodus eines Ausgangs
@@ -907,6 +946,57 @@ pub fn gdi_hauptbildschirm() -> Option<(i32, i32, i32, i32)> {
 
 // ----------------------------------------------------------- Duplication
 
+/// Was DXGI (IDXGIOutput6::GetDesc1) und DisplayConfig ueber die Farbe
+/// eines Ausgangs sagen.
+#[derive(Clone, Copy, Debug)]
+pub struct Farblage {
+    /// "HDR verwenden" ist an: ColorSpace G2084/P2020. Die Duplication
+    /// liefert dann FP16 (scRGB), der Wandler macht SDR daraus.
+    pub hdr: bool,
+    /// GetDesc1 war zu haben (IDXGIOutput6, ab Windows 10 1703).
+    pub desc1: bool,
+    pub farbraum: DXGI_COLOR_SPACE_TYPE,
+    pub bits: u32,
+    pub spitze_nit: f32,
+    pub vollbild_nit: f32,
+    pub min_nit: f32,
+    /// SDRWhiteLevel laut DisplayConfig (1000 = 80 nit), None = unbekannt.
+    pub sdr_weiss: Option<u32>,
+}
+
+impl Farblage {
+    /// Fuers Protokoll: Farbraum, Bits, Helligkeiten, SDR-Weiss.
+    pub fn zeile(&self) -> String {
+        let weiss = match self.sdr_weiss {
+            Some(l) => format!("SDR-Weiss {:.0} nit ({l})", wandler::sdr_weiss_nit(l)),
+            None => "SDR-Weiss unbekannt".into(),
+        };
+        if !self.desc1 {
+            return format!("keine Farbangaben (IDXGIOutput6 fehlt), {weiss}");
+        }
+        format!(
+            "{} (ColorSpace {}, {} Bit, Spitze {:.0} nit, Vollbild {:.0} nit, min {:.4} nit), {weiss}",
+            if self.hdr { "HDR" } else { "SDR" },
+            self.farbraum.0, self.bits, self.spitze_nit, self.vollbild_nit, self.min_nit
+        )
+    }
+}
+
+/// Die Farblage eines Ausgangs (Geraetename fuer DisplayConfig).
+fn farblage(output: &IDXGIOutput, name: &str) -> Farblage {
+    let d = output.cast::<IDXGIOutput6>().ok().and_then(|o| unsafe { o.GetDesc1() }.ok());
+    Farblage {
+        hdr: d.is_some_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020),
+        desc1: d.is_some(),
+        farbraum: d.map(|d| d.ColorSpace).unwrap_or_default(),
+        bits: d.map(|d| d.BitsPerColor).unwrap_or(0),
+        spitze_nit: d.map(|d| d.MaxLuminance).unwrap_or(0.0),
+        vollbild_nit: d.map(|d| d.MaxFullFrameLuminance).unwrap_or(0.0),
+        min_nit: d.map(|d| d.MinLuminance).unwrap_or(0.0),
+        sdr_weiss: sdr_weiss_lesen(name),
+    }
+}
+
 /// Geraet auf dem Adapter des Ausgangs plus die Duplication darauf.
 pub struct Duplication {
     pub device: ID3D11Device,
@@ -918,19 +1008,51 @@ pub struct Duplication {
     pub breite: u32,
     pub hoehe: u32,
     pub drehung: Drehung,
+    /// Format der eigenen Texturen und der Bilder aus `abholen`: das des
+    /// Desktops, auf einem HDR-Desktop B8G8R8A8_UNORM (der Wandler liefert
+    /// SDR).
     pub format: DXGI_FORMAT,
+    /// Format des Desktops laut Duplication (ModeDesc).
+    pub desktop_format: DXGI_FORMAT,
+    pub farbe: Farblage,
     pub im_systemspeicher: bool,
     /// Noch kein Bild abgeholt: das erste Abholen liefert den ganzen
     /// Desktop, auch wenn seit dem Aufbau nichts praesentiert wurde
     /// (LastPresentTime 0) - sonst bliebe ein stiller Desktop minutenlang
     /// ohne erstes Bild.
-    erstes_offen: std::cell::Cell<bool>,
+    erstes_offen: Cell<bool>,
+    /// Geraetename des Ausgangs (\\.\DISPLAYn), fuer das SDR-Weiss.
+    geraetename: String,
+    /// Wandler fuer FP16-Bilder: steht nach dem Aufbau eines HDR-Desktops,
+    /// sonst entsteht er mit dem ersten FP16-Bild.
+    wandler: RefCell<Option<Wandler>>,
+    /// Naechste Pruefung des SDR-Weiss (alle 2 s, solange ein Wandler steht).
+    weiss_pruefung: Cell<Instant>,
+    /// Format des letzten Bildes und wie oft es gewechselt hat (Protokoll).
+    bildformat: Cell<Option<DXGI_FORMAT>>,
+    formatwechsel: Cell<u32>,
+}
+
+/// Eigener Fehlercode: ein Bild, das der Bildweg nicht nehmen kann (fremdes
+/// Format, Wandler gescheitert). Kundenbit gesetzt - kein Code von Windows;
+/// den Grund haelt GRUND_BILD fest, dxgi_fehler_text setzt ihn ein.
+const BILD_UNBRAUCHBAR: windows::core::HRESULT = windows::core::HRESULT(0xA051_0001u32 as i32);
+
+thread_local! {
+    static GRUND_BILD: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn bild_unbrauchbar(grund: String) -> windows::core::Error {
+    GRUND_BILD.with(|g| *g.borrow_mut() = grund);
+    windows::core::Error::from_hresult(BILD_UNBRAUCHBAR)
 }
 
 /// Klartext zu den DXGI-Fehlern, die hier vorkommen.
 pub fn dxgi_fehler_text(e: &windows::core::Error) -> String {
     let c = e.code();
-    if c == DXGI_ERROR_UNSUPPORTED {
+    if c == BILD_UNBRAUCHBAR {
+        format!("Bild der Duplication nicht verwendbar: {}", GRUND_BILD.with(|g| g.borrow().clone()))
+    } else if c == DXGI_ERROR_UNSUPPORTED {
         "Duplication auf diesem Ausgang nicht moeglich (RDP/kein Bildschirm/WARP)".into()
     } else if c == DXGI_ERROR_ACCESS_LOST {
         "Zugriff verloren (Modewechsel, UAC-Bildschirm oder Vollbild-exklusiv)".into()
@@ -948,8 +1070,11 @@ pub fn dxgi_fehler_text(e: &windows::core::Error) -> String {
 /// Duplication auf dem Ausgang mit diesem Listenplatz aufbauen: Geraet auf
 /// seinem Adapter (D3D_DRIVER_TYPE_UNKNOWN mit dem IDXGIAdapter),
 /// ID3D11Multithread an (Aufnahme- und Encoderfaden teilen das Geraet),
-/// IDXGIOutput1::DuplicateOutput. HDR-Ausgaenge (R16G16B16A16_FLOAT) und
-/// alles ausser BGRA 8 Bit werden vorerst abgelehnt.
+/// IDXGIOutput5::DuplicateOutput1 - auf einem HDR-Desktop mit FP16 und BGRA
+/// 8 Bit, sonst nur mit BGRA 8 Bit (wie DuplicateOutput); ohne
+/// IDXGIOutput5, oder wenn DuplicateOutput1 scheitert, DuplicateOutput. Ein
+/// HDR-Desktop (FP16) bekommt gleich den Wandler nach SDR; andere Formate
+/// als BGRA 8 Bit und FP16 werden abgelehnt.
 pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| fehler("CreateDXGIFactory1", e))?;
     let adapter = unsafe { factory.EnumAdapters1(ausgang.karte as u32) }.map_err(|e| fehler("EnumAdapters1", e))?;
@@ -972,15 +1097,44 @@ pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
         }
     }
     let output1: IDXGIOutput1 = output.cast().map_err(|e| fehler("IDXGIOutput1", e))?;
-    let dup = unsafe { output1.DuplicateOutput(&device) }.map_err(|e| format!("DuplicateOutput: {}", dxgi_fehler_text(&e)))?;
+    let farbe = farblage(&output, &ausgang.name);
+    // Auf einem HDR-Desktop FP16 zuerst: das ist, was der Desktop wirklich
+    // traegt (scRGB), die Abbildung nach SDR macht der Wandler - nicht eine
+    // Umrechnung von Windows, deren Weiss niemand kennt. BGRA bleibt in der
+    // Liste fuer Vollbildprogramme, die 8 Bit praesentieren.
+    let formate: &[DXGI_FORMAT] = if farbe.hdr {
+        &[DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM]
+    } else {
+        &[DXGI_FORMAT_B8G8R8A8_UNORM]
+    };
+    let alt = || unsafe { output1.DuplicateOutput(&device) };
+    let dup = match output.cast::<IDXGIOutput5>() {
+        Ok(o5) => match unsafe { o5.DuplicateOutput1(&device, 0, formate) } {
+            Ok(d) => d,
+            Err(e1) => match alt() {
+                Ok(d) => {
+                    log(format!("DuplicateOutput1: {} - Aufnahme ueber DuplicateOutput", dxgi_fehler_text(&e1)));
+                    d
+                }
+                Err(e) => return Err(format!("DuplicateOutput: {} (DuplicateOutput1: {})", dxgi_fehler_text(&e), dxgi_fehler_text(&e1))),
+            },
+        },
+        Err(_) => alt().map_err(|e| format!("DuplicateOutput: {}", dxgi_fehler_text(&e)))?,
+    };
     let desc: DXGI_OUTDUPL_DESC = unsafe { dup.GetDesc() };
-    let format = desc.ModeDesc.Format;
-    if format == DXGI_FORMAT_R16G16B16A16_FLOAT {
-        return Err("HDR-Ausgang (R16G16B16A16_FLOAT) - vorerst nicht unterstuetzt".into());
-    }
-    if format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB {
-        return Err(format!("Desktopformat {} - vorerst nur BGRA 8 Bit", format.0));
-    }
+    let desktop_format = desc.ModeDesc.Format;
+    // Die eigenen Texturen nehmen BGRA 8 Bit - auf einem HDR-Desktop das,
+    // was der Wandler liefert.
+    let format = match wandler::eingang_art(desktop_format) {
+        Eingang::Bgra => desktop_format,
+        Eingang::Fp16 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        Eingang::Fremd => return Err(format!("Desktopformat {} - weder BGRA 8 Bit noch FP16 (HDR)", wandler::format_name(desktop_format))),
+    };
+    let wandler = if farbe.hdr || desktop_format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        Some(Wandler::neu(&device, &ctx, wandler::sdr_weiss_pruefen(farbe.sdr_weiss))?)
+    } else {
+        None
+    };
     // Gedreht (Hochformat, 180 Grad, auch ein hochkantes Panel, das Windows
     // quer betreibt): die Oberflaeche aus AcquireNextFrame liegt ungedreht
     // vor, der Desktop (DesktopCoordinates) gedreht. Die eigenen Texturen
@@ -996,8 +1150,15 @@ pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
         hoehe,
         drehung,
         format,
+        desktop_format,
+        farbe,
         im_systemspeicher: desc.DesktopImageInSystemMemory.as_bool(),
-        erstes_offen: std::cell::Cell::new(true),
+        erstes_offen: Cell::new(true),
+        geraetename: ausgang.name.clone(),
+        wandler: RefCell::new(wandler),
+        weiss_pruefung: Cell::new(Instant::now() + Duration::from_secs(2)),
+        bildformat: Cell::new(None),
+        formatwechsel: Cell::new(0),
     })
 }
 
@@ -1018,7 +1179,9 @@ pub enum Abholung {
     Nichts,
     /// Nur der Zeiger hat sich bewegt oder seine Form geaendert (LastPresentTime == 0).
     NurZeiger(ZeigerInfo),
-    /// Ein neues Bild: Textur der Duplication (bis ReleaseFrame gueltig),
+    /// Ein neues Bild: Textur der Duplication (bis ReleaseFrame gueltig) -
+    /// bei einem FP16-Bild die SDR-Textur des Wandlers (bis zum naechsten
+    /// Abholen gueltig), immer im BGRA-Format der eigenen Texturen -,
     /// Praesentationszeit (QPC) und die Zeigerangaben.
     Bild { textur: ID3D11Texture2D, praesentiert_qpc: i64, zeiger: ZeigerInfo },
 }
@@ -1029,9 +1192,96 @@ impl Duplication {
         self.drehung.groesse(self.breite, self.hoehe)
     }
 
+    /// Das Format fuers Protokoll: das der eigenen Texturen, auf einem
+    /// HDR-Desktop dazu das des Desktops.
+    pub fn format_text(&self) -> String {
+        if self.desktop_format == self.format {
+            wandler::format_name(self.format)
+        } else {
+            format!("{} (Desktop {}, gewandelt nach SDR)", wandler::format_name(self.format), wandler::format_name(self.desktop_format))
+        }
+    }
+
+    /// Alle 2 s, solange ein Wandler steht: das SDR-Weiss neu lesen (der
+    /// Schieber "SDR-Inhaltshelligkeit" aendert es ohne Modewechsel). Vor
+    /// AcquireNextFrame, nie zwischen Abholen und Freigeben.
+    fn sdr_weiss_nachfuehren(&self) {
+        let mut w = self.wandler.borrow_mut();
+        let Some(w) = w.as_mut() else { return };
+        let jetzt = Instant::now();
+        if jetzt < self.weiss_pruefung.get() {
+            return;
+        }
+        self.weiss_pruefung.set(jetzt + Duration::from_secs(2));
+        let neu = wandler::sdr_weiss_pruefen(sdr_weiss_lesen(&self.geraetename));
+        if neu != w.sdr_weiss() {
+            log(format!(
+                "HDR-Desktop {}: SDR-Weiss {:.0} -> {:.0} nit",
+                self.geraetename,
+                wandler::sdr_weiss_nit(w.sdr_weiss()),
+                wandler::sdr_weiss_nit(neu)
+            ));
+            w.sdr_weiss_setzen(neu);
+        }
+    }
+
+    /// Das Bild so, wie der Bildweg es nimmt (BGRA 8 Bit): BGRA unveraendert,
+    /// FP16 (HDR-Desktop) durch den Wandler nach SDR. Geprueft wird je Bild -
+    /// ein Vollbildprogramm kann auf einem HDR-Desktop auch BGRA liefern;
+    /// ein fremdes Format ist ein Verlust (Neuaufbau wie nach einem
+    /// Modewechsel).
+    fn bild_fuer_den_bildweg(&self, t: ID3D11Texture2D) -> Result<ID3D11Texture2D, windows::core::Error> {
+        let mut d = D3D11_TEXTURE2D_DESC::default();
+        unsafe { t.GetDesc(&mut d) };
+        let art = wandler::eingang_art(d.Format);
+        if art == Eingang::Fp16 && self.wandler.borrow().is_none() {
+            // FP16, ohne dass der Aufbau HDR erkannt hatte: der Wandler jetzt.
+            let weiss = wandler::sdr_weiss_pruefen(sdr_weiss_lesen(&self.geraetename));
+            match Wandler::neu(&self.device, &self.ctx, weiss) {
+                Ok(neu) => *self.wandler.borrow_mut() = Some(neu),
+                Err(e) => return Err(bild_unbrauchbar(format!("FP16 ohne Wandler ({e})"))),
+            }
+        }
+        self.bildformat_melden(d.Format, art);
+        match art {
+            Eingang::Bgra => Ok(t),
+            Eingang::Fp16 => match self.wandler.borrow_mut().as_mut() {
+                Some(w) => w.nach_sdr(&t),
+                None => Err(bild_unbrauchbar("FP16 ohne Wandler".into())),
+            },
+            Eingang::Fremd => Err(bild_unbrauchbar(format!("Format {} ist weder BGRA 8 Bit noch FP16", wandler::format_name(d.Format)))),
+        }
+    }
+
+    /// Das Format der Bilder ins Protokoll, wenn es sich aendert - das erste
+    /// nur, wenn es nicht das angekuendigte BGRA ist. Nach acht Wechseln
+    /// schweigt es.
+    fn bildformat_melden(&self, f: DXGI_FORMAT, art: Eingang) {
+        let vorher = self.bildformat.replace(Some(f));
+        if vorher == Some(f) || (vorher.is_none() && art == Eingang::Bgra && f == self.desktop_format) {
+            return;
+        }
+        let n = self.formatwechsel.get();
+        self.formatwechsel.set(n + 1);
+        if n < 8 {
+            let was = match art {
+                Eingang::Bgra => String::new(),
+                Eingang::Fp16 => format!(
+                    " (scRGB) - Wandler nach SDR, SDR-Weiss {:.0} nit",
+                    wandler::sdr_weiss_nit(self.wandler.borrow().as_ref().map(|w| w.sdr_weiss()).unwrap_or(wandler::SDR_WEISS_VORGABE))
+                ),
+                Eingang::Fremd => " - nicht verwendbar".into(),
+            };
+            log(format!("Aufnahme {}: Bilder im Format {}{was}", self.geraetename, wandler::format_name(f)));
+        } else if n == 8 {
+            log(format!("Aufnahme {}: das Bildformat wechselt oft - weitere Wechsel ohne Protokollzeile", self.geraetename));
+        }
+    }
+
     /// AcquireNextFrame mit Frist in ms. Der Aufrufer muss nach `Bild`
     /// SOFORT kopieren und `freigeben` rufen.
     pub fn abholen(&self, frist_ms: u32) -> Result<Abholung, windows::core::Error> {
+        self.sdr_weiss_nachfuehren();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
         match unsafe { self.dup.AcquireNextFrame(frist_ms, &mut info, &mut res) } {
@@ -1052,6 +1302,15 @@ impl Duplication {
             None => return Ok(Abholung::NurZeiger(zeiger)),
         };
         self.erstes_offen.set(false);
+        // Gleich nach AcquireNextFrame: ein FP16-Bild kopiert der Wandler
+        // jetzt, der Aufrufer bekommt sein SDR-Bild.
+        let textur = match self.bild_fuer_den_bildweg(textur) {
+            Ok(t) => t,
+            Err(e) => {
+                self.freigeben();
+                return Err(e);
+            }
+        };
         let praesentiert_qpc = if info.LastPresentTime != 0 {
             info.LastPresentTime
         } else {
@@ -1594,11 +1853,12 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     if verloren { "wiederhergestellt" } else { "gestartet" },
                                     a.name, gw, gh,
                                     if d.drehung != Drehung::Keine { format!(" gedreht {} Grad (Oberflaeche {}x{}, gedreht wird auf dem Prozessor)", d.drehung.grad(), d.breite, d.hoehe) } else { String::new() },
-                                    a.karte, a.karte_name, d.format.0,
+                                    a.karte, a.karte_name, d.format_text(),
                                     if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
                                     if halb { " (halbiert)" } else if (w, h) != (gw as i32, gh as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
                                     if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                                 ));
+                                log(format!("Aufnahme {}: Farbe {}", a.name, d.farbe.zeile()));
                             }
                             auf = Some(neu);
                             letztes = None;
