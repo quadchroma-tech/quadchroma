@@ -342,12 +342,12 @@ pub fn codecs_payload() -> Vec<u8> {
 }
 
 /// Typ 7: u8 idx, u8 h264, u8 chroma444, u8 zehn_bit, u8 vollbereich (immer 1),
-/// u8 umrechnung, u16 frei.
+/// u8 umrechnung, u8 Transfer nach H.273 (noch immer SDR), u8 frei.
 pub fn switch_senden(idx: usize) {
     let k = kandidat(idx);
     debug_assert!(im_protokoll(k), "{}: Codec nicht im Protokoll", k.name);
     let b = befund(idx);
-    let p = [idx as u8, k.h264 as u8, k.chroma444 as u8, k.zehn_bit as u8, 1, umrechnung_fuer(idx, &b) as u8, 0, 0];
+    let p = [idx as u8, k.h264 as u8, k.chroma444 as u8, k.zehn_bit as u8, 1, umrechnung_fuer(idx, &b) as u8, crate::hdr::TRANSFER_SDR, 0];
     netz::send_small(crate::protokoll_konst::MSG_SWITCH, &p);
 }
 

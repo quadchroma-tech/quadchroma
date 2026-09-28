@@ -297,9 +297,12 @@ pub fn apply_settings(mbit: u32, fps: u32, gaming: bool, fixed: bool, ton: bool)
     ));
 }
 
-/// Strominfo (Nachricht 1), immer aus dem laufenden Kandidaten abgeleitet.
-pub fn strominfo() -> [u8; 8] {
-    let mut p = [0u8; 8];
+/// Strominfo (Nachricht 1, Fassung 1), immer aus dem laufenden Kandidaten
+/// abgeleitet: die alten acht Byte, dahinter Farbe und HDR-Grund
+/// (crate::hdr). Noch sendet dieser Host nur SDR und liest kein IN_ANZEIGE -
+/// Grund 7.
+pub fn strominfo() -> [u8; crate::hdr::INFO_LAENGE] {
+    let mut p = [0u8; crate::hdr::INFO_LAENGE];
     let w = Z.info_w.load(Ordering::Relaxed) as u16;
     let h = Z.info_h.load(Ordering::Relaxed) as u16;
     let f = Z.fps.load(Ordering::Relaxed) as u16;
@@ -311,6 +314,7 @@ pub fn strominfo() -> [u8; 8] {
     p[6] = if k.h264 { 2 } else { 1 };
     // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
     p[7] = if k.chroma444 { if k.zehn_bit { 2 } else { 1 } } else if k.zehn_bit { 4 } else { 3 };
+    p[crate::hdr::INFO_LAENGE_ALT..].copy_from_slice(&crate::hdr::InfoV1::sdr(crate::hdr::GRUND_KEIN_IN_ANZEIGE).kodieren());
     p
 }
 
@@ -1657,6 +1661,19 @@ pub fn main_host(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Die Strominfo ist Fassung 1 (24 Byte): die alten acht Byte aus Z und
+    /// dem Kandidaten, dahinter SDR mit Grund 7 - dieser Host liest noch kein
+    /// IN_ANZEIGE. Nur lesend: Z teilen sich alle Tests.
+    #[test]
+    fn strominfo_fassung_1_mit_sdr() {
+        use crate::hdr::{InfoV1, GRUND_KEIN_IN_ANZEIGE, INFO_LAENGE};
+        let p = strominfo();
+        assert_eq!(p.len(), INFO_LAENGE);
+        assert!(matches!(p[6], 1 | 2) && (1..=4).contains(&p[7]), "{p:?}");
+        assert_eq!(p[8..], InfoV1::sdr(GRUND_KEIN_IN_ANZEIGE).kodieren());
+        assert_eq!(InfoV1::lesen(&p), Some(InfoV1::sdr(GRUND_KEIN_IN_ANZEIGE)));
+    }
 
     /// Wie der Knopf "Diesen PC freigeben" startet (Ausgaben nach NUL,
     /// DETACHED_PROCESS; danach holt main.rs mit AttachConsole die Konsole

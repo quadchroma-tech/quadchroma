@@ -14,7 +14,8 @@
 // der sie gemeldet hat), Bildschirmwahl (Pruefvektoren der Nachrichten 12 und
 // 70, Kuerzen, reine Wahl, Stromgroesse, bildschirm.txt, --display als Pin,
 // Begruessung mit Faehigkeiten 3 und Liste, Automatik folgt dem
-// Hauptbildschirm entprellt, Wunsch ueber den echten Eingabekanal, fehlender
+// Hauptbildschirm entprellt (INFO als Fassung 1 in SDR, SWITCH mit Transfer
+// SDR), Wunsch ueber den echten Eingabekanal, fehlender
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
 // Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
@@ -37,7 +38,7 @@
 //         -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
 //         -framework SystemConfiguration \
 //         host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
-//         host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+//         host/dateien.m host/bildschirm.m host/hdr.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
 //         host/zugang.c host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 //   /tmp/hosttest
 //
@@ -2299,8 +2300,9 @@ static int liste_lesen(const uint8_t *p, size_t n, char *wunsch, int idx, eintra
 // Alles, was in frist_ms beim Zuschauer ankommt: Typfolge (ohne Stempel),
 // die letzte Liste, die letzte Strominfo, Wechselansagen, Bilder, Hoststatus.
 typedef struct {
-    char folge[256]; uint8_t liste[QC_BILDSCHIRM_LISTE_MAX]; size_t liste_n; uint8_t info[8]; int infos;
-    int wechsel; uint8_t wechsel_codec; int bilder, voll, erstes_voll; int status, statusse;
+    char folge[256]; uint8_t liste[QC_BILDSCHIRM_LISTE_MAX]; size_t liste_n;
+    uint8_t info[QC_HDR_INFO_LAENGE]; size_t info_n; int infos;
+    int wechsel; uint8_t wechsel_codec, wechsel_transfer; int bilder, voll, erstes_voll; int status, statusse;
 } gelesen;
 
 static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
@@ -2318,8 +2320,16 @@ static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
                 g->liste_n = d.length < sizeof g->liste ? d.length : sizeof g->liste;
                 memcpy(g->liste, d.bytes, g->liste_n);
                 break;
-            case QC_MSG_INFO: if (d.length >= 8) memcpy(g->info, d.bytes, 8); g->infos++; break;
-            case QC_MSG_SWITCH: g->wechsel++; if (d.length) g->wechsel_codec = ((const uint8_t *)d.bytes)[0]; break;
+            case QC_MSG_INFO:
+                g->info_n = d.length;
+                if (d.length >= 8) memcpy(g->info, d.bytes, d.length < sizeof g->info ? d.length : sizeof g->info);
+                g->infos++;
+                break;
+            case QC_MSG_SWITCH:
+                g->wechsel++;
+                if (d.length) g->wechsel_codec = ((const uint8_t *)d.bytes)[0];
+                if (d.length >= 8) g->wechsel_transfer = ((const uint8_t *)d.bytes)[6];
+                break;
             case QC_MSG_VIDEO: {
                 int key = (h.flags & QC_FLAG_KEY) ? 1 : 0;
                 if (g->bilder == 0) g->erstes_voll = key;
@@ -2335,6 +2345,16 @@ static void alles_lesen(schein *s, int frist_ms, gelesen *g) {
 
 static uint16_t info_w(const gelesen *g) { uint16_t v; memcpy(&v, g->info, 2); return v; }
 static uint16_t info_h(const gelesen *g) { uint16_t v; memcpy(&v, g->info + 2, 2); return v; }
+
+// Die letzte INFO ist Fassung 1 (24 Byte) in SDR mit Grund 7 - dieser Host
+// liest noch kein IN_ANZEIGE (hdr.h).
+static int info_fassung1_sdr(const gelesen *g) {
+    qc_hdr_info i;
+    uint8_t soll[QC_HDR_INFO_LAENGE - QC_HDR_INFO_ALT];
+    qc_hdr_info_sdr(&i, QC_HDR_GRUND_KEIN_IN_ANZEIGE);
+    qc_hdr_info_kodieren(&i, soll);
+    return g->info_n == QC_HDR_INFO_LAENGE && memcmp(g->info + QC_HDR_INFO_ALT, soll, sizeof soll) == 0;
+}
 
 // Wie oft der Typ in der Folge steht (die Folge sind Zahlen mit Leerzeichen).
 static int typen_zaehlen(const char *folge, int typ) {
@@ -2630,6 +2650,8 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pruefe(strstr(g.folge, "7 1 12") && g.wechsel == 1 && g.wechsel_codec == 3 && info_w(&g) == 1920 && info_h(&g) == 1080 &&
            !wunsch[0] && eb.flags == (QC_BILDSCHIRM_FLAG_HAUPT | QC_BILDSCHIRM_FLAG_GESTREAMT) && ea.flags == 0 && session_jetzt() == s_a,
            "SWITCH mit dem laufenden Codec, INFO (gleiche Masse, Encoder bleibt), dann die Liste mit dem neuen als Haupt und gestreamt");
+    pruefe(info_fassung1_sdr(&g) && g.wechsel_transfer == QC_HDR_TRANSFER_SDR,
+           "INFO als Fassung 1 (24 Byte, SDR, Grund 7), SWITCH mit Transfer 1 (SDR)");
     pruefe(!letztes_bild_da() && g.bilder == 0,
            "auch bei gleicher Groesse ist das letzte Bild des alten Bildschirms weg - es kaeme sonst als erstes Vollbild des neuen");
     stdout_stumm(1);

@@ -71,6 +71,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include "zugang.h"
+#include "hdr.h"
 
 // ------------------------------------------------------------------ Logging
 
@@ -453,7 +454,8 @@ static const char *QC_PRO_INPUT = "QuadChroma/1 input Noise_XX_25519_ChaChaPoly_
 // --- Protokoll ---------------------------------------------------------
 // Beim Verbinden: 4 Byte Kennung "QCH1".
 // Danach Nachrichten: u8 Typ, u8 Flags, u16 frei, u32 Laenge (little endian).
-//   Typ 1 = Strominfo: u16 Breite, u16 Hoehe, u16 FPS, u8 Codec, u8 Profil, u8 Bereich, u8 frei
+//   Typ 1 = Strominfo Fassung 1 (24 Byte): u16 Breite, u16 Hoehe, u16 FPS, u8 Codec, u8 Format,
+//           dann Fassung, Farbe, HDR-Grund und Metadaten (hdr.h; vor 0.2.0 nur die acht Byte)
 //   Typ 2 = Bilddaten (Annex-B), Flag Bit 0 = Vollbild
 #define QC_MAGIC      "QCH1"
 #define QC_MSG_INFO   1
@@ -914,8 +916,10 @@ static void zeiger_log(const char *text) {
     logf_(@"%s", text);
 }
 
-// Eckdaten des Stroms, immer aus dem AKTUELLEN Codec abgeleitet.
-static void strominfo_fuellen(uint8_t p[8]) {
+// Eckdaten des Stroms, immer aus dem AKTUELLEN Codec abgeleitet: die alten
+// acht Byte, dahinter Fassung 1 (hdr.h). Noch sendet dieser Host nur SDR und
+// liest kein IN_ANZEIGE - Grund 7.
+static void strominfo_fuellen(uint8_t p[QC_HDR_INFO_LAENGE]) {
     int idx = atomic_load(&g_codec_id);
     uint16_t w16 = (uint16_t)g_info_w, h16 = (uint16_t)g_info_h, f16 = (uint16_t)g_info_fps;
     memcpy(p + 0, &w16, 2); memcpy(p + 2, &h16, 2); memcpy(p + 4, &f16, 2);
@@ -923,6 +927,9 @@ static void strominfo_fuellen(uint8_t p[8]) {
     const qc_codec_kandidat *k = &g_kandidaten[idx];
     // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
     p[7] = k->chroma444 ? (k->zehn_bit ? 2 : 1) : (k->zehn_bit ? 4 : 3);
+    qc_hdr_info farbe;
+    qc_hdr_info_sdr(&farbe, QC_HDR_GRUND_KEIN_IN_ANZEIGE);
+    qc_hdr_info_kodieren(&farbe, p + QC_HDR_INFO_ALT);
 }
 
 // Koennensliste: was dieser Mac wirklich codiert, mit Hardware- und
@@ -1540,13 +1547,13 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         return;
     }
 
-    uint8_t hello[4 + sizeof(qc_hdr) + 8];
+    uint8_t hello[4 + sizeof(qc_hdr) + QC_HDR_INFO_LAENGE];
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
     // Fenstergroesse und Format kennt, bevor das erste Bild kommt. Erst unter
     // der Sperre gefuellt: ein Codecwechsel, der gerade fertig wird, steht
     // dann entweder schon hier drin, oder sein SWITCH kommt danach beim Neuen an.
     memcpy(hello, QC_MAGIC, 4);
-    qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = 8 };
+    qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = QC_HDR_INFO_LAENGE };
     memcpy(hello + 4, &h, sizeof h);
     strominfo_fuellen(hello + 4 + sizeof h);
     char fp_alt[24] = {0};
@@ -2627,13 +2634,13 @@ static int g_wechsel_aktiv = 0;      // nur auf g_capq: ein Wechsel ist unterweg
 static int g_wechsel_wunsch = -1;    // nur auf g_capq: waehrenddessen eingegangener naechster Wunsch
 
 static void strominfo_senden(void) {
-    uint8_t p[8];
+    uint8_t p[QC_HDR_INFO_LAENGE];
     strominfo_fuellen(p);
     send_small(QC_MSG_INFO, p, sizeof p);
 }
 
 // Typ 7: u8 idx, u8 h264, u8 chroma444, u8 zehn_bit, u8 vollbereich (immer 1),
-// u8 umrechnung, u16 frei.
+// u8 umrechnung, u8 Transfer nach H.273 (noch immer SDR), u8 frei.
 static void switch_senden(int idx) {
     const qc_codec_kandidat *k = &g_kandidaten[idx];
     uint8_t p[8] = {0};
@@ -2643,6 +2650,7 @@ static void switch_senden(int idx) {
     p[3] = (uint8_t)k->zehn_bit;
     p[4] = 1;
     p[5] = (uint8_t)umrechnung_fuer(idx);
+    p[6] = QC_HDR_TRANSFER_SDR;
     send_small(QC_MSG_SWITCH, p, sizeof p);
 }
 

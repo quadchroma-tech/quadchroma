@@ -1886,10 +1886,11 @@ fn bild_annehmen(stream: TcpStream, platz: Platz, marke: &Laufmarke) {
 
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
     // Fenstergroesse und Format kennt, bevor das erste Bild kommt.
-    let mut hello = Vec::with_capacity(4 + 8 + 8);
+    let info = super::strominfo();
+    let mut hello = Vec::with_capacity(4 + 8 + info.len());
     hello.extend_from_slice(MAGIC);
-    hello.extend_from_slice(&kopf(MSG_INFO, 0, 0, 8));
-    hello.extend_from_slice(&super::strominfo());
+    hello.extend_from_slice(&kopf(MSG_INFO, 0, 0, info.len()));
+    hello.extend_from_slice(&info);
 
     let mut leitung = Leitung::neu(sock.abbruchgriff(), sock.peer.clone(), sock.handshake_hash.clone(), ip.clone());
     leitung.name = name.clone();
@@ -2801,7 +2802,7 @@ mod tests {
 
     /// Liest vom Bildkanal nach MAGIC bis MSG_FAEHIGKEITEN und gibt dessen
     /// Nutzlast zurueck. Die erste Nachricht muss die Begruessung (MSG_INFO)
-    /// sein.
+    /// sein, als Strominfo Fassung 1 (24 Byte, SDR).
     fn bis_faehigkeiten(s: &mut secure::Secure) -> Result<Vec<u8>, String> {
         let mut erste = true;
         loop {
@@ -2812,6 +2813,9 @@ mod tests {
             s.read_exact(&mut p)?;
             if erste && h[0] != MSG_INFO {
                 return Err(format!("erst Nachricht {} statt der Begruessung", h[0]));
+            }
+            if erste && crate::hdr::InfoV1::lesen(&p).map(|i| i.farbe) != Some(crate::hdr::Farbe::SDR) {
+                return Err(format!("Begruessung ohne Strominfo Fassung 1 in SDR ({len} Byte)"));
             }
             erste = false;
             if h[0] == MSG_FAEHIGKEITEN {

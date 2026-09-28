@@ -1114,7 +1114,7 @@ clang -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-decla
       -framework CoreVideo -framework CoreGraphics -framework CoreFoundation -framework IOKit \
       -framework SystemConfiguration \
       host/hosttest.m host/audio.m host/clipboard.m host/zeiger.m host/testbild.m host/last.m \
-      host/dateien.m host/bildschirm.m host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
+      host/dateien.m host/bildschirm.m host/hdr.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c \
       host/zugang.c host/vendor/monocypher/monocypher.c -o /tmp/hosttest
 
 clang -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter -Ihost -mmacosx-version-min=14.0 \
