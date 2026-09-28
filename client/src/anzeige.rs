@@ -414,16 +414,26 @@ pub const HDR_DARSTELLUNG: bool = false;
 /// GetContainingOutput der Swapchain, die der softbuffer-Weg nicht hat),
 /// seine Farblage aus IDXGIOutput6::GetDesc1 ("HDR verwenden" = G2084/P2020,
 /// Spitzen) und das SDR-Weiss aus DisplayConfig (dieselbe Hilfe wie der
-/// Host). Eine frische Factory je Aufruf: eine alte kennt neu angesteckte
-/// Bildschirme nicht, und alle zwei Sekunden kostet das nichts. None, wenn
-/// kein Ausgang passt.
+/// Host). Die Factory bleibt, solange sie gilt (IsCurrent - eine alte kennt
+/// neu angesteckte Bildschirme und einen umgeschalteten HDR-Modus nicht);
+/// der Fensterfaden fragt alle zwei Sekunden. None, wenn kein Ausgang passt.
 pub fn schirm_lage(hwnd: isize) -> Option<crate::hdr::Schirm> {
+    use std::cell::RefCell;
     use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    thread_local! {
+        static FABRIK: RefCell<Option<IDXGIFactory1>> = const { RefCell::new(None) };
+    }
     let monitor = unsafe { MonitorFromWindow(HWND(hwnd as *mut c_void), MONITOR_DEFAULTTONEAREST) };
     if monitor.is_invalid() {
         return None;
     }
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let factory = FABRIK.with(|f| {
+        let mut f = f.borrow_mut();
+        if !f.as_ref().is_some_and(|x| unsafe { x.IsCurrent() }.as_bool()) {
+            *f = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok();
+        }
+        f.clone()
+    })?;
     let mut i = 0;
     while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
         i += 1;
