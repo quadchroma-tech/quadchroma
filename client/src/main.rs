@@ -11699,6 +11699,12 @@ fn autostart_beim_start() -> Option<Meldung> {
         let letzte = abgeschaltet.last().map(|a| a.zeile()).unwrap_or(zeile);
         (!abgeschaltet.is_empty()).then(|| Meldung::neu(strings::Key::AutostartFailed, letzte))
     };
+    // Erst hier ins Protokoll (erste Instanz): main korrigiert die Umgebung
+    // vor allem anderen, auch in einer zweiten Instanz, die das Protokoll der
+    // laufenden nicht leeren darf.
+    if let Some(z) = installation::umgebung_korrigiert() {
+        protokoll::zeile(z.to_string());
+    }
     if let Some(grund) = installation::konto().grund() {
         let zeile = format!("Mit Windows starten: gesperrt - {grund}");
         protokoll::zeile(zeile.clone());
@@ -11942,6 +11948,12 @@ fn std_umleitung_behalten(f: impl FnOnce()) {
 }
 
 fn main() {
+    // Die App laeuft erhoeht: %SystemRoot% und %windir% auf den echten
+    // Windows-Ordner, bevor irgendetwas sie liest - geerbt koennten sie aus
+    // HKCU\Environment stammen, das jedes Programm des Kontos setzen kann
+    // (installation::umgebung_absichern).
+    #[cfg(windows)]
+    installation::umgebung_absichern();
     // An die Konsole des Aufrufers anhaengen, falls es eine gibt. Beim
     // Doppelklick gibt es keine, dann passiert hier einfach nichts. Eine
     // Umleitung in eine Datei oder Pipe bleibt, wie sie ist.

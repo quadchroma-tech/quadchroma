@@ -1226,7 +1226,15 @@ with --hintergrund, or the older "QuadChroma - Freigabe.lnk" with
 --host) counts as on and, if it starts this exe, is replaced the same
 way (install, task, then the shortcut is deleted); a shortcut to another
 copy stays as it is, so a test or portable copy never takes over the
-autostart.
+autostart. The Startup folder belongs to the user while the app runs as
+administrator, so each shortcut is opened once - without following a
+link, readable only for others until it is gone - read, checked and
+deleted through that one handle; a symbolic link or a file that is no
+readable shortcut stays as it is (a line in the log). schtasks.exe is
+started from the system folder Windows itself reports, never via
+%SystemRoot% or PATH, and the app sets %SystemRoot% and %windir% back to
+the real Windows folder when it starts: an account can set both for
+itself without administrator rights.
 
 If this fails - at the start, or when switching on - no task of this
 account stays enabled that starts an exe in a folder others than

@@ -284,7 +284,15 @@ fn lnk_speichern(
 // installierte erneuert - ausser sie ist neuer. Die alten Verknuepfungen im
 // Autostart-Ordner (QuadChroma.lnk der einen App frueherer Fassungen,
 // "QuadChroma - Freigabe.lnk" der noch aelteren Host-Rolle mit --host)
-// weichen ebenso der Aufgabe, wenn sie diese exe starten.
+// weichen ebenso der Aufgabe, wenn sie diese exe starten. Der Ordner gehoert
+// dem Nutzer, die App ist erhoeht: jede Verknuepfung wird ueber EINEN Griff
+// geprueft und geloescht (alte_lnk_oeffnen, ueber_griff_loeschen), der bis
+// zum Loeschen offen bleibt - kein Verweis, und nichts laesst sich
+// dazwischen unter ihrem Pfad austauschen.
+//
+// schtasks.exe startet aus dem Systemordner, den das System selbst nennt
+// (installation::system_ordner), nie ueber %SystemRoot% oder PATH - beide
+// kann jedes Programm des Kontos ohne Adminrechte setzen.
 //
 // Scheitert das Umstellen, bleibt keine Aufgabe dieses Kontos still aktiv,
 // die eine exe ausserhalb eines Administratorordners startet (eine fruehere
@@ -419,9 +427,15 @@ fn abschalten_args(task: &str) -> Vec<String> {
     vec!["/Change".into(), "/TN".into(), task.into(), "/DISABLE".into()]
 }
 
-/// schtasks.exe ausfuehren (voller Pfad %SystemRoot%\System32\schtasks.exe,
-/// damit kein fremdes schtasks im PATH zaehlt), ohne Konsolenfenster und mit
-/// leerer Eingabe (nie eine Rueckfrage abwarten). Liefert (Erfolg, Ausgabe).
+/// schtasks.exe ausfuehren, ohne Konsolenfenster und mit leerer Eingabe (nie
+/// eine Rueckfrage abwarten). Liefert (Erfolg, Ausgabe).
+///
+/// Voller Pfad im Systemordner, den das System selbst nennt
+/// (installation::system_ordner, GetSystemDirectoryW) - weder ueber PATH
+/// noch ueber %SystemRoot%: beide kann ein Programm des Kontos ohne
+/// Adminrechte setzen (HKCU\Environment), und die App laeuft erhoeht. Aus
+/// demselben Grund bekommt schtasks %SystemRoot% und %windir% mit dem echten
+/// Windows-Ordner, nicht mit dem geerbten Wert.
 #[cfg(windows)]
 fn schtasks(args: &[String]) -> Result<(bool, String), String> {
     use std::os::windows::process::CommandExt;
@@ -429,14 +443,18 @@ fn schtasks(args: &[String]) -> Result<(bool, String), String> {
     // CREATE_NO_WINDOW: eine erhoehte GUI-App soll fuer schtasks kein
     // Konsolenfenster aufblitzen lassen.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    let exe = format!("{root}\\System32\\schtasks.exe");
-    let ausgabe = Command::new(&exe)
+    let exe = crate::installation::system_ordner()?.join("schtasks.exe");
+    let windows = crate::installation::windows_ordner()?;
+    let mut befehl = Command::new(&exe);
+    for name in crate::installation::WINDOWS_VARIABLEN {
+        befehl.env(name, &windows);
+    }
+    let ausgabe = befehl
         .args(args)
         .stdin(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|e| format!("schtasks: {e}"))?;
+        .map_err(|e| format!("schtasks ({}): {e}", exe.display()))?;
     let mut text = String::from_utf8_lossy(&ausgabe.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&ausgabe.stderr));
     Ok((ausgabe.status.success(), text.trim().to_string()))
@@ -487,15 +505,129 @@ fn autostart_ordner() -> Result<PathBuf, String> {
     Err("im Test gibt es keinen Autostart-Ordner - Ordner angeben".into())
 }
 
-/// Pfad einer alten Autostart-Verknuepfung (in `ordner`, sonst im
-/// Autostart-Ordner).
+/// Wo die alten Autostart-Verknuepfungen liegen: `ordner`, sonst der
+/// Autostart-Ordner.
 #[cfg(windows)]
-fn autostart_lnk_pfad(ordner: Option<&Path>, datei: &str) -> Result<PathBuf, String> {
-    Ok(match ordner {
-        Some(o) => o.to_path_buf(),
-        None => autostart_ordner()?,
+fn autostart_lnk_ordner(ordner: Option<&Path>) -> Result<PathBuf, String> {
+    match ordner {
+        Some(o) => Ok(o.to_path_buf()),
+        None => autostart_ordner(),
     }
-    .join(datei))
+}
+
+/// Eine alte Autostart-Verknuepfung, wie alte_lnk_oeffnen sie vorfand.
+#[cfg(windows)]
+#[derive(Debug)]
+enum AlteLnk {
+    /// Es gibt sie nicht (bzw. dort liegt ein Ordner).
+    Fehlt,
+    /// Nicht angefasst - der Grund fuers Protokoll (mit Pfad).
+    Bleibt(String),
+    /// Geprueft: der offene Griff (fuer andere nur lesbar, mit Loeschrecht)
+    /// und das Ziel der Verknuepfung.
+    Gelesen(std::fs::File, String),
+}
+
+/// Hoechstgroesse einer alten Verknuepfung, die gelesen wird.
+#[cfg(windows)]
+const LNK_MAX: u64 = 1 << 20;
+
+/// Eine alte Autostart-Verknuepfung `datei` in `ordner` oeffnen und ihr Ziel
+/// lesen - alles ueber EINEN Griff, der offen bleibt, bis sie ueber ihn
+/// geloescht ist (ueber_griff_loeschen). Der Autostart-Ordner gehoert dem
+/// Nutzer (und laesst sich fuer das Konto umleiten), die App aber ist
+/// erhoeht; zwischen Pruefen und Loeschen darf deshalb nichts unter dem Pfad
+/// ausgetauscht werden koennen:
+/// - geoeffnet, ohne einem Verweis am Ende zu folgen
+///   (FILE_FLAG_OPEN_REPARSE_POINT), mit Lese- und Loeschrecht und fuer
+///   andere nur lesbar - solange der Griff offen ist, laesst sich die Datei
+///   weder aendern noch umbenennen noch loeschen;
+/// - nur eine gewoehnliche Datei (kein Verweis, kein Ordner), die laut Griff
+///   (GetFinalPathNameByHandleW) wirklich `datei` im aufgeloesten `ordner`
+///   ist, und hoechstens LNK_MAX gross;
+/// - gelesen wird ueber den Griff (IPersistStream aus dem Speicher), nie
+///   erneut ueber den Pfad.
+///
+/// So wird genau die Datei geloescht, deren Ziel geprueft wurde. Alles
+/// andere bleibt unangetastet (AlteLnk::Bleibt, ein Vermerk).
+#[cfg(windows)]
+fn alte_lnk_oeffnen(ordner: &Path, datei: &str) -> AlteLnk {
+    use std::io::Read;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let pfad = ordner.join(datei);
+    let bleibt = |grund: String| AlteLnk::Bleibt(format!("{}: {grund}", pfad.display()));
+    // Nur um Fehlendes und Ordner still zu uebergehen - entschieden wird
+    // allein ueber den Griff.
+    match std::fs::symlink_metadata(&pfad) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AlteLnk::Fehlt,
+        Ok(m) if m.is_dir() => return AlteLnk::Fehlt,
+        _ => {}
+    }
+    let mut griff = match std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&pfad)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AlteLnk::Fehlt,
+        Err(e) => return bleibt(format!("nicht zu oeffnen ({e})")),
+    };
+    let m = match griff.metadata() {
+        Ok(m) => m,
+        Err(e) => return bleibt(format!("nicht lesbar ({e})")),
+    };
+    if m.file_attributes() & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return bleibt("keine gewoehnliche Datei (Verweis oder Ordner)".into());
+    }
+    if m.len() > LNK_MAX {
+        return bleibt(format!("zu gross ({} Byte)", m.len()));
+    }
+    let Some(end) = crate::installation::endpfad(&griff, 0) else {
+        return bleibt("Pfad hinter dem Griff nicht lesbar".into());
+    };
+    let erwartet = match std::fs::canonicalize(ordner) {
+        Ok(o) => o.join(datei),
+        Err(e) => return bleibt(format!("Ordner nicht aufloesbar ({e})")),
+    };
+    if !crate::installation::gleicher_pfad(&end, &erwartet.to_string_lossy()) {
+        return bleibt(format!("die geoeffnete Datei liegt unter {end}, nicht unter {}", erwartet.display()));
+    }
+    let mut daten = Vec::new();
+    if let Err(e) = (&mut griff).take(LNK_MAX + 1).read_to_end(&mut daten) {
+        return bleibt(format!("nicht lesbar ({e})"));
+    }
+    match lnk_ziel_aus(&daten) {
+        Ok(ziel) => AlteLnk::Gelesen(griff, ziel),
+        Err(e) => bleibt(format!("keine lesbare Verknuepfung ({e})")),
+    }
+}
+
+/// Die ueber `griff` geoeffnete Datei loeschen (FileDispositionInfo) - genau
+/// diese, nicht was gerade unter `pfad` liegt (der steht nur in der
+/// Meldung). Sie verschwindet, sobald der Griff zu ist.
+#[cfg(windows)]
+fn ueber_griff_loeschen(griff: std::fs::File, pfad: &Path) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO};
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let r = unsafe {
+        SetFileInformationByHandle(
+            HANDLE(griff.as_raw_handle()),
+            FileDispositionInfo,
+            &info as *const FILE_DISPOSITION_INFO as *const core::ffi::c_void,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    drop(griff);
+    r.map_err(|e| format!("{}: nicht geloescht ({})", pfad.display(), e.message()))
 }
 
 /// Eine geplante Aufgabe, wie schtasks /Query /XML sie zeigt.
@@ -644,16 +776,6 @@ pub fn unsichere_aufgaben_abschalten(ort: Ort) -> Vec<Abgeschaltet> {
 #[cfg(windows)]
 fn mit_abgeschalteten(fehler: String, ab: &[Abgeschaltet]) -> String {
     ab.iter().fold(fehler, |t, a| format!("{t}; {}", a.zeile()))
-}
-
-/// Eine Datei loeschen; fehlt sie schon, ist das kein Fehler.
-#[cfg(windows)]
-fn loeschen(pfad: &Path) -> Result<(), String> {
-    match std::fs::remove_file(pfad) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("{}: {e}", pfad.display())),
-    }
 }
 
 /// Die geplante Aufgabe anlegen (bzw. mit /F erneuern): `exe` mit
@@ -836,7 +958,7 @@ pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> BeimStart {
         ));
     }
     let eigene_alte = alte.filter(|(_, _, eigen)| *eigen).map(|(_, a, _)| a);
-    let start = beim_start_pruefen(lnk_ordner, ort, eigene_alte.as_ref());
+    let start = beim_start_pruefen(lnk_ordner, ort, eigene_alte.as_ref(), &mut vermerke);
     let mut abgeschaltet = Vec::new();
     if start.is_err() {
         abgeschaltet = unsichere_aufgaben_abschalten(ort);
@@ -851,31 +973,39 @@ pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> BeimStart {
 
 /// Der Kern von `autostart_beim_start` (ohne Abschalten nach Fehlern).
 /// `eigene_alte`: die fruehere Aufgabe "QuadChroma", wenn sie diesem Konto
-/// gehoert.
+/// gehoert. Eine alte Verknuepfung, die nicht sicher ueber einen Griff
+/// gelesen werden kann (alte_lnk_oeffnen), bleibt - ein Eintrag in
+/// `vermerke`.
 #[cfg(windows)]
-fn beim_start_pruefen(lnk_ordner: Option<&Path>, ort: Ort, eigene_alte: Option<&Aufgabe>) -> Result<Start, String> {
+fn beim_start_pruefen(lnk_ordner: Option<&Path>, ort: Ort, eigene_alte: Option<&Aufgabe>, vermerke: &mut Vec<String>) -> Result<Start, String> {
     use crate::installation as inst;
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
+    let ordner = autostart_lnk_ordner(lnk_ordner)?;
     let mut zu_migrieren = Vec::new();
     let mut fremd = None;
     for datei in [AUTOSTART_DATEI, AUTOSTART_ALT] {
-        let pfad = autostart_lnk_pfad(lnk_ordner, datei)?;
-        if !pfad.is_file() {
-            continue;
-        }
-        let ziel = lnk_ziel(&pfad)?;
-        if inst::dieselbe_datei(Path::new(&ziel), &exe) {
-            zu_migrieren.push(pfad);
-        } else if fremd.is_none() {
-            fremd = Some(ziel);
+        match alte_lnk_oeffnen(&ordner, datei) {
+            AlteLnk::Fehlt => {}
+            AlteLnk::Bleibt(grund) => {
+                vermerke.push(format!("Mit Windows starten: die alte Verknuepfung {grund} - sie bleibt, wie sie ist"));
+            }
+            AlteLnk::Gelesen(griff, ziel) => {
+                if inst::dieselbe_datei(Path::new(&ziel), &exe) {
+                    zu_migrieren.push((ordner.join(datei), griff));
+                } else if fremd.is_none() {
+                    fremd = Some(ziel);
+                }
+            }
         }
     }
     if !zu_migrieren.is_empty() {
         // Erst installieren und die Aufgabe anlegen, dann die alten
-        // Verknuepfungen loeschen.
+        // Verknuepfungen loeschen - ueber die Griffe, die seit der Pruefung
+        // offen sind (scheitert etwas, schliessen sie, und nichts ist
+        // geloescht).
         let neu = einschalten(ort, &exe)?;
-        for pfad in zu_migrieren {
-            loeschen(&pfad)?;
+        for (pfad, griff) in zu_migrieren {
+            ueber_griff_loeschen(griff, &pfad)?;
         }
         return Ok(Start::VerknuepfungErsetzt(neu));
     }
@@ -916,16 +1046,19 @@ fn beim_start_pruefen(lnk_ordner: Option<&Path>, ort: Ort, eigene_alte: Option<&
     Ok(Start::Umgestellt { vorher: a.befehlszeile(), neu })
 }
 
-/// Das Ziel einer Verknuepfung (IShellLinkW::GetPath).
+/// Das Ziel einer Verknuepfung (IShellLinkW::GetPath) aus ihrem Inhalt
+/// `daten` - geladen ueber IPersistStream aus dem Speicher, nicht ueber
+/// einen Pfad (alte_lnk_oeffnen hat die Datei ueber ihren Griff gelesen).
 #[cfg(windows)]
-fn lnk_ziel(pfad: &Path) -> Result<String, String> {
-    use windows::core::{Interface, HSTRING};
-    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
-    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+fn lnk_ziel_aus(daten: &[u8]) -> Result<String, String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistStream, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{IShellLinkW, SHCreateMemStream, ShellLink};
     im_sta(|| unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| e.message())?;
-        let datei: IPersistFile = link.cast().map_err(|e| e.message())?;
-        datei.Load(&HSTRING::from(pfad.as_os_str()), STGM_READ).map_err(|e| format!("{}: {}", pfad.display(), e.message()))?;
+        let strom = SHCreateMemStream(Some(daten)).ok_or_else(|| "kein Speicherstrom".to_string())?;
+        let persist: IPersistStream = link.cast().map_err(|e| e.message())?;
+        persist.Load(&strom).map_err(|e| e.message())?;
         let mut ziel = vec![0u16; 1024];
         link.GetPath(&mut ziel, std::ptr::null_mut(), 0).map_err(|e| e.message())?;
         let n = ziel.iter().position(|&c| c == 0).unwrap_or(ziel.len());
@@ -1481,8 +1614,7 @@ mod tests {
         assert!(!temp.join(EXE).exists() && !autostart_an(test_ort(&task, &temp)), "{e}");
         // 2. Unter Program Files, aber "Benutzer" (S-1-5-32-545) duerfen aendern.
         std::fs::create_dir(&pf).unwrap();
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-        let icacls = std::process::Command::new(format!("{root}\\System32\\icacls.exe"))
+        let icacls = std::process::Command::new(crate::installation::system_ordner().unwrap().join("icacls.exe"))
             .arg(&pf)
             .args(["/grant", "*S-1-5-32-545:(OI)(CI)M"])
             .output()
@@ -1639,5 +1771,136 @@ mod tests {
         let _ = autostart_setzen(ort, false);
         let _ = std::fs::remove_dir_all(&ordner);
         let _ = std::fs::remove_dir_all(&pf);
+    }
+
+    /// Eine alte Verknuepfung wird ueber EINEN Griff geprueft und geloescht:
+    /// solange er offen ist, laesst sie sich weder loeschen noch umbenennen
+    /// noch ueberschreiben, und geloescht wird genau die geoeffnete Datei,
+    /// auch wenn inzwischen eine andere unter ihrem Pfad liegt. Ein Verweis
+    /// und eine Datei ohne lesbare Verknuepfung bleiben unangetastet, ein
+    /// Ordner zaehlt als fehlend; beim Start gibt das einen Vermerk, keinen
+    /// Fehler. Ohne Adminrechte (keine Aufgabe, keine Installation).
+    #[cfg(windows)]
+    #[test]
+    fn alte_verknuepfung_ueber_griff() {
+        use crate::installation::dieselbe_datei;
+        let ordner = std::env::temp_dir().join(format!("{}-lnk-griff", crate::secure::test_lauf()));
+        let _ = std::fs::remove_dir_all(&ordner);
+        std::fs::create_dir_all(&ordner).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let lnk = ordner.join(AUTOSTART_DATEI);
+        let anlegen = |p: &Path| im_sta(|| lnk_speichern(p, &exe, AUTOSTART_ARGUMENT, &ordner, "QuadChroma", &exe, 0)).unwrap();
+        // 1. Geprueft, und solange der Griff offen ist, bleibt die Datei, wie
+        // sie ist; geloescht ueber den Griff.
+        anlegen(&lnk);
+        let (griff, ziel) = match alte_lnk_oeffnen(&ordner, AUTOSTART_DATEI) {
+            AlteLnk::Gelesen(g, z) => (g, z),
+            a => panic!("{a:?}"),
+        };
+        assert!(dieselbe_datei(Path::new(&ziel), &exe), "{ziel}");
+        assert!(std::fs::remove_file(&lnk).is_err(), "geloescht trotz offenem Griff");
+        assert!(std::fs::rename(&lnk, ordner.join("anders.lnk")).is_err(), "umbenannt trotz offenem Griff");
+        assert!(std::fs::write(&lnk, b"x").is_err(), "ueberschrieben trotz offenem Griff");
+        ueber_griff_loeschen(griff, &lnk).unwrap();
+        assert!(!lnk.exists());
+        // 2. Der Ordner wird nach der Pruefung verschoben (sofern Windows das
+        // bei offenem Griff zulaesst), und an seiner Stelle liegt eine andere
+        // Datei gleichen Namens: geloescht wird die gepruefte, nicht die neue.
+        anlegen(&lnk);
+        let AlteLnk::Gelesen(griff, _) = alte_lnk_oeffnen(&ordner, AUTOSTART_DATEI) else { panic!("nicht gelesen") };
+        let verschoben = ordner.with_extension("verschoben");
+        let _ = std::fs::remove_dir_all(&verschoben);
+        if std::fs::rename(&ordner, &verschoben).is_ok() {
+            std::fs::create_dir_all(&ordner).unwrap();
+            std::fs::write(&lnk, b"andere Datei").unwrap();
+            ueber_griff_loeschen(griff, &lnk).unwrap();
+            assert_eq!(std::fs::read(&lnk).unwrap(), b"andere Datei", "die neue Datei wurde angefasst");
+            assert!(!verschoben.join(AUTOSTART_DATEI).exists(), "die gepruefte Datei ist noch da");
+            std::fs::remove_file(&lnk).unwrap();
+            let _ = std::fs::remove_dir_all(&verschoben);
+        } else {
+            ueber_griff_loeschen(griff, &lnk).unwrap();
+        }
+        assert!(!lnk.exists());
+        // 3. Ein Verweis (symbolische Verknuepfung auf eine echte .lnk; braucht
+        // das Recht dazu, sonst uebersprungen) bleibt samt Ziel.
+        let echt = ordner.join("echt.lnk");
+        anlegen(&echt);
+        if std::os::windows::fs::symlink_file(&echt, &lnk).is_ok() {
+            match alte_lnk_oeffnen(&ordner, AUTOSTART_DATEI) {
+                AlteLnk::Bleibt(g) => assert!(g.contains("Verweis"), "{g}"),
+                a => panic!("{a:?}"),
+            }
+            assert!(std::fs::symlink_metadata(&lnk).is_ok() && echt.is_file());
+            std::fs::remove_file(&lnk).unwrap();
+        } else {
+            eprintln!("keine symbolische Verknuepfung moeglich - Teil 3 uebersprungen");
+        }
+        // 4. Keine lesbare Verknuepfung bleibt; ein Ordner und eine fehlende
+        // Datei zaehlen als fehlend.
+        std::fs::write(&lnk, b"keine Verknuepfung").unwrap();
+        assert!(matches!(alte_lnk_oeffnen(&ordner, AUTOSTART_DATEI), AlteLnk::Bleibt(g) if g.contains("keine lesbare")));
+        assert!(lnk.is_file());
+        std::fs::create_dir(ordner.join(AUTOSTART_ALT)).unwrap();
+        assert!(matches!(alte_lnk_oeffnen(&ordner, AUTOSTART_ALT), AlteLnk::Fehlt));
+        assert!(matches!(alte_lnk_oeffnen(&ordner, "gibt-es-nicht.lnk"), AlteLnk::Fehlt));
+        // Beim Start: ein Vermerk, kein Fehler, nichts angefasst.
+        let task = format!("{}-lnk-griff", crate::secure::test_lauf());
+        let b = autostart_beim_start(Some(&ordner), test_ort(&task, &ordner));
+        assert_eq!(b.start, Ok(Start::Aus), "{b:?}");
+        assert!(b.vermerke.len() == 1 && b.vermerke[0].contains("bleibt"), "{:?}", b.vermerke);
+        assert!(b.abgeschaltet.is_empty() && lnk.is_file());
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// Systemordner und Windows-Ordner kommen vom System, nicht aus der
+    /// Umgebung: schtasks.exe und icacls.exe liegen im Systemordner, und der
+    /// ist System32 im Windows-Ordner. Ein Kindprozess mit falschem
+    /// %SystemRoot% und %windir% (wie aus HKCU\Environment geerbt) findet
+    /// dieselben Ordner, startet schtasks aus dem echten, und
+    /// umgebung_absichern stellt beide Variablen richtig.
+    #[cfg(windows)]
+    #[test]
+    fn systemordner_unabhaengig_von_der_umgebung() {
+        use crate::installation::{dieselbe_datei, system_ordner, windows_ordner};
+        let sys = system_ordner().unwrap();
+        let win = windows_ordner().unwrap();
+        assert!(sys.join("schtasks.exe").is_file() && sys.join("icacls.exe").is_file(), "{}", sys.display());
+        assert!(dieselbe_datei(&sys, &win.join("System32")), "{} / {}", sys.display(), win.display());
+        let falsch = std::env::temp_dir().join(format!("{}-falscher-windows-ordner", crate::secure::test_lauf()));
+        std::fs::create_dir_all(falsch.join("System32")).unwrap();
+        let aus = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "verknuepfung::tests::umgebung_im_kind"])
+            .env("QC_UMGEBUNG_KIND", &falsch)
+            .env("SystemRoot", &falsch)
+            .env("windir", &falsch)
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&aus.stdout), String::from_utf8_lossy(&aus.stderr));
+        assert!(aus.status.success() && text.contains("1 passed"), "{text}");
+        let _ = std::fs::remove_dir_all(&falsch);
+    }
+
+    /// Hilfe fuer den Test oben: prueft nur mit QC_UMGEBUNG_KIND (dem
+    /// falschen Windows-Ordner, der auch in %SystemRoot% und %windir% steht).
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn umgebung_im_kind() {
+        use crate::installation::{gleicher_pfad, system_ordner, umgebung_absichern, umgebung_korrigiert, windows_ordner, WINDOWS_VARIABLEN};
+        let Some(falsch) = std::env::var_os("QC_UMGEBUNG_KIND") else { return };
+        let falsch = falsch.to_string_lossy().to_string();
+        assert_eq!(std::env::var("SystemRoot").unwrap(), falsch, "nicht geerbt");
+        let sys = system_ordner().unwrap();
+        assert!(!sys.starts_with(&falsch) && sys.join("schtasks.exe").is_file(), "{}", sys.display());
+        // schtasks startet aus dem echten Systemordner (im falschen liegt keins).
+        let (ok, _) = schtasks(&xml_args(&format!("{}-gibt-es-nicht", crate::secure::test_lauf()))).unwrap();
+        assert!(!ok);
+        umgebung_absichern();
+        let win = windows_ordner().unwrap();
+        for name in WINDOWS_VARIABLEN {
+            assert!(gleicher_pfad(&std::env::var(name).unwrap(), &win.to_string_lossy()), "{name}");
+        }
+        assert!(umgebung_korrigiert().is_some_and(|z| z.contains(&falsch)), "{:?}", umgebung_korrigiert());
     }
 }

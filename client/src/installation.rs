@@ -911,6 +911,95 @@ pub fn installationsordner() -> Result<PathBuf, String> {
     Ok(program_files()?.join(ORDNER))
 }
 
+/// Einen Ordner des Systems ueber `f` (GetSystemDirectoryW bzw.
+/// GetSystemWindowsDirectoryW) lesen; ist der Puffer zu klein, liefert `f`
+/// die noetige Laenge samt Abschluss. Nur ein lokaler Laufwerkspfad taugt.
+#[cfg(windows)]
+fn systempfad(was: &str, f: impl Fn(&mut [u16]) -> u32) -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut puffer = vec![0u16; 261];
+    for _ in 0..3 {
+        let n = f(&mut puffer) as usize;
+        if n == 0 {
+            return Err(format!("{was}: {}", std::io::Error::last_os_error()));
+        }
+        if n < puffer.len() {
+            let p = PathBuf::from(std::ffi::OsString::from_wide(&puffer[..n]));
+            if !lokaler_laufwerkspfad(&p.to_string_lossy()) {
+                return Err(format!("{was}: {} ist kein lokaler Pfad", p.display()));
+            }
+            return Ok(p);
+        }
+        puffer.resize(n, 0);
+    }
+    Err(format!("{was}: Pfad nicht lesbar"))
+}
+
+/// Der Systemordner (etwa C:\WINDOWS\system32) vom System selbst
+/// (GetSystemDirectoryW) - nie aus %SystemRoot% oder %windir%: die kann
+/// jedes Programm des Kontos ohne Adminrechte setzen (HKCU\Environment),
+/// und die erhoehte App erbte sie, von der Aufgabe bei der Anmeldung wie
+/// beim Start mit UAC-Abfrage aus dem Explorer. schtasks.exe wird von hier
+/// gestartet (verknuepfung.rs).
+#[cfg(windows)]
+pub fn system_ordner() -> Result<PathBuf, String> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    systempfad("Systemordner", |p| unsafe { GetSystemDirectoryW(Some(p)) })
+}
+
+/// Der Windows-Ordner (etwa C:\WINDOWS) vom System selbst
+/// (GetSystemWindowsDirectoryW) - der richtige Wert fuer %SystemRoot% und
+/// %windir% (umgebung_absichern).
+#[cfg(windows)]
+pub fn windows_ordner() -> Result<PathBuf, String> {
+    use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+    systempfad("Windows-Ordner", |p| unsafe { GetSystemWindowsDirectoryW(Some(p)) })
+}
+
+/// Die Umgebungsvariablen, unter denen der Windows-Ordner steht.
+#[cfg(windows)]
+pub const WINDOWS_VARIABLEN: [&str; 2] = ["SystemRoot", "windir"];
+
+/// Was umgebung_absichern korrigiert hat (fuer das Protokoll der ersten
+/// Instanz; beim Start selbst gibt es noch keine Protokolldatei).
+#[cfg(windows)]
+static UMGEBUNG_KORRIGIERT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Erster Schritt in main: %SystemRoot% und %windir% dieses Prozesses auf
+/// den echten Windows-Ordner setzen, falls sie davon abweichen. Beide kann
+/// ein Programm des Kontos ohne Adminrechte setzen (HKCU\Environment), und
+/// die erhoehte App erbte sie. Windows selbst setzt sie in Pfade ein - etwa
+/// beim Laden von COM-Servern, deren Pfad als %SystemRoot%\... in der
+/// Registrierung steht (die Verknuepfungen nutzen IShellLinkW) -, und
+/// schtasks.exe erbte sie wiederum. Laeuft vor jedem weiteren Faden.
+#[cfg(windows)]
+pub fn umgebung_absichern() {
+    let Ok(echt) = windows_ordner() else { return };
+    let mut korrigiert = Vec::new();
+    for name in WINDOWS_VARIABLEN {
+        let wert = std::env::var_os(name).map(|w| w.to_string_lossy().into_owned());
+        // Nur die Schreibweise anders (C:\Windows statt C:\WINDOWS): derselbe Ordner.
+        if wert.as_deref().is_some_and(|w| gleicher_pfad(w, &echt.to_string_lossy())) {
+            continue;
+        }
+        korrigiert.push(format!("{name}={}", wert.unwrap_or_else(|| "(fehlte)".into())));
+        std::env::set_var(name, &echt);
+    }
+    if !korrigiert.is_empty() {
+        let _ = UMGEBUNG_KORRIGIERT.set(format!(
+            "Umgebung: {} wich vom Windows-Ordner ab - auf {} gesetzt",
+            korrigiert.join(", "),
+            echt.display()
+        ));
+    }
+}
+
+/// Die Zeile fuers Protokoll, wenn umgebung_absichern etwas korrigiert hat.
+#[cfg(windows)]
+pub fn umgebung_korrigiert() -> Option<&'static str> {
+    UMGEBUNG_KORRIGIERT.get().map(String::as_str)
+}
+
 /// Besitzer und DACL eines Ordners bzw. einer Datei lesen (GetFileSecurityW).
 #[cfg(windows)]
 fn sicherheit_lesen(pfad: &Path) -> Result<(String, Option<Vec<Ace>>), String> {
@@ -1118,7 +1207,7 @@ impl Quelle {
 /// Einen Endpfad des geoeffneten Griffs (GetFinalPathNameByHandleW mit
 /// `flags`: normalisiert oder wie geoeffnet, als DOS- oder NT-Pfad).
 #[cfg(windows)]
-fn endpfad(datei: &std::fs::File, flags: u32) -> Option<String> {
+pub fn endpfad(datei: &std::fs::File, flags: u32) -> Option<String> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, GETFINALPATHNAMEBYHANDLE_FLAGS};
