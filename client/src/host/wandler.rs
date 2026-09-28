@@ -106,10 +106,12 @@ pub fn format_name(f: DXGI_FORMAT) -> String {
 
 // ------------------------------------------------------------- Modus PQ
 
-/// Die PQ-Shader: hinter hdr_hlsl::WANDLER (vs_voll, Eingang t0) gesetzt,
-/// eigene Konstanten in b1. Die Zahlen sind die aus hdr.rs (PQ, BT.709 ->
-/// BT.2020, Luma-Gewichte BT.2020); der Test pq_zahlen_wie_in_hdr_rs haelt
-/// sie fest. Einstiege: ps_pq444 (drei Ziele), ps_pq420_y, ps_pq420_uv.
+/// Die PQ-Shader: hinter hdr_hlsl::WANDLER (vs_voll, Eingang t0) und
+/// hdr_hlsl::PQ (pq_oetf, srgb_eotf, M_709_NACH_2020 - dieselbe Quelle wie
+/// die Anzeige des Clients) gesetzt, eigene Konstanten in b1. Die Zahlen
+/// hier sind die Luma-Gewichte BT.2020 aus hdr.rs; der Test
+/// pq_zahlen_wie_in_hdr_rs haelt sie fest. Einstiege: ps_pq444 (drei Ziele),
+/// ps_pq420_y, ps_pq420_uv.
 pub(crate) const PQ_HLSL: &str = r#"
 // ---------- Wandler, Modus PQ: Desktop -> HDR10-Ebenen (BT.2020, PQ, voll, 10 Bit oben buendig) ----------
 cbuffer WandlerPq : register(b1) {
@@ -121,37 +123,12 @@ cbuffer WandlerPq : register(b1) {
     float weiss_scrgb;      // SDRWhiteLevel / 1000: sRGB-Weiss im scRGB (nur fuer BGRA)
 };
 
-static const float PQ_M1 = 0.1593017578125;
-static const float PQ_M2 = 78.84375;
-static const float PQ_C1 = 0.8359375;
-static const float PQ_C2 = 18.8515625;
-static const float PQ_C3 = 18.6875;
-static const float PQ_SPITZE = 10000.0;
 static const float SCRGB_NIT = 80.0;
-// BT.709 -> BT.2020 (linear, D65), zeilenweise wie M_709_NACH_2020 in hdr.rs
-static const float3 M2020_R = float3(0.6274039, 0.32928303, 0.043313067);
-static const float3 M2020_G = float3(0.06909729, 0.9195404, 0.011362316);
-static const float3 M2020_B = float3(0.01639144, 0.08801331, 0.89559525);
 // Luma-Gewichte BT.2020-NCL und die Teiler fuer Cb und Cr
 static const float KR = 0.2627;
 static const float KB = 0.0593;
 static const float CB_TEILER = 1.8814;
 static const float CR_TEILER = 1.4746;
-
-// sRGB-EOTF, stueckweise: kodiert 0..1 -> linear 0..1 (nur fuer BGRA-Bilder).
-float3 srgb_eotf(float3 v) {
-    v = saturate(v);
-    float3 tief = v * (1.0 / 12.92);
-    float3 hoch = exp2(log2((v + 0.055) * (1.0 / 1.055)) * 2.4);
-    return (v <= 0.04045) ? tief : hoch;
-}
-
-// PQ (SMPTE ST 2084, inverse EOTF): nit -> Signal 0..1, ueber 10000 nit geklemmt.
-float3 pq_oetf(float3 nit) {
-    float3 y = saturate(nit * (1.0 / PQ_SPITZE));
-    float3 ym = exp2(log2(y) * PQ_M1);
-    return exp2(log2((PQ_C1 + PQ_C2 * ym) / (1.0 + PQ_C3 * ym)) * PQ_M2);
-}
 
 // Ein Desktoppunkt (so gedreht, wie der Desktop steht) -> lineares BT.2020 in
 // scRGB-Einheiten (1.0 = 80 nit). Negatives (ausserhalb BT.2020) und NaN
@@ -163,7 +140,7 @@ float3 lin2020(int2 d) {
     else if (drehung == 3) q = int2(quelle_groesse.x - 1 - d.y, d.x);
     float3 c = eingang.Load(int3(q, 0)).rgb;
     if (eingang_srgb != 0) c = srgb_eotf(c) * weiss_scrgb;
-    return max(float3(dot(M2020_R, c), dot(M2020_G, c), dot(M2020_B, c)), 0.0);
+    return max(mul(M_709_NACH_2020, c), 0.0);
 }
 
 // Ein Strompunkt -> PQ-R'G'B' 0..1.
@@ -278,10 +255,10 @@ fn drehung_code(d: Drehung) -> i32 {
 }
 
 /// Die ganze Quelle der PQ-Shader: der Text des Wandlers (vs_voll, Eingang,
-/// gemeinsame Funktionen) und dahinter PQ_HLSL.
+/// gemeinsame Funktionen), die gemeinsamen PQ-Funktionen und dahinter PQ_HLSL.
 fn pq_quelle() -> &'static str {
     static Q: OnceLock<String> = OnceLock::new();
-    Q.get_or_init(|| format!("{}{}", hdr_hlsl::WANDLER, PQ_HLSL))
+    Q.get_or_init(|| format!("{}{}{}", hdr_hlsl::WANDLER, hdr_hlsl::PQ, PQ_HLSL))
 }
 
 /// Die uebersetzten Shader (Vertex, Pixel SDR) - einmal je Prozess; ein
@@ -802,25 +779,16 @@ mod tests {
         }
     }
 
-    /// Die Zahlen im PQ-HLSL sind die aus hdr.rs: PQ-Konstanten, BT.709 ->
-    /// BT.2020 (Zeile fuer Zeile), Luma-Gewichte und Teiler BT.2020.
+    /// Die Zahlen im PQ-HLSL des Wandlers sind die aus hdr.rs: Luma-Gewichte
+    /// und Teiler BT.2020 (PQ und BT.709 -> BT.2020 kommen aus hdr_hlsl::PQ,
+    /// dort geprueft). Die gemeinsamen Funktionen stehen nicht doppelt da.
     #[test]
     fn pq_zahlen_wie_in_hdr_rs() {
-        let steht = |name: &str, z: f64| {
-            let text = format!("{z}");
-            assert!(PQ_HLSL.contains(&text), "{name} {text} fehlt im PQ-HLSL");
-        };
-        steht("m1", hdr::PQ_M1);
-        steht("m2", hdr::PQ_M2);
-        steht("c1", hdr::PQ_C1);
-        steht("c2", hdr::PQ_C2);
-        steht("c3", hdr::PQ_C3);
-        steht("Spitze", hdr::PQ_SPITZE_NIT);
-        for (i, name) in ["M2020_R", "M2020_G", "M2020_B"].iter().enumerate() {
-            let z = hdr::M_709_NACH_2020[i];
-            let zeile = format!("{name} = float3({}, {}, {});", z[0], z[1], z[2]);
-            assert!(PQ_HLSL.contains(&zeile), "{zeile} fehlt im PQ-HLSL");
+        assert!(pq_quelle().contains(hdr_hlsl::PQ));
+        for doppelt in ["PQ_M1 =", "float3 pq_oetf(", "float3 srgb_eotf(", "float3x3 M_709_NACH_2020"] {
+            assert!(!PQ_HLSL.contains(doppelt), "{doppelt} gehoert nach hdr_hlsl.rs");
         }
+        assert!(PQ_HLSL.contains("mul(M_709_NACH_2020, c)"));
         assert!(PQ_HLSL.contains(&format!("KR = {};", hdr::KR_2020)));
         assert!(PQ_HLSL.contains(&format!("KB = {};", hdr::KB_2020)));
         assert!(PQ_HLSL.contains(&format!("CB_TEILER = {};", hdr::CB_B_2020)));

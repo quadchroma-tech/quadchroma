@@ -1,15 +1,18 @@
 // HDR-Shader in HLSL fuer die Windows-Seiten: der Wandler des Hosts
-// (host/wandler.rs) - und die Anzeige des Clients (anzeige.rs), sobald sie
-// HDR-Stroeme darstellt. Die Rechnung ist die aus dem HDR-Plan, Abschnitt 4:
+// (host/wandler.rs, Modus SDR und PQ) und die Anzeige des Clients
+// (anzeige.rs). Die Rechnung ist die aus dem HDR-Plan, Abschnitt 4:
 // Arbeitsraum ist lineares Licht relativ zum SDR-Weiss der Quelle (rel 1.0 =
 // SDR-Weiss des Hosts), auf SDR-Zielen wird farbtontreu abgeschnitten
-// (Entscheidung E4), ausgegeben wird stueckweise sRGB.
+// (Entscheidung E4), ausgegeben wird stueckweise sRGB bzw. PQ.
 //
 // Eine Quelle je Nutzer: die gemeinsamen Funktionen stehen in
-// hlsl_gemeinsam!, jeder Nutzer setzt seine Einstiege mit concat! dahinter -
-// D3DCompile bekommt EINEN Text, ohne #include. Das Gegenstueck in Rust
-// (`spiegel`, nur im Test) rechnet dieselben Schritte in f32; die Tests
-// halten die Zahlen im HLSL-Text und die Lage der Konstanten gegen Rust fest.
+// hlsl_gemeinsam! (Dreieck, Abschneiden, sRGB, acht Bit) und hlsl_pq! (PQ,
+// sRGB-EOTF, BT.709 <-> BT.2020, zehn Bit, die Abbildung aus hdr.rs); jeder
+// Nutzer setzt seine Einstiege dahinter - D3DCompile bekommt EINEN Text,
+// ohne #include. So rechnen Wandler und Anzeige PQ aus derselben Quelle. Das
+// Gegenstueck in Rust (`spiegel`, nur im Test) rechnet dieselben Schritte in
+// f32; die Tests halten die Zahlen im HLSL-Text (gegen hdr.rs) und die Lage
+// der Konstanten gegen Rust fest.
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -52,6 +55,84 @@ float3 acht_bit(float3 v) {
 "#
     };
 }
+
+/// Die gemeinsamen PQ-Funktionen (reiner Text wie hlsl_gemeinsam, das davor
+/// steht). Die Zahlen sind die aus hdr.rs; der Test pq_zahlen_wie_in_hdr_rs
+/// haelt sie fest.
+macro_rules! hlsl_pq {
+    () => {
+        r#"
+// ---------- gemeinsam, PQ: dieselbe Rechnung wie hdr.rs ----------
+// SMPTE ST 2084
+static const float PQ_M1 = 0.1593017578125;
+static const float PQ_M2 = 78.84375;
+static const float PQ_C1 = 0.8359375;
+static const float PQ_C2 = 18.8515625;
+static const float PQ_C3 = 18.6875;
+static const float PQ_SPITZE = 10000.0;
+
+// Lineares RGB BT.709 <-> BT.2020 (D65), zeilenweise wie hdr.rs (mul(M, v) = M v).
+static const float3x3 M_709_NACH_2020 = {
+    0.6274039, 0.32928303, 0.043313067,
+    0.06909729, 0.9195404, 0.011362316,
+    0.01639144, 0.08801331, 0.89559525
+};
+static const float3x3 M_2020_NACH_709 = {
+    1.660491, -0.5876411, -0.07284986,
+    -0.12455048, 1.1328999, -0.008349423,
+    -0.018150764, -0.1005789, 1.1187297
+};
+
+// PQ: Signal 0..1 <-> nit, ueber 10000 nit geklemmt. exp2(log2()) statt pow:
+// ohne die Warnung zu negativen Basen; log2(0) = -inf, exp2(-inf) = 0.
+float3 pq_eotf(float3 e) {
+    e = saturate(e);
+    float3 p = exp2(log2(e) * (1.0 / PQ_M2));
+    float3 z = max(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p);
+    return exp2(log2(z) * (1.0 / PQ_M1)) * PQ_SPITZE;
+}
+float3 pq_oetf(float3 nit) {
+    float3 y  = saturate(nit * (1.0 / PQ_SPITZE));
+    float3 ym = exp2(log2(y) * PQ_M1);
+    return exp2(log2((PQ_C1 + PQ_C2 * ym) / (1.0 + PQ_C3 * ym)) * PQ_M2);
+}
+
+// sRGB-EOTF, stueckweise (IEC 61966-2-1): kodiert 0..1 -> linear 0..1.
+float3 srgb_eotf(float3 v) {
+    v = saturate(v);
+    return (v <= 0.04045) ? v / 12.92 : exp2(log2((v + 0.055) / 1.055) * 2.4);
+}
+
+// Zehn Bit wie acht_bit: selbst runden, den exakten Bruch k/1023 ausgeben.
+float3 zehn_bit(float3 v) { return floor(saturate(v) * 1023.0 + 0.5) * (1.0 / 1023.0); }
+
+// Die Abbildung aus hdr.rs (abbilden, rgb_abbilden): Knie beim SDR-Weiss (1),
+// C1-stetig, bildet Hs genau auf Hd ab; Hs <= Hd oder Hd <= 1: bei Hd
+// abgeschnitten. Farbtreu ueber das groesste Glied.
+float abbilden(float m, float hs, float hd) {
+    if (hs <= hd) return min(m, hd);
+    float d = hd - 1.0;
+    if (d <= 0.0) return min(m, hd);
+    if (m <= 1.0) return m;
+    float e = m - 1.0;
+    float s = hs - 1.0;
+    return min(1.0 + e * (1.0 + e * d / (s * s)) / (1.0 + e / d), hd);
+}
+float3 rgb_abbilden(float3 rgb, float hs, float hd) {
+    float m = max(rgb.r, max(rgb.g, rgb.b));
+    return (m > 0.0) ? rgb * (abbilden(m, hs, hd) / m) : rgb;
+}
+"#
+    };
+}
+
+/// hlsl_gemeinsam und hlsl_pq als ein Text: der Anfang der Quelle der
+/// Anzeige des Clients (anzeige.rs setzt ihre Stufen dahinter).
+pub(crate) const GEMEINSAM_PQ: &str = concat!(hlsl_gemeinsam!(), hlsl_pq!());
+
+/// Nur hlsl_pq: der Wandler setzt es hinter WANDLER (das hlsl_gemeinsam
+/// schon enthaelt) und davor seine PQ-Einstiege (host/wandler.rs, PQ_HLSL).
+pub(crate) const PQ: &str = hlsl_pq!();
 
 /// Der Wandler des Hosts (host/wandler.rs), Modus SDR: ein HDR-Desktop
 /// (FP16, scRGB) wird SDR (sRGB, BGRA8). Einstiege vs_voll und ps_sdr;
@@ -224,11 +305,55 @@ mod tests {
     }
 
     /// Die Einstiege, die der Wandler uebersetzt, stehen im Text - je einmal.
+    /// Ebenso die gemeinsamen PQ-Funktionen im Anfang der Anzeige.
     #[test]
     fn einstiege_vorhanden() {
         for e in ["float4 vs_voll(", "float4 ps_sdr(", "float3 farbtontreu_abschneiden(", "float3 srgb_oetf(", "float3 acht_bit("] {
             assert_eq!(WANDLER.matches(e).count(), 1, "{e}");
         }
+        for e in [
+            "float4 vs_voll(",
+            "float3 srgb_oetf(",
+            "float3 acht_bit(",
+            "float3 pq_eotf(",
+            "float3 pq_oetf(",
+            "float3 srgb_eotf(",
+            "float3 zehn_bit(",
+            "float abbilden(",
+            "float3 rgb_abbilden(",
+        ] {
+            assert_eq!(GEMEINSAM_PQ.matches(e).count(), 1, "{e}");
+        }
+        assert!(GEMEINSAM_PQ.ends_with(PQ));
+        // Weder Register noch Einstiege: die legt jeder Nutzer selbst fest.
+        assert!(!PQ.contains("register(") && !PQ.contains("SV_"));
+    }
+
+    /// Die Zahlen im PQ-HLSL sind die aus hdr.rs: PQ, beide Matrizen
+    /// zeilenweise, sRGB, das Knie der Abbildung.
+    #[test]
+    fn pq_zahlen_wie_in_hdr_rs() {
+        use crate::hdr;
+        for (name, z) in [("M1", hdr::PQ_M1), ("M2", hdr::PQ_M2), ("C1", hdr::PQ_C1), ("C2", hdr::PQ_C2), ("C3", hdr::PQ_C3)] {
+            let zeile = format!("static const float PQ_{name} = {z};");
+            assert!(PQ.contains(&zeile), "{zeile} fehlt");
+        }
+        assert_eq!(hdr::PQ_SPITZE_NIT, 10000.0);
+        assert!(PQ.contains("static const float PQ_SPITZE = 10000.0;"));
+        for (name, m) in [("M_709_NACH_2020", hdr::M_709_NACH_2020), ("M_2020_NACH_709", hdr::M_2020_NACH_709)] {
+            let t = &PQ[PQ.find(&format!("float3x3 {name}")).unwrap_or_else(|| panic!("{name} fehlt"))..];
+            let t = &t[..t.find("};").expect("Ende der Matrix")];
+            for r in m {
+                let zeile = format!("{}, {}, {}", r[0], r[1], r[2]);
+                assert!(t.contains(&zeile), "{name}: Zeile {zeile} fehlt");
+            }
+        }
+        for z in ["0.04045", "12.92", "1.055", "0.055", "2.4"] {
+            assert!(PQ.contains(z), "sRGB {z}");
+        }
+        assert!(PQ.contains("(v <= 0.04045) ? v / 12.92 : exp2(log2((v + 0.055) / 1.055) * 2.4)"));
+        assert_eq!(hdr::KNIE, 1.0);
+        assert!(PQ.contains("float d = hd - 1.0;") && PQ.contains("if (m <= 1.0) return m;"));
     }
 
     /// FP16 wie auf der Karte: bekannte Bitmuster, Rundung, Subnormale.

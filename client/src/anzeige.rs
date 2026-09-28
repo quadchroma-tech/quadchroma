@@ -32,7 +32,8 @@
 // SDR-Schirm bleibt sie B8G8R8A8, und das PQ-Bild wird farbtontreu
 // abgeschnitten wie in `to_rgb_mit`. Umgeschaltet wird hoechstens alle 0,5 s
 // und nur, wenn Bild und Schirm es verlangen; ein SDR-Strom nimmt den
-// heutigen Weg, bitgleich.
+// heutigen Weg, bitgleich. PQ, sRGB, die Matrizen und die Abbildung stehen
+// in hdr_hlsl.rs - dieselbe HLSL-Quelle wie im Wandler des Windows-Hosts.
 
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -416,15 +417,10 @@ pub struct Gpu {
 /// `blit`. Register: Stufe 1 auf b0 und t0..t3, Stufe 2 auf b1 und t4..t5 -
 /// getrennt, damit sich die Deklarationen in EINER Quelle nicht in die Quere
 /// kommen. Die HDR-Einstiege dahinter nehmen dazu b2 (Stufe 1 PQ) und b3
-/// (Stufe 2 HDR); ihre Zahlen sind die aus hdr.rs (Test pq_zahlen_wie_in_hdr_rs).
+/// (Stufe 2 HDR). Davor steht hdr_hlsl::GEMEINSAM_PQ (vs_voll, sRGB, PQ,
+/// Matrizen, Abbildung - dieselbe Quelle wie der Wandler des Hosts, ihre
+/// Zahlen prueft hdr_hlsl.rs gegen hdr.rs); `quelle` setzt beides zusammen.
 const SHADER: &str = r#"
-// ---------- gemeinsam: ein Dreieck ueber das ganze Ziel, ohne Vertexpuffer ----------
-// (0,0) (2,0) (0,2) im Bildraum, nach Clip-Koordinaten gespiegelt (y nach unten).
-float4 vs_main(uint id : SV_VertexID) : SV_Position {
-    float2 p = float2((id << 1) & 2, id & 2);
-    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-
 // ---------- Stufe 1: Ebenen -> RGB, bitidentisch zu zeile_rgb ----------
 cbuffer Format : register(b0) { uint sub; uint paar; uint schieb; uint _f; };
 Texture2D<uint>  ebene_y  : register(t0);
@@ -533,66 +529,6 @@ cbuffer Hdr : register(b3) {
     uint  h_durchreichen;   // 1 = PQ-Codes unveraendert auf den HDR-Schirm
     uint2 _h;
 };
-
-// Lineares RGB BT.709 <-> BT.2020, zeilenweise wie hdr.rs (mul(M, v) = M v).
-static const float3x3 M_709_NACH_2020 = {
-    0.6274039, 0.32928303, 0.043313067,
-    0.06909729, 0.9195404, 0.011362316,
-    0.01639144, 0.08801331, 0.89559525
-};
-static const float3x3 M_2020_NACH_709 = {
-    1.660491, -0.5876411, -0.07284986,
-    -0.12455048, 1.1328999, -0.008349423,
-    -0.018150764, -0.1005789, 1.1187297
-};
-
-// PQ (SMPTE ST 2084): Signal 0..1 <-> nit. exp2(log2()) statt pow: ohne die
-// Warnung zu negativen Basen; log2(0) = -inf, exp2(-inf) = 0.
-float3 pq_eotf(float3 e) {
-    e = saturate(e);
-    float3 p = exp2(log2(e) * (1.0 / 78.84375));
-    float3 z = max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p);
-    return exp2(log2(z) * (1.0 / 0.1593017578125)) * 10000.0;
-}
-float3 pq_oetf(float3 nit) {
-    float3 y  = saturate(nit * (1.0 / 10000.0));
-    float3 ym = exp2(log2(y) * 0.1593017578125);
-    return exp2(log2((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym)) * 78.84375);
-}
-
-// sRGB, stueckweise (IEC 61966-2-1).
-float3 srgb_eotf(float3 v) {
-    v = saturate(v);
-    return (v <= 0.04045) ? v / 12.92 : exp2(log2((v + 0.055) / 1.055) * 2.4);
-}
-float3 srgb_oetf(float3 l) {
-    l = saturate(l);
-    float3 tief = l * 12.92;
-    float3 hoch = 1.055 * exp2(log2(l) * (1.0 / 2.4)) - 0.055;
-    return (l <= 0.0031308) ? tief : hoch;
-}
-
-// Selbst runden und den exakten Bruch k/255 bzw. k/1023 ausgeben - die
-// UNORM-Wandlung des Ziels trifft dann genau k.
-float3 acht_bit(float3 v) { return floor(saturate(v) * 255.0 + 0.5) * (1.0 / 255.0); }
-float3 zehn_bit(float3 v) { return floor(saturate(v) * 1023.0 + 0.5) * (1.0 / 1023.0); }
-
-// Die Abbildung aus hdr.rs (abbilden, rgb_abbilden): Knie beim SDR-Weiss (1),
-// C1-stetig, bildet Hs genau auf Hd ab; Hs <= Hd oder Hd <= 1: bei Hd
-// abgeschnitten. Farbtreu ueber das groesste Glied.
-float abbilden(float m, float hs, float hd) {
-    if (hs <= hd) return min(m, hd);
-    float d = hd - 1.0;
-    if (d <= 0.0) return min(m, hd);
-    if (m <= 1.0) return m;
-    float e = m - 1.0;
-    float s = hs - 1.0;
-    return min(1.0 + e * (1.0 + e * d / (s * s)) / (1.0 + e / d), hd);
-}
-float3 rgb_abbilden(float3 rgb, float hs, float hd) {
-    float m = max(rgb.r, max(rgb.g, rgb.b));
-    return (m > 0.0) ? rgb * (abbilden(m, hs, hd) / m) : rgb;
-}
 
 // Der Wert der Zwischentextur an diesem Zielpunkt, mit denselben Quellpunkten
 // wie ps_anzeigen (blit); false ausserhalb des Bildes.
@@ -956,9 +892,16 @@ fn blob_text(b: &ID3DBlob) -> String {
     }
 }
 
-/// Einen Einstiegspunkt aus SHADER uebersetzen.
+/// Die ganze Quelle der Anzeige: die gemeinsamen Funktionen aus hdr_hlsl.rs
+/// (auch PQ) und dahinter SHADER.
+fn hlsl_quelle() -> &'static str {
+    static Q: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    Q.get_or_init(|| format!("{}{}", crate::hdr_hlsl::GEMEINSAM_PQ, SHADER))
+}
+
+/// Einen Einstiegspunkt aus der Quelle der Anzeige uebersetzen.
 fn uebersetzen(einstieg: &[u8], ziel: &[u8]) -> Result<Vec<u8>, String> {
-    uebersetzen_aus(SHADER, b"anzeige.hlsl\0", einstieg, ziel)
+    uebersetzen_aus(hlsl_quelle(), b"anzeige.hlsl\0", einstieg, ziel)
 }
 
 /// Einen Einstiegspunkt aus einer HLSL-Quelle uebersetzen - der Anzeige
@@ -1410,7 +1353,7 @@ impl Gpu {
     /// Der gemeinsame Rest: Shader, Zustaende, Konstantenpuffer, Adapter.
     /// Ohne Swapchain - `neu` haengt sie danach an.
     fn aus_geraet(device: ID3D11Device, ctx: ID3D11DeviceContext, fl: D3D_FEATURE_LEVEL) -> Result<Gpu, String> {
-        let vs_code = uebersetzen(b"vs_main\0", b"vs_4_0\0")?;
+        let vs_code = uebersetzen(b"vs_voll\0", b"vs_4_0\0")?;
         let ps1_code = uebersetzen(b"ps_umrechnen\0", b"ps_4_0\0")?;
         let ps2_code = uebersetzen(b"ps_anzeigen\0", b"ps_4_0\0")?;
         let ps1_pq_code = uebersetzen(b"ps_umrechnen_pq\0", b"ps_4_0\0")?;
@@ -2566,28 +2509,16 @@ mod tests {
         }
     }
 
-    /// Die Zahlen im HLSL sind die aus hdr.rs: PQ, sRGB, beide Matrizen
-    /// zeilenweise, das Knie, die Skala der PQ-Zwischentextur.
+    /// PQ, sRGB, beide Matrizen und die Abbildung kommen aus hdr_hlsl.rs
+    /// (dort gegen hdr.rs geprueft) und stehen nicht doppelt in SHADER; hier
+    /// bleibt die Skala der PQ-Zwischentextur.
     #[test]
     fn pq_zahlen_wie_in_hdr_rs() {
-        for z in [hdr::PQ_M1, hdr::PQ_M2, hdr::PQ_C1, hdr::PQ_C2, hdr::PQ_C3] {
-            assert!(SHADER.contains(&format!("{z}")), "PQ-Konstante {z} fehlt");
+        assert!(hlsl_quelle().starts_with(crate::hdr_hlsl::GEMEINSAM_PQ) && hlsl_quelle().ends_with(SHADER));
+        for doppelt in ["float3 pq_eotf(", "float3 srgb_oetf(", "float3 acht_bit(", "float3x3 M_2020_NACH_709", "float abbilden(", "float4 vs_voll("] {
+            assert!(!SHADER.contains(doppelt), "{doppelt} gehoert nach hdr_hlsl.rs");
+            assert_eq!(hlsl_quelle().matches(doppelt).count(), 1, "{doppelt}");
         }
-        assert_eq!(hdr::PQ_SPITZE_NIT, 10000.0);
-        assert!(SHADER.contains("* 10000.0") && SHADER.contains("(1.0 / 10000.0)"));
-        for (name, m) in [("M_709_NACH_2020", hdr::M_709_NACH_2020), ("M_2020_NACH_709", hdr::M_2020_NACH_709)] {
-            let t = &SHADER[SHADER.find(&format!("float3x3 {name}")).unwrap_or_else(|| panic!("{name} fehlt"))..];
-            let t = &t[..t.find("};").expect("Ende der Matrix")];
-            for r in m {
-                let zeile = format!("{}, {}, {}", r[0], r[1], r[2]);
-                assert!(t.contains(&zeile), "{name}: Zeile {zeile} fehlt");
-            }
-        }
-        for z in ["0.04045", "12.92", "1.055", "0.055", "2.4", "0.0031308"] {
-            assert!(SHADER.contains(z), "sRGB {z}");
-        }
-        assert_eq!(hdr::KNIE, 1.0);
-        assert!(SHADER.contains("float d = hd - 1.0;") && SHADER.contains("if (m <= 1.0) return m;"));
         assert_eq!(PQ_S_MAX, 1023 * 64);
         assert!(SHADER.contains("clamp(int3(r, g, b), 0, 65472)") && SHADER.contains("(65535.0 / 65472.0)"));
     }
