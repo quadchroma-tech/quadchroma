@@ -477,7 +477,7 @@ immediately and reports back what is actually in effect; the client stores the v
 per host (by fingerprint) and restores them on the next connection. The choice of
 screen is stored by the host itself.
 
-![The menu (F10, or hold ESC) with its six tabs - Picture, Display, Encryption, Shortcuts, Benchmark, Computers - and Disconnect at the right of the header, above the host's address. The Picture tab is open: latency and frame rate, maximum bit rate and frame rate, gaming mode, fixed frame rate, sound, the host's screens (Automatic and two screens) and the codecs the host offers.](hud.png)
+![The menu (F10, or hold ESC) with its six tabs - Picture, Display, Encryption, Shortcuts, Benchmark, Computers - and Disconnect at the right of the header, above the host's address. The Picture tab is open: latency and frame rate, maximum bit rate and frame rate, gaming mode, fixed frame rate, sound, the HDR switch lit gold with a sparkle (HDR active on both sides), the host's screens (Automatic and two screens) and the codecs the host offers.](hud.png)
 
 ### Codecs
 
@@ -1395,3 +1395,8 @@ target, together with the FFmpeg build details, the source references and a writ
 offer, are collected in `THIRD_PARTY_NOTICES.txt`.
 
 Copyright 2026 Robert Brandt. Contact: hello@quadchroma.tech, https://github.com/quadchroma-tech/quadchroma.
+
+## Dedication
+
+For Michelle, who always has my back. The little heart with "Mi" in the corner of the
+app is hers.

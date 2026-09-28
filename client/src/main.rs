@@ -10366,7 +10366,7 @@ fn start_fuss(u: &mut ui::Ui, lang: &'static strings::Lang, w: i32, h: i32) -> S
     let tw = u.text.width(&tasten, 11, 1);
     // Zum Herzen derselbe Abstand wie vom Herzen zur Schrift der Sprache.
     let x = (w / 2 - tw / 2).min(herz.x - 12 - tw);
-    let tasten_x = (x > 20 + u.text.width("v0.1", 11, 2) + 12).then_some(x);
+    let tasten_x = (x > 20 + u.text.width(VERSION_KURZ, 11, 2) + 12).then_some(x);
     StartFuss { y, darueber: y - 16, tasten, tasten_x, sprache, herz }
 }
 
@@ -10943,7 +10943,7 @@ fn start_screen(
             action = Action::Website;
         }
     }
-    u.text.draw(c, 20, fy2, "v0.1", 11, ui::DIM, 2);
+    u.text.draw(c, 20, fy2, VERSION_KURZ, 11, ui::DIM, 2);
     // Die Tastenhinweise nur, wenn sie zwischen Version und Herz passen -
     // in schmalen Fenstern lagen sie sonst ueber Herz und Sprachknopf.
     if let Some(x) = fuss.tasten_x {
@@ -12417,6 +12417,10 @@ fn std_umleitung_behalten(f: impl FnOnce()) {
         }
     }
 }
+
+/// Kurze Versionsangabe unten links im Startbildschirm ("v0.2"), aus
+/// Cargo.toml - nie mehr von Hand nachziehen.
+const VERSION_KURZ: &str = concat!("v", env!("CARGO_PKG_VERSION_MAJOR"), ".", env!("CARGO_PKG_VERSION_MINOR"));
 
 fn main() {
     // Die App laeuft erhoeht: %SystemRoot% und %windir% auf den echten
@@ -16628,7 +16632,7 @@ mod tests {
                 let (tw, (oben, unten)) = (u.text.width(&f.tasten, 11, 1), u.text.senkrecht(&f.tasten, 11));
                 let tasten = ui::Rect { x, y: f.y - oben, w: tw, h: oben + unten };
                 assert!(!schneiden(herz, tasten) && x + tw <= herz.x - 12, "{ort}: Herz in den Tastenhinweisen");
-                assert!(x > 20 + u.text.width("v0.1", 11, 2) + 12 && x <= w / 2 - tw / 2, "{ort}: Tastenhinweise in der Version");
+                assert!(x > 20 + u.text.width(VERSION_KURZ, 11, 2) + 12 && x <= w / 2 - tw / 2, "{ort}: Tastenhinweise in der Version");
             }
         }
         let (w, h) = (1280usize, 720usize);
