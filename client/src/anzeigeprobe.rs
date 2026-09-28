@@ -32,6 +32,22 @@ pub fn probewert(x: usize, y: usize, bw: usize, bh: usize, ebene: usize, max: u3
     }) as u32
 }
 
+/// Wie `probewert`, fuer die PQ-Probebilder beider Anzeigen: das untere
+/// Viertel ist ein neutraler Streifen (Y ueber alle Codes, Cb = Cr = Mitte) -
+/// dort wirkt die Tonkurve selbst, darueber auch Farben weit ausserhalb
+/// jedes Farbraums und Pegel bis 10000 nit. Die Mitte ist die des Formats,
+/// auch oben buendig: 128, 512, 32768 (fuer 65472, 65520 und 65535).
+pub fn probewert_pq(x: usize, y: usize, bw: usize, bh: usize, ebene: usize, max: u32) -> u32 {
+    if y < bh * 3 / 4 {
+        return probewert(x, y, bw, bh, ebene, max);
+    }
+    if ebene == 0 {
+        (x as u64 * max as u64 / (bw - 1).max(1) as u64) as u32
+    } else {
+        (max + 1).next_power_of_two() / 2
+    }
+}
+
 /// Die Oberflaeche des Tests: alles, was die echte zeichnet - Schleier wie
 /// im Menue (auf der oberen Haelfte, damit die andere ohne Oberflaeche
 /// bleibt und der Kasten nicht das ganze Ziel ist), Tafel, Schrift in drei

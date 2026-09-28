@@ -48,7 +48,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::anzeigeprobe::{fall_pruefen, oberflaeche_probe, probewert};
+use crate::anzeigeprobe::{fall_pruefen, oberflaeche_probe, probewert, probewert_pq};
 use crate::{ebenen_format, hdr, protokoll, ui, EbenenFormat, Frame, Karte, Rolle};
 
 /// Ein Adapter, wie er im Protokoll und in der Statistik steht.
@@ -1975,10 +1975,21 @@ fn hoechstwert(p: ffmpeg::format::Pixel, fmt: EbenenFormat) -> u32 {
 /// jeder Richtung vorkommt. Der Allokator von FFmpeg legt die Zeilen breiter
 /// an als das Bild - damit prueft der Test die zeilenweise Kopie.
 fn probebild(p: ffmpeg::format::Pixel, w: u32, h: u32) -> Option<ffmpeg::frame::Video> {
+    probebild_muster(p, w, h, probewert)
+}
+
+/// Wie `probebild`, mit dem Muster der PQ-Probebilder (unten der neutrale
+/// Streifen, anzeigeprobe::probewert_pq) - dasselbe wie in der Mac-Anzeige.
+/// Das VUI setzt `als_pq`.
+fn probebild_pq(p: ffmpeg::format::Pixel, w: u32, h: u32) -> Option<ffmpeg::frame::Video> {
+    probebild_muster(p, w, h, probewert_pq)
+}
+
+fn probebild_muster(p: ffmpeg::format::Pixel, w: u32, h: u32, muster: fn(usize, usize, usize, usize, usize, u32) -> u32) -> Option<ffmpeg::frame::Video> {
     let fmt = ebenen_format(p)?;
     let max = hoechstwert(p, fmt);
     let mut f = ffmpeg::frame::Video::new(p, w, h);
-    let wert = |x: usize, y: usize, bw: usize, bh: usize, ebene: usize| -> u32 { probewert(x, y, bw, bh, ebene, max) };
+    let wert = |x: usize, y: usize, bw: usize, bh: usize, ebene: usize| -> u32 { muster(x, y, bw, bh, ebene, max) };
     let (w, h) = (w as usize, h as usize);
     let bpp = fmt.bpp() as usize;
     let cw = if fmt.sub { (w + 1) / 2 } else { w };
@@ -2315,7 +2326,7 @@ fn fall_pruefen10(name: &str, w: u32, h: u32, fall: &str, soll: &[[u16; 3]], kar
 #[allow(clippy::too_many_arguments)]
 fn pq_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, voll: bool, verzeichnis: &str, lang: &'static crate::strings::Lang, u: &mut ui::Ui) -> bool {
     let name = format!("{p:?}{}", if voll { "" } else { " begr." });
-    let (Some(fmt), Some(roh)) = (ebenen_format(p), probebild(p, w, h)) else {
+    let (Some(fmt), Some(roh)) = (ebenen_format(p), probebild_pq(p, w, h)) else {
         println!("{name:<15} {w:>4}x{h:<4} kein Probebild: Format unbekannt");
         return false;
     };

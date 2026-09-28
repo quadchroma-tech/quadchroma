@@ -1578,12 +1578,13 @@ impl Gpu {
             Err(e) => {
                 // Ohne IOSurface (oder was der Cache sonst ablehnt): dasselbe
                 // Bild auf der CPU umrechnen und fertig hochladen. Langsamer,
-                // aber das Bild steht.
+                // aber das Bild steht - ein PQ-Bild mit dem SDR-Weiss der
+                // Quelle auf SDR abgebildet (to_rgb_mit).
                 if !self.cache_rueckfall {
                     protokoll::zeile(format!("Anzeige: {e} - Umrechnung auf der CPU"));
                     self.cache_rueckfall = true;
                 }
-                let f = crate::to_rgb(bild)?;
+                let f = crate::to_rgb_mit(bild, self.quelle.as_ref())?;
                 return self.bild_rgb_puffer(&f);
             }
         };
@@ -2100,10 +2101,9 @@ fn probebild(format: u32, w: u32, h: u32) -> Result<vt_decoder::Bild, String> {
 }
 
 /// Wie `probebild`; mit `pq` als HDR10 gekennzeichnet (Anhaenge 2020/PQ/2020
-/// wie ein PQ-Bild aus VideoToolbox), und das untere Viertel ist ein
-/// neutraler Streifen (Cb = Cr = Mitte, Y ueber alle Codes): dort wirkt die
-/// Tonkurve selbst, darueber auch Farben weit ausserhalb jedes Farbraums und
-/// Pegel bis 10000 nit.
+/// wie ein PQ-Bild aus VideoToolbox) und mit dem Muster der PQ-Probebilder
+/// (anzeigeprobe::probewert_pq, unten der neutrale Streifen) - dasselbe wie
+/// in der Windows-Anzeige.
 fn probebild_farbe(format: u32, w: u32, h: u32, pq: bool) -> Result<vt_decoder::Bild, String> {
     let fmt = vt_decoder::ebenen(format).ok_or_else(|| format!("Format {} unbekannt", vt_decoder::fourcc_text(format)))?;
     let max = if fmt.bits == 8 { 255 } else { 65535 };
@@ -2133,23 +2133,16 @@ fn probebild_farbe(format: u32, w: u32, h: u32, pq: bool) -> Result<vt_decoder::
         let (d0, z0) = (cf::CVPixelBufferGetBaseAddressOfPlane(pb, 0) as *mut u8, cf::CVPixelBufferGetBytesPerRowOfPlane(pb, 0));
         let (d1, z1) = (cf::CVPixelBufferGetBaseAddressOfPlane(pb, 1) as *mut u8, cf::CVPixelBufferGetBytesPerRowOfPlane(pb, 1));
         let (w, h, cw, ch) = (w as usize, h as usize, cw as usize, ch as usize);
-        let mitte = (max as u32).div_ceil(2);
+        let wert = if pq { crate::anzeigeprobe::probewert_pq } else { crate::anzeigeprobe::probewert };
         for y in 0..h {
             for x in 0..w {
-                let v = if pq && y >= h * 3 / 4 { (x as u64 * max as u64 / (w - 1).max(1) as u64) as u32 } else { crate::anzeigeprobe::probewert(x, y, w, h, 0, max) };
-                schreib(d0, y * z0 + x * bpp, v);
+                schreib(d0, y * z0 + x * bpp, wert(x, y, w, h, 0, max));
             }
         }
         for y in 0..ch {
-            let neutral = pq && y >= ch * 3 / 4;
             for x in 0..cw {
-                let (u, v) = if neutral {
-                    (mitte, mitte)
-                } else {
-                    (crate::anzeigeprobe::probewert(x, y, cw, ch, 1, max), crate::anzeigeprobe::probewert(x, y, cw, ch, 2, max))
-                };
-                schreib(d1, y * z1 + 2 * x * bpp, u);
-                schreib(d1, y * z1 + (2 * x + 1) * bpp, v);
+                schreib(d1, y * z1 + 2 * x * bpp, wert(x, y, cw, ch, 1, max));
+                schreib(d1, y * z1 + (2 * x + 1) * bpp, wert(x, y, cw, ch, 2, max));
             }
         }
         cf::CVPixelBufferUnlockBaseAddress(pb, 0);
