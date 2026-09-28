@@ -1,6 +1,6 @@
 [package]
 name = "quadchroma"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Robert Brandt <hello@quadchroma.tech>"]
 description = "QuadChroma remote desktop (HEVC 4:4:4): one app per platform, client and host at once"

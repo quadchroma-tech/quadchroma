@@ -31,11 +31,11 @@
     <!-- Version number shown to users (three numbers). The Makefile reads it for
          the names of the ZIP and the DMG. -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <!-- Build number: increase by one before every distributed build (Apple:
          "increment the build version before you distribute a build"). -->
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSApplicationCategoryType</key>
