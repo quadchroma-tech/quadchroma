@@ -4558,6 +4558,9 @@ impl Ebenenbild for vt_decoder::Bild {
     fn zeilenlaenge(&self, ebene: usize) -> usize {
         vt_decoder::Bild::zeilenlaenge(self, ebene)
     }
+    fn farbe(&self) -> hdr::Farbe {
+        vt_decoder::Bild::farbe(self)
+    }
 }
 
 /// Flaches dunkles Bild in Fenstergrundfarbe - was gezeigt wird, wenn das
