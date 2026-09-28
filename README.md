@@ -193,7 +193,11 @@ QuadChroma is not signed with a paid certificate (Apple Developer Program, Windo
 code-signing certificate), so Windows and macOS warn before the first start.
 Download only from the project's Releases page and compare the SHA-256 of the file
 with `SHA256SUMS.txt` (Windows: `Get-FileHash -Algorithm SHA256 <file>`; macOS:
-`shasum -a 256 <file>`).
+`shasum -a 256 <file>`). From version 0.1.1 on, every download also carries a build
+provenance attestation: a signed statement that GitHub Actions built exactly this
+file from the tagged source, so nobody replaced it afterwards. With the GitHub CLI:
+`gh attestation verify <file> --repo quadchroma-tech/quadchroma`. It does not
+replace a code signature, but it can be checked by anyone.
 
 **Windows.** Before unpacking, right-click the ZIP > Properties > tick "Unblock" > OK;
 that avoids the SmartScreen warning. Without it, SmartScreen shows "Windows protected

@@ -403,7 +403,12 @@ agree; the `vorpruefung` job refuses the release otherwise.
 2. Open the draft under Releases. Check the job summary (which signatures were
    on), the notary logs artefact (`notary-logs`, always read it: Apple says the
    log "might contain warnings that you can fix prior to your next submission"),
-   the file names (no unexpected `-unsigned`), and `SHA256SUMS.txt`.
+   the file names (no unexpected `-unsigned`), and `SHA256SUMS.txt`. The job
+   `release` also creates a build provenance attestation for the four downloads
+   (ZIP, DMG, Mac ZIP, `SHA256SUMS.txt`); check one with
+   `gh attestation verify <file> --repo quadchroma-tech/quadchroma`. A file that is
+   replaced by hand later (a Windows ZIP signed by hand, section 4.2) or built
+   locally (section 4.3) has no attestation - say so in the notes or attest it again with a workflow run.
 3. Download and verify at least one file per platform (section 4.4). On the Mac
    verify a real download (Safari sets the quarantine attribute; `curl` and
    `scp` do not).

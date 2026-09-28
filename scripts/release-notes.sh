@@ -124,5 +124,8 @@ source of the FFmpeg DLLs is attached to this release (see
 \`THIRD_PARTY_NOTICES.txt\`, section 2).
 
 Verify downloads (optional): \`sha256sum -c SHA256SUMS.txt\` (Windows:
-\`Get-FileHash -Algorithm SHA256 <file>\`).
+\`Get-FileHash -Algorithm SHA256 <file>\`). Each download also carries a build
+provenance attestation - proof that GitHub Actions built exactly this file from the
+tagged source. Check it with the GitHub CLI:
+\`gh attestation verify <file> --repo $repo\`.
 EOF

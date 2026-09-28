@@ -631,7 +631,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write   # create the release and upload the assets
+      contents: write       # create the release and upload the assets
+      id-token: write       # sign the build provenance (Sigstore, keyless)
+      attestations: write   # store the attestations in the repository
     env:
       VERSION: ${{ needs.vorpruefung.outputs.version }}
       GH_TOKEN: ${{ github.token }}
@@ -660,6 +662,19 @@ jobs:
           # FFmpeg notice (ffmpeg.org/legal.html) - see scripts/release-notes.sh.
           bash ../scripts/release-notes.sh . "$VERSION" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > ../notes.md
           cat ../notes.md
+
+      # Build provenance: a signed statement that exactly these files were built by
+      # this workflow from this commit. Anyone can check a download with
+      # 'gh attestation verify <file> --repo quadchroma-tech/quadchroma'. It is no
+      # code signature, but shows that nobody replaced a file after the build.
+      - name: Build provenance for the downloads (attestation)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/quadchroma-*-windows-x64*.zip
+            dist/QuadChroma-*-macos-arm64*.dmg
+            dist/QuadChroma-*-macos-arm64*.zip
+            dist/SHA256SUMS.txt
 
       - name: Create the draft (gh release create --draft)
         shell: bash
