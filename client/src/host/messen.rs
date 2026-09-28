@@ -24,6 +24,10 @@
 //                   Cb/Cr innerhalb +-3 - sonst faellt Weg D1 weg
 //   I  Vollbild     erstes Paket traegt VPS/SPS/PPS + IDR, AV_PKT_FLAG_KEY,
 //                   forced-idr erzeugt ein IDR mitten im Lauf
+//   J  Farbprobe HDR  Kandidat 0 und 2 in PQ (HDR10): das Testbild als
+//                   SDR-Inhalt in PQ durch nvenc, zurueck durch den
+//                   hevc-Decoder - VUI 9/16/9 voll, SEI 137 (MDCV) und 144
+//                   (CLL) vor jedem Schluesselbild, Codes innerhalb +-2
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -38,7 +42,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use super::aufnahme::{self, Abholung, Ausgang, Duplication};
-use super::encoder::{bgra_nach_yuv444, hw_geraet, hw_pool, pool_textur, Bild, Oeffnung, Paket, Sitzung};
+use super::encoder::{self, bgra_nach_yuv444, hw_geraet, hw_pool, pool_textur, Bild, Mastering, Oeffnung, Paket, Sitzung, StromFarbe};
 use super::{arg_wert, log, testbild};
 
 // ----------------------------------------------------------------- Helfer
@@ -591,6 +595,190 @@ fn farbprobe() -> (bool, bool) {
     aus
 }
 
+// ---------------------------------------------------------- Farbprobe HDR
+
+/// Die Nutzlast-Typen aller SEI-Nachrichten in den Praefix-SEI-Einheiten
+/// (HEVC NAL-Typ 39) einer Zugriffseinheit, in ihrer Reihenfolge - etwa
+/// [137, 144] fuer MDCV und CLL. Emulationsschutz (00 00 03) wird entfernt;
+/// eine abgeschnittene Nachricht beendet die Einheit.
+pub fn sei_typen(d: &[u8]) -> Vec<u32> {
+    let mut aus = Vec::new();
+    // Startcodes finden, je Einheit die Bytes bis zum naechsten.
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= d.len() {
+        if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    for (n, &s) in starts.iter().enumerate() {
+        let e = if n + 1 < starts.len() { starts[n + 1] - 3 } else { d.len() };
+        if e < s + 2 || (d[s] >> 1) & 0x3f != 39 {
+            continue;
+        }
+        // RBSP ohne Emulationsschutz, hinter dem zwei Byte langen NAL-Kopf.
+        let mut rbsp = Vec::with_capacity(e - s);
+        let mut nullen = 0;
+        for &b in &d[s + 2..e] {
+            if nullen >= 2 && b == 3 {
+                nullen = 0;
+                continue;
+            }
+            nullen = if b == 0 { nullen + 1 } else { 0 };
+            rbsp.push(b);
+        }
+        let mut p = 0;
+        // sei_message: payloadType und payloadSize je als Folge 0xFF + Rest,
+        // bis rbsp_trailing_bits (0x80) oder das Ende.
+        while p < rbsp.len() && rbsp[p] != 0x80 {
+            let mut lesen = || -> Option<u32> {
+                let mut v = 0u32;
+                loop {
+                    let b = *rbsp.get(p)?;
+                    p += 1;
+                    v += b as u32;
+                    if b != 0xff {
+                        return Some(v);
+                    }
+                }
+            };
+            let (Some(typ), Some(groesse)) = (lesen(), lesen()) else { break };
+            aus.push(typ);
+            p += groesse as usize;
+        }
+    }
+    aus
+}
+
+/// Ein Code (10 Bit) aus einem decodierten Bild: Ebene, Punkt (bei 4:2:0
+/// die Farbebenen in halber Aufloesung).
+fn code10(b: &ffmpeg::frame::Video, ebene: usize, x: usize, y: usize) -> Option<u16> {
+    let halb = ebene > 0 && matches!(b.format(), ffmpeg::format::Pixel::YUV420P10LE);
+    let (x, y) = if halb { (x / 2, y / 2) } else { (x, y) };
+    let d = b.data(ebene);
+    let i = y * b.stride(ebene) + x * 2;
+    Some(u16::from_le_bytes([*d.get(i)?, *d.get(i + 1)?]) & 0x3ff)
+}
+
+/// Farbprobe HDR fuer einen Kandidaten (0 oder 2): zwoelf Testbilder in PQ
+/// (SDR-Inhalt mit 203 nit Weiss, encoder::testbilder) durch nvenc in
+/// PQ/BT.2020 mit Mastering 1000 nit / 0,005 nit, zurueck durch den
+/// hevc-Decoder. Bestanden: SEI 137 und 144 in jedem Schluesselbild, VUI
+/// BT.2020 / PQ / BT.2020-NCL / voll, die Mastering-Angaben kommen zurueck,
+/// und alle Probepunkte (Balken, Verlauf) liegen innerhalb +-2 Codes.
+fn farbprobe_hdr_weg(idx: usize, w: i32, h: i32) -> Result<bool, String> {
+    let k = encoder::kandidat(idx);
+    let farbe = StromFarbe::Pq2020(Mastering::VORGABE);
+    crate::protokoll::fehler_verwerfen();
+    let o = Oeffnung { encoder: k.encoder, pix_fmt: k.pix_fmt, profil: k.profil, rgb_444: k.chroma444, farbe, fps: 60, mbit: 50, delay: 0, ..Oeffnung::vorgabe(w, h) };
+    let mut s = Sitzung::oeffnen(&o)?;
+    let weiss = crate::hdr::SDR_WEISS_VORGABE_NIT as f64;
+    let bilder = encoder::testbilder_pq(k.pix_fmt, w, h, weiss)?;
+    let mut pakete: Vec<Paket> = Vec::new();
+    for (n, b) in bilder.iter().enumerate() {
+        s.senden(b.frame, (n as i64) * 16_667, n == 0 || n == 6)?;
+        pakete.extend(s.empfangen()?);
+    }
+    pakete.extend(s.leeren());
+    if pakete.is_empty() {
+        return Err("kein Paket".into());
+    }
+    let mut bestanden = true;
+    let schluessel: Vec<(usize, Vec<u32>)> = pakete.iter().enumerate().filter(|(_, p)| p.key).map(|(i, p)| (i, sei_typen(&p.data))).collect();
+    let sei_ok = !schluessel.is_empty() && schluessel.iter().all(|(_, t)| t.contains(&137) && t.contains(&144));
+    bestanden &= sei_ok;
+    log(format!(
+        "  J {}: {} Pakete, Schluesselbilder {:?}, SEI-Typen {:?} - SEI 137/144 {}",
+        k.name,
+        pakete.len(),
+        schluessel.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        schluessel.first().map(|(_, t)| t.clone()).unwrap_or_default(),
+        if sei_ok { "in jedem Schluesselbild" } else { "FEHLT" }
+    ));
+    let mut dec = crate::software_decoder(false)?;
+    let mut decodiert: Vec<ffmpeg::frame::Video> = Vec::new();
+    for (i, p) in pakete.iter().enumerate() {
+        let mut pk = ffmpeg::Packet::copy(&p.data);
+        pk.set_pts(Some(i as i64));
+        crate::decoder_fuettern(&mut dec, &pk, &mut decodiert);
+    }
+    let _ = dec.send_eof();
+    let mut f = ffmpeg::frame::Video::empty();
+    while dec.receive_frame(&mut f).is_ok() {
+        decodiert.push(f.clone());
+    }
+    let Some(b) = decodiert.first() else { return Err("Decoder liefert kein Bild".into()) };
+    let prim: AVColorPrimaries = b.color_primaries().into();
+    let trc: AVColorTransferCharacteristic = b.color_transfer_characteristic().into();
+    let mat: AVColorSpace = b.color_space().into();
+    let voll = b.color_range() == ffmpeg::color::Range::JPEG;
+    let vui = (prim as u32, trc as u32, mat as u32, voll);
+    let vui_ok = vui == (9, 16, 9, true);
+    bestanden &= vui_ok;
+    let mdcv = b.side_data(ffmpeg::frame::side_data::Type::MasteringDisplayMetadata).map(|sd| super::konserve::mastering_lesen(sd.data()));
+    let cll = b.side_data(ffmpeg::frame::side_data::Type::ContentLightLevel).map(|sd| super::konserve::lichtpegel_lesen(sd.data()));
+    let mdcv_ok = mdcv == Some((Mastering::VORGABE.max_nit, Mastering::VORGABE.min_zehntausendstel));
+    bestanden &= mdcv_ok;
+    log(format!(
+        "    decodiert als {:?} {}x{}, VUI Primaerfarben {} Transfer {} Matrix {} {} ({}), MDCV {:?} ({}), CLL {:?}",
+        b.format(), b.width(), b.height(), vui.0, vui.1, vui.2, if voll { "voll" } else { "begrenzt" },
+        if vui_ok { "richtig" } else { "FALSCH, soll 9/16/9 voll" },
+        mdcv, if mdcv_ok { "richtig" } else { "FALSCH, soll (1000, 50)" }, cll
+    ));
+    // Probepunkte in ruhigen Flaechen (die feinen Streifen verliert jeder
+    // Encoder etwas): Balkenmitten und der Verlauf links und rechts neben
+    // dem wandernden Quadrat - je Y, Cb, Cr.
+    let (wu, hu) = (w as usize, h as usize);
+    let mut punkte: Vec<(usize, usize)> = (0..8).map(|balken| ((balken * wu) / 8 + wu / 16, hu / 6)).collect();
+    punkte.extend([(wu / 8, 5 * hu / 6 + hu / 12), (7 * wu / 8, 5 * hu / 6 + hu / 12)]);
+    let mut schlimmste = 0i32;
+    for &(x, y) in &punkte {
+        let soll = encoder::pq_codes_aus_709(testbild::punkt(x as i32, y as i32, w, h, 0), weiss);
+        let ist = [code10(b, 0, x, y), code10(b, 1, x, y), code10(b, 2, x, y)];
+        let Some(ist) = ist.iter().copied().collect::<Option<Vec<u16>>>() else {
+            log("    Bild nicht abtastbar (Format unbekannt)");
+            return Ok(false);
+        };
+        let d: Vec<i32> = (0..3).map(|c| ist[c] as i32 - soll[c] as i32).collect();
+        let m = d.iter().map(|v| v.abs()).max().unwrap_or(0);
+        schlimmste = schlimmste.max(m);
+        log(format!(
+            "    ({x:>4},{y:>4}): Y {:>4} (soll {:>4})  Cb {:>4} (soll {:>4})  Cr {:>4} (soll {:>4}) {}",
+            ist[0], soll[0], ist[1], soll[1], ist[2], soll[2],
+            if m <= 2 { "" } else { "<-- daneben" }
+        ));
+    }
+    bestanden &= schlimmste <= 2;
+    log(format!(
+        "  J {}: {} (Abweichung hoechstens {schlimmste} Codes)",
+        k.name,
+        if bestanden { "bestanden (HDR10: PQ/BT.2020 voll, SEI 137/144)" } else { "NICHT bestanden" }
+    ));
+    Ok(bestanden)
+}
+
+/// Farbprobe HDR fuer die Kandidaten, die laut Befund HDR10 koennen.
+/// Liefert je Kandidat (0, 2) das Ergebnis; None = nicht messbar.
+fn farbprobe_hdr() -> [Option<bool>; 2] {
+    log("\n--- J Farbprobe HDR: Testbild in PQ 1920x1080 durch hevc_nvenc (HDR10), zurueck durch den hevc-Decoder ---");
+    let mut aus = [None, None];
+    for (n, idx) in [0usize, 2].into_iter().enumerate() {
+        let k = encoder::kandidat(idx);
+        if !encoder::befund(idx).hdr {
+            log(format!("  J {}: nicht messbar (kein HDR10 im Befund)", k.name));
+            continue;
+        }
+        match farbprobe_hdr_weg(idx, 1920, 1080) {
+            Ok(b) => aus[n] = Some(b),
+            Err(e) => log(format!("  J {}: nicht messbar: {e}", k.name)),
+        }
+    }
+    aus
+}
+
 // ------------------------------------------------------------- Vollbild
 
 fn vollbildprobe() {
@@ -760,6 +948,7 @@ pub fn laufen(args: &[String]) -> i32 {
     }
 
     let (h_bgra, h_444) = farbprobe();
+    let j = farbprobe_hdr();
     vollbildprobe();
     super::ffmpeg_zeilen();
 
@@ -773,6 +962,66 @@ pub fn laufen(args: &[String]) -> i32 {
         if h_444 { "bestanden" } else { "nicht bestanden" },
         if h_bgra { "BGRA direkt in NVENC ist der Hauptweg fuer 4:4:4 8 Bit" } else if h_444 { "eigene Umrechnung BGRA->yuv444p noetig (Weg D2)" } else { "kein 4:4:4-Weg bestanden" }
     ));
+    let j_text = |r: Option<bool>| match r {
+        Some(true) => "bestanden",
+        Some(false) => "NICHT bestanden",
+        None => "nicht messbar",
+    };
+    log(format!(
+        "Farbprobe HDR: {} {}, {} {}",
+        encoder::kandidat(0).name,
+        j_text(j[0]),
+        encoder::kandidat(2).name,
+        j_text(j[1])
+    ));
     log("Datei: %APPDATA%\\QuadChroma\\messung.txt");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sei_typen;
+
+    /// Emulationsschutz wie im Encoder: nach zwei Nullen vor 00..03 ein 03.
+    fn schuetzen(rbsp: &[u8]) -> Vec<u8> {
+        let mut aus = Vec::new();
+        let mut nullen = 0;
+        for &b in rbsp {
+            if nullen >= 2 && b <= 3 {
+                aus.push(3);
+                nullen = 0;
+            }
+            nullen = if b == 0 { nullen + 1 } else { 0 };
+            aus.push(b);
+        }
+        aus
+    }
+
+    /// Eine Zugriffseinheit mit Praefix-SEI (MDCV 137 mit 24 Byte voller
+    /// Nullen, CLL 144, ein Typ 300 mit 0xFF-Verlaengerung), einer
+    /// Suffix-SEI (40, zaehlt nicht), einer zweiten Praefix-SEI und einem
+    /// Slice: gefunden werden genau die Typen der Praefix-SEI, in ihrer
+    /// Reihenfolge, auch durch den Emulationsschutz hindurch.
+    #[test]
+    fn sei_typen_durch_den_emulationsschutz() {
+        let mut rbsp = vec![137u8, 24];
+        rbsp.extend([0u8; 24]);
+        rbsp.extend([144u8, 4, 0, 0, 0, 0]);
+        rbsp.extend([0xff, 45, 1, 0x55]);
+        rbsp.push(0x80);
+        let mut au = vec![0, 0, 0, 1, 39 << 1, 1];
+        au.extend(schuetzen(&rbsp));
+        au.extend([0, 0, 1, 40 << 1, 1]);
+        au.extend(schuetzen(&[5, 1, 0, 0x80]));
+        au.extend([0, 0, 1, 39 << 1, 1]);
+        au.extend(schuetzen(&[4, 2, 0, 0, 0x80]));
+        au.extend([0, 0, 1, 1 << 1, 1, 0xaf, 0, 0, 3, 1]);
+        assert!(au.windows(3).any(|w| w == [0, 0, 3]), "der Test braucht Emulationsschutz");
+        assert_eq!(sei_typen(&au), vec![137, 144, 300, 4]);
+        // Abgeschnitten: was lesbar ist, zaehlt; kein Lesen hinter dem Ende.
+        let kurz = &au[..8];
+        assert_eq!(sei_typen(kurz), vec![137]);
+        assert!(sei_typen(&[0, 0, 1, 39 << 1]).is_empty());
+        assert!(sei_typen(&[]).is_empty());
+    }
 }
