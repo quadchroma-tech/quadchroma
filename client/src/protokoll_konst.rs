@@ -66,8 +66,13 @@ pub const NAME_FLAG_HOST_UNBEKANNT: u8 = 1;
 // ------------------------------------------------ Host -> Client (Bildkanal)
 
 /// Strominfo: u16 Breite, u16 Hoehe, u16 fps, u8 Codec (1 HEVC, 2 H.264),
-/// u8 Profil (1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit,
-/// 4 = 4:2:0 10 Bit), u8 Bereich, u8 frei.
+/// u8 Format (1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit,
+/// 4 = 4:2:0 10 Bit; immer voller Bereich) - acht Byte bei Hosts vor 0.2.0.
+/// Fassung 1 (24 Byte) haengt Farbe und HDR-Metadaten an: u8 Fassung, u8
+/// Transfer, u8 Primaerfarben, u8 Matrix, u8 voll, u8 HDR-Grund, u16
+/// SDR-Weiss, u16 Mastering max, u16 Mastering min, u16 MaxCLL, u16 MaxFALL
+/// (Bytes und Lesen in hdr.rs, InfoV1). Eine andere Fassung liest der
+/// Client wie acht Byte.
 pub const MSG_INFO: u8 = 1;
 /// Bild: eine Zugriffseinheit in Annex B; Flag Bit 0 = Vollbild.
 pub const MSG_VIDEO: u8 = 2;
@@ -81,7 +86,10 @@ pub const MSG_STAMP: u8 = 5;
 /// Auslastung des Hosts (28 Byte, Fassung 1).
 pub const MSG_LAST: u8 = 6;
 /// Ab hier neuer Codec: Decoder wegwerfen, das naechste Bild ist ein
-/// Schluesselbild mit Parametersaetzen.
+/// Schluesselbild mit Parametersaetzen. Acht Byte: u8 idx, u8 h264, u8
+/// chroma444, u8 zehn_bit, u8 voll (immer 1), u8 Umrechnung, u8 Transfer
+/// nach H.273 (1 SDR, 16 PQ; Hosts vor 0.2.0: 0 = SDR; nur fuers
+/// Protokoll), u8 frei.
 pub const MSG_SWITCH: u8 = 7;
 /// Koennensliste des Hosts: welche Codecs er anbietet, mit Flaggen.
 pub const MSG_CODECS: u8 = 8;
@@ -154,6 +162,11 @@ pub const FAEHIG_DATEIEN: u32 = 1;
 /// an einen Host, der es in DIESER Sitzung gemeldet hat; in IN_FAEHIGKEITEN
 /// meldet der Client weiter nur FAEHIG_DATEIEN.
 pub const FAEHIG_BILDSCHIRM: u32 = 2;
+/// Bit 2 in MSG_FAEHIGKEITEN: der Host (ab 0.2.0) versteht IN_ANZEIGE und
+/// sendet die Strominfo Fassung 1 - auch wenn er gerade kein HDR kann; warum
+/// nicht, steht in deren HDR-Grund. Der Client schickt IN_ANZEIGE nur an
+/// einen Host, der es in DIESER Sitzung gemeldet hat.
+pub const FAEHIG_HDR: u32 = 4;
 
 /// Flag Bit 0 im Bildkopf: Vollbild.
 pub const FLAG_KEY: u8 = 0x01;
@@ -189,6 +202,12 @@ pub const IN_FAEHIGKEITEN: u8 = 69;
 /// einen Host mit FAEHIG_BILDSCHIRM; ein aelterer uebergeht sie ohnehin
 /// (unter 256 Byte). Zustandsnachricht, gehoert zu NACHREICHEN.
 pub const IN_BILDSCHIRM: u8 = 70;
+/// Lage der Anzeige: 14 Byte, u8 Fassung 1, u8 Flags (Bit 0 Bildschirm
+/// HDR-faehig, Bit 1 Client kann HDR darstellen), u8 Wunsch (0 Automatisch,
+/// 1 Aus, 2 Immer), u8 frei, dann u16 SDR-Weiss, Spitze, Vollbild-Spitze
+/// (nit), Kopfraum potentiell und aktuell (x100) - Bytes in hdr.rs
+/// (Anzeige). Nur an einen Host mit FAEHIG_HDR; Zustandsnachricht.
+pub const IN_ANZEIGE: u8 = 71;
 
 // Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
 pub const MOD_SHIFT: u32 = 1;

@@ -650,13 +650,18 @@ struct StreamInfo {
     /// Farbaufloesung: true = 4:4:4, false = 4:2:0 (aus Byte 7 der Strominfo).
     chroma444: bool,
     ten_bit: bool,
+    /// Farbe und HDR-Metadaten aus der Strominfo Fassung 1 (Bytes 8-23).
+    /// None bei einem Host vor 0.2.0 (acht Byte) oder einer fremden Fassung:
+    /// dann gilt die Farbe aus dem VUI und fuer HDR die Vorgabe (203 / 1000 nit).
+    hdr: Option<hdr::InfoV1>,
 }
 
 impl StreamInfo {
-    /// Aus den acht Bytes der Strominfo. Format-Byte: 1 = 4:4:4 8 Bit,
-    /// 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit. Immer Vollbereich.
+    /// Aus der Strominfo: die ersten acht Bytes wie seit jeher (Format-Byte:
+    /// 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit,
+    /// immer Vollbereich), ab 24 Byte mit Fassung 1 dazu Farbe und Metadaten.
     fn parse(p: &[u8]) -> Option<Self> {
-        if p.len() < 8 {
+        if p.len() < hdr::INFO_LAENGE_ALT {
             return None;
         }
         Some(StreamInfo {
@@ -666,6 +671,7 @@ impl StreamInfo {
             codec: p[6],
             chroma444: matches!(p[7], 1 | 2),
             ten_bit: matches!(p[7], 2 | 4),
+            hdr: hdr::InfoV1::lesen(p),
         })
     }
 
@@ -772,6 +778,9 @@ struct CodecWechsel {
     full_range: bool,
     #[allow(dead_code)]
     conversion: bool,
+    /// Transfer nach H.273 aus p[6] (1 SDR, 16 PQ; Hosts vor 0.2.0: 0 = SDR).
+    /// Nur fuers Protokoll: der Client entscheidet je Bild aus dem VUI.
+    transfer: u8,
 }
 
 impl CodecWechsel {
@@ -786,6 +795,7 @@ impl CodecWechsel {
             ten_bit: p[3] != 0,
             full_range: p[4] != 0,
             conversion: p[5] != 0,
+            transfer: p[6],
         })
     }
 }
@@ -2342,12 +2352,13 @@ fn software_dekoder(h264: bool) -> Result<Dekoder, String> {
 /// so wie der Decoder sie liefert - was to_rgb gleich zu sehen bekommt.
 fn bild_beschreiben(codec: &str, bild: &impl Ebenenbild) -> String {
     format!(
-        "Erstes Bild aus {}: {}x{} {}, Zeilen {}/{}/{} Byte, Ebenen {}",
+        "Erstes Bild aus {}: {}x{} {}, Zeilen {}/{}/{} Byte, Ebenen {}, Farbe {}",
         codec, bild.breite(), bild.hoehe(), bild.format_name(),
         bild.zeilenlaenge(0),
         if bild.ebenenzahl() > 1 { bild.zeilenlaenge(1) } else { 0 },
         if bild.ebenenzahl() > 2 { bild.zeilenlaenge(2) } else { 0 },
-        bild.ebenenzahl()
+        bild.ebenenzahl(),
+        bild.farbe().text()
     )
 }
 
@@ -3238,6 +3249,14 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         ring.clear();
                         mittel = None;
                     }
+                    // Farbe und HDR-Grund ins Protokoll, sobald sie sich
+                    // aendern (und beim ersten Mal).
+                    if info.map(|alt| alt.hdr) != Some(i.hdr) {
+                        protokoll::zeile(match &i.hdr {
+                            Some(h) => format!("Strominfo Fassung 1: {}", h.text()),
+                            None => "Strominfo ohne Farbangabe (Host vor 0.2.0 oder fremde Fassung): Farbe aus dem Strom".into(),
+                        });
+                    }
                     info = Some(i);
                     shared.lock().unwrap().info = Some(i);
                 }
@@ -3325,6 +3344,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // was noch zum alten Strom gehoerte, ist damit wertlos: die
                 // wartenden Stempel und der Latenzmittelwert.
                 let Some(w) = CodecWechsel::parse(&payload) else { continue };
+                protokoll::zeile(format!("Codecwechsel des Hosts: Kandidat {}, {}", w.idx, hdr::transfer_text(w.transfer)));
                 // Mit Bildparallelitaet (--faeden frame) gehen beim Wechsel bis zu
                 // 15 zurueckgehaltene Bilder verloren; sauber leeren ist eine spaetere Verfeinerung.
                 bedarf.h264 = w.is_h264;
@@ -4457,6 +4477,13 @@ trait Ebenenbild {
     /// Die Bytes einer Ebene (Zeilen im Abstand `zeilenlaenge`).
     fn daten(&self, ebene: usize) -> &[u8];
     fn zeilenlaenge(&self, ebene: usize) -> usize;
+    /// Die Farbe des Bildes aus dem VUI (hdr::Farbe::aus_vui): PQ mit Matrix
+    /// und Bereich, alles andere SDR BT.709 voll. Die Anzeige entscheidet je
+    /// Bild danach, nicht nach einer Nachricht - kein Wettlauf mit dem Wechsel.
+    /// Vorgabe SDR, bis die Decoder das VUI weiterreichen.
+    fn farbe(&self) -> hdr::Farbe {
+        hdr::Farbe::SDR
+    }
 }
 
 #[cfg(windows)]
@@ -11051,7 +11078,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             }
         }
         let hist: Vec<f32> = (0..120).map(|i| 90.0 + 25.0 * ((i as f32) / 9.0).sin()).collect();
-        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true });
+        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: None });
         let sas = Some("628 306".to_string());
         let fp = Some("9EB4-EC3D-6856-8AF6".to_string());
         {
@@ -11090,7 +11117,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         };
         let lh: Vec<f32> = (0..200).map(|i| 24.0 + 5.0 * ((i as f32) / 11.0).sin()).collect();
         let fh: Vec<f32> = (0..200).map(|i| 104.0 + 9.0 * ((i as f32) / 7.0).cos()).collect();
-        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true });
+        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: None });
         let mut c = ui::Canvas::neu(&mut buf, w, h);
         // Nachgestellte Koennensliste, wie sie der Mac mini schickt: AV1
         // fehlt ihm, 4:4:4 8 Bit und 4:2:0 10 Bit brauchen die Umrechnung.
@@ -15464,6 +15491,74 @@ mod tests {
         assert!(ende.recv_timeout(frist).is_ok(), "Sitzung endete nicht mit der Leitung");
     }
 
+    /// Strominfo und Wechsel lesen: acht Byte wie seit jeher (ohne Farbe),
+    /// 24 Byte Fassung 1 mit Farbe, 9 bis 23 Byte wie acht; SWITCH p[6] ist der
+    /// Transfer (Hosts vor 0.2.0: 0).
+    #[test]
+    fn strominfo_und_wechsel_lesen() {
+        let alt = [0x80, 0x07, 0x38, 0x04, 0x78, 0x00, 1, 2];
+        let i = StreamInfo::parse(&alt).unwrap();
+        assert_eq!((i.width, i.height, i.fps, i.codec, i.chroma444, i.ten_bit, i.hdr), (1920, 1080, 120, 1, true, true, None));
+        assert!(StreamInfo::parse(&alt[..7]).is_none());
+        let sdr = hdr::InfoV1::sdr(hdr::GRUND_KEIN_IN_ANZEIGE);
+        let mut neu = alt.to_vec();
+        neu.extend_from_slice(&sdr.kodieren());
+        assert_eq!(neu.len(), hdr::INFO_LAENGE);
+        let i = StreamInfo::parse(&neu).unwrap();
+        assert_eq!((i.width, i.codec, i.chroma444, i.ten_bit, i.hdr), (1920, 1, true, true, Some(sdr)));
+        assert_eq!(StreamInfo::parse(&neu[..20]).unwrap().hdr, None);
+        let w = CodecWechsel::parse(&[2, 0, 0, 1, 1, 1, hdr::TRANSFER_PQ, 0]).unwrap();
+        assert_eq!((w.idx, w.chroma444, w.ten_bit, w.transfer), (2, false, true, hdr::TRANSFER_PQ));
+        assert_eq!(CodecWechsel::parse(&[0, 0, 1, 1, 1, 1, 0, 0]).unwrap().transfer, 0);
+    }
+
+    /// Strominfo Fassung 1 ueber die Sitzung: 24 Byte landen mit Farbe und
+    /// Metadaten in Shared, acht Byte (Host vor 0.2.0) und eine fremde
+    /// Fassung ohne - Groesse, Bildrate und Codec gelten in allen drei Faellen.
+    #[test]
+    fn strominfo_fassung_1_ueber_die_sitzung() {
+        secure::test_identitaet();
+        decoder_bereit();
+        let (addr, tx) = scheinhost_bild();
+        let (shared, _input, ende) = sitzung_starten(&addr);
+        let frist = Duration::from_secs(10);
+        // HEVC 4:4:4 10 Bit, 60 fps, Hoehe 64; Breite je Nachricht anders.
+        let nachricht = |w: u16, zusatz: Option<[u8; 16]>| {
+            let mut p = w.to_le_bytes().to_vec();
+            p.extend_from_slice(&64u16.to_le_bytes());
+            p.extend_from_slice(&60u16.to_le_bytes());
+            p.extend_from_slice(&[1, 2]);
+            if let Some(z) = zusatz {
+                p.extend_from_slice(&z);
+            }
+            eingabe_rahmen(MSG_INFO, &p)
+        };
+        let info = || shared.lock().unwrap().info;
+        let pq = hdr::InfoV1 {
+            farbe: hdr::Farbe::PQ,
+            grund: hdr::GRUND_AKTIV,
+            sdr_weiss_nit: 203,
+            master_max_nit: 1000,
+            master_min_zehntausendstel: 50,
+            max_cll: 0,
+            max_fall: 0,
+        };
+        tx.send(nachricht(96, Some(pq.kodieren()))).unwrap();
+        assert!(warten_bis(frist, || info().is_some_and(|i| i.width == 96)), "keine Strominfo");
+        assert_eq!(info().unwrap().hdr, Some(pq));
+        tx.send(nachricht(128, None)).unwrap();
+        assert!(warten_bis(frist, || info().is_some_and(|i| i.width == 128)));
+        assert_eq!(info().unwrap().hdr, None, "acht Byte");
+        let mut fremd = pq.kodieren();
+        fremd[0] = 2;
+        tx.send(nachricht(160, Some(fremd))).unwrap();
+        assert!(warten_bis(frist, || info().is_some_and(|i| i.width == 160)));
+        let i = info().unwrap();
+        assert_eq!((i.height, i.fps, i.codec, i.chroma444, i.ten_bit, i.hdr), (64, 60, 1, true, true, None), "Fassung 2");
+        drop(tx);
+        assert!(ende.recv_timeout(frist).is_ok(), "Sitzung endete nicht mit der Leitung");
+    }
+
     /// Bildschirmwahl ueber die Sitzung (Spezifikation Bildschirmwahl 2.1,
     /// 2.2, 3.1): ohne Bit 1 der Faehigkeiten geht kein Wunsch hinaus; mit
     /// Bit 1 landet die Liste der Pruefvektoren in Shared; ein Wunsch setzt
@@ -15481,7 +15576,7 @@ mod tests {
             decoder_wunsch: einstellungen::DecoderWunsch::Software,
             target: Some(addr.clone()),
             // Reste eines vorigen Hosts: Strominfo, Liste, Faehigkeit.
-            info: Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true }),
+            info: Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: None }),
             host_bildschirmwahl: true,
             bildschirm_wunsch: Some("alt".into()),
             ..Shared::default()
