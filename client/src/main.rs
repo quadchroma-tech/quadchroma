@@ -7425,6 +7425,10 @@ impl App {
         // neue Bilder erscheinen und wieder verschwinden.
         let oberflaeche = self.oberflaeche_sichtbar(lage, wechsel);
         let vorher = std::mem::replace(&mut self.oberflaeche_vorher, oberflaeche);
+        // Das stehende HDR-Bild folgt dem Schirm (Kopfraum nach dem
+        // Einschalten von EDR, Helligkeit, Schirmwechsel) wie ein neues Bild -
+        // bei stillem Bildschirm schickt der Host keins.
+        let neues_bild = neues_bild || self.anzeige_nachfuehren();
         if neu_zeichnen(neues_bild, self.praesentation_ausstehend, oberflaeche, vorher, self.letzte_zeichnung.elapsed()) {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -7683,6 +7687,17 @@ impl App {
             Anzeige::Gpu(_) => anzeige::HDR_DARSTELLUNG,
             _ => false,
         }
+    }
+
+    /// Muss die Anzeige ohne neues Bild neu zeichnen? Auf dem Mac, wenn sie
+    /// ein PQ-Bild haelt, dessen Ziel sich geaendert hat
+    /// (anzeige_mac.rs, nachzeichnen_faellig). Sonst nie.
+    fn anzeige_nachfuehren(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Anzeige::Gpu(g) = &mut self.anzeige {
+            return g.nachzeichnen_faellig();
+        }
+        false
     }
 
     /// Praesentiert die Anzeige gerade in HDR bzw. EDR? Der softbuffer-Weg nie.

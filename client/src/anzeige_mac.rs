@@ -58,7 +58,9 @@
 // heutigen. Ein SDR-Strom laeuft unveraendert bitgleich. Das letzte PQ-Bild
 // haelt die Anzeige fest: aendern sich Schirm, Kopfraum oder die Metadaten der
 // Strominfo, rechnet `zeichnen` Stufe 1 daraus neu, und die Schicht wechselt
-// beim naechsten nextDrawable. `hdr_praesentiert` (Gold in der Oberflaeche)
+// beim naechsten nextDrawable. Den Anlass dazu gibt `nachzeichnen_faellig`,
+// das main.rs je Takt fragt - auch wenn der Host bei stillem Bildschirm
+// nichts schickt. `hdr_praesentiert` (Gold in der Oberflaeche)
 // heisst: das zuletzt gezeigte Bild lief ueber EDR mit Kopfraum ueber 1.
 //
 // Alle eigenen Texturen liegen privat auf der Karte. Die CPU schreibt ueber
@@ -183,6 +185,11 @@ const WAECHTER_FRIST: Duration = Duration::from_secs(3);
 /// Mehr offene Befehlspuffer als das heisst: die Karte kommt nicht nach.
 /// Dann wird auf den aeltesten gewartet, statt Speicher anzuhaeufen.
 const HOECHSTENS_BEFEHLSPUFFER: usize = 64;
+/// So oft fragt `nachzeichnen_faellig` den Schirm, solange ein PQ-Bild
+/// steht - im Takt der Oberflaeche. Nach dem Einschalten von EDR steigt der
+/// aktuelle Kopfraum erst, wenn die EDR-Schicht auf dem Schirm ist; diesem
+/// Anstieg folgt das stehende Bild damit binnen 33 ms.
+const PQ_PRUEFTAKT: Duration = Duration::from_millis(33);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1007,6 +1014,8 @@ pub struct Gpu {
     quelle: Option<hdr::InfoV1>,
     /// Das letzte PQ-Bild, solange der Strom PQ ist.
     pq_bild: Option<PqBild>,
+    /// Wann `nachzeichnen_faellig` den Schirm zuletzt gefragt hat.
+    pq_geprueft: Option<Instant>,
     /// Die Schicht ist gerade EDR (RGBA16Float, erweitert linear P3).
     schicht_edr: bool,
     /// Das zuletzt praesentierte Bild lief ueber EDR mit Kopfraum ueber 1.
@@ -1179,6 +1188,7 @@ impl Gpu {
                 weg: None,
                 quelle: None,
                 pq_bild: None,
+                pq_geprueft: None,
                 schicht_edr: false,
                 hdr_gezeigt: false,
                 kopfraum_ohne_fenster: (1.0, 1.0),
@@ -1267,6 +1277,33 @@ impl Gpu {
     /// Kopfraum (Hd = 1) sieht aus wie SDR und zaehlt nicht.
     pub fn hdr_praesentiert(&self) -> bool {
         self.hdr_gezeigt
+    }
+
+    /// Soll main.rs neu zeichnen lassen, obwohl kein neues Bild kam? Ja, wenn
+    /// die Anzeige ein PQ-Bild haelt und dessen Ziel sich seit der letzten
+    /// Rechnung geaendert hat: vor allem der Kopfraum, der auf einem XDR- oder
+    /// eingebauten Schirm erst steigt, nachdem die EDR-Schicht zu sehen ist
+    /// (das erste Bild rechnet noch mit Hd 1 - abgeschnitten, kein Gold),
+    /// dazu Helligkeit und Schirmwechsel. Bei stillem Bildschirm schickt der
+    /// Host nichts, und ohne diesen Anlass blieben Lichter abgeschnitten, bis
+    /// sich drueben etwas bewegt. Fragt den Schirm hoechstens alle
+    /// PQ_PRUEFTAKT; ohne PQ-Bild kostet es nichts. Verdeckt nie - `zeichnen`
+    /// liesse das Bild ohnehin aus, und das Aufdecken holt es nach.
+    /// Nur auf dem Hauptfaden.
+    pub fn nachzeichnen_faellig(&mut self) -> bool {
+        if self.pq_bild.is_none() {
+            return false;
+        }
+        let jetzt = Instant::now();
+        if self.pq_geprueft.is_some_and(|t| jetzt.duration_since(t) < PQ_PRUEFTAKT) {
+            return false;
+        }
+        self.pq_geprueft = Some(jetzt);
+        if self.verdeckt || !self.fenster_sichtbar() {
+            return false;
+        }
+        let ziel = self.pq_ziel();
+        self.pq_bild.as_ref().is_some_and(|p| p.gerechnet.anders(&ziel))
     }
 
     /// Die Metadaten der Quelle aus der Strominfo Fassung 1 (SDR-Weiss des
@@ -3553,6 +3590,86 @@ mod tests {
         unsafe { CGColorSpaceRelease(p3) };
         drop(g);
         assert_eq!(unsafe { msg_zahl(msg_id(wurzel.0, c"sublayers"), c"count") }, 0);
+    }
+
+    /// Durchsicht 5a: ein XDR- oder eingebauter Schirm hat vor der
+    /// EDR-Anforderung den aktuellen Kopfraum 1 - das erste PQ-Bild rechnet mit
+    /// Hd 1, abgeschnitten, kein Gold. Steigt der Kopfraum danach, kommt bei
+    /// stillem Bildschirm kein neues Bild; `nachzeichnen_faellig` gibt den
+    /// Anlass, und das gehaltene Bild erreicht den Kopfraum (Gold). Ebenso
+    /// Helligkeit und Schirmwechsel. Hoechstens alle PQ_PRUEFTAKT gefragt,
+    /// ohne PQ-Bild nie.
+    #[test]
+    fn pq_folgt_dem_kopfraum_ohne_neues_bild() {
+        if unsafe { Obj::eigen(MTLCreateSystemDefaultDevice()) }.is_none() {
+            eprintln!("uebersprungen: kein Metal-Geraet");
+            return;
+        }
+        let _pool = Pool::neu();
+        let wurzel = unsafe { Obj::halten(msg_id(klasse(c"CALayer"), c"layer")).expect("CALayer") };
+        unsafe {
+            senden!(wurzel.0, sel(c"setContentsScale:"), 1.0f64 => f64; -> ());
+            senden!(wurzel.0, sel(c"setBounds:"), CgRect { x: 0.0, y: 0.0, w: 320.0, h: 180.0 } => CgRect; -> ());
+        }
+        let mut g = Gpu::an_schicht(wurzel.zweiter(), 320, 180).expect("Schicht");
+        let zeichnen = |g: &mut Gpu| {
+            if !g.bereit() {
+                std::thread::sleep(PRAESENT_FRIST + Duration::from_millis(20));
+                assert!(g.bereit());
+            }
+            assert!(matches!(g.zeichnen(Some((0, 0, 320, 180)), false, false), Praesentiert::Ok));
+        };
+        // Ohne den Takt: jede Frage gilt.
+        let faellig = |g: &mut Gpu| {
+            g.pq_geprueft = None;
+            g.nachzeichnen_faellig()
+        };
+        assert!(!faellig(&mut g), "ohne PQ-Bild nie");
+        // EDR moeglich, aktuell noch 1 (vor der Anforderung).
+        g.kopfraum_ohne_fenster = (16.0, 1.0);
+        let bild = probebild_farbe(vt_decoder::XF44, 320, 180, true).expect("Probebild");
+        g.bild_roh(&bild).expect("bild_roh");
+        drop(bild);
+        zeichnen(&mut g);
+        assert!(g.schicht_edr, "die Schicht verlangt EDR");
+        assert!(!g.hdr_praesentiert(), "Hd 1: abgeschnitten, kein Gold");
+        assert!(!faellig(&mut g), "nichts geaendert");
+        // Die EDR-Schicht ist zu sehen, der Kopfraum steigt - kein neues Bild.
+        g.kopfraum_ohne_fenster = (16.0, 2.5);
+        assert!(faellig(&mut g), "Kopfraum gestiegen");
+        assert!(!g.nachzeichnen_faellig(), "binnen PQ_PRUEFTAKT nicht noch einmal gefragt");
+        zeichnen(&mut g);
+        assert_eq!(g.pq_bild.as_ref().map(|p| p.gerechnet.ab.hd), Some(2.5));
+        assert!(g.hdr_praesentiert(), "voller Kopfraum, Gold");
+        assert!(!faellig(&mut g), "nachgefuehrt");
+        // Unter einem Prozent: kein Anlass; Helligkeit spuerbar geaendert: ja.
+        g.kopfraum_ohne_fenster = (16.0, 2.51);
+        assert!(!faellig(&mut g));
+        g.kopfraum_ohne_fenster = (16.0, 1.8);
+        assert!(faellig(&mut g), "Helligkeit");
+        zeichnen(&mut g);
+        assert!(g.hdr_praesentiert());
+        // Verdeckt: kein Anlass (zeichnen liesse es ohnehin aus).
+        g.kopfraum_ohne_fenster = (16.0, 3.0);
+        g.verdeckt = true;
+        assert!(!faellig(&mut g), "verdeckt");
+        g.verdeckt = false;
+        assert!(faellig(&mut g), "wieder sichtbar");
+        zeichnen(&mut g);
+        // Auf einen SDR-Schirm geschoben: zurueck auf SDR, kein Gold.
+        g.kopfraum_ohne_fenster = (1.0, 1.0);
+        assert!(faellig(&mut g), "Schirmwechsel");
+        zeichnen(&mut g);
+        assert!(!g.schicht_edr);
+        assert!(!g.hdr_praesentiert());
+        assert!(!faellig(&mut g));
+        // Ein SDR-Bild laesst das PQ-Bild los: kein Anlass mehr.
+        g.kopfraum_ohne_fenster = (16.0, 2.5);
+        let bild = probebild(vt_decoder::XF44, 320, 180).expect("Probebild");
+        g.bild_roh(&bild).expect("bild_roh");
+        drop(bild);
+        assert!(!faellig(&mut g), "SDR-Strom");
+        drop(g);
     }
 
     /// Der Waechter als Rechnung: erst nach genug Versuchen UND genug Zeit,
