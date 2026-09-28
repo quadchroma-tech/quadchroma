@@ -44,7 +44,9 @@
 // ohne NVIDIA h264_mf in Software), Codecwechsel, Bildschirmwahl mit
 // Umschalten (aufnahme.rs, Nachrichten 12 und 70), Testbild, Ton
 // (WASAPI-Loopback), Zeigerform, Last, Wachhalten; die Konserve bleibt als
-// Bildquelle waehlbar (--konserve); die Messung (--messen).
+// Bildquelle waehlbar (--konserve); die Messung (--messen). HDR10: ein
+// HDR-Desktop geht als PQ/BT.2020 hinaus, wenn der Zuschauer es will und kann
+// (hdr_grund, Farbwechsel im Aufnahmefaden), sonst als SDR (wandler.rs).
 
 pub mod aufnahme;
 pub mod eingabe;
@@ -61,7 +63,7 @@ pub mod ton;
 pub mod wandler;
 pub mod zeiger;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -123,6 +125,23 @@ pub struct Zustand {
     /// neue Entscheidung einen anderen, geht eine neue Strominfo hinaus
     /// (netz::hdr_neu_entscheiden).
     pub hdr_grund_gesendet: AtomicU8,
+    /// Transfer des Stroms, wie er zuletzt angekuendigt wurde (Switch 7,
+    /// Strominfo): TRANSFER_SDR oder TRANSFER_PQ - vom Aufnahmefaden mit
+    /// jeder neuen Encoder-Sitzung gesetzt.
+    pub farbe: AtomicU8,
+    /// Der Aufnahmefaden soll die Farbe neu entscheiden (vom Netzfaden nach
+    /// einem IN_ANZEIGE gesetzt, wenn PQ/SDR wechseln muss).
+    pub hdr_neu: AtomicBool,
+    /// Kandidat, fuer den der Wechsel nach HDR10 zuletzt scheiterte (Grund 6),
+    /// -1 = keiner. Neu versucht wird nach einem anderen IN_ANZEIGE, einer
+    /// anderen Farblage oder mit einem neuen Zuschauer.
+    pub hdr_gescheitert: AtomicI32,
+    /// HDR10-Metadaten des aufgenommenen Schirms (Strominfo 14-19, SEI 137):
+    /// SDR-Weiss in nit (alle 2 s nachgefuehrt), Mastering max in nit und
+    /// min in 0,0001 nit (0 = unbekannt).
+    pub hdr_weiss_nit: AtomicU32,
+    pub hdr_master_max_nit: AtomicU32,
+    pub hdr_master_min: AtomicU32,
     /// Die Bildschirme des Hosts mit Wunsch und gestreamtem Eintrag
     /// (Nachricht 12) - vom Aufnahmefaden gepflegt, vom Netzfaden fuer die
     /// Begruessung gelesen.
@@ -159,6 +178,12 @@ pub static Z: Zustand = Zustand {
     konserve_farbe: Mutex::new(None),
     quelle_hdr: AtomicBool::new(false),
     hdr_grund_gesendet: AtomicU8::new(crate::hdr::GRUND_KEIN_IN_ANZEIGE),
+    farbe: AtomicU8::new(crate::hdr::TRANSFER_SDR),
+    hdr_neu: AtomicBool::new(false),
+    hdr_gescheitert: AtomicI32::new(-1),
+    hdr_weiss_nit: AtomicU32::new(0),
+    hdr_master_max_nit: AtomicU32::new(0),
+    hdr_master_min: AtomicU32::new(0),
     bildschirme: Mutex::new(crate::bildschirm::Bildschirme { wunsch: None, eintraege: Vec::new() }),
 };
 
@@ -318,20 +343,63 @@ pub fn strominfo() -> [u8; crate::hdr::INFO_LAENGE] {
     strominfo_fuer(netz::anzeige_aktuell().as_ref())
 }
 
-/// Farbe und HDR-Grund der Strominfo: die Entscheidung des Hosts
-/// (hdr::hdr_entscheiden) fuer den laufenden Kandidaten, den aufgenommenen
-/// Desktop und das IN_ANZEIGE des Zuschauers (None: noch keins - Grund 7).
-/// HDR10 codieren kann dieser Host noch mit keinem Kandidaten (der Encoder
-/// dafuer kommt mit Schritt 4b des HDR-Plans): bis dahin ist es immer SDR
-/// mit Grund, bei Kandidat 0 und 2 Grund 4. Eine Konserve sendet, was ihr
-/// Clip ist.
+/// Die Entscheidung des Hosts fuer Kandidat `idx` (hdr::hdr_entscheiden):
+/// der aufgenommene Desktop (Z.quelle_hdr), ob nvenc den Kandidaten in PQ
+/// oeffnet (Befund) und das IN_ANZEIGE des Zuschauers (None: noch keins -
+/// Grund 7). Ist der Wechsel nach HDR10 fuer genau diesen Kandidaten schon
+/// gescheitert, Grund 6 statt "aktiv".
+pub fn hdr_grund(idx: usize, anzeige: Option<&crate::hdr::Anzeige>) -> u8 {
+    let i = idx.min(u8::MAX as usize) as u8;
+    let g = crate::hdr::hdr_entscheiden(Z.quelle_hdr.load(Ordering::Relaxed), encoder::befund(idx).hdr, i, anzeige);
+    grund_mit_scheitern(g, idx, Z.hdr_gescheitert.load(Ordering::Relaxed))
+}
+
+/// "Aktiv" fuer einen Kandidaten, dessen Wechsel nach HDR10 scheiterte,
+/// ist Grund 6 - sonst bleibt der Grund.
+fn grund_mit_scheitern(grund: u8, idx: usize, gescheitert: i32) -> u8 {
+    if grund == crate::hdr::GRUND_AKTIV && gescheitert == idx as i32 {
+        crate::hdr::GRUND_WECHSEL_GESCHEITERT
+    } else {
+        grund
+    }
+}
+
+/// Soll Kandidat `idx` jetzt in PQ laufen? (Entscheidung fuer den
+/// aktuellen Zuschauer.)
+pub fn hdr_ziel_pq(idx: usize) -> bool {
+    hdr_grund(idx, netz::anzeige_aktuell().as_ref()) == crate::hdr::GRUND_AKTIV
+}
+
+/// Die Strominfo-Bytes 8-23 eines PQ-Stroms: HDR aktiv, SDR-Weiss des Hosts,
+/// Mastering des Schirms (wie in der SEI 137), MaxCLL/MaxFALL unbekannt (0).
+pub fn pq_info() -> crate::hdr::InfoV1 {
+    let m = encoder::mastering();
+    crate::hdr::InfoV1 {
+        farbe: crate::hdr::Farbe::PQ,
+        grund: crate::hdr::GRUND_AKTIV,
+        sdr_weiss_nit: Z.hdr_weiss_nit.load(Ordering::Relaxed).min(u16::MAX as u32) as u16,
+        master_max_nit: m.max_nit,
+        master_min_zehntausendstel: m.min_zehntausendstel,
+        max_cll: 0,
+        max_fall: 0,
+    }
+}
+
+/// Farbe und HDR-Grund der Strominfo. Sie beschreibt den Strom, wie er
+/// laeuft: ein PQ-Strom (Z.farbe) mit seinen Metadaten; sonst SDR mit dem
+/// Grund aus hdr_grund fuer den laufenden Kandidaten und dieses
+/// IN_ANZEIGE. Steht dort "aktiv", ist der Wechsel nach PQ unterwegs (der
+/// Client zeigt "wird ausgehandelt"); die Strominfo danach sagt PQ. Eine
+/// Konserve sendet, was ihr Clip ist.
 pub fn hdr_info(anzeige: Option<&crate::hdr::Anzeige>) -> crate::hdr::InfoV1 {
     if let Some(k) = *Z.konserve_farbe.lock().unwrap_or_else(|e| e.into_inner()) {
         return k;
     }
-    let idx = Z.codec_id.load(Ordering::Relaxed).min(u8::MAX as u32) as u8;
-    let host_kann = false;
-    crate::hdr::InfoV1::sdr(crate::hdr::hdr_entscheiden(Z.quelle_hdr.load(Ordering::Relaxed), host_kann, idx, anzeige))
+    if Z.farbe.load(Ordering::Relaxed) == crate::hdr::TRANSFER_PQ {
+        return pq_info();
+    }
+    let idx = Z.codec_id.load(Ordering::Relaxed) as usize;
+    crate::hdr::InfoV1::sdr(hdr_grund(idx, anzeige))
 }
 
 /// Strominfo (Nachricht 1, Fassung 1), immer aus dem laufenden Kandidaten
@@ -1701,9 +1769,9 @@ mod tests {
 
     /// Die Strominfo Fassung 1 dieses Hosts: die Begruessung ohne IN_ANZEIGE
     /// traegt SDR mit Grund 7; mit IN_ANZEIGE entscheidet hdr_entscheiden -
-    /// Wunsch Aus ergibt Grund 1, sonst (noch ohne HDR-Encoder) Grund 4 fuer
-    /// Kandidat 0 und 2, Grund 2 fuer die anderen. Nur lesend: Z teilen sich
-    /// alle Tests.
+    /// Wunsch Aus ergibt Grund 1, sonst (im Test ohne Befund, also ohne
+    /// HDR10-Encoder) Grund 4 fuer Kandidat 0 und 2, Grund 2 fuer die
+    /// anderen. Nur lesend: Z teilen sich alle Tests.
     #[test]
     fn strominfo_fassung_1_mit_sdr() {
         use crate::hdr::{Anzeige, InfoV1, Schirm, GRUND_CLIENT_SDR, GRUND_CODEC, GRUND_HOST_KANN_NICHT, GRUND_KEIN_IN_ANZEIGE, INFO_LAENGE};
@@ -1718,6 +1786,25 @@ mod tests {
         let auto = Anzeige::fuer_client(Some(&hdr_schirm), true, true);
         let g = strominfo_fuer(Some(&auto))[13];
         assert!(g == GRUND_HOST_KANN_NICHT || g == GRUND_CODEC, "Grund {g}");
+    }
+
+    /// Ein gescheiterter Wechsel nach HDR10 macht aus "aktiv" Grund 6 - nur
+    /// fuer genau diesen Kandidaten; andere Gruende bleiben. Die Strominfo
+    /// eines PQ-Stroms: PQ/BT.2020 voll, aktiv, Mastering wie in der SEI
+    /// (ohne Angabe 1000 nit / 0,005 nit), MaxCLL/MaxFALL unbekannt.
+    #[test]
+    fn hdr_grund_und_pq_info() {
+        use crate::hdr::{Farbe, InfoV1, GRUND_AKTIV, GRUND_CLIENT_SDR, GRUND_WECHSEL_GESCHEITERT};
+        assert_eq!(grund_mit_scheitern(GRUND_AKTIV, 0, 0), GRUND_WECHSEL_GESCHEITERT);
+        assert_eq!(grund_mit_scheitern(GRUND_AKTIV, 2, 0), GRUND_AKTIV);
+        assert_eq!(grund_mit_scheitern(GRUND_AKTIV, 0, -1), GRUND_AKTIV);
+        assert_eq!(grund_mit_scheitern(GRUND_CLIENT_SDR, 0, 0), GRUND_CLIENT_SDR);
+        let p = pq_info();
+        assert_eq!((p.farbe, p.grund, p.max_cll, p.max_fall), (Farbe::PQ, GRUND_AKTIV, 0, 0));
+        let m = encoder::mastering();
+        assert_eq!((p.master_max_nit, p.master_min_zehntausendstel), (m.max_nit, m.min_zehntausendstel));
+        assert!(m.max_nit > 0 && m.min_zehntausendstel > 0);
+        assert_eq!(InfoV1::lesen(&[&[0u8; 8][..], &p.kodieren()[..]].concat()), Some(p));
     }
 
     /// Wie der Knopf "Diesen PC freigeben" startet (Ausgaben nach NUL,

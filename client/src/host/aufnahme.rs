@@ -42,6 +42,16 @@
 // Duplication; ab da laeuft alles wie auf einem SDR-Desktop. Das Format wird
 // je Bild geprueft (ein Vollbildprogramm kann auch BGRA liefern), ein
 // fremdes ist ein Verlust wie ein Modewechsel.
+//
+// HDR10 (HDR-Plan 5.2): entscheidet der Host auf HDR (mod.rs hdr_grund - der
+// Desktop ist HDR, der Zuschauer will und kann, Kandidat 0 oder 2 und nvenc
+// kann PQ), laeuft der Encoder in PQ/BT.2020 und die Aufnahme im Modus PQ:
+// der Wandler rechnet jedes Bild (FP16, auch BGRA) auf der Karte in die
+// 10-Bit-Ebenen des Encoders (YUV444P16LE bzw. P010), gedreht und halbiert
+// schon dort; eingelesen werden nur noch die Ebenen. Ein Farbwechsel (SDR
+// <-> PQ) laeuft wie ein Codecwechsel zwischen zwei Bildern (strom_wechseln:
+// Encoder neu, Switch 7 mit dem Transfer, Strominfo 1, Vollbild), hoechstens
+// einer je 2 s; das letzte Bild rechnet der Wandler im neuen Modus nach.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -71,7 +81,7 @@ use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 use super::encoder::{self, Betrieb, Bild, Quelle, Weg};
 use super::takt::{Schrittmacher, INFLIGHT_AUFNAHME, INFLIGHT_TAKT};
-use super::wandler::{self, Eingang, Wandler};
+use super::wandler::{self, Eingang, PqPlan, Wandler};
 use super::zeiger::Zeiger;
 use super::{log, netz, Z};
 use crate::bildschirm::{self, BildschirmEintrag, Bildschirme};
@@ -983,6 +993,19 @@ impl Farblage {
     }
 }
 
+/// Die HDR10-Metadaten eines HDR-Desktops fuer Strominfo und Encoder: SDR-Weiss
+/// in nit (aus SDRWhiteLevel, ohne Angabe 80 nit), Mastering max in nit und
+/// min in 0,0001 nit aus GetDesc1 - ohne Angabe 1000 nit und 0,005 nit wie
+/// beim Mac-Host. Auf u16 gerundet und geklemmt.
+pub fn hdr_metadaten(f: &Farblage) -> (u16, encoder::Mastering) {
+    let u16_aus = |v: f32| -> u16 { if v.is_finite() { v.round().clamp(0.0, u16::MAX as f32) as u16 } else { 0 } };
+    let weiss = u16_aus(wandler::sdr_weiss_nit(wandler::sdr_weiss_pruefen(f.sdr_weiss)));
+    let max_nit = if f.spitze_nit >= 1.0 { u16_aus(f.spitze_nit) } else { encoder::Mastering::VORGABE.max_nit };
+    let min = u16_aus(f.min_nit * 10_000.0);
+    let min_zehntausendstel = if f.min_nit > 0.0 && min > 0 { min } else { encoder::Mastering::VORGABE.min_zehntausendstel };
+    (weiss, encoder::Mastering { max_nit, min_zehntausendstel })
+}
+
 /// Die Farblage eines Ausgangs (Geraetename fuer DisplayConfig).
 fn farblage(output: &IDXGIOutput, name: &str) -> Farblage {
     let d = output.cast::<IDXGIOutput6>().ok().and_then(|o| unsafe { o.GetDesc1() }.ok());
@@ -1032,6 +1055,9 @@ pub struct Duplication {
     /// Format des letzten Bildes und wie oft es gewechselt hat (Protokoll).
     bildformat: Cell<Option<DXGI_FORMAT>>,
     formatwechsel: Cell<u32>,
+    /// Modus PQ (HDR10-Strom): der Plan der Ebenen, nach dem der Wandler
+    /// jedes Bild rechnet; None = Bildweg BGRA wie bisher.
+    pq: Cell<Option<PqPlan>>,
 }
 
 /// Eigener Fehlercode: ein Bild, das der Bildweg nicht nehmen kann (fremdes
@@ -1160,6 +1186,7 @@ pub fn duplication_aufbauen(ausgang: &Ausgang) -> Result<Duplication, String> {
         weiss_pruefung: Cell::new(Instant::now() + Duration::from_secs(2)),
         bildformat: Cell::new(None),
         formatwechsel: Cell::new(0),
+        pq: Cell::new(None),
     })
 }
 
@@ -1203,9 +1230,72 @@ impl Duplication {
         }
     }
 
+    /// Kann dieser Desktop HDR10 liefern? "HDR verwenden" ist an UND die
+    /// Duplication liefert FP16 - ueber DuplicateOutput (ohne IDXGIOutput5)
+    /// kaeme nur das, was Windows selbst nach SDR abbildet.
+    pub fn quelle_hdr(&self) -> bool {
+        self.farbe.hdr && wandler::eingang_art(self.desktop_format) == Eingang::Fp16
+    }
+
+    /// Der Plan des Modus PQ (None: Bildweg BGRA).
+    pub fn pq(&self) -> Option<PqPlan> {
+        self.pq.get()
+    }
+
+    /// Den Wandler anlegen, falls noch keiner steht (erstes FP16-Bild ohne
+    /// erkannten HDR-Desktop, oder Modus PQ auf einem BGRA-Desktop).
+    fn wandler_sichern(&self) -> Result<(), String> {
+        if self.wandler.borrow().is_some() {
+            return Ok(());
+        }
+        let weiss = wandler::sdr_weiss_pruefen(sdr_weiss_lesen(&self.geraetename));
+        *self.wandler.borrow_mut() = Some(Wandler::neu(&self.device, &self.ctx, weiss)?);
+        Ok(())
+    }
+
+    /// Modus PQ an (mit diesem Plan) oder aus. Der Wandler entsteht, falls
+    /// noch keiner steht.
+    fn pq_setzen(&self, plan: Option<PqPlan>) -> Result<(), String> {
+        if plan.is_some() {
+            self.wandler_sichern()?;
+        }
+        self.pq.set(plan);
+        Ok(())
+    }
+
+    /// Nach einem Wechsel in den Modus PQ: das Bild, das der Wandler noch
+    /// haelt, nach dem Plan rechnen. false, wenn er keines haelt.
+    fn pq_nachrechnen(&self) -> Result<bool, String> {
+        let Some(plan) = self.pq.get() else { return Ok(false) };
+        match self.wandler.borrow_mut().as_mut() {
+            Some(w) => w.pq_rechnen(&plan),
+            None => Ok(false),
+        }
+    }
+
+    /// Die Ebenen des zuletzt gerechneten Bildes (dicht gepackt, u16).
+    fn pq_auslesen(&self, ziel: &mut Vec<u8>) -> Result<(), String> {
+        match self.wandler.borrow().as_ref() {
+            Some(w) => w.pq_auslesen(ziel),
+            None => Err("Modus PQ ohne Wandler".into()),
+        }
+    }
+
+    /// Nach einem Wechsel zurueck nach SDR: das Bild, das der Wandler noch
+    /// haelt, als BGRA (in Oberflaechengroesse); None, wenn er keines haelt.
+    fn sdr_nachrechnen(&self) -> Result<Option<ID3D11Texture2D>, String> {
+        match self.wandler.borrow_mut().as_mut() {
+            Some(w) => w.sdr_rechnen().map_err(|e| fehler("Wandler SDR", e)),
+            None => Ok(None),
+        }
+    }
+
     /// Alle 2 s, solange ein Wandler steht: das SDR-Weiss neu lesen (der
     /// Schieber "SDR-Inhaltshelligkeit" aendert es ohne Modewechsel). Vor
-    /// AcquireNextFrame, nie zwischen Abholen und Freigeben.
+    /// AcquireNextFrame, nie zwischen Abholen und Freigeben. Das neue Weiss
+    /// geht auch in die Strominfo (Z.hdr_weiss_nit) - laeuft der Strom in
+    /// PQ, bekommt der Zuschauer gleich eine neue (der Client gleicht sein
+    /// SDR-Weiss daran an).
     fn sdr_weiss_nachfuehren(&self) {
         let mut w = self.wandler.borrow_mut();
         let Some(w) = w.as_mut() else { return };
@@ -1223,6 +1313,12 @@ impl Duplication {
                 wandler::sdr_weiss_nit(neu)
             ));
             w.sdr_weiss_setzen(neu);
+            if self.quelle_hdr() {
+                let nit = wandler::sdr_weiss_nit(neu).round() as u32;
+                if Z.hdr_weiss_nit.swap(nit, Ordering::Relaxed) != nit && Z.farbe.load(Ordering::Relaxed) == crate::hdr::TRANSFER_PQ {
+                    netz::strominfo_senden();
+                }
+            }
         }
     }
 
@@ -1230,22 +1326,42 @@ impl Duplication {
     /// FP16 (HDR-Desktop) durch den Wandler nach SDR. Geprueft wird je Bild -
     /// ein Vollbildprogramm kann auf einem HDR-Desktop auch BGRA liefern;
     /// ein fremdes Format ist ein Verlust (Neuaufbau wie nach einem
-    /// Modewechsel).
+    /// Modewechsel). Im Modus PQ geht jedes Bild (FP16 oder BGRA) durch den
+    /// Wandler in die Ebenen; zurueck kommt dann das Bild der Duplication
+    /// selbst (fuer die Groessenpruefung) - in den Bildweg kopiert wird es
+    /// nicht mehr, eingelesen werden die Ebenen.
     fn bild_fuer_den_bildweg(&self, t: ID3D11Texture2D) -> Result<ID3D11Texture2D, windows::core::Error> {
         let mut d = D3D11_TEXTURE2D_DESC::default();
         unsafe { t.GetDesc(&mut d) };
         let art = wandler::eingang_art(d.Format);
-        if art == Eingang::Fp16 && self.wandler.borrow().is_none() {
-            // FP16, ohne dass der Aufbau HDR erkannt hatte: der Wandler jetzt.
-            let weiss = wandler::sdr_weiss_pruefen(sdr_weiss_lesen(&self.geraetename));
-            match Wandler::neu(&self.device, &self.ctx, weiss) {
-                Ok(neu) => *self.wandler.borrow_mut() = Some(neu),
-                Err(e) => return Err(bild_unbrauchbar(format!("FP16 ohne Wandler ({e})"))),
+        if let Some(plan) = self.pq.get() {
+            self.bildformat_melden(d.Format, art);
+            if art == Eingang::Fremd {
+                return Err(bild_unbrauchbar(format!("Format {} ist weder BGRA 8 Bit noch FP16", wandler::format_name(d.Format))));
             }
+            self.wandler_sichern().map_err(|e| bild_unbrauchbar(format!("Modus PQ ohne Wandler ({e})")))?;
+            let mut w = self.wandler.borrow_mut();
+            let Some(w) = w.as_mut() else { return Err(bild_unbrauchbar("Modus PQ ohne Wandler".into())) };
+            w.aufnehmen(&t)?;
+            if !w.pq_rechnen(&plan).map_err(|e| bild_unbrauchbar(format!("Wandler PQ: {e}")))? {
+                return Err(bild_unbrauchbar("Wandler PQ: kein Bild aufgenommen".into()));
+            }
+            return Ok(t);
+        }
+        if art == Eingang::Fp16 {
+            // FP16, ohne dass der Aufbau HDR erkannt hatte: der Wandler jetzt.
+            self.wandler_sichern().map_err(|e| bild_unbrauchbar(format!("FP16 ohne Wandler ({e})")))?;
         }
         self.bildformat_melden(d.Format, art);
         match art {
-            Eingang::Bgra => Ok(t),
+            Eingang::Bgra => {
+                // Das neueste Bild geht am Wandler vorbei: was er haelt, ist
+                // fuer einen Farbwechsel nicht mehr das neueste.
+                if let Some(w) = self.wandler.borrow_mut().as_mut() {
+                    w.eingang_vergessen();
+                }
+                Ok(t)
+            }
             Eingang::Fp16 => match self.wandler.borrow_mut().as_mut() {
                 Some(w) => w.nach_sdr(&t),
                 None => Err(bild_unbrauchbar("FP16 ohne Wandler".into())),
@@ -1265,13 +1381,14 @@ impl Duplication {
         let n = self.formatwechsel.get();
         self.formatwechsel.set(n + 1);
         if n < 8 {
-            let was = match art {
-                Eingang::Bgra => String::new(),
-                Eingang::Fp16 => format!(
+            let was = match (art, self.pq.get()) {
+                (Eingang::Fremd, _) => " - nicht verwendbar".into(),
+                (_, Some(p)) => format!(" - Wandler nach PQ (HDR10, {})", p.text()),
+                (Eingang::Bgra, None) => String::new(),
+                (Eingang::Fp16, None) => format!(
                     " (scRGB) - Wandler nach SDR, SDR-Weiss {:.0} nit",
                     wandler::sdr_weiss_nit(self.wandler.borrow().as_ref().map(|w| w.sdr_weiss()).unwrap_or(wandler::SDR_WEISS_VORGABE))
                 ),
-                Eingang::Fremd => " - nicht verwendbar".into(),
             };
             log(format!("Aufnahme {}: Bilder im Format {}{was}", self.geraetename, wandler::format_name(f)));
         } else if n == 8 {
@@ -1584,15 +1701,35 @@ struct Aufnahme {
     ram_voll: Vec<u8>,
     /// Gedrehter Ausgang: das ganze Bild, wie der Desktop steht.
     ram_gedreht: Vec<u8>,
+    /// Modus PQ: die Ebenen des Wandlers (u16, dicht gepackt) in Stromgroesse.
+    ram16: Vec<u8>,
 }
 
 impl Aufnahme {
     /// Die Aufnahme auf einer Duplication, mit der Quelle, die der Encoder
     /// nimmt (Texturen oder Systemspeicher).
     fn neu(dup: Duplication, texturen: bool, halb: bool) -> Result<Aufnahme, String> {
-        let mut a = Aufnahme { dup, staging: None, kopie: None, halb, ram: Vec::new(), ram_voll: Vec::new(), ram_gedreht: Vec::new() };
-        a.quelle_anlegen(texturen, 0, 0)?;
+        let mut a = Aufnahme { dup, staging: None, kopie: None, halb, ram: Vec::new(), ram_voll: Vec::new(), ram_gedreht: Vec::new(), ram16: Vec::new() };
+        a.quelle_anlegen(texturen, None, 0, 0)?;
         Ok(a)
+    }
+
+    /// Modus PQ der Aufnahme: Some(4:4:4) bzw. None fuer den Bildweg BGRA -
+    /// verglichen mit Betrieb::pq_art.
+    fn pq_art(&self) -> Option<bool> {
+        self.dup.pq().map(|p| p.chroma444)
+    }
+
+    /// Das festgehaltene Bild als Quelle fuer den Encoder: die Ebenen (Modus
+    /// PQ), die Kopie (Texturweg) oder BGRA im Hauptspeicher.
+    fn quelle(&self) -> Quelle<'_> {
+        if self.dup.pq().is_some() {
+            Quelle::Ebenen16(&self.ram16)
+        } else if let Some(k) = self.kopie.as_ref() {
+            Quelle::Textur(k)
+        } else {
+            Quelle::Ram(&self.ram)
+        }
     }
 
     /// Die Quelle fuer den Encoder anlegen - DEFAULT-Kopie (Texturweg) oder
@@ -1601,8 +1738,47 @@ impl Aufnahme {
     /// beim Wechsel auf den Prozessorweg auch gleich ausgelesen): ein neuer
     /// Encoder soll nicht auf die naechste Aenderung am Desktop warten.
     /// Liefert, ob das Bild mitkam.
-    fn quelle_anlegen(&mut self, texturen: bool, w: i32, h: i32) -> Result<bool, String> {
+    ///
+    /// `pq`: Modus PQ fuer einen HDR10-Encoder (Some(4:4:4)) - dann gibt es
+    /// weder Kopie noch STAGING, der Wandler rechnet die Ebenen in
+    /// Stromgroesse w x h. Beim Wechsel zwischen PQ und SDR kommt das Bild
+    /// aus dem, was der Wandler noch haelt (im neuen Modus nachgerechnet).
+    fn quelle_anlegen(&mut self, texturen: bool, pq: Option<bool>, w: i32, h: i32) -> Result<bool, String> {
         let (dw, dh) = (self.dup.breite, self.dup.hoehe);
+        if let Some(chroma444) = pq {
+            let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, halb: self.halb, drehung: self.dup.drehung, chroma444 };
+            self.staging = None;
+            self.kopie = None;
+            self.ram = Vec::new();
+            self.ram_voll = Vec::new();
+            self.ram_gedreht = Vec::new();
+            self.dup.pq_setzen(Some(plan))?;
+            if !self.dup.pq_nachrechnen()? {
+                return Ok(false);
+            }
+            self.dup.pq_auslesen(&mut self.ram16)?;
+            return Ok(true);
+        }
+        if self.dup.pq().is_some() {
+            // Zurueck aus dem Modus PQ: das letzte Bild haelt nur noch der
+            // Wandler - als BGRA nachgerechnet in die neue Quelle.
+            self.dup.pq_setzen(None)?;
+            self.ram16 = Vec::new();
+            let t = self.dup.textur(dw, dh, !texturen)?;
+            let bild = self.dup.sdr_nachrechnen()?;
+            if let Some(b) = bild.as_ref() {
+                unsafe { self.dup.ctx.CopyResource(&t, b) };
+            }
+            if texturen {
+                self.kopie = Some(t);
+            } else {
+                self.staging = Some(t);
+                if bild.is_some() {
+                    self.einlesen(w, h)?;
+                }
+            }
+            return Ok(bild.is_some());
+        }
         if texturen {
             let k = self.dup.textur(dw, dh, false)?;
             let mit = match self.staging.take() {
@@ -1635,8 +1811,12 @@ impl Aufnahme {
     /// Das Bild aus der STAGING-Textur in den Hauptspeicher, in
     /// Stromgroesse w x h: halbiert oder abgeschnitten, wie der Plan es
     /// sagt - nie aus einer Annahme. Gedreht: erst die ganze Oberflaeche
-    /// lesen und drehen, dann nach Plan.
+    /// lesen und drehen, dann nach Plan. Im Modus PQ die Ebenen des Wandlers.
     fn einlesen(&mut self, w: i32, h: i32) -> Result<(), String> {
+        if self.dup.pq().is_some() {
+            // Modus PQ: gedreht, halbiert und umgerechnet hat schon der Wandler.
+            return self.dup.pq_auslesen(&mut self.ram16);
+        }
         let Some(s) = self.staging.as_ref() else { return Ok(()) };
         let (dw, dh) = (self.dup.breite, self.dup.hoehe);
         let d = self.dup.drehung;
@@ -1725,6 +1905,12 @@ fn sitzung(stand: &mut Bildschirmstand) {
     let mut nachholen: Option<&'static str> = None;
     let (mut w, mut h) = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
     let mut zuschauer = netz::zuschauer_nr();
+    // HDR (Plan 3): ob die Farbe des Stroms neu zu entscheiden ist (Anstoss
+    // vom Netzfaden ueber Z.hdr_neu, neuer Zuschauer, andere Farblage), und
+    // wann der naechste Farbwechsel fruehestens darf (einer je 2 s).
+    let mut farbe_faellig = false;
+    let mut naechster_farbwechsel = Instant::now();
+    Z.hdr_gescheitert.store(-1, Ordering::Relaxed);
 
     while netz::zuschauer_da() {
         let fps = Z.fps.load(Ordering::Relaxed);
@@ -1744,6 +1930,10 @@ fn sitzung(stand: &mut Bildschirmstand) {
             if letztes.is_some() {
                 nachholen = Some("neuer Zuschauer");
             }
+            // Der Neue hat noch kein IN_ANZEIGE: ein PQ-Strom des Alten geht
+            // an ihn nicht weiter (Grund 7), bis er seine Anzeige meldet.
+            Z.hdr_gescheitert.store(-1, Ordering::Relaxed);
+            farbe_faellig = true;
         }
 
         // 1. Bildschirm (1.2): den Wunsch des Zuschauers (Nachricht 70)
@@ -1808,7 +1998,13 @@ fn sitzung(stand: &mut Bildschirmstand) {
                             // Neuaufbau wegen "HDR verwenden"): gleich
                             // eintragen, damit eine Strominfo unten schon
                             // danach entscheidet; neu entschieden wird unten.
-                            let quelle_anders = Z.quelle_hdr.swap(d.farbe.hdr, Ordering::Relaxed) != d.farbe.hdr;
+                            // Dazu die Metadaten fuer Strominfo und Encoder.
+                            let quelle_hdr = d.quelle_hdr();
+                            let quelle_anders = Z.quelle_hdr.swap(quelle_hdr, Ordering::Relaxed) != quelle_hdr;
+                            let (weiss, mastering) = hdr_metadaten(&d.farbe);
+                            Z.hdr_weiss_nit.store(weiss as u32, Ordering::Relaxed);
+                            Z.hdr_master_max_nit.store(mastering.max_nit as u32, Ordering::Relaxed);
+                            Z.hdr_master_min.store(mastering.min_zehntausendstel as u32, Ordering::Relaxed);
                             let (gw, gh) = d.desktop_groesse();
                             let ((nw, nh, halb), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
                             let groesse_neu = geaendert || nw != w || nh != h;
@@ -1837,7 +2033,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                 // Erst der Switch, dann die Info - auch bei
                                 // gleicher Groesse; das Vollbild (unten) traegt
                                 // die Parametersaetze (kein GLOBAL_HEADER).
-                                encoder::switch_senden(Z.codec_id.load(Ordering::Relaxed) as usize);
+                                encoder::switch_senden(Z.codec_id.load(Ordering::Relaxed) as usize, Z.farbe.load(Ordering::Relaxed));
                             }
                             if wechsel || groesse_neu {
                                 netz::strominfo_senden();
@@ -1865,9 +2061,14 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                                 ));
                                 log(format!("Aufnahme {}: Farbe {}", a.name, d.farbe.zeile()));
+                                if d.farbe.hdr && !quelle_hdr {
+                                    log(format!("Aufnahme {}: HDR-Desktop, aber die Duplication liefert kein FP16 - kein HDR10 (Windows bildet selbst nach SDR ab)", a.name));
+                                }
                             }
                             if quelle_anders {
-                                netz::hdr_neu_entscheiden(if d.farbe.hdr { "Desktop jetzt HDR" } else { "Desktop jetzt SDR" });
+                                Z.hdr_gescheitert.store(-1, Ordering::Relaxed);
+                                netz::hdr_neu_entscheiden(if quelle_hdr { "Desktop jetzt HDR" } else { "Desktop jetzt SDR" });
+                                farbe_faellig = true;
                             }
                             auf = Some(neu);
                             letztes = None;
@@ -1897,15 +2098,23 @@ fn sitzung(stand: &mut Bildschirmstand) {
         //     neuen Stroms (1.4 Schritt 6) - auch nach einem gescheiterten.
         stand.meldung_nachholen();
 
-        // 2. Encoder oeffnen, sobald die Aufnahme steht.
+        // 2. Encoder oeffnen, sobald die Aufnahme steht - gleich in der Farbe,
+        //    die der Host entscheidet (hdr_grund); weicht sie von der zuletzt
+        //    angekuendigten ab, gehen Switch 7 und Strominfo hinaus.
         if auf.is_some() && enc.is_none() && Instant::now() >= naechster_enc_versuch {
             let a = auf.as_ref().unwrap();
             let idx = Z.codec_id.load(Ordering::Relaxed) as usize;
-            match Betrieb::oeffnen(idx, w, h, weg, Some((&a.dup.device, &a.dup.ctx))) {
+            match oeffnen_in_farbe(idx, super::hdr_ziel_pq(idx), w, h, weg, Some((&a.dup.device, &a.dup.ctx))) {
                 Ok(b) => {
+                    let t = b.farbe().transfer();
                     enc = Some(b);
                     enc_fehler_gemeldet.clear();
                     testbilder = None;
+                    farbe_faellig = false;
+                    if Z.farbe.swap(t, Ordering::Relaxed) != t {
+                        encoder::switch_senden(idx, t);
+                        netz::strominfo_senden();
+                    }
                     Z.force_key.store(true, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -1918,10 +2127,36 @@ fn sitzung(stand: &mut Bildschirmstand) {
             }
         }
 
-        // 3. Codecwunsch (Nachricht 66): zwischen zwei Bildern, nie mittendrin.
+        // 3. Codecwunsch (Nachricht 66): zwischen zwei Bildern, nie mittendrin -
+        //    der neue Kandidat gleich in der Farbe, die fuer ihn gilt.
         if let Some(idx) = encoder::codec_wunsch_abholen() {
-            codec_wechseln(idx, &mut enc, auf.as_ref(), w, h, weg);
+            strom_wechseln(idx, super::hdr_ziel_pq(idx), &mut enc, auf.as_ref(), w, h, weg);
             testbilder = None;
+        }
+
+        // 3b. HDR: die Farbe neu entscheiden, wenn es angestossen wurde
+        //     (IN_ANZEIGE, Farblage, neuer Zuschauer). Weicht sie vom
+        //     laufenden Strom ab: ein Farbwechsel wie ein Codecwechsel,
+        //     hoechstens einer je 2 s - sonst bleibt es faellig.
+        if Z.hdr_neu.swap(false, Ordering::Relaxed) {
+            farbe_faellig = true;
+        }
+        if farbe_faellig {
+            match enc.as_ref().map(|e| (e.idx, e.farbe().ist_pq())) {
+                // Ohne Encoder entscheidet das naechste Oeffnen (Schritt 2).
+                None => farbe_faellig = false,
+                Some((idx, laeuft_pq)) => {
+                    let ziel_pq = super::hdr_ziel_pq(idx);
+                    if ziel_pq == laeuft_pq {
+                        farbe_faellig = false;
+                    } else if Instant::now() >= naechster_farbwechsel {
+                        naechster_farbwechsel = Instant::now() + Duration::from_secs(2);
+                        farbe_faellig = false;
+                        strom_wechseln(idx, ziel_pq, &mut enc, auf.as_ref(), w, h, weg);
+                        testbilder = None;
+                    }
+                }
+            }
         }
 
         // 4. Einstellungen (Nachricht 64) auf die Sitzung.
@@ -1948,14 +2183,23 @@ fn sitzung(stand: &mut Bildschirmstand) {
         //     ganz hinein, statt dass der Takt ins Leere wiederholt.
         let mut verlust: Option<String> = None;
         if let (Some(e), Some(a)) = (enc.as_ref(), auf.as_mut()) {
-            if a.kopie.is_some() != e.texturen() {
-                match a.quelle_anlegen(e.texturen(), w, h) {
+            if a.kopie.is_some() != e.texturen() || a.pq_art() != e.pq_art() {
+                match a.quelle_anlegen(e.texturen(), e.pq_art(), w, h) {
                     Ok(mit) => {
                         log(format!(
                             "Aufnahme: Quelle auf {} umgestellt (Kandidat {} {} nimmt {}){}",
-                            if e.texturen() { "Textur" } else { "Prozessorweg" },
+                            match e.pq_art() {
+                                Some(_) => "PQ-Ebenen des Wandlers",
+                                None if e.texturen() => "Textur",
+                                None => "Prozessorweg",
+                            },
                             e.idx, encoder::kandidat(e.idx).name,
-                            if e.texturen() { "Texturen" } else { "Systemspeicher" },
+                            match e.pq_art() {
+                                Some(true) => "YUV444P16LE, HDR10",
+                                Some(false) => "P010, HDR10",
+                                None if e.texturen() => "Texturen",
+                                None => "Systemspeicher",
+                            },
                             if mit { ", letztes Bild mitgenommen" } else { "" }
                         ));
                         letztes = if mit { letztes.map(|(t, _)| (t, false)) } else { None };
@@ -2002,7 +2246,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
         }
         if testbild_an && testbilder.is_none() {
             if let Some(e) = enc.as_ref() {
-                match encoder::testbilder(e.pix_fmt, w, h) {
+                match encoder::testbilder(e.pix_fmt, w, h, e.farbe()) {
                     Ok(b) => testbilder = Some(b),
                     Err(err) => {
                         log(format!("Testbild: {err}"));
@@ -2076,11 +2320,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     takt.ausgelassen();
                                 } else {
                                     let pts = takt.pts_vorwaerts(t_cap as i64, fps);
-                                    let q = match a.kopie.as_ref() {
-                                        Some(k) => Quelle::Textur(k),
-                                        None => Quelle::Ram(&a.ram),
-                                    };
-                                    if e.codieren(q, t_cap, pts, false).is_ok() {
+                                    if e.codieren(a.quelle(), t_cap, pts, false).is_ok() {
                                         letztes = Some((t_cap, true));
                                         nachholen = None;
                                     }
@@ -2158,13 +2398,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                         } else {
                             let pts = takt.pts_vorwaerts(super::now_us() as i64, fps);
                             let a = auf.as_ref().unwrap();
-                            let q = if codiert {
-                                Quelle::Wiederholung
-                            } else if let Some(k) = a.kopie.as_ref() {
-                                Quelle::Textur(k)
-                            } else {
-                                Quelle::Ram(&a.ram)
-                            };
+                            let q = if codiert { Quelle::Wiederholung } else { a.quelle() };
                             // Der Stempel traegt die ECHTE Aufnahmezeit des
                             // wiederholten Bildes; das Raster bleibt unberuehrt.
                             if e.codieren(q, t_cap, pts, true).is_ok() {
@@ -2221,6 +2455,8 @@ fn sitzung(stand: &mut Bildschirmstand) {
     }
     drop(testbilder);
     drop(auf);
+    // Der naechste Zuschauer beginnt in SDR (seine Begruessung sagt es so).
+    Z.farbe.store(crate::hdr::TRANSFER_SDR, Ordering::Relaxed);
     if Z.testbild.swap(false, Ordering::Relaxed) {
         log("Testbild aus (Zuschauer weg)");
     }
@@ -2245,20 +2481,56 @@ fn zeiger_auswerten(dup: &Duplication, zi: &ZeigerInfo, zeiger: &mut Zeiger, feh
     }
 }
 
-/// Codecwechsel wie main.m: alte Sitzung leeren (ihre letzten Pakete gehen
-/// noch raus), neue oeffnen, ERST DANN Switch 7, Vollbild erzwingen,
-/// Strominfo 1. Scheitert die neue, kommt die alte zurueck - ohne Switch.
-fn codec_wechseln(idx: usize, enc: &mut Option<Betrieb>, auf: Option<&Aufnahme>, w: i32, h: i32, weg: Weg) {
+/// "PQ/BT.2020" bzw. "SDR" fuers Protokoll.
+fn farbe_text(pq: bool) -> &'static str {
+    if pq { "HDR10 PQ/BT.2020" } else { "SDR" }
+}
+
+/// Eine Encoder-Sitzung fuer den Kandidaten in der gewuenschten Farbe. Geht
+/// sie in PQ nicht auf, merkt sich der Host das (Grund 6, Z.hdr_gescheitert
+/// fuer genau diesen Kandidaten) und oeffnet denselben Kandidaten in SDR.
+fn oeffnen_in_farbe(idx: usize, pq: bool, w: i32, h: i32, weg: Weg, geraet: Option<(&ID3D11Device, &ID3D11DeviceContext)>) -> Result<Betrieb, String> {
+    if !pq {
+        return Betrieb::oeffnen(idx, w, h, weg, geraet, encoder::StromFarbe::Sdr709);
+    }
+    match Betrieb::oeffnen(idx, w, h, weg, geraet, encoder::stromfarbe(true)) {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            log(format!("HDR10-Sitzung fuer {} scheitert ({e}) - derselbe Kandidat in SDR (Grund 6)", encoder::kandidat(idx).name));
+            Z.hdr_gescheitert.store(idx as i32, Ordering::Relaxed);
+            Betrieb::oeffnen(idx, w, h, weg, geraet, encoder::StromFarbe::Sdr709)
+        }
+    }
+}
+
+/// Codec- und Farbwechsel wie main.m: alte Sitzung leeren (ihre letzten
+/// Pakete gehen noch raus), neue oeffnen (Kandidat `idx`, PQ oder SDR), ERST
+/// DANN Switch 7 mit dem Transfer, Vollbild erzwingen, Strominfo 1. Geht
+/// sie in PQ nicht auf, derselbe Kandidat in SDR (oeffnen_in_farbe); scheitert
+/// sie ganz, kommt die alte zurueck - ohne Switch. Die Aufnahme stellt sich
+/// danach selbst um (Schritt 4b: Quelle, Modus PQ).
+fn strom_wechseln(idx: usize, pq: bool, enc: &mut Option<Betrieb>, auf: Option<&Aufnahme>, w: i32, h: i32, weg: Weg) {
     let alt = Z.codec_id.load(Ordering::Relaxed) as usize;
+    let alt_pq = match enc.as_ref() {
+        Some(e) => e.farbe().ist_pq(),
+        None => Z.farbe.load(Ordering::Relaxed) == crate::hdr::TRANSFER_PQ,
+    };
     let Some(a) = auf else {
-        log(format!("Codecwunsch {} abgelehnt: keine laufende Aufnahme", encoder::kandidat(idx).name));
+        log(format!("Wechsel auf {} ({}) abgelehnt: keine laufende Aufnahme", encoder::kandidat(idx).name, farbe_text(pq)));
         return;
     };
-    if idx == alt && enc.is_some() {
-        log(format!("Codecwunsch {}: laeuft bereits", encoder::kandidat(idx).name));
+    if idx == alt && pq == alt_pq && enc.is_some() {
+        log(format!("Codecwunsch {} ({}): laeuft bereits", encoder::kandidat(idx).name, farbe_text(pq)));
         return;
     }
-    log(format!("Codecwechsel: {} -> {}", encoder::kandidat(alt).name, encoder::kandidat(idx).name));
+    log(format!(
+        "{}: {} {} -> {} {}",
+        if idx == alt { "Farbwechsel" } else { "Codecwechsel" },
+        encoder::kandidat(alt).name,
+        farbe_text(alt_pq),
+        encoder::kandidat(idx).name,
+        farbe_text(pq)
+    ));
     if let Some(e) = enc.take() {
         e.schliessen();
     }
@@ -2267,23 +2539,30 @@ fn codec_wechseln(idx: usize, enc: &mut Option<Betrieb>, auf: Option<&Aufnahme>,
     Z.wait_key.store(true, Ordering::Relaxed);
     Z.force_key.store(true, Ordering::Relaxed);
     let geraet = Some((&a.dup.device, &a.dup.ctx));
-    match Betrieb::oeffnen(idx, w, h, weg, geraet) {
+    match oeffnen_in_farbe(idx, pq, w, h, weg, geraet) {
         Ok(b) => {
+            let t = b.farbe().transfer();
             Z.codec_id.store(idx as u32, Ordering::Relaxed);
+            Z.farbe.store(t, Ordering::Relaxed);
             *enc = Some(b);
-            encoder::switch_senden(idx);
+            encoder::switch_senden(idx, t);
             Z.force_key.store(true, Ordering::Relaxed);
             netz::strominfo_senden();
-            log(format!("Codec gewechselt: {}", encoder::kandidat(idx).name));
+            log(format!("Strom gewechselt: {} {}", encoder::kandidat(idx).name, farbe_text(t == crate::hdr::TRANSFER_PQ)));
         }
         Err(e) => {
-            log(format!("Codecwechsel auf {} fehlgeschlagen ({e}) - baue {} wieder auf", encoder::kandidat(idx).name, encoder::kandidat(alt).name));
-            match Betrieb::oeffnen(alt, w, h, weg, geraet) {
+            log(format!("Wechsel auf {} fehlgeschlagen ({e}) - baue {} wieder auf", encoder::kandidat(idx).name, encoder::kandidat(alt).name));
+            match oeffnen_in_farbe(alt, alt_pq, w, h, weg, geraet) {
                 Ok(b) => {
+                    let t = b.farbe().transfer();
+                    let anders = Z.farbe.swap(t, Ordering::Relaxed) != t;
                     *enc = Some(b);
+                    if anders {
+                        encoder::switch_senden(alt, t);
+                    }
                     Z.force_key.store(true, Ordering::Relaxed);
                     netz::strominfo_senden();
-                    log(format!("Alter Codec laeuft wieder: {}", encoder::kandidat(alt).name));
+                    log(format!("Alter Codec laeuft wieder: {} {}", encoder::kandidat(alt).name, farbe_text(t == crate::hdr::TRANSFER_PQ)));
                 }
                 Err(e2) => log(format!("Auch der alte Codec {} laesst sich nicht mehr oeffnen ({e2}) - es kommt kein Bild mehr", encoder::kandidat(alt).name)),
             }
@@ -2968,6 +3247,33 @@ mod tests {
             }
             assert_eq!(ram.len(), w * h * 4, "{sw}x{sh} {d:?}");
         }
+    }
+
+    /// Die HDR10-Metadaten eines Schirms: SDR-Weiss aus SDRWhiteLevel (ohne
+    /// oder mit unbrauchbarem Wert 80 nit), Spitze und Minimum aus GetDesc1,
+    /// ohne Angabe 1000 nit / 0,005 nit; geklemmt statt uebergelaufen.
+    #[test]
+    fn hdr_metadaten_aus_der_farblage() {
+        let f = Farblage {
+            hdr: true,
+            desc1: true,
+            farbraum: DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+            bits: 10,
+            spitze_nit: 1015.4,
+            vollbild_nit: 600.0,
+            min_nit: 0.0123,
+            sdr_weiss: Some(3000),
+        };
+        let (weiss, m) = hdr_metadaten(&f);
+        assert_eq!((weiss, m.max_nit, m.min_zehntausendstel), (240, 1015, 123));
+        let ohne = Farblage { spitze_nit: 0.0, min_nit: 0.0, sdr_weiss: None, desc1: false, ..f };
+        let (weiss, m) = hdr_metadaten(&ohne);
+        assert_eq!((weiss, m), (80, encoder::Mastering::VORGABE));
+        let faul = Farblage { spitze_nit: f32::NAN, min_nit: 1e-9, sdr_weiss: Some(99_999), ..f };
+        let (weiss, m) = hdr_metadaten(&faul);
+        assert_eq!((weiss, m), (80, encoder::Mastering::VORGABE));
+        let riesig = Farblage { spitze_nit: 1e9, min_nit: 100.0, ..f };
+        assert_eq!(hdr_metadaten(&riesig).1, encoder::Mastering { max_nit: u16::MAX, min_zehntausendstel: u16::MAX });
     }
 
     #[test]

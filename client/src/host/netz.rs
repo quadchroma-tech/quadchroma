@@ -1643,16 +1643,29 @@ pub fn anzeige_aktuell() -> Option<crate::hdr::Anzeige> {
 }
 
 /// Nach einem IN_ANZEIGE oder einer anderen Farblage des Desktops: neu
-/// entscheiden (super::hdr_info). Ergibt das einen anderen HDR-Grund als die
-/// zuletzt gesendete Strominfo, bekommt der Zuschauer eine neue - dieselbe
-/// Groesse und derselbe Codec, der Client baut dafuer nichts um. Einen
-/// Wechsel nach HDR (neue Encoder-Sitzung, SWITCH mit PQ) gibt es erst mit
-/// dem HDR-Encoder (Schritt 4b des HDR-Plans).
+/// entscheiden (super::hdr_grund). Muss der Strom dafuer zwischen PQ und SDR
+/// wechseln, macht das der Aufnahmefaden (Z.hdr_neu - neue Encoder-Sitzung,
+/// Switch 7 mit dem Transfer, Strominfo, Vollbild; einer je 2 s). Sonst:
+/// ergibt die Entscheidung einen anderen HDR-Grund als die zuletzt
+/// gesendete Strominfo, bekommt der Zuschauer eine neue - dieselbe Groesse
+/// und derselbe Codec, der Client baut dafuer nichts um. Eine Konserve
+/// wechselt nie (sie sendet, was ihr Clip ist).
 pub fn hdr_neu_entscheiden(anlass: &str) {
     if !zuschauer_da() {
         return;
     }
-    let info = super::hdr_info(anzeige_aktuell().as_ref());
+    let anzeige = anzeige_aktuell();
+    if !Z.konserve.load(Ordering::Relaxed) {
+        let idx = Z.codec_id.load(Ordering::Relaxed) as usize;
+        let ziel_pq = super::hdr_grund(idx, anzeige.as_ref()) == crate::hdr::GRUND_AKTIV;
+        let laeuft_pq = Z.farbe.load(Ordering::Relaxed) == crate::hdr::TRANSFER_PQ;
+        if ziel_pq != laeuft_pq {
+            log(format!("HDR-Entscheidung ({anlass}): Wechsel nach {} angefordert", if ziel_pq { "HDR10 (PQ)" } else { "SDR" }));
+            Z.hdr_neu.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
+    let info = super::hdr_info(anzeige.as_ref());
     let alt = Z.hdr_grund_gesendet.load(Ordering::Relaxed);
     if info.grund != alt {
         log(format!(
@@ -2209,7 +2222,13 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
                 // IN_ANZEIGE, der Kanal bleibt.
                 match crate::hdr::Anzeige::lesen(&payload) {
                     Some(a) => {
-                        *sperre(&ANZEIGE) = Some((bild.nr.load(Ordering::Relaxed), a));
+                        let nr_bild = bild.nr.load(Ordering::Relaxed);
+                        let vorher = sperre(&ANZEIGE).replace((nr_bild, a));
+                        // Eine andere Lage (Flags, Wunsch) ist ein neuer
+                        // Anlauf fuer HDR10, auch nach einem gescheiterten.
+                        if vorher.filter(|(n, _)| *n == nr_bild).is_none_or(|(_, alt)| a.entscheidend_anders(&alt)) {
+                            Z.hdr_gescheitert.store(-1, Ordering::Relaxed);
+                        }
                         anzeige_neu = Some(a);
                     }
                     None => log(format!("IN_ANZEIGE: ungueltig ({len} Byte) - uebergangen")),
