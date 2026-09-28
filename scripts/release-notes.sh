@@ -119,8 +119,8 @@ HDR** can now be streamed at all (as SDR to a viewer without HDR).
   account needs an administrator's password and gets no **Start with Windows**.
 - **HDR is HDR10 only** - no HLG, no HDR10+ or Dolby Vision; 8-bit codecs and H.264
   stay SDR, the mouse pointer is always SDR, and a computer with QuadChroma 0.1.0 on
-  either side gets SDR. HDR has been tested with test harnesses and recorded HDR10
-  clips, not yet on every kind of real HDR screen.
+  either side gets SDR. So far HDR has been tested with test harnesses and recorded
+  HDR10 clips only, not yet on real HDR screens.
 EOF
 
 case "$win" in

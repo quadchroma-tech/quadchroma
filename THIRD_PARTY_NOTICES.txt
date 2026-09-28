@@ -1,7 +1,7 @@
 # QuadChroma - Third-Party Notices
 
 **Date:** 28 September 2026  
-**Applies to:** QuadChroma 0.1.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as released with 0.1.0, static Microsoft C runtime; a release build of 28 September 2026 was 4,868,096 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS app `QuadChroma.app` 0.1.0 (build 3, bundle identifier `tech.quadchroma.host`; the Rust client for `aarch64-apple-darwin` with the Objective-C/C host engine built in).  
+**Applies to:** QuadChroma 0.2.0 - the Windows program `quadchroma.exe` (client and host role, target `x86_64-pc-windows-msvc`, built with Rust 1.98.1 from `client/Cargo.lock` as released with 0.2.0, static Microsoft C runtime; a release build of 28 September 2026 was 4,868,096 bytes) together with the two FFmpeg DLLs `avcodec-63.dll` and `avutil-61.dll` described in section 2, and the macOS app `QuadChroma.app` 0.1.0 (build 3, bundle identifier `tech.quadchroma.host`; the Rust client for `aarch64-apple-darwin` with the Objective-C/C host engine built in).  
 **Maintainer / licensor:** Robert Brandt, <hello@quadchroma.tech>, <https://github.com/quadchroma-tech/quadchroma>
 
 This file accompanies every binary distribution of QuadChroma (the Windows ZIP and the macOS DMG/ZIP) and is kept unchanged in the source repository. It lists every third-party component contained in, or shipped next to, the distributed binaries, states the license each component is under, reproduces the license texts verbatim and records where the exact source code of the FFmpeg libraries comes from.
@@ -1148,11 +1148,11 @@ Lesser General Public License for more details.
 
 ## 3. Rust crates (Windows program, statically linked)
 
-`quadchroma.exe` is built for the target `x86_64-pc-windows-msvc` (one binary for the Windows client and the Windows host role, static Microsoft C runtime). The crates below are compiled into it. The list is complete for this binary; it was derived from `client/Cargo.lock` as released with 0.1.0 and `cargo tree --target x86_64-pc-windows-msvc -e normal`.
+`quadchroma.exe` is built for the target `x86_64-pc-windows-msvc` (one binary for the Windows client and the Windows host role, static Microsoft C runtime). The crates below are compiled into it. The list is complete for this binary; it was derived from `client/Cargo.lock` as released with 0.2.0 and `cargo tree --target x86_64-pc-windows-msvc -e normal`.
 
 ### 3.1 Scope and method
 
-- Source of truth: `client/Cargo.lock` as released with 0.1.0 and `cargo tree --target x86_64-pc-windows-msvc -e normal` (normal dependency edges only). The build-dependencies (`cargo tree -e build`; for this target bindgen, cc, cexpr, cfg_aliases, clang-sys, find-msvc-tools, glob, itertools, libloading, memchr, minimal-lexical, nom, num_cpus, pkg-config, regex, regex-automata, regex-syntax, rustc-hash, rustc_version, semver, shlex and version_check) run only in build scripts while the program is built and put no code into it, so they are not listed; the crate has no dev-dependencies.
+- Source of truth: `client/Cargo.lock` as released with 0.2.0 and `cargo tree --target x86_64-pc-windows-msvc -e normal` (normal dependency edges only). The build-dependencies (`cargo tree -e build`; for this target bindgen, cc, cexpr, cfg_aliases, clang-sys, find-msvc-tools, glob, itertools, libloading, memchr, minimal-lexical, nom, num_cpus, pkg-config, regex, regex-automata, regex-syntax, rustc-hash, rustc_version, semver, shlex and version_check) run only in build scripts while the program is built and put no code into it, so they are not listed; the crate has no dev-dependencies.
 
 - 73 crates resolve for this target: 66 are compiled into the binary (or resolved as dependencies), 7 run only at build time (procedural macros and crates reached only through procedural macros). Build-time crates are listed in the last section.
 
@@ -2745,7 +2745,7 @@ This section lists the crates of the `aarch64-apple-darwin` target with their li
 
 ### 5.1 Scope and method
 
-- Source of truth: `client/Cargo.lock` as released with 0.1.0 and `cargo tree --target aarch64-apple-darwin -e normal` (normal dependency edges only). `ffmpeg-next` and `ffmpeg-sys-next` are Windows-only dependencies (the Mac client decodes with VideoToolbox) and do not resolve for this target. The build-dependencies (`cargo tree -e build`; for this target cc, cfg_aliases, find-msvc-tools, rustc_version, semver, shlex and version_check) run only in build scripts while the program is built and put no code into it, so they are not listed; the crate has no dev-dependencies.
+- Source of truth: `client/Cargo.lock` as released with 0.2.0 and `cargo tree --target aarch64-apple-darwin -e normal` (normal dependency edges only). `ffmpeg-next` and `ffmpeg-sys-next` are Windows-only dependencies (the Mac client decodes with VideoToolbox) and do not resolve for this target. The build-dependencies (`cargo tree -e build`; for this target cc, cfg_aliases, find-msvc-tools, rustc_version, semver, shlex and version_check) run only in build scripts while the program is built and put no code into it, so they are not listed; the crate has no dev-dependencies.
 
 - 74 crates resolve for this target: 69 are compiled into the binary (or resolved as dependencies), 5 run only at build time (procedural macros and crates reached only through procedural macros). Build-time crates are listed in the last section.
 
