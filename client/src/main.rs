@@ -34,6 +34,10 @@ mod discovery;
 mod einstellungen;
 /// Einzelinstanz: ein zweiter Start reicht seine Adresse an den ersten weiter.
 mod einzel;
+/// HDR10 (BT.2020, PQ): Strominfo Fassung 1, IN_ANZEIGE, die Entscheidung des
+/// Hosts, PQ, Matrizen und Tonwertabbildung - die Referenz fuer Shader und
+/// den C-Spiegel des Mac-Hosts (host/hdr.c).
+mod hdr;
 /// Das Programmsymbol, im Programm gezeichnet, und seine .ico-Datei.
 mod logo;
 mod noise;

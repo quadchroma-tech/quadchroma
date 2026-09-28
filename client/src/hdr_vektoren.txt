@@ -1,0 +1,467 @@
+# Pruefvektoren HDR10 (Protokoll Fassung 1) - EINE Datei fuer client/src/hdr.rs und
+# host/hdr.c. Die Rust-Tests lesen sie (hdr::tests) und pruefen auf dem Mac
+# dieselben Zeilen gegen den C-Spiegel (libqchost.a). Wer eine Regel aendert,
+# aendert zuerst diese Datei.
+#
+# Eine Zeile je Fall, Felder durch Leerzeichen getrennt, # beginnt einen Kommentar.
+#
+# entscheiden <quelle_hdr> <host_kann> <idx> <anzeige> <grund>
+#   quelle_hdr 0/1: der aufgenommene Bildschirm des Hosts ist HDR
+#   host_kann  0/1: Betriebssystem und Encoder koennen HDR10 mit diesem Kandidaten
+#   idx        Kandidat der Koennensliste (0 HEVC 4:4:4 10, 2 HEVC 4:2:0 10, 4 H.264 auch
+#              mit dem Media-Foundation-Rueckfall des Windows-Hosts, 5 AV1)
+#   anzeige    - = kein IN_ANZEIGE, sonst <flags>/<wunsch> (Bytes 1 und 2, dezimal;
+#              die uebrigen Bytes sind fuer die Entscheidung ohne Belang)
+#   grund      Byte 13 der INFO (0 = HDR aktiv)
+#
+# info <transfer> <primaer> <matrix> <voll> <grund> <weiss> <mmax> <mmin> <cll> <fall> <hex>
+#   die 16 Bytes 8..23 der INFO Fassung 1
+# anzeige <flags> <wunsch> <weiss> <spitze> <vollbild> <kpot> <kakt> <hex>
+#   die 14 Bytes von IN_ANZEIGE
+# pq <nit> <code10>
+#   PQ-Code (10 Bit, voller Bereich) eines Pegels in nit
+# sei <primaer> <max_zehntausendstel> <min_zehntausendstel> <maxcll> <maxfall> <hex>
+#   Praefix-SEI-NAL (Typ 39, ohne Startcode) mit 137 (MDCV) und 144 (CLL), mit
+#   Emulationsschutz; primaer p3 = Display P3 D65, 2020 = BT.2020 D65
+
+# Reihenfolge der Gruende: kein IN_ANZEIGE (7), Wunsch Aus oder unbekannt (1), Codec (2),
+# Host kann nicht (4), Host-Schirm SDR (3), Client ohne HDR-Darstellung (5), Client-Schirm
+# SDR bei Automatisch (1), sonst 0. Wunsch 3 steht fuer jeden unbekannten Wert.
+entscheiden 0 0 0 - 7
+entscheiden 0 0 0 0/0 4
+entscheiden 0 0 0 0/1 1
+entscheiden 0 0 0 0/2 4
+entscheiden 0 0 0 0/3 1
+entscheiden 0 0 0 1/0 4
+entscheiden 0 0 0 1/1 1
+entscheiden 0 0 0 1/2 4
+entscheiden 0 0 0 1/3 1
+entscheiden 0 0 0 2/0 4
+entscheiden 0 0 0 2/1 1
+entscheiden 0 0 0 2/2 4
+entscheiden 0 0 0 2/3 1
+entscheiden 0 0 0 3/0 4
+entscheiden 0 0 0 3/1 1
+entscheiden 0 0 0 3/2 4
+entscheiden 0 0 0 3/3 1
+entscheiden 0 0 1 - 7
+entscheiden 0 0 1 0/0 2
+entscheiden 0 0 1 0/1 1
+entscheiden 0 0 1 0/2 2
+entscheiden 0 0 1 0/3 1
+entscheiden 0 0 1 1/0 2
+entscheiden 0 0 1 1/1 1
+entscheiden 0 0 1 1/2 2
+entscheiden 0 0 1 1/3 1
+entscheiden 0 0 1 2/0 2
+entscheiden 0 0 1 2/1 1
+entscheiden 0 0 1 2/2 2
+entscheiden 0 0 1 2/3 1
+entscheiden 0 0 1 3/0 2
+entscheiden 0 0 1 3/1 1
+entscheiden 0 0 1 3/2 2
+entscheiden 0 0 1 3/3 1
+entscheiden 0 0 2 - 7
+entscheiden 0 0 2 0/0 4
+entscheiden 0 0 2 0/1 1
+entscheiden 0 0 2 0/2 4
+entscheiden 0 0 2 0/3 1
+entscheiden 0 0 2 1/0 4
+entscheiden 0 0 2 1/1 1
+entscheiden 0 0 2 1/2 4
+entscheiden 0 0 2 1/3 1
+entscheiden 0 0 2 2/0 4
+entscheiden 0 0 2 2/1 1
+entscheiden 0 0 2 2/2 4
+entscheiden 0 0 2 2/3 1
+entscheiden 0 0 2 3/0 4
+entscheiden 0 0 2 3/1 1
+entscheiden 0 0 2 3/2 4
+entscheiden 0 0 2 3/3 1
+entscheiden 0 0 3 - 7
+entscheiden 0 0 3 0/0 2
+entscheiden 0 0 3 0/1 1
+entscheiden 0 0 3 0/2 2
+entscheiden 0 0 3 0/3 1
+entscheiden 0 0 3 1/0 2
+entscheiden 0 0 3 1/1 1
+entscheiden 0 0 3 1/2 2
+entscheiden 0 0 3 1/3 1
+entscheiden 0 0 3 2/0 2
+entscheiden 0 0 3 2/1 1
+entscheiden 0 0 3 2/2 2
+entscheiden 0 0 3 2/3 1
+entscheiden 0 0 3 3/0 2
+entscheiden 0 0 3 3/1 1
+entscheiden 0 0 3 3/2 2
+entscheiden 0 0 3 3/3 1
+entscheiden 0 0 4 - 7
+entscheiden 0 0 4 0/0 2
+entscheiden 0 0 4 0/1 1
+entscheiden 0 0 4 0/2 2
+entscheiden 0 0 4 0/3 1
+entscheiden 0 0 4 1/0 2
+entscheiden 0 0 4 1/1 1
+entscheiden 0 0 4 1/2 2
+entscheiden 0 0 4 1/3 1
+entscheiden 0 0 4 2/0 2
+entscheiden 0 0 4 2/1 1
+entscheiden 0 0 4 2/2 2
+entscheiden 0 0 4 2/3 1
+entscheiden 0 0 4 3/0 2
+entscheiden 0 0 4 3/1 1
+entscheiden 0 0 4 3/2 2
+entscheiden 0 0 4 3/3 1
+entscheiden 0 0 5 - 7
+entscheiden 0 0 5 0/0 2
+entscheiden 0 0 5 0/1 1
+entscheiden 0 0 5 0/2 2
+entscheiden 0 0 5 0/3 1
+entscheiden 0 0 5 1/0 2
+entscheiden 0 0 5 1/1 1
+entscheiden 0 0 5 1/2 2
+entscheiden 0 0 5 1/3 1
+entscheiden 0 0 5 2/0 2
+entscheiden 0 0 5 2/1 1
+entscheiden 0 0 5 2/2 2
+entscheiden 0 0 5 2/3 1
+entscheiden 0 0 5 3/0 2
+entscheiden 0 0 5 3/1 1
+entscheiden 0 0 5 3/2 2
+entscheiden 0 0 5 3/3 1
+entscheiden 0 1 0 - 7
+entscheiden 0 1 0 0/0 3
+entscheiden 0 1 0 0/1 1
+entscheiden 0 1 0 0/2 3
+entscheiden 0 1 0 0/3 1
+entscheiden 0 1 0 1/0 3
+entscheiden 0 1 0 1/1 1
+entscheiden 0 1 0 1/2 3
+entscheiden 0 1 0 1/3 1
+entscheiden 0 1 0 2/0 3
+entscheiden 0 1 0 2/1 1
+entscheiden 0 1 0 2/2 3
+entscheiden 0 1 0 2/3 1
+entscheiden 0 1 0 3/0 3
+entscheiden 0 1 0 3/1 1
+entscheiden 0 1 0 3/2 3
+entscheiden 0 1 0 3/3 1
+entscheiden 0 1 1 - 7
+entscheiden 0 1 1 0/0 2
+entscheiden 0 1 1 0/1 1
+entscheiden 0 1 1 0/2 2
+entscheiden 0 1 1 0/3 1
+entscheiden 0 1 1 1/0 2
+entscheiden 0 1 1 1/1 1
+entscheiden 0 1 1 1/2 2
+entscheiden 0 1 1 1/3 1
+entscheiden 0 1 1 2/0 2
+entscheiden 0 1 1 2/1 1
+entscheiden 0 1 1 2/2 2
+entscheiden 0 1 1 2/3 1
+entscheiden 0 1 1 3/0 2
+entscheiden 0 1 1 3/1 1
+entscheiden 0 1 1 3/2 2
+entscheiden 0 1 1 3/3 1
+entscheiden 0 1 2 - 7
+entscheiden 0 1 2 0/0 3
+entscheiden 0 1 2 0/1 1
+entscheiden 0 1 2 0/2 3
+entscheiden 0 1 2 0/3 1
+entscheiden 0 1 2 1/0 3
+entscheiden 0 1 2 1/1 1
+entscheiden 0 1 2 1/2 3
+entscheiden 0 1 2 1/3 1
+entscheiden 0 1 2 2/0 3
+entscheiden 0 1 2 2/1 1
+entscheiden 0 1 2 2/2 3
+entscheiden 0 1 2 2/3 1
+entscheiden 0 1 2 3/0 3
+entscheiden 0 1 2 3/1 1
+entscheiden 0 1 2 3/2 3
+entscheiden 0 1 2 3/3 1
+entscheiden 0 1 3 - 7
+entscheiden 0 1 3 0/0 2
+entscheiden 0 1 3 0/1 1
+entscheiden 0 1 3 0/2 2
+entscheiden 0 1 3 0/3 1
+entscheiden 0 1 3 1/0 2
+entscheiden 0 1 3 1/1 1
+entscheiden 0 1 3 1/2 2
+entscheiden 0 1 3 1/3 1
+entscheiden 0 1 3 2/0 2
+entscheiden 0 1 3 2/1 1
+entscheiden 0 1 3 2/2 2
+entscheiden 0 1 3 2/3 1
+entscheiden 0 1 3 3/0 2
+entscheiden 0 1 3 3/1 1
+entscheiden 0 1 3 3/2 2
+entscheiden 0 1 3 3/3 1
+entscheiden 0 1 4 - 7
+entscheiden 0 1 4 0/0 2
+entscheiden 0 1 4 0/1 1
+entscheiden 0 1 4 0/2 2
+entscheiden 0 1 4 0/3 1
+entscheiden 0 1 4 1/0 2
+entscheiden 0 1 4 1/1 1
+entscheiden 0 1 4 1/2 2
+entscheiden 0 1 4 1/3 1
+entscheiden 0 1 4 2/0 2
+entscheiden 0 1 4 2/1 1
+entscheiden 0 1 4 2/2 2
+entscheiden 0 1 4 2/3 1
+entscheiden 0 1 4 3/0 2
+entscheiden 0 1 4 3/1 1
+entscheiden 0 1 4 3/2 2
+entscheiden 0 1 4 3/3 1
+entscheiden 0 1 5 - 7
+entscheiden 0 1 5 0/0 2
+entscheiden 0 1 5 0/1 1
+entscheiden 0 1 5 0/2 2
+entscheiden 0 1 5 0/3 1
+entscheiden 0 1 5 1/0 2
+entscheiden 0 1 5 1/1 1
+entscheiden 0 1 5 1/2 2
+entscheiden 0 1 5 1/3 1
+entscheiden 0 1 5 2/0 2
+entscheiden 0 1 5 2/1 1
+entscheiden 0 1 5 2/2 2
+entscheiden 0 1 5 2/3 1
+entscheiden 0 1 5 3/0 2
+entscheiden 0 1 5 3/1 1
+entscheiden 0 1 5 3/2 2
+entscheiden 0 1 5 3/3 1
+entscheiden 1 0 0 - 7
+entscheiden 1 0 0 0/0 4
+entscheiden 1 0 0 0/1 1
+entscheiden 1 0 0 0/2 4
+entscheiden 1 0 0 0/3 1
+entscheiden 1 0 0 1/0 4
+entscheiden 1 0 0 1/1 1
+entscheiden 1 0 0 1/2 4
+entscheiden 1 0 0 1/3 1
+entscheiden 1 0 0 2/0 4
+entscheiden 1 0 0 2/1 1
+entscheiden 1 0 0 2/2 4
+entscheiden 1 0 0 2/3 1
+entscheiden 1 0 0 3/0 4
+entscheiden 1 0 0 3/1 1
+entscheiden 1 0 0 3/2 4
+entscheiden 1 0 0 3/3 1
+entscheiden 1 0 1 - 7
+entscheiden 1 0 1 0/0 2
+entscheiden 1 0 1 0/1 1
+entscheiden 1 0 1 0/2 2
+entscheiden 1 0 1 0/3 1
+entscheiden 1 0 1 1/0 2
+entscheiden 1 0 1 1/1 1
+entscheiden 1 0 1 1/2 2
+entscheiden 1 0 1 1/3 1
+entscheiden 1 0 1 2/0 2
+entscheiden 1 0 1 2/1 1
+entscheiden 1 0 1 2/2 2
+entscheiden 1 0 1 2/3 1
+entscheiden 1 0 1 3/0 2
+entscheiden 1 0 1 3/1 1
+entscheiden 1 0 1 3/2 2
+entscheiden 1 0 1 3/3 1
+entscheiden 1 0 2 - 7
+entscheiden 1 0 2 0/0 4
+entscheiden 1 0 2 0/1 1
+entscheiden 1 0 2 0/2 4
+entscheiden 1 0 2 0/3 1
+entscheiden 1 0 2 1/0 4
+entscheiden 1 0 2 1/1 1
+entscheiden 1 0 2 1/2 4
+entscheiden 1 0 2 1/3 1
+entscheiden 1 0 2 2/0 4
+entscheiden 1 0 2 2/1 1
+entscheiden 1 0 2 2/2 4
+entscheiden 1 0 2 2/3 1
+entscheiden 1 0 2 3/0 4
+entscheiden 1 0 2 3/1 1
+entscheiden 1 0 2 3/2 4
+entscheiden 1 0 2 3/3 1
+entscheiden 1 0 3 - 7
+entscheiden 1 0 3 0/0 2
+entscheiden 1 0 3 0/1 1
+entscheiden 1 0 3 0/2 2
+entscheiden 1 0 3 0/3 1
+entscheiden 1 0 3 1/0 2
+entscheiden 1 0 3 1/1 1
+entscheiden 1 0 3 1/2 2
+entscheiden 1 0 3 1/3 1
+entscheiden 1 0 3 2/0 2
+entscheiden 1 0 3 2/1 1
+entscheiden 1 0 3 2/2 2
+entscheiden 1 0 3 2/3 1
+entscheiden 1 0 3 3/0 2
+entscheiden 1 0 3 3/1 1
+entscheiden 1 0 3 3/2 2
+entscheiden 1 0 3 3/3 1
+entscheiden 1 0 4 - 7
+entscheiden 1 0 4 0/0 2
+entscheiden 1 0 4 0/1 1
+entscheiden 1 0 4 0/2 2
+entscheiden 1 0 4 0/3 1
+entscheiden 1 0 4 1/0 2
+entscheiden 1 0 4 1/1 1
+entscheiden 1 0 4 1/2 2
+entscheiden 1 0 4 1/3 1
+entscheiden 1 0 4 2/0 2
+entscheiden 1 0 4 2/1 1
+entscheiden 1 0 4 2/2 2
+entscheiden 1 0 4 2/3 1
+entscheiden 1 0 4 3/0 2
+entscheiden 1 0 4 3/1 1
+entscheiden 1 0 4 3/2 2
+entscheiden 1 0 4 3/3 1
+entscheiden 1 0 5 - 7
+entscheiden 1 0 5 0/0 2
+entscheiden 1 0 5 0/1 1
+entscheiden 1 0 5 0/2 2
+entscheiden 1 0 5 0/3 1
+entscheiden 1 0 5 1/0 2
+entscheiden 1 0 5 1/1 1
+entscheiden 1 0 5 1/2 2
+entscheiden 1 0 5 1/3 1
+entscheiden 1 0 5 2/0 2
+entscheiden 1 0 5 2/1 1
+entscheiden 1 0 5 2/2 2
+entscheiden 1 0 5 2/3 1
+entscheiden 1 0 5 3/0 2
+entscheiden 1 0 5 3/1 1
+entscheiden 1 0 5 3/2 2
+entscheiden 1 0 5 3/3 1
+entscheiden 1 1 0 - 7
+entscheiden 1 1 0 0/0 5
+entscheiden 1 1 0 0/1 1
+entscheiden 1 1 0 0/2 5
+entscheiden 1 1 0 0/3 1
+entscheiden 1 1 0 1/0 5
+entscheiden 1 1 0 1/1 1
+entscheiden 1 1 0 1/2 5
+entscheiden 1 1 0 1/3 1
+entscheiden 1 1 0 2/0 1
+entscheiden 1 1 0 2/1 1
+entscheiden 1 1 0 2/2 0
+entscheiden 1 1 0 2/3 1
+entscheiden 1 1 0 3/0 0
+entscheiden 1 1 0 3/1 1
+entscheiden 1 1 0 3/2 0
+entscheiden 1 1 0 3/3 1
+entscheiden 1 1 1 - 7
+entscheiden 1 1 1 0/0 2
+entscheiden 1 1 1 0/1 1
+entscheiden 1 1 1 0/2 2
+entscheiden 1 1 1 0/3 1
+entscheiden 1 1 1 1/0 2
+entscheiden 1 1 1 1/1 1
+entscheiden 1 1 1 1/2 2
+entscheiden 1 1 1 1/3 1
+entscheiden 1 1 1 2/0 2
+entscheiden 1 1 1 2/1 1
+entscheiden 1 1 1 2/2 2
+entscheiden 1 1 1 2/3 1
+entscheiden 1 1 1 3/0 2
+entscheiden 1 1 1 3/1 1
+entscheiden 1 1 1 3/2 2
+entscheiden 1 1 1 3/3 1
+entscheiden 1 1 2 - 7
+entscheiden 1 1 2 0/0 5
+entscheiden 1 1 2 0/1 1
+entscheiden 1 1 2 0/2 5
+entscheiden 1 1 2 0/3 1
+entscheiden 1 1 2 1/0 5
+entscheiden 1 1 2 1/1 1
+entscheiden 1 1 2 1/2 5
+entscheiden 1 1 2 1/3 1
+entscheiden 1 1 2 2/0 1
+entscheiden 1 1 2 2/1 1
+entscheiden 1 1 2 2/2 0
+entscheiden 1 1 2 2/3 1
+entscheiden 1 1 2 3/0 0
+entscheiden 1 1 2 3/1 1
+entscheiden 1 1 2 3/2 0
+entscheiden 1 1 2 3/3 1
+entscheiden 1 1 3 - 7
+entscheiden 1 1 3 0/0 2
+entscheiden 1 1 3 0/1 1
+entscheiden 1 1 3 0/2 2
+entscheiden 1 1 3 0/3 1
+entscheiden 1 1 3 1/0 2
+entscheiden 1 1 3 1/1 1
+entscheiden 1 1 3 1/2 2
+entscheiden 1 1 3 1/3 1
+entscheiden 1 1 3 2/0 2
+entscheiden 1 1 3 2/1 1
+entscheiden 1 1 3 2/2 2
+entscheiden 1 1 3 2/3 1
+entscheiden 1 1 3 3/0 2
+entscheiden 1 1 3 3/1 1
+entscheiden 1 1 3 3/2 2
+entscheiden 1 1 3 3/3 1
+entscheiden 1 1 4 - 7
+entscheiden 1 1 4 0/0 2
+entscheiden 1 1 4 0/1 1
+entscheiden 1 1 4 0/2 2
+entscheiden 1 1 4 0/3 1
+entscheiden 1 1 4 1/0 2
+entscheiden 1 1 4 1/1 1
+entscheiden 1 1 4 1/2 2
+entscheiden 1 1 4 1/3 1
+entscheiden 1 1 4 2/0 2
+entscheiden 1 1 4 2/1 1
+entscheiden 1 1 4 2/2 2
+entscheiden 1 1 4 2/3 1
+entscheiden 1 1 4 3/0 2
+entscheiden 1 1 4 3/1 1
+entscheiden 1 1 4 3/2 2
+entscheiden 1 1 4 3/3 1
+entscheiden 1 1 5 - 7
+entscheiden 1 1 5 0/0 2
+entscheiden 1 1 5 0/1 1
+entscheiden 1 1 5 0/2 2
+entscheiden 1 1 5 0/3 1
+entscheiden 1 1 5 1/0 2
+entscheiden 1 1 5 1/1 1
+entscheiden 1 1 5 1/2 2
+entscheiden 1 1 5 1/3 1
+entscheiden 1 1 5 2/0 2
+entscheiden 1 1 5 2/1 1
+entscheiden 1 1 5 2/2 2
+entscheiden 1 1 5 2/3 1
+entscheiden 1 1 5 3/0 2
+entscheiden 1 1 5 3/1 1
+entscheiden 1 1 5 3/2 2
+entscheiden 1 1 5 3/3 1
+
+info 1 1 1 1 7 0 0 0 0 0 01010101010700000000000000000000
+info 1 1 1 1 4 0 0 0 0 0 01010101010400000000000000000000
+info 1 1 1 1 1 80 0 0 0 0 01010101010150000000000000000000
+info 16 9 9 1 0 203 1000 50 0 0 011009090100cb00e803320000000000
+info 16 9 9 1 0 240 1015 1 1000 400 011009090100f000f7030100e8039001
+info 16 9 9 1 0 65535 65535 65535 65535 65535 011009090100ffffffffffffffffffff
+
+anzeige 3 0 240 1015 600 423 423 01030000f000f7035802a701a701
+anzeige 3 0 0 0 0 1600 250 010300000000000000004006fa00
+anzeige 0 1 0 0 0 100 100 0100010000000000000064006400
+anzeige 2 2 80 270 270 100 100 0102020050000e010e0164006400
+anzeige 1 0 65535 65535 65535 65535 65535 01010000ffffffffffffffffffff
+
+pq 0 0
+pq 0.005 15
+pq 0.1 64
+pq 1 153
+pq 80 497
+pq 100 520
+pq 203 594
+pq 240 612
+pq 400 668
+pq 1000 769
+pq 4000 923
+pq 10000 1023
+
+sei p3 10000000 50 0 0 4e01891833c286c41d4c0bb884d03e803d1340420098968000000300329004000003000080
+sei 2020 10150000 1 1000 400 4e01891821349baa199608fc8a4839083d134042009ae0700000030001900403e8019080
+sei 2020 0 0 0 0 4e01891821349baa199608fc8a4839083d13404200000300000300000300009004000003000080

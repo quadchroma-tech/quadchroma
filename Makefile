@@ -137,7 +137,7 @@ IDENT_STAMP := build/.ident
 # host/start.m holds main and belongs only to the stand-alone host (make host-allein);
 # client/build.rs compiles the rest of this list into the Rust client (the host
 # engine as libqchost.a) - that is what QuadChroma.app runs.
-SRC     := host/start.m host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
+SRC     := host/start.m host/main.m host/audio.m host/clipboard.m host/dateien.m host/bildschirm.m host/zeiger.m host/testbild.m host/last.m host/menue.m host/texte.m host/hdr.c host/zugang.c host/qc_noise.c host/qc_secure.c host/qc_annahme.c host/vendor/monocypher/monocypher.c
 FLAGS   := -fobjc-arc -O2 -Wall -Ihost -Ihost/vendor/monocypher -Wno-deprecated-declarations -mmacosx-version-min=14.0
 # ServiceManagement: "Start at login" (SMAppService); SystemConfiguration: the computer
 # name for the announcement (SCDynamicStoreCopyComputerName).
