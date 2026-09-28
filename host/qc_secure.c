@@ -326,21 +326,35 @@ int qc_identity_load_pfad(const char *path, uint8_t priv[32], uint8_t pub[32]) {
     if (r != 1) return r;
 
     qc_keypair(priv, pub);
-    // O_EXCL: nie eine Datei ueberschreiben, die inzwischen doch da ist.
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (fd < 0) {
-        int e = errno;
+    // Erst vollstaendig in eine Zwischendatei im selben Ordner schreiben, dann
+    // in einem Schritt unter den Namen bringen (RENAME_EXCL: atomar, nie
+    // ueberschreiben). So sieht ein zweiter Erzeuger - der Rust-Teil desselben
+    // Prozesses oder ein zweiter Start - host.key entweder gar nicht oder
+    // vollstaendig, nie leer oder halb geschrieben. Frueher entstand die Datei
+    // mit O_EXCL leer und wurde erst danach beschrieben; dauerte das fsync
+    // laenger als das Nachlesen des anderen, galt ein gesunder Schluessel als
+    // beschaedigt (annahmetest, eine von 300 Runden auf dem CI-Rechner).
+    static unsigned zaehler;
+    char tmp[1300];
+    unsigned n = __atomic_add_fetch(&zaehler, 1, __ATOMIC_RELAXED);
+    if (snprintf(tmp, sizeof tmp, "%s.neu-%ld-%u", path, (long)getpid(), n) >= (int)sizeof tmp) {
         qc_wipe(priv, 32);
-        if (e != EEXIST) return -1;
-        // Inzwischen angelegt - vom Rust-Teil desselben Prozesses (der Client
-        // braucht den Geraeteschluessel womoeglich zuerst) oder von einem
-        // zweiten Start: dessen Schluessel gilt. Der eigene stuende nirgends,
-        // und eine Kopplung damit waere beim naechsten Start weg.
-        r = schluessel_lesen(path, priv, pub);
-        return r == 1 ? -1 : r;
+        return -1;
     }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) { qc_wipe(priv, 32); return -1; }
     int ok = write(fd, priv, 32) == 32 && fsync(fd) == 0;
     if (close(fd) != 0) ok = 0;
-    if (!ok) { unlink(path); qc_wipe(priv, 32); return -1; }
-    return 0;
+    if (!ok) { unlink(tmp); qc_wipe(priv, 32); return -1; }
+    if (renamex_np(tmp, path, RENAME_EXCL) == 0) return 0;
+    int e = errno;
+    unlink(tmp);
+    qc_wipe(priv, 32);
+    if (e != EEXIST) return -1;
+    // Inzwischen angelegt - vom Rust-Teil desselben Prozesses (der Client
+    // braucht den Geraeteschluessel womoeglich zuerst) oder von einem zweiten
+    // Start: dessen Schluessel gilt. Der eigene stuende nirgends, und eine
+    // Kopplung damit waere beim naechsten Start weg.
+    r = schluessel_lesen(path, priv, pub);
+    return r == 1 ? -1 : r;
 }
