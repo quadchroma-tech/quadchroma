@@ -58,6 +58,7 @@ pub mod oberflaeche;
 pub mod takt;
 pub mod testbild;
 pub mod ton;
+pub mod wandler;
 pub mod zeiger;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};

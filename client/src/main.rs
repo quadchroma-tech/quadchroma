@@ -121,6 +121,9 @@ use anzeige_mac as anzeige;
 /// Gemeinsame Teile der Goldbildtests beider Anzeigen (--anzeigetest).
 #[cfg(any(windows, target_os = "macos"))]
 mod anzeigeprobe;
+/// HDR-Shader in HLSL (Wandler des Windows-Hosts, Anzeige unter Windows);
+/// uebersetzt nur unter Windows, die Tests laufen ueberall.
+mod hdr_hlsl;
 /// Windows als Host: die Host-Rolle in derselben Programmdatei - in der
 /// einen App als eigener Faden (freigabe.rs), allein ohne Fenster mit
 /// --nur-host, --list, --messen.

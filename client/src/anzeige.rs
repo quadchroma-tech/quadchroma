@@ -452,18 +452,26 @@ fn blob_text(b: &ID3DBlob) -> String {
     }
 }
 
-/// Einen Einstiegspunkt aus SHADER uebersetzen. Der Fehlertext des
-/// Uebersetzers geht wortwoertlich ins Protokoll und in den Err - er nennt
-/// Zeile und Spalte, und ohne ihn waere ein Tippfehler im HLSL unauffindbar.
+/// Einen Einstiegspunkt aus SHADER uebersetzen.
 fn uebersetzen(einstieg: &[u8], ziel: &[u8]) -> Result<Vec<u8>, String> {
+    uebersetzen_aus(SHADER, b"anzeige.hlsl\0", einstieg, ziel)
+}
+
+/// Einen Einstiegspunkt aus einer HLSL-Quelle uebersetzen - der Anzeige
+/// oder einer anderen (Wandler des Hosts, hdr_hlsl.rs); `datei` ist der
+/// Name in den Meldungen, wie `einstieg` und `ziel` mit Nullbyte. Der
+/// Fehlertext des Uebersetzers geht wortwoertlich ins Protokoll und in den
+/// Err - er nennt Zeile und Spalte, und ohne ihn waere ein Tippfehler im
+/// HLSL unauffindbar.
+pub(crate) fn uebersetzen_aus(quelle: &str, datei: &[u8], einstieg: &[u8], ziel: &[u8]) -> Result<Vec<u8>, String> {
     let name = String::from_utf8_lossy(&einstieg[..einstieg.len() - 1]).into_owned();
     let mut code: Option<ID3DBlob> = None;
     let mut meldung: Option<ID3DBlob> = None;
     let r = unsafe {
         D3DCompile(
-            SHADER.as_ptr() as *const c_void,
-            SHADER.len(),
-            PCSTR(b"anzeige.hlsl\0".as_ptr()),
+            quelle.as_ptr() as *const c_void,
+            quelle.len(),
+            PCSTR(datei.as_ptr()),
             None,
             None,
             PCSTR(einstieg.as_ptr()),
