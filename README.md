@@ -325,6 +325,9 @@ prompt at launch.
 "Start with Windows" (menu and start screen) is therefore a scheduled task that runs
 at logon with highest privileges, so the app starts elevated without a prompt - not a
 Startup-folder shortcut, which Windows would not launch silently for an elevated exe.
+The task also starts and keeps running on battery, has no time limit and runs at normal
+priority, like a start by hand (a task from 0.1.0 with Windows' defaults is corrected at
+the next start).
 Every account has its own task, "QuadChroma (<the account's SID>)": two administrator
 accounts on one PC switch their autostart independently, and check box and menu item
 show only the task of the account the app runs under. Because that task runs a

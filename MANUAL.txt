@@ -1154,8 +1154,13 @@ at that account's logon with highest privileges (elevated, so it starts
 without a UAC prompt at logon; run level HIGHEST, logon type
 InteractiveToken - it runs in the user's interactive session after
 login, not as a service before it), its action being the installed exe
-with --hintergrund. A Startup-folder shortcut is no longer used: an exe
-with requireAdministrator would not launch silently from there.
+with --hintergrund. It also starts and keeps running on battery, has no
+time limit and runs at normal priority, like a start by hand; a task
+that QuadChroma 0.1.0 created with Windows' defaults (no start on
+battery, ended after 3 days, below-normal priority, started at any
+account's logon) is registered again with these settings at the next
+start. A Startup-folder shortcut is no longer used: an exe with
+requireAdministrator would not launch silently from there.
 
 Installed copy: a task that starts a program as administrator without
 asking must not point at a folder that programs with normal rights can
@@ -1216,7 +1221,7 @@ from it (SHA-256), the installed copy is refreshed - unless it is newer
 (see above). So an update is: quit QuadChroma in the icon's menu, start
 the new quadchroma.exe once. Earlier versions created one task
 "QuadChroma" for the whole PC; if it belongs to this account (its
-principal, read with schtasks /Query /XML), it is taken over at the
+principal, read from the task's XML), it is taken over at the
 start - install, the task of this account, then "QuadChroma" is deleted
 -, and switching off deletes it along with this account's task. A task
 "QuadChroma" of another account stays as it is (a line in the log). A
@@ -1282,6 +1287,14 @@ Log lines (protokoll.txt):
      fuer den ganzen Rechner (startete <command>)", "... - die alte
      Verknuepfung im Autostart-Ordner ist dadurch ersetzt"
                                        (at the start, see above)
+    "Mit Windows starten: die Aufgabe "<name>" ist neu registriert (auch
+     im Akkubetrieb, ohne Zeitlimit, Prioritaet 4, nur bei der Anmeldung
+     dieses Kontos) - vorher: <what differed>"   (at the start: a task
+                                       of 0.1.0 with Windows' defaults;
+                                       a task of that name running as
+                                       another account stays as it is,
+                                       "... laeuft als <account>, nicht
+                                       als dieses Konto ...")
     "Mit Windows starten: die fruehere Aufgabe "QuadChroma" gehoert
      <account>, nicht diesem Konto - sie bleibt, wie sie ist ..."
     "Mit Windows starten: die Aufgabe "<name>" (<command>) ist
