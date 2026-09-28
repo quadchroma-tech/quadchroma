@@ -7694,8 +7694,13 @@ impl App {
     /// Was die Oberflaeche gerade zu HDR zeigt: aus der Strominfo des Hosts
     /// und der Praesentation dieser Anzeige (hdr::lage).
     fn hdr_lage(&self) -> hdr::HdrLage {
-        let info = self.shared.lock().unwrap().info.and_then(|i| i.hdr);
-        hdr::lage(info.as_ref(), self.hdr_praesentiert())
+        let info = self.shared.lock().unwrap().info;
+        match info {
+            // Noch keine Strominfo in dieser Sitzung: wird ausgehandelt (nicht
+            // "Host vor 0.2.0" - das sagt erst eine Strominfo ohne Fassung 1).
+            None => hdr::HdrLage::Sdr(Some(hdr::GRUND_KEIN_IN_ANZEIGE)),
+            Some(i) => hdr::lage(i.hdr.as_ref(), self.hdr_praesentiert()),
+        }
     }
 
     /// Der Bildschirm, auf dem das Fenster steht (IN_ANZEIGE): unter Windows
@@ -8670,7 +8675,7 @@ impl App {
     /// Liegt gerade etwas ueber dem Bild, das sich bewegt und deshalb alle
     /// 33 ms neu gezeichnet werden will? Startbildschirm, Wartebild, Menue,
     /// Statistik, ESC-Balken, Lagemeldung bzw. Zeile zu Dateien, Banner,
-    /// Codecwechsel-Hinweis.
+    /// Codecwechsel-Hinweis, das goldene HDR-Abzeichen.
     /// `lage` und `wechsel` kommen aus `Shared`, damit der Aufrufer die
     /// Sperre nur einmal nimmt.
     fn oberflaeche_sichtbar(&self, lage: bool, wechsel: bool) -> bool {
@@ -8679,6 +8684,7 @@ impl App {
             || self.hud_offen
             || self.show_overlay
             || self.esc_seit.is_some()
+            || self.hdr_abzeichen.is_some()
             || lage
             || wechsel
     }
@@ -9258,6 +9264,7 @@ impl App {
                     self.ui.text.draw_centered(c, ww as i32 / 2, 42, t, 14, ui::AMBER, 1);
                 }
                 if self.show_overlay {
+                    let hdr_lage = self.hdr_lage();
                     let (stats, secure, lat, soll, hostlast, decoder, ausgelassen) = {
                         let s = self.shared.lock().unwrap();
                         (
@@ -9278,7 +9285,7 @@ impl App {
                         ausgelassen,
                     };
                     overlay(&mut self.ui, c, self.lang, self.fps_shown, &hist, stats, secure,
-                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder, &client);
+                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder, &client, hdr_lage);
                 }
                 // Das Erstkontakt-Banner mit dem Vergleichscode entfaellt
                 // (Spezifikation Pairing v1, 5): den Code zeigt der
@@ -9294,6 +9301,14 @@ impl App {
                 if !zeilen.is_empty() {
                     datei_zeilen_zeichnen(&mut self.ui, c, ww, wh, &zeilen);
                 }
+                // Das goldene HDR-Abzeichen, wenn HDR eben auf beiden Seiten
+                // aktiv wurde (anzeige_takt merkt sich, seit wann).
+                if let Some(seit) = self.hdr_abzeichen {
+                    match hdr_abzeichen_deckung(seit.elapsed().as_millis() as u64) {
+                        Some(d) => self.ui.hdr_abzeichen(c, ww, d, "HDR10 · PQ"),
+                        None => self.hdr_abzeichen = None,
+                    }
+                }
                 // Nerd-Modus. Liegt ueber allem, deshalb zuletzt gezeichnet.
                 if self.hud_offen {
                     // Der geltende Decoderwunsch kommt aus `shared`, nicht aus
@@ -9308,10 +9323,11 @@ impl App {
                             sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(), sh.decoder_wunsch, sh.decoder_pfad,
                         )
                     };
-                    let (bildschirmwahl, bildschirme, bildschirm_wunsch, bildschirm_wechsel) = {
+                    let (bildschirmwahl, bildschirme, bildschirm_wunsch, bildschirm_wechsel, hdr_an) = {
                         let sh = self.shared.lock().unwrap();
-                        (sh.host_bildschirmwahl, sh.bildschirme.clone(), sh.bildschirm_wunsch.clone(), sh.bildschirm_wechsel_laeuft())
+                        (sh.host_bildschirmwahl, sh.bildschirme.clone(), sh.bildschirm_wunsch.clone(), sh.bildschirm_wechsel_laeuft(), !sh.hdr_aus)
                     };
+                    let hdr_lage = self.hdr_lage();
                     let gespeichert = self
                         .angewandt_fuer
                         .as_ref()
@@ -9351,6 +9367,8 @@ impl App {
                         // Die Geraete nur, wenn der Reiter offen ist.
                         geraete: if reiter == 5 { self.geraete_fuer_reiter() } else { Vec::new() },
                         geraete_scroll: self.geraete_scroll,
+                        hdr_an,
+                        hdr_lage,
                     };
                     n.hud = Some(hud(
                         &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
@@ -9519,6 +9537,7 @@ impl App {
             HudAktion::Stellen(m, f, g, fx, ton) => self.stellen(m, f, g, fx, ton),
             HudAktion::Codec(idx) => self.codec_wuenschen(idx),
             HudAktion::Bildschirm(w) => self.bildschirm_wuenschen(w),
+            HudAktion::Hdr(an) => self.hdr_stellen(an),
             // --- Benchmark: Konfiguration nur, solange keiner laeuft -----
             HudAktion::BenchCodec(idx) => {
                 let aus = &mut self.bench_konfig.codecs_aus;
@@ -11096,6 +11115,7 @@ fn overlay(
     hostlast: Option<HostLast>,
     decoder: (Option<DecoderPfad>, Option<String>),
     client: &ClientStand,
+    hdr_lage: hdr::HdrLage,
 ) {
     use strings::Key::*;
     let (dec_ms, info, dropped, err, connected) = stats;
@@ -11132,6 +11152,9 @@ fn overlay(
         }
         if wahl.codec {
             rows.push((lang.get(Codec), i.codec_name(), ui::TEXT));
+            // Die Farbe des Stroms: golden nur, wenn beide Seiten HDR zeigen.
+            let (farbe, col) = hdr_f9(hdr_lage, i.hdr.as_ref(), nerd, lang);
+            rows.push((lang.get(StatColor), farbe, col));
         }
     }
     // Welcher Decoder das Bild macht: Hardware in Cyan. Im Nerd-Modus steht
@@ -11208,7 +11231,15 @@ fn overlay(
 
     let mut ty = y + 30;
     for (k, v, col) in &rows {
-        ty += label_value(u, c, x, w, ty, k, v, *col);
+        let zeile = label_value(u, c, x, w, ty, k, v, *col);
+        if *col == ui::GOLD {
+            // Die goldene Farbzeile funkelt leise mit (Wert rechtsbuendig,
+            // eine Zeile tiefer, wenn er nicht neben die Beschriftung passte).
+            let vw = u.text.width(v, 13, 1);
+            let vy = if zeile > 22 { ty + 18 } else { ty };
+            c.funkeln(ui::Rect { x: x + w - vw - 18, y: vy - 13, w: vw + 4, h: 16 }, u.tick, 3, 3, 255, 5);
+        }
+        ty += zeile;
     }
     if kette_h > 0 {
         if let Some(l) = lat {
@@ -11254,6 +11285,18 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     let mut u = ui::Ui::new();
     u.tick = 40;
     u.mouse = (-1, -1);
+    // "ansicht:n" haelt die Zeit fest, damit sich einzelne Bilder einer
+    // Animation ansehen lassen: bei "hud..." der Takt (8 ms je Takt), bei
+    // "sitzunghdr..." die Millisekunden seit dem Aktivwerden von HDR.
+    let (view, zeit) = match view.split_once(':') {
+        Some((v, t)) => (v, t.parse::<u64>().ok()),
+        None => (view, None),
+    };
+    // Die goldenen HDR-Ansichten: ein Strom in PQ (HDR10, 1000 nit).
+    let pq = hdr::InfoV1 {
+        farbe: hdr::Farbe::PQ, grund: hdr::GRUND_AKTIV, sdr_weiss_nit: 203, master_max_nit: 1000,
+        master_min_zehntausendstel: 50, max_cll: 0, max_fall: 0,
+    };
 
     // Ansicht "dateien": die Zeile zu Dateiuebertragungen unten mittig ueber
     // einem angedeuteten Bild - ein Empfang laeuft, eine Sendung ist gerade
@@ -11298,7 +11341,11 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // Ansicht "sitzung": so sieht es waehrend der Uebertragung aus - ein
     // angedeutetes Bild, darauf die Zahlen und die Einstellungstafel. Ohne
     // Bildschirm ist das die einzige Moeglichkeit, die Oberflaeche zu pruefen.
-    if view == "sitzung" || view == "nerd" {
+    // "sitzunghdr": HDR laeuft eben auf beiden Seiten an - die Farbzeile in
+    // Gold und das goldene Abzeichen (":ms" seit dem Aktivwerden, Vorgabe
+    // 1000); "sitzunghdr2": nur der Host sendet HDR - "HDR → SDR", nichts
+    // Goldenes.
+    if view == "sitzung" || view == "nerd" || view.starts_with("sitzunghdr") {
         for y in 0..h {
             for x in 0..w {
                 let a = (x * 255 / w) as u32;
@@ -11307,7 +11354,16 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             }
         }
         let hist: Vec<f32> = (0..120).map(|i| 90.0 + 25.0 * ((i as f32) / 9.0).sin()).collect();
-        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: None });
+        let hdr_strom = view.starts_with("sitzunghdr");
+        let info = Some(StreamInfo {
+            width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true,
+            hdr: Some(if hdr_strom { pq } else { hdr::InfoV1::sdr(hdr::GRUND_HOST_KANN_NICHT) }),
+        });
+        let hdr_lage = hdr::lage(info.and_then(|i| i.hdr).as_ref(), view == "sitzunghdr");
+        let alter_ms = zeit.unwrap_or(1000);
+        if hdr_strom {
+            u.tick = alter_ms / 8;
+        }
         let sas = Some("628 306".to_string());
         let fp = Some("9EB4-EC3D-6856-8AF6".to_string());
         {
@@ -11325,14 +11381,30 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             let client = ClientStand { anzeige: "Software".into(), cpu_eigen: 5.8, monitor_hz: Some(60.0), ausgelassen: 0 };
             overlay(&mut u, &mut c, lang, 98.0, &hist, (2.1, info, 3, None, true), (sas.clone(), fp.clone()),
                     Some(probe), einstellungen::StatWahl::default(), nerd, Some(120),
-                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec(None)), None), &client);
+                    if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec(None)), None), &client, hdr_lage);
+            if hdr_lage == hdr::HdrLage::Beidseitig {
+                if let Some(d) = hdr_abzeichen_deckung(alter_ms) {
+                    u.hdr_abzeichen(&mut c, w as u32, d, "HDR10 · PQ");
+                }
+            }
         }
         write_bmp(path, w, h, &buf, lang);
         return;
     }
 
     // Ansicht "hud" und "hud2": der Nerd-Modus ueber einem angedeuteten Bild.
+    // Der HDR-Schalter im Reiter Bild: "hud" wie heute (an, SDR, der Host
+    // kann noch kein HDR), "hudhdr" golden (beide Seiten HDR, ":takt" haelt
+    // das Funkeln an), "hudhdr2" nur der Host HDR ("HDR → SDR"), "hudhdr3"
+    // Schalter aus.
     if view.starts_with("hud") {
+        u.tick = zeit.unwrap_or(40);
+        let (hdr_an, hdr_lage) = match view {
+            "hudhdr" => (true, hdr::HdrLage::Beidseitig),
+            "hudhdr2" => (true, hdr::HdrLage::Abgebildet),
+            "hudhdr3" => (false, hdr::HdrLage::Sdr(Some(hdr::GRUND_CLIENT_SDR))),
+            _ => (true, hdr::HdrLage::Sdr(Some(hdr::GRUND_HOST_KANN_NICHT))),
+        };
         for y in 0..h {
             for x in 0..w {
                 let a = (x * 255 / w) as u32;
@@ -11346,7 +11418,11 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
         };
         let lh: Vec<f32> = (0..200).map(|i| 24.0 + 5.0 * ((i as f32) / 11.0).sin()).collect();
         let fh: Vec<f32> = (0..200).map(|i| 104.0 + 9.0 * ((i as f32) / 7.0).cos()).collect();
-        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: None });
+        let hdr_info = match hdr_lage {
+            hdr::HdrLage::Beidseitig | hdr::HdrLage::Abgebildet => pq,
+            hdr::HdrLage::Sdr(g) => hdr::InfoV1::sdr(g.unwrap_or(hdr::GRUND_KEIN_IN_ANZEIGE)),
+        };
+        let info = Some(StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: Some(hdr_info) });
         let mut c = ui::Canvas::neu(&mut buf, w, h);
         // Nachgestellte Koennensliste, wie sie der Mac mini schickt: AV1
         // fehlt ihm, 4:4:4 8 Bit und 4:2:0 10 Bit brauchen die Umrechnung.
@@ -11455,6 +11531,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                 Some(581_729_911),
             ),
             geraete_scroll: 0,
+            hdr_an,
+            hdr_lage,
         };
         let reiter = match view {
             "hud2" | "hud2tip" => 1u8,
@@ -12410,7 +12488,7 @@ fn main() {
             None => (view, None),
         };
         let (w, h) = groesse.unwrap_or(
-            if view == "sitzung" || view == "nerd" || view.starts_with("dateien") || view.starts_with("hud") {
+            if view.starts_with("sitzung") || view == "nerd" || view.starts_with("dateien") || view.starts_with("hud") {
                 (1280, 720)
             } else {
                 (900, 700)
@@ -13205,6 +13283,8 @@ pub enum HudAktion {
     Codec(u8),
     /// Wunsch nach diesem Bildschirm des Hosts (Kennung), None = Automatik.
     Bildschirm(Option<String>),
+    /// Der HDR-Schalter: an (HDR, sobald beide Seiten es koennen) oder aus.
+    Hdr(bool),
     /// Anderer Decoderpfad gewuenscht.
     Decoder(einstellungen::DecoderWunsch),
     /// Andere Anzeige gewuenscht - wird gespeichert, gilt ab dem naechsten Start.
@@ -13242,6 +13322,71 @@ fn skalenende(v: f32) -> f32 {
         }
     }
     800.0
+}
+
+/// Welcher Text zu einem HDR-Grund der Strominfo gehoert (None: Host vor
+/// 0.2.0). Grund 7, ein unbekannter und "aktiv" bei SDR-Farbe (Uebergang)
+/// heissen: wird ausgehandelt.
+fn hdr_grund_schluessel(grund: Option<u8>) -> strings::Key {
+    use strings::Key::*;
+    match grund {
+        None => HdrWhyOldHost,
+        Some(hdr::GRUND_CLIENT_SDR) => HdrWhyClientSdr,
+        Some(hdr::GRUND_CODEC) => HdrWhyCodec,
+        Some(hdr::GRUND_HOST_SCHIRM_SDR) => HdrWhyHostScreen,
+        Some(hdr::GRUND_HOST_KANN_NICHT) => HdrWhyHostCannot,
+        Some(hdr::GRUND_CLIENT_OHNE_DARSTELLUNG) => HdrWhyClientCannot,
+        Some(hdr::GRUND_WECHSEL_GESCHEITERT) => HdrWhySwitchFailed,
+        Some(_) => HdrWhyNegotiating,
+    }
+}
+
+/// Was der HDR-Schalter neben "HDR" zeigt, in welcher Farbe, und ob er
+/// golden leuchtet: nur mit eingeschaltetem Schalter und HDR auf beiden
+/// Seiten. Eine Seite allein ist nie golden ("HDR → SDR"); aus ist aus.
+fn hdr_zustand(lage: hdr::HdrLage, an: bool, lang: &'static strings::Lang) -> (String, u32, bool) {
+    use strings::Key::*;
+    if !an {
+        return (lang.get(HdrOff).to_string(), ui::DIM, false);
+    }
+    match lage {
+        hdr::HdrLage::Beidseitig => (lang.get(HdrActive).to_string(), ui::GOLD, true),
+        hdr::HdrLage::Abgebildet => (format!("HDR → SDR · {}", lang.get(HdrMapped)), ui::TEXT, false),
+        hdr::HdrLage::Sdr(g) => (format!("SDR · {}", lang.get(hdr_grund_schluessel(g))), ui::DIM, false),
+    }
+}
+
+/// Die Farbzeile der Statistik (F9): "HDR10 · PQ" in Gold, wenn beide
+/// Seiten HDR zeigen (im Nerd-Modus mit der Spitze der Quelle), "HDR → SDR",
+/// wenn nur der Host HDR sendet, sonst "SDR" (im Nerd-Modus mit Grund).
+fn hdr_f9(lage: hdr::HdrLage, info: Option<&hdr::InfoV1>, nerd: bool, lang: &'static strings::Lang) -> (String, u32) {
+    match lage {
+        hdr::HdrLage::Beidseitig => {
+            let spitze = info.map(|i| i.quell_spitze_nit()).unwrap_or(hdr::SPITZE_VORGABE_NIT);
+            (if nerd { format!("HDR10 · PQ · {spitze:.0} nit") } else { "HDR10 · PQ".to_string() }, ui::GOLD)
+        }
+        hdr::HdrLage::Abgebildet => ("HDR → SDR".to_string(), ui::TEXT),
+        hdr::HdrLage::Sdr(g) if nerd => (format!("SDR · {}", lang.get(hdr_grund_schluessel(g))), ui::TEXT),
+        hdr::HdrLage::Sdr(_) => ("SDR".to_string(), ui::TEXT),
+    }
+}
+
+/// So lange steht das goldene HDR-Abzeichen ueber dem Bild, wenn HDR auf
+/// beiden Seiten aktiv wird.
+const HDR_ABZEICHEN_MS: u64 = 3000;
+
+/// Deckung des Abzeichens `alter_ms` nach dem Aktivwerden: 250 ms weich
+/// herein, dann voll, ab 2200 ms weich hinaus; None, wenn es vorbei ist.
+fn hdr_abzeichen_deckung(alter_ms: u64) -> Option<u32> {
+    const EIN: u64 = 250;
+    const AUS_AB: u64 = 2200;
+    let glatt = |t: f32| -> u32 { ((t * t * (3.0 - 2.0 * t)) * 255.0).round() as u32 };
+    match alter_ms {
+        a if a >= HDR_ABZEICHEN_MS => None,
+        a if a < EIN => Some(glatt(a as f32 / EIN as f32)),
+        a if a < AUS_AB => Some(255),
+        a => Some(glatt((HDR_ABZEICHEN_MS - a) as f32 / (HDR_ABZEICHEN_MS - AUS_AB) as f32)),
+    }
 }
 
 pub struct HudStand {
@@ -13289,6 +13434,10 @@ pub struct HudStand {
     /// laufende Sitzung markiert) und die erste sichtbare Zeile.
     pub geraete: Vec<Geraetezeile>,
     pub geraete_scroll: usize,
+    /// Reiter "Bild": der HDR-Schalter (an = HDR, sobald beide Seiten es
+    /// koennen) und was gerade gilt - golden nur bei HdrLage::Beidseitig.
+    pub hdr_an: bool,
+    pub hdr_lage: hdr::HdrLage,
 }
 
 /// Ein Rollen-Knopf im Menue - fuer Anzeige und Decoder derselbe Satz,
@@ -13627,9 +13776,15 @@ fn hud(
             let r_gaming = ui::Rect { x: ix, y: cy + p(70), w: iw / 2 - p(30), h: p(28) };
             let r_fest = ui::Rect { x: ix + iw / 2, y: cy + p(70), w: iw / 2 - p(30), h: p(28) };
             let r_ton = ui::Rect { x: ix, y: cy + p(104), w: iw / 2 - p(30), h: p(28) };
+            // HDR rechts neben dem Ton, gerahmt und etwas hoeher als die
+            // anderen Schalter - er soll auffallen. Golden leuchtet er nur,
+            // wenn HDR auf beiden Seiten laeuft. Der Hinweis zur festen
+            // Bildrate, der frueher hier stand, steht in ihrem Tooltip.
+            let r_hdr = ui::Rect { x: ix + iw / 2, y: cy + p(102), w: iw / 2 - p(30), h: p(32) };
             if r_gaming.hit(maus.0, maus.1) { tip = Some(TipGaming); }
             if r_fest.hit(maus.0, maus.1) { tip = Some(FixedRateHint); }
             if r_ton.hit(maus.0, maus.1) { tip = Some(TipSound); }
+            if r_hdr.hit(maus.0, maus.1) { tip = Some(TipHdr); }
             if u.toggle(c, r_gaming, lang.get(GamingMode), gaming) {
                 aktion = HudAktion::Stellen(mbit, fps_soll, !gaming, fest, ton);
             }
@@ -13642,8 +13797,11 @@ fn hud(
             if u.toggle(c, r_ton, lang.get(Sound), ton) {
                 aktion = HudAktion::Stellen(mbit, fps_soll, gaming, fest, !ton);
             }
-            for (i, z) in umbruch(u, lang.get(FixedRateHint), iw / 2 - p(40), sz(10)).iter().enumerate() {
-                u.text.draw(c, ix + iw / 2, cy + p(104) + i as i32 * p(15), z, sz(10), ui::DIM, p(1));
+            let (zustand, zustand_farbe, gold) = hdr_zustand(stand.hdr_lage, stand.hdr_an, lang);
+            let platz = u.hdr_schalter_zustand_breite(r_hdr);
+            let zustand = kuerzen(u, &zustand, platz, 11, 1);
+            if u.hdr_schalter(c, r_hdr, &zustand, zustand_farbe, stand.hdr_an, gold) {
+                aktion = HudAktion::Hdr(!stand.hdr_an);
             }
             if stand.wechsel {
                 // Waehrend der Host umbaut, steht hier der Grund fuer den
@@ -16221,7 +16379,126 @@ mod tests {
             anzeige_name: String::new(),
             bench_konfig: BenchKonfig::vorgabe(5, true), bench: None, bench_scroll: 0,
             verknuepfung: None,
-            geraete: Vec::new(), geraete_scroll: 0,
+            geraete: Vec::new(), geraete_scroll: 0, hdr_an: true, hdr_lage: hdr::HdrLage::Sdr(None),
+        }
+    }
+
+    /// Wie viele warme, goldene Bildpunkte in einem Ausschnitt liegen (rot
+    /// und gruen hoch, blau deutlich darunter) - Cyan, Grau und das Weiss
+    /// der Texte zaehlen nicht.
+    fn goldene_punkte(buf: &[u32], ww: usize, r: ui::Rect) -> usize {
+        let mut n = 0;
+        for y in r.y.max(0) as usize..(r.y + r.h) as usize {
+            for x in r.x.max(0) as usize..(r.x + r.w) as usize {
+                let p = buf[y * ww + x];
+                let (rr, g, b) = ((p >> 16) & 255, (p >> 8) & 255, p & 255);
+                if rr > 150 && g > 100 && b + 80 < rr {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Der HDR-Schalter im Reiter Bild: Gold nur, wenn er an ist UND beide
+    /// Seiten HDR zeigen; eine Seite allein ("HDR → SDR"), SDR mit Grund und
+    /// aus sind nie golden. Der Zustandstext folgt dem Grund der Strominfo,
+    /// ein Klick schaltet um (HudAktion::Hdr), gespeichert wird je Host.
+    #[test]
+    fn hdr_schalter_gold_nur_beidseitig() {
+        use hdr::HdrLage::*;
+        let en = &strings::EN;
+        let (t, f, gold) = hdr_zustand(Beidseitig, true, en);
+        assert_eq!((t.as_str(), f, gold), ("active on both sides", ui::GOLD, true));
+        let (t, _, gold) = hdr_zustand(Abgebildet, true, en);
+        assert_eq!((t.as_str(), gold), ("HDR → SDR · this screen shows it as SDR", false));
+        let (t, _, gold) = hdr_zustand(Beidseitig, false, en);
+        assert_eq!((t.as_str(), gold), ("off – always SDR", false), "aus ist aus, auch wenn der Strom noch HDR ist");
+        for (g, soll) in [
+            (None, "SDR · the host has no HDR (older version)"),
+            (Some(hdr::GRUND_CLIENT_SDR), "SDR · this screen is SDR"),
+            (Some(hdr::GRUND_CODEC), "SDR · needs HEVC 10-bit"),
+            (Some(hdr::GRUND_HOST_SCHIRM_SDR), "SDR · the host's screen is SDR"),
+            (Some(hdr::GRUND_HOST_KANN_NICHT), "SDR · the host cannot send HDR"),
+            (Some(hdr::GRUND_CLIENT_OHNE_DARSTELLUNG), "SDR · this display cannot show HDR"),
+            (Some(hdr::GRUND_WECHSEL_GESCHEITERT), "SDR · switching to HDR failed"),
+            (Some(hdr::GRUND_KEIN_IN_ANZEIGE), "SDR · negotiating …"),
+            (Some(99), "SDR · negotiating …"),
+        ] {
+            let (t, f, gold) = hdr_zustand(Sdr(g), true, en);
+            assert_eq!((t.as_str(), f, gold), (soll, ui::DIM, false), "Grund {g:?}");
+        }
+        // F9: Gold nur beidseitig, im Nerd-Modus mit der Spitze der Quelle.
+        let pq = hdr::InfoV1 { farbe: hdr::Farbe::PQ, grund: 0, sdr_weiss_nit: 203, master_max_nit: 4000, master_min_zehntausendstel: 50, max_cll: 1000, max_fall: 400 };
+        assert_eq!(hdr_f9(Beidseitig, Some(&pq), false, en), ("HDR10 · PQ".to_string(), ui::GOLD));
+        assert_eq!(hdr_f9(Beidseitig, Some(&pq), true, en), ("HDR10 · PQ · 1000 nit".to_string(), ui::GOLD));
+        assert_eq!(hdr_f9(Abgebildet, Some(&pq), true, en), ("HDR → SDR".to_string(), ui::TEXT));
+        assert_eq!(hdr_f9(Sdr(Some(hdr::GRUND_CODEC)), None, false, en), ("SDR".to_string(), ui::TEXT));
+        assert_eq!(hdr_f9(Sdr(Some(hdr::GRUND_CODEC)), None, true, en), ("SDR · needs HEVC 10-bit".to_string(), ui::TEXT));
+
+        // Gezeichnet: der Schalter liegt rechts neben dem Ton (1280 x 720,
+        // Massstab 1: cy = 75 + 186, x = 110 + 530); golden nur beidseitig.
+        let (ww, wh) = (1280usize, 720usize);
+        let r_hdr = ui::Rect { x: 640, y: 261 + 102, w: 500, h: 32 };
+        let mut u = ui::Ui::new();
+        let mut zeichnen = |an: bool, lage: hdr::HdrLage, tick: u64, klick: bool| -> (Vec<u32>, HudAktion) {
+            let mut buf = vec![0u32; ww * wh];
+            let mut c = ui::Canvas::neu(&mut buf, ww, wh);
+            let stand = HudStand { hdr_an: an, hdr_lage: lage, ..hud_stand_leer(Vec::new()) };
+            u.tick = tick;
+            u.mouse = if klick { (r_hdr.x + 200, r_hdr.y + 16) } else { (-1, -1) };
+            u.click = klick;
+            let a = hud(&mut u, &mut c, en, ww as i32, wh as i32, 0, None, &[], 0.0, &[], None, None, (None, None),
+                        "192.168.178.194:9001", false, &stand);
+            (buf, a)
+        };
+        let (gold, _) = zeichnen(true, Beidseitig, 40, false);
+        assert!(goldene_punkte(&gold, ww, r_hdr) > 300, "beidseitig kaum Gold: {}", goldene_punkte(&gold, ww, r_hdr));
+        for (an, lage) in [(true, Abgebildet), (true, Sdr(Some(hdr::GRUND_HOST_KANN_NICHT))), (false, Beidseitig), (false, Sdr(None))] {
+            let (b, _) = zeichnen(an, lage, 40, false);
+            // Unterhalb der Kacheln: die zeigen ohne Messwerte Amber.
+            assert_eq!(goldene_punkte(&b, ww, ui::Rect { x: 0, y: 261, w: ww as i32, h: wh as i32 - 261 }), 0, "{an} {lage:?}: Gold");
+        }
+        // Das Funkeln lebt: derselbe Takt ergibt dasselbe Bild, andere Takte
+        // andere.
+        let (gold_nochmal, _) = zeichnen(true, Beidseitig, 40, false);
+        assert!(gold == gold_nochmal, "derselbe Takt, anderes Bild");
+        let verschieden = [0u64, 20, 60, 80].iter().filter(|&&t| zeichnen(true, Beidseitig, t, false).0 != gold).count();
+        assert_eq!(verschieden, 4, "das Funkeln steht still");
+        // Ein Klick schaltet um.
+        assert!(matches!(zeichnen(true, Sdr(None), 40, true).1, HudAktion::Hdr(false)));
+        assert!(matches!(zeichnen(false, Sdr(None), 40, true).1, HudAktion::Hdr(true)));
+    }
+
+    /// Das Abzeichen: weich herein (250 ms), voll, weich hinaus ab 2,2 s,
+    /// nach 3 s weg; das Glitzern (glanz_stand) leuchtet jeden Punkt einmal
+    /// je Runde auf und setzt ihn in jeder Runde anderswohin.
+    #[test]
+    fn hdr_abzeichen_und_funkeln() {
+        assert_eq!(hdr_abzeichen_deckung(0), Some(0));
+        assert_eq!(hdr_abzeichen_deckung(250), Some(255));
+        assert_eq!(hdr_abzeichen_deckung(1500), Some(255));
+        assert_eq!(hdr_abzeichen_deckung(2200), Some(255));
+        assert_eq!(hdr_abzeichen_deckung(HDR_ABZEICHEN_MS), None);
+        assert_eq!(hdr_abzeichen_deckung(60_000), None);
+        let mut vorher = 0;
+        for ms in 0..=250 {
+            let d = hdr_abzeichen_deckung(ms).unwrap();
+            assert!(d >= vorher && d <= 255, "{ms} ms");
+            vorher = d;
+        }
+        for ms in 2200..HDR_ABZEICHEN_MS {
+            let d = hdr_abzeichen_deckung(ms).unwrap();
+            assert!(d <= vorher, "{ms} ms");
+            vorher = d;
+        }
+        assert!(vorher < 10);
+        for i in 0..32 {
+            let staende: Vec<(f32, u64)> = (0..220).map(|t| ui::glanz_stand(i, t)).collect();
+            assert!(staende.iter().any(|(h, _)| *h > 0.95), "Punkt {i} leuchtet nie auf");
+            assert!(staende.iter().any(|(h, _)| *h == 0.0), "Punkt {i} leuchtet immer");
+            let orte: std::collections::HashSet<u64> = staende.iter().map(|(_, p)| *p).collect();
+            assert!(orte.len() >= 2, "Punkt {i} bleibt am selben Ort");
         }
     }
 

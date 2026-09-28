@@ -17,6 +17,74 @@ pub const MAGENTA: u32 = 0xff2fb9;
 pub const AMBER: u32 = 0xffb300;
 pub const TEXT: u32 = 0xd7e3ec;
 pub const DIM: u32 = 0x5d7183;
+/// Gold gibt es nur fuer eines: HDR laeuft auf BEIDEN Seiten (Host sendet
+/// PQ, der Client praesentiert in HDR/EDR). Gelber und heller als AMBER, das
+/// die Warnfarbe bleibt.
+pub const GOLD: u32 = 0xffd24a;
+/// Heller Glanz: Funkelpunkte und die Oberkante des goldenen Verlaufs.
+pub const GOLD_HELL: u32 = 0xfff4cf;
+/// Tiefes, metallisches Gold: Unterkante des Verlaufs.
+pub const GOLD_TIEF: u32 = 0xc08a1e;
+
+/// Innenabstand des HDR-Schalters und die Breite seines Schiebers.
+const HDR_SCHALTER_RAND: i32 = 10;
+const HDR_SCHALTER_BREITE: i32 = 46;
+
+/// Zwei Farben mischen, `t` 0..=255 (0 = a, 255 = b).
+pub fn farbe_mischen(a: u32, b: u32, t: u32) -> u32 {
+    let t = t.min(255);
+    let k = |s: u32| -> u32 { ((((a >> s) & 255) * (255 - t) + ((b >> s) & 255) * t) / 255) << s };
+    k(16) | k(8) | k(0)
+}
+
+/// Goldener Verlauf fuer Text in einem Kasten (`links`, `oben`, `breite`,
+/// `hoehe`): oben hell, in der Mitte Gold, unten metallisch tief. Dazu ein
+/// schraeger weisser Glanzstreifen, der mit `tick` von links nach rechts
+/// ueber den Kasten wandert - einmal je 300 Takte (2,4 s), mit einer Pause
+/// dazwischen, in der er ausserhalb liegt.
+pub fn gold_verlauf(x: i32, y: i32, links: i32, oben: i32, breite: i32, hoehe: i32, tick: u64) -> u32 {
+    let hoehe = hoehe.max(1);
+    let t = ((y - oben).clamp(0, hoehe) * 255 / hoehe) as u32;
+    let grund = if t < 110 {
+        farbe_mischen(GOLD_HELL, GOLD, t * 255 / 110)
+    } else {
+        farbe_mischen(GOLD, GOLD_TIEF, (t - 110) * 255 / 145)
+    };
+    let weg = breite + hoehe + 160;
+    let pos = (tick % 300) as i32 * weg / 300 - hoehe - 20;
+    let abstand = ((x - links) + (oben + hoehe - y) / 2 - pos).abs();
+    let band = (hoehe / 5).max(3);
+    if abstand < band {
+        farbe_mischen(grund, 0xffffff, (band - abstand) as u32 * 210 / band as u32)
+    } else {
+        grund
+    }
+}
+
+/// Ein 64-Bit-Mischer (splitmix64): feste Zufallszahlen fuer das Funkeln,
+/// ohne Zustand - dasselbe Bild fuer denselben Takt.
+fn mischen(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Wie hell Glanzpunkt `i` in Takt `tick` leuchtet (0.0..=1.0) und wo er
+/// in dieser Runde sitzt (zwei Zufallszahlen fuer x und y). Jeder hat einen
+/// eigenen Takt (60-109 Takte, bei 8 ms je Takt 0,5-0,9 s) und eine eigene
+/// Phase; er leuchtet in der ersten Haelfte davon auf und wieder ab und
+/// sitzt in jeder Runde an einer neuen Stelle - wie Glitzer, der das Licht
+/// faengt.
+pub fn glanz_stand(i: u32, tick: u64) -> (f32, u64) {
+    let h = mischen(0x51_7CC1_B727_220A ^ i as u64);
+    let periode = 60 + h % 50;
+    let t = tick + (h >> 8) % periode;
+    let runde = t / periode;
+    let f = (t % periode) as f32 / periode as f32;
+    let hell = if f < 0.5 { (f / 0.5 * std::f32::consts::PI).sin() } else { 0.0 };
+    (hell, mischen(h ^ runde.wrapping_mul(0xD1B5_4A32_D192_ED03)))
+}
 
 // Ein Bildpunkt ist 0xTTRRGGBB: das oberste Byte ist die DURCHSICHT T
 // (255 = ganz durchsichtig, 0 = deckend), die Farbe ist mit der Deckung
@@ -183,6 +251,74 @@ impl<'a> Canvas<'a> {
         self.vline(x + w - 1, y + c, h - 2 * c, accent, 40);
     }
 
+    /// Eckklammern um ein Rechteck, `laenge` je Schenkel.
+    pub fn klammern(&mut self, x: i32, y: i32, w: i32, h: i32, farbe: u32, alpha: u32, laenge: i32) {
+        let l = laenge.min(w / 3).min(h / 3).max(1);
+        for (cx, cy, dx, dy) in [(x, y, 1, 1), (x + w - 1, y, -1, 1), (x, y + h - 1, 1, -1), (x + w - 1, y + h - 1, -1, -1)] {
+            for i in 0..l {
+                self.px(cx + dx * i, cy, farbe, alpha);
+                self.px(cx, cy + dy * i, farbe, alpha);
+            }
+        }
+    }
+
+    /// Ein Glanzpunkt: ein kleiner Stern mit vier langen und vier kurzen
+    /// Strahlen und einem goldenen Hof, `r` die Laenge der langen Strahlen,
+    /// `staerke` 0..=255.
+    pub fn glanz(&mut self, x: i32, y: i32, r: i32, staerke: u32) {
+        let s = staerke.min(255);
+        if s == 0 || r <= 0 {
+            return;
+        }
+        // Hof: ein warmer Schein um den Kern.
+        for dy in -2..=2i32 {
+            for dx in -2..=2i32 {
+                let n = dx.abs() + dy.abs();
+                if n > 0 && n <= 3 {
+                    self.px(x + dx, y + dy, GOLD, s * (4 - n as u32) / 8);
+                }
+            }
+        }
+        // Lange Strahlen nach oben, unten, links, rechts; zur Spitze duenner.
+        for d in 1..=r {
+            let a = s * (r + 1 - d) as u32 / (r + 1) as u32;
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                self.px(x + dx * d, y + dy * d, if d <= r / 2 { 0xffffff } else { GOLD_HELL }, a);
+            }
+        }
+        // Kurze Strahlen schraeg.
+        let rd = (r / 2).max(1);
+        for d in 1..=rd {
+            let a = s * (rd + 1 - d) as u32 / (rd + 1) as u32 * 2 / 3;
+            for (dx, dy) in [(1, 1), (-1, 1), (1, -1), (-1, -1)] {
+                self.px(x + dx * d, y + dy * d, GOLD_HELL, a);
+            }
+        }
+        self.px(x, y, 0xffffff, s);
+    }
+
+    /// Funkeln ueber einem Rechteck: `n` Glanzpunkte nach glanz_stand, die
+    /// Strahlen bis `groesse` lang (mit dem Leuchten wachsend). Eine reine
+    /// Funktion von `tick` - Schnappschuesse zeigen dasselbe Bild fuer
+    /// denselben Takt. `deckung` 0..=255 blendet alles (Abzeichen).
+    /// `saat` trennt mehrere Funkelflaechen voneinander.
+    pub fn funkeln(&mut self, r: Rect, tick: u64, n: u32, groesse: i32, deckung: u32, saat: u32) {
+        if r.w <= 0 || r.h <= 0 {
+            return;
+        }
+        for i in 0..n {
+            let (hell, p) = glanz_stand(saat.wrapping_mul(97).wrapping_add(i), tick);
+            if hell <= 0.03 {
+                continue;
+            }
+            let x = r.x + (p % r.w as u64) as i32;
+            let y = r.y + ((p >> 24) % r.h as u64) as i32;
+            let staerke = (hell * 255.0) as u32 * deckung.min(255) / 255;
+            let laenge = ((groesse as f32) * (0.55 + 0.45 * hell)).round() as i32;
+            self.glanz(x, y, laenge, staerke);
+        }
+    }
+
     /// Hintergrund: Grundton, Raster, und ein langsam wanderndes Band.
     pub fn backdrop(&mut self, tick: u64) {
         self.buf.fill(BG);
@@ -334,6 +470,30 @@ impl Text {
         pen
     }
 
+    /// Wie `draw`, aber mit einer Farbe je Bildpunkt: `farbe(x, y)` liefert
+    /// Farbe und Deckung (0..=255), verrechnet mit der Deckung der Glyphe -
+    /// fuer den goldenen Verlauf samt wanderndem Glanz.
+    pub fn draw_mit(&mut self, c: &mut Canvas, x: i32, y: i32, s: &str, size: u32, spacing: i32, farbe: impl Fn(i32, i32) -> (u32, u32)) -> i32 {
+        let mut pen = x;
+        for ch in s.chars() {
+            let Some((m, bm, _)) = self.glyph(ch, size) else { continue };
+            let gx = pen + m.xmin;
+            let gy = y - m.height as i32 - m.ymin;
+            for row in 0..m.height {
+                for col in 0..m.width {
+                    let a = bm[row * m.width + col] as u32;
+                    if a > 8 {
+                        let (px, py) = (gx + col as i32, gy + row as i32);
+                        let (f, d) = farbe(px, py);
+                        c.px(px, py, f, a * d.min(255) / 255);
+                    }
+                }
+            }
+            pen += m.advance_width as i32 + spacing;
+        }
+        pen
+    }
+
     /// Rechtsbuendig setzen. Spart an gut zwanzig Stellen das Ausmessen davor.
     pub fn draw_right(&mut self, c: &mut Canvas, x_right: i32, y: i32, s: &str, size: u32, color: u32, spacing: i32) {
         let w = self.width(s, size, spacing);
@@ -466,6 +626,113 @@ impl Ui {
         c.rect(if on { sx + sw - 14 } else { sx }, r.y + r.h / 2 - 7, 14, 14, accent, 255);
         if hot { c.hline(r.x, r.y + r.h - 1, r.w, accent, 90); }
         hot && self.click
+    }
+
+    /// Der HDR-Schalter im Reiter Bild: wie `toggle`, aber groesser - "HDR"
+    /// als Titel, daneben der Zustand in einer Zeile (`zustand`, schon auf
+    /// den Platz gekuerzt), rechts der Schalter. `gold`: HDR laeuft auf
+    /// beiden Seiten - dann leuchtet die Zeile golden (Grund, Klammern,
+    /// Titel im Verlauf mit wanderndem Glanz, Schalter), und Glanzpunkte
+    /// funkeln ueber Titel und Schalter, animiert ueber `self.tick`. Sonst
+    /// ist er gerahmt wie ein Knopf, in Cyan (an) oder grau (aus). Gibt
+    /// true bei einem Klick zurueck. Wie breit der Zustand sein darf, sagt
+    /// `hdr_schalter_zustand_breite` - der Aufrufer kuerzt vorher.
+    pub fn hdr_schalter(&mut self, c: &mut Canvas, r: Rect, zustand: &str, zustand_farbe: u32, an: bool, gold: bool) -> bool {
+        let hot = r.hit(self.mouse.0, self.mouse.1);
+        let tick = self.tick;
+        let mitte = r.y + r.h / 2;
+        // Immer gerahmt, damit der Schalter unter den anderen auffaellt; in
+        // der Farbe seines Zustands.
+        let accent = if gold { GOLD } else if an { CYAN } else { DIM };
+        c.rect(r.x, r.y, r.w, r.h, accent, if gold { 16 } else { 8 });
+        c.klammern(r.x, r.y, r.w, r.h, accent, if gold { 255 } else { 150 }, 10);
+        if gold {
+            // Der Rahmen atmet: sein Schein schwillt alle 1,6 s an und ab.
+            let puls = ((tick % 200) as f32 / 200.0 * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+            let a = (50.0 + 60.0 * puls) as u32;
+            for (dy, teil) in [(0, 1u32), (-1, 3), (-2, 8)] {
+                c.hline(r.x + 10, r.y + dy, r.w - 20, GOLD, a / teil);
+                c.hline(r.x + 10, r.y + r.h - 1 - dy, r.w - 20, GOLD, a / teil);
+            }
+            for (dx, teil) in [(-1, 3u32), (-2, 8)] {
+                c.vline(r.x + dx, r.y + 4, r.h - 8, GOLD, a / teil);
+                c.vline(r.x + r.w - 1 - dx, r.y + 4, r.h - 8, GOLD, a / teil);
+            }
+        }
+        let tx = r.x + HDR_SCHALTER_RAND;
+        let ty = mitte + 6;
+        let tende = if gold {
+            let tw = self.text.width("HDR", 16, 3);
+            self.text.draw_mit(c, tx, ty, "HDR", 16, 3, |x, y| (gold_verlauf(x, y, tx, ty - 12, tw, 13, tick), 255))
+        } else {
+            self.text.draw(c, tx, ty, "HDR", 16, TEXT, 3)
+        };
+        let zx = self.hdr_schalter_zustand_x(r);
+        self.text.draw(c, zx, mitte + 4, zustand, 11, zustand_farbe, 1);
+        let (sw, sh) = (HDR_SCHALTER_BREITE, 16);
+        let sx = r.x + r.w - sw - HDR_SCHALTER_RAND;
+        c.rect(sx, mitte - sh / 2, sw, sh, accent, if an { 60 } else { 20 });
+        let kx = if an { sx + sw - sh } else { sx };
+        c.rect(kx, mitte - sh / 2, sh, sh, accent, 255);
+        if gold {
+            // Der Knopf glaenzt: eine helle Oberkante, eine tiefe Unterkante.
+            c.hline(kx + 2, mitte - sh / 2 + 2, sh - 4, GOLD_HELL, 230);
+            c.hline(kx + 2, mitte + sh / 2 - 2, sh - 4, GOLD_TIEF, 200);
+            c.funkeln(Rect { x: tx - 6, y: r.y + 2, w: tende - tx + 10, h: r.h - 4 }, tick, 6, 6, 255, 1);
+            c.funkeln(Rect { x: sx - 6, y: r.y + 2, w: sw + 12, h: r.h - 4 }, tick, 4, 5, 255, 2);
+            c.funkeln(Rect { x: r.x + 4, y: r.y, w: r.w - 8, h: r.h }, tick, 4, 3, 200, 6);
+        }
+        if hot {
+            c.hline(r.x, r.y + r.h - 1, r.w, accent, 90);
+        }
+        hot && self.click
+    }
+
+    /// Wo der Zustand im HDR-Schalter beginnt, und wie breit er hoechstens
+    /// sein darf (bis vor den Schalter).
+    pub fn hdr_schalter_zustand_x(&mut self, r: Rect) -> i32 {
+        r.x + HDR_SCHALTER_RAND + self.text.width("HDR", 16, 3) + 14
+    }
+
+    pub fn hdr_schalter_zustand_breite(&mut self, r: Rect) -> i32 {
+        r.x + r.w - HDR_SCHALTER_BREITE - HDR_SCHALTER_RAND - 12 - self.hdr_schalter_zustand_x(r)
+    }
+
+    /// Das goldene "HDR"-Abzeichen oben mittig ueber dem Bild, wenn HDR auf
+    /// beiden Seiten aktiv wird (fuer rund 3 s, der Aufrufer blendet ueber
+    /// `deckung` 0..=255 ein und aus): dunkle, warme Tafel mit goldenen
+    /// Klammern, "HDR" gross im goldenen Verlauf mit wanderndem Glanz,
+    /// darunter `unterzeile` (etwa "HDR10 · PQ"), und Glanzpunkte, die
+    /// ueber Titel und Tafel funkeln - alles nach `self.tick`.
+    pub fn hdr_abzeichen(&mut self, c: &mut Canvas, ww: u32, deckung: u32, unterzeile: &str) {
+        let d = deckung.min(255);
+        if d == 0 {
+            return;
+        }
+        let tick = self.tick;
+        let (gross, lauf) = (44u32, 10i32);
+        let tw = self.text.width("HDR", gross, lauf) - lauf;
+        let uw = self.text.width(unterzeile, 11, 3) - 3;
+        let w = tw.max(uw) + 84;
+        let h = 96;
+        let x = ww as i32 / 2 - w / 2;
+        let y = 28;
+        c.fill(x, y, w, h, 0x0d0a04, 215 * d / 255);
+        c.klammern(x, y, w, h, GOLD, d, 16);
+        c.hline(x + 16, y, w - 32, GOLD, 60 * d / 255);
+        c.hline(x + 16, y + h - 1, w - 32, GOLD, 60 * d / 255);
+        let tx = ww as i32 / 2 - tw / 2;
+        let ty = y + 58;
+        self.text.draw_mit(c, tx, ty, "HDR", gross, lauf, |px, py| (gold_verlauf(px, py, tx, ty - 33, tw, 34, tick), d));
+        // Ein goldener Strich mit Schein zwischen Titel und Unterzeile.
+        let sy = ty + 9;
+        for (dy, a) in [(0, 200u32), (-1, 60), (1, 60), (-2, 18), (2, 18)] {
+            c.hline(tx - 6, sy + dy, tw + 12, GOLD, a * d / 255);
+        }
+        let ux = ww as i32 / 2 - uw / 2;
+        self.text.draw_mit(c, ux, y + h - 12, unterzeile, 11, 3, |_, _| (GOLD_HELL, 220 * d / 255));
+        c.funkeln(Rect { x: tx - 14, y: ty - 44, w: tw + 28, h: 50 }, tick, 7, 8, d, 3);
+        c.funkeln(Rect { x: x + 4, y: y + 4, w: w - 8, h: h - 8 }, tick, 5, 4, d, 4);
     }
 
     /// Verlauf in einem gewaehlten Wertebereich statt ab null. Eine Reihe von

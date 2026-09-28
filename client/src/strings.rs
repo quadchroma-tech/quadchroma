@@ -532,6 +532,38 @@ pub enum Key {
     /// angemeldeten Administratorkonto (Standardkonto mit den Zugangsdaten
     /// eines Administrators). Nur Windows.
     AutostartNeedsAdmin,
+    // HDR (0.2.0): der Schalter im Reiter Bild, sein Zustand und die
+    // Farbzeile der Statistik (F9). "HDR", "HDR10 · PQ", "HDR → SDR" und
+    // "SDR" sind Fachkuerzel und stehen in keiner Tabelle.
+    /// Tooltip des HDR-Schalters: an = HDR, sobald beide Seiten es koennen,
+    /// aus = immer SDR, je Host gespeichert.
+    TipHdr,
+    /// Zustand neben dem Schalter, golden: HDR laeuft auf beiden Seiten.
+    HdrActive,
+    /// Zustand: der Host sendet HDR, dieser Bildschirm zeigt es als SDR
+    /// (davor steht "HDR → SDR · ").
+    HdrMapped,
+    /// Zustand: der Schalter ist aus.
+    HdrOff,
+    /// Warum SDR (HDR-Grund der Strominfo; davor steht "SDR · "): dieser
+    /// Bildschirm ist SDR (Grund 1 bei eingeschaltetem Schalter).
+    HdrWhyClientSdr,
+    /// Grund 2: der Codec ist nicht HEVC 10 Bit.
+    HdrWhyCodec,
+    /// Grund 3: der aufgenommene Bildschirm des Hosts ist SDR.
+    HdrWhyHostScreen,
+    /// Grund 4: Betriebssystem oder Encoder des Hosts koennen kein HDR10.
+    HdrWhyHostCannot,
+    /// Grund 5: diese Anzeige kann HDR nicht darstellen (Bit 1 = 0).
+    HdrWhyClientCannot,
+    /// Grund 6: der Wechsel nach HDR schlug fehl.
+    HdrWhySwitchFailed,
+    /// Grund 7: der Host hat IN_ANZEIGE noch nicht verarbeitet.
+    HdrWhyNegotiating,
+    /// Ein Host vor 0.2.0 (ohne Strominfo Fassung 1).
+    HdrWhyOldHost,
+    /// Zeile der Statistik (F9): die Farbe des Stroms.
+    StatColor,
 }
 
 pub struct Lang {
@@ -830,6 +862,19 @@ pub static EN: Lang = Lang {
         (AutostartInstalled, "Installed to {n} – QuadChroma starts from there with Windows."),
         (AutostartFailed, "\"Start with Windows\" could not be changed. Details are in protokoll.txt."),
         (AutostartNeedsAdmin, "Only with an administrator account"),
+        (TipHdr, "HDR10 whenever both sides can: the host's screen and this screen show HDR. Off: always SDR. Saved for this host."),
+        (HdrActive, "active on both sides"),
+        (HdrMapped, "this screen shows it as SDR"),
+        (HdrOff, "off – always SDR"),
+        (HdrWhyClientSdr, "this screen is SDR"),
+        (HdrWhyCodec, "needs HEVC 10-bit"),
+        (HdrWhyHostScreen, "the host's screen is SDR"),
+        (HdrWhyHostCannot, "the host cannot send HDR"),
+        (HdrWhyClientCannot, "this display cannot show HDR"),
+        (HdrWhySwitchFailed, "switching to HDR failed"),
+        (HdrWhyNegotiating, "negotiating …"),
+        (HdrWhyOldHost, "the host has no HDR (older version)"),
+        (StatColor, "Color"),
     ],
 };
 
@@ -1105,6 +1150,19 @@ pub static DE: Lang = Lang {
         (AutostartInstalled, "Nach {n} installiert – QuadChroma startet von dort mit Windows."),
         (AutostartFailed, "„Mit Windows starten“ ließ sich nicht umstellen. Einzelheiten stehen in protokoll.txt."),
         (AutostartNeedsAdmin, "Nur mit einem Administratorkonto"),
+        (TipHdr, "HDR10, sobald beide Seiten es können: der Bildschirm des Hosts und dieser Bildschirm zeigen HDR. Aus: immer SDR. Für diesen Host gespeichert."),
+        (HdrActive, "aktiv auf beiden Seiten"),
+        (HdrMapped, "dieser Bildschirm zeigt es als SDR"),
+        (HdrOff, "aus – immer SDR"),
+        (HdrWhyClientSdr, "dieser Bildschirm ist SDR"),
+        (HdrWhyCodec, "nur mit HEVC 10 Bit"),
+        (HdrWhyHostScreen, "der Bildschirm des Hosts ist SDR"),
+        (HdrWhyHostCannot, "der Host kann kein HDR senden"),
+        (HdrWhyClientCannot, "diese Anzeige kann kein HDR zeigen"),
+        (HdrWhySwitchFailed, "Wechsel nach HDR gescheitert"),
+        (HdrWhyNegotiating, "wird ausgehandelt …"),
+        (HdrWhyOldHost, "der Host kennt kein HDR (ältere Fassung)"),
+        (StatColor, "Farbe"),
     ],
 };
 
@@ -1150,8 +1208,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > AutostartNeedsAdmin as usize);
-        assert_eq!(n, AutostartNeedsAdmin as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > StatColor as usize);
+        assert_eq!(n, StatColor as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -1871,6 +1929,39 @@ mod tests {
         }
         assert_eq!(EN.get(AutostartInstalled).replace("{n}", "C:\\Program Files\\QuadChroma"), "Installed to C:\\Program Files\\QuadChroma – QuadChroma starts from there with Windows.");
         assert_eq!(DE.get(AutostartNeedsAdmin), "Nur mit einem Administratorkonto");
+    }
+
+    /// Die HDR-Texte (Reiter Bild, F9): am Ende des Enums hinter den Texten
+    /// des Autostarts, in jeder Sprache ohne Platzhalter; der Tooltip nennt
+    /// HDR10 und SDR und endet mit einem Satzzeichen, "aus" nennt SDR, die
+    /// Zustaende sind kurz (sie stehen neben dem Schalter in einer Zeile) und
+    /// ohne Punkt am Ende; ausser im Englischen nicht englisch (die Farbzeile
+    /// darf wie im Englischen heissen, etwa "Color" auf Spanisch).
+    #[test]
+    fn hdr_texte() {
+        assert_eq!(TipHdr as usize, AutostartNeedsAdmin as usize + 1);
+        let zustaende = [HdrActive, HdrMapped, HdrOff, HdrWhyClientSdr, HdrWhyCodec, HdrWhyHostScreen, HdrWhyHostCannot,
+                         HdrWhyClientCannot, HdrWhySwitchFailed, HdrWhyNegotiating, HdrWhyOldHost];
+        assert_eq!(StatColor as usize, TipHdr as usize + zustaende.len() + 1);
+        for l in all() {
+            let tip = l.get(TipHdr);
+            assert!(tip.contains("HDR10") && tip.contains("SDR") && !tip.contains('{'), "{}: {tip}", l.code);
+            assert!(tip.ends_with('.') || tip.ends_with('。'), "{}: {tip}", l.code);
+            assert!(l.get(HdrOff).contains("SDR"), "{}", l.code);
+            for k in zustaende {
+                let t = l.get(k);
+                assert!(!t.contains('{') && !t.ends_with('.') && !t.ends_with('。') && t.chars().count() <= 48, "{} {k:?}: {t}", l.code);
+            }
+            let f = l.get(StatColor);
+            assert!(!f.is_empty() && !f.contains(' ') && f.chars().count() <= 12, "{}: {f}", l.code);
+            if l.code != "en" {
+                for k in [TipHdr, HdrActive, HdrMapped, HdrOff, HdrWhyHostCannot] {
+                    assert_ne!(l.get(k), EN.get(k), "{} {k:?}: noch englisch", l.code);
+                }
+            }
+        }
+        assert_eq!(EN.get(HdrActive), "active on both sides");
+        assert_eq!(DE.get(HdrMapped), "dieser Bildschirm zeigt es als SDR");
     }
 
     /// Dieselben Worte auf beiden Hosts: jeder Zugangstext, den auch der
