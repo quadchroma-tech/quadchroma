@@ -4558,6 +4558,9 @@ impl Ebenenbild for vt_decoder::Bild {
     fn zeilenlaenge(&self, ebene: usize) -> usize {
         vt_decoder::Bild::zeilenlaenge(self, ebene)
     }
+    fn farbe(&self) -> hdr::Farbe {
+        vt_decoder::Bild::farbe(self)
+    }
 }
 
 /// Flaches dunkles Bild in Fenstergrundfarbe - was gezeigt wird, wenn das
@@ -7422,6 +7425,10 @@ impl App {
         // neue Bilder erscheinen und wieder verschwinden.
         let oberflaeche = self.oberflaeche_sichtbar(lage, wechsel);
         let vorher = std::mem::replace(&mut self.oberflaeche_vorher, oberflaeche);
+        // Das stehende HDR-Bild folgt dem Schirm (Kopfraum nach dem
+        // Einschalten von EDR, Helligkeit, Schirmwechsel) wie ein neues Bild -
+        // bei stillem Bildschirm schickt der Host keins.
+        let neues_bild = neues_bild || self.anzeige_nachfuehren();
         if neu_zeichnen(neues_bild, self.praesentation_ausstehend, oberflaeche, vorher, self.letzte_zeichnung.elapsed()) {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -7680,6 +7687,17 @@ impl App {
             Anzeige::Gpu(_) => anzeige::HDR_DARSTELLUNG,
             _ => false,
         }
+    }
+
+    /// Muss die Anzeige ohne neues Bild neu zeichnen? Auf dem Mac, wenn sie
+    /// ein PQ-Bild haelt, dessen Ziel sich geaendert hat
+    /// (anzeige_mac.rs, nachzeichnen_faellig). Sonst nie.
+    fn anzeige_nachfuehren(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Anzeige::Gpu(g) = &mut self.anzeige {
+            return g.nachzeichnen_faellig();
+        }
+        false
     }
 
     /// Praesentiert die Anzeige gerade in HDR bzw. EDR? Der softbuffer-Weg nie.
@@ -8889,6 +8907,10 @@ impl App {
         self.ui.tick = client_us() / 8000;
         self.letzte_zeichnung = jetzt;
 
+        // HDR: SDR-Weiss und Spitze der Quelle aus der Strominfo - damit
+        // bildet die Metal-Anzeige PQ-Bilder ab (anzeige_mac.rs).
+        #[cfg(target_os = "macos")]
+        g.quelle_setzen(self.shared.lock().unwrap().info.and_then(|i| i.hdr).as_ref());
         // Neues Bild abholen: roh ueber Stufe 1, oder fertig als RGB
         // (dunkles Bild, unbekanntes Format). Ein rohes Bild faellt gleich
         // nach dem Upload - der Pufferpool des Decoders will es zurueck.

@@ -40,6 +40,12 @@
 // so rechnet VideoToolbox nichts um, und die Werte kommen roh an wie aus
 // FFmpeg unter Windows. Den begrenzten Bereich (x444, 444v, x420, 420v)
 // dehnen `zeile_rgb` und die Metal-Anzeige selbst.
+//
+// HDR10: Neben dem Bereich liest die Sitzung aus der Formatbeschreibung
+// (also aus dem VUI des SPS) Primaerfarben, Transfer und Matrix; jedes Bild
+// traegt diese Farbe (`Bild::farbe`, hdr::Farbe). Auch ein PQ-Strom kommt
+// als xf44/xf20 mit den rohen Codes heraus - VideoToolbox rechnet nichts um,
+// PQ und die Tonwertabbildung rechnet die Anzeige.
 
 // Unter Windows laufen nur die Tests des reinen Teils.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -246,6 +252,11 @@ pub const X420: u32 = fourcc(b"x420");
 pub const F420: u32 = fourcc(b"420f");
 pub const V420: u32 = fourcc(b"420v");
 
+/// Primaerfarben Display P3 (D65) nach H.273 (SMPTE EG 432-1) - hdr.rs kennt
+/// nur 709 und 2020; P3 kommt vor, wenn ein Encoder die P3-PQ-Aufnahme
+/// unveraendert kennzeichnet.
+pub const PRIMAER_P3: u8 = 12;
+
 /// Eine Formatkennung lesbar ("xf44"); nicht druckbare Bytes als Zahl.
 pub fn fourcc_text(t: u32) -> String {
     let b = t.to_be_bytes();
@@ -402,6 +413,8 @@ pub struct Paket<'a> {
 
 #[cfg(target_os = "macos")]
 pub use mac::{Bild, Decoder};
+#[cfg(all(target_os = "macos", test))]
+pub use mac::farbe_der_saetze;
 
 /// Die Schnittstellen von CoreFoundation, CoreMedia, CoreVideo und
 /// VideoToolbox, soweit Decoder und Probe sie brauchen - und die Metal-
@@ -464,6 +477,8 @@ pub(crate) mod ffi {
     pub const BLOCK_SOFORT: u32 = 1;
     /// kCVPixelBufferLock_ReadOnly.
     pub const NUR_LESEN: u64 = 1;
+    /// kCVAttachmentMode_ShouldPropagate.
+    pub const ANHANG_WEITERGEBEN: u32 = 1;
     /// kVTDecodeInfo_FrameDropped.
     pub const BILD_VERWORFEN: u32 = 1 << 1;
     /// kCMVideoCodecType_HEVC ('hvc1').
@@ -485,11 +500,25 @@ pub(crate) mod ffi {
         ) -> CFMutableDictionaryRef;
         pub fn CFDictionarySetValue(d: CFMutableDictionaryRef, schluessel: *const c_void, wert: *const c_void);
         pub fn CFNumberCreate(alloc: *const c_void, typ: isize, wert: *const c_void) -> CFTypeRef;
+        pub fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
     }
 
     #[link(name = "CoreMedia", kind = "framework")]
     extern "C" {
         pub static kCMFormatDescriptionExtension_FullRangeVideo: CFStringRef;
+        // Die Farbangaben der Formatbeschreibung (aus dem VUI des SPS) und
+        // ihre Werte, soweit der Client sie unterscheidet.
+        pub static kCMFormatDescriptionExtension_ColorPrimaries: CFStringRef;
+        pub static kCMFormatDescriptionExtension_TransferFunction: CFStringRef;
+        pub static kCMFormatDescriptionExtension_YCbCrMatrix: CFStringRef;
+        pub static kCMFormatDescriptionColorPrimaries_ITU_R_709_2: CFStringRef;
+        pub static kCMFormatDescriptionColorPrimaries_ITU_R_2020: CFStringRef;
+        pub static kCMFormatDescriptionColorPrimaries_P3_D65: CFStringRef;
+        pub static kCMFormatDescriptionTransferFunction_ITU_R_709_2: CFStringRef;
+        pub static kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ: CFStringRef;
+        pub static kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG: CFStringRef;
+        pub static kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2: CFStringRef;
+        pub static kCMFormatDescriptionYCbCrMatrix_ITU_R_2020: CFStringRef;
         pub static kCMTimeInvalid: CMTime;
         pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
             alloc: *const c_void,
@@ -553,6 +582,17 @@ pub(crate) mod ffi {
         pub static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
         pub static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
         pub static kCVPixelBufferMetalCompatibilityKey: CFStringRef;
+        // Die Farbangaben als Anhaenge eines Puffers (dieselben Namen wie in
+        // der Formatbeschreibung); VideoToolbox gibt sie jedem Bild mit.
+        pub static kCVImageBufferColorPrimariesKey: CFStringRef;
+        pub static kCVImageBufferTransferFunctionKey: CFStringRef;
+        pub static kCVImageBufferYCbCrMatrixKey: CFStringRef;
+        pub static kCVImageBufferColorPrimaries_ITU_R_2020: CFStringRef;
+        pub static kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ: CFStringRef;
+        pub static kCVImageBufferYCbCrMatrix_ITU_R_2020: CFStringRef;
+        /// Liefert einen eigenen Griff (oder NULL).
+        pub fn CVBufferCopyAttachment(puffer: CVPixelBufferRef, schluessel: CFStringRef, modus: *mut u32) -> CFTypeRef;
+        pub fn CVBufferSetAttachment(puffer: CVPixelBufferRef, schluessel: CFStringRef, wert: CFTypeRef, modus: u32);
         pub fn CVPixelBufferGetPixelFormatType(pb: CVPixelBufferRef) -> u32;
         pub fn CVPixelBufferGetWidth(pb: CVPixelBufferRef) -> usize;
         pub fn CVPixelBufferGetHeight(pb: CVPixelBufferRef) -> usize;
@@ -584,6 +624,9 @@ pub(crate) mod ffi {
         pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
         pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
         pub static kVTCompressionPropertyKey_Quality: CFStringRef;
+        pub static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
+        pub static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
+        pub static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
         pub fn VTDecompressionSessionCreate(
             alloc: *const c_void,
             fd: CMFormatDescriptionRef,
@@ -657,6 +700,15 @@ pub(crate) mod ffi {
         CFRelease(wert);
     }
 
+    /// Einen Puffer als HDR10 kennzeichnen (BT.2020, PQ, Matrix BT.2020),
+    /// wie VideoToolbox ein decodiertes PQ-Bild kennzeichnet - fuer die
+    /// Probebilder und den Eingang des Probe-Encoders.
+    pub unsafe fn pq_kennzeichnen(pb: CVPixelBufferRef) {
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, ANHANG_WEITERGEBEN);
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, ANHANG_WEITERGEBEN);
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, ANHANG_WEITERGEBEN);
+    }
+
     pub fn wahr(b: bool) -> CFBooleanRef {
         unsafe {
             if b {
@@ -717,10 +769,71 @@ mod mac {
         ablage.lock().unwrap_or_else(|e| e.into_inner()).push(a);
     }
 
-    /// Eine laufende Sitzung mit ihrer Formatbeschreibung.
+    /// Ein Farbwert von CoreMedia/CoreVideo (CFString) als Code nach H.273,
+    /// ueber die Tabelle (Konstante, Code); was sie nicht kennt, ist 2
+    /// ("nicht angegeben"), ein fehlender Wert ebenso.
+    unsafe fn h273(wert: CFTypeRef, tabelle: &[(CFStringRef, u8)]) -> u8 {
+        if wert.is_null() {
+            return 2;
+        }
+        tabelle.iter().find(|(k, _)| CFEqual(wert, *k) != 0).map_or(2, |&(_, c)| c)
+    }
+
+    /// Die Farbe aus Primaerfarben, Transfer und Matrix, wie CoreMedia sie
+    /// nennt (Formatbeschreibung) oder CoreVideo sie anhaengt (Puffer) - die
+    /// Namen sind dieselben. Nur PQ zaehlt mit Matrix und Bereich, alles
+    /// andere ist SDR BT.709 voll (hdr::Farbe::aus_vui).
+    unsafe fn farbe_aus(prim: CFTypeRef, tf: CFTypeRef, mat: CFTypeRef, voll: bool) -> crate::hdr::Farbe {
+        use crate::hdr;
+        let p = h273(prim, &[
+            (kCMFormatDescriptionColorPrimaries_ITU_R_709_2, hdr::PRIMAER_709),
+            (kCMFormatDescriptionColorPrimaries_ITU_R_2020, hdr::PRIMAER_2020),
+            (kCMFormatDescriptionColorPrimaries_P3_D65, PRIMAER_P3),
+        ]);
+        let t = h273(tf, &[
+            (kCMFormatDescriptionTransferFunction_ITU_R_709_2, hdr::TRANSFER_SDR),
+            (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ, hdr::TRANSFER_PQ),
+            (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG, hdr::TRANSFER_HLG),
+        ]);
+        let m = h273(mat, &[
+            (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2, hdr::MATRIX_709),
+            (kCMFormatDescriptionYCbCrMatrix_ITU_R_2020, hdr::MATRIX_2020_NCL),
+        ]);
+        hdr::Farbe::aus_vui(t, p, m, voll)
+    }
+
+    /// Die Farbe laut Formatbeschreibung (aus dem VUI des SPS).
+    unsafe fn farbe_der_beschreibung(fd: CMFormatDescriptionRef, voll: bool) -> crate::hdr::Farbe {
+        farbe_aus(
+            CMFormatDescriptionGetExtension(fd, kCMFormatDescriptionExtension_ColorPrimaries),
+            CMFormatDescriptionGetExtension(fd, kCMFormatDescriptionExtension_TransferFunction),
+            CMFormatDescriptionGetExtension(fd, kCMFormatDescriptionExtension_YCbCrMatrix),
+            voll,
+        )
+    }
+
+    /// Die Farbe aus den Anhaengen eines Puffers; den Bereich sagt das
+    /// Format (xf44 voll, x444 begrenzt).
+    unsafe fn farbe_der_anhaenge(pb: CVPixelBufferRef, format: u32) -> crate::hdr::Farbe {
+        let holen = |k: CFStringRef| CVBufferCopyAttachment(pb, k, std::ptr::null_mut());
+        let (p, t, m) = (holen(kCVImageBufferColorPrimariesKey), holen(kCVImageBufferTransferFunctionKey), holen(kCVImageBufferYCbCrMatrixKey));
+        let voll = ebenen(format).is_some_and(|e| !e.begrenzt);
+        let f = farbe_aus(p, t, m, voll);
+        for w in [p, t, m] {
+            if !w.is_null() {
+                CFRelease(w);
+            }
+        }
+        f
+    }
+
+    /// Eine laufende Sitzung mit ihrer Formatbeschreibung und der Farbe,
+    /// die diese nennt - sie gilt fuer jedes Bild der Sitzung (neue
+    /// Parametersaetze ergeben eine neue Sitzung).
     struct Sitzung {
         vt: VTSessionRef,
         fd: CMFormatDescriptionRef,
+        farbe: crate::hdr::Farbe,
     }
 
     impl Drop for Sitzung {
@@ -868,7 +981,10 @@ mod mac {
                 return Err(Fehler { was: "Formatbeschreibung aus den Parametersaetzen", status: st });
             }
             let voll = unsafe { CMFormatDescriptionGetExtension(fd, kCMFormatDescriptionExtension_FullRangeVideo) == kCFBooleanTrue };
+            let farbe = unsafe { farbe_der_beschreibung(fd, voll) };
             let art = self.saetze.sps.first().and_then(|s| if self.h264 { h264_sps_lesen(s) } else { hevc_sps_lesen(s) });
+            // Auch PQ bleibt xf44/xf20: die Codes kommen roh an, die Anzeige
+            // rechnet PQ selbst (anzeige_mac.rs).
             let format = ausgabeformat(art, voll);
             let mut vt: VTSessionRef = std::ptr::null_mut();
             let st = unsafe {
@@ -899,7 +1015,7 @@ mod mac {
                 unsafe { CFRelease(fd) };
                 return Err(Fehler { was: "VTDecompressionSessionCreate", status: st });
             }
-            let sitzung = Sitzung { vt, fd };
+            let sitzung = Sitzung { vt, fd, farbe };
             let hardware = unsafe {
                 // Ein Hinweis an den Decoder; kann er ihn nicht, auch recht.
                 VTSessionSetProperty(vt, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
@@ -933,10 +1049,11 @@ mod mac {
                 None => "Format unbekannt (SPS nicht lesbar)".into(),
             };
             let zeile = format!(
-                "VideoToolbox: {}x{} {} {art_text}, Hardware {}, Ausgabe {} ({})",
+                "VideoToolbox: {}x{} {} {art_text}, {}, Hardware {}, Ausgabe {} ({})",
                 masse.width,
                 masse.height,
                 if self.h264 { "H.264" } else { "HEVC" },
+                farbe.text(),
                 match hardware {
                     Some(true) => "ja",
                     Some(false) => "nein",
@@ -985,9 +1102,10 @@ mod mac {
             unsafe { CFRelease(sb as CFTypeRef) };
             let ausgaenge = std::mem::take(&mut *self.ablage.lock().unwrap_or_else(|e| e.into_inner()));
             let mut fehler = (st != 0).then_some(Fehler { was: "VTDecompressionSessionDecodeFrame", status: st });
+            let farbe = s.farbe;
             for a in ausgaenge {
                 match a {
-                    Ausgang::Bild(pb, pts) => match unsafe { Bild::neu(pb, pts) } {
+                    Ausgang::Bild(pb, pts) => match unsafe { Bild::neu(pb, pts, farbe) } {
                         Ok(b) => bilder.push(b),
                         Err(f) => {
                             fehler.get_or_insert(f);
@@ -1022,6 +1140,7 @@ mod mac {
         puffer: CVPixelBufferRef,
         pts: i64,
         format: u32,
+        farbe: crate::hdr::Farbe,
     }
 
     // Ein CVPixelBuffer darf von jedem Faden gelesen und freigegeben werden.
@@ -1029,19 +1148,36 @@ mod mac {
 
     impl Bild {
         /// Uebernimmt den Griff `puffer` und sperrt die Ebenen zum Lesen.
-        unsafe fn neu(puffer: CVPixelBufferRef, pts: i64) -> Result<Bild, Fehler> {
+        unsafe fn neu(puffer: CVPixelBufferRef, pts: i64, farbe: crate::hdr::Farbe) -> Result<Bild, Fehler> {
             let st = CVPixelBufferLockBaseAddress(puffer, NUR_LESEN);
             if st != 0 {
                 CFRelease(puffer as CFTypeRef);
                 return Err(Fehler { was: "CVPixelBufferLockBaseAddress", status: st });
             }
-            Ok(Bild { puffer, pts, format: CVPixelBufferGetPixelFormatType(puffer) })
+            Ok(Bild { puffer, pts, format: CVPixelBufferGetPixelFormatType(puffer), farbe })
         }
 
         /// Wie `neu`, fuer Puffer, die nicht aus dem Decoder kommen (die
-        /// Probebilder des Anzeigetests). Uebernimmt den Griff `puffer`.
+        /// Probebilder des Anzeigetests). Uebernimmt den Griff `puffer`; die
+        /// Farbe kommt aus seinen Anhaengen (ohne Anhaenge: SDR).
         pub unsafe fn aus_puffer(puffer: CVPixelBufferRef, pts: i64) -> Result<Bild, Fehler> {
-            Bild::neu(puffer, pts)
+            let farbe = farbe_der_anhaenge(puffer, CVPixelBufferGetPixelFormatType(puffer));
+            Bild::neu(puffer, pts, farbe)
+        }
+
+        /// Die Farbe des Bildes nach H.273 aus dem VUI (ueber die
+        /// Formatbeschreibung der Sitzung): PQ mit Primaerfarben, Matrix und
+        /// Bereich, alles andere SDR BT.709 voll. Die Anzeige entscheidet je
+        /// Bild danach.
+        pub fn farbe(&self) -> crate::hdr::Farbe {
+            self.farbe
+        }
+
+        /// Die Farbe laut den Anhaengen des Puffers - was VideoToolbox dem
+        /// Bild selbst mitgab (nur fuer den Test, dass beides uebereinstimmt).
+        #[cfg(test)]
+        pub fn farbe_der_anhaenge(&self) -> crate::hdr::Farbe {
+            unsafe { farbe_der_anhaenge(self.puffer, self.format) }
         }
 
         /// Der CVPixelBuffer selbst (ohne eigenen Griff) - fuer die
@@ -1110,6 +1246,28 @@ mod mac {
                 CVPixelBufferUnlockBaseAddress(self.puffer, NUR_LESEN);
                 CFRelease(self.puffer as CFTypeRef);
             }
+        }
+    }
+
+    /// Die Farbe, die eine Sitzung aus diesen HEVC-Parametersaetzen ablesen
+    /// wuerde (Formatbeschreibung wie in `sitzung_bauen`) - nur Test.
+    #[cfg(test)]
+    pub fn farbe_der_saetze(saetze: &Parametersaetze) -> Result<crate::hdr::Farbe, Fehler> {
+        let liste = saetze.liste(false);
+        let zeiger: Vec<*const u8> = liste.iter().map(|s| s.as_ptr()).collect();
+        let groessen: Vec<usize> = liste.iter().map(|s| s.len()).collect();
+        let mut fd: CMFormatDescriptionRef = std::ptr::null();
+        unsafe {
+            let st = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                std::ptr::null(), liste.len(), zeiger.as_ptr(), groessen.as_ptr(), 4, std::ptr::null(), &mut fd,
+            );
+            if st != 0 || fd.is_null() {
+                return Err(Fehler { was: "Formatbeschreibung aus den Parametersaetzen", status: st });
+            }
+            let voll = CMFormatDescriptionGetExtension(fd, kCMFormatDescriptionExtension_FullRangeVideo) == kCFBooleanTrue;
+            let f = farbe_der_beschreibung(fd, voll);
+            CFRelease(fd);
+            Ok(f)
         }
     }
 }
@@ -1232,6 +1390,13 @@ pub mod probe {
     /// virtuellen Maschine oder hinter einer Sandbox ohne Zugang zu den
     /// Diensten von VideoToolbox) - dann gibt es nichts zu pruefen.
     pub fn hevc_444_10(breite: u32, hoehe: u32, bilder: u32) -> Result<Probe, String> {
+        hevc_444_10_farbe(breite, hoehe, bilder, false)
+    }
+
+    /// Wie `hevc_444_10`; mit `pq` als HDR10 gekennzeichnet (Primaerfarben
+    /// BT.2020, Transfer PQ, Matrix BT.2020 im VUI, wie der Mac-Host bei HDR)
+    /// - dieselben Codes, nur als PQ gemeint.
+    pub fn hevc_444_10_farbe(breite: u32, hoehe: u32, bilder: u32, pq: bool) -> Result<Probe, String> {
         let sammlung = Box::new(Mutex::new(Sammlung { einheiten: Vec::new(), fehler: None }));
         unsafe {
             let profil = dlsym(RTLD_DEFAULT, c"kVTProfileLevel_HEVC_Main44410_AutoLevel".as_ptr()) as *const CFStringRef;
@@ -1263,6 +1428,11 @@ pub mod probe {
             let q = kommazahl(1.0);
             VTSessionSetProperty(s, kVTCompressionPropertyKey_Quality, q);
             CFRelease(q);
+            if pq {
+                ok &= VTSessionSetProperty(s, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_2020) == 0;
+                ok &= VTSessionSetProperty(s, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) == 0;
+                ok &= VTSessionSetProperty(s, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_2020) == 0;
+            }
             ok &= VTCompressionSessionPrepareToEncodeFrames(s) == 0;
             let attribute = woerterbuch();
             setzen_und_freigeben(attribute, kCVPixelBufferIOSurfacePropertiesKey, woerterbuch() as CFTypeRef);
@@ -1293,6 +1463,11 @@ pub mod probe {
                     }
                 }
                 CVPixelBufferUnlockBaseAddress(pb, 0);
+                // Eingang wie Ausgang gekennzeichnet: so rechnet VideoToolbox
+                // nichts um, die Codes bleiben die des Musters.
+                if pq {
+                    pq_kennzeichnen(pb);
+                }
                 let st = VTCompressionSessionEncodeFrame(
                     s, pb, CMTimeMake(i as i64, 60), CMTimeMake(1, 60), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(),
                 );
@@ -1330,6 +1505,10 @@ mod tests {
     const VPS_444_10: &str = "40 01 0c 01 ff ff 04 08 00 00 03 00 bc 08 00 00 03 00 00 78 17 02 40";
     const SPS_444_10: &str = "42 01 01 04 08 00 00 03 00 bc 08 00 00 03 00 00 78 90 00 78 10 02 20 f8 96 c4 0b dc 8b 22 97 fe 5c fe 27 f5 37 02 02 02 00 80";
     const PPS_444_10: &str = "44 01 c0 72 f0 53 24";
+    /// Dieselben als HDR10 (2020/PQ/2020 im VUI; derselbe VPS), aus dem
+    /// Hardware-Encoder mit probe::hevc_444_10_farbe (M1, macOS 27).
+    const SPS_444_10_PQ: &str = "42 01 01 04 08 00 00 03 00 bc 08 00 00 03 00 00 78 90 00 78 10 02 20 f8 96 c4 0b dc 8b 02 97 fe 5c fe 27 f5 37 09 10 09 00 80";
+    const PPS_444_10_PQ: &str = "44 01 c0 60 4d 18 aa 48";
 
     fn mit_startcode(nal: &[u8], lang: bool) -> Vec<u8> {
         let mut v = if lang { vec![0, 0, 0, 1] } else { vec![0, 0, 1] };
@@ -1577,11 +1756,41 @@ mod tests {
         assert!(!d.schluesselbild_noetig());
     }
 
+    /// Die Farbe kommt aus dem VUI des SPS, ueber die Formatbeschreibung:
+    /// die Saetze des Hardware-Encoders mit 2020/PQ/2020 (HDR10, wie der
+    /// Mac-Host bei HDR) ergeben PQ, die heutigen SDR-Saetze SDR. Braucht
+    /// nur CoreMedia, keinen Encoder.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn farbe_aus_den_parametersaetzen() {
+        let saetze = |v: &str, s: &str, p: &str| Parametersaetze { vps: vec![hex(v)], sps: vec![hex(s)], pps: vec![hex(p)] };
+        assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10, PPS_444_10)), Ok(crate::hdr::Farbe::SDR));
+        assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10_PQ, PPS_444_10_PQ)), Ok(crate::hdr::Farbe::PQ));
+        // Das PQ-SPS liest sich wie das SDR-SPS: 4:4:4 10 Bit, also xf44.
+        assert_eq!(hevc_sps_lesen(&hex(SPS_444_10_PQ)), Some(Bildart { chroma: 3, bits: 10, profil: 4 }));
+    }
+
+    /// Hardware-Rundreise eines HDR10-Stroms (vthdrtest als Test): der
+    /// Hardware-Encoder kennzeichnet 2020/PQ/2020, der Decoder liefert xf44
+    /// mit den Codes des Musters, und jedes Bild traegt PQ - laut
+    /// Formatbeschreibung wie laut den Anhaengen des Puffers. Ohne
+    /// Hardware-Encoder (Sandbox) uebersprungen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hardware_decode_444_10_pq() {
+        pruefen_farbe(true, true);
+    }
+
     #[cfg(target_os = "macos")]
     fn pruefen(hardware: bool) {
+        pruefen_farbe(hardware, false);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pruefen_farbe(hardware: bool, pq: bool) {
         use crate::Ebenenbild;
         let (b, h) = (256u32, 128u32);
-        let p = match probe::hevc_444_10(b, h, 4) {
+        let p = match probe::hevc_444_10_farbe(b, h, 4, pq) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("uebersprungen: {e}");
@@ -1607,6 +1816,14 @@ mod tests {
         );
         assert_eq!(bild.ebenenzahl(), 2);
         assert_eq!(bild.ebenenbreite(1), b as usize);
+        let farbe = if pq { crate::hdr::Farbe::PQ } else { crate::hdr::Farbe::SDR };
+        for (i, bild) in bilder.iter().enumerate() {
+            assert_eq!(bild.farbe(), farbe, "Bild {i}: Farbe laut Formatbeschreibung");
+            assert_eq!(Ebenenbild::farbe(bild), farbe, "Bild {i}: Farbe ueber Ebenenbild");
+            if pq {
+                assert_eq!(bild.farbe_der_anhaenge(), farbe, "Bild {i}: Farbe laut Anhaengen");
+            }
+        }
         let wert = |ebene: usize, x: u32, y: u32, k: usize| -> u16 {
             let d = bild.daten(ebene);
             let i = y as usize * bild.zeilenlaenge(ebene) + (x as usize * if ebene == 0 { 1 } else { 2 } + k) * 2;
@@ -1632,8 +1849,12 @@ mod tests {
             assert!((a - n).abs() >= 300, "Spalte {x}: Cb {a} neben {n} - kein 4:4:4");
         }
         // Und durch to_rgb: dieselbe Rechnung wie zeile_rgb mit den Werten
-        // des Musters, auf wenige Stufen genau.
+        // des Musters, auf wenige Stufen genau (nur SDR - PQ rechnet die
+        // Anzeige, siehe anzeige_mac.rs).
         assert_eq!(bild.ebenen(), ebenen(bild.format()));
+        if pq {
+            return;
+        }
         let rgb = crate::to_rgb(bild).expect("to_rgb");
         assert_eq!((rgb.width, rgb.height), (b, h));
         let mut soll = [0u32; 1];
