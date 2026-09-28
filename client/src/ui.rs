@@ -61,6 +61,39 @@ pub fn gold_verlauf(x: i32, y: i32, links: i32, oben: i32, breite: i32, hoehe: i
     }
 }
 
+// Das Herz in Einheiten, die Spitze bei (0, 0), y nach oben: ein um 45 Grad
+// gedrehtes Quadrat mit den Ecken (0, 0), (0,5, 0,5), (0, 1) und (-0,5, 0,5),
+// auf seinen beiden oberen Kanten je ein Halbkreis (Mitte (+-0,25, 0,75),
+// Radius die halbe Kante).
+const HERZ_RADIUS: f32 = std::f32::consts::SQRT_2 / 4.0;
+const HERZ_HOEHE: f32 = 0.75 + HERZ_RADIUS;
+const HERZ_BREITE: f32 = 2.0 * (0.25 + HERZ_RADIUS);
+/// Schriftgroesse von "Mi" im Verhaeltnis zur Hoehe des Herzens, und wo die
+/// Mitte der Buchstaben steht (Anteil der Hoehe ab der Oberkante).
+const HERZ_SCHRIFT: f32 = 0.5;
+const HERZ_MITTE: f32 = 0.42;
+
+/// Breite des Herzens in Bildpunkten fuer eine Hoehe - es ist etwas
+/// breiter als hoch.
+pub fn herz_breite(hoehe: i32) -> i32 {
+    (hoehe as f32 * HERZ_BREITE / HERZ_HOEHE).round() as i32
+}
+
+/// Abstand eines Punkts zum Rand des Herzens in Einheiten, innen negativ;
+/// `x` ist schon gespiegelt (>= 0), rechts liegt der naehere Bogen. Die
+/// Vereinigung ist das Minimum der beiden Abstaende - aussen genau, innen
+/// nahe am Rand ebenso, und nur dort zaehlt er fuer die Kante.
+fn herz_abstand(x: f32, y: f32) -> f32 {
+    let bogen = (x - 0.25).hypot(y - 0.75) - HERZ_RADIUS;
+    // Das Quadrat um (0, 0,5) in gedrehten Achsen: dort achsparallel, halbe
+    // Seite 0,5 / Wurzel 2.
+    let (u, v) = ((x + y - 0.5) / std::f32::consts::SQRT_2, (x - y + 0.5) / std::f32::consts::SQRT_2);
+    let halbe_seite = 0.5 / std::f32::consts::SQRT_2;
+    let (qu, qv) = (u.abs() - halbe_seite, v.abs() - halbe_seite);
+    let quadrat = qu.max(0.0).hypot(qv.max(0.0)) + qu.max(qv).min(0.0);
+    bogen.min(quadrat)
+}
+
 /// Ein 64-Bit-Mischer (splitmix64): feste Zufallszahlen fuer das Funkeln,
 /// ohne Zustand - dasselbe Bild fuer denselben Takt.
 fn mischen(mut x: u64) -> u64 {
@@ -319,6 +352,32 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Ein gefuelltes Herz mit weichen Kanten, so hoch wie `r` und darin
+    /// waagrecht mittig (die Breite nach `herz_breite`), die Spitze unten.
+    /// Je Bildpunkt der Abstand seiner Mitte zum Rand (`herz_abstand`),
+    /// daraus die Deckung - ein halber Bildpunkt Uebergang wie bei einer
+    /// geglaetteten Kante.
+    pub fn herz(&mut self, r: Rect, farbe: u32, deckung: u32) {
+        if r.h <= 0 || deckung == 0 {
+            return;
+        }
+        let k = r.h as f32 / HERZ_HOEHE;
+        let mitte = r.x as f32 + r.w as f32 / 2.0;
+        let spitze = (r.y + r.h) as f32;
+        let halb = HERZ_BREITE / 2.0 * k;
+        for y in r.y - 1..=r.y + r.h {
+            for x in (mitte - halb).floor() as i32 - 1..=(mitte + halb).ceil() as i32 {
+                let ux = ((x as f32 + 0.5) - mitte).abs() / k;
+                let uy = (spitze - (y as f32 + 0.5)) / k;
+                let d = herz_abstand(ux, uy) * k;
+                let a = ((0.5 - d).clamp(0.0, 1.0) * deckung.min(255) as f32).round() as u32;
+                if a > 0 {
+                    self.px(x, y, farbe, a);
+                }
+            }
+        }
+    }
+
     /// Hintergrund: Grundton, Raster, und ein langsam wanderndes Band.
     pub fn backdrop(&mut self, tick: u64) {
         self.buf.fill(BG);
@@ -450,6 +509,22 @@ impl Text {
             }
         }
         w
+    }
+
+    /// Wie weit die Glyphen von `s` ueber die Grundlinie reichen und wie weit
+    /// darunter (Bildpunkte, je >= 0) - die Zeilen, die `draw` mit der
+    /// Grundlinie `y` beschreibt, sind y - oben bis vor y + unten.
+    pub fn senkrecht(&mut self, s: &str, size: u32) -> (i32, i32) {
+        let (mut oben, mut unten) = (0, 0);
+        for ch in s.chars() {
+            if let Some((m, _, _)) = self.glyph(ch, size) {
+                if m.width > 0 && m.height > 0 {
+                    oben = oben.max(m.height as i32 + m.ymin);
+                    unten = unten.max(-m.ymin);
+                }
+            }
+        }
+        (oben, unten)
     }
 
     /// Zeichnet Text. spacing weitet die Laufweite - das macht den technischen Look.
@@ -733,6 +808,28 @@ impl Ui {
         self.text.draw_mit(c, ux, y + h - 12, unterzeile, 11, 3, |_, _| (GOLD_HELL, 220 * d / 255));
         c.funkeln(Rect { x: tx - 14, y: ty - 44, w: tw + 28, h: 50 }, tick, 7, 8, d, 3);
         c.funkeln(Rect { x: x + 4, y: y + 4, w: w - 8, h: h - 8 }, tick, 5, 4, d, 4);
+    }
+
+    /// Ein kleiner Gruss an Mi: ein Herz in Magenta mit "Mi" in Weiss darin,
+    /// so hoch wie `r` und darin waagrecht mittig (Breite nach
+    /// `herz_breite`). Nur gezeichnet, kein Bedienteil - es nimmt weder Maus
+    /// noch Klick, was darunter laege, bliebe anklickbar. Ein Name, nicht
+    /// uebersetzt.
+    pub fn herz_mi(&mut self, c: &mut Canvas, r: Rect) {
+        c.herz(r, MAGENTA, 255);
+        let groesse = ((r.h as f32 * HERZ_SCHRIFT).round() as u32).max(6);
+        let (oben, _) = self.text.senkrecht("Mi", groesse);
+        // Die Buchstaben mittig um den Schwerpunkt der Flaeche, gut 40 %
+        // unter der Oberkante - dort ist das Herz fast am breitesten.
+        let mitte = r.y as f32 + r.h as f32 * HERZ_MITTE;
+        let grund = (mitte + oben as f32 / 2.0).round() as i32;
+        // Zweimal, um `fett` versetzt: die feinen Striche der Schrift werden
+        // kraeftiger und heben sich auf dem hellen Magenta besser ab.
+        let fett = (groesse as i32 / 12).max(1);
+        let tx = r.x + r.w / 2 - (self.text.width("Mi", groesse, 0) + fett) / 2;
+        for dx in [0, fett] {
+            self.text.draw(c, tx + dx, grund, "Mi", groesse, 0xffffff, 0);
+        }
     }
 
     /// Verlauf in einem gewaehlten Wertebereich statt ab null. Eine Reihe von

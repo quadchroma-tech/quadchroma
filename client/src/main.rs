@@ -10328,6 +10328,48 @@ fn start_zeile(u: &mut ui::Ui, w: i32, h: i32, lang: &'static strings::Lang, i: 
     (ui::Rect { w: zeile.w - kw - 8, ..zeile }, Some(knopf))
 }
 
+/// Hoehe des Herzens mit "Mi" unten rechts im Startbildschirm und im
+/// ESC-Menue (dort bei Massstab 1, sonst mitskaliert).
+const HERZ_HOEHE: i32 = 24;
+
+/// Die unterste Zeile der Fussleiste im Startbildschirm: links die Version,
+/// mittig die Tastenhinweise, rechts die Sprache (ein Klick oeffnet die
+/// Wahl) und links neben ihr das Herz mit "Mi". Das Herz haengt etwas unter
+/// die Grundlinie: sein oberer Rand bleibt unter der Zeile darueber
+/// (Urheber, Projektseite, unter Windows der FFmpeg-Hinweis), die in
+/// manchen Breiten bis an den rechten Rand reicht.
+struct StartFuss {
+    /// Grundlinie der untersten Zeile.
+    y: i32,
+    /// Grundlinie der Zeile darueber; alle weiteren stehen hoeher.
+    darueber: i32,
+    /// Die Tastenhinweise und wo sie beginnen: mittig, und wenn das Herz
+    /// dann im Weg ist, so weit nach links wie noetig. None, wenn sie nicht
+    /// zwischen Version und Herz passen - in schmalen Fenstern fehlen sie.
+    tasten: String,
+    tasten_x: Option<i32>,
+    sprache: ui::Rect,
+    herz: ui::Rect,
+}
+
+fn start_fuss(u: &mut ui::Ui, lang: &'static strings::Lang, w: i32, h: i32) -> StartFuss {
+    use strings::Key::*;
+    let y = h - 22;
+    let lw = u.text.width(lang.name, 12, 2);
+    let sprache = ui::Rect { x: w - lw - 34, y: y - 16, w: lw + 22, h: 22 };
+    let hb = ui::herz_breite(HERZ_HOEHE);
+    let herz = ui::Rect { x: sprache.x - 2 - hb, y: y - HERZ_HOEHE / 2, w: hb, h: HERZ_HOEHE };
+    let tasten = format!(
+        "F9 {}   F10 {}   F11 {}   F12 {}",
+        lang.get(ShowOverlay), lang.get(Settings), lang.get(Fullscreen), lang.get(PixelExact)
+    );
+    let tw = u.text.width(&tasten, 11, 1);
+    // Zum Herzen derselbe Abstand wie vom Herzen zur Schrift der Sprache.
+    let x = (w / 2 - tw / 2).min(herz.x - 12 - tw);
+    let tasten_x = (x > 20 + u.text.width("v0.1", 11, 2) + 12).then_some(x);
+    StartFuss { y, darueber: y - 16, tasten, tasten_x, sprache, herz }
+}
+
 /// Eine Zeile der Hostliste auf dem Startbildschirm (Spezifikation Pairing
 /// v1, 9.1) und im Reiter "Computer": Name links, rechts die ID (ohne ID
 /// "-"), bekannte Hosts mit Haken, die Adresse im Tooltip.
@@ -10856,11 +10898,12 @@ fn start_screen(
     }
 
     // Fussleiste: Oben die Urheberzeile mit Projektseite und FFmpeg-Hinweis
-    // (nur unter Windows), darunter Version, Tastenhinweise und die Sprache
-    // (Klick oeffnet die Wahl). Passt die Urheberzeile nicht in eine Zeile,
-    // steht der FFmpeg-Hinweis in einer eigenen Zeile darunter, und die
-    // Trennlinie rueckt nach oben.
-    let fy2 = c.h as i32 - 22;
+    // (nur unter Windows), darunter Version, Tastenhinweise, das Herz und
+    // die Sprache (Klick oeffnet die Wahl). Passt die Urheberzeile nicht in
+    // eine Zeile, steht der FFmpeg-Hinweis in einer eigenen Zeile darunter,
+    // und die Trennlinie rueckt nach oben.
+    let fuss = start_fuss(u, lang, c.w as i32, c.h as i32);
+    let fy2 = fuss.y;
     {
         let cw = u.text.width(COPYRIGHT, 11, 2);
         let ww_ = u.text.width(WEBSITE, 11, 2);
@@ -10880,7 +10923,8 @@ fn start_screen(
             umbruch(u, hinweis, c.w as i32 - 40, 11)
         };
         let n = hinweis_zeilen.len() as i32;
-        let wy = if einzeilig { fy2 - 16 } else { fy2 - 31 - (n - 1) * 14 };
+        // Die unterste dieser Zeilen steht auf fuss.darueber.
+        let wy = if einzeilig { fuss.darueber } else { fuss.darueber - 15 - (n - 1) * 14 };
         c.hline(0, wy - 22, c.w as i32, ui::CYAN, 30);
         if einzeilig && !hinweis.is_empty() {
             u.text.draw(c, x0 + cw + luecke + ww_ + luecke, wy, hinweis, 11, ui::DIM, 2);
@@ -10900,18 +10944,13 @@ fn start_screen(
         }
     }
     u.text.draw(c, 20, fy2, "v0.1", 11, ui::DIM, 2);
-    let hints = format!(
-        "F9 {}   F10 {}   F11 {}   F12 {}",
-        lang.get(ShowOverlay), lang.get(Settings), lang.get(Fullscreen), lang.get(PixelExact)
-    );
-    let lw = u.text.width(lang.name, 12, 2);
-    let lr = ui::Rect { x: c.w as i32 - lw - 34, y: fy2 - 16, w: lw + 22, h: 22 };
-    // Die Tastenhinweise nur, wenn sie zwischen Version und Sprache passen -
-    // in schmalen Fenstern lagen sie sonst ueber dem Sprachknopf.
-    let hw = u.text.width(&hints, 11, 1);
-    if cx - hw / 2 > 20 + u.text.width("v0.1", 11, 2) + 12 && cx + hw / 2 < lr.x - 4 {
-        u.text.draw_centered(c, cx, fy2, &hints, 11, ui::DIM, 1);
+    // Die Tastenhinweise nur, wenn sie zwischen Version und Herz passen -
+    // in schmalen Fenstern lagen sie sonst ueber Herz und Sprachknopf.
+    if let Some(x) = fuss.tasten_x {
+        u.text.draw(c, x, fy2, &fuss.tasten, 11, ui::DIM, 1);
     }
+    u.herz_mi(c, fuss.herz);
+    let lr = fuss.sprache;
     let hot = lr.hit(u.mouse.0, u.mouse.1);
     u.text.draw(c, lr.x + 10, fy2, lang.name, 12, if hot { ui::CYAN } else { ui::DIM }, 2);
     if hot {
@@ -13771,6 +13810,39 @@ fn hud_kopf(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> H
     HudKopf { reiter, namen, trennen, logo: false }
 }
 
+/// Die Fusszeile des ESC-Menues unter der Linie `linie_y`: links "ESC ·
+/// Zurueck" (`esc`, der Text auf der Grundlinie `y` ab esc.x), rechts das
+/// Herz mit "Mi", buendig mit dem rechten Rand der Linie und von Trennen.
+/// Dieselbe Rechnung wie in `hud` (Tafel, Rand, Massstab).
+struct HudFuss {
+    y: i32,
+    linie_y: i32,
+    esc_text: String,
+    esc: ui::Rect,
+    herz: ui::Rect,
+}
+
+fn hud_fuss(u: &mut ui::Ui, lang: &'static strings::Lang, ww: i32, wh: i32) -> HudFuss {
+    let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
+    let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
+    let sz = |v: u32| -> u32 { (v as f32 * s).round() as u32 };
+    let breite = (ww - p(80)).min(p(1100));
+    let hoehe = (wh - p(80)).min(p(570));
+    let x0 = (ww - breite) / 2;
+    let y0 = (wh - hoehe) / 2;
+    let ix = x0 + p(20);
+    let rechts = x0 + breite - p(20);
+    let y = y0 + hoehe - p(22);
+    let esc_text = format!("ESC · {}", lang.get(strings::Key::Back));
+    let (oben, unten) = u.text.senkrecht(&esc_text, sz(11));
+    let esc = ui::Rect { x: ix, y: y - oben, w: u.text.width(&esc_text, sz(11), p(3)), h: oben + unten };
+    // Das Herz so tief wie im Startbildschirm: halb ueber, halb unter der
+    // Grundlinie - zwischen Linie und Unterkante der Tafel ist Platz genug.
+    let (hh, hb) = (p(HERZ_HOEHE), ui::herz_breite(p(HERZ_HOEHE)));
+    let herz = ui::Rect { x: rechts - hb, y: y - hh / 2, w: hb, h: hh };
+    HudFuss { y, linie_y: y - p(24), esc_text, esc, herz }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hud(
     u: &mut ui::Ui,
@@ -14570,8 +14642,10 @@ fn hud(
         }
     }
 
-    c.hline(ix, fy - p(24), iw, ui::DIM, 60);
-    u.text.draw(c, ix, fy, &format!("ESC · {}", lang.get(Back)), sz(11), ui::DIM, p(3));
+    let fuss = hud_fuss(u, lang, ww, wh);
+    c.hline(ix, fuss.linie_y, iw, ui::DIM, 60);
+    u.text.draw(c, fuss.esc.x, fuss.y, &fuss.esc_text, sz(11), ui::DIM, p(3));
+    u.herz_mi(c, fuss.herz);
     if let Some(t) = tip_text {
         tooltip(u, c, &t, maus, ww, wh, sz(11), p(1));
     } else if let Some(k) = tip {
@@ -16521,6 +16595,92 @@ mod tests {
         let mut c = ui::Canvas::neu(&mut buf, w, h);
         let a = start_screen(&mut u, &mut c, &strings::EN, &[], 0, "", None, None, false, None, strings::Key::Quit);
         assert!(matches!(a, Action::Schliessen), "ohne die eine App");
+    }
+
+    /// Ob sich zwei Rechtecke ueberschneiden (Beruehren zaehlt nicht).
+    fn schneiden(a: ui::Rect, b: ui::Rect) -> bool {
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    }
+
+    /// Das Herz mit "Mi" unten rechts im Startbildschirm: ganz im Fenster,
+    /// links neben der Sprache, ohne sie, die Tastenhinweise (wo sie stehen)
+    /// oder die Zeilen darueber zu beruehren - Urheber, Projektseite und der
+    /// FFmpeg-Hinweis koennen bis an den rechten Rand reichen, das Herz
+    /// bleibt unter ihnen. In allen Sprachen und den ueblichen Groessen;
+    /// der Sprachknopf steht, wo er stand. Gezeichnet ist es in Magenta, ein
+    /// Klick darauf tut nichts.
+    #[test]
+    fn startbildschirm_herz_frei() {
+        let mut u = ui::Ui::new();
+        let unter = [COPYRIGHT, WEBSITE, FFMPEG_HINWEIS.unwrap_or("")].iter().map(|t| u.text.senkrecht(t, 11).1).max().unwrap_or(0);
+        for (w, h) in START_GROESSEN {
+            for lang in strings::all() {
+                let f = start_fuss(&mut u, lang, w, h);
+                let (herz, ort) = (f.herz, format!("{} {w}x{h}", lang.code));
+                assert_eq!((herz.h, herz.w), (HERZ_HOEHE, ui::herz_breite(HERZ_HOEHE)), "{ort}");
+                assert!(herz.x > w / 2 && herz.y > h - 60 && herz.x + herz.w < w && herz.y + herz.h < h, "{ort}: Herz nicht unten rechts");
+                assert_eq!(f.sprache, ui::Rect { x: w - u.text.width(lang.name, 12, 2) - 34, y: h - 38, w: u.text.width(lang.name, 12, 2) + 22, h: 22 }, "{ort}");
+                assert!(!schneiden(herz, f.sprache) && herz.x + herz.w <= f.sprache.x, "{ort}: Herz im Sprachknopf");
+                assert!(herz.y >= f.darueber + unter, "{ort}: Herz in der Zeile darueber");
+                // Die Tastenhinweise fehlen nirgends, wo sie ohne das Herz
+                // standen (ab 900 Punkten Breite).
+                let x = f.tasten_x.unwrap_or_else(|| panic!("{ort}: Tastenhinweise fehlen"));
+                let (tw, (oben, unten)) = (u.text.width(&f.tasten, 11, 1), u.text.senkrecht(&f.tasten, 11));
+                let tasten = ui::Rect { x, y: f.y - oben, w: tw, h: oben + unten };
+                assert!(!schneiden(herz, tasten) && x + tw <= herz.x - 12, "{ort}: Herz in den Tastenhinweisen");
+                assert!(x > 20 + u.text.width("v0.1", 11, 2) + 12 && x <= w / 2 - tw / 2, "{ort}: Tastenhinweise in der Version");
+            }
+        }
+        let (w, h) = (1280usize, 720usize);
+        let mut buf = vec![0u32; w * h];
+        let herz = start_fuss(&mut u, &strings::DE, w as i32, h as i32).herz;
+        u.mouse = (herz.x + herz.w / 2, herz.y + herz.h / 2);
+        u.click = true;
+        let mut c = ui::Canvas::neu(&mut buf, w, h);
+        let a = start_screen(&mut u, &mut c, &strings::DE, &[], 0, "", None, None, false, None, strings::Key::Quit);
+        assert!(matches!(a, Action::None), "Klick auf das Herz");
+        // Unter den Buchstaben, ueber der Spitze: ganz gedeckt.
+        let (x, y) = (herz.x + herz.w / 2, herz.y + herz.h * 4 / 5);
+        assert_eq!(buf[y as usize * w + x as usize], ui::MAGENTA);
+    }
+
+    /// Das Herz mit "Mi" im ESC-Menue: in der Fusszeile unter der Linie und
+    /// ueber der Unterkante der Tafel, rechts buendig mit Linie und Trennen,
+    /// ohne "ESC · Zurueck" zu beruehren - in allen Sprachen, bei Massstab
+    /// 1, 1,5 und 2 und in kleinen Fenstern. Ein Klick darauf tut nichts.
+    #[test]
+    fn hud_herz_frei() {
+        let mut u = ui::Ui::new();
+        for (ww, wh) in [(900, 700), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160), (800, 600), (640, 480)] {
+            let s: f32 = if wh >= 1800 { 2.0 } else if wh >= 1000 { 1.5 } else { 1.0 };
+            let p = |v: i32| -> i32 { (v as f32 * s).round() as i32 };
+            let hoehe = (wh - p(80)).min(p(570));
+            let unten = (wh - hoehe) / 2 + hoehe;
+            for lang in strings::all() {
+                let f = hud_fuss(&mut u, lang, ww, wh);
+                let k = hud_kopf(&mut u, lang, ww, wh);
+                let ort = format!("{} {ww}x{wh}", lang.code);
+                assert_eq!((f.herz.h, f.herz.w), (p(HERZ_HOEHE), ui::herz_breite(p(HERZ_HOEHE))), "{ort}");
+                assert!(!schneiden(f.herz, f.esc) && f.esc.x + f.esc.w < f.herz.x, "{ort}: Herz in ESC · Zurueck");
+                assert!(f.esc.w > 0 && f.esc.h > 0, "{ort}");
+                assert!(f.herz.y > f.linie_y + p(4) && f.herz.y + f.herz.h < unten - p(4), "{ort}: Herz nicht in der Fusszeile");
+                assert_eq!(f.herz.x + f.herz.w, k.trennen.x + k.trennen.w, "{ort}: nicht buendig mit Trennen");
+            }
+        }
+        let (ww, wh) = (1280, 720);
+        let stand = hud_stand_leer(Vec::new());
+        let mut buf = vec![0u32; (ww * wh) as usize];
+        let herz = hud_fuss(&mut u, &strings::EN, ww, wh).herz;
+        for reiter in 0..HUD_REITER as u8 {
+            u.mouse = (herz.x + herz.w / 2, herz.y + herz.h / 2);
+            u.click = true;
+            let mut c = ui::Canvas::neu(&mut buf, ww as usize, wh as usize);
+            let a = hud(&mut u, &mut c, &strings::EN, ww, wh, reiter, None, &[], 0.0, &[], None, None, (None, None),
+                        "192.168.178.194:9001", false, &stand);
+            assert!(matches!(a, HudAktion::Nichts), "Reiter {reiter}: Klick auf das Herz");
+            let (x, y) = (herz.x + herz.w / 2, herz.y + herz.h * 4 / 5);
+            assert_eq!(buf[(y * ww + x) as usize], ui::MAGENTA, "Reiter {reiter}");
+        }
     }
 
     /// Ein HudStand ohne Sitzungsdaten fuer die Tests des ESC-Menues; die
