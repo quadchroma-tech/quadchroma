@@ -1234,7 +1234,12 @@ fn reparieren(task: &str, a: &Aufgabe, installiert: &Path, vermerke: &mut Vec<St
         return Ok(None);
     }
     let ordner = installiert.parent().unwrap_or(installiert);
-    let maengel = abweichungen(&a.xml, ordner, &inst::ist_eigenes_konto);
+    // Das Konto des Ausloesers steht dort als Name; laesst er sich nicht
+    // aufloesen (Domaenenkonto ohne Verbindung), zaehlt auch der eigene
+    // Kontoname - sonst liefe die Reparatur bei jedem Start.
+    let ich = aktueller_benutzer();
+    let eigen = |u: &str| inst::ist_eigenes_konto(u) || (!ich.is_empty() && u.eq_ignore_ascii_case(&ich));
+    let maengel = abweichungen(&a.xml, ordner, &eigen);
     if maengel.is_empty() {
         return Ok(None);
     }
@@ -1313,7 +1318,12 @@ fn beim_start_pruefen(
     if inst::aufgabe_zeigt_auf(&a.befehl, &a.argumente, &installiert) {
         // Erst die Aufgabe selbst (eine aus 0.1.0 startete im Akkubetrieb
         // nie), dann die installierte Kopie.
-        *repariert = reparieren(&task, &a, &installiert, vermerke)?;
+        // Scheitert die Reparatur, laeuft die alte Aufgabe weiter; die
+        // Pruefung der installierten Kopie darf daran nicht haengen.
+        match reparieren(&task, &a, &installiert, vermerke) {
+            Ok(r) => *repariert = r,
+            Err(e) => vermerke.push(format!("Mit Windows starten: {e} - die installierte Kopie wird trotzdem geprueft")),
+        }
         if inst::dieselbe_datei(&exe, &installiert) {
             return Ok(Start::Aktuell);
         }
