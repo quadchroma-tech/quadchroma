@@ -7779,12 +7779,7 @@ impl App {
     /// und der Praesentation dieser Anzeige (hdr::lage).
     fn hdr_lage(&self) -> hdr::HdrLage {
         let info = self.shared.lock().unwrap().info;
-        match info {
-            // Noch keine Strominfo in dieser Sitzung: wird ausgehandelt (nicht
-            // "Host vor 0.2.0" - das sagt erst eine Strominfo ohne Fassung 1).
-            None => hdr::HdrLage::Sdr(Some(hdr::GRUND_KEIN_IN_ANZEIGE)),
-            Some(i) => hdr::lage(i.hdr.as_ref(), self.hdr_praesentiert()),
-        }
+        hdr_lage_aus(info.as_ref(), self.hdr_praesentiert())
     }
 
     /// Der Bildschirm, auf dem das Fenster steht (IN_ANZEIGE): unter Windows
@@ -11857,7 +11852,7 @@ fn shot_groesse(g: &str) -> Option<(usize, usize)> {
 const WERTIG: &[(&str, usize)] = &[
     ("--anzeige", 1), ("--adapter", 1), ("--decoder", 1), ("--codec", 1), ("--bildschirm", 1),
     ("--set", 1), ("--faeden", 1), ("--shot", 3), ("--anzeigetest", 1),
-    ("--benchmark-auswahl", 1), ("--mitschnitt", 1),
+    ("--benchmark-auswahl", 1), ("--mitschnitt", 1), ("--hdr-schirm", 1),
     // Desktop-Verknuepfung: --verknuepfung <adresse> [--name <name>]
     // [--ordner <verzeichnis>] legt nur an und verbindet nie.
     ("--verknuepfung", 1), ("--name", 1), ("--ordner", 1),
@@ -12846,6 +12841,19 @@ fn main() {
         // unten, im Abstand von einer Sekunde), danach endet das Programm.
         // Ob sie ankamen, zeigt die Zeigerposition auf dem Host.
         let eingabeprobe = std::env::args().any(|a| a == "--eingabeprobe");
+        // --hdr-schirm hdr|sdr: ein gedachter Bildschirm fuer die
+        // HDR-Aushandlung (Kreuztests ohne HDR-Hardware). Der Pruefmodus
+        // meldet ihn wie ein Fenster (IN_ANZEIGE: Bildschirm HDR bzw. SDR,
+        // Darstellung ja, Wunsch Automatisch), und die Zeile nennt die
+        // HDR-Lage, die die Oberflaeche zeigen wuerde: ein HDR-Schirm
+        // praesentiert ein PQ-Bild in HDR (Gold), ein SDR-Schirm bildet es ab
+        // ("HDR -> SDR"). Ohne den Schalter meldet er nichts (der Host sendet
+        // dann SDR, Grund 7) und praesentiert nie in HDR.
+        let hdr_schirm: Option<hdr::Schirm> = std::env::args()
+            .position(|a| a == "--hdr-schirm")
+            .and_then(|i| std::env::args().nth(i + 1))
+            .and_then(|v| pruef_schirm(&v));
+        let mut hdr_gemeldet: Option<AnzeigeGemeldet> = None;
         const PROBEN: [(f32, f32); 2] = [(0.5, 0.5), (0.75, 0.75)];
         let mut probe_stand = 0usize;
         let mut probe_zeit: Option<Instant> = None;
@@ -13048,9 +13056,12 @@ fn main() {
             // Dazu die Masse des Stroms: ein Bildschirmwechsel des Hosts wird
             // so in der Zeile sichtbar, auch wenn der Codec bleibt.
             let strom = s.info.map(|i| format!("{}x{}@{}", i.width, i.height, i.fps)).unwrap_or_else(|| "?".into());
+            // Die HDR-Lage wie in der F9-Zeile; praesentiert wird nur mit einem
+            // gedachten HDR-Schirm (--hdr-schirm hdr).
+            let hdr_text = pruef_hdr_text(s.info.as_ref(), hdr_schirm.is_some_and(|x| x.hdr));
             let line = format!(
-                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Strom {} | Decoder {} | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, strom, pfad, lat, hl, fehler
+                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Strom {} | Farbe {} | Decoder {} | {}{} | Fehler {:?}",
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, strom, hdr_text, pfad, lat, hl, fehler
             );
             println!("{line}");
             std::io::stdout().flush().ok();
@@ -13094,6 +13105,13 @@ fn main() {
                     }
                 }
                 println!("Eingabekanal: {} gesendet | Host meldet: {:?}", l.sent, cur);
+            }
+            // Der gedachte Bildschirm an den Host, wie anzeige_takt es fuer
+            // ein Fenster tut: nur an einen Host mit FAEHIG_HDR, die erste
+            // Lage jeder Sitzung, ohne Eingabekanal nachgereicht.
+            if let Some(schirm) = &hdr_schirm {
+                let a = hdr::Anzeige::fuer_client(Some(schirm), true, true);
+                anzeige_melden(&shared, &input, &a, &mut hdr_gemeldet, false, Instant::now());
             }
             let mut s = shared.lock().unwrap();
             protokoll::nur_datei(&line);
@@ -13448,6 +13466,48 @@ fn hdr_zustand(lage: hdr::HdrLage, an: bool, lang: &'static strings::Lang) -> (S
         hdr::HdrLage::Beidseitig => (lang.get(HdrActive).to_string(), ui::GOLD, true),
         hdr::HdrLage::Abgebildet => (format!("HDR → SDR · {}", lang.get(HdrMapped)), ui::TEXT, false),
         hdr::HdrLage::Sdr(g) => (format!("SDR · {}", lang.get(hdr_grund_schluessel(g))), ui::DIM, false),
+    }
+}
+
+/// Die HDR-Lage aus der Strominfo des Hosts und der Praesentation der
+/// Anzeige (hdr::lage) - fuer das Fenster und den Pruefmodus.
+fn hdr_lage_aus(info: Option<&StreamInfo>, praesentiert: bool) -> hdr::HdrLage {
+    match info {
+        // Noch keine Strominfo in dieser Sitzung: wird ausgehandelt (nicht
+        // "Host vor 0.2.0" - das sagt erst eine Strominfo ohne Fassung 1).
+        None => hdr::HdrLage::Sdr(Some(hdr::GRUND_KEIN_IN_ANZEIGE)),
+        Some(i) => hdr::lage(i.hdr.as_ref(), praesentiert),
+    }
+}
+
+/// Der gedachte Bildschirm des Pruefmodus (--hdr-schirm): "hdr" wie ein
+/// HDR-Monitor (SDR-Weiss 203 nit, Spitze 1000 nit), "sdr" wie ein
+/// SDR-Monitor; sonst None - dann meldet der Pruefmodus keine Anzeige.
+fn pruef_schirm(wert: &str) -> Option<hdr::Schirm> {
+    match wert {
+        "hdr" => Some(hdr::Schirm {
+            hdr: true,
+            sdr_weiss_nit: 203.0,
+            spitze_nit: 1000.0,
+            vollbild_spitze_nit: 600.0,
+            kopfraum_potentiell: 1000.0 / 203.0,
+            kopfraum_aktuell: 1000.0 / 203.0,
+        }),
+        "sdr" => Some(hdr::Schirm { kopfraum_potentiell: 1.0, kopfraum_aktuell: 1.0, ..hdr::Schirm::default() }),
+        _ => None,
+    }
+}
+
+/// Die Spalte "Farbe" der Zeile des Pruefmodus: der Text der F9-Farbzeile
+/// (Nerd-Modus, Englisch) und "(gold)", wenn die Oberflaeche golden
+/// leuchten wuerde.
+fn pruef_hdr_text(info: Option<&StreamInfo>, praesentiert: bool) -> String {
+    let lage = hdr_lage_aus(info, praesentiert);
+    let (text, farbe) = hdr_f9(lage, info.and_then(|i| i.hdr).as_ref(), true, &strings::EN);
+    if farbe == ui::GOLD {
+        format!("{text} (gold)")
+    } else {
+        text
     }
 }
 
@@ -19164,5 +19224,30 @@ mod tests {
         f.set_color_transfer_characteristic(color::TransferCharacteristic::BT709);
         f.set_color_space(color::Space::BT470BG);
         assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR);
+    }
+
+    /// Der gedachte Bildschirm des Pruefmodus (--hdr-schirm): was er dem
+    /// Host meldet und welche HDR-Lage die Zeile nennt - golden nur, wenn der
+    /// Host PQ sendet UND der Schirm HDR kann; eine Seite allein "HDR → SDR".
+    #[test]
+    fn pruefmodus_hdr_schirm() {
+        let hdr_schirm = pruef_schirm("hdr").expect("hdr");
+        let sdr_schirm = pruef_schirm("sdr").expect("sdr");
+        assert!(pruef_schirm("gold").is_none());
+        let a = hdr::Anzeige::fuer_client(Some(&hdr_schirm), true, true);
+        assert_eq!((a.flags, a.wunsch, a.sdr_weiss_nit, a.spitze_nit), (hdr::ANZEIGE_SCHIRM_HDR | hdr::ANZEIGE_DARSTELLUNG, hdr::WUNSCH_AUTOMATISCH, 203, 1000));
+        let a = hdr::Anzeige::fuer_client(Some(&sdr_schirm), true, true);
+        assert_eq!((a.flags, a.wunsch), (hdr::ANZEIGE_DARSTELLUNG, hdr::WUNSCH_AUTOMATISCH));
+        // Der Wert gehoert zum Schalter, nie zur Adresse.
+        assert_eq!(adresse_aus_argumenten(&argumente(&["--headless", "--hdr-schirm", "hdr", "h"])), "h:9001");
+
+        let pq = hdr::InfoV1 { farbe: hdr::Farbe::PQ, grund: 0, sdr_weiss_nit: 203, master_max_nit: 1000, master_min_zehntausendstel: 50, max_cll: 0, max_fall: 0 };
+        let strom = |hdr: Option<hdr::InfoV1>| StreamInfo { width: 640, height: 360, fps: 60, codec: 1, chroma444: true, ten_bit: true, hdr };
+        assert_eq!(pruef_hdr_text(Some(&strom(Some(pq))), true), "HDR10 · PQ · 1000 nit (gold)");
+        assert_eq!(pruef_hdr_text(Some(&strom(Some(pq))), false), "HDR → SDR");
+        let sdr = hdr::InfoV1::sdr(hdr::GRUND_HOST_KANN_NICHT);
+        assert_eq!(pruef_hdr_text(Some(&strom(Some(sdr))), true), "SDR · the host cannot send HDR");
+        assert_eq!(pruef_hdr_text(Some(&strom(None)), true), "SDR · the host has no HDR (older version)");
+        assert_eq!(pruef_hdr_text(None, true), "SDR · negotiating …");
     }
 }
