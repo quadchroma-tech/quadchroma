@@ -2940,10 +2940,11 @@ mod tests {
         let stumm = TcpStream::connect(&bild_addr).unwrap();
         let mut a = bild_verbinden(&bild_addr);
         drop(stumm);
-        // Nach der Begruessung kommt MSG_FAEHIGKEITEN: Dateien Fassung 1 und
-        // Bildschirmwahl (3), gleich danach die Bildschirme (12).
+        // Nach der Begruessung kommt MSG_FAEHIGKEITEN: Dateien Fassung 1,
+        // Bildschirmwahl und HDR-Aushandlung (7), gleich danach die
+        // Bildschirme (12).
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(bis_faehigkeiten(&mut a), Ok(vec![3, 0, 0, 0]));
+        assert_eq!(bis_faehigkeiten(&mut a), Ok(vec![7, 0, 0, 0]));
         let (typ, p) = naechste(&mut a).unwrap();
         assert_eq!(typ, MSG_BILDSCHIRME, "nach 11 kommt 12");
         assert_eq!(crate::bildschirm::bildschirme_lesen(&p), Some(begruessungsliste()));
@@ -2982,7 +2983,7 @@ mod tests {
         assert!(!aktuell().unwrap().kann_dateien(), "Faehigkeiten von A gelten fuer B");
         // Auch B bekommt MSG_FAEHIGKEITEN und die Bildschirme.
         b.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(bis_faehigkeiten(&mut b), Ok(vec![3, 0, 0, 0]));
+        assert_eq!(bis_faehigkeiten(&mut b), Ok(vec![7, 0, 0, 0]));
         let (typ, p) = naechste(&mut b).unwrap();
         assert_eq!(typ, MSG_BILDSCHIRME);
         assert_eq!(crate::bildschirm::bildschirme_lesen(&p), Some(begruessungsliste()));
