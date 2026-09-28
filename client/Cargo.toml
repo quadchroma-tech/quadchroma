@@ -102,4 +102,8 @@ windows = { version = "0.62", features = [
     # (WTSQuerySessionInformationW) - a standard account that runs the app
     # with an administrator's credentials gets no autostart (installation.rs)
     "Win32_System_RemoteDesktop",
+    # "Start with Windows": register and read the logon task through the
+    # Task Scheduler COM API (ITaskService, ITaskFolder::RegisterTask with the
+    # complete task XML, see verknuepfung.rs)
+    "Win32_System_TaskScheduler",
 ] }

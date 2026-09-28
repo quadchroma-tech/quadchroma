@@ -12108,13 +12108,13 @@ fn autostart_text(u: &verknuepfung::Umstellung) -> (String, Option<Meldung>) {
 }
 
 /// Beim Start der ersten Instanz (Windows): ist "Mit Windows starten" an,
-/// die Aufgabe dieses Kontos auf die installierte exe richten bzw. die
-/// installierte Kopie erneuern (nie mit einer aelteren); eine fruehere
-/// Aufgabe "QuadChroma" dieses Kontos und alte Verknuepfungen im
-/// Autostart-Ordner ersetzen (verknuepfung::autostart_beim_start). Ohne
-/// Administratorkonto wird nichts umgestellt, aber eine Aufgabe dieses
-/// Kontos, die eine exe ausserhalb eines Administratorordners startet,
-/// abgeschaltet. Liefert die Meldung fuer den Startbildschirm: wohin
+/// die Aufgabe dieses Kontos auf die installierte exe richten bzw. mit ihren
+/// richtigen Einstellungen neu registrieren und die installierte Kopie
+/// erneuern (nie mit einer aelteren); eine fruehere Aufgabe "QuadChroma"
+/// dieses Kontos und alte Verknuepfungen im Autostart-Ordner ersetzen
+/// (verknuepfung::autostart_beim_start). Ohne Administratorkonto wird nichts
+/// umgestellt, aber eine Aufgabe dieses Kontos, die eine exe ausserhalb
+/// eines Administratorordners startet, abgeschaltet. Liefert die Meldung fuer den Startbildschirm: wohin
 /// installiert wurde, oder - wurde eine Aufgabe abgeschaltet -
 /// AutostartFailed.
 #[cfg(windows)]
@@ -12141,6 +12141,10 @@ fn autostart_beim_start() -> Option<Meldung> {
     let b = verknuepfung::autostart_beim_start(None, verknuepfung::Ort::STANDARD);
     for v in &b.vermerke {
         protokoll::zeile(v.clone());
+    }
+    // Eine Aufgabe mit den Standards von schtasks (0.1.0) ist neu registriert.
+    if let Some(r) = &b.repariert {
+        protokoll::zeile(r.zeile());
     }
     let (zeile, meldung) = match b.start {
         Ok(S::Aus) | Ok(S::Aktuell) => (None, None),

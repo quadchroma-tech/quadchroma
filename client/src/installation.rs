@@ -206,8 +206,61 @@ fn xml_text(t: &str) -> String {
     t.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
+/// Das Gegenstueck zu xml_text: & < > " ' als Entitaeten, fuer jeden Wert,
+/// der in das XML einer Aufgabe eingesetzt wird.
+pub fn xml_maskieren(t: &str) -> String {
+    let mut s = String::with_capacity(t.len());
+    for c in t.chars() {
+        match c {
+            '&' => s.push_str("&amp;"),
+            '<' => s.push_str("&lt;"),
+            '>' => s.push_str("&gt;"),
+            '"' => s.push_str("&quot;"),
+            '\'' => s.push_str("&apos;"),
+            c => s.push(c),
+        }
+    }
+    s
+}
+
+/// Der Inhalt des ersten Elements `name` in `xml`, mit oder ohne Attribute
+/// (`<Principal id="Author">`); ein leeres `<name/>` ergibt "". None ohne
+/// ein solches Element. Ein laengerer Name mit demselben Anfang zaehlt nicht
+/// (`<Settings>` ist nicht `<SettingsX>`, und `<IdleSettings>` beginnt gar
+/// nicht mit `<Settings`).
+pub fn xml_element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let auf = format!("<{name}");
+    let mut von = 0;
+    while let Some(i) = xml[von..].find(&auf) {
+        let kopf_ab = von + i + auf.len();
+        let rest = &xml[kopf_ab..];
+        if rest.starts_with(['>', '/']) || rest.starts_with(char::is_whitespace) {
+            let kopf_ende = rest.find('>')?;
+            if rest[..kopf_ende].ends_with('/') {
+                return Some("");
+            }
+            let inhalt = &rest[kopf_ende + 1..];
+            return inhalt.find(&format!("</{name}>")).map(|j| &inhalt[..j]);
+        }
+        von = kopf_ab;
+    }
+    None
+}
+
+/// Der Text des Elements am Ende von `pfad` - je Schritt das erste Element
+/// dieses Namens innerhalb des vorigen -, Entitaeten aufgeloest, ohne
+/// Leerraum am Rand. None, wenn eines davon fehlt.
+pub fn xml_wert(xml: &str, pfad: &[&str]) -> Option<String> {
+    let mut t = xml;
+    for name in pfad {
+        t = xml_element(t, name)?;
+    }
+    Some(xml_text(t.trim()))
+}
+
 /// Befehl und Argumente der ersten Aktion aus dem XML einer geplanten
-/// Aufgabe (schtasks /Query /XML): <Exec><Command>..</Command>
+/// Aufgabe (IRegisteredTask::Xml bzw. schtasks /Query /XML):
+/// <Exec><Command>..</Command>
 /// <Arguments>..</Arguments></Exec>. Ohne <Exec> None; ohne Argumente leer.
 pub fn aufgabe_aus_xml(xml: &str) -> Option<(String, String)> {
     let exec = &xml[xml.find("<Exec>")?..];
@@ -227,7 +280,7 @@ pub fn aufgabe_zeigt_auf(befehl: &str, argumente: &str, exe: &Path) -> bool {
 }
 
 /// Das Konto, als das die Aufgabe laeuft (<Principals><Principal><UserId>),
-/// wie schtasks /Query /XML es zeigt: "RECHNER\name", "DOMAENE\name" oder
+/// wie ihr XML es zeigt: "RECHNER\name", "DOMAENE\name" oder
 /// eine SID ("S-1-5-21-..."). None ohne UserId (etwa eine Gruppe als
 /// Prinzipal) - dann gehoert die Aufgabe keinem einzelnen Konto.
 pub fn aufgabe_konto(xml: &str) -> Option<String> {
@@ -1605,6 +1658,31 @@ mod tests {
         let xml = "<Exec><Command>C:\\A &amp; B\\q.exe</Command></Exec>";
         assert_eq!(aufgabe_aus_xml(xml), Some(("C:\\A & B\\q.exe".into(), String::new())));
         assert_eq!(aufgabe_aus_xml("<Task></Task>"), None);
+    }
+
+    /// Elemente im XML einer Aufgabe: mit Attributen, leer (`<X/>`), nicht
+    /// ein laengerer Name mit demselben Anfang, verschachtelt ueber einen
+    /// Pfad, Entitaeten aufgeloest; maskieren und aufloesen sind
+    /// gegenlaeufig.
+    #[test]
+    fn xml_elemente_und_masken() {
+        let xml = "<Task><IdleSettings><Enabled>x</Enabled></IdleSettings><SettingsX>nein</SettingsX>\
+                   <Settings><Priority> 4 </Priority><Leer/><Hidden /></Settings>\
+                   <Principals><Principal id=\"Author\"><UserId>PC\\a &amp; b</UserId></Principal></Principals></Task>";
+        assert_eq!(xml_element(xml, "Settings"), Some("<Priority> 4 </Priority><Leer/><Hidden />"));
+        assert_eq!(xml_wert(xml, &["Settings", "Priority"]).as_deref(), Some("4"));
+        assert_eq!(xml_wert(xml, &["Settings", "Leer"]).as_deref(), Some(""));
+        assert_eq!(xml_wert(xml, &["Settings", "Hidden"]).as_deref(), Some(""));
+        assert_eq!(xml_wert(xml, &["Settings", "Enabled"]), None, "Enabled steht nur in IdleSettings");
+        assert_eq!(xml_wert(xml, &["Principals", "Principal", "UserId"]).as_deref(), Some("PC\\a & b"));
+        assert_eq!(xml_element(xml, "Principal"), Some("<UserId>PC\\a &amp; b</UserId>"));
+        assert_eq!(xml_element(xml, "Setting"), None);
+        assert_eq!(xml_element("<A>ohne Ende", "A"), None);
+        assert_eq!(xml_element("<A", "A"), None);
+        let t = "C:\\A & B <x> \"q\" 'y' &amp;";
+        assert_eq!(xml_maskieren(t), "C:\\A &amp; B &lt;x&gt; &quot;q&quot; &apos;y&apos; &amp;amp;");
+        assert_eq!(xml_text(&xml_maskieren(t)), t);
+        assert_eq!(xml_maskieren("QuadChroma (S-1-5-18)"), "QuadChroma (S-1-5-18)");
     }
 
     /// Das Konto: gleiche Sitzung und erhoeht (bzw. Administrator mit UAC)

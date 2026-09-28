@@ -246,25 +246,48 @@ fn lnk_speichern(
 // ------------------------------------------------ Mit Windows starten
 //
 // Die eine App startet mit der Anmeldung des Nutzers ueber eine GEPLANTE
-// AUFGABE (Aufgabenplanung, schtasks.exe), nicht mehr ueber eine Verknuepfung
-// im Autostart-Ordner. Grund: mit dem Manifest requireAdministrator ist die
-// exe erhoeht, und eine erhoehte exe startet Windows NICHT still aus dem
+// AUFGABE (Aufgabenplanung), nicht mehr ueber eine Verknuepfung im
+// Autostart-Ordner. Grund: mit dem Manifest requireAdministrator ist die exe
+// erhoeht, und eine erhoehte exe startet Windows NICHT still aus dem
 // Autostart-Ordner (sie wird blockiert oder bis zur naechsten Anmeldung mit
-// Abfrage aufgeschoben). Die geplante Aufgabe laeuft "bei der Anmeldung"
-// (/SC ONLOGON) mit hoechsten Rechten (/RL HIGHEST) im Anmeldetoken des
-// Nutzers - erhoeht, aber OHNE UAC-Abfrage (LogonType InteractiveToken, kein
-// gespeichertes Passwort). Sie laeuft in der interaktiven Sitzung NACH der
-// Anmeldung (Desktop Duplication braucht die Sitzung) - kein Dienst vor der
-// Anmeldung. So bietet es auch AnyDesk bzw. RustDesk an.
+// Abfrage aufgeschoben). Die geplante Aufgabe laeuft bei der Anmeldung DIESES
+// Kontos (LogonTrigger mit seiner SID) mit hoechsten Rechten
+// (HighestAvailable) im Anmeldetoken des Nutzers - erhoeht, aber OHNE
+// UAC-Abfrage (LogonType InteractiveToken, kein gespeichertes Passwort). Sie
+// laeuft in der interaktiven Sitzung NACH der Anmeldung (Desktop Duplication
+// braucht die Sitzung) - kein Dienst vor der Anmeldung. So bietet es auch
+// AnyDesk bzw. RustDesk an.
+//
+// Angelegt wird die Aufgabe ueber die COM-Schnittstelle der Aufgabenplanung
+// (ITaskService -> ITaskFolder::RegisterTask) mit dem VOLLSTAENDIGEN XML
+// (aufgabe_definition), nicht mehr mit schtasks /Create: dessen Standards
+// passen fuer eine App, die dauernd laeuft, nicht - ein Laptop im
+// Akkubetrieb startete sie nie (DisallowStartIfOnBatteries), das Abstecken
+// beendete sie (StopIfGoingOnBatteries), nach 3 Tagen beendete Windows sie
+// (ExecutionTimeLimit PT72H), ihre Prioritaet lag unter normal (7 statt 4,
+// schlechter fuer den Encoder), der Ausloeser galt fuer JEDE Anmeldung, und
+// einen Arbeitsordner gab es nicht. Das XML geht als Text an RegisterTask,
+// nie ueber eine Datei: eine Datei an einem fuer den Nutzer beschreibbaren
+// Ort koennte ausgetauscht werden, bevor der erhoehte Prozess sie liest.
+// Gelesen wird ebenfalls ueber COM (IRegisteredTask::Xml, UTF-16 - die
+// Ausgabe von schtasks stuende in der Codepage der Konsole und verloere
+// Umlaute in Kontonamen).
+//
+// Eine Aufgabe dieses Kontos, die noch mit den alten Standards angelegt ist
+// (bzw. deren Einstellungen sonst abweichen: Akku, Zeitlimit, Prioritaet,
+// Konto des Ausloesers, Arbeitsordner, hoechste Rechte - abweichungen), wird
+// beim Start neu registriert (reparieren; eine Zeile im Protokoll). Eine
+// Aufgabe, deren Prinzipal ein anderes Konto oder SYSTEM ist, bleibt, wie
+// sie ist.
 //
 // Eine Aufgabe je Konto: sie heisst "QuadChroma (<SID des Kontos>)"
 // (task_fuer_konto), so haben zwei Administratorkonten auf einem PC je ihre
 // eigene, und Haken und Menuepunkt zeigen nur die des Kontos, unter dem die
 // App laeuft. Die fruehere Aufgabe "QuadChroma" fuer den ganzen Rechner wird
-// beim Start uebernommen, wenn sie diesem Konto gehoert (Prinzipal aus
-// schtasks /Query /XML): die Aufgabe dieses Kontos entsteht, die alte wird
-// geloescht. Gehoert sie einem anderen Konto, bleibt sie, wie sie ist (ein
-// Vermerk im Protokoll).
+// beim Start uebernommen, wenn sie diesem Konto gehoert (Prinzipal aus ihrem
+// XML): die Aufgabe dieses Kontos entsteht, die alte wird geloescht. Gehoert
+// sie einem anderen Konto, bleibt sie, wie sie ist (ein Vermerk im
+// Protokoll).
 //
 // Aktion ist die INSTALLIERTE exe in %ProgramFiles%\QuadChroma mit
 // --hintergrund, nie die exe dort, wo der Nutzer das ZIP entpackt hat: dort
@@ -290,9 +313,10 @@ fn lnk_speichern(
 // zum Loeschen offen bleibt - kein Verweis, und nichts laesst sich
 // dazwischen unter ihrem Pfad austauschen.
 //
-// schtasks.exe startet aus dem Systemordner, den das System selbst nennt
-// (installation::system_ordner), nie ueber %SystemRoot% oder PATH - beide
-// kann jedes Programm des Kontos ohne Adminrechte setzen.
+// Loeschen (schtasks /Delete) und Abschalten (schtasks /Change /DISABLE)
+// bleiben bei schtasks.exe. Es startet aus dem Systemordner, den das System
+// selbst nennt (installation::system_ordner), nie ueber %SystemRoot% oder
+// PATH - beide kann jedes Programm des Kontos ohne Adminrechte setzen.
 //
 // Scheitert das Umstellen, bleibt keine Aufgabe dieses Kontos still aktiv,
 // die eine exe ausserhalb eines Administratorordners startet (eine fruehere
@@ -304,11 +328,11 @@ fn lnk_speichern(
 // Aufgabe abgeschaltet (unsichere_aufgaben_abschalten).
 //
 // Ob der Punkt einen Haken traegt, sagt allein, ob die Aufgabe dieses Kontos
-// da und eingeschaltet ist (autostart_an -> schtasks /Query /XML).
+// da und eingeschaltet ist (autostart_an -> IRegisteredTask::Xml).
 //
-// Reine Logik (Aufgabennamen und die Befehlszeilen von schtasks) laeuft auf
-// jeder Plattform und in den Tests; die echten schtasks-Aufrufe und die
-// Konten stehen hinter cfg(windows).
+// Reine Logik (Aufgabennamen, das XML der Aufgabe und der Vergleich damit,
+// die Befehlszeilen von schtasks) laeuft auf jeder Plattform und in den
+// Tests; Aufgabenplanung, schtasks und Konten stehen hinter cfg(windows).
 
 /// Vorsatz der Aufgabennamen - und der Name der frueheren Aufgabe fuer den
 /// ganzen Rechner, die beim Start uebernommen wird.
@@ -383,16 +407,162 @@ impl Ort<'_> {
     }
 }
 
-/// Wert fuer schtasks /TR: die exe in Anfuehrungszeichen (der Pfad kann
-/// Leerzeichen enthalten), dann --hintergrund. schtasks legt das als Command
-/// und Arguments getrennt ab.
+/// Autor der Aufgabe (RegistrationInfo).
+pub const AUFGABE_AUTOR: &str = "QuadChroma";
+/// Beschreibung der Aufgabe (RegistrationInfo), wie die Aufgabenplanung sie
+/// zeigt - wie der Aufgabenname ein fester Text, nicht in der Sprache der
+/// Oberflaeche (die Aufgabe entsteht auch ohne Fenster).
+pub const AUFGABE_BESCHREIBUNG: &str =
+    "Starts QuadChroma in the background when this account signs in (\"Start with Windows\" in QuadChroma).";
+/// Prioritaet der Aufgabe: 4 ist normal. Ohne Angabe nimmt die
+/// Aufgabenplanung 7 (unter normal) - schlechter fuer den Encoder als ein
+/// Start von Hand.
+pub const AUFGABE_PRIORITAET: u32 = 4;
+
+/// Das vollstaendige XML der Aufgabe "Mit Windows starten": bei der
+/// Anmeldung des Kontos `konto` (SID oder DOMAENE\name; Ausloeser und
+/// Prinzipal), mit dessen Anmeldetoken und hoechsten Rechten, auch im
+/// Akkubetrieb und ohne beim Abstecken zu enden, ohne Zeitlimit, mit
+/// normaler Prioritaet; Aktion `exe` (in Anfuehrungszeichen wie bisher bei
+/// schtasks /TR) mit --hintergrund, Arbeitsordner `ordner`. Jeder
+/// eingesetzte Wert ist maskiert (xml_maskieren). Die Eintraege, die
+/// abweichungen prueft, stehen alle ausdruecklich da, ebenso die uebrigen
+/// Einstellungen - nichts haengt an Standards der Aufgabenplanung.
+pub fn aufgabe_definition(konto: &str, exe: &Path, ordner: &Path) -> String {
+    use crate::installation::xml_maskieren as m;
+    let konto = m(konto.trim());
+    let befehl = m(&format!("\"{}\"", exe.display()));
+    let ordner = m(&ordner.display().to_string());
+    let (autor, beschreibung, arg) = (m(AUFGABE_AUTOR), m(AUFGABE_BESCHREIBUNG), m(AUTOSTART_ARGUMENT));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>{autor}</Author>
+    <Description>{beschreibung}</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{konto}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{konto}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>{AUFGABE_PRIORITAET}</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{befehl}</Command>
+      <Arguments>{arg}</Arguments>
+      <WorkingDirectory>{ordner}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// Ist die Dauer (ISO 8601, wie in ExecutionTimeLimit) null - "kein
+/// Zeitlimit"? PT0S, P0D und aehnliche; jede andere Angabe (auch eine
+/// unlesbare) ist ein Limit.
+fn ohne_zeitlimit(dauer: &str) -> bool {
+    let d = dauer.trim();
+    d.starts_with('P')
+        && d.chars().any(|c| c.is_ascii_digit())
+        && d.chars().all(|c| c == '0' || c == '.' || "PYMWDTHS".contains(c))
+}
+
+/// Worin das XML einer Aufgabe (wie die Aufgabenplanung es liefert) von der
+/// Definition abweicht, die aufgabe_definition fuer den Installationsordner
+/// `ordner` schreibt - je Abweichung eine Zeile fuers Protokoll; leer: sie
+/// stimmt. Geprueft werden, was fuer eine dauernd laufende App zaehlt: beide
+/// Akku-Bedingungen, das Zeitlimit, die Prioritaet, das Konto des
+/// Anmelde-Ausloesers (`eigenes_konto`: ist das dieses Konto?), der
+/// Arbeitsordner und die hoechsten Rechte. Fehlt ein Eintrag, gilt der
+/// Standard der Aufgabenplanung - so wie sie selbst ihn nicht mitschreibt
+/// (schtasks /Create: kein ExecutionTimeLimit, keine Priority, also PT72H
+/// und 7).
+pub fn abweichungen(xml: &str, ordner: &Path, eigenes_konto: &dyn Fn(&str) -> bool) -> Vec<String> {
+    use crate::installation::{gleicher_pfad, xml_element, xml_wert};
+    let mut v = Vec::new();
+    let einstellung = |name: &str| xml_wert(xml, &["Settings", name]);
+    let schalter = |name: &str, standard: bool| match einstellung(name).as_deref() {
+        Some("true") | Some("1") => true,
+        Some("false") | Some("0") => false,
+        _ => standard,
+    };
+    if schalter("DisallowStartIfOnBatteries", true) {
+        v.push("startet nicht im Akkubetrieb (DisallowStartIfOnBatteries)".to_string());
+    }
+    if schalter("StopIfGoingOnBatteries", true) {
+        v.push("endet beim Wechsel auf Akku (StopIfGoingOnBatteries)".to_string());
+    }
+    let limit = einstellung("ExecutionTimeLimit").unwrap_or_else(|| "PT72H".into());
+    if !ohne_zeitlimit(&limit) {
+        v.push(format!("Zeitlimit {limit} statt keinem (ExecutionTimeLimit)"));
+    }
+    let prioritaet = einstellung("Priority").unwrap_or_else(|| "7".into());
+    if prioritaet.parse::<u32>().ok() != Some(AUFGABE_PRIORITAET) {
+        v.push(format!("Prioritaet {prioritaet} statt {AUFGABE_PRIORITAET} (Priority)"));
+    }
+    match xml_element(xml, "Triggers").and_then(|t| xml_element(t, "LogonTrigger")) {
+        None => v.push("kein Anmelde-Ausloeser (LogonTrigger)".to_string()),
+        Some(t) => match xml_wert(t, &["UserId"]).filter(|u| !u.is_empty()) {
+            None => v.push("der Anmelde-Ausloeser gilt fuer jede Anmeldung (ohne UserId)".to_string()),
+            Some(u) if !eigenes_konto(&u) => v.push(format!("der Anmelde-Ausloeser gilt fuer {u}, nicht fuer dieses Konto")),
+            Some(_) => {}
+        },
+    }
+    let soll = ordner.display().to_string();
+    match xml_wert(xml, &["Actions", "Exec", "WorkingDirectory"]).filter(|w| !w.is_empty()) {
+        None => v.push(format!("ohne Arbeitsordner (soll {soll})")),
+        Some(w) if !gleicher_pfad(&w, &soll) => v.push(format!("Arbeitsordner {w} statt {soll}")),
+        Some(_) => {}
+    }
+    let stufe = xml_wert(xml, &["Principals", "Principal", "RunLevel"]).unwrap_or_else(|| "LeastPrivilege".into());
+    if stufe != "HighestAvailable" {
+        v.push(format!("ohne hoechste Rechte (RunLevel {stufe})"));
+    }
+    v
+}
+
+/// Wert fuer schtasks /TR, wie QuadChroma 0.1.0 die Aufgabe anlegte: die exe
+/// in Anfuehrungszeichen (der Pfad kann Leerzeichen enthalten), dann
+/// --hintergrund. Nur noch fuer Tests, die eine Aufgabe auf die alte Weise
+/// (mit den Standards von schtasks) anlegen.
+#[cfg(test)]
 fn tr_wert(exe: &Path) -> String {
     format!("\"{}\" {AUTOSTART_ARGUMENT}", exe.display())
 }
 
-/// Argumente fuer schtasks /Create: bei der Anmeldung (ONLOGON), hoechste
-/// Rechte (HIGHEST), als der aktuelle Nutzer (`benutzer`), Aktion `tr`,
-/// vorhandene ueberschreiben (/F).
+/// Argumente fuer schtasks /Create, wie QuadChroma 0.1.0 die Aufgabe
+/// anlegte: bei der Anmeldung (ONLOGON), hoechste Rechte (HIGHEST), als
+/// `benutzer`, Aktion `tr`, vorhandene ueberschreiben (/F) - alles andere
+/// nach den Standards von schtasks. Nur noch fuer Tests (siehe tr_wert).
+#[cfg(test)]
 fn erstellen_args(task: &str, benutzer: &str, tr: &str) -> Vec<String> {
     vec![
         "/Create".into(),
@@ -410,8 +580,10 @@ fn erstellen_args(task: &str, benutzer: &str, tr: &str) -> Vec<String> {
     ]
 }
 
-/// Argumente fuer schtasks /Query der Aufgabe als XML (Befehl und Argumente
-/// ihrer Aktion, Prinzipal, eingeschaltet oder nicht).
+/// Argumente fuer schtasks /Query der Aufgabe als XML. Gelesen wird ueber
+/// COM (registriertes_xml); nur noch fuer Tests (schtasks aus dem
+/// Systemordner, dasselbe XML wie ueber COM).
+#[cfg(test)]
 fn xml_args(task: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), task.into(), "/XML".into()]
 }
@@ -460,12 +632,12 @@ fn schtasks(args: &[String]) -> Result<(bool, String), String> {
     Ok((ausgabe.status.success(), text.trim().to_string()))
 }
 
-/// SAM-Name des aktuellen Nutzers (RECHNER\user bzw. DOMAENE\user) fuer /RU
-/// und die Pruefung des Kontos (installation::konto). %USERDOMAIN% taugt
-/// nicht: bei einem lokalen Konto steht dort die Arbeitsgruppe (etwa
-/// WORKGROUP), nicht der Rechnername. GetUserNameEx liefert den richtigen
-/// Namen; klappt es nicht, der blosse %USERNAME% (schtasks loest ihn als
-/// lokales Konto auf).
+/// SAM-Name des aktuellen Nutzers (RECHNER\user bzw. DOMAENE\user) fuer die
+/// Pruefung des Kontos (installation::konto; die Aufgabe selbst nennt das
+/// Konto ueber seine SID). %USERDOMAIN% taugt nicht: bei einem lokalen Konto
+/// steht dort die Arbeitsgruppe (etwa WORKGROUP), nicht der Rechnername.
+/// GetUserNameEx liefert den richtigen Namen; klappt es nicht, der blosse
+/// %USERNAME%.
 #[cfg(windows)]
 pub fn aktueller_benutzer() -> String {
     use windows::core::PWSTR;
@@ -630,7 +802,7 @@ fn ueber_griff_loeschen(griff: std::fs::File, pfad: &Path) -> Result<(), String>
     r.map_err(|e| format!("{}: nicht geloescht ({})", pfad.display(), e.message()))
 }
 
-/// Eine geplante Aufgabe, wie schtasks /Query /XML sie zeigt.
+/// Eine geplante Aufgabe, wie die Aufgabenplanung sie als XML liefert.
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Aufgabe {
@@ -641,6 +813,8 @@ pub struct Aufgabe {
     pub konto: Option<String>,
     /// Eingeschaltet (nicht mit /DISABLE abgeschaltet).
     pub aktiv: bool,
+    /// Ihr ganzes XML (fuer den Vergleich mit der Definition, abweichungen).
+    pub xml: String,
 }
 
 #[cfg(windows)]
@@ -651,17 +825,65 @@ impl Aufgabe {
     }
 }
 
-/// Die Aufgabe `task` lesen (schtasks /Query /XML); None, wenn es sie nicht
-/// gibt.
+/// Die Aufgabenplanung dieses Rechners (ITaskService, verbunden) und darin
+/// der Stammordner "\", in dem die Aufgaben liegen. Nur innerhalb von im_sta
+/// aufrufen; die Objekte muessen vor dessen Ende freigegeben sein.
+#[cfg(windows)]
+fn stammordner() -> Result<windows::Win32::System::TaskScheduler::ITaskFolder, String> {
+    use windows::core::BSTR;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::System::TaskScheduler::{ITaskService, TaskScheduler};
+    use windows::Win32::System::Variant::VARIANT;
+    let fehler = |was: &str, e: windows::core::Error| format!("Aufgabenplanung ({was}): {} (0x{:08x})", e.message(), e.code().0 as u32);
+    unsafe {
+        let dienst: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).map_err(|e| fehler("ITaskService", e))?;
+        // Leere Werte: dieser Rechner, das Konto dieses Prozesses.
+        let leer = VARIANT::default();
+        dienst.Connect(&leer, &leer, &leer, &leer).map_err(|e| fehler("Connect", e))?;
+        dienst.GetFolder(&BSTR::from("\\")).map_err(|e| fehler("GetFolder", e))
+    }
+}
+
+/// Die Aufgabe `task` mit dem vollstaendigen XML `xml` registrieren
+/// (TASK_CREATE_OR_UPDATE: eine vorhandene gleichen Namens wird ersetzt,
+/// auch eine abgeschaltete - sie ist danach so, wie das XML sagt), im
+/// Anmeldetoken des Prinzipals aus dem XML (TASK_LOGON_INTERACTIVE_TOKEN,
+/// kein Passwort). Das XML geht als Text hinein, nie ueber eine Datei.
+#[cfg(windows)]
+fn aufgabe_registrieren(task: &str, xml: &str) -> Result<(), String> {
+    use windows::core::BSTR;
+    use windows::Win32::System::TaskScheduler::{TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN};
+    use windows::Win32::System::Variant::VARIANT;
+    im_sta(|| {
+        let ordner = stammordner()?;
+        let leer = VARIANT::default();
+        unsafe { ordner.RegisterTask(&BSTR::from(task), &BSTR::from(xml), TASK_CREATE_OR_UPDATE.0, &leer, &leer, TASK_LOGON_INTERACTIVE_TOKEN, &leer) }
+            .map(|_| ())
+            .map_err(|e| format!("Aufgabenplanung (RegisterTask \"{task}\"): {} (0x{:08x})", e.message(), e.code().0 as u32))
+    })
+}
+
+/// Das XML der registrierten Aufgabe `task` (IRegisteredTask::Xml, als
+/// UTF-16 - auch Umlaute in Kontonamen kommen richtig an); None, wenn es
+/// sie nicht gibt oder sie nicht lesbar ist.
+#[cfg(windows)]
+fn registriertes_xml(task: &str) -> Option<String> {
+    use windows::core::BSTR;
+    im_sta(|| {
+        let ordner = stammordner().ok()?;
+        let t = unsafe { ordner.GetTask(&BSTR::from(task)) }.ok()?;
+        unsafe { t.Xml() }.ok().map(|x| x.to_string())
+    })
+}
+
+/// Die Aufgabe `task` lesen (ihr XML ueber die Aufgabenplanung); None, wenn
+/// es sie nicht gibt.
 #[cfg(windows)]
 pub fn aufgabe(task: &str) -> Option<Aufgabe> {
     use crate::installation as inst;
-    let (ok, xml) = schtasks(&xml_args(task)).ok()?;
-    if !ok {
-        return None;
-    }
+    let xml = registriertes_xml(task)?;
     let (befehl, argumente) = inst::aufgabe_aus_xml(&xml).unwrap_or_default();
-    Some(Aufgabe { befehl, argumente, konto: inst::aufgabe_konto(&xml), aktiv: inst::aufgabe_aktiv(&xml) })
+    Some(Aufgabe { befehl, argumente, konto: inst::aufgabe_konto(&xml), aktiv: inst::aufgabe_aktiv(&xml), xml })
 }
 
 /// Startet QuadChroma mit Windows - liegt die Aufgabe dieses Kontos vor und
@@ -778,24 +1000,19 @@ fn mit_abgeschalteten(fehler: String, ab: &[Abgeschaltet]) -> String {
     ab.iter().fold(fehler, |t, a| format!("{t}; {}", a.zeile()))
 }
 
-/// Die geplante Aufgabe anlegen (bzw. mit /F erneuern): `exe` mit
-/// --hintergrund, bei der Anmeldung, hoechste Rechte, als der aktuelle
-/// Nutzer. `exe` muss auf einem lokalen festen Laufwerk liegen, und nur
-/// Administratoren duerfen sie und ihren Ordner aendern - sonst verweigert
-/// (nie ein Netzwerkpfad, nie ein Ordner des Nutzers).
+/// Die geplante Aufgabe anlegen (bzw. ersetzen) mit dem XML aus
+/// aufgabe_definition: `exe` mit --hintergrund und ihrem Ordner als
+/// Arbeitsordner, bei der Anmeldung dieses Kontos (seine SID), hoechste
+/// Rechte, auch im Akkubetrieb, ohne Zeitlimit, normale Prioritaet. `exe`
+/// muss auf einem lokalen festen Laufwerk liegen, und nur Administratoren
+/// duerfen sie und ihren Ordner aendern - sonst verweigert (nie ein
+/// Netzwerkpfad, nie ein Ordner des Nutzers).
 #[cfg(windows)]
 fn task_anlegen(task: &str, exe: &Path) -> Result<(), String> {
     crate::installation::ziel_pruefen(exe)?;
-    let benutzer = aktueller_benutzer();
-    if benutzer.is_empty() {
-        return Err("kein aktueller Nutzer fuer /RU".into());
-    }
-    let (ok, ausgabe) = schtasks(&erstellen_args(task, &benutzer, &tr_wert(exe)))?;
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("schtasks /Create: {ausgabe}"))
-    }
+    let konto = crate::installation::eigene_sid()?;
+    let ordner = exe.parent().ok_or_else(|| format!("{}: kein Ordner", exe.display()))?;
+    aufgabe_registrieren(task, &aufgabe_definition(konto, exe, ordner))
 }
 
 /// Was "Mit Windows starten" beim Umschalten tat.
@@ -908,14 +1125,40 @@ pub enum Start {
     AndereExe(String),
 }
 
+/// Die Aufgabe dieses Kontos wich von ihrer Definition ab und ist neu
+/// registriert (reparieren).
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reparatur {
+    pub task: String,
+    /// Was abwich (abweichungen), je eine Angabe.
+    pub maengel: Vec<String>,
+}
+
+#[cfg(windows)]
+impl Reparatur {
+    /// Die Zeile fuers Protokoll.
+    pub fn zeile(&self) -> String {
+        format!(
+            "Mit Windows starten: die Aufgabe \"{}\" ist neu registriert (auch im Akkubetrieb, ohne Zeitlimit, Prioritaet {AUFGABE_PRIORITAET}, nur bei der Anmeldung dieses Kontos) - vorher: {}",
+            self.task,
+            self.maengel.join("; ")
+        )
+    }
+}
+
 /// Ergebnis von `autostart_beim_start`.
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeimStart {
     /// Was mit der Aufgabe dieses Kontos geschah (Err: gescheitert).
     pub start: Result<Start, String>,
+    /// Some: die Aufgabe dieses Kontos startete schon die installierte exe,
+    /// wich aber von ihrer Definition ab (etwa mit den Standards von
+    /// schtasks aus 0.1.0 angelegt) und ist neu registriert.
+    pub repariert: Option<Reparatur>,
     /// Weitere Zeilen fuers Protokoll (eine fruehere Aufgabe eines anderen
-    /// Kontos).
+    /// Kontos, eine Aufgabe dieses Namens mit fremdem Prinzipal).
     pub vermerke: Vec<String>,
     /// Aufgaben, die nach einem Fehlschlag abgeschaltet wurden - dann gehoert
     /// der Hinweis AutostartFailed in den Startbildschirm.
@@ -937,7 +1180,10 @@ pub struct BeimStart {
 ///   --hintergrund (fruehere Fassung: der entpackte Ordner), wird
 ///   installiert und umgestellt;
 /// - zeigt sie dorthin, ist diese exe aber eine andere (SHA-256 von exe und
-///   DLLs), wird die installierte Kopie erneuert - ausser sie ist neuer.
+///   DLLs), wird die installierte Kopie erneuert - ausser sie ist neuer;
+/// - zeigt sie dorthin, weicht aber von ihrer Definition ab (abweichungen:
+///   noch mit den Standards von schtasks angelegt), wird sie neu
+///   registriert (`repariert`) - nur wenn ihr Prinzipal dieses Konto ist.
 ///
 /// Scheitert etwas, werden die Aufgaben dieses Kontos abgeschaltet, die
 /// eine exe ausserhalb eines Administratorordners starten, und eine
@@ -958,7 +1204,8 @@ pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> BeimStart {
         ));
     }
     let eigene_alte = alte.filter(|(_, _, eigen)| *eigen).map(|(_, a, _)| a);
-    let start = beim_start_pruefen(lnk_ordner, ort, eigene_alte.as_ref(), &mut vermerke);
+    let mut repariert = None;
+    let start = beim_start_pruefen(lnk_ordner, ort, eigene_alte.as_ref(), &mut repariert, &mut vermerke);
     let mut abgeschaltet = Vec::new();
     if start.is_err() {
         abgeschaltet = unsichere_aufgaben_abschalten(ort);
@@ -968,16 +1215,47 @@ pub fn autostart_beim_start(lnk_ordner: Option<&Path>, ort: Ort) -> BeimStart {
             }
         }
     }
-    BeimStart { start, vermerke, abgeschaltet }
+    BeimStart { start, repariert, vermerke, abgeschaltet }
+}
+
+/// Die Aufgabe `task` dieses Kontos, die schon die installierte exe
+/// `installiert` startet, mit ihrer Definition vergleichen (abweichungen)
+/// und bei einer Abweichung mit dem richtigen XML neu registrieren. Nur,
+/// wenn ihr Prinzipal dieses Konto ist: eine Aufgabe eines anderen Kontos
+/// (oder SYSTEM) bleibt, wie sie ist - ein Vermerk.
+#[cfg(windows)]
+fn reparieren(task: &str, a: &Aufgabe, installiert: &Path, vermerke: &mut Vec<String>) -> Result<Option<Reparatur>, String> {
+    use crate::installation as inst;
+    if !a.konto.as_deref().is_some_and(inst::ist_eigenes_konto) {
+        vermerke.push(format!(
+            "Mit Windows starten: die Aufgabe \"{task}\" laeuft als {}, nicht als dieses Konto - ihre Einstellungen bleiben, wie sie sind",
+            a.konto.as_deref().unwrap_or("keinem einzelnen Konto")
+        ));
+        return Ok(None);
+    }
+    let ordner = installiert.parent().unwrap_or(installiert);
+    let maengel = abweichungen(&a.xml, ordner, &inst::ist_eigenes_konto);
+    if maengel.is_empty() {
+        return Ok(None);
+    }
+    task_anlegen(task, installiert)
+        .map_err(|e| format!("die Aufgabe \"{task}\" weicht ab ({}), neu registrieren scheiterte: {e}", maengel.join("; ")))?;
+    Ok(Some(Reparatur { task: task.to_string(), maengel }))
 }
 
 /// Der Kern von `autostart_beim_start` (ohne Abschalten nach Fehlern).
 /// `eigene_alte`: die fruehere Aufgabe "QuadChroma", wenn sie diesem Konto
 /// gehoert. Eine alte Verknuepfung, die nicht sicher ueber einen Griff
 /// gelesen werden kann (alte_lnk_oeffnen), bleibt - ein Eintrag in
-/// `vermerke`.
+/// `vermerke`. Eine reparierte Aufgabe (reparieren) steht in `repariert`.
 #[cfg(windows)]
-fn beim_start_pruefen(lnk_ordner: Option<&Path>, ort: Ort, eigene_alte: Option<&Aufgabe>, vermerke: &mut Vec<String>) -> Result<Start, String> {
+fn beim_start_pruefen(
+    lnk_ordner: Option<&Path>,
+    ort: Ort,
+    eigene_alte: Option<&Aufgabe>,
+    repariert: &mut Option<Reparatur>,
+    vermerke: &mut Vec<String>,
+) -> Result<Start, String> {
     use crate::installation as inst;
     let exe = std::env::current_exe().map_err(|e| format!("Programmpfad: {e}"))?;
     let ordner = autostart_lnk_ordner(lnk_ordner)?;
@@ -1033,6 +1311,9 @@ fn beim_start_pruefen(lnk_ordner: Option<&Path>, ort: Ort, eigene_alte: Option<&
     let ordner = ort.ordner()?;
     let installiert = ordner.join(inst::EXE);
     if inst::aufgabe_zeigt_auf(&a.befehl, &a.argumente, &installiert) {
+        // Erst die Aufgabe selbst (eine aus 0.1.0 startete im Akkubetrieb
+        // nie), dann die installierte Kopie.
+        *repariert = reparieren(&task, &a, &installiert, vermerke)?;
         if inst::dieselbe_datei(&exe, &installiert) {
             return Ok(Start::Aktuell);
         }
@@ -1246,6 +1527,249 @@ mod tests {
         assert_eq!(abschalten_args("QuadChroma (S-1-5-18)"), vec!["/Change", "/TN", "QuadChroma (S-1-5-18)", "/DISABLE"]);
     }
 
+    const SID: &str = "S-1-5-21-1413765741-3029102522-1828496402-1002";
+    const PF: &str = "C:\\Program Files\\QuadChroma";
+    const PF_EXE: &str = "C:\\Program Files\\QuadChroma\\quadchroma.exe";
+
+    /// Das XML der Aufgabe: jede Einstellung steht ausdruecklich da (nichts
+    /// haengt an Standards der Aufgabenplanung), Ausloeser und Prinzipal
+    /// nennen das Konto, die Aktion ist die exe in Anfuehrungszeichen mit
+    /// --hintergrund und ihrem Ordner als Arbeitsordner - und die Parser,
+    /// die die App beim Lesen benutzt, finden alles wieder.
+    #[test]
+    fn aufgabe_definition_vollstaendig() {
+        use crate::installation::{aufgabe_aktiv, aufgabe_aus_xml, aufgabe_konto, aufgabe_zeigt_auf, xml_wert};
+        let xml = aufgabe_definition(SID, Path::new(PF_EXE), Path::new(PF));
+        let w = |pfad: &[&str]| xml_wert(&xml, pfad).unwrap_or_else(|| panic!("{pfad:?} fehlt: {xml}"));
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"));
+        assert_eq!(w(&["RegistrationInfo", "Author"]), "QuadChroma");
+        assert_eq!(w(&["RegistrationInfo", "Description"]), AUFGABE_BESCHREIBUNG);
+        assert_eq!(w(&["Triggers", "LogonTrigger", "UserId"]), SID);
+        assert_eq!(w(&["Triggers", "LogonTrigger", "Enabled"]), "true");
+        assert_eq!(w(&["Principals", "Principal", "UserId"]), SID);
+        assert_eq!(w(&["Principals", "Principal", "LogonType"]), "InteractiveToken");
+        assert_eq!(w(&["Principals", "Principal", "RunLevel"]), "HighestAvailable");
+        for (name, wert) in [
+            ("MultipleInstancesPolicy", "IgnoreNew"),
+            ("DisallowStartIfOnBatteries", "false"),
+            ("StopIfGoingOnBatteries", "false"),
+            ("AllowHardTerminate", "true"),
+            ("StartWhenAvailable", "false"),
+            ("RunOnlyIfNetworkAvailable", "false"),
+            ("AllowStartOnDemand", "true"),
+            ("Enabled", "true"),
+            ("Hidden", "false"),
+            ("RunOnlyIfIdle", "false"),
+            ("WakeToRun", "false"),
+            ("ExecutionTimeLimit", "PT0S"),
+            ("Priority", "4"),
+        ] {
+            assert_eq!(w(&["Settings", name]), wert, "{name}");
+        }
+        assert_eq!(w(&["Settings", "IdleSettings", "StopOnIdleEnd"]), "false");
+        assert_eq!(w(&["Settings", "IdleSettings", "RestartOnIdle"]), "false");
+        assert_eq!(w(&["Actions", "Exec", "Command"]), format!("\"{PF_EXE}\""));
+        assert_eq!(w(&["Actions", "Exec", "Arguments"]), "--hintergrund");
+        assert_eq!(w(&["Actions", "Exec", "WorkingDirectory"]), PF);
+        // Genau ein Ausloeser und eine Aktion.
+        assert_eq!(xml.matches("<LogonTrigger>").count(), 1);
+        assert_eq!(xml.matches("<Exec>").count(), 1);
+        // Die Parser der App lesen dasselbe.
+        let (befehl, argumente) = aufgabe_aus_xml(&xml).unwrap();
+        assert!(aufgabe_zeigt_auf(&befehl, &argumente, Path::new(PF_EXE)), "{befehl} {argumente}");
+        assert_eq!(aufgabe_konto(&xml).as_deref(), Some(SID));
+        assert!(aufgabe_aktiv(&xml));
+        assert_eq!(abweichungen(&xml, Path::new(PF), &|u| u == SID), Vec::<String>::new());
+    }
+
+    /// Jeder eingesetzte Wert ist maskiert: ein Pfad mit & < > " ' und ein
+    /// Kontoname mit & ergeben wohlgeformtes XML, und gelesen kommt genau
+    /// der Wert zurueck.
+    #[test]
+    fn aufgabe_definition_maskiert() {
+        use crate::installation::{aufgabe_aus_xml, aufgabe_konto, xml_wert};
+        let ordner = "C:\\A & B <x> \"q\" 'y'";
+        let exe = format!("{ordner}\\quadchroma.exe");
+        let xml = aufgabe_definition("PC\\a&b", Path::new(&exe), Path::new(ordner));
+        assert!(xml.contains("<WorkingDirectory>C:\\A &amp; B &lt;x&gt; &quot;q&quot; &apos;y&apos;</WorkingDirectory>"), "{xml}");
+        assert!(xml.contains("<Command>&quot;C:\\A &amp; B &lt;x&gt; &quot;q&quot; &apos;y&apos;\\quadchroma.exe&quot;</Command>"), "{xml}");
+        assert!(xml.contains("<UserId>PC\\a&amp;b</UserId>"), "{xml}");
+        assert!(!xml.contains("<x>") && !xml.contains("& B") && !xml.contains("'y'"), "{xml}");
+        // In jedem Elementtext: kein < > " ' und kein & ausserhalb einer Entitaet.
+        let mut rest = xml.as_str();
+        while let Some(i) = rest.find('>') {
+            rest = &rest[i + 1..];
+            let text = &rest[..rest.find('<').unwrap_or(rest.len())];
+            assert!(!text.contains(['>', '"', '\'']), "{text:?}");
+            for (j, _) in text.match_indices('&') {
+                let e = &text[j..];
+                assert!(["&amp;", "&lt;", "&gt;", "&quot;", "&apos;"].iter().any(|x| e.starts_with(x)), "{text:?}");
+            }
+        }
+        assert_eq!(aufgabe_aus_xml(&xml), Some((format!("\"{exe}\""), "--hintergrund".into())));
+        assert_eq!(xml_wert(&xml, &["Actions", "Exec", "WorkingDirectory"]).as_deref(), Some(ordner));
+        assert_eq!(aufgabe_konto(&xml).as_deref(), Some("PC\\a&b"));
+        assert_eq!(xml_wert(&xml, &["Triggers", "LogonTrigger", "UserId"]).as_deref(), Some("PC\\a&b"));
+        // Die Definition selbst stimmt mit sich ueberein, auch mit diesem Pfad.
+        assert!(abweichungen(&xml, Path::new(ordner), &|u| u == "PC\\a&b").is_empty());
+    }
+
+    /// Eine Aufgabe, wie schtasks /Create /SC ONLOGON /RL HIGHEST /RU ...
+    /// sie in 0.1.0 anlegte, so wie die Aufgabenplanung sie liefert
+    /// (IRegisteredTask::Xml bzw. schtasks /Query /XML, Windows 11 24H2):
+    /// ohne ExecutionTimeLimit und Priority (also PT72H und 7), Akku-Sperren
+    /// an, Ausloeser ohne UserId, kein Arbeitsordner.
+    const ALTE_AUFGABE: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2026-09-28T03:03:57</Date>
+    <Author>FORK-WIN\rober</Author>
+    <URI>\QuadChroma (S-1-5-21-1413765741-3029102522-1828496402-1002)</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-1413765741-3029102522-1828496402-1002</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <IdleSettings>
+      <Duration>PT10M</Duration>
+      <WaitTimeout>PT1H</WaitTimeout>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <StartBoundary>2026-09-28T03:03:00</StartBoundary>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"C:\Program Files\QuadChroma\quadchroma.exe"</Command>
+      <Arguments>--hintergrund</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    /// Die Aufgabe aus aufgabe_definition, wie die Aufgabenplanung sie nach
+    /// RegisterTask zurueckgibt (IRegisteredTask::Xml, Windows 11 24H2):
+    /// Eintraege mit dem Standardwert fallen weg, die uebrigen sind
+    /// umgeordnet, und der Ausloeser nennt das Konto beim Namen statt mit
+    /// der SID.
+    const REGISTRIERT: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>QuadChroma</Author>
+    <Description>Starts QuadChroma in the background when this account signs in ("Start with Windows" in QuadChroma).</Description>
+    <URI>\QuadChroma (S-1-5-21-1413765741-3029102522-1828496402-1002)</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-1413765741-3029102522-1828496402-1002</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <Priority>4</Priority>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <UserId>FORK-WIN\rober</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"C:\Program Files\QuadChroma\quadchroma.exe"</Command>
+      <Arguments>--hintergrund</Arguments>
+      <WorkingDirectory>C:\Program Files\QuadChroma</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    /// Braucht die Aufgabe eine Reparatur? Die aus 0.1.0 (Standards von
+    /// schtasks) weicht in genau sechs Punkten ab; die neue Definition in
+    /// keinem - auch nicht so, wie die Aufgabenplanung sie zurueckgibt
+    /// (Eintraege umgeordnet, der Ausloeser mit dem Kontonamen). Jede
+    /// einzelne Abweichung faellt auf, ein fehlender Eintrag zaehlt mit dem
+    /// Standard der Aufgabenplanung.
+    #[test]
+    fn abweichungen_alt_und_neu() {
+        let eigen = |u: &str| u == SID || u.eq_ignore_ascii_case("FORK-WIN\\rober");
+        let pf = Path::new(PF);
+        let alt = abweichungen(ALTE_AUFGABE, pf, &eigen);
+        assert_eq!(
+            alt,
+            vec![
+                "startet nicht im Akkubetrieb (DisallowStartIfOnBatteries)",
+                "endet beim Wechsel auf Akku (StopIfGoingOnBatteries)",
+                "Zeitlimit PT72H statt keinem (ExecutionTimeLimit)",
+                "Prioritaet 7 statt 4 (Priority)",
+                "der Anmelde-Ausloeser gilt fuer jede Anmeldung (ohne UserId)",
+                "ohne Arbeitsordner (soll C:\\Program Files\\QuadChroma)",
+            ]
+        );
+        let neu = aufgabe_definition(SID, Path::new(PF_EXE), pf);
+        assert!(abweichungen(&neu, pf, &eigen).is_empty());
+        assert!(abweichungen(REGISTRIERT, pf, &eigen).is_empty(), "{:?}", abweichungen(REGISTRIERT, pf, &eigen));
+        // Je eine Abweichung.
+        let eine = |von: &str, zu: &str| -> Vec<String> {
+            assert!(neu.contains(von), "{von}");
+            abweichungen(&neu.replace(von, zu), pf, &eigen)
+        };
+        let akku = eine("<DisallowStartIfOnBatteries>false", "<DisallowStartIfOnBatteries>true");
+        assert!(akku.len() == 1 && akku[0].contains("Akkubetrieb"), "{akku:?}");
+        assert_eq!(eine("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>", "").len(), 1);
+        assert_eq!(eine("<ExecutionTimeLimit>PT0S", "<ExecutionTimeLimit>P3D"), vec!["Zeitlimit P3D statt keinem (ExecutionTimeLimit)"]);
+        assert!(eine("<ExecutionTimeLimit>PT0S", "<ExecutionTimeLimit>P0D").is_empty());
+        assert_eq!(eine("<Priority>4</Priority>", "").len(), 1);
+        assert_eq!(eine("<Priority>4", "<Priority>6"), vec!["Prioritaet 6 statt 4 (Priority)"]);
+        let fremd = eine(&format!("<UserId>{SID}</UserId>\n    </LogonTrigger>"), "<UserId>PC\\anderer</UserId>\n    </LogonTrigger>");
+        assert_eq!(fremd, vec!["der Anmelde-Ausloeser gilt fuer PC\\anderer, nicht fuer dieses Konto"]);
+        assert_eq!(
+            eine(&format!("<UserId>{SID}</UserId>\n    </LogonTrigger>"), "</LogonTrigger>"),
+            vec!["der Anmelde-Ausloeser gilt fuer jede Anmeldung (ohne UserId)"]
+        );
+        assert_eq!(
+            abweichungen(&neu.replace("<LogonTrigger>", "<BootTrigger>").replace("</LogonTrigger>", "</BootTrigger>"), pf, &eigen),
+            vec!["kein Anmelde-Ausloeser (LogonTrigger)"]
+        );
+        assert_eq!(
+            eine("<WorkingDirectory>C:\\Program Files\\QuadChroma<", "<WorkingDirectory>C:\\Users\\rob\\Downloads<"),
+            vec!["Arbeitsordner C:\\Users\\rob\\Downloads statt C:\\Program Files\\QuadChroma"]
+        );
+        // Gross/klein und ein "\" am Ende sind derselbe Ordner.
+        assert!(eine("<WorkingDirectory>C:\\Program Files\\QuadChroma<", "<WorkingDirectory>c:\\program files\\quadchroma\\<").is_empty());
+        assert_eq!(eine("<RunLevel>HighestAvailable", "<RunLevel>LeastPrivilege"), vec!["ohne hoechste Rechte (RunLevel LeastPrivilege)"]);
+        assert_eq!(eine("<RunLevel>HighestAvailable</RunLevel>", "").len(), 1);
+        // Eine leere Aufgabe weicht in allem ab.
+        assert_eq!(abweichungen("<Task></Task>", pf, &eigen).len(), 7);
+    }
+
+    #[test]
+    fn zeitlimit() {
+        for d in ["PT0S", "P0D", "PT0M", "P0DT0H0M0S", " PT0S "] {
+            assert!(ohne_zeitlimit(d), "{d}");
+        }
+        for d in ["PT72H", "P3D", "PT1S", "", "P", "PT", "0", "unbegrenzt", "PT0.5S"] {
+            assert!(!ohne_zeitlimit(d), "{d}");
+        }
+    }
+
     /// Ein Ort fuer Tests: eigene Aufgabe, eigener Ordner, keine fruehere
     /// Aufgabe.
     #[cfg(windows)]
@@ -1268,12 +1792,59 @@ mod tests {
         aufgabe(task).map(|a| (a.befehl, a.argumente))
     }
 
-    /// Eine Aufgabe wie frueher anlegen: sie startet `exe` dort, wo sie
-    /// liegt, als `konto` (ohne die Pruefungen von task_anlegen).
+    /// Eine Aufgabe wie frueher (0.1.0) anlegen - schtasks /Create mit dessen
+    /// Standards: sie startet `exe` dort, wo sie liegt, als `konto` (ohne die
+    /// Pruefungen von task_anlegen).
     #[cfg(windows)]
     fn alte_anlegen(task: &str, konto: &str, exe: &Path) {
         let (ok, a) = schtasks(&erstellen_args(task, konto, &tr_wert(exe))).unwrap();
         assert!(ok, "{a}");
+    }
+
+    /// Die Aufgabe, wie Get-ScheduledTask (PowerShell, aus dem Systemordner)
+    /// sie zeigt: Akku-Bedingungen, Zeitlimit, Prioritaet, Konto des ersten
+    /// Ausloesers, Arbeitsordner der ersten Aktion, Stufe und Konto des
+    /// Prinzipals, eingeschaltet - als Name -> Wert.
+    #[cfg(windows)]
+    fn geplant(task: &str) -> std::collections::HashMap<String, String> {
+        let ps = crate::installation::system_ordner().unwrap().join("WindowsPowerShell\\v1.0\\powershell.exe");
+        let skript = format!(
+            "$ErrorActionPreference = 'Stop'; $t = Get-ScheduledTask -TaskPath '\\' -TaskName '{}'; $s = $t.Settings; \
+             'DisallowStartIfOnBatteries=' + $s.DisallowStartIfOnBatteries; 'StopIfGoingOnBatteries=' + $s.StopIfGoingOnBatteries; \
+             'ExecutionTimeLimit=' + $s.ExecutionTimeLimit; 'Priority=' + $s.Priority; 'Enabled=' + $s.Enabled; \
+             'Trigger=' + $t.Triggers.Count; 'TriggerUserId=' + $t.Triggers[0].UserId; \
+             'WorkingDirectory=' + $t.Actions[0].WorkingDirectory; 'RunLevel=' + $t.Principal.RunLevel; \
+             'LogonType=' + $t.Principal.LogonType",
+            task.replace('\'', "''")
+        );
+        let aus = std::process::Command::new(ps).args(["-NoProfile", "-NonInteractive", "-Command", &skript]).output().unwrap();
+        let text = String::from_utf8_lossy(&aus.stdout).to_string();
+        assert!(aus.status.success(), "Get-ScheduledTask {task}: {text}{}", String::from_utf8_lossy(&aus.stderr));
+        text.lines().filter_map(|z| z.split_once('=')).map(|(n, w)| (n.trim().to_string(), w.trim().to_string())).collect()
+    }
+
+    /// Get-ScheduledTask zeigt die Aufgabe `task` mit den Einstellungen aus
+    /// aufgabe_definition: startet auch im Akkubetrieb und endet dort nicht,
+    /// kein Zeitlimit, Prioritaet 4, genau ein Ausloeser, und der gilt fuer
+    /// dieses Konto, Arbeitsordner `ordner`, hoechste Rechte im Anmeldetoken.
+    /// Auch das XML, das die App liest, weicht nicht ab.
+    #[cfg(windows)]
+    fn einstellungen_pruefen(task: &str, ordner: &Path) {
+        use crate::installation::{gleicher_pfad, ist_eigenes_konto};
+        let g = geplant(task);
+        let w = |n: &str| g.get(n).cloned().unwrap_or_else(|| panic!("{n} fehlt: {g:?}"));
+        assert_eq!(w("DisallowStartIfOnBatteries"), "False", "{g:?}");
+        assert_eq!(w("StopIfGoingOnBatteries"), "False", "{g:?}");
+        assert_eq!(w("ExecutionTimeLimit"), "PT0S", "{g:?}");
+        assert_eq!(w("Priority"), "4", "{g:?}");
+        assert_eq!(w("Enabled"), "True", "{g:?}");
+        assert_eq!(w("Trigger"), "1", "{g:?}");
+        assert!(!w("TriggerUserId").is_empty() && ist_eigenes_konto(&w("TriggerUserId")), "{g:?}");
+        assert!(gleicher_pfad(&w("WorkingDirectory"), &ordner.to_string_lossy()), "{g:?}");
+        assert_eq!(w("RunLevel"), "Highest", "{g:?}");
+        assert_eq!(w("LogonType"), "Interactive", "{g:?}");
+        let a = aufgabe(task).unwrap();
+        assert_eq!(abweichungen(&a.xml, ordner, &ist_eigenes_konto), Vec::<String>::new(), "{}", a.xml);
     }
 
     /// Die Dateiversion einer exe auf der Platte aendern (Versionsressource).
@@ -1371,7 +1942,8 @@ mod tests {
         }
         assert!(reste(&ordner).is_empty(), "{:?}", reste(&ordner));
         // Die Aufgabe: die installierte exe mit --hintergrund, hoechste
-        // Rechte, Anmelde-Ausloeser, als der aktuelle Nutzer, eingeschaltet.
+        // Rechte, Anmelde-Ausloeser, als der aktuelle Nutzer, eingeschaltet -
+        // auch so, wie schtasks /Query /XML sie liest.
         let (befehl, argumente) = befehl(&task).unwrap();
         assert!(crate::installation::aufgabe_zeigt_auf(&befehl, &argumente, &installiert), "{befehl} {argumente}");
         let (ok, xml) = schtasks(&xml_args(&task)).unwrap();
@@ -1381,6 +1953,9 @@ mod tests {
         let konto = crate::installation::aufgabe_konto(&xml).unwrap();
         assert!(crate::installation::ist_eigenes_konto(&konto), "nicht als aktueller Nutzer ({konto}): {xml}");
         assert!(crate::installation::aufgabe_aktiv(&xml));
+        // Registriert ueber COM mit dem ganzen XML: auch im Akkubetrieb, ohne
+        // Zeitlimit, Prioritaet 4, Ausloeser dieses Kontos, Arbeitsordner.
+        einstellungen_pruefen(&task, &ordner);
         // Zweimal an: kein Fehler, die Aufgabe bleibt genau eine, die Kopie
         // stimmt schon.
         assert_eq!(autostart_setzen(ort, true), Ok(Umstellung::Vorhanden(ordner.clone())));
@@ -1397,6 +1972,68 @@ mod tests {
         // Zweimal aus: die Aufgabe fehlt schon, das ist kein Fehler.
         assert!(autostart_setzen(ort, false).is_ok());
         assert!(!autostart_an(ort));
+        let _ = std::fs::remove_dir_all(&ordner);
+    }
+
+    /// Reparatur beim Start: eine Aufgabe dieses Kontos, die schon die
+    /// installierte exe startet, aber wie in 0.1.0 mit schtasks und dessen
+    /// Standards angelegt ist (startet nicht im Akkubetrieb, Zeitlimit 72 h,
+    /// Prioritaet 7, Ausloeser fuer jede Anmeldung, kein Arbeitsordner),
+    /// wird beim Start mit dem richtigen XML neu registriert; danach zeigt
+    /// Get-ScheduledTask die richtigen Einstellungen, und ein zweiter Start
+    /// findet nichts mehr. Eine Aufgabe dieses Namens, die als SYSTEM laeuft,
+    /// bleibt, wie sie ist (ein Vermerk). Eigene Aufgabe und eigener Ordner.
+    #[cfg(windows)]
+    #[test]
+    fn autostart_aufgabe_reparieren() {
+        use crate::installation::EXE;
+        let Some(ordner) = pf_ordner("reparatur") else { return };
+        let task = format!("{}-reparatur", crate::secure::test_lauf());
+        let ort = test_ort(&task, &ordner);
+        let _ = autostart_setzen(ort, false);
+        assert!(matches!(autostart_setzen(ort, true), Ok(Umstellung::Installiert { .. })));
+        let installiert = ordner.join(EXE);
+        // So registriert, wie diese Fassung es tut: nichts zu reparieren.
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert_eq!((&b.start, &b.repariert), (&Ok(Start::Aktuell), &None), "{b:?}");
+        // Wie 0.1.0: schtasks /Create mit dessen Standards, auf die
+        // installierte exe (sie zeigt also schon richtig).
+        alte_anlegen(&task, &aktueller_benutzer(), &installiert);
+        let g = geplant(&task);
+        assert_eq!((g["DisallowStartIfOnBatteries"].as_str(), g["StopIfGoingOnBatteries"].as_str()), ("True", "True"), "{g:?}");
+        assert_eq!((g["ExecutionTimeLimit"].as_str(), g["Priority"].as_str()), ("PT72H", "7"), "{g:?}");
+        assert_eq!((g["TriggerUserId"].as_str(), g["WorkingDirectory"].as_str()), ("", ""), "{g:?}");
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert!(b.abgeschaltet.is_empty() && b.vermerke.is_empty(), "{b:?}");
+        assert_eq!(b.start, Ok(Start::Aktuell), "{b:?}");
+        let r = b.repariert.expect("nicht repariert");
+        assert_eq!(r.task, task);
+        assert_eq!(r.maengel.len(), 6, "{:?}", r.maengel);
+        for teil in ["DisallowStartIfOnBatteries", "StopIfGoingOnBatteries", "PT72H", "Prioritaet 7", "jede Anmeldung", "ohne Arbeitsordner"] {
+            assert!(r.maengel.iter().any(|m| m.contains(teil)), "{teil}: {:?}", r.maengel);
+        }
+        assert!(r.zeile().contains("neu registriert") && r.zeile().contains("Akkubetrieb"), "{}", r.zeile());
+        einstellungen_pruefen(&task, &ordner);
+        let (befehl, argumente) = befehl(&task).unwrap();
+        assert!(crate::installation::aufgabe_zeigt_auf(&befehl, &argumente, &installiert), "{befehl} {argumente}");
+        // Zweiter Start: nichts mehr zu reparieren.
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert_eq!((&b.start, &b.repariert), (&Ok(Start::Aktuell), &None), "{b:?}");
+        // Eine abgeschaltete Aufgabe mit alten Standards bleibt aus.
+        alte_anlegen(&task, &aktueller_benutzer(), &installiert);
+        assert!(schtasks(&abschalten_args(&task)).unwrap().0);
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert_eq!((&b.start, &b.repariert), (&Ok(Start::Aus), &None), "{b:?}");
+        assert!(aufgabe(&task).is_some_and(|a| !a.aktiv));
+        // Laeuft sie als SYSTEM, bleibt sie, wie sie ist - mit Vermerk.
+        alte_anlegen(&task, "SYSTEM", &installiert);
+        let b = autostart_beim_start(Some(&leer()), ort);
+        assert_eq!(b.repariert, None, "{b:?}");
+        assert!(b.vermerke.len() == 1 && b.vermerke[0].contains("S-1-5-18") && b.vermerke[0].contains("bleiben"), "{:?}", b.vermerke);
+        assert_eq!(geplant(&task)["DisallowStartIfOnBatteries"], "True");
+        // Aus: geloescht, auch die als SYSTEM.
+        assert!(autostart_setzen(ort, false).is_ok());
+        assert!(aufgabe(&task).is_none());
         let _ = std::fs::remove_dir_all(&ordner);
     }
 
