@@ -366,6 +366,15 @@ static uint64_t g_in_kanal = 0;             // seine Nummer; unter g_send_mtx
 // g_send_mtx.
 static uint64_t g_faehig_sitzung = 0, g_faehig_kanal = 0;
 static uint32_t g_faehig_bits = 0;
+// HDR (hdr.h): das zuletzt gelesene IN_ANZEIGE und die Sitzung, in der es
+// kam - es gilt nur fuer diese (anzeige_jetzt). Unter g_send_mtx.
+static qc_hdr_anzeige g_anzeige;
+static uint64_t g_anzeige_sitzung = 0;
+static int g_anzeige_da = 0;
+// HDR-Grund der zuletzt gesendeten Strominfo (Byte 13): ergibt eine neue
+// Entscheidung einen anderen, geht eine neue Strominfo hinaus
+// (hdr_neu_entscheiden).
+static _Atomic int g_hdr_grund_gesendet = QC_HDR_GRUND_KEIN_IN_ANZEIGE;
 static char g_vid_ip[INET_ADDRSTRLEN] = {0};  // Adresse des Zuschauers, fuers Protokoll; unter g_send_mtx
 // Wer hereinkommt, steht in host-devices.txt (zugang.c, mit eigener kleiner
 // Sperre nur fuer das Lesen und Eintragen). Eine Zugangsphase haelt keine
@@ -916,10 +925,20 @@ static void zeiger_log(const char *text) {
     logf_(@"%s", text);
 }
 
+// Die HDR-Entscheidung dieses Hosts (qc_hdr_entscheiden) fuer den
+// laufenden Kandidaten und das IN_ANZEIGE des Zuschauers (NULL: noch keins -
+// Grund 7). HDR10 codieren und den Bildschirm als HDR aufnehmen kann dieser
+// Host noch nicht (das kommt mit Schritt 4a des HDR-Plans): bis dahin immer
+// SDR mit Grund, bei Kandidat 0 und 2 Grund 4.
+static int hdr_grund_fuer(const qc_hdr_anzeige *a) {
+    int quelle_hdr = 0, host_kann = 0;
+    return qc_hdr_entscheiden(quelle_hdr, host_kann, atomic_load(&g_codec_id), a);
+}
+
 // Eckdaten des Stroms, immer aus dem AKTUELLEN Codec abgeleitet: die alten
-// acht Byte, dahinter Fassung 1 (hdr.h). Noch sendet dieser Host nur SDR und
-// liest kein IN_ANZEIGE - Grund 7.
-static void strominfo_fuellen(uint8_t p[QC_HDR_INFO_LAENGE]) {
+// acht Byte, dahinter Fassung 1 (hdr.h) mit Farbe und HDR-Grund fuer dieses
+// IN_ANZEIGE (NULL: die Begruessung - der Neue hat noch nichts gemeldet).
+static void strominfo_fuellen(uint8_t p[QC_HDR_INFO_LAENGE], const qc_hdr_anzeige *a) {
     int idx = atomic_load(&g_codec_id);
     uint16_t w16 = (uint16_t)g_info_w, h16 = (uint16_t)g_info_h, f16 = (uint16_t)g_info_fps;
     memcpy(p + 0, &w16, 2); memcpy(p + 2, &h16, 2); memcpy(p + 4, &f16, 2);
@@ -928,8 +947,21 @@ static void strominfo_fuellen(uint8_t p[QC_HDR_INFO_LAENGE]) {
     // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
     p[7] = k->chroma444 ? (k->zehn_bit ? 2 : 1) : (k->zehn_bit ? 4 : 3);
     qc_hdr_info farbe;
-    qc_hdr_info_sdr(&farbe, QC_HDR_GRUND_KEIN_IN_ANZEIGE);
+    qc_hdr_info_sdr(&farbe, (uint8_t)hdr_grund_fuer(a));
     qc_hdr_info_kodieren(&farbe, p + QC_HDR_INFO_ALT);
+}
+
+// Nach einem IN_ANZEIGE neu entscheiden (steht bei strominfo_senden).
+static void hdr_neu_entscheiden(const char *anlass);
+
+// Das IN_ANZEIGE der laufenden Sitzung nach *a; 0, wenn sie keins hat.
+// Nimmt g_send_mtx.
+static int anzeige_jetzt(qc_hdr_anzeige *a) {
+    pthread_mutex_lock(&g_send_mtx);
+    int da = g_anzeige_da && g_anzeige_sitzung == g_sitzung;
+    if (da) *a = g_anzeige;
+    pthread_mutex_unlock(&g_send_mtx);
+    return da;
 }
 
 // Koennensliste: was dieser Mac wirklich codiert, mit Hardware- und
@@ -1555,7 +1587,9 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     memcpy(hello, QC_MAGIC, 4);
     qc_hdr h = { .type = QC_MSG_INFO, .flags = 0, .reserved = 0, .len = QC_HDR_INFO_LAENGE };
     memcpy(hello + 4, &h, sizeof h);
-    strominfo_fuellen(hello + 4 + sizeof h);
+    // Der Neue hat noch kein IN_ANZEIGE geschickt: Grund 7.
+    strominfo_fuellen(hello + 4 + sizeof h, NULL);
+    atomic_store(&g_hdr_grund_gesendet, QC_HDR_GRUND_KEIN_IN_ANZEIGE);
     char fp_alt[24] = {0};
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
@@ -1627,11 +1661,12 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
         send_small(QC_MSG_SETTINGS, cur, sizeof cur);
     }
     codecs_senden();
-    // Was dieser Host kann: Dateien (Fassung 1) und Bildschirmwahl. Aeltere
-    // Clients uebergehen Typ 11 und 12; ein Client ohne Bit 1 schickt nie
-    // einen Bildschirmwunsch.
+    // Was dieser Host kann: Dateien (Fassung 1), Bildschirmwahl und die
+    // HDR-Aushandlung (IN_ANZEIGE, Strominfo Fassung 1). Aeltere Clients
+    // uebergehen Typ 11 und 12; ein Client ohne Bit 1 schickt nie einen
+    // Bildschirmwunsch, einer ohne Bit 2 nie IN_ANZEIGE.
     {
-        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM);
+        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM | QC_FAEHIG_HDR);
         send_small(QC_MSG_FAEHIGKEITEN, f.bytes, f.length);
     }
     bildschirme_senden();
@@ -2231,6 +2266,32 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
                 else logf_(@"Bildschirmwunsch %@ verworfen: Aufnahme laeuft noch nicht", kennung ?: @"Automatik");
                 break;
             }
+            case QC_IN_ANZEIGE: {
+                // Lage der Anzeige des Clients (hdr.h): fuer diese Sitzung
+                // merken und neu entscheiden, auf der Aufnahmewarteschlange.
+                // Unlesbares (zu kurz, andere Fassung) gilt wie kein
+                // IN_ANZEIGE, der Kanal bleibt.
+                qc_hdr_anzeige a;
+                if (!qc_hdr_anzeige_lesen(payload, h.len, &a)) {
+                    logf_(@"IN_ANZEIGE ungueltig (%u Byte) - uebergangen", h.len);
+                    break;
+                }
+                pthread_mutex_lock(&g_send_mtx);
+                int gilt = sitzung == g_sitzung;
+                if (gilt) {
+                    g_anzeige = a;
+                    g_anzeige_sitzung = sitzung;
+                    g_anzeige_da = 1;
+                }
+                pthread_mutex_unlock(&g_send_mtx);
+                if (!gilt) break;
+                logf_(@"IN_ANZEIGE: Schirm %s, Darstellung %s, Wunsch %d, Weiss %u nit, Spitze %u nit, Kopfraum %.2f/%.2f",
+                      (a.flags & QC_HDR_ANZEIGE_SCHIRM_HDR) ? "HDR" : "SDR", (a.flags & QC_HDR_ANZEIGE_DARSTELLUNG) ? "ja" : "nein",
+                      a.wunsch, a.sdr_weiss_nit, a.spitze_nit, a.kopfraum_potentiell / 100.0, a.kopfraum_aktuell / 100.0);
+                if (g_capq) dispatch_async(g_capq, ^{ hdr_neu_entscheiden("IN_ANZEIGE"); });
+                else hdr_neu_entscheiden("IN_ANZEIGE");
+                break;
+            }
             default: break;
         }
     }
@@ -2635,8 +2696,29 @@ static int g_wechsel_wunsch = -1;    // nur auf g_capq: waehrenddessen eingegang
 
 static void strominfo_senden(void) {
     uint8_t p[QC_HDR_INFO_LAENGE];
-    strominfo_fuellen(p);
+    qc_hdr_anzeige a;
+    int da = anzeige_jetzt(&a);
+    strominfo_fuellen(p, da ? &a : NULL);
+    atomic_store(&g_hdr_grund_gesendet, p[13]);
     send_small(QC_MSG_INFO, p, sizeof p);
+}
+
+// Nach einem IN_ANZEIGE: neu entscheiden. Ergibt das einen anderen
+// HDR-Grund als die zuletzt gesendete Strominfo, bekommt der Zuschauer eine
+// neue - dieselbe Groesse, derselbe Codec, der Client baut dafuer nichts um.
+// Einen Wechsel nach HDR (neue Encoder-Sitzung, SWITCH mit PQ) gibt es erst
+// mit Schritt 4a. Auf g_capq, wie Codecwechsel: so landet die Strominfo nie
+// zwischen einem SWITCH und dessen eigener Strominfo.
+static void hdr_neu_entscheiden(const char *anlass) {
+    if (atomic_load(&g_client_fd) < 0) return;
+    qc_hdr_anzeige a;
+    int da = anzeige_jetzt(&a);
+    int grund = hdr_grund_fuer(da ? &a : NULL);
+    int alt = atomic_load(&g_hdr_grund_gesendet);
+    if (grund == alt) return;
+    logf_(@"HDR-Entscheidung (%s): SDR, Grund %d (%s) - vorher Grund %d (%s), neue Strominfo", anlass, grund,
+          qc_hdr_grund_text(grund), alt, qc_hdr_grund_text(alt));
+    strominfo_senden();
 }
 
 // Typ 7: u8 idx, u8 h264, u8 chroma444, u8 zehn_bit, u8 vollbereich (immer 1),

@@ -1129,6 +1129,10 @@ static SEQ: AtomicU32 = AtomicU32::new(0);
 static NR: AtomicU64 = AtomicU64::new(0);
 /// Laufende Nummer der Eingabekanaele (siehe Leitung::eingabe_loesen).
 static EINGABE_NR: AtomicU64 = AtomicU64::new(0);
+/// Das zuletzt gelesene IN_ANZEIGE und die Nummer des Zuschauers, der es
+/// schickte. Es gilt nur fuer genau diesen (anzeige_aktuell): ein Neuer
+/// beginnt ohne, seine Begruessung traegt Grund 7.
+static ANZEIGE: Mutex<Option<(u64, crate::hdr::Anzeige)>> = Mutex::new(None);
 /// Einspeisen und Abloesen schliessen sich aus: Die Eingabeschleife prueft
 /// unter dieser Sperre, ob ihr Kanal noch gilt, und fuehrt die Nachricht
 /// aus; wer einen Zuschauer oder Eingabekanal abloest und danach alle Tasten
@@ -1625,7 +1629,39 @@ pub fn settings_senden() {
 }
 
 pub fn strominfo_senden() {
-    send_small(MSG_INFO, &super::strominfo());
+    let p = super::strominfo();
+    Z.hdr_grund_gesendet.store(p[13], Ordering::Relaxed);
+    send_small(MSG_INFO, &p);
+}
+
+/// Das IN_ANZEIGE des aktuellen Zuschauers, falls er in dieser Sitzung
+/// eins geschickt hat.
+pub fn anzeige_aktuell() -> Option<crate::hdr::Anzeige> {
+    let nr = NR.load(Ordering::Relaxed);
+    let gemerkt = *sperre(&ANZEIGE);
+    gemerkt.filter(|(n, _)| *n == nr).map(|(_, a)| a)
+}
+
+/// Nach einem IN_ANZEIGE oder einer anderen Farblage des Desktops: neu
+/// entscheiden (super::hdr_info). Ergibt das einen anderen HDR-Grund als die
+/// zuletzt gesendete Strominfo, bekommt der Zuschauer eine neue - dieselbe
+/// Groesse und derselbe Codec, der Client baut dafuer nichts um. Einen
+/// Wechsel nach HDR (neue Encoder-Sitzung, SWITCH mit PQ) gibt es erst mit
+/// dem HDR-Encoder (Schritt 4b des HDR-Plans).
+pub fn hdr_neu_entscheiden(anlass: &str) {
+    if !zuschauer_da() {
+        return;
+    }
+    let info = super::hdr_info(anzeige_aktuell().as_ref());
+    let alt = Z.hdr_grund_gesendet.load(Ordering::Relaxed);
+    if info.grund != alt {
+        log(format!(
+            "HDR-Entscheidung ({anlass}): {} - vorher Grund {alt} ({}), neue Strominfo",
+            info.text(),
+            crate::hdr::grund_text(alt)
+        ));
+        strominfo_senden();
+    }
 }
 
 /// Nachricht 12: die Bildschirme des Hosts, wie sie in Z stehen.
@@ -1886,7 +1922,8 @@ fn bild_annehmen(stream: TcpStream, platz: Platz, marke: &Laufmarke) {
 
     // Begruessung: Kennung und Eckdaten des Stroms, damit der Empfaenger
     // Fenstergroesse und Format kennt, bevor das erste Bild kommt.
-    let info = super::strominfo();
+    // Ein neuer Zuschauer hat noch kein IN_ANZEIGE geschickt: Grund 7.
+    let info = super::strominfo_fuer(None);
     let mut hello = Vec::with_capacity(4 + 8 + info.len());
     hello.extend_from_slice(MAGIC);
     hello.extend_from_slice(&kopf(MSG_INFO, 0, 0, info.len()));
@@ -1948,6 +1985,7 @@ fn bild_annehmen(stream: TcpStream, platz: Platz, marke: &Laufmarke) {
         // an ihn (bild_senden wartet auf AKTUELL).
         Z.force_key.store(true, Ordering::Relaxed);
         Z.wait_key.store(true, Ordering::Relaxed);
+        Z.hdr_grund_gesendet.store(info[13], Ordering::Relaxed);
         let _ = leitung.einreihen(hello, Art::Klein, None);
         let nr = NR.fetch_add(1, Ordering::Relaxed) + 1;
         leitung.nr.store(nr, Ordering::Relaxed);
@@ -1962,10 +2000,11 @@ fn bild_annehmen(stream: TcpStream, platz: Platz, marke: &Laufmarke) {
     super::ton::info_zuruecksetzen();
     settings_senden();
     send_small(MSG_CODECS, &encoder::codecs_payload());
-    // Was dieser Host kann (2.2): Dateien Fassung 1 und die Bildschirmwahl -
-    // nur an genau diesen Zuschauer; danach die Bildschirme (12). Ein
-    // aelterer Client uebergeht Typ 11 und 12.
-    send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN | FAEHIG_BILDSCHIRM));
+    // Was dieser Host kann (2.2): Dateien Fassung 1, die Bildschirmwahl und
+    // die HDR-Aushandlung (IN_ANZEIGE, Strominfo Fassung 1) - nur an genau
+    // diesen Zuschauer; danach die Bildschirme (12). Ein aelterer Client
+    // uebergeht Typ 11 und 12.
+    send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN | FAEHIG_BILDSCHIRM | FAEHIG_HDR));
     send_small_an(&AKTUELL, &NR, nr, MSG_BILDSCHIRME, &bildschirme_payload());
     log(format!(
         "Zuschauer verbunden: {name} ({ip}:{port}), ID {}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}{}",
@@ -2110,6 +2149,7 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
             return Kanalende::Abgeloest;
         }
         let mut faehigkeiten = false;
+        let mut anzeige_neu = None;
         match typ {
             IN_MOVE | IN_BUTTON | IN_SCROLL | IN_KEY => eingabe::verarbeiten(typ, &payload),
             IN_CLIP => {
@@ -2162,6 +2202,19 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
                     None => log(format!("Bildschirmwunsch: ungueltig ({len} Byte) - uebergangen")),
                 }
             }
+            IN_ANZEIGE => {
+                // Lage der Anzeige des Clients (hdr.rs): fuer diesen
+                // Zuschauer merken, entschieden wird ausserhalb der Sperre.
+                // Unlesbares (zu kurz, andere Fassung) gilt wie kein
+                // IN_ANZEIGE, der Kanal bleibt.
+                match crate::hdr::Anzeige::lesen(&payload) {
+                    Some(a) => {
+                        *sperre(&ANZEIGE) = Some((bild.nr.load(Ordering::Relaxed), a));
+                        anzeige_neu = Some(a);
+                    }
+                    None => log(format!("IN_ANZEIGE: ungueltig ({len} Byte) - uebergangen")),
+                }
+            }
             // Dateien Client -> Host: nur in die Warteschlange des
             // Empfaenger-Fadens; die Nutzlast wandert ohne Kopie hinueber.
             DATEI_ANGEBOT | DATEI_STUECK | DATEI_ENDE => bild.datei_eingang(typ, std::mem::take(&mut payload)),
@@ -2184,6 +2237,10 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
         // von EINSPEISEN: das Starten des Senders ist ein Fadenstart.
         if faehigkeiten {
             bild.vorgemerkte_pruefen(u, None);
+        }
+        if let Some(a) = anzeige_neu {
+            log(format!("IN_ANZEIGE: {}", a.text()));
+            hdr_neu_entscheiden("IN_ANZEIGE");
         }
     }
 }
@@ -4211,6 +4268,53 @@ mod tests {
         }
         // Ueber 65 Byte ist der Wunsch nie; die Grenze des Typs bleibt 256.
         assert_eq!(eingangsgrenze(IN_BILDSCHIRM), 256);
+        l.schliessen();
+        assert!(endet_binnen(leser, Duration::from_secs(5)).is_some());
+        let _ = std::fs::remove_dir_all(&u.basis);
+    }
+
+    /// IN_ANZEIGE (71) ueber den echten Eingabekanal: gemerkt fuer genau
+    /// diesen Zuschauer (seine Nummer); Unlesbares (zu kurz, andere Fassung)
+    /// wird uebergangen, ohne den Kanal zu beenden - die naechste gilt.
+    #[test]
+    fn anzeige_kommt_ueber_den_eingabekanal() {
+        use crate::hdr::{Anzeige, Schirm};
+        static PLATZ: Mutex<Option<Arc<Leitung>>> = Mutex::new(None);
+        static ZAEHLER: AtomicU64 = AtomicU64::new(0);
+        let (r, s) = (Rekorder::default(), Staende::default());
+        let u = Arc::new(umgebung_test(&PLATZ, &ZAEHLER, "anzeige", &r, &s));
+        let (mut h, mut c) = paar();
+        let l = Arc::new(Leitung::neu(None, vec![1], vec![1], "C".into()));
+        zuschauer_eintragen(&PLATZ, &ZAEHLER, l.clone());
+        assert!(l.eingabe_binden(1, h.abbruchgriff().unwrap()));
+        let (l2, u2) = (l.clone(), u.clone());
+        let leser = std::thread::spawn(move || eingabe_lesen(&mut h, &l2, 1, &u2));
+        let senden = |c: &mut secure::Secure, nutzlast: &[u8]| {
+            let mut m = kopf(IN_ANZEIGE, 0, 0, nutzlast.len()).to_vec();
+            m.extend_from_slice(nutzlast);
+            c.write_all(&m).unwrap();
+        };
+        let nr = l.nr.load(Ordering::Relaxed);
+        let warten_auf = |soll: Anzeige| {
+            let bis = Instant::now() + Duration::from_secs(5);
+            while *sperre(&ANZEIGE) != Some((nr, soll)) {
+                assert!(Instant::now() < bis, "IN_ANZEIGE kam nicht an: {:?}", *sperre(&ANZEIGE));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let schirm = Schirm { hdr: true, sdr_weiss_nit: 240.0, spitze_nit: 1000.0, kopfraum_potentiell: 4.17, kopfraum_aktuell: 4.17, ..Schirm::default() };
+        let a = Anzeige::fuer_client(Some(&schirm), false, true);
+        senden(&mut c, &a.kodieren());
+        warten_auf(a);
+        // Zu kurz und eine fremde Fassung: uebergangen; die naechste gilt.
+        let b = Anzeige::fuer_client(None, false, false);
+        senden(&mut c, &b.kodieren()[..13]);
+        let mut fremd = b.kodieren();
+        fremd[0] = 2;
+        senden(&mut c, &fremd);
+        senden(&mut c, &b.kodieren());
+        warten_auf(b);
+        assert_eq!(eingangsgrenze(IN_ANZEIGE), 256);
         l.schliessen();
         assert!(endet_binnen(leser, Duration::from_secs(5)).is_some());
         let _ = std::fs::remove_dir_all(&u.basis);

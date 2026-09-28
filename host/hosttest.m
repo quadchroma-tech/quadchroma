@@ -19,7 +19,10 @@
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
 // Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
-// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt), Dienst-Takt
+// Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt),
+// HDR-Aushandlung (Faehigkeiten mit Bit 2, IN_ANZEIGE ueber den echten
+// Eingabekanal: neue Strominfo in SDR mit dem Grund des Hosts, nichts bei
+// gleicher Lage, Unlesbares uebergangen), Dienst-Takt
 // ohne Run-Loop (Auslastung im Takt, Drosselzeilen nachgetragen), Abschied
 // beim Beenden (Typ 13 mit Grund 0 als letzte Nachricht, ohne Typ 10, dann
 // Verbindung zu) und Zugang
@@ -1828,7 +1831,7 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
     char magic[4];
     if (klartext(&s->l, magic, 4, 2000) != 1) return -1;
     // Was nach der Begruessung kommt, bis einschliesslich der Bildschirmliste;
-    // die Faehigkeiten davor muessen genau 3 sein (Dateien und Bildschirmwahl).
+    // die Faehigkeiten davor muessen genau 7 sein (Dateien, Bildschirmwahl, HDR).
     qc_hdr h;
     NSData *d = nil;
     size_t n = 0;
@@ -1836,7 +1839,8 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
         n += (size_t)snprintf(s->folge + n, sizeof s->folge - n, "%s%d", n ? " " : "", h.type);
         if (h.type == QC_MSG_FAEHIGKEITEN) {
             uint32_t bits = 0;
-            if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 || bits != 3) return -1;
+            if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 ||
+                bits != (QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM | QC_FAEHIG_HDR)) return -1;
         }
         if (h.type == QC_MSG_BILDSCHIRME) {
             if (d.length > sizeof s->liste) return -1;
@@ -2006,7 +2010,7 @@ static void dateien_pruefen(int bild_port, int ein_port) {
     int nachher = warten_bis(faehig_jetzt, 1);
     stdout_stumm(0);
     printf("         (nach der Begruessung: %s)\n", F.folge);
-    pruefe(ok && strstr(F.folge, "3 8 11 12"), "MSG_FAEHIGKEITEN (11) mit Bit 0 und 1 kommt nach Einstellungen und Codecliste, dann die Bildschirmliste (12)");
+    pruefe(ok && strstr(F.folge, "3 8 11 12"), "MSG_FAEHIGKEITEN (11) mit Bit 0, 1 und 2 kommt nach Einstellungen und Codecliste, dann die Bildschirmliste (12)");
     pruefe(!vorher && nachher, "IN_FAEHIGKEITEN wird fuer diese Sitzung und diesen Eingabekanal gemerkt");
 
     printf("\n-- Dateien: Client -> Host ueber die echten Kanaele\n");
@@ -2356,6 +2360,15 @@ static int info_fassung1_sdr(const gelesen *g) {
     return g->info_n == QC_HDR_INFO_LAENGE && memcmp(g->info + QC_HDR_INFO_ALT, soll, sizeof soll) == 0;
 }
 
+// IN_ANZEIGE (14 Byte, hdr.h) mit diesen Flags, diesem Wunsch und Kopfraum.
+static NSData *anzeige_daten(uint8_t flags, uint8_t wunsch, uint16_t kopfraum) {
+    uint8_t p[QC_HDR_ANZEIGE_LAENGE] = { QC_HDR_ANZEIGE_FASSUNG, flags, wunsch, 0 };
+    uint16_t weiss = 240, spitze = 1000;
+    memcpy(p + 4, &weiss, 2); memcpy(p + 6, &spitze, 2);
+    memcpy(p + 10, &kopfraum, 2); memcpy(p + 12, &kopfraum, 2);
+    return [NSData dataWithBytes:p length:sizeof p];
+}
+
 // Wie oft der Typ in der Folge steht (die Folge sind Zahlen mit Leerzeichen).
 static int typen_zaehlen(const char *folge, int typ) {
     int n = 0;
@@ -2603,7 +2616,7 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     int ok = schein_verbinden(&H, bild_port, ein_port, h_priv) == 0;
     stdout_stumm(0);
     printf("         (nach der Begruessung: %s)\n", H.folge);
-    pruefe(ok && strstr(H.folge, "3 8 11 12"), "Begruessung: Faehigkeiten 3 (Dateien und Bildschirmwahl), danach die Bildschirmliste (12)");
+    pruefe(ok && strstr(H.folge, "3 8 11 12"), "Begruessung: Faehigkeiten 7 (Dateien, Bildschirmwahl, HDR), danach die Bildschirmliste (12)");
     pruefe(H.liste_n == soll.length && memcmp(H.liste, soll.bytes, soll.length) == 0,
            "die Liste in der Begruessung ist der Pruefvektor: X27 X1 Haupt und gestreamt, Automatik");
     VTCompressionSessionRef s_a = session_jetzt();
@@ -2983,6 +2996,63 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pruefe(zeilen_mit(logpfad, "-> Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" (Wunsch des Zuschauers: Automatik)") == 1 &&
            zeilen_mit(logpfad, "(Hauptbildschirm gewechselt)") == haupt_zeilen_vorher,
            "Protokollzeile mit Grund \"Wunsch des Zuschauers: Automatik\", keine weitere \"Hauptbildschirm gewechselt\"");
+
+    printf("\n-- HDR: IN_ANZEIGE ueber den Eingabekanal (noch ohne HDR-Encoder)\n");
+    // Bis hier hat H kein IN_ANZEIGE geschickt: jede Strominfo trug Grund 7.
+    // Jetzt meldet er einen HDR-Schirm mit Wunsch Automatisch: neu
+    // entschieden, eine neue Strominfo in SDR mit dem Grund des Hosts (Codec
+    // 2 bzw. Host kann nicht 4), kein SWITCH, kein neuer Encoder. Dieselbe
+    // Lage und nur ein anderer Kopfraum: nichts. Wunsch Aus: Grund 1.
+    // Unlesbares wird uebergangen, der Kanal bleibt.
+    int idx_jetzt = atomic_load(&g_codec_id);
+    int grund_auto = qc_hdr_codec_kann(idx_jetzt) ? QC_HDR_GRUND_HOST_KANN_NICHT : QC_HDR_GRUND_CODEC;
+    VTCompressionSessionRef s_hdr = session_jetzt();
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(QC_HDR_ANZEIGE_SCHIRM_HDR, QC_HDR_WUNSCH_AUTOMATISCH, 417));
+    usleep(200 * 1000);
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    printf("         (nach IN_ANZEIGE: %s, Grund %d)\n", g.folge, g.info_n >= 14 ? g.info[13] : -1);
+    pruefe(g.infos == 1 && g.wechsel == 0 && g.info_n == QC_HDR_INFO_LAENGE && g.info[9] == QC_HDR_TRANSFER_SDR &&
+           g.info[13] == grund_auto && session_jetzt() == s_hdr,
+           "IN_ANZEIGE (HDR-Schirm, Automatisch): eine neue Strominfo in SDR mit dem Grund des Hosts, kein SWITCH, Encoder bleibt");
+    pruefe(zeilen_mit(logpfad, "IN_ANZEIGE: Schirm HDR, Darstellung nein, Wunsch 0, Weiss 240 nit, Spitze 1000 nit, Kopfraum 4.17/4.17") == 1 &&
+           zeilen_mit(logpfad, "HDR-Entscheidung (IN_ANZEIGE): SDR, Grund") == 1,
+           "Protokoll: die Lage des Clients und die Entscheidung");
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(QC_HDR_ANZEIGE_SCHIRM_HDR, QC_HDR_WUNSCH_AUTOMATISCH, 417));
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(QC_HDR_ANZEIGE_SCHIRM_HDR, QC_HDR_WUNSCH_AUTOMATISCH, 250));
+    usleep(200 * 1000);
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g.infos == 0, "dieselbe Lage oder nur ein anderer Kopfraum: keine neue Strominfo");
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(QC_HDR_ANZEIGE_SCHIRM_HDR, QC_HDR_WUNSCH_AUS, 417));
+    usleep(200 * 1000);
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g.infos == 1 && g.info[13] == QC_HDR_GRUND_CLIENT_SDR, "Wunsch Aus: neue Strominfo mit Grund 1");
+    NSData *kurz = [anzeige_daten(0, QC_HDR_WUNSCH_AUTOMATISCH, 100) subdataWithRange:NSMakeRange(0, 13)];
+    NSMutableData *fremd = [anzeige_daten(0, QC_HDR_WUNSCH_AUTOMATISCH, 100) mutableCopy];
+    ((uint8_t *)fremd.mutableBytes)[0] = 2;
+    stdout_stumm(1);
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, kurz);
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, fremd);
+    usleep(200 * 1000);
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    int nach_kaputt = g.infos;
+    ein_daten(H.ein, &H.tx, QC_IN_ANZEIGE, anzeige_daten(0, QC_HDR_WUNSCH_AUTOMATISCH, 100));
+    usleep(200 * 1000);
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(nach_kaputt == 0 && zeilen_mit(logpfad, "IN_ANZEIGE ungueltig (13 Byte)") == 1 && zeilen_mit(logpfad, "IN_ANZEIGE ungueltig (14 Byte)") == 1 &&
+           g.infos == 1 && g.info[13] == grund_auto,
+           "zu kurz und fremde Fassung: uebergangen und protokolliert, der Kanal lebt (SDR-Schirm, Automatisch: wieder der Grund des Hosts)");
 
     zuschauer_weg();
     schein_schliessen(&H);

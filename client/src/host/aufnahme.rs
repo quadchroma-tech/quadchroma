@@ -1803,6 +1803,11 @@ fn sitzung(stand: &mut Bildschirmstand) {
                             kein_bildschirm_gemeldet = false;
                             dup_fehler_gemeldet.clear();
                             let d = &neu.dup;
+                            // HDR-Desktop an oder aus (auch nach einem
+                            // Neuaufbau wegen "HDR verwenden"): gleich
+                            // eintragen, damit eine Strominfo unten schon
+                            // danach entscheidet; neu entschieden wird unten.
+                            let quelle_anders = Z.quelle_hdr.swap(d.farbe.hdr, Ordering::Relaxed) != d.farbe.hdr;
                             let (gw, gh) = d.desktop_groesse();
                             let ((nw, nh, halb), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
                             let groesse_neu = geaendert || nw != w || nh != h;
@@ -1859,6 +1864,9 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                                 ));
                                 log(format!("Aufnahme {}: Farbe {}", a.name, d.farbe.zeile()));
+                            }
+                            if quelle_anders {
+                                netz::hdr_neu_entscheiden(if d.farbe.hdr { "Desktop jetzt HDR" } else { "Desktop jetzt SDR" });
                             }
                             auf = Some(neu);
                             letztes = None;

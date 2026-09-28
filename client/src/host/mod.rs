@@ -112,6 +112,17 @@ pub struct Zustand {
     pub testbild: AtomicBool,
     /// Bildquelle ist eine Konserve (kein Encoder, kein Codecwechsel).
     pub konserve: AtomicBool,
+    /// Farbe und HDR-Metadaten einer Konserve (aus VUI und Seitendaten des
+    /// Clips): ein HDR10-Clip geht als PQ hinaus - die einzige Stelle, die
+    /// HDR ohne Aushandlung sendet (Testwerkzeug, nie im Dienst).
+    pub konserve_farbe: Mutex<Option<crate::hdr::InfoV1>>,
+    /// Der aufgenommene Desktop ist HDR ("HDR verwenden", G2084/P2020) -
+    /// aus der Farblage beim Aufbau der Duplication, fuer hdr_entscheiden.
+    pub quelle_hdr: AtomicBool,
+    /// HDR-Grund der zuletzt gesendeten Strominfo (Byte 13). Ergibt eine
+    /// neue Entscheidung einen anderen, geht eine neue Strominfo hinaus
+    /// (netz::hdr_neu_entscheiden).
+    pub hdr_grund_gesendet: AtomicU8,
     /// Die Bildschirme des Hosts mit Wunsch und gestreamtem Eintrag
     /// (Nachricht 12) - vom Aufnahmefaden gepflegt, vom Netzfaden fuer die
     /// Begruessung gelesen.
@@ -145,6 +156,9 @@ pub static Z: Zustand = Zustand {
     enc_n: AtomicU64::new(0),
     testbild: AtomicBool::new(false),
     konserve: AtomicBool::new(false),
+    konserve_farbe: Mutex::new(None),
+    quelle_hdr: AtomicBool::new(false),
+    hdr_grund_gesendet: AtomicU8::new(crate::hdr::GRUND_KEIN_IN_ANZEIGE),
     bildschirme: Mutex::new(crate::bildschirm::Bildschirme { wunsch: None, eintraege: Vec::new() }),
 };
 
@@ -298,11 +312,33 @@ pub fn apply_settings(mbit: u32, fps: u32, gaming: bool, fixed: bool, ton: bool)
     ));
 }
 
+/// Strominfo (Nachricht 1, Fassung 1) fuer den aktuellen Zuschauer, mit
+/// seinem letzten IN_ANZEIGE (netz::anzeige_aktuell).
+pub fn strominfo() -> [u8; crate::hdr::INFO_LAENGE] {
+    strominfo_fuer(netz::anzeige_aktuell().as_ref())
+}
+
+/// Farbe und HDR-Grund der Strominfo: die Entscheidung des Hosts
+/// (hdr::hdr_entscheiden) fuer den laufenden Kandidaten, den aufgenommenen
+/// Desktop und das IN_ANZEIGE des Zuschauers (None: noch keins - Grund 7).
+/// HDR10 codieren kann dieser Host noch mit keinem Kandidaten (der Encoder
+/// dafuer kommt mit Schritt 4b des HDR-Plans): bis dahin ist es immer SDR
+/// mit Grund, bei Kandidat 0 und 2 Grund 4. Eine Konserve sendet, was ihr
+/// Clip ist.
+pub fn hdr_info(anzeige: Option<&crate::hdr::Anzeige>) -> crate::hdr::InfoV1 {
+    if let Some(k) = *Z.konserve_farbe.lock().unwrap_or_else(|e| e.into_inner()) {
+        return k;
+    }
+    let idx = Z.codec_id.load(Ordering::Relaxed).min(u8::MAX as u32) as u8;
+    let host_kann = false;
+    crate::hdr::InfoV1::sdr(crate::hdr::hdr_entscheiden(Z.quelle_hdr.load(Ordering::Relaxed), host_kann, idx, anzeige))
+}
+
 /// Strominfo (Nachricht 1, Fassung 1), immer aus dem laufenden Kandidaten
 /// abgeleitet: die alten acht Byte, dahinter Farbe und HDR-Grund
-/// (crate::hdr). Noch sendet dieser Host nur SDR und liest kein IN_ANZEIGE -
-/// Grund 7.
-pub fn strominfo() -> [u8; crate::hdr::INFO_LAENGE] {
+/// (crate::hdr, hdr_info) fuer dieses IN_ANZEIGE. Die Begruessung eines
+/// neuen Zuschauers nimmt None - er hat noch nichts gemeldet.
+pub fn strominfo_fuer(anzeige: Option<&crate::hdr::Anzeige>) -> [u8; crate::hdr::INFO_LAENGE] {
     let mut p = [0u8; crate::hdr::INFO_LAENGE];
     let w = Z.info_w.load(Ordering::Relaxed) as u16;
     let h = Z.info_h.load(Ordering::Relaxed) as u16;
@@ -315,7 +351,7 @@ pub fn strominfo() -> [u8; crate::hdr::INFO_LAENGE] {
     p[6] = if k.h264 { 2 } else { 1 };
     // 1 = 4:4:4 8 Bit, 2 = 4:4:4 10 Bit, 3 = 4:2:0 8 Bit, 4 = 4:2:0 10 Bit; alles Vollbereich
     p[7] = if k.chroma444 { if k.zehn_bit { 2 } else { 1 } } else if k.zehn_bit { 4 } else { 3 };
-    p[crate::hdr::INFO_LAENGE_ALT..].copy_from_slice(&crate::hdr::InfoV1::sdr(crate::hdr::GRUND_KEIN_IN_ANZEIGE).kodieren());
+    p[crate::hdr::INFO_LAENGE_ALT..].copy_from_slice(&hdr_info(anzeige).kodieren());
     p
 }
 
@@ -1663,17 +1699,25 @@ pub fn main_host(args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
-    /// Die Strominfo ist Fassung 1 (24 Byte): die alten acht Byte aus Z und
-    /// dem Kandidaten, dahinter SDR mit Grund 7 - dieser Host liest noch kein
-    /// IN_ANZEIGE. Nur lesend: Z teilen sich alle Tests.
+    /// Die Strominfo Fassung 1 dieses Hosts: die Begruessung ohne IN_ANZEIGE
+    /// traegt SDR mit Grund 7; mit IN_ANZEIGE entscheidet hdr_entscheiden -
+    /// Wunsch Aus ergibt Grund 1, sonst (noch ohne HDR-Encoder) Grund 4 fuer
+    /// Kandidat 0 und 2, Grund 2 fuer die anderen. Nur lesend: Z teilen sich
+    /// alle Tests.
     #[test]
     fn strominfo_fassung_1_mit_sdr() {
-        use crate::hdr::{InfoV1, GRUND_KEIN_IN_ANZEIGE, INFO_LAENGE};
-        let p = strominfo();
+        use crate::hdr::{Anzeige, InfoV1, Schirm, GRUND_CLIENT_SDR, GRUND_CODEC, GRUND_HOST_KANN_NICHT, GRUND_KEIN_IN_ANZEIGE, INFO_LAENGE};
+        let p = strominfo_fuer(None);
         assert_eq!(p.len(), INFO_LAENGE);
         assert!(matches!(p[6], 1 | 2) && (1..=4).contains(&p[7]), "{p:?}");
         assert_eq!(p[8..], InfoV1::sdr(GRUND_KEIN_IN_ANZEIGE).kodieren());
         assert_eq!(InfoV1::lesen(&p), Some(InfoV1::sdr(GRUND_KEIN_IN_ANZEIGE)));
+        let hdr_schirm = Schirm { hdr: true, sdr_weiss_nit: 240.0, spitze_nit: 1000.0, kopfraum_potentiell: 4.17, kopfraum_aktuell: 4.17, ..Schirm::default() };
+        let aus = Anzeige::fuer_client(Some(&hdr_schirm), true, false);
+        assert_eq!(InfoV1::lesen(&strominfo_fuer(Some(&aus))), Some(InfoV1::sdr(GRUND_CLIENT_SDR)));
+        let auto = Anzeige::fuer_client(Some(&hdr_schirm), true, true);
+        let g = strominfo_fuer(Some(&auto))[13];
+        assert!(g == GRUND_HOST_KANN_NICHT || g == GRUND_CODEC, "Grund {g}");
     }
 
     /// Wie der Knopf "Diesen PC freigeben" startet (Ausgaben nach NUL,

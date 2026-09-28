@@ -7,7 +7,11 @@
 // Parametersaetze davor gehoeren dazu.
 //
 // Die Eckdaten des Stroms (Groesse, Farbaufloesung, Bittiefe) liest der
-// Software-Decoder von FFmpeg aus dem ersten Vollbild - einmal beim Laden.
+// Software-Decoder von FFmpeg aus dem ersten Vollbild - einmal beim Laden;
+// ebenso die Farbe aus dem VUI und bei einem HDR10-Clip die Metadaten aus
+// den Seitendaten (MDCV, CLL). Ein PQ-Clip geht mit der Strominfo Fassung 1
+// als PQ hinaus, ohne Aushandlung - die einzige Stelle, die das tut (Pruefweg
+// fuer die Clients ohne HDR-Encoder, Plan 7.3).
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +32,69 @@ pub struct Konserve {
     pub hoehe: u32,
     pub chroma444: bool,
     pub zehn_bit: bool,
+    /// Farbe und Metadaten eines HDR10-Clips; None bei SDR.
+    pub hdr: Option<crate::hdr::InfoV1>,
+}
+
+/// Ein AVRational (num, den als i32) aus den Seitendaten als Zahl.
+fn rational(d: &[u8], o: usize) -> f64 {
+    let num = i32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    let den = i32::from_le_bytes([d[o + 4], d[o + 5], d[o + 6], d[o + 7]]);
+    if den > 0 { num as f64 / den as f64 } else { 0.0 }
+}
+
+/// Auf u16 gerundet und geklemmt.
+fn u16_aus(v: f64) -> u16 {
+    if v.is_finite() { v.round().clamp(0.0, u16::MAX as f64) as u16 } else { 0 }
+}
+
+/// Mastering max (nit) und min (0,0001 nit) aus AVMasteringDisplayMetadata:
+/// sechs AVRational Primaerfarben, zwei Weisspunkt, dann min_luminance (64),
+/// max_luminance (72), has_primaries (80), has_luminance (84) - 88 Byte.
+/// (0, 0) ohne Leuchtdichte.
+pub fn mastering_lesen(d: &[u8]) -> (u16, u16) {
+    if d.len() < 88 || i32::from_le_bytes([d[84], d[85], d[86], d[87]]) == 0 {
+        return (0, 0);
+    }
+    (u16_aus(rational(d, 72)), u16_aus(rational(d, 64) * 10000.0))
+}
+
+/// MaxCLL und MaxFALL aus AVContentLightMetadata (zwei u32).
+pub fn lichtpegel_lesen(d: &[u8]) -> (u16, u16) {
+    if d.len() < 8 {
+        return (0, 0);
+    }
+    let cll = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+    let fall = u32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+    (cll.min(u16::MAX as u32) as u16, fall.min(u16::MAX as u32) as u16)
+}
+
+/// Farbe und HDR-Metadaten aus dem ersten decodierten Bild: VUI (Transfer,
+/// Primaerfarben, Matrix, Bereich) und die Seitendaten MDCV und CLL. None
+/// fuer SDR - dann entscheidet der Host wie sonst.
+fn hdr_aus_bild(b: &ffmpeg::frame::Video) -> Option<crate::hdr::InfoV1> {
+    use ffmpeg::ffi::{AVColorPrimaries, AVColorSpace, AVColorTransferCharacteristic};
+    use ffmpeg::frame::side_data::Type;
+    let trc: AVColorTransferCharacteristic = b.color_transfer_characteristic().into();
+    let prim: AVColorPrimaries = b.color_primaries().into();
+    let mat: AVColorSpace = b.color_space().into();
+    let voll = b.color_range() == ffmpeg::color::Range::JPEG;
+    let farbe = crate::hdr::Farbe::aus_vui(trc as u32 as u8, prim as u32 as u8, mat as u32 as u8, voll);
+    if !farbe.ist_pq() {
+        return None;
+    }
+    let (master_max_nit, master_min_zehntausendstel) =
+        b.side_data(Type::MasteringDisplayMetadata).map(|sd| mastering_lesen(sd.data())).unwrap_or((0, 0));
+    let (max_cll, max_fall) = b.side_data(Type::ContentLightLevel).map(|sd| lichtpegel_lesen(sd.data())).unwrap_or((0, 0));
+    Some(crate::hdr::InfoV1 {
+        farbe,
+        grund: crate::hdr::GRUND_AKTIV,
+        sdr_weiss_nit: crate::hdr::SDR_WEISS_VORGABE_NIT as u16,
+        master_max_nit,
+        master_min_zehntausendstel,
+        max_cll,
+        max_fall,
+    })
 }
 
 /// Grenzen der NAL-Einheiten (Beginn der Nutzlast hinter dem Startcode, Ende).
@@ -144,14 +211,19 @@ impl Konserve {
             ffmpeg::format::Pixel::YUV420P10LE | ffmpeg::format::Pixel::P010LE => (false, true),
             _ => (false, false),
         };
-        let k = Konserve { aus, h264, breite: b.width(), hoehe: b.height(), chroma444, zehn_bit };
+        let hdr = hdr_aus_bild(b);
+        let k = Konserve { aus, h264, breite: b.width(), hoehe: b.height(), chroma444, zehn_bit, hdr };
         let keys = k.aus.iter().filter(|a| a.key).count();
         log(format!(
-            "Konserve: {} Zugriffseinheiten ({} Vollbilder), {}x{}, {}, {}, {} Bit, {:.1} MB",
+            "Konserve: {} Zugriffseinheiten ({} Vollbilder), {}x{}, {}, {}, {} Bit, {}, {:.1} MB",
             k.aus.len(), keys, k.breite, k.hoehe,
             if h264 { "H.264" } else { "HEVC" },
             if chroma444 { "4:4:4" } else { "4:2:0" },
             if zehn_bit { 10 } else { 8 },
+            match &k.hdr {
+                Some(i) => i.text(),
+                None => "SDR".into(),
+            },
             d.len() as f64 / 1e6
         ));
         Ok(k)
@@ -182,6 +254,8 @@ pub fn abspielen(k: Konserve) {
     encoder::konserve_setzen(idx);
     Z.info_w.store(k.breite, Ordering::Relaxed);
     Z.info_h.store(k.hoehe, Ordering::Relaxed);
+    // Ein HDR10-Clip geht als PQ hinaus (Strominfo Fassung 1, hdr_info).
+    *Z.konserve_farbe.lock().unwrap_or_else(|e| e.into_inner()) = k.hdr;
     log(format!("Konserve laeuft als Kandidat {idx} ({}) in Schleife, Codecwechsel wird abgelehnt", encoder::kandidat(idx).name));
     std::thread::spawn(move || {
         let n = k.aus.len();
@@ -221,7 +295,34 @@ pub fn abspielen(k: Konserve) {
 
 #[cfg(test)]
 mod tests {
-    use super::nal_grenzen;
+    use super::{lichtpegel_lesen, mastering_lesen, nal_grenzen};
+
+    /// Die Seitendaten eines HDR10-Clips, wie FFmpeg sie anlegt: 1000 nit
+    /// max, 0,005 nit min (als 50/10000), MaxCLL 1000, MaxFALL 400; ohne
+    /// has_luminance oder zu kurz nichts.
+    #[test]
+    fn seitendaten_werden_gelesen() {
+        let mut m = vec![0u8; 88];
+        let r = |m: &mut Vec<u8>, o: usize, num: i32, den: i32| {
+            m[o..o + 4].copy_from_slice(&num.to_le_bytes());
+            m[o + 4..o + 8].copy_from_slice(&den.to_le_bytes());
+        };
+        r(&mut m, 64, 50, 10000);
+        r(&mut m, 72, 1000, 1);
+        m[80..84].copy_from_slice(&1i32.to_le_bytes());
+        assert_eq!(mastering_lesen(&m), (0, 0), "ohne has_luminance");
+        m[84..88].copy_from_slice(&1i32.to_le_bytes());
+        assert_eq!(mastering_lesen(&m), (1000, 50));
+        assert_eq!(mastering_lesen(&m[..87]), (0, 0));
+        r(&mut m, 72, 4000, 0);
+        assert_eq!(mastering_lesen(&m).0, 0, "Nenner 0");
+        let mut c = 1000u32.to_le_bytes().to_vec();
+        c.extend_from_slice(&400u32.to_le_bytes());
+        assert_eq!(lichtpegel_lesen(&c), (1000, 400));
+        assert_eq!(lichtpegel_lesen(&c[..7]), (0, 0));
+        c[0..4].copy_from_slice(&100_000u32.to_le_bytes());
+        assert_eq!(lichtpegel_lesen(&c).0, u16::MAX);
+    }
 
     #[test]
     fn startcodes_werden_gefunden() {
