@@ -23,7 +23,9 @@ H.264 in software for now.
   lines fray. 10 bits per sample instead of 8 remove banding in gradients.
 - **The pointer is yours.** It is never part of the video: Windows draws its own
   pointer in the shape the Mac reports, so the mouse feels local even when the
-  picture is a few milliseconds behind.
+  picture is a few milliseconds behind. In games the mouse is captured
+  automatically: no second pointer over the game, and the camera turns without
+  stopping at the edge of the picture (F8 by hand).
 - **Latency you can see.** 15 to 20 ms from capture on a Mac mini M1 to hand-over to
   the display at 1080p and 120 frames/s in the LAN (about 24 ms when the PC decodes
   4:4:4 in software); the statistics panel shows every link of the chain live
@@ -76,7 +78,10 @@ in hardware as HEVC 4:4:4 with 10 bits per sample and sends it to a Windows PC. 
 mouse pointer is deliberately *not* rendered into the video: what you see is the
 Windows pointer, and the Mac follows it invisibly, so the mouse feels local. To make
 it still look like the Mac's pointer, the host sends only the pointer *shape* (arrow,
-hand, resize arrows, text cursor, spinning wait cursor) whenever it changes.
+hand, resize arrows, text cursor, spinning wait cursor) whenever it changes. When an
+application on the host hides the pointer, the client hides its own; when a game
+captures the mouse, the client captures its pointer too and sends relative movement,
+which the host injects as such (see "Mouse capture for games" in MANUAL.txt).
 
 Status as of 28 September 2026: it runs, but it is still a scaffold, not a finished
 application. Releases: https://github.com/quadchroma-tech/quadchroma/releases. The Mac
@@ -138,10 +143,13 @@ graphics card the CPU draws.
   is one app for both directions - client and host in one process with one icon; on the
   Mac the Rust client has the Objective-C host engine built in.
 - Pointer on the client side: the client shows its own local pointer in the shape the
-  host reports; the video never contains one. The shape comes in pixels of the stream
-  (a HiDPI Mac sends it at twice its point size) and the client draws it exactly as
-  large as the picture appears - enlarged by whole factors, reduced by area average -,
-  so it is as large relative to the picture as on the host.
+  host reports, and hides it when the host's application hides its pointer; the video
+  never contains one. The shape comes in pixels of the stream (a HiDPI Mac sends it at
+  twice its point size) and the client draws it exactly as large as the picture
+  appears - enlarged by whole factors, reduced by area average -, so it is as large
+  relative to the picture as on the host. Games that capture the mouse get relative
+  movement (raw input on Windows, mouse deltas on the Mac); F8 captures or releases it
+  by hand.
 - Always encrypted: Noise XX with X25519, ChaCha20-Poly1305 and SHA-256, no switch to
   turn it off.
 - Access by password or click: every device has a permanent key and a nine-digit
@@ -441,13 +449,15 @@ and no key reaches the host.
 
 | Key | Effect |
 |---|---|
+| F8 | capture or release the mouse (games; the host captures it by itself when a game hides and locks the pointer) |
 | F9 | statistics on and off |
 | F10, or hold ESC for two seconds | menu: Picture, Display, Encryption, Shortcuts, Benchmark, Computers |
 | F11 | full screen on and off (on the Mac without menu bar and Dock) |
 | F12 | pixel-exact rendering instead of scaled |
 | Ctrl+Esc | back to the start screen |
 
-Every key function is also a switch in the menu. All other keys go to the Mac. What
+Every key function except F8 is also a switch in the menu (the menu releases a captured
+mouse anyway). All other keys go to the Mac. What
 travels is the key's position, not the character, so umlauts, accents and AltGr work
 without any mapping; the Windows key is the Mac's Command key. While the menu is
 open, mouse and keyboard belong to the menu, not to the Mac.
@@ -1148,13 +1158,18 @@ exit code is the number of failures.
     the streamed screen with a real 3840x2160 encoder, the pointer scale (2, 1, 1.5)
     and "encoder full" from two open frames;
     `bildschirm.txt` (also broken); `--display` as a pin for the run; the greeting
-    with capabilities 7 and the list; Automatic follows the main screen (debounced);
+    with capabilities 15 and the list; Automatic follows the main screen (debounced);
     a request via the real input channel; a missing requested screen with fallback
     and return; a different size with a new encoder and keyframe; waiting for a
     running codec switch (every request gets its answer, the waiting ends as soon as
     no switch is pending, after 5 s the switch happens anyway); an empty list with a
     running stream; screen loss and recovery. List and stream come from mocks, the
     encoders are real.
+  - Mouse capture: the capture guard with the same cases as the client's `maus.rs`
+    (typing, hidden despite movement, locked, detached), relative movement (message
+    72) with deltas and clamping at the screen edge, buttons without position, and the
+    capture flag in byte 10 of message 49 - posted to hooks, never into the system.
+    The pointer scale is checked with the stream sizes above.
   - HDR negotiation: capabilities with bit 2, message 71 over the real input channel
     (a new stream info in SDR with the host's reason, nothing on an unchanged state,
     unreadable data skipped), then up to HDR10 and back - HDR on the host's screen on
@@ -1299,7 +1314,7 @@ decoder, reset at the end of the session) and the texts in all 29 languages; in 
 Windows host role the pure selection (Automatic follows the main screen, request,
 fallback, return, reasons), identifier and name from the device ID, `bildschirm.txt`
 including leftovers, message 12 only after setup, the Win32 paths of the list, the
-request over the real input channel and the greeting with capabilities 7 and list 12.
+request over the real input channel and the greeting with capabilities 15 and list 12.
 
 For the access the Rust tests check the test vectors (device ID, norm, K, both proofs,
 HMAC after RFC 4231, PBKDF2), messages 20 to 23 including truncated ones and a wrong

@@ -991,7 +991,8 @@ static void hoststatus_senden(uint8_t lage) {
 #define QC_MSG_AUDIO      33
 #define QC_MSG_CLIP       48
 // Host -> Client: Zeigerform. 12 Byte Kopf (u16 Breite, u16 Hoehe, u16 Hotspot x,
-// u16 Hotspot y, u8 sichtbar, u8 Massstab (1 = Punkte), u16 frei), dann RGBA.
+// u16 Hotspot y, u8 sichtbar, u8 Massstab (1: die Form in Bildpunkten des
+// Stroms, zeiger.h), u8 Merkmale (Bit 0 QC_ZEIGER_GEFANGEN), u8 frei), dann RGBA.
 #define QC_MSG_CURSOR     49
 
 static _Atomic int g_audio_info_sent = 0;
@@ -1130,7 +1131,8 @@ static void dateien_nachricht(uint64_t sitzung, uint64_t kanal, uint8_t typ, NSD
 
 // Zeigerform: Kopf und Bild in einem Stueck, damit send_small sie unter einem
 // Griff schickt - sie darf nie zwischen zwei Bildhaelften landen.
-static void zeiger_cb(uint16_t w, uint16_t h, uint16_t hx, uint16_t hy, int sichtbar, const uint8_t *rgba) {
+static void zeiger_cb(uint16_t w, uint16_t h, uint16_t hx, uint16_t hy, int sichtbar, int gefangen,
+                      const uint8_t *rgba) {
     size_t n = (size_t)w * h * 4;
     uint8_t *p = malloc(12 + n);
     if (!p) return;
@@ -1138,6 +1140,7 @@ static void zeiger_cb(uint16_t w, uint16_t h, uint16_t hx, uint16_t hy, int sich
     memcpy(p, &w, 2); memcpy(p + 2, &h, 2); memcpy(p + 4, &hx, 2); memcpy(p + 6, &hy, 2);
     p[8] = (uint8_t)(sichtbar ? 1 : 0);
     p[9] = 1;
+    p[10] = (uint8_t)(gefangen ? QC_ZEIGER_GEFANGEN : 0);
     memcpy(p + 12, rgba, n);
     send_small(QC_MSG_CURSOR, p, 12 + n);
     free(p);
@@ -1919,7 +1922,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     // uebergehen Typ 11 und 12; ein Client ohne Bit 1 schickt nie einen
     // Bildschirmwunsch, einer ohne Bit 2 nie IN_ANZEIGE.
     {
-        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM | QC_FAEHIG_HDR);
+        NSData *f = qc_datei_faehigkeiten_kodieren(QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM | QC_FAEHIG_HDR | QC_FAEHIG_MAUS);
         send_small(QC_MSG_FAEHIGKEITEN, f.bytes, f.length);
     }
     bildschirme_senden();
@@ -2053,7 +2056,9 @@ static void start_beacon(int port) {
 //
 // Nachrichten vom Client (gleicher 8-Byte-Kopf):
 //   16 MAUS_BEWEGUNG : f32 x, f32 y            (0..1, Anteil der Bildbreite/-hoehe)
-//   17 MAUS_TASTE    : u8 taste, u8 gedrueckt, u16 frei, f32 x, f32 y
+//   17 MAUS_TASTE    : u8 taste, u8 gedrueckt, u8 Merkmale, u8 frei, f32 x, f32 y
+//                      Merkmale Bit 0: ohne Position (QC_MAUS_OHNE_POSITION)
+//   72 MAUS_RELATIV  : f32 dx, f32 dy          (Zaehler, y nach unten; eingefangen)
 //   18 RAD           : f32 dx, f32 dy          (Pixel)
 //   19 TASTE         : u16 keycode, u8 gedrueckt, u8 Merkmale, u32 Umschalter
 //                      Merkmale Bit 0: Wiederholung (QC_TASTE_WIEDERHOLUNG)
@@ -2063,6 +2068,14 @@ static void start_beacon(int port) {
 #define QC_IN_BUTTON  17
 #define QC_IN_SCROLL  18
 #define QC_IN_KEY     19
+#define QC_IN_MOVE_REL 72
+
+// Merkmal im dritten Byte der Maustaste: der Client hat eingefangen
+// (relativer Weg) - geklickt wird, wo der Zeiger steht, ohne ihn erst auf
+// x/y zu setzen (im Spiel waere das ein Sprung der Kamera).
+#define QC_MAUS_OHNE_POSITION 1
+// Hoechstens so viele Zaehler je relativer Nachricht und Achse.
+#define QC_REL_GRENZE 16384.0f
 
 // Merkmal im vierten Byte der Tastennachricht: der Client haelt die Taste
 // und sein System wiederholt sie. Der Mac wiederholt eingespeiste Tasten
@@ -2081,6 +2094,7 @@ static CGEventSourceRef g_evsrc = NULL;
 static CGEventFlags g_mods = 0;
 static uint64_t g_mods_kanal = 0;         // welcher Eingabekanal g_mods zuletzt setzte
 static CGPoint g_pos = {0, 0};
+static double g_rel_rest_x = 0, g_rel_rest_y = 0;  // Bruchteile relativer Bewegungen
 static int g_buttons = 0;                 // Bitmaske der gedrueckten Maustasten
 static uint64_t g_button_kanal[3] = {0};  // wer sie gedrueckt hat: links, rechts, Mitte
 // Der Bildschirm, auf dem die Maus laeuft: immer der gestreamte. Geschrieben
@@ -2096,27 +2110,91 @@ static CGPoint to_display_point(float nx, float ny) {
     return CGPointMake(b.origin.x + nx * b.size.width, b.origin.y + ny * b.size.height);
 }
 
+// Wohin Mausereignisse gehen: ins System. Der Pruefstand lenkt sie auf sich
+// um (wie die Tasten) und gibt die Lage des Zeigers vor. Nur unter
+// g_inject_mtx.
+static void maus_posten_system(CGEventRef e) { CGEventPost(kCGHIDEventTap, e); }
+static void (*g_maus_posten)(CGEventRef e) = maus_posten_system;
+static CGPoint zeiger_ort_system(void) {
+    CGPoint p = g_pos;
+    CGEventRef e = CGEventCreate(NULL);
+    if (e) { p = CGEventGetLocation(e); CFRelease(e); }
+    return p;
+}
+static CGPoint (*g_zeiger_ort)(void) = zeiger_ort_system;
+
 static void post(CGEventType type, CGMouseButton btn) {
     CGEventRef e = CGEventCreateMouseEvent(g_evsrc, type, g_pos, btn);
     if (!e) return;
     if (g_mods) CGEventSetFlags(e, g_mods);
-    CGEventPost(kCGHIDEventTap, e);
+    g_maus_posten(e);
     CFRelease(e);
     atomic_fetch_add(&g_input_events, 1);
 }
 
-static void inject_move(float nx, float ny) {
-    g_pos = to_display_point(nx, ny);
-    CGEventType t = kCGEventMouseMoved;
-    CGMouseButton b = kCGMouseButtonLeft;
-    if (g_buttons & 1) { t = kCGEventLeftMouseDragged; b = kCGMouseButtonLeft; }
-    else if (g_buttons & 2) { t = kCGEventRightMouseDragged; b = kCGMouseButtonRight; }
-    else if (g_buttons & 4) { t = kCGEventOtherMouseDragged; b = kCGMouseButtonCenter; }
-    post(t, b);
+// Bewegt oder gezogen, je nach gedrueckter Taste.
+static void bewegungsart(CGEventType *t, CGMouseButton *b) {
+    *t = kCGEventMouseMoved;
+    *b = kCGMouseButtonLeft;
+    if (g_buttons & 1) { *t = kCGEventLeftMouseDragged; *b = kCGMouseButtonLeft; }
+    else if (g_buttons & 2) { *t = kCGEventRightMouseDragged; *b = kCGMouseButtonRight; }
+    else if (g_buttons & 4) { *t = kCGEventOtherMouseDragged; *b = kCGMouseButtonCenter; }
 }
 
-static void inject_button(uint64_t kanal, int button, int down, float nx, float ny) {
+static void inject_move(float nx, float ny) {
     g_pos = to_display_point(nx, ny);
+    CGEventType t;
+    CGMouseButton b;
+    bewegungsart(&t, &b);
+    post(t, b);
+    qc_zeiger_eingabe_bewegung(1, g_pos.x, g_pos.y);
+}
+
+// Relativ (eingefangen, Typ 72): ganze Punkte, der Rest wartet. Das
+// Ereignis traegt die Bewegung in kCGMouseEventDeltaX/Y - daraus lesen Spiele
+// mit abgekoppeltem Zeiger (NSEvent deltaX/deltaY) -, seine Lage ist die
+// jetzige des Zeigers plus die Bewegung, auf den gestreamten Bildschirm
+// geklemmt: am Rand geht die Bewegung trotzdem hinaus.
+static void inject_move_rel(float dx, float dy) {
+    if (!isfinite(dx) || !isfinite(dy)) return;
+    if (dx > QC_REL_GRENZE) dx = QC_REL_GRENZE;
+    if (dx < -QC_REL_GRENZE) dx = -QC_REL_GRENZE;
+    if (dy > QC_REL_GRENZE) dy = QC_REL_GRENZE;
+    if (dy < -QC_REL_GRENZE) dy = -QC_REL_GRENZE;
+    g_rel_rest_x += dx;
+    g_rel_rest_y += dy;
+    double gx = trunc(g_rel_rest_x), gy = trunc(g_rel_rest_y);
+    g_rel_rest_x -= gx;
+    g_rel_rest_y -= gy;
+    qc_zeiger_eingabe_bewegung(0, 0, 0);
+    if (gx == 0 && gy == 0) return;
+    CGPoint p = g_zeiger_ort();
+    CGRect b = CGDisplayBounds(atomic_load(&g_input_display));
+    p.x += gx;
+    p.y += gy;
+    if (b.size.width > 0 && b.size.height > 0) {
+        if (p.x < b.origin.x) p.x = b.origin.x;
+        if (p.x > b.origin.x + b.size.width - 1) p.x = b.origin.x + b.size.width - 1;
+        if (p.y < b.origin.y) p.y = b.origin.y;
+        if (p.y > b.origin.y + b.size.height - 1) p.y = b.origin.y + b.size.height - 1;
+    }
+    g_pos = p;
+    CGEventType t;
+    CGMouseButton knopf;
+    bewegungsart(&t, &knopf);
+    CGEventRef e = CGEventCreateMouseEvent(g_evsrc, t, g_pos, knopf);
+    if (!e) return;
+    if (g_mods) CGEventSetFlags(e, g_mods);
+    CGEventSetIntegerValueField(e, kCGMouseEventDeltaX, (int64_t)gx);
+    CGEventSetIntegerValueField(e, kCGMouseEventDeltaY, (int64_t)gy);
+    g_maus_posten(e);
+    CFRelease(e);
+    atomic_fetch_add(&g_input_events, 1);
+}
+
+static void inject_button(uint64_t kanal, int button, int down, float nx, float ny, int ohne_position) {
+    // Eingefangen: klicken, wo der Zeiger steht.
+    g_pos = ohne_position ? g_zeiger_ort() : to_display_point(nx, ny);
     CGEventType t;
     CGMouseButton b;
     switch (button) {
@@ -2140,7 +2218,7 @@ static void inject_button(uint64_t kanal, int button, int down, float nx, float 
         last_t = now; last_p = g_pos;
     }
     CGEventSetIntegerValueField(e, kCGMouseEventClickState, clicks < 1 ? 1 : clicks);
-    CGEventPost(kCGHIDEventTap, e);
+    g_maus_posten(e);
     CFRelease(e);
     atomic_fetch_add(&g_input_events, 1);
 }
@@ -2191,6 +2269,9 @@ static void inject_key(uint64_t kanal, uint16_t keycode, int down, int wiederhol
     if (autorepeat) CGEventSetIntegerValueField(e, kCGKeyboardEventAutorepeat, 1);
     g_tasten_posten(e);
     CFRelease(e);
+    // Fuer den Fangwaechter (zeiger.m): ein Zeiger, der gleich danach
+    // verschwindet, ist beim Tippen versteckt.
+    if (down) qc_zeiger_eingabe_taste();
 
     // Mitschreiben, was gerade gedrueckt ist - das ist die Grundlage fuer das
     // Freigeben, wenn die Verbindung wegbricht.
@@ -2211,8 +2292,14 @@ static BOOL einspeisen(int fd, uint64_t kanal, uint8_t typ, const uint8_t *paylo
         case QC_IN_MOVE:
             if (len >= 8) { memcpy(f, payload, 8); inject_move(f[0], f[1]); }
             break;
+        case QC_IN_MOVE_REL:
+            if (len >= 8) { memcpy(f, payload, 8); inject_move_rel(f[0], f[1]); }
+            break;
         case QC_IN_BUTTON:
-            if (len >= 12) { memcpy(f, payload + 4, 8); inject_button(kanal, payload[0], payload[1], f[0], f[1]); }
+            if (len >= 12) {
+                memcpy(f, payload + 4, 8);
+                inject_button(kanal, payload[0], payload[1], f[0], f[1], payload[2] & QC_MAUS_OHNE_POSITION);
+            }
             break;
         case QC_IN_SCROLL:
             if (len >= 8) { memcpy(f, payload, 8); inject_scroll(f[0], f[1]); }
@@ -2330,12 +2417,13 @@ static void alle_tasten_loslassen(uint64_t kanal) {
             offen++;
             CGEventRef e = CGEventCreateMouseEvent(g_evsrc, maus_los[i].typ, g_pos, maus_los[i].taste);
             if (e) {
-                CGEventPost(kCGHIDEventTap, e);
+                g_maus_posten(e);
                 CFRelease(e);
             }
         }
     }
     if (g_mods_kanal == kanal) g_mods = 0;
+    g_rel_rest_x = g_rel_rest_y = 0;
     pthread_mutex_unlock(&g_inject_mtx);
     if (offen) logf_(@"Verbindung weg: %d haengende Taste(n) freigegeben", offen);
 }
@@ -2460,7 +2548,8 @@ static void eingabe_verbindung(qc_platz *platz, int fd, const struct sockaddr_in
         if (h.len && qc_chan_read(in, payload, h.len) != 0) break;
         // Abgeloest (neuer Zuschauer, Bild weg, neuerer Eingabekanal):
         // was jetzt noch kommt, wird nicht mehr eingespeist.
-        if (h.type == QC_IN_MOVE || h.type == QC_IN_BUTTON || h.type == QC_IN_SCROLL || h.type == QC_IN_KEY) {
+        if (h.type == QC_IN_MOVE || h.type == QC_IN_BUTTON || h.type == QC_IN_SCROLL || h.type == QC_IN_KEY ||
+            h.type == QC_IN_MOVE_REL) {
             if (!einspeisen(fd, kanal, h.type, payload, h.len)) break;
             continue;
         }

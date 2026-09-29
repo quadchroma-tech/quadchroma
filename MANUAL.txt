@@ -1084,6 +1084,8 @@ every copy of it.
 
 Keys:
 
+    F8         capture or release the mouse (games, see "Mouse capture
+               for games")
     F9         statistics on and off (the menu sets which lines)
     F10        menu - or hold ESC for two seconds
     F11        full screen on and off (on the Mac without menu bar and
@@ -1091,8 +1093,8 @@ Keys:
     F12        pixel-exact rendering instead of stretched
     Ctrl+Esc   back to the start screen
 
-Every key function is also a switch in the menu; nobody has to memorize
-the keys.
+Every key function except F8 is also a switch in the menu (opening the
+menu releases a captured mouse anyway); nobody has to memorize the keys.
 
 Windows: one app for both directions
 ------------------------------------
@@ -1875,31 +1877,151 @@ processor path (zero tolerance at 1:1), writes difference images to the
 directory. Also runs without a card, on Windows' software rasterizer
 (WARP). On the Mac the display is Metal, see "Mac client".
 
-Mouse pointer: the pointer shown is always the Windows pointer - that is
-what makes the mouse feel local. It takes the shape of the Mac pointer,
-though: arrow, hand over buttons, resize arrows at window edges, text
-cursor, spinning wait cursor. The host sends the shape only when it
-changes. The pointer is never hidden here - macOS hides its pointer while
-you type and keeps it hidden until the physical mouse moves, which,
-driven from the client, it never does. The size follows the picture
-scale: at 1:1 as large as on the host. The host sends the shape in
-pixels of the stream: a Mac in a HiDPI mode is streamed natively, so its
-pointer comes at twice its point size, drawn from the sharp 2x artwork
-(1.5 times in a scaled mode such as "looks like 2560x1440" on a 4K
-panel); the Windows host sends the shape of the Desktop Duplication,
-whose pixels are the stream's. A host that fits its stream into the H.264
-limit ("Stream size and H.264" under "Host display") scales the shape the
-same way. The client
-draws it exactly as large as the picture appears - shown width divided
-by stream width: enlarged by whole factors, pixel for pixel (1.5 becomes
-2, 1.4 stays 1), up to 256 pixels; reduced exactly, by area average,
-when the picture appears smaller than the stream - a 4K stream in a
+Mouse pointer: the pointer shown is always the client's own pointer -
+that is what makes the mouse feel local. It takes the shape of the host's
+pointer, though: arrow, hand over buttons, resize arrows at window edges,
+text cursor, spinning wait cursor. The host sends the shape only when it
+changes. The size follows the picture scale: at 1:1 as large as on the
+host. The host sends the shape in pixels of the stream: a Mac in a HiDPI
+mode is streamed natively, so its pointer comes at twice its point size,
+drawn from the sharp 2x artwork (1.5 times in a scaled mode such as
+"looks like 2560x1440" on a 4K panel); the Windows host sends the shape
+of the Desktop Duplication, whose pixels are the stream's. A host that
+fits its stream into the H.264 limit ("Stream size and H.264" under
+"Host display") scales the shape the same way. The client draws it
+exactly as large as the picture appears - shown width divided by stream
+width: enlarged by whole factors, pixel for pixel (1.5 becomes 2, 1.4
+stays 1), up to 256 pixels; reduced exactly, by area average, when the
+picture appears smaller than the stream - a 4K stream in a
 1920-pixel-wide picture halves it (a 64-pixel HiDPI pointer becomes 32
 pixels), a Mac laptop's 3024-pixel-wide stream shown 1663 pixels wide
 gets 0.55 (its 64-pixel pointer becomes 35 pixels, not 32) - but never
 below 16 pixels. On the Mac client winit builds the pointer in points, so
 the client also divides by the window's backing scale (2 on Retina); the
 shape is then drawn at 1x resolution.
+
+A host after 0.2.0 (capability bit 3) also says reliably whether its
+pointer is visible: when an application hides it (a game drawing its own
+pointer, or none at all), the client hides its pointer over the picture
+as well - no second pointer on top of the game's. A host up to 0.2.0
+does not: a Mac host there reports the pointer hidden while you type
+(macOS keeps it hidden until the Mac's own mouse moves, which, driven
+from the client, it never does), so with such a host the pointer is
+never hidden here.
+
+Mouse capture for games
+-----------------------
+
+A game that turns its camera with the mouse hides the pointer and reads
+relative movement (raw input); many also lock the pointer into their
+window. Absolute pointer positions - what a remote desktop normally sends
+- do not work there: the camera stops as soon as the client's pointer
+reaches the edge of the picture, and the client's pointer stands over the
+game as a second one. So the host watches its own pointer and tells the
+client when an application has captured the mouse:
+
+    Windows host   the pointer is hidden (GetCursorInfo: not showing, or
+                   no shape) and either locked to a part of the desktop
+                   (ClipCursor smaller than the virtual screen), or put
+                   back by the game (it does not stay where the last
+                   absolute movement put it), or - with a full-screen
+                   window in front, also borderless - it stays hidden
+                   while the mouse moves (three movements over 150 ms):
+                   "Hide pointer while typing" ends with any movement, a
+                   game does not. A pointer hidden right after a key
+                   press counts as hidden by typing until then. A
+                   drawing program that hides the pointer over its
+                   canvas and draws its own is usually not full-screen:
+                   the client hides its pointer there, but stays
+                   absolute.
+    Mac host       the pointer is hidden (CGCursorIsVisible) and does not
+                   follow the last absolute movement (the game has
+                   detached it with CGAssociateMouseAndMouseCursorPosition
+                   or puts it back). Hidden alone does not count on the
+                   Mac, and the Mac host reports "hidden" to the client
+                   only while captured: macOS hides the pointer while you
+                   type until the Mac's own mouse moves.
+
+A reason has to hold for 50 ms. The capture ends when the pointer has
+been visible again for 100 ms - a game that shows it for one frame keeps
+it.
+
+The client then captures its own pointer: it stays where it is and is
+hidden (Mac: detached from the mouse; Windows: locked to one point), and
+movements go to the host as relative counts - on Windows from raw input
+(unaccelerated), on the Mac from the deltas of the mouse events. The
+Windows host injects them with SendInput without MOUSEEVENTF_ABSOLUTE, so
+games reading raw input see them and turn without limit; the Mac host
+posts mouse events carrying the movement in kCGMouseEventDeltaX/Y (their
+position is clamped to the screen, the movement is not). Mouse buttons
+then click where the host's pointer is. For three seconds a hint at the
+top of the picture says that the mouse is captured and that F8 releases
+it.
+
+Released at once by F8, by the menu (hold ESC for two seconds, or F10),
+when the window loses focus (Alt-Tab, Cmd-Tab; captured again only after
+a click into the picture), at the end of the session, and by the host as
+soon as the game shows its pointer again (a pause menu, for instance).
+F8 also captures by hand when the host does not detect it; pressing it
+while the host reports "captured" releases the mouse until the game
+releases and captures again. With F8 on a desktop whose pointer is
+visible, no pointer can be seen - press F8 again. Desktop use stays as it
+was: absolute positions, the client's pointer in the host's shape.
+
+Older peers: a host up to 0.2.0 sends no bit 3 - the client stays
+absolute, always shows its pointer, and F8 only writes a log line. A
+client up to 0.2.0 ignores the flag and keeps the absolute mode.
+
+Log lines of the client (protokoll.txt):
+
+    "Host meldet Faehigkeiten 0xf: ..., Maus einfangen ja|nein"
+    "Zeigerform vom Host: 32x32, Hotspot 0,0, sichtbar true, eingefangen
+     false" (the first shape of a session), then on every change
+    "Zeiger vom Host: sichtbar false, eingefangen true (32x32)"
+    "Maus eingefangen (der Host meldet eingefangen|F8): Bewegungen
+     relativ, F8 gibt sie frei"
+    "Maus frei (der Host gibt frei|F8|Menue|Fenster ohne Fokus|kein
+     Bild|Sitzung beendet|Ende)"
+    "F8: dieser Host kann die Maus nicht einfangen (Fassung bis 0.2.0) -
+     sie bleibt absolut"
+
+Log lines of the hosts (host-protokoll.txt; on the Mac the host log):
+
+    "Zeiger: versteckt - Maus eingefangen (eingesperrt, folgt der Maus
+     nicht, versteckt trotz Bewegung), an den Client: nicht zeigen"
+    "Zeiger: versteckt, an den Client: nicht zeigen" (hidden, not
+     captured - Windows only)
+    "Zeiger: sichtbar, an den Client: zeigen"
+    "Zeigerform: aus GetCursorInfo (32x32, Hotspot 0,0) - die
+     Duplication lieferte noch keine" (Windows, once)
+
+At most 40 of these per session, then "... weitere Wechsel ohne
+Protokollzeile".
+
+Wire messages (header as everywhere else):
+
+    11  capabilities: bit 3 (value 8) "Maus einfangen" (mouse capture):
+                  the host reports the visibility of its pointer
+                  reliably, sends the capture flag and understands
+                  message 72 and bit 0 of byte 2 of message 17. Both
+                  hosts report 15.
+    49  pointer   12-byte header: u16 width, u16 height, u16 hotspot x,
+                  u16 hotspot y, u8 visible, u8 scale (always 1: the
+                  shape in pixels of the stream, see "Mouse pointer"
+                  above), u8 flags (bit 0 captured), u8
+                  unused; then RGBA with straight alpha. A 1x1 fully
+                  transparent shape is a placeholder (no shape known
+                  yet): the client shows its own arrow for it. Hosts up
+                  to 0.2.0 send 0 in byte 10.
+    17  mouse button: byte 2 flags, bit 0 "without position": click where
+                  the pointer is instead of moving it to x/y first
+                  (sent while captured).
+    72  relative movement, Client -> Host, input channel, 8 bytes: f32 dx,
+                  f32 dy (counts of the client's mouse, y down; further
+                  bytes are ignored). Only while captured and only to a
+                  host with bit 3; the hosts clamp each axis to 16384 and
+                  carry fractions over. After a stall the client adds up
+                  queued relative movements instead of dropping them.
 
 Everything else goes to the Mac. What is transmitted is the position of
 the key, not the character, so umlauts and AltGr come out right without
@@ -2530,7 +2652,8 @@ Wire messages (header as everywhere else):
                   send 0 = SDR), for the log only.
     11  capabilities: bit 2 (value 4) "HDR-Aushandlung" (HDR negotiation):
                   the host understands message 71 and sends version 1 of
-                  message 1. Both hosts report 7.
+                  message 1. Both hosts report 15 (bit 3: see "Mouse
+                  capture for games").
     71  Display   Client -> Host, input channel, 14 bytes, a state message
                   (sent again when the input channel comes up), only to a
                   host with bit 2 in this session: u8 version (1), u8 flags
@@ -3014,8 +3137,9 @@ u32 length; all numbers little endian):
     11  Capabilities  Host -> client, video channel: u32 bits (at least
                       4 bytes, further ones are ignored), bit 0 means
                       "files, version 1", bit 1 "display selection" (see
-                      "Host display"), bit 2 "HDR negotiation" (see "HDR";
-                      both hosts report 7). Goes to
+                      "Host display"), bit 2 "HDR negotiation" (see "HDR"),
+                      bit 3 "mouse capture" (see "Mouse capture for
+                      games"; both hosts report 15). Goes to
                       every new viewer after the greeting, settings and
                       codec list; the display list (12) follows right
                       after it.
@@ -3451,7 +3575,12 @@ host re-enumerates the outputs right away - often a monitor change is behind
 it, and the host then follows the main display or its requested one (see "Host
 display"). The pointer shape comes from Duplication (Windows pointers are
 mostly 32x32; monochrome and masked shapes are converted, inverting pixels
-approximated as opaque); the picture itself contains no pointer. Audio:
+approximated as opaque) and goes out in pixels of the stream (as delivered
+for a native stream, scaled down with a stream fitted for H.264); before
+Duplication has delivered one, the host takes the shape of the system
+pointer (GetCursorInfo). Visibility and capture come from GetCursorInfo and
+GetClipCursor, also while the capture is lost (see "Mouse capture for
+games"); the picture itself contains no pointer. Audio:
 loopback of the default output device, mixed down to two channels, at the
 device's rate; a silent playback stream in the same process keeps the loopback
 running, and gaps are filled with silence. If the device is lost (unplugged,
@@ -3516,8 +3645,9 @@ host-protokoll.txt - next to the client's hosts.txt.
 
 Keys arrive over the connection as positions (macOS key codes) and are
 translated into scancodes on Windows; the client's Command key becomes the
-Windows key, its Option key Alt. On disconnect the host releases all held
-keys. The app runs elevated (requireAdministrator, see "Windows: one app for
+Windows key, its Option key Alt. Relative movement (message 72, mouse
+captured) goes in through SendInput without MOUSEEVENTF_ABSOLUTE. On
+disconnect the host releases all held keys. The app runs elevated (requireAdministrator, see "Windows: one app for
 both directions"), so SendInput reaches windows with higher rights in the
 user's session - Task Manager, the registry editor, installer windows. The one
 window that stays out of reach is the real UAC consent prompt on the secure

@@ -564,6 +564,10 @@ pub enum Key {
     HdrWhyOldHost,
     /// Zeile der Statistik (F9): die Farbe des Stroms.
     StatColor,
+    /// Reiter "Tastenkombinationen": F8 faengt die Maus ein oder gibt sie frei.
+    ShortcutMouseCapture,
+    /// Hinweis ueber dem Bild, solange die Maus frisch eingefangen ist.
+    MouseCapturedHint,
 }
 
 pub struct Lang {
@@ -875,6 +879,8 @@ pub static EN: Lang = Lang {
         (HdrWhyNegotiating, "negotiating …"),
         (HdrWhyOldHost, "the host has no HDR (older version)"),
         (StatColor, "Color"),
+        (ShortcutMouseCapture, "Capture or release the mouse (games)"),
+        (MouseCapturedHint, "Mouse captured · F8 releases it"),
     ],
 };
 
@@ -1163,6 +1169,8 @@ pub static DE: Lang = Lang {
         (HdrWhyNegotiating, "wird ausgehandelt …"),
         (HdrWhyOldHost, "der Host kennt kein HDR (ältere Fassung)"),
         (StatColor, "Farbe"),
+        (ShortcutMouseCapture, "Maus einfangen oder freigeben (Spiele)"),
+        (MouseCapturedHint, "Maus eingefangen · F8 gibt sie frei"),
     ],
 };
 
@@ -1208,8 +1216,8 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > StatColor as usize);
-        assert_eq!(n, StatColor as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > MouseCapturedHint as usize);
+        assert_eq!(n, MouseCapturedHint as usize + 1, "Tabellen laenger als das Enum");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt
@@ -2005,5 +2013,22 @@ mod tests {
         // "Diesen Mac freigeben", sechs des Fensters "Geraetename",
         // Ruhezustand), in jeder Sprache.
         assert!(je_sprache.iter().all(|&n| n == 50), "{je_sprache:?}");
+    }
+
+    /// Maus einfangen (F8): der Hinweis nennt F8 in jeder Sprache, keine
+    /// Platzhalter, nirgends noch englisch; die Zeile im Reiter ist kurz
+    /// genug fuer die Spalte hinter der Taste.
+    #[test]
+    fn maus_texte() {
+        for l in all() {
+            let h = l.get(MouseCapturedHint);
+            let t = l.get(ShortcutMouseCapture);
+            assert!(h.contains("F8") && !h.contains('{') && !h.ends_with('.'), "{}: {h}", l.code);
+            assert!(!t.contains('{') && !t.contains("F8") && t.chars().count() <= 52, "{}: {t}", l.code);
+            if l.code != "en" {
+                assert_ne!(h, EN.get(MouseCapturedHint), "{}: noch englisch", l.code);
+                assert_ne!(t, EN.get(ShortcutMouseCapture), "{}: noch englisch", l.code);
+            }
+        }
     }
 }

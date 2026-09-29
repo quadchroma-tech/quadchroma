@@ -2694,6 +2694,8 @@ fn zeiger_auswerten(dup: &Duplication, zi: &ZeigerInfo, zeiger: &mut Zeiger, feh
             }
         }
     }
+    // Nur der Rueckfall: sichtbar und eingefangen entscheidet der
+    // Fangwaechter aus GetCursorInfo (zeiger.rs).
     if zi.maus_aktualisiert {
         zeiger.sichtbar_setzen(zi.sichtbar);
     }

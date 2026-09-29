@@ -1913,7 +1913,8 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
     char magic[4];
     if (klartext(&s->l, magic, 4, 2000) != 1) return -1;
     // Was nach der Begruessung kommt, bis einschliesslich der Bildschirmliste;
-    // die Faehigkeiten davor muessen genau 7 sein (Dateien, Bildschirmwahl, HDR).
+    // die Faehigkeiten davor muessen genau 15 sein (Dateien, Bildschirmwahl,
+    // HDR, Maus einfangen).
     qc_hdr h;
     NSData *d = nil;
     size_t n = 0;
@@ -1926,7 +1927,7 @@ static int schein_verbinden(schein *s, int bild_port, int ein_port, const uint8_
         if (h.type == QC_MSG_FAEHIGKEITEN) {
             uint32_t bits = 0;
             if (d.length != 4 || qc_datei_faehigkeiten_lesen(d.bytes, d.length, &bits) != 0 ||
-                bits != (QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM | QC_FAEHIG_HDR)) return -1;
+                bits != (QC_FAEHIG_DATEIEN | QC_FAEHIG_BILDSCHIRM | QC_FAEHIG_HDR | QC_FAEHIG_MAUS)) return -1;
         }
         if (h.type == QC_MSG_BILDSCHIRME) {
             if (d.length > sizeof s->liste) return -1;
@@ -5150,6 +5151,209 @@ static void tasten_pruefen(void) {
     atomic_store(&g_in_fd, alt);
 }
 
+// ------------------------------------------------ Maus und Zeiger (Spiele)
+//
+// Der Fangwaechter mit denselben Faellen wie maus.rs im Client (FANG_MAC und
+// FANG_WINDOWS), "folgt nicht", die relative Bewegung (Typ 72) samt Deltas
+// und Klemmen, Maustasten ohne Position - ueber Haken statt ins System - und
+// das Merkmal in Nachricht 49.
+
+typedef struct { CGEventType typ; double x, y; int64_t dx, dy; } maus_mitschrift;
+static maus_mitschrift g_test_maus[32];
+static int g_test_maus_n = 0;
+static CGPoint g_test_ort = { 100, 100 };
+
+static void test_maus_posten(CGEventRef e) {
+    if (g_test_maus_n >= 32) return;
+    CGPoint p = CGEventGetLocation(e);
+    g_test_maus[g_test_maus_n++] = (maus_mitschrift){
+        CGEventGetType(e), p.x, p.y,
+        CGEventGetIntegerValueField(e, kCGMouseEventDeltaX),
+        CGEventGetIntegerValueField(e, kCGMouseEventDeltaY),
+    };
+}
+static CGPoint test_zeiger_ort(void) { return g_test_ort; }
+
+static BOOL test_rel(int fd, uint64_t kanal, float dx, float dy) {
+    float f[2] = { dx, dy };
+    return einspeisen(fd, kanal, QC_IN_MOVE_REL, (const uint8_t *)f, sizeof f);
+}
+
+static BOOL test_maustaste(int fd, uint64_t kanal, int taste, int down, int merkmale, float x, float y) {
+    uint8_t p[12] = { (uint8_t)taste, (uint8_t)down, (uint8_t)merkmale, 0 };
+    memcpy(p + 4, &x, 4);
+    memcpy(p + 8, &y, 4);
+    return einspeisen(fd, kanal, QC_IN_BUTTON, p, sizeof p);
+}
+
+// Ein Durchgang alle 10 ms mit gleicher Lage bis `bis` (wie laufen() in maus.rs).
+static qc_fang_urteil test_laufen(qc_fang_waechter *w, uint64_t von, uint64_t bis, qc_zeiger_lage lage,
+                                  qc_eingabe_zaehler *ein, int bewegt, qc_fang_art art) {
+    uint64_t t = von;
+    qc_fang_urteil u = qc_fang_schritt(w, t, lage, *ein, art);
+    while (t < bis) {
+        t += 10000;
+        if (bewegt) ein->bewegungen++;
+        u = qc_fang_schritt(w, t, lage, *ein, art);
+    }
+    return u;
+}
+
+static int urteil_ist(qc_fang_urteil u, int sichtbar, int gefangen, uint8_t grund) {
+    return u.sichtbar == sichtbar && u.gefangen == gefangen && u.grund == grund;
+}
+
+static void maus_pruefen(int bild_port) {
+    (void)bild_port;
+    printf("\n-- Maus und Zeiger (Spiele)\n");
+    const uint64_t MS = 1000;
+    qc_zeiger_lage frei = { 0, 0, 0, 0 }, versteckt = { 1, 0, 0, 1 };
+
+    // Windows-Regeln (Paritaet mit maus.rs): versteckt heisst "nicht zeigen",
+    // gefangen erst trotz Bewegung, bleibt ohne Bewegung, 100 ms sichtbar loest.
+    qc_fang_waechter w = {0};
+    qc_eingabe_zaehler ein = {0, 0};
+    qc_fang_urteil u = test_laufen(&w, 0, 500 * MS, frei, &ein, 1, QC_FANG_WINDOWS);
+    pruefe(urteil_ist(u, 1, 0, 0), "Windows-Regeln: Desktop sichtbar, nicht gefangen");
+    u = qc_fang_schritt(&w, 510 * MS, versteckt, ein, QC_FANG_WINDOWS);
+    pruefe(urteil_ist(u, 0, 0, 0), "Windows-Regeln: versteckt heisst sofort 'nicht zeigen', noch nicht gefangen");
+    u = test_laufen(&w, 510 * MS, 600 * MS, versteckt, &ein, 0, QC_FANG_WINDOWS);
+    pruefe(!u.gefangen, "ohne Bewegung nicht gefangen");
+    u = test_laufen(&w, 600 * MS, 800 * MS, versteckt, &ein, 1, QC_FANG_WINDOWS);
+    pruefe(urteil_ist(u, 0, 1, QC_FANG_GRUND_BEWEGUNG), "versteckt trotz Bewegung: gefangen");
+    u = test_laufen(&w, 800 * MS, 2000 * MS, versteckt, &ein, 0, QC_FANG_WINDOWS);
+    pruefe(u.gefangen, "bleibt gefangen ohne weitere Bewegung (relativer Weg)");
+    int kurz = qc_fang_schritt(&w, 2010 * MS, frei, ein, QC_FANG_WINDOWS).gefangen &&
+               qc_fang_schritt(&w, 2060 * MS, frei, ein, QC_FANG_WINDOWS).gefangen;
+    u = qc_fang_schritt(&w, 2110 * MS, frei, ein, QC_FANG_WINDOWS);
+    pruefe(kurz && urteil_ist(u, 1, 0, 0), "ein Bild sichtbar loest nicht, 100 ms schon");
+
+    // Mac-Regeln: beim Tippen versteckt - nie gefangen, der Zeiger bleibt beim
+    // Client, auch bei Bewegung (macOS zeigt ihn erst mit der echten Maus).
+    memset(&w, 0, sizeof w);
+    ein = (qc_eingabe_zaehler){ 10, 1000 * MS };
+    u = test_laufen(&w, 1200 * MS, 5000 * MS, versteckt, &ein, 1, QC_FANG_MAC);
+    pruefe(urteil_ist(u, 1, 0, 0), "Mac: beim Tippen versteckt - weder gefangen noch 'nicht zeigen'");
+    memset(&w, 0, sizeof w);
+    ein = (qc_eingabe_zaehler){ 0, 0 };
+    u = test_laufen(&w, 0, 2000 * MS, versteckt, &ein, 1, QC_FANG_MAC);
+    pruefe(urteil_ist(u, 1, 0, 0), "Mac: versteckt trotz Bewegung allein faengt nicht (keine Bewegungsregel)");
+    qc_zeiger_lage abgekoppelt = { 1, 0, 1, 0 };
+    u = test_laufen(&w, 2000 * MS, 2100 * MS, abgekoppelt, &ein, 1, QC_FANG_MAC);
+    pruefe(urteil_ist(u, 0, 1, QC_FANG_GRUND_FOLGT_NICHT), "Mac: versteckt und folgt nicht (abgekoppelt): gefangen, 'nicht zeigen'");
+    // Windows: getippt, dann versteckt; Bewegung haette das beendet -> gefangen.
+    memset(&w, 0, sizeof w);
+    ein = (qc_eingabe_zaehler){ 10, 1000 * MS };
+    u = qc_fang_schritt(&w, 1200 * MS, versteckt, ein, QC_FANG_WINDOWS);
+    int tippen = urteil_ist(u, 1, 0, 0);
+    u = test_laufen(&w, 1200 * MS, 1500 * MS, versteckt, &ein, 1, QC_FANG_WINDOWS);
+    pruefe(tippen && u.gefangen && !u.sichtbar, "Windows: beim Tippen zeigen, trotz Bewegung versteckt dann gefangen");
+    // Nicht im Vollbild (Zeichenprogramm mit eigenem Pinselzeiger): die
+    // Bewegungsregel faengt nicht, "nicht zeigen" gilt.
+    memset(&w, 0, sizeof w);
+    ein = (qc_eingabe_zaehler){ 0, 0 };
+    qc_zeiger_lage fenster = { 1, 0, 0, 0 };
+    u = test_laufen(&w, 0, 2000 * MS, fenster, &ein, 1, QC_FANG_WINDOWS);
+    pruefe(urteil_ist(u, 0, 0, 0), "Windows: versteckt trotz Bewegung, aber kein Vollbild: nicht gefangen");
+    // Eingesperrt und versteckt: 50 ms.
+    memset(&w, 0, sizeof w);
+    qc_zeiger_lage gesperrt = { 1, 1, 0, 0 };
+    int vorher = qc_fang_schritt(&w, 0, gesperrt, ein, QC_FANG_WINDOWS).gefangen;
+    u = qc_fang_schritt(&w, 60 * MS, gesperrt, ein, QC_FANG_WINDOWS);
+    pruefe(!vorher && urteil_ist(u, 0, 1, QC_FANG_GRUND_EINGESPERRT), "eingesperrt und versteckt: nach 50 ms gefangen");
+
+    // folgt nicht: nur 30 ms bis 2 s nach der absoluten Bewegung.
+    pruefe(!qc_zeiger_folgt_nicht(1010 * MS, 960, 540, 100, 100, 1000 * MS, 3) &&
+           qc_zeiger_folgt_nicht(1050 * MS, 960, 540, 100, 100, 1000 * MS, 3) &&
+           !qc_zeiger_folgt_nicht(1050 * MS, 102, 99, 100, 100, 1000 * MS, 3) &&
+           !qc_zeiger_folgt_nicht(3100 * MS, 960, 540, 100, 100, 1000 * MS, 3) &&
+           !qc_zeiger_folgt_nicht(1050 * MS, 960, 540, 100, 100, 0, 3),
+           "folgt nicht: zu frueh, Toleranz, zu alt und ohne Ziel nie");
+
+    // Den Massstab der Form (Bildpunkte des Stroms je Punkt) pruefen die
+    // Abschnitte zur nativen Stromgroesse (qc_zeiger_massstab je Strom).
+
+    // Relative Bewegung (72) und Tasten ohne Position - ueber Haken.
+    g_maus_posten = test_maus_posten;
+    g_zeiger_ort = test_zeiger_ort;
+    const int fd = 1000001;
+    const uint64_t kn = 4712;
+    int alt = atomic_exchange(&g_in_fd, fd);
+    CGDirectDisplayID alt_display = atomic_exchange(&g_input_display, CGMainDisplayID());
+    CGRect b = CGDisplayBounds(CGMainDisplayID());
+    g_test_ort = CGPointMake(b.origin.x + 100, b.origin.y + 100);
+    g_test_maus_n = 0;
+    BOOL ok = test_rel(fd, kn, 2.5f, -1.0f);
+    ok &= test_rel(fd, kn, 0.5f, 0.0f);
+    pruefe(ok && g_test_maus_n == 2 && g_test_maus[0].typ == kCGEventMouseMoved && g_test_maus[0].dx == 2 &&
+           g_test_maus[0].dy == -1 && g_test_maus[1].dx == 1 && g_test_maus[1].dy == 0,
+           "relativ: ganze Punkte in kCGMouseEventDeltaX/Y, der Bruchteil wartet auf die naechste");
+    pruefe(g_test_maus[0].x == g_test_ort.x + 2 && g_test_maus[0].y == g_test_ort.y - 1,
+           "relativ: die Lage ist die jetzige des Zeigers plus die Bewegung");
+    // Am Rand: die Lage klemmt, die Bewegung geht trotzdem hinaus.
+    if (b.size.width > 0) {
+        g_test_ort = CGPointMake(b.origin.x + b.size.width - 1, b.origin.y + 10);
+        g_test_maus_n = 0;
+        test_rel(fd, kn, 50.0f, 0.0f);
+        pruefe(g_test_maus_n == 1 && g_test_maus[0].dx == 50 && g_test_maus[0].x == b.origin.x + b.size.width - 1,
+               "relativ am Bildrand: Lage geklemmt, Delta 50 bleibt - das Spiel dreht sich weiter");
+    }
+    g_test_maus_n = 0;
+    test_rel(fd, kn, NAN, 1.0f);
+    test_rel(fd, kn, 0.2f, 0.2f);
+    pruefe(g_test_maus_n == 0, "relativ: NaN und Bruchteile unter einem Punkt posten nichts");
+    // Taste ohne Position: dort, wo der Zeiger steht; mit Taste wird gezogen.
+    g_test_ort = CGPointMake(b.origin.x + 300, b.origin.y + 200);
+    g_test_maus_n = 0;
+    test_maustaste(fd, kn, 0, 1, QC_MAUS_OHNE_POSITION, 0.0f, 0.0f);
+    test_rel(fd, kn, 3.0f, 4.0f);
+    test_maustaste(fd, kn, 0, 0, QC_MAUS_OHNE_POSITION, 0.0f, 0.0f);
+    pruefe(g_test_maus_n == 3 && g_test_maus[0].typ == kCGEventLeftMouseDown && g_test_maus[0].x == g_test_ort.x &&
+           g_test_maus[0].y == g_test_ort.y && g_test_maus[1].typ == kCGEventLeftMouseDragged &&
+           g_test_maus[1].dx == 3 && g_test_maus[1].dy == 4 && g_test_maus[2].typ == kCGEventLeftMouseUp,
+           "Taste ohne Position: am Zeiger, nicht bei x/y (0,0); relativ mit gedrueckter Taste ist Ziehen");
+    // Mit Position wie bisher: die Lage aus x/y.
+    g_test_maus_n = 0;
+    test_maustaste(fd, kn, 1, 1, 0, 0.5f, 0.5f);
+    test_maustaste(fd, kn, 1, 0, 0, 0.5f, 0.5f);
+    pruefe(g_test_maus_n == 2 && g_test_maus[0].typ == kCGEventRightMouseDown &&
+           fabs(g_test_maus[0].x - (b.origin.x + b.size.width * 0.5)) < 1,
+           "Taste mit Position (Client bis 0.2.0, absoluter Weg): wie bisher bei x/y");
+    // Verbindungsende mit gedrueckter Taste: das Loslassen geht auch ueber den Haken.
+    test_maustaste(fd, kn, 0, 1, QC_MAUS_OHNE_POSITION, 0, 0);
+    g_test_maus_n = 0;
+    alle_tasten_loslassen(kn);
+    pruefe(g_test_maus_n == 1 && g_test_maus[0].typ == kCGEventLeftMouseUp, "Verbindungsende: gedrueckte Maustaste losgelassen");
+    // Abgeloest: nichts.
+    g_test_maus_n = 0;
+    pruefe(!test_rel(fd + 1, kn, 5, 5) && g_test_maus_n == 0, "abgeloester Kanal: keine relative Bewegung");
+    atomic_store(&g_input_display, alt_display);
+    atomic_store(&g_in_fd, alt);
+    g_maus_posten = maus_posten_system;
+    g_zeiger_ort = zeiger_ort_system;
+
+    // Nachricht 49: Merkmal "eingefangen" in Byte 10, Massstab 1 in Byte 9.
+    int h, c;
+    if (paar(&h, &c, 0)) { pruefe(0, "Verbindung"); return; }
+    zuschauer_setzen(h, kanal(h, 0x49));
+    uint8_t rgba[2 * 1 * 4] = { 255, 255, 255, 255, 0, 0, 0, 0 };
+    zeiger_cb(2, 1, 1, 0, 0, 1, rgba);
+    zeiger_cb(2, 1, 1, 0, 1, 0, rgba);
+    zuschauer_weg();
+    leser l;
+    leser_init(&l, c, 0x49);
+    qc_hdr m;
+    NSData *d = nil;
+    uint8_t kopf[2][12];
+    int n = 0;
+    while (n < 2 && nachricht_ganz(&l, &m, &d, 2000) == 1)
+        if (m.type == QC_MSG_CURSOR && d.length == 12 + 8) memcpy(kopf[n++], d.bytes, 12);
+    pruefe(n == 2 && kopf[0][8] == 0 && kopf[0][9] == 1 && kopf[0][10] == QC_ZEIGER_GEFANGEN && kopf[0][11] == 0 &&
+           kopf[1][8] == 1 && kopf[1][10] == 0,
+           "Nachricht 49: sichtbar in Byte 8, Massstab 1 in Byte 9, eingefangen in Byte 10");
+    close(c); free(l.buf);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -5198,6 +5402,7 @@ int main(void) {
         qc_bildschirm_liste_setzen(test_liste);
         qc_strom_fabrik_setzen(test_fabrik);
         tasten_pruefen();
+        maus_pruefen(bild_port);
         protokoll_pruefen(bild_port, ein_port);
         zugang_pruefen(bild_port, ein_port);
         name_und_freigabe_pruefen(bild_port);

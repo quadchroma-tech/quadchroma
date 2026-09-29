@@ -290,6 +290,8 @@ pub static FR: Lang = Lang {
         (HdrWhyNegotiating, "négociation …"),
         (HdrWhyOldHost, "l'hôte ne connaît pas le HDR (ancienne version)"),
         (StatColor, "Couleur"),
+        (ShortcutMouseCapture, "Capturer ou libérer la souris (jeux)"),
+        (MouseCapturedHint, "Souris capturée · F8 la libère"),
     ],
 };
 
@@ -578,6 +580,8 @@ pub static ES: Lang = Lang {
         (HdrWhyNegotiating, "negociando …"),
         (HdrWhyOldHost, "el host no admite HDR (versión anterior)"),
         (StatColor, "Color"),
+        (ShortcutMouseCapture, "Capturar o liberar el ratón (juegos)"),
+        (MouseCapturedHint, "Ratón capturado · F8 lo libera"),
     ],
 };
 
@@ -866,6 +870,8 @@ pub static IT: Lang = Lang {
         (HdrWhyNegotiating, "negoziazione …"),
         (HdrWhyOldHost, "l'host non supporta l'HDR (versione precedente)"),
         (StatColor, "Colore"),
+        (ShortcutMouseCapture, "Cattura o rilascia il mouse (giochi)"),
+        (MouseCapturedHint, "Mouse catturato · F8 lo rilascia"),
     ],
 };
 
@@ -1154,6 +1160,8 @@ pub static PT: Lang = Lang {
         (HdrWhyNegotiating, "a negociar …"),
         (HdrWhyOldHost, "o host não suporta HDR (versão anterior)"),
         (StatColor, "Cor"),
+        (ShortcutMouseCapture, "Capturar ou libertar o rato (jogos)"),
+        (MouseCapturedHint, "Rato capturado · F8 liberta-o"),
     ],
 };
 
@@ -1442,5 +1450,7 @@ pub static NL: Lang = Lang {
         (HdrWhyNegotiating, "wordt afgestemd …"),
         (HdrWhyOldHost, "de host kent geen HDR (oudere versie)"),
         (StatColor, "Kleur"),
+        (ShortcutMouseCapture, "Muis vangen of vrijgeven (games)"),
+        (MouseCapturedHint, "Muis gevangen · F8 geeft hem vrij"),
     ],
 };

@@ -132,9 +132,17 @@ pub const MSG_AUDIO: u8 = 33;
 /// Zwischenablage (UTF-8), in beide Richtungen unter derselben Nummer.
 pub const MSG_CLIP: u8 = 48;
 /// Zeigerform: 12 Byte Kopf (u16 Breite, u16 Hoehe, u16 Hotspot x,
-/// u16 Hotspot y, u8 sichtbar, u8 Massstab, u16 frei), dann RGBA mit gerader
-/// Deckkraft. Kommt nur, wenn sich die Form aendert.
+/// u16 Hotspot y, u8 sichtbar, u8 Massstab (immer 1: ein Formpunkt je Punkt
+/// des Stroms), u8 Merkmale (ZEIGER_*), u8 frei), dann RGBA mit gerader
+/// Deckkraft. Kommt nur, wenn sich Form, Sichtbarkeit oder Merkmale aendern,
+/// und an jeden neuen Zuschauer. Kopf lesen und schreiben: maus.rs.
 pub const MSG_CURSOR: u8 = 49;
+/// Merkmal Bit 0 in MSG_CURSOR (Byte 10): die Anwendung des Hosts hat die
+/// Maus eingefangen (Spiel: Zeiger versteckt und eingesperrt, zurueckgesetzt
+/// oder trotz Bewegung versteckt). Ein Client mit FAEHIG_MAUS faengt dann
+/// seinen Zeiger ein und schickt IN_MOVE_REL. Hosts bis 0.2.0 schicken 0,
+/// Clients bis 0.2.0 uebergehen das Byte und bleiben beim absoluten Weg.
+pub const ZEIGER_GEFANGEN: u8 = 1;
 
 // ------------------------------------ Dateien (beide Richtungen, dateien.rs)
 //
@@ -167,6 +175,13 @@ pub const FAEHIG_BILDSCHIRM: u32 = 2;
 /// nicht, steht in deren HDR-Grund. Der Client schickt IN_ANZEIGE nur an
 /// einen Host, der es in DIESER Sitzung gemeldet hat.
 pub const FAEHIG_HDR: u32 = 4;
+/// Bit 3 in MSG_FAEHIGKEITEN: der Host (nach 0.2.0) meldet in MSG_CURSOR die
+/// Sichtbarkeit verlaesslich (versteckt nur, wenn seine Anwendung den Zeiger
+/// wirklich versteckt - nicht das Verstecken beim Tippen) und das Merkmal
+/// ZEIGER_GEFANGEN, und er versteht IN_MOVE_REL und MAUS_OHNE_POSITION. Erst
+/// damit versteckt der Client seinen Zeiger ueber dem Bild und faengt ein;
+/// einem aelteren Host schickt er nie Typ 72.
+pub const FAEHIG_MAUS: u32 = 8;
 
 /// Flag Bit 0 im Bildkopf: Vollbild.
 pub const FLAG_KEY: u8 = 0x01;
@@ -175,8 +190,15 @@ pub const FLAG_KEY: u8 = 0x01;
 
 /// Mausbewegung: f32 x, f32 y in 0..1 der Bildflaeche.
 pub const IN_MOVE: u8 = 16;
-/// Maustaste: u8 taste (0 links, 1 rechts, 2 mitte), u8 gedrueckt, u16 frei, f32 x, f32 y.
+/// Maustaste: u8 taste (0 links, 1 rechts, 2 mitte), u8 gedrueckt, u8
+/// Merkmale (MAUS_*), u8 frei, f32 x, f32 y.
 pub const IN_BUTTON: u8 = 17;
+/// Merkmal Bit 0 in IN_BUTTON (Byte 2): ohne Position - der Host klickt, wo
+/// sein Zeiger steht, und setzt ihn nicht erst auf x/y. So schickt der Client
+/// Tasten, solange er eingefangen hat (relativer Weg); x/y sind dann die
+/// letzte absolute Lage und nur fuer Hosts bis 0.2.0 da, die das Byte
+/// uebergehen (sie bekommen den relativen Weg nie).
+pub const MAUS_OHNE_POSITION: u8 = 1;
 /// Rad: f32 dx, f32 dy in Pixeln.
 pub const IN_SCROLL: u8 = 18;
 /// Taste: u16 macOS-Keycode, u8 gedrueckt, u8 Merkmale (TASTE_*), u32
@@ -216,6 +238,14 @@ pub const IN_BILDSCHIRM: u8 = 70;
 /// (nit), Kopfraum potentiell und aktuell (x100) - Bytes in hdr.rs
 /// (Anzeige). Nur an einen Host mit FAEHIG_HDR; Zustandsnachricht.
 pub const IN_ANZEIGE: u8 = 71;
+/// Relative Mausbewegung: f32 dx, f32 dy (little endian) in Zaehlern der
+/// Maus des Clients (Windows: Raw Input, Mac: Deltas der Mausereignisse),
+/// y nach unten. Nur, solange der Client eingefangen hat, nur an einen Host
+/// mit FAEHIG_MAUS (ein aelterer uebergaebe sie - unter 256 Byte -, und die
+/// Maus waere tot). Der Windows-Host speist sie mit SendInput ohne
+/// MOUSEEVENTF_ABSOLUTE ein (Raw Input sieht sie), der Mac-Host als
+/// Mausereignis mit kCGMouseEventDeltaX/Y. Lesen: maus::rel_lesen.
+pub const IN_MOVE_REL: u8 = 72;
 
 // Umschalter als Bitmaske, damit der Mac denselben Zustand sieht wie Windows.
 pub const MOD_SHIFT: u32 = 1;

@@ -21,6 +21,17 @@
 // ihn selbst als Wiederholung (WM_KEYDOWN, lParam Bit 30: war schon
 // gedrueckt). Das Merkmal braucht es deshalb hier nicht.
 //
+// Eingefangen (Spiele, siehe maus.rs): der Client schickt relative
+// Bewegungen (IN_MOVE_REL), hier SendInput mit MOUSEEVENTF_MOVE OHNE
+// MOUSEEVENTF_ABSOLUTE - so kommen sie als echte Zaehler im Raw Input an, und
+// ein Spiel dreht sich weiter, auch wenn der Zeiger am Rand staende. Absolute
+// Bewegungen sahen Spiele mit Raw Input als MOUSE_MOVE_ABSOLUTE (oft gar
+// nicht) oder als Sprung, und am Bildrand war Schluss. Maustasten kommen
+// dann mit MAUS_OHNE_POSITION: geklickt wird, wo der Zeiger steht.
+// Mitgeschrieben wird fuer den Fangwaechter (zeiger.rs), was eingespeist
+// wurde: Zahl der Bewegungen, Zeit der letzten Taste, Ziel und Zeit der
+// letzten absoluten Bewegung.
+//
 // UIPI: SendInput erreicht keine Fenster mit hoeheren Rechten als der eigene
 // Prozess. Die App laeuft jetzt erhoeht (Manifest requireAdministrator), also
 // erreicht sie den Task-Manager, den Registrierungs-Editor und Installer im
@@ -32,6 +43,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+use crate::maus;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
@@ -64,6 +77,11 @@ struct Stand {
     key_down: [bool; 256],
     /// Restakkumulation des Rads (Windows will ganze Einheiten).
     rad_rest: (f32, f32),
+    /// Bruchteile relativer Bewegungen (SendInput will ganze Zaehler).
+    rel_rest: maus::RelRest,
+    /// Ziel und Zeit (Hostuhr, us) der letzten absoluten Bewegung - fuer
+    /// "folgt nicht" im Fangwaechter. Nach einer relativen Bewegung keins.
+    abs_ziel: Option<(i32, i32, u64)>,
 }
 
 static STAND: Mutex<Stand> = Mutex::new(Stand {
@@ -72,7 +90,23 @@ static STAND: Mutex<Stand> = Mutex::new(Stand {
     buttons: 0,
     key_down: [false; 256],
     rad_rest: (0.0, 0.0),
+    rel_rest: maus::RelRest::NEU,
+    abs_ziel: None,
 });
+/// Eingespeiste Mausbewegungen (absolut und relativ) seit dem Start.
+static BEWEGUNGEN: AtomicU64 = AtomicU64::new(0);
+/// Wann zuletzt eine Taste gedrueckt wurde (Hostuhr, us; 0 = nie).
+static LETZTE_TASTE_US: AtomicU64 = AtomicU64::new(0);
+
+/// Was bisher eingespeist wurde - fuer den Fangwaechter (zeiger.rs): die
+/// Zaehler und das Ziel der letzten absoluten Bewegung.
+pub fn zaehler() -> (maus::EingabeZaehler, Option<(i32, i32, u64)>) {
+    let ziel = STAND.lock().unwrap().abs_ziel;
+    (
+        maus::EingabeZaehler { bewegungen: BEWEGUNGEN.load(Ordering::Relaxed), letzte_taste_us: LETZTE_TASTE_US.load(Ordering::Relaxed) },
+        ziel,
+    )
+}
 static UIPI_GEMELDET: AtomicBool = AtomicBool::new(false);
 static UNBEKANNT_GEMELDET: AtomicBool = AtomicBool::new(false);
 /// Liegt gerade ein Fenster mit hoeheren Rechten vorn, das die Eingaben
@@ -320,6 +354,8 @@ fn punkt(s: &Stand, nx: f32, ny: f32) -> (i32, i32) {
 fn bewegung(s: &mut Stand, nx: f32, ny: f32) -> INPUT {
     let p = punkt(s, nx, ny);
     s.pos = p;
+    s.abs_ziel = Some((p.0, p.1, super::now_us()));
+    BEWEGUNGEN.fetch_add(1, Ordering::Relaxed);
     let (ax, ay) = absolut(p.0, p.1);
     maus(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, ax, ay, 0)
 }
@@ -331,9 +367,26 @@ fn inject_move(nx: f32, ny: f32) {
     senden(&[e]);
 }
 
-fn inject_button(button: u8, down: bool, nx: f32, ny: f32) {
+/// Relativ (eingefangen): ganze Zaehler, der Rest wartet auf die naechste.
+/// Ohne MOUSEEVENTF_ABSOLUTE - Raw Input liefert dem Spiel genau dx/dy; den
+/// Zeiger selbst bewegt Windows mit Zeigergeschwindigkeit und Beschleunigung.
+fn inject_move_rel(dx: f32, dy: f32) {
     let mut s = STAND.lock().unwrap();
-    let m = bewegung(&mut s, nx, ny);
+    let (gx, gy) = s.rel_rest.nehmen(dx, dy);
+    s.abs_ziel = None;
+    drop(s);
+    BEWEGUNGEN.fetch_add(1, Ordering::Relaxed);
+    if gx != 0 || gy != 0 {
+        senden(&[maus(MOUSEEVENTF_MOVE, gx, gy, 0)]);
+    }
+}
+
+/// `ohne_position` (MAUS_OHNE_POSITION, eingefangen): klicken, wo der Zeiger
+/// steht - sonst setzte die absolute Bewegung vorher ihn (und die Kamera
+/// eines Spiels) auf die letzte absolute Lage des Clients zurueck.
+fn inject_button(button: u8, down: bool, nx: f32, ny: f32, ohne_position: bool) {
+    let mut s = STAND.lock().unwrap();
+    let m = if ohne_position { None } else { Some(bewegung(&mut s, nx, ny)) };
     let (flag, bit) = match (button, down) {
         (1, true) => (MOUSEEVENTF_RIGHTDOWN, 2u8),
         (1, false) => (MOUSEEVENTF_RIGHTUP, 2),
@@ -350,7 +403,10 @@ fn inject_button(button: u8, down: bool, nx: f32, ny: f32) {
     drop(s);
     // Position vorher setzen, wie inject_button auf dem Mac; Doppelklicks
     // erkennt Windows selbst am Abstand der Klicks.
-    senden(&[m, maus(flag, 0, 0, 0)]);
+    match m {
+        Some(m) => senden(&[m, maus(flag, 0, 0, 0)]),
+        None => senden(&[maus(flag, 0, 0, 0)]),
+    }
 }
 
 /// Rad: dy in Pixeln (der Client schickt LineDelta*40) -> Windows-Einheiten
@@ -406,6 +462,11 @@ fn inject_key(keycode: u16, down: bool, _mods: u32) {
     if (keycode as usize) < 256 {
         STAND.lock().unwrap().key_down[keycode as usize] = down;
     }
+    // Fuer den Fangwaechter: ein Zeiger, der gleich danach verschwindet, ist
+    // beim Tippen versteckt ("Zeiger beim Tippen ausblenden").
+    if down {
+        LETZTE_TASTE_US.store(super::now_us().max(1), Ordering::Relaxed);
+    }
     senden(&[taste(sc, e0, down)]);
 }
 
@@ -435,6 +496,7 @@ pub fn alle_tasten_loslassen() {
     let tasten = s.buttons.count_ones();
     s.buttons = 0;
     s.rad_rest = (0.0, 0.0);
+    s.rel_rest.leeren();
     drop(s);
     if !e.is_empty() {
         senden(&e);
@@ -444,12 +506,17 @@ pub fn alle_tasten_loslassen() {
     }
 }
 
-/// Eine Eingabenachricht vom Client (16-19) ausfuehren.
+/// Eine Eingabenachricht vom Client (16-19, 72) ausfuehren.
 pub fn verarbeiten(typ: u8, p: &[u8]) {
     let f32le = |o: usize| f32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
     match typ {
         IN_MOVE if p.len() >= 8 => inject_move(f32le(0), f32le(4)),
-        IN_BUTTON if p.len() >= 12 => inject_button(p[0], p[1] != 0, f32le(4), f32le(8)),
+        IN_MOVE_REL => {
+            if let Some((dx, dy)) = maus::rel_lesen(p) {
+                inject_move_rel(dx, dy);
+            }
+        }
+        IN_BUTTON if p.len() >= 12 => inject_button(p[0], p[1] != 0, f32le(4), f32le(8), p[2] & MAUS_OHNE_POSITION != 0),
         IN_SCROLL if p.len() >= 8 => inject_scroll(f32le(0), f32le(4)),
         IN_KEY if p.len() >= 8 => {
             let kc = u16::from_le_bytes([p[0], p[1]]);
