@@ -266,9 +266,14 @@ impl<'a> Canvas<'a> {
         self.vline(x + 1, y, h, color, 70);
     }
 
-    /// Panel: dunkle Flaeche, Eckklammern statt Rahmen.
+    /// Panel: dunkle Flaeche, Eckklammern statt Rahmen. Die Flaeche ueber
+    /// `fill`, nicht Punkt fuer Punkt ueber `rect`: die Tafel des ESC-Menues
+    /// ist fast fensterbreit und wird alle 33 ms neu gerastert, im Faden, der
+    /// auch praesentiert - ueber `rect` kostete sie mehr als der ganze Rest
+    /// des Menues (gemessen am 2026-09-29, --shot hudhdr2@1920x1080 auf einem
+    /// M1, 60 Rasterungen: 5,0 ms je Rasterung mit `rect`, 2,4 ms mit `fill`).
     pub fn panel(&mut self, x: i32, y: i32, w: i32, h: i32, accent: u32) {
-        self.rect(x, y, w, h, 0x080c14, 225);
+        self.fill(x, y, w, h, 0x080c14, 225);
         let c = 18.min(w / 3).min(h / 3);
         // vier Ecken
         for (cx, cy, dx, dy) in [(x, y, 1, 1), (x + w - 1, y, -1, 1), (x, y + h - 1, 1, -1), (x + w - 1, y + h - 1, -1, -1)] {

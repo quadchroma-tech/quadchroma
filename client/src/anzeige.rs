@@ -229,6 +229,16 @@ fn umschalten_jetzt(ist: Ausgabe, soll: Ausgabe, seit: Option<Duration>) -> bool
     ist != soll && seit.map_or(true, |d| d >= UMSCHALT_SPERRE)
 }
 
+/// Zeigt dieses Present ein PQ-Bild? Ja, solange ein Bild im Fenster steht
+/// (`rect` mit Flaeche, wie stufe2 es nimmt) und die Zwischentextur PQ haelt
+/// (`zwischen_pq`, None: noch keine). Ob seit dem letzten Present ein neues
+/// Bild kam und ob die Oberflaeche darueberliegt, geht hier nicht ein - das
+/// Fenster praesentiert bis 240-mal je Sekunde, Bilder kommen seltener, und
+/// das Menue kommt und geht; die Ausgabe darf mit beidem nicht wechseln.
+fn bild_pq(rect: Option<(i32, i32, u32, u32)>, zwischen_pq: Option<bool>) -> bool {
+    rect.is_some_and(|r| r.2 > 0 && r.3 > 0) && zwischen_pq == Some(true)
+}
+
 /// Die Entscheidung vor jedem Present: None = bleiben, Some(a) = jetzt auf
 /// `a` umschalten (ausgabe_soll, dann umschalten_jetzt).
 fn ausgabe_wechsel(ist: Ausgabe, bild_pq: bool, schirm_hdr: bool, abgelehnt: bool, seit: Option<Duration>) -> Option<Ausgabe> {
@@ -1235,6 +1245,13 @@ impl Gpu {
         hdr_darstellung_moeglich(self.hdr10_abgelehnt)
     }
 
+    /// Nur fuer die Tests in main.rs: so tun, als praesentierte die
+    /// Swapchain HDR10 (`an`) bzw. wieder SDR - ohne Fenster gibt es keine.
+    #[cfg(test)]
+    pub fn hdr_vortaeuschen(&mut self, an: bool) {
+        self.ausgabe = if an { Ausgabe::Hdr10 } else { Ausgabe::Sdr };
+    }
+
     /// Die Strominfo Fassung 1 des Stroms, zu dem das naechste rohe Bild
     /// gehoert (None: Host vor 0.2.0 - dann gelten die Vorgaben 203 / 1000
     /// nit). Der Empfangsfaden gibt sie jedem Bild mit.
@@ -1342,9 +1359,9 @@ impl Gpu {
     /// Vor jedem Present: Schirm pruefen, Ausgabe waehlen (umschalten, wenn
     /// noetig und erlaubt), bei HDR10 die Metadaten nachfuehren. Gibt die
     /// Zahlen fuer Stufe 2 zurueck.
-    fn ausgabe_fuehren(&mut self, bild_da: bool) -> KonstHdr {
+    fn ausgabe_fuehren(&mut self, rect: Option<(i32, i32, u32, u32)>) -> KonstHdr {
         self.lage_pruefen();
-        let pq = bild_da && self.zwischen.as_ref().is_some_and(|z| z.pq);
+        let pq = bild_pq(rect, self.zwischen.as_ref().map(|z| z.pq));
         let schirm_hdr = self.schirm.as_ref().is_some_and(|z| z.schirm.hdr);
         if let Some(soll) = ausgabe_wechsel(self.ausgabe, pq, schirm_hdr, self.hdr10_abgelehnt, self.umgeschaltet.map(|t| t.elapsed())) {
             match self.ausgabe_setzen(soll) {
@@ -1438,7 +1455,7 @@ impl Gpu {
     pub fn zeichnen(&mut self, rect: Option<(i32, i32, u32, u32)>, ui_an: bool, sofort: bool) -> Praesentiert {
         let Some(sc) = self.swapchain.clone() else { return Praesentiert::Fehler("keine Swapchain".into()) };
         // Vor der Sicht auf den Backbuffer: eine Umschaltung legt sie neu an.
-        let k = self.ausgabe_fuehren(rect.is_some_and(|r| r.2 > 0 && r.3 > 0));
+        let k = self.ausgabe_fuehren(rect);
         let Some(rtv) = self.rtv.clone() else { return Praesentiert::Fehler("keine Sicht auf den Backbuffer".into()) };
         if let Err(e) = self.stufe2(&rtv, self.breite, self.hoehe, rect, ui_an, self.ausgabe, &k) {
             return self.einordnen(e);
@@ -2772,6 +2789,57 @@ mod tests {
             }
             assert_eq!(ist, danach, "bei {t} ms");
         }
+    }
+
+    /// Live 2026-09-29 (X17 mit RTX 3080 Ti, X27 mit "HDR verwenden" an):
+    /// das Menue zeigte "HDR → SDR", das Protokoll eine HDR10-Swapchain ohne
+    /// Rueckweg. Die Ausgabe selbst flattert nicht - Present fuer Present mit
+    /// 240 Hz, neue Bilder nur mit 110 Hz (dazwischen Presents ohne neues
+    /// Bild), eine Sekunde Standbild ohne jedes neue Bild, das Menue alle
+    /// 0,7 s auf und zu: genau eine Umschaltung auf HDR10 mit dem ersten
+    /// PQ-Bild, und die bleibt, bis "HDR verwenden" ausgeht - dann genau eine
+    /// zurueck. (Der Fehler lag in main.rs: waehrend der Zeichnung fragte die
+    /// Oberflaeche eine leere Anzeige; siehe karte_ausleihen.)
+    #[test]
+    fn ausgabe_flattert_nicht() {
+        let rect = Some((0, 0, 1920, 1080));
+        let (mut ist, mut zuletzt): (Ausgabe, Option<u64>) = (Ausgabe::Sdr, None);
+        let mut zwischen_pq: Option<bool> = None;
+        let mut wechsel = Vec::new();
+        let mut presents_ohne_bild = 0;
+        let mut presents_mit_menue = 0;
+        for n in 0..1440u64 {
+            let t_ms = n * 1000 / 240;
+            // Bild Nummer n * 110 / 240: neu, wenn die Nummer weiterzaehlt;
+            // die ersten 0,3 s SDR (Start), dann PQ; 2 s bis 3 s Standbild.
+            let neues_bild = (n == 0 || n * 110 / 240 != (n - 1) * 110 / 240) && !(2000..3000).contains(&t_ms);
+            if neues_bild {
+                zwischen_pq = Some(t_ms >= 300);
+            } else {
+                presents_ohne_bild += 1;
+            }
+            // Das Menue liegt darueber oder nicht - fuer die Ausgabe gleich.
+            if (t_ms / 700) % 2 == 1 {
+                presents_mit_menue += 1;
+            }
+            let schirm_hdr = t_ms < 5000;
+            let seit = zuletzt.map(|z| Duration::from_millis(t_ms - z));
+            if let Some(a) = ausgabe_wechsel(ist, bild_pq(rect, zwischen_pq), schirm_hdr, false, seit) {
+                ist = a;
+                zuletzt = Some(t_ms);
+                wechsel.push((t_ms, a));
+            }
+            if (300..5000).contains(&t_ms) && zwischen_pq == Some(true) {
+                assert_eq!(ist, Ausgabe::Hdr10, "Present {n} bei {t_ms} ms (neues Bild {neues_bild})");
+            }
+        }
+        assert!(presents_ohne_bild > 700 && presents_mit_menue > 600, "{presents_ohne_bild} {presents_mit_menue}");
+        assert_eq!(wechsel, vec![(300, Ausgabe::Hdr10), (5000, Ausgabe::Sdr)]);
+        // Kein Bild im Fenster (Warten, Start) ist kein PQ-Bild; eine leere
+        // Flaeche auch nicht.
+        assert!(!bild_pq(None, Some(true)));
+        assert!(!bild_pq(Some((0, 0, 0, 1080)), Some(true)));
+        assert!(!bild_pq(rect, None) && !bild_pq(rect, Some(false)));
     }
 
     /// Lehnt DXGI HDR10 ab, meldet die Anzeige keine HDR-Darstellung (Bit 1),

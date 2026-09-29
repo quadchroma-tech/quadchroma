@@ -6431,7 +6431,85 @@ enum Anzeige {
         context: softbuffer::Context<Arc<Window>>,
         surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
     },
+    /// Die Karte zeichnet gerade: draw_gpu hat sie fuer die Dauer der
+    /// Zeichnung herausgenommen (karte_ausleihen). Hier bleibt ihr HDR-Stand
+    /// stehen, denn genau dann rastert die Oberflaeche Menue und Statistik,
+    /// fuehrt die Sekundenzeile und wirken Klicks (hdr_stellen ->
+    /// anzeige_takt -> IN_ANZEIGE). Vorher stand hier `Keine`, und alle
+    /// sahen "kein HDR": das Menue "HDR → SDR" unter einer HDR10-Swapchain,
+    /// IN_ANZEIGE "Darstellung nein" nach einem Klick auf den Schalter.
+    #[cfg(any(windows, target_os = "macos"))]
+    Geliehen(AnzeigeHdr),
     Keine,
+}
+
+/// Was die Anzeige zu HDR sagt - fuer das Menue (Reiter Bild), die Zeile
+/// "Farbe" der Statistik, das goldene Abzeichen, die Sekundenzeile und
+/// IN_ANZEIGE Bit 1. Alle lesen es ueber `Anzeige::hdr`, keiner an der Karte
+/// vorbei; so sagen sie dasselbe - auch waehrend der Zeichnung.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AnzeigeHdr {
+    /// Die Anzeige praesentiert HDR: unter Windows eine HDR10-Swapchain
+    /// (R10G10B10A2, G2084/P2020), auf dem Mac ein PQ-Bild ueber EDR mit
+    /// Kopfraum (hdr_praesentiert der Karte).
+    praesentiert: bool,
+    /// Sie kann HDR-Bilder zeigen (IN_ANZEIGE Bit 1): unter Windows nicht,
+    /// solange DXGI HDR10 an diesem Schirm abgelehnt hat; auf dem Mac
+    /// HDR_DARSTELLUNG.
+    darstellung: bool,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl AnzeigeHdr {
+    fn von(g: &anzeige::Gpu) -> AnzeigeHdr {
+        AnzeigeHdr {
+            praesentiert: g.hdr_praesentiert(),
+            #[cfg(windows)]
+            darstellung: g.hdr_darstellung(),
+            #[cfg(target_os = "macos")]
+            darstellung: anzeige::HDR_DARSTELLUNG,
+        }
+    }
+}
+
+impl Anzeige {
+    /// Der HDR-Stand dessen, was ins Fenster zeichnet: die Karte selbst,
+    /// ausgeliehen der Stand, den sie dabei zuruecklaesst; softbuffer und
+    /// keine Anzeige zeigen nie HDR.
+    fn hdr(&self) -> AnzeigeHdr {
+        match self {
+            #[cfg(any(windows, target_os = "macos"))]
+            Anzeige::Gpu(g) => AnzeigeHdr::von(g),
+            #[cfg(any(windows, target_os = "macos"))]
+            Anzeige::Geliehen(h) => *h,
+            _ => AnzeigeHdr::default(),
+        }
+    }
+
+    /// Die Karte fuer eine Zeichnung herausnehmen (draw_gpu braucht sie und
+    /// `&mut App` zugleich). An ihrer Stelle bleibt ihr HDR-Stand stehen
+    /// (`Geliehen`). None, wenn keine Karte zeichnet - dann bleibt alles, wie
+    /// es ist.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn karte_ausleihen(&mut self) -> Option<anzeige::Gpu> {
+        if !matches!(self, Anzeige::Gpu(_)) {
+            return None;
+        }
+        let Anzeige::Gpu(g) = std::mem::replace(self, Anzeige::Keine) else { return None };
+        *self = Anzeige::Geliehen(AnzeigeHdr::von(&g));
+        Some(g)
+    }
+
+    /// Nach dem Present der ausgeliehenen Karte: ihr Stand kann sich eben
+    /// geaendert haben (Umschaltung SDR <-> HDR10, EDR). Was danach kommt -
+    /// die Klicks der Oberflaeche -, soll den neuen sehen. Steht hier keine
+    /// Leihe mehr (die Anzeige wurde waehrenddessen ersetzt), bleibt es dabei.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn leihe_nachfuehren(&mut self, g: &anzeige::Gpu) {
+        if let Anzeige::Geliehen(h) = self {
+            *h = AnzeigeHdr::von(g);
+        }
+    }
 }
 
 /// Was auf dem Weg ueber die Karte schiefgehen kann: ein Aufruf (die Karte
@@ -6553,6 +6631,9 @@ struct App {
     /// Wann die Oberflaeche zuletzt gerastert wurde - alle 33 ms reicht,
     /// das Video darunter laeuft mit voller Bildrate weiter.
     letzte_oberflaeche: Instant,
+    /// Weg ueber die Karte: Rastern und Hochladen der Oberflaeche in der
+    /// laufenden Sekunde - fuer die Sekundenzeile.
+    ui_zeit: OberflaechenZeit,
     /// Bild hochgeladen, aber Present ausgelassen, weil DXGI noch nicht
     /// bereit war: beim naechsten Takt wieder versuchen.
     praesentation_ausstehend: bool,
@@ -7800,15 +7881,11 @@ impl App {
     /// Kann diese Anzeige HDR darstellen (Bit 1 in IN_ANZEIGE)? Nur der Weg
     /// ueber die Karte, und nur, wenn er HDR-Bilder auch zeigen kann: unter
     /// Windows nicht, solange DXGI HDR10 an diesem Schirm abgelehnt hat (dann
-    /// sendet der Host SDR), auf dem Mac HDR_DARSTELLUNG der Anzeige.
+    /// sendet der Host SDR), auf dem Mac HDR_DARSTELLUNG der Anzeige. Auch
+    /// waehrend der Zeichnung (Anzeige::Geliehen) - ein Klick auf den
+    /// HDR-Schalter meldet von dort aus.
     fn hdr_darstellung(&self) -> bool {
-        match &self.anzeige {
-            #[cfg(windows)]
-            Anzeige::Gpu(g) => g.hdr_darstellung(),
-            #[cfg(target_os = "macos")]
-            Anzeige::Gpu(_) => anzeige::HDR_DARSTELLUNG,
-            _ => false,
-        }
+        self.anzeige.hdr().darstellung
     }
 
     /// Muss die Anzeige ohne neues Bild neu zeichnen? Auf dem Mac, wenn sie
@@ -7822,13 +7899,10 @@ impl App {
         false
     }
 
-    /// Praesentiert die Anzeige gerade in HDR bzw. EDR? Der softbuffer-Weg nie.
+    /// Praesentiert die Anzeige gerade in HDR bzw. EDR? Der softbuffer-Weg
+    /// nie. Waehrend der Zeichnung der Stand der ausgeliehenen Karte.
     fn hdr_praesentiert(&self) -> bool {
-        match &self.anzeige {
-            #[cfg(any(windows, target_os = "macos"))]
-            Anzeige::Gpu(g) => g.hdr_praesentiert(),
-            _ => false,
-        }
+        self.anzeige.hdr().praesentiert
     }
 
     /// Was die Oberflaeche gerade zu HDR zeigt: aus der Strominfo des Hosts
@@ -7896,10 +7970,13 @@ impl App {
         let an = !self.shared.lock().unwrap().hdr_aus;
         let a = hdr::Anzeige::fuer_client(self.schirm.as_ref(), self.hdr_darstellung(), an);
         anzeige_melden(&self.shared, &self.input, &a, &mut self.anzeige_gemeldet, sofort, jetzt);
-        let beidseitig = self.hdr_lage() == hdr::HdrLage::Beidseitig;
-        if beidseitig && !self.hdr_beidseitig_vorher {
-            protokoll::zeile("HDR auf beiden Seiten aktiv (Host PQ, Anzeige HDR)".into());
-            self.hdr_abzeichen = Some(jetzt);
+        let lage = self.hdr_lage();
+        let beidseitig = lage == hdr::HdrLage::Beidseitig;
+        if let Some(z) = beidseitig_wechsel(self.hdr_beidseitig_vorher, lage) {
+            protokoll::zeile(z);
+            if beidseitig {
+                self.hdr_abzeichen = Some(jetzt);
+            }
         }
         self.hdr_beidseitig_vorher = beidseitig;
     }
@@ -8862,7 +8939,16 @@ impl App {
             // Die Sekundenzeile der Sitzung, nur in die Datei: die Basislinie,
             // gegen die jede spaetere Behauptung ueber die Anzeige gemessen
             // wird. "Kette" sind alle fuenf Glieder, wie die Latenz-Zeile.
+            // "Farbe" ist die HDR-Lage, wie Menue und Statistik sie in dieser
+            // Sekunde zeigen (die Zeile entsteht mitten in der Zeichnung, wie
+            // die Oberflaeche); "Menue offen": das ESC-Menue wird ueber dem
+            // Bild alle 33 ms auf dem Prozessor gerastert und hochgeladen, im
+            // selben Faden, der praesentiert - das kostet Anzeigezeit und
+            // Bilder, und "Oberflaeche" sagt, wie viel: Anzahl, dann je Mal
+            // Rastern + Hochladen (Weg ueber die Karte).
+            let ui_zeit = std::mem::take(&mut self.ui_zeit);
             if self.screen == Screen::Session {
+                let farbe = hdr_lage_kurz(self.hdr_lage());
                 let (anzeige_ms, kette, verworfen, ausgelassen) = {
                     let s = self.shared.lock().unwrap();
                     (
@@ -8873,7 +8959,7 @@ impl App {
                     )
                 };
                 protokoll::nur_datei(&format!(
-                    "{:.0}s | {:.0} B/s | Anzeige {:.1} ms | Kette {} ms | verworfen {} | ausgelassen {} | {} | Client-CPU {:.1} %",
+                    "{:.0}s | {:.0} B/s | Anzeige {:.1} ms | Kette {} ms | verworfen {} | ausgelassen {} | {} | Client-CPU {:.1} % | Farbe {} | Menue {} | Oberflaeche {}",
                     client_us() as f64 / 1e6,
                     self.fps_shown,
                     anzeige_ms,
@@ -8881,7 +8967,10 @@ impl App {
                     verworfen,
                     ausgelassen,
                     if self.sofort { "Sofort" } else { "Sync" },
-                    self.cpu_eigen
+                    self.cpu_eigen,
+                    farbe,
+                    if self.hud_offen { "offen" } else { "zu" },
+                    ui_zeit.text()
                 ));
             }
             let (dec_ms, err) = {
@@ -8908,6 +8997,9 @@ impl App {
             Anzeige::Cpu { .. } => self.draw_cpu(),
             #[cfg(any(windows, target_os = "macos"))]
             Anzeige::Gpu(_) => self.draw_gpu(),
+            // Die Karte zeichnet schon (ein Aufruf aus der Zeichnung heraus).
+            #[cfg(any(windows, target_os = "macos"))]
+            Anzeige::Geliehen(_) => {}
             Anzeige::Keine => {}
         }
     }
@@ -8928,13 +9020,14 @@ impl App {
     }
 
     /// Der Weg ueber die Karte. Die Karte wird fuer die Dauer des Zeichnens
-    /// aus dem Zustand genommen (wie die Flaeche beim CPU-Weg); geht dabei
-    /// das Geraet verloren, kommt sie nicht zurueck, sondern wird neu gebaut
-    /// oder aufgegeben.
+    /// aus dem Zustand genommen (wie die Flaeche beim CPU-Weg); ihr
+    /// HDR-Stand bleibt dabei stehen (Anzeige::Geliehen) - Menue, Statistik
+    /// und Klicks laufen genau in dieser Zeit. Geht das Geraet verloren,
+    /// kommt sie nicht zurueck, sondern wird neu gebaut oder aufgegeben.
     #[cfg(any(windows, target_os = "macos"))]
     fn draw_gpu(&mut self) {
         let Some(window) = self.window.clone() else { return };
-        let Anzeige::Gpu(mut g) = std::mem::replace(&mut self.anzeige, Anzeige::Keine) else { return };
+        let Some(mut g) = self.anzeige.karte_ausleihen() else { return };
         match self.draw_gpu_auf(&window, &mut g) {
             // Mac: am sichtbaren Fenster kam nie ein Bild auf dem Schirm an
             // (anzeige_mac.rs, Waechter) - dann waere auch die Oberflaeche
@@ -8942,6 +9035,8 @@ impl App {
             #[cfg(target_os = "macos")]
             Ok(()) if g.nie_auf_dem_schirm() => {
                 drop(g);
+                // Keine Leihe ohne Karte - bis softbuffer steht, zeigt nichts HDR.
+                self.anzeige = Anzeige::Keine;
                 self.auf_software_wechseln("Metal zeigt nichts - am sichtbaren Fenster kam kein Bild auf dem Schirm an");
             }
             Ok(()) => self.anzeige = Anzeige::Gpu(g),
@@ -8949,7 +9044,10 @@ impl App {
                 self.gpu_fehler_melden(e);
                 self.anzeige = Anzeige::Gpu(g);
             }
-            Err(Ausfall::GeraetWeg(grund)) => self.geraet_verloren_behandeln(g, grund),
+            Err(Ausfall::GeraetWeg(grund)) => {
+                self.anzeige = Anzeige::Keine;
+                self.geraet_verloren_behandeln(g, grund);
+            }
         }
     }
 
@@ -9071,6 +9169,7 @@ impl App {
                 // Der Puffer gehoert waehrend des Zeichnens der Canvas, nicht
                 // dem App-Zustand - sonst kaeme oberflaeche_zeichnen nicht an
                 // `&mut self`.
+                let raster_ab = Instant::now();
                 let mut puffer = std::mem::take(&mut self.ui_puffer);
                 if let Some(k) = self.ui_kasten_alt {
                     // Was beim letzten Mal dort stand, wieder durchsichtig.
@@ -9085,10 +9184,14 @@ impl App {
                     nach = Some(self.oberflaeche_zeichnen(&mut c, ww, wh));
                     c.kasten_nehmen()
                 };
+                let hochladen_ab = Instant::now();
                 let hochladen = match kasten_vereinigen(self.ui_kasten_alt, kasten_neu) {
                     Some(k) => g.oberflaeche_hochladen(&puffer, ww, wh, k),
                     None => Ok(()),
                 };
+                self.ui_zeit.raster += hochladen_ab.duration_since(raster_ab);
+                self.ui_zeit.hochladen += hochladen_ab.elapsed();
+                self.ui_zeit.anzahl += 1;
                 self.ui_puffer = puffer;
                 self.ui_kasten_alt = kasten_neu;
                 self.ui_an = kasten_neu.is_some();
@@ -9113,6 +9216,9 @@ impl App {
         // naechsten Takt, und das Bild zaehlt als ausgelassen.
         let ergebnis = if g.bereit() {
             let p = g.zeichnen(rect, self.ui_an, self.sofort);
+            // Das Present kann die Ausgabe eben umgeschaltet haben: die
+            // Klicks unten (nachwirkung) sehen schon den neuen Stand.
+            self.anzeige.leihe_nachfuehren(g);
             // Hat DXGI das Tearing im Lauf zurueckgenommen, sagt es auch
             // die Sekundenzeile.
             if !g.tearing {
@@ -13395,6 +13501,7 @@ fn main() {
         ui_masse: (0, 0),
         ui_an: false,
         letzte_oberflaeche: Instant::now(),
+        ui_zeit: OberflaechenZeit::default(),
         praesentation_ausstehend: false,
         geraet_verloren: None,
         letzter_gpu_fehler: None,
@@ -13580,6 +13687,56 @@ fn hdr_lage_aus(info: Option<&StreamInfo>, praesentiert: bool) -> hdr::HdrLage {
         // "Host vor 0.2.0" - das sagt erst eine Strominfo ohne Fassung 1).
         None => hdr::HdrLage::Sdr(Some(hdr::GRUND_KEIN_IN_ANZEIGE)),
         Some(i) => hdr::lage(i.hdr.as_ref(), praesentiert),
+    }
+}
+
+/// Was die Oberflaeche in einer Sekunde auf dem Weg ueber die Karte
+/// gekostet hat - im Fensterfaden, der auch praesentiert: solange er
+/// rastert und hochlaedt, wartet jedes neue Bild.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct OberflaechenZeit {
+    /// Rastern auf dem Prozessor, samt Leeren des alten Kastens.
+    raster: Duration,
+    /// Hochladen des Kastens in die Textur der Karte.
+    hochladen: Duration,
+    /// Wie oft (hoechstens alle 33 ms).
+    anzahl: u32,
+}
+
+impl OberflaechenZeit {
+    /// "Oberflaeche" der Sekundenzeile: wie oft, und je Mal Rastern +
+    /// Hochladen im Mittel; "-", wenn gar nicht.
+    fn text(&self) -> String {
+        if self.anzahl == 0 {
+            return "-".into();
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / self.anzahl as f64;
+        format!("{}x {:.1} + {:.1} ms", self.anzahl, ms(self.raster), ms(self.hochladen))
+    }
+}
+
+/// Die HDR-Lage kurz, wie die Zeile "Farbe" der Statistik sie zeigt - fuer
+/// die Sekundenzeile des Protokolls.
+fn hdr_lage_kurz(lage: hdr::HdrLage) -> &'static str {
+    match lage {
+        hdr::HdrLage::Beidseitig => "HDR10",
+        hdr::HdrLage::Abgebildet => "HDR->SDR",
+        hdr::HdrLage::Sdr(_) => "SDR",
+    }
+}
+
+/// Beginnt oder endet "HDR auf beiden Seiten"? Dann die Zeile fuers
+/// Protokoll (anzeige_takt), sonst None - jeder Wechsel genau einmal, das
+/// Ende mit der Lage danach. Mit dem Beginn geht das goldene Abzeichen auf.
+fn beidseitig_wechsel(vorher: bool, lage: hdr::HdrLage) -> Option<String> {
+    match (vorher, lage) {
+        (false, hdr::HdrLage::Beidseitig) => Some("HDR auf beiden Seiten aktiv (Host PQ, Anzeige HDR)".into()),
+        (true, hdr::HdrLage::Beidseitig) | (false, _) => None,
+        (true, hdr::HdrLage::Abgebildet) => Some("HDR nicht mehr auf beiden Seiten: HDR->SDR (Host PQ, Anzeige SDR)".into()),
+        (true, hdr::HdrLage::Sdr(g)) => Some(format!(
+            "HDR nicht mehr auf beiden Seiten: SDR ({})",
+            g.map_or("Host ohne Strominfo Fassung 1".to_string(), |g| format!("Grund {g}"))
+        )),
     }
 }
 
@@ -19550,5 +19707,238 @@ mod tests {
         assert_eq!(pruef_hdr_text(Some(&strom(Some(sdr))), true), "SDR · the host cannot send HDR");
         assert_eq!(pruef_hdr_text(Some(&strom(None)), true), "SDR · the host has no HDR (older version)");
         assert_eq!(pruef_hdr_text(None, true), "SDR · negotiating …");
+    }
+
+    /// Der X27 aus dem Protokoll vom 2026-09-29: "HDR verwenden" an.
+    fn x27_hdr() -> hdr::Schirm {
+        hdr::Schirm { hdr: true, sdr_weiss_nit: 480.0, spitze_nit: 417.0, vollbild_spitze_nit: 366.0, kopfraum_potentiell: 1.0, kopfraum_aktuell: 1.0 }
+    }
+
+    /// Die Strominfo des Mac-Hosts aus demselben Protokoll: HEVC 4:4:4 10 Bit, PQ.
+    fn strom_pq() -> StreamInfo {
+        let pq = hdr::InfoV1 { farbe: hdr::Farbe::PQ, grund: 0, sdr_weiss_nit: 100, master_max_nit: 1000, master_min_zehntausendstel: 50, max_cll: 0, max_fall: 0 };
+        StreamInfo { width: 1920, height: 1080, fps: 120, codec: 1, chroma444: true, ten_bit: true, hdr: Some(pq) }
+    }
+
+    /// Was aus dem Stand der Anzeige wird, auf denselben Wegen wie im
+    /// Fenster (hdr_lage, anzeige_takt): der Zustand im Menue samt Gold, die
+    /// Zeile "Farbe" der Statistik, die Sekundenzeile und die Flags von
+    /// IN_ANZEIGE (HDR-Schalter an).
+    fn hdr_sicht(platz: &Anzeige, info: Option<&StreamInfo>, schirm: &hdr::Schirm) -> (String, bool, (String, u32), &'static str, u8) {
+        let en = &strings::EN;
+        let lage = hdr_lage_aus(info, platz.hdr().praesentiert);
+        let (menue, _, gold) = hdr_zustand(lage, true, en);
+        let f9 = hdr_f9(lage, info.and_then(|i| i.hdr).as_ref(), false, en);
+        let flags = hdr::Anzeige::fuer_client(Some(schirm), platz.hdr().darstellung, true).flags;
+        (menue, gold, f9, hdr_lage_kurz(lage), flags)
+    }
+
+    /// Wie draw_gpu die Karte fuer eine Zeichnung nimmt: heute ueber
+    /// karte_ausleihen (ihr HDR-Stand bleibt stehen) oder wie bis a6054b6
+    /// (test/live2) mit `std::mem::replace(.., Anzeige::Keine)`.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Leihe {
+        Heute,
+        Vorher,
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn karte_nehmen(platz: &mut Anzeige, leihe: Leihe) -> anzeige::Gpu {
+        match leihe {
+            Leihe::Heute => platz.karte_ausleihen().expect("die Karte zeichnet"),
+            Leihe::Vorher => match std::mem::replace(platz, Anzeige::Keine) {
+                Anzeige::Gpu(g) => g,
+                _ => panic!("keine Karte am Platz"),
+            },
+        }
+    }
+
+    /// Eine Karte ohne Fenster: unter Windows WARP (auch in der VM), auf dem
+    /// Mac Metal - ohne Metal (Sandbox, virtuelle Maschine) None, dann wird
+    /// der Test uebersprungen wie die Goldbildtests der Anzeige. Sie
+    /// praesentiert SDR, bis hdr_vortaeuschen etwas anderes sagt.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn karte_ohne_fenster() -> Option<anzeige::Gpu> {
+        #[cfg(windows)]
+        let karte = anzeige::Gpu::ohne_fenster(true);
+        #[cfg(target_os = "macos")]
+        let karte = anzeige::Gpu::ohne_fenster();
+        karte.map_err(|e| eprintln!("uebersprungen: {e}")).ok()
+    }
+
+    /// Live 2026-09-29 (Windows-Client auf einem Alienware X17, Fenster auf
+    /// dem X27 mit HDR an, Host HDR10): Menue "HDR → SDR · dieser Bildschirm
+    /// zeigt es als SDR", Statistik "HDR → SDR", nie Gold - das Protokoll
+    /// aber "Swapchain HDR10" ohne Rueckweg. draw_gpu nahm die Karte fuer die
+    /// Zeichnung heraus und liess `Keine` stehen; genau dann rastern Menue und
+    /// Statistik und entsteht die Sekundenzeile - alle sahen "keine Karte,
+    /// kein HDR". Der Teil `Leihe::Vorher` zeigt genau das Bild vom Schirm;
+    /// ausgeliehen sehen alle, was die Karte praesentiert.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn karte_ausleihen_laesst_den_hdr_stand_da() {
+        let en = &strings::EN;
+        let (schirm, info) = (x27_hdr(), Some(strom_pq()));
+        let Some(mut karte) = karte_ohne_fenster() else { return };
+        karte.hdr_vortaeuschen(true);
+        let mut platz = Anzeige::Gpu(karte);
+        let stand = platz.hdr();
+        assert_eq!(stand, AnzeigeHdr { praesentiert: true, darstellung: true });
+        let davor = hdr_sicht(&platz, info.as_ref(), &schirm);
+        assert_eq!(davor.0, en.get(strings::Key::HdrActive));
+        assert!(davor.1, "Menue golden");
+        assert_eq!(davor.2, ("HDR10 · PQ".to_string(), ui::GOLD));
+        assert_eq!(davor.3, "HDR10");
+        assert_ne!(davor.4 & hdr::ANZEIGE_DARSTELLUNG, 0);
+
+        // Wie bis a6054b6: in der Zeichnung steht `Keine` - das Bild vom X17.
+        let g = karte_nehmen(&mut platz, Leihe::Vorher);
+        let alt = hdr_sicht(&platz, info.as_ref(), &schirm);
+        assert_eq!(alt.0, format!("HDR → SDR · {}", en.get(strings::Key::HdrMapped)));
+        assert!(!alt.1);
+        assert_eq!(alt.2, ("HDR → SDR".to_string(), ui::TEXT));
+        assert_eq!(alt.3, "HDR->SDR");
+        assert_eq!(alt.4 & hdr::ANZEIGE_DARSTELLUNG, 0, "ein Klick meldete dem Host 'Darstellung nein'");
+        platz = Anzeige::Gpu(g);
+
+        // Heute: ausgeliehen bleibt der Stand der Karte stehen.
+        let mut g = karte_nehmen(&mut platz, Leihe::Heute);
+        assert!(matches!(platz, Anzeige::Geliehen(_)));
+        assert!(platz.karte_ausleihen().is_none(), "aus einer Leihe kommt keine zweite Karte");
+        assert_eq!(platz.hdr(), stand);
+        assert_eq!(hdr_sicht(&platz, info.as_ref(), &schirm), davor, "Menue, Statistik, Sekundenzeile und IN_ANZEIGE in der Zeichnung");
+        // Das Present schaltet auf SDR ("HDR verwenden" aus): die Klicks
+        // danach sehen es schon, nicht erst die naechste Zeichnung.
+        g.hdr_vortaeuschen(false);
+        platz.leihe_nachfuehren(&g);
+        let nach = hdr_sicht(&platz, info.as_ref(), &schirm);
+        assert_eq!((nach.1, nach.3), (false, "HDR->SDR"));
+        platz = Anzeige::Gpu(g);
+        assert_eq!(hdr_sicht(&platz, info.as_ref(), &schirm), nach, "zurueck an ihrem Platz");
+        // Wird die Anzeige in der Zeichnung ersetzt (aufgegeben), bleibt es dabei.
+        let Anzeige::Gpu(g) = platz else { unreachable!() };
+        let mut ersetzt = Anzeige::Keine;
+        ersetzt.leihe_nachfuehren(&g);
+        assert!(matches!(ersetzt, Anzeige::Keine) && ersetzt.hdr() == AnzeigeHdr::default());
+        assert!(Anzeige::Keine.karte_ausleihen().is_none());
+    }
+
+    /// Was ein Durchlauf von Zeichnungen ergibt (durchspielen).
+    #[cfg(any(windows, target_os = "macos"))]
+    #[derive(Debug, Default)]
+    struct Durchlauf {
+        /// Rasterungen der Oberflaeche, bei denen Menue, Statistik oder
+        /// Sekundenzeile etwas anderes zeigten, als die Karte in diesem
+        /// Moment praesentierte: (Present, Text im Menue).
+        falsch: Vec<(u32, String)>,
+        /// Die Zeilen, die anzeige_takt ins Protokoll schrieb.
+        zeilen: Vec<String>,
+        /// Wie oft das goldene Abzeichen aufging.
+        abzeichen: u32,
+        /// IN_ANZEIGE nach dem Klick auf den HDR-Schalter (aus der Zeichnung).
+        klick_flags: u8,
+    }
+
+    /// Present fuer Present wie am X27: 240 Presents je Sekunde, 6 s lang;
+    /// der Host sendet PQ ab Present 10 und ab 1260 wieder SDR; die Karte
+    /// praesentiert HDR10 ab dem ersten PQ-Bild (Present 12) bis "HDR
+    /// verwenden" ausgeht (Present 1200). Das Menue geht alle 170 Presents
+    /// auf und zu; offen rastert die Oberflaeche jeden achten Present
+    /// (33 ms), in der Zeichnung vor dem Present - dort entsteht auch die
+    /// Sekundenzeile. Bei Present 700 wirkt ein Klick auf den HDR-Schalter
+    /// (nachwirkung -> hdr_stellen -> anzeige_takt, noch in der Zeichnung);
+    /// zwischen den Zeichnungen fragt anzeige_takt jedes Mal.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn durchspielen(karte: anzeige::Gpu, leihe: Leihe) -> Durchlauf {
+        let schirm = x27_hdr();
+        let pq = strom_pq();
+        let sdr = StreamInfo { hdr: Some(hdr::InfoV1::sdr(hdr::GRUND_CLIENT_SDR)), ..pq };
+        let mut platz = Anzeige::Gpu(karte);
+        let mut d = Durchlauf::default();
+        let mut vorher = false;
+        // anzeige_takt: Lage, Protokollzeile, Abzeichen - wie im Fenster.
+        let takt = |platz: &Anzeige, info: &StreamInfo, vorher: &mut bool, d: &mut Durchlauf| {
+            let lage = hdr_lage_aus(Some(info), platz.hdr().praesentiert);
+            if let Some(z) = beidseitig_wechsel(*vorher, lage) {
+                d.abzeichen += (lage == hdr::HdrLage::Beidseitig) as u32;
+                d.zeilen.push(z);
+            }
+            *vorher = lage == hdr::HdrLage::Beidseitig;
+        };
+        for n in 0..1440u32 {
+            let info = if (10..1260).contains(&n) { &pq } else { &sdr };
+            let menue = (n / 170) % 2 == 1;
+            let mut g = karte_nehmen(&mut platz, leihe);
+            if menue && n % 8 == 0 {
+                let (text, gold, f9, kurz, _) = hdr_sicht(&platz, Some(info), &schirm);
+                let wahr = hdr_lage_aus(Some(info), g.hdr_praesentiert()) == hdr::HdrLage::Beidseitig;
+                if gold != wahr || (f9.1 == ui::GOLD) != wahr || (kurz == "HDR10") != wahr {
+                    d.falsch.push((n, text));
+                }
+            }
+            if n == 12 || n == 1200 {
+                g.hdr_vortaeuschen(n == 12);
+            }
+            platz.leihe_nachfuehren(&g);
+            if n == 700 {
+                d.klick_flags = hdr::Anzeige::fuer_client(Some(&schirm), platz.hdr().darstellung, true).flags;
+                takt(&platz, info, &mut vorher, &mut d);
+            }
+            platz = Anzeige::Gpu(g);
+            takt(&platz, info, &mut vorher, &mut d);
+        }
+        d
+    }
+
+    /// Menue, Statistik, Sekundenzeile, Gold und IN_ANZEIGE folgen dem, was
+    /// die Karte praesentiert - in jeder Zeichnung, mit offenem und
+    /// geschlossenem Menue; Beginn und Ende von "HDR auf beiden Seiten"
+    /// stehen je genau einmal im Protokoll, das Abzeichen geht einmal auf,
+    /// und der Klick meldet "Darstellung ja". Derselbe Durchlauf mit der
+    /// Leihe von vorher zeigt die Live-Befunde vom 2026-09-29: "HDR → SDR" in
+    /// jeder Rasterung unter HDR10, nach dem Klick "Darstellung nein" (der
+    /// Host ging mit Grund 5 kurz auf SDR) und ein zweites "HDR auf beiden
+    /// Seiten aktiv" samt Abzeichen (Protokoll cce163b0, Zeilen 120-122).
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn hdr_lage_folgt_dem_praesentierten() {
+        let aktiv = "HDR auf beiden Seiten aktiv (Host PQ, Anzeige HDR)".to_string();
+        let ende = "HDR nicht mehr auf beiden Seiten: HDR->SDR (Host PQ, Anzeige SDR)".to_string();
+        let (Some(k1), Some(k2)) = (karte_ohne_fenster(), karte_ohne_fenster()) else { return };
+        let heute = durchspielen(k1, Leihe::Heute);
+        assert_eq!(heute.falsch, Vec::<(u32, String)>::new());
+        assert_eq!(heute.zeilen, vec![aktiv.clone(), ende.clone()]);
+        assert_eq!(heute.abzeichen, 1);
+        assert_ne!(heute.klick_flags & hdr::ANZEIGE_DARSTELLUNG, 0);
+
+        let vorher = durchspielen(k2, Leihe::Vorher);
+        assert!(vorher.falsch.len() > 20, "{:?}", vorher.falsch);
+        assert!(vorher.falsch.iter().all(|(n, t)| (13..=1200).contains(n) && t.starts_with("HDR → SDR")), "{:?}", vorher.falsch);
+        assert_eq!(vorher.zeilen, vec![aktiv.clone(), ende.clone(), aktiv, ende]);
+        assert_eq!(vorher.abzeichen, 2);
+        assert_eq!(vorher.klick_flags & hdr::ANZEIGE_DARSTELLUNG, 0);
+    }
+
+    /// Die Protokollzeilen zu "HDR auf beiden Seiten" und die Teile der
+    /// Sekundenzeile.
+    #[test]
+    fn hdr_zeilen_und_sekundenzeile() {
+        assert_eq!(beidseitig_wechsel(false, hdr::HdrLage::Beidseitig).as_deref(), Some("HDR auf beiden Seiten aktiv (Host PQ, Anzeige HDR)"));
+        assert_eq!(beidseitig_wechsel(true, hdr::HdrLage::Beidseitig), None);
+        assert_eq!(beidseitig_wechsel(false, hdr::HdrLage::Abgebildet), None);
+        assert_eq!(beidseitig_wechsel(true, hdr::HdrLage::Abgebildet).as_deref(), Some("HDR nicht mehr auf beiden Seiten: HDR->SDR (Host PQ, Anzeige SDR)"));
+        // Das Ende mit dem Grund des Hosts, und ohne Strominfo Fassung 1.
+        assert_eq!(beidseitig_wechsel(true, hdr::HdrLage::Sdr(Some(hdr::GRUND_CLIENT_SDR))).as_deref(), Some("HDR nicht mehr auf beiden Seiten: SDR (Grund 1)"));
+        assert_eq!(beidseitig_wechsel(true, hdr::HdrLage::Sdr(None)).as_deref(), Some("HDR nicht mehr auf beiden Seiten: SDR (Host ohne Strominfo Fassung 1)"));
+        // softbuffer und keine Anzeige: nie HDR, nie Darstellung.
+        assert_eq!(Anzeige::Keine.hdr(), AnzeigeHdr::default());
+        assert_eq!(hdr_lage_kurz(hdr::HdrLage::Beidseitig), "HDR10");
+        assert_eq!(hdr_lage_kurz(hdr::HdrLage::Abgebildet), "HDR->SDR");
+        assert_eq!(hdr_lage_kurz(hdr::HdrLage::Sdr(None)), "SDR");
+        // "Oberflaeche": wie oft, und je Mal Rastern + Hochladen.
+        assert_eq!(OberflaechenZeit::default().text(), "-");
+        let z = OberflaechenZeit { raster: Duration::from_micros(69_000), hochladen: Duration::from_micros(24_000), anzahl: 30 };
+        assert_eq!(z.text(), "30x 2.3 + 0.8 ms");
     }
 }

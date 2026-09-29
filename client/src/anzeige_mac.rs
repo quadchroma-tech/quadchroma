@@ -1279,6 +1279,14 @@ impl Gpu {
         self.hdr_gezeigt
     }
 
+    /// Nur fuer die Tests in main.rs: so tun, als zeigte die Schicht ein
+    /// PQ-Bild ueber EDR mit Kopfraum (`an`) bzw. wieder SDR - ohne Fenster
+    /// gibt es keine.
+    #[cfg(test)]
+    pub fn hdr_vortaeuschen(&mut self, an: bool) {
+        self.hdr_gezeigt = an;
+    }
+
     /// Soll main.rs neu zeichnen lassen, obwohl kein neues Bild kam? Ja, wenn
     /// die Anzeige ein PQ-Bild haelt und dessen Ziel sich seit der letzten
     /// Rechnung geaendert hat: vor allem der Kopfraum, der auf einem XDR- oder
