@@ -1888,7 +1888,8 @@ pointer comes at twice its point size, drawn from the sharp 2x artwork
 (1.5 times in a scaled mode such as "looks like 2560x1440" on a 4K
 panel); the Windows host sends the shape of the Desktop Duplication,
 whose pixels are the stream's. A host that fits its stream into the H.264
-limit (see "Stream size" below) scales the shape the same way. The client
+limit ("Stream size and H.264" under "Host display") scales the shape the
+same way. The client
 draws it exactly as large as the picture appears - shown width divided
 by stream width: enlarged by whole factors, pixel for pixel (1.5 becomes
 2, 1.4 stays 1), up to 256 pixels; reduced exactly, by area average,
@@ -2074,10 +2075,15 @@ pixels behind the points:
 
 A scaled HiDPI mode renders more pixels than the panel has ("looks like
 2560x1440" draws 5120x2880 and hands 3840x2160 to the panel); the host
-then streams the panel's native resolution (the largest mode macOS marks
-as native), keeping the aspect ratio - more than that is not visible on
-the Mac either. Odd sizes lose one pixel. --out <B>x<H> takes precedence
-over all of this, for a smaller stream. If the streamed display changes
+then streams the panel's resolution, keeping the aspect ratio - more
+than that is not visible on the Mac either. The panel's resolution is
+the larger of the largest mode without HiDPI (pixels = points) and the
+largest mode macOS marks as native: a display whose EDID prefers
+1920x1080 marks only that as native but may run 3840x2160 without HiDPI,
+and a built-in Retina panel may offer its full resolution only as a
+HiDPI mode. Only a scaled HiDPI mode is capped; a mode without HiDPI is
+streamed exactly as set. Odd sizes lose one pixel. --out <B>x<H> takes
+precedence over all of this, for a smaller stream. If the streamed display changes
 its mode while a viewer watches (another resolution, HiDPI on or off),
 the stream follows like a display switch - new encoder, SWITCH, INFO,
 keyframe - with the reason "Aufloesung geaendert: Strom <B>x<H> ->
@@ -2087,10 +2093,41 @@ only changes the pointer scale. The mouse is unaffected: the host maps
 the client's position onto the display in points. Measured on the M1
 (VideoToolbox, every frame different, at most two frames in flight):
 3840x2160 HEVC 4:4:4 10 bit 85 frames/s, 4:4:4 8 bit 91, 4:2:0 10 bit
-89, 4:2:0 8 bit 96; 1920x1080 HEVC 4:4:4 10 bit 187. The M1's H.264
-encoder takes 3840x2160 but refuses 5120x2880 and larger (a 5K or 6K
-panel, measured): a switch to H.264 fails there, and the stream stays on
-its previous codec (HEVC opens up to 7680x4320).
+89, 4:2:0 8 bit 96; 1920x1080 HEVC 4:4:4 10 bit 187.
+
+Stream size and H.264 (both hosts): H.264 has a size limit - at most
+4096 pixels per side and 36864 macroblocks (4096x2304, level 5.2). The
+M1's hardware H.264 encoder opens up to 4096 per side and refuses
+4112x2304, 5120x1440, 5120x2880 and 6016x3384 (measured, error -12903);
+NVENC H.264 stops at 4096x4096, and many hardware decoders stop at level
+5.2. HEVC has no such limit here (the M1 opens 6016x3384). While H.264
+runs and the native size is larger than the limit, the host fits the
+stream into it, keeping the aspect ratio - the only exception to native:
+
+    5120x2880 (5K)                 -> 4096x2304 with H.264
+    6016x3384 (6K)                 -> 4096x2304 with H.264
+    5120x1440 (super ultrawide)    -> 4096x1152 with H.264
+    2880x5120 (5K in portrait)     -> 2304x4096 with H.264
+    3840x2160, 3840x2400, 4096x2304   stay native with H.264
+
+The log says so once per size: "Stromgroesse: <B>x<H> ist fuer H.264 zu
+gross (hoechstens 4096 Bildpunkte je Seite und 36864 Makrobloecke) -
+eingepasst auf <B>x<H> bei gleichem Seitenverhaeltnis, die einzige
+Ausnahme von nativ" (too large for H.264, fitted). Start, recovery,
+display switch, a new resolution and the codec switch all use this one
+rule: a switch between HEVC and H.264 that changes the size logs
+"Stromgroesse: <B>x<H> -> <B>x<H> (fuer H.264 eingepasst)" or "(wieder
+nativ)", reconfigures the capture and sends SWITCH, then INFO with the
+new size and a keyframe, like a display switch; the pointer shape gets
+the new scale. If the new codec does not open, the old one comes back at
+the old size. The Mac captures directly at the fitted size
+(ScreenCaptureKit scales); the Windows host role scales on the CPU
+(area average, "Null-Kopien-Weg: der fuer H.264 eingepasste Strom wird
+auf dem Prozessor skaliert - Prozessorweg (bgra)" when zero-copy was
+chosen). The capability probe opens H.264 at 4096x2304 too ("H.264 High
+ja (Hardware), bis 4096x2304 geprueft - groessere Bildschirme werden
+eingepasst"); if the encoder refuses that size, the limit becomes
+1920x1080 and larger streams are fitted into it.
 
 bildschirm.txt: the request is stored in the host's data folder, exactly
 one line, "auto" or the identifier:
@@ -2161,7 +2198,11 @@ reason, <Fehler> error:
      "Aufnahme gestartet: Bildschirm 3840x2160 (HiDPI, wie 1920x1080),
      120 Hz, Kennung 2 (v1138-m1234-s0) "X27 X1" -> 3840x2160"
     "Zeigerform: Massstab <m> (Strom <B> Bildpunkte breit, Bildschirm
-     <P> Punkte)"      (pointer scale, when it changes: 2.00 for HiDPI)
+     <P> Punkte)"      (pointer scale, when it changes: 2.00 for HiDPI,
+                        1.60 for a 5K panel fitted for H.264)
+    "Stromgroesse: <B>x<H> ist fuer H.264 zu gross (...) - eingepasst
+     auf <B>x<H> ..." and "Stromgroesse: <B>x<H> -> <B>x<H> (fuer
+     H.264 eingepasst|wieder nativ)"          (see "Stream size and H.264")
     "Bildschirmwunsch: <Kennung|Automatik>" (plus " - bildschirm.txt
      liess sich nicht schreiben" if saving fails)
     "Bildschirmwunsch: <Kennung> - nicht angeschlossen, Ausweichplatz
@@ -2190,14 +2231,18 @@ reason, <Fehler> error:
     "Aufnahme wiederhergestellt: Bildschirm <Masse>, <Hz> Hz, <Text> ->
      <B>x<H>"
 
+"Aufnahme gestartet" and "Aufnahme wiederhergestellt" end with " (nativ
+<B>x<H>, fuer H.264 eingepasst)" while the stream is fitted for H.264.
+
 <Masse> is the display's pixel size, "<B>x<H>", in a HiDPI mode followed
 by " (HiDPI, wie <b>x<h>)" (its size in points), and with ", Panel
 <B>x<H>" (or " (Panel <B>x<H>)") when the mode has more pixels than the
 panel.
 
 --list writes for each display "Display N: id=<n>, Kennung <Kennung>,
-Name "<Name>", <Masse> Pixel, <Hz> Hz  (Hauptbildschirm), Strom <B>x<H>,
-EDR-Kopfraum ..." - Strom is the size the host would stream.
+Name "<Name>", <Masse> Pixel, <Hz> Hz  (Hauptbildschirm), Strom <B>x<H>
+[ (mit H.264 <B>x<H>)], EDR-Kopfraum ..." - Strom is the size the host
+would stream, the part in brackets the size with H.264 when it differs.
 
 Log lines of the Windows host role (host-protokoll.txt); <Text> is
 "<Kennung> (<Name>)", for example "ACR0501 (X27 X1)":
@@ -2238,8 +2283,13 @@ Log lines of the Windows host role (host-protokoll.txt); <Text> is
     "Aufnahme verloren: <Fehler> - Nachricht 9, neuer Versuch alle 2 s"
     "Kein Bildschirm - warte auf seine Rueckkehr"
     "Aufnahme wiederhergestellt: \\.\DISPLAYn <B>x<H> an Karte K
-     (<Karte>), Format ..., Strom <B>x<H>, Quelle Textur|Prozessorweg"
-                                        (like "Aufnahme gestartet: ...")
+     (<Karte>), Format ..., Strom <B>x<H> (nativ), Quelle
+     Textur|Prozessorweg"               (like "Aufnahme gestartet: ...";
+                                         " (nativ <B>x<H>, fuer H.264
+                                         eingepasst)" while fitted)
+    "Stromgroesse: ..." and "Zeigerform: Massstab <m> (Strom <B>
+     Bildpunkte breit, Desktop <B>)" as on the Mac (see "Stream size
+     and H.264")
     "Ausgaenge: <Fehler> - die letzte Liste gilt weiter", later
      "Ausgaenge: wieder aufzaehlbar"
 
@@ -3292,8 +3342,11 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     output's full size in pixels (native, 3840x2160 and larger
                     included; Windows scaling such as 150 % does not change
                     it); with odd dimensions one pixel of border is dropped.
-                    There is no --out here: a smaller stream needs a smaller
-                    display resolution on the host.
+                    The one exception: while H.264 runs, an output larger
+                    than its limit (4096 per side, 4096x2304) is fitted into
+                    it, on the CPU (see "Stream size and H.264" under "Host
+                    display"). There is no --out here: a smaller stream
+                    needs a smaller display resolution on the host.
     --fps N, --mbit N, --fest   as on the Mac (defaults 120, 150, off).
     --konserve datei.hevc   an Annex B stream (HEVC or H.264) as the picture
                     source instead of capture, looped at the frame rate - the
@@ -3315,12 +3368,18 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     "Null-Kopien-Weg: gedrehter Ausgang ... - Prozessorweg
                     (bgra)", i.e. switched to the CPU path). The size does
                     not matter: a 4K output takes the same paths as a smaller
-                    one, zero-copy included.
+                    one, zero-copy included - except while a stream is
+                    fitted for H.264, which is scaled on the CPU ("Null-
+                    Kopien-Weg: der fuer H.264 eingepasste Strom wird auf
+                    dem Prozessor skaliert - Prozessorweg (bgra)").
     --list          cards, outputs (each with identifier, name and Hz) and
                     what this computer can encode (hevc_nvenc and h264_nvenc
                     per candidate via avcodec_open2; without an NVIDIA driver
                     it says "Cannot load nvcuda.dll"), plus whether the Media
-                    Foundation encoders open and encode in software. AV1 is
+                    Foundation encoders open and encode in software. H.264 is
+                    also opened at its limit, 4096x2304 ("bis 4096x2304
+                    geprueft - groessere Ausgaenge werden fuer H.264
+                    eingepasst", checked up to 4096x2304). AV1 is
                     listed there without a probe as "nein (Protokoll und
                     Client kennen AV1 noch nicht)" (no, protocol and client do
                     not support AV1 yet).

@@ -542,6 +542,25 @@ static qc_codec_befund g_befund[QC_KANDIDATEN];
 // wissen muss, leitet sich hieraus ab - nicht aus dem Zustand beim Start.
 static _Atomic int g_codec_id = 0;
 
+// --- Stromgroesse und H.264 -------------------------------------------------
+// Gestreamt wird nativ (stromgroesse_fuer). Die einzige Ausnahme ist H.264:
+// ist die native Groesse groesser als seine Grenze (bildschirm.h: 4096 je
+// Seite, 4096x2304), wird der Strom darin eingepasst, bei gleichem
+// Seitenverhaeltnis - sonst oeffnete der Encoder gar nicht (VideoToolbox
+// H.264 auf dem M1: -12903 ab 4097 Bildpunkten je Seite), ein Zuschauer, der
+// nur H.264 kann, bekaeme kein Bild, und ein Bildschirmwechsel oder eine
+// neue Aufloesung bei laufendem H.264 endete in Wiederholungen ohne Ende.
+// Start, Wiederherstellung, Bildschirmwechsel und Codecwechsel nehmen alle
+// dieselbe Regel (groesse_fuer_codec). Die Grenze bestaetigt codecs_pruefen
+// mit dem Encoder selbst.
+static qc_h264_grenze g_h264_grenze = { QC_H264_MAX_SEITE, QC_H264_MAX_MB };
+// Die native Stromgroesse des laufenden Stroms (vor dem Einpassen fuer
+// H.264) und die Breite des gestreamten Bildschirms in Punkten - fuer einen
+// Codecwechsel, der die Stromgroesse aendert, und den Zeigermassstab.
+// Gesetzt mit jedem Strom und jeder Bewertung desselben Bildschirms.
+static _Atomic int g_strom_nativ_w = 0, g_strom_nativ_h = 0;
+static _Atomic size_t g_zeiger_punkte = 0;
+
 // --- HDR (HDR-Plan 5.1) ----------------------------------------------------
 // Die Farbe ist die zweite Dimension des Codecwechsels: Kandidat und Farbe
 // zusammen bestimmen Aufnahme, Encoder, SWITCH und Strominfo.
@@ -615,6 +634,23 @@ static OSType pixfmt_fuer(int idx) {
 }
 static int umrechnung_fuer(int idx) { return idx == 1 || idx == 2; }
 static int ist_h264(int idx) { return g_kandidaten[idx].codec == kCMVideoCodecType_H264; }
+
+// Die Stromgroesse fuer Kandidat idx aus der nativen nw x nh: nativ, bei
+// H.264 in dessen Grenze eingepasst (siehe g_h264_grenze). melden: die
+// Zeile dazu, einmal je Groesse - nicht bei jeder Bewertung und nicht fuer
+// --list. Aus jedem Faden.
+static void groesse_fuer_codec(int nw, int nh, int idx, int melden, int *w, int *h) {
+    *w = nw;
+    *h = nh;
+    if (!ist_h264(idx) || !qc_h264_einpassen(nw, nh, g_h264_grenze, w, h) || !melden) return;
+    static _Atomic uint64_t gemeldet = 0;
+    uint64_t k = ((uint64_t)(uint16_t)nw << 48) | ((uint64_t)(uint16_t)nh << 32) |
+                 ((uint64_t)(uint16_t)*w << 16) | (uint64_t)(uint16_t)*h;
+    if (atomic_exchange(&gemeldet, k) != k)
+        logf_(@"Stromgroesse: %dx%d ist fuer H.264 zu gross (hoechstens %d Bildpunkte je Seite und %d Makrobloecke) - "
+              @"eingepasst auf %dx%d bei gleichem Seitenverhaeltnis, die einzige Ausnahme von nativ",
+              nw, nh, g_h264_grenze.max_seite, g_h264_grenze.max_mb, *w, *h);
+}
 
 // --- HDR: Aufnahme, Metadaten, Faehigkeit -----------------------------------
 //
@@ -758,6 +794,7 @@ static int g_info_w = 0, g_info_h = 0, g_info_fps = 0;
 // Codecwechsel im Betrieb. Laeuft ausschliesslich auf der Aufnahmewarteschlange;
 // die Eingabe reicht den Wunsch nur dorthin weiter.
 static void codec_wechseln(int idx);
+static void zeiger_massstab_nachfuehren(size_t punkte, int strom_w);
 // Bildschirmwunsch (Nachricht 70). Laeuft ausschliesslich auf der
 // Lebenslauf-Warteschlange; die Eingabe reicht ihn nur dorthin weiter.
 static void bildschirm_wunsch_setzen(NSString *kennung);
@@ -2812,14 +2849,15 @@ static void set_i32(VTCompressionSessionRef s, CFStringRef key, int32_t v) {
 
 
 
-// Einen Kandidaten pruefen. hw_pflicht = 1 verlangt einen Hardware-Encoder.
-static int kandidat_pruefen(const qc_codec_kandidat *k, int hw_pflicht, int *ist_hw) {
+// Einen Kandidaten in w x h pruefen. hw_pflicht = 1 verlangt einen
+// Hardware-Encoder.
+static int kandidat_pruefen(const qc_codec_kandidat *k, int hw_pflicht, int *ist_hw, int w, int h) {
     CFMutableDictionaryRef spec = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     if (hw_pflicht)
         CFDictionarySetValue(spec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, kCFBooleanTrue);
 
     VTCompressionSessionRef s = NULL;
-    OSStatus st = VTCompressionSessionCreate(NULL, 1920, 1080, k->codec, spec, NULL, NULL, NULL, NULL, &s);
+    OSStatus st = VTCompressionSessionCreate(NULL, w, h, k->codec, spec, NULL, NULL, NULL, NULL, &s);
     CFRelease(spec);
     if (st != noErr || !s) return 0;
 
@@ -2908,24 +2946,39 @@ static void codecs_pruefen(void) {
             continue;
         }
         int hw = 0;
-        int da = kandidat_pruefen(k, 1, &hw);   // erst mit Hardware-Pflicht
+        int da = kandidat_pruefen(k, 1, &hw, 1920, 1080);   // erst mit Hardware-Pflicht
         if (da) {
             g_befund[i].vorhanden = 1;
             g_befund[i].hardware = hw;
         } else {
             hw = 0;
-            da = kandidat_pruefen(k, 0, &hw);   // dann ohne
+            da = kandidat_pruefen(k, 0, &hw, 1920, 1080);   // dann ohne
             g_befund[i].vorhanden = da;
             g_befund[i].hardware = da ? hw : 0;
+        }
+        // H.264 auch in der Groesse, bis zu der der Host es einsetzt: seine
+        // Grenze (groessere Stroeme passt er ein). Angeboten wird es nur
+        // ehrlich, wenn der Encoder dort auch aufgeht - sonst gilt 1920x1080
+        // als Grenze, und groessere Stroeme werden darauf eingepasst.
+        NSString *h264_grenze = @"";
+        if (g_befund[i].vorhanden && ist_h264((int)i)) {
+            int gw = QC_H264_MAX_SEITE, gh = QC_H264_MAX_MB * 256 / QC_H264_MAX_SEITE, hw_g = 0;
+            g_h264_grenze = (qc_h264_grenze){ QC_H264_MAX_SEITE, QC_H264_MAX_MB };
+            if (kandidat_pruefen(k, g_befund[i].hardware, &hw_g, gw, gh)) {
+                h264_grenze = [NSString stringWithFormat:@", bis %dx%d geprueft - groessere Bildschirme werden eingepasst", gw, gh];
+            } else {
+                g_h264_grenze = (qc_h264_grenze){ 1920, 8160 };
+                h264_grenze = [NSString stringWithFormat:@", oeffnet nicht in %dx%d - Grenze 1920x1080, groessere Bildschirme werden eingepasst", gw, gh];
+            }
         }
         // HDR10 nur mit HEVC 10 Bit (Kandidat 0 und 2), und nur, wenn auch
         // die Aufnahme HDR liefern kann.
         if (g_befund[i].vorhanden && system_hdr && qc_hdr_codec_kann((int)i))
             g_befund[i].hdr = kandidat_hdr_pruefen(k, g_befund[i].hardware);
-        logf_(@"  %-18s %@%@%@", k->name,
+        logf_(@"  %-18s %@%@%@%@", k->name,
               g_befund[i].vorhanden ? @"ja " : @"nein",
               g_befund[i].vorhanden ? (g_befund[i].hardware ? @"(Hardware)" : @"(Software)") : @"",
-              g_befund[i].hdr ? @", HDR10 (BT.2020/PQ)" : @"");
+              g_befund[i].hdr ? @", HDR10 (BT.2020/PQ)" : @"", h264_grenze);
     }
     if (!system_hdr) logf_(@"  HDR10: nein - die Aufnahme in HDR braucht macOS 15 und Apple Silicon");
 }
@@ -3233,12 +3286,18 @@ static void codec_alt_aufbauen(int alt, int alt_pq) {
 // noch kann kein Bild in der neuen Sitzung sein, weil Bilder nur ueber g_capq
 // hineingehen und wir gerade darauf laufen; dann Vollbild erzwingen und die
 // Strominfo hinterher. alt_fmt und alt_aufnahme_pq: wie die Aufnahme vor dem
-// Wechsel eingestellt war (fuer den Rueckweg).
+// Wechsel eingestellt war (fuer den Rueckweg). alt_w x alt_h und neu_w x
+// neu_h: die Stromgroesse vorher und fuer den neuen Kandidaten - bei H.264
+// womoeglich eingepasst (groesse_fuer_codec); die Strominfo traegt sie, der
+// Zeiger bekommt ihren Massstab.
 static void codec_wechsel_abschliessen(int idx, int pq, int alt, int alt_pq, OSType alt_fmt, int alt_aufnahme_pq,
-                                       BOOL aufnahme_geaendert) {
+                                       BOOL aufnahme_geaendert, int alt_w, int alt_h, int neu_w, int neu_h) {
     if (codec_wechsel_ueberholt(idx)) return;
+    g_info_w = neu_w;
+    g_info_h = neu_h;
     if (encoder_start(idx, g_info_w, g_info_h, atomic_load(&g_cur_fps), atomic_load(&g_cur_mbit), pq)) {
         atomic_store(&g_codec_id, idx);
+        if (neu_w != alt_w || neu_h != alt_h) zeiger_massstab_nachfuehren(atomic_load(&g_zeiger_punkte), neu_w);
         if (pq != alt_pq) {
             g_farbe_gewechselt_us = now_us();
             atomic_store(&g_anhaenge_loggen, 1);
@@ -3258,6 +3317,8 @@ static void codec_wechsel_abschliessen(int idx, int pq, int alt, int alt_pq, OST
     logf_(@"Codecwechsel auf %s (%s) fehlgeschlagen - baue %s (%s) wieder auf", g_kandidaten[idx].name, farbe_text(pq),
           g_kandidaten[alt].name, farbe_text(alt_pq));
     hdr_wechsel_gescheitert(idx, pq, alt, alt_pq);
+    g_info_w = alt_w;
+    g_info_h = alt_h;
     // Kein SWITCH: der Client hat noch seinen alten Decoder und behaelt ihn.
     // Ohne Strom (inzwischen abgebaut) kaeme der Abschluss von
     // updateConfiguration nie - eine Nachricht an nil tut nichts -, und der
@@ -3267,6 +3328,8 @@ static void codec_wechsel_abschliessen(int idx, int pq, int alt, int alt_pq, OST
     if (aufnahme_geaendert) {
         g_cfg.pixelFormat = alt_fmt;
         aufnahme_farbe_setzen(g_cfg, alt_aufnahme_pq);
+        g_cfg.width = (size_t)alt_w;
+        g_cfg.height = (size_t)alt_h;
     }
     if (aufnahme_geaendert && g_stream) {
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
@@ -3307,7 +3370,15 @@ static void wechsel_ausfuehren(int idx, int pq) {
     OSType neu_fmt = pixfmt_fuer(idx);
     int alt_aufnahme_pq = aufnahme_ist_pq(g_cfg);
     BOOL fmt_geaendert = (alt_fmt != neu_fmt);
-    BOOL aufnahme_geaendert = fmt_geaendert || alt_aufnahme_pq != pq;
+    // Die Stromgroesse fuer den neuen Kandidaten: nativ, bei H.264 in dessen
+    // Grenze eingepasst. Aendert sie sich (5K-Bildschirm, HEVC <-> H.264),
+    // stellt die Aufnahme mit um, und die Strominfo nach dem SWITCH traegt
+    // die neuen Masse - wie bei einem Bildschirmwechsel.
+    int alt_w = g_info_w, alt_h = g_info_h, neu_w = alt_w, neu_h = alt_h;
+    int nw = atomic_load(&g_strom_nativ_w), nh = atomic_load(&g_strom_nativ_h);
+    if (nw > 0 && nh > 0) groesse_fuer_codec(nw, nh, idx, 1, &neu_w, &neu_h);
+    BOOL groesse_geaendert = neu_w != alt_w || neu_h != alt_h;
+    BOOL aufnahme_geaendert = fmt_geaendert || alt_aufnahme_pq != pq || groesse_geaendert;
 
     if (g_session) {
         // c) Alles, was der alte Encoder noch hat, abliefern lassen. Danach feuert
@@ -3340,8 +3411,13 @@ static void wechsel_ausfuehren(int idx, int pq) {
         }
         if (alt_aufnahme_pq != pq)
             logf_(@"Aufnahme: %s -> %s%s%s", farbe_text(alt_aufnahme_pq), farbe_text(pq), pq ? " - " : "", pq ? hdr_aufnahme_text() : "");
+        if (groesse_geaendert)
+            logf_(@"Stromgroesse: %dx%d -> %dx%d (%s)", alt_w, alt_h, neu_w, neu_h,
+                  ist_h264(idx) ? "fuer H.264 eingepasst" : "wieder nativ");
         g_cfg.pixelFormat = neu_fmt;
         aufnahme_farbe_setzen(g_cfg, pq);
+        g_cfg.width = (size_t)neu_w;
+        g_cfg.height = (size_t)neu_h;
         [g_stream updateConfiguration:g_cfg completionHandler:^(NSError *e) {
             if (e) {
                 // Die Aufnahme liefert weiter das alte Format - dann bleibt es
@@ -3353,17 +3429,20 @@ static void wechsel_ausfuehren(int idx, int pq) {
                 dispatch_async(g_capq, ^{
                     g_cfg.pixelFormat = alt_fmt;
                     aufnahme_farbe_setzen(g_cfg, alt_aufnahme_pq);
+                    g_cfg.width = (size_t)alt_w;
+                    g_cfg.height = (size_t)alt_h;
                     hdr_wechsel_gescheitert(idx, pq, alt, alt_pq);
                     codec_alt_aufbauen(alt, alt_pq);
                 });
                 return;
             }
             dispatch_async(g_capq, ^{
-                codec_wechsel_abschliessen(idx, pq, alt, alt_pq, alt_fmt, alt_aufnahme_pq, aufnahme_geaendert);
+                codec_wechsel_abschliessen(idx, pq, alt, alt_pq, alt_fmt, alt_aufnahme_pq, aufnahme_geaendert,
+                                           alt_w, alt_h, neu_w, neu_h);
             });
         }];
     } else {
-        codec_wechsel_abschliessen(idx, pq, alt, alt_pq, alt_fmt, alt_aufnahme_pq, aufnahme_geaendert);
+        codec_wechsel_abschliessen(idx, pq, alt, alt_pq, alt_fmt, alt_aufnahme_pq, aufnahme_geaendert, alt_w, alt_h, neu_w, neu_h);
     }
 }
 
@@ -3893,8 +3972,10 @@ __attribute__((unused)) static void qc_strom_fabrik_setzen(qc_strom_fabrik f) { 
 // Stromgroesse fuer einen Bildschirm, bei jedem Strombau: --out hat Vorrang,
 // sonst nativ (Produktentscheidung 2026-09-29, keine Halbierung mehr) - genau
 // die Pixel des Modus, bei HiDPI die Pixel hinter den Punkten ("wie
-// 1920x1080" auf einem 4K-Panel: 3840x2160), hoechstens die native
-// Aufloesung des Panels; immer gerade (qc_stromgroesse_nativ).
+// 1920x1080" auf einem 4K-Panel: 3840x2160), ein skalierter HiDPI-Modus
+// hoechstens mit der Aufloesung des Panels; immer gerade
+// (qc_stromgroesse_nativ). Ohne Codec: fuer H.264 kommt das Einpassen dazu
+// (stromgroesse_codec).
 static void stromgroesse_fuer(QCBildschirm *b, int *w, int *h) {
     int ow = g_out_fest_w, oh = g_out_fest_h;
     if (ow > 0 && oh > 0) {
@@ -3902,7 +3983,22 @@ static void stromgroesse_fuer(QCBildschirm *b, int *w, int *h) {
         *h = oh & ~1;
         return;
     }
-    qc_stromgroesse_nativ(b.w, b.h, b.nativ_w, b.nativ_h, w, h);
+    qc_stromgroesse_nativ(b.w, b.h, b.punkte_w, b.punkte_h, b.nativ_w, b.nativ_h, w, h);
+}
+
+// Stromgroesse fuer einen Bildschirm und Kandidat idx: stromgroesse_fuer,
+// bei H.264 eingepasst (groesse_fuer_codec). Der Pruefstand rechnet damit.
+__attribute__((unused)) static void stromgroesse_codec(QCBildschirm *b, int idx, int melden, int *w, int *h) {
+    int nw = 0, nh = 0;
+    stromgroesse_fuer(b, &nw, &nh);
+    groesse_fuer_codec(nw, nh, idx, melden, w, h);
+}
+
+// Fuer die Protokollzeilen: " (nativ <B>x<H>, fuer H.264 eingepasst)", wenn
+// der laufende Strom fuer H.264 kleiner ist als nativ.
+static NSString *eingepasst_text(void) {
+    int nw = atomic_load(&g_strom_nativ_w), nh = atomic_load(&g_strom_nativ_h);
+    return (nw > 0 && (nw != g_info_w || nh != g_info_h)) ? [NSString stringWithFormat:@" (nativ %dx%d, fuer H.264 eingepasst)", nw, nh] : @"";
 }
 
 static NSString *bildschirm_text(QCBildschirm *b) {
@@ -3926,12 +4022,18 @@ static NSString *bildschirm_masse(QCBildschirm *b) {
     return t;
 }
 
+// Die Breite eines Bildschirms in Punkten; ohne Punkte (Attrappen) gilt ein
+// Punkt je Pixel.
+static size_t zeiger_punkte(QCBildschirm *b) { return b.punkte_w ? b.punkte_w : b.w; }
+
 // Der Zeiger im Massstab des Stroms (zeiger.h): Bildpunkte des Stroms je
-// Punkt des Bildschirms - bei HiDPI nativ gestreamt 2, bei --out kleiner.
-// Ohne Punkte (Attrappen) gilt ein Punkt je Pixel. Eine Zeile, wenn er sich
-// aendert. Auf g_lifeq.
-static void zeiger_massstab_nachfuehren(QCBildschirm *b, int strom_w) {
-    size_t punkte = b.punkte_w ? b.punkte_w : b.w;
+// Punkt des Bildschirms (punkte breit) - bei HiDPI nativ gestreamt 2, bei
+// --out oder fuer H.264 eingepasst kleiner. So kommt die Form in
+// Bildpunkten des Stroms, wie der Client sie erwartet (zeigerbild.rs). Eine
+// Zeile, wenn er sich aendert. Aus jedem Faden (Strombau auf g_lifeq,
+// Codecwechsel auf g_capq).
+static void zeiger_massstab_nachfuehren(size_t punkte, int strom_w) {
+    atomic_store(&g_zeiger_punkte, punkte);
     double m = (punkte && strom_w > 0) ? (double)strom_w / (double)punkte : 1.0;
     double alt = qc_zeiger_massstab();
     qc_zeiger_massstab_setzen(m);
@@ -3997,13 +4099,19 @@ static void bildschirme_senden(void) {
 // ScreenCaptureKit das erste echte liefert (ein Bild vom falschen Bildschirm).
 // YES = laeuft (g_stream gesetzt, Maus folgt); NO = nicht gestartet, mit Zeile.
 static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
-    int w = 0, h = 0;
-    stromgroesse_fuer(ziel, &w, &h);
+    int nw = 0, nh = 0;
+    stromgroesse_fuer(ziel, &nw, &nh);
+    __block int w = nw, h = nh;
     // Kann der neue Bildschirm HDR? Davon haengt die Farbe des Stroms ab.
     quelle_setzen(ziel.hdr, ziel.edr_potentiell, NULL);
     __block BOOL enc = YES;
     dispatch_sync(g_capq, ^{
         int codec = atomic_load(&g_codec_id);
+        // Nativ, bei H.264 in dessen Grenze eingepasst - mit dem Kandidaten,
+        // der gerade gilt, auf g_capq gelesen wie beim Codecwechsel.
+        groesse_fuer_codec(nw, nh, codec, 1, &w, &h);
+        atomic_store(&g_strom_nativ_w, nw);
+        atomic_store(&g_strom_nativ_h, nh);
         int fps = atomic_load(&g_cur_fps), mbit = atomic_load(&g_cur_mbit);
         BOOL neue_groesse = (w != g_info_w || h != g_info_h);
         // Die Farbe fuer diesen Bildschirm und den laufenden Zuschauer: ohne
@@ -4100,7 +4208,7 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
     // rechnet in Punkten (CGDisplayBounds) und ist deshalb von der
     // Stromgroesse unabhaengig; der Zeiger nicht: er bekommt den Massstab.
     atomic_store(&g_input_display, ziel.displayID);
-    zeiger_massstab_nachfuehren(ziel, w);
+    zeiger_massstab_nachfuehren(zeiger_punkte(ziel), w);
     atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
     // Solange gestreamt wird, darf der Bildschirm nicht einschlafen.
     if (g_wach == kIOPMNullAssertionID)
@@ -4281,13 +4389,29 @@ static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
     // ein Wechsel auf denselben Bildschirm, mit neuem Encoder, SWITCH, INFO
     // und Vollbild. Frueher blieb die Groesse, und ScreenCaptureKit skalierte
     // den neuen Modus in die alte.
-    if (g_stream) {
-        int sw = 0, sh = 0;
-        stromgroesse_fuer(ziel, &sw, &sh);
-        if (sw != g_info_w || sh != g_info_h) {
+    // Verglichen wird mit dem Kandidaten, der laeuft (bei H.264 die
+    // eingepasste Groesse), auf g_capq gelesen - Kandidat und Stromgroesse
+    // aendert ein Codecwechsel dort in einem Zug.
+    if (g_stream && g_capq) {
+        int nw = 0, nh = 0;
+        stromgroesse_fuer(ziel, &nw, &nh);
+        __block int sw = 0, sh = 0, iw = 0, ih = 0;
+        dispatch_sync(g_capq, ^{
+            groesse_fuer_codec(nw, nh, atomic_load(&g_codec_id), 0, &sw, &sh);
+            iw = g_info_w;
+            ih = g_info_h;
+        });
+        if (sw != iw || sh != ih) {
             bildschirm_wechseln(ziel, [NSString stringWithFormat:@"Aufloesung geaendert: Strom %dx%d -> %dx%d",
-                                       g_info_w, g_info_h, sw, sh], anlass);
+                                       iw, ih, sw, sh], anlass);
             return ziel;
+        }
+        // Dieselbe Stromgroesse, womoeglich aber eine andere native (ein
+        // anderer Modus, fuer H.264 auf dieselbe Groesse eingepasst): ein
+        // spaeterer Codecwechsel rechnet mit der neuen.
+        if (ziel.displayID == g_display_id) {
+            atomic_store(&g_strom_nativ_w, nw);
+            atomic_store(&g_strom_nativ_h, nh);
         }
     }
     // Kein Wechsel (mehr) noetig - auch ein wartender ist damit hinfaellig.
@@ -4299,7 +4423,7 @@ static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
     // 3840x2160 nativ): dann nur ein anderer Zeigermassstab.
     if (g_stream && ziel.displayID == g_display_id) {
         quelle_setzen(ziel.hdr, ziel.edr_potentiell, "Bildschirmkonfiguration");
-        zeiger_massstab_nachfuehren(ziel, g_info_w);
+        zeiger_massstab_nachfuehren(zeiger_punkte(ziel), g_info_w);
     }
     bildschirm_zustand_nachfuehren();
     if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
@@ -4346,11 +4470,13 @@ static void list_displays(void) {
     if (!liste) { logf_(@"Inhalte nicht abrufbar"); return; }
     int i = 0;
     for (QCBildschirm *b in liste) {
-        int sw = 0, sh = 0;
+        int sw = 0, sh = 0, hw = 0, hh = 0;
         stromgroesse_fuer(b, &sw, &sh);
-        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %@ Pixel, %.0f Hz%@, Strom %dx%d, EDR-Kopfraum %.2f (jetzt %.2f)%@",
+        qc_h264_einpassen(sw, sh, g_h264_grenze, &hw, &hh);
+        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %@ Pixel, %.0f Hz%@, Strom %dx%d%@, EDR-Kopfraum %.2f (jetzt %.2f)%@",
               i++, b.displayID, b.kennung, b.name, bildschirm_masse(b), b.hz, b.haupt ? @"  (Hauptbildschirm)" : @"",
-              sw, sh, b.edr_potentiell, b.edr_aktuell, b.hdr ? @" - HDR" : @"");
+              sw, sh, (hw != sw || hh != sh) ? [NSString stringWithFormat:@" (mit H.264 %dx%d)", hw, hh] : @"",
+              b.edr_potentiell, b.edr_aktuell, b.hdr ? @" - HDR" : @"");
     }
 }
 
@@ -4389,8 +4515,8 @@ static void aufnahme_wiederherstellen(void) {
     bildschirm_zustand_nachfuehren();
     bildschirme_senden();
     hoststatus_senden(0);
-    logf_(@"Aufnahme wiederhergestellt: Bildschirm %@, %.0f Hz, %@ -> %dx%d", bildschirm_masse(ziel), ziel.hz, bildschirm_text(ziel),
-          g_info_w, g_info_h);
+    logf_(@"Aufnahme wiederhergestellt: Bildschirm %@, %.0f Hz, %@ -> %dx%d%@", bildschirm_masse(ziel), ziel.hz, bildschirm_text(ziel),
+          g_info_w, g_info_h, eingepasst_text());
 }
 
 // Aufnahme und Encoder fuer einen Zuschauer aufbauen. Wird vom Faden der
@@ -4405,8 +4531,8 @@ static BOOL stream_hochfahren_sync(void) {
         if (!ziel) { logf_(@"Kein Bildschirm - Aufnahme kann nicht starten"); return; }
         if (!strom_fuer_bildschirm_starten(ziel, NO)) return;
         bildschirm_zustand_nachfuehren();
-        logf_(@"Aufnahme gestartet: Bildschirm %@, %.0f Hz, %@ -> %dx%d%@",
-              bildschirm_masse(ziel), ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h,
+        logf_(@"Aufnahme gestartet: Bildschirm %@, %.0f Hz, %@ -> %dx%d%@%@",
+              bildschirm_masse(ziel), ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h, eingepasst_text(),
               ziel.hdr ? [NSString stringWithFormat:@", Bildschirm HDR-faehig (EDR-Kopfraum %.2f)", ziel.edr_potentiell] : @"");
         ok = YES;
     });
@@ -4574,8 +4700,8 @@ static void ersatzgroesse(int *w, int *h) {
         return;
     }
     qc_bildschirm_modus m;
-    if (!qc_bildschirm_modus_lesen(CGMainDisplayID(), &m) || !m.pw || !m.ph) { m.pw = 1920; m.ph = 1080; m.nativ_w = m.nativ_h = 0; }
-    qc_stromgroesse_nativ(m.pw, m.ph, m.nativ_w, m.nativ_h, w, h);
+    if (!qc_bildschirm_modus_lesen(CGMainDisplayID(), &m) || !m.pw || !m.ph) { m.pw = 1920; m.ph = 1080; m.punkte_w = m.punkte_h = m.nativ_w = m.nativ_h = 0; }
+    qc_stromgroesse_nativ(m.pw, m.ph, m.punkte_w, m.punkte_h, m.nativ_w, m.nativ_h, w, h);
 }
 
 // Wert hinter einem Schalter (versatz 1 = gleich dahinter). Fehlt er - Ende

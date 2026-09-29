@@ -15,7 +15,9 @@
 // aelterer Client ohne IN_FAEHIGKEITEN, Faehigkeit nur fuer den Eingabekanal,
 // der sie gemeldet hat), Bildschirmwahl (Pruefvektoren der Nachrichten 12 und
 // 70, Kuerzen, reine Wahl, Stromgroesse nativ - 4K, HiDPI, ueber dem Panel,
-// --out -, bildschirm.txt, --display als Pin,
+// 1x nie begrenzt, Panel aus der Modusliste, --out -, H.264-Grenze
+// (Einpassen; 5K mit echten Encodern HEVC -> H.264 -> HEVC, neue Aufloesung
+// bei laufendem H.264 ohne Wiederholversuche), bildschirm.txt, --display als Pin,
 // Begruessung mit Faehigkeiten 7 und Liste, Automatik folgt dem
 // Hauptbildschirm entprellt (INFO als Fassung 1 in SDR, SWITCH mit Transfer
 // SDR), Wunsch ueber den echten Eingabekanal, fehlender
@@ -1479,7 +1481,7 @@ static void codec_abschluss_pruefen(void) {
         encoder_start(3, 640, 360, 60, 10, 0);
         vorher = g_session;
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(4, 0, 3, 0, f420, 0, NO);
+        codec_wechsel_abschliessen(4, 0, 3, 0, f420, 0, NO, 640, 360, 640, 360);
         nachher = g_session;
     });
     stdout_stumm(0);
@@ -1496,7 +1498,7 @@ static void codec_abschluss_pruefen(void) {
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(3, 0, 4, 0, f420, 0, NO);
+        codec_wechsel_abschliessen(3, 0, 4, 0, f420, 0, NO, 640, 360, 640, 360);
     });
     SCStream *st = strom_jetzt();                    // der angestossene Abbau ist durch
     __block VTCompressionSessionRef rest = NULL;
@@ -1511,7 +1513,7 @@ static void codec_abschluss_pruefen(void) {
     stdout_stumm(1);
     dispatch_sync(g_capq, ^{
         g_wechsel_aktiv = 1;
-        codec_wechsel_abschliessen(5, 0, 3, 0, f420, 0, YES);
+        codec_wechsel_abschliessen(5, 0, 3, 0, f420, 0, YES, 640, 360, 640, 360);
     });
     st = strom_jetzt();
     dispatch_sync(g_capq, ^{ rest = g_session; });
@@ -2986,8 +2988,63 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     stromgroesse_fuer(bs(@"k", @"ungerade", 1, 1921, 1081, 60, NO), &sw, &sh);
     int ok_gerade = sw == 1920 && sh == 1080;
     int w16 = 0, h16 = 0;
-    qc_stromgroesse_nativ(5120, 3200, 3840, 2160, &w16, &h16);    // 16:10 ueber einem 16:9-Panel: Seitenverhaeltnis bleibt
+    qc_stromgroesse_nativ(5120, 3200, 2560, 1600, 3840, 2160, &w16, &h16);    // 16:10 ueber einem 16:9-Panel: Seitenverhaeltnis bleibt
     int ok_seiten = w16 == 3456 && h16 == 2160;
+    // Ein Bildschirm, dessen EDID 1920x1080 bevorzugt (nur das ist nativ
+    // markiert), laeuft mit 3840x2160 in 1x: nichts wird begrenzt - nur ein
+    // skalierter HiDPI-Modus kommt aufs Panel.
+    QCBildschirm *edid = bs(@"k", @"4K, EDID 1080p", 1, 3840, 2160, 60, NO);
+    edid.punkte_w = 3840; edid.punkte_h = 2160; edid.nativ_w = 1920; edid.nativ_h = 1080;
+    stromgroesse_fuer(edid, &sw, &sh);
+    int ok_edid = sw == 3840 && sh == 2160;
+    int w1x = 0, h1x = 0;
+    qc_stromgroesse_nativ(3840, 2160, 3840, 2160, 1920, 1080, &w1x, &h1x);
+    ok_edid = ok_edid && w1x == 3840 && h1x == 2160;
+    // Die Obergrenze aus der Modusliste: der groesste 1x-Modus oder der
+    // groesste native, was mehr Pixel hat (Pixel, Punkte, nativ).
+    qc_modus_eintrag m_edid[] = { { 1920, 1080, 1920, 1080, 1 }, { 3840, 2160, 3840, 2160, 0 }, { 2560, 1440, 2560, 1440, 0 } };
+    qc_modus_eintrag m_retina[] = { { 3024, 1964, 1512, 982, 1 }, { 3600, 2338, 1800, 1169, 0 },
+                                    { 1512, 982, 1512, 982, 0 }, { 1800, 1169, 1800, 1169, 0 } };
+    qc_modus_eintrag m_x27[] = { { 3840, 2160, 3840, 2160, 1 }, { 3840, 2160, 1920, 1080, 1 },
+                                 { 5120, 2880, 2560, 1440, 0 }, { 1920, 1080, 1920, 1080, 0 } };
+    size_t p1w = 0, p1h = 0, p2w = 0, p2h = 0, p3w = 0, p3h = 0, p4w = 9, p4h = 9;
+    qc_panelgroesse(m_edid, 3, &p1w, &p1h);
+    qc_panelgroesse(m_retina, 4, &p2w, &p2h);
+    qc_panelgroesse(m_x27, 4, &p3w, &p3h);
+    qc_panelgroesse(NULL, 0, &p4w, &p4h);
+    int ok_panel = p1w == 3840 && p1h == 2160 && p2w == 3024 && p2h == 1964 && p3w == 3840 && p3h == 2160 && p4w == 0 && p4h == 0;
+    printf("         (EDID 1080p, 3840x2160 in 1x: Strom %dx%d; Panel aus Modi: EDID %zux%zu, Retina %zux%zu, X27 %zux%zu, leer %zux%zu)\n",
+           sw, sh, p1w, p1h, p2w, p2h, p3w, p3h, p4w, p4h);
+    pruefe(ok_edid && ok_panel,
+           "1x wird nie begrenzt (3840x2160 bei EDID-Vorzug 1920x1080); Panel = groesster 1x- oder nativer Modus (EDID 3840x2160, "
+           "Retina 3024x1964, X27 3840x2160)");
+    // H.264: hoechstens 4096 je Seite und 36864 Makrobloecke (4096x2304),
+    // eingepasst bei gleichem Seitenverhaeltnis - sonst bleibt alles nativ.
+    qc_h264_grenze g264 = { QC_H264_MAX_SEITE, QC_H264_MAX_MB };
+    struct { int w, h, ew, eh, ein; } f264[] = {
+        { 3840, 2160, 3840, 2160, 0 }, { 4096, 2304, 4096, 2304, 0 }, { 3840, 2400, 3840, 2400, 0 }, { 2160, 3840, 2160, 3840, 0 },
+        { 3024, 1964, 3024, 1964, 0 }, { 5120, 2880, 4096, 2304, 1 }, { 5120, 1440, 4096, 1152, 1 }, { 6016, 3384, 4096, 2304, 1 },
+        { 2880, 5120, 2304, 4096, 1 }, { 7680, 4320, 4096, 2304, 1 },
+    };
+    int ok_264 = 1;
+    for (size_t i = 0; i < sizeof f264 / sizeof f264[0]; i++) {
+        int ow = 0, oh = 0, ein = qc_h264_einpassen(f264[i].w, f264[i].h, g264, &ow, &oh);
+        if (ein != f264[i].ein || ow != f264[i].ew || oh != f264[i].eh || !qc_h264_passt(ow, oh, g264)) {
+            ok_264 = 0;
+            printf("         H.264 %dx%d -> %dx%d (%d), erwartet %dx%d\n", f264[i].w, f264[i].h, ow, oh, ein, f264[i].ew, f264[i].eh);
+        }
+    }
+    int q_w = 0, q_h = 0;       // 16:10 mit 4096 Breite: zu viele Makrobloecke
+    int q_ein = qc_h264_einpassen(4096, 2560, g264, &q_w, &q_h);
+    ok_264 = ok_264 && q_ein && qc_h264_passt(q_w, q_h, g264) && q_w % 2 == 0 && q_h % 2 == 0 && q_w > 3800 &&
+             fabs((double)q_w / q_h - 1.6) < 0.01 && !qc_h264_passt(4112, 2304, g264) && !qc_h264_passt(4096, 2320, g264);
+    int k5_264w = 0, k5_264h = 0, k5_hevc_w = 0, k5_hevc_h = 0;
+    stromgroesse_codec(k5, 4, 0, &k5_264w, &k5_264h);
+    stromgroesse_codec(k5, 0, 0, &k5_hevc_w, &k5_hevc_h);
+    printf("         (H.264 4096x2560 -> %dx%d; 5K mit H.264 %dx%d, mit HEVC %dx%d)\n", q_w, q_h, k5_264w, k5_264h, k5_hevc_w, k5_hevc_h);
+    pruefe(ok_264 && k5_264w == 4096 && k5_264h == 2304 && k5_hevc_w == 5120 && k5_hevc_h == 2880,
+           "H.264-Grenze: bis 4096 je Seite und 4096x2304 nativ, darueber eingepasst (5K 4096x2304, 5120x1440 4096x1152, "
+           "hochkant 2304x4096), Seitenverhaeltnis bleibt; HEVC bleibt nativ");
     g_out_fest_w = 640; g_out_fest_h = 360;
     stromgroesse_fuer(hidpi, &sw, &sh);
     int ok_out = sw == 640 && sh == 360;
@@ -3592,6 +3649,113 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
            g_bild.bilder == 1 && g_bild.erstes_voll == 1,
            "zurueck auf 1920x1080: der Strom folgt (INFO 1920x1080, Vollbild), der Zeiger hat wieder Massstab 1");
     CVPixelBufferRelease(pb_4k);
+
+    printf("\n-- Bildschirm: nativ und H.264 - 5K, Codecwechsel HEVC <-> H.264, neue Aufloesung bei laufendem H.264 (echte Encoder)\n");
+    // Ein 5K-Panel in "wie 2560x1440": HEVC streamt nativ 5120x2880. Der
+    // Wechsel auf H.264 passt den Strom in dessen Grenze ein (4096x2304, die
+    // einzige Ausnahme von nativ): SWITCH, INFO 4096x2304, die Aufnahme
+    // stellt mit um, der Zeiger bekommt 4096/2560 = 1,6. Frueher oeffnete
+    // H.264 dort gar nicht (VideoToolbox -12903).
+    int codec_vorher = atomic_load(&g_codec_id), h264 = -1;
+    for (int i = 0; i < (int)QC_KANDIDATEN; i++) if (ist_h264(i) && g_befund[i].vorhanden) h264 = i;
+    QCBildschirm *B_5k = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 5120, 2880, 240, YES);
+    B_5k.punkte_w = 2560; B_5k.punkte_h = 1440; B_5k.nativ_w = 5120; B_5k.nativ_h = 2880;
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    liste_setzen(@[ B_5k, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    stand_zeile("5K wie 2560x1440, HEVC");
+    int ok_5k_hevc = atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && g.wechsel == 1 && info_w(&g) == 5120 &&
+                     info_h(&g) == 2880 && g_info_w == 5120 && g_info_h == 2880 && fabs(qc_zeiger_massstab() - 2.0) < 1e-6;
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{ codec_wechseln(h264); });
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    __block long cfg_w = 0, cfg_h = 0;
+    dispatch_sync(g_capq, ^{ cfg_w = (long)g_cfg.width; cfg_h = (long)g_cfg.height; });
+    printf("         (5K HEVC %d; nach H.264: %s, Kandidat %d, INFO %ux%u, g_cfg %ldx%ld, Zeiger %.2f)\n", ok_5k_hevc, g.folge,
+           atomic_load(&g_codec_id), info_w(&g), info_h(&g), cfg_w, cfg_h, qc_zeiger_massstab());
+    pruefe(h264 >= 0 && ok_5k_hevc && atomic_load(&g_codec_id) == h264 && session_jetzt() != NULL && g.wechsel == 1 &&
+           g.wechsel_codec == h264 && info_w(&g) == 4096 && info_h(&g) == 2304 && g_info_w == 4096 && g_info_h == 2304 &&
+           cfg_w == 4096 && cfg_h == 2304 && fabs(qc_zeiger_massstab() - 1.6) < 1e-6 &&
+           zeilen_mit(logpfad, "Stromgroesse: 5120x2880 ist fuer H.264 zu gross (hoechstens 4096 Bildpunkte je Seite und 36864 "
+                               "Makrobloecke) - eingepasst auf 4096x2304 bei gleichem Seitenverhaeltnis") == 1 &&
+           zeilen_mit(logpfad, "Stromgroesse: 5120x2880 -> 4096x2304 (fuer H.264 eingepasst)") == 1 &&
+           zeilen_mit(logpfad, "Encoder: Kandidat 4 H.264 High, 4096x2304") == 1 &&
+           zeilen_mit(logpfad, "Zeigerform: Massstab 1.60 (Strom 4096 Bildpunkte breit, Bildschirm 2560 Punkte)") == 1,
+           "5K mit HEVC nativ 5120x2880; Codecwechsel auf H.264 passt ein: 4096x2304 (SWITCH, INFO, Aufnahme, Zeiger 1,6), "
+           "eine Zeile mit dem Grund");
+    // Ein Bild, das die Aufnahme noch in der alten Groesse lieferte: es geht
+    // hinein (VideoToolbox skaliert), der Zuschauer bekommt sein Vollbild.
+    CVPixelBufferRef pb_5k = testpuffer(5120, 2880);
+    stdout_stumm(1);
+    bild_einspeisen(pb_5k);
+    alles_lesen(&H, 400, &g);
+    stdout_stumm(0);
+    pruefe(g.bilder >= 1 && g.erstes_voll == 1, "ein Nachzuegler in 5120x2880 geht in den H.264-Encoder (4096x2304), als Vollbild");
+    CVPixelBufferRelease(pb_5k);
+
+    // Neue Aufloesung bei laufendem H.264, eingepasst gleich gross (6K in
+    // "wie 3008x1692"): kein neuer Strom, nur Zeiger und native Groesse.
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    QCBildschirm *B_6k = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 6016, 3384, 240, YES);
+    B_6k.punkte_w = 3008; B_6k.punkte_h = 1692; B_6k.nativ_w = 6016; B_6k.nativ_h = 3384;
+    liste_setzen(@[ B_6k, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    int ok_6k = atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && g_info_w == 4096 && g_info_h == 2304 &&
+                atomic_load(&g_strom_nativ_w) == 6016 && atomic_load(&g_strom_nativ_h) == 3384 &&
+                zeilen_mit(logpfad, "Zeigerform: Massstab 1.36 (Strom 4096 Bildpunkte breit, Bildschirm 3008 Punkte)") == 1;
+    // Eine Aufloesung, die eingepasst anders gross ist (5120x1440 in 1x):
+    // der Strom folgt mit H.264 in 4096x1152 - frueher scheiterte der
+    // Encoder hier bei jedem Versuch, und die Wiederherstellung lief ohne Ende.
+    QCBildschirm *B_breit = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 5120, 1440, 240, YES);
+    B_breit.punkte_w = 5120; B_breit.punkte_h = 1440; B_breit.nativ_w = 5120; B_breit.nativ_h = 1440;
+    int versuche_vorher = zeilen_mit(logpfad, "Aufnahme: neuer Versuch in 3 s"), fehl_vorher = zeilen_mit(logpfad, "Encoder laesst sich nicht starten");
+    liste_setzen(@[ B_breit, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    stand_zeile("5120x1440 mit H.264");
+    pruefe(ok_6k && atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && session_jetzt() != NULL && strstr(g.folge, "7 1 12") &&
+           info_w(&g) == 4096 && info_h(&g) == 1152 && g_info_w == 4096 && g_info_h == 1152 && atomic_load(&g_codec_id) == h264 &&
+           zeilen_mit(logpfad, "(Aufloesung geaendert: Strom 4096x2304 -> 4096x1152)") == 1 &&
+           zeilen_mit(logpfad, "Encoder: Kandidat 4 H.264 High, 4096x1152") == 1 &&
+           zeilen_mit(logpfad, "Aufnahme: neuer Versuch in 3 s") == versuche_vorher &&
+           zeilen_mit(logpfad, "Encoder laesst sich nicht starten") == fehl_vorher,
+           "neue Aufloesung bei laufendem H.264: gleich eingepasst bleibt der Strom (6K: 4096x2304, Zeiger 1,36), sonst folgt er "
+           "eingepasst (5120x1440 -> 4096x1152) - Encoder offen, kein Wiederholversuch");
+    // Zurueck auf HEVC: wieder nativ 5120x1440.
+    stdout_stumm(1);
+    dispatch_sync(g_capq, ^{ codec_wechseln(codec_vorher); });
+    dispatch_sync(g_capq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(atomic_load(&g_codec_id) == codec_vorher && g.wechsel == 1 && info_w(&g) == 5120 && info_h(&g) == 1440 &&
+           g_info_w == 5120 && g_info_h == 1440 && fabs(qc_zeiger_massstab() - 1.0) < 1e-6 &&
+           zeilen_mit(logpfad, "Stromgroesse: 4096x1152 -> 5120x1440 (wieder nativ)") == 1,
+           "zurueck auf HEVC: der Strom ist wieder nativ (5120x1440, SWITCH und INFO), Zeiger 1");
+    // Und zurueck auf 1920x1080 fuer die folgenden Abschnitte.
+    liste_setzen(@[ B2, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g_info_w == 1920 && g_info_h == 1080 && atomic_load(&g_codec_id) == codec_vorher, "wieder 1920x1080 mit dem Codec von vorher");
 
     printf("\n-- HDR: IN_ANZEIGE ueber den Eingabekanal (noch ohne HDR-Encoder)\n");
     // Bis hier hat H kein IN_ANZEIGE geschickt: jede Strominfo trug Grund 7.

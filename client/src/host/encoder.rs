@@ -235,6 +235,79 @@ pub fn kandidat(idx: usize) -> &'static Kandidat {
     &KANDIDATEN[idx.min(KANDIDATEN.len() - 1)]
 }
 
+// ------------------------------------------------------------ H.264-Grenze
+
+/// Die Grenze der H.264-Encoder - dieselbe wie QC_H264_MAX_SEITE und
+/// QC_H264_MAX_MB auf dem Mac (host/bildschirm.h): hoechstens 4096
+/// Bildpunkte je Seite und 36864 Makrobloecke (4096x2304, Level 5.2). NVENC
+/// H.264 nimmt hoechstens 4096x4096 (NVIDIA), VideoToolbox auf dem M1 4096
+/// je Seite (gemessen: 4112x2304 -12903); die Hardware-Decoder der Clients
+/// sind oft auf Level 5.2 begrenzt. Der Software-Encoder von Media
+/// Foundation nahm auf der VM auch 5120x2880 an (gemessen) - die Grenze gilt
+/// trotzdem fuer jeden H.264-Strom, damit er ueberall aufgeht. Ein nativer Strom,
+/// der groesser ist, wird fuer H.264 eingepasst (aufnahme::stromplan_codec) -
+/// die einzige Ausnahme von nativ. pruefen() probiert die Grenze mit dem
+/// Encoder aus und nimmt 1920x1080, wenn er sie nicht oeffnet.
+pub const H264_MAX_SEITE: i32 = 4096;
+pub const H264_MAX_MB: i32 = 36864;
+static H264_GRENZE: [AtomicI32; 2] = [AtomicI32::new(H264_MAX_SEITE), AtomicI32::new(H264_MAX_MB)];
+
+/// Die geltende Grenze: (Bildpunkte je Seite, Makrobloecke je Bild).
+pub fn h264_grenze() -> (i32, i32) {
+    (H264_GRENZE[0].load(Ordering::Relaxed), H264_GRENZE[1].load(Ordering::Relaxed))
+}
+
+fn h264_grenze_setzen(seite: i32, mb: i32) {
+    H264_GRENZE[0].store(seite, Ordering::Relaxed);
+    H264_GRENZE[1].store(mb, Ordering::Relaxed);
+}
+
+/// Passt w x h in die Grenze g (Seite, Makrobloecke)?
+pub fn h264_passt(w: i32, h: i32, g: (i32, i32)) -> bool {
+    if w <= 0 || h <= 0 {
+        return true;
+    }
+    let mb = ((w as i64 + 15) / 16) * ((h as i64 + 15) / 16);
+    w <= g.0 && h <= g.0 && mb <= g.1 as i64
+}
+
+/// w x h in die Grenze g einpassen, bei gleichem Seitenverhaeltnis und
+/// gerade (wie qc_h264_einpassen auf dem Mac); None, wenn es schon passt.
+pub fn h264_einpassen(w: i32, h: i32, g: (i32, i32)) -> Option<(i32, i32)> {
+    if h264_passt(w, h, g) || g.0 < 16 || g.1 < 1 {
+        return None;
+    }
+    let (wf, hf) = (w as f64, h as f64);
+    let mut f = (g.0 as f64 / wf).min(g.0 as f64 / hf).min((g.1 as f64 * 256.0 / (wf * hf)).sqrt());
+    for _ in 0..1000 {
+        let nw = (((wf * f + 1e-6).floor() as i32) & !1).max(16);
+        let nh = (((hf * f + 1e-6).floor() as i32) & !1).max(16);
+        if h264_passt(nw, nh, g) {
+            return Some((nw, nh));
+        }
+        f *= 0.999;
+    }
+    Some((1920, 1080))
+}
+
+/// Die Grenze mit dem Encoder ausprobieren (nach dem Befund in 1920x1080):
+/// oeffnet er in 4096x2304, gilt sie; sonst 1920x1080. Liefert den Text
+/// fuers Protokoll.
+fn h264_grenze_pruefen(encoder: &'static str, pix_fmt: AVPixelFormat, profil: &'static str) -> String {
+    let (gw, gh) = (H264_MAX_SEITE, H264_MAX_MB * 256 / H264_MAX_SEITE);
+    crate::protokoll::fehler_verwerfen();
+    match Sitzung::oeffnen(&Oeffnung { encoder, pix_fmt, profil, rgb_444: false, ..Oeffnung::vorgabe(gw, gh) }) {
+        Ok(_) => {
+            h264_grenze_setzen(H264_MAX_SEITE, H264_MAX_MB);
+            format!("bis {gw}x{gh} geprueft - groessere Ausgaenge werden fuer H.264 eingepasst")
+        }
+        Err(e) => {
+            h264_grenze_setzen(1920, 8160);
+            format!("oeffnet nicht in {gw}x{gh} ({e}) - Grenze 1920x1080, groessere Ausgaenge werden fuer H.264 eingepasst")
+        }
+    }
+}
+
 /// Kennt das Protokoll den Codec? Strominfo (Nachricht 1) und Codecwechsel
 /// (Nachricht 7) unterscheiden nur HEVC und H.264 - AV1 kaeme beim
 /// Zuschauer als HEVC an und bliebe schwarz. Bis Protokoll und Client AV1
@@ -416,6 +489,9 @@ pub fn pruefen() {
             Ok(_) => {
                 befund[i] = Befund { vorhanden: true, hardware: true, encoder: k.encoder, vorlauf: 0, hdr: false };
                 log(format!("  {:<18} ja (Hardware, {} {}{})", k.name, k.encoder, pix_fmt_name(k.pix_fmt), if k.umrechnung { ", mit Umrechnung" } else { "" }));
+                if k.h264 {
+                    log(format!("  {:<18}   {}", "", h264_grenze_pruefen(k.encoder, k.pix_fmt, k.profil)));
+                }
                 if crate::hdr::codec_kann_hdr(i as u8) {
                     // HDR10: dieselbe Sitzung in PQ/BT.2020 mit Seitendaten.
                     crate::protokoll::fehler_verwerfen();
@@ -436,6 +512,7 @@ pub fn pruefen() {
                         Ok(n) => {
                             befund[i] = Befund { vorhanden: true, hardware: false, encoder: MF_H264, vorlauf: n - 1, hdr: false };
                             log(format!("  {:<18} ja (Software (MediaFoundation), {MF_H264} nv12, Vorlauf {} Bilder; nvenc: {e})", k.name, n - 1));
+                            log(format!("  {:<18}   {}", "", h264_grenze_pruefen(MF_H264, AVPixelFormat::AV_PIX_FMT_NV12, "")));
                             continue;
                         }
                         Err(m) => log(format!("  {:<18} nein ({e}; {MF_H264}: {m})", k.name)),

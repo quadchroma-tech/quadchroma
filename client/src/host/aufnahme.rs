@@ -34,7 +34,13 @@
 // von Windows (150 %) aendert daran nichts. Nichts wird halbiert, nur ein
 // ungerader Rand faellt weg. Damit braucht kein Weg einen Skalierer, und
 // ein 4K-Ausgang nimmt dieselben Wege wie ein kleinerer (bgra in NVENC,
-// Null-Kopien, wo er erlaubt ist).
+// Null-Kopien, wo er erlaubt ist). Die einzige Ausnahme ist H.264 ueber
+// seiner Grenze (encoder::h264_grenze, 4096 je Seite, 4096x2304): dann
+// passt stromplan_codec den Strom darin ein, bei gleichem
+// Seitenverhaeltnis, flaechengemittelt auf dem Prozessor (bgra_einpassen) -
+// sonst oeffnete der Encoder gar nicht. Aufbau, Wiederherstellung,
+// Bildschirm- und Codecwechsel nehmen alle diese eine Regel; die Zeigerform
+// bekommt denselben Massstab (sie kommt in Bildpunkten des Stroms).
 //
 // Gedrehte Ausgaenge (Hochformat, 180 Grad, hochkantes Panel, das Windows
 // quer betreibt): die Oberflaeche kommt ungedreht, gedreht wird beim
@@ -822,6 +828,39 @@ pub fn stromplan(dw: i32, dh: i32) -> (i32, i32) {
     (dw.max(0) & !1, dh.max(0) & !1)
 }
 
+/// Stromgroesse fuer einen Kandidaten: nativ (stromplan), bei H.264 (`h264`)
+/// in dessen Grenze `grenze` eingepasst (encoder::h264_einpassen) - die
+/// einzige Ausnahme von nativ. Liefert Breite, Hoehe und ob eingepasst wird;
+/// die Aufnahme folgt diesem Plan (Aufnahme::eingepasst), sie raet nie aus
+/// Abweichungen.
+pub fn stromplan_codec(dw: i32, dh: i32, h264: bool, grenze: (i32, i32)) -> (i32, i32, bool) {
+    let (w, h) = stromplan(dw, dh);
+    match h264.then(|| encoder::h264_einpassen(w, h, grenze)).flatten() {
+        Some((ew, eh)) => (ew, eh, true),
+        None => (w, h, false),
+    }
+}
+
+/// Der Plan fuer Kandidat idx mit der geltenden Grenze; beim ersten
+/// Einpassen einer Groesse eine Zeile mit dem Grund.
+fn stromplan_fuer(dw: i32, dh: i32, idx: usize) -> (i32, i32, bool) {
+    let grenze = encoder::h264_grenze();
+    let (w, h, ein) = stromplan_codec(dw, dh, encoder::kandidat(idx).h264, grenze);
+    if ein {
+        static GEMELDET: Mutex<(i32, i32)> = Mutex::new((0, 0));
+        let mut g = GEMELDET.lock().unwrap();
+        if *g != (dw, dh) {
+            *g = (dw, dh);
+            log(format!(
+                "Stromgroesse: {dw}x{dh} ist fuer H.264 zu gross (hoechstens {} Bildpunkte je Seite und {} Makrobloecke) - \
+                 eingepasst auf {w}x{h} bei gleichem Seitenverhaeltnis, die einzige Ausnahme von nativ (skaliert auf dem Prozessor)",
+                grenze.0, grenze.1
+            ));
+        }
+    }
+    (w, h, ein)
+}
+
 /// Vorlaeufige Stromgroesse fuer einen Ausgang (beim Start, vor der
 /// Duplication); danach gilt der Anzeigemodus der Duplication.
 pub fn stromgroesse(a: &Ausgang) -> (i32, i32) {
@@ -955,6 +994,79 @@ pub fn bgra_drehen(src: &[u8], sw: usize, sh: usize, d: Drehung, ziel: &mut Vec<
             }
         }),
     }
+    Ok(())
+}
+
+/// Die Stuetzstellen einer Flaechenmittelung von n Quellpunkten auf m
+/// Zielpunkte (m <= n): je Zielpunkt der erste Quellpunkt und die Gewichte
+/// der Quellpunkte, die er abdeckt (Anteil der Flaeche, Summe genau 1 << 14).
+fn einpass_gewichte(n: usize, m: usize) -> Vec<(usize, Vec<u32>)> {
+    let s = n as f64 / m as f64;
+    (0..m)
+        .map(|o| {
+            let (a, b) = (o as f64 * s, ((o + 1) as f64 * s).min(n as f64));
+            let erst = (a.floor() as usize).min(n - 1);
+            let ende = (b.ceil() as usize).clamp(erst + 1, n);
+            let mut g: Vec<u32> = (erst..ende).map(|k| ((b.min(k as f64 + 1.0) - a.max(k as f64)).max(0.0) / s * 16384.0).round() as u32).collect();
+            let summe: i64 = g.iter().map(|&x| x as i64).sum();
+            if let Some(gross) = g.iter_mut().max_by_key(|x| **x) {
+                *gross = (*gross as i64 + 16384 - summe).max(0) as u32;
+            }
+            (erst, g)
+        })
+        .collect()
+}
+
+/// BGRA (dicht gepackt, sw x sh) auf w x h verkleinern, flaechengemittelt:
+/// jeder Zielpunkt mittelt genau die Flaeche der Quelle, die er abdeckt -
+/// fuer den Strom, den H.264 nicht nativ nimmt (stromplan_codec, etwa
+/// 5120x2880 -> 4096x2304). Getrennt nach Zeilen und Spalten, in
+/// Festkomma, zeilenparallel; `zwischen` haelt das Zwischenergebnis. Nur
+/// verkleinern (w <= sw, h <= sh); passt es nicht zusammen, ein Fehler.
+pub fn bgra_einpassen(src: &[u8], sw: usize, sh: usize, w: usize, h: usize, zwischen: &mut Vec<u16>, ziel: &mut Vec<u8>) -> Result<(), String> {
+    if w == 0 || h == 0 || w > sw || h > sh {
+        return Err(format!("Einpassen {sw}x{sh} -> {w}x{h} geht nicht"));
+    }
+    if src.len() < sw * sh * 4 {
+        return Err(format!("Einpassen: Quelle zu kurz: {} statt {} Byte", src.len(), sw * sh * 4));
+    }
+    if (w, h) == (sw, sh) {
+        ziel.clear();
+        ziel.extend_from_slice(&src[..sw * sh * 4]);
+        return Ok(());
+    }
+    let gx = einpass_gewichte(sw, w);
+    let gy = einpass_gewichte(sh, h);
+    // Zeilen: je Quellzeile w Punkte, 8 Bit Nachkomma (Wert * 256).
+    zwischen.resize(w * sh * 4, 0);
+    zwischen.par_chunks_mut(w * 4).enumerate().for_each(|(y, z)| {
+        let zeile = &src[y * sw * 4..(y + 1) * sw * 4];
+        for (ox, (erst, g)) in gx.iter().enumerate() {
+            let mut acc = [0u32; 4];
+            for (k, &wk) in g.iter().enumerate() {
+                let q = (erst + k) * 4;
+                for c in 0..4 {
+                    acc[c] += wk * zeile[q + c] as u32;
+                }
+            }
+            for c in 0..4 {
+                z[ox * 4 + c] = ((acc[c] + 32) >> 6) as u16;
+            }
+        }
+    });
+    // Spalten: je Zielzeile die Quellzeilen, die sie abdeckt.
+    ziel.resize(w * h * 4, 0);
+    let zw: &[u16] = zwischen;
+    ziel.par_chunks_mut(w * 4).enumerate().for_each(|(oy, z)| {
+        let (erst, g) = &gy[oy];
+        for (x, p) in z.iter_mut().enumerate() {
+            let mut acc = 0u32;
+            for (k, &wk) in g.iter().enumerate() {
+                acc += wk * zw[(erst + k) * w * 4 + x] as u32;
+            }
+            *p = ((acc + (1 << 21)) >> 22).min(255) as u8;
+        }
+    });
     Ok(())
 }
 
@@ -1597,25 +1709,27 @@ pub fn start(wunsch: Option<String>, liste: Vec<Ausgang>, weg_cli: Weg, weg: Weg
 
 /// Bild und Maus auf denselben Ausgang; die Stromgroesse kommt aus dem
 /// Anzeigemodus der Duplication (dw x dh) - das ist die Groesse der Bilder,
-/// die wirklich ankommen - und steht danach in Z. Liefert die Stromgroesse
-/// und ob sie sich geaendert hat.
-fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32) -> ((i32, i32), bool) {
-    let (w, h) = stromplan(dw, dh);
+/// die wirklich ankommen - und dem laufenden Kandidaten idx (bei H.264
+/// womoeglich eingepasst, stromplan_codec) und steht danach in Z. Liefert
+/// den Plan (Breite, Hoehe, eingepasst) und ob sich die Stromgroesse
+/// geaendert hat.
+fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32, idx: usize) -> ((i32, i32, bool), bool) {
+    let (w, h, ein) = stromplan_fuer(dw, dh, idx);
     super::eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
     let alt = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
     Z.info_w.store(w as u32, Ordering::Relaxed);
     Z.info_h.store(h as u32, Ordering::Relaxed);
-    ((w, h), alt != (w, h))
+    ((w, h, ein), alt != (w, h))
 }
 
-/// Der Encoderweg fuer eine neue Aufnahme: der Null-Kopien-Weg (d3d11)
-/// kennt keine Drehung - ein gedrehter Ausgang nimmt dann den Prozessorweg
-/// (bgra, gedreht wird beim Einlesen). Die Groesse spielt keine Rolle mehr:
-/// frueher schickte ein Ausgang ab 3840 Breite ihn ebenfalls auf den
-/// Prozessor, weil nur dort halbiert wurde; der Strom ist jetzt nativ, und
-/// die Textur geht ohne Skalierer in den Pool.
-pub fn weg_fuer_aufnahme(weg: Weg, drehung: Drehung) -> Weg {
-    if weg == Weg::D3d11 && drehung != Drehung::Keine { Weg::Bgra } else { weg }
+/// Der Encoderweg fuer eine Aufnahme: der Null-Kopien-Weg (d3d11) kennt
+/// weder Drehung noch Skalierer - ein gedrehter Ausgang und ein fuer H.264
+/// eingepasster Strom (`eingepasst`) nehmen dann den Prozessorweg (bgra,
+/// gedreht und eingepasst wird beim Einlesen). Sonst spielt die Groesse
+/// keine Rolle: der Strom ist nativ, auch ab 3840 Breite, und die Textur
+/// geht ohne Skalierer in den Pool.
+pub fn weg_fuer_aufnahme(weg: Weg, drehung: Drehung, eingepasst: bool) -> Weg {
+    if weg == Weg::D3d11 && (drehung != Drehung::Keine || eingepasst) { Weg::Bgra } else { weg }
 }
 
 /// Bleibt der stehende Encoder ueber einen Aufbau der Duplication bei
@@ -1746,13 +1860,29 @@ struct Aufnahme {
     ram_gedreht: Vec<u8>,
     /// Modus PQ: die Ebenen des Wandlers (u16, dicht gepackt) in Stromgroesse.
     ram16: Vec<u8>,
+    /// Plan aus stromplan_codec: der Strom ist fuer H.264 eingepasst - dann
+    /// liest einlesen die ganze Oberflaeche und passt sie auf dem
+    /// Prozessor ein (bgra_einpassen); nie aus einer Annahme.
+    eingepasst: bool,
+    /// Zwischenergebnis des Einpassens (Zeilen schon eingepasst).
+    ram_zwischen: Vec<u16>,
 }
 
 impl Aufnahme {
     /// Die Aufnahme auf einer Duplication, mit der Quelle, die der Encoder
     /// nimmt (Texturen oder Systemspeicher).
-    fn neu(dup: Duplication, texturen: bool) -> Result<Aufnahme, String> {
-        let mut a = Aufnahme { dup, staging: None, kopie: None, ram: Vec::new(), ram_voll: Vec::new(), ram_gedreht: Vec::new(), ram16: Vec::new() };
+    fn neu(dup: Duplication, texturen: bool, eingepasst: bool) -> Result<Aufnahme, String> {
+        let mut a = Aufnahme {
+            dup,
+            staging: None,
+            kopie: None,
+            ram: Vec::new(),
+            ram_voll: Vec::new(),
+            ram_gedreht: Vec::new(),
+            ram16: Vec::new(),
+            eingepasst,
+            ram_zwischen: Vec::new(),
+        };
         a.quelle_anlegen(texturen, None, 0, 0)?;
         Ok(a)
     }
@@ -1795,6 +1925,7 @@ impl Aufnahme {
             self.ram = Vec::new();
             self.ram_voll = Vec::new();
             self.ram_gedreht = Vec::new();
+            self.ram_zwischen = Vec::new();
             self.dup.pq_setzen(Some(plan))?;
             if !self.dup.pq_nachrechnen()? {
                 return Ok(false);
@@ -1835,6 +1966,7 @@ impl Aufnahme {
             self.ram = Vec::new();
             self.ram_voll = Vec::new();
             self.ram_gedreht = Vec::new();
+            self.ram_zwischen = Vec::new();
             Ok(mit)
         } else {
             let s = self.dup.textur(dw, dh, true)?;
@@ -1854,7 +1986,10 @@ impl Aufnahme {
     /// Das Bild aus der STAGING-Textur in den Hauptspeicher, in
     /// Stromgroesse w x h (nativ; ein ungerader Rand faellt beim Auslesen
     /// weg). Gedreht: erst die ganze Oberflaeche lesen, dann drehen
-    /// (gedreht_in_stromgroesse). Im Modus PQ die Ebenen des Wandlers.
+    /// (gedreht_in_stromgroesse). Fuer H.264 eingepasst (Plan `eingepasst`):
+    /// die ganze Oberflaeche, gedreht, wie der Desktop steht, dann
+    /// flaechengemittelt auf w x h (bgra_einpassen). Im Modus PQ die Ebenen
+    /// des Wandlers.
     fn einlesen(&mut self, w: i32, h: i32) -> Result<(), String> {
         if self.dup.pq().is_some() {
             // Modus PQ: gedreht und umgerechnet hat schon der Wandler.
@@ -1862,12 +1997,22 @@ impl Aufnahme {
         }
         let Some(s) = self.staging.as_ref() else { return Ok(()) };
         let d = self.dup.drehung;
-        if d == Drehung::Keine {
+        if d == Drehung::Keine && !self.eingepasst {
             return self.dup.auslesen(s, w as u32, h as u32, &mut self.ram);
         }
         let (dw, dh) = (self.dup.breite, self.dup.hoehe);
         self.dup.auslesen(s, dw, dh, &mut self.ram_voll)?;
-        gedreht_in_stromgroesse(&self.ram_voll, dw as usize, dh as usize, d, w as usize, h as usize, &mut self.ram_gedreht, &mut self.ram)
+        if !self.eingepasst {
+            return gedreht_in_stromgroesse(&self.ram_voll, dw as usize, dh as usize, d, w as usize, h as usize, &mut self.ram_gedreht, &mut self.ram);
+        }
+        let (gw, gh) = d.groesse(dw as usize, dh as usize);
+        let quelle: &[u8] = if d == Drehung::Keine {
+            &self.ram_voll
+        } else {
+            bgra_drehen(&self.ram_voll, dw as usize, dh as usize, d, &mut self.ram_gedreht)?;
+            &self.ram_gedreht
+        };
+        bgra_einpassen(quelle, gw, gh, w as usize, h as usize, &mut self.ram_zwischen, &mut self.ram)
     }
 }
 
@@ -1953,6 +2098,8 @@ fn sitzung(stand: &mut Bildschirmstand) {
     // Desktopbild einmal nachlegen, auch ohne feste Bildrate (mit Grund).
     let mut nachholen: Option<&'static str> = None;
     let (mut w, mut h) = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
+    // Der Plan der laufenden Aufnahme: fuer H.264 eingepasst (stromplan_codec)?
+    let mut eingepasst = false;
     let mut zuschauer = netz::zuschauer_nr();
     // HDR (Plan 3): ob die Farbe des Stroms neu zu entscheiden ist (Anstoss
     // vom Netzfaden ueber Z.hdr_neu, neuer Zuschauer, andere Farblage, nach
@@ -2034,8 +2181,11 @@ fn sitzung(stand: &mut Bildschirmstand) {
                         weg = neu;
                     }
                     let aufbau = duplication_aufbauen(&a).and_then(move |d| {
-                        let weg_hier = weg_fuer_aufnahme(weg, d.drehung);
-                        Aufnahme::neu(d, encoder::texturweg(Z.codec_id.load(Ordering::Relaxed) as usize, weg_hier))
+                        let idx = Z.codec_id.load(Ordering::Relaxed) as usize;
+                        let (gw, gh) = d.desktop_groesse();
+                        let (_, _, ein) = stromplan_codec(gw as i32, gh as i32, encoder::kandidat(idx).h264, encoder::h264_grenze());
+                        let texturen = encoder::texturweg(idx, weg_fuer_aufnahme(weg, d.drehung, ein));
+                        Aufnahme::neu(d, texturen, ein)
                     });
                     match aufbau {
                         Ok(neu) => {
@@ -2054,8 +2204,10 @@ fn sitzung(stand: &mut Bildschirmstand) {
                             Z.hdr_master_max_nit.store(mastering.max_nit as u32, Ordering::Relaxed);
                             Z.hdr_master_min.store(mastering.min_zehntausendstel as u32, Ordering::Relaxed);
                             let (gw, gh) = d.desktop_groesse();
-                            let ((nw, nh), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
+                            let ((nw, nh, ein), geaendert) = strom_anpassen(&a, gw as i32, gh as i32, Z.codec_id.load(Ordering::Relaxed) as usize);
                             let groesse_neu = geaendert || nw != w || nh != h;
+                            eingepasst = ein;
+                            zeiger.massstab_setzen(nw, gw);
                             if groesse_neu {
                                 w = nw;
                                 h = nh;
@@ -2087,7 +2239,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                 netz::strominfo_senden();
                             }
                             gestreamt = Some(a.kennung.clone());
-                            let weg_hier = weg_fuer_aufnahme(weg, d.drehung);
+                            let weg_hier = weg_fuer_aufnahme(weg, d.drehung, false);
                             if weg_hier != weg {
                                 log("Null-Kopien-Weg: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg (bgra)");
                                 weg = weg_hier;
@@ -2103,7 +2255,13 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     if d.drehung != Drehung::Keine { format!(" gedreht {} Grad (Oberflaeche {}x{}, gedreht wird auf dem Prozessor)", d.drehung.grad(), d.breite, d.hoehe) } else { String::new() },
                                     a.karte, a.karte_name, d.format_text(),
                                     if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
-                                    if (w, h) != (gw as i32, gh as i32) { " (nativ, ungerader Rand abgeschnitten)" } else { " (nativ)" },
+                                    if eingepasst {
+                                        format!(" (nativ {gw}x{gh}, fuer H.264 eingepasst)")
+                                    } else if (w, h) != (gw as i32, gh as i32) {
+                                        " (nativ, ungerader Rand abgeschnitten)".to_string()
+                                    } else {
+                                        " (nativ)".to_string()
+                                    },
                                     if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                                 ));
                                 log(format!("Aufnahme {}: Farbe {}", a.name, d.farbe.zeile()));
@@ -2150,7 +2308,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
         if auf.is_some() && enc.is_none() && Instant::now() >= naechster_enc_versuch {
             let a = auf.as_ref().unwrap();
             let idx = Z.codec_id.load(Ordering::Relaxed) as usize;
-            match oeffnen_in_farbe(idx, super::hdr_ziel_pq(idx), w, h, weg, Some((&a.dup.device, &a.dup.ctx))) {
+            match oeffnen_in_farbe(idx, super::hdr_ziel_pq(idx), w, h, weg_im_betrieb(weg, eingepasst), Some((&a.dup.device, &a.dup.ctx))) {
                 Ok(b) => {
                     let t = b.farbe().transfer();
                     enc = Some(b);
@@ -2180,7 +2338,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
         // 3. Codecwunsch (Nachricht 66): zwischen zwei Bildern, nie mittendrin -
         //    der neue Kandidat gleich in der Farbe, die fuer ihn gilt.
         if let Some(idx) = encoder::codec_wunsch_abholen() {
-            strom_wechseln(idx, super::hdr_ziel_pq(idx), &mut enc, auf.as_ref(), w, h, weg);
+            strom_wechseln(idx, super::hdr_ziel_pq(idx), &mut enc, auf.as_mut(), (&mut w, &mut h, &mut eingepasst), &mut zeiger, weg);
             testbilder = None;
             // Wie nach Schritt 2: was waehrend des Oeffnens kam, vergleicht 3b.
             farbe_faellig = true;
@@ -2203,7 +2361,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                         farbe_faellig = false;
                     } else if auf.is_some() && Instant::now() >= naechster_farbwechsel {
                         naechster_farbwechsel = Instant::now() + Duration::from_secs(2);
-                        strom_wechseln(idx, ziel_pq, &mut enc, auf.as_ref(), w, h, weg);
+                        strom_wechseln(idx, ziel_pq, &mut enc, auf.as_mut(), (&mut w, &mut h, &mut eingepasst), &mut zeiger, weg);
                         testbilder = None;
                         // Steht der Wechsel, bleibt es faellig: was waehrend
                         // des Oeffnens kam, hat der Netzfaden noch gegen die
@@ -2222,7 +2380,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
         // 4. Einstellungen (Nachricht 64) auf die Sitzung.
         let mut enc_kaputt = false;
         if let (Some(e), Some(a)) = (enc.as_mut(), auf.as_ref()) {
-            match e.einstellungen_nachziehen(weg, Some((&a.dup.device, &a.dup.ctx))) {
+            match e.einstellungen_nachziehen(weg_im_betrieb(weg, eingepasst), Some((&a.dup.device, &a.dup.ctx))) {
                 Ok(true) => testbilder = None,
                 Ok(false) => {}
                 Err(err) => {
@@ -2563,13 +2721,33 @@ fn oeffnen_in_farbe(idx: usize, pq: bool, w: i32, h: i32, weg: Weg, geraet: Opti
     }
 }
 
+/// Der Weg, mit dem ein Encoder geoeffnet wird: der entschiedene, ausser der
+/// Strom ist fuer H.264 eingepasst - dann skaliert der Prozessor, und der
+/// Null-Kopien-Weg (d3d11) wird zu bgra (weg_fuer_aufnahme). Eine Zeile beim
+/// ersten Mal.
+fn weg_im_betrieb(weg: Weg, eingepasst: bool) -> Weg {
+    let w = weg_fuer_aufnahme(weg, Drehung::Keine, eingepasst);
+    static GEMELDET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if w != weg && !GEMELDET.swap(true, Ordering::Relaxed) {
+        log("Null-Kopien-Weg: der fuer H.264 eingepasste Strom wird auf dem Prozessor skaliert - Prozessorweg (bgra)");
+    }
+    w
+}
+
 /// Codec- und Farbwechsel wie main.m: alte Sitzung leeren (ihre letzten
 /// Pakete gehen noch raus), neue oeffnen (Kandidat `idx`, PQ oder SDR), ERST
 /// DANN Switch 7 mit dem Transfer, Vollbild erzwingen, Strominfo 1. Geht
 /// sie in PQ nicht auf, derselbe Kandidat in SDR (oeffnen_in_farbe); scheitert
 /// sie ganz, kommt die alte zurueck - ohne Switch. Die Aufnahme stellt sich
 /// danach selbst um (Schritt 4b: Quelle, Modus PQ).
-fn strom_wechseln(idx: usize, pq: bool, enc: &mut Option<Betrieb>, auf: Option<&Aufnahme>, w: i32, h: i32, weg: Weg) {
+///
+/// `strom` (Breite, Hoehe, eingepasst) ist der Plan der laufenden Aufnahme.
+/// Hat der neue Kandidat einen anderen (H.264 ueber seiner Grenze, zurueck
+/// auf HEVC nativ), gilt ab dem Oeffnen der neue: die Strominfo nach dem
+/// Switch traegt die neuen Masse, die Aufnahme liest das letzte Bild in der
+/// neuen Groesse neu ein, der Zeiger bekommt den neuen Massstab. Scheitert
+/// der Wechsel, gilt wieder der alte Plan.
+fn strom_wechseln(idx: usize, pq: bool, enc: &mut Option<Betrieb>, auf: Option<&mut Aufnahme>, strom: (&mut i32, &mut i32, &mut bool), zeiger: &mut Zeiger, weg: Weg) {
     let alt = Z.codec_id.load(Ordering::Relaxed) as usize;
     let alt_pq = match enc.as_ref() {
         Some(e) => e.farbe().ist_pq(),
@@ -2598,13 +2776,36 @@ fn strom_wechseln(idx: usize, pq: bool, enc: &mut Option<Betrieb>, auf: Option<&
     // wenn die neue Sitzung steht.
     Z.wait_key.store(true, Ordering::Relaxed);
     Z.force_key.store(true, Ordering::Relaxed);
-    let geraet = Some((&a.dup.device, &a.dup.ctx));
-    match oeffnen_in_farbe(idx, pq, w, h, weg, geraet) {
+    let (w, h, eingepasst) = strom;
+    let (alt_w, alt_h, alt_ein) = (*w, *h, *eingepasst);
+    let (gw, gh) = a.dup.desktop_groesse();
+    let (nw, nh, ein) = stromplan_fuer(gw as i32, gh as i32, idx);
+    let groesse_neu = (nw, nh) != (alt_w, alt_h) || ein != alt_ein;
+    let plan_setzen = |a: &mut Aufnahme, w: &mut i32, h: &mut i32, eingepasst: &mut bool, zeiger: &mut Zeiger, pw: i32, ph: i32, pe: bool| {
+        (*w, *h, *eingepasst) = (pw, ph, pe);
+        a.eingepasst = pe;
+        Z.info_w.store(pw as u32, Ordering::Relaxed);
+        Z.info_h.store(ph as u32, Ordering::Relaxed);
+        zeiger.massstab_setzen(pw, gw);
+    };
+    if groesse_neu {
+        log(format!("Stromgroesse: {alt_w}x{alt_h} -> {nw}x{nh} ({})", if ein { "fuer H.264 eingepasst" } else { "wieder nativ" }));
+        plan_setzen(a, w, h, eingepasst, zeiger, nw, nh, ein);
+    }
+    let (device, ctx) = (a.dup.device.clone(), a.dup.ctx.clone());
+    match oeffnen_in_farbe(idx, pq, *w, *h, weg_im_betrieb(weg, *eingepasst), Some((&device, &ctx))) {
         Ok(b) => {
             let t = b.farbe().transfer();
             Z.codec_id.store(idx as u32, Ordering::Relaxed);
             Z.farbe.store(t, Ordering::Relaxed);
             *enc = Some(b);
+            // Das letzte Bild in der neuen Groesse (der Prozessorweg haelt
+            // es in STAGING in voller Groesse); Textur und PQ stellt 4b um.
+            if groesse_neu && a.staging.is_some() && a.dup.pq().is_none() {
+                if let Err(e) = a.einlesen(*w, *h) {
+                    log(format!("Stromgroesse: letztes Bild nicht neu eingelesen ({e}) - das naechste kommt von der Aufnahme"));
+                }
+            }
             encoder::switch_senden(idx, t);
             Z.force_key.store(true, Ordering::Relaxed);
             netz::strominfo_senden();
@@ -2612,7 +2813,13 @@ fn strom_wechseln(idx: usize, pq: bool, enc: &mut Option<Betrieb>, auf: Option<&
         }
         Err(e) => {
             log(format!("Wechsel auf {} fehlgeschlagen ({e}) - baue {} wieder auf", encoder::kandidat(idx).name, encoder::kandidat(alt).name));
-            match oeffnen_in_farbe(alt, alt_pq, w, h, weg, geraet) {
+            if groesse_neu {
+                plan_setzen(a, w, h, eingepasst, zeiger, alt_w, alt_h, alt_ein);
+                if a.staging.is_some() && a.dup.pq().is_none() {
+                    let _ = a.einlesen(*w, *h);
+                }
+            }
+            match oeffnen_in_farbe(alt, alt_pq, *w, *h, weg_im_betrieb(weg, *eingepasst), Some((&device, &ctx))) {
                 Ok(b) => {
                     let t = b.farbe().transfer();
                     let anders = Z.farbe.swap(t, Ordering::Relaxed) != t;
@@ -3010,16 +3217,71 @@ mod tests {
     #[test]
     fn null_kopien_auch_ab_4k_nur_nicht_gedreht() {
         // Die Groesse entscheidet nichts mehr (weg_fuer_aufnahme kennt sie
-        // gar nicht): ein 4K-Ausgang behaelt d3d11. Nur ein gedrehter geht
-        // auf den Prozessorweg - dort wird gedreht.
+        // gar nicht): ein 4K-Ausgang behaelt d3d11. Nur ein gedrehter und
+        // ein fuer H.264 eingepasster Strom gehen auf den Prozessorweg - dort
+        // wird gedreht und eingepasst.
         for w in [Weg::Bgra, Weg::Yuv444, Weg::D3d11, Weg::Auto] {
-            assert_eq!(weg_fuer_aufnahme(w, Drehung::Keine), w);
+            assert_eq!(weg_fuer_aufnahme(w, Drehung::Keine, false), w);
         }
         for d in [Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
-            assert_eq!(weg_fuer_aufnahme(Weg::D3d11, d), Weg::Bgra);
-            assert_eq!(weg_fuer_aufnahme(Weg::Bgra, d), Weg::Bgra);
-            assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, d), Weg::Yuv444);
+            assert_eq!(weg_fuer_aufnahme(Weg::D3d11, d, false), Weg::Bgra);
+            assert_eq!(weg_fuer_aufnahme(Weg::Bgra, d, false), Weg::Bgra);
+            assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, d, false), Weg::Yuv444);
         }
+        assert_eq!(weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, true), Weg::Bgra);
+        assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, Drehung::Keine, true), Weg::Yuv444);
+    }
+
+    #[test]
+    fn h264_passt_den_strom_ein_sonst_nativ() {
+        // Nativ bleibt alles bis 4096 je Seite und 4096x2304; darueber
+        // passt nur H.264 ein, bei gleichem Seitenverhaeltnis, gerade.
+        let g = (encoder::H264_MAX_SEITE, encoder::H264_MAX_MB);
+        for (dw, dh) in [(1920, 1080), (3840, 2160), (4096, 2304), (3840, 2400), (2160, 3840), (3841, 2161)] {
+            let (w, h) = stromplan(dw, dh);
+            assert_eq!(stromplan_codec(dw, dh, true, g), (w, h, false), "{dw}x{dh}");
+            assert_eq!(stromplan_codec(dw, dh, false, g), (w, h, false), "{dw}x{dh}");
+        }
+        for ((dw, dh), (ew, eh)) in [((5120, 2880), (4096, 2304)), ((5120, 1440), (4096, 1152)), ((6016, 3384), (4096, 2304)), ((2880, 5120), (2304, 4096)), ((7680, 4320), (4096, 2304)), ((5121, 2881), (4096, 2304))] {
+            assert_eq!(stromplan_codec(dw, dh, true, g), (ew, eh, true), "H.264 {dw}x{dh}");
+            assert_eq!(stromplan_codec(dw, dh, false, g), (dw & !1, dh & !1, false), "HEVC {dw}x{dh}");
+            assert!(encoder::h264_passt(ew, eh, g));
+        }
+        // 16:10 mit 4096 Breite hat zu viele Makrobloecke: eingepasst, 1,6 bleibt.
+        let (w, h, ein) = stromplan_codec(4096, 2560, true, g);
+        assert!(ein && encoder::h264_passt(w, h, g) && w % 2 == 0 && h % 2 == 0 && w > 3800 && ((w as f64 / h as f64) - 1.6).abs() < 0.01, "{w}x{h}");
+        assert!(!encoder::h264_passt(4112, 2304, g) && !encoder::h264_passt(4096, 2320, g) && encoder::h264_passt(4096, 2304, g));
+        assert_eq!(encoder::h264_einpassen(3840, 2160, g), None);
+        // Die Rueckfallgrenze 1920x1080 (der Encoder oeffnet 4096x2304 nicht).
+        assert_eq!(stromplan_codec(3840, 2160, true, (1920, 8160)), (1920, 1080, true));
+        assert_eq!(stromplan_codec(1920, 1080, true, (1920, 8160)), (1920, 1080, false));
+    }
+
+    #[test]
+    fn einpassen_mittelt_die_flaeche() {
+        // Genau die Zielgroesse, auch krumm; eine einfarbige Flaeche bleibt
+        // einfarbig; zwei Spalten (schwarz, weiss) auf eine mitteln sich.
+        for (sw, sh, w, h) in [(5120usize, 2880usize, 4096usize, 2304usize), (6016, 3384, 4096, 2304), (37, 21, 29, 16), (8, 8, 8, 8)] {
+            let src: Vec<u8> = [10u8, 20, 30, 255].repeat(sw * sh);
+            let (mut zw, mut ziel) = (Vec::new(), Vec::new());
+            bgra_einpassen(&src, sw, sh, w, h, &mut zw, &mut ziel).unwrap();
+            assert_eq!(ziel.len(), w * h * 4, "{sw}x{sh}");
+            assert!(ziel.chunks_exact(4).all(|p| p == [10, 20, 30, 255]), "{sw}x{sh} einfarbig");
+        }
+        let src = [0u8, 0, 0, 255, 255, 255, 255, 255].repeat(2);
+        let (mut zw, mut ziel) = (Vec::new(), Vec::new());
+        bgra_einpassen(&src, 2, 2, 1, 1, &mut zw, &mut ziel).unwrap();
+        assert_eq!(ziel, vec![128, 128, 128, 255]);
+        // 5 -> 4: der erste Zielpunkt deckt 4/5 des ersten und 1/5 des
+        // zweiten Quellpunkts ab (0 und 200 -> 40), die anderen nur 200er.
+        let src: Vec<u8> = [0u8, 200, 200, 200, 200].iter().flat_map(|&v| [v, v, v, 255]).collect();
+        bgra_einpassen(&src, 5, 1, 4, 1, &mut zw, &mut ziel).unwrap();
+        assert_eq!(&ziel[0..4], &[40, 40, 40, 255]);
+        assert!(ziel[4..].chunks_exact(4).all(|p| p == [200, 200, 200, 255]));
+        // Vergroessern, zu kurze Quelle, leeres Ziel: Fehler statt Lesen hinter dem Ende.
+        assert!(bgra_einpassen(&[0u8; 16], 2, 2, 3, 2, &mut zw, &mut ziel).is_err());
+        assert!(bgra_einpassen(&[0u8; 12], 2, 2, 1, 1, &mut zw, &mut ziel).is_err());
+        assert!(bgra_einpassen(&[0u8; 16], 2, 2, 0, 1, &mut zw, &mut ziel).is_err());
     }
 
     #[test]

@@ -139,8 +139,9 @@ graphics card the CPU draws.
   Mac the Rust client has the Objective-C host engine built in.
 - Pointer on the client side: the client shows its own local pointer in the shape the
   host reports; the video never contains one. The shape comes in pixels of the stream
-  (a HiDPI Mac sends it at twice its point size) and the client scales it with the
-  picture, so it is as large relative to the picture as on the host.
+  (a HiDPI Mac sends it at twice its point size) and the client draws it exactly as
+  large as the picture appears - enlarged by whole factors, reduced by area average -,
+  so it is as large relative to the picture as on the host.
 - Always encrypted: Noise XX with X25519, ChaCha20-Poly1305 and SHA-256, no switch to
   turn it off.
 - Access by password or click: every device has a permanent key and a nine-digit
@@ -160,7 +161,7 @@ on the Mac, `quadchroma.exe` on Windows. The table lists the two roles of each.
 |---|---|---|
 | Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; part of `QuadChroma.app` ("Share this Mac", on by default); host engine in Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; HDR10 in the 10-bit HEVC modes from macOS 15 on, when the streamed screen shows HDR; audio; clipboard including files; choice of the streamed screen; the app's menu-bar icon with device ID, access password, allowed devices, the sharing switch, "Start at login", the device name and "Prevent sleep". |
 | Client | Windows 10 or 11, 64-bit; part of `quadchroma.exe`; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display, HDR10 output on a screen with "Use HDR"; notification-area icon, single instance, desktop shortcut per host. |
-| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. A desktop with "Use HDR" is streamed as HDR10 through NVENC when the viewer can show it, otherwise converted to SDR on the GPU. The stream has the output's native resolution (4K included, never halved). The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, rotation on the GPU for SDR (runs on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
+| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. A desktop with "Use HDR" is streamed as HDR10 through NVENC when the viewer can show it, otherwise converted to SDR on the GPU. The stream has the output's native resolution (4K included, never halved). The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, rotation on the GPU for SDR and the scaling for an H.264 stream above 4096x2304 (both run on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
 | Client | Mac (arm64), part of the same `QuadChroma.app`; the same Rust source as on Windows | Secondary. Decoding with VideoToolbox (no FFmpeg on the Mac), audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), HDR10 through EDR on a screen with headroom, the app's one menu-bar icon, no desktop shortcut. Ships inside `QuadChroma.app`. |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
@@ -574,14 +575,26 @@ The Mac host streams natively: exactly the pixels the display is set to, in a Hi
 mode the pixels behind the points - "looks like 1920x1080" on a 4K panel is streamed
 as 3840x2160, a plain 1920x1080 mode as 1920x1080, native 4K as 3840x2160. A scaled
 mode that renders more pixels than the panel has ("looks like 2560x1440" on a 4K panel
-draws 5120x2880) is streamed at the panel's native 3840x2160. `--out <W>x<H>` still
-takes precedence, for a smaller stream. If the streamed screen changes its mode while
+draws 5120x2880) is streamed at the panel's 3840x2160; a mode without HiDPI is never
+capped. `--out <W>x<H>` still takes precedence, for a smaller stream. If the streamed screen changes its mode while
 a viewer watches, the stream follows like a screen switch (reason `Aufloesung
 geaendert`, resolution changed); the mouse maps onto the screen in points and is
 unaffected, the pointer shape gets the new scale. At native 4K the M1's encoder is the
 bottleneck (HEVC 4:4:4 10 bit about 85 frames/s with every frame different); the host
 keeps at most two frames in it, so a busy encoder skips frames instead of queueing
 them.
+
+The one exception to native, on both hosts, is H.264 above its limit: at most 4096
+pixels per side and 4096x2304 (36864 macroblocks, level 5.2) - the M1's hardware
+H.264 encoder refuses anything wider than 4096 (measured), NVENC stops at 4096x4096
+and many hardware decoders at level 5.2. While H.264 runs on a larger screen, the host
+fits the stream into the limit, keeping the aspect ratio (5K and 6K become 4096x2304,
+5120x1440 becomes 4096x1152), and logs it once (`Stromgroesse: ... ist fuer H.264 zu
+gross ... eingepasst auf ...`). Start, recovery, screen switch, a new resolution and
+the codec switch use the same rule; a switch between HEVC and H.264 that changes the
+size sends SWITCH and INFO with the new size like a screen switch. The Mac captures at
+the fitted size, the Windows host role scales on the CPU. The capability probe opens
+H.264 at 4096x2304 too; if the encoder refuses it, the limit becomes 1920x1080.
 
 Unplugging the streamed screen is not a switch but a loss: the stream ends, the host
 reports "no screen" (message 9) and rebuilds the stream - the Mac after 2 s, the
@@ -949,7 +962,8 @@ for the exe. The one-time steps are in `RELEASING.md`.
   keystrokes or frames wait briefly).
 - A desktop shortcut on the Mac client.
 - Windows host role: AMF/QSV encoders, rotation on the GPU for SDR (runs on the CPU
-  today; in HDR the GPU does it already).
+  today; in HDR the GPU does it already) and the scaling of an H.264 stream fitted
+  below a screen larger than 4096x2304 on the GPU (CPU today).
 - HDR: HLG, dynamic metadata (HDR10+, Dolby Vision), an HDR pointer.
 - AV1: no host offers it until protocol and client support it.
 - Audio compression as an option; uncompressed audio can take more bandwidth than the
@@ -1126,7 +1140,11 @@ exit code is the number of failures.
     clipboard base lies in the test's own `HOME`.
   - Screen selection (`host/bildschirm.m`): test vectors of messages 12 and 70;
     truncation at character boundaries; the pure selection logic; the native stream
-    size (4K, HiDPI, scaled modes above the panel, `--out` first); a mode change on
+    size (4K, HiDPI, scaled modes above the panel, modes without HiDPI never capped,
+    the panel from the mode list, `--out` first); the H.264 limit (fitting vectors;
+    a 5K screen with real encoders: HEVC 5120x2880, a codec switch to H.264 fitted to
+    4096x2304 with SWITCH, INFO and pointer scale 1.6 and back; a new resolution while
+    H.264 runs without recovery retries); a mode change on
     the streamed screen with a real 3840x2160 encoder, the pointer scale (2, 1, 1.5)
     and "encoder full" from two open frames;
     `bildschirm.txt` (also broken); `--display` as a pin for the run; the greeting

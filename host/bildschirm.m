@@ -88,6 +88,17 @@ NSString *qc_bildschirm_kennung(uint32_t vendor, uint32_t model, uint32_t serial
     return [NSString stringWithFormat:@"v%u-m%u-s%u", vendor, model, serial];
 }
 
+void qc_panelgroesse(const qc_modus_eintrag *modi, size_t n, size_t *w, size_t *h) {
+    size_t w1 = 0, h1 = 0, wn = 0, hn = 0;
+    for (size_t i = 0; i < n; i++) {
+        const qc_modus_eintrag *x = &modi[i];
+        if (x->pw == x->punkte_w && x->ph == x->punkte_h && x->pw * x->ph > w1 * h1) { w1 = x->pw; h1 = x->ph; }
+        if (x->nativ && x->pw * x->ph > wn * hn) { wn = x->pw; hn = x->ph; }
+    }
+    if (w1 * h1 >= wn * hn) { *w = w1; *h = h1; }
+    else { *w = wn; *h = hn; }
+}
+
 int qc_bildschirm_modus_lesen(CGDirectDisplayID d, qc_bildschirm_modus *m) {
     memset(m, 0, sizeof *m);
     CGDisplayModeRef jetzt = CGDisplayCopyDisplayMode(d);
@@ -98,32 +109,64 @@ int qc_bildschirm_modus_lesen(CGDirectDisplayID d, qc_bildschirm_modus *m) {
     m->punkte_h = CGDisplayModeGetHeight(jetzt);
     m->hz = CGDisplayModeGetRefreshRate(jetzt);
     CGDisplayModeRelease(jetzt);
-    // Die native Aufloesung: mit den HiDPI-Doppeln, sonst fehlt bei manchen
-    // Panels der native Eintrag. Ein 4K-Panel meldet "3840x2160" und "wie
-    // 1920x1080" als nativ, beide mit 3840x2160 Pixeln (gemessen am X27).
+    // Die Aufloesung des Panels: mit den HiDPI-Doppeln, sonst fehlt bei
+    // manchen Panels der native Eintrag. Ein 4K-Panel meldet "3840x2160" und
+    // "wie 1920x1080" als nativ, beide mit 3840x2160 Pixeln, und 3840x2160
+    // auch als groessten 1x-Modus (gemessen am X27).
     NSDictionary *opt = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
     CFArrayRef alle = CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)opt);
     if (alle) {
-        for (CFIndex i = 0; i < CFArrayGetCount(alle); i++) {
-            CGDisplayModeRef x = (CGDisplayModeRef)CFArrayGetValueAtIndex(alle, i);
-            if (!(CGDisplayModeGetIOFlags(x) & kDisplayModeNativeFlag)) continue;
-            size_t w = CGDisplayModeGetPixelWidth(x), h = CGDisplayModeGetPixelHeight(x);
-            if (w * h > m->nativ_w * m->nativ_h) { m->nativ_w = w; m->nativ_h = h; }
+        CFIndex n = CFArrayGetCount(alle);
+        qc_modus_eintrag *modi = n > 0 ? calloc((size_t)n, sizeof *modi) : NULL;
+        if (modi) {
+            for (CFIndex i = 0; i < n; i++) {
+                CGDisplayModeRef x = (CGDisplayModeRef)CFArrayGetValueAtIndex(alle, i);
+                modi[i] = (qc_modus_eintrag){ CGDisplayModeGetPixelWidth(x), CGDisplayModeGetPixelHeight(x),
+                                              CGDisplayModeGetWidth(x), CGDisplayModeGetHeight(x),
+                                              (CGDisplayModeGetIOFlags(x) & kDisplayModeNativeFlag) != 0 };
+            }
+            qc_panelgroesse(modi, (size_t)n, &m->nativ_w, &m->nativ_h);
+            free(modi);
         }
         CFRelease(alle);
     }
     return 1;
 }
 
-void qc_stromgroesse_nativ(size_t pw, size_t ph, size_t nativ_w, size_t nativ_h, int *w, int *h) {
+void qc_stromgroesse_nativ(size_t pw, size_t ph, size_t punkte_w, size_t punkte_h, size_t nativ_w, size_t nativ_h,
+                           int *w, int *h) {
     double f = 1.0;
-    if (nativ_w && nativ_h && pw && ph && (pw > nativ_w || ph > nativ_h))
+    BOOL skaliert = punkte_w && punkte_h && (punkte_w != pw || punkte_h != ph);
+    if (skaliert && nativ_w && nativ_h && pw && ph && (pw > nativ_w || ph > nativ_h))
         f = fmin((double)nativ_w / (double)pw, (double)nativ_h / (double)ph);
     long ow = lround((double)pw * f), oh = lround((double)ph * f);
     if (ow > 65534) ow = 65534;      // INFO traegt u16
     if (oh > 65534) oh = 65534;
     *w = (int)ow & ~1;
     *h = (int)oh & ~1;
+}
+
+int qc_h264_passt(int w, int h, qc_h264_grenze g) {
+    if (w <= 0 || h <= 0) return 1;
+    long mb = (long)((w + 15) / 16) * (long)((h + 15) / 16);
+    return w <= g.max_seite && h <= g.max_seite && mb <= g.max_mb;
+}
+
+int qc_h264_einpassen(int w, int h, qc_h264_grenze g, int *ow, int *oh) {
+    *ow = w;
+    *oh = h;
+    if (qc_h264_passt(w, h, g) || g.max_seite < 16 || g.max_mb < 1) return 0;
+    double f = fmin(fmin((double)g.max_seite / w, (double)g.max_seite / h),
+                    sqrt((double)g.max_mb * 256.0 / ((double)w * (double)h)));
+    for (int i = 0; i < 1000; i++) {
+        int nw = (int)floor((double)w * f + 1e-6) & ~1, nh = (int)floor((double)h * f + 1e-6) & ~1;
+        if (nw < 16) nw = 16;
+        if (nh < 16) nh = 16;
+        if (qc_h264_passt(nw, nh, g)) { *ow = nw; *oh = nh; return 1; }
+        f *= 0.999;
+    }
+    *ow = 1920; *oh = 1080;   // nie erreicht: f schrumpft, bis es passt
+    return 1;
 }
 
 // Die Produktion: ScreenCaptureKit fragen, Groesse und Hz aus dem

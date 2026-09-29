@@ -91,8 +91,17 @@ impl Massstab {
         }
     }
 
-    /// Die Groesse einer Form w x h in diesem Massstab (wie skalieren).
+    /// Der Faktor als Zahl (fuers Protokoll).
     #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    pub fn faktor(self) -> f64 {
+        match self {
+            Massstab::Mal(f) => f as f64,
+            Massstab::Promille(p) => p as f64 / 1000.0,
+        }
+    }
+
+    /// Die Groesse einer Form w x h in diesem Massstab (wie skalieren).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn groesse(self, w: u16, h: u16) -> (u16, u16) {
         match self {
             Massstab::Mal(f) => {
@@ -257,6 +266,10 @@ mod tests {
         // Jeder Massstab eine eigene Kennung.
         assert_ne!(Massstab::Mal(2).kennung(), Massstab::Promille(2).kennung());
         assert_ne!(Massstab::Promille(500).kennung(), Massstab::Promille(550).kennung());
+        assert_eq!((Massstab::Mal(2).faktor(), Massstab::Promille(800).faktor()), (2.0, 0.8));
+        // Der Windows-Host, fuer H.264 eingepasst (5120 -> 4096): 0,8, ohne Untergrenze.
+        assert_eq!(Massstab::aus_faktor(4096.0 / 5120.0, None), Massstab::Promille(800));
+        assert_eq!(Massstab::aus_faktor(3839.0 / 3840.0, None), Massstab::EINS, "ungerader Rand: 1");
     }
 
     /// Hochziehen Punkt fuer Punkt (Hotspot mit), hoechstens MAX je Seite;

@@ -9,6 +9,12 @@
 // Zeiger im Video" gilt von selbst. Sichtbarkeit kommt aus
 // FrameInfo.PointerPosition.Visible, sobald LastMouseUpdateTime != 0.
 //
+// Massstab: die Form der Duplication hat Desktoppunkte, und die sind
+// Bildpunkte des Stroms - der Strom ist nativ. Nur wenn er fuer H.264
+// eingepasst ist (aufnahme::stromplan_codec, etwa 5120 -> 4096 breit), wird
+// die Form beim Senden im selben Mass verkleinert (zeigerbild.rs,
+// flaechengemittelt): der Client erwartet sie in Bildpunkten des Stroms.
+//
 // Formen: MONOCHROME (1) ist doppelt hoch (AND-Maske, dann XOR-Maske), ein
 // Bit je Punkt; AND=0/XOR=0 schwarz, AND=0/XOR=1 weiss, AND=1/XOR=0
 // durchsichtig, AND=1/XOR=1 heisst "invertieren" - naeherungsweise schwarz
@@ -25,6 +31,7 @@ use windows::Win32::Graphics::Dxgi::{
 
 use super::{log, netz};
 use crate::protokoll_konst::MSG_CURSOR;
+use crate::zeigerbild::{self, Massstab};
 
 /// Groesser schickt der Host keinen Zeiger; was groesser ist, wird eingepasst.
 const MAX: u32 = 256;
@@ -147,7 +154,10 @@ pub fn form_umrechnen(info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO, daten: &[u8], xor_
 
 /// Stand der Zeigerform auf dem Aufnahmefaden.
 pub struct Zeiger {
+    /// Die Form in Desktoppunkten, wie die Duplication sie liefert.
     form: Option<Form>,
+    /// Bildpunkte des Stroms je Desktoppunkt (1, eingepasst kleiner).
+    massstab: Massstab,
     sichtbar: bool,
     hash: u64,
     letzte_sendung: Instant,
@@ -157,7 +167,27 @@ pub struct Zeiger {
 
 impl Zeiger {
     pub fn neu() -> Zeiger {
-        Zeiger { form: None, sichtbar: true, hash: 0, letzte_sendung: Instant::now() - Duration::from_secs(1), gross_gemeldet: false, xor_gemeldet: false }
+        Zeiger {
+            form: None,
+            massstab: Massstab::EINS,
+            sichtbar: true,
+            hash: 0,
+            letzte_sendung: Instant::now() - Duration::from_secs(1),
+            gross_gemeldet: false,
+            xor_gemeldet: false,
+        }
+    }
+
+    /// Der Massstab fuer einen Strom, der `strom_w` Bildpunkte breit ist, von
+    /// einem Desktop, der `desktop_w` breit ist (wie er steht): nativ 1, fuer
+    /// H.264 eingepasst kleiner. Eine Aenderung schickt die Form neu, mit
+    /// einer Zeile.
+    pub fn massstab_setzen(&mut self, strom_w: i32, desktop_w: u32) {
+        let m = if strom_w > 0 && desktop_w > 0 { Massstab::aus_faktor(strom_w as f64 / desktop_w as f64, None) } else { Massstab::EINS };
+        if m != self.massstab {
+            self.massstab = m;
+            log(format!("Zeigerform: Massstab {:.2} (Strom {strom_w} Bildpunkte breit, Desktop {desktop_w})", m.faktor()));
+        }
     }
 
     pub fn form_setzen(&mut self, info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO, daten: &[u8]) {
@@ -177,11 +207,13 @@ impl Zeiger {
         self.sichtbar = sichtbar;
     }
 
-    /// Bei Aenderung (oder erzwungen) senden, hoechstens 20 je Sekunde.
+    /// Bei Aenderung (oder erzwungen) senden, hoechstens 20 je Sekunde - im
+    /// Massstab des Stroms.
     pub fn pruefen(&mut self) {
         let Some(f) = self.form.as_ref() else { return };
         let mut h = fnv(&f.rgba, 1469598103934665603);
         h = fnv(&[f.w as u8, f.h as u8, f.hx as u8, f.hy as u8, self.sichtbar as u8, 0], h);
+        h = fnv(&self.massstab.kennung().to_le_bytes(), h);
         // Das Zeichen "auf jeden Fall senden" wird immer verbraucht, sonst
         // ginge dieselbe Form beim naechsten Mal noch einmal raus.
         let erzwingen = ERZWINGEN.swap(false, Ordering::Relaxed);
@@ -194,16 +226,37 @@ impl Zeiger {
         }
         self.hash = h;
         self.letzte_sendung = Instant::now();
-        let mut p = Vec::with_capacity(12 + f.rgba.len());
-        p.extend_from_slice(&f.w.to_le_bytes());
-        p.extend_from_slice(&f.h.to_le_bytes());
-        p.extend_from_slice(&f.hx.to_le_bytes());
-        p.extend_from_slice(&f.hy.to_le_bytes());
-        p.push(self.sichtbar as u8);
-        p.push(1);
-        p.extend_from_slice(&[0, 0]);
-        p.extend_from_slice(&f.rgba);
-        netz::send_small(MSG_CURSOR, &p);
+        netz::send_small(MSG_CURSOR, &nachricht(f, self.massstab, self.sichtbar));
+    }
+}
+
+/// Nachricht 49 fuer eine Form im Massstab `m`: w, h, hx, hy (u16), sichtbar,
+/// Fassung 1, zwei Byte frei, RGBA.
+fn nachricht(f: &Form, m: Massstab, sichtbar: bool) -> Vec<u8> {
+    let skaliert;
+    let (w, h, hx, hy, rgba): (u16, u16, u16, u16, &[u8]) = if m == Massstab::EINS {
+        (f.w, f.h, f.hx, f.hy, &f.rgba)
+    } else {
+        skaliert = zeigerbild::skalieren(&f.rgba, f.w, f.h, f.hx, f.hy, m);
+        (skaliert.1, skaliert.2, skaliert.3, skaliert.4, &skaliert.0)
+    };
+    let mut p = Vec::with_capacity(12 + rgba.len());
+    p.extend_from_slice(&w.to_le_bytes());
+    p.extend_from_slice(&h.to_le_bytes());
+    p.extend_from_slice(&hx.to_le_bytes());
+    p.extend_from_slice(&hy.to_le_bytes());
+    p.push(sichtbar as u8);
+    p.push(1);
+    p.extend_from_slice(&[0, 0]);
+    p.extend_from_slice(rgba);
+    p
+}
+
+impl Zeiger {
+    /// Der geltende Massstab (fuer die Pruefung).
+    #[cfg(test)]
+    fn massstab(&self) -> Massstab {
+        self.massstab
     }
 }
 
@@ -230,5 +283,26 @@ mod tests {
         let info = DXGI_OUTDUPL_POINTER_SHAPE_INFO { Type: 2, Width: 512, Height: 512, Pitch: 2048, HotSpot: POINT { x: 512, y: 0 } };
         let f = form_umrechnen(&info, &vec![255u8; 512 * 2048], &mut xg).unwrap();
         assert_eq!((f.w, f.h, f.hx), (256, 256, 255));
+    }
+
+    /// Nativ geht die Form unveraendert hinaus; fuer H.264 eingepasst (5120
+    /// -> 4096 breit) im selben Mass verkleinert, Hotspot mit - in
+    /// Bildpunkten des Stroms, wie der Client sie erwartet.
+    #[test]
+    fn form_im_massstab_des_stroms() {
+        let f = Form { w: 48, h: 48, hx: 47, hy: 0, rgba: vec![255u8; 48 * 48 * 4] };
+        let p = nachricht(&f, Massstab::EINS, true);
+        assert_eq!((&p[0..8], p[8], p[9], p.len()), (&[48u8, 0, 48, 0, 47, 0, 0, 0][..], 1, 1, 12 + 48 * 48 * 4));
+        let mut z = Zeiger::neu();
+        z.massstab_setzen(3840, 3840);
+        assert_eq!(z.massstab(), Massstab::EINS);
+        z.massstab_setzen(3838, 3839);
+        assert_eq!(z.massstab(), Massstab::EINS, "ungerader Rand");
+        z.massstab_setzen(4096, 5120);
+        assert_eq!(z.massstab(), Massstab::Promille(800));
+        let p = nachricht(&f, z.massstab(), false);
+        let (w, h, hx) = (u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]]), u16::from_le_bytes([p[4], p[5]]));
+        assert_eq!((w, h, hx, p[8], p.len()), (38, 38, 37, 0, 12 + 38 * 38 * 4));
+        assert!(p[12..].iter().all(|&b| b == 255));
     }
 }

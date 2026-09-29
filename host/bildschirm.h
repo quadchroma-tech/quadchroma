@@ -68,8 +68,9 @@
 // HDR-faehig - dann darf der Host ihn als HDR aufnehmen (HDR-Plan 5.1).
 // punkte_w, punkte_h: derselbe Modus in Punkten (bei HiDPI die Haelfte der
 // Pixel: "wie 1920x1080" auf einem 4K-Panel sind 1920x1080 Punkte, 3840x2160
-// Pixel); nativ_w, nativ_h: die native Aufloesung des Panels. 0 = unbekannt
-// (Attrappen, virtuelle Bildschirme ohne native Modi).
+// Pixel); nativ_w, nativ_h: die Aufloesung des Panels - die Obergrenze fuer
+// einen skalierten HiDPI-Modus (qc_bildschirm_modus_lesen). 0 = unbekannt
+// (Attrappen, virtuelle Bildschirme ohne solche Modi).
 @interface QCBildschirm : NSObject
 @property (nonatomic) CGDirectDisplayID displayID;
 @property (nonatomic, copy) NSString *kennung;
@@ -119,24 +120,62 @@ int qc_bildschirm_edr(CGDirectDisplayID d, double *potentiell, double *aktuell);
 NSString *qc_bildschirm_kennung(uint32_t vendor, uint32_t model, uint32_t serial);
 
 // Der laufende Modus eines Bildschirms: Pixel (bei HiDPI die Pixel hinter
-// den Punkten), Punkte, Hz und die native Aufloesung des Panels - die
-// groessten Pixelmasse unter den Modi mit kDisplayModeNativeFlag, 0 ohne
-// solche Modi. Rueckgabe 0 ohne Modus (alles 0).
+// den Punkten), Punkte, Hz und die Aufloesung des Panels - die groessten
+// Pixelmasse unter den Modi mit 1x-Darstellung (Pixel = Punkte) und den Modi
+// mit kDisplayModeNativeFlag, 0 ohne solche Modi. Beides, weil keins allein
+// reicht: ein Bildschirm, dessen EDID 1920x1080 bevorzugt, markiert nur das
+// als nativ, laeuft aber auch mit 3840x2160 in 1x; ein eingebautes
+// Retina-Panel bietet seine volle Aufloesung womoeglich nur als HiDPI-Modus
+// an, und der ist nativ markiert. Rueckgabe 0 ohne Modus (alles 0).
 typedef struct {
     size_t pw, ph;               // Pixel
     size_t punkte_w, punkte_h;   // Punkte
-    size_t nativ_w, nativ_h;     // native Aufloesung des Panels
+    size_t nativ_w, nativ_h;     // Aufloesung des Panels
     double hz;
 } qc_bildschirm_modus;
 int qc_bildschirm_modus_lesen(CGDirectDisplayID d, qc_bildschirm_modus *m);
 
+// Die Obergrenze aus einer Modusliste (Pixel, Punkte, native Markierung je
+// Modus): der groesste 1x-Modus oder der groesste native, was mehr Pixel
+// hat. Rein, damit der Pruefstand sie mit erfundenen Listen fahren kann.
+typedef struct {
+    size_t pw, ph, punkte_w, punkte_h;
+    int nativ;
+} qc_modus_eintrag;
+void qc_panelgroesse(const qc_modus_eintrag *modi, size_t n, size_t *w, size_t *h);
+
 // Stromgroesse ohne --out (Produktentscheidung 2026-09-29: nativ als Basis):
-// genau die Pixel des Modus, hoechstens die native Aufloesung des Panels
-// (nativ 0 = unbekannt: keine Grenze) bei gleichem Seitenverhaeltnis, immer
-// gerade. Ein skalierter HiDPI-Modus ("wie 2560x1440" auf einem 4K-Panel)
-// rechnet intern mit 5120x2880 und gibt 3840x2160 aufs Panel - mehr sieht
-// auch der Mac selbst nicht, gestreamt werden die 3840x2160.
-void qc_stromgroesse_nativ(size_t pw, size_t ph, size_t nativ_w, size_t nativ_h, int *w, int *h);
+// genau die Pixel des Modus, immer gerade. Nur ein skalierter HiDPI-Modus
+// (Pixel ungleich Punkte) mit mehr Pixeln als das Panel wird auf das Panel
+// begrenzt (nativ 0 = unbekannt: keine Grenze), bei gleichem
+// Seitenverhaeltnis: "wie 2560x1440" auf einem 4K-Panel rechnet intern mit
+// 5120x2880 und gibt 3840x2160 aufs Panel - mehr sieht auch der Mac selbst
+// nicht, gestreamt werden die 3840x2160. Ein Modus in 1x wird nie begrenzt:
+// was eingestellt ist, wird gestreamt.
+void qc_stromgroesse_nativ(size_t pw, size_t ph, size_t punkte_w, size_t punkte_h, size_t nativ_w, size_t nativ_h,
+                           int *w, int *h);
+
+// Die Grenze der H.264-Encoder: hoechstens 4096 Bildpunkte je Seite und
+// hoechstens 36864 Makrobloecke (4096x2304, Level 5.2) - dieselbe wie
+// encoder::H264_MAX_* beim Windows-Host. Gemessen: VideoToolbox H.264 auf
+// dem M1 (Hardware) oeffnet bis 4096 je Seite (auch 4096x4096) und lehnt
+// 4112x2304, 5120x1440, 5120x2880 und 6016x3384 mit -12903 ab. NVENC H.264
+// nimmt hoechstens 4096x4096 (NVIDIA), und die Hardware-Decoder der Clients
+// sind oft auf Level 5.2 begrenzt - darum gilt auch die Flaeche. Die Groesse
+// ist eine Vorgabe: codecs_pruefen probiert sie mit dem Encoder aus und
+// nimmt 1920x1080, wenn er sie nicht oeffnet.
+#define QC_H264_MAX_SEITE 4096
+#define QC_H264_MAX_MB    36864
+typedef struct {
+    int max_seite;   // Bildpunkte je Seite
+    int max_mb;      // Makrobloecke (16x16) je Bild
+} qc_h264_grenze;
+
+// Passt w x h in die Grenze?
+int qc_h264_passt(int w, int h, qc_h264_grenze g);
+// w x h in die Grenze einpassen, bei gleichem Seitenverhaeltnis und gerade;
+// passt es schon, bleibt es. Rueckgabe 1, wenn eingepasst wurde.
+int qc_h264_einpassen(int w, int h, qc_h264_grenze g, int *ow, int *oh);
 
 // ------------------------------------------------------------------- Wahl
 
