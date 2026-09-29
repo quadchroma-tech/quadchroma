@@ -38,6 +38,10 @@ mod einzel;
 /// Hosts, PQ, Matrizen und Tonwertabbildung - die Referenz fuer Shader und
 /// den C-Spiegel des Mac-Hosts (host/hdr.c).
 mod hdr;
+/// Welcher Bildschirm das Fenster zeigt und was Windows ueber genau diesen
+/// weiss (HDR, SDR-Weiss, Spitzen): die reine Zuordnung aus GDI, DXGI und
+/// DisplayConfig fuer anzeige.rs - geprueft wird sie ueberall.
+mod schirmerkennung;
 /// Das Programmsymbol, im Programm gezeichnet, und seine .ico-Datei.
 mod logo;
 mod noise;
@@ -7019,10 +7023,12 @@ impl App {
                 }
             }
 
-            // Auf einen anderen Bildschirm geschoben oder anderer Massstab:
-            // den Bildschirm des Fensters beim naechsten Takt neu lesen
-            // (IN_ANZEIGE), nicht erst nach zwei Sekunden.
-            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            // Auf einen anderen Bildschirm geschoben, so vergroessert, dass
+            // der groessere Teil jetzt auf einem anderen liegt, oder anderer
+            // Massstab: den Bildschirm des Fensters beim naechsten Takt neu
+            // lesen (IN_ANZEIGE), nicht erst nach zwei Sekunden. Gemeldet
+            // wird trotzdem nur, was sich wirklich aendert (anzeige_melden).
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.schirm_pruefen = true;
             }
             WindowEvent::CursorMoved { position, .. } => {

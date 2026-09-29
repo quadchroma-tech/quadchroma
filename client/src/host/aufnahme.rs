@@ -62,10 +62,10 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use windows::core::{Interface, BOOL, PCWSTR};
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
+    DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -212,8 +212,8 @@ fn monitor_geraet(name: &str) -> (Option<String>, Option<String>) {
 /// Die aktiven Anzeigepfade aus QueryDisplayConfig, je Pfad mit dem
 /// Geraetenamen seiner Quelle (\\.\DISPLAYn - der Schluessel zu DXGI und
 /// GDI). Leer, wenn Windows nichts liefert. Grundlage fuer Monitornamen und
-/// SDR-Weiss.
-fn anzeigepfade() -> Vec<(String, DISPLAYCONFIG_PATH_INFO)> {
+/// SDR-Weiss - und fuer die Schirmerkennung des Clients (anzeige.rs).
+pub(crate) fn anzeigepfade() -> Vec<(String, DISPLAYCONFIG_PATH_INFO)> {
     let mut out = Vec::new();
     unsafe {
         let (mut np, mut nm) = (0u32, 0u32);
@@ -243,39 +243,65 @@ fn anzeigepfade() -> Vec<(String, DISPLAYCONFIG_PATH_INFO)> {
     out
 }
 
+/// Der Anzeigename am Ziel eines Pfads (monitorFriendlyDeviceName, leer bei
+/// manchem eingebauten Panel); None, wenn Windows nichts liefert.
+pub(crate) fn ziel_anzeigename(p: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+    let mut ziel = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    ziel.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+        r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+        adapterId: p.targetInfo.adapterId,
+        id: p.targetInfo.id,
+    };
+    (unsafe { DisplayConfigGetDeviceInfo(&mut ziel.header) } == 0).then(|| utf16_text(&ziel.monitorFriendlyDeviceName))
+}
+
 /// Die Monitornamen aus QueryDisplayConfig: je aktivem Pfad (Geraetename
 /// der Quelle, Anzeigename des Ziels). Leer, wenn Windows nichts liefert.
 fn anzeigenamen() -> Vec<(String, String)> {
-    anzeigepfade()
-        .into_iter()
-        .filter_map(|(quelle, p)| {
-            let mut ziel = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-            ziel.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
-                adapterId: p.targetInfo.adapterId,
-                id: p.targetInfo.id,
-            };
-            (unsafe { DisplayConfigGetDeviceInfo(&mut ziel.header) } == 0).then(|| (quelle, utf16_text(&ziel.monitorFriendlyDeviceName)))
-        })
-        .collect()
+    anzeigepfade().into_iter().filter_map(|(quelle, p)| ziel_anzeigename(&p).map(|n| (quelle, n))).collect()
 }
 
-/// SDRWhiteLevel des Bildschirms an diesem Ausgang (1000 = 80 nit): das
-/// Weiss, mit dem Windows SDR-Inhalt in einen HDR-Desktop legt (Schieber
-/// "SDR-Inhaltshelligkeit"). DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)
-/// am Ziel des Pfads; None, wenn Windows ihn nicht nennt.
+/// SDRWhiteLevel am Ziel eines Pfads (1000 = 80 nit): das Weiss, mit dem
+/// Windows SDR-Inhalt in einen HDR-Desktop legt (Schieber
+/// "SDR-Inhaltshelligkeit"). DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL);
+/// None, wenn Windows ihn nicht nennt.
+pub(crate) fn ziel_sdr_weiss(p: &DISPLAYCONFIG_PATH_INFO) -> Option<u32> {
+    let mut weiss = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+    weiss.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+        r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+        size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+        adapterId: p.targetInfo.adapterId,
+        id: p.targetInfo.id,
+    };
+    (unsafe { DisplayConfigGetDeviceInfo(&mut weiss.header) } == 0).then_some(weiss.SDRWhiteLevel)
+}
+
+/// "HDR verwenden" am Ziel eines Pfads laut Advanced Color
+/// (GET_ADVANCED_COLOR_INFO): an und nicht bloss erzwungen - erzwungen ist
+/// es bei WCG auf einem SDR-Schirm (automatische Farbverwaltung), das ist
+/// kein HDR. None, wenn Windows es nicht nennt.
+pub(crate) fn ziel_hdr(p: &DISPLAYCONFIG_PATH_INFO) -> Option<bool> {
+    let mut farbe = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+    farbe.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+        r#type: DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+        size: std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32,
+        adapterId: p.targetInfo.adapterId,
+        id: p.targetInfo.id,
+    };
+    if unsafe { DisplayConfigGetDeviceInfo(&mut farbe.header) } != 0 {
+        return None;
+    }
+    // Bit 1 advancedColorEnabled, Bit 2 wideColorEnforced.
+    let bits = unsafe { farbe.Anonymous.value };
+    Some(bits & 0b010 != 0 && bits & 0b100 == 0)
+}
+
+/// SDRWhiteLevel des Bildschirms an diesem Ausgang (1000 = 80 nit), am Ziel
+/// des ersten Pfads seiner Quelle, der ihn nennt (ziel_sdr_weiss); None, wenn
+/// Windows ihn nicht nennt.
 pub(crate) fn sdr_weiss_lesen(name: &str) -> Option<u32> {
-    anzeigepfade().into_iter().filter(|(quelle, _)| quelle == name).find_map(|(_, p)| {
-        let mut weiss = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
-        weiss.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
-            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
-            size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
-            adapterId: p.targetInfo.adapterId,
-            id: p.targetInfo.id,
-        };
-        (unsafe { DisplayConfigGetDeviceInfo(&mut weiss.header) } == 0).then_some(weiss.SDRWhiteLevel)
-    })
+    anzeigepfade().into_iter().filter(|(quelle, _)| quelle == name).find_map(|(_, p)| ziel_sdr_weiss(&p))
 }
 
 /// Bildwiederholrate des laufenden Anzeigemodus eines Ausgangs
