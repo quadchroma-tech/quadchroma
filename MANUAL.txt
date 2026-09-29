@@ -1907,7 +1907,10 @@ as well - no second pointer on top of the game's. A host up to 0.2.0
 does not: a Mac host there reports the pointer hidden while you type
 (macOS keeps it hidden until the Mac's own mouse moves, which, driven
 from the client, it never does), so with such a host the pointer is
-never hidden here.
+never hidden here. On a Windows host without a mouse attached
+(headless) the system reports its pointer hidden all the time, because
+Windows never shows one there; the host does not pass that on (see
+below), so the client keeps its pointer.
 
 Mouse capture for games
 -----------------------
@@ -1933,7 +1936,19 @@ client when an application has captured the mouse:
                    drawing program that hides the pointer over its
                    canvas and draws its own is usually not full-screen:
                    the client hides its pointer there, but stays
-                   absolute.
+                   absolute. "Hidden" counts only when an application
+                   can have hidden it: a mouse is attached
+                   (SM_MOUSEPRESENT), the pointer has been visible at
+                   least once in this session, and neither the desktop
+                   (Progman, WorkerW) nor a taskbar is in front. A PC
+                   without a mouse reports the pointer hidden all the
+                   time, and the desktop covers the whole screen like a
+                   full-screen game - without these checks the pointer
+                   vanished for good and moving the mouse captured it on
+                   the plain desktop. A game that already hid the
+                   pointer before you connected is therefore captured
+                   only after the pointer has been visible once (switch
+                   out and back, or press F8).
     Mac host       the pointer is hidden (CGCursorIsVisible) and does not
                    follow the last absolute movement (the game has
                    detached it with CGAssociateMouseAndMouseCursorPosition
@@ -1994,6 +2009,11 @@ Log lines of the hosts (host-protokoll.txt; on the Mac the host log):
     "Zeiger: sichtbar, an den Client: zeigen"
     "Zeigerform: aus GetCursorInfo (32x32, Hotspot 0,0) - die
      Duplication lieferte noch keine" (Windows, once)
+    "Zeiger: das System meldet ihn versteckt, aber keine Maus ist
+     angeschlossen (SM_MOUSEPRESENT 0) - gilt als sichtbar, kein
+     Einfangen" (Windows, once per session; likewise "... Desktop oder
+     Taskleiste liegen vorn ..." and "... war in dieser Sitzung aber
+     noch nie sichtbar (ohne Maus?) ...")
 
 At most 40 of these per session, then "... weitere Wechsel ohne
 Protokollzeile".
@@ -3579,8 +3599,9 @@ approximated as opaque) and goes out in pixels of the stream (as delivered
 for a native stream, scaled down with a stream fitted for H.264); before
 Duplication has delivered one, the host takes the shape of the system
 pointer (GetCursorInfo). Visibility and capture come from GetCursorInfo and
-GetClipCursor, also while the capture is lost (see "Mouse capture for
-games"); the picture itself contains no pointer. Audio:
+GetClipCursor, also while the capture is lost, and never from a PC without
+a mouse or with the desktop in front (see "Mouse capture for games"); the
+picture itself contains no pointer. Audio:
 loopback of the default output device, mixed down to two channels, at the
 device's rate; a silent playback stream in the same process keeps the loopback
 running, and gaps are filled with silence. If the device is lost (unplugged,

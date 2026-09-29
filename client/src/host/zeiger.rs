@@ -13,7 +13,11 @@
 // Sichtbarkeit nur aus FrameInfo.PointerPosition.Visible, und nur mit einer
 // Zeigerbewegung (LastMouseUpdateTime != 0); nach einem Verlust der Aufnahme
 // blieb der alte Stand stehen. Die Duplication bleibt der Rueckfall, wenn
-// GetCursorInfo scheitert (sicherer Desktop). Hat die Duplication
+// GetCursorInfo scheitert (sicherer Desktop). "Versteckt" glaubt der Host
+// nur, wenn eine Anwendung es gewesen sein kann (maus::VersteckGlaube): mit
+// Maus (SM_MOUSEPRESENT), nachdem der Zeiger in dieser Sitzung einmal
+// sichtbar war, und nicht mit dem Desktop oder der Taskleiste vorn - ein
+// Rechner ohne Maus meldet den Zeiger immer versteckt. Hat die Duplication
 // noch keine Form geliefert (Zeiger schon beim Start versteckt, Aufnahme
 // verloren), baut der Host sie aus dem Zeiger von GetCursorInfo (GetIconInfo,
 // GetDIBits). Ist dann noch immer keine da, geht fuer "versteckt" ein
@@ -46,12 +50,13 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClipCursor, GetCursorInfo, GetForegroundWindow, GetIconInfo, GetSystemMetrics, GetWindowRect, CURSORINFO,
-    CURSOR_SHOWING, HCURSOR, HICON, ICONINFO, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetClassNameW, GetClipCursor, GetCursorInfo, GetForegroundWindow, GetIconInfo, GetSystemMetrics, GetWindowRect,
+    CURSORINFO, CURSOR_SHOWING, HCURSOR, HICON, ICONINFO, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_MOUSEPRESENT,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 use super::{eingabe, log, netz};
-use crate::maus::{self, FangUrteil, FangWaechter, ZeigerLage, ZeigerNachricht};
+use crate::maus::{self, FangUrteil, FangWaechter, SystemZeiger, VersteckGlaube, ZeigerNachricht};
 use crate::protokoll_konst::MSG_CURSOR;
 use crate::zeigerbild::{self, Massstab};
 
@@ -197,6 +202,11 @@ pub struct Zeiger {
     platzhalter_gesendet: bool,
     /// Sichtbarkeit laut Duplication - nur der Rueckfall.
     dd_sichtbar: bool,
+    /// Glaubt der Host "versteckt"? (maus::VersteckGlaube: nicht ohne Maus,
+    /// nicht vor dem ersten sichtbaren Zeiger, nie mit dem Desktop vorn.)
+    glaube: VersteckGlaube,
+    /// Welche Zweifel schon im Protokoll stehen (Zweifel::bit).
+    zweifel_gemeldet: u8,
     waechter: FangWaechter,
     urteil: FangUrteil,
     naechste_lage: Instant,
@@ -218,6 +228,8 @@ impl Zeiger {
             system_gemeldet: false,
             platzhalter_gesendet: false,
             dd_sichtbar: true,
+            glaube: VersteckGlaube::default(),
+            zweifel_gemeldet: 0,
             waechter: FangWaechter::default(),
             urteil: FangUrteil { sichtbar: true, gefangen: false, grund: 0 },
             naechste_lage: Instant::now(),
@@ -271,11 +283,11 @@ impl Zeiger {
         self.naechste_lage = Instant::now() + LAGE_TAKT;
         let jetzt = super::now_us();
         let (ein, ziel) = eingabe::zaehler();
-        let lage = match lage_lesen(jetzt, ziel) {
-            Some((l, zeiger)) => {
+        let system = match system_lesen(jetzt, ziel) {
+            Some((s, zeiger)) => {
                 // Ohne Form aus der Duplication: die des Systems, solange
                 // der Zeiger sichtbar ist und sich die Form aendert.
-                if (self.form.is_none() || self.form_aus_system) && !l.versteckt && zeiger != 0 && zeiger != self.system_zeiger {
+                if (self.form.is_none() || self.form_aus_system) && s.zeigt && zeiger != 0 && zeiger != self.system_zeiger {
                     self.system_zeiger = zeiger;
                     if let Some(f) = form_aus_system(HCURSOR(zeiger as *mut _)) {
                         if !self.system_gemeldet {
@@ -286,16 +298,23 @@ impl Zeiger {
                         self.form_aus_system = true;
                     }
                 }
-                l
+                s
             }
             None => {
                 if !self.lage_fehler_gemeldet {
                     self.lage_fehler_gemeldet = true;
                     log("Zeiger: GetCursorInfo scheitert (sicherer Desktop?) - Sichtbarkeit aus der Duplication");
                 }
-                ZeigerLage { versteckt: !self.dd_sichtbar, eingesperrt: false, folgt_nicht: false, vollbild: false }
+                SystemZeiger { zeigt: self.dd_sichtbar, maus_da: maus_angeschlossen(), ..Default::default() }
             }
         };
+        let (lage, zweifel) = self.glaube.lage(system);
+        if let Some(z) = zweifel {
+            if self.zweifel_gemeldet & z.bit() == 0 {
+                self.zweifel_gemeldet |= z.bit();
+                log(z.text());
+            }
+        }
         let urteil = self.waechter.schritt(jetzt, lage, ein, maus::FANG_WINDOWS);
         // Jeder Wechsel, den der Client sieht, ins Protokoll.
         if urteil != self.urteil {
@@ -497,46 +516,67 @@ pub fn form_aus_bitmaps(w: usize, h: usize, farbe: Option<&[u8]>, maske: &[u8], 
     Some(Form { w: w as u16, h: h as u16, hx: (hx as usize).min(w - 1) as u16, hy: (hy as usize).min(h - 1) as u16, rgba: out })
 }
 
-/// Was das System ueber den Zeiger sagt: versteckt (kein CURSOR_SHOWING oder
-/// keine Form - SetCursor(NULL)), eingesperrt (ClipCursor kleiner als der
+/// Was das System ueber den Zeiger sagt, roh (maus::SystemZeiger): zeigt es
+/// einen (CURSOR_SHOWING und eine Form - SetCursor(NULL) versteckt auch),
+/// ist eine Maus angeschlossen, eingesperrt (ClipCursor kleiner als der
 /// virtuelle Bildschirm), folgt nicht (steht nicht, wo die letzte absolute
-/// Bewegung ihn hinsetzte), Vollbild (das Fenster im Vordergrund deckt seinen
-/// Bildschirm). Dazu der Zeiger (HCURSOR) selbst. None, wenn GetCursorInfo
-/// scheitert.
-fn lage_lesen(jetzt: u64, ziel: Option<(i32, i32, u64)>) -> Option<(ZeigerLage, usize)> {
+/// Bewegung ihn hinsetzte) und - nur ohne Zeiger - was vorn liegt: Vollbild
+/// (das Fenster im Vordergrund deckt seinen Bildschirm) oder die Oberflaeche
+/// selbst (Desktop, Taskleiste). Dazu der Zeiger (HCURSOR). None, wenn
+/// GetCursorInfo scheitert.
+fn system_lesen(jetzt: u64, ziel: Option<(i32, i32, u64)>) -> Option<(SystemZeiger, usize)> {
     let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
     // SAFETY: ci ist gross genug und traegt cbSize.
     unsafe { GetCursorInfo(&mut ci) }.ok()?;
-    let versteckt = ci.flags.0 & CURSOR_SHOWING.0 == 0 || ci.hCursor.is_invalid();
+    let zeigt = ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.is_invalid();
     let mut clip = RECT::default();
     // SAFETY: gueltiger Zeiger auf ein RECT.
     let eingesperrt = unsafe { GetClipCursor(&mut clip) }.is_ok() && maus::eingesperrt([clip.left, clip.top, clip.right, clip.bottom], virtueller_bildschirm());
     let folgt_nicht = maus::folgt_nicht(jetzt, (ci.ptScreenPos.x, ci.ptScreenPos.y), ziel, FOLGT_TOLERANZ);
-    // Vollbild fragt nur die Bewegungsregel - also nur bei verstecktem Zeiger.
-    let vollbild = versteckt && vordergrund_vollbild();
-    Some((ZeigerLage { versteckt, eingesperrt, folgt_nicht, vollbild }, ci.hCursor.0 as usize))
+    let maus_da = maus_angeschlossen();
+    // Was vorn liegt, fragen nur die Regeln fuer einen versteckten Zeiger,
+    // der geglaubt werden kann (mit Maus).
+    let (vollbild, oberflaeche_vorn) = if zeigt || !maus_da { (false, false) } else { vordergrund() };
+    let s = SystemZeiger { zeigt, maus_da, oberflaeche_vorn, eingesperrt, folgt_nicht, vollbild };
+    Some((s, ci.hCursor.0 as usize))
 }
 
-/// Deckt das Fenster im Vordergrund seinen Bildschirm ganz (Vollbild, auch
-/// randlos)? Ein maximiertes Fenster laesst die Taskleiste frei - nein.
-fn vordergrund_vollbild() -> bool {
+/// Ist eine Maus angeschlossen? Ohne (SM_MOUSEPRESENT 0) steht der Zaehler
+/// von ShowCursor auf -1, und Windows zeigt nie einen Zeiger.
+fn maus_angeschlossen() -> bool {
+    // SAFETY: reine Abfrage.
+    unsafe { GetSystemMetrics(SM_MOUSEPRESENT) != 0 }
+}
+
+/// Was vorn liegt: deckt das Fenster im Vordergrund seinen Bildschirm ganz
+/// (Vollbild, auch randlos - ein maximiertes Fenster laesst die Taskleiste
+/// frei: nein), und ist es die Oberflaeche selbst (Desktop Progman/WorkerW,
+/// Taskleiste - maus::oberflaeche_klasse)? Der Desktop deckt den ganzen
+/// Bildschirm, zaehlt aber nie als Vollbild.
+fn vordergrund() -> (bool, bool) {
     // SAFETY: reine Abfragen mit gueltigen Zeigern auf eigene Strukturen.
     unsafe {
         let h = GetForegroundWindow();
         if h.is_invalid() {
-            return false;
+            return (false, false);
+        }
+        let mut name = [0u16; 64];
+        let n = GetClassNameW(h, &mut name).max(0) as usize;
+        let oberflaeche = maus::oberflaeche_klasse(&String::from_utf16_lossy(&name[..n.min(name.len())]));
+        if oberflaeche {
+            return (false, true);
         }
         let mut r = RECT::default();
         if GetWindowRect(h, &mut r).is_err() {
-            return false;
+            return (false, false);
         }
         let m = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if !GetMonitorInfoW(m, &mut mi).as_bool() {
-            return false;
+            return (false, false);
         }
         let b = mi.rcMonitor;
-        r.left <= b.left && r.top <= b.top && r.right >= b.right && r.bottom >= b.bottom
+        (r.left <= b.left && r.top <= b.top && r.right >= b.right && r.bottom >= b.bottom, false)
     }
 }
 
@@ -645,12 +685,14 @@ mod tests {
     }
 
     /// GetCursorInfo auf dieser Maschine: eine Lage kommt (ausser auf dem
-    /// sicheren Desktop), und ohne ClipCursor ist nichts eingesperrt.
+    /// sicheren Desktop), ohne ClipCursor ist nichts eingesperrt, und was
+    /// vorn liegt, wird nur ohne Zeiger gefragt.
     #[test]
     fn lage_des_systems() {
-        if let Some((l, _)) = lage_lesen(super::super::now_us(), None) {
-            assert!(!l.folgt_nicht, "ohne absolute Bewegung kein 'folgt nicht'");
-            assert!(!l.eingesperrt, "niemand sperrt den Zeiger ein");
+        if let Some((s, _)) = system_lesen(super::super::now_us(), None) {
+            assert!(!s.folgt_nicht, "ohne absolute Bewegung kein 'folgt nicht'");
+            assert!(!s.eingesperrt, "niemand sperrt den Zeiger ein");
+            assert!(!s.zeigt || (!s.vollbild && !s.oberflaeche_vorn), "{s:?}");
             let v = virtueller_bildschirm();
             assert!(v[2] > v[0] && v[3] > v[1], "{v:?}");
         }

@@ -11,6 +11,9 @@
 // 2. Sichtbarkeit: ein Host mit FAEHIG_MAUS meldet sie verlaesslich, der
 //    Client versteckt seinen Zeiger ueber dem Bild, wenn der Host es sagt
 //    (zeiger_zeigen) - kein doppelter Zeiger ueber dem eigenen eines Spiels.
+//    Der Windows-Host glaubt "versteckt" nur, wenn es von einer Anwendung
+//    kommen kann (VersteckGlaube): nicht ohne Maus, nicht bevor der Zeiger in
+//    dieser Sitzung einmal sichtbar war, nie mit dem Desktop im Vordergrund.
 // 3. Einfangen: der Host erkennt, dass seine Anwendung die Maus einfaengt
 //    (Zeiger versteckt und eingesperrt, zurueckgesetzt oder trotz Bewegung
 //    versteckt), und sagt es dem Client im Merkmal. Der Client faengt dann
@@ -342,6 +345,114 @@ pub fn urteil_text(u: &FangUrteil, versteckt: bool) -> String {
     )
 }
 
+// ------------------------------------ Host: "versteckt" glauben (Windows)
+//
+// GetCursorInfo meldet "versteckt" (kein CURSOR_SHOWING) auch dort, wo keine
+// Anwendung den Zeiger versteckt hat: ein Rechner ohne Maus (SM_MOUSEPRESENT
+// 0, der Zaehler von ShowCursor steht von Anfang an auf -1) zeigt nie einen,
+// auch nicht, wenn der Host Bewegungen einspeist. Das hiess fuer den Client
+// "nicht zeigen" - der Zeiger war fuer immer weg -, und drei eingespeiste
+// Bewegungen ueber 150 ms mit dem Desktop im Vordergrund (Progman, WorkerW:
+// er deckt den ganzen Bildschirm, also "Vollbild") fingen die Maus auf dem
+// blanken Desktop ein. Der Windows-Host glaubt "versteckt" deshalb nur, wenn
+// eine Maus angeschlossen ist UND der Zeiger in dieser Sitzung schon einmal
+// sichtbar war, und nie, solange die Oberflaeche selbst (Desktop,
+// Taskleiste) vorn liegt - dort faengt keine Anwendung die Maus ein.
+
+/// Was das System roh ueber den Zeiger sagt (Windows-Host), bevor der
+/// Waechter es als Lage bekommt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemZeiger {
+    /// Das System zeigt einen Zeiger: CURSOR_SHOWING mit einer Form (im
+    /// Rueckfall die Sichtbarkeit laut Duplication).
+    pub zeigt: bool,
+    /// Eine Maus ist angeschlossen (GetSystemMetrics(SM_MOUSEPRESENT)).
+    pub maus_da: bool,
+    /// Im Vordergrund liegt die Oberflaeche selbst: der Desktop oder eine
+    /// Taskleiste (oberflaeche_klasse).
+    pub oberflaeche_vorn: bool,
+    /// Wie in ZeigerLage.
+    pub eingesperrt: bool,
+    pub folgt_nicht: bool,
+    pub vollbild: bool,
+}
+
+/// Warum ein "versteckt" des Systems nicht zaehlt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zweifel {
+    /// SM_MOUSEPRESENT ist 0: ohne Maus zeigt Windows nie einen Zeiger.
+    KeineMaus,
+    /// Desktop oder Taskleiste liegen vorn.
+    Oberflaeche,
+    /// In dieser Sitzung noch nie sichtbar gewesen - ein Rechner, dessen
+    /// Maus Windows nicht als solche zaehlt, oder ein Spiel, das den Zeiger
+    /// schon vor der Verbindung versteckt hatte (dann faengt F8 ein).
+    NieSichtbar,
+}
+
+impl Zweifel {
+    /// Je Grund ein Bit (einmal je Sitzung ins Protokoll).
+    pub fn bit(self) -> u8 {
+        match self {
+            Zweifel::KeineMaus => 1,
+            Zweifel::Oberflaeche => 2,
+            Zweifel::NieSichtbar => 4,
+        }
+    }
+
+    /// Eine Zeile fuers Protokoll des Hosts.
+    pub fn text(self) -> &'static str {
+        match self {
+            Zweifel::KeineMaus => "Zeiger: das System meldet ihn versteckt, aber keine Maus ist angeschlossen (SM_MOUSEPRESENT 0) - gilt als sichtbar, kein Einfangen",
+            Zweifel::Oberflaeche => "Zeiger: versteckt, aber Desktop oder Taskleiste liegen vorn - gilt als sichtbar, kein Einfangen",
+            Zweifel::NieSichtbar => "Zeiger: versteckt, war in dieser Sitzung aber noch nie sichtbar (ohne Maus?) - gilt als sichtbar, kein Einfangen bis zum ersten sichtbaren Zeiger (F8 geht immer)",
+        }
+    }
+}
+
+/// Die Fensterklassen der Oberflaeche: Desktop (Progman, WorkerW) und
+/// Taskleisten. Liegt eine davon vorn, faengt nichts die Maus ein.
+pub fn oberflaeche_klasse(klasse: &str) -> bool {
+    matches!(klasse, "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// Der Glaube des Windows-Hosts an "versteckt", einer je Sitzung (wie der
+/// Waechter).
+#[derive(Clone, Debug, Default)]
+pub struct VersteckGlaube {
+    /// Der Zeiger war in dieser Sitzung schon einmal sichtbar.
+    gesehen: bool,
+}
+
+impl VersteckGlaube {
+    /// Die Lage fuer den Waechter. Ein "versteckt", das nicht zaehlt, wird
+    /// "sichtbar" - der Client behaelt seinen Zeiger, und ohne "versteckt"
+    /// faengt der Waechter nie ein -, dazu der Grund.
+    pub fn lage(&mut self, s: SystemZeiger) -> (ZeigerLage, Option<Zweifel>) {
+        if s.zeigt {
+            self.gesehen = true;
+        }
+        let zweifel = if s.zeigt {
+            None
+        } else if !s.maus_da {
+            Some(Zweifel::KeineMaus)
+        } else if s.oberflaeche_vorn {
+            Some(Zweifel::Oberflaeche)
+        } else if !self.gesehen {
+            Some(Zweifel::NieSichtbar)
+        } else {
+            None
+        };
+        let lage = ZeigerLage {
+            versteckt: !s.zeigt && zweifel.is_none(),
+            eingesperrt: s.eingesperrt,
+            folgt_nicht: s.folgt_nicht,
+            vollbild: s.vollbild && !s.oberflaeche_vorn,
+        };
+        (lage, zweifel)
+    }
+}
+
 // ------------------------------------------------------- Client: Fangweg
 
 /// Was der Nutzer mit F8 gesagt hat.
@@ -625,6 +736,98 @@ mod tests {
         assert!(!u.sichtbar);
         let u = laufen(&mut w, 3_000 * MS, 3_300 * MS, v, &mut ein, true, FANG_WINDOWS);
         assert!(u.gefangen);
+    }
+
+    /// Ein Durchgang alle 10 ms mit einer Bewegung je Durchgang: das System
+    /// meldet `s`, der Glaube macht die Lage daraus, der Waechter urteilt -
+    /// wie lage_pruefen im Windows-Host. Dazu der Zweifel des letzten
+    /// Durchgangs.
+    fn laufen_system(
+        g: &mut VersteckGlaube,
+        w: &mut FangWaechter,
+        von: u64,
+        bis: u64,
+        s: SystemZeiger,
+        ein: &mut EingabeZaehler,
+    ) -> (FangUrteil, Option<Zweifel>) {
+        let mut t = von;
+        loop {
+            let (lage, zweifel) = g.lage(s);
+            let u = w.schritt(t, lage, *ein, FANG_WINDOWS);
+            if t >= bis {
+                return (u, zweifel);
+            }
+            t += 10 * MS;
+            ein.bewegungen += 1;
+        }
+    }
+
+    /// Kopfloser Windows-Host (keine Maus, Zaehler von ShowCursor -1):
+    /// CURSOR_SHOWING fehlt von Anfang an, der Desktop liegt vorn und deckt
+    /// den Bildschirm. Vorher hiess das "nicht zeigen" fuer immer, und drei
+    /// Bewegungen ueber 150 ms fingen die Maus ein. Jetzt bleibt der Zeiger
+    /// beim Client, und nichts faengt ein.
+    #[test]
+    fn kopfloser_host_faengt_nie_ein() {
+        let kopflos = SystemZeiger { zeigt: false, maus_da: false, oberflaeche_vorn: true, vollbild: true, ..Default::default() };
+        // So sah der Fehler aus: roh an den Waechter - eingefangen.
+        let mut w = FangWaechter::default();
+        let mut ein = EingabeZaehler::default();
+        let roh = ZeigerLage { versteckt: true, vollbild: true, ..Default::default() };
+        let u = laufen(&mut w, 0, 300 * MS, roh, &mut ein, true, FANG_WINDOWS);
+        assert!(u.gefangen && !u.sichtbar, "{u:?}");
+        // Mit dem Glauben: sichtbar und frei, ueber Sekunden voller Bewegung.
+        let (mut g, mut w, mut ein) = (VersteckGlaube::default(), FangWaechter::default(), EingabeZaehler::default());
+        let (u, z) = laufen_system(&mut g, &mut w, 0, 5_000 * MS, kopflos, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, Some(Zweifel::KeineMaus)));
+        // Ohne Maus auch nicht mit einem Spiel vorn, das einsperrt und zuruecksetzt.
+        let spiel = SystemZeiger { oberflaeche_vorn: false, eingesperrt: true, folgt_nicht: true, ..kopflos };
+        let (u, z) = laufen_system(&mut g, &mut w, 5_010 * MS, 6_000 * MS, spiel, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, Some(Zweifel::KeineMaus)));
+        // SM_MOUSEPRESENT meldet oft eine Maus, die es nicht gibt (Anschluss
+        // statt Geraet, virtuelle Maus): "nie sichtbar gewesen" haelt genauso.
+        let (mut g, mut w) = (VersteckGlaube::default(), FangWaechter::default());
+        let angeblich = SystemZeiger { maus_da: true, ..kopflos };
+        let (u, z) = laufen_system(&mut g, &mut w, 0, 2_000 * MS, angeblich, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, Some(Zweifel::Oberflaeche)));
+        let (u, z) = laufen_system(&mut g, &mut w, 2_010 * MS, 4_000 * MS, SystemZeiger { oberflaeche_vorn: false, eingesperrt: true, ..angeblich }, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, Some(Zweifel::NieSichtbar)));
+    }
+
+    /// Mit Maus: Desktop oder Taskleiste vorn fangen nie ein - versteckt,
+    /// eingesperrt, trotz Bewegung. Ein Spiel vorn schon, sobald der Zeiger
+    /// in der Sitzung einmal sichtbar war; Alt-Tab zum Desktop gibt frei.
+    #[test]
+    fn desktop_vorn_faengt_nie_ein() {
+        let sichtbar = SystemZeiger { zeigt: true, maus_da: true, ..Default::default() };
+        let desktop = SystemZeiger { zeigt: false, maus_da: true, oberflaeche_vorn: true, vollbild: true, ..Default::default() };
+        let (mut g, mut w, mut ein) = (VersteckGlaube::default(), FangWaechter::default(), EingabeZaehler::default());
+        let (u, z) = laufen_system(&mut g, &mut w, 0, 200 * MS, sichtbar, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, None));
+        let (u, z) = laufen_system(&mut g, &mut w, 210 * MS, 3_000 * MS, desktop, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, Some(Zweifel::Oberflaeche)));
+        let gesperrt = SystemZeiger { eingesperrt: true, folgt_nicht: true, ..desktop };
+        let (u, _) = laufen_system(&mut g, &mut w, 3_010 * MS, 4_000 * MS, gesperrt, &mut ein);
+        assert_eq!(u, FangUrteil { sichtbar: true, gefangen: false, grund: 0 });
+        // Ein Spiel im Vollbild vorn: versteckt trotz Bewegung - eingefangen.
+        let spiel = SystemZeiger { oberflaeche_vorn: false, ..desktop };
+        let (u, z) = laufen_system(&mut g, &mut w, 4_010 * MS, 4_400 * MS, spiel, &mut ein);
+        assert!(u.gefangen && !u.sichtbar && u.grund == GRUND_BEWEGUNG && z.is_none(), "{u:?}");
+        // Alt-Tab zum Desktop: nach 100 ms frei, der Client zeigt seinen Zeiger.
+        let (u, _) = laufen_system(&mut g, &mut w, 4_410 * MS, 4_600 * MS, desktop, &mut ein);
+        assert_eq!(u, FangUrteil { sichtbar: true, gefangen: false, grund: 0 });
+        // Die Maus abgezogen, waehrend das Spiel vorn liegt: nicht mehr geglaubt.
+        let (u, z) = laufen_system(&mut g, &mut w, 4_610 * MS, 5_000 * MS, SystemZeiger { maus_da: false, ..spiel }, &mut ein);
+        assert_eq!((u, z), (FangUrteil { sichtbar: true, gefangen: false, grund: 0 }, Some(Zweifel::KeineMaus)));
+        // Die Klassen der Oberflaeche - und was keine ist.
+        for k in ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+            assert!(oberflaeche_klasse(k), "{k}");
+        }
+        for k in ["UnrealWindow", "CabinetWClass", "progman", ""] {
+            assert!(!oberflaeche_klasse(k), "{k}");
+        }
+        // Je Zweifel ein eigenes Bit.
+        assert_eq!(Zweifel::KeineMaus.bit() | Zweifel::Oberflaeche.bit() | Zweifel::NieSichtbar.bit(), 7);
     }
 
     #[test]
