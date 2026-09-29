@@ -5,9 +5,10 @@
 // Duplication-Fehler, mehr nicht). Alle Zeilen gehen auf die Konsole und
 // nach %APPDATA%\QuadChroma\messung.txt.
 //
-// Je Ausgang (und, wenn er breiter als 3840 ist, zusaetzlich als
-// 1080p-Ausschnitt oben links) ueber N Sekunden echte Bilder (der Benutzer
-// bewegt derweil ein Fenster; Bilder ohne Inhalt zaehlen nicht):
+// Je Ausgang in seiner vollen Groesse - so gross ist der Strom (nativ, auch
+// ab 3840 Breite; frueher kam dort ein 1080p-Ausschnitt dazu, weil der Strom
+// halbiert wurde) - ueber N Sekunden echte Bilder (der Benutzer bewegt
+// derweil ein Fenster; Bilder ohne Inhalt zaehlen nicht):
 //   A  Acquire      AcquireNextFrame -> Rueckkehr, dazu das Alter des Bildes
 //   B  Kopie GPU    CopyResource in eine eigene Textur, ReleaseFrame
 //   C  Staging      CopyResource -> STAGING, Map(READ), memcpy, Unmap
@@ -34,7 +35,6 @@ use std::time::Instant;
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::sys::*;
-use windows::Win32::Graphics::Direct3D11::*;
 // Ausdruecklich, weil ffmpeg::sys dieselben Namen als undurchsichtige
 // Bindgen-Typen mitbringt - die ausdrueckliche Einfuhr hat Vorrang.
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
@@ -188,13 +188,10 @@ struct Ergebnis {
     staging: f64,
 }
 
-/// Ein Messlauf auf einem Ausgang in einer Groesse.
-fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, ausschnitt: bool, sekunden: f64, nvidia_adapter: Option<&IDXGIAdapter1>) -> Result<Ergebnis, String> {
+/// Ein Messlauf auf einem Ausgang in seiner vollen Groesse w x h.
+fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, sekunden: f64, nvidia_adapter: Option<&IDXGIAdapter1>) -> Result<Ergebnis, String> {
     let hz = qpc_hz() as f64;
-    log(format!(
-        "\n--- Ausgang {}: {} {}x{}{} an Karte {} ({}), {} s ---",
-        a.index, a.name, w, h, if ausschnitt { " (Ausschnitt oben links)" } else { "" }, a.karte, a.karte_name, sekunden
-    ));
+    log(format!("\n--- Ausgang {}: {} {}x{} an Karte {} ({}), {} s ---", a.index, a.name, w, h, a.karte, a.karte_name, sekunden));
     log(format!("  Duplication: Format {}, Desktopbild im Systemspeicher: {}", dup.format.0, if dup.im_systemspeicher { "ja" } else { "nein" }));
 
     let kopie = dup.textur(w, h, false)?;
@@ -289,7 +286,6 @@ fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, ausschnitt: bool, se
     let mut v444 = vec![0u8; (w * h) as usize];
     let cpu0 = crate::prozesszeit_100ns().unwrap_or(0);
     let start = Instant::now();
-    let ausschnitt_box = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
     let mut fehler_lauf: Option<String> = None;
 
     while start.elapsed().as_secs_f64() < sekunden {
@@ -320,11 +316,7 @@ fn messlauf(a: &Ausgang, dup: &Duplication, w: u32, h: u32, ausschnitt: bool, se
         // B: Kopie auf der Karte, dann sofort freigeben.
         let t_b = Instant::now();
         unsafe {
-            if ausschnitt {
-                dup.ctx.CopySubresourceRegion(&kopie, 0, 0, 0, 0, &textur, 0, Some(&ausschnitt_box));
-            } else {
-                dup.ctx.CopyResource(&kopie, &textur);
-            }
+            dup.ctx.CopyResource(&kopie, &textur);
         }
         dup.freigeben();
         drop(textur);
@@ -904,24 +896,13 @@ pub fn laufen(args: &[String]) -> i32 {
         }
         let mut laeufe: Vec<(String, Ergebnis)> = Vec::new();
         MEDIANE.with(|m| m.borrow_mut().clear());
-        match messlauf(a, &dup, w, h, false, sekunden, nvidia.as_ref()) {
+        match messlauf(a, &dup, w, h, sekunden, nvidia.as_ref()) {
             Ok(mut e) => {
                 e.null_kopien = d3_median();
                 e.prozessor = prozessor_median();
                 laeufe.push((format!("{w}x{h}"), e));
             }
             Err(e) => log(format!("  Lauf {w}x{h}: {e}")),
-        }
-        if w >= 3840 {
-            MEDIANE.with(|m| m.borrow_mut().clear());
-            match messlauf(a, &dup, 1920, 1080, true, sekunden, nvidia.as_ref()) {
-                Ok(mut e) => {
-                    e.null_kopien = d3_median();
-                    e.prozessor = prozessor_median();
-                    laeufe.push(("1920x1080 Ausschnitt".into(), e));
-                }
-                Err(e) => log(format!("  Lauf 1080p-Ausschnitt: {e}")),
-            }
         }
         // Entscheidung je Ausgang (Abschnitt 3.3): Null-Kopien, wenn D3 da
         // und schneller als D1 und D2; sonst Prozessor. Bildrate aus dem
@@ -936,7 +917,7 @@ pub fn laufen(args: &[String]) -> i32 {
                     if e.staging > 6.0 && w < 3840 {
                         s.push_str(" - Staging allein ueber 6 ms: fuer 120 fps ungeeignet");
                     }
-                    if w >= 3840 && pz > 16.0 && !groesse.contains("Ausschnitt") {
+                    if w >= 3840 && pz > 16.0 {
                         s.push_str(" (4K ueber den Prozessor: hoechstens 60 Bilder/s)");
                     }
                     s

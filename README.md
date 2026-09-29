@@ -160,7 +160,7 @@ on the Mac, `quadchroma.exe` on Windows. The table lists the two roles of each.
 |---|---|---|
 | Host | Mac (developed and measured on a Mac mini M1), macOS 14 or later; part of `QuadChroma.app` ("Share this Mac", on by default); host engine in Objective-C and C | Main role. HEVC 4:4:4 and 4:2:0 in 8 and 10 bit and H.264, all in hardware and switchable while running; HDR10 in the 10-bit HEVC modes from macOS 15 on, when the streamed screen shows HDR; audio; clipboard including files; choice of the streamed screen; the app's menu-bar icon with device ID, access password, allowed devices, the sharing switch, "Start at login", the device name and "Prevent sleep". |
 | Client | Windows 10 or 11, 64-bit; part of `quadchroma.exe`; Rust | Main role. NVDEC, D3D11VA or software decoding; Direct3D 11 display, HDR10 output on a screen with "Use HDR"; notification-area icon, single instance, desktop shortcut per host. |
-| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. A desktop with "Use HDR" is streamed as HDR10 through NVENC when the viewer can show it, otherwise converted to SDR on the GPU. The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, scaling and rotation on the GPU for SDR (both run on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
+| Host | Windows, part of the same `quadchroma.exe` ("Share this PC", on by default; `--nur-host` runs it alone for tests) | Secondary. Capture via Desktop Duplication, encoder via NVENC on NVIDIA; without NVIDIA only H.264 in software via Media Foundation, which holds back 16 frames and is enough to test the chain but not for real use. A desktop with "Use HDR" is streamed as HDR10 through NVENC when the viewer can show it, otherwise converted to SDR on the GPU. The stream has the output's native resolution (4K included, never halved). The app's icon in the notification area carries device ID, access password, allowed devices, the sharing switch, "Start with Windows", the device name and "Prevent sleep". Missing: AMF/QSV, rotation on the GPU for SDR (runs on the CPU today). HEVC 4:4:4 at 10 bits through NVENC verified on real hardware (RTX 3080 Ti laptop GPU as the host, 1080p, a Windows PC as the viewer, 28 September 2026). |
 | Client | Mac (arm64), part of the same `QuadChroma.app`; the same Rust source as on Windows | Secondary. Decoding with VideoToolbox (no FFmpeg on the Mac), audio via AudioToolbox, clipboard including files via NSPasteboard, display through Metal (the CPU as fallback), HDR10 through EDR on a screen with headroom, the app's one menu-bar icon, no desktop shortcut. Ships inside `QuadChroma.app`. |
 
 Signing: the project does not pay for certificates yet. Mac releases are signed with
@@ -948,8 +948,8 @@ for the exe. The one-time steps are in `RELEASING.md`.
   list of entries in parts instead of in one piece (up to 1 MiB, during which
   keystrokes or frames wait briefly).
 - A desktop shortcut on the Mac client.
-- Windows host role: AMF/QSV encoders, scaling and rotation on the GPU for SDR (both
-  run on the CPU today; in HDR the GPU does them already).
+- Windows host role: AMF/QSV encoders, rotation on the GPU for SDR (runs on the CPU
+  today; in HDR the GPU does it already).
 - HDR: HLG, dynamic metadata (HDR10+, Dolby Vision), an HDR pointer.
 - AV1: no host offers it until protocol and client support it.
 - Audio compression as an option; uncompressed audio can take more bandwidth than the
@@ -959,8 +959,9 @@ for the exe. The one-time steps are in `RELEASING.md`.
 - Stream size as the client wishes (it reports its window size, the host adjusts the
   stream); today the size changes only with the host's screen, and the client follows.
 - Display: a choice between immediate and vsync presentation in the menu, a fresh
-  window after device loss; from 4K on, the zero-copy path (the NVDEC frame stays on
-  the GPU).
+  window after device loss; the zero-copy path (the NVDEC frame stays on the GPU),
+  which matters most for native 4K streams: there the copy stage moves about 50 MB
+  per frame at 4:4:4 and 10 bits.
 - D3D11VA without a copy: the decoded frame stays on the GPU that draws (today it is
   copied via the CPU).
 - Conceivable later as add-ons: streaming both of the host's screens on request; a

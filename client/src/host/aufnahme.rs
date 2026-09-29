@@ -29,6 +29,13 @@
 // Wechsel laeuft wie ein Codecwechsel zwischen zwei Bildern: Duplication
 // neu, Switch 7, Info 1, Vollbild, Nachricht 12 mit dem neuen Stand.
 //
+// Stromgroesse (stromplan): nativ - genau die Pixel des Anzeigemodus, wie
+// die Duplication sie liefert, auch 3840x2160 und groesser; die Skalierung
+// von Windows (150 %) aendert daran nichts. Nichts wird halbiert, nur ein
+// ungerader Rand faellt weg. Damit braucht kein Weg einen Skalierer, und
+// ein 4K-Ausgang nimmt dieselben Wege wie ein kleinerer (bgra in NVENC,
+// Null-Kopien, wo er erlaubt ist).
+//
 // Gedrehte Ausgaenge (Hochformat, 180 Grad, hochkantes Panel, das Windows
 // quer betreibt): die Oberflaeche kommt ungedreht, gedreht wird beim
 // Einlesen auf dem Prozessor (Drehung, bgra_drehen); der Strom hat die
@@ -47,8 +54,8 @@
 // Desktop ist HDR, der Zuschauer will und kann, Kandidat 0 oder 2 und nvenc
 // kann PQ), laeuft der Encoder in PQ/BT.2020 und die Aufnahme im Modus PQ:
 // der Wandler rechnet jedes Bild (FP16, auch BGRA) auf der Karte in die
-// 10-Bit-Ebenen des Encoders (YUV444P16LE bzw. P010), gedreht und halbiert
-// schon dort; eingelesen werden nur noch die Ebenen. Ein Farbwechsel (SDR
+// 10-Bit-Ebenen des Encoders (YUV444P16LE bzw. P010), gedreht schon dort;
+// eingelesen werden nur noch die Ebenen. Ein Farbwechsel (SDR
 // <-> PQ) laeuft wie ein Codecwechsel zwischen zwei Bildern (strom_wechseln:
 // Encoder neu, Switch 7 mit dem Transfer, Strominfo 1, Vollbild), hoechstens
 // einer je 2 s; das letzte Bild rechnet der Wandler im neuen Modus nach.
@@ -804,21 +811,21 @@ impl Bildschirmstand {
     }
 }
 
-/// Groesse des Stroms aus der Bildgroesse (dw x dh): ab 3840 Breite wird
-/// halbiert (wie beim Mac), immer gerade - ein ungerader Rand wird
-/// abgeschnitten, nicht skaliert. Liefert Breite, Hoehe und ob halbiert
-/// wird; die Aufnahme folgt diesem Plan, sie raet nie aus Abweichungen.
-pub fn stromplan(dw: i32, dh: i32) -> (i32, i32, bool) {
-    let halb = dw >= 3840;
-    let (w, h) = if halb { (dw / 2, dh / 2) } else { (dw, dh) };
-    (w & !1, h & !1, halb)
+/// Groesse des Stroms aus der Bildgroesse (dw x dh, der Desktop so, wie er
+/// steht - bei einem gedrehten Ausgang also gedreht): nativ, genau diese
+/// Pixel, auch ab 3840 Breite - nie halbiert (Entscheidung vom 29.09.2026:
+/// "QC soll nativ uebertragen"). Immer gerade: ein ungerader Rand wird
+/// abgeschnitten, nicht skaliert. Der Windows-Host kennt keine Vorgabe
+/// der Stromgroesse (--out gibt es nur beim Mac-Host); kleiner wird der
+/// Strom nur ueber eine kleinere Aufloesung des Ausgangs.
+pub fn stromplan(dw: i32, dh: i32) -> (i32, i32) {
+    (dw.max(0) & !1, dh.max(0) & !1)
 }
 
 /// Vorlaeufige Stromgroesse fuer einen Ausgang (beim Start, vor der
 /// Duplication); danach gilt der Anzeigemodus der Duplication.
 pub fn stromgroesse(a: &Ausgang) -> (i32, i32) {
-    let (w, h, _) = stromplan(a.breite, a.hoehe);
-    (w, h)
+    stromplan(a.breite, a.hoehe)
 }
 
 /// w*4 Byte je Zeile aus einer Quelle mit Zeilenabstand `abstand` holen,
@@ -1590,15 +1597,25 @@ pub fn start(wunsch: Option<String>, liste: Vec<Ausgang>, weg_cli: Weg, weg: Weg
 
 /// Bild und Maus auf denselben Ausgang; die Stromgroesse kommt aus dem
 /// Anzeigemodus der Duplication (dw x dh) - das ist die Groesse der Bilder,
-/// die wirklich ankommen - und steht danach in Z. Liefert den Plan (Breite,
-/// Hoehe, halbiert) und ob sich die Stromgroesse geaendert hat.
-fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32) -> ((i32, i32, bool), bool) {
-    let (w, h, halb) = stromplan(dw, dh);
+/// die wirklich ankommen - und steht danach in Z. Liefert die Stromgroesse
+/// und ob sie sich geaendert hat.
+fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32) -> ((i32, i32), bool) {
+    let (w, h) = stromplan(dw, dh);
     super::eingabe::ausgang_setzen(a.links, a.oben, a.breite, a.hoehe);
     let alt = (Z.info_w.load(Ordering::Relaxed) as i32, Z.info_h.load(Ordering::Relaxed) as i32);
     Z.info_w.store(w as u32, Ordering::Relaxed);
     Z.info_h.store(h as u32, Ordering::Relaxed);
-    ((w, h, halb), alt != (w, h))
+    ((w, h), alt != (w, h))
+}
+
+/// Der Encoderweg fuer eine neue Aufnahme: der Null-Kopien-Weg (d3d11)
+/// kennt keine Drehung - ein gedrehter Ausgang nimmt dann den Prozessorweg
+/// (bgra, gedreht wird beim Einlesen). Die Groesse spielt keine Rolle mehr:
+/// frueher schickte ein Ausgang ab 3840 Breite ihn ebenfalls auf den
+/// Prozessor, weil nur dort halbiert wurde; der Strom ist jetzt nativ, und
+/// die Textur geht ohne Skalierer in den Pool.
+pub fn weg_fuer_aufnahme(weg: Weg, drehung: Drehung) -> Weg {
+    if weg == Weg::D3d11 && drehung != Drehung::Keine { Weg::Bgra } else { weg }
 }
 
 /// Bleibt der stehende Encoder ueber einen Aufbau der Duplication bei
@@ -1658,7 +1675,7 @@ fn nachlegen_grund(nachholen: Option<&'static str>, hat_bild: bool, fest_faellig
 /// Gezaehlt wird - wie beim Mac-Host seit b3e9055 - ab der Ankunft, nicht
 /// ab der Aufnahmezeit (LastPresentTime der Duplication). Der Faden holt
 /// erst ab, wenn er mit dem Vorigen fertig ist (Encoder, Einlesen,
-/// Halbieren, Drehen); was dazwischen praesentiert wurde, liefert
+/// Drehen); was dazwischen praesentiert wurde, liefert
 /// AcquireNextFrame zusammen, mit der Zeit der juengsten Praesentation. Die
 /// liegt also bis zu einem Bildabstand der Quelle vor dem Abholen, und bis
 /// zum Takt kommt noch das Einlesen dieses Bildes dazu. Bei Zielraten nahe
@@ -1720,12 +1737,12 @@ struct Aufnahme {
     /// STAGING zum Auslesen (Prozessorweg) bzw. DEFAULT-Kopie (Texturweg).
     staging: Option<ID3D11Texture2D>,
     kopie: Option<ID3D11Texture2D>,
-    /// Plan aus stromplan: halbieren (ab 3840) oder nur abschneiden.
-    halb: bool,
     /// Bild im Hauptspeicher (Prozessorweg), in Stromgroesse.
     ram: Vec<u8>,
+    /// Gedrehter Ausgang: die ganze Oberflaeche, ungedreht.
     ram_voll: Vec<u8>,
-    /// Gedrehter Ausgang: das ganze Bild, wie der Desktop steht.
+    /// Gedrehter Ausgang mit ungeradem Rand: das ganze Bild, wie der
+    /// Desktop steht (sonst dreht es direkt in `ram`).
     ram_gedreht: Vec<u8>,
     /// Modus PQ: die Ebenen des Wandlers (u16, dicht gepackt) in Stromgroesse.
     ram16: Vec<u8>,
@@ -1734,8 +1751,8 @@ struct Aufnahme {
 impl Aufnahme {
     /// Die Aufnahme auf einer Duplication, mit der Quelle, die der Encoder
     /// nimmt (Texturen oder Systemspeicher).
-    fn neu(dup: Duplication, texturen: bool, halb: bool) -> Result<Aufnahme, String> {
-        let mut a = Aufnahme { dup, staging: None, kopie: None, halb, ram: Vec::new(), ram_voll: Vec::new(), ram_gedreht: Vec::new(), ram16: Vec::new() };
+    fn neu(dup: Duplication, texturen: bool) -> Result<Aufnahme, String> {
+        let mut a = Aufnahme { dup, staging: None, kopie: None, ram: Vec::new(), ram_voll: Vec::new(), ram_gedreht: Vec::new(), ram16: Vec::new() };
         a.quelle_anlegen(texturen, None, 0, 0)?;
         Ok(a)
     }
@@ -1772,7 +1789,7 @@ impl Aufnahme {
     fn quelle_anlegen(&mut self, texturen: bool, pq: Option<bool>, w: i32, h: i32) -> Result<bool, String> {
         let (dw, dh) = (self.dup.breite, self.dup.hoehe);
         if let Some(chroma444) = pq {
-            let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, halb: self.halb, drehung: self.dup.drehung, chroma444 };
+            let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, drehung: self.dup.drehung, chroma444 };
             self.staging = None;
             self.kopie = None;
             self.ram = Vec::new();
@@ -1835,33 +1852,39 @@ impl Aufnahme {
     }
 
     /// Das Bild aus der STAGING-Textur in den Hauptspeicher, in
-    /// Stromgroesse w x h: halbiert oder abgeschnitten, wie der Plan es
-    /// sagt - nie aus einer Annahme. Gedreht: erst die ganze Oberflaeche
-    /// lesen und drehen, dann nach Plan. Im Modus PQ die Ebenen des Wandlers.
+    /// Stromgroesse w x h (nativ; ein ungerader Rand faellt beim Auslesen
+    /// weg). Gedreht: erst die ganze Oberflaeche lesen, dann drehen
+    /// (gedreht_in_stromgroesse). Im Modus PQ die Ebenen des Wandlers.
     fn einlesen(&mut self, w: i32, h: i32) -> Result<(), String> {
         if self.dup.pq().is_some() {
-            // Modus PQ: gedreht, halbiert und umgerechnet hat schon der Wandler.
+            // Modus PQ: gedreht und umgerechnet hat schon der Wandler.
             return self.dup.pq_auslesen(&mut self.ram16);
         }
         let Some(s) = self.staging.as_ref() else { return Ok(()) };
-        let (dw, dh) = (self.dup.breite, self.dup.hoehe);
         let d = self.dup.drehung;
-        if d != Drehung::Keine {
-            self.dup.auslesen(s, dw, dh, &mut self.ram_voll)?;
-            bgra_drehen(&self.ram_voll, dw as usize, dh as usize, d, &mut self.ram_gedreht)?;
-            let (gw, gh) = d.groesse(dw as usize, dh as usize);
-            if self.halb {
-                encoder::bgra_halbieren(&self.ram_gedreht, gw, gh, w as usize, h as usize, &mut self.ram)
-            } else {
-                zeilen_holen(&self.ram_gedreht, gw * 4, w as usize, h as usize, &mut self.ram)
-            }
-        } else if self.halb {
-            self.dup.auslesen(s, dw, dh, &mut self.ram_voll)?;
-            encoder::bgra_halbieren(&self.ram_voll, dw as usize, dh as usize, w as usize, h as usize, &mut self.ram)
-        } else {
-            self.dup.auslesen(s, w as u32, h as u32, &mut self.ram)
+        if d == Drehung::Keine {
+            return self.dup.auslesen(s, w as u32, h as u32, &mut self.ram);
         }
+        let (dw, dh) = (self.dup.breite, self.dup.hoehe);
+        self.dup.auslesen(s, dw, dh, &mut self.ram_voll)?;
+        gedreht_in_stromgroesse(&self.ram_voll, dw as usize, dh as usize, d, w as usize, h as usize, &mut self.ram_gedreht, &mut self.ram)
     }
+}
+
+/// Gedrehter Ausgang auf dem Prozessorweg: die ganze Oberflaeche `voll`
+/// (sw x sh, ungedreht, dicht gepackt) so drehen, wie der Desktop steht, und
+/// in Stromgroesse w x h nach `ram` legen. Hat der Desktop gerade Masse
+/// (der Regelfall, der Strom ist dann genau so gross), dreht sie direkt in
+/// `ram` - bei 4K im Hochformat eine Kopie von 33 MB je Bild weniger;
+/// sonst ueber `zwischen`, und der ungerade Rand faellt weg.
+#[allow(clippy::too_many_arguments)]
+pub fn gedreht_in_stromgroesse(voll: &[u8], sw: usize, sh: usize, d: Drehung, w: usize, h: usize, zwischen: &mut Vec<u8>, ram: &mut Vec<u8>) -> Result<(), String> {
+    let (gw, gh) = d.groesse(sw, sh);
+    if (gw, gh) == (w, h) {
+        return bgra_drehen(voll, sw, sh, d, ram);
+    }
+    bgra_drehen(voll, sw, sh, d, zwischen)?;
+    zeilen_holen(zwischen, gw * 4, w, h, ram)
 }
 
 /// Wachhalten und 1-ms-Timerperiode fuer die Dauer einer Aufnahmesitzung.
@@ -1999,8 +2022,8 @@ fn sitzung(stand: &mut Bildschirmstand) {
                 }
                 // Die Quelle (Textur oder STAGING) richtet sich nach dem, was
                 // der Encoder des laufenden Kandidaten nimmt, nicht nach dem
-                // Weg allein; der Null-Kopien-Weg kennt noch keine Skalierung
-                // und keine Drehung. Ein anderer Bildschirm als der zuletzt
+                // Weg allein; der Null-Kopien-Weg kennt noch keine Drehung
+                // (weg_fuer_aufnahme). Ein anderer Bildschirm als der zuletzt
                 // gestreamte ist ein Wechsel (1.4): der Encoderweg wird fuer
                 // ihn neu entschieden, und nach dem Aufbau gehen Switch 7
                 // (mit dem laufenden Codec - der Zuschauer baut den Decoder
@@ -2011,10 +2034,8 @@ fn sitzung(stand: &mut Bildschirmstand) {
                         weg = neu;
                     }
                     let aufbau = duplication_aufbauen(&a).and_then(move |d| {
-                        let (gw, gh) = d.desktop_groesse();
-                        let (_, _, halb) = stromplan(gw as i32, gh as i32);
-                        let weg_hier = if weg == Weg::D3d11 && (halb || d.drehung != Drehung::Keine) { Weg::Bgra } else { weg };
-                        Aufnahme::neu(d, encoder::texturweg(Z.codec_id.load(Ordering::Relaxed) as usize, weg_hier), halb)
+                        let weg_hier = weg_fuer_aufnahme(weg, d.drehung);
+                        Aufnahme::neu(d, encoder::texturweg(Z.codec_id.load(Ordering::Relaxed) as usize, weg_hier))
                     });
                     match aufbau {
                         Ok(neu) => {
@@ -2033,7 +2054,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                             Z.hdr_master_max_nit.store(mastering.max_nit as u32, Ordering::Relaxed);
                             Z.hdr_master_min.store(mastering.min_zehntausendstel as u32, Ordering::Relaxed);
                             let (gw, gh) = d.desktop_groesse();
-                            let ((nw, nh, halb), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
+                            let ((nw, nh), geaendert) = strom_anpassen(&a, gw as i32, gh as i32);
                             let groesse_neu = geaendert || nw != w || nh != h;
                             if groesse_neu {
                                 w = nw;
@@ -2066,12 +2087,10 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                 netz::strominfo_senden();
                             }
                             gestreamt = Some(a.kennung.clone());
-                            if weg == Weg::D3d11 && halb {
-                                log("Null-Kopien-Weg: Ausgang ab 3840 Breite wird noch nicht auf der Karte skaliert - Prozessorweg (bgra)");
-                                weg = Weg::Bgra;
-                            } else if weg == Weg::D3d11 && d.drehung != Drehung::Keine {
+                            let weg_hier = weg_fuer_aufnahme(weg, d.drehung);
+                            if weg_hier != weg {
                                 log("Null-Kopien-Weg: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg (bgra)");
-                                weg = Weg::Bgra;
+                                weg = weg_hier;
                             }
                             if verlustmeldung.aufgebaut() {
                                 if (a.breite, a.hoehe) != (gw as i32, gh as i32) {
@@ -2084,7 +2103,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                     if d.drehung != Drehung::Keine { format!(" gedreht {} Grad (Oberflaeche {}x{}, gedreht wird auf dem Prozessor)", d.drehung.grad(), d.breite, d.hoehe) } else { String::new() },
                                     a.karte, a.karte_name, d.format_text(),
                                     if d.im_systemspeicher { "ja" } else { "nein" }, w, h,
-                                    if halb { " (halbiert)" } else if (w, h) != (gw as i32, gh as i32) { " (ungerader Rand abgeschnitten)" } else { "" },
+                                    if (w, h) != (gw as i32, gh as i32) { " (nativ, ungerader Rand abgeschnitten)" } else { " (nativ)" },
                                     if neu.kopie.is_some() { "Textur" } else { "Prozessorweg" }
                                 ));
                                 log(format!("Aufnahme {}: Farbe {}", a.name, d.farbe.zeile()));
@@ -2957,36 +2976,64 @@ mod tests {
     }
 
     #[test]
-    fn stromplan_halbiert_nur_ab_3840() {
-        // Halbiert wird nach Plan (ab 3840 Breite), ein ungerader Rand nur
-        // abgeschnitten - nie "weicht ab, also halbieren".
-        assert_eq!(stromplan(1920, 1080), (1920, 1080, false));
-        assert_eq!(stromplan(1367, 769), (1366, 768, false));
-        assert_eq!(stromplan(1080, 1920), (1080, 1920, false));
-        assert_eq!(stromplan(5120, 1440), (2560, 720, true));
-        assert_eq!(stromplan(3842, 2160), (1920, 1080, true));
-        assert_eq!(stromplan(3840, 2160), (1920, 1080, true));
-        assert_eq!(stromplan(3839, 2160), (3838, 2160, false));
+    fn stromplan_ist_nativ() {
+        // Nativ (29.09.2026): genau die Pixel des Anzeigemodus, auch ab 3840
+        // Breite - nichts wird halbiert; ein ungerader Rand faellt weg.
+        assert_eq!(stromplan(1920, 1080), (1920, 1080));
+        assert_eq!(stromplan(2560, 1440), (2560, 1440));
+        assert_eq!(stromplan(3840, 2160), (3840, 2160));
+        assert_eq!(stromplan(5120, 1440), (5120, 1440));
+        assert_eq!(stromplan(5120, 2880), (5120, 2880));
+        assert_eq!(stromplan(6016, 3384), (6016, 3384));
+        assert_eq!(stromplan(1367, 769), (1366, 768));
+        assert_eq!(stromplan(3841, 2161), (3840, 2160));
+        assert_eq!(stromplan(3839, 2160), (3838, 2160));
+        // Gedreht: der Desktop, wie er steht - Oberflaeche 3840x2160 bei 90
+        // bzw. 270 Grad ergibt den Strom 2160x3840, bei 180 Grad 3840x2160.
+        assert_eq!(stromplan(1080, 1920), (1080, 1920));
+        for d in [Drehung::Grad90, Drehung::Grad270] {
+            let (gw, gh) = d.groesse(3840, 2160);
+            assert_eq!(stromplan(gw, gh), (2160, 3840));
+            let (gw, gh) = d.groesse(1921, 1081);
+            assert_eq!(stromplan(gw, gh), (1080, 1920));
+        }
+        let (gw, gh) = Drehung::Grad180.groesse(3840, 2160);
+        assert_eq!(stromplan(gw, gh), (3840, 2160));
+        // Der vorlaeufige Wert beim Start folgt derselben Regel.
+        let mut a = ausgang(0, "ACR0501", "a", 0, 60, true);
+        for (b, h) in [(1920, 1080), (2560, 1440), (3840, 2160), (1367, 769)] {
+            (a.breite, a.hoehe) = (b, h);
+            assert_eq!(stromgroesse(&a), stromplan(b, h));
+        }
+    }
+
+    #[test]
+    fn null_kopien_auch_ab_4k_nur_nicht_gedreht() {
+        // Die Groesse entscheidet nichts mehr (weg_fuer_aufnahme kennt sie
+        // gar nicht): ein 4K-Ausgang behaelt d3d11. Nur ein gedrehter geht
+        // auf den Prozessorweg - dort wird gedreht.
+        for w in [Weg::Bgra, Weg::Yuv444, Weg::D3d11, Weg::Auto] {
+            assert_eq!(weg_fuer_aufnahme(w, Drehung::Keine), w);
+        }
+        for d in [Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
+            assert_eq!(weg_fuer_aufnahme(Weg::D3d11, d), Weg::Bgra);
+            assert_eq!(weg_fuer_aufnahme(Weg::Bgra, d), Weg::Bgra);
+            assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, d), Weg::Yuv444);
+        }
     }
 
     #[test]
     fn plan_und_quelle_ergeben_genau_die_stromgroesse() {
-        // Fuer jeden Plan liefert der Weg der Aufnahme (Abschneiden beim
-        // Auslesen bzw. Halbieren) genau w*h*4 Byte - mit einem
-        // Zeilenabstand wie bei einer gemappten STAGING-Textur.
-        for (dw, dh) in [(1920usize, 1080usize), (1367, 769), (5120, 1440), (3842, 2160), (3840, 2160), (1080, 1920)] {
-            let (w, h, halb) = stromplan(dw as i32, dh as i32);
+        // Ungedreht liefert das Auslesen (die linke obere Ecke in
+        // Stromgroesse) genau w*h*4 Byte - mit einem Zeilenabstand wie bei
+        // einer gemappten STAGING-Textur, auch bei 4K und groesser.
+        for (dw, dh) in [(1920usize, 1080usize), (1367, 769), (2560, 1440), (5120, 1440), (3842, 2160), (3840, 2160), (1080, 1920)] {
+            let (w, h) = stromplan(dw as i32, dh as i32);
             let (w, h) = (w as usize, h as usize);
             let abstand = (dw * 4 + 255) & !255;
             let gemappt = vec![9u8; abstand * dh];
             let mut ram = Vec::new();
-            if halb {
-                let mut voll = Vec::new();
-                zeilen_holen(&gemappt, abstand, dw, dh, &mut voll).unwrap();
-                encoder::bgra_halbieren(&voll, dw, dh, w, h, &mut ram).unwrap();
-            } else {
-                zeilen_holen(&gemappt, abstand, w, h, &mut ram).unwrap();
-            }
+            zeilen_holen(&gemappt, abstand, w, h, &mut ram).unwrap();
             assert_eq!(ram.len(), w * h * 4, "{dw}x{dh}");
         }
     }
@@ -3264,29 +3311,39 @@ mod tests {
     #[test]
     fn gedreht_ergeben_plan_und_quelle_genau_die_stromgroesse() {
         // Wie plan_und_quelle_ergeben_genau_die_stromgroesse, mit Drehung:
-        // gemappte Oberflaeche -> drehen -> abschneiden bzw. halbieren.
+        // gemappte Oberflaeche -> drehen -> Stromgroesse, genau so, wie
+        // Aufnahme::einlesen es tut (gedreht_in_stromgroesse). Gerade Masse
+        // drehen direkt in den Strom (kein Zwischenpuffer), ungerade ueber
+        // den Zwischenpuffer mit abgeschnittenem Rand - Punkt fuer Punkt
+        // dasselbe wie Drehen und dann Abschneiden.
         for (sw, sh, d) in [
             (1920usize, 1080usize, Drehung::Grad90),
             (1920, 1080, Drehung::Grad270),
             (1367, 769, Drehung::Grad90),
+            (1367, 769, Drehung::Grad180),
             (3840, 2160, Drehung::Grad180),
+            (3840, 2160, Drehung::Grad90),
             (1200, 1920, Drehung::Grad90),
             (2160, 3840, Drehung::Grad270),
         ] {
             let (gw, gh) = d.groesse(sw, sh);
-            let (w, h, halb) = stromplan(gw as i32, gh as i32);
+            let (w, h) = stromplan(gw as i32, gh as i32);
             let (w, h) = (w as usize, h as usize);
             let abstand = (sw * 4 + 255) & !255;
-            let gemappt = vec![9u8; abstand * sh];
-            let (mut voll, mut gedreht, mut ram) = (Vec::new(), Vec::new(), Vec::new());
-            zeilen_holen(&gemappt, abstand, sw, sh, &mut voll).unwrap();
-            bgra_drehen(&voll, sw, sh, d, &mut gedreht).unwrap();
-            if halb {
-                encoder::bgra_halbieren(&gedreht, gw, gh, w, h, &mut ram).unwrap();
-            } else {
-                zeilen_holen(&gedreht, gw * 4, w, h, &mut ram).unwrap();
+            let mut gemappt = vec![0u8; abstand * sh];
+            let bild = lagebild(sw, sh);
+            for y in 0..sh {
+                gemappt[y * abstand..y * abstand + sw * 4].copy_from_slice(&bild[y * sw * 4..(y + 1) * sw * 4]);
             }
+            let (mut voll, mut zwischen, mut ram) = (Vec::new(), Vec::new(), Vec::new());
+            zeilen_holen(&gemappt, abstand, sw, sh, &mut voll).unwrap();
+            gedreht_in_stromgroesse(&voll, sw, sh, d, w, h, &mut zwischen, &mut ram).unwrap();
             assert_eq!(ram.len(), w * h * 4, "{sw}x{sh} {d:?}");
+            assert_eq!(zwischen.is_empty(), (gw, gh) == (w, h), "{sw}x{sh} {d:?}: Zwischenpuffer nur bei ungeradem Rand");
+            let (mut gedreht, mut erwartet) = (Vec::new(), Vec::new());
+            bgra_drehen(&voll, sw, sh, d, &mut gedreht).unwrap();
+            zeilen_holen(&gedreht, gw * 4, w, h, &mut erwartet).unwrap();
+            assert!(ram == erwartet, "{sw}x{sh} {d:?}: anderer Inhalt");
         }
     }
 

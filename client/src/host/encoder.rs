@@ -297,8 +297,38 @@ impl Weg {
     }
 }
 
-/// auto -> die Entscheidung aus messung.txt: "Null-Kopien" fuer den Ausgang
+/// Was messung.txt fuer einen Ausgang entschieden hat: (Null-Kopien,
+/// Farbprobe bgra bestanden, Farbprobe yuv444p bestanden); None ohne den
+/// Abschnitt "=== Entscheidung ===". Es zaehlt nur die Zeile des Ausgangs in
+/// voller Groesse - der Strom ist nativ. Eine Messung von frueher fuehrt fuer
+/// Ausgaenge ab 3840 Breite zusaetzlich einen 1080p-Ausschnitt ("Ausgang 0
+/// (1920x1080 Ausschnitt): Null-Kopien ..."), gemessen, als der Strom dort
+/// noch halbiert wurde; der sagt ueber 4K nichts.
+pub fn messung_lesen(text: &str, ausgang_idx: usize) -> Option<(bool, bool, bool)> {
+    let ent = text.split("=== Entscheidung ===").nth(1)?;
+    let kopf = format!("Ausgang {ausgang_idx} ");
+    let null_kopien = ent.lines().any(|z| z.starts_with(&kopf) && !z.contains("Ausschnitt") && z.contains("Null-Kopien"));
+    let farb_bgra = ent.lines().any(|z| z.starts_with("Farbprobe:") && z.contains("bgra direkt bestanden"));
+    let farb_444 = ent.lines().any(|z| z.starts_with("Farbprobe:") && z.contains("yuv444p bestanden"));
+    Some((null_kopien, farb_bgra, farb_444))
+}
+
+/// Der Weg aus der Messung: Null-Kopien (mit bestandener Farbprobe bgra)
 /// heisst d3d11, sonst entscheidet die Farbprobe zwischen bgra und yuv444;
+/// ohne bestandene Probe bgra. Die Groesse des Ausgangs spielt keine Rolle.
+pub fn weg_aus_messung(null_kopien: bool, farb_bgra: bool, farb_444: bool) -> Weg {
+    if null_kopien && farb_bgra {
+        Weg::D3d11
+    } else if farb_bgra {
+        Weg::Bgra
+    } else if farb_444 {
+        Weg::Yuv444
+    } else {
+        Weg::Bgra
+    }
+}
+
+/// auto -> die Entscheidung aus messung.txt (messung_lesen, weg_aus_messung);
 /// ohne Datei oder ohne Entscheidung bleibt es bei bgra.
 pub fn weg_entscheiden(wunsch: Weg, ausgang_idx: usize) -> Weg {
     if wunsch != Weg::Auto {
@@ -307,26 +337,14 @@ pub fn weg_entscheiden(wunsch: Weg, ausgang_idx: usize) -> Weg {
         return wunsch;
     }
     let text = crate::einstellungen::datei_pfad("messung.txt").and_then(|p| std::fs::read_to_string(p).ok());
-    let weg = match text {
-        Some(t) if t.contains("=== Entscheidung ===") => {
-            let ent = t.split("=== Entscheidung ===").nth(1).unwrap_or("");
-            let null_kopien = ent.lines().any(|z| z.starts_with(&format!("Ausgang {ausgang_idx} ")) && z.contains("Null-Kopien"));
-            let farb_bgra = ent.lines().any(|z| z.starts_with("Farbprobe:") && z.contains("bgra direkt bestanden"));
-            let farb_444 = ent.lines().any(|z| z.starts_with("Farbprobe:") && z.contains("yuv444p bestanden"));
-            let w = if null_kopien && farb_bgra {
-                Weg::D3d11
-            } else if farb_bgra {
-                Weg::Bgra
-            } else if farb_444 {
-                Weg::Yuv444
-            } else {
-                Weg::Bgra
-            };
+    let weg = match text.as_deref().and_then(|t| messung_lesen(t, ausgang_idx)) {
+        Some((null_kopien, farb_bgra, farb_444)) => {
+            let w = weg_aus_messung(null_kopien, farb_bgra, farb_444);
             log(format!("Encoderweg: {} (aus messung.txt: Null-Kopien {}, Farbprobe bgra {}, yuv444p {})", w.name(),
                 if null_kopien { "ja" } else { "nein" }, if farb_bgra { "bestanden" } else { "nicht bestanden" }, if farb_444 { "bestanden" } else { "nicht bestanden" }));
             w
         }
-        _ => {
+        None => {
             log("Encoderweg: bgra (keine Entscheidung in messung.txt - erst --messen laufen lassen)");
             Weg::Bgra
         }
@@ -1064,31 +1082,6 @@ pub fn bgra_nach_yuv444(src: &[u8], w: usize, y: &mut [u8], u: &mut [u8], v: &mu
     });
 }
 
-/// BGRA auf die Haelfte (Mittel aus 2x2), fuer Ausgaenge ab 3840 Breite:
-/// Quelle w x h, Ziel w2 x h2 - hoechstens die Haelfte, ein ungerader Rand
-/// faellt weg. Passt das nicht zusammen, kommt ein Fehler statt eines
-/// Zugriffs hinter das Ende.
-pub fn bgra_halbieren(src: &[u8], w: usize, h: usize, w2: usize, h2: usize, ziel: &mut Vec<u8>) -> Result<(), String> {
-    if w2 == 0 || h2 == 0 || w2 > w / 2 || h2 > h / 2 {
-        return Err(format!("Halbieren {w}x{h} -> {w2}x{h2} geht nicht"));
-    }
-    if src.len() < w * h * 4 {
-        return Err(format!("Halbieren: Quelle zu kurz: {} statt {} Byte", src.len(), w * h * 4));
-    }
-    ziel.resize(w2 * h2 * 4, 0);
-    ziel.par_chunks_mut(w2 * 4).enumerate().for_each(|(row, z)| {
-        let a = &src[2 * row * w * 4..(2 * row + 1) * w * 4];
-        let b = &src[(2 * row + 1) * w * 4..(2 * row + 2) * w * 4];
-        for x in 0..w2 {
-            for k in 0..4 {
-                let i = 8 * x + k;
-                z[4 * x + k] = ((a[i] as u32 + a[i + 4] as u32 + b[i] as u32 + b[i + 4] as u32 + 2) / 4) as u8;
-            }
-        }
-    });
-    Ok(())
-}
-
 // ---------------------------------------------- FFmpeg-Geraet aus D3D11
 
 /// AVHWDeviceContext (D3D11VA) aus einem VORHANDENEN Geraet: FFmpeg legt
@@ -1727,26 +1720,6 @@ mod tests {
             assert!((u[i] as i32 - super::super::testbild::BALKEN_CB[b] as i32).abs() <= 2, "Cb Balken {b}");
             assert!((v[i] as i32 - super::super::testbild::BALKEN_CR[b] as i32).abs() <= 2, "Cr Balken {b}");
         }
-        let mut halb = Vec::new();
-        bgra_halbieren(&src, w as usize, h as usize, (w / 2) as usize, (h / 2) as usize, &mut halb).unwrap();
-        assert_eq!(halb.len(), (w * h) as usize);
-    }
-
-    #[test]
-    fn halbieren_liefert_genau_die_zielgroesse() {
-        // Ziel = die Haelfte, auch bei ungeradem Rand; zu kurze Quelle oder
-        // zu grosses Ziel sind Fehler, kein Lesen hinter dem Ende.
-        for (sw, sh, w2, h2) in [(5120usize, 1440usize, 2560usize, 720usize), (3842, 2160, 1920, 1080), (3840, 2160, 1920, 1080), (7, 5, 2, 2)] {
-            let src = vec![7u8; sw * sh * 4];
-            let mut ziel = Vec::new();
-            bgra_halbieren(&src, sw, sh, w2, h2, &mut ziel).unwrap();
-            assert_eq!(ziel.len(), w2 * h2 * 4, "{sw}x{sh}");
-            assert!(ziel.iter().all(|&b| b == 7));
-        }
-        let mut ziel = Vec::new();
-        assert!(bgra_halbieren(&vec![0u8; 1280 * 720 * 4], 1920, 1080, 960, 540, &mut ziel).is_err());
-        assert!(bgra_halbieren(&vec![0u8; 1920 * 1080 * 4], 1920, 1080, 961, 540, &mut ziel).is_err());
-        assert!(bgra_halbieren(&vec![0u8; 16], 2, 2, 0, 1, &mut ziel).is_err());
     }
 
     // Die Tests kommen ohne FFmpeg-Aufrufe aus: die Testdatei darf die
@@ -1830,6 +1803,33 @@ mod tests {
         }
         assert!(KANDIDATEN.iter().filter(|k| k.encoder == "av1_nvenc").all(|k| !im_protokoll(k)));
         assert_eq!(KANDIDATEN.iter().filter(|k| im_protokoll(k)).count(), 5);
+    }
+
+    #[test]
+    fn messung_zaehlt_nur_die_volle_groesse() {
+        // Eine Messung von frueher an einem 4K-Ausgang: voll auf dem
+        // Prozessor, der 1080p-Ausschnitt ohne Kopie. Der Strom ist nativ -
+        // es gilt die volle Groesse, also kein d3d11.
+        let alt = "Kopf\n=== Entscheidung ===\n\
+            Ausgang 0 (3840x2160): Prozessor, 14.2 ms je Bild, hoechstens 60 fps\n\
+            Ausgang 0 (1920x1080 Ausschnitt): Null-Kopien, 2.9 ms je Bild, hoechstens 120 fps\n\
+            Ausgang 1 (2560x1440): Null-Kopien, 3.1 ms je Bild, hoechstens 120 fps\n\
+            Farbprobe: bgra direkt bestanden, yuv444p bestanden -> BGRA direkt in NVENC ist der Hauptweg fuer 4:4:4 8 Bit\n";
+        assert_eq!(messung_lesen(alt, 0), Some((false, true, true)));
+        assert_eq!(messung_lesen(alt, 1), Some((true, true, true)));
+        assert_eq!(messung_lesen(alt, 2), Some((false, true, true)));
+        // Eine neue Messung: 4K ohne Kopie -> d3d11 auch fuer 4K.
+        let neu = "=== Entscheidung ===\n\
+            Ausgang 0 (3840x2160): Null-Kopien, 4.8 ms je Bild, hoechstens 120 fps\n\
+            Ausgang 10 (1920x1080): Null-Kopien, 2.0 ms je Bild, hoechstens 120 fps\n\
+            Farbprobe: bgra direkt bestanden, yuv444p nicht bestanden -> ...\n";
+        assert_eq!(messung_lesen(neu, 0), Some((true, true, false)));
+        assert_eq!(messung_lesen(neu, 1), Some((false, true, false)), "Ausgang 10 ist nicht Ausgang 1");
+        assert_eq!(messung_lesen("keine Entscheidung", 0), None);
+        assert_eq!(weg_aus_messung(true, true, true), Weg::D3d11);
+        assert_eq!(weg_aus_messung(true, false, true), Weg::Yuv444);
+        assert_eq!(weg_aus_messung(false, true, false), Weg::Bgra);
+        assert_eq!(weg_aus_messung(false, false, false), Weg::Bgra);
     }
 
     #[test]
