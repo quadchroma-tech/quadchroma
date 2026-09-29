@@ -170,6 +170,7 @@ static void zuschauer_setzen(int host_fd, qc_chan *c) {
     memset(g_vid_peer, 0x77, sizeof g_vid_peer);
     g_stau_seit = 0;
     g_schub_zuletzt = 0;                  // wie im Host: jeder Zuschauer faengt frisch an
+    g_schub_ohne = 0;
     g_schub_luecke = 0;
     g_schub_frei_seit = 0;
     g_ton_stau_seit = 0;
@@ -768,6 +769,38 @@ static void stau_pruefen(void) {
     printf("         (Zuschauer weg %.1f s nach dem Einfrieren)\n", etf.weg_nach_frieren_s);
     pruefe(etf.weg && etf.weg_nach_frieren_s >= 1.9 && etf.weg_nach_frieren_s <= QC_STAU_FRIST_MAX_US / 1e6 + 1.0,
            "friert er nach Abnahme in Schueben ein, gilt er nach hoechstens 8 s als weg");
+    // Als Luecke zaehlt nur beobachtete Zeit ohne Abnahme. Bei stillem
+    // Bildschirm blickt nur der 5-s-Takt, und auf einer langsamen Leitung
+    // (Ton an, viel unterwegs) sieht jeder Blick eine Abnahme - vorher wurde
+    // daraus eine Luecke von 5 s und fuer die ganze Sitzung eine Frist von 8 s.
+    {
+        pthread_mutex_lock(&g_send_mtx);
+        g_schub_zuletzt = g_schub_ohne = g_schub_luecke = g_schub_frei_seit = 0;
+        uint64_t t = 1000000000ull, g = 0;
+        int r = 200 * 1024;
+        schuebe_verfolgen(r, g, t);
+        for (int k = 0; k < 6; k++) { t += 5000000; g += 100 * 1024; schuebe_verfolgen(r, g, t); }
+        uint64_t f_takt = stau_frist_us();
+        // Blicke mit 60 Hz: Abnahme, 2 s nichts, Abnahme.
+        g += 100 * 1024; schuebe_verfolgen(r, g, t += 16667);
+        for (int k = 0; k < 120; k++) schuebe_verfolgen(r, g, t += 16667);
+        g += 100 * 1024; schuebe_verfolgen(r, g, t += 16667);
+        uint64_t f_schub = stau_frist_us();
+        // 5 s nichts, dann Abnahme: gedeckelt.
+        for (int k = 0; k < 300; k++) schuebe_verfolgen(r, g, t += 16667);
+        g += 100 * 1024; schuebe_verfolgen(r, g, t += 16667);
+        uint64_t f_deckel = stau_frist_us();
+        // 8 s lang kaum etwas im Kernel: alte Luecken zaehlen nicht mehr.
+        for (int k = 0; k <= 8; k++) schuebe_verfolgen(16 * 1024, g, t += 1000000);
+        uint64_t f_frei = stau_frist_us();
+        g_schub_zuletzt = g_schub_ohne = g_schub_luecke = g_schub_frei_seit = 0;
+        pthread_mutex_unlock(&g_send_mtx);
+        printf("         (Frist: 5-s-Takt %.2f s, Schub nach 2 s %.2f s, nach 5 s %.2f s, nach 8 s frei %.2f s)\n",
+               f_takt / 1e6, f_schub / 1e6, f_deckel / 1e6, f_frei / 1e6);
+        pruefe(f_takt == QC_STAU_FRIST_US && f_schub > 3800000 && f_schub < 4100000 && f_deckel == QC_STAU_FRIST_MAX_US &&
+               f_frei == QC_STAU_FRIST_US,
+               "Luecke nur aus beobachteter Zeit: der 5-s-Takt allein hebt die Frist nicht, Schuebe schon, hoechstens 8 s");
+    }
     // Gewoehnlicher Stau und gesunde Leitung mit grossen Vollbildern: der
     // Rueckstand liegt nur kurz ueber der Grenze, kein Tonpaket faellt weg.
     strom ts = { "150 Mbit/s auf 100 Mbit/s, mit Ton", 120, 150, K, 100, 0, 0, 4, .ton = 1 };
