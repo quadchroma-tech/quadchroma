@@ -695,7 +695,7 @@ impl Bildschirmstand {
         if self.weg_fuer.as_deref() == Some(a.kennung.as_str()) {
             return None;
         }
-        self.weg = encoder::weg_entscheiden(self.weg_cli, a.index);
+        self.weg = encoder::weg_entscheiden(self.weg_cli, a);
         self.weg_fuer = Some(a.kennung.clone());
         Some(self.weg)
     }
@@ -2377,17 +2377,32 @@ fn sitzung(stand: &mut Bildschirmstand) {
             }
         }
 
-        // 4. Einstellungen (Nachricht 64) auf die Sitzung.
+        // 4. Einstellungen (Nachricht 64) auf die Sitzung. Hat der Weg auf
+        //    der Karte im Betrieb versagt (Grund steht im Protokoll), faellt
+        //    die Sitzung, und Schritt 2 oeffnet sie gleich neu - auf dem
+        //    Prozessorweg; 4b stellt danach die Aufnahme um.
         let mut enc_kaputt = false;
+        let mut enc_neu = false;
         if let (Some(e), Some(a)) = (enc.as_mut(), auf.as_ref()) {
-            match e.einstellungen_nachziehen(weg_im_betrieb(weg, eingepasst), Some((&a.dup.device, &a.dup.ctx))) {
-                Ok(true) => testbilder = None,
-                Ok(false) => {}
-                Err(err) => {
-                    log(format!("Encoder nach Einstellungen nicht mehr zu oeffnen: {err}"));
-                    enc_kaputt = true;
+            if e.prozessorweg_noetig() {
+                enc_neu = true;
+            } else {
+                match e.einstellungen_nachziehen(weg_im_betrieb(weg, eingepasst), Some((&a.dup.device, &a.dup.ctx))) {
+                    Ok(true) => testbilder = None,
+                    Ok(false) => {}
+                    Err(err) => {
+                        log(format!("Encoder nach Einstellungen nicht mehr zu oeffnen: {err}"));
+                        enc_kaputt = true;
+                    }
                 }
             }
+        }
+        if enc_neu {
+            if let Some(e) = enc.take() {
+                e.schliessen();
+            }
+            testbilder = None;
+            naechster_enc_versuch = Instant::now();
         }
         if enc_kaputt {
             enc = None;
@@ -3230,6 +3245,22 @@ mod tests {
         }
         assert_eq!(weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, true), Weg::Bgra);
         assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, Drehung::Keine, true), Weg::Yuv444);
+        // Auch die 10-Bit-Kandidaten: gedreht oder fuer H.264 eingepasst
+        // gehen alle auf den Prozessorweg (Umrechnung auf dem Prozessor),
+        // sonst bleiben sie auf der Karte.
+        use encoder::Eingabe;
+        use ffmpeg_next::sys::AVPixelFormat::*;
+        let eingabe = |idx: usize, d: Drehung, ein: bool| encoder::eingabe_waehlen(idx, weg_fuer_aufnahme(Weg::D3d11, d, ein), "hevc_nvenc", false, false);
+        assert_eq!(eingabe(0, Drehung::Keine, false), Eingabe::Karte(AV_PIX_FMT_YUV444P16LE));
+        assert_eq!(eingabe(2, Drehung::Keine, false), Eingabe::Karte(AV_PIX_FMT_P010LE));
+        assert_eq!(eingabe(1, Drehung::Keine, false), Eingabe::Textur);
+        for d in [Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
+            assert_eq!(eingabe(0, d, false), Eingabe::Ram(AV_PIX_FMT_YUV444P16LE), "{d:?}");
+            assert_eq!(eingabe(2, d, false), Eingabe::Ram(AV_PIX_FMT_P010LE), "{d:?}");
+            assert_eq!(eingabe(1, d, false), Eingabe::Ram(AV_PIX_FMT_BGRA), "{d:?}");
+        }
+        assert_eq!(encoder::eingabe_waehlen(4, weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, true), "h264_nvenc", false, false), Eingabe::Ram(AV_PIX_FMT_BGRA), "H.264 eingepasst");
+        assert_eq!(encoder::eingabe_waehlen(4, weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, false), "h264_nvenc", false, false), Eingabe::Textur, "H.264 nativ");
     }
 
     #[test]

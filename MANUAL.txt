@@ -3322,6 +3322,8 @@ started as administrator (see "Starting (Windows)" at the beginning).
     quadchroma.exe --nur-host [port] [the same switches]
     quadchroma.exe --list
     quadchroma.exe --messen [--output n] [--sekunden 10]
+    quadchroma.exe --encodermessung [--groessen 1920x1080,3840x2160]
+                   [--bilder 300] [--kandidaten 0,1,2,3,4] [--last N]
 
     --host [port]   the one app in the background with sharing on: video on
                     port (9001), input on port+1, announcement on port+2.
@@ -3356,22 +3358,47 @@ started as administrator (see "Starting (Windows)" at the beginning).
                         quadchroma.exe 192.168.178.194:9001 --headless
                                        --mitschnitt C:\qc\qc.hevc
                     (one command line, wrapped here).
-    --encoderweg    how the picture gets into the encoder: bgra (BGRA directly
-                    into NVENC, which converts on the card), yuv444 (own
-                    conversion on the CPU), d3d11 (textures without a copy,
-                    only for the 8-bit candidates via NVENC and only when the
-                    output is connected to the NVIDIA card) or auto (default:
-                    the decision from messung.txt, otherwise bgra). 10-bit
-                    candidates, Media Foundation and rotated outputs always go
-                    through the CPU; the host switches the source itself
-                    ("Aufnahme: Quelle auf Prozessorweg umgestellt ..." or
-                    "Null-Kopien-Weg: gedrehter Ausgang ... - Prozessorweg
-                    (bgra)", i.e. switched to the CPU path). The size does
-                    not matter: a 4K output takes the same paths as a smaller
-                    one, zero-copy included - except while a stream is
-                    fitted for H.264, which is scaled on the CPU ("Null-
-                    Kopien-Weg: der fuer H.264 eingepasste Strom wird auf
-                    dem Prozessor skaliert - Prozessorweg (bgra)").
+    --encoderweg    how the picture gets into the encoder: bgra (BGRA from
+                    main memory into NVENC, which converts on the card; 10-bit
+                    candidates are converted on the CPU), yuv444 (own
+                    conversion on the CPU), d3d11 (the picture stays on the
+                    card: the 8-bit candidates as textures without a copy, the
+                    10-bit candidates converted on the card - the same
+                    integer arithmetic as the CPU conversion - and handed to
+                    NVENC through CUDA) or auto. auto is the default: the
+                    decision from messung.txt if --messen wrote one, otherwise
+                    d3d11 when the output is connected to the NVIDIA card that
+                    encodes, otherwise bgra. The log says which and why
+                    ("Encoderweg: d3d11 (das Bild bleibt auf der Karte)
+                    (Vorgabe: \\.\DISPLAY1 an Karte 0 (NVIDIA ...), dort
+                    codiert nvenc ...)", or "... (Vorgabe: ..., nicht an einer
+                    NVIDIA-Karte - das Bild geht ueber den Prozessor)", i.e.
+                    not on the NVIDIA card, the picture goes through the CPU).
+                    d3d11 needs the output on the NVIDIA card: on a laptop
+                    without a MUX switch all outputs sit on the integrated
+                    card, and d3d11 from the command line or messung.txt
+                    becomes bgra there ("... statt d3d11 ... haengt nicht an
+                    einer NVIDIA-Karte ..."). The encoder line shows the
+                    input: "Eingabe d3d11/bgra ohne Kopie" (8 bit) or
+                    "Eingabe cuda/yuv444p16le aus dem Wandler auf der Karte"
+                    (10 bit; p010le for 4:2:0) on the card, otherwise the
+                    format in main memory ("Eingabe yuv444p16le"). If the
+                    card path cannot be set up for a candidate (no CUDA, an
+                    older driver), that candidate takes the CPU path for the
+                    rest of the run, with the reason logged once ("Encoder:
+                    Kandidat N ...: der Weg auf der Karte (...) geht nicht auf
+                    (...) - Prozessorweg (...) fuer diesen Lauf"); if it fails
+                    while running, the session is reopened on the CPU path
+                    right away ("... versagt im Betrieb ..."). Media
+                    Foundation and rotated outputs always go through the CPU;
+                    the host switches the source itself ("Aufnahme: Quelle
+                    auf Prozessorweg umgestellt ..." or "Null-Kopien-Weg:
+                    gedrehter Ausgang ... - Prozessorweg (bgra)", i.e.
+                    switched to the CPU path). The size does not matter: a
+                    4K output takes the same paths as a smaller one - except
+                    while a stream is fitted for H.264, which is scaled on the
+                    CPU ("Null-Kopien-Weg: der fuer H.264 eingepasste Strom
+                    wird auf dem Prozessor skaliert - Prozessorweg (bgra)").
     --list          cards, outputs (each with identifier, name and Hz) and
                     what this computer can encode (hevc_nvenc and h264_nvenc
                     per candidate via avcodec_open2; without an NVIDIA driver
@@ -3399,9 +3426,29 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     (crop) line for 4K outputs, measured when the stream was
                     still halved there; auto ignores it and goes by the
                     full-size line - measure again for a current verdict.
+    --encodermessung   old against new path into the encoder, without a
+                    screen (it also runs while the screen is locked, and over
+                    SSH): on the NVIDIA card it plays the test pattern as the
+                    desktop and runs every candidate once on the CPU path
+                    (bgra: staging into main memory, 10 bit converted on the
+                    CPU) and once on the card (d3d11), each for --bilder
+                    frames (300) at each size of --groessen (1920x1080 and
+                    3840x2160), with the real encoder session. Per run: time
+                    per frame from the copy to the finished packet (median,
+                    95 %), CPU time of the process per frame, and the time to
+                    open the session. Then both paths are compared - they get
+                    the same frames, so the packets must be the same ("Bitstrom
+                    gleich", SHA-256); at the first size also the side paths
+                    (test pattern, BGRA from main memory, repeat) and the
+                    color bars after the software decoder. --last N adds N
+                    threads that compute without a pause next to it (roughly
+                    the CPU next to a game). Result on the console and in
+                    %APPDATA%\QuadChroma\encodermessung.txt - never in
+                    messung.txt, which the path decision reads.
 
 The candidates are the same six as on the Mac. The desktop is 8 bit, so
-"10 Bit" on Windows is always a conversion (noted in the capability list); the
+"10 Bit" on Windows is always a conversion (noted in the capability list; on
+the NVIDIA card it runs on the GPU, see --encoderweg); the
 start candidate is 0, otherwise the first one available. nvenc changes the bit
 rate while running (without a restart, with a keyframe); a new frame rate or a
 different encoder means a restart of the session with a keyframe. The host
