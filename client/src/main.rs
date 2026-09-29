@@ -1210,6 +1210,9 @@ struct Shared {
     /// Host gerade statt des Wunsches in `settings`, weil dieser Rechner
     /// nicht schneller decodiert. None: es gilt der Wunsch.
     fps_angepasst: Option<u16>,
+    /// Der Bildratenregler hat gerade gedrosselt: der Wunsch, mit dem er
+    /// begann - fuer regler_wunsch_merken im Fensterfaden. None: nichts neu.
+    wunsch_vor_grenze: Option<regler::Einstellung>,
     /// Ton gewuenscht? Der Client haelt sich selbst daran - auch gegenueber
     /// einem Host, der den Schalter noch nicht kennt und weiter Ton schickt.
     ton: bool,
@@ -4006,10 +4009,16 @@ const AUFHOL_ZEILEN: u32 = 20;
 fn regler_ausfuehren(regler: &mut regler::Regler, shared: &Mutex<Shared>, input: &Mutex<InputLink>) {
     let Some(a) = regler.takt(client_us()) else { return };
     let basis = shared.lock().unwrap().settings;
-    let (gesendet, wunsch) = {
+    let (gesendet, wunsch_ganz) = {
         let mut l = input.lock().unwrap();
-        (l.fps_grenze_setzen(a.grenze, basis), l.wunsch_und_grenze().0.map(|w| w.1))
+        (l.fps_grenze_setzen(a.grenze, basis), l.wunsch_und_grenze().0)
     };
+    let wunsch = wunsch_ganz.map(|w| w.1);
+    // Gedrosselt: der Wunsch fuer den Fensterfaden, der ihn fuer diesen Host
+    // speichert, falls dort noch nichts steht (regler_wunsch_merken).
+    if gesendet && a.grenze.is_some() {
+        shared.lock().unwrap().wunsch_vor_grenze = wunsch_ganz;
+    }
     if let Some(z) = a.zeile(wunsch) {
         protokoll::zeile(if gesendet { z } else { format!("{z} - nicht gesendet: noch keine Einstellungen vom Host") });
     }
@@ -5739,6 +5748,32 @@ fn gespeicherte_werte_anwenden(
         (None, _) => *angewandt_fuer = None,
         _ => {}
     }
+}
+
+/// Die Hosts behalten eine vom Regler erbetene Bildrate ueber das Ende der
+/// Sitzung hinaus und melden sie der naechsten als ihren Stand. Hat dieser
+/// Client fuer den Host nichts gespeichert, gaelte die Grenze dann als Wunsch
+/// des Nutzers, und der Regler kaeme nie mehr darueber (er steigt hoechstens
+/// bis zum Wunsch). Deshalb wird beim ersten Drosseln der Wunsch fuer diesen
+/// Host gespeichert; gespeicherte_werte_anwenden schickt ihn beim naechsten
+/// Mal zuerst. Steht schon etwas da, war es der Nutzer - es bleibt. true:
+/// neu eingetragen, der Aufrufer sichert die Datei.
+fn regler_wunsch_uebernehmen(cfg: &mut einstellungen::Einstellungen, shared: &Mutex<Shared>) -> bool {
+    let (wunsch, fp, hdr_aus) = {
+        let mut s = shared.lock().unwrap();
+        let Some(w) = s.wunsch_vor_grenze.take() else { return false };
+        (w, s.peer_fp.clone(), s.hdr_aus)
+    };
+    let Some(fp) = fp else { return false };
+    if cfg.fuer_host(&fp).is_some() {
+        return false;
+    }
+    let (mbit, fps, gaming, fest, ton) = wunsch;
+    cfg.hosts.insert(fp, einstellungen::HostWerte { mbit, fps, gaming, fest, ton, hdr: !hdr_aus });
+    protokoll::zeile(format!(
+        "Bildratenregler: Wunsch {fps} Bilder/s fuer diesen Host gespeichert - die naechste Sitzung beginnt wieder damit"
+    ));
+    true
 }
 
 // ---------------------------------------------------------------- Benchmark
@@ -7856,6 +7891,9 @@ impl App {
         }
         // Bindung des Eingabekanals und die fuer diesen Host gespeicherten Werte.
         gespeicherte_werte_anwenden(&self.cfg, &self.shared, &self.input, &mut self.angewandt_fuer);
+        if regler_wunsch_uebernehmen(&mut self.cfg, &self.shared) {
+            self.cfg.sichern();
+        }
         // Lage der Anzeige (IN_ANZEIGE) und das HDR-Abzeichen.
         self.anzeige_takt(false);
         // Der Benchmark arbeitet im selben Takt: nie blockierend, das Bild
@@ -16094,6 +16132,37 @@ mod tests {
     /// Einstellungen liegen dann zum Nachreichen bereit, einmal je Host.
     /// Wechselt die Sitzung, bevor sie hinaus waren, kommen sie in der neuen
     /// noch einmal. Frueher wartete das alles auf den Eingabekanal.
+    /// Drosselt der Regler einen Host ohne gespeicherte Werte, bleibt der
+    /// Wunsch des Nutzers fuer ihn stehen - sonst meldete der Host in der
+    /// naechsten Sitzung die Grenze, und sie galte als Wunsch (Review ee1d36c).
+    /// Hat der Nutzer schon Werte gespeichert, bleiben sie unberuehrt.
+    #[test]
+    fn regler_speichert_den_wunsch_fuer_die_naechste_sitzung() {
+        let mut cfg = einstellungen::Einstellungen::default();
+        let shared = Mutex::new(Shared { ton: true, ..Shared::default() });
+        assert!(!regler_wunsch_uebernehmen(&mut cfg, &shared), "nichts gedrosselt");
+        {
+            let mut s = shared.lock().unwrap();
+            s.peer_fp = Some("fp-b".into());
+            s.wunsch_vor_grenze = Some((150, 60, false, true, true));
+        }
+        assert!(regler_wunsch_uebernehmen(&mut cfg, &shared));
+        let w = cfg.fuer_host("fp-b").expect("gespeichert");
+        assert_eq!((w.mbit, w.fps, w.gaming, w.fest, w.ton, w.hdr), (150, 60, false, true, true, true));
+        assert!(shared.lock().unwrap().wunsch_vor_grenze.is_none(), "einmal genommen");
+        // Ein zweites Drosseln mit anderem Stand aendert nichts mehr.
+        shared.lock().unwrap().wunsch_vor_grenze = Some((150, 45, false, true, true));
+        assert!(!regler_wunsch_uebernehmen(&mut cfg, &shared));
+        assert_eq!(cfg.fuer_host("fp-b").unwrap().fps, 60);
+        // Ohne bekannten Host: nichts.
+        {
+            let mut s = shared.lock().unwrap();
+            s.peer_fp = None;
+            s.wunsch_vor_grenze = Some((150, 60, false, true, true));
+        }
+        assert!(!regler_wunsch_uebernehmen(&mut cfg, &shared));
+    }
+
     #[test]
     fn gespeicherte_werte_gelten_ohne_eingabekanal() {
         let mut cfg = einstellungen::Einstellungen::default();
