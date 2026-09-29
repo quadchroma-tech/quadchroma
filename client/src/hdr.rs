@@ -72,6 +72,11 @@ pub const MATRIX_2020_NCL: u8 = 9;
 /// Matrix nicht angegeben (H.273: 2) - so steht sie in FFmpeg
 /// (AVCOL_SPC_UNSPECIFIED), wenn das VUI keine Farbbeschreibung traegt.
 pub const MATRIX_OHNE: u8 = 2;
+/// Matrix 0 (RGB, "identity"): FFmpeg bis 9.0.x uebernimmt im cuvid-Decoder
+/// die Farbfelder des NVDEC-Parsers ohne Pruefung, und der meldet 0 fuer
+/// alles, was der Strom nicht angibt. Kein Host sendet ein YUV-Bild mit
+/// RGB-Matrix - 0 heisst hier also ebenso "keine Matrix genannt".
+pub const MATRIX_RGB: u8 = 0;
 
 /// Y'CbCr -> R'G'B' eines SDR-Bildes in 16.16, wie `zeile_rgb` und die
 /// Shader beider Anzeigen rechnen: Cr -> R, Cb -> G, Cr -> G, Cb -> B.
@@ -167,10 +172,12 @@ impl Farbe {
     /// innerhalb der Bereichsangabe (colour_description in video_signal_type):
     /// nennt ein Bild eine Matrix, war auch der Bereich angegeben - jeder
     /// Host, der wirklich begrenzt sendet (der bgra-Weg, Windows-Hosts bis
-    /// 0.2.0), schreibt Matrix 5 dazu. PQ traegt Bereich und Matrix immer;
-    /// dort zaehlt MPEG, wie es ist.
+    /// 0.2.0), schreibt Matrix 5 dazu. Matrix 0 zaehlt wie "nicht genannt"
+    /// (MATRIX_RGB: FFmpeg 9.0.x meldet ueber cuvid 0 statt 2). PQ traegt
+    /// Bereich und Matrix immer; dort zaehlt MPEG, wie es ist.
     pub fn aus_ffmpeg(transfer: u8, primaer: u8, matrix: u8, mpeg: bool) -> Farbe {
-        let begrenzt = mpeg && (transfer == TRANSFER_PQ || matrix != MATRIX_OHNE);
+        let genannt = matrix != MATRIX_OHNE && matrix != MATRIX_RGB;
+        let begrenzt = mpeg && (transfer == TRANSFER_PQ || genannt);
         Farbe::aus_vui(transfer, primaer, matrix, !begrenzt)
     }
 
@@ -1354,6 +1361,8 @@ mod tests {
         // FFmpeg: MPEG ist bei SDR nur mit Matrix begrenzt - cuvid meldet MPEG
         // auch ohne jede Bereichsangabe (Matrix dann nicht angegeben).
         assert_eq!(Farbe::aus_ffmpeg(2, 2, MATRIX_OHNE, true), Farbe::SDR, "cuvid ohne VUI: BT.709 voll");
+        assert_eq!(Farbe::aus_ffmpeg(0, 0, MATRIX_RGB, true), Farbe::SDR, "cuvid in FFmpeg 9.0.x ohne Farbangabe: 0/0/0, voll");
+        assert_eq!(Farbe::aus_ffmpeg(1, 1, MATRIX_RGB, true), Farbe::SDR);
         assert_eq!(Farbe::aus_ffmpeg(1, 1, MATRIX_OHNE, true), Farbe::SDR);
         assert_eq!(Farbe::aus_ffmpeg(2, 2, MATRIX_OHNE, false), Farbe::SDR);
         assert_eq!(Farbe::aus_ffmpeg(1, 1, 5, true), bt601, "der bgra-Weg: BT.601 begrenzt");

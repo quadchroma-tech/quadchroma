@@ -20108,6 +20108,14 @@ mod tests {
         f.set_color_transfer_characteristic(color::TransferCharacteristic::Unspecified);
         f.set_color_primaries(color::Primaries::Unspecified);
         assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "cuvid ohne VUI: BT.709 voll");
+        // FFmpeg 9.0.x (unser Stand) setzt in cuvid die Felder des NVDEC-
+        // Parsers ungeprueft: ohne Farbangabe 0/0/0 (RGB, Reserved0).
+        f.set_color_space(color::Space::RGB);
+        f.set_color_transfer_characteristic(color::TransferCharacteristic::Reserved0);
+        f.set_color_primaries(color::Primaries::Reserved0);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "cuvid 9.0.x ohne Farbangabe: BT.709 voll");
+        f.set_color_transfer_characteristic(color::TransferCharacteristic::Unspecified);
+        f.set_color_primaries(color::Primaries::Unspecified);
         // Mit Matrix bleibt MPEG begrenzt: BT.601 (der bgra-Weg) und BT.709.
         f.set_color_space(color::Space::BT470BG);
         assert_eq!(Ebenenbild::farbe(&f), bt601, "BT.470BG, MPEG: BT.601 begrenzt");
