@@ -2619,7 +2619,7 @@ fn decoder_melden(shared: &Arc<Mutex<Shared>>, bau: &DecoderBau, wunsch: einstel
         protokoll::zeile("NVDEC: Zugriffseinheiten-Begrenzer angehaengt".into());
     }
     if matches!(bau.pfad, DecoderPfad::Nvdec(_)) && bau.codec.starts_with("h264") && vui_gewuenscht() {
-        protokoll::zeile("NVDEC: SPS um VUI ergaenzt (max_num_reorder_frames 0)".into());
+        protokoll::zeile("NVDEC: SPS um VUI ergaenzt (max_num_reorder_frames 0, BT.709 voll)".into());
     }
     let mut s = shared.lock().unwrap();
     s.decoder_pfad = Some(bau.pfad);
@@ -2649,13 +2649,16 @@ fn aud_gewuenscht() -> bool {
     !std::env::args().any(|a| a == "--ohne-aud")
 }
 
-/// Bekommt jedes H.264-SPS fuer NVDEC ein VUI mit max_num_reorder_frames 0?
-/// Ja, ausser mit --ohne-vui - zum Vergleich auf demselben Rechner.
+/// Bekommt jedes H.264-SPS ohne VUI fuer NVDEC eines mit
+/// max_num_reorder_frames 0 und BT.709 voll? Ja, ausser mit --ohne-vui - zum
+/// Vergleich auf demselben Rechner.
 ///
 /// Der Mac-Host codiert ohne Bildumsortierung, sagt es aber nicht im SPS
 /// (VideoToolbox schreibt kein VUI). cuvids H.264-Parser nimmt dann die
 /// groesste Umsortierungstiefe des Levels an und haelt rund 16 Bilder
-/// zurueck - gemessen 150-290 ms Decoderzeit. Siehe `sps.rs`.
+/// zurueck - gemessen 150-290 ms Decoderzeit - und meldet den begrenzten
+/// Bereich (Ebenenbild::farbe liest ihn ohne Matrix trotzdem voll). Siehe
+/// `sps.rs`.
 fn vui_gewuenscht() -> bool {
     !std::env::args().any(|a| a == "--ohne-vui")
 }
@@ -3142,9 +3145,10 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     #[cfg(windows)]
     let aud_anhang = aud_gewuenscht();
     // Jedes H.264-SPS fuer NVDEC um ein VUI mit max_num_reorder_frames 0
-    // ergaenzen, damit cuvids Parser keine Bilder fuer eine Umsortierung
-    // zurueckhaelt, die es nicht gibt - siehe `sps.rs`. --ohne-vui laesst
-    // es zum Vergleich weg. Das erste Umschreiben kommt ins Protokoll.
+    // (und BT.709 voll) ergaenzen, damit cuvids Parser keine Bilder fuer
+    // eine Umsortierung zurueckhaelt, die es nicht gibt - siehe `sps.rs`.
+    // --ohne-vui laesst es zum Vergleich weg. Das erste Umschreiben kommt
+    // ins Protokoll.
     #[cfg(windows)]
     let vui_anhang = vui_gewuenscht();
     #[cfg(windows)]
@@ -3466,7 +3470,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                             vui_gemeldet = true;
                             let alt_len = sps::erstes_sps(&payload).map(|s| s.len()).unwrap_or(0);
                             let neu_len = alt_len + (neu.len() - payload.len());
-                            protokoll::zeile(format!("NVDEC: SPS umgeschrieben, {alt_len} -> {neu_len} Byte (VUI mit max_num_reorder_frames 0)"));
+                            protokoll::zeile(format!("NVDEC: SPS umgeschrieben, {alt_len} -> {neu_len} Byte (VUI mit max_num_reorder_frames 0, BT.709 voll)"));
                         }
                     }
                     let einheit: &[u8] = mit_vui.as_deref().unwrap_or(&payload);
@@ -4340,9 +4344,10 @@ fn clamp8(v: i32) -> u32 {
 /// 16.16 mit Rundung (Y: (y - 16) * 255/219, Cb/Cr: c * 255/224 um den
 /// Nullpunkt). Das sagt das Format (VideoToolbox: x444, 444v, x420, 420v -
 /// wenn die Formatbeschreibung keinen vollen Bereich meldet) oder das VUI
-/// des Bildes (FFmpeg: color_range MPEG, etwa der bgra-Weg des
-/// Windows-Hosts). `k` ist die Matrix aus dem VUI in 16.16 (Cr -> R, Cb ->
-/// G, Cr -> G, Cb -> B; hdr::Farbe::sdr_koeffizienten: BT.709 oder BT.601).
+/// des Bildes (FFmpeg: color_range MPEG mit einer Matrix, etwa der
+/// bgra-Weg des Windows-Hosts). `k` ist die Matrix aus dem VUI in 16.16
+/// (Cr -> R, Cb -> G, Cr -> G, Cb -> B; hdr::Farbe::sdr_koeffizienten:
+/// BT.709 oder BT.601).
 /// Beide Anzeigen (anzeige.rs, anzeige_mac.rs) rechnen dieselben Schritte
 /// mit denselben Konstanten.
 #[inline(always)]
@@ -4641,13 +4646,15 @@ impl Ebenenbild for ffmpeg::frame::Video {
     /// Software-HEVC, cuvid (ff_decode_frame_props) und D3D11VA (Kopie mit
     /// av_frame_copy_props) gleichermassen. FFmpegs Codes sind die aus H.273
     /// (AVCOL_TRC_SMPTE2084 = 16, AVCOL_PRI_BT2020 = 9, AVCOL_SPC_BT2020_NCL
-    /// = 9; BT.470BG = 5, SMPTE 170M = 6). Bereich: nur MPEG heisst begrenzt
-    /// - ein PQ-Strom traegt das Flag immer, ein SDR-Strom dieser Hosts auch
-    /// (H.264 vom Mac-Host hat kein VUI: nicht angegeben, also voll).
+    /// = 9; BT.470BG = 5, SMPTE 170M = 6). Bereich: nur MPEG heisst begrenzt,
+    /// bei SDR nur zusammen mit einer Matrix (hdr::Farbe::aus_ffmpeg) - cuvid
+    /// meldet MPEG fuer jeden Strom ohne video_full_range_flag = 1, auch fuer
+    /// H.264 vom Mac-Host (kein VUI) und von h264_mf (kein Bereich); die
+    /// Software-Decoder melden dort "nicht angegeben". Beides ist voll.
     fn farbe(&self) -> hdr::Farbe {
         use ffmpeg::sys::AVColorRange;
         let f = unsafe { &*self.as_ptr() };
-        hdr::Farbe::aus_vui(f.color_trc as u8, f.color_primaries as u8, f.colorspace as u8, f.color_range != AVColorRange::AVCOL_RANGE_MPEG)
+        hdr::Farbe::aus_ffmpeg(f.color_trc as u8, f.color_primaries as u8, f.colorspace as u8, f.color_range == AVColorRange::AVCOL_RANGE_MPEG)
     }
 }
 
@@ -20065,7 +20072,8 @@ mod tests {
 
     /// Die Farbe eines FFmpeg-Bildes kommt aus seinem VUI: PQ/BT.2020 mit
     /// Bereich; SDR mit Matrix und Bereich - das BT.601 begrenzt des
-    /// bgra-Wegs (VUI BT.470BG, MPEG) ist genau das, was nvenc rechnete.
+    /// bgra-Wegs (VUI BT.470BG, MPEG) ist genau das, was nvenc rechnete; MPEG
+    /// ohne Matrix (cuvid ohne Bereichsangabe) ist voll.
     #[cfg(windows)]
     #[test]
     fn farbe_aus_dem_ffmpeg_bild() {
@@ -20092,6 +20100,24 @@ mod tests {
         f.set_color_range(color::Range::Unspecified);
         f.set_color_space(color::Space::Unspecified);
         assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "ohne VUI: BT.709 voll");
+        // cuvid (NVDEC) meldet MPEG fuer jeden Strom ohne
+        // video_full_range_flag = 1 und laesst die Matrix ungesetzt: H.264
+        // vom Mac-Host, h264_mf. Ohne Matrix heisst MPEG nicht begrenzt.
+        f.set_color_range(color::Range::MPEG);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "cuvid ohne Bereichsangabe: BT.709 voll");
+        f.set_color_transfer_characteristic(color::TransferCharacteristic::Unspecified);
+        f.set_color_primaries(color::Primaries::Unspecified);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "cuvid ohne VUI: BT.709 voll");
+        // Mit Matrix bleibt MPEG begrenzt: BT.601 (der bgra-Weg) und BT.709.
+        f.set_color_space(color::Space::BT470BG);
+        assert_eq!(Ebenenbild::farbe(&f), bt601, "BT.470BG, MPEG: BT.601 begrenzt");
+        f.set_color_space(color::Space::BT709);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe { voll: false, ..hdr::Farbe::SDR }, "BT.709, MPEG: begrenzt");
+        // PQ traegt den Bereich immer: MPEG bleibt begrenzt, auch ohne Matrix.
+        f.set_color_transfer_characteristic(color::TransferCharacteristic::SMPTE2084);
+        f.set_color_primaries(color::Primaries::BT2020);
+        f.set_color_space(color::Space::Unspecified);
+        assert!(Ebenenbild::farbe(&f).ist_pq() && !Ebenenbild::farbe(&f).voll, "PQ, MPEG: begrenzt");
     }
 
     /// Ein Strom eines Hosts, der BGRA an nvenc gibt (bgra-Weg, jeder

@@ -3353,9 +3353,10 @@ sees the start of the next one - without an AUD that costs one frame period of
 decoder time. The switch is there for comparison; the log shows "NVDEC:
 Zugriffseinheiten-Begrenzer angehaengt" (access unit delimiter added) when it
 is not set. Likewise, --ohne-vui leaves out the VUI that the client otherwise
-writes into every SPS for H.264 via NVDEC (max_num_reorder_frames 0 - the Mac
-host encodes without reordering but does not say so in the SPS, and NVIDIA's
-parser then holds back about 16 frames).
+writes into every SPS without one for H.264 via NVDEC (max_num_reorder_frames
+0 - the Mac host encodes without reordering but does not say so in the SPS,
+and NVIDIA's parser then holds back about 16 frames; the VUI also says BT.709
+full range, the color of every SDR stream).
 
 Windows as host
 ---------------
@@ -3518,11 +3519,13 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     and handed to NVENC through CUDA) or auto. Clients after
                     0.2.0 show both the BT.709 full-range streams and the
                     BT.601 limited-range ones of the bgra path correctly (they
-                    read matrix and range from the VUI); clients up to 0.2.0
-                    read every SDR stream as BT.709 full range and show the
-                    bgra path washed out (black comes out as 16 of 255, white
-                    as 235). auto is the default: the decision from
-                    messung.txt if --messen wrote one, otherwise
+                    read matrix and range from the VUI; a stream that names no
+                    matrix counts as full range, since NVDEC reports limited
+                    range for every stream without the full-range flag);
+                    clients up to 0.2.0 read every SDR stream as BT.709 full
+                    range and show the bgra path washed out (black comes out
+                    as 16 of 255, white as 235). auto is the default: the
+                    decision from messung.txt if --messen wrote one, otherwise
                     d3d11 when the output is connected to the NVIDIA card that
                     encodes, otherwise bgra. The log says which and why
                     ("Encoderweg: d3d11 (das Bild bleibt auf der Karte)

@@ -69,6 +69,9 @@ pub const MATRIX_470BG: u8 = 5;
 /// (der bgra-Weg des Windows-Hosts, dort mit dem VUI BT.470BG).
 pub const MATRIX_601: u8 = 6;
 pub const MATRIX_2020_NCL: u8 = 9;
+/// Matrix nicht angegeben (H.273: 2) - so steht sie in FFmpeg
+/// (AVCOL_SPC_UNSPECIFIED), wenn das VUI keine Farbbeschreibung traegt.
+pub const MATRIX_OHNE: u8 = 2;
 
 /// Y'CbCr -> R'G'B' eines SDR-Bildes in 16.16, wie `zeile_rgb` und die
 /// Shader beider Anzeigen rechnen: Cr -> R, Cb -> G, Cr -> G, Cb -> B.
@@ -145,7 +148,7 @@ impl Farbe {
     /// um und sagt das im VUI -, sonst BT.709; `voll` sagt der Aufrufer (ein
     /// fehlender Bereich gilt als voll). Eine fehlende oder andere Matrix
     /// gilt als BT.709: das Protokoll ist BT.709 voll, und H.264 vom Mac-Host
-    /// traegt gar kein VUI.
+    /// traegt gar kein VUI. FFmpeg-Bilder gehen ueber `aus_ffmpeg`.
     pub fn aus_vui(transfer: u8, primaer: u8, matrix: u8, voll: bool) -> Farbe {
         if transfer == TRANSFER_PQ {
             Farbe { transfer, primaer, matrix, voll }
@@ -153,6 +156,22 @@ impl Farbe {
             let matrix = if matrix == MATRIX_470BG || matrix == MATRIX_601 { MATRIX_601 } else { MATRIX_709 };
             Farbe { matrix, voll, ..Farbe::SDR }
         }
+    }
+
+    /// Wie `aus_vui`, fuer ein Bild aus FFmpeg: `mpeg` heisst color_range
+    /// AVCOL_RANGE_MPEG. Das ist bei SDR nur dann ein begrenzter Bereich,
+    /// wenn das Bild auch eine Matrix nennt. FFmpegs cuvid-Decoder (NVDEC)
+    /// setzt MPEG fuer jeden Strom ohne video_full_range_flag = 1, auch fuer
+    /// einen ganz ohne Bereichsangabe (H.264 vom Mac-Host ohne VUI, h264_mf),
+    /// und laesst die Matrix dann ungesetzt. Im VUI steht die Matrix aber nur
+    /// innerhalb der Bereichsangabe (colour_description in video_signal_type):
+    /// nennt ein Bild eine Matrix, war auch der Bereich angegeben - jeder
+    /// Host, der wirklich begrenzt sendet (der bgra-Weg, Windows-Hosts bis
+    /// 0.2.0), schreibt Matrix 5 dazu. PQ traegt Bereich und Matrix immer;
+    /// dort zaehlt MPEG, wie es ist.
+    pub fn aus_ffmpeg(transfer: u8, primaer: u8, matrix: u8, mpeg: bool) -> Farbe {
+        let begrenzt = mpeg && (transfer == TRANSFER_PQ || matrix != MATRIX_OHNE);
+        Farbe::aus_vui(transfer, primaer, matrix, !begrenzt)
     }
 
     /// Die Zahlen, mit denen ein SDR-Bild dieser Farbe nach R'G'B' geht
@@ -1332,6 +1351,19 @@ mod tests {
         assert_eq!(Farbe::aus_vui(2, 2, 2, false), Farbe { voll: false, ..Farbe::SDR });
         assert_eq!(Farbe::aus_vui(1, 1, 9, true), Farbe::SDR, "SDR mit Matrix BT.2020: gerechnet wird BT.709");
         assert_eq!(Farbe::aus_vui(18, 9, 9, true), Farbe::SDR, "HLG nicht in 0.2.0");
+        // FFmpeg: MPEG ist bei SDR nur mit Matrix begrenzt - cuvid meldet MPEG
+        // auch ohne jede Bereichsangabe (Matrix dann nicht angegeben).
+        assert_eq!(Farbe::aus_ffmpeg(2, 2, MATRIX_OHNE, true), Farbe::SDR, "cuvid ohne VUI: BT.709 voll");
+        assert_eq!(Farbe::aus_ffmpeg(1, 1, MATRIX_OHNE, true), Farbe::SDR);
+        assert_eq!(Farbe::aus_ffmpeg(2, 2, MATRIX_OHNE, false), Farbe::SDR);
+        assert_eq!(Farbe::aus_ffmpeg(1, 1, 5, true), bt601, "der bgra-Weg: BT.601 begrenzt");
+        assert_eq!(Farbe::aus_ffmpeg(6, 5, 6, true), bt601);
+        assert_eq!(Farbe::aus_ffmpeg(1, 1, 5, false), Farbe { matrix: MATRIX_601, ..Farbe::SDR });
+        assert_eq!(Farbe::aus_ffmpeg(1, 1, 1, true), Farbe { voll: false, ..Farbe::SDR }, "BT.709 begrenzt mit Matrix");
+        assert_eq!(Farbe::aus_ffmpeg(1, 1, 1, false), Farbe::SDR);
+        assert_eq!(Farbe::aus_ffmpeg(16, 9, 9, true), Farbe { voll: false, ..Farbe::PQ });
+        assert_eq!(Farbe::aus_ffmpeg(16, 9, MATRIX_OHNE, true).voll, false, "PQ: MPEG bleibt begrenzt");
+        assert_eq!(Farbe::aus_ffmpeg(16, 9, 9, false), Farbe::PQ);
         assert_eq!(Farbe::PQ.text(), "PQ/BT.2020");
         assert_eq!(Farbe::SDR.text(), "SDR/BT.709");
         assert_eq!(bt601.text(), "SDR/BT.709, Matrix BT.601 begrenzt");

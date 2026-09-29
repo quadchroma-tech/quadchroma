@@ -10,13 +10,23 @@
 //! zeit. FFmpegs eigener h264-Decoder ist nicht betroffen (er schaetzt aus
 //! dem Strom), HEVC auch nicht (dort steht die Tiefe im SPS selbst).
 //!
-//! Abhilfe: in jedem SPS ohne VUI eines anlegen, das nur
+//! Abhilfe: in jedem SPS ohne VUI eines anlegen, das
 //! bitstream_restriction_flag=1 mit max_num_reorder_frames=0 traegt (H.264
 //! Anhang E.1.1). Alles vor dem Flag wird bitgenau uebernommen; ein SPS,
 //! das schon ein VUI hat, bleibt unangetastet - was drin steht, wissen wir
 //! dann nicht, und der Encoder hatte einen Grund. Ebenso bleibt ein SPS mit
 //! Skalierungsmatrizen liegen (die lesen wir nicht; VideoToolbox schreibt
 //! keine).
+//!
+//! Dazu sagt das neue VUI die Farbe: voller Bereich, BT.709 (Primaerfarben,
+//! Transfer, Matrix 1) - das SDR des Protokolls. Ohne Angabe meldet FFmpegs
+//! cuvid-Decoder den begrenzten Bereich (AVCOL_RANGE_MPEG fuer jeden Strom
+//! ohne video_full_range_flag = 1). Ein SPS ohne VUI nennt weder Bereich
+//! noch Transfer, ist also nie ein PQ-Strom (H.264 ist im Protokoll immer
+//! SDR); eines mit VUI - auch eines mit Bereich oder Matrix - bleibt, wie es
+//! ist. Dieselben Felder schreibt VideoToolbox, wenn es selbst ein VUI
+//! schreibt (gemessen auf dem M1 unter macOS 27: 420f mit den
+//! Farbeigenschaften des Hosts ergibt video_format 5, voll, 1/1/1).
 
 /// Liest Bits aus einer RBSP (Nutzlast OHNE Emulationsschutz). Auch fuer
 /// die Sequenzparametersaetze in vt_decoder.rs.
@@ -263,10 +273,17 @@ fn sps_lesen(rbsp: &[u8]) -> Option<SpsFelder> {
 /// NAL-Typ SPS in H.264.
 const NAL_SPS: u8 = 7;
 
+/// video_format 5: nicht angegeben (Tabelle E-2).
+const VIDEO_FORMAT_OHNE: u32 = 5;
+/// BT.709 als Primaerfarben, Transfer und Matrix (H.273: je 1) - mit
+/// video_full_range_flag = 1 das SDR des Protokolls (hdr::Farbe::SDR).
+const FARBE_709: u32 = 1;
+
 /// Ein SPS-NAL (nal[0] = Kopfbyte, danach die geschuetzte Nutzlast) mit
 /// einem VUI, das bitstream_restriction_flag=1 und max_num_reorder_frames=0
-/// traegt. None, wenn es kein SPS ist, nicht aufgeht, Skalierungsmatrizen
-/// traegt oder schon ein VUI hat - dann bleibt das Original.
+/// traegt, dazu BT.709 im vollen Bereich. None, wenn es kein SPS ist, nicht
+/// aufgeht, Skalierungsmatrizen traegt oder schon ein VUI hat - dann bleibt
+/// das Original.
 pub fn h264_sps_mit_vui(nal: &[u8]) -> Option<Vec<u8>> {
     let (&kopf, nutzlast) = nal.split_first()?;
     if kopf & 0x1f != NAL_SPS {
@@ -280,10 +297,17 @@ pub fn h264_sps_mit_vui(nal: &[u8]) -> Option<Vec<u8>> {
     let mut s = BitSchreiber::neu();
     s.kopie(&rbsp, felder.vui_flag_pos);
     s.u1(true); // vui_parameters_present_flag
-    // vui_parameters() nach E.1.1 - alles aus, bis auf die Begrenzung.
+    // vui_parameters() nach E.1.1 - alles aus, bis auf die Farbe und die
+    // Begrenzung.
     s.u1(false); // aspect_ratio_info_present_flag
     s.u1(false); // overscan_info_present_flag
-    s.u1(false); // video_signal_type_present_flag
+    s.u1(true); // video_signal_type_present_flag
+    s.u(3, VIDEO_FORMAT_OHNE); // video_format
+    s.u1(true); // video_full_range_flag
+    s.u1(true); // colour_description_present_flag
+    s.u(8, FARBE_709); // colour_primaries
+    s.u(8, FARBE_709); // transfer_characteristics
+    s.u(8, FARBE_709); // matrix_coefficients
     s.u1(false); // chroma_loc_info_present_flag
     s.u1(false); // timing_info_present_flag
     s.u1(false); // nal_hrd_parameters_present_flag
@@ -383,14 +407,15 @@ mod tests {
 
     /// Das VUI hinter dem Flag, so weit es hier gebraucht wird:
     /// (bitstream_restriction_flag, max_num_reorder_frames,
-    /// max_dec_frame_buffering).
+    /// max_dec_frame_buffering). Die Farbe muss BT.709 voll sein (Felder
+    /// siehe `vui_farbe_lesen`).
     fn vui_lesen(rbsp: &[u8], pos: usize) -> Option<(bool, u32, u32)> {
         let mut l = BitLeser::neu(rbsp);
         l.pos = pos;
         assert!(l.u1()?, "vui_parameters_present_flag");
         assert!(!l.u1()?, "aspect_ratio_info_present_flag");
         assert!(!l.u1()?, "overscan_info_present_flag");
-        assert!(!l.u1()?, "video_signal_type_present_flag");
+        assert_eq!(vui_farbe_lesen(&mut l)?, Some((VIDEO_FORMAT_OHNE, true, Some((1, 1, 1)))), "BT.709 voll");
         assert!(!l.u1()?, "chroma_loc_info_present_flag");
         assert!(!l.u1()?, "timing_info_present_flag");
         assert!(!l.u1()?, "nal_hrd_parameters_present_flag");
@@ -412,6 +437,21 @@ mod tests {
         Some((restriction, reorder, puffer))
     }
 
+    /// video_signal_type nach E.1.1, wie ein Decoder ihn liest: None ohne
+    /// Angabe (video_signal_type_present_flag 0), sonst (video_format,
+    /// video_full_range_flag, (colour_primaries, transfer_characteristics,
+    /// matrix_coefficients) oder None ohne colour_description).
+    #[allow(clippy::type_complexity)]
+    fn vui_farbe_lesen(l: &mut BitLeser) -> Option<Option<(u32, bool, Option<(u32, u32, u32)>)>> {
+        if !l.u1()? {
+            return Some(None);
+        }
+        let format = l.u(3)?;
+        let voll = l.u1()?;
+        let beschreibung = if l.u1()? { Some((l.u(8)?, l.u(8)?, l.u(8)?)) } else { None };
+        Some(Some((format, voll, beschreibung)))
+    }
+
     /// Echte SPS aus VideoToolbox auf dem M1, mit den Einstellungen des Hosts
     /// (H.264 High, RealTime, AllowFrameReordering aus, MaxFrameDelayCount 1),
     /// ausgelesen aus der Formatbeschreibung des ersten Bildes:
@@ -427,6 +467,25 @@ mod tests {
     /// vui_parameters_present_flag) und dem Abschluss. Damit lassen sich die
     /// Faelle bauen, die VideoToolbox nicht liefert (mit VUI, mit Beschnitt).
     fn test_sps(vui: bool, cropping: bool) -> Vec<u8> {
+        // Ein karges VUI: nur timing_info, wie es manche Encoder tun.
+        let karg = |s: &mut BitSchreiber| {
+            for _ in 0..4 {
+                s.u1(false);
+            }
+            s.u1(true); // timing_info_present_flag
+            s.u(32, 1);
+            s.u(32, 120);
+            s.u1(true); // fixed_frame_rate_flag
+            for _ in 0..4 {
+                s.u1(false);
+            }
+        };
+        test_sps_mit(cropping, if vui { Some(&karg) } else { None })
+    }
+
+    /// Wie `test_sps`, mit einem VUI, das `vui` schreibt (ab
+    /// aspect_ratio_info_present_flag).
+    fn test_sps_mit(cropping: bool, vui: Option<&dyn Fn(&mut BitSchreiber)>) -> Vec<u8> {
         let mut s = BitSchreiber::neu();
         s.u(8, 100); // profile_idc
         s.u(8, 0); // constraint_set-Flags
@@ -453,19 +512,9 @@ mod tests {
             s.ue(0);
             s.ue(4);
         }
-        s.u1(vui); // vui_parameters_present_flag
-        if vui {
-            // Ein karges VUI: nur timing_info, wie es manche Encoder tun.
-            for _ in 0..4 {
-                s.u1(false);
-            }
-            s.u1(true); // timing_info_present_flag
-            s.u(32, 1);
-            s.u(32, 120);
-            s.u1(true); // fixed_frame_rate_flag
-            for _ in 0..4 {
-                s.u1(false);
-            }
+        s.u1(vui.is_some()); // vui_parameters_present_flag
+        if let Some(vui) = vui {
+            vui(&mut s);
         }
         let mut nal = vec![0x67];
         nal.extend_from_slice(&schuetzen(&s.abschluss()));
@@ -535,10 +584,11 @@ mod tests {
             assert_eq!(reorder, 0);
             assert_eq!(puffer, 1);
         }
-        // Die Laengen, die das Protokoll bei 1080p meldet ("12 -> 16 Byte"):
-        // 80 Bit bis zum Flag, 39 Bit VUI, Abschlussbit = 120 Bit, plus Kopf.
-        assert_eq!(h264_sps_mit_vui(&VT_1080P).unwrap().len(), 16);
-        assert_eq!(h264_sps_mit_vui(&VT_720P).unwrap().len(), 15);
+        // Die Laengen, die das Protokoll bei 1080p meldet ("12 -> 20 Byte"):
+        // 80 Bit bis zum Flag, 68 Bit VUI (39 fuer die Begrenzung, 29 fuer
+        // die Farbe), Abschlussbit = 149 Bit, also 19 Byte, plus Kopf.
+        assert_eq!(h264_sps_mit_vui(&VT_1080P).unwrap().len(), 20);
+        assert_eq!(h264_sps_mit_vui(&VT_720P).unwrap().len(), 19);
     }
 
     #[test]
@@ -581,6 +631,60 @@ mod tests {
             assert_eq!(reorder, 0);
             assert_eq!(puffer, 1);
         }
+    }
+
+    /// Rundlauf der Farbe im eingesetzten VUI, gelesen wie ein Decoder es
+    /// liest (E.1.1): video_signal_type_present_flag 1, video_format 5,
+    /// video_full_range_flag 1, colour_description 1/1/1 - fuer die echten
+    /// SPS aus VideoToolbox und die kuenstlichen mit und ohne Beschnitt. Ein
+    /// SPS, dessen VUI Bereich und Matrix schon nennt (hier BT.601 begrenzt,
+    /// wie der bgra-Weg), bleibt, wie es ist - ebenso eines mit VUI ohne
+    /// Farbe.
+    #[test]
+    fn vui_sagt_bt709_voll() {
+        let alle = [VT_1080P.to_vec(), VT_720P.to_vec(), test_sps(false, false), test_sps(false, true)];
+        for alt in alle {
+            let neu = h264_sps_mit_vui(&alt).expect("wird umgeschrieben");
+            let rbsp = entschuetzen(&neu[1..]);
+            let felder = sps_lesen(&rbsp).unwrap();
+            assert!(felder.vui_present);
+            let mut l = BitLeser::neu(&rbsp);
+            l.pos = felder.vui_flag_pos + 1;
+            assert_eq!((l.u1(), l.u1()), (Some(false), Some(false)), "aspect_ratio_info, overscan_info");
+            assert_eq!(vui_farbe_lesen(&mut l), Some(Some((5, true, Some((1, 1, 1))))));
+            // Und der Rest geht bis zum Abschluss auf.
+            assert!(vui_lesen(&rbsp, felder.vui_flag_pos).is_some());
+        }
+        let bt601_begrenzt = |s: &mut BitSchreiber| {
+            s.u1(false); // aspect_ratio_info_present_flag
+            s.u1(false); // overscan_info_present_flag
+            s.u1(true); // video_signal_type_present_flag
+            s.u(3, 5); // video_format
+            s.u1(false); // video_full_range_flag
+            s.u1(true); // colour_description_present_flag
+            s.u(8, 1);
+            s.u(8, 1);
+            s.u(8, 5); // matrix_coefficients BT.470BG
+            for _ in 0..7 {
+                s.u1(false); // chroma_loc bis bitstream_restriction
+            }
+        };
+        let mit = test_sps_mit(false, Some(&bt601_begrenzt));
+        let rbsp = entschuetzen(&mit[1..]);
+        let felder = sps_lesen(&rbsp).unwrap();
+        let mut l = BitLeser::neu(&rbsp);
+        l.pos = felder.vui_flag_pos + 3;
+        assert_eq!(vui_farbe_lesen(&mut l), Some(Some((5, false, Some((1, 1, 5))))), "das Test-SPS nennt BT.601 begrenzt");
+        assert_eq!(h264_sps_mit_vui(&mit), None);
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&mit);
+        assert_eq!(h264_au_mit_vui(&au), None);
+        let ohne_farbe = test_sps(true, false);
+        let rbsp = entschuetzen(&ohne_farbe[1..]);
+        let mut l = BitLeser::neu(&rbsp);
+        l.pos = sps_lesen(&rbsp).unwrap().vui_flag_pos + 3;
+        assert_eq!(vui_farbe_lesen(&mut l), Some(None));
+        assert_eq!(h264_sps_mit_vui(&ohne_farbe), None);
     }
 
     #[test]

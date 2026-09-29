@@ -1285,18 +1285,24 @@ mod mac {
         }
     }
 
-    /// Die Farbe, die eine Sitzung aus diesen HEVC-Parametersaetzen ablesen
-    /// wuerde (Formatbeschreibung wie in `sitzung_bauen`) - nur Test.
+    /// Die Farbe, die eine Sitzung aus diesen HEVC- oder H.264-Parametersaetzen
+    /// ablesen wuerde (Formatbeschreibung wie in `sitzung_bauen`) - nur Test.
     #[cfg(test)]
-    pub fn farbe_der_saetze(saetze: &Parametersaetze) -> Result<crate::hdr::Farbe, Fehler> {
-        let liste = saetze.liste(false);
+    pub fn farbe_der_saetze(saetze: &Parametersaetze, h264: bool) -> Result<crate::hdr::Farbe, Fehler> {
+        let liste = saetze.liste(h264);
         let zeiger: Vec<*const u8> = liste.iter().map(|s| s.as_ptr()).collect();
         let groessen: Vec<usize> = liste.iter().map(|s| s.len()).collect();
         let mut fd: CMFormatDescriptionRef = std::ptr::null();
         unsafe {
-            let st = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                std::ptr::null(), liste.len(), zeiger.as_ptr(), groessen.as_ptr(), 4, std::ptr::null(), &mut fd,
-            );
+            let st = if h264 {
+                CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    std::ptr::null(), liste.len(), zeiger.as_ptr(), groessen.as_ptr(), 4, &mut fd,
+                )
+            } else {
+                CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    std::ptr::null(), liste.len(), zeiger.as_ptr(), groessen.as_ptr(), 4, std::ptr::null(), &mut fd,
+                )
+            };
             if st != 0 || fd.is_null() {
                 return Err(Fehler { was: "Formatbeschreibung aus den Parametersaetzen", status: st });
             }
@@ -1818,16 +1824,30 @@ mod tests {
     #[test]
     fn farbe_aus_den_parametersaetzen() {
         let saetze = |v: &str, s: &str, p: &str| Parametersaetze { vps: vec![hex(v)], sps: vec![hex(s)], pps: vec![hex(p)] };
-        assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10, PPS_444_10)), Ok(crate::hdr::Farbe::SDR));
-        assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10_PQ, PPS_444_10_PQ)), Ok(crate::hdr::Farbe::PQ));
+        assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10, PPS_444_10), false), Ok(crate::hdr::Farbe::SDR));
+        assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10_PQ, PPS_444_10_PQ), false), Ok(crate::hdr::Farbe::PQ));
         // Das VUI des bgra-Wegs: CoreMedia nennt BT.470BG ITU_R_601_4, der
         // Bereich ist begrenzt - so rechnet die Anzeige BT.601 begrenzt.
         assert_eq!(
-            farbe_der_saetze(&saetze(VPS_420_8_BT601, SPS_420_8_BT601, PPS_420_8_BT601)),
+            farbe_der_saetze(&saetze(VPS_420_8_BT601, SPS_420_8_BT601, PPS_420_8_BT601), false),
             Ok(crate::hdr::Farbe { matrix: crate::hdr::MATRIX_601, voll: false, ..crate::hdr::Farbe::SDR })
         );
         // Das PQ-SPS liest sich wie das SDR-SPS: 4:4:4 10 Bit, also xf44.
         assert_eq!(hevc_sps_lesen(&hex(SPS_444_10_PQ)), Some(Bildart { chroma: 3, bits: 10, profil: 4 }));
+    }
+
+    /// H.264 vom Mac-Host (VideoToolbox schreibt kein VUI) mit dem VUI, das
+    /// der Windows-Client fuer NVDEC einsetzt (sps::h264_sps_mit_vui):
+    /// CoreMedia liest daraus BT.709 im vollen Bereich - ein zweiter Parser
+    /// neben dem Rundlauf in sps.rs. SPS 1080p vom M1 (wie sps.rs VT_1080P),
+    /// dazu ein PPS fuer High mit CABAC.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn h264_vui_des_clients_ist_bt709_voll() {
+        let alt = hex("27 64 00 33 ac 56 80 78 02 27 e5 40");
+        let neu = crate::sps::h264_sps_mit_vui(&alt).expect("wird umgeschrieben");
+        let saetze = |sps: &[u8]| Parametersaetze { vps: vec![], sps: vec![sps.to_vec()], pps: vec![hex("28 ee 3c b0")] };
+        assert_eq!(farbe_der_saetze(&saetze(&neu), true), Ok(crate::hdr::Farbe::SDR));
     }
 
     /// Hardware-Rundreise eines HDR10-Stroms (vthdrtest als Test): der
