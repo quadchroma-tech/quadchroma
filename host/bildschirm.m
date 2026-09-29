@@ -1,7 +1,9 @@
 // QuadChroma Host: Bildschirmwahl, Mac-Seite. Siehe bildschirm.h.
 #import "bildschirm.h"
 #import <AppKit/AppKit.h>
+#include <IOKit/graphics/IOGraphicsTypes.h>
 #include "qc_secure.h"
+#include <math.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -86,6 +88,44 @@ NSString *qc_bildschirm_kennung(uint32_t vendor, uint32_t model, uint32_t serial
     return [NSString stringWithFormat:@"v%u-m%u-s%u", vendor, model, serial];
 }
 
+int qc_bildschirm_modus_lesen(CGDirectDisplayID d, qc_bildschirm_modus *m) {
+    memset(m, 0, sizeof *m);
+    CGDisplayModeRef jetzt = CGDisplayCopyDisplayMode(d);
+    if (!jetzt) return 0;
+    m->pw = CGDisplayModeGetPixelWidth(jetzt);
+    m->ph = CGDisplayModeGetPixelHeight(jetzt);
+    m->punkte_w = CGDisplayModeGetWidth(jetzt);
+    m->punkte_h = CGDisplayModeGetHeight(jetzt);
+    m->hz = CGDisplayModeGetRefreshRate(jetzt);
+    CGDisplayModeRelease(jetzt);
+    // Die native Aufloesung: mit den HiDPI-Doppeln, sonst fehlt bei manchen
+    // Panels der native Eintrag. Ein 4K-Panel meldet "3840x2160" und "wie
+    // 1920x1080" als nativ, beide mit 3840x2160 Pixeln (gemessen am X27).
+    NSDictionary *opt = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
+    CFArrayRef alle = CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)opt);
+    if (alle) {
+        for (CFIndex i = 0; i < CFArrayGetCount(alle); i++) {
+            CGDisplayModeRef x = (CGDisplayModeRef)CFArrayGetValueAtIndex(alle, i);
+            if (!(CGDisplayModeGetIOFlags(x) & kDisplayModeNativeFlag)) continue;
+            size_t w = CGDisplayModeGetPixelWidth(x), h = CGDisplayModeGetPixelHeight(x);
+            if (w * h > m->nativ_w * m->nativ_h) { m->nativ_w = w; m->nativ_h = h; }
+        }
+        CFRelease(alle);
+    }
+    return 1;
+}
+
+void qc_stromgroesse_nativ(size_t pw, size_t ph, size_t nativ_w, size_t nativ_h, int *w, int *h) {
+    double f = 1.0;
+    if (nativ_w && nativ_h && pw && ph && (pw > nativ_w || ph > nativ_h))
+        f = fmin((double)nativ_w / (double)pw, (double)nativ_h / (double)ph);
+    long ow = lround((double)pw * f), oh = lround((double)ph * f);
+    if (ow > 65534) ow = 65534;      // INFO traegt u16
+    if (oh > 65534) oh = 65534;
+    *w = (int)ow & ~1;
+    *h = (int)oh & ~1;
+}
+
 // Die Produktion: ScreenCaptureKit fragen, Groesse und Hz aus dem
 // Anzeigemodus, Kennung aus den CGDisplay-Nummern. Zwei gleiche Kennungen
 // (zwei baugleiche Monitore ohne Seriennummer) bekommen die Unit angehaengt.
@@ -105,13 +145,15 @@ static NSArray<QCBildschirm *> *bildschirme_sck(void) {
     NSCountedSet *kennungen = [NSCountedSet set];
     for (SCDisplay *d in displays) {
         CGDirectDisplayID id_ = d.displayID;
-        CGDisplayModeRef m = CGDisplayCopyDisplayMode(id_);
-        size_t pw = m ? CGDisplayModeGetPixelWidth(m) : 0, ph = m ? CGDisplayModeGetPixelHeight(m) : 0;
-        double hz = m ? CGDisplayModeGetRefreshRate(m) : 0;
-        if (m) CGDisplayModeRelease(m);
+        qc_bildschirm_modus m;
+        qc_bildschirm_modus_lesen(id_, &m);
         NSString *k = qc_bildschirm_kennung(CGDisplayVendorNumber(id_), CGDisplayModelNumber(id_), CGDisplaySerialNumber(id_));
         [kennungen addObject:k];
-        QCBildschirm *b = [QCBildschirm kennung:k name:name_fuer(id_) displayID:id_ w:pw h:ph hz:hz haupt:id_ == haupt];
+        QCBildschirm *b = [QCBildschirm kennung:k name:name_fuer(id_) displayID:id_ w:m.pw h:m.ph hz:m.hz haupt:id_ == haupt];
+        b.punkte_w = m.punkte_w;
+        b.punkte_h = m.punkte_h;
+        b.nativ_w = m.nativ_w;
+        b.nativ_h = m.nativ_h;
         b.sc = d;
         double ep = 0, ea = 0;
         qc_bildschirm_edr(id_, &ep, &ea);

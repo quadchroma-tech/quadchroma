@@ -24,6 +24,18 @@ static _Atomic int g_erzwingen;
 static _Atomic int g_offen;           // Formen, die auf den Versand warten
 static int g_nil_gemeldet;            // "System liefert keinen Zeiger" nur einmal
 static int g_gross_gemeldet;          // Verkleinern nur einmal melden
+// Bildpunkte des Stroms je Punkt, in Tausendsteln (siehe zeiger.h).
+static _Atomic int g_massstab_promille = 1000;
+
+void qc_zeiger_massstab_setzen(double massstab) {
+    if (!(massstab > 0)) massstab = 1.0;
+    if (massstab < 0.1) massstab = 0.1;
+    if (massstab > 8.0) massstab = 8.0;
+    int neu = (int)lround(massstab * 1000.0);
+    if (atomic_exchange(&g_massstab_promille, neu) != neu) atomic_store(&g_erzwingen, 1);
+}
+
+double qc_zeiger_massstab(void) { return atomic_load(&g_massstab_promille) / 1000.0; }
 
 static void melden(const char *text) {
     if (g_log) g_log(text);
@@ -62,22 +74,27 @@ static void zeiger_pruefen(void) {
         melden("Zeigerform: das System liefert wieder einen Zeiger");
     }
     NSSize sz = img.size;
-    int qw = (int)ceil(sz.width), qh = (int)ceil(sz.height);
+    if (!(sz.width > 0) || !(sz.height > 0)) return;
+    // Groesse im Strom: Punkte mal Massstab (Bildpunkte des Stroms je Punkt).
+    double m = qc_zeiger_massstab();
+    int qw = (int)ceil(sz.width * m), qh = (int)ceil(sz.height * m);
     if (qw <= 0 || qh <= 0) return;
     // Einpassen statt verwerfen: der Zeiger wird ohnehin gezeichnet, also
     // notfalls kleiner - Hotspot im selben Mass.
-    double f = 1.0;
+    double f = m;
     if (qw > QC_ZEIGER_MAX || qh > QC_ZEIGER_MAX) {
-        f = fmin((double)QC_ZEIGER_MAX / qw, (double)QC_ZEIGER_MAX / qh);
+        f = m * fmin((double)QC_ZEIGER_MAX / qw, (double)QC_ZEIGER_MAX / qh);
         if (!g_gross_gemeldet) {
             g_gross_gemeldet = 1;
             char t[160];
-            snprintf(t, sizeof t, "Zeigerform: Zeiger mit %dx%d Punkten wird auf %dx%d verkleinert",
-                     qw, qh, (int)ceil(qw * f), (int)ceil(qh * f));
+            snprintf(t, sizeof t, "Zeigerform: Zeiger mit %dx%d Bildpunkten wird auf %dx%d verkleinert",
+                     qw, qh, (int)ceil(sz.width * f), (int)ceil(sz.height * f));
             melden(t);
         }
     }
-    int w = (int)ceil(qw * f), h = (int)ceil(qh * f);
+    int w = (int)ceil(sz.width * f), h = (int)ceil(sz.height * f);
+    if (w > QC_ZEIGER_MAX) w = QC_ZEIGER_MAX;
+    if (h > QC_ZEIGER_MAX) h = QC_ZEIGER_MAX;
     if (w <= 0 || h <= 0) return;
     // Der Hotspot liegt bei NSCursor von links oben aus - wie bei Windows.
     NSPoint hot = c.hotSpot;
@@ -89,10 +106,11 @@ static void zeiger_pruefen(void) {
     // was der harmlosere Fehler ist.
     int sichtbar = CGCursorIsVisible() ? 1 : 0;
 
-    // In Bildpunkten zeichnen (ein Punkt = ein Bildpunkt): auf einem Retina-Mac
-    // waehlt AppKit die 2x-Darstellung und rechnet sie herunter. Was ankommt,
-    // hat die Groesse, die Windows fuer einen Zeiger erwartet; der Client
-    // zieht sie auf den Massstab seines Bildes hoch.
+    // In Bildpunkten des Stroms zeichnen: bei Massstab 2 (HiDPI, nativ
+    // gestreamt) waehlt AppKit fuer das doppelt so grosse Ziel die
+    // 2x-Darstellung - der Zeiger ist so scharf wie auf dem Mac selbst. Was
+    // ankommt, ist so gross wie der Zeiger im Bild; der Client bringt es auf
+    // den Massstab, in dem er das Bild zeigt.
     size_t n = (size_t)w * (size_t)h * 4;
     uint8_t *buf = calloc(n, 1);
     if (!buf) return;

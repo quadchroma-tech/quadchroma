@@ -1735,7 +1735,12 @@ display - each of them used to go through encoder, network and decoder.
 Now a frame gets the next free time slot or is dropped ("zu schnell", too
 fast, in the host's log), and the encoder never gets more than a few
 frames at once ("Encoder voll", encoder full) - better a skipped frame
-than a queue that delays every movement by seconds.
+than a queue that delays every movement by seconds. The Mac host keeps
+at most two frames in its encoder: one being encoded, one waiting, so
+the encoder never runs dry. At native 4K the encoder is the bottleneck
+(M1, every frame different: HEVC 4:4:4 10 bit 85 frames/s, 11.8 ms per
+frame); a third frame would only wait behind two others, about 12 ms
+more latency for no extra throughput.
 
 The same applies to congestion on the network: if more than 2 MB for the
 viewer are waiting unsent (512 kB in gaming mode), the next frame does not
@@ -1877,7 +1882,15 @@ cursor, spinning wait cursor. The host sends the shape only when it
 changes. The pointer is never hidden here - macOS hides its pointer while
 you type and keeps it hidden until the physical mouse moves, which,
 driven from the client, it never does. The size follows the picture
-scale: at 1:1 as large as on the Mac.
+scale: at 1:1 as large as on the Mac. The host sends the shape in pixels
+of the stream - a Mac in a HiDPI mode is streamed natively, so its
+pointer comes at twice its point size, drawn from the sharp 2x artwork.
+The client scales it with the picture: enlarged by whole factors, pixel
+for pixel; reduced exactly (area average) when the picture appears
+smaller than the stream, for example a 4K stream on a 1080p screen. On
+the Mac client winit builds the pointer in points, so the client divides
+by the window's backing scale (2 on Retina); the shape is then drawn at
+1x resolution.
 
 Everything else goes to the Mac. What is transmitted is the position of
 the key, not the character, so umlauts and AltGr come out right without
@@ -1981,8 +1994,8 @@ it only remembers the target, and the stream starts only with the next
 viewer.
 
 The switch works like a codec switch, in the stream's thread: stop the
-old stream, take the stream size from the new display (Mac: halved from
-3840 pixels wide or 2160 high, kept even, --out takes precedence;
+old stream, take the stream size from the new display (Mac: native, see
+"Stream size on the Mac" below, --out takes precedence;
 Windows: halved from 3840 wide), open a new encoder if the size differs,
 then send the viewer message 7 (SWITCH with the current codec - the
 client rebuilds its decoder), message 1 (INFO with the dimensions), the
@@ -2038,6 +2051,37 @@ Rueckkehr" -, and the setup attempt every 2 s takes the target: SWITCH
 and INFO as soon as it is a different display (INFO also on a different
 size), then "Aufnahme wiederhergestellt: ..." (capture restored) and a
 keyframe.
+
+Stream size on the Mac: the host streams exactly the pixels the display
+is set to, never halved (decision of 29 September 2026: native as the
+basis). The pixels are those of the display mode, in a HiDPI mode the
+pixels behind the points:
+
+    3840x2160 (native 4K panel mode)              -> 3840x2160
+    "looks like 1920x1080" (HiDPI) on a 4K panel  -> 3840x2160
+    1920x1080 without HiDPI on a 4K panel         -> 1920x1080
+    "looks like 2560x1440" (HiDPI) on a 4K panel  -> 3840x2160
+    "looks like 2560x1440" on a 5K panel          -> 5120x2880
+
+A scaled HiDPI mode renders more pixels than the panel has ("looks like
+2560x1440" draws 5120x2880 and hands 3840x2160 to the panel); the host
+then streams the panel's native resolution (the largest mode macOS marks
+as native), keeping the aspect ratio - more than that is not visible on
+the Mac either. Odd sizes lose one pixel. --out <B>x<H> takes precedence
+over all of this, for a smaller stream. If the streamed display changes
+its mode while a viewer watches (another resolution, HiDPI on or off),
+the stream follows like a display switch - new encoder, SWITCH, INFO,
+keyframe - with the reason "Aufloesung geaendert: Strom <B>x<H> ->
+<B>x<H>" (resolution changed). A mode with the same pixels and other
+points (3840x2160 against "looks like 1920x1080") keeps the stream and
+only changes the pointer scale. The mouse is unaffected: the host maps
+the client's position onto the display in points. Measured on the M1
+(VideoToolbox, every frame different, at most two frames in flight):
+3840x2160 HEVC 4:4:4 10 bit 85 frames/s, 4:4:4 8 bit 91, 4:2:0 10 bit
+89, 4:2:0 8 bit 96; 1920x1080 HEVC 4:4:4 10 bit 187. The M1's H.264
+encoder takes 3840x2160 but refuses 5120x2880 and larger (a 5K or 6K
+panel, measured): a switch to H.264 fails there, and the stream stays on
+its previous codec (HEVC opens up to 7680x4320).
 
 bildschirm.txt: the request is stored in the host's data folder, exactly
 one line, "auto" or the identifier:
@@ -2098,12 +2142,17 @@ reason, <Fehler> error:
     "Bildschirm --display N: <Text> gilt als Wunsch fuer diesen Lauf"
     "Bildschirm N nicht verfuegbar (M in der Liste) - Automatik" or
      "... - der Wunsch aus bildschirm.txt gilt"
-    "Bildschirm <Text> (<B>x<H> Pixel, <Hz> Hz) -> <B>x<H>, <fps> fps
+    "Bildschirm <Text>: <Masse>, <Hz> Hz -> <B>x<H>, <fps> fps
      - Automatik (folgt dem Hauptbildschirm)" or "... - Wunsch
      <Kennung>"                                 (at service start)
     "Bildschirm gewaehlt: <Text>, <B>x<H> Pixel, <Hz> Hz
      [ (Hauptbildschirm)][ - Ausweichplatz]"       (once per target)
-    "Aufnahme gestartet: Bildschirm <B>x<H>, <Hz> Hz, <Text> -> <B>x<H>"
+    "Aufnahme gestartet: Bildschirm <Masse>, <Hz> Hz, <Text> -> <B>x<H>"
+     for example, 4K panel in "looks like 1920x1080":
+     "Aufnahme gestartet: Bildschirm 3840x2160 (HiDPI, wie 1920x1080),
+     120 Hz, Kennung 2 (v1138-m1234-s0) "X27 X1" -> 3840x2160"
+    "Zeigerform: Massstab <m> (Strom <B> Bildpunkte breit, Bildschirm
+     <P> Punkte)"      (pointer scale, when it changes: 2.00 for HiDPI)
     "Bildschirmwunsch: <Kennung|Automatik>" (plus " - bildschirm.txt
      liess sich nicht schreiben" if saving fails)
     "Bildschirmwunsch: <Kennung> - nicht angeschlossen, Ausweichplatz
@@ -2115,8 +2164,9 @@ reason, <Fehler> error:
      "Wunsch des Zuschauers" (viewer's request), "Wunsch des
      Zuschauers: Automatik" (the viewer switched to Automatic),
      "Hauptbildschirm gewechselt" (main display changed),
-     "Ausweichplatz" (fallback) and "zurueck zum gewuenschten
-     Bildschirm" (back to the requested display)
+     "Ausweichplatz" (fallback), "zurueck zum gewuenschten
+     Bildschirm" (back to the requested display) and "Aufloesung
+     geaendert: Strom <B>x<H> -> <B>x<H>" (same display, other mode)
     "Bildschirmwechsel: <alt> -> <neu> (<Grund>) nicht vollzogen"
      (plus " - Ausweichweg wie beim Bildschirmverlust" if a viewer is
      present; without a viewer only the target is kept)
@@ -2128,10 +2178,17 @@ reason, <Fehler> error:
     "Aufnahme gestoppt: <Fehler> (Code <n>)"             (display loss)
     "Kein Bildschirm - warte auf seine Rueckkehr"
     "Aufnahme: neuer Versuch in 3 s"
-    "Aufnahme wiederhergestellt: Bildschirm <B>x<H>, <Hz> Hz, <Text>"
+    "Aufnahme wiederhergestellt: Bildschirm <Masse>, <Hz> Hz, <Text> ->
+     <B>x<H>"
+
+<Masse> is the display's pixel size, "<B>x<H>", in a HiDPI mode followed
+by " (HiDPI, wie <b>x<h>)" (its size in points), and with ", Panel
+<B>x<H>" (or " (Panel <B>x<H>)") when the mode has more pixels than the
+panel.
 
 --list writes for each display "Display N: id=<n>, Kennung <Kennung>,
-Name "<Name>", <B> x <H> Pixel, <Hz> Hz  (Hauptbildschirm)".
+Name "<Name>", <Masse> Pixel, <Hz> Hz  (Hauptbildschirm), Strom <B>x<H>,
+EDR-Kopfraum ..." - Strom is the size the host would stream.
 
 Log lines of the Windows host role (host-protokoll.txt); <Text> is
 "<Kennung> (<Name>)", for example "ACR0501 (X27 X1)":

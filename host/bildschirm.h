@@ -66,11 +66,17 @@
 // maximumPotential... bzw. maximumExtendedDynamicRangeColorComponentValue;
 // 1.0 = SDR, 0 = unbekannt). Ueber 1.0 potentiell gilt der Bildschirm als
 // HDR-faehig - dann darf der Host ihn als HDR aufnehmen (HDR-Plan 5.1).
+// punkte_w, punkte_h: derselbe Modus in Punkten (bei HiDPI die Haelfte der
+// Pixel: "wie 1920x1080" auf einem 4K-Panel sind 1920x1080 Punkte, 3840x2160
+// Pixel); nativ_w, nativ_h: die native Aufloesung des Panels. 0 = unbekannt
+// (Attrappen, virtuelle Bildschirme ohne native Modi).
 @interface QCBildschirm : NSObject
 @property (nonatomic) CGDirectDisplayID displayID;
 @property (nonatomic, copy) NSString *kennung;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) size_t w, h;
+@property (nonatomic) size_t punkte_w, punkte_h;
+@property (nonatomic) size_t nativ_w, nativ_h;
 @property (nonatomic) double hz;
 @property (nonatomic) BOOL haupt;
 @property (nonatomic, strong) SCDisplay *sc;
@@ -81,6 +87,8 @@
 // gleich sind - so erkennt der Host, ob sich die Liste geaendert hat. Der
 // EDR-Kopfraum zaehlt nicht mit: er steht nicht in Nachricht 12, und sein
 // Wechsel (HDR am Host an/aus) ist Sache der HDR-Entscheidung (main.m).
+// Punkte und native Aufloesung ebenso wenig: Stromgroesse und Zeigermassstab
+// prueft main.m bei jeder Bewertung selbst.
 - (BOOL)isEqual:(id)other;
 // Kann dieser Bildschirm HDR zeigen? Potentieller EDR-Kopfraum ueber 1.0.
 - (BOOL)hdr;
@@ -109,6 +117,26 @@ int qc_bildschirm_edr(CGDirectDisplayID d, double *potentiell, double *aktuell);
 // Stabile Kennung aus den drei Nummern; die Unit haengt der Lieferant nur
 // bei Gleichheit an.
 NSString *qc_bildschirm_kennung(uint32_t vendor, uint32_t model, uint32_t serial);
+
+// Der laufende Modus eines Bildschirms: Pixel (bei HiDPI die Pixel hinter
+// den Punkten), Punkte, Hz und die native Aufloesung des Panels - die
+// groessten Pixelmasse unter den Modi mit kDisplayModeNativeFlag, 0 ohne
+// solche Modi. Rueckgabe 0 ohne Modus (alles 0).
+typedef struct {
+    size_t pw, ph;               // Pixel
+    size_t punkte_w, punkte_h;   // Punkte
+    size_t nativ_w, nativ_h;     // native Aufloesung des Panels
+    double hz;
+} qc_bildschirm_modus;
+int qc_bildschirm_modus_lesen(CGDirectDisplayID d, qc_bildschirm_modus *m);
+
+// Stromgroesse ohne --out (Produktentscheidung 2026-09-29: nativ als Basis):
+// genau die Pixel des Modus, hoechstens die native Aufloesung des Panels
+// (nativ 0 = unbekannt: keine Grenze) bei gleichem Seitenverhaeltnis, immer
+// gerade. Ein skalierter HiDPI-Modus ("wie 2560x1440" auf einem 4K-Panel)
+// rechnet intern mit 5120x2880 und gibt 3840x2160 aufs Panel - mehr sieht
+// auch der Mac selbst nicht, gestreamt werden die 3840x2160.
+void qc_stromgroesse_nativ(size_t pw, size_t ph, size_t nativ_w, size_t nativ_h, int *w, int *h);
 
 // ------------------------------------------------------------------- Wahl
 

@@ -14,11 +14,14 @@
 // Uebertragung, Sitzungsbindung des Wegs, Zuschauer ohne Eingabekanal,
 // aelterer Client ohne IN_FAEHIGKEITEN, Faehigkeit nur fuer den Eingabekanal,
 // der sie gemeldet hat), Bildschirmwahl (Pruefvektoren der Nachrichten 12 und
-// 70, Kuerzen, reine Wahl, Stromgroesse, bildschirm.txt, --display als Pin,
+// 70, Kuerzen, reine Wahl, Stromgroesse nativ - 4K, HiDPI, ueber dem Panel,
+// --out -, bildschirm.txt, --display als Pin,
 // Begruessung mit Faehigkeiten 7 und Liste, Automatik folgt dem
 // Hauptbildschirm entprellt (INFO als Fassung 1 in SDR, SWITCH mit Transfer
 // SDR), Wunsch ueber den echten Eingabekanal, fehlender
 // Wunsch mit Ausweichplatz und Rueckkehr, andere Groesse mit neuem Encoder,
+// andere Aufloesung am selben Bildschirm (HiDPI 3840x2160 mit echtem
+// Encoder, Zeigermassstab 2 / 1 / 1,5, Encoder voll ab zwei offenen Bildern),
 // Warten auf einen Codecwechsel (endet, sobald kein Wechsel mehr ansteht;
 // 5-s-Frist), leere Liste bei laufendem Strom, Bildschirmverlust und
 // Wiederherstellung - Liste und Strom aus Attrappen, Encoder echt),
@@ -2952,19 +2955,57 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pruefe(qc_bildschirm_wahl(@[], @"a", &grund) == nil && grund == QC_WAHL_KEINER, "Wahl: leere Liste -> keiner");
     pruefe([qc_bildschirm_kennung(1138, 1234, 0) isEqualToString:@"v1138-m1234-s0"], "Kennung aus Vendor, Model, Serial");
 
+    // Nativ (Produktentscheidung 2026-09-29): die Pixel des Modus, keine
+    // Halbierung mehr; ein Modus ueber dem Panel auf die native Aufloesung.
     int sw = 0, sh = 0;
     g_out_fest_w = g_out_fest_h = 0;
-    stromgroesse_fuer(bs(@"k", @"4K", 1, 3840, 2160, 60, NO), &sw, &sh);
-    int ok_4k = sw == 1920 && sh == 1080;
+    QCBildschirm *k4 = bs(@"k", @"4K nativ", 1, 3840, 2160, 60, NO);
+    k4.punkte_w = 3840; k4.punkte_h = 2160; k4.nativ_w = 3840; k4.nativ_h = 2160;
+    QCBildschirm *hidpi = bs(@"k", @"4K HiDPI", 1, 3840, 2160, 60, NO);
+    hidpi.punkte_w = 1920; hidpi.punkte_h = 1080; hidpi.nativ_w = 3840; hidpi.nativ_h = 2160;
+    QCBildschirm *fhd = bs(@"k", @"1080 an 4K", 1, 1920, 1080, 60, NO);
+    fhd.punkte_w = 1920; fhd.punkte_h = 1080; fhd.nativ_w = 3840; fhd.nativ_h = 2160;
+    QCBildschirm *skal = bs(@"k", @"wie 2560 an 4K", 1, 5120, 2880, 60, NO);
+    skal.punkte_w = 2560; skal.punkte_h = 1440; skal.nativ_w = 3840; skal.nativ_h = 2160;
+    QCBildschirm *k5 = bs(@"k", @"5K", 1, 5120, 2880, 60, NO);
+    k5.punkte_w = 2560; k5.punkte_h = 1440; k5.nativ_w = 5120; k5.nativ_h = 2880;
+    stromgroesse_fuer(k4, &sw, &sh);
+    int ok_4k = sw == 3840 && sh == 2160;
+    stromgroesse_fuer(hidpi, &sw, &sh);
+    int ok_hidpi = sw == 3840 && sh == 2160;
+    stromgroesse_fuer(fhd, &sw, &sh);
+    int ok_fhd = sw == 1920 && sh == 1080;
+    stromgroesse_fuer(skal, &sw, &sh);
+    int ok_skal = sw == 3840 && sh == 2160;
+    stromgroesse_fuer(k5, &sw, &sh);
+    int ok_5k = sw == 5120 && sh == 2880;
+    stromgroesse_fuer(bs(@"k", @"ohne Modi", 1, 3840, 2160, 60, NO), &sw, &sh);
+    int ok_ohne = sw == 3840 && sh == 2160;
     stromgroesse_fuer(bs(@"k", @"breit", 1, 3840, 1080, 60, NO), &sw, &sh);
-    int ok_breit = sw == 1920 && sh == 1080;
+    int ok_breit = sw == 3840 && sh == 1080;
     stromgroesse_fuer(bs(@"k", @"ungerade", 1, 1921, 1081, 60, NO), &sw, &sh);
     int ok_gerade = sw == 1920 && sh == 1080;
+    int w16 = 0, h16 = 0;
+    qc_stromgroesse_nativ(5120, 3200, 3840, 2160, &w16, &h16);    // 16:10 ueber einem 16:9-Panel: Seitenverhaeltnis bleibt
+    int ok_seiten = w16 == 3456 && h16 == 2160;
     g_out_fest_w = 640; g_out_fest_h = 360;
-    stromgroesse_fuer(bs(@"k", @"4K", 1, 3840, 2160, 60, NO), &sw, &sh);
+    stromgroesse_fuer(hidpi, &sw, &sh);
     int ok_out = sw == 640 && sh == 360;
+    stromgroesse_fuer(k5, &sw, &sh);
+    ok_out = ok_out && sw == 640 && sh == 360;
     g_out_fest_w = g_out_fest_h = 0;
-    pruefe(ok_4k && ok_breit && ok_gerade && ok_out, "Stromgroesse: ab 3840 bzw. 2160 halbiert, gerade, --out hat Vorrang");
+    printf("         (4K %d, HiDPI %d, 1080 an 4K %d, skaliert %d, 5K %d, ohne Modi %d, breit %d, gerade %d, 16:10 %dx%d, --out %d)\n",
+           ok_4k, ok_hidpi, ok_fhd, ok_skal, ok_5k, ok_ohne, ok_breit, ok_gerade, w16, h16, ok_out);
+    pruefe(ok_4k && ok_hidpi && ok_fhd && ok_ohne && ok_breit && ok_gerade && ok_out,
+           "Stromgroesse nativ: 4K 3840x2160, HiDPI wie 1920x1080 (3840x2160 Pixel) 3840x2160, 1920x1080 an 4K 1920x1080, "
+           "ohne Halbierung, gerade, --out hat Vorrang");
+    pruefe(ok_skal && ok_5k && ok_seiten,
+           "ueber dem Panel (wie 2560x1440 an 4K, 5120x2880 Pixel): 3840x2160; 5K-Panel 5120x2880; Seitenverhaeltnis bleibt");
+    pruefe([bildschirm_masse(k4) isEqualToString:@"3840x2160"] &&
+           [bildschirm_masse(hidpi) isEqualToString:@"3840x2160 (HiDPI, wie 1920x1080)"] &&
+           [bildschirm_masse(skal) isEqualToString:@"5120x2880 (HiDPI, wie 2560x1440, Panel 3840x2160)"] &&
+           [bildschirm_masse(bs(@"k", @"Attrappe", 1, 1920, 1080, 60, NO)) isEqualToString:@"1920x1080"],
+           "Masse in den Protokollzeilen: HiDPI mit Punkten, ueber dem Panel mit dessen Aufloesung, sonst nur die Pixel");
 
     printf("\n-- Bildschirm: bildschirm.txt\n");
     char pfad[1200];
@@ -3441,6 +3482,116 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
     pruefe(zeilen_mit(logpfad, "-> Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" (Wunsch des Zuschauers: Automatik)") == 1 &&
            zeilen_mit(logpfad, "(Hauptbildschirm gewechselt)") == haupt_zeilen_vorher,
            "Protokollzeile mit Grund \"Wunsch des Zuschauers: Automatik\", keine weitere \"Hauptbildschirm gewechselt\"");
+
+    printf("\n-- Bildschirm: nativ - Aufloesung am selben Bildschirm, HiDPI, Zeigermassstab (echter Encoder 3840x2160)\n");
+    // Der gestreamte Bildschirm (Kennung 6, 1920x1080) wird umgestellt: HiDPI
+    // "wie 1920x1080" an einem 4K-Panel, 3840x2160 Pixel. Der Strom folgt
+    // nativ - neuer Encoder, SWITCH, INFO und g_cfg 3840x2160, derselbe
+    // Bildschirm, die Maus bleibt (sie rechnet in Punkten), der Zeiger
+    // bekommt Massstab 2. Frueher blieb die alte Groesse stehen.
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    int info_fhd = g_info_w;
+    double zm_fhd = qc_zeiger_massstab();
+    QCBildschirm *B_hidpi = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 3840, 2160, 240, YES);
+    B_hidpi.punkte_w = 1920; B_hidpi.punkte_h = 1080; B_hidpi.nativ_w = 3840; B_hidpi.nativ_h = 2160;
+    liste_setzen(@[ B_hidpi, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    printf("         (vorher Strom %d breit, Zeigermassstab %.2f; nach HiDPI: %s, INFO %ux%u, Zeigermassstab %.2f)\n",
+           info_fhd, zm_fhd, g.folge, info_w(&g), info_h(&g), qc_zeiger_massstab());
+    stand_zeile("HiDPI wie 1920x1080 an 4K");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && atomic_load(&g_fabrik_zuletzt) == 6 && display_jetzt() == 6 &&
+           atomic_load(&g_input_display) == 6 && strstr(g.folge, "7 1 12") && g.wechsel == 1 &&
+           info_w(&g) == 3840 && info_h(&g) == 2160 && g_info_w == 3840 && g_info_h == 2160 &&
+           atomic_load(&g_fabrik_cfg_w) == 3840 && atomic_load(&g_fabrik_cfg_h) == 2160 &&
+           session_jetzt() != NULL && zeilen_mit(logpfad, "Encoder: Kandidat 3 HEVC 4:2:0 8 Bit, 3840x2160") == 1,
+           "HiDPI wie 1920x1080 (3840x2160 Pixel) am gestreamten Bildschirm: der Strom folgt nativ - Encoder, g_cfg und INFO 3840x2160, SWITCH davor");
+    pruefe(info_fhd == 1920 && fabs(zm_fhd - 1.0) < 1e-6 && fabs(qc_zeiger_massstab() - 2.0) < 1e-6 &&
+           zeilen_mit(logpfad, "Bildschirmwechsel: Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" -> Kennung 6 (v0-m0-s0) \"Virtuell 16:9\" "
+                               "(Aufloesung geaendert: Strom 1920x1080 -> 3840x2160)") == 1 &&
+           zeilen_mit(logpfad, "Zeigerform: Massstab 2.00 (Strom 3840 Bildpunkte breit, Bildschirm 1920 Punkte)") == 1,
+           "Zeiger vorher Massstab 1, jetzt 2 (3840 Bildpunkte auf 1920 Punkte); Zeilen zum Wechsel und zum Massstab");
+    CVPixelBufferRef pb_4k = testpuffer(3840, 2160);
+    stdout_stumm(1);
+    bild_einspeisen(pb_4k);
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    pruefe(g.bilder == 1 && g.erstes_voll == 1, "das erste Bild in 3840x2160 ist ein Vollbild");
+    // Encoder voll: ab zwei offenen Bildern faellt ein echtes weg (bei 4K
+    // ist der Encoder der Engpass - kein drittes wartet mit).
+    long stau_vorher = atomic_load(&g_enc_stau), schnell_vorher = atomic_load(&g_zu_schnell);
+    usleep(50 * 1000);
+    dispatch_sync(g_capq, ^{ atomic_store(&g_inflight, QC_ENCODER_OFFEN_MAX); });
+    stdout_stumm(1);
+    bild_einspeisen(pb_4k);
+    stdout_stumm(0);
+    int offen_danach = 0;
+    dispatch_sync(g_capq, ^{});
+    offen_danach = atomic_load(&g_inflight);
+    dispatch_sync(g_capq, ^{ atomic_store(&g_inflight, 0); });
+    stdout_stumm(1);
+    alles_lesen(&H, 200, &g);
+    stdout_stumm(0);
+    pruefe(QC_ENCODER_OFFEN_MAX == 2 && atomic_load(&g_enc_stau) == stau_vorher + 1 && atomic_load(&g_zu_schnell) == schnell_vorher &&
+           offen_danach == QC_ENCODER_OFFEN_MAX && g.bilder == 0,
+           "Encoder voll: bei zwei offenen Bildern faellt ein echtes weg, statt als drittes zu warten");
+    // Dieselben Pixel, andere Punkte (3840x2160 ohne HiDPI): kein neuer
+    // Strom, nur der Zeigermassstab.
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    VTCompressionSessionRef s_4k = session_jetzt();
+    QCBildschirm *B_4k = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 3840, 2160, 240, YES);
+    B_4k.punkte_w = 3840; B_4k.punkte_h = 2160; B_4k.nativ_w = 3840; B_4k.nativ_h = 2160;
+    liste_setzen(@[ B_4k, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    stdout_stumm(0);
+    double zm_4k = qc_zeiger_massstab();
+    // Skaliert "wie 2560x1440" (5120x2880 Pixel an einem 4K-Panel): gestreamt
+    // wird, was das Panel zeigt - 3840x2160, derselbe Strom, Zeiger 1,5.
+    QCBildschirm *B_skal = bs(@"v0-m0-s0", @"Virtuell 16:9", 6, 5120, 2880, 240, YES);
+    B_skal.punkte_w = 2560; B_skal.punkte_h = 1440; B_skal.nativ_w = 3840; B_skal.nativ_h = 2160;
+    liste_setzen(@[ B_skal, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    gelesen g_skal;
+    alles_lesen(&H, 300, &g_skal);
+    stdout_stumm(0);
+    printf("         (3840x2160 nativ: %s, Zeiger %.2f; wie 2560x1440: %s, Zeiger %.2f; Strom %dx%d)\n",
+           g.folge, zm_4k, g_skal.folge, qc_zeiger_massstab(), g_info_w, g_info_h);
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher && g.wechsel == 0 && g_skal.wechsel == 0 && session_jetzt() == s_4k &&
+           g_info_w == 3840 && g_info_h == 2160 && fabs(zm_4k - 1.0) < 1e-6 && fabs(qc_zeiger_massstab() - 1.5) < 1e-6 &&
+           zeilen_mit(logpfad, "Zeigerform: Massstab 1.00 (Strom 3840 Bildpunkte breit, Bildschirm 3840 Punkte)") == 1 &&
+           zeilen_mit(logpfad, "Zeigerform: Massstab 1.50 (Strom 3840 Bildpunkte breit, Bildschirm 2560 Punkte)") == 1,
+           "3840x2160 ohne HiDPI und skaliert wie 2560x1440 (Panel 3840x2160): der Strom bleibt 3840x2160, nur der Zeigermassstab folgt (1 bzw. 1,5)");
+    // Zurueck auf 1920x1080: der Strom folgt, Zeiger wieder 1.
+    fabrik_vorher = atomic_load(&g_fabrik_aufrufe);
+    liste_setzen(@[ B2, A2, C ]);
+    stdout_stumm(1);
+    bildschirm_konfiguration_geaendert();
+    usleep(600 * 1000);
+    dispatch_sync(g_lifeq, ^{});
+    alles_lesen(&H, 300, &g);
+    bild_einspeisen(pb_gross);
+    gelesen g_bild;
+    alles_lesen(&H, 300, &g_bild);
+    stdout_stumm(0);
+    stand_zeile("zurueck auf 1920x1080");
+    pruefe(atomic_load(&g_fabrik_aufrufe) == fabrik_vorher + 1 && display_jetzt() == 6 && strstr(g.folge, "7 1 12") && g.wechsel == 1 &&
+           info_w(&g) == 1920 && info_h(&g) == 1080 && g_info_w == 1920 && g_info_h == 1080 &&
+           atomic_load(&g_fabrik_cfg_w) == 1920 && fabs(qc_zeiger_massstab() - 1.0) < 1e-6 &&
+           zeilen_mit(logpfad, "(Aufloesung geaendert: Strom 3840x2160 -> 1920x1080)") == 1 &&
+           g_bild.bilder == 1 && g_bild.erstes_voll == 1,
+           "zurueck auf 1920x1080: der Strom folgt (INFO 1920x1080, Vollbild), der Zeiger hat wieder Massstab 1");
+    CVPixelBufferRelease(pb_4k);
 
     printf("\n-- HDR: IN_ANZEIGE ueber den Eingabekanal (noch ohne HDR-Encoder)\n");
     // Bis hier hat H kein IN_ANZEIGE geschickt: jede Strominfo trug Grund 7.

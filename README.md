@@ -138,7 +138,9 @@ graphics card the CPU draws.
   is one app for both directions - client and host in one process with one icon; on the
   Mac the Rust client has the Objective-C host engine built in.
 - Pointer on the client side: the client shows its own local pointer in the shape the
-  host reports; the video never contains one.
+  host reports; the video never contains one. The shape comes in pixels of the stream
+  (a HiDPI Mac sends it at twice its point size) and the client scales it with the
+  picture, so it is as large relative to the picture as on the host.
 - Always encrypted: Noise XX with X25519, ChaCha20-Poly1305 and SHA-256, no switch to
   turn it off.
 - Access by password or click: every device has a permanent key and a nine-digit
@@ -567,6 +569,19 @@ texture path is bound to the device of the old Duplication). The client also reb
 its decoder on an INFO with new dimensions and waits for the keyframe. While a codec
 switch is in progress, the screen switch waits until it is done (the Mac host switches
 after 5 s regardless).
+
+The Mac host streams natively: exactly the pixels the display is set to, in a HiDPI
+mode the pixels behind the points - "looks like 1920x1080" on a 4K panel is streamed
+as 3840x2160, a plain 1920x1080 mode as 1920x1080, native 4K as 3840x2160. A scaled
+mode that renders more pixels than the panel has ("looks like 2560x1440" on a 4K panel
+draws 5120x2880) is streamed at the panel's native 3840x2160. `--out <W>x<H>` still
+takes precedence, for a smaller stream. If the streamed screen changes its mode while
+a viewer watches, the stream follows like a screen switch (reason `Aufloesung
+geaendert`, resolution changed); the mouse maps onto the screen in points and is
+unaffected, the pointer shape gets the new scale. At native 4K the M1's encoder is the
+bottleneck (HEVC 4:4:4 10 bit about 85 frames/s with every frame different); the host
+keeps at most two frames in it, so a busy encoder skips frames instead of queueing
+them.
 
 Unplugging the streamed screen is not a switch but a loss: the stream ends, the host
 reports "no screen" (message 9) and rebuilds the stream - the Mac after 2 s, the
@@ -1109,7 +1124,10 @@ exit code is the number of failures.
     channel. Received files go to a recorder instead of the clipboard, and the
     clipboard base lies in the test's own `HOME`.
   - Screen selection (`host/bildschirm.m`): test vectors of messages 12 and 70;
-    truncation at character boundaries; the pure selection logic; stream size;
+    truncation at character boundaries; the pure selection logic; the native stream
+    size (4K, HiDPI, scaled modes above the panel, `--out` first); a mode change on
+    the streamed screen with a real 3840x2160 encoder, the pointer scale (2, 1, 1.5)
+    and "encoder full" from two open frames;
     `bildschirm.txt` (also broken); `--display` as a pin for the run; the greeting
     with capabilities 7 and the list; Automatic follows the main screen (debounced);
     a request via the real input channel; a missing requested screen with fallback
