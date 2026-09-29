@@ -2097,6 +2097,9 @@ fn sitzung(stand: &mut Bildschirmstand) {
                                 netz::hdr_neu_entscheiden(if quelle_hdr { "Desktop jetzt HDR" } else { "Desktop jetzt SDR" });
                                 farbe_faellig = true;
                             }
+                            // Die Zeigerform geht in Strompunkten hinaus:
+                            // halbiert der Strom, halbiert sich der Zeiger.
+                            zeiger.massstab_setzen(if halb { 0.5 } else { 1.0 });
                             auf = Some(neu);
                             letztes = None;
                             if verloren {
@@ -2517,6 +2520,8 @@ fn zeiger_auswerten(dup: &Duplication, zi: &ZeigerInfo, zeiger: &mut Zeiger, feh
             }
         }
     }
+    // Nur der Rueckfall: sichtbar und eingefangen entscheidet der
+    // Fangwaechter aus GetCursorInfo (zeiger.rs).
     if zi.maus_aktualisiert {
         zeiger.sichtbar_setzen(zi.sichtbar);
     }

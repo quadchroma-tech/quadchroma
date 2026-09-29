@@ -288,6 +288,8 @@ pub static ET: Lang = Lang {
         (HdrWhyNegotiating, "kokkuleppimisel …"),
         (HdrWhyOldHost, "host ei toeta HDR-i (vanem versioon)"),
         (StatColor, "Värv"),
+        (ShortcutMouseCapture, "Püüa või vabasta hiir (mängud)"),
+        (MouseCapturedHint, "Hiir on püütud · F8 vabastab selle"),
     ],
 };
 
@@ -576,6 +578,8 @@ pub static LV: Lang = Lang {
         (HdrWhyNegotiating, "notiek saskaņošana …"),
         (HdrWhyOldHost, "hosts neatbalsta HDR (vecāka versija)"),
         (StatColor, "Krāsa"),
+        (ShortcutMouseCapture, "Tvert vai atbrīvot peli (spēles)"),
+        (MouseCapturedHint, "Pele notverta · F8 to atbrīvo"),
     ],
 };
 
@@ -864,6 +868,8 @@ pub static LT: Lang = Lang {
         (HdrWhyNegotiating, "derinama …"),
         (HdrWhyOldHost, "hostas nepalaiko HDR (senesnė versija)"),
         (StatColor, "Spalva"),
+        (ShortcutMouseCapture, "Pagauti arba atleisti pelę (žaidimai)"),
+        (MouseCapturedHint, "Pelė pagauta · F8 ją atleidžia"),
     ],
 };
 
@@ -1152,6 +1158,8 @@ pub static SL: Lang = Lang {
         (HdrWhyNegotiating, "dogovarjanje …"),
         (HdrWhyOldHost, "gostitelj ne podpira HDR (starejša različica)"),
         (StatColor, "Barva"),
+        (ShortcutMouseCapture, "Zajemi ali sprosti miško (igre)"),
+        (MouseCapturedHint, "Miška zajeta · F8 jo sprosti"),
     ],
 };
 
@@ -1440,6 +1448,8 @@ pub static HR: Lang = Lang {
         (HdrWhyNegotiating, "usklađuje se …"),
         (HdrWhyOldHost, "host ne podržava HDR (starija verzija)"),
         (StatColor, "Boja"),
+        (ShortcutMouseCapture, "Uhvati ili otpusti miš (igre)"),
+        (MouseCapturedHint, "Miš uhvaćen · F8 ga otpušta"),
     ],
 };
 
@@ -1728,5 +1738,7 @@ pub static UK: Lang = Lang {
         (HdrWhyNegotiating, "узгоджується …"),
         (HdrWhyOldHost, "хост не підтримує HDR (старіша версія)"),
         (StatColor, "Колір"),
+        (ShortcutMouseCapture, "Захопити або відпустити мишу (ігри)"),
+        (MouseCapturedHint, "Мишу захоплено · F8 її відпускає"),
     ],
 };

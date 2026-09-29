@@ -1,7 +1,9 @@
 #import <AppKit/AppKit.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "zeiger.h"
 
@@ -24,6 +26,143 @@ static _Atomic int g_erzwingen;
 static _Atomic int g_offen;           // Formen, die auf den Versand warten
 static int g_nil_gemeldet;            // "System liefert keinen Zeiger" nur einmal
 static int g_gross_gemeldet;          // Verkleinern nur einmal melden
+static _Atomic double g_massstab = 1.0; // Strompunkte je Punkt des Bildschirms
+
+// Maus einfangen: was die Eingabe eingespeist hat (Eingabefaden) und der
+// Waechter samt letztem Urteil (Hauptwarteschlange, zeiger_pruefen).
+static _Atomic uint64_t g_bewegungen;
+static _Atomic uint64_t g_letzte_taste_us;
+static pthread_mutex_t g_ziel_mtx = PTHREAD_MUTEX_INITIALIZER;
+static double g_ziel_x, g_ziel_y;     // letzte absolute Bewegung (globale Punkte)
+static uint64_t g_ziel_us;            // wann (0 = keine, oder zuletzt relativ)
+static qc_fang_waechter g_waechter;
+static qc_fang_urteil g_urteil = { 1, 0, 0 };
+static int g_lage_zeilen;
+#define QC_ZEIGER_LAGE_ZEILEN 40
+#define QC_ZEIGER_FOLGT_TOLERANZ 3.0
+
+static void melden(const char *text);
+
+const qc_fang_art QC_FANG_MAC = { 0, 0, 1 };
+const qc_fang_art QC_FANG_WINDOWS = { 1, 1, 0 };
+
+static uint64_t jetzt_us(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000ull;
+}
+
+double qc_zeiger_massstab(double strom_w, double punkte_w) {
+    if (!(strom_w > 0) || !(punkte_w > 0)) return 1.0;
+    double m = strom_w / punkte_w;
+    if (m < 1.0 / 16) m = 1.0 / 16;
+    if (m > 16) m = 16;
+    return m;
+}
+
+void qc_zeiger_massstab_setzen(double m) {
+    if (!(m > 0) || m != m) m = 1.0;
+    double alt = atomic_exchange(&g_massstab, m);
+    if (alt != m) atomic_store(&g_erzwingen, 1);
+}
+
+qc_fang_urteil qc_fang_schritt(qc_fang_waechter *w, uint64_t jetzt, qc_zeiger_lage lage,
+                               qc_eingabe_zaehler ein, qc_fang_art art) {
+    if (!lage.versteckt) {
+        w->versteckt = 0;
+        w->grund_offen = 0;
+        if (w->gefangen) {
+            if (!w->sichtbar_offen) { w->sichtbar_offen = 1; w->sichtbar_seit = jetzt; }
+            if (jetzt - w->sichtbar_seit >= QC_FANG_AUS_US) {
+                w->gefangen = 0;
+                w->grund = 0;
+                w->sichtbar_offen = 0;
+            }
+        }
+        return (qc_fang_urteil){ !w->gefangen, w->gefangen, w->grund };
+    }
+    w->sichtbar_offen = 0;
+    if (!w->versteckt) {
+        w->versteckt = 1;
+        w->versteckt_seit = jetzt;
+        w->bewegungen_basis = ein.bewegungen;
+        w->taste_vor_verstecken = ein.letzte_taste_us != 0 && jetzt - ein.letzte_taste_us < QC_FANG_TIPPEN_US;
+    }
+    uint64_t bewegt = ein.bewegungen >= w->bewegungen_basis ? ein.bewegungen - w->bewegungen_basis : 0;
+    int tippen = w->taste_vor_verstecken && !(art.tippen_endet_mit_bewegung && bewegt >= QC_FANG_BEWEGUNGEN_MIN);
+    uint8_t grund = 0;
+    if (lage.eingesperrt) grund |= QC_FANG_GRUND_EINGESPERRT;
+    if (lage.folgt_nicht) grund |= QC_FANG_GRUND_FOLGT_NICHT;
+    if (art.bewegung_regel && lage.vollbild && !tippen && bewegt >= QC_FANG_BEWEGUNGEN_MIN &&
+        jetzt - w->versteckt_seit >= QC_FANG_VERSTECKT_MIN_US)
+        grund |= QC_FANG_GRUND_BEWEGUNG;
+    if (!w->gefangen) {
+        if (grund) {
+            if (!w->grund_offen) { w->grund_offen = 1; w->grund_seit = jetzt; }
+            if (jetzt - w->grund_seit >= QC_FANG_AN_US) {
+                w->gefangen = 1;
+                w->grund = grund;
+            }
+        } else {
+            w->grund_offen = 0;
+        }
+    }
+    int sichtbar = w->gefangen ? 0 : art.versteckt_nur_mit_fang ? 1 : tippen;
+    return (qc_fang_urteil){ sichtbar, w->gefangen, w->grund };
+}
+
+int qc_zeiger_folgt_nicht(uint64_t jetzt, double px, double py, double zx, double zy, uint64_t ziel_us,
+                          double toleranz) {
+    if (!ziel_us || jetzt < ziel_us) return 0;
+    uint64_t alter = jetzt - ziel_us;
+    if (alter < 30000ull || alter > 2000000ull) return 0;
+    return fabs(px - zx) > toleranz || fabs(py - zy) > toleranz;
+}
+
+void qc_zeiger_eingabe_bewegung(int absolut, double x, double y) {
+    atomic_fetch_add(&g_bewegungen, 1);
+    pthread_mutex_lock(&g_ziel_mtx);
+    if (absolut) { g_ziel_x = x; g_ziel_y = y; g_ziel_us = jetzt_us(); }
+    else g_ziel_us = 0;
+    pthread_mutex_unlock(&g_ziel_mtx);
+}
+
+void qc_zeiger_eingabe_taste(void) {
+    uint64_t t = jetzt_us();
+    atomic_store(&g_letzte_taste_us, t ? t : 1);
+}
+
+// Die Lage des Systems fuer den Waechter: versteckt (CGCursorIsVisible) und
+// "folgt nicht" (die Lage des Zeigers gegen das Ziel der letzten absoluten
+// Bewegung). Einsperren kennt der Mac nicht.
+static void fang_pruefen(void) {
+    uint64_t jetzt = jetzt_us();
+    qc_zeiger_lage lage = { CGCursorIsVisible() ? 0 : 1, 0, 0, 0 };
+    CGEventRef e = CGEventCreate(NULL);
+    if (e) {
+        CGPoint p = CGEventGetLocation(e);
+        CFRelease(e);
+        pthread_mutex_lock(&g_ziel_mtx);
+        double zx = g_ziel_x, zy = g_ziel_y;
+        uint64_t zt = g_ziel_us;
+        pthread_mutex_unlock(&g_ziel_mtx);
+        lage.folgt_nicht = qc_zeiger_folgt_nicht(jetzt, p.x, p.y, zx, zy, zt, QC_ZEIGER_FOLGT_TOLERANZ);
+    }
+    qc_eingabe_zaehler ein = { atomic_load(&g_bewegungen), atomic_load(&g_letzte_taste_us) };
+    qc_fang_urteil u = qc_fang_schritt(&g_waechter, jetzt, lage, ein, QC_FANG_MAC);
+    if (u.sichtbar != g_urteil.sichtbar || u.gefangen != g_urteil.gefangen) {
+        if (++g_lage_zeilen <= QC_ZEIGER_LAGE_ZEILEN) {
+            char t[200];
+            snprintf(t, sizeof t, "Zeiger: %s%s, an den Client: %s", lage.versteckt ? "versteckt" : "sichtbar",
+                     u.gefangen ? (u.grund & QC_FANG_GRUND_FOLGT_NICHT ? " - Maus eingefangen (folgt der Maus nicht)"
+                                                                      : " - Maus eingefangen")
+                                : "",
+                     u.sichtbar ? "zeigen" : "nicht zeigen");
+            melden(t);
+        } else if (g_lage_zeilen == QC_ZEIGER_LAGE_ZEILEN + 1) {
+            melden("Zeiger: weitere Wechsel ohne Protokollzeile");
+        }
+    }
+    g_urteil = u;
+}
 
 static void melden(const char *text) {
     if (g_log) g_log(text);
@@ -42,7 +181,14 @@ static uint64_t fnv(const uint8_t *p, size_t n, uint64_t h) {
 // darf der Hauptfaden nicht stehen (Einstellungen, Zwischenablage, Erholung
 // nach Bildschirmverlust laufen dort).
 static void zeiger_pruefen(void) {
-    if (g_aktiv && !g_aktiv()) return;
+    if (g_aktiv && !g_aktiv()) {
+        // Kein Zuschauer: der naechste faengt mit einem frischen Waechter an.
+        memset(&g_waechter, 0, sizeof g_waechter);
+        g_urteil = (qc_fang_urteil){ 1, 0, 0 };
+        g_lage_zeilen = 0;
+        return;
+    }
+    fang_pruefen();
     NSCursor *c = [NSCursor currentSystemCursor];
     NSImage *img = c ? c.image : nil;
     if (!img) {
@@ -61,9 +207,13 @@ static void zeiger_pruefen(void) {
         g_nil_gemeldet = 0;
         melden("Zeigerform: das System liefert wieder einen Zeiger");
     }
+    // In Strompunkten: Punkte des Bildschirms mal Massstab (siehe zeiger.h).
     NSSize sz = img.size;
-    int qw = (int)ceil(sz.width), qh = (int)ceil(sz.height);
-    if (qw <= 0 || qh <= 0) return;
+    double m = atomic_load(&g_massstab);
+    int qw = (int)lround(sz.width * m), qh = (int)lround(sz.height * m);
+    if (qw <= 0) qw = 1;
+    if (qh <= 0) qh = 1;
+    if (!(sz.width > 0) || !(sz.height > 0)) return;
     // Einpassen statt verwerfen: der Zeiger wird ohnehin gezeichnet, also
     // notfalls kleiner - Hotspot im selben Mass.
     double f = 1.0;
@@ -79,20 +229,23 @@ static void zeiger_pruefen(void) {
     }
     int w = (int)ceil(qw * f), h = (int)ceil(qh * f);
     if (w <= 0 || h <= 0) return;
-    // Der Hotspot liegt bei NSCursor von links oben aus - wie bei Windows.
+    // Der Hotspot liegt bei NSCursor von links oben aus - wie bei Windows;
+    // in Punkten, also mit dem Massstab.
     NSPoint hot = c.hotSpot;
-    int hxi = (int)(hot.x * f), hyi = (int)(hot.y * f);
+    int hxi = (int)(hot.x * m * f), hyi = (int)(hot.y * m * f);
     if (hxi < 0) hxi = 0; if (hxi >= w) hxi = w - 1;
     if (hyi < 0) hyi = 0; if (hyi >= h) hyi = h - 1;
-    // CGCursorIsVisible gilt als veraltet, liefert hier aber den Wert - ob es
-    // je aufhoert, steht im Protokoll: dann bliebe der Zeiger ewig sichtbar,
-    // was der harmlosere Fehler ist.
-    int sichtbar = CGCursorIsVisible() ? 1 : 0;
+    // Sichtbar und eingefangen sagt der Waechter (fang_pruefen): versteckt
+    // meldet der Mac nur im Fang - CGCursorIsVisible allein meldet auch das
+    // Verstecken beim Tippen, das nie endet. CGCursorIsVisible gilt als
+    // veraltet, liefert hier aber den Wert; hoerte es auf, bliebe der Zeiger
+    // sichtbar und nie eingefangen - der harmlosere Fehler.
+    int sichtbar = g_urteil.sichtbar ? 1 : 0;
+    int gefangen = g_urteil.gefangen ? 1 : 0;
 
-    // In Bildpunkten zeichnen (ein Punkt = ein Bildpunkt): auf einem Retina-Mac
-    // waehlt AppKit die 2x-Darstellung und rechnet sie herunter. Was ankommt,
-    // hat die Groesse, die Windows fuer einen Zeiger erwartet; der Client
-    // zieht sie auf den Massstab seines Bildes hoch.
+    // In Strompunkten zeichnen: AppKit waehlt die passende Darstellung (auf
+    // Retina die 2x) und rechnet sie auf w x h. Der Client zieht das auf den
+    // Massstab seines Bildes.
     size_t n = (size_t)w * (size_t)h * 4;
     uint8_t *buf = calloc(n, 1);
     if (!buf) return;
@@ -120,7 +273,7 @@ static void zeiger_pruefen(void) {
     }
 
     uint64_t hh = fnv(buf, n, 1469598103934665603ull);
-    uint8_t rand[6] = { (uint8_t)w, (uint8_t)h, (uint8_t)hxi, (uint8_t)hyi, (uint8_t)sichtbar, 0 };
+    uint8_t rand[6] = { (uint8_t)w, (uint8_t)h, (uint8_t)hxi, (uint8_t)hyi, (uint8_t)sichtbar, (uint8_t)gefangen };
     hh = fnv(rand, sizeof rand, hh);
     // Das Zeichen "auf jeden Fall senden" wird immer verbraucht, sonst ginge
     // dieselbe Form beim naechsten Tick noch einmal raus.
@@ -134,7 +287,7 @@ static void zeiger_pruefen(void) {
     atomic_fetch_add(&g_offen, 1);
     dispatch_async(g_sendq, ^{
         int spaetere = atomic_fetch_sub(&g_offen, 1) - 1;
-        if (spaetere == 0 && g_cb) g_cb(w16, h16, hx16, hy16, sichtbar, buf);
+        if (spaetere == 0 && g_cb) g_cb(w16, h16, hx16, hy16, sichtbar, gefangen, buf);
         free(buf);
     });
 }

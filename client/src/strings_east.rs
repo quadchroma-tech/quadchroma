@@ -288,6 +288,8 @@ pub static PL: Lang = Lang {
         (HdrWhyNegotiating, "trwa uzgadnianie …"),
         (HdrWhyOldHost, "host nie obsługuje HDR (starsza wersja)"),
         (StatColor, "Kolor"),
+        (ShortcutMouseCapture, "Przechwyć lub zwolnij mysz (gry)"),
+        (MouseCapturedHint, "Mysz przechwycona · F8 ją zwalnia"),
     ],
 };
 
@@ -576,6 +578,8 @@ pub static CS: Lang = Lang {
         (HdrWhyNegotiating, "vyjednává se …"),
         (HdrWhyOldHost, "hostitel nepodporuje HDR (starší verze)"),
         (StatColor, "Barva"),
+        (ShortcutMouseCapture, "Zachytit nebo uvolnit myš (hry)"),
+        (MouseCapturedHint, "Myš zachycena · F8 ji uvolní"),
     ],
 };
 
@@ -864,6 +868,8 @@ pub static SK: Lang = Lang {
         (HdrWhyNegotiating, "vyjednáva sa …"),
         (HdrWhyOldHost, "hostiteľ nepodporuje HDR (staršia verzia)"),
         (StatColor, "Farba"),
+        (ShortcutMouseCapture, "Zachytiť alebo uvoľniť myš (hry)"),
+        (MouseCapturedHint, "Myš zachytená · F8 ju uvoľní"),
     ],
 };
 
@@ -1152,6 +1158,8 @@ pub static HU: Lang = Lang {
         (HdrWhyNegotiating, "egyeztetés …"),
         (HdrWhyOldHost, "a gazdagép nem ismeri a HDR-t (régebbi verzió)"),
         (StatColor, "Szín"),
+        (ShortcutMouseCapture, "Egér befogása vagy elengedése (játékok)"),
+        (MouseCapturedHint, "Egér befogva · F8 elengedi"),
     ],
 };
 
@@ -1440,6 +1448,8 @@ pub static RO: Lang = Lang {
         (HdrWhyNegotiating, "se negociază …"),
         (HdrWhyOldHost, "gazda nu suportă HDR (versiune mai veche)"),
         (StatColor, "Culoare"),
+        (ShortcutMouseCapture, "Capturează sau eliberează mouse-ul (jocuri)"),
+        (MouseCapturedHint, "Mouse capturat · F8 îl eliberează"),
     ],
 };
 
@@ -1728,6 +1738,8 @@ pub static BG: Lang = Lang {
         (HdrWhyNegotiating, "договаря се …"),
         (HdrWhyOldHost, "хостът не поддържа HDR (по-стара версия)"),
         (StatColor, "Цвят"),
+        (ShortcutMouseCapture, "Захващане или освобождаване на мишката (игри)"),
+        (MouseCapturedHint, "Мишката е захваната · F8 я освобождава"),
     ],
 };
 
@@ -2016,5 +2028,7 @@ pub static EL: Lang = Lang {
         (HdrWhyNegotiating, "γίνεται διαπραγμάτευση …"),
         (HdrWhyOldHost, "ο host δεν υποστηρίζει HDR (παλαιότερη έκδοση)"),
         (StatColor, "Χρώμα"),
+        (ShortcutMouseCapture, "Κλείδωμα ή απελευθέρωση του ποντικιού (παιχνίδια)"),
+        (MouseCapturedHint, "Το ποντίκι κλειδώθηκε · το F8 το απελευθερώνει"),
     ],
 };

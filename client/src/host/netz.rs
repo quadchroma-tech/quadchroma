@@ -2016,11 +2016,12 @@ fn bild_annehmen(stream: TcpStream, platz: Platz, marke: &Laufmarke) {
     super::ton::info_zuruecksetzen();
     settings_senden();
     send_small(MSG_CODECS, &encoder::codecs_payload());
-    // Was dieser Host kann (2.2): Dateien Fassung 1, die Bildschirmwahl und
-    // die HDR-Aushandlung (IN_ANZEIGE, Strominfo Fassung 1) - nur an genau
-    // diesen Zuschauer; danach die Bildschirme (12). Ein aelterer Client
-    // uebergeht Typ 11 und 12.
-    send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN | FAEHIG_BILDSCHIRM | FAEHIG_HDR));
+    // Was dieser Host kann (2.2): Dateien Fassung 1, die Bildschirmwahl, die
+    // HDR-Aushandlung (IN_ANZEIGE, Strominfo Fassung 1) und das Einfangen der
+    // Maus (verlaessliche Sichtbarkeit, Merkmal in MSG_CURSOR, IN_MOVE_REL) -
+    // nur an genau diesen Zuschauer; danach die Bildschirme (12). Ein
+    // aelterer Client uebergeht Typ 11 und 12.
+    send_small_an(&AKTUELL, &NR, nr, MSG_FAEHIGKEITEN, &dateien::faehigkeiten_kodieren(FAEHIG_DATEIEN | FAEHIG_BILDSCHIRM | FAEHIG_HDR | FAEHIG_MAUS));
     send_small_an(&AKTUELL, &NR, nr, MSG_BILDSCHIRME, &bildschirme_payload());
     log(format!(
         "Zuschauer verbunden: {name} ({ip}:{port}), ID {}, verschluesselt, Gegenstelle {fp}, Vergleichscode {sas}{}",
@@ -2167,7 +2168,7 @@ fn eingabe_lesen(sock: &mut secure::Secure, bild: &Leitung, nr: u64, u: &DateiUm
         let mut faehigkeiten = false;
         let mut anzeige_neu = None;
         match typ {
-            IN_MOVE | IN_BUTTON | IN_SCROLL | IN_KEY => eingabe::verarbeiten(typ, &payload),
+            IN_MOVE | IN_BUTTON | IN_SCROLL | IN_KEY | IN_MOVE_REL => eingabe::verarbeiten(typ, &payload),
             IN_CLIP => {
                 if let Ok(text) = std::str::from_utf8(&payload) {
                     crate::clipboard::set(text);
@@ -2966,7 +2967,7 @@ mod tests {
         // Bildschirmwahl und HDR-Aushandlung (7), gleich danach die
         // Bildschirme (12).
         a.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(bis_faehigkeiten(&mut a), Ok(vec![7, 0, 0, 0]));
+        assert_eq!(bis_faehigkeiten(&mut a), Ok(vec![15, 0, 0, 0]));
         let (typ, p) = naechste(&mut a).unwrap();
         assert_eq!(typ, MSG_BILDSCHIRME, "nach 11 kommt 12");
         assert_eq!(crate::bildschirm::bildschirme_lesen(&p), Some(begruessungsliste()));
@@ -3005,7 +3006,7 @@ mod tests {
         assert!(!aktuell().unwrap().kann_dateien(), "Faehigkeiten von A gelten fuer B");
         // Auch B bekommt MSG_FAEHIGKEITEN und die Bildschirme.
         b.socket().set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(bis_faehigkeiten(&mut b), Ok(vec![7, 0, 0, 0]));
+        assert_eq!(bis_faehigkeiten(&mut b), Ok(vec![15, 0, 0, 0]));
         let (typ, p) = naechste(&mut b).unwrap();
         assert_eq!(typ, MSG_BILDSCHIRME);
         assert_eq!(crate::bildschirm::bildschirme_lesen(&p), Some(begruessungsliste()));

@@ -44,6 +44,10 @@ mod hdr;
 mod schirmerkennung;
 /// Das Programmsymbol, im Programm gezeichnet, und seine .ico-Datei.
 mod logo;
+/// Maus und Zeiger fuer Spiele: Zeigerform samt Merkmalen, Groesse im
+/// Massstab des Bildes, Einfangen (Host erkennt, Client faengt ein) -
+/// reine Entscheidungen fuer Client und Windows-Host.
+mod maus;
 mod noise;
 mod protokoll_konst;
 mod secure;
@@ -616,21 +620,30 @@ const ESC_HALTEDAUER: Duration = Duration::from_secs(2);
 /// So lange gilt ein nachgereichter ESC als gedrueckt.
 const ESC_TIPPDAUER: Duration = Duration::from_millis(60);
 
-/// Die Form des Mac-Zeigers, wie sie der Host zuletzt geschickt hat. Der
-/// Zeiger selbst bleibt der von Windows (Regel des Projekts: kein Zeiger im
-/// Video) - er bekommt nur das Aussehen des Macs: Pfeil, Hand, Ziehpfeile am
-/// Fensterrand, Textcursor, Wartekugel.
+/// Die Form des Host-Zeigers, wie sie der Host zuletzt geschickt hat (in
+/// Punkten des Stroms). Der Zeiger selbst bleibt der des Clients (Regel des
+/// Projekts: kein Zeiger im Video) - er bekommt nur das Aussehen des Hosts:
+/// Pfeil, Hand, Ziehpfeile am Fensterrand, Textcursor, Wartekugel.
 #[derive(Clone)]
 struct ZeigerForm {
     w: u16,
     h: u16,
     hx: u16,
     hy: u16,
+    /// Soll ein Zeiger zu sehen sein? Gilt nur von einem Host mit
+    /// FAEHIG_MAUS (siehe maus::zeiger_zeigen).
     sichtbar: bool,
+    /// Die Anwendung des Hosts hat die Maus eingefangen (ZEIGER_GEFANGEN).
+    gefangen: bool,
     rgba: Vec<u8>,
 }
 
 impl ZeigerForm {
+    /// Der Platzhalter der Hosts (maus::platzhalter): ein durchsichtiger Punkt.
+    fn platzhalter(&self) -> bool {
+        self.w == 1 && self.h == 1 && self.rgba.get(3) == Some(&0)
+    }
+
     /// Kennung fuer den Vorrat schon gebauter Zeiger - die Wartekugel dreht
     /// sich durch ein Dutzend Formen, jede soll nur einmal gebaut werden.
     fn kennung(&self) -> u64 {
@@ -642,6 +655,12 @@ impl ZeigerForm {
         h
     }
 }
+
+/// Hoechstens so viele Zeilen je Sitzung zu Wechseln von Sichtbarkeit und
+/// Fang des Host-Zeigers - ein Spiel mit Menue wechselt oft.
+const ZEIGER_ZEILEN: u32 = 40;
+/// So lange steht der Hinweis "Maus eingefangen" ueber dem Bild.
+const FANG_HINWEIS: Duration = Duration::from_secs(3);
 
 /// So lange gilt ein Codecwunsch als "unterwegs", falls der Host nie
 /// antwortet. Danach verschwindet der Hinweis von selbst.
@@ -1209,6 +1228,12 @@ struct Shared {
     /// kein IN_ANZEIGE hinaus. Zurueck mit den anderen Faehigkeiten
     /// (dateien_zuruecksetzen).
     host_hdr: bool,
+    /// Der Host meldet die Sichtbarkeit seines Zeigers verlaesslich, sagt,
+    /// wann seine Anwendung die Maus einfaengt, und versteht IN_MOVE_REL:
+    /// Bit 3 (FAEHIG_MAUS) in MSG_FAEHIGKEITEN DIESER Sitzung. Ohne das Bit
+    /// bleibt der Zeiger immer sichtbar und die Maus absolut. Zurueck mit den
+    /// anderen Faehigkeiten (dateien_zuruecksetzen).
+    host_maus: bool,
     /// Der HDR-Schalter ist fuer diesen Host aus (immer SDR, Wunsch Aus in
     /// IN_ANZEIGE). Aus den gespeicherten Werten des Hosts; Voreinstellung an.
     hdr_aus: bool,
@@ -1474,6 +1499,7 @@ impl Shared {
     fn dateien_zuruecksetzen(&mut self) -> Option<DateiSendung> {
         self.host_dateien = false;
         self.host_hdr = false;
+        self.host_maus = false;
         self.faehigkeiten_da = false;
         self.datei_vorgemerkt = None;
         self.datei_senden.take()
@@ -3101,8 +3127,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // darf ein gutes Bild wieder loeschen - Fehler anderer Pfade (Ton,
     // Verbindung) bleiben stehen, statt hundertmal je Sekunde zu verschwinden.
     let mut bild_fehler = false;
-    // Die erste Zeigerform je Sitzung einmal ins Protokoll.
+    // Die erste Zeigerform je Sitzung einmal ins Protokoll, danach jeder
+    // Wechsel von Sichtbarkeit und Fang (hoechstens ZEIGER_ZEILEN).
     let mut zeiger_gemeldet = false;
+    let mut zeiger_lage: Option<(bool, bool)> = None;
+    let mut zeiger_zeilen = 0u32;
     // Jeder Zugriffseinheit fuer NVDEC einen Begrenzer (AUD) anhaengen,
     // damit cuvids Parser das Bild sofort abschliesst - siehe `mit_aud`.
     // --ohne-aud laesst es zum Vergleich weg.
@@ -3814,18 +3843,23 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     // Bit 2: der Host versteht IN_ANZEIGE (ab 0.2.0); erst
                     // damit meldet der Fensterfaden die Lage der Anzeige.
                     let hdr_faehig = bits & FAEHIG_HDR != 0;
+                    // Bit 3: verlaessliche Sichtbarkeit, Merkmal "eingefangen"
+                    // und der relative Weg (IN_MOVE_REL).
+                    let maus_faehig = bits & FAEHIG_MAUS != 0;
                     {
                         let mut s = shared.lock().unwrap();
                         s.host_dateien = kann;
                         s.host_bildschirmwahl = bildschirmwahl;
                         s.host_hdr = hdr_faehig;
+                        s.host_maus = maus_faehig;
                         s.faehigkeiten_da = true;
                     }
                     protokoll::zeile(format!(
-                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}, Bildschirmwahl {}, HDR-Aushandlung {}",
+                        "Host meldet Faehigkeiten {bits:#x}: Dateien {}, Bildschirmwahl {}, HDR-Aushandlung {}, Maus einfangen {}",
                         if kann { "ja" } else { "nein" },
                         if bildschirmwahl { "ja" } else { "nein" },
-                        if hdr_faehig { "ja" } else { "nein" }
+                        if hdr_faehig { "ja" } else { "nein" },
+                        if maus_faehig { "ja" } else { "nein" }
                     ));
                 }
             }
@@ -3854,24 +3888,26 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 }
             }
             MSG_CURSOR => {
-                if len >= 12 {
-                    let w = u16::from_le_bytes([payload[0], payload[1]]);
-                    let h = u16::from_le_bytes([payload[2], payload[3]]);
-                    let hx = u16::from_le_bytes([payload[4], payload[5]]);
-                    let hy = u16::from_le_bytes([payload[6], payload[7]]);
-                    let sichtbar = payload[8] != 0;
-                    let n = w as usize * h as usize * 4;
-                    // Nur, was zusammenpasst: Groesse plausibel, Bild vollstaendig,
-                    // Hotspot im Bild. Alles andere ist kein Zeiger.
-                    if (1..=256).contains(&w) && (1..=256).contains(&h) && len == 12 + n && hx < w && hy < h {
-                        if !zeiger_gemeldet {
-                            zeiger_gemeldet = true;
-                            protokoll::zeile(format!("Zeigerform vom Host: {w}x{h}, Hotspot {hx},{hy}, sichtbar {sichtbar}"));
+                // Nur, was zusammenpasst: Groesse plausibel, Bild vollstaendig,
+                // Hotspot im Bild (maus::zeiger_lesen). Alles andere ist kein
+                // Zeiger.
+                if let Some(z) = maus::zeiger_lesen(&payload[..len]) {
+                    let (w, h, hx, hy, sichtbar, gefangen) = (z.w, z.h, z.hx, z.hy, z.sichtbar, z.gefangen);
+                    if !zeiger_gemeldet {
+                        zeiger_gemeldet = true;
+                        protokoll::zeile(format!("Zeigerform vom Host: {w}x{h}, Hotspot {hx},{hy}, sichtbar {sichtbar}, eingefangen {gefangen}"));
+                    } else if zeiger_lage != Some((sichtbar, gefangen)) {
+                        zeiger_zeilen += 1;
+                        if zeiger_zeilen <= ZEIGER_ZEILEN {
+                            protokoll::zeile(format!("Zeiger vom Host: sichtbar {sichtbar}, eingefangen {gefangen} ({w}x{h})"));
+                        } else if zeiger_zeilen == ZEIGER_ZEILEN + 1 {
+                            protokoll::zeile("Zeiger vom Host: weitere Wechsel ohne Protokollzeile".into());
                         }
-                        let mut s = shared.lock().unwrap();
-                        s.zeiger = Some(ZeigerForm { w, h, hx, hy, sichtbar, rgba: payload[12..].to_vec() });
-                        s.zeiger_seq = s.zeiger_seq.wrapping_add(1);
                     }
+                    zeiger_lage = Some((sichtbar, gefangen));
+                    let mut s = shared.lock().unwrap();
+                    s.zeiger = Some(ZeigerForm { w, h, hx, hy, sichtbar, gefangen, rgba: z.rgba });
+                    s.zeiger_seq = s.zeiger_seq.wrapping_add(1);
                 }
             }
             _ => {}
@@ -4679,13 +4715,13 @@ fn mac_keycode(code: winit::keyboard::KeyCode) -> Option<u16> {
 /// wiederholt eingespeiste Tasten nicht selbst (CGEventPost), also reicht der
 /// Client die seines Systems weiter, mit dessen Verzoegerung und Rate. Nie:
 /// kuenstliche Ereignisse, alles bei offener Tafel, die Tasten des Fensters
-/// selbst (ESC mit seinem Halten, F9 bis F12) und Umschalter samt
+/// selbst (ESC mit seinem Halten, F8 bis F12) und Umschalter samt
 /// Feststelltaste (54-63) - ein Mac wiederholt sie nicht, und eine
 /// wiederholte Feststelltaste schaltete drueben jedes Mal um. Ob der Druck
 /// selbst hinausging, prueft `InputLink::key_wiederholung`.
 fn wiederholung_an_host(code: winit::keyboard::KeyCode, synthetisch: bool, hud_offen: bool) -> Option<u16> {
     use winit::keyboard::KeyCode as K;
-    if synthetisch || hud_offen || matches!(code, K::Escape | K::F9 | K::F10 | K::F11 | K::F12) {
+    if synthetisch || hud_offen || matches!(code, K::Escape | K::F8 | K::F9 | K::F10 | K::F11 | K::F12) {
         return None;
     }
     mac_keycode(code).filter(|mac| !(54..=63).contains(mac))
@@ -4709,6 +4745,10 @@ struct InputLink {
     kanal: Option<Schreiber>,
     addr: String,
     last: (f32, f32),
+    /// Eingefangen (relativer Weg): Maustasten gehen ohne Position hinaus
+    /// (MAUS_OHNE_POSITION), sonst setzte der Host den Zeiger erst auf die
+    /// letzte absolute Lage - im Spiel ein Sprung der Kamera.
+    relativ: bool,
     /// Eingereihte Nachrichten.
     sent: u64,
     /// Pruefsumme des Bildkanals und Schluessel seines Hosts. Ohne die
@@ -4889,12 +4929,20 @@ fn eingabe_rahmen(t: u8, payload: &[u8]) -> Vec<u8> {
 /// fasste Windows WM_MOUSEMOVE zusammen, solange das blockierende Schreiben
 /// den Fensterfaden aufhielt). Alles andere bleibt in seiner Reihenfolge:
 /// Klicks tragen ihre eigene Lage, und eine Bewegung zwischen zwei Klicks
-/// (Ziehen) bleibt stehen.
+/// (Ziehen) bleibt stehen. Relative Bewegungen (eingefangen) werden
+/// dagegen addiert: jede ist ein Stueck Weg, keine Lage - das Spiel drueben
+/// soll sich nach dem Stocken so weit drehen wie die Maus hier.
 fn bewegungen_zusammenfassen(stapel: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut aus: Vec<Vec<u8>> = Vec::with_capacity(stapel.len());
     for b in stapel {
         match aus.last_mut() {
             Some(l) if b.first() == Some(&IN_MOVE) && l.first() == Some(&IN_MOVE) => *l = b,
+            Some(l) if b.first() == Some(&IN_MOVE_REL) && l.first() == Some(&IN_MOVE_REL) => {
+                match (l.get(8..).and_then(maus::rel_lesen), b.get(8..).and_then(maus::rel_lesen)) {
+                    (Some(a), Some(n)) => *l = eingabe_rahmen(IN_MOVE_REL, &maus::rel_kodieren(a.0 + n.0, a.1 + n.1)),
+                    _ => aus.push(b),
+                }
+            }
             _ => aus.push(b),
         }
     }
@@ -5058,6 +5106,7 @@ impl InputLink {
             kanal: None,
             addr,
             last: (0.5, 0.5),
+            relativ: false,
             sent: 0,
             link: None,
             gedrueckt: std::collections::HashSet::new(),
@@ -5304,10 +5353,17 @@ impl InputLink {
         self.send(IN_MOVE, &p);
     }
 
+    /// Relative Bewegung (eingefangen). Nur an einen Host mit FAEHIG_MAUS -
+    /// das prueft der Aufrufer (maus::fang_soll).
+    fn mouse_rel(&mut self, dx: f32, dy: f32) {
+        self.send(IN_MOVE_REL, &maus::rel_kodieren(dx, dy));
+    }
+
     fn mouse_button(&mut self, button: u8, down: bool) {
         let mut p = [0u8; 12];
         p[0] = button;
         p[1] = down as u8;
+        p[2] = if self.relativ { MAUS_OHNE_POSITION } else { 0 };
         p[4..8].copy_from_slice(&self.last.0.to_le_bytes());
         p[8..12].copy_from_slice(&self.last.1.to_le_bytes());
         self.send(IN_BUTTON, &p);
@@ -5373,6 +5429,7 @@ impl InputLink {
             let mut p = [0u8; 12];
             p[0] = b;
             p[1] = 0;
+            p[2] = if self.relativ { MAUS_OHNE_POSITION } else { 0 };
             p[4..8].copy_from_slice(&self.last.0.to_le_bytes());
             p[8..12].copy_from_slice(&self.last.1.to_le_bytes());
             self.send(IN_BUTTON, &p);
@@ -6641,16 +6698,35 @@ struct App {
     cpu_zeiten: (u64, Instant),
     /// Bildwiederholrate des Monitors, auf dem das Fenster steht.
     monitor_hz: Option<f32>,
-    /// Zeigerform: welche Nummer aus `Shared` gerade gilt, ob der Windows-Zeiger
-    /// im Moment eine Mac-Form traegt, und der Vorrat schon gebauter Formen
-    /// (Kennung -> Zeiger), damit die Wartekugel nicht je Bild neu gebaut wird.
+    /// Zeigerform: welche Nummer aus `Shared` gerade gilt, ob der Zeiger des
+    /// Clients im Moment die Form des Hosts traegt, und der Vorrat schon
+    /// gebauter Formen (Kennung -> Zeiger), damit die Wartekugel nicht je Bild
+    /// neu gebaut wird.
     zeiger_seq_gezeigt: u64,
     zeiger_eigen: bool,
     zeiger_vorrat: Vec<(u64, CustomCursor)>,
-    /// Massstab, mit dem die geltende Form gebaut wurde (siehe zeiger_massstab).
-    zeiger_faktor: u32,
+    /// Massstab, mit dem die geltende Form gebaut wurde (siehe zeiger_skala).
+    zeiger_skala_gebaut: f64,
+    /// Der Zeiger ist ueber dem Bild gerade versteckt (Host versteckt ihn,
+    /// oder eingefangen).
+    zeiger_versteckt: bool,
     /// Ist die Maus gerade im Fenster? Nur dann wird eine Form gesetzt.
     maus_im_fenster: bool,
+    /// Maus eingefangen (relativer Weg): Zeiger fest und versteckt,
+    /// Bewegungen gehen als IN_MOVE_REL. Siehe fang_nachfuehren.
+    fang_aktiv: bool,
+    /// Was F8 zuletzt sagte (maus::Hand).
+    fang_hand: maus::Hand,
+    /// Nach einem Fokusverlust faengt erst ein Klick ins Bild wieder ein.
+    fang_klick_noetig: bool,
+    /// Seit wann der Hinweis "Maus eingefangen" steht (FANG_HINWEIS lang).
+    fang_hinweis: Option<Instant>,
+    /// Relative Bewegungen seit dem letzten Senden.
+    fang_sammler: maus::Sammler,
+    /// set_cursor_grab ist einmal gescheitert (nur eine Protokollzeile).
+    fang_fehler_gemeldet: bool,
+    /// Zeilen zu Fang und Freigabe bisher (hoechstens ZEIGER_ZEILEN).
+    fang_zeilen: u32,
     /// Der laufende oder zuletzt gelaufene Benchmark, und was der naechste
     /// durchprobieren soll.
     benchmark: Option<Benchmark>,
@@ -6843,6 +6919,18 @@ impl ApplicationHandler<Benutzer> for App {
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         self.fenster_ereignis(event);
+    }
+
+    /// Eingefangen kommen die Bewegungen von hier: unter Windows aus Raw
+    /// Input (unbeschleunigt, auch wenn der Zeiger festsitzt), auf dem Mac
+    /// aus den Deltas der Mausereignisse (auch bei abgekoppeltem Zeiger).
+    /// Gesammelt, gesendet in vor_dem_warten.
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            if self.fang_aktiv {
+                self.fang_sammler.dazu(delta.0, delta.1);
+            }
+        }
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
@@ -7040,6 +7128,9 @@ impl App {
                 // Steht die Einstellungstafel offen, gehoert die Maus ihr und
                 // nicht dem Mac - sonst klickt man dort zweimal gleichzeitig.
                 if self.hud_offen || !self.bild_vorhanden() { return; }
+                // Eingefangen gehen nur relative Bewegungen hinaus
+                // (device_event); der Zeiger hier steht ohnehin fest.
+                if self.fang_aktiv { return; }
                 if let Some((nx, ny)) = self.maus_ins_bild(position.x, position.y) {
                     self.input.lock().unwrap().mouse_move(nx, ny);
                 }
@@ -7064,7 +7155,16 @@ impl App {
                     MouseButton::Middle => 2,
                     _ => return,
                 };
-                self.input.lock().unwrap().mouse_button(b, state == winit::event::ElementState::Pressed);
+                let gedrueckt = state == winit::event::ElementState::Pressed;
+                // Nach einem Fokusverlust faengt dieser Klick wieder ein (der
+                // Klick selbst geht noch absolut hinaus).
+                if gedrueckt {
+                    self.fang_klick_noetig = false;
+                }
+                // Eingefangen: erst die gesammelte Bewegung, dann die Taste -
+                // ohne Position (InputLink::relativ).
+                self.fang_senden();
+                self.input.lock().unwrap().mouse_button(b, gedrueckt);
             }
             WindowEvent::CursorEntered { .. } => {
                 self.maus_im_fenster = true;
@@ -7077,8 +7177,20 @@ impl App {
             WindowEvent::Focused(false) => {
                 // Das Fenster ist weg - Alt-Tab, Sperrbildschirm, ein Dialog.
                 // Alles loslassen, was drueben noch gedrueckt ist, sonst laeuft
-                // die Spielfigur dort bis in alle Ewigkeit gegen die Wand.
+                // die Spielfigur dort bis in alle Ewigkeit gegen die Wand -
+                // noch eingefangen, also Maustasten ohne Position (sonst
+                // sprang die Kamera beim Alt-Tab).
                 self.input.lock().unwrap().alle_loslassen();
+                // Dann die Maus sofort freigeben (auf dem Mac haengt sonst der
+                // Zeiger des ganzen Rechners fest); wieder eingefangen wird
+                // erst nach einem Klick ins Bild, ein F8-Fang endet hier.
+                if self.fang_aktiv {
+                    self.fang_aus("Fenster ohne Fokus");
+                }
+                self.fang_klick_noetig = true;
+                if self.fang_hand == maus::Hand::An {
+                    self.fang_hand = maus::Hand::Auto;
+                }
                 self.mods = 0;
                 self.esc_seit = None;
                 self.esc_verbraucht = false;
@@ -7235,6 +7347,14 @@ impl App {
                                 self.cfg.sichern();
                                 return;
                             }
+                            KC::F8 => {
+                                // Maus einfangen bzw. freigeben (Spiele). Bei
+                                // offenem Menue nichts: das Menue gibt frei.
+                                if !self.hud_offen {
+                                    self.fang_umschalten();
+                                }
+                                return;
+                            }
                             KC::F10 => {
                                 // Dasselbe Menue wie das Halten von ESC - nur
                                 // fuer alle, die sich eine Taste merken wollen.
@@ -7253,7 +7373,7 @@ impl App {
                     }
                 }
                 if let winit::keyboard::PhysicalKey::Code(c) = event.physical_key {
-                    if c == KC::F9 || c == KC::F10 { return; }
+                    if c == KC::F8 || c == KC::F9 || c == KC::F10 { return; }
                 }
                 if is_synthetic {
                     return;
@@ -7345,7 +7465,15 @@ impl App {
     }
 
     fn vor_dem_warten(&mut self, el: &ActiveEventLoop) {
-        if self.quit { el.exit(); return; }
+        if self.quit {
+            // Nie mit festgehaltenem Zeiger enden (Mac: die Kopplung gilt
+            // fuer den ganzen Rechner).
+            if self.fang_aktiv {
+                self.fang_aus("Ende");
+            }
+            el.exit();
+            return;
+        }
         // Symbol: Menue (gefundene Hosts, Sprache) und Tooltip (Sitzung).
         self.symbol_nachfuehren();
         // Ohne Fenster (die eine App im Hintergrund): nichts zeichnen, nichts
@@ -7486,39 +7614,56 @@ impl App {
                 b.takt(&self.shared, &self.input, self.cpu_eigen);
             }
         }
-        // Zeigerform: ueber dem Bild traegt der Windows-Zeiger die Form des
-        // Macs, ueber der Oberflaeche (Menue, Start, Warten) den eigenen Pfeil.
-        // Nur solange die Maus im Fenster ist (Windows' Regel: ein Fenster
-        // setzt den Zeiger nur ueber seiner eigenen Flaeche), und nur solange
-        // der Host eine Form geliefert hat - reisst die Verbindung ab, nimmt
-        // der Empfangsfaden sie weg, und hier faellt der Zeiger auf den Pfeil
-        // zurueck, statt als "unsichtbar" ueber dem stehenden Bild zu bleiben.
-        // Der Massstab folgt dem Bild: so gross, wie das Mac-Bild im Fenster
-        // erscheint, so gross der Zeiger - 1:1 also so gross wie auf dem Mac.
+        // Maus einfangen (Spiele): Lage bestimmen, Uebergaenge anwenden - vor
+        // der Zeigerform, deren Sichtbarkeit davon abhaengt. Dann die
+        // gesammelten relativen Bewegungen hinaus, eine Nachricht je Runde.
+        self.fang_nachfuehren();
+        self.fang_senden();
+        // Zeigerform: ueber dem Bild traegt der Zeiger des Clients die Form
+        // des Hosts, ueber der Oberflaeche (Menue, Start, Warten) den eigenen
+        // Pfeil. Nur solange die Maus im Fenster ist (Windows' Regel: ein
+        // Fenster setzt den Zeiger nur ueber seiner eigenen Flaeche), und nur
+        // solange der Host eine Form geliefert hat - reisst die Verbindung ab,
+        // nimmt der Empfangsfaden sie weg, und hier faellt der Zeiger auf den
+        // Pfeil zurueck, statt als "unsichtbar" ueber dem stehenden Bild zu
+        // bleiben. Der Massstab folgt dem Bild (maus::zeiger_skala): so gross,
+        // wie der Zeiger im Bild erschiene - nie doppelt, auch nicht auf
+        // Retina. Sichtbar ist er, wie ein Host mit FAEHIG_MAUS es meldet
+        // (maus::zeiger_zeigen): versteckt ein Spiel den Zeiger, steht keiner
+        // doppelt ueber seinem eigenen; eingefangen nie.
         let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden() && self.maus_im_fenster;
-        let faktor = self.zeiger_massstab();
-        let (neu, form_da) = {
+        let skala = self.zeiger_skala();
+        let (neu, form_da, zeigen) = {
             let s = self.shared.lock().unwrap();
             let form_da = s.zeiger.is_some();
-            let neu = if im_bild && form_da && (s.zeiger_seq != self.zeiger_seq_gezeigt || faktor != self.zeiger_faktor) {
+            let (sichtbar, gefangen) = s.zeiger.as_ref().map(|z| (z.sichtbar, z.gefangen)).unwrap_or((true, false));
+            let zeigen = maus::zeiger_zeigen(s.host_maus, sichtbar, gefangen, self.fang_aktiv);
+            let neu = if im_bild && form_da && (s.zeiger_seq != self.zeiger_seq_gezeigt || skala != self.zeiger_skala_gebaut) {
                 s.zeiger.clone().map(|z| (s.zeiger_seq, z))
             } else {
                 None
             };
-            (neu, form_da)
+            (neu, form_da, zeigen)
         };
-        if im_bild && form_da {
+        if im_bild && (form_da || self.fang_aktiv) {
             if let Some((seq, z)) = neu {
                 self.zeiger_seq_gezeigt = seq;
-                self.zeiger_faktor = faktor;
-                self.zeiger_anwenden(el, &z, faktor);
+                self.zeiger_skala_gebaut = skala;
+                self.zeiger_anwenden(el, &z, skala);
             }
-        } else if self.zeiger_eigen {
+            if zeigen == self.zeiger_versteckt {
+                if let Some(w) = &self.window {
+                    w.set_cursor_visible(zeigen);
+                }
+                self.zeiger_versteckt = !zeigen;
+            }
+        } else if self.zeiger_eigen || self.zeiger_versteckt {
             if let Some(w) = &self.window {
                 w.set_cursor(CursorIcon::Default);
                 w.set_cursor_visible(true);
             }
             self.zeiger_eigen = false;
+            self.zeiger_versteckt = false;
             // Zurueck im Bild wird die Form wieder angewandt.
             self.zeiger_seq_gezeigt = 0;
         }
@@ -7572,35 +7717,32 @@ impl App {
     /// loslassen, den Eingabekanal schliessen und die Bildleitung kappen,
     /// damit das blockierende Lesen aufwacht. Vorher blieb nach "Trennen"
     /// alles offen, und der Client decodierte weiter - mit voller Last.
-    /// Dem Windows-Zeiger die Form des Mac-Zeigers geben. Jede Form wird nur
-    /// einmal gebaut; der Vorrat haelt die letzten 32 (die Wartekugel hat ein
-    /// Dutzend Bilder, ein Zeigerwechsel zwischen Pfeil, Hand und Textcursor
-    /// soll nichts kosten).
-    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, faktor: u32) {
+    /// Dem Zeiger des Clients die Form des Host-Zeigers geben, in `skala`
+    /// Einheiten der Schnittstelle je Formpunkt (maus::zeiger_skala). Jede
+    /// Form wird nur einmal gebaut; der Vorrat haelt die letzten 32 (die
+    /// Wartekugel hat ein Dutzend Bilder, ein Zeigerwechsel zwischen Pfeil,
+    /// Hand und Textcursor soll nichts kosten). Die Sichtbarkeit setzt der
+    /// Aufrufer (vor_dem_warten) - frueher war der Zeiger hier immer sichtbar,
+    /// weil der Mac-Host das Verstecken beim Tippen meldete, das nie endet;
+    /// ein Host mit FAEHIG_MAUS meldet nur noch echtes Verstecken.
+    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, skala: f64) {
         let Some(w) = self.window.clone() else { return };
-        let k = z.kennung().wrapping_mul(31).wrapping_add(faktor as u64);
+        // Der Platzhalter (ein durchsichtiger Punkt: der Host kennt noch keine
+        // Form) ist kein Zeiger - der eigene Pfeil steht fuer ihn.
+        if z.platzhalter() {
+            w.set_cursor(CursorIcon::Default);
+            self.zeiger_eigen = true;
+            return;
+        }
+        let k = z.kennung().wrapping_mul(31).wrapping_add(skala.to_bits());
         let zeiger = match self.zeiger_vorrat.iter().find(|(kk, _)| *kk == k) {
             Some((_, c)) => c.clone(),
             None => {
-                // Ganzzahlig hochziehen, Punkt fuer Punkt: ein Zeiger ist eine
-                // kleine Strichzeichnung, weich gefiltert saehe er verwaschen aus.
-                let f = faktor.max(1);
-                let (w2, h2) = (z.w as u32 * f, z.h as u32 * f);
-                let rgba = if f == 1 {
-                    z.rgba.clone()
-                } else {
-                    let mut aus = vec![0u8; (w2 * h2 * 4) as usize];
-                    for y in 0..h2 as usize {
-                        let qy = y / f as usize;
-                        for x in 0..w2 as usize {
-                            let q = (qy * z.w as usize + x / f as usize) * 4;
-                            let z4 = (y * w2 as usize + x) * 4;
-                            aus[z4..z4 + 4].copy_from_slice(&z.rgba[q..q + 4]);
-                        }
-                    }
-                    aus
-                };
-                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2 as u16, h2 as u16, z.hx * f as u16, z.hy * f as u16) else { return };
+                // Ganzzahlig Punkt fuer Punkt (ein Zeiger ist eine kleine
+                // Strichzeichnung, weich gefiltert saehe er verwaschen aus),
+                // sonst gemittelt - genau so gross wie im Bild.
+                let (w2, h2, hx2, hy2, rgba) = maus::zeiger_skalieren(z.w, z.h, z.hx, z.hy, &z.rgba, skala);
+                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2, h2, hx2, hy2) else { return };
                 let c = el.create_custom_cursor(quelle);
                 if self.zeiger_vorrat.len() >= 32 {
                     self.zeiger_vorrat.remove(0);
@@ -7610,14 +7752,6 @@ impl App {
             }
         };
         w.set_cursor(zeiger);
-        // Die Sichtbarkeit des Mac-Zeigers wird NICHT uebernommen. macOS
-        // blendet ihn beim Tippen aus und laesst ihn ausgeblendet, bis die
-        // physische Maus sich bewegt - vom Client aus bewegt sich die aber
-        // nie. Ergebnis war ein Windows-Zeiger, der ueber dem Bild einfach
-        // verschwand ("Maus geht nicht"). Der Wert reist weiter mit und steht
-        // im Protokoll; sichtbar ist der Zeiger hier immer.
-        w.set_cursor_visible(true);
-        let _ = z.sichtbar;
         self.zeiger_eigen = true;
     }
 
@@ -7642,24 +7776,143 @@ impl App {
         Some((nx, ny))
     }
 
-    /// Um wie viel das Mac-Bild im Fenster vergroessert erscheint, ganzzahlig
-    /// gerundet - der Zeiger bekommt denselben Massstab. Begrenzt, damit die
-    /// Form unter der Grenze von 256 Bildpunkten bleibt.
-    fn zeiger_massstab(&self) -> u32 {
-        let Some(w) = &self.window else { return 1 };
-        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return 1 };
+    /// Massstab der Zeigerform: Bildpunkte des Bildes im Fenster je
+    /// Strompunkt, geteilt durch den Massstab der Zeiger-Schnittstelle - auf
+    /// dem Mac baut winit das NSImage in Punkten, dort also durch den
+    /// backingScaleFactor (sonst waere der Zeiger auf Retina doppelt so gross
+    /// wie das Bild), unter Windows in Bildpunkten. Siehe maus::zeiger_skala.
+    fn zeiger_skala(&self) -> f64 {
+        let Some(w) = &self.window else { return 1.0 };
+        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return 1.0 };
         if fw == 0 || fh == 0 {
-            return 1;
+            return 1.0;
         }
         let s = w.inner_size();
         let (_, _, zw, _) = ziel_rechteck(s.width.max(1), s.height.max(1), fw, fh, self.pixel_exact);
-        let mut f = ((zw as f32 / fw as f32) + 0.5).floor().clamp(1.0, 8.0) as u32;
-        if let Some(z) = self.shared.lock().unwrap().zeiger.as_ref() {
-            while f > 1 && (z.w as u32 * f > 256 || z.h as u32 * f > 256) {
-                f -= 1;
+        let api = if cfg!(target_os = "macos") { w.scale_factor() } else { 1.0 };
+        maus::zeiger_skala(zw, fw, api)
+    }
+
+    /// Einfangen oder freigeben, wie es die Lage will (maus::fang_soll): der
+    /// Host meldet eingefangen (Merkmal in MSG_CURSOR) oder F8 sagt es,
+    /// solange Bild, Fokus und Maus im Fenster sind. Das Menue (F10, ESC
+    /// halten) und ein Fokusverlust geben sofort frei.
+    fn fang_nachfuehren(&mut self) {
+        let (host_kann, host_gefangen) = {
+            let s = self.shared.lock().unwrap();
+            (s.host_maus, s.zeiger.as_ref().map(|z| z.gefangen).unwrap_or(false))
+        };
+        self.fang_hand = maus::hand_nachfuehren(self.fang_hand, host_gefangen);
+        // Ein erzwungener Fang (F8) endet mit dem Menue.
+        if self.hud_offen && self.fang_hand == maus::Hand::An {
+            self.fang_hand = maus::Hand::Auto;
+        }
+        // Den Fokus fragt winit selbst - ein verpasstes Focused(false) liesse
+        // auf dem Mac die Maus des ganzen Rechners abgekoppelt.
+        let fokus = self.window.as_ref().map(|w| w.has_focus()).unwrap_or(false);
+        let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden() && !self.zugang_offen() && !self.verborgen;
+        let lage = maus::FangLage {
+            host_kann,
+            host_gefangen,
+            im_bild,
+            fokus,
+            maus_im_fenster: self.maus_im_fenster,
+            aktiv: self.fang_aktiv,
+            klick_noetig: self.fang_klick_noetig,
+        };
+        let soll = maus::fang_soll(&lage, self.fang_hand);
+        if soll == self.fang_aktiv {
+            return;
+        }
+        if soll {
+            let grund = if self.fang_hand == maus::Hand::An { "F8" } else { "der Host meldet eingefangen" };
+            self.fang_an(grund);
+        } else {
+            let grund = if !fokus {
+                "Fenster ohne Fokus"
+            } else if self.hud_offen {
+                "Menue"
+            } else if !im_bild {
+                "kein Bild"
+            } else if matches!(self.fang_hand, maus::Hand::Aus { .. }) {
+                "F8"
+            } else if !host_kann {
+                "Host ohne relativen Weg"
+            } else {
+                "der Host gibt frei"
+            };
+            self.fang_aus(grund);
+        }
+    }
+
+    /// Einfangen: Zeiger fest (Mac: CGAssociateMouseAndMouseCursorPosition
+    /// aus, Windows: ClipCursor auf einen Punkt - beides winit Locked) und
+    /// versteckt (das tut vor_dem_warten), Bewegungen ab jetzt aus Raw Input
+    /// bzw. den Deltas der Mausereignisse (device_event) als IN_MOVE_REL.
+    fn fang_an(&mut self, grund: &str) {
+        let Some(w) = self.window.clone() else { return };
+        if let Err(e) = w.set_cursor_grab(winit::window::CursorGrabMode::Locked) {
+            // Ohne Sperre geht es trotzdem relativ - der versteckte Zeiger
+            // kann dann nur das Fenster verlassen.
+            if !self.fang_fehler_gemeldet {
+                self.fang_fehler_gemeldet = true;
+                protokoll::zeile(format!("Maus einfangen: Zeiger nicht festzuhalten ({e}) - relativ trotzdem"));
             }
         }
-        f
+        self.fang_aktiv = true;
+        self.fang_sammler.leeren();
+        self.input.lock().unwrap().relativ = true;
+        self.fang_hinweis = Some(Instant::now());
+        self.fang_zeile(format!("Maus eingefangen ({grund}): Bewegungen relativ, F8 gibt sie frei"));
+    }
+
+    /// Freigeben: Zeiger los, Bewegungen wieder absolut. Was noch gesammelt
+    /// war, faellt weg.
+    fn fang_aus(&mut self, grund: &str) {
+        if let Some(w) = &self.window {
+            let _ = w.set_cursor_grab(winit::window::CursorGrabMode::None);
+        }
+        self.fang_aktiv = false;
+        self.fang_sammler.leeren();
+        self.input.lock().unwrap().relativ = false;
+        self.fang_hinweis = None;
+        self.fang_zeile(format!("Maus frei ({grund})"));
+    }
+
+    fn fang_zeile(&mut self, zeile: String) {
+        self.fang_zeilen += 1;
+        if self.fang_zeilen <= ZEIGER_ZEILEN {
+            protokoll::zeile(zeile);
+        } else if self.fang_zeilen == ZEIGER_ZEILEN + 1 {
+            protokoll::zeile("Maus: weitere Wechsel ohne Protokollzeile".into());
+        }
+    }
+
+    /// Die gesammelten relativen Bewegungen hinaus - einmal je Runde der
+    /// Ereignisschleife und vor jeder Maustaste (Reihenfolge).
+    fn fang_senden(&mut self) {
+        if !self.fang_aktiv {
+            self.fang_sammler.leeren();
+            return;
+        }
+        if let Some((dx, dy)) = self.fang_sammler.nehmen() {
+            self.input.lock().unwrap().mouse_rel(dx, dy);
+        }
+    }
+
+    /// F8: einfangen bzw. freigeben (maus::hand_umschalten). Ein Host ohne
+    /// FAEHIG_MAUS kann es nicht - dann bleibt es beim absoluten Weg.
+    fn fang_umschalten(&mut self) {
+        let (host_kann, host_gefangen) = {
+            let s = self.shared.lock().unwrap();
+            (s.host_maus, s.zeiger.as_ref().map(|z| z.gefangen).unwrap_or(false))
+        };
+        if !host_kann {
+            protokoll::zeile("F8: dieser Host kann die Maus nicht einfangen (Fassung bis 0.2.0) - sie bleibt absolut".into());
+            return;
+        }
+        self.fang_hand = maus::hand_umschalten(self.fang_aktiv, host_gefangen);
+        self.fang_klick_noetig = false;
     }
 
     /// Einen laufenden Benchmark abbrechen. Mit `wiederherstellen` bekommt
@@ -7956,12 +8209,18 @@ impl App {
         self.bild_da = None;
         self.ui_kasten_alt = None;
         self.zugang_leeren();
-        if self.zeiger_eigen {
+        if self.fang_aktiv {
+            self.fang_aus("Sitzung beendet");
+        }
+        self.fang_hand = maus::Hand::Auto;
+        self.fang_klick_noetig = false;
+        if self.zeiger_eigen || self.zeiger_versteckt {
             if let Some(w) = &self.window {
                 w.set_cursor(CursorIcon::Default);
                 w.set_cursor_visible(true);
             }
             self.zeiger_eigen = false;
+            self.zeiger_versteckt = false;
         }
         self.zeiger_seq_gezeigt = 0;
         self.angewandt_fuer = None;
@@ -8820,6 +9079,7 @@ impl App {
             || self.show_overlay
             || self.esc_seit.is_some()
             || self.hdr_abzeichen.is_some()
+            || self.fang_hinweis.is_some()
             || lage
             || wechsel
     }
@@ -9529,6 +9789,22 @@ impl App {
                         self.geraete_scroll = erste_zeile(self.geraete_scroll, self.ui.geraete_sichtbar, self.ui.geraete_anzahl);
                     }
                     return n;
+                }
+
+                // Maus eingefangen: oben mittig, FANG_HINWEIS lang, wie man
+                // sie wieder freibekommt.
+                if let Some(t) = self.fang_hinweis {
+                    if self.fang_aktiv && t.elapsed() < FANG_HINWEIS {
+                        let text = self.lang.get(strings::Key::MouseCapturedHint);
+                        let bw = (self.ui.text.width(text, 12, 2) + 60).max(220).min(ww as i32 - 40);
+                        let bh = 44i32;
+                        let bx = ww as i32 / 2 - bw / 2;
+                        let by = 40i32;
+                        c.panel(bx, by, bw, bh, ui::CYAN);
+                        self.ui.text.draw_centered(c, bx + bw / 2, by + 27, text, 12, ui::TEXT, 2);
+                    } else {
+                        self.fang_hinweis = None;
+                    }
                 }
 
                 // Codec- oder Bildschirmwechsel unterwegs: der Host baut den
@@ -13435,8 +13711,16 @@ fn main() {
         zeiger_seq_gezeigt: 0,
         zeiger_eigen: false,
         zeiger_vorrat: Vec::new(),
-        zeiger_faktor: 1,
+        zeiger_skala_gebaut: 0.0,
+        zeiger_versteckt: false,
         maus_im_fenster: false,
+        fang_aktiv: false,
+        fang_hand: maus::Hand::Auto,
+        fang_klick_noetig: false,
+        fang_hinweis: None,
+        fang_sammler: maus::Sammler::default(),
+        fang_fehler_gemeldet: false,
+        fang_zeilen: 0,
         benchmark: None,
         bench_konfig: BenchKonfig::vorgabe(5, true),
         bench_scroll: 0,
@@ -14376,10 +14660,12 @@ fn hud(
         }
         3 => {
             // Die Tasten, die der Client selbst abfaengt - alles andere geht
-            // an den Mac. Jede davon ist auch ein Schalter im Menue; hier
+            // an den Mac. Jede davon ist auch ein Schalter im Menue (ausser
+            // F8: das Menue gibt eine eingefangene Maus ohnehin frei); hier
             // steht sie zum Nachschlagen.
             let strg = if lang.code == "de" { "Strg+Esc" } else { "Ctrl+Esc" };
-            let zeilen: [(&str, &str); 6] = [
+            let zeilen: [(&str, &str); 7] = [
+                ("F8", lang.get(ShortcutMouseCapture)),
                 ("F9", lang.get(ShowOverlay)),
                 ("F10", lang.get(ShortcutMenu)),
                 ("ESC 2 s", lang.get(ShortcutMenu)),
@@ -15055,7 +15341,7 @@ mod tests {
         let weiter = [
             (K::KeyE, 14), (K::Backspace, 51), (K::Delete, 117), (K::ArrowLeft, 123), (K::ArrowRight, 124),
             (K::ArrowUp, 126), (K::ArrowDown, 125), (K::Space, 49), (K::Enter, 36), (K::Digit1, 18),
-            (K::IntlBackslash, 10), (K::F1, 122), (K::F8, 100), (K::PageDown, 121), (K::Numpad5, 87),
+            (K::IntlBackslash, 10), (K::F1, 122), (K::F7, 98), (K::PageDown, 121), (K::Numpad5, 87),
         ];
         for (k, mac) in weiter {
             assert_eq!(wiederholung_an_host(k, false, false), Some(mac), "{k:?}");
@@ -15063,7 +15349,7 @@ mod tests {
             assert_eq!(wiederholung_an_host(k, false, true), None, "{k:?} bei offener Tafel");
         }
         let hier = [
-            K::Escape, K::F9, K::F10, K::F11, K::F12, K::ShiftLeft, K::ShiftRight, K::ControlLeft,
+            K::Escape, K::F8, K::F9, K::F10, K::F11, K::F12, K::ShiftLeft, K::ShiftRight, K::ControlLeft,
             K::ControlRight, K::AltLeft, K::AltRight, K::SuperLeft, K::SuperRight, K::CapsLock, K::PrintScreen,
         ];
         for k in hier {
@@ -15136,6 +15422,64 @@ mod tests {
             aus,
             vec![(IN_MOVE, 2), (IN_BUTTON, 3), (IN_MOVE, 6), (IN_KEY, 7), (IN_MOVE, 8), (IN_CLIP, 9), (IN_MOVE, 10)]
         );
+    }
+
+    /// Relative Bewegungen (eingefangen) werden addiert, nicht ersetzt - und
+    /// nur, solange nichts dazwischen liegt.
+    #[test]
+    fn relative_bewegungen_werden_addiert() {
+        let r = |dx: f32, dy: f32| eingabe_rahmen(IN_MOVE_REL, &maus::rel_kodieren(dx, dy));
+        let taste = eingabe_rahmen(IN_BUTTON, &[0, 1, MAUS_OHNE_POSITION, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let aus = bewegungen_zusammenfassen(vec![r(1.0, 2.0), r(3.0, -4.0), r(0.5, 0.0), taste.clone(), r(-7.0, 1.0), eingabe_rahmen(IN_MOVE, &[0; 8]), r(2.0, 2.0)]);
+        let lage = |b: &Vec<u8>| maus::rel_lesen(&b[8..]);
+        assert_eq!(aus.len(), 5);
+        assert_eq!((aus[0][0], lage(&aus[0])), (IN_MOVE_REL, Some((4.5, -2.0))));
+        assert_eq!(aus[1], taste);
+        assert_eq!((aus[2][0], lage(&aus[2])), (IN_MOVE_REL, Some((-7.0, 1.0))));
+        assert_eq!(aus[3][0], IN_MOVE);
+        assert_eq!((aus[4][0], lage(&aus[4])), (IN_MOVE_REL, Some((2.0, 2.0))));
+    }
+
+    /// Eingefangen: relative Bewegungen gehen als Typ 72 hinaus, Maustasten
+    /// mit MAUS_OHNE_POSITION (auch das Loslassen beim Fokusverlust); frei
+    /// wieder mit Position.
+    #[test]
+    fn eingefangen_relativ_und_tasten_ohne_position() {
+        secure::test_identitaet();
+        let hh = vec![0x7d; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_TESTBILD);
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        l.mouse_move(0.25, 0.75);
+        l.relativ = true;
+        l.mouse_rel(5.0, -3.5);
+        l.mouse_button(0, true);
+        l.alle_loslassen();
+        l.relativ = false;
+        l.mouse_button(1, true);
+        l.testbild(false);
+        let _ = los.send(());
+        let (gelesen, zu) = host.join().unwrap();
+        assert!(!zu);
+        let rel: Vec<(f32, f32)> = gelesen.iter().filter(|(a, _)| *a == IN_MOVE_REL).filter_map(|(_, p)| maus::rel_lesen(p)).collect();
+        assert_eq!(rel, vec![(5.0, -3.5)]);
+        let tasten: Vec<(u8, u8, u8)> = gelesen.iter().filter(|(a, _)| *a == IN_BUTTON).map(|(_, p)| (p[0], p[1], p[2])).collect();
+        assert_eq!(
+            tasten,
+            vec![
+                (0, 1, MAUS_OHNE_POSITION),
+                (0, 0, MAUS_OHNE_POSITION),
+                (1, 0, MAUS_OHNE_POSITION),
+                (2, 0, MAUS_OHNE_POSITION),
+                (1, 1, 0),
+            ]
+        );
+        // Die Position der freien Taste ist die letzte absolute Lage.
+        let frei = gelesen.iter().filter(|(a, _)| *a == IN_BUTTON).last().unwrap();
+        assert_eq!(f32::from_le_bytes(frei.1[4..8].try_into().unwrap()), 0.25);
     }
 
     /// Stockt die Leitung, gehen danach nicht alle alten Lagen einzeln
@@ -16464,6 +16808,18 @@ mod tests {
         assert!(!shared.lock().unwrap().host_hdr);
         tx.send(eingabe_rahmen(MSG_FAEHIGKEITEN, &[7, 0, 0, 0])).unwrap();
         assert!(warten_bis(frist, || shared.lock().unwrap().host_hdr), "Bit 2 kam nicht an");
+        // Ohne Bit 3 (Host bis 0.2.0) kein Einfangen; mit Bit 3 schon, und
+        // das Merkmal "eingefangen" der Zeigerform kommt an.
+        assert!(!shared.lock().unwrap().host_maus);
+        tx.send(eingabe_rahmen(MSG_FAEHIGKEITEN, &[15, 0, 0, 0])).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().host_maus), "Bit 3 kam nicht an");
+        let zf = maus::ZeigerNachricht { w: 2, h: 1, hx: 0, hy: 0, sichtbar: false, gefangen: true, rgba: vec![255; 8] };
+        tx.send(eingabe_rahmen(MSG_CURSOR, &maus::zeiger_kodieren(&zf))).unwrap();
+        assert!(warten_bis(frist, || shared.lock().unwrap().zeiger.as_ref().is_some_and(|z| z.gefangen && !z.sichtbar)), "Merkmal kam nicht an");
+        // Eine kaputte Form (Bild zu kurz) aendert nichts.
+        let mut kaputt_z = maus::zeiger_kodieren(&maus::ZeigerNachricht { gefangen: false, sichtbar: true, ..zf.clone() });
+        kaputt_z.pop();
+        tx.send(eingabe_rahmen(MSG_CURSOR, &kaputt_z)).unwrap();
         // Die Liste der Pruefvektoren, byte-genau wie der Mac-Host sie schickt.
         tx.send(eingabe_rahmen(MSG_BILDSCHIRME, &hex(BILDSCHIRME_2_4))).unwrap();
         assert!(warten_bis(frist, || shared.lock().unwrap().bildschirme.len() == 2), "Liste kam nicht an");
@@ -16538,6 +16894,8 @@ mod tests {
             assert!(!s.host_bildschirmwahl && s.bildschirme.is_empty() && s.bildschirm_wunsch.is_none());
             assert!(s.bildschirm_wechsel.is_none());
             assert!(!s.host_hdr, "FAEHIG_HDR ueberlebte das Sitzungsende");
+            // Ohne Bit 3 faengt der Fensterfaden nicht mehr ein (fang_soll).
+            assert!(!s.host_maus, "FAEHIG_MAUS ueberlebte das Sitzungsende");
         }
         assert!(!bildschirm_wunsch_senden(&shared, &input, None));
     }

@@ -288,6 +288,8 @@ pub static SV: Lang = Lang {
         (HdrWhyNegotiating, "förhandlas …"),
         (HdrWhyOldHost, "värden saknar HDR (äldre version)"),
         (StatColor, "Färg"),
+        (ShortcutMouseCapture, "Fånga eller släpp musen (spel)"),
+        (MouseCapturedHint, "Musen fångad · F8 släpper den"),
     ],
 };
 
@@ -576,6 +578,8 @@ pub static DA: Lang = Lang {
         (HdrWhyNegotiating, "forhandles …"),
         (HdrWhyOldHost, "værten kender ikke HDR (ældre version)"),
         (StatColor, "Farve"),
+        (ShortcutMouseCapture, "Fang eller frigiv musen (spil)"),
+        (MouseCapturedHint, "Musen fanget · F8 frigiver den"),
     ],
 };
 
@@ -864,6 +868,8 @@ pub static NB: Lang = Lang {
         (HdrWhyNegotiating, "forhandles …"),
         (HdrWhyOldHost, "verten kjenner ikke HDR (eldre versjon)"),
         (StatColor, "Farge"),
+        (ShortcutMouseCapture, "Fang eller slipp musen (spill)"),
+        (MouseCapturedHint, "Musen fanget · F8 slipper den"),
     ],
 };
 
@@ -1152,6 +1158,8 @@ pub static FI: Lang = Lang {
         (HdrWhyNegotiating, "neuvotellaan …"),
         (HdrWhyOldHost, "isäntäkone ei tue HDR:ää (vanhempi versio)"),
         (StatColor, "Väri"),
+        (ShortcutMouseCapture, "Kaappaa tai vapauta hiiri (pelit)"),
+        (MouseCapturedHint, "Hiiri kaapattu · F8 vapauttaa sen"),
     ],
 };
 
@@ -1440,5 +1448,7 @@ pub static IS: Lang = Lang {
         (HdrWhyNegotiating, "verið að semja …"),
         (HdrWhyOldHost, "hýsillinn styður ekki HDR (eldri útgáfa)"),
         (StatColor, "Litur"),
+        (ShortcutMouseCapture, "Fanga eða sleppa músinni (leikir)"),
+        (MouseCapturedHint, "Músin föst · F8 sleppir henni"),
     ],
 };

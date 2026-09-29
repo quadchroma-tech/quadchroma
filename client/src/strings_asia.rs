@@ -291,6 +291,8 @@ pub static RU: Lang = Lang {
         (HdrWhyNegotiating, "согласование …"),
         (HdrWhyOldHost, "хост не поддерживает HDR (старая версия)"),
         (StatColor, "Цвет"),
+        (ShortcutMouseCapture, "Захватить или отпустить мышь (игры)"),
+        (MouseCapturedHint, "Мышь захвачена · F8 отпускает её"),
     ],
 };
 
@@ -581,6 +583,8 @@ pub static ZH: Lang = Lang {
         (HdrWhyNegotiating, "正在协商 …"),
         (HdrWhyOldHost, "主机不支持 HDR（旧版本）"),
         (StatColor, "色彩"),
+        (ShortcutMouseCapture, "捕获或释放鼠标（游戏）"),
+        (MouseCapturedHint, "鼠标已捕获 · 按 F8 释放"),
     ],
 };
 
@@ -871,6 +875,8 @@ pub static JA: Lang = Lang {
         (HdrWhyNegotiating, "調整中 …"),
         (HdrWhyOldHost, "ホストは HDR 非対応（旧バージョン）"),
         (StatColor, "色"),
+        (ShortcutMouseCapture, "マウスを捕捉・解放（ゲーム）"),
+        (MouseCapturedHint, "マウスを捕捉中 · F8 で解放"),
     ],
 };
 
@@ -1159,5 +1165,7 @@ pub static TR: Lang = Lang {
         (HdrWhyNegotiating, "anlaşılıyor …"),
         (HdrWhyOldHost, "host HDR desteklemiyor (eski sürüm)"),
         (StatColor, "Renk"),
+        (ShortcutMouseCapture, "Fareyi yakala veya bırak (oyunlar)"),
+        (MouseCapturedHint, "Fare yakalandı · F8 bırakır"),
     ],
 };
