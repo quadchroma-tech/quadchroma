@@ -372,11 +372,13 @@ static int g_stau_rueckstand = 0;
 static uint64_t g_stau_gesendet = 0;
 // Abnahme in Schueben (QC_SCHUB_AB): Rueckstand und gesendete Bytes beim
 // letzten Blick, Zeit der letzten Abnahme oder des letzten Blicks mit wenig
-// Rueckstand (0 = noch keiner), die laengste Luecke dazwischen und seit wann
-// ununterbrochen wenig im Kernel liegt (0 = gerade nicht). Unter g_send_mtx.
+// Rueckstand (0 = noch keiner), des letzten Blicks ohne Abnahme danach
+// (0 = keiner), die laengste Luecke und seit wann ununterbrochen wenig im
+// Kernel liegt (0 = gerade nicht). Unter g_send_mtx.
 static int g_schub_rueckstand = 0;
 static uint64_t g_schub_gesendet = 0;
 static uint64_t g_schub_zuletzt = 0;
+static uint64_t g_schub_ohne = 0;
 static uint64_t g_schub_luecke = 0;
 static uint64_t g_schub_frei_seit = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
@@ -1793,6 +1795,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     g_vid = chan;
     g_stau_seit = 0;                    // ein Stau des Vorgaengers zaehlt nicht fuer ihn
     g_schub_zuletzt = 0;
+    g_schub_ohne = 0;
     g_schub_luecke = 0;
     g_schub_frei_seit = 0;
     g_ton_stau_seit = 0;
@@ -3404,12 +3407,20 @@ static void schuebe_verfolgen(int rueckstand, uint64_t gesendet, uint64_t jetzt)
         if (!g_schub_frei_seit) g_schub_frei_seit = jetzt;
         else if (jetzt - g_schub_frei_seit >= QC_STAU_FRIST_MAX_US) g_schub_luecke = 0;
         g_schub_zuletzt = jetzt;
+        g_schub_ohne = 0;
     } else {
         g_schub_frei_seit = 0;
         int64_t abgenommen = (int64_t)(gesendet - g_schub_gesendet) - ((int64_t)rueckstand - g_schub_rueckstand);
         if (abgenommen > 0) {
-            if (g_schub_zuletzt && jetzt - g_schub_zuletzt > g_schub_luecke) g_schub_luecke = jetzt - g_schub_zuletzt;
+            // Als Luecke zaehlt nur, was ein Blick ohne Abnahme auch gesehen
+            // hat - nicht die Zeit, in der niemand hinsah (stiller Bildschirm:
+            // nur der 5-s-Takt blickt, und jeder Blick sieht eine Abnahme).
+            if (g_schub_zuletzt && g_schub_ohne > g_schub_zuletzt && g_schub_ohne - g_schub_zuletzt > g_schub_luecke)
+                g_schub_luecke = g_schub_ohne - g_schub_zuletzt;
             g_schub_zuletzt = jetzt;
+            g_schub_ohne = 0;
+        } else {
+            g_schub_ohne = jetzt;
         }
     }
     g_schub_gesendet = gesendet;
