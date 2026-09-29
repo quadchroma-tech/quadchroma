@@ -13,6 +13,14 @@
 // Tasten). Gehaltene Tasten werden mitgeschrieben und beim Trennen
 // losgelassen - sonst haelt Windows sie fuer immer gedrueckt.
 //
+// Wiederholungen: eingespeiste Tasten wiederholt Windows nicht selbst (das
+// tut bei einer echten Tastatur deren Treiber). Der Client schickt die
+// Wiederholungen seines Systems als weitere Druecke (Merkmal
+// TASTE_WIEDERHOLUNG); hier geht jeder ungefiltert als Druck durch SendInput
+// - genau das liefert auch eine echte Tastatur, und Windows kennzeichnet
+// ihn selbst als Wiederholung (WM_KEYDOWN, lParam Bit 30: war schon
+// gedrueckt). Das Merkmal braucht es deshalb hier nicht.
+//
 // UIPI: SendInput erreicht keine Fenster mit hoeheren Rechten als der eigene
 // Prozess. Die App laeuft jetzt erhoeht (Manifest requireAdministrator), also
 // erreicht sie den Task-Manager, den Registrierungs-Editor und Installer im

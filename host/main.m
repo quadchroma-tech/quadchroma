@@ -1984,12 +1984,21 @@ static void start_beacon(int port) {
 //   16 MAUS_BEWEGUNG : f32 x, f32 y            (0..1, Anteil der Bildbreite/-hoehe)
 //   17 MAUS_TASTE    : u8 taste, u8 gedrueckt, u16 frei, f32 x, f32 y
 //   18 RAD           : f32 dx, f32 dy          (Pixel)
+//   19 TASTE         : u16 keycode, u8 gedrueckt, u8 Merkmale, u32 Umschalter
+//                      Merkmale Bit 0: Wiederholung (QC_TASTE_WIEDERHOLUNG)
 //   50-53, 69        : Dateien und Faehigkeiten (dateien.h), eigene Obergrenzen
 //   70 BILDSCHIRM    : Bildschirmwunsch (bildschirm.h), hoechstens 65 Byte
 #define QC_IN_MOVE    16
 #define QC_IN_BUTTON  17
 #define QC_IN_SCROLL  18
 #define QC_IN_KEY     19
+
+// Merkmal im vierten Byte der Tastennachricht: der Client haelt die Taste
+// und sein System wiederholt sie. Der Mac wiederholt eingespeiste Tasten
+// nicht selbst, also kommt die Wiederholung von dort - mit Verzoegerung und
+// Rate des Clients. Aeltere Clients schicken hier 0 und keine Wiederholungen,
+// aeltere Hosts uebergehen das Byte und sehen einen weiteren Druck.
+#define QC_TASTE_WIEDERHOLUNG 1
 
 // Einspeisen und das Mitschreiben dessen, was gedrueckt ist, laufen unter
 // g_inject_mtx. Beim Abloesen eines Eingabekanals arbeiten kurz zwei Faeden
@@ -2080,7 +2089,20 @@ static void inject_scroll(float dx, float dy) {
 // jedem weiteren Klick einen Rechtsklick. Nur unter g_inject_mtx.
 static uint64_t g_key_down[256] = {0};
 
-static void inject_key(uint64_t kanal, uint16_t keycode, int down, uint32_t mods) {
+// Wohin Tastenereignisse gehen: ins System. Der Pruefstand (hosttest.m)
+// lenkt sie auf sich um - er soll pruefen, was hinausginge, und nicht auf
+// dem eigenen Mac tippen. Nur unter g_inject_mtx.
+static void tasten_posten_system(CGEventRef e) { CGEventPost(kCGHIDEventTap, e); }
+static void (*g_tasten_posten)(CGEventRef e) = tasten_posten_system;
+
+// wiederholung: der Client meldet eine Wiederholung seines Systems
+// (QC_TASTE_WIEDERHOLUNG). Ist die Taste hier gedrueckt, geht sie als keyDown
+// mit kCGKeyboardEventAutorepeat hinaus - so, wie der Mac eine gehaltene
+// Taste selbst wiederholt: kein zweiter Druck, kein Loslassen dazwischen.
+// Ist sie es nicht (freigegeben, weil ein Eingabekanal ablief, oder das
+// Loslassen kam zuerst), ist es ein gewoehnlicher Druck und wird
+// mitgeschrieben wie jeder - so bleibt nichts haengen, was niemand freigibt.
+static void inject_key(uint64_t kanal, uint16_t keycode, int down, int wiederholung, uint32_t mods) {
     // Umschalter aus der Client-Sicht uebernehmen: so sieht der Mac genau den
     // Zustand, den der Benutzer an seiner Tastatur haelt.
     CGEventFlags f = 0;
@@ -2091,10 +2113,12 @@ static void inject_key(uint64_t kanal, uint16_t keycode, int down, uint32_t mods
     g_mods = f;
     g_mods_kanal = kanal;
 
+    BOOL autorepeat = down && wiederholung && keycode < 256 && g_key_down[keycode] != 0;
     CGEventRef e = CGEventCreateKeyboardEvent(g_evsrc, (CGKeyCode)keycode, down ? true : false);
     if (!e) return;
     CGEventSetFlags(e, f);
-    CGEventPost(kCGHIDEventTap, e);
+    if (autorepeat) CGEventSetIntegerValueField(e, kCGKeyboardEventAutorepeat, 1);
+    g_tasten_posten(e);
     CFRelease(e);
 
     // Mitschreiben, was gerade gedrueckt ist - das ist die Grundlage fuer das
@@ -2127,7 +2151,7 @@ static BOOL einspeisen(int fd, uint64_t kanal, uint8_t typ, const uint8_t *paylo
                 uint16_t kc; uint32_t mods;
                 memcpy(&kc, payload, 2);
                 memcpy(&mods, payload + 4, 4);
-                inject_key(kanal, kc, payload[2], mods);
+                inject_key(kanal, kc, payload[2], payload[3] & QC_TASTE_WIEDERHOLUNG, mods);
             }
             break;
         default: break;
@@ -2221,7 +2245,7 @@ static void alle_tasten_loslassen(uint64_t kanal) {
             CGEventRef e = CGEventCreateKeyboardEvent(g_evsrc, (CGKeyCode)k, false);
             if (e) {
                 CGEventSetFlags(e, 0);
-                CGEventPost(kCGHIDEventTap, e);
+                g_tasten_posten(e);
                 CFRelease(e);
             }
         }
