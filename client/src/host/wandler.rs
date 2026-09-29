@@ -27,6 +27,16 @@
 // Hauptspeicher. Ein BGRA-Bild (Vollbildprogramm mit 8 Bit auf dem
 // HDR-Desktop) ist sRGB mit dem SDR-Weiss: linear * SDRWhiteLevel / 1000.
 //
+// Modus Zehn (die 10-Bit-Kandidaten in SDR, Standardweg des Encoders auf
+// einer NVIDIA-Karte): das BGRA-Bild der Aufnahme wird auf der Karte zu den
+// Ebenen von YUV444P16LE (4:4:4, drei R16_UINT-Ziele in einem Durchgang)
+// bzw. P010 (4:2:0, Y und die CbCr-Paare) - mit genau der Ganzzahlrechnung,
+// die Bild::aus_bgra auf dem Prozessor macht (encoder.rs, ycbcr: BT.709,
+// voller Bereich, 8 Bit oben buendig in 16 Bit; bei 4:2:0 die Farbe des
+// Punktes oben links je Vierergruppe). Dieselben Ziele wie im Modus PQ; die
+// Ebenen bleiben auf der Karte (die CUDA-Bruecke kopiert sie in den Rahmen
+// fuer nvenc, cuda.rs), STAGING gibt es nur zum Auslesen (Tests).
+//
 // Je Bild: CopyResource der Duplication-Textur in den eigenen Eingang mit
 // Lesesicht (FP16, im Modus PQ auch BGRA; gleich nach AcquireNextFrame, vor
 // ReleaseFrame), dann ein Dreieck ueber das Ziel. Der Eingang bleibt stehen:
@@ -187,6 +197,55 @@ uint2 ps_pq420_uv(float4 pos : SV_Position) : SV_Target {
 }
 "#;
 
+/// Die Shader des Modus Zehn: hinter hdr_hlsl::WANDLER (vs_voll, Eingang t0)
+/// gesetzt, ohne eigene Konstanten. Die Zahlen sind die Ganzzahlen aus
+/// encoder::ycbcr (54/183/19, 138, 163, Rundung +128, >> 8 arithmetisch wie
+/// in Rust); der Test zehn_zahlen_wie_ycbcr haelt sie fest. Einstiege:
+/// ps_zehn444 (drei Ziele), ps_zehn420_y, ps_zehn420_uv.
+pub(crate) const ZEHN_HLSL: &str = r#"
+// ---------- Wandler, Modus Zehn: SDR-Desktop (BGRA 8 Bit) -> Ebenen der 10-Bit-Kandidaten ----------
+// Ein Punkt der Aufnahme als 8-Bit-Ganzzahlen (die Lesesicht ist UNORM: k/255).
+int3 rgb8(int2 p) {
+    return int3(floor(saturate(eingang.Load(int3(p, 0)).rgb) * 255.0 + 0.5));
+}
+
+// BT.709, voller Bereich, 8 Bit - Schritt fuer Schritt wie encoder::ycbcr.
+int3 ycbcr709(int3 c) {
+    int y = (54 * c.r + 183 * c.g + 19 * c.b + 128) >> 8;
+    int cb = (((c.b - y) * 138 + 128) >> 8) + 128;
+    int cr = (((c.r - y) * 163 + 128) >> 8) + 128;
+    return clamp(int3(y, cb, cr), 0, 255);
+}
+
+// 8 Bit oben buendig in 16 Bit (v << 8), wie aus_bgra die 10-Bit-Formate fuellt.
+uint oben(int v) { return ((uint)v) << 8; }
+
+struct Zehn444 {
+    uint y  : SV_Target0;
+    uint cb : SV_Target1;
+    uint cr : SV_Target2;
+};
+
+Zehn444 ps_zehn444(float4 pos : SV_Position) {
+    int3 v = ycbcr709(rgb8(int2(pos.xy)));
+    Zehn444 o;
+    o.y = oben(v.x);
+    o.cb = oben(v.y);
+    o.cr = oben(v.z);
+    return o;
+}
+
+uint ps_zehn420_y(float4 pos : SV_Position) : SV_Target {
+    return oben(ycbcr709(rgb8(int2(pos.xy))).x);
+}
+
+// Cb/Cr je Vierergruppe: der Punkt oben links, wie aus_bgra (und das Testbild).
+uint2 ps_zehn420_uv(float4 pos : SV_Position) : SV_Target {
+    int3 v = ycbcr709(rgb8(int2(pos.xy) * 2));
+    return uint2(oben(v.y), oben(v.z));
+}
+"#;
+
 /// Konstanten des PQ-Modus (cbuffer WandlerPq, 28 Byte, der Puffer auf 32
 /// aufgefuellt - ein Konstantenpuffer ist ein Vielfaches von 16 Byte).
 #[repr(C)]
@@ -252,6 +311,12 @@ fn pq_quelle() -> &'static str {
     Q.get_or_init(|| format!("{}{}{}", hdr_hlsl::WANDLER, hdr_hlsl::PQ, PQ_HLSL))
 }
 
+/// Die ganze Quelle des Modus Zehn: der Text des Wandlers und ZEHN_HLSL.
+fn zehn_quelle() -> &'static str {
+    static Q: OnceLock<String> = OnceLock::new();
+    Q.get_or_init(|| format!("{}{}", hdr_hlsl::WANDLER, ZEHN_HLSL))
+}
+
 /// Die uebersetzten Shader (Vertex, Pixel SDR) - einmal je Prozess; ein
 /// Fehler bleibt stehen, er aendert sich zur Laufzeit nicht.
 fn shader_code() -> Result<&'static (Vec<u8>, Vec<u8>), String> {
@@ -274,6 +339,21 @@ fn pq_shader_code() -> Result<&'static [Vec<u8>; 3], String> {
         let a = crate::anzeige::uebersetzen_aus(q, b"wandler_pq.hlsl\0", b"ps_pq444\0", b"ps_4_0\0")?;
         let b = crate::anzeige::uebersetzen_aus(q, b"wandler_pq.hlsl\0", b"ps_pq420_y\0", b"ps_4_0\0")?;
         let c = crate::anzeige::uebersetzen_aus(q, b"wandler_pq.hlsl\0", b"ps_pq420_uv\0", b"ps_4_0\0")?;
+        Ok([a, b, c])
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// Die uebersetzten Shader des Modus Zehn (444, 420 Y, 420 CbCr) - einmal je
+/// Prozess, erst wenn ein 10-Bit-Kandidat den Weg auf der Karte nimmt.
+fn zehn_shader_code() -> Result<&'static [Vec<u8>; 3], String> {
+    static CODE: OnceLock<Result<[Vec<u8>; 3], String>> = OnceLock::new();
+    CODE.get_or_init(|| {
+        let q = zehn_quelle();
+        let a = crate::anzeige::uebersetzen_aus(q, b"wandler_zehn.hlsl\0", b"ps_zehn444\0", b"ps_4_0\0")?;
+        let b = crate::anzeige::uebersetzen_aus(q, b"wandler_zehn.hlsl\0", b"ps_zehn420_y\0", b"ps_4_0\0")?;
+        let c = crate::anzeige::uebersetzen_aus(q, b"wandler_zehn.hlsl\0", b"ps_zehn420_uv\0", b"ps_4_0\0")?;
         Ok([a, b, c])
     })
     .as_ref()
@@ -349,11 +429,12 @@ fn ziel_textur(device: &ID3D11Device, w: u32, h: u32, format: DXGI_FORMAT) -> wi
     Ok(Textur { tex, sicht: rtv.ok_or_else(kein_zeiger)?, w, h })
 }
 
-/// Eine Ebene des Modus PQ: Ziel (R16_UINT bzw. R16G16_UINT) und seine
-/// STAGING-Kopie zum Auslesen.
+/// Eine Ebene des Modus PQ oder Zehn: Ziel (R16_UINT bzw. R16G16_UINT) und
+/// seine STAGING-Kopie zum Auslesen - die entsteht erst, wenn ausgelesen
+/// wird (im Modus Zehn bleiben die Ebenen auf der Karte).
 struct Ebene {
     ziel: Textur<ID3D11RenderTargetView>,
-    staging: ID3D11Texture2D,
+    staging: Option<ID3D11Texture2D>,
     /// Byte je Punkt (2 fuer Y/Cb/Cr, 4 fuer das CbCr-Paar).
     punkt_bytes: usize,
 }
@@ -372,6 +453,13 @@ struct PqZiele {
     plan: PqPlan,
     ebenen: Vec<Ebene>,
     bereit: bool,
+}
+
+/// Die Shader des Modus Zehn - entstehen mit dem ersten 10-Bit-Bild.
+struct ZehnShader {
+    ps444: ID3D11PixelShader,
+    ps420_y: ID3D11PixelShader,
+    ps420_uv: ID3D11PixelShader,
 }
 
 /// Der Wandler auf dem Geraet der Duplication.
@@ -396,9 +484,12 @@ pub struct Wandler {
     letzter: Option<Eingang>,
     /// Ausgang Modus SDR: B8G8R8A8_UNORM, Groesse der Oberflaeche.
     sdr: Option<Textur<ID3D11RenderTargetView>>,
-    /// Modus PQ: Shader (einmal) und Ziele (je Plan).
+    /// Modus PQ: Shader (einmal) und Ziele (je Plan) - die Ziele teilt er
+    /// mit dem Modus Zehn (dieselben Formate).
     pq_shader: Option<PqShader>,
     pq: Option<PqZiele>,
+    /// Modus Zehn: Shader (einmal).
+    zehn_shader: Option<ZehnShader>,
 }
 
 impl Wandler {
@@ -443,6 +534,7 @@ impl Wandler {
             sdr: None,
             pq_shader: None,
             pq: None,
+            zehn_shader: None,
         })
     }
 
@@ -591,11 +683,109 @@ impl Wandler {
         for (w, h, b) in plan.ebenen() {
             let format = if b == 2 { DXGI_FORMAT_R16_UINT } else { DXGI_FORMAT_R16G16_UINT };
             let ziel = ziel_textur(&self.device, w, h, format).map_err(|e| fehler("Wandler PQ: Ziel", e))?;
-            let st = staging(&self.device, w, h, format).map_err(|e| fehler("Wandler PQ: STAGING", e))?;
-            ebenen.push(Ebene { ziel, staging: st, punkt_bytes: b });
+            ebenen.push(Ebene { ziel, staging: None, punkt_bytes: b });
         }
         self.pq = Some(PqZiele { plan: *plan, ebenen, bereit: false });
         Ok(())
+    }
+
+    /// Die Ziele in ihre STAGING-Kopien geben (die entstehen hier beim
+    /// ersten Mal) - danach kann pq_auslesen sie holen.
+    fn ebenen_nach_staging(&mut self) -> Result<(), String> {
+        let Some(z) = self.pq.as_mut() else { return Err("Wandler: keine Ebenen".into()) };
+        for e in z.ebenen.iter_mut() {
+            if e.staging.is_none() {
+                let mut d = D3D11_TEXTURE2D_DESC::default();
+                unsafe { e.ziel.tex.GetDesc(&mut d) };
+                e.staging = Some(staging(&self.device, e.ziel.w, e.ziel.h, d.Format).map_err(|x| fehler("Wandler: STAGING", x))?);
+            }
+            if let Some(s) = e.staging.as_ref() {
+                unsafe { self.ctx.CopyResource(s, &e.ziel.tex) };
+            }
+        }
+        z.bereit = true;
+        Ok(())
+    }
+
+    /// Ein Durchgang je Ziel(-satz) mit dem Eingang `srv`: der Zustand wie
+    /// zustand(), die Konstanten in b1 (nur PQ), dann das Dreieck.
+    unsafe fn ebenen_zeichnen(&self, srv: &ID3D11ShaderResourceView, durchgaenge: &[(&[Option<ID3D11RenderTargetView>], u32, u32, &ID3D11PixelShader)], konst: Option<&ID3D11Buffer>) {
+        for (rtv, w, h, ps) in durchgaenge {
+            self.ctx.OMSetRenderTargets(Some(rtv), None);
+            self.ctx.OMSetBlendState(None, None, 0xffff_ffff);
+            self.ctx.OMSetDepthStencilState(None, 0);
+            self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: *w as f32, Height: *h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]));
+            self.ctx.RSSetState(&self.raster);
+            self.ctx.IASetInputLayout(None);
+            self.ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.ctx.VSSetShader(&self.vs, None);
+            self.ctx.PSSetShader(*ps, None);
+            if let Some(k) = konst {
+                self.ctx.PSSetConstantBuffers(1, Some(&[Some(k.clone())]));
+            }
+            self.ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+            self.ctx.Draw(3, 0);
+        }
+        self.loesen();
+    }
+
+    /// Shader des Modus Zehn - beim ersten Mal.
+    fn zehn_shader_sichern(&mut self) -> Result<(), String> {
+        if self.zehn_shader.is_some() {
+            return Ok(());
+        }
+        let [a, b, c] = zehn_shader_code()?;
+        let erzeugen = |code: &Vec<u8>| -> Result<ID3D11PixelShader, String> {
+            let mut ps = None;
+            unsafe { self.device.CreatePixelShader(code, None, Some(&mut ps)) }.map_err(|e| fehler("Wandler Zehn: CreatePixelShader", e))?;
+            ps.ok_or_else(|| "Wandler Zehn: CreatePixelShader lieferte nichts".to_string())
+        };
+        self.zehn_shader = Some(ZehnShader { ps444: erzeugen(a)?, ps420_y: erzeugen(b)?, ps420_uv: erzeugen(c)? });
+        Ok(())
+    }
+
+    /// Modus Zehn vorbereiten: Shader und Ziele fuer diesen Plan (ungedreht,
+    /// Stromgroesse). Liefert die Ziele als (Textur, Byte je Zeile, Zeilen) -
+    /// genau die Ebenen von YUV444P16LE (Y, Cb, Cr) bzw. P010 (Y, CbCr), fuer
+    /// die CUDA-Bruecke.
+    pub fn zehn_vorbereiten(&mut self, plan: &PqPlan) -> Result<Vec<(ID3D11Texture2D, usize, usize)>, String> {
+        if plan.drehung != Drehung::Keine {
+            return Err(format!("Wandler Zehn: gedrehter Strom ({} Grad) nicht vorgesehen", plan.drehung.grad()));
+        }
+        self.zehn_shader_sichern()?;
+        self.pq_ziele_sichern(plan)?;
+        let z = self.pq.as_ref().ok_or("Wandler Zehn: keine Ziele")?;
+        Ok(z.ebenen.iter().map(|e| (e.ziel.tex.clone(), e.ziel.w as usize * e.punkt_bytes, e.ziel.h as usize)).collect())
+    }
+
+    /// Modus Zehn aus dem gehaltenen Bild (BGRA - ein FP16-Bild geht vorher
+    /// durch nach_sdr): die Ebenen nach dem Plan rechnen. `auslesen`: gleich
+    /// in die STAGING-Kopien geben (pq_auslesen holt sie ab) - sonst bleiben
+    /// sie nur auf der Karte. Ok(false), wenn der Wandler kein BGRA-Bild haelt.
+    pub fn zehn_rechnen(&mut self, plan: &PqPlan, auslesen: bool) -> Result<bool, String> {
+        if self.letzter != Some(Eingang::Bgra) {
+            return Ok(false);
+        }
+        let Some((srv, sw, sh)) = self.eingang_bgra.as_ref().map(|e| (e.sicht.clone(), e.w, e.h)) else { return Ok(false) };
+        if plan.w > sw || plan.h > sh {
+            return Err(format!("Wandler Zehn: Strom {}x{} groesser als das Bild {sw}x{sh}", plan.w, plan.h));
+        }
+        self.zehn_vorbereiten(plan)?;
+        let (Some(s), Some(z)) = (self.zehn_shader.as_ref(), self.pq.as_ref()) else { return Err("Wandler Zehn: nicht eingerichtet".into()) };
+        let ziele: Vec<Option<ID3D11RenderTargetView>> = z.ebenen.iter().map(|e| Some(e.ziel.sicht.clone())).collect();
+        let durchgaenge: Vec<(&[Option<ID3D11RenderTargetView>], u32, u32, &ID3D11PixelShader)> = if plan.chroma444 {
+            vec![(&ziele[..], plan.w, plan.h, &s.ps444)]
+        } else {
+            vec![(&ziele[..1], plan.w, plan.h, &s.ps420_y), (&ziele[1..], plan.w / 2, plan.h / 2, &s.ps420_uv)]
+        };
+        unsafe { self.ebenen_zeichnen(&srv, &durchgaenge, None) };
+        if let Some(z) = self.pq.as_mut() {
+            z.bereit = false;
+        }
+        if auslesen {
+            self.ebenen_nach_staging()?;
+        }
+        Ok(true)
     }
 
     /// Modus PQ aus dem gehaltenen Bild: die Ebenen nach dem Plan rechnen
@@ -610,7 +800,7 @@ impl Wandler {
         let Some((srv, sw, sh)) = eingang.map(|e| (e.sicht.clone(), e.w, e.h)) else { return Ok(false) };
         self.pq_shader_sichern()?;
         self.pq_ziele_sichern(plan)?;
-        let (Some(s), Some(z)) = (self.pq_shader.as_ref(), self.pq.as_mut()) else { return Err("Wandler PQ: nicht eingerichtet".into()) };
+        let (Some(s), Some(z)) = (self.pq_shader.as_ref(), self.pq.as_ref()) else { return Err("Wandler PQ: nicht eingerichtet".into()) };
         let k = KonstPq {
             quelle_groesse: [sw as i32, sh as i32],
             strom_groesse: [plan.w as i32, plan.h as i32],
@@ -627,28 +817,9 @@ impl Wandler {
             } else {
                 vec![(&ziele[..1], plan.w, plan.h, &s.ps420_y), (&ziele[1..], plan.w / 2, plan.h / 2, &s.ps420_uv)]
             };
-            for (rtv, w, h, ps) in durchgaenge {
-                // Wie zustand(), aber ohne &self - z haelt einen Teil davon.
-                self.ctx.OMSetRenderTargets(Some(rtv), None);
-                self.ctx.OMSetBlendState(None, None, 0xffff_ffff);
-                self.ctx.OMSetDepthStencilState(None, 0);
-                self.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]));
-                self.ctx.RSSetState(&self.raster);
-                self.ctx.IASetInputLayout(None);
-                self.ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                self.ctx.VSSetShader(&self.vs, None);
-                self.ctx.PSSetShader(ps, None);
-                self.ctx.PSSetConstantBuffers(1, Some(&[Some(s.konst.clone())]));
-                self.ctx.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
-                self.ctx.Draw(3, 0);
-            }
-            self.ctx.PSSetShaderResources(0, Some(&[None]));
-            self.ctx.OMSetRenderTargets(None, None);
-            for e in &z.ebenen {
-                self.ctx.CopyResource(&e.staging, &e.ziel.tex);
-            }
+            self.ebenen_zeichnen(&srv, &durchgaenge, Some(&s.konst));
         }
-        z.bereit = true;
+        self.ebenen_nach_staging()?;
         Ok(true)
     }
 
@@ -663,8 +834,9 @@ impl Wandler {
         for e in &z.ebenen {
             let zeile = e.ziel.w as usize * e.punkt_bytes;
             let hoehe = e.ziel.h as usize;
+            let Some(st) = e.staging.as_ref() else { return Err("Wandler PQ: keine STAGING-Kopie".into()) };
             let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-            unsafe { self.ctx.Map(&e.staging, 0, D3D11_MAP_READ, 0, Some(&mut m)) }.map_err(|x| fehler("Wandler PQ: Map", x))?;
+            unsafe { self.ctx.Map(st, 0, D3D11_MAP_READ, 0, Some(&mut m)) }.map_err(|x| fehler("Wandler PQ: Map", x))?;
             let r = if m.pData.is_null() || (m.RowPitch as usize) < zeile {
                 Err(format!("Wandler PQ: Map lieferte {} Byte je Zeile fuer {zeile}", m.RowPitch))
             } else {
@@ -676,7 +848,7 @@ impl Wandler {
                 }
                 Ok(())
             };
-            unsafe { self.ctx.Unmap(&e.staging, 0) };
+            unsafe { self.ctx.Unmap(st, 0) };
             r?;
             o += zeile * hoehe;
         }
@@ -1075,6 +1247,114 @@ mod tests {
         // Rundungsgrenzen: f32 auf der Karte gegen f64 - selten.
         eprintln!("PQ auf WARP: {abweichend} von {gesamt} Codes um 1 neben hdr.rs");
         assert!(abweichend * 100 <= gesamt, "{abweichend} von {gesamt} Codes um 1 daneben");
+    }
+
+    // ------------------------------------------- Modus Zehn gegen aus_bgra
+
+    /// Die Zahlen im HLSL des Modus Zehn sind die Ganzzahlen aus
+    /// encoder::ycbcr - und die Rechnung steht nur einmal da.
+    #[test]
+    fn zehn_zahlen_wie_ycbcr() {
+        for t in ["(54 * c.r + 183 * c.g + 19 * c.b + 128) >> 8", "(((c.b - y) * 138 + 128) >> 8) + 128", "(((c.r - y) * 163 + 128) >> 8) + 128", "clamp(int3(y, cb, cr), 0, 255)", "((uint)v) << 8", "rgb8(int2(pos.xy) * 2)"] {
+            assert_eq!(ZEHN_HLSL.matches(t).count(), 1, "{t}");
+        }
+        assert!(!ZEHN_HLSL.contains("register("), "Modus Zehn liest nur den Eingang des Wandlers (t0), ohne Konstanten");
+        for e in ["Zehn444 ps_zehn444(", "uint ps_zehn420_y(", "uint2 ps_zehn420_uv(", "float4 vs_voll("] {
+            assert_eq!(zehn_quelle().matches(e).count(), 1, "{e}");
+        }
+    }
+
+    /// Die Ebenen eines Bild (YUV444P16LE: Y, Cb, Cr; P010: Y, CbCr) dicht
+    /// gepackt als u16 - wie pq_auslesen sie liefert.
+    fn bild_ebenen(b: &super::super::encoder::Bild, w: usize, h: usize, chroma444: bool) -> Vec<u16> {
+        let ebenen: Vec<(usize, usize)> = if chroma444 { vec![(2 * w, h); 3] } else { vec![(2 * w, h), (2 * w, h / 2)] };
+        let mut aus = Vec::new();
+        for (i, (zeile, zeilen)) in ebenen.into_iter().enumerate() {
+            let ls = unsafe { (*b.frame).linesize[i] as usize };
+            for y in 0..zeilen {
+                let z = unsafe { std::slice::from_raw_parts((*b.frame).data[i].add(y * ls), zeile) };
+                aus.extend(z.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])));
+            }
+        }
+        aus
+    }
+
+    /// Modus Zehn auf WARP gegen die Umrechnung auf dem Prozessor
+    /// (Bild::aus_bgra, der alte Weg der 10-Bit-Kandidaten): 4:4:4
+    /// (YUV444P16LE) und 4:2:0 (P010), alle 16,7 Mio. Farben ueber mehrere
+    /// Bilder verteilt, das Testbild, und eine ungerade Oberflaeche mit
+    /// abgeschnittenem Rand (Strom kleiner als das Bild). Jeder Code
+    /// hoechstens 1 daneben (10 Bit) - gerechnet wird dieselbe Ganzzahlrechnung,
+    /// also ist jeder Code genau gleich.
+    #[test]
+    fn zehn_ebenen_auf_warp_wie_aus_bgra() {
+        let Some((device, ctx)) = warp() else { return };
+        use ffmpeg_next::sys::AVPixelFormat;
+        let mut wandler = Wandler::neu(&device, &ctx, 1000).expect("Wandler");
+        // Bilder: (Oberflaeche w x h, Strom w x h, Punkte [R, G, B]).
+        let mut bilder: Vec<(u32, u32, u32, u32, Vec<[u8; 3]>)> = Vec::new();
+        // Alle 2^24 Farben: 16 Bilder 1024x1024.
+        for teil in 0..16u32 {
+            let punkte: Vec<[u8; 3]> = (0..1024 * 1024u32).map(|i| {
+                let c = teil * 1024 * 1024 + i;
+                [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+            }).collect();
+            bilder.push((1024, 1024, 1024, 1024, punkte));
+        }
+        // Das Testbild (BGRA) in 64x48.
+        let tb = super::super::testbild::bgra(64, 48, 3);
+        bilder.push((64, 48, 64, 48, tb.chunks_exact(4).map(|p| [p[2], p[1], p[0]]).collect()));
+        // Ungerade Oberflaeche 37x21, Strom 36x20 (stromplan).
+        bilder.push((37, 21, 36, 20, (0..37 * 21u32).map(|i| [(i * 7) as u8, (i * 13 + 5) as u8, (i * 29 + 11) as u8]).collect()));
+        let mut gesamt = 0usize;
+        let mut daneben = 0usize;
+        for (sw, sh, w, h, punkte) in &bilder {
+            let tex = bgra_textur(&device, *sw, *sh, punkte);
+            assert_eq!(wandler.aufnehmen(&tex).expect("aufnehmen"), Eingang::Bgra);
+            // Die Quelle der Umrechnung auf dem Prozessor: BGRA in Stromgroesse.
+            let mut ram = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..*h as usize {
+                for x in 0..*w as usize {
+                    let p = punkte[y * *sw as usize + x];
+                    ram.extend([p[2], p[1], p[0], 255]);
+                }
+            }
+            for chroma444 in [true, false] {
+                let plan = PqPlan { w: *w, h: *h, drehung: Drehung::Keine, chroma444 };
+                assert!(wandler.zehn_rechnen(&plan, true).expect("zehn_rechnen"), "{}", plan.text());
+                let mut aus = Vec::new();
+                wandler.pq_auslesen(&mut aus).expect("auslesen");
+                assert_eq!(aus.len(), plan.bytes(), "{}", plan.text());
+                let karte = als_u16(&aus);
+                let pf = if chroma444 { AVPixelFormat::AV_PIX_FMT_YUV444P16LE } else { AVPixelFormat::AV_PIX_FMT_P010LE };
+                let mut b = super::super::encoder::Bild::neu(pf, *w as i32, *h as i32).expect("Bild");
+                b.aus_bgra(&ram, *w as usize, *h as usize).expect("aus_bgra");
+                let prozessor = bild_ebenen(&b, *w as usize, *h as usize, chroma444);
+                assert_eq!(karte.len(), prozessor.len(), "{}", plan.text());
+                for (i, (&k, &p)) in karte.iter().zip(&prozessor).enumerate() {
+                    assert_eq!(k & 0xff, 0, "{}: Code {i} nicht wie aus_bgra oben buendig ({k:#06x})", plan.text());
+                    let d = (k >> 6) as i32 - (p >> 6) as i32;
+                    assert!(d.abs() <= 1, "{}: Code {i} ist {} statt {} (10 Bit)", plan.text(), k >> 6, p >> 6);
+                    daneben += (d != 0) as usize;
+                }
+                gesamt += karte.len();
+            }
+        }
+        eprintln!("Zehn auf WARP: {daneben} von {gesamt} Codes neben aus_bgra");
+        assert_eq!(daneben, 0, "dieselbe Ganzzahlrechnung - jeder Code gleich");
+        // Ohne BGRA-Bild nichts zu rechnen; gedreht und groesser als das Bild gibt es nicht.
+        let mut leer = Wandler::neu(&device, &ctx, 1000).unwrap();
+        let plan = PqPlan { w: 36, h: 20, drehung: Drehung::Keine, chroma444: true };
+        assert!(!leer.zehn_rechnen(&plan, true).unwrap());
+        assert!(leer.zehn_vorbereiten(&PqPlan { drehung: Drehung::Grad90, ..plan }).is_err());
+        let tex = bgra_textur(&device, 8, 8, &[[1, 2, 3]; 64]);
+        leer.aufnehmen(&tex).unwrap();
+        assert!(leer.zehn_rechnen(&plan, false).is_err(), "Strom groesser als das Bild");
+        // Die Ziele fuer die CUDA-Bruecke: Y, Cb, Cr zu je 2 Byte bzw. Y und die CbCr-Paare.
+        let z = leer.zehn_vorbereiten(&plan).unwrap();
+        assert_eq!(z.iter().map(|(_, b, h)| (*b, *h)).collect::<Vec<_>>(), vec![(72, 20); 3]);
+        let z = leer.zehn_vorbereiten(&PqPlan { chroma444: false, ..plan }).unwrap();
+        assert_eq!(z.iter().map(|(_, b, h)| (*b, *h)).collect::<Vec<_>>(), vec![(72, 20), (72, 10)]);
     }
 
     /// SDR-Inhalt im PQ-Strom: Grau v bei SDR-Weiss 2,5 (200 nit) ist Y' =

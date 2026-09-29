@@ -12894,11 +12894,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Windows, nur die Host-Rolle: --nur-host [port] (VM und Tests), --list,
-    // --messen - ohne Fenster und ohne Client, Abzweig VOR allem, was ein
-    // Fenster oder einen Client braucht. --host ist dagegen die eine App im
-    // Hintergrund mit Freigabe an (weiter unten).
+    // --messen, --encodermessung - ohne Fenster und ohne Client, Abzweig VOR
+    // allem, was ein Fenster oder einen Client braucht. --host ist dagegen
+    // die eine App im Hintergrund mit Freigabe an (weiter unten).
     #[cfg(windows)]
-    if args.iter().any(|a| a == "--nur-host" || a == "--list" || a == "--messen") {
+    if args.iter().any(|a| a == "--nur-host" || a == "--list" || a == "--messen" || a == "--encodermessung") {
         let code = host::main_host(&args);
         std::process::exit(code);
     }
@@ -12915,8 +12915,8 @@ fn main() {
     // Ohne diesen Zweig wuerde der Schalter zur Adresse und ein Fenster
     // aufgehen, das auf eine Verbindung wartet.
     #[cfg(not(windows))]
-    if args.iter().any(|a| a == "--host" || a == "--nur-host" || a == "--list" || a == "--messen") {
-        eprintln!("Die reine Host-Rolle (--host, --nur-host, --messen) gibt es nur unter Windows; auf dem Mac gibt die App selbst frei (Menueleiste).");
+    if args.iter().any(|a| a == "--host" || a == "--nur-host" || a == "--list" || a == "--messen" || a == "--encodermessung") {
+        eprintln!("Die reine Host-Rolle (--host, --nur-host, --messen, --encodermessung) gibt es nur unter Windows; auf dem Mac gibt die App selbst frei (Menueleiste).");
         std::process::exit(2);
     }
 

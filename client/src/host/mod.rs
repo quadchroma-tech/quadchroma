@@ -9,6 +9,8 @@
 //                                     nur die Host-Rolle, ohne Fenster (VM, Tests)
 //   quadchroma.exe --list
 //   quadchroma.exe --messen [--output n] [--sekunden 10]
+//   quadchroma.exe --encodermessung [--groessen 1920x1080,3840x2160] [--bilder 300]
+//                  [--kandidaten 0,1,2,3,4] [--last N]
 //
 // Die eine App (Plan W6) faehrt die Rolle in ihrem eigenen Prozess: `Rolle`
 // startet einen Faden, der den Dienst einrichtet und taktet; die App
@@ -49,9 +51,11 @@
 // (hdr_grund, Farbwechsel im Aufnahmefaden), sonst als SDR (wandler.rs).
 
 pub mod aufnahme;
+pub mod cuda;
 pub mod eingabe;
 pub mod einlass;
 pub mod encoder;
+pub mod encodermessung;
 pub mod fenster;
 pub mod konserve;
 pub mod messen;
@@ -1040,7 +1044,7 @@ impl Dienst {
         } else {
             match (&ausgang, startkandidat) {
                 (Some(a), Some(_)) => {
-                    let weg = encoder::weg_entscheiden(weg_cli, a.index);
+                    let weg = encoder::weg_entscheiden(weg_cli, a);
                     aufnahme::start(wunsch, ausgaenge, weg_cli, weg);
                 }
                 (None, _) => {
@@ -1676,14 +1680,15 @@ fn rolle_laufen(
     log("Host-Rolle beendet");
 }
 
-/// Rollenwahl der reinen Host-Prozesse: --list, --messen oder --nur-host.
+/// Rollenwahl der reinen Host-Prozesse: --list, --messen, --encodermessung
+/// oder --nur-host.
 /// Rueckgabe ist der Exit-Code; das Beenden des Prozesses bleibt dem
 /// Aufrufer (main.rs).
 pub fn main_host(args: &[String]) -> i32 {
     // Einzelinstanz der Freigabe (Spezifikation 10.1) - vor allem anderen,
     // auch vor der Protokolldatei: ein zweiter Start leerte sonst das
     // Protokoll des laufenden.
-    let freigabe = !args.iter().any(|a| a == "--list" || a == "--messen");
+    let freigabe = !args.iter().any(|a| a == "--list" || a == "--messen" || a == "--encodermessung");
     let mut instanz_fehler = None;
     let _instanz = if freigabe {
         match oberflaeche::einzelinstanz(oberflaeche::MUTEX) {
@@ -1728,6 +1733,14 @@ pub fn main_host(args: &[String]) -> i32 {
         protokoll_oeffnen("messung.txt");
         log(&dpi);
         return messen::laufen(args);
+    }
+
+    if args.iter().any(|a| a == "--encodermessung") {
+        // Ohne Bildschirm und ohne Einzelinstanz (neben der App erlaubt):
+        // eine eigene Datei, nie messung.txt.
+        protokoll_oeffnen("encodermessung.txt");
+        log(&dpi);
+        return encodermessung::laufen(args);
     }
 
     if args.iter().any(|a| a == "--list") {
