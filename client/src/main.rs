@@ -4670,6 +4670,23 @@ fn mac_keycode(code: winit::keyboard::KeyCode) -> Option<u16> {
     })
 }
 
+/// Geht eine Wiederholung des Systems (winit `repeat`) fuer eine gehaltene
+/// Taste an den Host - und mit welchem macOS-Tastencode? Der Mac drueben
+/// wiederholt eingespeiste Tasten nicht selbst (CGEventPost), also reicht der
+/// Client die seines Systems weiter, mit dessen Verzoegerung und Rate. Nie:
+/// kuenstliche Ereignisse, alles bei offener Tafel, die Tasten des Fensters
+/// selbst (ESC mit seinem Halten, F9 bis F12) und Umschalter samt
+/// Feststelltaste (54-63) - ein Mac wiederholt sie nicht, und eine
+/// wiederholte Feststelltaste schaltete drueben jedes Mal um. Ob der Druck
+/// selbst hinausging, prueft `InputLink::key_wiederholung`.
+fn wiederholung_an_host(code: winit::keyboard::KeyCode, synthetisch: bool, hud_offen: bool) -> Option<u16> {
+    use winit::keyboard::KeyCode as K;
+    if synthetisch || hud_offen || matches!(code, K::Escape | K::F9 | K::F10 | K::F11 | K::F12) {
+        return None;
+    }
+    mac_keycode(code).filter(|mac| !(54..=63).contains(mac))
+}
+
 /// Zweite, eigene Verbindung nur fuer Maus und Tastatur. Klein, dringend,
 /// niemals hinter einem Bild in der Warteschlange.
 ///
@@ -5303,6 +5320,25 @@ impl InputLink {
         p[2] = down as u8;
         p[4..8].copy_from_slice(&mods.to_le_bytes());
         self.send(IN_KEY, &p);
+    }
+
+    /// Wiederholung einer gehaltenen Taste (TASTE_WIEDERHOLUNG), siehe
+    /// `wiederholung_an_host`. Nur fuer eine Taste, deren Druck hinausging
+    /// und die noch nicht losgelassen ist - nach Fokusverlust oder offenem
+    /// Menue (alle_loslassen) nicht mehr: sonst drueckte die Wiederholung
+    /// drueben eine Taste, deren Loslassen niemand mehr schickt. Liefert, ob
+    /// sie hinausging.
+    fn key_wiederholung(&mut self, keycode: u16, mods: u32) -> bool {
+        if !self.gedrueckt.contains(&keycode) {
+            return false;
+        }
+        let mut p = [0u8; 8];
+        p[0..2].copy_from_slice(&keycode.to_le_bytes());
+        p[2] = 1;
+        p[3] = TASTE_WIEDERHOLUNG;
+        p[4..8].copy_from_slice(&mods.to_le_bytes());
+        self.send(IN_KEY, &p);
+        true
     }
 
     /// Eingabekanal schliessen. Der naechste Sendeversuch baut ihn neu auf.
@@ -7169,6 +7205,20 @@ impl App {
                     return;
                 }
 
+                // Wiederholungen des Systems fuer eine gehaltene Taste gehen an
+                // den Host (siehe wiederholung_an_host) - und hier nirgends
+                // sonst hin: F9 bis F12 schalten nur beim ersten Druck um, die
+                // Tafel sieht keine.
+                if event.repeat {
+                    if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                        if let Some(mac) = wiederholung_an_host(code, is_synthetic, self.hud_offen) {
+                            let mods = self.mods;
+                            self.input.lock().unwrap().key_wiederholung(mac, mods);
+                        }
+                    }
+                    return;
+                }
+
                 // Sitzung: eigene Tasten abfangen
                 if pressed {
                     if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
@@ -7199,8 +7249,8 @@ impl App {
                 if let winit::keyboard::PhysicalKey::Code(c) = event.physical_key {
                     if c == KC::F9 || c == KC::F10 { return; }
                 }
-                if is_synthetic || event.repeat {
-                    return; // Wiederholungen erzeugt der Mac selbst
+                if is_synthetic {
+                    return;
                 }
                 // Steht die Tafel offen, gehoert die Tastatur ihr. Bei der Maus
                 // war das schon so, bei der Tastatur fehlte es - jeder Tastendruck
@@ -14987,6 +15037,83 @@ mod tests {
             }
         });
         (addr, los_tx, t)
+    }
+
+    /// Wiederholungen des Systems: gewoehnliche Tasten gehen mit ihrem
+    /// macOS-Tastencode an den Host. ESC (sein Halten oeffnet das Menue), F9
+    /// bis F12, Umschalter und Feststelltaste, kuenstliche Ereignisse und
+    /// alles bei offener Tafel bleiben hier.
+    #[test]
+    fn wiederholung_nur_fuer_gewoehnliche_tasten() {
+        use winit::keyboard::KeyCode as K;
+        let weiter = [
+            (K::KeyE, 14), (K::Backspace, 51), (K::Delete, 117), (K::ArrowLeft, 123), (K::ArrowRight, 124),
+            (K::ArrowUp, 126), (K::ArrowDown, 125), (K::Space, 49), (K::Enter, 36), (K::Digit1, 18),
+            (K::IntlBackslash, 10), (K::F1, 122), (K::F8, 100), (K::PageDown, 121), (K::Numpad5, 87),
+        ];
+        for (k, mac) in weiter {
+            assert_eq!(wiederholung_an_host(k, false, false), Some(mac), "{k:?}");
+            assert_eq!(wiederholung_an_host(k, true, false), None, "{k:?} kuenstlich");
+            assert_eq!(wiederholung_an_host(k, false, true), None, "{k:?} bei offener Tafel");
+        }
+        let hier = [
+            K::Escape, K::F9, K::F10, K::F11, K::F12, K::ShiftLeft, K::ShiftRight, K::ControlLeft,
+            K::ControlRight, K::AltLeft, K::AltRight, K::SuperLeft, K::SuperRight, K::CapsLock, K::PrintScreen,
+        ];
+        for k in hier {
+            assert_eq!(wiederholung_an_host(k, false, false), None, "{k:?}");
+        }
+    }
+
+    /// Eine Wiederholung geht als Druck mit TASTE_WIEDERHOLUNG im vierten
+    /// Byte hinaus, mit den Umschaltern dieses Augenblicks - aber nur fuer
+    /// eine Taste, deren Druck hinausging und die noch gilt: nicht fuer eine
+    /// nie gedrueckte, nicht nach dem Loslassen, nicht nach alle_loslassen
+    /// (Fokusverlust, Menue). Sonst hielte der Host eine Taste, deren
+    /// Loslassen niemand mehr schickt.
+    #[test]
+    fn wiederholung_nur_fuer_gehaltene_tasten() {
+        secure::test_identitaet();
+        let hh = vec![0x7c; 32];
+        let (host_priv, host_pub) = noise::keypair().unwrap();
+        let (addr, los, host) = eingabe_host(hh.clone(), host_priv, Duration::ZERO, IN_TESTBILD);
+        let mut l = InputLink::new(addr);
+        l.set_link(Some((hh, host_pub)));
+        eingabe_abwarten(&mut l);
+        assert!(l.steht());
+        assert!(!l.key_wiederholung(14, 0), "nie gedrueckt");
+        l.key(14, true, 0);
+        assert!(l.key_wiederholung(14, 0));
+        assert!(l.key_wiederholung(14, MOD_SHIFT));
+        l.key(14, false, 0);
+        assert!(!l.key_wiederholung(14, 0), "losgelassen");
+        l.key(51, true, 0);
+        assert!(l.key_wiederholung(51, 0));
+        l.alle_loslassen();
+        assert!(!l.key_wiederholung(51, 0), "nach alle_loslassen");
+        l.testbild(false);
+        let _ = los.send(());
+        let (gelesen, zu) = host.join().unwrap();
+        assert!(!zu);
+        let taste = |k: u16, gedrueckt: u8, merkmale: u8, mods: u32| {
+            let mut p = k.to_le_bytes().to_vec();
+            p.extend_from_slice(&[gedrueckt, merkmale]);
+            p.extend_from_slice(&mods.to_le_bytes());
+            p
+        };
+        let tasten: Vec<Vec<u8>> = gelesen.iter().filter(|(a, _)| *a == IN_KEY).map(|(_, p)| p.clone()).collect();
+        assert_eq!(
+            tasten,
+            vec![
+                taste(14, 1, 0, 0),
+                taste(14, 1, TASTE_WIEDERHOLUNG, 0),
+                taste(14, 1, TASTE_WIEDERHOLUNG, MOD_SHIFT),
+                taste(14, 0, 0, 0),
+                taste(51, 1, 0, 0),
+                taste(51, 1, TASTE_WIEDERHOLUNG, 0),
+                taste(51, 0, 0, 0),
+            ]
+        );
     }
 
     /// Aufeinanderfolgende Bewegungen: nur die letzte; dazwischen liegende

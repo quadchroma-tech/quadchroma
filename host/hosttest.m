@@ -1,6 +1,8 @@
 // Pruefprogramm fuer die Teile von main.m, die ohne Bildschirmaufnahme laufen:
-// Protokoll (Drossel je Art und Adresse, Obergrenze, auch wenn das Umbenennen
-// scheitert), Abloesen eines Zuschauers (Typ 10), Zuschauerwechsel im
+// Tastenwiederholung (keyDown mit kCGKeyboardEventAutorepeat nur fuer eine
+// gedrueckte Taste, Freigeben beim Verbindungsende - ueber einen Haken statt
+// ins System), Protokoll (Drossel je Art und Adresse, Obergrenze, auch wenn
+// das Umbenennen scheitert), Abloesen eines Zuschauers (Typ 10), Zuschauerwechsel im
 // laufenden Strom, Testbild-Rest beim neuen Zuschauer, Abbau zwischen
 // Hochfahren und Eintragen, Nachreichen bei stillem Bildschirm (als
 // wiederholt gestempelt, im Stau ohne Taktversuche), Abschluss eines
@@ -4708,6 +4710,98 @@ static void zugang_pruefen(int bild_port, int ein_port) {
     pthread_mutex_unlock(&g_log_mtx);
 }
 
+// ------------------------------------------------------------ Tasten
+//
+// Der Mac wiederholt eingespeiste Tasten nicht selbst; die Wiederholung
+// kommt vom Client (Merkmal QC_TASTE_WIEDERHOLUNG im vierten Byte). Die
+// Ereignisse gehen an g_tasten_posten - hier an eine Mitschrift statt ins
+// System, damit der Pruefstand nicht auf dem eigenen Mac tippt.
+
+typedef struct { CGEventType typ; int taste; int wiederholt; int umschalt; } test_mitschrift;
+static test_mitschrift g_test_tasten[32];
+static int g_test_tasten_n = 0;
+
+static void test_tasten_posten(CGEventRef e) {
+    if (g_test_tasten_n >= 32) return;
+    g_test_tasten[g_test_tasten_n++] = (test_mitschrift){
+        CGEventGetType(e),
+        (int)CGEventGetIntegerValueField(e, kCGKeyboardEventKeycode),
+        (int)CGEventGetIntegerValueField(e, kCGKeyboardEventAutorepeat),
+        (CGEventGetFlags(e) & kCGEventFlagMaskShift) != 0,
+    };
+}
+
+// Eine Tastennachricht wie aus dem Eingabekanal (Typ 19, acht Byte).
+static BOOL test_taste(int fd, uint64_t kanal, uint16_t kc, int down, int merkmale, uint32_t mods) {
+    uint8_t p[8] = {0};
+    memcpy(p, &kc, 2);
+    p[2] = (uint8_t)down;
+    p[3] = (uint8_t)merkmale;
+    memcpy(p + 4, &mods, 4);
+    return einspeisen(fd, kanal, QC_IN_KEY, p, sizeof p);
+}
+
+static int test_ist(int i, CGEventType typ, int taste, int wiederholt) {
+    return i < g_test_tasten_n && g_test_tasten[i].typ == typ && g_test_tasten[i].taste == taste &&
+           g_test_tasten[i].wiederholt == wiederholt;
+}
+
+static void tasten_pruefen(void) {
+    printf("\n-- Tasten: Wiederholung\n");
+    // Bleibt so: nichts in diesem Pruefstand tippt ins System.
+    g_tasten_posten = test_tasten_posten;
+    const int fd = 1000000;              // nie ein echter Deskriptor
+    const uint64_t kanal = 4711;
+    int alt = atomic_exchange(&g_in_fd, fd);
+
+    // e (14) druecken, zweimal wiederholen (einmal mit Umschalt), loslassen.
+    g_test_tasten_n = 0;
+    BOOL ein = test_taste(fd, kanal, 14, 1, 0, 0);
+    ein &= test_taste(fd, kanal, 14, 1, QC_TASTE_WIEDERHOLUNG, 0);
+    ein &= test_taste(fd, kanal, 14, 1, QC_TASTE_WIEDERHOLUNG, 1);
+    pruefe(ein && g_test_tasten_n == 3 && test_ist(0, kCGEventKeyDown, 14, 0) &&
+           test_ist(1, kCGEventKeyDown, 14, 1) && test_ist(2, kCGEventKeyDown, 14, 1),
+           "gehaltene Taste: erst ein Druck, dann keyDown mit kCGKeyboardEventAutorepeat - kein Loslassen dazwischen");
+    pruefe(g_test_tasten[2].umschalt && !g_test_tasten[1].umschalt, "die Wiederholung traegt die Umschalter ihrer Nachricht");
+    pruefe(g_key_down[14] == kanal, "die wiederholte Taste bleibt als gedrueckt mitgeschrieben");
+    test_taste(fd, kanal, 14, 0, 0, 0);
+    pruefe(g_test_tasten_n == 4 && test_ist(3, kCGEventKeyUp, 14, 0) && g_key_down[14] == 0, "Loslassen");
+
+    // Wiederholung einer Taste, die hier nicht (mehr) gedrueckt ist: ein
+    // gewoehnlicher Druck, mitgeschrieben - sonst gaebe sie niemand frei.
+    g_test_tasten_n = 0;
+    test_taste(fd, kanal, 14, 1, QC_TASTE_WIEDERHOLUNG, 0);
+    pruefe(g_test_tasten_n == 1 && test_ist(0, kCGEventKeyDown, 14, 0) && g_key_down[14] == kanal,
+           "Wiederholung ohne gedrueckte Taste: gewoehnlicher Druck, mitgeschrieben");
+    // Ohne Merkmal (Client bis 0.2.0): ein weiterer Druck bleibt ein Druck.
+    test_taste(fd, kanal, 14, 1, 0, 0);
+    pruefe(g_test_tasten_n == 2 && test_ist(1, kCGEventKeyDown, 14, 0), "Druck ohne Merkmal auf eine gehaltene Taste: wie bisher, ohne Autorepeat");
+
+    // Rueckschritt (51) gehalten und wiederholt, dann ist die Verbindung weg:
+    // genau ein Loslassen je Taste, keine Wiederholung haengt nach.
+    test_taste(fd, kanal, 51, 1, 0, 0);
+    test_taste(fd, kanal, 51, 1, QC_TASTE_WIEDERHOLUNG, 0);
+    g_test_tasten_n = 0;
+    alle_tasten_loslassen(kanal);
+    int e14 = 0, e51 = 0, sonst = 0;
+    for (int i = 0; i < g_test_tasten_n; i++) {
+        if (g_test_tasten[i].typ != kCGEventKeyUp || g_test_tasten[i].wiederholt) sonst++;
+        else if (g_test_tasten[i].taste == 14) e14++;
+        else if (g_test_tasten[i].taste == 51) e51++;
+        else sonst++;
+    }
+    pruefe(e14 == 1 && e51 == 1 && sonst == 0 && g_key_down[14] == 0 && g_key_down[51] == 0,
+           "Verbindungsende: je gehaltene Taste genau ein Loslassen, auch nach Wiederholungen");
+    g_test_tasten_n = 0;
+    alle_tasten_loslassen(kanal);
+    pruefe(g_test_tasten_n == 0, "danach ist nichts mehr freizugeben");
+
+    // Abgeloest (ein anderer Eingabekanal gilt): nichts wird eingespeist.
+    pruefe(!test_taste(fd + 1, kanal, 14, 1, QC_TASTE_WIEDERHOLUNG, 0) && g_test_tasten_n == 0 && g_key_down[14] == 0,
+           "abgeloester Kanal: auch eine Wiederholung geht nicht mehr hinaus");
+    atomic_store(&g_in_fd, alt);
+}
+
 // --------------------------------------------------- N5: Koennensliste
 
 static void codecs_pruefen_pruefen(void) {
@@ -4755,6 +4849,7 @@ int main(void) {
         // (leer, bis der Abschnitt Bildschirm sie fuellt), der Strom aus der Fabrik.
         qc_bildschirm_liste_setzen(test_liste);
         qc_strom_fabrik_setzen(test_fabrik);
+        tasten_pruefen();
         protokoll_pruefen(bild_port, ein_port);
         zugang_pruefen(bild_port, ein_port);
         name_und_freigabe_pruefen(bild_port);

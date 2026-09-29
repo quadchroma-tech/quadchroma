@@ -179,8 +179,16 @@ pub const IN_MOVE: u8 = 16;
 pub const IN_BUTTON: u8 = 17;
 /// Rad: f32 dx, f32 dy in Pixeln.
 pub const IN_SCROLL: u8 = 18;
-/// Taste: u16 macOS-Keycode, u8 gedrueckt, u8 frei, u32 Umschalter (MOD_*).
+/// Taste: u16 macOS-Keycode, u8 gedrueckt, u8 Merkmale (TASTE_*), u32
+/// Umschalter (MOD_*).
 pub const IN_KEY: u8 = 19;
+/// Merkmal Bit 0 in IN_KEY: Wiederholung einer gehaltenen Taste durch das
+/// System des Clients. Der Mac-Host speist sie als keyDown mit
+/// kCGKeyboardEventAutorepeat ein, der Windows-Host als weiteren Druck (so
+/// wiederholt auch eine echte Tastatur). Hosts bis 0.2.0 uebergehen das Byte
+/// und sehen einen weiteren Druck; Clients bis 0.2.0 schicken 0 und keine
+/// Wiederholungen.
+pub const TASTE_WIEDERHOLUNG: u8 = 1;
 /// Zwischenablage vom Client (UTF-8).
 pub const IN_CLIP: u8 = 48;
 /// Wunsch: wie MSG_SETTINGS.
