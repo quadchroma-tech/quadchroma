@@ -874,6 +874,83 @@ static int backlog_bytes(int fd) {
     return n;
 }
 
+// Zeitregel der Stauregel (29.09.2026; dieselben Zahlen und die Begruendung
+// in client/src/abfluss.rs, dort fuer den Windows-Host). Der Nutzer spuert
+// Latenz, nicht Bytes: die Bytegrenze (QC_BACKLOG_LIMIT) fasste bei
+// 10 Mbit/s 1,6 s Bild (Messung Alienware -> Mac mini M1, Kette bis 2,7 s).
+// Deshalb faellt ein Bild vor dem Encoder auch aus, wenn mehr ungesendet im
+// Kernel liegt, als der Zuschauer in QC_STAU_ZEIT_US abnimmt - nie unter
+// QC_STAU_ZEIT_MIN (ein Vollbild bei niedriger Bitrate soll auf einer
+// gesunden Leitung kein folgendes Bild kosten) und nie ueber der
+// Bytegrenze. Was er abnimmt (gesendet minus SO_NWRITE), wird nur gemessen,
+// solange mehr als QC_ABFLUSS_BESETZT wartet: dann ist es das, was Leitung
+// und Leser schaffen, nicht das, was der Encoder gerade liefert. Je
+// Abschnitt von mindestens QC_ABFLUSS_TAKT_US ein Wert, gemittelt mit dem
+// vorigen (Schuebe, siehe QC_SCHUB_AB). Ohne Messung, mit einer aelter als
+// QC_ABFLUSS_ALTER_US oder wenn der Zuschauer seit QC_ABFLUSS_STILL_US
+// nichts abgenommen hat, gilt die Bytegrenze allein: ein eingefrorener
+// Zuschauer laeuft dann wie bisher in sie hinein, und die Frist fuer "weg"
+// (samt Nachsicht fuer Schuebe) entscheidet ueber ihn wie bisher. Die
+// Zeitregel laesst nur Bilder aus, austragen tut sie niemanden.
+#define QC_STAU_ZEIT_US     100000ull
+#define QC_STAU_ZEIT_MIN    (128 * 1024)
+#define QC_ABFLUSS_BESETZT  (64 * 1024)
+#define QC_ABFLUSS_TAKT_US  250000ull
+#define QC_ABFLUSS_STILL_US 2500000ull
+#define QC_ABFLUSS_ALTER_US (10 * 1000000ull)
+
+// Stand der Messung, unter g_send_mtx; jeder Zuschauer faengt frisch an.
+static uint64_t g_abfl_beginn = 0;       // Beginn des Messabschnitts, 0 = keiner
+static uint64_t g_abfl_beginn_ab = 0;    // abgenommen zu seinem Beginn
+static double g_abfl_rate = 0;           // Byte/s, 0 = keine Messung
+static uint64_t g_abfl_gemessen = 0;     // Zeit der letzten Messung
+static uint64_t g_abfl_bewegt = 0;       // wann zuletzt eine Abnahme zu sehen war
+static uint64_t g_abfl_ab = 0;           // abgenommen bis dahin
+static _Atomic long g_stau_zeit = 0;     // Bilder, die allein die Zeitregel ausliess
+
+static void abfluss_zuruecksetzen(void) {
+    g_abfl_beginn = g_abfl_beginn_ab = g_abfl_gemessen = g_abfl_bewegt = g_abfl_ab = 0;
+    g_abfl_rate = 0;
+}
+
+// Ein Blick auf den Zuschauer: Rueckstand (SO_NWRITE) und was qc_chan_send
+// ihm bisher uebergeben hat. Unter g_send_mtx.
+static void abfluss_verfolgen(int rueckstand, uint64_t gesendet, uint64_t jetzt) {
+    uint64_t r = rueckstand > 0 ? (uint64_t)rueckstand : 0;
+    uint64_t ab = gesendet > r ? gesendet - r : 0;
+    if (ab > g_abfl_ab) { g_abfl_ab = ab; g_abfl_bewegt = jetzt; }
+    if (rueckstand <= QC_ABFLUSS_BESETZT) { g_abfl_beginn = 0; return; }
+    if (!g_abfl_beginn) { g_abfl_beginn = jetzt; g_abfl_beginn_ab = ab; return; }
+    if (jetzt - g_abfl_beginn < QC_ABFLUSS_TAKT_US) return;
+    double wert = (double)(ab > g_abfl_beginn_ab ? ab - g_abfl_beginn_ab : 0) * 1e6 / (double)(jetzt - g_abfl_beginn);
+    g_abfl_rate = g_abfl_rate > 0 ? 0.5 * (g_abfl_rate + wert) : wert;
+    g_abfl_gemessen = jetzt;
+    g_abfl_beginn = jetzt;
+    g_abfl_beginn_ab = ab;
+}
+
+// Was abfliesst, in Byte/s - 0 ohne gueltige Messung. Unter g_send_mtx.
+static double abfluss_rate(uint64_t jetzt) {
+    if (g_abfl_rate <= 0 || jetzt - g_abfl_gemessen > QC_ABFLUSS_ALTER_US || jetzt - g_abfl_bewegt > QC_ABFLUSS_STILL_US)
+        return 0;
+    return g_abfl_rate;
+}
+
+// Die Grenze der Stauregel in Byte: die Bytegrenze, und sobald bekannt ist,
+// was abfliesst (rate > 0), hoechstens so viel, wie in QC_STAU_ZEIT_US
+// abfliesst - nie unter QC_STAU_ZEIT_MIN und nie ueber der Bytegrenze.
+static int stau_grenze_aus(double rate, int bytegrenze) {
+    if (rate <= 0) return bytegrenze;
+    double z = rate * (double)QC_STAU_ZEIT_US / 1e6;
+    if (z < QC_STAU_ZEIT_MIN) z = QC_STAU_ZEIT_MIN;
+    return z < (double)bytegrenze ? (int)z : bytegrenze;
+}
+
+// Die Bytegrenze: 2 MB, im Spielmodus ein Viertel.
+static int stau_bytegrenze(void) {
+    return atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT;
+}
+
 
 // Ton im Dauerstau. Ton geht an der Stauregel vorbei - er ist klein und soll
 // nicht warten. Liegt die Leitung aber unter der Tonrate (unverdichtet rund
@@ -881,15 +958,17 @@ static int backlog_bytes(int fd) {
 // kein Bild kaeme mehr durch die Stauregel, und der Zuschauer bliebe (er
 // nimmt ja ab) mit stehendem Bild und einem Ton, der immer weiter nachhinkt.
 // Deshalb faellt Ton weg, wenn der Rueckstand QC_STAU_FRIST_US lang ohne
-// Unterbrechung ueber der Staugrenze liegt. Liegt er nur kurz darueber - nach
+// Unterbrechung ueber der Staugrenze liegt - der Grenze, die gerade fuer
+// Bilder gilt, mit der Zeitregel also auch darunter: sonst sperrte der Ton
+// dort die Bilder aus. Liegt er nur kurz darueber - nach
 // einem grossen Vollbild, oder im gewoehnlichen Stau, in dem die Stauregel
 // ein Bild durchlaesst, sobald er darunter faellt -, bleibt der Ton ganz. Die
 // Luecken ueberbrueckt der Tonpuffer des Clients. Nur unter g_send_mtx.
 static uint64_t g_ton_stau_seit = 0;          // 0 = Rueckstand gerade unter der Grenze
 static int ton_verwerfen(int fd) {
-    int grenze = atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT;
-    if (backlog_bytes(fd) <= grenze) { g_ton_stau_seit = 0; return 0; }
     uint64_t jetzt = now_us();
+    int grenze = stau_grenze_aus(abfluss_rate(jetzt), stau_bytegrenze());
+    if (backlog_bytes(fd) <= grenze) { g_ton_stau_seit = 0; return 0; }
     if (!g_ton_stau_seit) g_ton_stau_seit = jetzt;
     return jetzt - g_ton_stau_seit >= QC_STAU_FRIST_US;
 }
@@ -1847,6 +1926,7 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     g_schub_luecke = 0;
     g_schub_frei_seit = 0;
     g_ton_stau_seit = 0;
+    abfluss_zuruecksetzen();
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
     memcpy(g_last_sas, sas, sizeof g_last_sas);
@@ -3589,7 +3669,8 @@ static void codec_wechseln(int idx) {
 // Stauregel. Liegt beim Zuschauer mehr als QC_BACKLOG_LIMIT (Spielmodus: ein
 // Viertel) ungesendet im Kernel, geht das naechste Bild gar nicht erst in den
 // Encoder - wie beim vollen Encoder: lieber ein Auslasser als eine
-// Warteschlange. Der Encoder sieht dann nur weniger Bilder, jedes codierte
+// Warteschlange. Ebenso darunter nach der Zeitregel (abfluss_verfolgen):
+// liegt mehr im Kernel, als der Zuschauer in QC_STAU_ZEIT_US abnimmt. Der Encoder sieht dann nur weniger Bilder, jedes codierte
 // hat sein Bezugsbild, und es braucht kein erzwungenes Vollbild.
 // Nimmt der Zuschauer im Stau so lange gar nichts ab (stau_frist_us), gilt
 // er als weg; sonst liefe fuer eine eingefrorene Gegenstelle alles weiter.
@@ -3634,15 +3715,24 @@ static uint64_t stau_frist_us(void) {
     return f < QC_STAU_FRIST_US ? QC_STAU_FRIST_US : f > QC_STAU_FRIST_MAX_US ? QC_STAU_FRIST_MAX_US : f;
 }
 
-static BOOL stau_vor_dem_encoder(void) {
-    BOOL stau = NO;
+// Was die Stauregel sagt: frei, ueber der Bytegrenze, oder allein nach der
+// Zeitregel. Beide "Stau"-Werte sind wahr: auslassen.
+#define QC_STAU_FREI  0
+#define QC_STAU_BYTES 1
+#define QC_STAU_ZEIT  2
+
+static int stau_vor_dem_encoder(void) {
+    int stau = QC_STAU_FREI;
     pthread_mutex_lock(&g_send_mtx);
     int fd = atomic_load(&g_client_fd);
     if (fd >= 0 && atomic_load(&g_vid_ready) && g_vid) {
         int rueckstand = backlog_bytes(fd);
-        schuebe_verfolgen(rueckstand, g_vid->gesendet, now_us());
-        if (rueckstand > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
-            stau = YES;
+        uint64_t blick = now_us();
+        schuebe_verfolgen(rueckstand, g_vid->gesendet, blick);
+        abfluss_verfolgen(rueckstand, g_vid->gesendet, blick);
+        int bytegrenze = stau_bytegrenze();
+        if (rueckstand > bytegrenze) {
+            stau = QC_STAU_BYTES;
             // Fortschritt heisst: seit dem letzten Blick hat die Gegenstelle
             // etwas abgenommen - was in den Puffer ging, weniger dem, was dort
             // jetzt mehr liegt. Am Rueckstand allein laesst sich das nicht
@@ -3673,6 +3763,10 @@ static BOOL stau_vor_dem_encoder(void) {
             }
         } else {
             g_stau_seit = 0;
+            // Zeitregel: unter der Bytegrenze, aber mehr, als der Zuschauer
+            // in QC_STAU_ZEIT_US abnimmt. Ohne Frist fuer "weg" - die
+            // bleibt an die Bytegrenze gebunden.
+            if (rueckstand > stau_grenze_aus(abfluss_rate(blick), bytegrenze)) stau = QC_STAU_ZEIT;
         }
     }
     pthread_mutex_unlock(&g_send_mtx);
@@ -3708,7 +3802,12 @@ static BOOL encode_buffer(CVPixelBufferRef pb, CMTime pts, uint64_t t_cap_us, in
     }
     // Vor dem Abholen eines erzwungenen Vollbilds: das kommt dann mit dem
     // naechsten Bild, das wirklich codiert wird.
-    if (stau_vor_dem_encoder()) { atomic_fetch_add(&g_skipped_backlog, 1); return NO; }
+    int stau = stau_vor_dem_encoder();
+    if (stau) {
+        atomic_fetch_add(&g_skipped_backlog, 1);
+        if (stau == QC_STAU_ZEIT) atomic_fetch_add(&g_stau_zeit, 1);
+        return NO;
+    }
     NSDictionary *opts = nil;
     if (atomic_exchange(&g_force_key, 0))
         opts = @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES};
@@ -4869,12 +4968,12 @@ static void dienst_takt_schritt(void) {
     long long b = atomic_load(&g_sent_bytes);
     const double dt = g_takt_s;
     if (atomic_load(&g_client_fd) >= 0)
-        logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB, %ld verworfen | Stau: %ld | Encoder verworfen: %ld | nachgelegt: %ld | nachgereicht: %ld | zu schnell: %ld | Encoder voll: %ld",
+        logf_(@"[%.0f s] Bild: %ld (%.1f/s, %.1f Mbit/s) | Ton: %ld Pakete, %.0f kB, %ld verworfen | Stau: %ld (Zeit %ld) | Encoder verworfen: %ld | nachgelegt: %ld | nachgereicht: %ld | zu schnell: %ld | Encoder voll: %ld",
               CFAbsoluteTimeGetCurrent() - g_takt_t0, f, (f - g_takt_bilder) / dt,
               (b - g_takt_bytes) * 8.0 / dt / 1e6,
               atomic_load(&g_audio_packets), atomic_load(&g_audio_bytes) / 1000.0,
               atomic_load(&g_audio_verworfen),
-              atomic_load(&g_skipped_backlog), g_stats.dropped,
+              atomic_load(&g_skipped_backlog), atomic_load(&g_stau_zeit), g_stats.dropped,
               atomic_load(&g_repeats), atomic_load(&g_nachgereicht), atomic_load(&g_zu_schnell), atomic_load(&g_enc_stau));
     g_takt_bilder = f; g_takt_bytes = b;
 

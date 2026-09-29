@@ -30,7 +30,10 @@ H.264 in software for now.
   the display at 1080p and 120 frames/s in the LAN (about 24 ms when the PC decodes
   4:4:4 in software); the statistics panel shows every link of the chain live
   (encoder, network, decoder), and a built-in benchmark recommends codec, bit rate
-  and frame rate for your network.
+  and frame rate for your network. If a computer decodes more slowly than the host
+  sends (a Mac mini M1 decodes about 55 frames/s of 4K 4:4:4), it catches up at the
+  next keyframe and asks the host for a frame rate it can sustain ("Frame rate adapted
+  to this computer") instead of letting the delay grow by seconds.
 - **One app on every computer, nothing else.** `QuadChroma.app` on the Mac,
   `quadchroma.exe` on Windows - each one is client and host at once. Install it on
   every computer you use; from whichever one you sit at, pick any other from the
@@ -1141,8 +1144,10 @@ exit code is the number of failures.
   leftover test pattern; teardown between start-up and registration; re-sending the
   last frame on a still screen; the codec switch without a viewer and with a format
   change (real VideoToolbox encoders); `--fest`; the congestion rule including audio
-  during congestion; the announcement of the audio format and AV1 in the capability
-  list.
+  during congestion and the time limit (a viewer that takes 50 of 120 frames per
+  second waits at most about 100 ms at the host instead of 1.5 s); the announcement of
+  the audio format and AV1 in the capability list. `HOSTTEST_NUR=stau,zeitregel` runs
+  only the named sections.
   - Files via the clipboard over the real channels: capabilities (messages 11 and 69);
     client to host with acknowledgements on the video channel and the lines
     "empfange …" and "empfangen …" (receiving, received) in the host log; host to

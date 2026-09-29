@@ -290,6 +290,7 @@ pub static ET: Lang = Lang {
         (StatColor, "Värv"),
         (ShortcutMouseCapture, "Püüa või vabasta hiir (mängud)"),
         (MouseCapturedHint, "Hiir on püütud · F8 vabastab selle"),
+        (FpsAdapted, "Kaadrisagedus on kohandatud sellele arvutile"),
     ],
 };
 
@@ -580,6 +581,7 @@ pub static LV: Lang = Lang {
         (StatColor, "Krāsa"),
         (ShortcutMouseCapture, "Tvert vai atbrīvot peli (spēles)"),
         (MouseCapturedHint, "Pele notverta · F8 to atbrīvo"),
+        (FpsAdapted, "Kadru ātrums pielāgots šim datoram"),
     ],
 };
 
@@ -870,6 +872,7 @@ pub static LT: Lang = Lang {
         (StatColor, "Spalva"),
         (ShortcutMouseCapture, "Pagauti arba atleisti pelę (žaidimai)"),
         (MouseCapturedHint, "Pelė pagauta · F8 ją atleidžia"),
+        (FpsAdapted, "Kadrų dažnis pritaikytas šiam kompiuteriui"),
     ],
 };
 
@@ -1160,6 +1163,7 @@ pub static SL: Lang = Lang {
         (StatColor, "Barva"),
         (ShortcutMouseCapture, "Zajemi ali sprosti miško (igre)"),
         (MouseCapturedHint, "Miška zajeta · F8 jo sprosti"),
+        (FpsAdapted, "Hitrost sličic prilagojena temu računalniku"),
     ],
 };
 
@@ -1450,6 +1454,7 @@ pub static HR: Lang = Lang {
         (StatColor, "Boja"),
         (ShortcutMouseCapture, "Uhvati ili otpusti miš (igre)"),
         (MouseCapturedHint, "Miš uhvaćen · F8 ga otpušta"),
+        (FpsAdapted, "Broj sličica prilagođen ovom računalu"),
     ],
 };
 
@@ -1740,5 +1745,6 @@ pub static UK: Lang = Lang {
         (StatColor, "Колір"),
         (ShortcutMouseCapture, "Захопити або відпустити мишу (ігри)"),
         (MouseCapturedHint, "Мишу захоплено · F8 її відпускає"),
+        (FpsAdapted, "Частоту кадрів підлаштовано під цей комп’ютер"),
     ],
 };

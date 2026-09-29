@@ -95,6 +95,9 @@ pub struct Zustand {
     /// gingen (netz::stau_vor_dem_encoder) - dazu die seltenen, die schon
     /// codiert ueber der harten Grenze wegfielen (eigene Protokollzeile).
     pub stau: AtomicU64,
+    /// Davon: ausgelassen allein nach der Zeitregel (abfluss.rs) - unter
+    /// der Bytegrenze, aber mehr, als der Zuschauer in 100 ms abnimmt.
+    pub stau_zeit: AtomicU64,
     pub repeats: AtomicU64,
     /// Ohne feste Bildrate nachgeschoben, damit ein Encoder mit Vorlauf
     /// (h264_mf) die echten Bilder herausgibt (takt::vorlauf_nachschieben).
@@ -163,6 +166,7 @@ pub static Z: Zustand = Zustand {
     sent_frames: AtomicU64::new(0),
     sent_bytes: AtomicU64::new(0),
     stau: AtomicU64::new(0),
+    stau_zeit: AtomicU64::new(0),
     repeats: AtomicU64::new(0),
     nachgeschoben: AtomicU64::new(0),
     zu_schnell: AtomicU64::new(0),
@@ -1236,7 +1240,7 @@ impl Dienst {
             return Lage::Laeuft;
         }
         log(format!(
-            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} | Encoder verworfen: {} | nachgelegt: {} | nachgeschoben: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
+            "[{:.0} s] Bild: {} ({:.1}/s, {:.1} Mbit/s) | Ton: {} Pakete, {:.0} kB | Stau: {} (Zeit {}) | Encoder verworfen: {} | nachgelegt: {} | nachgeschoben: {} | zu schnell: {} | Encoder voll: {} | Ton verworfen: {}",
             self.t0.elapsed().as_secs_f32(),
             f,
             (f - self.last_frames) as f32 / 5.0,
@@ -1244,6 +1248,7 @@ impl Dienst {
             Z.audio_packets.load(Ordering::Relaxed),
             Z.audio_bytes.load(Ordering::Relaxed) as f64 / 1000.0,
             Z.stau.load(Ordering::Relaxed),
+            Z.stau_zeit.load(Ordering::Relaxed),
             Z.enc_verworfen.load(Ordering::Relaxed),
             Z.repeats.load(Ordering::Relaxed),
             Z.nachgeschoben.load(Ordering::Relaxed),

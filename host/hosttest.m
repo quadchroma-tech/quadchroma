@@ -8,7 +8,8 @@
 // wiederholt gestempelt, im Stau ohne Taktversuche), Abschluss eines
 // Codecwechsels ohne Zuschauer, Codecwechsel mit anderem Aufnahmeformat bei
 // stillem Bildschirm (Umrechnung des letzten Bildes), --fest beim Start,
-// Stauregel samt Ton im Stau, Ansage des Tonformats, Koennensliste (AV1),
+// Stauregel samt Ton im Stau, Zeitregel der Stauregel (langsamer Leser: 50
+// von 120 Bildern je Sekunde, Wartezeit mit und ohne), Ansage des Tonformats, Koennensliste (AV1),
 // Dateien ueber die Zwischenablage (Faehigkeiten, beide Richtungen ueber echte
 // Kanaele, Fenster, Umlaute im Protokoll, Zuschauerwechsel mitten in der
 // Uebertragung, Sitzungsbindung des Wegs, Zuschauer ohne Eingabekanal,
@@ -78,7 +79,8 @@
 // Dateien: die Ablagebasis liegt im eigenen HOME, und statt
 // qc_clip_set_dateien bekommt ein Rekorder die fertigen Pfade - die
 // Zwischenablage des Nutzers bleibt unberuehrt.
-// Dauer rund 125 s. Rueckgabe: Zahl der Fehler.
+// Dauer rund 150 s. Rueckgabe: Zahl der Fehler. HOSTTEST_NUR=stau,zeitregel
+// (Namen der Abschnitte in main, mit Komma) laesst nur diese laufen.
 
 #include "main.m"
 
@@ -87,6 +89,21 @@
 #include <signal.h>
 
 static int g_fehler = 0;
+
+// Soll dieser Abschnitt laufen? HOSTTEST_NUR leer oder nicht gesetzt: alle.
+static int teil(const char *name) {
+    const char *nur = getenv("HOSTTEST_NUR");
+    if (!nur || !*nur) return 1;
+    size_t n = strlen(name);
+    for (const char *p = nur; *p;) {
+        const char *k = strchr(p, ',');
+        size_t l = k ? (size_t)(k - p) : strlen(p);
+        if (l == n && strncmp(p, name, n) == 0) return 1;
+        if (!k) break;
+        p = k + 1;
+    }
+    return 0;
+}
 
 static void pruefe(int ok, const char *was) {
     printf("%s  %s\n", ok ? "ok     " : "FEHLER ", was);
@@ -179,6 +196,7 @@ static void zuschauer_setzen(int host_fd, qc_chan *c) {
     g_schub_luecke = 0;
     g_schub_frei_seit = 0;
     g_ton_stau_seit = 0;
+    abfluss_zuruecksetzen();
     atomic_store(&g_force_key, 1);
     atomic_store(&g_wait_key, 1);
     atomic_store(&g_audio_info_sent, 0);
@@ -536,6 +554,7 @@ typedef struct {
     int still;              // nach Staubeginn kein Bild mehr, nur noch die Frist im Takt
     int ton;                // Ton im Dauerlauf (3 Mbit/s, wie ScreenCaptureKit liefert)
     double einfrieren_s;    // nach so vielen Sekunden liest die Gegenstelle nichts mehr, 0 = nie
+    int nur_bytegrenze;     // ohne Zeitregel, wie bis 0.2.0 (Vergleich "vorher")
 } strom;
 
 typedef struct {
@@ -608,6 +627,11 @@ static ergebnis strom_fahren(const strom *s) {
         }
 
         e.bilder++;
+        if (s->nur_bytegrenze) {
+            pthread_mutex_lock(&g_send_mtx);
+            abfluss_zuruecksetzen();
+            pthread_mutex_unlock(&g_send_mtx);
+        }
         // Wie encode_buffer: erst die Stauregel, dann in den Encoder. Der
         // Encoder hier liefert sofort; Vollbild im festen Abstand der
         // codierten Bilder (MaxKeyFrameInterval) oder wenn erzwungen.
@@ -719,7 +743,7 @@ static void stau_pruefen(void) {
     pruefe(ec.vollbilder <= 3, "keine Vollbild-Kaskade: nur die regulaeren Vollbilder (alle 2 s)");
     pruefe(ec.gesendet >= 300, "die Leitung traegt weiter Zwischenbilder (rund 80 je Sekunde moeglich)");
     pruefe(!ec.weg, "der langsame, aber lebende Zuschauer bleibt");
-    strom ca = { "dasselbe mit 2 MB Sendepuffer (vorher)", 120, 150, K, 100, 0, 1, 5 };
+    strom ca = { "dasselbe mit 2 MB Sendepuffer (vorher)", 120, 150, K, 100, 0, 1, 5, .nur_bytegrenze = 1 };
     ergebnis eca = strom_fahren(&ca);
     pruefe(eca.verworfen == 0 && eca.max_emit_ms > ec.max_emit_ms,
            "Vergleich vorher: nie verworfen, statt dessen blockiert das Senden");
@@ -816,6 +840,174 @@ static void stau_pruefen(void) {
     pruefe(ets.ton_verworfen == 0 && etg.ton_verworfen == 0 && !ets.weg && !etg.weg,
            "im gewoehnlichen Stau und nach grossen Vollbildern bleibt der Ton ganz");
     atomic_store(&g_cur_ton, 1);
+}
+
+// ------------------------------------- N2b: Zeitregel, langsamer Leser
+
+// Wann das Bild mit dieser Nummer (Bildkopf, reserved) gesendet wurde.
+static _Atomic uint64_t g_gesendet_um[65536];
+
+typedef struct {
+    int fd;
+    double ende;                 // nach dieser Zeit (sek) zaehlt nichts mehr
+    double spaet;                // ab dieser Zeit zaehlt das Alter
+    long empfangen;
+    double alter_max, alter_summe;
+    long alter_n;
+    long long bytes_spaet;       // Nutzlast der Bilder ab `spaet`
+} langsamer_leser;
+
+// Liest Nachricht um Nachricht und nimmt hoechstens ein Bild je 20 ms ab,
+// wie ein Client, der so lange decodiert (Messung 29.09.2026: M1 an 4K
+// 4:4:4, rund 18 ms). Misst, wie alt jedes Bild bei ihm ankommt.
+static void *langsam_lesen(void *arg) {
+    langsamer_leser *a = arg;
+    leser l;
+    leser_init(&l, a->fd, 0x44);
+    qc_hdr h;
+    uint8_t anfang[8];
+    double takt = sek();
+    for (;;) {
+        int r = nachricht(&l, &h, anfang, 3000);
+        if (r != 1) break;
+        if (h.type != QC_MSG_VIDEO) continue;
+        double jetzt = sek();
+        if (jetzt > a->ende) break;
+        double alter = (double)(now_us() - atomic_load(&g_gesendet_um[h.reserved])) / 1000.0;
+        a->empfangen++;
+        if (jetzt >= a->spaet) {
+            if (alter > a->alter_max) a->alter_max = alter;
+            a->alter_summe += alter;
+            a->alter_n++;
+            a->bytes_spaet += h.len;
+        }
+        takt = (takt + 0.02 > jetzt ? takt : jetzt - 0.02) + 0.02;
+        jetzt = sek();
+        if (takt > jetzt) usleep((useconds_t)((takt - jetzt) * 1e6));
+    }
+    free(l.buf);
+    return NULL;
+}
+
+typedef struct {
+    long bilder, gesendet, ausgelassen, zeit, empfangen;
+    double alter_max, alter_mittel;
+    int rueckstand_max;          // SO_NWRITE vor einem gesendeten Bild, zweite Haelfte
+    double warten_max_ms;        // derselbe Rueckstand in Zeit beim Abfluss der Gegenstelle
+    int weg;
+} langsam_ergebnis;
+
+// Der Host liefert 120 Bilder je Sekunde mit 25 Mbit/s (Vollbild 200 kB
+// alle 2 s), die Gegenstelle nimmt 50 je Sekunde ab. `zeitregel` 0: nur die
+// Bytegrenze, wie bis 0.2.0 (die Messung des Abflusses wird vor jedem Blick
+// verworfen).
+static langsam_ergebnis langsam_fahren(int zeitregel, double sekunden) {
+    langsam_ergebnis e = {0};
+    int h, c;
+    if (paar(&h, &c, 64 * 1024)) { pruefe(0, "Verbindung"); return e; }
+    zuschauer_setzen(h, kanal(h, 0x44));
+    double t0 = sek();
+    langsamer_leser le = { .fd = c, .ende = t0 + sekunden, .spaet = t0 + sekunden / 2 };
+    pthread_t t;
+    pthread_create(&t, NULL, langsam_lesen, &le);
+    const int fps = 120;
+    CMSampleBufferRef kb = bild(200 * 1024), pb = bild(25000000 / 8 / fps);
+    long zeit0 = atomic_load(&g_stau_zeit), codiert = 0;
+    long n = (long)(sekunden * fps);
+    for (long i = 0; i < n; i++) {
+        if (!zeitregel) {
+            pthread_mutex_lock(&g_send_mtx);
+            abfluss_zuruecksetzen();
+            pthread_mutex_unlock(&g_send_mtx);
+        }
+        e.bilder++;
+        int stau = stau_vor_dem_encoder();
+        if (stau) {
+            e.ausgelassen++;
+            if (stau == QC_STAU_ZEIT) atomic_fetch_add(&g_stau_zeit, 1);
+        } else {
+            int key = (codiert++ % (2 * fps)) == 0;
+            if (atomic_exchange(&g_force_key, 0)) key = 1;
+            uint32_t seq = atomic_load(&g_seq);
+            atomic_store(&g_gesendet_um[seq & 0xffff], now_us());
+            int rueck = backlog_bytes(h);
+            long vorher = atomic_load(&g_sent_frames);
+            emit_access_unit(key ? kb : pb, key ? YES : NO, now_us(), 0);
+            if (atomic_load(&g_sent_frames) > vorher) {
+                e.gesendet++;
+                if (sek() >= le.spaet && rueck > e.rueckstand_max) e.rueckstand_max = rueck;
+            }
+        }
+        if (atomic_load(&g_client_fd) < 0) { e.weg = 1; break; }
+        double soll = t0 + (double)(i + 1) / fps, jetzt = sek();
+        if (soll > jetzt) usleep((useconds_t)((soll - jetzt) * 1e6));
+    }
+    e.zeit = atomic_load(&g_stau_zeit) - zeit0;
+    // Der Leser endet mit der Messzeit (oder spaetestens nach seiner Frist).
+    pthread_join(t, NULL);
+    zuschauer_weg();
+    close(c);
+    CFRelease(kb); CFRelease(pb);
+    e.empfangen = le.empfangen;
+    e.alter_max = le.alter_max;
+    e.alter_mittel = le.alter_n ? le.alter_summe / le.alter_n : 0;
+    double abfluss = (double)le.bytes_spaet / (sekunden / 2);
+    e.warten_max_ms = abfluss > 0 ? e.rueckstand_max / abfluss * 1000 : 0;
+    printf("         %-26s %4ld Bilder, %4ld gesendet, %4ld ausgelassen (Zeitregel %4ld), %4ld gelesen (%.2f MB/s); "
+           "zweite Haelfte: beim Host hoechstens %4d KB (%4.0f ms), Alter beim Leser hoechstens %5.0f ms, im Mittel %5.0f ms%s\n",
+           zeitregel ? "mit Zeitregel" : "nur Bytegrenze (bis 0.2.0)", e.bilder, e.gesendet, e.ausgelassen, e.zeit,
+           e.empfangen, abfluss / 1e6, e.rueckstand_max / 1024, e.warten_max_ms, e.alter_max, e.alter_mittel,
+           e.weg ? " - Zuschauer weg" : "");
+    return e;
+}
+
+static void zeitregel_pruefen(void) {
+    printf("\n-- Zeitregel: Grenze aus dem Abfluss (wie client/src/abfluss.rs)\n");
+    pruefe(stau_grenze_aus(0, QC_BACKLOG_LIMIT) == QC_BACKLOG_LIMIT, "ohne Messung gilt die Bytegrenze");
+    pruefe(stau_grenze_aus(1250000.0, QC_BACKLOG_LIMIT) == QC_STAU_ZEIT_MIN, "10 Mbit/s: die Untergrenze 128 kB statt 125 kB");
+    pruefe(stau_grenze_aus(12500000.0, QC_BACKLOG_LIMIT) == 1250000, "100 Mbit/s: 1,25 MB statt 2 MB");
+    pruefe(stau_grenze_aus(117000000.0, QC_BACKLOG_LIMIT) == QC_BACKLOG_LIMIT &&
+           stau_grenze_aus(117000000.0, QC_BACKLOG_LIMIT / 4) == QC_BACKLOG_LIMIT / 4,
+           "Gigabit: die Bytegrenze bleibt die Obergrenze, auch im Spielmodus");
+    pthread_mutex_lock(&g_send_mtx);
+    abfluss_zuruecksetzen();
+    uint64_t t = 1000000000ull, g = 0;
+    // Kaum etwas wartet: keine Messung.
+    for (int k = 0; k < 100; k++) { t += 10000; g += 100000; abfluss_verfolgen(10000, g, t); }
+    int ohne = abfluss_rate(t) == 0;
+    // Es staut sich, der Zuschauer nimmt 1 MB/s ab.
+    for (int k = 0; k < 100; k++) { t += 10000; g += 10000; abfluss_verfolgen(500000, g, t); }
+    double r = abfluss_rate(t);
+    // Er friert ein: nach QC_ABFLUSS_STILL_US gilt die Bytegrenze wieder.
+    uint64_t gefroren = t;
+    int still_noch = 1;
+    while (t < gefroren + QC_ABFLUSS_STILL_US) { t += 100000; abfluss_verfolgen(500000, g, t); still_noch &= abfluss_rate(t) > 0; }
+    t += 100000;
+    abfluss_verfolgen(500000, g, t);
+    int still = abfluss_rate(t) == 0;
+    abfluss_zuruecksetzen();
+    pthread_mutex_unlock(&g_send_mtx);
+    printf("         (gemessen %.0f Byte/s)\n", r);
+    pruefe(ohne && r > 999000 && r < 1001000 && still_noch && still,
+           "Abfluss nur gemessen, solange etwas wartet; eingefroren nach 2,5 s wieder die Bytegrenze");
+
+    printf("\n-- Zeitregel: langsamer Leser (Host 120 Bilder/s, Gegenstelle 50/s)\n");
+    langsam_ergebnis mit = langsam_fahren(1, 6);
+    langsam_ergebnis ohne_regel = langsam_fahren(0, 6);
+    // Was beim Host wartet, begrenzt die Zeitregel: 100 ms Abfluss,
+    // mindestens 128 kB (bei 1,3 MB/s rund 100 ms), dazu ein Bild oder ein
+    // Vollbild (200 kB). Was schon beim Leser im Empfangspuffer liegt, sieht
+    // der Host nicht - macOS uebergeht SO_RCVBUF auf Loopback (siehe
+    // QC_SCHUB_AB); darum kuemmert sich der Client (client/src/regler.rs).
+    pruefe(!mit.weg && !ohne_regel.weg, "der langsame, aber lebende Zuschauer bleibt");
+    pruefe(mit.zeit > 0, "die Zeitregel greift (unter der Bytegrenze)");
+    pruefe(mit.rueckstand_max <= QC_STAU_ZEIT_MIN + 256 * 1024 && mit.warten_max_ms < 300,
+           "mit Zeitregel wartet vor keinem Bild mehr als rund 100 ms Abfluss beim Host");
+    pruefe(ohne_regel.rueckstand_max > QC_BACKLOG_LIMIT / 2 && ohne_regel.warten_max_ms > 1000,
+           "Gegenprobe: nur mit der Bytegrenze warten beim Host ueber 1 s");
+    pruefe(mit.alter_max < 1000 && ohne_regel.alter_max > 2 * mit.alter_max && mit.alter_mittel * 3 < ohne_regel.alter_mittel,
+           "beim Leser: hoechstens 1 s alt statt ueber 2 s, im Mittel weniger als ein Drittel");
+    pruefe(mit.empfangen * 10 >= ohne_regel.empfangen * 9, "die Gegenstelle bekommt so viele Bilder wie ohne die Regel");
 }
 
 // ------------------------------------------ Protokoll: Drossel und Grenze
@@ -5401,26 +5593,27 @@ int main(void) {
         // (leer, bis der Abschnitt Bildschirm sie fuellt), der Strom aus der Fabrik.
         qc_bildschirm_liste_setzen(test_liste);
         qc_strom_fabrik_setzen(test_fabrik);
-        tasten_pruefen();
-        maus_pruefen(bild_port);
-        protokoll_pruefen(bild_port, ein_port);
-        zugang_pruefen(bild_port, ein_port);
-        name_und_freigabe_pruefen(bild_port);
-        abloesen_pruefen();
-        wechsel_pruefen(bild_port);
-        testbild_rest_pruefen();
-        abbau_wettlauf_pruefen(bild_port);
-        nachreichen_pruefen(bild_port);
-        codec_abschluss_pruefen();
-        formatwechsel_pruefen(bild_port);
-        fest_pruefen();
-        dateien_pruefen(bild_port, ein_port);
-        bildschirm_pruefen(bild_port, ein_port);
-        ton_pruefen();
-        stau_pruefen();
-        takt_pruefen();
-        codecs_pruefen_pruefen();
-        hdr_encoder_pruefen();
+        if (teil("tasten")) tasten_pruefen();
+        if (teil("maus")) maus_pruefen(bild_port);
+        if (teil("protokoll")) protokoll_pruefen(bild_port, ein_port);
+        if (teil("zugang")) zugang_pruefen(bild_port, ein_port);
+        if (teil("name_und_freigabe")) name_und_freigabe_pruefen(bild_port);
+        if (teil("abloesen")) abloesen_pruefen();
+        if (teil("wechsel")) wechsel_pruefen(bild_port);
+        if (teil("testbild_rest")) testbild_rest_pruefen();
+        if (teil("abbau_wettlauf")) abbau_wettlauf_pruefen(bild_port);
+        if (teil("nachreichen")) nachreichen_pruefen(bild_port);
+        if (teil("codec_abschluss")) codec_abschluss_pruefen();
+        if (teil("formatwechsel")) formatwechsel_pruefen(bild_port);
+        if (teil("fest")) fest_pruefen();
+        if (teil("dateien")) dateien_pruefen(bild_port, ein_port);
+        if (teil("bildschirm")) bildschirm_pruefen(bild_port, ein_port);
+        if (teil("ton")) ton_pruefen();
+        if (teil("stau")) stau_pruefen();
+        if (teil("zeitregel")) zeitregel_pruefen();
+        if (teil("takt")) takt_pruefen();
+        if (teil("codecs")) codecs_pruefen_pruefen();
+        if (teil("hdr_encoder")) hdr_encoder_pruefen();
         // Das eigene HOME bleibt nur liegen, wenn etwas fehlschlug (zum Nachsehen).
         if (!g_fehler) [[NSFileManager defaultManager] removeItemAtPath:@(g_home) error:nil];
         printf("\n%s: %d Fehler\n", g_fehler ? "NICHT BESTANDEN" : "bestanden", g_fehler);

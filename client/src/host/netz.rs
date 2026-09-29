@@ -24,7 +24,11 @@
 // Rest des Pakets, das der Sendefaden gerade schreibt. Entschieden wird wie
 // auf dem Mac (stau_vor_dem_encoder in main.m) VOR dem Encoder: liegt mehr
 // als das Budget (2 MB, Gaming 512 kB) im Rueckstand, geht das naechste
-// Bild gar nicht erst in den Encoder (Zaehler "Stau"). Ein codiertes Bild
+// Bild gar nicht erst in den Encoder (Zaehler "Stau"). Dazu die Zeitregel
+// (abfluss.rs, wie auf dem Mac): auch schon, wenn mehr wartet, als der
+// Zuschauer in 100 ms abnimmt (gemessen an `geschrieben`, solange etwas
+// wartet), mindestens 128 kB - die Latenz, nicht die Bytes, spuert der
+// Nutzer. Die Frist fuer "weg" bleibt an das Budget gebunden. Ein codiertes Bild
 // geht immer hinaus - nur ueber der harten Grenze (HARTE_GRENZE) faellt es
 // weg, und dann wird ein Vollbild erzwungen. Nimmt der Zuschauer im Stau
 // STAU_FRIST_US lang nichts ab, gilt er als weg. send_small (Ton,
@@ -102,6 +106,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{eingabe, encoder, log, now_us, Z};
+use crate::abfluss::Abfluss;
 use crate::dateien::{self, Gesendet};
 use crate::protokoll_konst::*;
 use crate::{noise, secure, zugang};
@@ -432,14 +437,15 @@ fn budget(gaming: bool) -> usize {
     if gaming { BACKLOG_LIMIT / 4 } else { BACKLOG_LIMIT }
 }
 
-/// Ton, der hoechstens noch auf den Zuschauer warten darf: ein Viertel des
-/// Budgets (rund 1,3 s, im Spielmodus 0,3 s unkomprimierter Ton). Gezaehlt
-/// wird nur der wartende Ton selbst - ein grosses Vollbild davor laesst ihn
-/// also nicht ausfallen. Liegt die Leitung unter der Tonrate (float32
-/// Stereo, rund 3 Mbit/s), bleibt dem Bild so immer drei Viertel des
-/// Budgets, und der Ton hinkt nicht immer weiter nach.
-fn ton_grenze(gaming: bool) -> usize {
-    budget(gaming) / 4
+/// Ton, der hoechstens noch auf den Zuschauer warten darf: ein Viertel
+/// dessen, was vor einem Bild warten darf - des Budgets (rund 1,3 s, im
+/// Spielmodus 0,3 s unkomprimierter Ton), mit der Zeitregel (abfluss.rs)
+/// weniger. Gezaehlt wird nur der wartende Ton selbst - ein grosses Vollbild
+/// davor laesst ihn also nicht ausfallen. Liegt die Leitung unter der
+/// Tonrate (float32 Stereo, rund 3 Mbit/s), bleibt dem Bild so immer drei
+/// Viertel, und der Ton hinkt nicht immer weiter nach.
+fn ton_grenze(grenze: usize) -> usize {
+    grenze / 4
 }
 
 /// Warum ein Paket nicht in die Warteschlange kam.
@@ -535,6 +541,8 @@ struct Warteschlange {
     geschrieben: u64,
     /// Laufender Stau dieses Zuschauers (siehe stau_urteil).
     stau: Option<Stau>,
+    /// Was dieser Zuschauer abnimmt - fuer die Zeitregel (abfluss.rs).
+    abfluss: Abfluss,
     offen: bool,
     /// Abbruchgriff des Eingabekanals dieses Zuschauers, mit seiner Nummer.
     /// Liegt unter derselben Sperre wie `offen`: wer schliesst, sieht einen
@@ -683,6 +691,7 @@ impl Leitung {
                 im_schreiben: 0,
                 geschrieben: 0,
                 stau: None,
+                abfluss: Abfluss::default(),
                 offen: true,
                 eingabe: None,
                 schlusswort: None,
@@ -1078,7 +1087,13 @@ impl Leitung {
     /// das nach dem Stau fragt) und laeuft nur der Ton in einen
     /// eingefrorenen Zuschauer, fiele er sonst nie auf.
     fn klein_senden(&self, typ: u8, paket: Vec<u8>, gaming: bool, jetzt_us: u64) -> Result<(), Abgewiesen> {
-        let (art, grenze) = if typ == MSG_AUDIO { (Art::Ton, ton_grenze(gaming)) } else { (Art::Klein, KLEIN_GRENZE) };
+        // Ton bekommt ein Viertel dessen, was vor einem Bild warten darf -
+        // mit der Zeitregel also weniger, sonst sperrte er das Bild aus.
+        let (art, grenze) = if typ == MSG_AUDIO {
+            (Art::Ton, ton_grenze(self.zeitgrenze(budget(gaming), jetzt_us)))
+        } else {
+            (Art::Klein, KLEIN_GRENZE)
+        };
         let r = self.einreihen(paket, art, Some(grenze));
         match r {
             Ok(()) => {
@@ -1098,6 +1113,32 @@ impl Leitung {
             }
         }
         r
+    }
+
+    /// Zeitregel (abfluss.rs): ein Blick auf das, was dieser Zuschauer
+    /// abnimmt (`geschrieben` beim Kernel - ist dessen Puffer voll, kommt
+    /// nur hinein, was er abnimmt), und true, wenn mehr wartet, als er in
+    /// STAU_ZEIT abnimmt - dann das naechste Bild auslassen. Unter dem
+    /// Budget, also ohne Frist fuer "weg": die bleibt bei `stau`.
+    fn zeitstau(&self, budget: usize, jetzt_us: u64) -> bool {
+        let mut q = sperre(&self.q);
+        if !q.offen {
+            return false;
+        }
+        let rueckstand = q.bytes + q.im_schreiben;
+        let geschrieben = q.geschrieben;
+        q.abfluss.beobachten(jetzt_us, geschrieben, rueckstand);
+        let rate = q.abfluss.rate(jetzt_us);
+        // Windows kennt kein SO_NWRITE: steht die Warteschlange, ist der
+        // Kernelpuffer voll, und was dort liegt, wartet ebenso - fuer die
+        // Zeitregel zaehlt er mit (der Mac-Host sieht ihn in SO_NWRITE).
+        let wartet = if rate.is_some() && rueckstand > crate::abfluss::BESETZT { rueckstand + SNDBUF } else { rueckstand };
+        wartet > crate::abfluss::zeit_grenze(rate, budget)
+    }
+
+    /// Was nach Budget und Zeitregel vor einem Bild warten darf.
+    fn zeitgrenze(&self, budget: usize, jetzt_us: u64) -> usize {
+        sperre(&self.q).abfluss.grenze(jetzt_us, budget)
     }
 
     /// Stauregel fuer diesen Zuschauer (stau_urteil) mit Grenze `grenze`.
@@ -1711,8 +1752,17 @@ pub fn hoststatus_senden_an(nr: u64, lage: u8) -> bool {
 /// jedes codierte hat sein Bezugsbild, und es braucht kein Vollbild.
 pub fn stau_vor_dem_encoder() -> bool {
     let Some(l) = aktuell() else { return false };
-    if l.stau(budget(Z.gaming.load(Ordering::Relaxed)), now_us()) == Stauurteil::Frei {
-        return false;
+    let budget = budget(Z.gaming.load(Ordering::Relaxed));
+    let jetzt = now_us();
+    // Zuerst der Blick der Zeitregel (misst auch den Abfluss), dann das
+    // Budget mit der Frist fuer "weg".
+    let zeit = l.zeitstau(budget, jetzt);
+    match l.stau(budget, jetzt) {
+        Stauurteil::Frei if !zeit => return false,
+        Stauurteil::Frei => {
+            Z.stau_zeit.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
     }
     Z.stau.fetch_add(1, Ordering::Relaxed);
     true
@@ -3485,10 +3535,10 @@ mod tests {
             }
             {
                 let q = sperre(&l.q);
-                assert!(q.ton <= ton_grenze(gaming) + 8 + TONPAKET, "{} Byte Ton", q.ton);
+                assert!(q.ton <= ton_grenze(budget(gaming)) + 8 + TONPAKET, "{} Byte Ton", q.ton);
                 assert_eq!(q.ton, q.bytes);
             }
-            assert!(angenommen * (8 + TONPAKET) > ton_grenze(gaming), "{angenommen}");
+            assert!(angenommen * (8 + TONPAKET) > ton_grenze(budget(gaming)), "{angenommen}");
             assert!(verworfen > 0);
             // Der Ton allein haelt kein Bild auf.
             assert_eq!(l.stau(budget(gaming), 1_000), Stauurteil::Frei, "gaming {gaming}");
@@ -3602,9 +3652,9 @@ mod tests {
              hoechster Ton {hoechster_ton}, hoechster Rueckstand {hoechster_rueckstand}, empfangen {bilder} Bilder und {ton} Tonpakete"
         );
         assert!(ton_verworfen > 0, "Leitung nicht zu langsam - Probe ohne Wert");
-        assert!(hoechster_ton <= ton_grenze(true) + 8 + TONPAKET, "{hoechster_ton}");
+        assert!(hoechster_ton <= ton_grenze(budget(true)) + 8 + TONPAKET, "{hoechster_ton}");
         // Bilder bis zum Budget, der Ton daneben bis zu seiner Grenze.
-        assert!(hoechster_rueckstand <= budget(true) + ton_grenze(true) + 2 * (8 + TONPAKET) + 8 + 4000, "{hoechster_rueckstand}");
+        assert!(hoechster_rueckstand <= budget(true) + ton_grenze(budget(true)) + 2 * (8 + TONPAKET) + 8 + 4000, "{hoechster_rueckstand}");
         assert!(codiert_zweite_haelfte >= 5, "Bild in der zweiten Haelfte gesperrt: {codiert_zweite_haelfte}");
         assert!(bilder > 0 && ton > 0);
     }
@@ -3827,6 +3877,203 @@ mod tests {
         // wird dann spaeter geprueft, nicht falsch. Die VM liegt bei gut 2 s.
         assert!(weg <= Duration::from_micros(STAU_FRIST_US) + Duration::from_secs(2), "{weg:?}");
         assert_eq!(lauf.verworfen, 0, "{lauf:?}");
+    }
+
+    /// Empfangspuffer der Gegenstelle klein halten: ihr Lesen ist dann der
+    /// Engpass, wie bei einem Client, der langsamer decodiert, als der Host
+    /// liefert (hosttest.m nimmt dasselbe).
+    fn empfangspuffer_setzen(s: &TcpStream, groesse: i32) {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET, SO_RCVBUF};
+        unsafe {
+            setsockopt(SOCKET(s.as_raw_socket() as usize), SOL_SOCKET, SO_RCVBUF, Some(&groesse.to_ne_bytes()));
+        }
+    }
+
+    /// Ergebnis eines Laufs mit langsamem Leser.
+    #[derive(Debug, Default)]
+    struct Leserlauf {
+        codiert: u32,
+        /// Davon allein nach der Zeitregel ausgelassen.
+        zeit: u32,
+        ausgelassen: u32,
+        empfangen: u32,
+        /// Hoechstes Alter eines Bildes bei der Gegenstelle (Einreihen bis
+        /// gelesen), in der zweiten Haelfte des Laufs, und das Mittel dort.
+        hoechstes_alter_ms: f64,
+        mittleres_alter_ms: f64,
+    }
+
+    /// Der Host liefert 120 Bilder je Sekunde mit 25 Mbit/s (ein Vollbild
+    /// von 200 kB alle 2 s), die Gegenstelle nimmt nur 50 je Sekunde ab -
+    /// wie ein Client, der 20 ms je Bild decodiert (Messung 29.09.2026: M1
+    /// an 4K 4:4:4). Jedes Bild traegt die Zeit seines Einreihens (Hostuhr,
+    /// derselbe Prozess), die Gegenstelle misst sein Alter. Ohne Zeitregel
+    /// (`zeitregel` false) nur Budget und Frist wie bis 0.2.0.
+    fn langsamer_leser(zeitregel: bool) -> Leserlauf {
+        let (h, mut c) = paar();
+        sendepuffer_setzen(h.socket());
+        empfangspuffer_setzen(c.socket(), 64 * 1024);
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let sender = std::thread::spawn(move || sendefaden(l2, h));
+        let dauer = Duration::from_secs(6);
+        let t0 = Instant::now();
+        let leser = std::thread::spawn(move || {
+            c.socket().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut puffer = vec![0u8; 1 << 20];
+            let (mut empfangen, mut hoechstes, mut summe, mut n) = (0u32, 0f64, 0f64, 0u32);
+            loop {
+                let mut hdr = [0u8; 8];
+                if c.read_exact(&mut hdr).is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                if c.read_exact(&mut puffer[..len]).is_err() {
+                    break;
+                }
+                match hdr[0] {
+                    MSG_VIDEO => {
+                        let t = u64::from_le_bytes(puffer[..8].try_into().unwrap());
+                        let alter = now_us().saturating_sub(t) as f64 / 1000.0;
+                        empfangen += 1;
+                        if t0.elapsed() > dauer / 2 && t0.elapsed() <= dauer {
+                            hoechstes = f64::max(hoechstes, alter);
+                            summe += alter;
+                            n += 1;
+                        }
+                        // "Decodieren": 20 ms je Bild.
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    MSG_TIME => break,
+                    _ => {}
+                }
+            }
+            (empfangen, hoechstes, summe / n.max(1) as f64)
+        });
+        let mut lauf = Leserlauf::default();
+        let (fps, zwischen, vollbild) = (120u32, 25_000_000 / 8 / 120, 200 * 1024);
+        let bildzeit = Duration::from_secs_f64(1.0 / fps as f64);
+        let mut i = 0u32;
+        while t0.elapsed() < dauer {
+            if let Some(w) = (t0 + bildzeit * i).checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+            let jetzt = now_us();
+            let zeit = zeitregel && leitung.zeitstau(budget(false), jetzt);
+            match leitung.stau(budget(false), jetzt) {
+                Stauurteil::Frei if !zeit => {}
+                Stauurteil::Frei => {
+                    lauf.zeit += 1;
+                    lauf.ausgelassen += 1;
+                    i += 1;
+                    continue;
+                }
+                Stauurteil::Stau => {
+                    lauf.ausgelassen += 1;
+                    i += 1;
+                    continue;
+                }
+                Stauurteil::Weg => panic!("lebender Zuschauer ausgetragen"),
+            }
+            let key = lauf.codiert % 240 == 0;
+            let n = if key { vollbild } else { zwischen };
+            let mut p = kopf(MSG_VIDEO, if key { FLAG_KEY } else { 0 }, 0, n).to_vec();
+            p.extend_from_slice(&now_us().to_le_bytes());
+            p.resize(8 + n, 0);
+            assert_eq!(leitung.einreihen(p, Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+            lauf.codiert += 1;
+            i += 1;
+        }
+        let _ = leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), Art::Klein, None);
+        let (empfangen, hoechstes, mittel) = endet_binnen(leser, Duration::from_secs(30)).expect("Gegenstelle endet nicht");
+        lauf.empfangen = empfangen;
+        lauf.hoechstes_alter_ms = hoechstes;
+        lauf.mittleres_alter_ms = mittel;
+        leitung.schliessen();
+        assert!(endet_binnen(sender, Duration::from_secs(5)).is_some(), "Sendefaden endet nicht");
+        lauf
+    }
+
+    /// Zeitregel: der langsame Leser (50 von 120 Bildern je Sekunde) bekommt
+    /// seine Bilder nach dem Anlauf hoechstens rund 0,4 s alt - Warteschlange
+    /// bis zur Untergrenze (128 kB), Kernelpuffer (256 kB), sein eigener
+    /// Empfangspuffer (64 kB) bei 1,3 MB/s. Nur mit dem Budget (bis 0.2.0)
+    /// wartete jedes Bild hinter 2 MB, rund 1,8 s. Kein Bild geht verloren,
+    /// das codiert wurde, und der Zuschauer bleibt.
+    #[test]
+    fn zeitregel_haelt_langsamen_leser_unter_einer_halben_sekunde() {
+        let mit = langsamer_leser(true);
+        let ohne = langsamer_leser(false);
+        println!("langsamer Leser, mit Zeitregel: {mit:?}");
+        println!("langsamer Leser, nur Budget:    {ohne:?}");
+        assert!(mit.zeit > 0, "{mit:?}");
+        assert_eq!(mit.empfangen, mit.codiert, "{mit:?}");
+        assert!(mit.hoechstes_alter_ms < 500.0, "{mit:?}");
+        assert!(ohne.hoechstes_alter_ms > 1000.0, "Gegenprobe ohne Wert: {ohne:?}");
+        assert!(mit.mittleres_alter_ms * 3.0 < ohne.mittleres_alter_ms, "mit {mit:?} ohne {ohne:?}");
+        // Die Gegenstelle bekommt weiter rund 50 Bilder je Sekunde.
+        assert!(mit.empfangen as f64 >= 0.8 * 50.0 * 6.0, "{mit:?}");
+    }
+
+    /// Normale Last mit Zeitregel: auf einer schnellen Leitung laesst sie
+    /// nichts aus, auch nicht hinter grossen Vollbildern.
+    #[test]
+    fn zeitregel_laesst_bei_normaler_last_nichts_aus() {
+        let (h, mut c) = paar();
+        sendepuffer_setzen(h.socket());
+        let leitung = leitung_zu(&h);
+        let l2 = leitung.clone();
+        let sender = std::thread::spawn(move || sendefaden(l2, h));
+        let leser = std::thread::spawn(move || {
+            c.socket().set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut puffer = vec![0u8; 4 << 20];
+            let mut empfangen = 0u32;
+            loop {
+                let mut hdr = [0u8; 8];
+                if c.read_exact(&mut hdr).is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+                if c.read_exact(&mut puffer[..len]).is_err() {
+                    break;
+                }
+                match hdr[0] {
+                    MSG_VIDEO => empfangen += 1,
+                    MSG_TIME => break,
+                    _ => {}
+                }
+            }
+            empfangen
+        });
+        let (fps, zwischen, vollbild) = (120u32, 150_000_000 / 8 / 120, 1900 * 1024);
+        let bildzeit = Duration::from_secs_f64(1.0 / fps as f64);
+        let t0 = Instant::now();
+        let (mut codiert, mut ausgelassen) = (0u32, 0u32);
+        for i in 0..(3 * fps) {
+            if let Some(w) = (t0 + bildzeit * i).checked_duration_since(Instant::now()) {
+                std::thread::sleep(w);
+            }
+            let jetzt = now_us();
+            let zeit = leitung.zeitstau(budget(false), jetzt);
+            if zeit || leitung.stau(budget(false), jetzt) != Stauurteil::Frei {
+                ausgelassen += 1;
+                continue;
+            }
+            let key = codiert % 240 == 0;
+            let n = if key { vollbild } else { zwischen };
+            let mut p = kopf(MSG_VIDEO, if key { FLAG_KEY } else { 0 }, 0, n).to_vec();
+            p.resize(8 + n, 0);
+            assert_eq!(leitung.einreihen(p, Art::Bild, Some(HARTE_GRENZE)), Ok(()));
+            codiert += 1;
+        }
+        let _ = leitung.einreihen(kopf(MSG_TIME, 0, 0, 0).to_vec(), Art::Klein, None);
+        let empfangen = endet_binnen(leser, Duration::from_secs(15)).expect("Gegenstelle endet nicht");
+        leitung.schliessen();
+        assert!(endet_binnen(sender, Duration::from_secs(5)).is_some());
+        println!("normale Last mit Zeitregel: {codiert} codiert, {ausgelassen} ausgelassen, {empfangen} empfangen");
+        assert_eq!(ausgelassen, 0);
+        assert_eq!(empfangen, codiert);
     }
 
     // -------------------------------------------------------- Dateien

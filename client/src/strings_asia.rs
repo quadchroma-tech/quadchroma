@@ -293,6 +293,7 @@ pub static RU: Lang = Lang {
         (StatColor, "Цвет"),
         (ShortcutMouseCapture, "Захватить или отпустить мышь (игры)"),
         (MouseCapturedHint, "Мышь захвачена · F8 отпускает её"),
+        (FpsAdapted, "Частота кадров подстроена под этот компьютер"),
     ],
 };
 
@@ -585,6 +586,7 @@ pub static ZH: Lang = Lang {
         (StatColor, "色彩"),
         (ShortcutMouseCapture, "捕获或释放鼠标（游戏）"),
         (MouseCapturedHint, "鼠标已捕获 · 按 F8 释放"),
+        (FpsAdapted, "帧率已适配本机"),
     ],
 };
 
@@ -877,6 +879,7 @@ pub static JA: Lang = Lang {
         (StatColor, "色"),
         (ShortcutMouseCapture, "マウスを捕捉・解放（ゲーム）"),
         (MouseCapturedHint, "マウスを捕捉中 · F8 で解放"),
+        (FpsAdapted, "フレームレートをこのコンピュータに合わせました"),
     ],
 };
 
@@ -1167,5 +1170,6 @@ pub static TR: Lang = Lang {
         (StatColor, "Renk"),
         (ShortcutMouseCapture, "Fareyi yakala veya bırak (oyunlar)"),
         (MouseCapturedHint, "Fare yakalandı · F8 bırakır"),
+        (FpsAdapted, "Kare hızı bu bilgisayara uyarlandı"),
     ],
 };

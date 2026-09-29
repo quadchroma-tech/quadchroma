@@ -292,6 +292,7 @@ pub static FR: Lang = Lang {
         (StatColor, "Couleur"),
         (ShortcutMouseCapture, "Capturer ou libérer la souris (jeux)"),
         (MouseCapturedHint, "Souris capturée · F8 la libère"),
+        (FpsAdapted, "Fréquence d'images adaptée à cet ordinateur"),
     ],
 };
 
@@ -582,6 +583,7 @@ pub static ES: Lang = Lang {
         (StatColor, "Color"),
         (ShortcutMouseCapture, "Capturar o liberar el ratón (juegos)"),
         (MouseCapturedHint, "Ratón capturado · F8 lo libera"),
+        (FpsAdapted, "Tasa de fotogramas adaptada a este equipo"),
     ],
 };
 
@@ -872,6 +874,7 @@ pub static IT: Lang = Lang {
         (StatColor, "Colore"),
         (ShortcutMouseCapture, "Cattura o rilascia il mouse (giochi)"),
         (MouseCapturedHint, "Mouse catturato · F8 lo rilascia"),
+        (FpsAdapted, "Frequenza fotogrammi adattata a questo computer"),
     ],
 };
 
@@ -1162,6 +1165,7 @@ pub static PT: Lang = Lang {
         (StatColor, "Cor"),
         (ShortcutMouseCapture, "Capturar ou libertar o rato (jogos)"),
         (MouseCapturedHint, "Rato capturado · F8 liberta-o"),
+        (FpsAdapted, "Taxa de imagens adaptada a este computador"),
     ],
 };
 
@@ -1452,5 +1456,6 @@ pub static NL: Lang = Lang {
         (StatColor, "Kleur"),
         (ShortcutMouseCapture, "Muis vangen of vrijgeven (games)"),
         (MouseCapturedHint, "Muis gevangen · F8 geeft hem vrij"),
+        (FpsAdapted, "Framerate aangepast aan deze computer"),
     ],
 };

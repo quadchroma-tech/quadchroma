@@ -50,6 +50,13 @@ mod logo;
 mod maus;
 mod noise;
 mod protokoll_konst;
+/// Bildratenregler: Aufholen und eine tragbare Bildrate, wenn dieser Rechner
+/// langsamer decodiert, als der Host liefert.
+mod regler;
+/// Zeitregel der Stauregel des Windows-Hosts (host/netz.rs); der Mac-Host
+/// rechnet dasselbe in C. Die Pruefungen laufen ueberall.
+#[cfg(any(windows, test))]
+mod abfluss;
 mod secure;
 mod sps;
 /// Der Decoder des Mac-Clients: VideoToolbox direkt (Annex B nach
@@ -1199,6 +1206,10 @@ struct Shared {
     /// Was auf dem Host gerade gilt: Mbit/s, Bilder je Sekunde, Gaming-Schalter.
     /// Was beim Host gilt: Datenrate, Bildrate, Spielmodus, feste Bildrate, Ton.
     settings: Option<(u32, u16, bool, bool, bool)>,
+    /// Bildratenregler (regler.rs): so viele Bilder je Sekunde liefert der
+    /// Host gerade statt des Wunsches in `settings`, weil dieser Rechner
+    /// nicht schneller decodiert. None: es gilt der Wunsch.
+    fps_angepasst: Option<u16>,
     /// Ton gewuenscht? Der Client haelt sich selbst daran - auch gegenueber
     /// einem Host, der den Schalter noch nicht kennt und weiter Ton schickt.
     ton: bool,
@@ -3065,6 +3076,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         Ok(false) => {}
         Err(e) => protokoll::zeile(format!("hosts.txt: {name} nicht gemerkt - {e}")),
     }
+    // Der Bildratenregler faengt je Sitzung neu an: keine Grenze, und der
+    // Wunsch eines anderen Hosts gilt hier nicht (die gespeicherten Werte
+    // dieses Hosts kommen gleich ueber gespeicherte_werte_anwenden). Vor dem
+    // Setzen der Bindung, damit sie danach nichts mehr ueberschreibt.
+    input.lock().unwrap().regler_zuruecksetzen();
     // Dateien: je Sitzung eine Nummer, gegen die Sender und Empfaenger ihren
     // Stand melden; die Faehigkeit des Hosts gilt erst mit MSG_FAEHIGKEITEN
     // dieser Sitzung.
@@ -3085,6 +3101,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
         s.codec_idx = None;
         s.codec_wechsel = None;
         s.info = None;
+        s.fps_angepasst = None;
         s.bildschirme_zuruecksetzen();
         s.decoder_baue = 0;
         s.sitzung_nr += 1;
@@ -3198,6 +3215,12 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
     // den Uhrenversatz fuer die ganze Sitzung ein und die Drift laeuft weg.
     let mut umlaeufe: Vec<(u64, i64)> = Vec::new();
     let mut mittel: Option<(f32, f32, f32, f32)> = None;
+    // Der Bildratenregler (regler.rs): holt auf und wuenscht sich eine
+    // tragbare Bildrate, wenn dieser Rechner langsamer decodiert, als der
+    // Host liefert. Wie oft in dieser Sitzung aufgeholt wurde - die ersten
+    // AUFHOL_ZEILEN mit einer Zeile im Protokoll, danach jedes 50. Mal.
+    let mut regler = regler::Regler::neu();
+    let mut aufgeholt = 0u32;
 
     loop {
         // Wurde die Trennung verlangt, ist hier Schluss - auch wenn der Host
@@ -3235,6 +3258,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     warte_auf_schluesselbild = true;
                     ring.clear();
                     mittel = None;
+                    regler.neuer_decoder(client_us());
                 }
             }
         }
@@ -3305,6 +3329,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         nach_wechsel = true;
                         ring.clear();
                         mittel = None;
+                        regler.neuer_decoder(client_us());
                     }
                     // Farbe und HDR-Grund ins Protokoll, sobald sie sich
                     // aendern (und beim ersten Mal).
@@ -3412,6 +3437,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 nach_wechsel = true;
                 ring.clear();
                 mittel = None;
+                regler.neuer_decoder(client_us());
                 // Die Strominfo kommt gleich hinterher; bis dahin gilt schon,
                 // was der Wechsel selbst gesagt hat - dann zeigt das Menue
                 // ohne Verzug den richtigen Eintrag als laufend.
@@ -3428,6 +3454,40 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                 // Jedes Byte zaehlt, auch das eines Bildes, das gleich
                 // verworfen wird: die Leitung hat es getragen.
                 shared.lock().unwrap().bytes_video += len as u64;
+                // Ankunftszeit sofort nehmen, noch vor dem Decodieren.
+                let t_empfangen = client_us();
+                // Die Bildnummer reist durch den Decoder mit, damit auf der
+                // anderen Seite der richtige Stempel zum richtigen Bild passt.
+                let seq = u16::from_le_bytes([hdr[2], hdr[3]]);
+                let vollbild = flags & FLAG_KEY != 0;
+                // Kommt dieser Rechner nicht mit, holt er auf: bis zu einem
+                // frischen Vollbild geht nichts in den Decoder, und der Host
+                // bekommt eine tragbare Bildrate gewuenscht (regler.rs). Der
+                // Stempel (Nachricht 5) kam vor dem Bild und sagt, wann der
+                // Encoder fertig war.
+                let t_enc = ring.iter().find(|(s, ..)| *s == seq).map(|e| e.2);
+                match regler.bild_da(t_empfangen, t_enc, vollbild) {
+                    regler::Bildwahl::Decodieren => {}
+                    regler::Bildwahl::Verwerfen => {
+                        regler_ausfuehren(&mut regler, shared, input);
+                        continue;
+                    }
+                    regler::Bildwahl::Aufgeholt(b) => {
+                        aufgeholt += 1;
+                        if aufgeholt <= AUFHOL_ZEILEN || aufgeholt % 50 == 0 {
+                            protokoll::zeile(format!(
+                                "Aufgeholt ({aufgeholt}. Mal): {} Bilder nicht decodiert, weiter mit einem Vollbild nach {:.0} ms{} - Rueckstand {:.0} -> {:.0} ms",
+                                b.verworfen,
+                                b.dauer_ms,
+                                if b.frist { " (Frist abgelaufen)" } else { "" },
+                                b.stau_vorher_ms,
+                                b.stau_jetzt_ms
+                            ));
+                        }
+                        // Der Mittelwert der Latenz stammt aus dem Stau.
+                        mittel = None;
+                    }
+                }
                 // Nach einem Wechsel muss das erste Bild ein Schluesselbild
                 // sein (Flaggenbit 0). Alles andere gehoert noch zum alten
                 // Codec oder ist ohne Parametersaetze nicht decodierbar.
@@ -3447,12 +3507,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         mitschnitt = None;
                     }
                 }
-                // Ankunftszeit sofort nehmen, noch vor dem Decodieren.
-                let t_empfangen = client_us();
                 let t0 = Instant::now();
-                // Die Bildnummer reist durch den Decoder mit, damit auf der
-                // anderen Seite der richtige Stempel zum richtigen Bild passt.
-                let seq = u16::from_le_bytes([hdr[2], hdr[3]]);
                 // Ankunftszeit gehoert zu DIESEM Bild, nicht zu dem, das
                 // gleich aus dem Decoder faellt - der haelt mehrere zurueck.
                 if let Some(e) = ring.iter_mut().find(|(s, ..)| *s == seq) {
@@ -3576,6 +3631,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     decoder_melden(shared, &bau, wunsch);
                     ring.clear();
                     mittel = None;
+                    regler.neuer_decoder(client_us());
                     if flags & 1 == 0 {
                         warte_auf_schluesselbild = true;
                         break;
@@ -3697,6 +3753,11 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                         }
                     }
                 }
+                // Die Arbeit an diesem Bild (Decodieren, auf dem Weg ueber den
+                // Prozessor auch das Umrechnen) - daraus misst der Regler, was
+                // dieser Rechner schafft.
+                regler.bild_fertig(client_us(), t0.elapsed().as_micros() as u64, vollbild);
+                regler_ausfuehren(&mut regler, shared, input);
                 // Ein Hardware-Decoder, der Bilder in einem Format liefert,
                 // das to_rgb nicht kennt, zeigt ein dunkles Bild mit Meldung.
                 // Bleibt es dabei, ist Software mit einem lesbaren Format die
@@ -3709,6 +3770,7 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     decoder_melden(shared, &bau, wunsch);
                     ring.clear();
                     mittel = None;
+                    regler.neuer_decoder(client_us());
                     warte_auf_schluesselbild = true;
                 }
             }
@@ -3776,7 +3838,16 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
                     let fps = u16::from_le_bytes([payload[4], payload[5]]);
                     // Neuntes Byte: Ton. Ein aelterer Host schickt acht - dann gilt "an".
                     let ton = if len >= 9 { payload[8] != 0 } else { true };
-                    shared.lock().unwrap().settings = Some((mbit, fps, payload[6] != 0, payload[7] != 0, ton));
+                    // Steht der Host auf der Bildrate, die der Regler statt des
+                    // Wunsches erbeten hat, gilt fuer Oberflaeche, Benchmark
+                    // und gespeicherte Werte der Wunsch - die angepasste Rate
+                    // steht daneben.
+                    let (wunsch, grenze) = input.lock().unwrap().wunsch_und_grenze();
+                    let (zeigen, angepasst) = regler::gemeldet_deuten((mbit, fps, payload[6] != 0, payload[7] != 0, ton), wunsch, grenze);
+                    regler.wunsch_setzen(Some(wunsch.map_or(zeigen.1, |w| w.1)));
+                    let mut s = shared.lock().unwrap();
+                    s.settings = Some(zeigen);
+                    s.fps_angepasst = angepasst;
                 }
             }
             MSG_AUDIO_INFO => {
@@ -3920,6 +3991,27 @@ fn run_session(addr: &str, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputL
             }
             _ => {}
         }
+    }
+}
+
+/// So viele Aufholvorgaenge je Sitzung bekommen eine Zeile im Protokoll,
+/// danach jeder 50.
+const AUFHOL_ZEILEN: u32 = 20;
+
+/// Was der Bildratenregler gerade verlangt, an den Host: Nachricht 64 mit
+/// dem Wunsch des Nutzers, hoechstens der Grenze - das erzwingt dort auch
+/// ein Vollbild (Aufholen). Eine neue Grenze einmal ins Protokoll. Hat der
+/// Nutzer in dieser Sitzung nichts gewuenscht, gilt, was der Host meldet.
+/// `shared` und `input` nacheinander, nie ineinander.
+fn regler_ausfuehren(regler: &mut regler::Regler, shared: &Mutex<Shared>, input: &Mutex<InputLink>) {
+    let Some(a) = regler.takt(client_us()) else { return };
+    let basis = shared.lock().unwrap().settings;
+    let (gesendet, wunsch) = {
+        let mut l = input.lock().unwrap();
+        (l.fps_grenze_setzen(a.grenze, basis), l.wunsch_und_grenze().0.map(|w| w.1))
+    };
+    if let Some(z) = a.zeile(wunsch) {
+        protokoll::zeile(if gesendet { z } else { format!("{z} - nicht gesendet: noch keine Einstellungen vom Host") });
     }
 }
 
@@ -4805,6 +4897,13 @@ struct InputLink {
     /// einer Uebertragung ohne ihr Angebot hinaus (Spezifikation 2.7 Schritt
     /// 5, Verlust des Eingabekanals).
     kanal_nr: u64,
+    /// Was in dieser Sitzung zuletzt gewuenscht wurde (Menue, gespeicherte
+    /// Werte, Benchmark): Mbit/s, Bilder je Sekunde, Spielmodus, feste
+    /// Bildrate, Ton. None: noch nichts - dann gilt, was der Host meldet.
+    wunsch: Option<regler::Einstellung>,
+    /// Obergrenze des Bildratenreglers (regler.rs). Hinaus geht der Wunsch
+    /// mit hoechstens dieser Bildrate; None = keine.
+    fps_grenze: Option<u16>,
 }
 
 /// Ergebnis eines Aufbaus: die Leitung oder der Fehler, dazu der
@@ -5139,6 +5238,8 @@ impl InputLink {
             nachreichen: Vec::new(),
             schreibfrist: SCHREIBFRIST,
             kanal_nr: 0,
+            wunsch: None,
+            fps_grenze: None,
         }
     }
 
@@ -5329,7 +5430,18 @@ impl InputLink {
     }
 
     /// Wunsch an den Host: Bitrate, Bildrate, Spielmodus, feste Bildrate, Ton.
+    /// Die Bildrate geht hoechstens mit der Grenze des Bildratenreglers
+    /// hinaus; der Wunsch bleibt gemerkt.
     fn settings(&mut self, mbit: u32, fps: u16, gaming: bool, fixed: bool, ton: bool) {
+        self.wunsch = Some((mbit, fps, gaming, fixed, ton));
+        self.settings_senden();
+    }
+
+    /// Den Wunsch (mit der Grenze) an den Host - jede Nachricht 64 erzwingt
+    /// dort auch ein Vollbild, bei beiden Hosts in jeder Fassung.
+    fn settings_senden(&mut self) {
+        let Some((mbit, fps, gaming, fixed, ton)) = self.wunsch else { return };
+        let fps = regler::wirksame_fps(fps, self.fps_grenze);
         let mut p = [0u8; 9];
         p[0..4].copy_from_slice(&mbit.to_le_bytes());
         p[4..6].copy_from_slice(&fps.to_le_bytes());
@@ -5337,6 +5449,36 @@ impl InputLink {
         p[7] = fixed as u8;
         p[8] = ton as u8;
         self.send(IN_SETTINGS, &p);
+    }
+
+    /// Bildratenregler: neue Grenze (None = keine) und die Einstellungen
+    /// neu an den Host - das erzwingt dort ein Vollbild, auch wenn die
+    /// Grenze bleibt (Aufholen). `basis`: was der Host meldet, falls in
+    /// dieser Sitzung noch nichts gewuenscht wurde. false: nichts gesendet
+    /// (weder Wunsch noch Meldung bekannt).
+    fn fps_grenze_setzen(&mut self, grenze: Option<u16>, basis: Option<regler::Einstellung>) -> bool {
+        self.fps_grenze = grenze;
+        if self.wunsch.is_none() {
+            self.wunsch = basis;
+        }
+        if self.wunsch.is_none() {
+            return false;
+        }
+        self.settings_senden();
+        true
+    }
+
+    /// Wunsch und Grenze, um die Meldung des Hosts zu deuten
+    /// (regler::gemeldet_deuten).
+    fn wunsch_und_grenze(&self) -> (Option<regler::Einstellung>, Option<u16>) {
+        (self.wunsch, self.fps_grenze)
+    }
+
+    /// Neue Sitzung: keine Grenze, kein Wunsch (der gehoerte zum vorigen
+    /// Host). Sendet nichts.
+    fn regler_zuruecksetzen(&mut self) {
+        self.wunsch = None;
+        self.fps_grenze = None;
     }
 
     /// Wunsch an den Host: auf diesen Kandidaten der Koennensliste wechseln.
@@ -5744,6 +5886,9 @@ pub struct Ergebnis {
     pub host_cpu: f32,
     pub client_cpu: f32,
     pub bestanden: bool,
+    /// Die Bildrate, die der Bildratenregler statt der Soll-Bildrate beim
+    /// Host erbeten hatte (Stand am Ende der Messzeit); None: keine.
+    pub angepasst: Option<u16>,
 }
 
 impl Ergebnis {
@@ -5775,13 +5920,14 @@ impl Ergebnis {
             );
         }
         format!(
-            "Benchmark {nr}/{gesamt}: {}, {} fps, {} Mbit/s: {:.1} Bilder/s, {:.1} Mbit/s, Kette {:.1} ms (Encoder {:.1}, Leitung {:.1}, Decoder {:.1}, Anzeige {}), verworfen {}, ausgelassen {}, Host-Encoder {:.1}/{:.1} ms, Host-CPU {:.0} %, Client-CPU {:.1} % - {}",
+            "Benchmark {nr}/{gesamt}: {}, {} fps, {} Mbit/s: {:.1} Bilder/s, {:.1} Mbit/s, Kette {:.1} ms (Encoder {:.1}, Leitung {:.1}, Decoder {:.1}, Anzeige {}), verworfen {}, ausgelassen {}, Host-Encoder {:.1}/{:.1} ms, Host-CPU {:.0} %, Client-CPU {:.1} %{} - {}",
             self.codec, self.fps, self.mbit, self.fps_gemessen, self.mbit_gemessen, self.kette_ms,
             self.encoder_ms, self.leitung_ms, self.decoder_ms,
             if mit_anzeige { format!("{:.1}", self.anzeige_ms) } else { "-".into() },
             if mit_anzeige { self.verworfen.to_string() } else { "-".into() },
             if mit_anzeige { self.ausgelassen.to_string() } else { "-".into() },
             self.host_encoder_ms, self.budget_ms, self.host_cpu, self.client_cpu,
+            self.angepasst.map(|f| format!(", Bildrate an diesen Rechner angepasst: {f}")).unwrap_or_default(),
             if self.bestanden { "bestanden" } else { "nicht bestanden" }
         )
     }
@@ -6124,9 +6270,9 @@ impl Benchmark {
     /// Messzeit vorbei: Zaehlerdifferenzen und Mittel der Proben.
     fn auswerten(&mut self, shared: &Arc<Mutex<Shared>>, input: &Arc<Mutex<InputLink>>) {
         let sek = self.seit.elapsed().as_secs_f32().max(0.001);
-        let (decoded, dropped, ausgelassen, bytes) = {
+        let (decoded, dropped, ausgelassen, bytes, angepasst) = {
             let s = shared.lock().unwrap();
-            (s.decoded, s.dropped, s.ausgelassen, s.bytes_video)
+            (s.decoded, s.dropped, s.ausgelassen, s.bytes_video, s.fps_angepasst)
         };
         let empfangen = decoded.saturating_sub(self.start.0);
         // Nur Proben mit stehendem Zeitabgleich sagen etwas ueber die Kette.
@@ -6162,6 +6308,7 @@ impl Benchmark {
             host_cpu: host_mittel(&|h| h.cpu),
             client_cpu,
             bestanden: false,
+            angepasst,
         };
         e.pruefen(self.mit_anzeige, !mit_latenz.is_empty());
         self.eintragen(e, shared, input);
@@ -9805,13 +9952,18 @@ impl App {
                 }
                 if self.show_overlay {
                     let hdr_lage = self.hdr_lage();
-                    let (stats, secure, lat, soll, hostlast, decoder, ausgelassen) = {
+                    let (stats, secure, lat, soll, angepasst, hostlast, decoder, ausgelassen) = {
                         let s = self.shared.lock().unwrap();
                         (
                             (s.last_decode_ms, s.info, s.dropped, s.error.as_ref().map(|m| m.text(self.lang)), s.connected),
                             (s.sas.clone(), s.peer_fp.clone()),
                             s.latenz(),
-                            s.settings.map(|x| x.1 as u32).or_else(|| s.info.map(|i| i.fps)),
+                            // Was beim Host gilt: eine angepasste Bildrate vor dem Wunsch.
+                            s.fps_angepasst
+                                .map(u32::from)
+                                .or_else(|| s.settings.map(|x| x.1 as u32))
+                                .or_else(|| s.info.map(|i| i.fps)),
+                            s.fps_angepasst,
                             s.hostlast,
                             (s.decoder_pfad, s.decoder_hinweis.clone()),
                             s.ausgelassen,
@@ -9825,7 +9977,7 @@ impl App {
                         ausgelassen,
                     };
                     overlay(&mut self.ui, c, self.lang, self.fps_shown, &hist, stats, secure,
-                            lat, self.cfg.stats, self.cfg.nerd, soll, hostlast, decoder, &client, hdr_lage);
+                            lat, self.cfg.stats, self.cfg.nerd, soll, angepasst, hostlast, decoder, &client, hdr_lage);
                 }
                 // Das Erstkontakt-Banner mit dem Vergleichscode entfaellt
                 // (Spezifikation Pairing v1, 5): den Code zeigt der
@@ -9856,11 +10008,12 @@ impl App {
                     // beiden voneinander ab, und das Menue soll zeigen, was
                     // wirklich gilt - sonst ist der falsche Knopf in Cyan, und
                     // ein Klick auf den richtigen bewirkt nichts.
-                    let (lat, info, stell, secure, codecs, codec_idx, wechsel, decoder_wunsch, decoder_aktiv) = {
+                    let (lat, info, stell, secure, codecs, codec_idx, wechsel, decoder_wunsch, decoder_aktiv, fps_angepasst) = {
                         let sh = self.shared.lock().unwrap();
                         (
                             sh.latenz(), sh.info, sh.settings, (sh.sas.clone(), sh.peer_fp.clone()),
                             sh.codecs.clone(), sh.codec_idx, sh.wechsel_laeuft(), sh.decoder_wunsch, sh.decoder_pfad,
+                            sh.fps_angepasst,
                         )
                     };
                     let (bildschirmwahl, bildschirme, bildschirm_wunsch, bildschirm_wechsel, hdr_an) = {
@@ -9909,6 +10062,7 @@ impl App {
                         geraete_scroll: self.geraete_scroll,
                         hdr_an,
                         hdr_lage,
+                        fps_angepasst,
                     };
                     n.hud = Some(hud(
                         &mut self.ui, c, self.lang, ww as i32, wh as i32, reiter,
@@ -11508,16 +11662,35 @@ fn label_value(
     value: &str,
     col: u32,
 ) -> i32 {
-    let lw = u.text.width(label, 12, 1);
-    let vw = u.text.width(value, 13, 1);
-    u.text.draw(c, x + 16, ty, label, 12, ui::DIM, 1);
-    if lw + vw + 44 <= w {
-        u.text.draw(c, x + w - vw - 16, ty, value, 13, col, 1);
-        22
-    } else {
-        u.text.draw(c, x + w - vw - 16, ty + 18, value, 13, col, 1);
-        40
+    let (zeilen, neben) = label_zeilen(u, w, label, value);
+    for (i, z) in zeilen.iter().enumerate() {
+        u.text.draw(c, x + 16, ty + 18 * i as i32, z, 12, ui::DIM, 1);
     }
+    let vw = u.text.width(value, 13, 1);
+    let letzte = 18 * (zeilen.len() as i32 - 1);
+    if neben {
+        u.text.draw(c, x + w - vw - 16, ty + letzte, value, 13, col, 1);
+        letzte + 22
+    } else {
+        u.text.draw(c, x + w - vw - 16, ty + letzte + 18, value, 13, col, 1);
+        letzte + 40
+    }
+}
+
+/// Die Beschriftung einer Zeile der Statistik: umgebrochen, wenn sie allein
+/// breiter ist als die Tafel (etwa "Bildrate an diesen Rechner angepasst"),
+/// und ob der Wert neben ihre letzte Zeile passt.
+fn label_zeilen(u: &mut ui::Ui, w: i32, label: &str, value: &str) -> (Vec<String>, bool) {
+    let zeilen = if u.text.width(label, 12, 1) + 32 <= w { vec![label.to_string()] } else { umbruch(u, label, w - 32, 12) };
+    let letzte = zeilen.last().map(|z| u.text.width(z, 12, 1)).unwrap_or(0);
+    let neben = letzte + u.text.width(value, 13, 1) + 44 <= w;
+    (zeilen, neben)
+}
+
+/// Hoehe einer Zeile der Statistik, wie label_value sie zeichnet.
+fn label_value_hoehe(u: &mut ui::Ui, w: i32, label: &str, value: &str) -> i32 {
+    let (zeilen, neben) = label_zeilen(u, w, label, value);
+    18 * (zeilen.len() as i32 - 1) + if neben { 22 } else { 40 }
 }
 
 /// Text auf eine Breite kuerzen, mit Auslassungszeichen am Ende - fuer
@@ -11707,6 +11880,7 @@ fn overlay(
     wahl: einstellungen::StatWahl,
     nerd: bool,
     soll_fps: Option<u32>,
+    angepasst: Option<u16>,
     hostlast: Option<HostLast>,
     decoder: (Option<DecoderPfad>, Option<String>),
     client: &ClientStand,
@@ -11719,6 +11893,12 @@ fn overlay(
     let mut rows: Vec<(&str, String, u32)> = Vec::new();
     if wahl.fps {
         rows.push((lang.get(Fps), format!("{fps:.0}"), if fps > 50.0 { ui::CYAN } else { ui::AMBER }));
+    }
+    // Der Bildratenregler hat die Bildrate an diesen Rechner angepasst
+    // (regler.rs) - immer, sobald die Statistik steht: sonst saehe die
+    // niedrigere Rate wie ein Fehler aus.
+    if let Some(n) = angepasst {
+        rows.push((lang.get(FpsAdapted), format!("{n}"), ui::AMBER));
     }
     if wahl.latenz {
         if let Some(l) = lat {
@@ -11815,7 +11995,7 @@ fn overlay(
     let w = if nerd { 620 } else { 300 };
     let mut need = 0;
     for (k, v, _) in &rows {
-        need += if u.text.width(k, 12, 1) + u.text.width(v, 13, 1) + 44 <= w { 22 } else { 40 };
+        need += label_value_hoehe(u, w, k, v);
     }
     let kette_h = if nerd && lat.map(|l| l.gesamt_ms > 0.0).unwrap_or(false) { 150 } else { 0 };
     let h = 30 + need + kette_h + 42;
@@ -11940,7 +12120,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
     // Gold und das goldene Abzeichen (":ms" seit dem Aktivwerden, Vorgabe
     // 1000); "sitzunghdr2": nur der Host sendet HDR - "HDR → SDR", nichts
     // Goldenes.
-    if view == "sitzung" || view == "nerd" || view.starts_with("sitzunghdr") {
+    // "sitzungangepasst": der Bildratenregler hat 120 auf 50 gesenkt.
+    if view == "sitzung" || view == "nerd" || view.starts_with("sitzunghdr") || view == "sitzungangepasst" {
         for y in 0..h {
             for x in 0..w {
                 let a = (x * 255 / w) as u32;
@@ -11976,6 +12157,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             let client = ClientStand { anzeige: "Software".into(), cpu_eigen: 5.8, monitor_hz: Some(60.0), ausgelassen: 0 };
             overlay(&mut u, &mut c, lang, 98.0, &hist, (2.1, info, 3, None, true), (sas.clone(), fp.clone()),
                     Some(probe), einstellungen::StatWahl::default(), nerd, Some(120),
+                    (view == "sitzungangepasst").then_some(50),
                     if nerd { Some(hl) } else { None }, (Some(DecoderPfad::Nvdec(None)), None), &client, hdr_lage);
             if hdr_lage == hdr::HdrLage::Beidseitig {
                 if let Some(d) = hdr_abzeichen_deckung(alter_ms) {
@@ -12054,7 +12236,7 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
                             empfangen: fps as u64 * 5, verworfen: if mbit >= 150 { 7 } else { 0 }, ausgelassen: 0,
                             host_encoder_ms: enc + 0.6, budget_ms: 1000.0 / fps as f32,
                             host_cpu: 24.0 + mbit as f32 / 10.0, client_cpu: 5.0 + mbit as f32 / 50.0,
-                            bestanden: false,
+                            bestanden: false, angepasst: None,
                         };
                         e.pruefen(true, true);
                         ergebnisse.push(e);
@@ -12128,6 +12310,8 @@ fn screenshot(path: &str, w: usize, h: usize, lang: &'static strings::Lang, view
             geraete_scroll: 0,
             hdr_an,
             hdr_lage,
+            // "hudangepasst": der Bildratenregler hat 120 auf 50 gesenkt.
+            fps_angepasst: (view == "hudangepasst").then_some(50),
         };
         let reiter = match view {
             "hud2" | "hud2tip" => 1u8,
@@ -13572,9 +13756,11 @@ fn main() {
             // Die HDR-Lage wie in der F9-Zeile; praesentiert wird nur mit einem
             // gedachten HDR-Schirm (--hdr-schirm hdr).
             let hdr_text = pruef_hdr_text(s.info.as_ref(), hdr_schirm.is_some_and(|x| x.hdr));
+            // Hat der Bildratenregler die Bildrate angepasst, steht es dabei.
+            let angepasst = s.fps_angepasst.map(|f| format!(" | Bildrate angepasst {f}")).unwrap_or_default();
             let line = format!(
-                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Strom {} | Farbe {} | Decoder {} | {}{} | Fehler {:?}",
-                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, strom, hdr_text, pfad, lat, hl, fehler
+                "{:.0}s | decodiert {} ({:.1}/s) | Codec {} | Strom {}{} | Farbe {} | Decoder {} | {}{} | Fehler {:?}",
+                start.elapsed().as_secs_f32(), n, (n - last) as f32 / 3.0, codec, strom, angepasst, hdr_text, pfad, lat, hl, fehler
             );
             println!("{line}");
             std::io::stdout().flush().ok();
@@ -14165,6 +14351,9 @@ pub struct HudStand {
     /// koennen) und was gerade gilt - golden nur bei HdrLage::Beidseitig.
     pub hdr_an: bool,
     pub hdr_lage: hdr::HdrLage,
+    /// Reiter "Bild": die Bildrate, die der Bildratenregler statt des
+    /// Wunsches beim Host erbeten hat (Shared::fps_angepasst).
+    pub fps_angepasst: Option<u16>,
 }
 
 /// Ein Rollen-Knopf im Menue - fuer Anzeige und Decoder derselbe Satz,
@@ -14460,7 +14649,13 @@ fn hud(
     // --- Befund: die zwei Zahlen, waehrend man dreht ----------------------
     // Der Reiter "Benchmark" braucht die ganze Hoehe fuer seine Tabelle
     // und verzichtet auf die beiden Kacheln.
-    let soll = stell.map(|x| x.1 as f32).or_else(|| info.map(|i| i.fps as f32)).unwrap_or(60.0);
+    // Was beim Host gilt: eine angepasste Bildrate vor dem Wunsch.
+    let soll = stand
+        .fps_angepasst
+        .map(f32::from)
+        .or_else(|| stell.map(|x| x.1 as f32))
+        .or_else(|| info.map(|i| i.fps as f32))
+        .unwrap_or(60.0);
     let kw = (iw - p(16)) / 2;
     // Der Reiter "Computer" braucht den Platz fuer seine Liste.
     let ohne_kacheln = reiter == 4 || reiter == REITER_COMPUTER;
@@ -14532,6 +14727,12 @@ fn hud(
             let d = stellen(u, c, ix + iw / 2, cy, lang.get(MaxFps), format!("{fps_soll}"));
             if d != 0 {
                 aktion = HudAktion::Stellen(mbit, (fps_soll as i32 + d * 10).clamp(10, 240) as u16, gaming, fest, ton);
+            }
+            // Der Wunsch bleibt stehen; darunter, was dieser Rechner schafft
+            // und der Host deshalb gerade liefert (regler.rs).
+            if let Some(n) = stand.fps_angepasst {
+                let t = kuerzen(u, &format!("{}: {n}", lang.get(FpsAdapted)), iw / 2 - p(30), sz(10), p(1));
+                u.text.draw(c, ix + iw / 2, cy + p(60), &t, sz(10), ui::AMBER, p(1));
             }
             let r_gaming = ui::Rect { x: ix, y: cy + p(70), w: iw / 2 - p(30), h: p(28) };
             let r_fest = ui::Rect { x: ix + iw / 2, y: cy + p(70), w: iw / 2 - p(30), h: p(28) };
@@ -15772,6 +15973,51 @@ mod tests {
         let _ = los.send(());
         let (_, zu) = host.join().unwrap();
         assert!(zu);
+    }
+
+    /// Bildratenregler im Eingabekanal: der Wunsch bleibt gemerkt, hinaus
+    /// geht er mit hoechstens der Grenze, und jede Grenze - auch dieselbe -
+    /// schickt Nachricht 64 neu (das Vollbild beim Aufholen). Ohne Wunsch
+    /// gilt, was der Host meldet; eine neue Sitzung vergisst beides.
+    #[test]
+    fn grenze_des_reglers_geht_mit_dem_wunsch_hinaus() {
+        let mut l = InputLink::new(String::new());
+        // Ohne Kanal landet Nachricht 64 beim Nachzureichenden (die letzte).
+        let einst = |l: &InputLink| -> Option<(u32, u16, u8, u8, u8)> {
+            l.nachreichen.iter().find(|b| b[0] == IN_SETTINGS).map(|b| {
+                let p = &b[8..];
+                (u32::from_le_bytes(p[0..4].try_into().unwrap()), u16::from_le_bytes([p[4], p[5]]), p[6], p[7], p[8])
+            })
+        };
+        // Weder Wunsch noch Meldung: nichts zu senden.
+        assert!(!l.fps_grenze_setzen(Some(50), None));
+        assert_eq!(einst(&l), None);
+        // Der Nutzer will 120: hinaus gehen 50, gemerkt bleiben 120.
+        l.settings(50, 120, false, true, true);
+        assert_eq!(einst(&l), Some((50, 50, 0, 1, 1)));
+        assert_eq!(l.wunsch_und_grenze(), (Some((50, 120, false, true, true)), Some(50)));
+        // Die Meldung des Hosts dazu gilt als der Wunsch, angepasst auf 50.
+        assert_eq!(
+            regler::gemeldet_deuten((50, 50, false, true, true), l.wunsch_und_grenze().0, l.wunsch_und_grenze().1),
+            ((50, 120, false, true, true), Some(50))
+        );
+        // Aufholen: dieselbe Grenze, und doch eine neue Nachricht 64.
+        l.nachreichen.clear();
+        assert!(l.fps_grenze_setzen(Some(50), None));
+        assert_eq!(einst(&l), Some((50, 50, 0, 1, 1)));
+        // Ein Wunsch unter der Grenze geht, wie er ist.
+        l.settings(50, 40, false, true, true);
+        assert_eq!(einst(&l), Some((50, 40, 0, 1, 1)));
+        // Keine Grenze mehr: der Wunsch.
+        l.settings(50, 120, false, true, true);
+        assert!(l.fps_grenze_setzen(None, None));
+        assert_eq!(einst(&l), Some((50, 120, 0, 1, 1)));
+        // Neue Sitzung: nichts mehr gemerkt; die Meldung des Hosts wird der Wunsch.
+        l.regler_zuruecksetzen();
+        assert_eq!(l.wunsch_und_grenze(), (None, None));
+        assert!(l.fps_grenze_setzen(Some(45), Some((25, 60, true, false, true))));
+        assert_eq!(einst(&l), Some((25, 45, 1, 0, 1)));
+        assert_eq!(l.wunsch_und_grenze(), (Some((25, 60, true, false, true)), Some(45)));
     }
 
     /// Einstellungen, Codec, Testbild und Zwischenablage, die ohne stehenden
@@ -17400,6 +17646,7 @@ mod tests {
             bench_konfig: BenchKonfig::vorgabe(5, true), bench: None, bench_scroll: 0,
             verknuepfung: None,
             geraete: Vec::new(), geraete_scroll: 0, hdr_an: true, hdr_lage: hdr::HdrLage::Sdr(None),
+            fps_angepasst: None,
         }
     }
 

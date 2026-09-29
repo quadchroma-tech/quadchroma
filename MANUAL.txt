@@ -1763,14 +1763,35 @@ clipboard and pointer, which also go out during congestion, do not make a
 live viewer look hung. The Mac host checks this even with a still screen,
 every 5 s.
 
+On top of the byte limit there is a time limit - latency, not bytes, is
+what you feel: 2 MB are 1.6 s of picture at 10 Mbit/s. While something is
+waiting (more than 64 kB), both hosts measure how fast the viewer takes
+it, and skip the next frame as soon as more is waiting than the viewer
+takes in 100 ms - never below 128 kB (so that a keyframe on a healthy link
+costs no following frame) and never above the byte limit. On the Windows
+host the kernel's send buffer (256 kB) counts as waiting as soon as its own
+queue holds more than 64 kB. Without a measurement - no congestion yet,
+the last measurement more than 10 s old, or the viewer has taken nothing
+for 2.5 s - the byte limit alone applies. Dropping a viewer stays tied to
+the byte limit and its deadline, as described above; a frozen viewer
+first runs into the byte limit again. The five-second status line counts
+the frames skipped by the time limit alone in brackets: "Stau: <n> (Zeit
+<m>)". In the test harnesses (host 120 frames/s at 25 Mbit/s, the viewer
+takes 50 per second, like a client that needs 20 ms per frame) a frame
+waited at most about 100 ms at the Mac host (127 kB) instead of 1.5 s
+(2 MB); what already lies in the viewer's receive buffer the host cannot
+see - that is the client's part (see below).
+
 Audio and control messages bypass the congestion rule, but have limits of
 their own. If the link is slower than the uncompressed audio (about
 3 Mbit/s), audio is dropped instead of pushing out the picture: the Mac
 host discards it as long as the backlog has been above the congestion
-limit for 2 s ("Ton verworfen: Rueckstand seit 2 s ueber der Staugrenze -
-Leitung langsamer als der Ton"), the Windows host as soon as more than
-512 kB of audio are waiting (128 kB in gaming mode; "Leitung langsamer
-als der Ton: Tonpaket verworfen (ueber 512 kB Ton wartet)").
+limit (including the time limit) for 2 s ("Ton verworfen: Rueckstand seit
+2 s ueber der Staugrenze - Leitung langsamer als der Ton"), the Windows
+host as soon as more audio is waiting than a quarter of what may wait
+before a frame - 512 kB (128 kB in gaming mode), less under the time limit
+("Leitung langsamer als der Ton: Tonpaket verworfen (ueber 512 kB Ton
+wartet)").
 Both lines are rate-limited; the count appears in the five-second status
 line ("Ton: ..., N verworfen" or "| Ton verworfen: N", N being the number
 of discarded packets). The Windows host never discards control messages;
@@ -1793,6 +1814,62 @@ count toward the measured latency.
 Gaming mode tightens the reins: more frequent keyframes and a smaller
 permitted backlog, so that nothing piles up during motion. It costs some
 bandwidth and gives steadier frames in return.
+
+When this computer decodes more slowly than the host sends: the client
+decodes one frame after the other. If the host sends more frames than
+this computer decodes - a Mac mini M1 needs about 18 ms for a 4K 4:4:4
+frame, about 55 per second (4:2:0 about 12 ms), while a 4K display runs
+at 60 to 240 Hz - no frame is dropped; they pile up in the buffers
+between host and client, and the latency grows by seconds (measured on
+29.09.2026 against a Windows host at 3840x2160: whole chain 0.3 to
+2.7 s). The client therefore watches three things: how much later than
+the fastest frames of the last 15 s a frame arrives (arrival minus
+"encoder done" from the frame's timestamp - no clock sync needed), how
+long it works on each frame, and how many frames per second the host
+sends. When the delay grows (over 30 ms in three frames in a row) and the
+client is the bottleneck - its receive thread busy at least 85 % of the
+time, or the host sending more than 95 % of its decoding rate; congestion
+on the network is the host's business, a keyframe would only make it
+worse - the client
+  - catches up: no frame goes into the decoder until a fresh keyframe
+    (at most 30 ms late; after 1.5 s any keyframe), and it asks the host
+    for one. A frame without its reference is never decoded, so no
+    corrupted picture appears;
+  - asks the host for a frame rate this computer can sustain: 90 % of
+    the measured decoding rate, in steps of 5, at least one step below
+    the rate before, never below 20 and never above your own setting.
+    If the host sends no more than the client decodes (the system was
+    busy for a moment), it only catches up; the third time within 10 s
+    costs one step.
+Both go out as the existing settings message (every host forces a
+keyframe on it), so older hosts work as well. Your setting stays as it
+is, also the one stored for the host; the statistics (F9) show "Frame
+rate adapted to this computer" with the rate the host actually sends,
+the Picture tab shows the same line below "Maximum frame rate". The log
+gets one line per change ("Bildrate an diesen Rechner angepasst: 50
+(Decoder 18.3 ms je Bild = 54.6 Bilder/s, Host lieferte 120.0 Bilder/s,
+Rueckstand 212 ms)") and one per catch-up ("Aufgeholt (1. Mal): <n>
+Bilder nicht decodiert, weiter mit einem Vollbild nach <t> ms -
+Rueckstand <a> -> <b> ms", the first 20 per session, then every 50th).
+For 1.2 s after a change the client only catches up and changes no
+rate (unless the delay passes 0.5 s) - the Windows host reopens its
+encoder for a new frame rate (up to 0.6 s without a frame).
+After 10 s without congestion the client tries one step higher if the
+measurement shows headroom (the next step needs at most 90 % of the
+decoding rate) - "wieder wie gewuenscht" once your own setting is
+reached; if a step does not hold for 10 s, it goes back and waits twice
+as long before the next try (at most 160 s). A new codec or picture size
+decodes at a different speed: the adaptation is lifted with the first
+frame of the new decoder and measured anew. Measured on 29.09.2026
+(Mac mini M1, headless benchmark against a Windows host streaming its
+display at 3840x2160, 50 steps): the whole chain stayed between 22 and
+41 ms in every step, before up to 2.7 s; the client settled on 45
+frames/s for HEVC 4:4:4, 75 and 80 for HEVC 4:2:0 and 85 for H.264 at
+120. Against a Windows host without the time limit the HEVC 4:4:4 steps
+stayed between 37 and 44 ms as well. The host's time limit alone (a
+client without the adaptation) brought HEVC 4:4:4 8 bit from 0.5 to
+2.7 s down to 0.3 to 0.7 s - the rest waits in the client's receive
+buffer, which only the client can empty.
 
 The "Sound" switch in the same tab turns off audio transmission: the host
 then sends no audio packets (about 3 Mbit/s less), and the client plays
@@ -2314,7 +2391,9 @@ The status line every three seconds carries, after the codec, the field
 "| Strom <B>x<H>@<fps>" (stream width x height @ frame rate; "?" without
 stream information - also right after connecting, the dimensions of a
 previous host do not linger), so that a switch is visible even when the
-codec stays the same. --eingabeprobe waits for the switch: the probe
+codec stays the same. While the client has adapted the frame rate to
+this computer (see "When this computer decodes more slowly than the host
+sends"), "| Bildrate angepasst <n>" follows. --eingabeprobe waits for the switch: the probe
 goes out only once the request has been sent and answered by the host
 (a list with the request; without an answer, after 5 s), and quits the
 client about 2 s later. The mouse therefore lands on the requested
@@ -3239,8 +3318,11 @@ passes when at least 95 % of the target frame rate arrives, under 1 % is
 dropped and the whole chain is at most 30 ms long - an absolute limit,
 independent of the frame rate: measuring latency in frames penalizes high
 frame rates, and 30 ms go unnoticed in remote control. The host's encoder time
-is only shown, not judged (it is already part of the chain). The
-recommendation is the best color quality that passes at the highest frame
+is only shown, not judged (it is already part of the chain). If the
+client had to adapt the frame rate to this computer, the step's log line
+says so (", Bildrate an diesen Rechner angepasst: 45"); such a step does
+not reach 95 % of its target frame rate and does not pass, but its chain
+stays short. The recommendation is the best color quality that passes at the highest frame
 rate, with the highest bit rate at which it still passes; "Apply" sets it and
 saves it for this host. If not all rows fit into the table, the mouse wheel
 scrolls it (three rows per notch, Page Up/Page Down likewise); a scroll bar

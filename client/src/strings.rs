@@ -568,6 +568,9 @@ pub enum Key {
     ShortcutMouseCapture,
     /// Hinweis ueber dem Bild, solange die Maus frisch eingefangen ist.
     MouseCapturedHint,
+    /// Statistik (F9) und Reiter "Bild": der Bildratenregler (regler.rs)
+    /// hat die Bildrate an diesen Rechner angepasst - dahinter die Zahl.
+    FpsAdapted,
 }
 
 pub struct Lang {
@@ -881,6 +884,7 @@ pub static EN: Lang = Lang {
         (StatColor, "Color"),
         (ShortcutMouseCapture, "Capture or release the mouse (games)"),
         (MouseCapturedHint, "Mouse captured · F8 releases it"),
+        (FpsAdapted, "Frame rate adapted to this computer"),
     ],
 };
 
@@ -1171,6 +1175,7 @@ pub static DE: Lang = Lang {
         (StatColor, "Farbe"),
         (ShortcutMouseCapture, "Maus einfangen oder freigeben (Spiele)"),
         (MouseCapturedHint, "Maus eingefangen · F8 gibt sie frei"),
+        (FpsAdapted, "Bildrate an diesen Rechner angepasst"),
     ],
 };
 
@@ -1216,8 +1221,23 @@ mod tests {
             }
         }
         // Der letzte Schluessel des Enums steht auch in der Tabelle.
-        assert!(n > MouseCapturedHint as usize);
-        assert_eq!(n, MouseCapturedHint as usize + 1, "Tabellen laenger als das Enum");
+        assert!(n > FpsAdapted as usize);
+        assert_eq!(n, FpsAdapted as usize + 1, "Tabellen laenger als das Enum");
+    }
+
+    /// "Bildrate an diesen Rechner angepasst": in jeder Sprache ein eigener
+    /// Text ohne Platzhalter und ohne Punkt - die Zahl steht dahinter (F9,
+    /// Reiter Bild).
+    #[test]
+    fn bildrate_angepasst_texte() {
+        for l in all() {
+            let t = l.get(FpsAdapted);
+            assert!(!t.is_empty() && !t.contains('{') && !t.ends_with('.'), "{}: {t}", l.code);
+            if l.code != "en" {
+                assert_ne!(t, EN.get(FpsAdapted), "{}", l.code);
+            }
+        }
+        assert_eq!(DE.get(FpsAdapted), "Bildrate an diesen Rechner angepasst");
     }
 
     /// Die Tooltips der Anzeigewahl auf dem Mac: in jeder Sprache Metal statt

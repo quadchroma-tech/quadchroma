@@ -290,6 +290,7 @@ pub static SV: Lang = Lang {
         (StatColor, "Färg"),
         (ShortcutMouseCapture, "Fånga eller släpp musen (spel)"),
         (MouseCapturedHint, "Musen fångad · F8 släpper den"),
+        (FpsAdapted, "Bildfrekvens anpassad till den här datorn"),
     ],
 };
 
@@ -580,6 +581,7 @@ pub static DA: Lang = Lang {
         (StatColor, "Farve"),
         (ShortcutMouseCapture, "Fang eller frigiv musen (spil)"),
         (MouseCapturedHint, "Musen fanget · F8 frigiver den"),
+        (FpsAdapted, "Billedfrekvens tilpasset denne computer"),
     ],
 };
 
@@ -870,6 +872,7 @@ pub static NB: Lang = Lang {
         (StatColor, "Farge"),
         (ShortcutMouseCapture, "Fang eller slipp musen (spill)"),
         (MouseCapturedHint, "Musen fanget · F8 slipper den"),
+        (FpsAdapted, "Bildefrekvens tilpasset denne datamaskinen"),
     ],
 };
 
@@ -1160,6 +1163,7 @@ pub static FI: Lang = Lang {
         (StatColor, "Väri"),
         (ShortcutMouseCapture, "Kaappaa tai vapauta hiiri (pelit)"),
         (MouseCapturedHint, "Hiiri kaapattu · F8 vapauttaa sen"),
+        (FpsAdapted, "Kuvataajuus sovitettu tähän tietokoneeseen"),
     ],
 };
 
@@ -1450,5 +1454,6 @@ pub static IS: Lang = Lang {
         (StatColor, "Litur"),
         (ShortcutMouseCapture, "Fanga eða sleppa músinni (leikir)"),
         (MouseCapturedHint, "Músin föst · F8 sleppir henni"),
+        (FpsAdapted, "Rammatíðni aðlöguð að þessari tölvu"),
     ],
 };

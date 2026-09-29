@@ -290,6 +290,7 @@ pub static PL: Lang = Lang {
         (StatColor, "Kolor"),
         (ShortcutMouseCapture, "Przechwyć lub zwolnij mysz (gry)"),
         (MouseCapturedHint, "Mysz przechwycona · F8 ją zwalnia"),
+        (FpsAdapted, "Liczba klatek dopasowana do tego komputera"),
     ],
 };
 
@@ -580,6 +581,7 @@ pub static CS: Lang = Lang {
         (StatColor, "Barva"),
         (ShortcutMouseCapture, "Zachytit nebo uvolnit myš (hry)"),
         (MouseCapturedHint, "Myš zachycena · F8 ji uvolní"),
+        (FpsAdapted, "Snímková frekvence přizpůsobena tomuto počítači"),
     ],
 };
 
@@ -870,6 +872,7 @@ pub static SK: Lang = Lang {
         (StatColor, "Farba"),
         (ShortcutMouseCapture, "Zachytiť alebo uvoľniť myš (hry)"),
         (MouseCapturedHint, "Myš zachytená · F8 ju uvoľní"),
+        (FpsAdapted, "Snímková frekvencia prispôsobená tomuto počítaču"),
     ],
 };
 
@@ -1160,6 +1163,7 @@ pub static HU: Lang = Lang {
         (StatColor, "Szín"),
         (ShortcutMouseCapture, "Egér befogása vagy elengedése (játékok)"),
         (MouseCapturedHint, "Egér befogva · F8 elengedi"),
+        (FpsAdapted, "Képkockaszám ehhez a számítógéphez igazítva"),
     ],
 };
 
@@ -1450,6 +1454,7 @@ pub static RO: Lang = Lang {
         (StatColor, "Culoare"),
         (ShortcutMouseCapture, "Capturează sau eliberează mouse-ul (jocuri)"),
         (MouseCapturedHint, "Mouse capturat · F8 îl eliberează"),
+        (FpsAdapted, "Rata de cadre adaptată la acest computer"),
     ],
 };
 
@@ -1740,6 +1745,7 @@ pub static BG: Lang = Lang {
         (StatColor, "Цвят"),
         (ShortcutMouseCapture, "Захващане или освобождаване на мишката (игри)"),
         (MouseCapturedHint, "Мишката е захваната · F8 я освобождава"),
+        (FpsAdapted, "Кадрите в секунда са съобразени с този компютър"),
     ],
 };
 
@@ -2030,5 +2036,6 @@ pub static EL: Lang = Lang {
         (StatColor, "Χρώμα"),
         (ShortcutMouseCapture, "Κλείδωμα ή απελευθέρωση του ποντικιού (παιχνίδια)"),
         (MouseCapturedHint, "Το ποντίκι κλειδώθηκε · το F8 το απελευθερώνει"),
+        (FpsAdapted, "Ο ρυθμός καρέ προσαρμόστηκε σε αυτόν τον υπολογιστή"),
     ],
 };
