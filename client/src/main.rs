@@ -643,6 +643,120 @@ impl ZeigerForm {
     }
 }
 
+/// Wie gross die Zeigerform gezeichnet wird: `mal`-fach vergroessert oder
+/// durch `durch` verkleinert - eines von beiden ist 1. Ganzzahlig, damit der
+/// Zeiger (eine kleine Strichzeichnung) scharf bleibt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ZeigerMassstab {
+    mal: u32,
+    durch: u32,
+}
+
+/// Kleiner als so viele Punkte (die groessere Seite der Form) wird ein Zeiger
+/// beim Verkleinern nicht - ein Bild in einem kleinen Fenster soll noch
+/// einen greifbaren Zeiger haben. Ein 32er-Zeiger wird also hoechstens
+/// halbiert, ein 64er (HiDPI, 200 %) hoechstens geviertelt.
+const ZEIGER_MIN: u32 = 16;
+/// Groesser als so viele Punkte je Seite baut der Client keinen Zeiger.
+const ZEIGER_MAX: u32 = 256;
+
+impl ZeigerMassstab {
+    const EINS: ZeigerMassstab = ZeigerMassstab { mal: 1, durch: 1 };
+
+    /// Der Massstab fuer ein Bild, das `fw` Strompunkte breit ist und im
+    /// Fenster `zw` Punkte breit erscheint (ziel_rechteck), bei einer Form
+    /// von `form` (Breite, Hoehe). Die Form kommt in Strompunkten - so
+    /// schickt der Host sie (Windows: die Form der Duplication in
+    /// Desktoppunkten, und der Strom ist nativ). Ein Strom, der groesser ist
+    /// als sein Bild im Fenster (4K im 1080p-Fenster, ein HiDPI-Mac mit
+    /// 3840x2160), verkleinert also auch den Zeiger - sonst stuende er
+    /// doppelt so gross ueber dem Bild. Gerundet auf ganze Faktoren in
+    /// beide Richtungen (1,5 -> 2, 0,75 -> 1, 0,5 -> durch 2, 0,67 -> durch
+    /// 2); vergroessert hoechstens 8-fach und bis ZEIGER_MAX, verkleinert
+    /// hoechstens durch 8 und nicht unter ZEIGER_MIN.
+    fn fuer(zw: u32, fw: u32, form: Option<(u16, u16)>) -> ZeigerMassstab {
+        if zw == 0 || fw == 0 {
+            return ZeigerMassstab::EINS;
+        }
+        let durch = (fw as f64 / zw as f64).round();
+        if durch >= 2.0 {
+            let mut d = (durch as u32).min(8);
+            if let Some((w, h)) = form {
+                while d > 1 && (w.max(h) as u32) < ZEIGER_MIN * d {
+                    d -= 1;
+                }
+            }
+            return ZeigerMassstab { mal: 1, durch: d };
+        }
+        let mut f = (zw as f64 / fw as f64 + 0.5).floor().clamp(1.0, 8.0) as u32;
+        if let Some((w, h)) = form {
+            while f > 1 && (w as u32 * f > ZEIGER_MAX || h as u32 * f > ZEIGER_MAX) {
+                f -= 1;
+            }
+        }
+        ZeigerMassstab { mal: f, durch: 1 }
+    }
+}
+
+/// Die Form im Massstab `m`: (RGBA, Breite, Hoehe, Hotspot x, Hotspot y).
+/// Vergroessert Punkt fuer Punkt - weich gefiltert saehe eine Strichzeichnung
+/// verwaschen aus. Verkleinert als Mittel ueber je durch x durch Punkte,
+/// nach Deckkraft gewichtet (sonst dunkelten halbdurchsichtige Raender
+/// nach) - so, wie macOS eine 2x-Form auf 1x zeichnet; was am Rand ueber
+/// die Form hinausragt, zaehlt als durchsichtig. Der Hotspot folgt im
+/// selben Mass und bleibt in der Form.
+fn zeiger_skalieren(z: &ZeigerForm, m: ZeigerMassstab) -> (Vec<u8>, u16, u16, u16, u16) {
+    let (w, h) = (z.w as usize, z.h as usize);
+    if m.durch > 1 {
+        let d = m.durch as usize;
+        let (w2, h2) = (w.div_ceil(d), h.div_ceil(d));
+        let n = (d * d) as u32;
+        let mut aus = vec![0u8; w2 * h2 * 4];
+        for y2 in 0..h2 {
+            for x2 in 0..w2 {
+                let (mut a, mut r, mut g, mut b) = (0u32, 0u32, 0u32, 0u32);
+                for y in y2 * d..((y2 + 1) * d).min(h) {
+                    for x in x2 * d..((x2 + 1) * d).min(w) {
+                        let q = (y * w + x) * 4;
+                        let al = z.rgba[q + 3] as u32;
+                        a += al;
+                        r += z.rgba[q] as u32 * al;
+                        g += z.rgba[q + 1] as u32 * al;
+                        b += z.rgba[q + 2] as u32 * al;
+                    }
+                }
+                if a > 0 {
+                    let o = (y2 * w2 + x2) * 4;
+                    aus[o] = ((r + a / 2) / a) as u8;
+                    aus[o + 1] = ((g + a / 2) / a) as u8;
+                    aus[o + 2] = ((b + a / 2) / a) as u8;
+                    aus[o + 3] = ((a + n / 2) / n) as u8;
+                }
+            }
+        }
+        let hx = (z.hx as usize / d).min(w2 - 1);
+        let hy = (z.hy as usize / d).min(h2 - 1);
+        return (aus, w2 as u16, h2 as u16, hx as u16, hy as u16);
+    }
+    let f = m.mal.max(1) as usize;
+    let (w2, h2) = (w * f, h * f);
+    let rgba = if f == 1 {
+        z.rgba.clone()
+    } else {
+        let mut aus = vec![0u8; w2 * h2 * 4];
+        for y in 0..h2 {
+            let qy = y / f;
+            for x in 0..w2 {
+                let q = (qy * w + x / f) * 4;
+                let z4 = (y * w2 + x) * 4;
+                aus[z4..z4 + 4].copy_from_slice(&z.rgba[q..q + 4]);
+            }
+        }
+        aus
+    };
+    (rgba, w2 as u16, h2 as u16, z.hx * f as u16, z.hy * f as u16)
+}
+
 /// So lange gilt ein Codecwunsch als "unterwegs", falls der Host nie
 /// antwortet. Danach verschwindet der Hinweis von selbst.
 const CODEC_WECHSEL_FRIST: Duration = Duration::from_secs(5);
@@ -6648,7 +6762,7 @@ struct App {
     zeiger_eigen: bool,
     zeiger_vorrat: Vec<(u64, CustomCursor)>,
     /// Massstab, mit dem die geltende Form gebaut wurde (siehe zeiger_massstab).
-    zeiger_faktor: u32,
+    zeiger_faktor: ZeigerMassstab,
     /// Ist die Maus gerade im Fenster? Nur dann wird eine Form gesetzt.
     maus_im_fenster: bool,
     /// Der laufende oder zuletzt gelaufene Benchmark, und was der naechste
@@ -7493,8 +7607,9 @@ impl App {
         // der Host eine Form geliefert hat - reisst die Verbindung ab, nimmt
         // der Empfangsfaden sie weg, und hier faellt der Zeiger auf den Pfeil
         // zurueck, statt als "unsichtbar" ueber dem stehenden Bild zu bleiben.
-        // Der Massstab folgt dem Bild: so gross, wie das Mac-Bild im Fenster
-        // erscheint, so gross der Zeiger - 1:1 also so gross wie auf dem Mac.
+        // Der Massstab folgt dem Bild: so gross, wie das Bild des Hosts im
+        // Fenster erscheint, so gross der Zeiger - 1:1 also so gross wie auf
+        // dem Host; ein nativer 4K-Strom im kleineren Fenster verkleinert ihn.
         let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden() && self.maus_im_fenster;
         let faktor = self.zeiger_massstab();
         let (neu, form_da) = {
@@ -7576,31 +7691,14 @@ impl App {
     /// einmal gebaut; der Vorrat haelt die letzten 32 (die Wartekugel hat ein
     /// Dutzend Bilder, ein Zeigerwechsel zwischen Pfeil, Hand und Textcursor
     /// soll nichts kosten).
-    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, faktor: u32) {
+    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, faktor: ZeigerMassstab) {
         let Some(w) = self.window.clone() else { return };
-        let k = z.kennung().wrapping_mul(31).wrapping_add(faktor as u64);
+        let k = z.kennung().wrapping_mul(31).wrapping_add(((faktor.mal as u64) << 8) | faktor.durch as u64);
         let zeiger = match self.zeiger_vorrat.iter().find(|(kk, _)| *kk == k) {
             Some((_, c)) => c.clone(),
             None => {
-                // Ganzzahlig hochziehen, Punkt fuer Punkt: ein Zeiger ist eine
-                // kleine Strichzeichnung, weich gefiltert saehe er verwaschen aus.
-                let f = faktor.max(1);
-                let (w2, h2) = (z.w as u32 * f, z.h as u32 * f);
-                let rgba = if f == 1 {
-                    z.rgba.clone()
-                } else {
-                    let mut aus = vec![0u8; (w2 * h2 * 4) as usize];
-                    for y in 0..h2 as usize {
-                        let qy = y / f as usize;
-                        for x in 0..w2 as usize {
-                            let q = (qy * z.w as usize + x / f as usize) * 4;
-                            let z4 = (y * w2 as usize + x) * 4;
-                            aus[z4..z4 + 4].copy_from_slice(&z.rgba[q..q + 4]);
-                        }
-                    }
-                    aus
-                };
-                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2 as u16, h2 as u16, z.hx * f as u16, z.hy * f as u16) else { return };
+                let (rgba, w2, h2, hx, hy) = zeiger_skalieren(z, faktor);
+                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2, h2, hx, hy) else { return };
                 let c = el.create_custom_cursor(quelle);
                 if self.zeiger_vorrat.len() >= 32 {
                     self.zeiger_vorrat.remove(0);
@@ -7642,24 +7740,19 @@ impl App {
         Some((nx, ny))
     }
 
-    /// Um wie viel das Mac-Bild im Fenster vergroessert erscheint, ganzzahlig
-    /// gerundet - der Zeiger bekommt denselben Massstab. Begrenzt, damit die
-    /// Form unter der Grenze von 256 Bildpunkten bleibt.
-    fn zeiger_massstab(&self) -> u32 {
-        let Some(w) = &self.window else { return 1 };
-        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return 1 };
+    /// Um wie viel das Bild des Hosts im Fenster vergroessert oder
+    /// verkleinert erscheint - der Zeiger bekommt denselben Massstab
+    /// (ZeigerMassstab::fuer).
+    fn zeiger_massstab(&self) -> ZeigerMassstab {
+        let Some(w) = &self.window else { return ZeigerMassstab::EINS };
+        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return ZeigerMassstab::EINS };
         if fw == 0 || fh == 0 {
-            return 1;
+            return ZeigerMassstab::EINS;
         }
         let s = w.inner_size();
         let (_, _, zw, _) = ziel_rechteck(s.width.max(1), s.height.max(1), fw, fh, self.pixel_exact);
-        let mut f = ((zw as f32 / fw as f32) + 0.5).floor().clamp(1.0, 8.0) as u32;
-        if let Some(z) = self.shared.lock().unwrap().zeiger.as_ref() {
-            while f > 1 && (z.w as u32 * f > 256 || z.h as u32 * f > 256) {
-                f -= 1;
-            }
-        }
-        f
+        let form = self.shared.lock().unwrap().zeiger.as_ref().map(|z| (z.w, z.h));
+        ZeigerMassstab::fuer(zw, fw, form)
     }
 
     /// Einen laufenden Benchmark abbrechen. Mit `wiederherstellen` bekommt
@@ -13435,7 +13528,7 @@ fn main() {
         zeiger_seq_gezeigt: 0,
         zeiger_eigen: false,
         zeiger_vorrat: Vec::new(),
-        zeiger_faktor: 1,
+        zeiger_faktor: ZeigerMassstab::EINS,
         maus_im_fenster: false,
         benchmark: None,
         bench_konfig: BenchKonfig::vorgabe(5, true),
@@ -14770,6 +14863,87 @@ mod tests {
     fn besteht(mut e: Ergebnis, mit_anzeige: bool, hat_latenz: bool) -> bool {
         e.pruefen(mit_anzeige, hat_latenz);
         e.bestanden
+    }
+
+    /// Der Zeiger folgt dem Bild: ein nativer 4K-Strom (Windows-Host 4K, ein
+    /// HiDPI-Mac mit 3840x2160) im 1080p-Fenster verkleinert ihn auf die
+    /// Haelfte, statt ihn doppelt so gross ueber das Bild zu legen; 1:1
+    /// bleibt 1:1, ein vergroessertes Bild vergroessert ihn wie bisher.
+    #[test]
+    fn zeiger_massstab_folgt_dem_bild_auch_verkleinert() {
+        let m = |mal, durch| ZeigerMassstab { mal, durch };
+        let z32 = Some((32u16, 32u16));
+        let z64 = Some((64u16, 64u16));
+        let z48 = Some((48u16, 48u16));
+        // 1:1 und das Fenster, das ein kleines Bild fuellt.
+        assert_eq!(ZeigerMassstab::fuer(1920, 1920, z32), ZeigerMassstab::EINS);
+        assert_eq!(ZeigerMassstab::fuer(3840, 3840, z64), ZeigerMassstab::EINS);
+        assert_eq!(ZeigerMassstab::fuer(3840, 1920, z32), m(2, 1));
+        assert_eq!(ZeigerMassstab::fuer(2560, 1920, z32), ZeigerMassstab::EINS, "1,33 rundet auf 1");
+        assert_eq!(ZeigerMassstab::fuer(2880, 1920, z32), m(2, 1), "1,5 rundet auf 2");
+        assert_eq!(ZeigerMassstab::fuer(3840, 1920, Some((200, 200))), ZeigerMassstab::EINS, "nie ueber 256");
+        // Nativer 4K-Strom in kleineren Fenstern.
+        assert_eq!(ZeigerMassstab::fuer(1920, 3840, z32), m(1, 2));
+        assert_eq!(ZeigerMassstab::fuer(1920, 3840, z48), m(1, 2), "Windows 4K bei 150 %: 48 -> 24");
+        assert_eq!(ZeigerMassstab::fuer(1920, 3840, z64), m(1, 2), "HiDPI-Mac: 2x-Form -> 1x");
+        assert_eq!(ZeigerMassstab::fuer(2560, 3840, z32), m(1, 2), "0,67 rundet auf durch 2");
+        assert_eq!(ZeigerMassstab::fuer(2880, 3840, z32), ZeigerMassstab::EINS, "0,75 rundet auf 1");
+        assert_eq!(ZeigerMassstab::fuer(3000, 3840, z32), ZeigerMassstab::EINS);
+        // Sehr kleines Fenster: verkleinert, aber nicht unter ZEIGER_MIN.
+        assert_eq!(ZeigerMassstab::fuer(1280, 3840, z64), m(1, 3));
+        assert_eq!(ZeigerMassstab::fuer(1280, 3840, z32), m(1, 2));
+        assert_eq!(ZeigerMassstab::fuer(960, 3840, z64), m(1, 4));
+        assert_eq!(ZeigerMassstab::fuer(100, 3840, Some((200, 200))), m(1, 8));
+        assert_eq!(ZeigerMassstab::fuer(960, 3840, Some((16, 16))), ZeigerMassstab::EINS);
+        // Ohne Bild oder ohne Form: nichts Falsches.
+        assert_eq!(ZeigerMassstab::fuer(0, 3840, z32), ZeigerMassstab::EINS);
+        assert_eq!(ZeigerMassstab::fuer(1920, 0, z32), ZeigerMassstab::EINS);
+        assert_eq!(ZeigerMassstab::fuer(1920, 3840, None), m(1, 2));
+        // Das Fenster ueber ziel_rechteck: 3840x2160 im 1920x1080-Fenster
+        // (eingepasst) erscheint 1920 breit, pixelgenau 3840.
+        let (_, _, zw, _) = ziel_rechteck(1920, 1080, 3840, 2160, false);
+        assert_eq!(ZeigerMassstab::fuer(zw, 3840, z32), m(1, 2));
+        let (_, _, zw, _) = ziel_rechteck(1920, 1080, 3840, 2160, true);
+        assert_eq!(ZeigerMassstab::fuer(zw, 3840, z32), ZeigerMassstab::EINS);
+    }
+
+    /// Verkleinern mittelt nach Deckkraft (keine dunklen Raender), ein
+    /// ungerader Rand zaehlt als durchsichtig, der Hotspot folgt;
+    /// Vergroessern bleibt Punkt fuer Punkt.
+    #[test]
+    fn zeiger_skalieren_mittelt_nach_deckkraft() {
+        // 3x2: Zeile 0 rot deckend, rot deckend, weiss deckend;
+        //      Zeile 1 durchsichtig (Farbe schwarz), rot halb, weiss deckend.
+        let rgba = vec![
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255, //
+            0, 0, 0, 0, 255, 0, 0, 128, 255, 255, 255, 255,
+        ];
+        let z = ZeigerForm { w: 3, h: 2, hx: 2, hy: 1, sichtbar: true, rgba: rgba.clone() };
+        let (aus, w, h, hx, hy) = zeiger_skalieren(&z, ZeigerMassstab { mal: 1, durch: 2 });
+        assert_eq!((w, h, hx, hy), (2, 1, 1, 0));
+        // Links: 255+255+0+128 Deckkraft ueber vier Punkte, Farbe rein rot -
+        // der durchsichtige schwarze Punkt dunkelt nicht nach.
+        assert_eq!(&aus[0..4], &[255, 0, 0, 160]);
+        // Rechts ragt der Block ueber die Form: zwei weisse Punkte, zwei
+        // durchsichtige -> weiss mit halber Deckkraft.
+        assert_eq!(&aus[4..8], &[255, 255, 255, 128]);
+        // Ganz durchsichtig bleibt ganz durchsichtig.
+        let leer = ZeigerForm { w: 4, h: 4, hx: 3, hy: 3, sichtbar: true, rgba: vec![0; 64] };
+        let (aus, w, h, hx, hy) = zeiger_skalieren(&leer, ZeigerMassstab { mal: 1, durch: 4 });
+        assert_eq!((aus, w, h, hx, hy), (vec![0; 4], 1, 1, 0, 0));
+        // 1:1 unveraendert, 2x Punkt fuer Punkt mit doppeltem Hotspot.
+        let (aus, w, h, hx, hy) = zeiger_skalieren(&z, ZeigerMassstab::EINS);
+        assert_eq!((aus, w, h, hx, hy), (rgba.clone(), 3, 2, 2, 1));
+        let (aus, w, h, hx, hy) = zeiger_skalieren(&z, ZeigerMassstab { mal: 2, durch: 1 });
+        assert_eq!((w, h, hx, hy), (6, 4, 4, 2));
+        assert_eq!(aus.len(), 6 * 4 * 4);
+        assert_eq!(&aus[(3 * 6 + 5) * 4..(3 * 6 + 6) * 4], &rgba[20..24]);
+        assert_eq!(&aus[2 * 6 * 4..(2 * 6 + 1) * 4], &rgba[12..16]);
+        // Eine 64er-Form durch 2 ergibt 32x32, der Hotspot bleibt darin.
+        let gross = ZeigerForm { w: 64, h: 64, hx: 63, hy: 63, sichtbar: true, rgba: vec![255; 64 * 64 * 4] };
+        let (aus, w, h, hx, hy) = zeiger_skalieren(&gross, ZeigerMassstab { mal: 1, durch: 2 });
+        assert_eq!((w, h, hx, hy), (32, 32, 31, 31));
+        assert!(aus.iter().all(|&b| b == 255));
     }
 
     #[test]

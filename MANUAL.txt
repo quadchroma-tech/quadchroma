@@ -1877,7 +1877,11 @@ cursor, spinning wait cursor. The host sends the shape only when it
 changes. The pointer is never hidden here - macOS hides its pointer while
 you type and keeps it hidden until the physical mouse moves, which,
 driven from the client, it never does. The size follows the picture
-scale: at 1:1 as large as on the Mac.
+scale: at 1:1 as large as on the Mac. A picture shown smaller than its
+stream (a native 4K stream in a 1920-pixel-wide window) shrinks the pointer
+by the same whole factor, averaged by coverage (a 64-pixel HiDPI pointer
+becomes 32 pixels), but never below 16 pixels; a picture shown larger
+enlarges it by a whole factor, pixel by pixel, up to 256 pixels.
 
 Everything else goes to the Mac. What is transmitted is the position of
 the key, not the character, so umlauts and AltGr come out right without
@@ -1983,7 +1987,7 @@ viewer.
 The switch works like a codec switch, in the stream's thread: stop the
 old stream, take the stream size from the new display (Mac: halved from
 3840 pixels wide or 2160 high, kept even, --out takes precedence;
-Windows: halved from 3840 wide), open a new encoder if the size differs,
+Windows: full size, kept even), open a new encoder if the size differs,
 then send the viewer message 7 (SWITCH with the current codec - the
 client rebuilds its decoder), message 1 (INFO with the dimensions), the
 new list (12) and then the first frame as a keyframe; the mouse follows
@@ -2368,7 +2372,7 @@ The host's side:
     Windows   On a desktop with "Use HDR" the Desktop Duplication delivers
               FP16 (scRGB). For an HDR10 stream the converter on the GPU
               turns it into PQ planes (4:4:4 YUV444P16LE or 4:2:0 P010,
-              rotation and halving included) for NVENC, with the mastering
+              rotation included) for NVENC, with the mastering
               values from the output (GetDesc1) as side data, so that NVENC
               writes SEI 137/144 itself. For an SDR stream the same converter
               maps it to SDR (BGRA8, clipped at SDR white keeping the hue)
@@ -2508,7 +2512,7 @@ Verified in test harnesses and on the build VM, not yet on real HDR
 screens: the decision and the bytes in Rust and C (hdr_vektoren.txt), the
 Mac host up to HDR10 and back in hosttest with the real VideoToolbox encoder
 and decoder, the converter of the Windows host role on WARP (PQ planes
-against hdr.rs, all rotations, halving), both clients' displays offscreen
+against hdr.rs, all rotations, odd sizes), both clients' displays offscreen
 against the CPU reference (Windows: passed-through codes exact, mapped
 +-1; Mac: EDR path against hdr.rs), and HDR10 clips (4:4:4 and 4:2:0) from
 the Windows host role to a Mac client (VideoToolbox) and a Windows client
@@ -3222,9 +3226,12 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     Picture and mouse refer to the same output; its identifier
                     is remembered: if the output goes away, the host falls
                     back to the main display, and when it comes back, it
-                    applies again (see "Host display"). From a width of 3840
-                    on, the picture is halved; with odd dimensions one pixel
-                    of border is dropped.
+                    applies again (see "Host display"). The stream has the
+                    output's full size in pixels (native, 3840x2160 and larger
+                    included; Windows scaling such as 150 % does not change
+                    it); with odd dimensions one pixel of border is dropped.
+                    There is no --out here: a smaller stream needs a smaller
+                    display resolution on the host.
     --fps N, --mbit N, --fest   as on the Mac (defaults 120, 150, off).
     --konserve datei.hevc   an Annex B stream (HEVC or H.264) as the picture
                     source instead of capture, looped at the frame rate - the
@@ -3240,11 +3247,13 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     only for the 8-bit candidates via NVENC and only when the
                     output is connected to the NVIDIA card) or auto (default:
                     the decision from messung.txt, otherwise bgra). 10-bit
-                    candidates, Media Foundation, rotated outputs and outputs
-                    from a width of 3840 on always go through the CPU; the
-                    host switches the source itself ("Aufnahme: Quelle auf
-                    Prozessorweg umgestellt ..." or "Null-Kopien-Weg: ... -
-                    Prozessorweg (bgra)", i.e. switched to the CPU path).
+                    candidates, Media Foundation and rotated outputs always go
+                    through the CPU; the host switches the source itself
+                    ("Aufnahme: Quelle auf Prozessorweg umgestellt ..." or
+                    "Null-Kopien-Weg: gedrehter Ausgang ... - Prozessorweg
+                    (bgra)", i.e. switched to the CPU path). The size does
+                    not matter: a 4K output takes the same paths as a smaller
+                    one, zero-copy included.
     --list          cards, outputs (each with identifier, name and Hz) and
                     what this computer can encode (hevc_nvenc and h264_nvenc
                     per candidate via avcodec_open2; without an NVIDIA driver
@@ -3253,7 +3262,8 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     listed there without a probe as "nein (Protokoll und
                     Client kennen AV1 noch nicht)" (no, protocol and client do
                     not support AV1 yet).
-    --messen        the measurement for capture: per output Acquire, copy on
+    --messen        the measurement for capture: per output, at its full
+                    size (the size of the stream), Acquire, copy on
                     the card, staging into main memory, nvenc from memory
                     (bgra, yuv444p) and, on the NVIDIA card, without a copy
                     from the texture, each with delay 0 and 2, plus a color
@@ -3263,7 +3273,11 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     at the end one verdict per output ("Null-Kopien, 2,9 ms je
                     Bild" or "Prozessor, 5,1 ms, hoechstens 120 fps", i.e.
                     zero-copy or CPU path with the time per frame);
-                    --encoderweg auto reads it.
+                    --encoderweg auto reads it. A messung.txt from an
+                    earlier version may also list a "1920x1080 Ausschnitt"
+                    (crop) line for 4K outputs, measured when the stream was
+                    still halved there; auto ignores it and goes by the
+                    full-size line - measure again for a current verdict.
 
 The candidates are the same six as on the Mac. The desktop is 8 bit, so
 "10 Bit" on Windows is always a conversion (noted in the capability list); the
@@ -3283,15 +3297,17 @@ otherwise, without a fixed frame rate, new frames only come when something
 changes on the desktop.
 
 The host runs with per-monitor DPI awareness: with Windows scaling (125 %,
-150 %) it streams the real resolution of the display mode. The first line in
-the log says whether this worked ("DPI-Awareness: ..."). Rotated outputs
-(portrait, 180 degrees, also portrait panels that Windows runs in landscape,
-as on handhelds) are rotated by the host on the CPU; the stream has the size
-of the desktop ("Aufnahme gestartet: ... gedreht N Grad (Oberflaeche WxH,
-gedreht wird auf dem Prozessor)", i.e. capture started, rotated by N degrees
-on the CPU). This costs some CPU time per frame, --messen measures the
-unrotated surface there without the rotation, and it has not yet been tested
-on real hardware.
+150 %) it streams the real resolution of the display mode, 4K and larger
+included, never halved ("Aufnahme gestartet: \\.\DISPLAY1 3840x2160 ...,
+Strom 3840x2160 (nativ), Quelle Textur" or "... Quelle Prozessorweg"). The
+first line in the log says whether this worked ("DPI-Awareness: ...").
+Rotated outputs (portrait, 180 degrees, also portrait panels that Windows
+runs in landscape, as on handhelds) are rotated by the host on the CPU;
+the stream has the size of the desktop ("Aufnahme gestartet: ... gedreht N
+Grad (Oberflaeche WxH, gedreht wird auf dem Prozessor)", i.e. capture
+started, rotated by N degrees on the CPU). This costs some CPU time per
+frame, --messen measures the unrotated surface there without the rotation,
+and it has not yet been tested on real hardware.
 
 Without NVIDIA (for example in a virtual machine) there is only "H.264 High"
 via the Media Foundation software encoder (h264_mf), listed as software in the

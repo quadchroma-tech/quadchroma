@@ -11,14 +11,14 @@
 // heraus, die er ohne HDR haette; Helleres (HDR-Video, Spiele) wird auf
 // SDR-Weiss begrenzt, ohne den Farbton zu verschieben. Das Ergebnis ist
 // BGRA8 in Groesse der Oberflaeche (ungedreht) und ersetzt die Textur der
-// Duplication - Drehen, Halbieren und Encoder bleiben, wie sie sind.
+// Duplication - Drehen und Encoder bleiben, wie sie sind.
 //
 // Modus PQ (HDR-Plan 5.2, HDR10 auf der Leitung): der Desktop geht, wie er
 // ist, als BT.2020/PQ hinaus - absolute Pegel (scRGB * 80 nit), die
 // Helligkeit gleicht erst der Client an (SDR-Weiss des Hosts steht in der
-// Strominfo). Je Strompunkt: Drehen (wie Drehung::quelle) und, ab 3840
-// Breite, das Mittel aus 2x2 Desktoppunkten in linearem Licht, dann BT.709 ->
-// BT.2020, Negatives (ausserhalb BT.2020) und NaN auf 0, PQ (SMPTE ST 2084),
+// Strominfo). Je Strompunkt (der Strom ist nativ, ein Strompunkt ist ein
+// Desktoppunkt): Drehen (wie Drehung::quelle), dann BT.709 -> BT.2020,
+// Negatives (ausserhalb BT.2020) und NaN auf 0, PQ (SMPTE ST 2084),
 // Y'CbCr BT.2020-NCL im vollen Bereich, 10-Bit-Codes oben buendig (<< 6) in
 // R16_UINT-Zielen in Stromgroesse. 4:4:4: drei Ziele (Y, Cb, Cr) in einem
 // Durchgang (MRT) -> YUV444P16LE. 4:2:0: Y in voller Groesse, dann Cb/Cr als
@@ -116,9 +116,8 @@ pub(crate) const PQ_HLSL: &str = r#"
 // ---------- Wandler, Modus PQ: Desktop -> HDR10-Ebenen (BT.2020, PQ, voll, 10 Bit oben buendig) ----------
 cbuffer WandlerPq : register(b1) {
     int2  quelle_groesse;   // Oberflaeche der Duplication (ungedreht) in Punkten
-    int2  strom_groesse;    // Strom (gedreht, halbiert) in Punkten
+    int2  strom_groesse;    // Strom (gedreht, nativ) in Punkten
     int   drehung;          // 0 keine, 1 = 90, 2 = 180, 3 = 270 Grad
-    int   halb;             // 1: je Strompunkt das Mittel aus 2x2 Desktoppunkten (linear)
     int   eingang_srgb;     // 1: der Eingang ist BGRA 8 Bit (sRGB), nicht scRGB
     float weiss_scrgb;      // SDRWhiteLevel / 1000: sRGB-Weiss im scRGB (nur fuer BGRA)
 };
@@ -145,14 +144,7 @@ float3 lin2020(int2 d) {
 
 // Ein Strompunkt -> PQ-R'G'B' 0..1.
 float3 strompunkt(int2 p) {
-    float3 l;
-    if (halb != 0) {
-        int2 d = p * 2;
-        l = (lin2020(d) + lin2020(d + int2(1, 0)) + lin2020(d + int2(0, 1)) + lin2020(d + int2(1, 1))) * 0.25;
-    } else {
-        l = lin2020(p);
-    }
-    return pq_oetf(l * SCRGB_NIT);
+    return pq_oetf(lin2020(p) * SCRGB_NIT);
 }
 
 // R'G'B' -> Y' 0..1, Cb/Cr -0.5..0.5 (BT.2020-NCL).
@@ -195,24 +187,24 @@ uint2 ps_pq420_uv(float4 pos : SV_Position) : SV_Target {
 }
 "#;
 
-/// Konstanten des PQ-Modus (cbuffer WandlerPq, 32 Byte).
+/// Konstanten des PQ-Modus (cbuffer WandlerPq, 28 Byte, der Puffer auf 32
+/// aufgefuellt - ein Konstantenpuffer ist ein Vielfaches von 16 Byte).
 #[repr(C)]
 pub(crate) struct KonstPq {
     pub quelle_groesse: [i32; 2],
     pub strom_groesse: [i32; 2],
     pub drehung: i32,
-    pub halb: i32,
     pub eingang_srgb: i32,
     pub weiss_scrgb: f32,
+    pub _rest: i32,
 }
 
-/// Was der Modus PQ rechnet: Stromgroesse, Drehung und Halbieren, wie die
+/// Was der Modus PQ rechnet: Stromgroesse (nativ) und Drehung, wie die
 /// Aufnahme sie vorgibt, und 4:4:4 (YUV444P16LE) oder 4:2:0 (P010).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PqPlan {
     pub w: u32,
     pub h: u32,
-    pub halb: bool,
     pub drehung: Drehung,
     pub chroma444: bool,
 }
@@ -235,11 +227,10 @@ impl PqPlan {
 
     pub fn text(&self) -> String {
         format!(
-            "{}x{} {}{}{}",
+            "{}x{} {}{}",
             self.w,
             self.h,
             if self.chroma444 { "4:4:4" } else { "4:2:0" },
-            if self.halb { ", halbiert" } else { "" },
             if self.drehung != Drehung::Keine { format!(", gedreht {} Grad", self.drehung.grad()) } else { String::new() }
         )
     }
@@ -624,9 +615,9 @@ impl Wandler {
             quelle_groesse: [sw as i32, sh as i32],
             strom_groesse: [plan.w as i32, plan.h as i32],
             drehung: drehung_code(plan.drehung),
-            halb: plan.halb as i32,
             eingang_srgb: srgb as i32,
             weiss_scrgb: self.sdr_weiss as f32 / 1000.0,
+            _rest: 0,
         };
         unsafe {
             konstanten_schreiben(&self.ctx, &s.konst, &k).map_err(|e| fehler("Wandler PQ: Konstanten", e))?;
@@ -753,20 +744,21 @@ mod tests {
         assert_eq!(weiss_kehrwert(0), 1000.0);
     }
 
-    /// Die Konstanten des Modus PQ liegen so, wie der Shader sie liest: 32
-    /// Byte, die Glieder in derselben Reihenfolge wie im cbuffer, und die
-    /// int2-Paare teilen sich das erste 16-Byte-Register.
+    /// Die Konstanten des Modus PQ liegen so, wie der Shader sie liest: 28
+    /// Byte plus Auffuellung auf 32, die Glieder in derselben Reihenfolge wie
+    /// im cbuffer, und die int2-Paare teilen sich das erste 16-Byte-Register.
+    /// Ein Halbieren gibt es nicht mehr (der Strom ist nativ).
     #[test]
     fn pq_konstanten_wie_im_shader() {
         assert_eq!(std::mem::size_of::<KonstPq>(), 32);
         assert_eq!(std::mem::offset_of!(KonstPq, quelle_groesse), 0);
         assert_eq!(std::mem::offset_of!(KonstPq, strom_groesse), 8);
         assert_eq!(std::mem::offset_of!(KonstPq, drehung), 16);
-        assert_eq!(std::mem::offset_of!(KonstPq, halb), 20);
-        assert_eq!(std::mem::offset_of!(KonstPq, eingang_srgb), 24);
-        assert_eq!(std::mem::offset_of!(KonstPq, weiss_scrgb), 28);
+        assert_eq!(std::mem::offset_of!(KonstPq, eingang_srgb), 20);
+        assert_eq!(std::mem::offset_of!(KonstPq, weiss_scrgb), 24);
         let cb = &PQ_HLSL[PQ_HLSL.find("cbuffer WandlerPq : register(b1)").expect("cbuffer WandlerPq in b1")..];
-        let lage: Vec<usize> = ["int2  quelle_groesse;", "int2  strom_groesse;", "int   drehung;", "int   halb;", "int   eingang_srgb;", "float weiss_scrgb;"]
+        assert!(!cb[..cb.find('}').unwrap()].contains("halb"), "kein Halbieren im cbuffer");
+        let lage: Vec<usize> = ["int2  quelle_groesse;", "int2  strom_groesse;", "int   drehung;", "int   eingang_srgb;", "float weiss_scrgb;"]
             .iter()
             .map(|n| cb.find(n).unwrap_or_else(|| panic!("{n} fehlt")))
             .collect();
@@ -798,13 +790,14 @@ mod tests {
 
     #[test]
     fn plan_ebenen_und_bytes() {
-        let p = PqPlan { w: 64, h: 40, halb: false, drehung: Drehung::Keine, chroma444: true };
+        let p = PqPlan { w: 64, h: 40, drehung: Drehung::Keine, chroma444: true };
         assert_eq!(p.ebenen(), vec![(64, 40, 2); 3]);
         assert_eq!(p.bytes(), 64 * 40 * 2 * 3);
         let p = PqPlan { chroma444: false, ..p };
         assert_eq!(p.ebenen(), vec![(64, 40, 2), (32, 20, 4)]);
         assert_eq!(p.bytes(), 64 * 40 * 2 * 3 / 2);
-        assert_eq!(PqPlan { halb: true, drehung: Drehung::Grad90, ..p }.text(), "64x40 4:2:0, halbiert, gedreht 90 Grad");
+        assert_eq!(PqPlan { drehung: Drehung::Grad90, ..p }.text(), "64x40 4:2:0, gedreht 90 Grad");
+        assert_eq!(PqPlan { w: 3840, h: 2160, chroma444: true, ..p }.text(), "3840x2160 4:4:4");
     }
 
     /// Ein Geraet fuer die Kartentests: WARP (die VM hat keine Karte). Ohne
@@ -967,19 +960,11 @@ mod tests {
 
     /// Die Referenz des Modus PQ in hdr.rs (f64-PQ): je Strompunkt die
     /// Oberflaeche nach Drehung::quelle, BT.709 -> BT.2020 (hdr::mal),
-    /// Negatives und NaN auf 0, bei halb das Mittel aus 2x2, * 80 nit,
-    /// hdr::pq_oetf, hdr::rgb_nach_ycbcr_2020 - Y', Cb, Cr als f64.
+    /// Negatives und NaN auf 0, * 80 nit, hdr::pq_oetf,
+    /// hdr::rgb_nach_ycbcr_2020 - Y', Cb, Cr als f64.
     fn referenz_punkt(ober: &[[f32; 3]], sw: usize, sh: usize, plan: &PqPlan, x: usize, y: usize) -> [f64; 3] {
-        let lin = |dx: usize, dy: usize| -> [f32; 3] {
-            let (qx, qy) = plan.drehung.quelle(sw, sh, dx, dy);
-            hdr::mal(&hdr::M_709_NACH_2020, ober[qy * sw + qx]).map(|v| v.max(0.0))
-        };
-        let l = if plan.halb {
-            let (a, b, c, d) = (lin(2 * x, 2 * y), lin(2 * x + 1, 2 * y), lin(2 * x, 2 * y + 1), lin(2 * x + 1, 2 * y + 1));
-            [0, 1, 2].map(|k| (a[k] + b[k] + c[k] + d[k]) * 0.25)
-        } else {
-            lin(x, y)
-        };
+        let (qx, qy) = plan.drehung.quelle(sw, sh, x, y);
+        let l = hdr::mal(&hdr::M_709_NACH_2020, ober[qy * sw + qx]).map(|v| v.max(0.0));
         let e = l.map(|v| hdr::pq_oetf(v as f64 * 80.0) as f32);
         hdr::rgb_nach_ycbcr_2020(e).map(|v| v as f64)
     }
@@ -1058,25 +1043,25 @@ mod tests {
     }
 
     /// Modus PQ auf WARP gegen hdr.rs: 4:4:4 und 4:2:0, alle vier
-    /// Drehungen, mit und ohne Halbieren - jeder Code hoechstens 1 von der
+    /// Drehungen, in voller Groesse und mit ungeradem Rand (abgeschnitten,
+    /// wie stromplan es vorgibt) - jeder Code hoechstens 1 von der
     /// f64-Referenz, fast alle genau. Dazu: ein zweiter Plan rechnet aus dem
     /// gehaltenen Bild nach (Farbwechsel ohne neues Bild der Duplication).
     #[test]
     fn pq_ebenen_auf_warp_wie_hdr_rs() {
         let Some((device, ctx)) = warp() else { return };
         let mut wandler = Wandler::neu(&device, &ctx, 2500).expect("Wandler");
-        let (dw, dh) = (36usize, 20usize);
         let mut gesamt = 0usize;
         let mut abweichend = 0usize;
-        for d in [Drehung::Keine, Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
-            let (sw, sh) = d.groesse(dw, dh);
-            let ober = pq_oberflaeche(sw, sh);
-            let tex = fp16_textur(&device, sw as u32, sh as u32, &ober);
-            assert_eq!(wandler.aufnehmen(&tex).expect("aufnehmen"), Eingang::Fp16);
-            for halb in [false, true] {
+        for (dw, dh) in [(36usize, 20usize), (37, 21)] {
+            for d in [Drehung::Keine, Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
+                let (sw, sh) = d.groesse(dw, dh);
+                let ober = pq_oberflaeche(sw, sh);
+                let tex = fp16_textur(&device, sw as u32, sh as u32, &ober);
+                assert_eq!(wandler.aufnehmen(&tex).expect("aufnehmen"), Eingang::Fp16);
+                let (w, h) = super::super::aufnahme::stromplan(dw as i32, dh as i32);
                 for chroma444 in [true, false] {
-                    let (w, h) = if halb { (dw / 2, dh / 2) } else { (dw, dh) };
-                    let plan = PqPlan { w: w as u32, h: h as u32, halb, drehung: d, chroma444 };
+                    let plan = PqPlan { w: w as u32, h: h as u32, drehung: d, chroma444 };
                     assert!(wandler.pq_rechnen(&plan).expect("pq_rechnen"), "{}", plan.text());
                     let mut aus = Vec::new();
                     wandler.pq_auslesen(&mut aus).expect("pq_auslesen");
@@ -1102,7 +1087,7 @@ mod tests {
         let Some((device, ctx)) = warp() else { return };
         let mut wandler = Wandler::neu(&device, &ctx, 2500).expect("Wandler");
         let (w, h) = (256u32, 2u32);
-        let plan = PqPlan { w, h, halb: false, drehung: Drehung::Keine, chroma444: true };
+        let plan = PqPlan { w, h, drehung: Drehung::Keine, chroma444: true };
         let grau: Vec<[f32; 3]> = (0..w * h).map(|i| [spiegel::srgb_eotf((i % 256) as f32 / 255.0) * 2.5; 3]).collect();
         let tex = fp16_textur(&device, w, h, &grau);
         wandler.aufnehmen(&tex).unwrap();

@@ -7,6 +7,13 @@
 // Bild um zwei Punkte wandern (links grau, rechts Rot/Blau - da zeigt sich,
 // was 4:4:4 wert ist), unteres Drittel ein Verlauf mit einem Quadrat, das
 // eine Runde je Schleife laeuft.
+//
+// Das Testbild hat die Groesse des Stroms - nativ also auch 3840x2160 und
+// mehr. Gerechnet wird darum zeilenparallel: zwoelf 4K-Bilder am Stueck
+// hielten den Aufnahmefaden sonst Sekunden auf (bei jedem Codecwechsel im
+// Benchmark neu).
+
+use rayon::prelude::*;
 
 pub const N: usize = 12;
 
@@ -45,19 +52,19 @@ pub fn punkt(x: i32, y: i32, w: i32, h: i32, k: usize) -> (u8, u8, u8) {
 
 /// Drei Ebenen Y, Cb, Cr in voller Aufloesung, 8 Bit.
 pub fn yuv444p(w: i32, h: i32, k: usize) -> [Vec<u8>; 3] {
-    let n = (w * h) as usize;
+    let n = (w.max(0) * h.max(0)) as usize;
+    let zeile = w.max(1) as usize;
     let mut y = vec![0u8; n];
     let mut u = vec![0u8; n];
     let mut v = vec![0u8; n];
-    for yy in 0..h {
-        for x in 0..w {
-            let (a, b, c) = punkt(x, yy, w, h, k);
-            let i = (yy * w + x) as usize;
-            y[i] = a;
-            u[i] = b;
-            v[i] = c;
+    y.par_chunks_mut(zeile).zip(u.par_chunks_mut(zeile)).zip(v.par_chunks_mut(zeile)).enumerate().for_each(|(yy, ((yz, uz), vz))| {
+        for x in 0..zeile {
+            let (a, b, c) = punkt(x as i32, yy as i32, w, h, k);
+            yz[x] = a;
+            uz[x] = b;
+            vz[x] = c;
         }
-    }
+    });
     [y, u, v]
 }
 
@@ -71,22 +78,21 @@ pub fn yuv444p16(w: i32, h: i32, k: usize) -> [Vec<u8>; 3] {
 
 /// NV12: Y-Ebene und verschraenkte CbCr-Ebene in halber Aufloesung.
 pub fn nv12(w: i32, h: i32, k: usize) -> [Vec<u8>; 2] {
-    let n = (w * h) as usize;
+    let n = (w.max(0) * h.max(0)) as usize;
     let mut y = vec![0u8; n];
-    let mut uv = vec![0u8; ((w / 2) * (h / 2) * 2) as usize];
-    for yy in 0..h {
-        for x in 0..w {
-            y[(yy * w + x) as usize] = punkt(x, yy, w, h, k).0;
+    let mut uv = vec![0u8; ((w / 2).max(0) * (h / 2).max(0) * 2) as usize];
+    y.par_chunks_mut(w.max(1) as usize).enumerate().for_each(|(yy, z)| {
+        for (x, p) in z.iter_mut().enumerate() {
+            *p = punkt(x as i32, yy as i32, w, h, k).0;
         }
-    }
-    for yy in 0..h / 2 {
-        for x in 0..w / 2 {
-            let (_, cb, cr) = punkt(2 * x, 2 * yy, w, h, k);
-            let i = ((yy * (w / 2) + x) * 2) as usize;
-            uv[i] = cb;
-            uv[i + 1] = cr;
+    });
+    uv.par_chunks_mut(((w / 2).max(1) * 2) as usize).enumerate().for_each(|(yy, z)| {
+        for (x, p) in z.chunks_exact_mut(2).enumerate() {
+            let (_, cb, cr) = punkt(2 * x as i32, 2 * yy as i32, w, h, k);
+            p[0] = cb;
+            p[1] = cr;
         }
-    }
+    });
     [y, uv]
 }
 
@@ -94,21 +100,17 @@ pub fn nv12(w: i32, h: i32, k: usize) -> [Vec<u8>; 2] {
 /// dieselben Koeffizienten wie zeile_rgb im Client. Fuer die Farbprobe: was
 /// NVENC daraus macht, muss wieder auf die Balkenwerte fuehren.
 pub fn bgra(w: i32, h: i32, k: usize) -> Vec<u8> {
-    let mut out = vec![0u8; (w * h * 4) as usize];
-    for yy in 0..h {
-        for x in 0..w {
-            let (y, cb, cr) = punkt(x, yy, w, h, k);
+    let mut out = vec![0u8; (w.max(0) * h.max(0) * 4) as usize];
+    out.par_chunks_mut((w.max(1) * 4) as usize).enumerate().for_each(|(yy, z)| {
+        for (x, p) in z.chunks_exact_mut(4).enumerate() {
+            let (y, cb, cr) = punkt(x as i32, yy as i32, w, h, k);
             let (y, cb, cr) = (y as f32, cb as f32 - 128.0, cr as f32 - 128.0);
             let r = (y + 1.5748 * cr).round().clamp(0.0, 255.0) as u8;
             let g = (y - 0.1873 * cb - 0.4681 * cr).round().clamp(0.0, 255.0) as u8;
             let b = (y + 1.8556 * cb).round().clamp(0.0, 255.0) as u8;
-            let i = ((yy * w + x) * 4) as usize;
-            out[i] = b;
-            out[i + 1] = g;
-            out[i + 2] = r;
-            out[i + 3] = 255;
+            p.copy_from_slice(&[b, g, r, 255]);
         }
-    }
+    });
     out
 }
 
@@ -125,5 +127,33 @@ mod tests {
         assert_eq!(yuv444p(64, 48, 3)[0].len(), 64 * 48);
         assert_eq!(nv12(64, 48, 3)[1].len(), 32 * 24 * 2);
         assert_eq!(bgra(64, 48, 0)[3], 255);
+    }
+
+    /// Zeilenparallel gerechnet ergibt Punkt fuer Punkt dasselbe wie
+    /// testbild::punkt - auch mit ungeraden Massen.
+    #[test]
+    fn zeilenparallel_wie_punkt() {
+        for (w, h) in [(64, 48), (37, 21), (1, 1)] {
+            let k = 5;
+            let [y, u, v] = yuv444p(w, h, k);
+            let [y12, uv] = nv12(w, h, k);
+            let b = bgra(w, h, k);
+            assert_eq!((y.len(), b.len(), uv.len()), ((w * h) as usize, (w * h * 4) as usize, ((w / 2) * (h / 2) * 2) as usize));
+            for yy in 0..h {
+                for x in 0..w {
+                    let i = (yy * w + x) as usize;
+                    assert_eq!((y[i], u[i], v[i]), punkt(x, yy, w, h, k), "{w}x{h} ({x},{yy})");
+                    assert_eq!(y12[i], y[i]);
+                    assert_eq!(b[4 * i + 3], 255);
+                }
+            }
+            for yy in 0..h / 2 {
+                for x in 0..w / 2 {
+                    let i = ((yy * (w / 2) + x) * 2) as usize;
+                    let (_, cb, cr) = punkt(2 * x, 2 * yy, w, h, k);
+                    assert_eq!((uv[i], uv[i + 1]), (cb, cr));
+                }
+            }
+        }
     }
 }
