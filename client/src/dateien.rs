@@ -5280,7 +5280,13 @@ mod tests {
     /// langsamer Schreibfaden); `haengt` wird gesetzt, sobald es haengt.
     struct Reihe {
         n: Mutex<Vec<(u8, u32, u8)>>,
-        halten: Mutex<Option<(u32, Duration)>>,
+        // Das erste Stueck dieses Senders (None: des ersten, der eins
+        // schickt) so lange aufhalten. Vor dem Start des Senders setzen:
+        // danach kann er sein ganzes Fenster schon hinausgeschickt haben und
+        // wartet auf eine Quittung, die nie kommt - dann haelt nichts mehr
+        // an (so scheiterte warten_auf_den_vorgaenger_ist_begrenzt in der
+        // CI am 29.09.2026).
+        halten: Mutex<Option<(Option<u32>, Duration)>>,
         haengt: std::sync::atomic::AtomicBool,
     }
 
@@ -5297,7 +5303,7 @@ mod tests {
         fn senden(&self, typ: u8, n: &[u8]) -> Gesendet {
             let k = kennung_lesen(n).unwrap_or(0);
             if typ == DATEI_STUECK {
-                let halt = sperre(&self.halten).take_if(|h| h.0 == k);
+                let halt = sperre(&self.halten).take_if(|h| h.0.map_or(true, |x| x == k));
                 if let Some((_, d)) = halt {
                     self.haengt.store(true, Ordering::SeqCst);
                     thread::sleep(d);
@@ -5323,9 +5329,9 @@ mod tests {
         let pb = quelle_datei(&o, "b.bin", 1000);
         let weg = Reihe::neu();
         let (ev_a, melden_a) = sammler();
+        *sperre(&weg.halten) = Some((None, Duration::from_millis(300)));
         let a = Sender::starten_mit(vec![pa], weg.clone(), FENSTER, melden_a, vorgaben(5000));
         let ka = a.kennung();
-        *sperre(&weg.halten) = Some((ka, Duration::from_millis(300)));
         assert!(bis(Duration::from_secs(3), || weg.haengt.load(Ordering::SeqCst)), "A kam nicht in den Weg");
         let (ev_b, melden_b) = sammler();
         let b = Sender::starten_nach(Some(a), vec![pb], weg.clone(), || FENSTER, melden_b, vorgaben(5000));
@@ -5360,8 +5366,8 @@ mod tests {
         let pb = quelle_datei(&o, "b.bin", 1000);
         let weg = Reihe::neu();
         let (_ev_a, melden_a) = sammler();
+        *sperre(&weg.halten) = Some((None, Duration::from_secs(3)));
         let a = Sender::starten_mit(vec![pa], weg.clone(), FENSTER, melden_a, vorgaben(5000));
-        *sperre(&weg.halten) = Some((a.kennung(), Duration::from_secs(3)));
         assert!(bis(Duration::from_secs(3), || weg.haengt.load(Ordering::SeqCst)));
         let t0 = Instant::now();
         let (_ev_b, melden_b) = sammler();
