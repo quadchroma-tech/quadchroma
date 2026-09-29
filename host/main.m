@@ -468,6 +468,14 @@ static _Atomic long g_zu_schnell = 0;        // verworfen, weil schneller als di
 // (H.264 bei 500 Mbit/s: 30 Bilder/s) bekam sonst 120 Bilder je Sekunde in
 // die Warteschlange gelegt - eine halbe Sekunde Verzoegerung statt Auslassern.
 static _Atomic int g_inflight = 0;
+// So viele duerfen es sein; ein echtes Bild darueber faellt weg ("Encoder
+// voll"), der Takt legt schon ab dieser Zahl nichts nach. Zwei: eins in
+// Arbeit, das naechste wartet - der Encoder laeuft nie leer. Bei nativem 4K
+// ist der Encoder der Engpass (M1, jedes Bild anders, hoechstens zwei offen:
+// HEVC 4:4:4 10 Bit 3840x2160 85 Bilder/s, 11,8 ms je Bild); mit drei offenen
+// wartete jedes Bild hinter zwei anderen, rund 12 ms mehr Verzoegerung fuer
+// keinen Durchsatz.
+#define QC_ENCODER_OFFEN_MAX 2
 static _Atomic long g_enc_stau = 0;          // verworfen, weil der Encoder noch voll war
 static dispatch_queue_t g_capq = NULL;
 static dispatch_source_t g_tick = NULL;
@@ -3636,7 +3644,7 @@ static void fixed_tick(void) {
     if (seit < 0.9 / (double)fps) return;
     // Haengt der Encoder noch an frueheren Bildern, wird nichts nachgelegt -
     // ein Auslasser ist billiger als eine wachsende Warteschlange.
-    if (atomic_load(&g_inflight) >= 2) return;
+    if (atomic_load(&g_inflight) >= QC_ENCODER_OFFEN_MAX) return;
     // Nach einem Codecwechsel mit anderem Aufnahmeformat: das letzte Bild
     // einmal umrechnen, statt es bei jedem Schlag abweisen zu lassen.
     if (!testbild && !letztes_bild_angleichen()) return;
@@ -3764,7 +3772,7 @@ static void fixed_tick(void) {
     // aelteren Bildern beschaeftigt, ebenfalls - lieber ein Auslasser als
     // eine Warteschlange, die jede Bewegung um Sekunden verspaetet.
     if (!schlitz_frei(CMTimeGetSeconds(pts))) { atomic_fetch_add(&g_zu_schnell, 1); return; }
-    if (atomic_load(&g_inflight) >= 3) { atomic_fetch_add(&g_enc_stau, 1); return; }
+    if (atomic_load(&g_inflight) >= QC_ENCODER_OFFEN_MAX) { atomic_fetch_add(&g_enc_stau, 1); return; }
 
     if (encode_buffer(pb, pts, t_cap, 0)) atomic_store(&g_bild_offen, 0);
     g_last_pts = pts;
@@ -3882,21 +3890,53 @@ static qc_strom_fabrik g_strom_fabrik = strom_bauen_sck;
 // Nur der Pruefstand ruft das (er bindet main.m ein).
 __attribute__((unused)) static void qc_strom_fabrik_setzen(qc_strom_fabrik f) { g_strom_fabrik = f ?: strom_bauen_sck; }
 
-// Stromgroesse fuer einen Bildschirm, wie beim Start: --out hat Vorrang,
-// sonst die Pixelmasse, ab 3840 bzw. 2160 halbiert, immer gerade.
+// Stromgroesse fuer einen Bildschirm, bei jedem Strombau: --out hat Vorrang,
+// sonst nativ (Produktentscheidung 2026-09-29, keine Halbierung mehr) - genau
+// die Pixel des Modus, bei HiDPI die Pixel hinter den Punkten ("wie
+// 1920x1080" auf einem 4K-Panel: 3840x2160), hoechstens die native
+// Aufloesung des Panels; immer gerade (qc_stromgroesse_nativ).
 static void stromgroesse_fuer(QCBildschirm *b, int *w, int *h) {
     int ow = g_out_fest_w, oh = g_out_fest_h;
-    if (ow <= 0 || oh <= 0) {
-        ow = (int)(b.w >= 3840 ? b.w / 2 : b.w);
-        oh = (int)(b.h >= 2160 ? b.h / 2 : b.h);
+    if (ow > 0 && oh > 0) {
+        *w = ow & ~1;
+        *h = oh & ~1;
+        return;
     }
-    *w = ow & ~1;
-    *h = oh & ~1;
+    qc_stromgroesse_nativ(b.w, b.h, b.nativ_w, b.nativ_h, w, h);
 }
 
 static NSString *bildschirm_text(QCBildschirm *b) {
     if (!b) return @"keiner";
     return [NSString stringWithFormat:@"Kennung %u (%@) \"%@\"", b.displayID, b.kennung, b.name ?: @""];
+}
+
+// Die Pixel des Bildschirms fuer die Protokollzeilen, bei HiDPI mit den
+// Punkten ("3840x2160 (HiDPI, wie 1920x1080)"), und die native Aufloesung,
+// wenn der Modus mehr Pixel hat als das Panel.
+static NSString *bildschirm_masse(QCBildschirm *b) {
+    NSMutableString *t = [NSMutableString stringWithFormat:@"%zux%zu", b.w, b.h];
+    BOOL hidpi = b.punkte_w && b.punkte_h && (b.punkte_w != b.w || b.punkte_h != b.h);
+    BOOL ueber_panel = b.nativ_w && b.nativ_h && (b.w > b.nativ_w || b.h > b.nativ_h);
+    if (hidpi || ueber_panel) {
+        [t appendString:@" ("];
+        if (hidpi) [t appendFormat:@"HiDPI, wie %zux%zu", b.punkte_w, b.punkte_h];
+        if (ueber_panel) [t appendFormat:@"%@Panel %zux%zu", hidpi ? @", " : @"", b.nativ_w, b.nativ_h];
+        [t appendString:@")"];
+    }
+    return t;
+}
+
+// Der Zeiger im Massstab des Stroms (zeiger.h): Bildpunkte des Stroms je
+// Punkt des Bildschirms - bei HiDPI nativ gestreamt 2, bei --out kleiner.
+// Ohne Punkte (Attrappen) gilt ein Punkt je Pixel. Eine Zeile, wenn er sich
+// aendert. Auf g_lifeq.
+static void zeiger_massstab_nachfuehren(QCBildschirm *b, int strom_w) {
+    size_t punkte = b.punkte_w ? b.punkte_w : b.w;
+    double m = (punkte && strom_w > 0) ? (double)strom_w / (double)punkte : 1.0;
+    double alt = qc_zeiger_massstab();
+    qc_zeiger_massstab_setzen(m);
+    if (fabs(qc_zeiger_massstab() - alt) >= 0.0005)
+        logf_(@"Zeigerform: Massstab %.2f (Strom %d Bildpunkte breit, Bildschirm %zu Punkte)", qc_zeiger_massstab(), strom_w, punkte);
 }
 
 // Nachricht 12 aus dem Stand neu kodieren. Auf g_lifeq (oder vor den Warteschlangen).
@@ -4056,8 +4096,11 @@ static BOOL strom_fuer_bildschirm_starten(QCBildschirm *ziel, BOOL wechsel) {
     stream_setzen(st);
     g_display_id = ziel.displayID;
     g_display_aktuell = ziel;
-    // Die Maus folgt dem Bild - immer, nicht nur beim Programmstart.
+    // Die Maus folgt dem Bild - immer, nicht nur beim Programmstart. Sie
+    // rechnet in Punkten (CGDisplayBounds) und ist deshalb von der
+    // Stromgroesse unabhaengig; der Zeiger nicht: er bekommt den Massstab.
     atomic_store(&g_input_display, ziel.displayID);
+    zeiger_massstab_nachfuehren(ziel, w);
     atomic_store(&g_cur_fixed, atomic_load(&g_fixed_gewollt));
     // Solange gestreamt wird, darf der Bildschirm nicht einschlafen.
     if (g_wach == kIOPMNullAssertionID)
@@ -4233,12 +4276,31 @@ static QCBildschirm *bildschirm_neu_bewerten(int anlass) {
         bildschirm_wechseln(ziel, grund, anlass);
         return ziel;
     }
+    // Derselbe Bildschirm in einer anderen Aufloesung (Modus umgestellt,
+    // HiDPI an oder aus): der Strom folgt, denn gestreamt wird nativ - wie
+    // ein Wechsel auf denselben Bildschirm, mit neuem Encoder, SWITCH, INFO
+    // und Vollbild. Frueher blieb die Groesse, und ScreenCaptureKit skalierte
+    // den neuen Modus in die alte.
+    if (g_stream) {
+        int sw = 0, sh = 0;
+        stromgroesse_fuer(ziel, &sw, &sh);
+        if (sw != g_info_w || sh != g_info_h) {
+            bildschirm_wechseln(ziel, [NSString stringWithFormat:@"Aufloesung geaendert: Strom %dx%d -> %dx%d",
+                                       g_info_w, g_info_h, sw, sh], anlass);
+            return ziel;
+        }
+    }
     // Kein Wechsel (mehr) noetig - auch ein wartender ist damit hinfaellig.
     bildschirm_warten_beenden();
     if (!g_stream) g_display_id = ziel.displayID;       // Ziel des naechsten Starts
     g_display_aktuell = ziel;
-    // Derselbe Bildschirm, aber vielleicht HDR an oder aus.
-    if (g_stream && ziel.displayID == g_display_id) quelle_setzen(ziel.hdr, ziel.edr_potentiell, "Bildschirmkonfiguration");
+    // Derselbe Bildschirm, aber vielleicht HDR an oder aus - oder ein Modus
+    // mit denselben Pixeln und anderen Punkten (HiDPI "wie 1920x1080" gegen
+    // 3840x2160 nativ): dann nur ein anderer Zeigermassstab.
+    if (g_stream && ziel.displayID == g_display_id) {
+        quelle_setzen(ziel.hdr, ziel.edr_potentiell, "Bildschirmkonfiguration");
+        zeiger_massstab_nachfuehren(ziel, g_info_w);
+    }
     bildschirm_zustand_nachfuehren();
     if (liste_neu || ziel_neu || wunsch) bildschirme_senden();
     return ziel;
@@ -4283,10 +4345,13 @@ static void list_displays(void) {
     NSArray<QCBildschirm *> *liste = qc_bildschirme_holen();
     if (!liste) { logf_(@"Inhalte nicht abrufbar"); return; }
     int i = 0;
-    for (QCBildschirm *b in liste)
-        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %zu x %zu Pixel, %.0f Hz%@, EDR-Kopfraum %.2f (jetzt %.2f)%@",
-              i++, b.displayID, b.kennung, b.name, b.w, b.h, b.hz, b.haupt ? @"  (Hauptbildschirm)" : @"",
-              b.edr_potentiell, b.edr_aktuell, b.hdr ? @" - HDR" : @"");
+    for (QCBildschirm *b in liste) {
+        int sw = 0, sh = 0;
+        stromgroesse_fuer(b, &sw, &sh);
+        logf_(@"Display %d: id=%u, Kennung %@, Name \"%@\", %@ Pixel, %.0f Hz%@, Strom %dx%d, EDR-Kopfraum %.2f (jetzt %.2f)%@",
+              i++, b.displayID, b.kennung, b.name, bildschirm_masse(b), b.hz, b.haupt ? @"  (Hauptbildschirm)" : @"",
+              sw, sh, b.edr_potentiell, b.edr_aktuell, b.hdr ? @" - HDR" : @"");
+    }
 }
 
 // Aufnahme nach einem Bildschirmverlust neu aufbauen. Auf g_lifeq; kommt
@@ -4324,7 +4389,8 @@ static void aufnahme_wiederherstellen(void) {
     bildschirm_zustand_nachfuehren();
     bildschirme_senden();
     hoststatus_senden(0);
-    logf_(@"Aufnahme wiederhergestellt: Bildschirm %zux%zu, %.0f Hz, %@", ziel.w, ziel.h, ziel.hz, bildschirm_text(ziel));
+    logf_(@"Aufnahme wiederhergestellt: Bildschirm %@, %.0f Hz, %@ -> %dx%d", bildschirm_masse(ziel), ziel.hz, bildschirm_text(ziel),
+          g_info_w, g_info_h);
 }
 
 // Aufnahme und Encoder fuer einen Zuschauer aufbauen. Wird vom Faden der
@@ -4339,8 +4405,8 @@ static BOOL stream_hochfahren_sync(void) {
         if (!ziel) { logf_(@"Kein Bildschirm - Aufnahme kann nicht starten"); return; }
         if (!strom_fuer_bildschirm_starten(ziel, NO)) return;
         bildschirm_zustand_nachfuehren();
-        logf_(@"Aufnahme gestartet: Bildschirm %zux%zu, %.0f Hz, %@ -> %dx%d%@",
-              ziel.w, ziel.h, ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h,
+        logf_(@"Aufnahme gestartet: Bildschirm %@, %.0f Hz, %@ -> %dx%d%@",
+              bildschirm_masse(ziel), ziel.hz, bildschirm_text(ziel), g_info_w, g_info_h,
               ziel.hdr ? [NSString stringWithFormat:@", Bildschirm HDR-faehig (EDR-Kopfraum %.2f)", ziel.edr_potentiell] : @"");
         ok = YES;
     });
@@ -4496,21 +4562,20 @@ static void bedienungshilfen_einmal_fragen(void) {
 static void zugang_zeile(const char *z) { logf_(@"%@", utf8(z)); }
 
 // Stromgroesse ohne Bildschirmliste (keine Freigabe, kein Monitor beim Start):
-// aus dem Hauptbildschirm wie stromgroesse_fuer, sonst 1920x1080. Sie steht
-// nur in der Begruessung eines Zuschauers, der ohne Aufnahme hereinkommt; mit
-// der Aufnahme bekommt er die echten Masse (SWITCH und INFO).
+// aus dem Hauptbildschirm wie stromgroesse_fuer (nativ), ohne Modus
+// 1920x1080. Sie steht nur in der Begruessung eines Zuschauers, der ohne
+// Aufnahme hereinkommt; mit der Aufnahme bekommt er die echten Masse (SWITCH
+// und INFO).
 static void ersatzgroesse(int *w, int *h) {
     int ow = g_out_fest_w, oh = g_out_fest_h;
-    if (ow <= 0 || oh <= 0) {
-        CGDisplayModeRef m = CGDisplayCopyDisplayMode(CGMainDisplayID());
-        size_t pw = m ? CGDisplayModeGetPixelWidth(m) : 0, ph = m ? CGDisplayModeGetPixelHeight(m) : 0;
-        if (m) CGDisplayModeRelease(m);
-        if (!pw || !ph) { pw = 1920; ph = 1080; }
-        ow = (int)(pw >= 3840 ? pw / 2 : pw);
-        oh = (int)(ph >= 2160 ? ph / 2 : ph);
+    if (ow > 0 && oh > 0) {
+        *w = ow & ~1;
+        *h = oh & ~1;
+        return;
     }
-    *w = ow & ~1;
-    *h = oh & ~1;
+    qc_bildschirm_modus m;
+    if (!qc_bildschirm_modus_lesen(CGMainDisplayID(), &m) || !m.pw || !m.ph) { m.pw = 1920; m.ph = 1080; m.nativ_w = m.nativ_h = 0; }
+    qc_stromgroesse_nativ(m.pw, m.ph, m.nativ_w, m.nativ_h, w, h);
 }
 
 // Wert hinter einem Schalter (versatz 1 = gleich dahinter). Fehlt er - Ende
@@ -4894,8 +4959,13 @@ static int formattest_laufen(void) {
     QCBildschirm *b = qc_bildschirm_wahl(qc_bildschirme_holen(), nil, NULL);
     SCDisplay *d = b.sc;
     if (!d) return 4;
+    // In der Groesse, die der Dienst ohne --out streamen wuerde (nativ).
+    int fw = 0, fh = 0;
+    stromgroesse_fuer(b, &fw, &fh);
+    logf_(@"Formattest: Bildschirm %@, %@ -> %dx%d", bildschirm_text(b), bildschirm_masse(b), fw, fh);
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
-    cfg.width = 1920; cfg.height = 1080;
+    cfg.width = (size_t)fw; cfg.height = (size_t)fh;
+    cfg.captureResolution = SCCaptureResolutionBest;
     cfg.pixelFormat = kCVPixelFormatType_444YpCbCr10BiPlanarFullRange;
     cfg.showsCursor = NO;
     cfg.minimumFrameInterval = CMTimeMake(1, 60);
@@ -5259,7 +5329,8 @@ int qc_dienst_starten(const qc_dienst_cfg *dc) { @autoreleasepool {
     BOOL ax = AXIsProcessTrusted();
     bedienungshilfen_einmal_fragen();
     if (laeuft) logf_(@"\n=== Dienst laeuft: Bild %d, Eingabe %d, Bekanntgabe %d ===", port, port + 1, port + 2);
-    logf_(@"Bildschirm %@ (%zux%zu Pixel, %.0f Hz) -> %dx%d, %d fps%@", bildschirm_text(display), pxW, pxH, hz, outW, outH, fps, wunsch_text);
+    logf_(@"Bildschirm %@: %@, %.0f Hz -> %dx%d, %d fps%@", bildschirm_text(display),
+          display ? bildschirm_masse(display) : [NSString stringWithFormat:@"%zux%zu", pxW, pxH], hz, outW, outH, fps, wunsch_text);
     logf_(@"Bedienungshilfen-Freigabe (fuer Maus und Tastatur): %@", ax ? @"erteilt" : @"FEHLT - Eingaben werden ignoriert");
 
     // Einmal blind messen, damit die erste echte Meldung schon eine Differenz

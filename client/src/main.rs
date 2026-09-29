@@ -6647,8 +6647,8 @@ struct App {
     zeiger_seq_gezeigt: u64,
     zeiger_eigen: bool,
     zeiger_vorrat: Vec<(u64, CustomCursor)>,
-    /// Massstab, mit dem die geltende Form gebaut wurde (siehe zeiger_massstab).
-    zeiger_faktor: u32,
+    /// Stufe, in der die geltende Form gebaut wurde (siehe zeiger_stufe).
+    zeiger_stufe: u32,
     /// Ist die Maus gerade im Fenster? Nur dann wird eine Form gesetzt.
     maus_im_fenster: bool,
     /// Der laufende oder zuletzt gelaufene Benchmark, und was der naechste
@@ -7495,12 +7495,16 @@ impl App {
         // zurueck, statt als "unsichtbar" ueber dem stehenden Bild zu bleiben.
         // Der Massstab folgt dem Bild: so gross, wie das Mac-Bild im Fenster
         // erscheint, so gross der Zeiger - 1:1 also so gross wie auf dem Mac.
+        // Die Form kommt in Bildpunkten des Stroms (der Host streamt nativ,
+        // bei HiDPI mit doppelt so grossem Zeiger); ein Bild, das kleiner
+        // erscheint als der Strom (4K-Strom auf einem 1080p-Schirm), bekommt
+        // einen kleineren Zeiger.
         let im_bild = self.screen == Screen::Session && !self.hud_offen && self.bild_vorhanden() && self.maus_im_fenster;
-        let faktor = self.zeiger_massstab();
+        let stufe = self.zeiger_massstab();
         let (neu, form_da) = {
             let s = self.shared.lock().unwrap();
             let form_da = s.zeiger.is_some();
-            let neu = if im_bild && form_da && (s.zeiger_seq != self.zeiger_seq_gezeigt || faktor != self.zeiger_faktor) {
+            let neu = if im_bild && form_da && (s.zeiger_seq != self.zeiger_seq_gezeigt || stufe != self.zeiger_stufe) {
                 s.zeiger.clone().map(|z| (s.zeiger_seq, z))
             } else {
                 None
@@ -7510,8 +7514,8 @@ impl App {
         if im_bild && form_da {
             if let Some((seq, z)) = neu {
                 self.zeiger_seq_gezeigt = seq;
-                self.zeiger_faktor = faktor;
-                self.zeiger_anwenden(el, &z, faktor);
+                self.zeiger_stufe = stufe;
+                self.zeiger_anwenden(el, &z, stufe);
             }
         } else if self.zeiger_eigen {
             if let Some(w) = &self.window {
@@ -7576,31 +7580,14 @@ impl App {
     /// einmal gebaut; der Vorrat haelt die letzten 32 (die Wartekugel hat ein
     /// Dutzend Bilder, ein Zeigerwechsel zwischen Pfeil, Hand und Textcursor
     /// soll nichts kosten).
-    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, faktor: u32) {
+    fn zeiger_anwenden(&mut self, el: &ActiveEventLoop, z: &ZeigerForm, stufe: u32) {
         let Some(w) = self.window.clone() else { return };
-        let k = z.kennung().wrapping_mul(31).wrapping_add(faktor as u64);
+        let k = z.kennung().wrapping_mul(31).wrapping_add(stufe as u64);
         let zeiger = match self.zeiger_vorrat.iter().find(|(kk, _)| *kk == k) {
             Some((_, c)) => c.clone(),
             None => {
-                // Ganzzahlig hochziehen, Punkt fuer Punkt: ein Zeiger ist eine
-                // kleine Strichzeichnung, weich gefiltert saehe er verwaschen aus.
-                let f = faktor.max(1);
-                let (w2, h2) = (z.w as u32 * f, z.h as u32 * f);
-                let rgba = if f == 1 {
-                    z.rgba.clone()
-                } else {
-                    let mut aus = vec![0u8; (w2 * h2 * 4) as usize];
-                    for y in 0..h2 as usize {
-                        let qy = y / f as usize;
-                        for x in 0..w2 as usize {
-                            let q = (qy * z.w as usize + x / f as usize) * 4;
-                            let z4 = (y * w2 as usize + x) * 4;
-                            aus[z4..z4 + 4].copy_from_slice(&z.rgba[q..q + 4]);
-                        }
-                    }
-                    aus
-                };
-                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2 as u16, h2 as u16, z.hx * f as u16, z.hy * f as u16) else { return };
+                let (rgba, w2, h2, hx2, hy2) = zeiger_skalieren(z, stufe);
+                let Ok(quelle) = CustomCursor::from_rgba(rgba, w2, h2, hx2, hy2) else { return };
                 let c = el.create_custom_cursor(quelle);
                 if self.zeiger_vorrat.len() >= 32 {
                     self.zeiger_vorrat.remove(0);
@@ -7642,24 +7629,37 @@ impl App {
         Some((nx, ny))
     }
 
-    /// Um wie viel das Mac-Bild im Fenster vergroessert erscheint, ganzzahlig
-    /// gerundet - der Zeiger bekommt denselben Massstab. Begrenzt, damit die
-    /// Form unter der Grenze von 256 Bildpunkten bleibt.
+    /// Wie gross das Bild des Hosts im Fenster erscheint - Fensterbildpunkte
+    /// je Bildpunkt des Stroms -, als Stufe fuer den Zeiger (zeiger_stufe).
+    /// Vergroessert ganzzahlig gerundet und unter der Grenze von 256
+    /// Bildpunkten, verkleinert (ein Strom, groesser als das Fenster) genau.
     fn zeiger_massstab(&self) -> u32 {
-        let Some(w) = &self.window else { return 1 };
-        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return 1 };
+        let Some(w) = &self.window else { return 100 };
+        let Some((fw, fh)) = self.bild_da.or_else(|| self.last_frame.as_ref().map(|f| (f.width, f.height))) else { return 100 };
         if fw == 0 || fh == 0 {
-            return 1;
+            return 100;
         }
         let s = w.inner_size();
         let (_, _, zw, _) = ziel_rechteck(s.width.max(1), s.height.max(1), fw, fh, self.pixel_exact);
-        let mut f = ((zw as f32 / fw as f32) + 0.5).floor().clamp(1.0, 8.0) as u32;
-        if let Some(z) = self.shared.lock().unwrap().zeiger.as_ref() {
-            while f > 1 && (z.w as u32 * f > 256 || z.h as u32 * f > 256) {
-                f -= 1;
+        #[allow(unused_mut)]
+        let mut t = zw as f32 / fw as f32;
+        // macOS: winit legt den Zeiger in Punkten an (ein Bildpunkt der Form
+        // wird ein Punkt), das Fenster misst in Bildpunkten - auf einem
+        // Retina-Schirm erschiene der Zeiger sonst doppelt so gross wie das Bild.
+        #[cfg(target_os = "macos")]
+        {
+            let sf = w.scale_factor() as f32;
+            if sf > 0.0 {
+                t /= sf;
             }
         }
-        f
+        let mut stufe = zeiger_stufe(t);
+        if let Some(z) = self.shared.lock().unwrap().zeiger.as_ref() {
+            while stufe > 100 && (z.w as u32 * (stufe / 100) > 256 || z.h as u32 * (stufe / 100) > 256) {
+                stufe -= 100;
+            }
+        }
+        stufe
     }
 
     /// Einen laufenden Benchmark abbrechen. Mit `wiederherstellen` bekommt
@@ -10163,6 +10163,88 @@ fn bump_port(addr: &str, n: u16) -> String {
 ///
 /// EINE Ganzzahlrechnung fuer blit und - sobald die Karte zeichnet - fuer
 /// deren Stufe 2, damit beide das Bild an dieselbe Stelle legen.
+/// Die Stufe des Zeigers zum Massstab `t` (Fensterbildpunkte je Bildpunkt
+/// des Stroms), in Hundertsteln: ab 1 ganzzahlig gerundet (100, 200, ... bis
+/// 800) - ein Zeiger ist eine kleine Strichzeichnung und wird Punkt fuer Punkt
+/// hochgezogen -, darunter genau (mindestens 5). Unbrauchbar (0, NaN): 100.
+fn zeiger_stufe(t: f32) -> u32 {
+    if !t.is_finite() || t <= 0.0 {
+        return 100;
+    }
+    let p = (t * 100.0).round() as u32;
+    if p >= 100 {
+        ((t + 0.5).floor().clamp(1.0, 8.0) as u32) * 100
+    } else {
+        p.max(5)
+    }
+}
+
+/// Die Form in einer Stufe (zeiger_stufe): ab 100 ganzzahlig Punkt fuer Punkt
+/// hochgezogen (hoechstens 256 Bildpunkte je Seite, sonst eine Stufe
+/// kleiner), darunter flaechengemittelt verkleinert - mit vormultiplizierter
+/// Deckkraft, sonst faerbte das Durchsichtige die Raender. Rueckgabe: RGBA,
+/// Breite, Hoehe, Hotspot.
+fn zeiger_skalieren(z: &ZeigerForm, stufe: u32) -> (Vec<u8>, u16, u16, u16, u16) {
+    let (w, h) = (z.w as usize, z.h as usize);
+    if w == 0 || h == 0 || z.rgba.len() < w * h * 4 {
+        return (z.rgba.clone(), z.w, z.h, z.hx, z.hy);
+    }
+    if stufe >= 100 {
+        let mut f = (stufe / 100).max(1) as usize;
+        while f > 1 && (w * f > 256 || h * f > 256) {
+            f -= 1;
+        }
+        if f == 1 {
+            return (z.rgba.clone(), z.w, z.h, z.hx, z.hy);
+        }
+        let (w2, h2) = (w * f, h * f);
+        let mut aus = vec![0u8; w2 * h2 * 4];
+        for y in 0..h2 {
+            let qy = y / f;
+            for x in 0..w2 {
+                let q = (qy * w + x / f) * 4;
+                let z4 = (y * w2 + x) * 4;
+                aus[z4..z4 + 4].copy_from_slice(&z.rgba[q..q + 4]);
+            }
+        }
+        return (aus, w2 as u16, h2 as u16, z.hx * f as u16, z.hy * f as u16);
+    }
+    let w2 = ((w * stufe as usize + 50) / 100).max(1);
+    let h2 = ((h * stufe as usize + 50) / 100).max(1);
+    let (sx, sy) = (w as f64 / w2 as f64, h as f64 / h2 as f64);
+    let mut aus = vec![0u8; w2 * h2 * 4];
+    for oy in 0..h2 {
+        let (y0, y1) = (oy as f64 * sy, (oy + 1) as f64 * sy);
+        for ox in 0..w2 {
+            let (x0, x1) = (ox as f64 * sx, (ox + 1) as f64 * sx);
+            let (mut r, mut g, mut b, mut a, mut flaeche) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for qy in (y0.floor() as usize)..(y1.ceil() as usize).min(h) {
+                let wy = (y1.min(qy as f64 + 1.0) - y0.max(qy as f64)).max(0.0);
+                for qx in (x0.floor() as usize)..(x1.ceil() as usize).min(w) {
+                    let gewicht = wy * (x1.min(qx as f64 + 1.0) - x0.max(qx as f64)).max(0.0);
+                    let q = (qy * w + qx) * 4;
+                    let deck = z.rgba[q + 3] as f64 / 255.0 * gewicht;
+                    r += z.rgba[q] as f64 * deck;
+                    g += z.rgba[q + 1] as f64 * deck;
+                    b += z.rgba[q + 2] as f64 * deck;
+                    a += deck;
+                    flaeche += gewicht;
+                }
+            }
+            let z4 = (oy * w2 + ox) * 4;
+            if a > 0.0 && flaeche > 0.0 {
+                aus[z4] = (r / a).round().clamp(0.0, 255.0) as u8;
+                aus[z4 + 1] = (g / a).round().clamp(0.0, 255.0) as u8;
+                aus[z4 + 2] = (b / a).round().clamp(0.0, 255.0) as u8;
+                aus[z4 + 3] = (a / flaeche * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    let hx2 = (((z.hx as f64 + 0.5) * w2 as f64 / w as f64).floor() as usize).min(w2 - 1);
+    let hy2 = (((z.hy as f64 + 0.5) * h2 as f64 / h as f64).floor() as usize).min(h2 - 1);
+    (aus, w2 as u16, h2 as u16, hx2 as u16, hy2 as u16)
+}
+
 pub fn ziel_rechteck(ww: u32, wh: u32, fw: u32, fh: u32, pixelgenau: bool) -> (i32, i32, u32, u32) {
     let (winw, winh, fw, fh) = (ww as usize, wh as usize, fw as usize, fh as usize);
     if fw == 0 || fh == 0 {
@@ -13435,7 +13517,7 @@ fn main() {
         zeiger_seq_gezeigt: 0,
         zeiger_eigen: false,
         zeiger_vorrat: Vec::new(),
-        zeiger_faktor: 1,
+        zeiger_stufe: 100,
         maus_im_fenster: false,
         benchmark: None,
         bench_konfig: BenchKonfig::vorgabe(5, true),
@@ -14756,6 +14838,65 @@ mod tests {
     }
 
     use super::*;
+
+    fn form(w: u16, h: u16, hx: u16, hy: u16, rgba: Vec<u8>) -> ZeigerForm {
+        ZeigerForm { w, h, hx, hy, sichtbar: true, rgba }
+    }
+
+    /// Zeigerstufe: ab 1 ganzzahlig gerundet (bis 8), darunter genau in
+    /// Hundertsteln - ein 4K-Strom auf einem 1080p-Schirm (0,5) bekommt einen
+    /// halb so grossen Zeiger, nicht mehr den vollen.
+    #[test]
+    fn zeiger_stufe_rundet_hoch_ganzzahlig_und_verkleinert_genau() {
+        assert_eq!(zeiger_stufe(1.0), 100);
+        assert_eq!(zeiger_stufe(1.4), 100);
+        assert_eq!(zeiger_stufe(1.5), 200);
+        assert_eq!(zeiger_stufe(2.6), 300);
+        assert_eq!(zeiger_stufe(20.0), 800);
+        assert_eq!(zeiger_stufe(0.996), 100);
+        assert_eq!(zeiger_stufe(0.5), 50);
+        assert_eq!(zeiger_stufe(2560.0 / 3840.0), 67);
+        assert_eq!(zeiger_stufe(0.01), 5);
+        assert_eq!(zeiger_stufe(0.0), 100);
+        assert_eq!(zeiger_stufe(f32::NAN), 100);
+    }
+
+    /// Hochziehen Punkt fuer Punkt (Hotspot mit), hoechstens 256 je Seite;
+    /// Verkleinern flaechengemittelt mit vormultiplizierter Deckkraft - das
+    /// Durchsichtige (hier gruen mit Deckkraft 0) faerbt den Rand nicht.
+    #[test]
+    fn zeiger_skalieren_hoch_und_runter() {
+        let rot = [255u8, 0, 0, 255];
+        let leer = [0u8, 255, 0, 0];
+        let mut px = Vec::new();
+        for i in 0..4 {
+            px.extend_from_slice(if i % 2 == 0 { &rot } else { &leer });
+        }
+        let z = form(2, 2, 1, 1, px.clone());
+        let (rgba, w, h, hx, hy) = zeiger_skalieren(&z, 200);
+        assert_eq!((w, h, hx, hy), (4, 4, 2, 2));
+        assert_eq!(&rgba[0..8], &[255, 0, 0, 255, 255, 0, 0, 255]);
+        assert_eq!(&rgba[8..12], &leer);
+        let (rgba, w, h, hx, hy) = zeiger_skalieren(&z, 50);
+        assert_eq!((w, h, hx, hy), (1, 1, 0, 0));
+        assert_eq!(rgba, vec![255, 0, 0, 128]);
+        let (rgba, w, h, _, _) = zeiger_skalieren(&z, 100);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgba, px);
+
+        // Ein HiDPI-Zeiger (64 Bildpunkte, Hotspot 8,8) im 4K-Strom auf einem
+        // 1440p-Schirm: 43 Bildpunkte, Hotspot mit; voll deckend bleibt voll.
+        let z = form(64, 64, 8, 8, [10u8, 20, 30, 255].repeat(64 * 64));
+        let (rgba, w, h, hx, hy) = zeiger_skalieren(&z, 67);
+        assert_eq!((w, h, hx, hy), (43, 43, 5, 5));
+        assert!(rgba.chunks_exact(4).all(|p| p == [10, 20, 30, 255]));
+
+        // 100 Bildpunkte in Stufe 300 waeren 300: eine Stufe kleiner.
+        let z = form(100, 100, 99, 0, vec![0u8; 100 * 100 * 4]);
+        let (rgba, w, h, hx, hy) = zeiger_skalieren(&z, 300);
+        assert_eq!((w, h, hx, hy), (200, 200, 198, 0));
+        assert_eq!(rgba.len(), 200 * 200 * 4);
+    }
 
     /// Ein gemessener Schritt mit sonst unauffaelligen Werten.
     fn schritt(fps: u16, kette_ms: f32, fps_gemessen: f32, verworfen: u64, host_encoder_ms: f32) -> Ergebnis {
