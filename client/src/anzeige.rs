@@ -35,6 +35,7 @@
 // heutigen Weg, bitgleich. PQ, sRGB, die Matrizen und die Abbildung stehen
 // in hdr_hlsl.rs - dieselbe HLSL-Quelle wie im Wandler des Windows-Hosts.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,9 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::anzeigeprobe::{fall_pruefen, oberflaeche_probe, probewert, probewert_pq};
+use crate::schirmerkennung::{
+    schirm_gewechselt, schirm_zuordnen, text_ohne_ausgang, AnzeigePfad, AusgangFarbe, DxgiAusgang, FensterMonitor, Zuordnung,
+};
 use crate::{ebenen_format, hdr, protokoll, ui, EbenenFormat, Frame, Karte, Rolle};
 
 /// Ein Adapter, wie er im Protokoll und in der Statistik steht.
@@ -361,7 +365,7 @@ pub struct Gpu {
     pub hoehe: u32,
     /// Darf Present ohne Warten auf den Bildwechsel (ALLOW_TEARING)?
     pub tearing: bool,
-    /// Das Fenster (MonitorFromWindow, schirm_lage); null ohne Fenster.
+    /// Das Fenster (MonitorFromWindow, schirm_lesen); null ohne Fenster.
     hwnd: HWND,
     /// Was die Swapchain gerade ausgibt; ohne Fenster immer SDR.
     ausgabe: Ausgabe,
@@ -371,9 +375,10 @@ pub struct Gpu {
     /// sich der Schirm aendert; bis dahin meldet die Anzeige dem Host keine
     /// HDR-Darstellung (hdr_darstellung), er sendet dann SDR.
     hdr10_abgelehnt: bool,
-    /// Der Bildschirm des Fensters (schirm_lage) und wann er gelesen wurde;
-    /// der Monitor, auf dem das Fenster zuletzt stand, und wann das geprueft wurde.
-    schirm: Option<hdr::Schirm>,
+    /// Der Bildschirm des Fensters mit allem, was von genau ihm stammt
+    /// (schirm_lesen), und wann er gelesen wurde; der HMONITOR, auf dem das
+    /// Fenster zuletzt stand, und wann das geprueft wurde.
+    schirm: Option<Zuordnung>,
     schirm_zeit: Option<Instant>,
     monitor: isize,
     monitor_zeit: Option<Instant>,
@@ -626,7 +631,7 @@ fn adapter_info(a: &IDXGIAdapter1) -> Result<AdapterInfo, windows::core::Error> 
     // (aeltere WARP-Faelle tragen das Kennzeichen nicht).
     let software = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 || d.VendorId == 0x1414;
     let hat_ausgang = unsafe { a.EnumOutputs(0) }.is_ok();
-    let luid = ((d.AdapterLuid.HighPart as i64) << 32) | d.AdapterLuid.LowPart as i64;
+    let luid = luid_zahl(d.AdapterLuid);
     Ok(AdapterInfo {
         name,
         vendor: d.VendorId,
@@ -785,60 +790,169 @@ fn hdr_darstellung_moeglich(abgelehnt: bool) -> bool {
     !abgelehnt
 }
 
-/// Der Bildschirm des Fensters fuer IN_ANZEIGE: der Ausgang, auf dem der
-/// groesste Teil des Fensters liegt (MonitorFromWindow - nicht
-/// GetContainingOutput der Swapchain, die der softbuffer-Weg nicht hat),
-/// seine Farblage aus IDXGIOutput6::GetDesc1 ("HDR verwenden" = G2084/P2020,
-/// Spitzen) und das SDR-Weiss aus DisplayConfig (dieselbe Hilfe wie der
-/// Host). Die Factory bleibt, solange sie gilt (IsCurrent - eine alte kennt
-/// neu angesteckte Bildschirme und einen umgeschalteten HDR-Modus nicht);
-/// der Fensterfaden fragt alle zwei Sekunden, die Anzeige selbst ebenso (fuer
-/// ihre Ausgabe, `lage_pruefen`). None, wenn kein Ausgang passt.
-pub fn schirm_lage(hwnd: isize) -> Option<crate::hdr::Schirm> {
-    use std::cell::RefCell;
-    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
-    thread_local! {
-        static FABRIK: RefCell<Option<IDXGIFactory1>> = const { RefCell::new(None) };
-    }
-    let monitor = unsafe { MonitorFromWindow(HWND(hwnd as *mut c_void), MONITOR_DEFAULTTONEAREST) };
-    if monitor.is_invalid() {
+/// So lange gilt eine eben angelegte Factory der Schirmerkennung als frisch:
+/// ein zweiter Versuch in dieser Zeit (etwa die Anzeige gleich nach dem
+/// Fensterfaden) legt keine weitere an.
+const FABRIK_FRISCH: Duration = Duration::from_secs(1);
+
+thread_local! {
+    /// Die Factory der Schirmerkennung und wann sie angelegt wurde. Sie
+    /// bleibt, solange sie gilt (IsCurrent - eine alte kennt neu angesteckte
+    /// Bildschirme, neu vergebene HMONITOR und einen umgeschalteten HDR-Modus
+    /// nicht).
+    static FABRIK: RefCell<Option<(IDXGIFactory1, Instant)>> = const { RefCell::new(None) };
+    /// Die zuletzt ins Protokoll geschriebene Zeile der Schirmerkennung.
+    static SCHIRM_GEMELDET: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Text aus einem nullterminierten UTF-16-Feld (Geraete- und Adapternamen).
+fn utf16_text(s: &[u16]) -> String {
+    let n = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    String::from_utf16_lossy(&s[..n])
+}
+
+/// Eine LUID als Zahl - dieselbe Rechnung fuer AdapterInfo::luid, die
+/// Adapter der Schirmerkennung und die Karten aus DisplayConfig, damit sie
+/// sich vergleichen lassen.
+fn luid_zahl(l: windows::Win32::Foundation::LUID) -> i64 {
+    ((l.HighPart as i64) << 32) | l.LowPart as i64
+}
+
+/// Die Factory der Schirmerkennung: die gemerkte, solange sie gilt; `neu`
+/// verlangt eine neue, ausser die gemerkte ist juenger als FABRIK_FRISCH.
+fn fabrik(neu: bool) -> Option<IDXGIFactory1> {
+    FABRIK.with(|f| {
+        let mut f = f.borrow_mut();
+        let behalten = f
+            .as_ref()
+            .is_some_and(|(x, seit)| unsafe { x.IsCurrent() }.as_bool() && (!neu || seit.elapsed() < FABRIK_FRISCH));
+        if !behalten {
+            *f = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok().map(|x| (x, Instant::now()));
+        }
+        f.as_ref().map(|(x, _)| x.clone())
+    })
+}
+
+/// Gilt die gemerkte Factory nicht mehr (IsCurrent nein)? Dann hat Windows
+/// Bildschirme oder "HDR verwenden" umgestellt, und `lage_pruefen` liest
+/// sofort. Ohne gemerkte Factory nein.
+fn fabrik_veraltet() -> bool {
+    FABRIK.with(|f| f.borrow().as_ref().is_some_and(|(x, _)| !unsafe { x.IsCurrent() }.as_bool()))
+}
+
+/// Der Monitor des Fensters laut GDI: HMONITOR (MonitorFromWindow, der mit
+/// dem groessten Teil des Fensters) und sein Geraetename (GetMonitorInfoW).
+fn fenster_monitor(hwnd: HWND) -> Option<FensterMonitor> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST};
+    let m = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if m.is_invalid() {
         return None;
     }
-    let factory = FABRIK.with(|f| {
-        let mut f = f.borrow_mut();
-        if !f.as_ref().is_some_and(|x| unsafe { x.IsCurrent() }.as_bool()) {
-            *f = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.ok();
-        }
-        f.clone()
-    })?;
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !unsafe { GetMonitorInfoW(m, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) }.as_bool() {
+        return None;
+    }
+    Some(FensterMonitor { monitor: m.0 as isize, name: utf16_text(&info.szDevice) })
+}
+
+/// Alle Ausgaenge ALLER Adapter der Factory - nicht nur die der Karte der
+/// Swapchain: auf Laptops mit zwei Karten haengt der Bildschirm oft an der
+/// anderen. Je Ausgang HMONITOR, Geraetename und Karte, dazu die Farblage aus
+/// IDXGIOutput6::GetDesc1 - Beschreibung und Werte aus EINEM Aufruf.
+fn dxgi_ausgaenge(factory: &IDXGIFactory1) -> Vec<DxgiAusgang> {
+    let mut liste = Vec::new();
     let mut i = 0;
     while let Ok(a) = unsafe { factory.EnumAdapters1(i) } {
+        let adapter = i;
         i += 1;
+        let Ok(ad) = (unsafe { a.GetDesc1() }) else { continue };
         let mut j = 0;
         while let Ok(o) = unsafe { a.EnumOutputs(j) } {
             j += 1;
-            let Ok(d) = (unsafe { o.GetDesc() }) else { continue };
-            if d.Monitor != monitor {
-                continue;
-            }
-            let ende = d.DeviceName.iter().position(|&c| c == 0).unwrap_or(d.DeviceName.len());
-            let name = String::from_utf16_lossy(&d.DeviceName[..ende]);
-            let d1 = o.cast::<IDXGIOutput6>().ok().and_then(|o6| unsafe { o6.GetDesc1() }.ok());
-            let hdr = d1.is_some_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-            let weiss = crate::host::aufnahme::sdr_weiss_lesen(&name).map(crate::host::wandler::sdr_weiss_nit).unwrap_or(0.0);
-            let spitze = d1.map(|d| d.MaxLuminance).unwrap_or(0.0);
-            let kopfraum = if hdr && weiss > 0.0 && spitze > weiss { spitze / weiss } else { 1.0 };
-            return Some(crate::hdr::Schirm {
-                hdr,
-                sdr_weiss_nit: weiss,
-                spitze_nit: spitze,
-                vollbild_spitze_nit: d1.map(|d| d.MaxFullFrameLuminance).unwrap_or(0.0),
-                kopfraum_potentiell: kopfraum,
-                kopfraum_aktuell: kopfraum,
+            let (monitor, name, farbe) = match o.cast::<IDXGIOutput6>().ok().and_then(|o6| unsafe { o6.GetDesc1() }.ok()) {
+                Some(d) => (
+                    d.Monitor.0 as isize,
+                    utf16_text(&d.DeviceName),
+                    Some(AusgangFarbe {
+                        hdr: d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+                        spitze_nit: d.MaxLuminance,
+                        vollbild_spitze_nit: d.MaxFullFrameLuminance,
+                    }),
+                ),
+                None => match unsafe { o.GetDesc() } {
+                    Ok(d) => (d.Monitor.0 as isize, utf16_text(&d.DeviceName), None),
+                    Err(_) => continue,
+                },
+            };
+            liste.push(DxgiAusgang {
+                adapter,
+                luid: luid_zahl(ad.AdapterLuid),
+                adapter_name: utf16_text(&ad.Description),
+                monitor,
+                name,
+                farbe,
             });
         }
     }
-    None
+    liste
+}
+
+/// Die aktiven Pfade aus DisplayConfig (live, ohne Factory), je mit der
+/// Karte der Quelle, dem Ziel, seinem Anzeigenamen, SDR-Weiss und "HDR
+/// verwenden" (Advanced Color) - dieselben Hilfen wie der Host.
+fn anzeige_pfade() -> Vec<AnzeigePfad> {
+    use crate::host::aufnahme as au;
+    au::anzeigepfade()
+        .into_iter()
+        .map(|(quelle, p)| AnzeigePfad {
+            quelle,
+            quelle_luid: luid_zahl(p.sourceInfo.adapterId),
+            ziel_luid: luid_zahl(p.targetInfo.adapterId),
+            ziel_id: p.targetInfo.id,
+            anzeigename: au::ziel_anzeigename(&p).unwrap_or_default(),
+            sdr_weiss_nit: au::ziel_sdr_weiss(&p).map(crate::host::wandler::sdr_weiss_nit),
+            hdr: au::ziel_hdr(&p),
+        })
+        .collect()
+}
+
+/// Der Bildschirm des Fensters mit allem, was von genau ihm stammt
+/// (schirmerkennung.rs): der Monitor laut GDI, sein DXGI-Ausgang ueber alle
+/// Adapter, sein Pfad in DisplayConfig. Passt kein Ausgang oder sagen DXGI
+/// und DisplayConfig Verschiedenes ueber "HDR verwenden", wird einmal mit
+/// einer neuen Factory gelesen. Jede neue Lage (anderer Bildschirm, andere
+/// Werte) steht einmal im Protokoll ("Fenster auf ..."): der Fensterfaden
+/// (IN_ANZEIGE) und die Anzeige (lage_pruefen) fragen auf demselben Faden.
+/// None, wenn das Fenster keinen Monitor hat oder kein Ausgang passt.
+fn schirm_lesen(hwnd: HWND) -> Option<Zuordnung> {
+    let fenster = fenster_monitor(hwnd)?;
+    let pfade = anzeige_pfade();
+    let mut z = None;
+    for neu in [false, true] {
+        let Some(factory) = fabrik(neu) else { break };
+        z = schirm_zuordnen(&fenster, &dxgi_ausgaenge(&factory), &pfade);
+        if z.as_ref().is_some_and(|z| !z.widerspruch) {
+            break;
+        }
+    }
+    let zeile = z.as_ref().map_or_else(|| text_ohne_ausgang(&fenster), Zuordnung::text);
+    SCHIRM_GEMELDET.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.as_deref() != Some(zeile.as_str()) {
+            protokoll::zeile(zeile.clone());
+            *g = Some(zeile);
+        }
+    });
+    z
+}
+
+/// Der Bildschirm des Fensters fuer IN_ANZEIGE (main.rs, alle zwei Sekunden
+/// und nach einem Verschieben): HDR, SDR-Weiss und Spitzen von genau dem
+/// Bildschirm, auf dem der groesste Teil des Fensters liegt (schirm_lesen).
+/// None, wenn keiner passt - dann gilt SDR.
+pub fn schirm_lage(hwnd: isize) -> Option<crate::hdr::Schirm> {
+    schirm_lesen(HWND(hwnd as *mut c_void)).map(|z| z.schirm)
 }
 
 /// Geraet und Kontext. Mit Adapter: genau der (--adapter n); ohne: der
@@ -1130,9 +1244,12 @@ impl Gpu {
 
     /// Den Bildschirm des Fensters neu lesen, wenn es Zeit ist: alle
     /// SCHIRM_TAKT, und sofort, wenn das Fenster auf einem anderen Monitor
-    /// steht (alle MONITOR_TAKT nachgesehen - MonitorFromWindow ist billig).
-    /// Ein anderer Monitor oder ein umgeschaltetes "HDR verwenden": HDR10 darf
-    /// wieder versucht werden.
+    /// steht oder Windows Bildschirme oder "HDR verwenden" umgestellt hat (die
+    /// Factory der Schirmerkennung gilt nicht mehr) - beides alle
+    /// MONITOR_TAKT nachgesehen, beides billig. Ein anderer Bildschirm oder
+    /// ein umgeschaltetes "HDR verwenden" (schirm_gewechselt) kommt ins
+    /// Protokoll, und HDR10 darf wieder versucht werden; ein neuer HMONITOR
+    /// fuer denselben Bildschirm oder andere Pegel aendern daran nichts.
     fn lage_pruefen(&mut self) {
         use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
         if self.hwnd.0.is_null() {
@@ -1143,9 +1260,8 @@ impl Gpu {
         if lesen || self.monitor_zeit.map_or(true, |t| jetzt.duration_since(t) >= MONITOR_TAKT) {
             self.monitor_zeit = Some(jetzt);
             let m = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize;
-            if m != self.monitor {
+            if m != self.monitor || fabrik_veraltet() {
                 self.monitor = m;
-                self.hdr10_abgelehnt = false;
                 lesen = true;
             }
         }
@@ -1153,11 +1269,11 @@ impl Gpu {
             return;
         }
         self.schirm_zeit = Some(jetzt);
-        let neu = schirm_lage(self.hwnd.0 as isize);
-        if neu.map(|s| s.hdr) != self.schirm.map(|s| s.hdr) {
+        let neu = schirm_lesen(self.hwnd);
+        if schirm_gewechselt(self.schirm.as_ref(), neu.as_ref()) {
             protokoll::zeile(format!(
                 "Anzeige: Bildschirm {}",
-                match &neu {
+                match neu.as_ref().map(|z| &z.schirm) {
                     Some(s) if s.hdr => format!("HDR (SDR-Weiss {:.0} nit, Spitze {:.0} nit)", s.sdr_weiss_nit, s.spitze_nit),
                     Some(_) => "SDR".into(),
                     None => "unbekannt (gilt als SDR)".into(),
@@ -1229,11 +1345,11 @@ impl Gpu {
     fn ausgabe_fuehren(&mut self, bild_da: bool) -> KonstHdr {
         self.lage_pruefen();
         let pq = bild_da && self.zwischen.as_ref().is_some_and(|z| z.pq);
-        let schirm_hdr = self.schirm.is_some_and(|s| s.hdr);
+        let schirm_hdr = self.schirm.as_ref().is_some_and(|z| z.schirm.hdr);
         if let Some(soll) = ausgabe_wechsel(self.ausgabe, pq, schirm_hdr, self.hdr10_abgelehnt, self.umgeschaltet.map(|t| t.elapsed())) {
             match self.ausgabe_setzen(soll) {
                 Ok(()) => {
-                    let k = hdr_zahlen(self.quelle.as_ref(), self.schirm.as_ref(), soll, pq);
+                    let k = hdr_zahlen(self.quelle.as_ref(), self.schirm.as_ref().map(|z| &z.schirm), soll, pq);
                     protokoll::zeile(match soll {
                         Ausgabe::Hdr10 => format!(
                             "Anzeige: Swapchain HDR10 (R10G10B10A2, G2084/P2020), Weiss Quelle {:.0} nit, Schirm {:.0} nit, Kopfraum Quelle {:.2}, Schirm {:.2}, Durchreichen {}",
@@ -1258,7 +1374,7 @@ impl Gpu {
                 }
             }
         }
-        let k = hdr_zahlen(self.quelle.as_ref(), self.schirm.as_ref(), self.ausgabe, self.zwischen.as_ref().is_some_and(|z| z.pq));
+        let k = hdr_zahlen(self.quelle.as_ref(), self.schirm.as_ref().map(|z| &z.schirm), self.ausgabe, self.zwischen.as_ref().is_some_and(|z| z.pq));
         if self.ausgabe == Ausgabe::Hdr10 {
             let m = hdr10_metadaten(&k, self.quelle.as_ref());
             if self.metadaten != Some(m) {
@@ -2684,5 +2800,32 @@ mod tests {
         let k = hdr_zahlen(Some(&q), Some(&schirm(203.0, 1000.0)), Ausgabe::Hdr10, true);
         let m = hdr10_metadaten(&k, Some(&hdr::InfoV1 { master_min_zehntausendstel: 10, max_fall: 2000, ..q }));
         assert_eq!((m.MaxMasteringLuminance, m.MinMasteringLuminance, m.MaxFrameAverageLightLevel), (1000, 10, 1000));
+    }
+
+    /// Die Schirmerkennung am echten System (die Windows-VM hat einen
+    /// virtuellen Bildschirm; ohne Desktop, etwa ueber SSH, gibt DXGI keine
+    /// Ausgaenge her - dann steht nur da, was fehlt): der Monitor des
+    /// Desktop-Fensters, alle Ausgaenge, alle Pfade und die Zuordnung. Wo es
+    /// eine gibt, stammt sie von genau diesem Monitor. Die Faelle mit zwei
+    /// Karten prueft schirmerkennung.rs an Listen.
+    #[test]
+    fn schirmerkennung_am_system() {
+        use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+        let hwnd = unsafe { GetDesktopWindow() };
+        let Some(fenster) = fenster_monitor(hwnd) else {
+            println!("Schirmerkennung: kein Monitor am Desktop-Fenster");
+            return;
+        };
+        let ausgaenge = fabrik(true).map(|f| dxgi_ausgaenge(&f)).unwrap_or_default();
+        let pfade = anzeige_pfade();
+        println!("Schirmerkennung: {fenster:?}\nAusgaenge: {ausgaenge:#?}\nPfade: {pfade:#?}");
+        match schirm_lesen(hwnd) {
+            Some(z) => {
+                println!("{}", z.text());
+                assert!(z.name.eq_ignore_ascii_case(&fenster.name));
+                assert!(ausgaenge.iter().any(|a| a.monitor == fenster.monitor && a.name.eq_ignore_ascii_case(&fenster.name) && a.adapter == z.adapter));
+            }
+            None => println!("{}", text_ohne_ausgang(&fenster)),
+        }
     }
 }
