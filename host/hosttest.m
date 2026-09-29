@@ -3512,20 +3512,20 @@ static void bildschirm_pruefen(int bild_port, int ein_port) {
         k = g_letztes_vollbild ? nals_zerlegen(g_letztes_vollbild.bytes, g_letztes_vollbild.length, nals, 64) : 0;
         strom_pruefen(nals, k, sei_soll, &sb);
         int dr_ok = 1;
-        if (@available(macOS 15.0, *)) dr_ok = g_cfg.captureDynamicRange == SCCaptureDynamicRangeHDRCanonicalDisplay;
+        if (@available(macOS 15.0, *)) dr_ok = g_cfg.captureDynamicRange == SCCaptureDynamicRangeHDRLocalDisplay;
         printf("         (HDR10: %s, SWITCH Codec %d Transfer %d Umrechnung %d, Grund %d, Vollbild: SEI richtig %d)\n", g.folge,
                g.wechsel_codec, g.wechsel_transfer, g.wechsel_umrechnung, g.info[13], sb.sei_richtig);
         pruefe(g.wechsel == 1 && g.wechsel_codec == 0 && g.wechsel_transfer == QC_HDR_TRANSFER_PQ && g.wechsel_umrechnung == 1 &&
                g.infos == 1 && g.info_n == QC_HDR_INFO_LAENGE && memcmp(g.info + QC_HDR_INFO_ALT, info_pq_soll, sizeof info_pq_soll) == 0 &&
                atomic_load(&g_farbe_pq) == 1,
-               "IN_ANZEIGE (HDR-Schirm, Darstellung, Automatisch): SWITCH Transfer 16 (P3 -> BT.2020 als Umrechnung), Strominfo PQ/2020/2020 voll, Grund 0, Weiss 203, Mastering 1000/0,005");
+               "IN_ANZEIGE (HDR-Schirm, Darstellung, Automatisch): SWITCH Transfer 16 (P3 -> BT.2020 als Umrechnung), Strominfo PQ/2020/2020 voll, Grund 0, Weiss 100, Mastering 1000/0,005");
         pruefe(aufnahme_ist_pq(g_cfg) && CFEqual(g_cfg.colorSpaceName, kCGColorSpaceDisplayP3_PQ) &&
                g_cfg.colorMatrix && CFEqual(g_cfg.colorMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) && dr_ok && g_cfg.pixelFormat == xf44,
-               "Aufnahme in HDR: kanonisch, Display P3 PQ, Matrix BT.709, xf44 (Apples HDRStreamCanonicalDisplay)");
+               "Aufnahme in HDR: lokal, Display P3 PQ, Matrix BT.709, xf44");
         pruefe(g.voll == 1 && sb.vollbilder == 1 && sb.sei_richtig == 1 && sb.sei_sonst == 0,
                "das Vollbild beim Zuschauer: VPS, SPS, PPS, dann unsere SEI 137/144 (byte-genau)");
         pruefe(zeilen_mit(logpfad, "HDR-Entscheidung (IN_ANZEIGE): HDR10, Grund 0 (HDR aktiv) - Farbwechsel SDR -> HDR10") == 1 &&
-               zeilen_mit(logpfad, "Aufnahme: SDR -> HDR10 - kanonisch, Display P3 PQ, Matrix BT.709") == 1 &&
+               zeilen_mit(logpfad, "Aufnahme: SDR -> HDR10 - lokal, Display P3 PQ, Matrix BT.709") == 1 &&
                zeilen_mit(logpfad, "Aufnahme: erstes Bild xf44 1920x1080, P3_D65 / SMPTE_ST_2084_PQ / ITU_R_709_2 (Encoder HDR10)") >= 1,
                "Protokoll: Entscheidung, Umstellen der Aufnahme, Anhaenge des ersten Bildes");
 

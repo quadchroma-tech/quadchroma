@@ -589,21 +589,24 @@ static int ist_h264(int idx) { return g_kandidaten[idx].codec == kCMVideoCodecTy
 // --- HDR: Aufnahme, Metadaten, Faehigkeit -----------------------------------
 //
 // Wie ScreenCaptureKit HDR liefert, misst scripts/hdrprobe.m (HDR-Plan G0).
-// Vorgabe wie Apples Voreinstellung HDRStreamCanonicalDisplay: Dynamikumfang
-// kanonisch (unabhaengig vom Bildschirm des Hosts), xf44, Display P3 mit PQ und
-// Matrix BT.709 - VideoToolbox rechnet dann P3 nach BT.2020 um (steht in
-// SWITCH p[5] und im Protokoll). Fuer die Abnahme umstellbar ueber die
-// Umgebungsvariable QC_HDR_AUFNAHME: kanonisch-p3 (Vorgabe), lokal-p3,
-// kanonisch-2100, lokal-2100 (BT.2100 PQ mit Matrix BT.2020: ohne Umrechnung).
+// Vorgabe: Dynamikumfang lokal, xf44, Display P3 mit PQ und Matrix BT.709 -
+// VideoToolbox rechnet dann P3 nach BT.2020 um (steht in SWITCH p[5] und im
+// Protokoll). Gemessen am 29.09.2026 (macOS 27, M1, X27 X1 und virtueller
+// Bildschirm, HDR-Video laeuft): kanonisch (wie Apples Voreinstellung
+// HDRStreamCanonicalDisplay) kappt bei rund 120 nit, lokal liefert die
+// Spitzen (bis 2471 nit); SDR-Weiss liegt in beiden bei 100 nit. Fuer die
+// Abnahme umstellbar ueber die Umgebungsvariable QC_HDR_AUFNAHME: lokal-p3
+// (Vorgabe), kanonisch-p3, lokal-2100, kanonisch-2100 (BT.2100 PQ mit Matrix
+// BT.2020: ohne Umrechnung).
 typedef struct { int lokal, bt2100; } qc_hdr_aufnahme_art;
 
 static qc_hdr_aufnahme_art hdr_aufnahme_art(void) {
-    static qc_hdr_aufnahme_art art;
+    static qc_hdr_aufnahme_art art = { 1, 0 };
     static dispatch_once_t einmal;
     dispatch_once(&einmal, ^{
         const char *e = getenv("QC_HDR_AUFNAHME");
         if (e && *e) {
-            art.lokal = strstr(e, "lokal") != NULL;
+            art.lokal = strstr(e, "kanonisch") == NULL;
             art.bt2100 = strstr(e, "2100") != NULL;
         }
     });
@@ -621,10 +624,11 @@ static int hdr_p3_umrechnung(void) { return !hdr_aufnahme_art().bt2100; }
 
 // SDR-Weiss der HDR-Aufnahme in nit - wohin ScreenCaptureKit das Weiss eines
 // SDR-Fensters im PQ-Signal legt. BT.2408 und VideoToolbox (SDR -> PQ, im
-// Versuch gemessen: Code 594) nehmen 203; G0 misst es fuer ScreenCaptureKit.
-// Bis dahin 203, fuer die Abnahme ueber QC_HDR_SDR_WEISS (50..1000) umstellbar.
+// Versuch gemessen: Code 594) nehmen 203, ScreenCaptureKit aber 100 (G0 am
+// 29.09.2026: Code 520 auf beiden Bildschirmen, kanonisch wie lokal). Fuer
+// die Abnahme ueber QC_HDR_SDR_WEISS (50..1000) umstellbar.
 static uint16_t hdr_sdr_weiss_nit(void) {
-    static uint16_t weiss = 203;
+    static uint16_t weiss = 100;
     static dispatch_once_t einmal;
     dispatch_once(&einmal, ^{
         const char *e = getenv("QC_HDR_SDR_WEISS");

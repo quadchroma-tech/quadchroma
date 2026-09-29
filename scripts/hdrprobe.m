@@ -26,6 +26,9 @@
 //                                   dabei ein HDR-Video abspielen
 //   hdrprobe beobachten [sekunden]  meldet Bildschirm-Ereignisse und EDR-Werte
 //                                   (Vorgabe 60 s) - dabei HDR an- und ausschalten
+//   hdrprobe fenster [N] [sekunden] nur das weisse Fenster (startet "messen" selbst:
+//                                   ScreenCaptureKit laesst die Fenster des eigenen
+//                                   Prozesses aus der Aufnahme weg)
 //
 // Bauen und starten: scripts/hdrprobe.sh (legt build/hdrprobe an und schreibt
 // den Bericht zusaetzlich in eine Datei), oder von Hand:
@@ -41,7 +44,11 @@
 #import <CoreVideo/CoreVideo.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/sysctl.h>
+
+extern char **environ;
 
 // ------------------------------------------------------------------ Hilfen
 
@@ -217,8 +224,9 @@ static SCStreamConfiguration *konfiguration(const art *a) {
 
 // Luma-Code (auf 10 Bit) an (x, y), Formate xf44/xf20/x444/x420 (10 Bit
 // oben buendig) und 420f/420v (8 Bit). -1 = Format unbekannt.
-static int luma(CVPixelBufferRef pb, const uint8_t *basis, size_t bpr, int x, int y) {
-    OSType f = CVPixelBufferGetPixelFormatType(pb);
+// Das Format einmal je Bild holen: CVPixelBufferGetPixelFormatType je Pixel
+// ist so langsam, dass bei laufendem Video kein Bild fertig gemessen wird.
+static int luma(OSType f, const uint8_t *basis, size_t bpr, int x, int y) {
     if (f == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || f == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         return basis[(size_t)y * bpr + x] << 2;
     if (f == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange || f == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
@@ -237,11 +245,12 @@ static messung bild_messen(CVPixelBufferRef pb) {
     const uint8_t *b = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
     size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
     int w = (int)CVPixelBufferGetWidthOfPlane(pb, 0), h = (int)CVPixelBufferGetHeightOfPlane(pb, 0);
-    if (luma(pb, b, bpr, 0, 0) >= 0) {
+    OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+    if (luma(fmt, b, bpr, 0, 0) >= 0) {
         uint32_t hist[1024];
         memset(hist, 0, sizeof hist);
         for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++) hist[luma(pb, b, bpr, x, y)]++;
+            for (int x = 0; x < w; x++) hist[luma(fmt, b, bpr, x, y)]++;
         uint64_t n = (uint64_t)w * h, summe = 0;
         for (int v = 1023; v >= 0; v--) if (hist[v]) { m.max_y = v; break; }
         for (int v = 1023; v >= 0; v--) { summe += hist[v]; if (summe * 1000 >= n) { m.p999_y = v; break; } }
@@ -254,7 +263,7 @@ static messung bild_messen(CVPixelBufferRef pb) {
             memset(hist, 0, sizeof hist);
             uint64_t k = 0;
             for (int y = y0; y < y1; y++)
-                for (int x = x0; x < x1; x++) { hist[luma(pb, b, bpr, x, y)]++; k++; }
+                for (int x = x0; x < x1; x++) { hist[luma(fmt, b, bpr, x, y)]++; k++; }
             summe = 0;
             for (int v = 0; v < 1024; v++) { summe += hist[v]; if (summe * 2 >= k) { m.fenster_y = v; break; } }
         }
@@ -432,6 +441,25 @@ static void fenster_oeffnen(void) {
     g_fenster_px = CGRectMake((f.origin.x - sf.origin.x) * sx, (NSMaxY(sf) - NSMaxY(f)) * sy, f.size.width * sx, f.size.height * sy);
 }
 
+// ScreenCaptureKit laesst die Fenster des aufnehmenden Prozesses weg (gemessen
+// 29.09.2026: das eigene weisse Fenster fehlte, gemessen wurde das
+// Hintergrundbild). Deshalb zeigt ein zweiter Prozess dasselbe Fenster.
+static pid_t g_helfer = 0;
+static void helfer_beenden(void) { if (g_helfer > 0) kill(g_helfer, SIGTERM); }
+static void helfer_starten(const char *ich, int platz) {
+    char p[16], d[16];
+    snprintf(p, sizeof p, "%d", platz);
+    snprintf(d, sizeof d, "%d", 600);
+    char *args[] = { (char *)ich, "fenster", p, d, NULL };
+    if (posix_spawn(&g_helfer, ich, NULL, NULL, args, environ) != 0) {
+        g_helfer = 0;
+        zeile(@"   Hilfsfenster startet nicht - der Wert fuer das weisse Fenster stimmt dann nicht");
+        return;
+    }
+    atexit(helfer_beenden);
+    [NSThread sleepForTimeInterval:1.0];
+}
+
 static void messen(void) {
     zeile(@"\n== Messung auf [%ld] \"%s\" (id %u, %zux%zu Pixel, EDR potentiell %.3f, aktuell %.3f)", (long)(g_ziel - g_schirme),
           g_ziel->name, g_ziel->id_, g_ziel->px_w, g_ziel->px_h, g_ziel->edr_pot, g_ziel->edr_akt);
@@ -596,8 +624,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     int platz = argc > 2 ? atoi(argv[2]) : -1;
     double dauer = argc > 3 ? atof(argv[3]) : 20;
     if ([modus isEqualToString:@"beobachten"]) dauer = argc > 2 ? atof(argv[2]) : 60;
-    if (![@[ @"liste", @"messen", @"spitze", @"beobachten" ] containsObject:modus]) {
-        printf("Aufruf: hdrprobe [liste | messen [N] | spitze [N] [sekunden] | beobachten [sekunden]]\n");
+    if (![@[ @"liste", @"messen", @"spitze", @"beobachten", @"fenster" ] containsObject:modus]) {
+        printf("Aufruf: hdrprobe [liste | messen [N] | spitze [N] [sekunden] | beobachten [sekunden] | fenster [N] [sekunden]]\n");
         return 2;
     }
     [NSApplication sharedApplication];
@@ -609,6 +637,20 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     zeile(@"hdrprobe - macOS %ld.%ld.%ld, %@, %@", (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion,
           arm ? @"Apple Silicon" : @"Intel", [NSDate date]);
     schirme_lesen();
+    if ([modus isEqualToString:@"fenster"]) {
+        g_ziel = &g_schirme[platz_waehlen(platz)];
+        fenster_oeffnen();
+        // Laufend leicht umfaerben, damit die Aufnahme Bilder liefert.
+        __block int an = 0;
+        [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) {
+            (void)t;
+            g_fenster.backgroundColor = (an ^= 1) ? [NSColor colorWithWhite:0.999 alpha:1] : NSColor.whiteColor;
+        }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((dauer > 0 ? dauer : 60) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ exit(0); });
+        [NSApp run];
+        return 0;
+    }
     zeile(@"Bildschirme (NSScreen):");
     schirme_zeigen();
     if ([modus isEqualToString:@"liste"]) return 0;
@@ -630,6 +672,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     g_ziel = &g_schirme[platz_waehlen(platz)];
     fenster_oeffnen();
     BOOL ist_spitze = [modus isEqualToString:@"spitze"];
+    if (!ist_spitze) helfer_starten(argv[0], (int)(g_ziel - g_schirme));
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if (!sc_suchen()) { zeile(@"Kein SCDisplay zum Bildschirm %u - Ende", g_ziel->id_); exit(4); }
         [NSThread sleepForTimeInterval:0.5];     // das Fenster steht
