@@ -1,26 +1,33 @@
 // Die Encodermessung (`quadchroma.exe --encodermessung [--groessen 1920x1080,3840x2160]
-// [--bilder 300] [--kandidaten 0,1,2,3,4] [--last N]`): alter gegen neuen
-// Weg in den Encoder, je Kandidat und Groesse, ohne Bildschirm; mit --last
-// rechnen N Faeden daneben ohne Pause (der Prozessor wie neben einem Spiel).
+// [--bilder 300] [--kandidaten 0,1,2,3,4] [--last N]`): die Wege in den
+// Encoder gegeneinander, je Kandidat und Groesse, ohne Bildschirm; mit
+// --last rechnen N Faeden daneben ohne Pause (der Prozessor wie neben einem
+// Spiel).
 //
 // Laeuft ohne Duplication - also auch bei gesperrtem Bildschirm und ueber
 // SSH (Sitzung 0): das Geraet entsteht auf der NVIDIA-Karte wie das der
 // Duplication, die zwoelf Bilder des Testbilds (BGRA) liegen als Texturen
 // darauf und spielen den Desktop. Je Bild genau das, was der Aufnahmefaden
 // tut, mit dem echten Betrieb (encoder.rs):
-//   alt (Prozessorweg, bgra): CopyResource in STAGING, Map, Zeilen in den
-//        Hauptspeicher, codieren(Quelle::Ram) - 8 Bit BGRA in nvenc, 10 Bit
-//        mit der Umrechnung auf dem Prozessor (aus_bgra)
-//   neu (Karte, d3d11): CopyResource in die Kopie, codieren(Quelle::Textur) -
-//        8 Bit ohne Kopie in den Pool, 10 Bit ueber den Wandler (Modus Zehn)
-//        und die CUDA-Bruecke
+//   bgra (nur 8 Bit; --encoderweg bgra, Ausgang nicht an der NVIDIA):
+//        CopyResource in STAGING, Map, Zeilen in den Hauptspeicher,
+//        codieren(Quelle::Ram) - BGRA in nvenc, der rechnet nach BT.601
+//        begrenzt um
+//   Prozessor (yuv444, der Rueckfall des Wegs auf der Karte): ebenso, dann
+//        die Umrechnung auf dem Prozessor (aus_bgra, BT.709 voll)
+//   Karte (d3d11, die Vorgabe an der NVIDIA): CopyResource in die Kopie,
+//        codieren(Quelle::Textur) - der Wandler (Modus Zehn bzw. Acht) und
+//        die CUDA-Bruecke
 // Gemessen je Bild die Zeit von der Kopie bis zum fertigen Paket (nvenc
 // synchron, delay 0), dazu die Prozessorzeit des Prozesses ueber den Lauf
-// (GetProcessTimes) je Bild. Danach der Vergleich: beide Wege bekommen
-// dieselben Bilder - die Pakete (SHA-256) und, wenn sie sich unterscheiden,
-// die ersten zwoelf Bilder durch den Software-Decoder muessen gleich sein.
-// Bei der ersten Groesse dazu die Nebenwege jeder Sitzung (Testbild, BGRA
-// aus dem Hauptspeicher, Wiederholung), ebenfalls alt gegen neu.
+// (GetProcessTimes) je Bild. Danach der Vergleich Prozessor gegen Karte:
+// beide bekommen dieselben Bilder und rechnen dieselben Ebenen - die Pakete
+// (SHA-256) und, wenn sie sich unterscheiden, die ersten zwoelf Bilder durch
+// den Software-Decoder muessen gleich sein. Bei der ersten Groesse dazu die
+// Nebenwege jeder Sitzung (Testbild, BGRA aus dem Hauptspeicher,
+// Wiederholung), ebenfalls Prozessor gegen Karte, und die Farbe jedes Wegs:
+// die Farbbalken nach dem Decoder gegen BT.709 voll, und so, wie ein Client
+// sie zeigt (to_rgb mit dem VUI des Stroms), gegen das RGB des Testbilds.
 //
 // Alle Zeilen gehen auf die Konsole und nach
 // %APPDATA%\QuadChroma\encodermessung.txt (nie nach messung.txt - die liest
@@ -308,15 +315,18 @@ fn faden_zeit(f: &std::thread::JoinHandle<u64>) -> u64 {
 }
 
 /// Die Farbbalken des ersten Bildes (Testbild, BGRA) nach nvenc und dem
-/// Software-Decoder gegen die Balkenwerte des Testbilds (BT.709 voll, wie
-/// der Client liest) - wie die Farbprobe von --messen: groesste Abweichung
-/// in 8-Bit-Stufen (10 Bit durch 4).
-fn farbe(pakete: &[Paket], h264: bool, w: u32, h: u32) -> String {
+/// Software-Decoder: die Werte gegen die Balkenwerte des Testbilds (BT.709
+/// voll - so kommt ein Strom dieses Hosts an), in 8-Bit-Stufen (10 Bit
+/// durch 4); dazu das Bild so, wie ein Client es zeigt (to_rgb: Matrix und
+/// Bereich aus dem VUI), gegen das RGB des Testbilds - das muss auch der
+/// BT.601-Strom des bgra-Wegs treffen. Liefert (Text, Abweichung Y/Cb/Cr,
+/// Abweichung RGB).
+fn farbe(pakete: &[Paket], h264: bool, w: u32, h: u32) -> (String, i32, i32) {
     let bilder = match decodieren(pakete, h264, 1) {
         Ok(b) => b,
-        Err(e) => return format!("Farbe nicht pruefbar: {e}"),
+        Err(e) => return (format!("Farbe nicht pruefbar: {e}"), i32::MAX, i32::MAX),
     };
-    let Some(b) = bilder.first() else { return "Farbe nicht pruefbar: kein Bild".into() };
+    let Some(b) = bilder.first() else { return ("Farbe nicht pruefbar: kein Bild".into(), i32::MAX, i32::MAX) };
     use ffmpeg::format::Pixel::*;
     let zehn = matches!(b.format(), YUV444P10LE | YUV420P10LE);
     let halb = matches!(b.format(), YUV420P | YUV420P10LE | YUVJ420P);
@@ -330,24 +340,49 @@ fn farbe(pakete: &[Paket], h264: bool, w: u32, h: u32) -> String {
             d.get(y * b.stride(ebene) + x).map(|v| *v as i32)
         }
     };
+    let rgb = crate::to_rgb(b);
+    let quelle = testbild::bgra(w as i32, h as i32, 0);
     let mut max = 0;
+    let mut max_rgb = 0;
     let mut werte = Vec::new();
+    let mut werte_rgb = Vec::new();
     for balken in 0..8usize {
         let (x, y) = (balken * w as usize / 8 + w as usize / 16, h as usize / 6);
-        let (Some(yy), Some(cb), Some(cr)) = (wert(0, x, y), wert(1, x, y), wert(2, x, y)) else { return format!("Farbe nicht pruefbar ({:?})", b.format()) };
+        let (Some(yy), Some(cb), Some(cr)) = (wert(0, x, y), wert(1, x, y), wert(2, x, y)) else {
+            return (format!("Farbe nicht pruefbar ({:?})", b.format()), i32::MAX, i32::MAX);
+        };
         max = max
             .max((yy - testbild::BALKEN_Y[balken] as i32).abs())
             .max((cb - testbild::BALKEN_CB[balken] as i32).abs())
             .max((cr - testbild::BALKEN_CR[balken] as i32).abs());
         werte.push(format!("{yy}/{cb}/{cr} (soll {}/{}/{})", testbild::BALKEN_Y[balken], testbild::BALKEN_CB[balken], testbild::BALKEN_CR[balken]));
+        let i = (y * w as usize + x) * 4;
+        let soll = [quelle[i + 2] as i32, quelle[i + 1] as i32, quelle[i] as i32];
+        match rgb.as_ref() {
+            Ok(f) => {
+                let p = f.pixels[y * f.width as usize + x];
+                let ist = [((p >> 16) & 255) as i32, ((p >> 8) & 255) as i32, (p & 255) as i32];
+                max_rgb = (0..3).map(|k| (ist[k] - soll[k]).abs()).fold(max_rgb, i32::max);
+                werte_rgb.push(format!("{}/{}/{} (soll {}/{}/{})", ist[0], ist[1], ist[2], soll[0], soll[1], soll[2]));
+            }
+            Err(_) => max_rgb = i32::MAX,
+        }
     }
-    format!(
-        "Farbbalken nach dem Decoder ({:?}, VUI Matrix {:?}, {:?}): hoechstens {max} Stufen neben BT.709 voll{}",
+    let rgb_text = match rgb {
+        Ok(_) => format!(
+            "; wie der Client es zeigt (Matrix und Bereich aus dem VUI): hoechstens {max_rgb} Stufen neben dem RGB des Testbilds{}",
+            if max_rgb <= 3 { String::new() } else { format!(" - DANEBEN: R/G/B {}", werte_rgb.join(", ")) }
+        ),
+        Err(e) => format!("; to_rgb: {e}"),
+    };
+    let text = format!(
+        "Farbbalken nach dem Decoder ({:?}, VUI Matrix {:?}, {:?}): hoechstens {max} Stufen neben BT.709 voll{}{rgb_text}",
         b.format(),
         b.color_space(),
         b.color_range(),
         if max <= 3 { String::new() } else { format!(" - DANEBEN: Y/Cb/Cr {}", werte.join(", ")) }
-    )
+    );
+    (text, max, max_rgb)
 }
 
 fn groessen(args: &[String]) -> Vec<(u32, u32)> {
@@ -388,7 +423,7 @@ pub fn laufen(args: &[String]) -> i32 {
     // Die Prozessorzeit der Lastfaeden zaehlt nicht zum Lauf.
     let lastzeit = || -> u64 { lastfaeden.iter().map(faden_zeit).sum() };
     log(format!(
-        "=== QuadChroma Encodermessung: alter Weg (Prozessor) gegen neuen (Karte), {n} Bilder je Lauf, {kerne} logische Kerne{} ===",
+        "=== QuadChroma Encodermessung: die Wege in den Encoder (bgra, Prozessor, Karte), {n} Bilder je Lauf, {kerne} logische Kerne{} ===",
         if last > 0 { format!(", {last} Lastfaeden daneben") } else { String::new() }
     ));
     super::encoder::pruefen();
@@ -428,16 +463,25 @@ pub fn laufen(args: &[String]) -> i32 {
         };
         for &idx in &kandidaten {
             let k = encoder::kandidat(idx);
-            if !encoder::befund(idx).vorhanden {
+            let befund = encoder::befund(idx);
+            if !befund.vorhanden {
                 log(format!("  Kandidat {idx} {}: auf diesem Rechner nicht vorhanden", k.name));
                 continue;
             }
-            let mut ergebnis: Vec<Option<Lauf>> = Vec::new();
-            for (weg, was) in [(Weg::Bgra, "alt"), (Weg::D3d11, "neu")] {
+            // Die Wege dieses Kandidaten, jeder nur einmal: bgra nur, wo nvenc
+            // dort selbst umrechnet (8 Bit) - bei 10 Bit ist bgra schon die
+            // Umrechnung auf dem Prozessor.
+            let eingabe = |weg: Weg| encoder::eingabe_waehlen(idx, weg, befund.encoder, false, false);
+            let mut wege: Vec<(Weg, &str)> = vec![(Weg::Yuv444, "Prozessor"), (Weg::D3d11, "Karte")];
+            if eingabe(Weg::Bgra) != eingabe(Weg::Yuv444) {
+                wege.insert(0, (Weg::Bgra, "bgra"));
+            }
+            let mut ergebnis: Vec<(&str, Option<Lauf>)> = Vec::new();
+            for &(weg, was) in &wege {
                 match lauf(idx, weg, w, h, n, &dev, &ctx, &quellen, &lastzeit) {
                     Ok(l) => {
                         log(format!(
-                            "  Kandidat {idx} {:<18} {was} ({}, geoeffnet in {:.0} ms): Median {:>6.2} ms, 95 % {:>6.2} ms, Mittel {:>6.2} ms je Bild, Prozessorzeit {:>6.2} ms je Bild ({:.0} % eines Kerns bei 60 Bildern/s, {:.1} % aller Kerne)",
+                            "  Kandidat {idx} {:<18} {was:<9} ({}, geoeffnet in {:.0} ms): Median {:>6.2} ms, 95 % {:>6.2} ms, Mittel {:>6.2} ms je Bild, Prozessorzeit {:>6.2} ms je Bild ({:.0} % eines Kerns bei 60 Bildern/s, {:.1} % aller Kerne)",
                             k.name,
                             l.eingabe,
                             l.oeffnen_ms,
@@ -448,45 +492,48 @@ pub fn laufen(args: &[String]) -> i32 {
                             l.cpu_ms * 60.0 / 10.0,
                             l.cpu_ms * 60.0 / 10.0 / kerne as f64
                         ));
-                        ergebnis.push(Some(l));
+                        ergebnis.push((was, Some(l)));
                     }
                     Err(e) => {
-                        log(format!("  Kandidat {idx} {:<18} {was}: nicht messbar: {e}", k.name));
-                        ergebnis.push(None);
+                        log(format!("  Kandidat {idx} {:<18} {was:<9}: nicht messbar: {e}", k.name));
+                        ergebnis.push((was, None));
                     }
                 }
             }
             if erste_groesse {
-                match (nebenwege(idx, Weg::Bgra, w, h, &dev, &ctx), nebenwege(idx, Weg::D3d11, w, h, &dev, &ctx)) {
+                match (nebenwege(idx, Weg::Yuv444, w, h, &dev, &ctx), nebenwege(idx, Weg::D3d11, w, h, &dev, &ctx)) {
                     (Ok((_, a)), Ok((e, b))) => log(format!(
                         "  Kandidat {idx} {:<18} Nebenwege ({e}: Testbild, BGRA aus dem Hauptspeicher, Wiederholung): {}",
                         k.name,
-                        if !a.is_empty() && fingerabdruck(&a) == fingerabdruck(&b) { format!("Bitstrom gleich ({} Pakete)", a.len()) } else { format!("Bitstrom ANDERS ({} gegen {} Pakete)", a.len(), b.len()) }
+                        if !a.is_empty() && fingerabdruck(&a) == fingerabdruck(&b) { format!("Bitstrom gleich wie auf dem Prozessor ({} Pakete)", a.len()) } else { format!("Bitstrom ANDERS ({} gegen {} Pakete)", a.len(), b.len()) }
                     )),
                     (Err(e), _) | (_, Err(e)) => log(format!("  Kandidat {idx} {:<18} Nebenwege: {e}", k.name)),
                 }
-            }
-            if let [Some(alt), Some(neu)] = &ergebnis[..] {
-                let g = gleichheit(alt, neu, k.h264);
-                log(format!("  Kandidat {idx} {:<18} {g}", k.name));
-                if erste_groesse {
-                    log(format!("  Kandidat {idx} {:<18} neu: {}", k.name, farbe(&neu.pakete, k.h264, w, h)));
+                for (was, l) in &ergebnis {
+                    if let Some(l) = l {
+                        let (text, _, _) = farbe(&l.pakete, k.h264, w, h);
+                        log(format!("  Kandidat {idx} {:<18} {was:<9} {text}", k.name));
+                    }
                 }
-                tafel.push(format!(
-                    "{w}x{h} | {:<18} | alt {:>6.2} / {:>6.2} ms, Prozessor {:>6.2} ms | neu {:>6.2} / {:>6.2} ms, Prozessor {:>6.2} ms | {}",
-                    k.name,
-                    alt.zeiten.median(),
-                    alt.zeiten.p95(),
-                    alt.cpu_ms,
-                    neu.zeiten.median(),
-                    neu.zeiten.p95(),
-                    neu.cpu_ms,
-                    if g.starts_with("Bitstrom gleich") { "gleich".to_string() } else { g }
-                ));
+            }
+            let finden = |name: &str| ergebnis.iter().find(|(was, _)| *was == name).and_then(|(_, l)| l.as_ref());
+            let zelle = |name: &str| match finden(name) {
+                Some(l) => format!("{name} {:>6.2} / {:>6.2} ms, Prozessor {:>6.2} ms", l.zeiten.median(), l.zeiten.p95(), l.cpu_ms),
+                None => format!("{name} -"),
+            };
+            if let (Some(prozessor), Some(karte)) = (finden("Prozessor"), finden("Karte")) {
+                let g = gleichheit(prozessor, karte, k.h264);
+                log(format!("  Kandidat {idx} {:<18} Prozessor gegen Karte: {g}", k.name));
+                let mut zeile = format!("{w}x{h} | {:<18} | ", k.name);
+                if finden("bgra").is_some() {
+                    zeile += &format!("{} | ", zelle("bgra"));
+                }
+                zeile += &format!("{} | {} | {}", zelle("Prozessor"), zelle("Karte"), if g.starts_with("Bitstrom gleich") { "gleich".to_string() } else { g });
+                tafel.push(zeile);
             }
         }
     }
-    log("\n=== Uebersicht (Median / 95 % je Bild von der Kopie bis zum Paket; Prozessorzeit des Prozesses je Bild) ===");
+    log("\n=== Uebersicht (Median / 95 % je Bild von der Kopie bis zum Paket; Prozessorzeit des Prozesses je Bild; Prozessor gegen Karte) ===");
     for z in &tafel {
         log(z);
     }

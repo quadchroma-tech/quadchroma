@@ -1,11 +1,13 @@
 // CUDA-Bruecke des Windows-Hosts: die Ebenen, die der Wandler auf der Karte
-// rechnet (D3D11-Texturen R16_UINT bzw. R16G16_UINT), ohne Umweg ueber den
-// Hauptspeicher in einen CUDA-Rahmen fuer nvenc.
+// rechnet (D3D11-Texturen R16_UINT bzw. R16G16_UINT, im Modus Acht R8_UINT
+// bzw. R8G8_UINT), ohne Umweg ueber den Hauptspeicher in einen CUDA-Rahmen
+// fuer nvenc.
 //
 // Warum CUDA: nvenc nimmt ueber FFmpeg D3D11-Texturen nur in den Formaten,
 // die hwcontext_d3d11va kennt (NV12, P010, BGRA, X2BGR10, ...) - fuer 4:4:4
-// mit 10 Bit gibt es kein DXGI-Format. CUDA-Rahmen gibt es in YUV444P16 und
-// P010 (hwcontext_cuda); nvenc liest sie direkt aus dem Kartenspeicher. Die
+// gibt es kein planares DXGI-Format. CUDA-Rahmen gibt es in YUV444P16,
+// P010, YUV444P und NV12 (hwcontext_cuda); nvenc liest sie direkt aus dem
+// Kartenspeicher - fuer alle SDR-Kandidaten derselbe Weg. Die
 // Bruecke meldet die Zieltexturen des Wandlers einmal bei CUDA an
 // (cuGraphicsD3D11RegisterResource) und kopiert je Bild jede Ebene mit
 // cuMemcpy2DAsync in die Ebene des Rahmens - Karte zu Karte, ein paar
@@ -177,8 +179,8 @@ pub fn geraet(device: &ID3D11Device) -> Result<*mut AVBufferRef, String> {
     Ok(r)
 }
 
-/// Rahmenpool (CUDA) in diesem Format (YUV444P16LE oder P010LE) und dieser
-/// Groesse - Kartenspeicher, den nvenc direkt liest.
+/// Rahmenpool (CUDA) in diesem Format (YUV444P16LE, P010LE, YUV444P oder
+/// NV12) und dieser Groesse - Kartenspeicher, den nvenc direkt liest.
 pub fn pool(geraet: *mut AVBufferRef, sw_format: AVPixelFormat, w: i32, h: i32) -> Result<*mut AVBufferRef, String> {
     unsafe {
         let r = av_hwframe_ctx_alloc(geraet);

@@ -4338,18 +4338,19 @@ fn clamp8(v: i32) -> u32 {
 /// BEGRENZT = begrenzter Wertebereich (Y 16..235, Cb/Cr 16..240): die acht
 /// Anzeigebits werden vor der Matrix auf den vollen Bereich gedehnt, in
 /// 16.16 mit Rundung (Y: (y - 16) * 255/219, Cb/Cr: c * 255/224 um den
-/// Nullpunkt). Das kommt nur aus VideoToolbox (x444, 444v, x420, 420v -
-/// wenn die Formatbeschreibung keinen vollen Bereich meldet); die Formate
-/// von FFmpeg sind alle voll. Die Metal-Anzeige (anzeige_mac.rs) rechnet
-/// dieselben Schritte mit denselben Konstanten.
+/// Nullpunkt). Das sagt das Format (VideoToolbox: x444, 444v, x420, 420v -
+/// wenn die Formatbeschreibung keinen vollen Bereich meldet) oder das VUI
+/// des Bildes (FFmpeg: color_range MPEG, etwa der bgra-Weg des
+/// Windows-Hosts). `k` ist die Matrix aus dem VUI in 16.16 (Cr -> R, Cb ->
+/// G, Cr -> G, Cb -> B; hdr::Farbe::sdr_koeffizienten: BT.709 oder BT.601).
+/// Beide Anzeigen (anzeige.rs, anzeige_mac.rs) rechnen dieselben Schritte
+/// mit denselben Konstanten.
 #[inline(always)]
-fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool, const BEGRENZT: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8]) {
-    const CR_R: i32 = 103206; // 1.5748
-    const CB_G: i32 = 12276;  // 0.1873
-    const CR_G: i32 = 30681;  // 0.4681
-    const CB_B: i32 = 121609; // 1.8556
+fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool, const BEGRENZT: bool>(out: &mut [u32], yr: &[u8], ur: &[u8], vr: &[u8], k: &[i32; 4]) {
     const Y_DEHNEN: i32 = 76309; // 255/219
     const C_DEHNEN: i32 = 74606; // 255/224
+    // BT.709: 1.5748, 0.1873, 0.4681, 1.8556; BT.601: 1.402, 0.3441, 0.7141, 1.772.
+    let [cr_r, cb_g, cr_g, cb_b] = *k;
 
     #[inline(always)]
     fn wert<const BITS: u8>(p: &[u8], i: usize) -> i32 {
@@ -4373,9 +4374,9 @@ fn zeile_rgb<const SUB: bool, const BITS: u8, const PAAR: bool, const BEGRENZT: 
             cb = (cb * C_DEHNEN + 32768) >> 16;
             cr = (cr * C_DEHNEN + 32768) >> 16;
         }
-        let r = y + ((CR_R * cr) >> 16);
-        let g = y - ((CB_G * cb + CR_G * cr) >> 16);
-        let b = y + ((CB_B * cb) >> 16);
+        let r = y + ((cr_r * cr) >> 16);
+        let g = y - ((cb_g * cb + cr_g * cr) >> 16);
+        let b = y + ((cb_b * cb) >> 16);
         *o = (clamp8(r) << 16) | (clamp8(g) << 8) | clamp8(b);
     }
 }
@@ -4395,8 +4396,9 @@ pub struct EbenenFormat {
     /// U und V als Paare in EINER Ebene (NV12, P010, P012, P016; auf dem
     /// Mac alle Formate von VideoToolbox, auch 4:4:4).
     pub paar: bool,
-    /// Begrenzter Wertebereich (Y 16..235): nur die Formate von VideoToolbox
-    /// ohne "f" (x444, 444v, x420, 420v); FFmpegs Formate sind alle voll.
+    /// Begrenzter Wertebereich (Y 16..235) laut Format: nur die Formate von
+    /// VideoToolbox ohne "f" (x444, 444v, x420, 420v). FFmpegs Formate sagen
+    /// es nicht - dort steht der Bereich im VUI (Ebenenbild::farbe).
     pub begrenzt: bool,
 }
 
@@ -4433,8 +4435,7 @@ pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
     let (sub, bits, paar) = match p {
         // Die J-Formate sind FFmpegs alte Schreibweise fuer "voller
         // Wertebereich" - der H.264-Decoder liefert 8 Bit so, 4:2:0 wie 4:4:4. Die
-        // Ebenen sind dieselben, und Vollbereich ist ohnehin, was wir
-        // annehmen.
+        // Ebenen sind dieselben; den Bereich sagt das VUI (color_range JPEG).
         Pixel::YUV444P | Pixel::YUVJ444P => (false, 8u8, false),
         Pixel::YUV444P10LE => (false, 10, false),
         // Die MSB-Formate legen den Wert oben buendig in 16 Bit ab - genau
@@ -4460,9 +4461,11 @@ pub fn ebenen_format(p: ffmpeg::format::Pixel) -> Option<EbenenFormat> {
 /// Hardware-Decoder liefert andere Formate als der Software-Decoder.
 ///
 /// Welche Formate gelesen werden, sagt `Ebenenbild::ebenen`; alles andere
-/// ist ein Fehler mit Meldung, kein Absturz. Die Stroeme der Hosts sind
-/// Vollbereich (der Host garantiert das); gedehnt wird nur, wenn
-/// VideoToolbox ein Format im begrenzten Bereich liefert (`begrenzt`).
+/// ist ein Fehler mit Meldung, kein Absturz. Matrix und Bereich eines
+/// SDR-Bildes kommen aus seinem VUI (`Ebenenbild::farbe`): die Stroeme
+/// dieser Hosts sind BT.709 voll, der bgra-Weg des Windows-Hosts (und jeder
+/// Windows-Host bis 0.2.0 mit 8 Bit) BT.601 begrenzt - gedehnt wird, wenn
+/// das VUI oder das Format von VideoToolbox den begrenzten Bereich sagt.
 ///
 /// Ein PQ-Bild ohne Strominfo: SDR-Weiss und Spitze nach Vorgabe (203 / 1000
 /// nit), siehe `to_rgb_mit`.
@@ -4474,9 +4477,10 @@ fn to_rgb(src: &impl Ebenenbild) -> Result<Frame, String> {
 /// 0.2.0). Ein PQ-Bild (Transfer aus dem VUI, `Ebenenbild::farbe`) geht ueber
 /// `hdr::zeile_rgb_pq`: relativ zum SDR-Weiss des Hosts, farbtontreu beim
 /// SDR-Weiss abgeschnitten (E4), BT.2020 -> BT.709, sRGB - der CPU-Weg auf
-/// einem SDR-Schirm, wie die Karte es auf einem SDR-Schirm rechnet. Bei PQ
-/// zaehlt der begrenzte Bereich auch aus dem VUI. Ein SDR-Bild rechnet wie
-/// seit jeher, bitgleich.
+/// einem SDR-Schirm, wie die Karte es auf einem SDR-Schirm rechnet. Der
+/// begrenzte Bereich zaehlt aus dem Format und aus dem VUI, bei SDR auch die
+/// Matrix (BT.709 oder BT.601); ein SDR-Bild in BT.709 voll rechnet wie seit
+/// jeher, bitgleich.
 fn to_rgb_mit(src: &impl Ebenenbild, quelle: Option<&hdr::InfoV1>) -> Result<Frame, String> {
     let Some(fmt) = src.ebenen() else {
         return Err(format!("Unbekanntes Bildformat vom Decoder: {}", src.format_name()));
@@ -4513,7 +4517,9 @@ fn to_rgb_mit(src: &impl Ebenenbild, quelle: Option<&hdr::InfoV1>) -> Result<Fra
 
     let farbe = src.farbe();
     let pq = farbe.ist_pq().then(|| hdr::Abbildung::sdr(quelle));
-    let pq_begrenzt = begrenzt || !farbe.voll;
+    // Begrenzt laut Format (VideoToolbox) oder laut VUI - fuer PQ wie SDR.
+    let begrenzt = begrenzt || !farbe.voll;
+    let k = farbe.sdr_koeffizienten();
 
     let mut pixels = vec![0u32; w * h];
     pixels.par_chunks_mut(w).enumerate().for_each(|(row, out)| {
@@ -4525,32 +4531,36 @@ fn to_rgb_mit(src: &impl Ebenenbild, quelle: Option<&hdr::InfoV1>) -> Result<Fra
         let vr = if paar { &up[crow * us + bpp..crow * us + cbreite] } else { &vp[crow * vs..crow * vs + cbreite] };
         if let Some(ab) = &pq {
             match (sub, paar) {
-                (false, false) => zeile_pq::<false, false>(bits, pq_begrenzt, out, yr, ur, vr, ab),
-                (false, true) => zeile_pq::<false, true>(bits, pq_begrenzt, out, yr, ur, vr, ab),
-                (true, false) => zeile_pq::<true, false>(bits, pq_begrenzt, out, yr, ur, vr, ab),
-                (true, true) => zeile_pq::<true, true>(bits, pq_begrenzt, out, yr, ur, vr, ab),
+                (false, false) => zeile_pq::<false, false>(bits, begrenzt, out, yr, ur, vr, ab),
+                (false, true) => zeile_pq::<false, true>(bits, begrenzt, out, yr, ur, vr, ab),
+                (true, false) => zeile_pq::<true, false>(bits, begrenzt, out, yr, ur, vr, ab),
+                (true, true) => zeile_pq::<true, true>(bits, begrenzt, out, yr, ur, vr, ab),
             }
             return;
         }
-        match (sub, bits, paar, begrenzt) {
-            (false, 8, false, false) => zeile_rgb::<false, 8, false, false>(out, yr, ur, vr),
-            (false, 10, false, false) => zeile_rgb::<false, 10, false, false>(out, yr, ur, vr),
-            (false, _, false, false) => zeile_rgb::<false, 16, false, false>(out, yr, ur, vr),
-            (true, 8, false, false) => zeile_rgb::<true, 8, false, false>(out, yr, ur, vr),
-            (true, 10, false, false) => zeile_rgb::<true, 10, false, false>(out, yr, ur, vr),
-            (true, 8, true, false) => zeile_rgb::<true, 8, true, false>(out, yr, ur, vr),
-            (true, _, true, false) => zeile_rgb::<true, 16, true, false>(out, yr, ur, vr),
-            // 4:4:4 mit Paaren: nur VideoToolbox (444f, xf44).
-            (false, 8, true, false) => zeile_rgb::<false, 8, true, false>(out, yr, ur, vr),
-            (false, _, true, false) => zeile_rgb::<false, 16, true, false>(out, yr, ur, vr),
-            // Begrenzter Bereich: nur VideoToolbox, immer mit Paaren
-            // (444v, x444, 420v, x420).
-            (false, 8, true, true) => zeile_rgb::<false, 8, true, true>(out, yr, ur, vr),
-            (false, _, true, true) => zeile_rgb::<false, 16, true, true>(out, yr, ur, vr),
-            (true, 8, true, true) => zeile_rgb::<true, 8, true, true>(out, yr, ur, vr),
-            (true, _, true, true) => zeile_rgb::<true, 16, true, true>(out, yr, ur, vr),
-            // 4:2:0 planar 16 Bit und planar im begrenzten Bereich erzeugt
-            // keine der Tabellen; der Arm steht nur fuer die Vollstaendigkeit.
+        // Je Format eine Schleife, voll und begrenzt.
+        macro_rules! zeile {
+            ($sub:literal, $bits:literal, $paar:literal) => {
+                if begrenzt {
+                    zeile_rgb::<$sub, $bits, $paar, true>(out, yr, ur, vr, &k)
+                } else {
+                    zeile_rgb::<$sub, $bits, $paar, false>(out, yr, ur, vr, &k)
+                }
+            };
+        }
+        match (sub, bits, paar) {
+            (false, 8, false) => zeile!(false, 8, false),
+            (false, 10, false) => zeile!(false, 10, false),
+            (false, _, false) => zeile!(false, 16, false),
+            (true, 8, false) => zeile!(true, 8, false),
+            (true, 10, false) => zeile!(true, 10, false),
+            (true, 8, true) => zeile!(true, 8, true),
+            (true, _, true) => zeile!(true, 16, true),
+            // 4:4:4 mit Paaren: nur VideoToolbox (444f, xf44, 444v, x444).
+            (false, 8, true) => zeile!(false, 8, true),
+            (false, _, true) => zeile!(false, 16, true),
+            // 4:2:0 planar 16 Bit erzeugt keine der Tabellen; der Arm steht
+            // nur fuer die Vollstaendigkeit.
             _ => {}
         }
     });
@@ -4592,9 +4602,10 @@ trait Ebenenbild {
     fn daten(&self, ebene: usize) -> &[u8];
     fn zeilenlaenge(&self, ebene: usize) -> usize;
     /// Die Farbe des Bildes aus dem VUI (hdr::Farbe::aus_vui): PQ mit Matrix
-    /// und Bereich, alles andere SDR BT.709 voll. Die Anzeige entscheidet je
-    /// Bild danach, nicht nach einer Nachricht - kein Wettlauf mit dem Wechsel.
-    /// Vorgabe SDR, bis die Decoder das VUI weiterreichen.
+    /// und Bereich, SDR mit Matrix (BT.709 oder BT.601) und Bereich. Die
+    /// Anzeige entscheidet je Bild danach, nicht nach einer Nachricht - kein
+    /// Wettlauf mit dem Wechsel. Vorgabe SDR, bis die Decoder das VUI
+    /// weiterreichen.
     fn farbe(&self) -> hdr::Farbe {
         hdr::Farbe::SDR
     }
@@ -4630,8 +4641,9 @@ impl Ebenenbild for ffmpeg::frame::Video {
     /// Software-HEVC, cuvid (ff_decode_frame_props) und D3D11VA (Kopie mit
     /// av_frame_copy_props) gleichermassen. FFmpegs Codes sind die aus H.273
     /// (AVCOL_TRC_SMPTE2084 = 16, AVCOL_PRI_BT2020 = 9, AVCOL_SPC_BT2020_NCL
-    /// = 9). Bereich: nur MPEG heisst begrenzt - ein PQ-Strom traegt das Flag
-    /// immer, und unser Protokoll ist voll.
+    /// = 9; BT.470BG = 5, SMPTE 170M = 6). Bereich: nur MPEG heisst begrenzt
+    /// - ein PQ-Strom traegt das Flag immer, ein SDR-Strom dieser Hosts auch
+    /// (H.264 vom Mac-Host hat kein VUI: nicht angegeben, also voll).
     fn farbe(&self) -> hdr::Farbe {
         use ffmpeg::sys::AVColorRange;
         let f = unsafe { &*self.as_ptr() };
@@ -20052,8 +20064,8 @@ mod tests {
     }
 
     /// Die Farbe eines FFmpeg-Bildes kommt aus seinem VUI: PQ/BT.2020 mit
-    /// Bereich; alles andere - auch das irrefuehrende BT.601 begrenzt des
-    /// bgra-Wegs - ist SDR BT.709 voll.
+    /// Bereich; SDR mit Matrix und Bereich - das BT.601 begrenzt des
+    /// bgra-Wegs (VUI BT.470BG, MPEG) ist genau das, was nvenc rechnete.
     #[cfg(windows)]
     #[test]
     fn farbe_aus_dem_ffmpeg_bild() {
@@ -20068,8 +20080,109 @@ mod tests {
         f.set_color_range(color::Range::MPEG);
         assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe { voll: false, ..hdr::Farbe::PQ });
         f.set_color_transfer_characteristic(color::TransferCharacteristic::BT709);
+        f.set_color_primaries(color::Primaries::BT709);
         f.set_color_space(color::Space::BT470BG);
-        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR);
+        let bt601 = hdr::Farbe { matrix: hdr::MATRIX_601, voll: false, ..hdr::Farbe::SDR };
+        assert_eq!(Ebenenbild::farbe(&f), bt601, "der bgra-Weg: BT.601 begrenzt");
+        f.set_color_space(color::Space::SMPTE170M);
+        assert_eq!(Ebenenbild::farbe(&f), bt601);
+        f.set_color_space(color::Space::BT709);
+        f.set_color_range(color::Range::JPEG);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "dieser Host: BT.709 voll");
+        f.set_color_range(color::Range::Unspecified);
+        f.set_color_space(color::Space::Unspecified);
+        assert_eq!(Ebenenbild::farbe(&f), hdr::Farbe::SDR, "ohne VUI: BT.709 voll");
+    }
+
+    /// Ein Strom eines Hosts, der BGRA an nvenc gibt (bgra-Weg, jeder
+    /// Windows-Host bis 0.2.0 mit 8 Bit): nvenc rechnet RGB nach BT.601 im
+    /// begrenzten Bereich um und sagt das im VUI. to_rgb mit dieser Farbe
+    /// trifft das RGB wieder - fuer ein Raster ueber alle Farben, 4:4:4 planar
+    /// (Software-Decoder) wie NV12 (NVDEC, 4:2:0 mit einfarbigen
+    /// Vierergruppen); hoechstens 3 Stufen daneben (8 Bit begrenzt hat 219
+    /// statt 256 Stufen, dazu die Ganzzahlrechnung). Mit der alten Lesart
+    /// (BT.709 voll) blieb Schwarz bei 16 und Weiss bei 235.
+    #[test]
+    fn bt601_begrenzt_wie_nvenc_ihn_schreibt() {
+        let bt601 = hdr::Farbe { matrix: hdr::MATRIX_601, voll: false, ..hdr::Farbe::SDR };
+        // RGB -> Y'CbCr BT.601 begrenzt, wie nvenc (gerundet).
+        let hin = |r: f64, g: f64, b: f64| -> (u8, u8, u8) {
+            let (kr, kb) = (0.299, 0.114);
+            let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+            let cb = (b - y) / (2.0 * (1.0 - kb));
+            let cr = (r - y) / (2.0 * (1.0 - kr));
+            let q = |v: f64| v.round().clamp(0.0, 255.0) as u8;
+            (q(16.0 + 219.0 * y / 255.0), q(128.0 + 224.0 * cb / 255.0), q(128.0 + 224.0 * cr / 255.0))
+        };
+        let raster: Vec<[u8; 3]> = (0..=255u32).step_by(15).flat_map(|r| (0..=255u32).step_by(15).flat_map(move |g| (0..=255u32).step_by(15).map(move |b| [r as u8, g as u8, b as u8]))).collect();
+        let n = raster.len();
+        let yuv: Vec<(u8, u8, u8)> = raster.iter().map(|p| hin(p[0] as f64, p[1] as f64, p[2] as f64)).collect();
+        let pruefen = |aus: &[u32], welche: &dyn Fn(usize) -> usize, was: &str| {
+            let mut max = 0u32;
+            for (i, p) in raster.iter().enumerate() {
+                let o = aus[welche(i)];
+                let ist = [(o >> 16) & 255, (o >> 8) & 255, o & 255];
+                for c in 0..3 {
+                    max = max.max(ist[c].abs_diff(p[c] as u32));
+                }
+            }
+            assert!(max <= 3, "{was}: {max} Stufen neben dem RGB");
+        };
+        // 4:4:4 planar 8 Bit, eine Zeile.
+        let planar = Farbprobe(
+            Ebenenprobe {
+                fmt: EbenenFormat { sub: false, bits: 8, paar: false, begrenzt: false },
+                w: n as u32,
+                h: 1,
+                ebenen: vec![yuv.iter().map(|c| c.0).collect(), yuv.iter().map(|c| c.1).collect(), yuv.iter().map(|c| c.2).collect()],
+                zeilen: vec![n; 3],
+            },
+            bt601,
+        );
+        pruefen(&to_rgb(&planar).expect("planar").pixels, &|i| i, "YUV444P");
+        // NV12: je Farbe eine Vierergruppe (2x2 Punkte), Farbe einmal je Gruppe.
+        let (w, h) = (2 * n, 2);
+        let y: Vec<u8> = (0..h).flat_map(|_| yuv.iter().flat_map(|c| [c.0, c.0])).collect();
+        let uv: Vec<u8> = yuv.iter().flat_map(|c| [c.1, c.2]).collect();
+        let nv12 = Farbprobe(
+            Ebenenprobe { fmt: EbenenFormat { sub: true, bits: 8, paar: true, begrenzt: false }, w: w as u32, h: h as u32, ebenen: vec![y, uv], zeilen: vec![w, w] },
+            bt601,
+        );
+        let aus = to_rgb(&nv12).expect("NV12").pixels;
+        pruefen(&aus, &|i| 2 * i, "NV12 oben");
+        pruefen(&aus, &|i| w + 2 * i + 1, "NV12 unten");
+        // Schwarz und Weiss genau; die alte Lesart (BT.709 voll) lag daneben.
+        let grau = |v: u8| hin(v as f64, v as f64, v as f64);
+        let (s, wi) = (grau(0), grau(255));
+        assert_eq!((s, wi), ((16, 128, 128), (235, 128, 128)));
+        let zwei = Farbprobe(
+            Ebenenprobe { fmt: EbenenFormat { sub: false, bits: 8, paar: false, begrenzt: false }, w: 2, h: 1, ebenen: vec![vec![s.0, wi.0], vec![128, 128], vec![128, 128]], zeilen: vec![2; 3] },
+            bt601,
+        );
+        assert_eq!(to_rgb(&zwei).expect("grau").pixels, vec![0x000000, 0xffffff]);
+        let alt = Farbprobe(Ebenenprobe { ..zwei.0 }, hdr::Farbe::SDR);
+        assert_eq!(to_rgb(&alt).expect("alt").pixels, vec![0x101010, 0xebebeb], "als BT.709 voll gelesen: flau");
+    }
+
+    /// Die Matrix zaehlt auch im vollen Bereich, und BT.709 voll rechnet
+    /// bitgleich wie vor der Matrix aus dem VUI (dieselben Zahlen): ein
+    /// Rot ueber die Matrix BT.601 ist ein anderes als ueber BT.709.
+    #[test]
+    fn matrix_aus_dem_vui_auch_im_vollen_bereich() {
+        let probe = |farbe: hdr::Farbe| {
+            Farbprobe(
+                Ebenenprobe { fmt: EbenenFormat { sub: false, bits: 8, paar: false, begrenzt: false }, w: 3, h: 1, ebenen: vec![vec![76, 128, 29], vec![85, 128, 255], vec![255, 128, 107]], zeilen: vec![3; 3] },
+                farbe,
+            )
+        };
+        let bt601 = to_rgb(&probe(hdr::Farbe { matrix: hdr::MATRIX_601, ..hdr::Farbe::SDR })).unwrap().pixels;
+        let bt709 = to_rgb(&probe(hdr::Farbe::SDR)).unwrap().pixels;
+        // Y'CbCr von Rot und Blau nach BT.601 voll: zurueck ueber BT.601 fast genau.
+        let kanal = |p: u32, s: u32| ((p >> s) & 255) as i32;
+        assert!((kanal(bt601[0], 16) - 255).abs() <= 1 && kanal(bt601[0], 8) <= 1 && kanal(bt601[0], 0) <= 1, "{:06x}", bt601[0]);
+        assert!(kanal(bt601[2], 16) <= 1 && kanal(bt601[2], 8) <= 1 && (kanal(bt601[2], 0) - 255).abs() <= 1, "{:06x}", bt601[2]);
+        assert_ne!(bt601[0], bt709[0]);
+        assert_eq!(bt601[1], bt709[1], "Grau haengt nicht an der Matrix");
     }
 
     /// Der gedachte Bildschirm des Pruefmodus (--hdr-schirm): was er dem

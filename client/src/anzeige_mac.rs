@@ -476,8 +476,9 @@ vertex Punkt vs_main(uint id [[vertex_id]]) {
 struct Format {
     uint sub;        // 4:2:0: je zwei Bildpunkte teilen sich einen Farbwert
     uint schieb;     // 8 Bit: >>0, oben buendig 16 Bit: >>8
-    uint begrenzt;   // begrenzter Wertebereich: vor der Matrix dehnen
+    uint begrenzt;   // begrenzter Wertebereich (Format oder VUI): vor der Matrix dehnen
     uint _f;
+    int4 c;          // Matrix aus dem VUI in 16.16: Cr->R, Cb->G, Cr->G, Cb->B (BT.709 oder BT.601)
 };
 
 fragment uint4 ps_umrechnen(Punkt in [[stage_in]],
@@ -495,9 +496,9 @@ fragment uint4 ps_umrechnen(Punkt in [[stage_in]],
         cb = (cb * 74606 + 32768) >> 16;            // 255/224, gerundet
         cr = (cr * 74606 + 32768) >> 16;
     }
-    int r = y + ((103206 * cr) >> 16);              // 1.5748 - dieselben Konstanten wie zeile_rgb
-    int g = y - ((12276 * cb + 30681 * cr) >> 16);  // 0.1873, 0.4681 - EINE Verschiebung der Summe
-    int b = y + ((121609 * cb) >> 16);              // 1.8556
+    int r = y + ((f.c.x * cr) >> 16);               // BT.709: 1.5748 - dieselben Konstanten wie zeile_rgb
+    int g = y - ((f.c.y * cb + f.c.z * cr) >> 16);  // 0.1873, 0.4681 - EINE Verschiebung der Summe
+    int b = y + ((f.c.w * cb) >> 16);               // 1.8556
     int3 rgb = clamp(int3(r, g, b), 0, 255);
     return uint4(uint(rgb.b), uint(rgb.g), uint(rgb.r), 255u);   // Bytes B, G, R, A = 0x00RRGGBB
 }
@@ -754,13 +755,25 @@ fn shader_quelle() -> String {
     format!("{SHADER}{}{SHADER_HDR}", hdr_konstanten())
 }
 
-/// Konstanten von Stufe 1 (struct Format, 16 Byte).
+/// Konstanten von Stufe 1 (struct Format, 32 Byte; int4 auf 16 Byte
+/// ausgerichtet): Aufbau der Ebenen, Bereich und Matrix (wie `zeile_rgb`).
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KonstFormat {
     sub: u32,
     schieb: u32,
     begrenzt: u32,
     _f: u32,
+    c: [i32; 4],
+}
+
+impl KonstFormat {
+    /// Fuer ein SDR-Bild dieses Formats in dieser Farbe: begrenzt, wenn das
+    /// Format (VideoToolbox ohne "f") oder das VUI es sagt; die Matrix aus
+    /// dem VUI (BT.709 oder BT.601).
+    fn neu(fmt: &crate::EbenenFormat, farbe: &hdr::Farbe) -> KonstFormat {
+        KonstFormat { sub: fmt.sub as u32, schieb: fmt.schieb(), begrenzt: (fmt.begrenzt || !farbe.voll) as u32, _f: 0, c: farbe.sdr_koeffizienten() }
+    }
 }
 
 /// Konstanten von Stufe 2 (struct Anzeige, 48 Byte; int4 ist in MSL auf 16
@@ -1622,7 +1635,7 @@ impl Gpu {
         self.hdr_lage_melden(None);
         self.zwischen_sichern(w, h, RGBA8_UINT)?;
         let z = self.zwischen.as_ref().ok_or("Zwischentextur fehlt")?.tex.0;
-        let k = KonstFormat { sub: fmt.sub as u32, schieb: fmt.schieb(), begrenzt: fmt.begrenzt as u32, _f: 0 };
+        let k = KonstFormat::neu(&fmt, &farbe);
         unsafe {
             let cb = self.befehlspuffer()?;
             let enc = malen(cb.0, z)?;
@@ -2113,6 +2126,17 @@ fn probebild(format: u32, w: u32, h: u32) -> Result<vt_decoder::Bild, String> {
 /// (anzeigeprobe::probewert_pq, unten der neutrale Streifen) - dasselbe wie
 /// in der Windows-Anzeige.
 fn probebild_farbe(format: u32, w: u32, h: u32, pq: bool) -> Result<vt_decoder::Bild, String> {
+    probebild_mit(format, w, h, pq, false)
+}
+
+/// Wie `probebild`, mit der Matrix BT.601 gekennzeichnet - so traegt ein
+/// Bild aus VideoToolbox das VUI des bgra-Wegs eines Windows-Hosts (444v
+/// und 420v: BT.601 begrenzt, wie nvenc RGB umrechnet).
+fn probebild_bt601(format: u32, w: u32, h: u32) -> Result<vt_decoder::Bild, String> {
+    probebild_mit(format, w, h, false, true)
+}
+
+fn probebild_mit(format: u32, w: u32, h: u32, pq: bool, bt601: bool) -> Result<vt_decoder::Bild, String> {
     let fmt = vt_decoder::ebenen(format).ok_or_else(|| format!("Format {} unbekannt", vt_decoder::fourcc_text(format)))?;
     let max = if fmt.bits == 8 { 255 } else { 65535 };
     let (cw, ch) = if fmt.sub { ((w + 1) / 2, (h + 1) / 2) } else { (w, h) };
@@ -2157,8 +2181,55 @@ fn probebild_farbe(format: u32, w: u32, h: u32, pq: bool) -> Result<vt_decoder::
         if pq {
             cf::pq_kennzeichnen(pb);
         }
+        if bt601 {
+            cf::bt601_kennzeichnen(pb);
+        }
         vt_decoder::Bild::aus_puffer(pb, 0).map_err(|e| e.to_string())
     }
+}
+
+/// Ein SDR-Format mit der Matrix BT.601 (und dem Bereich des Formats): Stufe 1
+/// gegen `to_rgb` (Toleranz 0) - beide lesen Matrix und Bereich aus dem
+/// Bild. Und das VUI muss wirken: dieselben Ebenen ohne Kennzeichen (BT.709)
+/// ergeben ein anderes Bild.
+fn bt601_pruefen(gpu: &mut Gpu, format: u32, w: u32, h: u32, verzeichnis: Option<&str>, lang: &'static crate::strings::Lang) -> bool {
+    use crate::anzeigeprobe::fall_pruefen;
+    let name = vt_decoder::fourcc_text(format);
+    let (bild, ohne) = match (probebild_bt601(format, w, h), probebild(format, w, h)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            println!("{name:<15} {w:>4}x{h:<4} BT.601: kein Probebild: {e}");
+            return false;
+        }
+    };
+    if bild.farbe().matrix != hdr::MATRIX_601 {
+        println!("{name:<15} {w:>4}x{h:<4} BT.601: das Bild traegt {} statt BT.601", bild.farbe().text());
+        return false;
+    }
+    let (referenz, bt709) = match (crate::to_rgb(&bild), crate::to_rgb(&ohne)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            println!("{name:<15} {w:>4}x{h:<4} BT.601: to_rgb: {e}");
+            return false;
+        }
+    };
+    let mut ok = true;
+    if referenz.pixels == bt709.pixels {
+        println!("{name:<15} {w:>4}x{h:<4} BT.601      FEHLER: die Matrix wirkt nicht (dasselbe Bild wie BT.709)");
+        ok = false;
+    }
+    match gpu.bild_roh(&bild).and_then(|_| gpu.zwischen_auslesen()) {
+        Ok((aus, zw, zh)) if (zw, zh) == (w, h) => ok &= fall_pruefen(&name, w, h, "BT.601", &referenz.pixels, &aus, w, h, 0, verzeichnis, lang),
+        Ok((_, zw, zh)) => {
+            println!("{name:<15} {w:>4}x{h:<4} BT.601: Zwischentextur ist {zw}x{zh}");
+            ok = false;
+        }
+        Err(e) => {
+            println!("{name:<15} {w:>4}x{h:<4} BT.601: {e}");
+            ok = false;
+        }
+    }
+    ok
 }
 
 /// Ein Format in einer Groesse: (a) `to_rgb` als Referenz, (b) rohes Bild
@@ -2685,6 +2756,16 @@ pub fn anzeigetest(verzeichnis: &str) -> bool {
     for format in FORMATE {
         for (w, h) in [(257u32, 131u32), (1920, 1080)] {
             ok &= format_pruefen(&mut gpu, format, w, h, Some(verzeichnis), lang, &mut u);
+            for z in protokoll::abholen() {
+                println!("    {z}");
+            }
+        }
+    }
+    // SDR mit der Matrix BT.601 aus dem VUI: 444v und 420v wie der bgra-Weg
+    // eines Windows-Hosts (BT.601 begrenzt), 444f und 420f voll.
+    for format in [vt_decoder::V444, vt_decoder::V420, vt_decoder::F444, vt_decoder::F420] {
+        for (w, h) in [(257u32, 131u32), (1920, 1080)] {
+            ok &= bt601_pruefen(&mut gpu, format, w, h, Some(verzeichnis), lang);
             for z in protokoll::abholen() {
                 println!("    {z}");
             }
@@ -3284,7 +3365,17 @@ mod tests {
     /// Die Konstanten liegen so, wie die Shader sie lesen.
     #[test]
     fn konstanten_wie_im_shader() {
-        assert_eq!(std::mem::size_of::<KonstFormat>(), 16);
+        assert_eq!(std::mem::size_of::<KonstFormat>(), 32);
+        assert_eq!(std::mem::offset_of!(KonstFormat, begrenzt), 8);
+        assert_eq!(std::mem::offset_of!(KonstFormat, c), 16);
+        {
+            let s = &SHADER[SHADER.find("struct Format {").expect("struct Format")..];
+            let lage: Vec<usize> = ["uint sub;", "uint schieb;", "uint begrenzt;", "uint _f;", "int4 c;"]
+                .iter()
+                .map(|f| s.find(f).unwrap_or_else(|| panic!("{f} fehlt")))
+                .collect();
+            assert!(lage.windows(2).all(|p| p[0] < p[1]), "Reihenfolge {lage:?}");
+        }
         assert_eq!(std::mem::size_of::<KonstAnzeige>(), 48);
         assert_eq!(std::mem::offset_of!(KonstAnzeige, bild), 16);
         assert_eq!(std::mem::offset_of!(KonstAnzeige, modus), 32);
@@ -3441,6 +3532,37 @@ mod tests {
     #[test]
     fn goldbild_begrenzt() {
         goldbild(vt_decoder::X420);
+    }
+
+    /// Die Matrix aus dem VUI (BT.601, wie der bgra-Weg eines Windows-Hosts
+    /// sie schreibt): 420v und 444v begrenzt, 420f voll - Stufe 1 bitgleich
+    /// zu to_rgb, und anders als BT.709.
+    #[test]
+    fn goldbild_bt601() {
+        let Some(mut g) = geraet() else { return };
+        let lang = crate::strings::pick("de");
+        for format in [vt_decoder::V420, vt_decoder::V444, vt_decoder::F420] {
+            for (w, h) in [(257u32, 131u32), (64, 36)] {
+                assert!(bt601_pruefen(&mut g, format, w, h, None, lang), "{} BT.601 {w}x{h}", vt_decoder::fourcc_text(format));
+            }
+        }
+        // Danach wieder BT.709: bitgleich wie vorher.
+        let mut u = ui::Ui::new();
+        u.tick = 40;
+        u.mouse = (-1, -1);
+        assert!(format_pruefen(&mut g, vt_decoder::F420, 64, 36, None, lang, &mut u), "BT.709 nach BT.601");
+    }
+
+    /// Stufe 1 fuer SDR: Bereich aus Format oder VUI, Matrix aus dem VUI.
+    #[test]
+    fn stufe1_sdr_nach_dem_vui() {
+        let fmt = crate::EbenenFormat { sub: true, bits: 8, paar: true, begrenzt: false };
+        assert_eq!(KonstFormat::neu(&fmt, &hdr::Farbe::SDR), KonstFormat { sub: 1, schieb: 0, begrenzt: 0, _f: 0, c: hdr::SDR_KOEFF_709 });
+        let bt601 = hdr::Farbe { matrix: hdr::MATRIX_601, voll: false, ..hdr::Farbe::SDR };
+        assert_eq!(KonstFormat::neu(&fmt, &bt601), KonstFormat { sub: 1, schieb: 0, begrenzt: 1, _f: 0, c: hdr::SDR_KOEFF_601 });
+        let v420 = crate::EbenenFormat { begrenzt: true, ..fmt };
+        assert_eq!(KonstFormat::neu(&v420, &hdr::Farbe::SDR).begrenzt, 1, "begrenzt laut Format");
+        assert_eq!(hdr::SDR_KOEFF_709, [103206, 12276, 30681, 121609], "BT.709 bitgleich zu frueher");
     }
 
     fn goldbild_pq(format: u32) {

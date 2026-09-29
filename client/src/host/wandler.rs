@@ -27,15 +27,19 @@
 // Hauptspeicher. Ein BGRA-Bild (Vollbildprogramm mit 8 Bit auf dem
 // HDR-Desktop) ist sRGB mit dem SDR-Weiss: linear * SDRWhiteLevel / 1000.
 //
-// Modus Zehn (die 10-Bit-Kandidaten in SDR, Standardweg des Encoders auf
-// einer NVIDIA-Karte): das BGRA-Bild der Aufnahme wird auf der Karte zu den
-// Ebenen von YUV444P16LE (4:4:4, drei R16_UINT-Ziele in einem Durchgang)
-// bzw. P010 (4:2:0, Y und die CbCr-Paare) - mit genau der Ganzzahlrechnung,
-// die Bild::aus_bgra auf dem Prozessor macht (encoder.rs, ycbcr: BT.709,
-// voller Bereich, 8 Bit oben buendig in 16 Bit; bei 4:2:0 die Farbe des
-// Punktes oben links je Vierergruppe). Dieselben Ziele wie im Modus PQ; die
-// Ebenen bleiben auf der Karte (die CUDA-Bruecke kopiert sie in den Rahmen
-// fuer nvenc, cuda.rs), STAGING gibt es nur zum Auslesen (Tests).
+// Modus Zehn und Modus Acht (die SDR-Kandidaten, Standardweg des Encoders
+// auf einer NVIDIA-Karte): das BGRA-Bild der Aufnahme wird auf der Karte zu
+// den Y/Cb/Cr-Ebenen des Kandidaten - mit genau der Ganzzahlrechnung, die
+// Bild::aus_bgra auf dem Prozessor macht (encoder.rs, ycbcr: BT.709, voller
+// Bereich; bei 4:2:0 die Farbe des Punktes oben links je Vierergruppe).
+// Modus Zehn: YUV444P16LE (4:4:4, drei R16_UINT-Ziele in einem Durchgang)
+// bzw. P010 (4:2:0, Y und die CbCr-Paare), der 8-Bit-Wert oben buendig in 16
+// Bit - dieselben Ziele wie im Modus PQ. Modus Acht: YUV444P (drei R8_UINT)
+// bzw. NV12 (R8_UINT und R8G8_UINT) - so bekommt nvenc auch die
+// 8-Bit-Kandidaten als fertiges BT.709 voll, statt BGRA selbst umzurechnen
+// (nvenc rechnet RGB nach BT.601 im begrenzten Bereich). Die Ebenen bleiben
+// auf der Karte (die CUDA-Bruecke kopiert sie in den Rahmen fuer nvenc,
+// cuda.rs), STAGING gibt es nur zum Auslesen (Tests).
 //
 // Je Bild: CopyResource der Duplication-Textur in den eigenen Eingang mit
 // Lesesicht (FP16, im Modus PQ auch BGRA; gleich nach AcquireNextFrame, vor
@@ -197,13 +201,16 @@ uint2 ps_pq420_uv(float4 pos : SV_Position) : SV_Target {
 }
 "#;
 
-/// Die Shader des Modus Zehn: hinter hdr_hlsl::WANDLER (vs_voll, Eingang t0)
-/// gesetzt, ohne eigene Konstanten. Die Zahlen sind die Ganzzahlen aus
-/// encoder::ycbcr (54/183/19, 138, 163, Rundung +128, >> 8 arithmetisch wie
-/// in Rust); der Test zehn_zahlen_wie_ycbcr haelt sie fest. Einstiege:
-/// ps_zehn444 (drei Ziele), ps_zehn420_y, ps_zehn420_uv.
-pub(crate) const ZEHN_HLSL: &str = r#"
-// ---------- Wandler, Modus Zehn: SDR-Desktop (BGRA 8 Bit) -> Ebenen der 10-Bit-Kandidaten ----------
+/// Die Shader der Modi Zehn und Acht: hinter hdr_hlsl::WANDLER (vs_voll,
+/// Eingang t0) gesetzt, ohne eigene Konstanten. Die Zahlen sind die
+/// Ganzzahlen aus encoder::ycbcr (54/183/19, 138, 163, Rundung +128, >> 8
+/// arithmetisch wie in Rust); der Test yuv_zahlen_wie_ycbcr haelt sie fest.
+/// Gerechnet wird in punkt/vierergruppe, einmal fuer beide Modi; die
+/// Einstiege unterscheiden sich nur darin, wie der Wert ins Ziel geht (Zehn:
+/// oben buendig in 16 Bit, Acht: wie er ist). Einstiege: ps_zehn444 und
+/// ps_acht444 (drei Ziele), ps_zehn420_y/ps_acht420_y, ps_zehn420_uv/ps_acht420_uv.
+pub(crate) const YUV_HLSL: &str = r#"
+// ---------- Wandler, Modus Zehn und Acht: SDR-Desktop (BGRA 8 Bit) -> Y/Cb/Cr-Ebenen der SDR-Kandidaten ----------
 // Ein Punkt der Aufnahme als 8-Bit-Ganzzahlen (die Lesesicht ist UNORM: k/255).
 int3 rgb8(int2 p) {
     return int3(floor(saturate(eingang.Load(int3(p, 0)).rgb) * 255.0 + 0.5));
@@ -217,18 +224,24 @@ int3 ycbcr709(int3 c) {
     return clamp(int3(y, cb, cr), 0, 255);
 }
 
-// 8 Bit oben buendig in 16 Bit (v << 8), wie aus_bgra die 10-Bit-Formate fuellt.
+// Y/Cb/Cr des Strompunkts unter dem Zielpunkt.
+int3 punkt(float4 pos) { return ycbcr709(rgb8(int2(pos.xy))); }
+
+// Cb/Cr je Vierergruppe: der Punkt oben links, wie aus_bgra (und das Testbild).
+int3 vierergruppe(float4 pos) { return ycbcr709(rgb8(int2(pos.xy) * 2)); }
+
+// Modus Zehn: 8 Bit oben buendig in 16 Bit (v << 8), wie aus_bgra die 10-Bit-Formate fuellt.
 uint oben(int v) { return ((uint)v) << 8; }
 
-struct Zehn444 {
+struct Yuv444Ziele {
     uint y  : SV_Target0;
     uint cb : SV_Target1;
     uint cr : SV_Target2;
 };
 
-Zehn444 ps_zehn444(float4 pos : SV_Position) {
-    int3 v = ycbcr709(rgb8(int2(pos.xy)));
-    Zehn444 o;
+Yuv444Ziele ps_zehn444(float4 pos : SV_Position) {
+    int3 v = punkt(pos);
+    Yuv444Ziele o;
     o.y = oben(v.x);
     o.cb = oben(v.y);
     o.cr = oben(v.z);
@@ -236,13 +249,31 @@ Zehn444 ps_zehn444(float4 pos : SV_Position) {
 }
 
 uint ps_zehn420_y(float4 pos : SV_Position) : SV_Target {
-    return oben(ycbcr709(rgb8(int2(pos.xy))).x);
+    return oben(punkt(pos).x);
 }
 
-// Cb/Cr je Vierergruppe: der Punkt oben links, wie aus_bgra (und das Testbild).
 uint2 ps_zehn420_uv(float4 pos : SV_Position) : SV_Target {
-    int3 v = ycbcr709(rgb8(int2(pos.xy) * 2));
+    int3 v = vierergruppe(pos);
     return uint2(oben(v.y), oben(v.z));
+}
+
+// Modus Acht: der 8-Bit-Wert, wie er ist (R8_UINT, R8G8_UINT).
+Yuv444Ziele ps_acht444(float4 pos : SV_Position) {
+    int3 v = punkt(pos);
+    Yuv444Ziele o;
+    o.y = (uint)v.x;
+    o.cb = (uint)v.y;
+    o.cr = (uint)v.z;
+    return o;
+}
+
+uint ps_acht420_y(float4 pos : SV_Position) : SV_Target {
+    return (uint)punkt(pos).x;
+}
+
+uint2 ps_acht420_uv(float4 pos : SV_Position) : SV_Target {
+    int3 v = vierergruppe(pos);
+    return uint2((uint)v.y, (uint)v.z);
 }
 "#;
 
@@ -258,24 +289,39 @@ pub(crate) struct KonstPq {
     pub _rest: i32,
 }
 
-/// Was der Modus PQ rechnet: Stromgroesse (nativ) und Drehung, wie die
-/// Aufnahme sie vorgibt, und 4:4:4 (YUV444P16LE) oder 4:2:0 (P010).
+/// Was der Modus PQ (und Zehn, Acht) rechnet: Stromgroesse (nativ) und
+/// Drehung, wie die Aufnahme sie vorgibt, 4:4:4 oder 4:2:0 und die Breite
+/// der Ebenen: 16 Bit (YUV444P16LE, P010 - PQ und Zehn) oder 8 Bit
+/// (`acht`: YUV444P, NV12 - nur Modus Acht).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PqPlan {
     pub w: u32,
     pub h: u32,
     pub drehung: Drehung,
     pub chroma444: bool,
+    pub acht: bool,
 }
 
 impl PqPlan {
     /// Die Ebenen: (Breite, Hoehe, Byte je Punkt) - 4:4:4 Y, Cb, Cr; 4:2:0
-    /// Y und CbCr als Paare in halber Groesse.
+    /// Y und CbCr als Paare in halber Groesse; je Wert 2 Byte, mit `acht` 1.
     pub fn ebenen(&self) -> Vec<(u32, u32, usize)> {
+        let b = if self.acht { 1 } else { 2 };
         if self.chroma444 {
-            vec![(self.w, self.h, 2); 3]
+            vec![(self.w, self.h, b); 3]
         } else {
-            vec![(self.w, self.h, 2), (self.w / 2, self.h / 2, 4)]
+            vec![(self.w, self.h, b), (self.w / 2, self.h / 2, 2 * b)]
+        }
+    }
+
+    /// Das Format des Ziels fuer eine Ebene mit so vielen Byte je Punkt:
+    /// ein Wert (Y, Cb, Cr) oder ein CbCr-Paar, je 16 oder 8 Bit.
+    fn ziel_format(&self, punkt_bytes: usize) -> DXGI_FORMAT {
+        match (self.acht, punkt_bytes) {
+            (true, 1) => DXGI_FORMAT_R8_UINT,
+            (true, _) => DXGI_FORMAT_R8G8_UINT,
+            (false, 2) => DXGI_FORMAT_R16_UINT,
+            (false, _) => DXGI_FORMAT_R16G16_UINT,
         }
     }
 
@@ -286,10 +332,11 @@ impl PqPlan {
 
     pub fn text(&self) -> String {
         format!(
-            "{}x{} {}{}",
+            "{}x{} {}{}{}",
             self.w,
             self.h,
             if self.chroma444 { "4:4:4" } else { "4:2:0" },
+            if self.acht { " 8 Bit" } else { "" },
             if self.drehung != Drehung::Keine { format!(", gedreht {} Grad", self.drehung.grad()) } else { String::new() }
         )
     }
@@ -311,10 +358,10 @@ fn pq_quelle() -> &'static str {
     Q.get_or_init(|| format!("{}{}{}", hdr_hlsl::WANDLER, hdr_hlsl::PQ, PQ_HLSL))
 }
 
-/// Die ganze Quelle des Modus Zehn: der Text des Wandlers und ZEHN_HLSL.
-fn zehn_quelle() -> &'static str {
+/// Die ganze Quelle der Modi Zehn und Acht: der Text des Wandlers und YUV_HLSL.
+fn yuv_quelle() -> &'static str {
     static Q: OnceLock<String> = OnceLock::new();
-    Q.get_or_init(|| format!("{}{}", hdr_hlsl::WANDLER, ZEHN_HLSL))
+    Q.get_or_init(|| format!("{}{}", hdr_hlsl::WANDLER, YUV_HLSL))
 }
 
 /// Die uebersetzten Shader (Vertex, Pixel SDR) - einmal je Prozess; ein
@@ -345,19 +392,31 @@ fn pq_shader_code() -> Result<&'static [Vec<u8>; 3], String> {
     .map_err(|e| e.clone())
 }
 
-/// Die uebersetzten Shader des Modus Zehn (444, 420 Y, 420 CbCr) - einmal je
-/// Prozess, erst wenn ein 10-Bit-Kandidat den Weg auf der Karte nimmt.
-fn zehn_shader_code() -> Result<&'static [Vec<u8>; 3], String> {
-    static CODE: OnceLock<Result<[Vec<u8>; 3], String>> = OnceLock::new();
-    CODE.get_or_init(|| {
-        let q = zehn_quelle();
-        let a = crate::anzeige::uebersetzen_aus(q, b"wandler_zehn.hlsl\0", b"ps_zehn444\0", b"ps_4_0\0")?;
-        let b = crate::anzeige::uebersetzen_aus(q, b"wandler_zehn.hlsl\0", b"ps_zehn420_y\0", b"ps_4_0\0")?;
-        let c = crate::anzeige::uebersetzen_aus(q, b"wandler_zehn.hlsl\0", b"ps_zehn420_uv\0", b"ps_4_0\0")?;
+/// Die uebersetzten Shader des Modus Zehn bzw. Acht (`acht`; je 444, 420 Y,
+/// 420 CbCr) - einmal je Prozess und Modus, erst wenn ein Kandidat dieser
+/// Bittiefe den Weg auf der Karte nimmt.
+fn yuv_shader_code(acht: bool) -> Result<&'static [Vec<u8>; 3], String> {
+    static ZEHN: OnceLock<Result<[Vec<u8>; 3], String>> = OnceLock::new();
+    static ACHT: OnceLock<Result<[Vec<u8>; 3], String>> = OnceLock::new();
+    let (code, e444, e420y, e420uv): (_, &[u8], &[u8], &[u8]) = if acht {
+        (&ACHT, b"ps_acht444\0", b"ps_acht420_y\0", b"ps_acht420_uv\0")
+    } else {
+        (&ZEHN, b"ps_zehn444\0", b"ps_zehn420_y\0", b"ps_zehn420_uv\0")
+    };
+    code.get_or_init(|| {
+        let q = yuv_quelle();
+        let a = crate::anzeige::uebersetzen_aus(q, b"wandler_yuv.hlsl\0", e444, b"ps_4_0\0")?;
+        let b = crate::anzeige::uebersetzen_aus(q, b"wandler_yuv.hlsl\0", e420y, b"ps_4_0\0")?;
+        let c = crate::anzeige::uebersetzen_aus(q, b"wandler_yuv.hlsl\0", e420uv, b"ps_4_0\0")?;
         Ok([a, b, c])
     })
     .as_ref()
     .map_err(|e| e.clone())
+}
+
+/// Der Name des Modus fuer Meldungen: Acht (8-Bit-Ebenen) oder Zehn.
+fn modus_name(acht: bool) -> &'static str {
+    if acht { "Acht" } else { "Zehn" }
 }
 
 fn fehler(was: &str, e: windows::core::Error) -> String {
@@ -429,13 +488,14 @@ fn ziel_textur(device: &ID3D11Device, w: u32, h: u32, format: DXGI_FORMAT) -> wi
     Ok(Textur { tex, sicht: rtv.ok_or_else(kein_zeiger)?, w, h })
 }
 
-/// Eine Ebene des Modus PQ oder Zehn: Ziel (R16_UINT bzw. R16G16_UINT) und
-/// seine STAGING-Kopie zum Auslesen - die entsteht erst, wenn ausgelesen
-/// wird (im Modus Zehn bleiben die Ebenen auf der Karte).
+/// Eine Ebene des Modus PQ, Zehn oder Acht: Ziel (R16_UINT bzw. R16G16_UINT,
+/// im Modus Acht R8_UINT bzw. R8G8_UINT) und seine STAGING-Kopie zum
+/// Auslesen - die entsteht erst, wenn ausgelesen wird (in den Modi Zehn und
+/// Acht bleiben die Ebenen auf der Karte).
 struct Ebene {
     ziel: Textur<ID3D11RenderTargetView>,
     staging: Option<ID3D11Texture2D>,
-    /// Byte je Punkt (2 fuer Y/Cb/Cr, 4 fuer das CbCr-Paar).
+    /// Byte je Punkt (2 fuer Y/Cb/Cr, 4 fuer das CbCr-Paar; 8 Bit: 1 und 2).
     punkt_bytes: usize,
 }
 
@@ -455,8 +515,9 @@ struct PqZiele {
     bereit: bool,
 }
 
-/// Die Shader des Modus Zehn - entstehen mit dem ersten 10-Bit-Bild.
-struct ZehnShader {
+/// Die Shader des Modus Zehn bzw. Acht - entstehen mit dem ersten Bild
+/// dieser Bittiefe.
+struct YuvShader {
     ps444: ID3D11PixelShader,
     ps420_y: ID3D11PixelShader,
     ps420_uv: ID3D11PixelShader,
@@ -485,11 +546,12 @@ pub struct Wandler {
     /// Ausgang Modus SDR: B8G8R8A8_UNORM, Groesse der Oberflaeche.
     sdr: Option<Textur<ID3D11RenderTargetView>>,
     /// Modus PQ: Shader (einmal) und Ziele (je Plan) - die Ziele teilt er
-    /// mit dem Modus Zehn (dieselben Formate).
+    /// mit den Modi Zehn und Acht (der Plan sagt die Formate).
     pq_shader: Option<PqShader>,
     pq: Option<PqZiele>,
-    /// Modus Zehn: Shader (einmal).
-    zehn_shader: Option<ZehnShader>,
+    /// Modus Zehn und Modus Acht: Shader (je einmal).
+    zehn_shader: Option<YuvShader>,
+    acht_shader: Option<YuvShader>,
 }
 
 impl Wandler {
@@ -535,6 +597,7 @@ impl Wandler {
             pq_shader: None,
             pq: None,
             zehn_shader: None,
+            acht_shader: None,
         })
     }
 
@@ -681,7 +744,7 @@ impl Wandler {
         }
         let mut ebenen = Vec::new();
         for (w, h, b) in plan.ebenen() {
-            let format = if b == 2 { DXGI_FORMAT_R16_UINT } else { DXGI_FORMAT_R16G16_UINT };
+            let format = plan.ziel_format(b);
             let ziel = ziel_textur(&self.device, w, h, format).map_err(|e| fehler("Wandler PQ: Ziel", e))?;
             ebenen.push(Ebene { ziel, staging: None, punkt_bytes: b });
         }
@@ -729,49 +792,60 @@ impl Wandler {
         self.loesen();
     }
 
-    /// Shader des Modus Zehn - beim ersten Mal.
-    fn zehn_shader_sichern(&mut self) -> Result<(), String> {
-        if self.zehn_shader.is_some() {
+    /// Shader des Modus Zehn bzw. Acht (`acht`) - beim ersten Mal.
+    fn yuv_shader_sichern(&mut self, acht: bool) -> Result<(), String> {
+        if (if acht { &self.acht_shader } else { &self.zehn_shader }).is_some() {
             return Ok(());
         }
-        let [a, b, c] = zehn_shader_code()?;
+        let modus = modus_name(acht);
+        let [a, b, c] = yuv_shader_code(acht)?;
         let erzeugen = |code: &Vec<u8>| -> Result<ID3D11PixelShader, String> {
             let mut ps = None;
-            unsafe { self.device.CreatePixelShader(code, None, Some(&mut ps)) }.map_err(|e| fehler("Wandler Zehn: CreatePixelShader", e))?;
-            ps.ok_or_else(|| "Wandler Zehn: CreatePixelShader lieferte nichts".to_string())
+            unsafe { self.device.CreatePixelShader(code, None, Some(&mut ps)) }.map_err(|e| fehler(&format!("Wandler {modus}: CreatePixelShader"), e))?;
+            ps.ok_or_else(|| format!("Wandler {modus}: CreatePixelShader lieferte nichts"))
         };
-        self.zehn_shader = Some(ZehnShader { ps444: erzeugen(a)?, ps420_y: erzeugen(b)?, ps420_uv: erzeugen(c)? });
+        let s = YuvShader { ps444: erzeugen(a)?, ps420_y: erzeugen(b)?, ps420_uv: erzeugen(c)? };
+        if acht {
+            self.acht_shader = Some(s);
+        } else {
+            self.zehn_shader = Some(s);
+        }
         Ok(())
     }
 
-    /// Modus Zehn vorbereiten: Shader und Ziele fuer diesen Plan (ungedreht,
-    /// Stromgroesse). Liefert die Ziele als (Textur, Byte je Zeile, Zeilen) -
-    /// genau die Ebenen von YUV444P16LE (Y, Cb, Cr) bzw. P010 (Y, CbCr), fuer
-    /// die CUDA-Bruecke.
-    pub fn zehn_vorbereiten(&mut self, plan: &PqPlan) -> Result<Vec<(ID3D11Texture2D, usize, usize)>, String> {
+    /// Modus Zehn bzw. Acht (plan.acht) vorbereiten: Shader und Ziele fuer
+    /// diesen Plan (ungedreht, Stromgroesse). Liefert die Ziele als (Textur,
+    /// Byte je Zeile, Zeilen) - genau die Ebenen von YUV444P16LE bzw.
+    /// YUV444P (Y, Cb, Cr) oder P010 bzw. NV12 (Y, CbCr), fuer die
+    /// CUDA-Bruecke.
+    pub fn yuv_vorbereiten(&mut self, plan: &PqPlan) -> Result<Vec<(ID3D11Texture2D, usize, usize)>, String> {
+        let modus = modus_name(plan.acht);
         if plan.drehung != Drehung::Keine {
-            return Err(format!("Wandler Zehn: gedrehter Strom ({} Grad) nicht vorgesehen", plan.drehung.grad()));
+            return Err(format!("Wandler {modus}: gedrehter Strom ({} Grad) nicht vorgesehen", plan.drehung.grad()));
         }
-        self.zehn_shader_sichern()?;
+        self.yuv_shader_sichern(plan.acht)?;
         self.pq_ziele_sichern(plan)?;
-        let z = self.pq.as_ref().ok_or("Wandler Zehn: keine Ziele")?;
+        let z = self.pq.as_ref().ok_or_else(|| format!("Wandler {modus}: keine Ziele"))?;
         Ok(z.ebenen.iter().map(|e| (e.ziel.tex.clone(), e.ziel.w as usize * e.punkt_bytes, e.ziel.h as usize)).collect())
     }
 
-    /// Modus Zehn aus dem gehaltenen Bild (BGRA - ein FP16-Bild geht vorher
-    /// durch nach_sdr): die Ebenen nach dem Plan rechnen. `auslesen`: gleich
-    /// in die STAGING-Kopien geben (pq_auslesen holt sie ab) - sonst bleiben
-    /// sie nur auf der Karte. Ok(false), wenn der Wandler kein BGRA-Bild haelt.
-    pub fn zehn_rechnen(&mut self, plan: &PqPlan, auslesen: bool) -> Result<bool, String> {
+    /// Modus Zehn bzw. Acht aus dem gehaltenen Bild (BGRA - ein FP16-Bild
+    /// geht vorher durch nach_sdr): die Ebenen nach dem Plan rechnen.
+    /// `auslesen`: gleich in die STAGING-Kopien geben (pq_auslesen holt sie
+    /// ab) - sonst bleiben sie nur auf der Karte. Ok(false), wenn der Wandler
+    /// kein BGRA-Bild haelt.
+    pub fn yuv_rechnen(&mut self, plan: &PqPlan, auslesen: bool) -> Result<bool, String> {
         if self.letzter != Some(Eingang::Bgra) {
             return Ok(false);
         }
+        let modus = modus_name(plan.acht);
         let Some((srv, sw, sh)) = self.eingang_bgra.as_ref().map(|e| (e.sicht.clone(), e.w, e.h)) else { return Ok(false) };
         if plan.w > sw || plan.h > sh {
-            return Err(format!("Wandler Zehn: Strom {}x{} groesser als das Bild {sw}x{sh}", plan.w, plan.h));
+            return Err(format!("Wandler {modus}: Strom {}x{} groesser als das Bild {sw}x{sh}", plan.w, plan.h));
         }
-        self.zehn_vorbereiten(plan)?;
-        let (Some(s), Some(z)) = (self.zehn_shader.as_ref(), self.pq.as_ref()) else { return Err("Wandler Zehn: nicht eingerichtet".into()) };
+        self.yuv_vorbereiten(plan)?;
+        let shader = if plan.acht { self.acht_shader.as_ref() } else { self.zehn_shader.as_ref() };
+        let (Some(s), Some(z)) = (shader, self.pq.as_ref()) else { return Err(format!("Wandler {modus}: nicht eingerichtet")) };
         let ziele: Vec<Option<ID3D11RenderTargetView>> = z.ebenen.iter().map(|e| Some(e.ziel.sicht.clone())).collect();
         let durchgaenge: Vec<(&[Option<ID3D11RenderTargetView>], u32, u32, &ID3D11PixelShader)> = if plan.chroma444 {
             vec![(&ziele[..], plan.w, plan.h, &s.ps444)]
@@ -792,6 +866,9 @@ impl Wandler {
     /// und gleich in die STAGING-Kopien geben (pq_auslesen holt sie ab).
     /// Ok(false), wenn der Wandler kein Bild haelt.
     pub fn pq_rechnen(&mut self, plan: &PqPlan) -> Result<bool, String> {
+        if plan.acht {
+            return Err("Wandler PQ: HDR10 braucht 10-Bit-Ebenen, nicht 8 Bit".into());
+        }
         let (eingang, srgb) = match self.letzter {
             Some(Eingang::Fp16) => (self.eingang.as_ref(), false),
             Some(Eingang::Bgra) => (self.eingang_bgra.as_ref(), true),
@@ -823,10 +900,11 @@ impl Wandler {
         Ok(true)
     }
 
-    /// Die Ebenen des letzten pq_rechnen aus STAGING, dicht gepackt (u16
-    /// LE, 10 Bit oben buendig): 4:4:4 Y, Cb, Cr je w x h; 4:2:0 Y (w x h),
-    /// dann die CbCr-Paare (w/2 x h/2) - genau die Ebenen von YUV444P16LE
-    /// bzw. P010 ohne Zeilenrest.
+    /// Die Ebenen des letzten pq_rechnen (oder yuv_rechnen mit `auslesen`)
+    /// aus STAGING, dicht gepackt (u16 LE, 10 Bit oben buendig; im Modus
+    /// Acht u8): 4:4:4 Y, Cb, Cr je w x h; 4:2:0 Y (w x h), dann die
+    /// CbCr-Paare (w/2 x h/2) - genau die Ebenen von YUV444P16LE bzw. P010
+    /// (YUV444P bzw. NV12) ohne Zeilenrest.
     pub fn pq_auslesen(&self, ziel: &mut Vec<u8>) -> Result<(), String> {
         let Some(z) = self.pq.as_ref().filter(|z| z.bereit) else { return Err("Wandler PQ: noch kein Bild gerechnet".into()) };
         ziel.resize(z.plan.bytes(), 0);
@@ -962,14 +1040,26 @@ mod tests {
 
     #[test]
     fn plan_ebenen_und_bytes() {
-        let p = PqPlan { w: 64, h: 40, drehung: Drehung::Keine, chroma444: true };
+        let p = PqPlan { w: 64, h: 40, drehung: Drehung::Keine, chroma444: true, acht: false };
         assert_eq!(p.ebenen(), vec![(64, 40, 2); 3]);
         assert_eq!(p.bytes(), 64 * 40 * 2 * 3);
+        assert_eq!(p.ebenen().iter().map(|e| p.ziel_format(e.2)).collect::<Vec<_>>(), vec![DXGI_FORMAT_R16_UINT; 3]);
         let p = PqPlan { chroma444: false, ..p };
         assert_eq!(p.ebenen(), vec![(64, 40, 2), (32, 20, 4)]);
         assert_eq!(p.bytes(), 64 * 40 * 2 * 3 / 2);
+        assert_eq!(p.ebenen().iter().map(|e| p.ziel_format(e.2)).collect::<Vec<_>>(), vec![DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16_UINT]);
         assert_eq!(PqPlan { drehung: Drehung::Grad90, ..p }.text(), "64x40 4:2:0, gedreht 90 Grad");
         assert_eq!(PqPlan { w: 3840, h: 2160, chroma444: true, ..p }.text(), "3840x2160 4:4:4");
+        // Modus Acht: YUV444P (drei R8) und NV12 (R8 und R8G8), halb so viele Byte.
+        let a = PqPlan { acht: true, ..p };
+        assert_eq!(a.ebenen(), vec![(64, 40, 1), (32, 20, 2)]);
+        assert_eq!(a.bytes(), 64 * 40 * 3 / 2);
+        assert_eq!(a.ebenen().iter().map(|e| a.ziel_format(e.2)).collect::<Vec<_>>(), vec![DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8G8_UINT]);
+        let a = PqPlan { chroma444: true, ..a };
+        assert_eq!(a.ebenen(), vec![(64, 40, 1); 3]);
+        assert_eq!(a.bytes(), 64 * 40 * 3);
+        assert_eq!(a.ebenen().iter().map(|e| a.ziel_format(e.2)).collect::<Vec<_>>(), vec![DXGI_FORMAT_R8_UINT; 3]);
+        assert_eq!(a.text(), "64x40 4:4:4 8 Bit");
     }
 
     /// Ein Geraet fuer die Kartentests: WARP (die VM hat keine Karte). Ohne
@@ -1233,7 +1323,7 @@ mod tests {
                 assert_eq!(wandler.aufnehmen(&tex).expect("aufnehmen"), Eingang::Fp16);
                 let (w, h) = super::super::aufnahme::stromplan(dw as i32, dh as i32);
                 for chroma444 in [true, false] {
-                    let plan = PqPlan { w: w as u32, h: h as u32, drehung: d, chroma444 };
+                    let plan = PqPlan { w: w as u32, h: h as u32, drehung: d, chroma444, acht: false };
                     assert!(wandler.pq_rechnen(&plan).expect("pq_rechnen"), "{}", plan.text());
                     let mut aus = Vec::new();
                     wandler.pq_auslesen(&mut aus).expect("pq_auslesen");
@@ -1249,66 +1339,88 @@ mod tests {
         assert!(abweichend * 100 <= gesamt, "{abweichend} von {gesamt} Codes um 1 daneben");
     }
 
-    // ------------------------------------------- Modus Zehn gegen aus_bgra
+    // ------------------------------------ Modus Zehn und Acht gegen aus_bgra
 
-    /// Die Zahlen im HLSL des Modus Zehn sind die Ganzzahlen aus
-    /// encoder::ycbcr - und die Rechnung steht nur einmal da.
+    /// Die Zahlen im HLSL der Modi Zehn und Acht sind die Ganzzahlen aus
+    /// encoder::ycbcr - und die Rechnung steht nur einmal da (punkt,
+    /// vierergruppe), fuer beide Modi.
     #[test]
-    fn zehn_zahlen_wie_ycbcr() {
-        for t in ["(54 * c.r + 183 * c.g + 19 * c.b + 128) >> 8", "(((c.b - y) * 138 + 128) >> 8) + 128", "(((c.r - y) * 163 + 128) >> 8) + 128", "clamp(int3(y, cb, cr), 0, 255)", "((uint)v) << 8", "rgb8(int2(pos.xy) * 2)"] {
-            assert_eq!(ZEHN_HLSL.matches(t).count(), 1, "{t}");
+    fn yuv_zahlen_wie_ycbcr() {
+        for t in [
+            "(54 * c.r + 183 * c.g + 19 * c.b + 128) >> 8",
+            "(((c.b - y) * 138 + 128) >> 8) + 128",
+            "(((c.r - y) * 163 + 128) >> 8) + 128",
+            "clamp(int3(y, cb, cr), 0, 255)",
+            "((uint)v) << 8",
+            "rgb8(int2(pos.xy) * 2)",
+            "ycbcr709(rgb8(int2(pos.xy)))",
+        ] {
+            assert_eq!(YUV_HLSL.matches(t).count(), 1, "{t}");
         }
-        assert!(!ZEHN_HLSL.contains("register("), "Modus Zehn liest nur den Eingang des Wandlers (t0), ohne Konstanten");
-        for e in ["Zehn444 ps_zehn444(", "uint ps_zehn420_y(", "uint2 ps_zehn420_uv(", "float4 vs_voll("] {
-            assert_eq!(zehn_quelle().matches(e).count(), 1, "{e}");
+        assert!(!YUV_HLSL.contains("register("), "Modi Zehn und Acht lesen nur den Eingang des Wandlers (t0), ohne Konstanten");
+        for e in ["Yuv444Ziele ps_zehn444(", "uint ps_zehn420_y(", "uint2 ps_zehn420_uv(", "Yuv444Ziele ps_acht444(", "uint ps_acht420_y(", "uint2 ps_acht420_uv(", "float4 vs_voll("] {
+            assert_eq!(yuv_quelle().matches(e).count(), 1, "{e}");
         }
+        // Jeder Einstieg rechnet ueber punkt/vierergruppe, keiner selbst.
+        assert_eq!(YUV_HLSL.matches("punkt(pos)").count(), 4);
+        assert_eq!(YUV_HLSL.matches("vierergruppe(pos)").count(), 2);
     }
 
-    /// Die Ebenen eines Bild (YUV444P16LE: Y, Cb, Cr; P010: Y, CbCr) dicht
-    /// gepackt als u16 - wie pq_auslesen sie liefert.
-    fn bild_ebenen(b: &super::super::encoder::Bild, w: usize, h: usize, chroma444: bool) -> Vec<u16> {
-        let ebenen: Vec<(usize, usize)> = if chroma444 { vec![(2 * w, h); 3] } else { vec![(2 * w, h), (2 * w, h / 2)] };
+    /// Die Ebenen eines Bild (YUV444P16LE/YUV444P: Y, Cb, Cr; P010/NV12: Y,
+    /// CbCr) dicht gepackt, je Wert als u16 - wie pq_auslesen sie liefert
+    /// (8 Bit: ein Byte je Wert).
+    fn bild_ebenen(b: &super::super::encoder::Bild, w: usize, h: usize, chroma444: bool, acht: bool) -> Vec<u16> {
+        let bpw = if acht { 1 } else { 2 };
+        let ebenen: Vec<(usize, usize)> = if chroma444 { vec![(bpw * w, h); 3] } else { vec![(bpw * w, h), (bpw * w, h / 2)] };
         let mut aus = Vec::new();
         for (i, (zeile, zeilen)) in ebenen.into_iter().enumerate() {
             let ls = unsafe { (*b.frame).linesize[i] as usize };
             for y in 0..zeilen {
                 let z = unsafe { std::slice::from_raw_parts((*b.frame).data[i].add(y * ls), zeile) };
-                aus.extend(z.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])));
+                if acht {
+                    aus.extend(z.iter().map(|&v| v as u16));
+                } else {
+                    aus.extend(z.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])));
+                }
             }
         }
         aus
     }
 
-    /// Modus Zehn auf WARP gegen die Umrechnung auf dem Prozessor
-    /// (Bild::aus_bgra, der alte Weg der 10-Bit-Kandidaten): 4:4:4
-    /// (YUV444P16LE) und 4:2:0 (P010), alle 16,7 Mio. Farben ueber mehrere
-    /// Bilder verteilt, das Testbild, und eine ungerade Oberflaeche mit
-    /// abgeschnittenem Rand (Strom kleiner als das Bild). Jeder Code
-    /// hoechstens 1 daneben (10 Bit) - gerechnet wird dieselbe Ganzzahlrechnung,
-    /// also ist jeder Code genau gleich.
+    /// Modus Zehn und Modus Acht auf WARP gegen die Umrechnung auf dem
+    /// Prozessor (Bild::aus_bgra, der Prozessorweg der SDR-Kandidaten): 4:4:4
+    /// (YUV444P16LE, YUV444P) und 4:2:0 (P010, NV12), alle 16,7 Mio. Farben
+    /// ueber mehrere Bilder verteilt, das Testbild, eine ungerade Oberflaeche
+    /// mit abgeschnittenem Rand (Strom kleiner als das Bild) und 4:4:4 in
+    /// ungerader Stromgroesse. Dieselbe Ganzzahlrechnung - jeder Code genau gleich.
     #[test]
-    fn zehn_ebenen_auf_warp_wie_aus_bgra() {
+    fn yuv_ebenen_auf_warp_wie_aus_bgra() {
         let Some((device, ctx)) = warp() else { return };
         use ffmpeg_next::sys::AVPixelFormat;
         let mut wandler = Wandler::neu(&device, &ctx, 1000).expect("Wandler");
-        // Bilder: (Oberflaeche w x h, Strom w x h, Punkte [R, G, B]).
-        let mut bilder: Vec<(u32, u32, u32, u32, Vec<[u8; 3]>)> = Vec::new();
+        // Bilder: (Oberflaeche w x h, Strom w x h, nur 4:4:4, Punkte [R, G, B]).
+        let mut bilder: Vec<(u32, u32, u32, u32, bool, Vec<[u8; 3]>)> = Vec::new();
         // Alle 2^24 Farben: 16 Bilder 1024x1024.
         for teil in 0..16u32 {
-            let punkte: Vec<[u8; 3]> = (0..1024 * 1024u32).map(|i| {
-                let c = teil * 1024 * 1024 + i;
-                [(c >> 16) as u8, (c >> 8) as u8, c as u8]
-            }).collect();
-            bilder.push((1024, 1024, 1024, 1024, punkte));
+            let punkte: Vec<[u8; 3]> = (0..1024 * 1024u32)
+                .map(|i| {
+                    let c = teil * 1024 * 1024 + i;
+                    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+                })
+                .collect();
+            bilder.push((1024, 1024, 1024, 1024, false, punkte));
         }
         // Das Testbild (BGRA) in 64x48.
         let tb = super::super::testbild::bgra(64, 48, 3);
-        bilder.push((64, 48, 64, 48, tb.chunks_exact(4).map(|p| [p[2], p[1], p[0]]).collect()));
-        // Ungerade Oberflaeche 37x21, Strom 36x20 (stromplan).
-        bilder.push((37, 21, 36, 20, (0..37 * 21u32).map(|i| [(i * 7) as u8, (i * 13 + 5) as u8, (i * 29 + 11) as u8]).collect()));
-        let mut gesamt = 0usize;
-        let mut daneben = 0usize;
-        for (sw, sh, w, h, punkte) in &bilder {
+        bilder.push((64, 48, 64, 48, false, tb.chunks_exact(4).map(|p| [p[2], p[1], p[0]]).collect()));
+        // Ungerade Oberflaeche 37x21, Strom 36x20 (stromplan) - und 4:4:4 in 37x21 selbst.
+        let ungerade: Vec<[u8; 3]> = (0..37 * 21u32).map(|i| [(i * 7) as u8, (i * 13 + 5) as u8, (i * 29 + 11) as u8]).collect();
+        bilder.push((37, 21, 36, 20, false, ungerade.clone()));
+        bilder.push((37, 21, 37, 21, true, ungerade));
+        let mut gesamt = [0usize; 2];
+        let mut daneben = [0usize; 2];
+        let mut erste: Option<String> = None;
+        for (sw, sh, w, h, nur444, punkte) in &bilder {
             let tex = bgra_textur(&device, *sw, *sh, punkte);
             assert_eq!(wandler.aufnehmen(&tex).expect("aufnehmen"), Eingang::Bgra);
             // Die Quelle der Umrechnung auf dem Prozessor: BGRA in Stromgroesse.
@@ -1319,42 +1431,58 @@ mod tests {
                     ram.extend([p[2], p[1], p[0], 255]);
                 }
             }
-            for chroma444 in [true, false] {
-                let plan = PqPlan { w: *w, h: *h, drehung: Drehung::Keine, chroma444 };
-                assert!(wandler.zehn_rechnen(&plan, true).expect("zehn_rechnen"), "{}", plan.text());
-                let mut aus = Vec::new();
-                wandler.pq_auslesen(&mut aus).expect("auslesen");
-                assert_eq!(aus.len(), plan.bytes(), "{}", plan.text());
-                let karte = als_u16(&aus);
-                let pf = if chroma444 { AVPixelFormat::AV_PIX_FMT_YUV444P16LE } else { AVPixelFormat::AV_PIX_FMT_P010LE };
-                let mut b = super::super::encoder::Bild::neu(pf, *w as i32, *h as i32).expect("Bild");
-                b.aus_bgra(&ram, *w as usize, *h as usize).expect("aus_bgra");
-                let prozessor = bild_ebenen(&b, *w as usize, *h as usize, chroma444);
-                assert_eq!(karte.len(), prozessor.len(), "{}", plan.text());
-                for (i, (&k, &p)) in karte.iter().zip(&prozessor).enumerate() {
-                    assert_eq!(k & 0xff, 0, "{}: Code {i} nicht wie aus_bgra oben buendig ({k:#06x})", plan.text());
-                    let d = (k >> 6) as i32 - (p >> 6) as i32;
-                    assert!(d.abs() <= 1, "{}: Code {i} ist {} statt {} (10 Bit)", plan.text(), k >> 6, p >> 6);
-                    daneben += (d != 0) as usize;
+            for acht in [false, true] {
+                for chroma444 in [true, false] {
+                    if *nur444 && !chroma444 {
+                        continue;
+                    }
+                    let plan = PqPlan { w: *w, h: *h, drehung: Drehung::Keine, chroma444, acht };
+                    assert!(wandler.yuv_rechnen(&plan, true).expect("yuv_rechnen"), "{}", plan.text());
+                    let mut aus = Vec::new();
+                    wandler.pq_auslesen(&mut aus).expect("auslesen");
+                    assert_eq!(aus.len(), plan.bytes(), "{}", plan.text());
+                    let karte: Vec<u16> = if acht { aus.iter().map(|&v| v as u16).collect() } else { als_u16(&aus) };
+                    let pf = match (chroma444, acht) {
+                        (true, false) => AVPixelFormat::AV_PIX_FMT_YUV444P16LE,
+                        (false, false) => AVPixelFormat::AV_PIX_FMT_P010LE,
+                        (true, true) => AVPixelFormat::AV_PIX_FMT_YUV444P,
+                        (false, true) => AVPixelFormat::AV_PIX_FMT_NV12,
+                    };
+                    let mut b = super::super::encoder::Bild::neu(pf, *w as i32, *h as i32).expect("Bild");
+                    b.aus_bgra(&ram, *w as usize, *h as usize).expect("aus_bgra");
+                    let prozessor = bild_ebenen(&b, *w as usize, *h as usize, chroma444, acht);
+                    assert_eq!(karte.len(), prozessor.len(), "{}", plan.text());
+                    for (i, (&k, &p)) in karte.iter().zip(&prozessor).enumerate() {
+                        if k != p {
+                            erste.get_or_insert(format!("{}: Code {i} ist {k:#06x} statt {p:#06x} wie aus_bgra", plan.text()));
+                            daneben[acht as usize] += 1;
+                        }
+                    }
+                    gesamt[acht as usize] += karte.len();
                 }
-                gesamt += karte.len();
             }
         }
-        eprintln!("Zehn auf WARP: {daneben} von {gesamt} Codes neben aus_bgra");
-        assert_eq!(daneben, 0, "dieselbe Ganzzahlrechnung - jeder Code gleich");
+        eprintln!("Zehn auf WARP: {} von {} Codes neben aus_bgra", daneben[0], gesamt[0]);
+        eprintln!("Acht auf WARP: {} von {} Codes neben aus_bgra", daneben[1], gesamt[1]);
+        assert_eq!(daneben, [0, 0], "dieselbe Ganzzahlrechnung - jeder Code gleich; zuerst {erste:?}");
         // Ohne BGRA-Bild nichts zu rechnen; gedreht und groesser als das Bild gibt es nicht.
         let mut leer = Wandler::neu(&device, &ctx, 1000).unwrap();
-        let plan = PqPlan { w: 36, h: 20, drehung: Drehung::Keine, chroma444: true };
-        assert!(!leer.zehn_rechnen(&plan, true).unwrap());
-        assert!(leer.zehn_vorbereiten(&PqPlan { drehung: Drehung::Grad90, ..plan }).is_err());
+        let plan = PqPlan { w: 36, h: 20, drehung: Drehung::Keine, chroma444: true, acht: false };
+        for acht in [false, true] {
+            let plan = PqPlan { acht, ..plan };
+            assert!(!leer.yuv_rechnen(&plan, true).unwrap());
+            assert!(leer.yuv_vorbereiten(&PqPlan { drehung: Drehung::Grad90, ..plan }).is_err());
+        }
         let tex = bgra_textur(&device, 8, 8, &[[1, 2, 3]; 64]);
         leer.aufnehmen(&tex).unwrap();
-        assert!(leer.zehn_rechnen(&plan, false).is_err(), "Strom groesser als das Bild");
-        // Die Ziele fuer die CUDA-Bruecke: Y, Cb, Cr zu je 2 Byte bzw. Y und die CbCr-Paare.
-        let z = leer.zehn_vorbereiten(&plan).unwrap();
-        assert_eq!(z.iter().map(|(_, b, h)| (*b, *h)).collect::<Vec<_>>(), vec![(72, 20); 3]);
-        let z = leer.zehn_vorbereiten(&PqPlan { chroma444: false, ..plan }).unwrap();
-        assert_eq!(z.iter().map(|(_, b, h)| (*b, *h)).collect::<Vec<_>>(), vec![(72, 20), (72, 10)]);
+        assert!(leer.yuv_rechnen(&plan, false).is_err(), "Strom groesser als das Bild");
+        assert!(leer.yuv_rechnen(&PqPlan { acht: true, ..plan }, false).is_err(), "Strom groesser als das Bild");
+        // Die Ziele fuer die CUDA-Bruecke: Y, Cb, Cr zu je 2 (8 Bit: 1) Byte bzw. Y und die CbCr-Paare.
+        let ziele = |p: PqPlan, l: &mut Wandler| l.yuv_vorbereiten(&p).unwrap().iter().map(|(_, b, h)| (*b, *h)).collect::<Vec<_>>();
+        assert_eq!(ziele(plan, &mut leer), vec![(72, 20); 3]);
+        assert_eq!(ziele(PqPlan { chroma444: false, ..plan }, &mut leer), vec![(72, 20), (72, 10)]);
+        assert_eq!(ziele(PqPlan { acht: true, ..plan }, &mut leer), vec![(36, 20); 3]);
+        assert_eq!(ziele(PqPlan { acht: true, chroma444: false, ..plan }, &mut leer), vec![(36, 20), (36, 10)]);
     }
 
     /// SDR-Inhalt im PQ-Strom: Grau v bei SDR-Weiss 2,5 (200 nit) ist Y' =
@@ -1367,7 +1495,7 @@ mod tests {
         let Some((device, ctx)) = warp() else { return };
         let mut wandler = Wandler::neu(&device, &ctx, 2500).expect("Wandler");
         let (w, h) = (256u32, 2u32);
-        let plan = PqPlan { w, h, drehung: Drehung::Keine, chroma444: true };
+        let plan = PqPlan { w, h, drehung: Drehung::Keine, chroma444: true, acht: false };
         let grau: Vec<[f32; 3]> = (0..w * h).map(|i| [spiegel::srgb_eotf((i % 256) as f32 / 255.0) * 2.5; 3]).collect();
         let tex = fp16_textur(&device, w, h, &grau);
         wandler.aufnehmen(&tex).unwrap();
@@ -1410,5 +1538,7 @@ mod tests {
         // Eine ungerade Stromgroesse gibt es fuer 4:2:0 nicht.
         leer.aufnehmen(&tex).unwrap();
         assert!(leer.pq_rechnen(&PqPlan { w: 7, h: 2, chroma444: false, ..plan }).is_err());
+        // HDR10 gibt es nur in 10 Bit.
+        assert!(leer.pq_rechnen(&PqPlan { acht: true, ..plan }).is_err());
     }
 }

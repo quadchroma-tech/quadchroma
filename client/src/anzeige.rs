@@ -104,13 +104,29 @@ struct Ebenen {
     uv: Option<Textur>,
 }
 
-/// Konstanten von Stufe 1 (cbuffer Format, 16 Byte).
+/// Konstanten von Stufe 1 (cbuffer Format, 32 Byte): Aufbau der Ebenen, fuer
+/// ein SDR-Bild dazu Bereich und Matrix aus dem VUI (wie `zeile_rgb`).
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KonstFormat {
     sub: u32,
     paar: u32,
     schieb: u32,
-    _f: u32,
+    /// Begrenzter Bereich (Format oder VUI): vor der Matrix dehnen.
+    begrenzt: u32,
+    /// Cr -> R, Cb -> G, Cr -> G, Cb -> B in 16.16 (hdr::Farbe::sdr_koeffizienten).
+    c: [i32; 4],
+}
+
+/// Die Konstanten von Stufe 1 fuer ein Bild dieses Formats in dieser Farbe.
+fn konst_format(fmt: EbenenFormat, farbe: hdr::Farbe) -> KonstFormat {
+    KonstFormat {
+        sub: fmt.sub as u32,
+        paar: fmt.paar as u32,
+        schieb: fmt.schieb(),
+        begrenzt: (fmt.begrenzt || !farbe.voll) as u32,
+        c: farbe.sdr_koeffizienten(),
+    }
 }
 
 /// Konstanten von Stufe 2 (cbuffer Anzeige, 64 Byte, HLSL-Packung: jede
@@ -410,7 +426,7 @@ pub struct Gpu {
     sampler: ID3D11SamplerState,
     /// CULL_NONE.
     raster: ID3D11RasterizerState,
-    /// 16 Byte, DYNAMIC.
+    /// 32 Byte, DYNAMIC.
     konst_format: ID3D11Buffer,
     /// 64 Byte, DYNAMIC.
     konst_anzeige: ID3D11Buffer,
@@ -437,7 +453,11 @@ pub struct Gpu {
 /// Zahlen prueft hdr_hlsl.rs gegen hdr.rs); `quelle` setzt beides zusammen.
 const SHADER: &str = r#"
 // ---------- Stufe 1: Ebenen -> RGB, bitidentisch zu zeile_rgb ----------
-cbuffer Format : register(b0) { uint sub; uint paar; uint schieb; uint _f; };
+cbuffer Format : register(b0) {
+    uint sub; uint paar; uint schieb;
+    uint begrenzt;   // begrenzter Bereich (VUI): vor der Matrix dehnen, wie zeile_rgb
+    int4 sdr_c;      // Matrix aus dem VUI in 16.16: Cr->R, Cb->G, Cr->G, Cb->B (BT.709 oder BT.601)
+};
 Texture2D<uint>  ebene_y  : register(t0);
 Texture2D<uint>  ebene_u  : register(t1);
 Texture2D<uint>  ebene_v  : register(t2);
@@ -456,9 +476,14 @@ float4 ps_umrechnen(float4 pos : SV_Position) : SV_Target {
         cr = int(ebene_v.Load(int3(c, 0)) >> schieb);
     }
     cb -= 128; cr -= 128;                                  // Nullpunkt 128, nicht 0.5
-    int r = y + ((103206 * cr) >> 16);                    // 1.5748 - dieselben Konstanten wie zeile_rgb
-    int g = y - ((12276 * cb + 30681 * cr) >> 16);        // 0.1873, 0.4681 - EINE Verschiebung der Summe
-    int b = y + ((121609 * cb) >> 16);                    // 1.8556
+    if (begrenzt != 0) {
+        y = ((y - 16) * 76309 + 32768) >> 16;             // 255/219, gerundet
+        cb = (cb * 74606 + 32768) >> 16;                  // 255/224, gerundet
+        cr = (cr * 74606 + 32768) >> 16;
+    }
+    int r = y + ((sdr_c.x * cr) >> 16);                   // BT.709: 1.5748 - dieselben Konstanten wie zeile_rgb
+    int g = y - ((sdr_c.y * cb + sdr_c.z * cr) >> 16);    // 0.1873, 0.4681 - EINE Verschiebung der Summe
+    int b = y + ((sdr_c.w * cb) >> 16);                   // 1.8556
     int3 rgb = clamp(int3(r, g, b), 0, 255);
     return float4(float3(rgb) * (1.0 / 255.0), 1.0);      // UNORM-Rundung liefert exakt rgb
 }
@@ -1786,9 +1811,9 @@ impl Gpu {
                 self.matrix_gemeldet = true;
                 protokoll::zeile(format!("Anzeige: PQ-Bild mit Matrix {} - gerechnet wird BT.2020-NCL", farbe.matrix));
             }
-            self.stufe1(Some(konst_pq(fmt, farbe)))
+            self.stufe1(konst_format(fmt, farbe), Some(konst_pq(fmt, farbe)))
         } else {
-            self.stufe1(None)
+            self.stufe1(konst_format(fmt, farbe), None)
         }
     }
 
@@ -1860,15 +1885,13 @@ impl Gpu {
 
     /// Stufe 1: Ebenen -> Zwischentextur. Mit `pq` (ein PQ-Bild) ueber
     /// ps_umrechnen_pq in die R16G16B16A16-Zwischentextur, ganzzahlig wie
-    /// `pq_stufe1`; sonst der heutige Weg (ps_umrechnen, bitidentisch zu to_rgb).
-    fn stufe1(&self, pq: Option<KonstPq>) -> Result<(), String> {
+    /// `pq_stufe1`; sonst der heutige Weg (ps_umrechnen mit Matrix und
+    /// Bereich aus `format`, bitidentisch zu to_rgb).
+    fn stufe1(&self, format: KonstFormat, pq: Option<KonstPq>) -> Result<(), String> {
         let e = self.ebenen.as_ref().ok_or("Ebenen fehlen")?;
         let z = self.zwischen.as_ref().ok_or("Zwischentextur fehlt")?;
         self.sichten_loesen();
-        self.konstanten_schreiben(
-            &self.konst_format,
-            &KonstFormat { sub: e.fmt.sub as u32, paar: e.fmt.paar as u32, schieb: e.fmt.schieb(), _f: 0 },
-        )?;
+        self.konstanten_schreiben(&self.konst_format, &format)?;
         if let Some(k) = &pq {
             self.konstanten_schreiben(&self.konst_pq, k)?;
         }
@@ -2338,6 +2361,18 @@ pub fn anzeigetest(verzeichnis: &str) -> bool {
         }
     }
 
+    // SDR mit Matrix und Bereich aus dem VUI: BT.601 begrenzt (der bgra-Weg
+    // eines Windows-Hosts), BT.601 voll, BT.709 begrenzt.
+    println!("SDR nach dem VUI: BT.601 begrenzt (bgra-Weg), BT.601 voll, BT.709 begrenzt - gegen to_rgb, Toleranz 0");
+    for p in [Pixel::YUV444P, Pixel::YUV420P, Pixel::NV12, Pixel::YUV444P10LE, Pixel::P010LE] {
+        for (w, h) in [(257u32, 131u32), (1920, 1080)] {
+            ok &= vui_pruefen(&mut gpu, p, w, h, verzeichnis, lang);
+            for z in protokoll::abholen() {
+                println!("    {z}");
+            }
+        }
+    }
+
     // HDR10: die Formate, in denen PQ ankommt (Software-Decoder 4:4:4 und
     // 4:2:0, cuvid oben buendig und P010), dazu zweimal begrenzter Bereich.
     println!("HDR10: PQ-Ebenen gegen hdr.rs - Durchreichen exakt, sonst +-1 (CPU-Tabellen +-2)");
@@ -2358,6 +2393,59 @@ pub fn anzeigetest(verzeichnis: &str) -> bool {
         println!("    {z}");
     }
     println!("{}", if ok { "Anzeigetest bestanden" } else { "Anzeigetest NICHT bestanden" });
+    ok
+}
+
+/// Ein SDR-Format in einer Groesse mit dem VUI anderer Hosts: Stufe 1 gegen
+/// `to_rgb` (Toleranz 0) - beide lesen Matrix und Bereich aus dem Bild. Und
+/// das VUI muss wirken: dieselben Ebenen als BT.709 voll ergeben ein
+/// anderes Bild.
+fn vui_pruefen(gpu: &mut Gpu, p: ffmpeg::format::Pixel, w: u32, h: u32, verzeichnis: &str, lang: &'static crate::strings::Lang) -> bool {
+    use ffmpeg::color;
+    let mut ok = true;
+    let Some(roh) = probebild(p, w, h) else {
+        println!("{p:?} {w}x{h}: kein Probebild");
+        return false;
+    };
+    let Ok(bt709_voll) = crate::to_rgb(&roh) else {
+        println!("{p:?} {w}x{h}: to_rgb ohne VUI scheitert");
+        return false;
+    };
+    for (space, range, fall) in [
+        (color::Space::BT470BG, color::Range::MPEG, "601 begr."),
+        (color::Space::SMPTE170M, color::Range::JPEG, "601 voll"),
+        (color::Space::BT709, color::Range::MPEG, "709 begr."),
+    ] {
+        let name = format!("{p:?}");
+        let mut bild = roh.clone();
+        bild.set_color_transfer_characteristic(color::TransferCharacteristic::BT709);
+        bild.set_color_primaries(color::Primaries::BT709);
+        bild.set_color_space(space);
+        bild.set_color_range(range);
+        let referenz = match crate::to_rgb(&bild) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("{name:<15} {w:>4}x{h:<4} {fall}: to_rgb: {e}");
+                ok = false;
+                continue;
+            }
+        };
+        if referenz.pixels == bt709_voll.pixels {
+            println!("{name:<15} {w:>4}x{h:<4} {fall:<11} FEHLER: das VUI wirkt nicht (dasselbe Bild wie BT.709 voll)");
+            ok = false;
+        }
+        match gpu.bild_roh(&bild).and_then(|_| gpu.zwischen_auslesen()) {
+            Ok((aus, zw, zh)) if (zw, zh) == (w, h) => ok &= fall_pruefen(&name, w, h, fall, &referenz.pixels, &aus, w, h, 0, Some(verzeichnis), lang),
+            Ok((_, zw, zh)) => {
+                println!("{name:<15} {w:>4}x{h:<4} {fall}: Zwischentextur ist {zw}x{zh}");
+                ok = false;
+            }
+            Err(e) => {
+                println!("{name:<15} {w:>4}x{h:<4} {fall}: {e}");
+                ok = false;
+            }
+        }
+    }
     ok
 }
 
@@ -2636,6 +2724,9 @@ mod tests {
     /// Reihenfolge in den cbuffern FormatPq (b2) und Hdr (b3).
     #[test]
     fn konstanten_wie_im_shader() {
+        assert_eq!(std::mem::size_of::<KonstFormat>(), 32);
+        assert_eq!(std::mem::offset_of!(KonstFormat, begrenzt), 12);
+        assert_eq!(std::mem::offset_of!(KonstFormat, c), 16);
         assert_eq!(std::mem::size_of::<KonstPq>(), 32);
         assert_eq!(std::mem::offset_of!(KonstPq, c), 16);
         assert_eq!(std::mem::size_of::<KonstHdr>(), 32);
@@ -2646,11 +2737,29 @@ mod tests {
             let lage: Vec<usize> = namen.iter().map(|n| t.find(n).unwrap_or_else(|| panic!("{n} fehlt in {cb}"))).collect();
             assert!(lage.windows(2).all(|w| w[0] < w[1]), "{cb}: Reihenfolge {namen:?}");
         };
+        reihenfolge("cbuffer Format : register(b0)", &["uint sub", "uint paar", "uint schieb", "uint begrenzt", "int4 sdr_c"]);
         reihenfolge("cbuffer FormatPq : register(b2)", &["pq_ky", "pq_y0", "pq_links", "pq_rechts", "pq_c"]);
         reihenfolge("cbuffer Hdr : register(b3)", &["h_weiss_quelle", "h_hs", "h_hd", "h_weiss_ziel", "h_quelle_pq", "h_durchreichen", "uint2 _h"]);
         for e in ["float4 ps_umrechnen_pq(", "float4 ps_anzeigen_pq_sdr(", "float4 ps_anzeigen_hdr("] {
             assert_eq!(SHADER.matches(e).count(), 1, "{e}");
         }
+    }
+
+    /// Stufe 1 fuer SDR nimmt Bereich und Matrix aus dem VUI: BT.709 voll
+    /// wie seit jeher (dieselben Zahlen wie zeile_rgb), der bgra-Weg (BT.601
+    /// begrenzt) mit den BT.601-Zahlen und Dehnen; ein begrenztes Format
+    /// dehnt auch ohne VUI.
+    #[test]
+    fn stufe1_sdr_nach_dem_vui() {
+        let fmt = EbenenFormat { sub: true, bits: 8, paar: true, begrenzt: false };
+        let k = konst_format(fmt, hdr::Farbe::SDR);
+        assert_eq!(k, KonstFormat { sub: 1, paar: 1, schieb: 0, begrenzt: 0, c: [103206, 12276, 30681, 121609] });
+        let bt601 = hdr::Farbe { matrix: hdr::MATRIX_601, voll: false, ..hdr::Farbe::SDR };
+        let k = konst_format(fmt, bt601);
+        assert_eq!((k.begrenzt, k.c), (1, hdr::SDR_KOEFF_601));
+        let k = konst_format(EbenenFormat { begrenzt: true, bits: 16, ..fmt }, hdr::Farbe::SDR);
+        assert_eq!((k.begrenzt, k.schieb, k.c), (1, 8, hdr::SDR_KOEFF_709));
+        assert!(SHADER.contains("if (begrenzt != 0) {") && SHADER.contains("(y - 16) * 76309 + 32768") && SHADER.contains("(cb * 74606 + 32768)"));
     }
 
     /// PQ, sRGB, beide Matrizen und die Abbildung kommen aus hdr_hlsl.rs

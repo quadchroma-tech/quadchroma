@@ -11,18 +11,23 @@
 // ganze Kette Duplication -> Encoder -> Zuschauer auch ohne Karte.
 //
 // Eingabeweg (--encoderweg bgra|yuv444|d3d11|auto): BGRA direkt in nvenc
-// (der rechnet auf der Karte nach YUV um; rgb_mode=yuv444 fuer 4:4:4, sonst
-// ergibt nvenc aus RGB immer 4:2:0), yuv444p/nv12 aus eigener Umrechnung
-// auf dem Prozessor, oder d3d11: das Bild bleibt auf der Karte (hw_frames_ctx
-// auf dem Geraet der Duplication). auto = --encoderweg, sonst die
+// (der rechnet auf der Karte nach YUV um - nach BT.601 im begrenzten
+// Bereich, und FFmpeg schreibt dann ein VUI BT.470BG/begrenzt;
+// rgb_mode=yuv444 fuer 4:4:4, sonst ergibt nvenc aus RGB immer 4:2:0),
+// yuv444p/nv12 aus eigener Umrechnung auf dem Prozessor (BT.709 voll), oder
+// d3d11: das Bild bleibt auf der Karte. auto = --encoderweg, sonst die
 // Entscheidung aus messung.txt, sonst die Vorgabe: d3d11, wenn der Ausgang an
 // der NVIDIA-Karte haengt, auf der nvenc codiert, sonst bgra (weg_waehlen).
-// Auf d3d11 nehmen die 8-Bit-Kandidaten BGRA-Texturen ohne Kopie, die
-// 10-Bit-Kandidaten den Wandler auf der Karte (wandler.rs, Modus Zehn:
-// dieselbe Rechnung wie aus_bgra) und die CUDA-Bruecke (cuda.rs) in einen
-// CUDA-Rahmen - Eingabe::Karte. Geht der Weg auf der Karte fuer einen
-// Kandidaten nicht auf, nimmt er den Prozessorweg (Grund einmal im
-// Protokoll). 10-Bit-Kandidaten sind auf Windows immer eine Umrechnung (der
+// Auf d3d11 nehmen alle SDR-Kandidaten den Wandler auf der Karte
+// (wandler.rs, Modus Zehn fuer 10 Bit, Modus Acht fuer 8 Bit: dieselbe
+// Rechnung wie aus_bgra, BT.709 voll) und die CUDA-Bruecke (cuda.rs) in
+// einen CUDA-Rahmen - Eingabe::Karte. Geht der Weg auf der Karte fuer einen
+// Kandidaten nicht auf, nimmt er den Prozessorweg mit der Umrechnung auf
+// dem Prozessor (Grund einmal im Protokoll) - dieselben Werte wie auf der
+// Karte. BGRA in nvenc bleibt dem Weg bgra (Ausgang nicht an der
+// NVIDIA-Karte, gedreht, fuer H.264 eingepasst, --encoderweg bgra): dort
+// kommt 8 Bit als BT.601 begrenzt an, das VUI sagt es, und die Clients
+// lesen es. 10-Bit-Kandidaten sind auf Windows immer eine Umrechnung (der
 // Desktop ist 8 Bit), Media Foundation nimmt nur NV12.
 //
 // Alles ueber die rohe C-Schnittstelle (ffmpeg::sys), weil die Optionen der
@@ -48,7 +53,7 @@ use ffmpeg::sys::*;
 use rayon::prelude::*;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -374,7 +379,7 @@ impl Weg {
 
     pub fn name(self) -> &'static str {
         match self {
-            Weg::Bgra => "bgra (NVENC rechnet um)",
+            Weg::Bgra => "bgra (NVENC rechnet um, 8 Bit in BT.601 begrenzt)",
             Weg::Yuv444 => "yuv444 (Umrechnung auf dem Prozessor)",
             Weg::D3d11 => "d3d11 (das Bild bleibt auf der Karte)",
             Weg::Auto => "auto",
@@ -481,7 +486,7 @@ pub fn weg_entscheiden(wunsch: Weg, a: &Ausgang) -> Weg {
             if farb_444 { "bestanden" } else { "nicht bestanden" }
         )),
         _ if weg == Weg::D3d11 => log(format!(
-            "Encoderweg: {} (Vorgabe: {karte}, dort codiert nvenc - 8 Bit als Textur ohne Kopie, 10 Bit ueber den Wandler auf der Karte; keine Entscheidung in messung.txt)",
+            "Encoderweg: {} (Vorgabe: {karte}, dort codiert nvenc - 8 und 10 Bit ueber den Wandler auf der Karte, BT.709 voll; keine Entscheidung in messung.txt)",
             weg.name()
         )),
         _ => log(format!("Encoderweg: {} (Vorgabe: {karte}, nicht an einer NVIDIA-Karte - das Bild geht ueber den Prozessor)", weg.name())),
@@ -502,39 +507,41 @@ fn weg_code(w: Weg) -> u8 {
 /// Wie das Bild eines Kandidaten in den Encoder kommt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Eingabe {
-    /// Systemspeicher in diesem Format: BGRA (nvenc rechnet um), die eigene
-    /// Umrechnung auf dem Prozessor (YUV444P, NV12, YUV444P16LE, P010) oder
-    /// bei HDR10 die PQ-Ebenen des Wandlers - der Prozessorweg.
+    /// Systemspeicher in diesem Format: BGRA (nvenc rechnet um, BT.601
+    /// begrenzt), die eigene Umrechnung auf dem Prozessor (YUV444P, NV12,
+    /// YUV444P16LE, P010 - BT.709 voll) oder bei HDR10 die PQ-Ebenen des
+    /// Wandlers - der Prozessorweg.
     Ram(AVPixelFormat),
-    /// BGRA-Texturen aus einem Pool auf dem Geraet der Aufnahme, ohne Kopie
-    /// ueber den Hauptspeicher (8-Bit-Kandidaten; nvenc rechnet um).
-    Textur,
-    /// Die 10-Bit-Kandidaten auf der Karte: der Wandler rechnet die Ebenen
-    /// in diesem Format (YUV444P16LE bzw. P010, dieselben Werte wie
-    /// aus_bgra), die CUDA-Bruecke kopiert sie in einen CUDA-Rahmen.
+    /// Die SDR-Kandidaten auf der Karte: der Wandler rechnet die Ebenen in
+    /// diesem Format (YUV444P16LE, P010, YUV444P bzw. NV12 - dieselben Werte
+    /// wie aus_bgra), die CUDA-Bruecke kopiert sie in einen CUDA-Rahmen.
     Karte(AVPixelFormat),
 }
 
 impl Eingabe {
     /// Braucht die Aufnahme eine Textur (DEFAULT-Kopie) statt STAGING?
     pub fn texturen(self) -> bool {
-        !matches!(self, Eingabe::Ram(_))
+        matches!(self, Eingabe::Karte(_))
     }
 
     /// Das Format der Bilder im Systemspeicher, die diese Eingabe nimmt
-    /// (Testbild, Befund): bei Textur BGRA, sonst das Format der Ebenen.
+    /// (Testbild, Befund): das Format der Ebenen bzw. BGRA.
     pub fn pix_fmt(self) -> AVPixelFormat {
         match self {
             Eingabe::Ram(p) | Eingabe::Karte(p) => p,
-            Eingabe::Textur => AVPixelFormat::AV_PIX_FMT_BGRA,
         }
+    }
+
+    /// Rechnet nvenc selbst aus RGB um (BT.601 im begrenzten Bereich, VUI
+    /// BT.470BG/begrenzt)? Nur BGRA im Systemspeicher.
+    pub fn nvenc_rechnet(self) -> bool {
+        self == Eingabe::Ram(AVPixelFormat::AV_PIX_FMT_BGRA)
     }
 
     /// Fuers Protokoll.
     pub fn text(self) -> String {
         match self {
             Eingabe::Ram(p) => pix_fmt_name(p),
-            Eingabe::Textur => "d3d11/bgra ohne Kopie".into(),
             Eingabe::Karte(p) => format!("cuda/{} aus dem Wandler auf der Karte", pix_fmt_name(p)),
         }
     }
@@ -542,25 +549,23 @@ impl Eingabe {
 
 /// Die Eingabe eines Kandidaten (idx) auf diesem Weg mit diesem Encoder:
 /// Media Foundation nimmt nur NV12 im Systemspeicher; HDR10 (`pq`) die
-/// PQ-Ebenen des Wandlers im Systemspeicher; auf d3d11 die 8-Bit-Kandidaten
-/// Texturen, die 10-Bit-Kandidaten den Wandler auf der Karte - ausser der
-/// Weg auf der Karte ging fuer diesen Kandidaten schon nicht auf
-/// (`karte_gescheitert`), dann wie bgra. Auf bgra und yuv444 der
-/// Systemspeicher, 10 Bit mit der Umrechnung auf dem Prozessor.
+/// PQ-Ebenen des Wandlers im Systemspeicher; auf d3d11 jeder SDR-Kandidat
+/// den Wandler auf der Karte - ausser der Weg auf der Karte ging fuer ihn
+/// schon nicht auf (`karte_gescheitert`), dann die Umrechnung auf dem
+/// Prozessor (wie yuv444: dieselben Werte, nur langsamer). Auf yuv444 der
+/// Systemspeicher mit der Umrechnung auf dem Prozessor, auf bgra ebenso fuer
+/// 10 Bit, 8 Bit dort als BGRA - nvenc rechnet um.
 pub fn eingabe_waehlen(idx: usize, weg: Weg, encoder: &str, pq: bool, karte_gescheitert: bool) -> Eingabe {
     let k = kandidat(idx);
     if encoder == MF_H264 {
         return Eingabe::Ram(AVPixelFormat::AV_PIX_FMT_NV12);
     }
-    let weg = if weg == Weg::D3d11 && karte_gescheitert { Weg::Bgra } else { weg };
     if pq {
         return Eingabe::Ram(k.pix_fmt);
     }
     match weg {
-        Weg::D3d11 if k.zehn_bit => Eingabe::Karte(k.pix_fmt),
-        Weg::D3d11 => Eingabe::Textur,
-        _ if k.zehn_bit => Eingabe::Ram(k.pix_fmt),
-        Weg::Bgra => Eingabe::Ram(AVPixelFormat::AV_PIX_FMT_BGRA),
+        Weg::D3d11 if !karte_gescheitert => Eingabe::Karte(k.pix_fmt),
+        Weg::Bgra if !k.zehn_bit => Eingabe::Ram(AVPixelFormat::AV_PIX_FMT_BGRA),
         _ => Eingabe::Ram(k.pix_fmt),
     }
 }
@@ -573,10 +578,11 @@ fn karte_gescheitert(idx: usize) -> bool {
     KARTE_GESCHEITERT[idx.min(KANDIDATEN.len() - 1)].load(Ordering::Relaxed)
 }
 
-/// Nimmt der Encoder dieses Kandidaten auf diesem Weg Texturen? Danach
-/// richtet sich die Aufnahme (DEFAULT-Kopie oder STAGING) - nicht nach dem
-/// Weg allein: Media Foundation nimmt auch bei d3d11 den Systemspeicher,
-/// und ein Kandidat, dessen Weg auf der Karte nicht aufging, ebenso.
+/// Nimmt der Encoder dieses Kandidaten auf diesem Weg Texturen (den Wandler
+/// auf der Karte)? Danach richtet sich die Aufnahme (DEFAULT-Kopie oder
+/// STAGING) - nicht nach dem Weg allein: Media Foundation nimmt auch bei
+/// d3d11 den Systemspeicher, und ein Kandidat, dessen Weg auf der Karte
+/// nicht aufging, ebenso.
 pub fn texturweg(idx: usize, weg: Weg) -> bool {
     eingabe_waehlen(idx, weg, befund(idx).encoder, false, karte_gescheitert(idx)).texturen()
 }
@@ -772,8 +778,8 @@ pub struct Oeffnung<'a> {
     /// nvenc "delay": 0 = synchron, 2 = bis zwei Bilder unterwegs.
     pub delay: i32,
     pub preset: &'a str,
-    /// Rahmen auf der Karte statt Systemspeicher: ein D3D11-Pool
-    /// (Null-Kopien-Weg) oder ein CUDA-Pool (Wandler auf der Karte).
+    /// Rahmen auf der Karte statt Systemspeicher: ein CUDA-Pool (Wandler
+    /// auf der Karte) oder ein D3D11-Pool (--messen, Weg D3).
     pub hw_frames: Option<*mut AVBufferRef>,
     /// RGB-Eingabe soll 4:4:4 ergeben (nvenc rgb_mode=yuv444; Vorgabe waere 4:2:0).
     pub rgb_444: bool,
@@ -1308,7 +1314,8 @@ pub fn hw_geraet(device: &ID3D11Device) -> Result<*mut AVBufferRef, String> {
     }
 }
 
-/// Texturpool fuer den Null-Kopien-Weg: Format D3D11, sw_format BGRA,
+/// Texturpool fuer den Null-Kopien-Weg (--messen, Weg D3 - der Betrieb
+/// nimmt fuer 8 Bit den Wandler auf der Karte): Format D3D11, sw_format BGRA,
 /// RENDER_TARGET, sechs Texturen (bis zu drei beim Encoder, das zuletzt
 /// gegebene Bild fuer die Wiederholung, das Testbild und eine Reserve).
 pub fn hw_pool(geraet: *mut AVBufferRef, w: i32, h: i32) -> Result<*mut AVBufferRef, String> {
@@ -1353,25 +1360,6 @@ pub fn pool_textur(pool: *mut AVBufferRef, bild: &mut Bild) -> Result<(ID3D11Tex
     }
 }
 
-/// Ein Bild im Systemspeicher (BGRA in Poolgroesse, das Testbild) in eine
-/// Textur des Pools laden; `rahmen` haelt danach diese Textur. Eine
-/// Sitzung mit hw_frames_ctx nimmt nur Texturen - nvenc liest bei ihr
-/// frame->hw_frames_ctx, ohne zu pruefen, ob es ihn gibt.
-pub fn pool_hochladen(pool: *mut AVBufferRef, ctx: &ID3D11DeviceContext, quelle: &Bild, rahmen: &mut Bild) -> Result<(), String> {
-    let (w, h) = unsafe {
-        let fc = (*pool).data as *const AVHWFramesContext;
-        ((*fc).width, (*fc).height)
-    };
-    if !rahmen_passt(quelle.frame, None, AVPixelFormat::AV_PIX_FMT_BGRA, w, h) {
-        return Err(format!("Bild fuer den Pool ({w}x{h} BGRA) passt nicht"));
-    }
-    let (t, idx) = pool_textur(pool, rahmen)?;
-    unsafe {
-        ctx.UpdateSubresource(&t, idx, None, (*quelle.frame).data[0] as *const _, (*quelle.frame).linesize[0] as u32, 0);
-    }
-    Ok(())
-}
-
 /// Passt ein Rahmen zur Sitzung? Mit Pool nur Texturen aus genau diesem
 /// Pool, ohne Pool nur Systemspeicher im Eingabeformat - immer in der
 /// Groesse der Sitzung. Was nicht passt, erreicht avcodec_send_frame nie.
@@ -1405,7 +1393,7 @@ fn textur_pruefen(tex: &ID3D11Texture2D, w: i32, h: i32) -> Result<(), String> {
 pub enum Quelle<'a> {
     /// BGRA im Systemspeicher (Staging-Kopie der Duplication).
     Ram(&'a [u8]),
-    /// Eine Textur auf dem Geraet der Duplication (Null-Kopien-Weg).
+    /// Eine Textur auf dem Geraet der Duplication (Weg auf der Karte).
     Textur(&'a ID3D11Texture2D),
     /// Die PQ-Ebenen des Wandlers (HDR10: YUV444P16LE bzw. P010, u16 dicht
     /// gepackt, Stromgroesse).
@@ -1424,9 +1412,9 @@ pub enum Quelle<'a> {
 /// Bild hatte (frisch geoeffnet): nichts gesendet, nichts zu zaehlen.
 pub const KEIN_VORBILD: &str = "kein Bild fuer die Wiederholung";
 
-/// Geraet und Rahmenpool auf der Karte: D3D11 (Null-Kopien-Weg, BGRA) oder
-/// CUDA (Wandler auf der Karte, 10 Bit). Wird als Feld NACH Sitzung und Bild
-/// abgebaut - die halten Referenzen auf den Pool.
+/// Geraet und Rahmenpool auf der Karte: CUDA (Wandler auf der Karte). Wird
+/// als Feld NACH Sitzung und Bild abgebaut - die halten Referenzen auf den
+/// Pool.
 struct Pool {
     geraet: *mut AVBufferRef,
     pool: *mut AVBufferRef,
@@ -1441,11 +1429,11 @@ impl Drop for Pool {
     }
 }
 
-/// Der Weg eines 10-Bit-Kandidaten auf der Karte (Eingabe::Karte): der
-/// Wandler auf dem Geraet der Aufnahme rechnet aus deren Textur die Ebenen
-/// (Modus Zehn), die Bruecke kopiert sie in einen Rahmen des CUDA-Pools.
-/// Die Bruecke zuerst: sie meldet die Ziele des Wandlers bei CUDA ab, bevor
-/// sie mit ihm fallen.
+/// Der Weg eines SDR-Kandidaten auf der Karte (Eingabe::Karte): der Wandler
+/// auf dem Geraet der Aufnahme rechnet aus deren Textur die Ebenen (Modus
+/// Zehn fuer 10 Bit, Modus Acht fuer 8 Bit), die Bruecke kopiert sie in
+/// einen Rahmen des CUDA-Pools. Die Bruecke zuerst: sie meldet die Ziele des
+/// Wandlers bei CUDA ab, bevor sie mit ihm fallen.
 struct Kartenweg {
     bruecke: cuda::Bruecke,
     wandler: Wandler,
@@ -1455,12 +1443,21 @@ struct Kartenweg {
 }
 
 impl Kartenweg {
-    /// Wandler, CUDA-Geraet, -Pool und Bruecke fuer w x h auf diesem Geraet;
-    /// liefert den Weg und den Pool (fuer die Sitzung).
-    fn einrichten(dev: &ID3D11Device, dc: &ID3D11DeviceContext, pix_fmt: AVPixelFormat, chroma444: bool, w: i32, h: i32) -> Result<(Kartenweg, Pool), String> {
+    /// Wandler, CUDA-Geraet, -Pool und Bruecke fuer w x h in diesem Format
+    /// (YUV444P16LE, P010, YUV444P oder NV12) auf diesem Geraet; liefert den
+    /// Weg und den Pool (fuer die Sitzung).
+    fn einrichten(dev: &ID3D11Device, dc: &ID3D11DeviceContext, pix_fmt: AVPixelFormat, w: i32, h: i32) -> Result<(Kartenweg, Pool), String> {
+        use AVPixelFormat::*;
+        let (chroma444, acht) = match pix_fmt {
+            AV_PIX_FMT_YUV444P16LE => (true, false),
+            AV_PIX_FMT_P010LE => (false, false),
+            AV_PIX_FMT_YUV444P => (true, true),
+            AV_PIX_FMT_NV12 => (false, true),
+            f => return Err(format!("Weg auf der Karte in {} nicht vorgesehen", pix_fmt_name(f))),
+        };
         let mut wandler = Wandler::neu(dev, dc, super::wandler::SDR_WEISS_VORGABE)?;
-        let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, drehung: Drehung::Keine, chroma444 };
-        let ziele = wandler.zehn_vorbereiten(&plan)?;
+        let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, drehung: Drehung::Keine, chroma444, acht };
+        let ziele = wandler.yuv_vorbereiten(&plan)?;
         let g = cuda::geraet(dev)?;
         let p = match cuda::pool(g, pix_fmt, w, h) {
             Ok(p) => p,
@@ -1482,9 +1479,9 @@ impl Kartenweg {
     /// Rahmen `bild` aus dem CUDA-Pool: in den Wandler, Ebenen rechnen,
     /// hinueber kopieren - alles auf der Karte.
     fn rahmen_fuellen(&mut self, tex: &ID3D11Texture2D, pool: *mut AVBufferRef, bild: &mut Bild) -> Result<(), String> {
-        self.wandler.aufnehmen(tex).map_err(|e| format!("Wandler Zehn: Bild nicht aufgenommen ({})", e.message().trim()))?;
-        if !self.wandler.zehn_rechnen(&self.plan, false)? {
-            return Err("Wandler Zehn: kein BGRA-Bild".into());
+        self.wandler.aufnehmen(tex).map_err(|e| format!("Wandler: Bild nicht aufgenommen ({})", e.message().trim()))?;
+        if !self.wandler.yuv_rechnen(&self.plan, false)? {
+            return Err("Wandler: kein BGRA-Bild".into());
         }
         cuda::rahmen_holen(pool, bild.frame)?;
         self.bruecke.kopieren(bild.frame)
@@ -1530,8 +1527,8 @@ pub struct Betrieb {
     /// Leerer Rahmen fuer das Testbild im Pool - `bild` behaelt derweil das
     /// letzte Desktopbild fuer die Wiederholung.
     tb_rahmen: Bild,
-    /// Der Wandler auf der Karte (10 Bit, Eingabe::Karte) - vor dem Pool
-    /// abgebaut (die Bruecke haelt ihr eigenes Geraet).
+    /// Der Wandler auf der Karte (Eingabe::Karte) - vor dem Pool abgebaut
+    /// (die Bruecke haelt ihr eigenes Geraet).
     karte: Option<Kartenweg>,
     pool: Option<Pool>,
     /// Fuer Texturquellen: Geraet und Kontext der Aufnahme.
@@ -1567,13 +1564,14 @@ pub struct Betrieb {
 
 impl Betrieb {
     /// Sitzung fuer einen Kandidaten oeffnen: Encoder und Eingabe aus Befund
-    /// und Weg (eingabe_waehlen); auf d3d11 der Pool auf dem Geraet der
-    /// Duplication - BGRA-Texturen fuer 8 Bit, fuer 10 Bit der Wandler auf
-    /// der Karte mit CUDA-Pool. Geht der Weg auf der Karte nicht auf, der
-    /// Prozessorweg: der Grund steht einmal im Protokoll, und der Kandidat
-    /// bleibt fuer diesen Lauf dort (texturweg sagt es der Aufnahme). In PQ
-    /// nur Kandidaten mit HDR10 im Befund (0 und 2 auf nvenc) - die nehmen
-    /// immer den Systemspeicher (die Ebenen des Wandlers der Aufnahme).
+    /// und Weg (eingabe_waehlen); auf d3d11 der Wandler auf dem Geraet der
+    /// Duplication mit CUDA-Pool, fuer 8 wie fuer 10 Bit. Geht der Weg auf
+    /// der Karte nicht auf, der Prozessorweg mit der Umrechnung auf dem
+    /// Prozessor (dieselben Werte): der Grund steht einmal im Protokoll, und
+    /// der Kandidat bleibt fuer diesen Lauf dort (texturweg sagt es der
+    /// Aufnahme). In PQ nur Kandidaten mit HDR10 im Befund (0 und 2 auf
+    /// nvenc) - die nehmen immer den Systemspeicher (die Ebenen des Wandlers
+    /// der Aufnahme).
     pub fn oeffnen(idx: usize, w: i32, h: i32, weg: Weg, geraet: Option<(&ID3D11Device, &ID3D11DeviceContext)>, farbe: StromFarbe) -> Result<Betrieb, String> {
         let k = kandidat(idx);
         let b = befund(idx);
@@ -1620,27 +1618,10 @@ impl Betrieb {
         if eingabe.texturen() && geraet.is_none() {
             return Err("Weg auf der Karte ohne Geraet".into());
         }
-        match (eingabe, geraet) {
-            (Eingabe::Textur, Some((dev, _))) => {
-                let g = hw_geraet(dev)?;
-                let p = match hw_pool(g, w, h) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        unsafe {
-                            let mut g = g;
-                            av_buffer_unref(&mut g);
-                        }
-                        return Err(e);
-                    }
-                };
-                pool = Some(Pool { geraet: g, pool: p });
-            }
-            (Eingabe::Karte(p), Some((dev, dc))) => {
-                let (kw, pl) = Kartenweg::einrichten(dev, dc, p, k.chroma444, w, h)?;
-                karte = Some(kw);
-                pool = Some(pl);
-            }
-            _ => {}
+        if let (Eingabe::Karte(p), Some((dev, dc))) = (eingabe, geraet) {
+            let (kw, pl) = Kartenweg::einrichten(dev, dc, p, w, h)?;
+            karte = Some(kw);
+            pool = Some(pl);
         }
         crate::protokoll::fehler_verwerfen();
         let o = Oeffnung {
@@ -1664,7 +1645,7 @@ impl Betrieb {
             if b.hardware { format!("Hardware ({})", b.encoder) } else { format!("Software ({})", b.encoder) },
             if farbe.ist_pq() { format!("{} (PQ-Ebenen des Wandlers)", pix_fmt_name(pix_fmt)) } else { eingabe.text() },
             if umrechnung_fuer(idx, &b) && !farbe.ist_pq() { " (mit Umrechnung)" } else { "" },
-            farbe.text()
+            if eingabe.nvenc_rechnet() { "BT.601 begrenzt (nvenc rechnet aus BGRA um, VUI BT.470BG)".to_string() } else { farbe.text() }
         ) + &if b.vorlauf > 0 { format!(", Vorlauf {} Bilder", b.vorlauf) } else { String::new() });
         Ok(Betrieb {
             idx,
@@ -1725,7 +1706,8 @@ impl Betrieb {
     }
 
     /// Was die Aufnahme liefern muss: Some(4:4:4) fuer die PQ-Ebenen des
-    /// Wandlers, None fuer den Bildweg BGRA (Systemspeicher oder Textur).
+    /// Wandlers, None fuer den Bildweg BGRA (Systemspeicher oder Textur fuer
+    /// den Wandler auf der Karte).
     pub fn pq_art(&self) -> Option<bool> {
         self.farbe.ist_pq().then(|| kandidat(self.idx).chroma444)
     }
@@ -1736,9 +1718,9 @@ impl Betrieb {
         self.hat_bild
     }
 
-    /// Testbild aus: die Pooltextur, die `tb_rahmen` noch haelt, geht an
-    /// den Pool zurueck (der Encoder haelt seine eigene Referenz, solange er
-    /// sie braucht). Ohne Pool haelt `tb_rahmen` nichts.
+    /// Testbild aus: der Rahmen des CUDA-Pools, den `tb_rahmen` noch haelt,
+    /// geht an den Pool zurueck (der Encoder haelt seine eigene Referenz,
+    /// solange er sie braucht). Ohne Pool haelt `tb_rahmen` nichts.
     pub fn testbild_freigeben(&mut self) {
         if self.pool.is_some() {
             unsafe { av_frame_unref(self.tb_rahmen.frame) };
@@ -1823,8 +1805,8 @@ impl Betrieb {
     }
 
     /// Den Rahmen fuer die Sitzung bereitstellen, in dem, was sie nimmt:
-    /// Systemspeicher im Eingabeformat, eine Textur aus ihrem Pool oder (10
-    /// Bit auf der Karte) ein CUDA-Rahmen mit den Ebenen des Wandlers.
+    /// Systemspeicher im Eingabeformat oder (auf der Karte) ein CUDA-Rahmen
+    /// mit den Ebenen des Wandlers.
     fn rahmen(&mut self, quelle: Quelle) -> Result<*mut AVFrame, String> {
         if self.karte.is_some() {
             return self.rahmen_karte(quelle);
@@ -1836,23 +1818,12 @@ impl Betrieb {
                     return Err("BGRA an eine HDR10-Sitzung (die Aufnahme ist noch nicht im Modus PQ)".into());
                 }
                 self.hat_bild = false;
-                if let Some(p) = self.pool.as_ref() {
-                    let noetig = (self.w * self.h * 4) as usize;
-                    if bgra.len() < noetig {
-                        return Err(format!("Quelle zu kurz: {} statt {noetig} Byte ({}x{} BGRA)", bgra.len(), self.w, self.h));
-                    }
-                    let (t, idx) = pool_textur(p.pool, &mut self.bild)?;
-                    unsafe {
-                        self.ctx.as_ref().unwrap().UpdateSubresource(&t, idx, None, bgra.as_ptr() as *const _, (self.w * 4) as u32, 0);
-                    }
-                } else {
-                    self.bild.aus_bgra(bgra, self.w as usize, self.h as usize)?;
-                }
+                self.bild.aus_bgra(bgra, self.w as usize, self.h as usize)?;
                 self.hat_bild = true;
                 self.bild.frame
             }
             Quelle::Ebenen16(ebenen) => {
-                if self.pool.is_some() || !self.farbe.ist_pq() {
+                if !self.farbe.ist_pq() {
                     return Err("PQ-Ebenen an eine Sitzung ohne HDR10".into());
                 }
                 self.hat_bild = false;
@@ -1860,28 +1831,9 @@ impl Betrieb {
                 self.hat_bild = true;
                 self.bild.frame
             }
-            Quelle::Textur(tex) => {
-                let Some(p) = self.pool.as_ref() else { return Err("Textur ohne Pool".into()) };
-                textur_pruefen(tex, self.w, self.h)?;
-                self.hat_bild = false;
-                let (t, idx) = pool_textur(p.pool, &mut self.bild)?;
-                // Nur der Ausschnitt in Stromgroesse: ein ungerader Rand faellt weg.
-                let kasten = D3D11_BOX { left: 0, top: 0, front: 0, right: self.w as u32, bottom: self.h as u32, back: 1 };
-                unsafe {
-                    self.ctx.as_ref().unwrap().CopySubresourceRegion(&t, idx, 0, 0, 0, tex, 0, Some(&kasten));
-                }
-                self.hat_bild = true;
-                self.bild.frame
-            }
-            // Das Testbild liegt immer im Systemspeicher; eine Sitzung mit
-            // Pool bekommt es als Textur, `bild` bleibt das letzte Desktopbild.
-            Quelle::Fertig(b) => match self.pool.as_ref() {
-                Some(p) => {
-                    pool_hochladen(p.pool, self.ctx.as_ref().unwrap(), b, &mut self.tb_rahmen)?;
-                    self.tb_rahmen.frame
-                }
-                None => b.frame,
-            },
+            Quelle::Textur(_) => return Err("Textur an eine Sitzung ohne Weg auf der Karte".into()),
+            // Das Testbild liegt im Systemspeicher, schon im Eingabeformat.
+            Quelle::Fertig(b) => b.frame,
             Quelle::Wiederholung | Quelle::Nachschub => self.bild.frame,
         })
     }
@@ -1889,7 +1841,7 @@ impl Betrieb {
     /// rahmen() fuer den Weg auf der Karte: jede Bildquelle wird ein Rahmen
     /// aus dem CUDA-Pool - die Textur der Aufnahme ueber den Wandler, BGRA
     /// aus dem Hauptspeicher ueber den eigenen Eingang des Wandlers, das
-    /// Testbild (schon in YUV444P16LE bzw. P010) per av_hwframe_transfer_data.
+    /// Testbild (schon im Format des Pools) per av_hwframe_transfer_data.
     fn rahmen_karte(&mut self, quelle: Quelle) -> Result<*mut AVFrame, String> {
         let (Some(k), Some(p)) = (self.karte.as_mut(), self.pool.as_ref()) else { return Err("Weg auf der Karte ohne Pool".into()) };
         match quelle {
@@ -2005,10 +1957,9 @@ impl Betrieb {
 
 /// Die zwoelf Testbilder im Eingabeformat der Sitzung, vorgerechnet - so
 /// wie qc_testbild_start auf dem Mac sie im Aufnahmeformat anlegt. Immer im
-/// Systemspeicher: fuer BGRA-Sitzungen und den Null-Kopien-Weg (dessen
-/// pix_fmt ist BGRA; codieren laedt das Bild in eine Textur des Pools) aus
-/// dem BGRA-Testbild, sonst direkt aus den Y/Cb/Cr-Ganzzahlen (dieselben
-/// Werte wie auf dem Mac). Eine HDR10-Sitzung bekommt dieselben Bilder in PQ
+/// Systemspeicher: fuer BGRA-Sitzungen aus dem BGRA-Testbild, sonst direkt
+/// aus den Y/Cb/Cr-Ganzzahlen (dieselben Werte wie auf dem Mac); der Weg auf
+/// der Karte laedt sie in einen Rahmen seines CUDA-Pools. Eine HDR10-Sitzung bekommt dieselben Bilder in PQ
 /// (testbilder_pq) - sonst saehe der Zuschauer SDR-Werte als PQ gedeutet.
 pub fn testbilder(pix_fmt: AVPixelFormat, w: i32, h: i32, farbe: StromFarbe) -> Result<Vec<Bild>, String> {
     use super::testbild;
@@ -2183,8 +2134,8 @@ mod tests {
     #[test]
     fn rahmen_passt_nur_zur_sitzung() {
         // Ein Bild im Systemspeicher erreicht eine Sitzung mit Pool nie
-        // (nvenc wuerde frame->hw_frames_ctx lesen), eine Textur nur die
-        // Sitzung ihres Pools, und ohne Pool zaehlen Format und Groesse.
+        // (nvenc wuerde frame->hw_frames_ctx lesen), ein Rahmen auf der Karte
+        // nur die Sitzung seines Pools, und ohne Pool zaehlen Format und Groesse.
         let mut puffer = vec![0u8; 64 * 48 * 4];
         let mut ram: AVFrame = unsafe { std::mem::zeroed() };
         ram.format = AVPixelFormat::AV_PIX_FMT_BGRA as i32;
@@ -2267,42 +2218,48 @@ mod tests {
     #[test]
     fn eingabe_folgt_weg_bittiefe_und_encoder() {
         // Die Aufnahme liefert Texturen nur, wenn der Encoder sie auch
-        // nimmt: auf d3d11 ueber nvenc - 8 Bit als BGRA-Textur, 10 Bit ueber
-        // den Wandler auf der Karte (CUDA-Rahmen im Format des Kandidaten);
-        // nicht Media Foundation, nicht die anderen Wege, nicht HDR10 (die
-        // PQ-Ebenen kommen vom Wandler der Aufnahme in den Systemspeicher)
-        // und nicht ein Kandidat, dessen Weg auf der Karte schon scheiterte.
-        // Getestet mit dem Encodernamen direkt, ohne den gemeinsamen BEFUND
-        // anzufassen (die Tests laufen parallel).
+        // nimmt: auf d3d11 ueber nvenc jeder SDR-Kandidat ueber den Wandler
+        // auf der Karte (CUDA-Rahmen im Format des Kandidaten, 8 wie 10
+        // Bit); nicht Media Foundation, nicht die anderen Wege, nicht HDR10
+        // (die PQ-Ebenen kommen vom Wandler der Aufnahme in den
+        // Systemspeicher) und nicht ein Kandidat, dessen Weg auf der Karte
+        // schon scheiterte. Getestet mit dem Encodernamen direkt, ohne den
+        // gemeinsamen BEFUND anzufassen (die Tests laufen parallel).
         use AVPixelFormat::*;
         let e = |idx: usize, weg: Weg, enc: &str| eingabe_waehlen(idx, weg, enc, false, false);
         assert_eq!(e(0, Weg::D3d11, "hevc_nvenc"), Eingabe::Karte(AV_PIX_FMT_YUV444P16LE), "4:4:4 10 Bit auf der Karte");
-        assert_eq!(e(1, Weg::D3d11, "hevc_nvenc"), Eingabe::Textur);
+        assert_eq!(e(1, Weg::D3d11, "hevc_nvenc"), Eingabe::Karte(AV_PIX_FMT_YUV444P), "4:4:4 8 Bit auf der Karte");
         assert_eq!(e(2, Weg::D3d11, "hevc_nvenc"), Eingabe::Karte(AV_PIX_FMT_P010LE), "4:2:0 10 Bit auf der Karte");
-        assert_eq!(e(3, Weg::D3d11, "hevc_nvenc"), Eingabe::Textur);
-        assert_eq!(e(4, Weg::D3d11, "h264_nvenc"), Eingabe::Textur);
+        assert_eq!(e(3, Weg::D3d11, "hevc_nvenc"), Eingabe::Karte(AV_PIX_FMT_NV12), "4:2:0 8 Bit auf der Karte");
+        assert_eq!(e(4, Weg::D3d11, "h264_nvenc"), Eingabe::Karte(AV_PIX_FMT_NV12), "H.264 auf der Karte");
         assert_eq!(e(4, Weg::D3d11, MF_H264), Eingabe::Ram(AV_PIX_FMT_NV12), "Media Foundation nimmt nur NV12");
         // Prozessorweg: 8 Bit BGRA in nvenc (bgra) bzw. die eigene
         // Umrechnung (yuv444), 10 Bit immer die Umrechnung auf dem Prozessor.
         assert_eq!(e(1, Weg::Bgra, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_BGRA));
         assert_eq!(e(3, Weg::Bgra, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_BGRA));
+        assert_eq!(e(4, Weg::Bgra, "h264_nvenc"), Eingabe::Ram(AV_PIX_FMT_BGRA));
         assert_eq!(e(1, Weg::Yuv444, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_YUV444P));
         assert_eq!(e(3, Weg::Yuv444, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_NV12));
+        assert_eq!(e(4, Weg::Yuv444, "h264_nvenc"), Eingabe::Ram(AV_PIX_FMT_NV12));
         assert_eq!(e(0, Weg::Bgra, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_YUV444P16LE));
         assert_eq!(e(2, Weg::Bgra, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_P010LE));
         assert_eq!(e(0, Weg::Yuv444, "hevc_nvenc"), Eingabe::Ram(AV_PIX_FMT_YUV444P16LE));
         // HDR10: die PQ-Ebenen, auch auf d3d11.
         assert_eq!(eingabe_waehlen(0, Weg::D3d11, "hevc_nvenc", true, false), Eingabe::Ram(AV_PIX_FMT_YUV444P16LE));
         assert_eq!(eingabe_waehlen(2, Weg::D3d11, "hevc_nvenc", true, false), Eingabe::Ram(AV_PIX_FMT_P010LE));
-        // Weg auf der Karte gescheitert: wie bgra.
-        for idx in 0..5 {
-            assert_eq!(eingabe_waehlen(idx, Weg::D3d11, "hevc_nvenc", false, true), e(idx, Weg::Bgra, "hevc_nvenc"), "Kandidat {idx}");
-            assert!(!eingabe_waehlen(idx, Weg::D3d11, "hevc_nvenc", false, true).texturen());
+        // Weg auf der Karte gescheitert: die Umrechnung auf dem Prozessor in
+        // dasselbe Format (wie yuv444) - dieselben Werte, nie BGRA in nvenc.
+        for (idx, enc) in [(0, "hevc_nvenc"), (1, "hevc_nvenc"), (2, "hevc_nvenc"), (3, "hevc_nvenc"), (4, "h264_nvenc")] {
+            let ersatz = eingabe_waehlen(idx, Weg::D3d11, enc, false, true);
+            assert_eq!(ersatz, e(idx, Weg::Yuv444, enc), "Kandidat {idx}");
+            assert_eq!(ersatz.pix_fmt(), e(idx, Weg::D3d11, enc).pix_fmt(), "Kandidat {idx}: dasselbe Format wie auf der Karte");
+            assert!(!ersatz.texturen() && !ersatz.nvenc_rechnet());
         }
-        // Texturen braucht die Aufnahme genau fuer Textur und Karte.
-        assert!(Eingabe::Textur.texturen() && Eingabe::Karte(AV_PIX_FMT_P010LE).texturen() && !Eingabe::Ram(AV_PIX_FMT_BGRA).texturen());
-        assert_eq!(Eingabe::Textur.pix_fmt(), AV_PIX_FMT_BGRA);
+        // Texturen braucht die Aufnahme genau fuer die Karte; nvenc rechnet nur BGRA um.
+        assert!(Eingabe::Karte(AV_PIX_FMT_P010LE).texturen() && Eingabe::Karte(AV_PIX_FMT_NV12).texturen() && !Eingabe::Ram(AV_PIX_FMT_BGRA).texturen());
         assert_eq!(Eingabe::Karte(AV_PIX_FMT_YUV444P16LE).pix_fmt(), AV_PIX_FMT_YUV444P16LE);
+        assert!(Eingabe::Ram(AV_PIX_FMT_BGRA).nvenc_rechnet());
+        assert!(!Eingabe::Ram(AV_PIX_FMT_NV12).nvenc_rechnet() && !Eingabe::Karte(AV_PIX_FMT_YUV444P).nvenc_rechnet());
     }
 
     /// Der Weg eines Ausgangs: --encoderweg vor messung.txt vor der Vorgabe;

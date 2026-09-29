@@ -63,7 +63,19 @@ pub const TRANSFER_HLG: u8 = 18;
 pub const PRIMAER_709: u8 = 1;
 pub const PRIMAER_2020: u8 = 9;
 pub const MATRIX_709: u8 = 1;
+/// Matrix BT.470BG (BT.601 625 Zeilen) - dieselben Zahlen wie SMPTE 170M.
+pub const MATRIX_470BG: u8 = 5;
+/// Matrix SMPTE 170M (BT.601 525 Zeilen): so rechnet nvenc RGB-Eingaenge um
+/// (der bgra-Weg des Windows-Hosts, dort mit dem VUI BT.470BG).
+pub const MATRIX_601: u8 = 6;
 pub const MATRIX_2020_NCL: u8 = 9;
+
+/// Y'CbCr -> R'G'B' eines SDR-Bildes in 16.16, wie `zeile_rgb` und die
+/// Shader beider Anzeigen rechnen: Cr -> R, Cb -> G, Cr -> G, Cb -> B.
+/// BT.709 mit den Zahlen, die seit jeher gelten (bitgleich zu frueher),
+/// BT.601 aus Kr 0,299 und Kb 0,114 (1,402, 0,344136, 0,714136, 1,772).
+pub const SDR_KOEFF_709: [i32; 4] = [103206, 12276, 30681, 121609];
+pub const SDR_KOEFF_601: [i32; 4] = [91881, 22553, 46802, 116130];
 
 // ------------------------------------------------------------ Protokoll
 
@@ -126,15 +138,27 @@ impl Farbe {
     /// HDR10 auf der Leitung: PQ, BT.2020, BT.2020-NCL, voller Bereich.
     pub const PQ: Farbe = Farbe { transfer: TRANSFER_PQ, primaer: PRIMAER_2020, matrix: MATRIX_2020_NCL, voll: true };
 
-    /// Aus dem VUI eines decodierten Bildes. Matrix und Bereich zaehlen nur bei
-    /// PQ; alles andere ist SDR und bleibt fest BT.709 voll - der bgra-Weg des
-    /// Windows-Hosts schreibt ein irrefuehrendes VUI (BT.601 begrenzt).
+    /// Aus dem VUI eines decodierten Bildes. PQ traegt alles weiter. Alles
+    /// andere ist SDR (Transfer und Primaerfarben BT.709), mit Matrix und
+    /// Bereich aus dem VUI: BT.601 (5 und 6) - so kommt der bgra-Weg des
+    /// Windows-Hosts an, nvenc rechnet RGB nach BT.601 im begrenzten Bereich
+    /// um und sagt das im VUI -, sonst BT.709; `voll` sagt der Aufrufer (ein
+    /// fehlender Bereich gilt als voll). Eine fehlende oder andere Matrix
+    /// gilt als BT.709: das Protokoll ist BT.709 voll, und H.264 vom Mac-Host
+    /// traegt gar kein VUI.
     pub fn aus_vui(transfer: u8, primaer: u8, matrix: u8, voll: bool) -> Farbe {
         if transfer == TRANSFER_PQ {
             Farbe { transfer, primaer, matrix, voll }
         } else {
-            Farbe::SDR
+            let matrix = if matrix == MATRIX_470BG || matrix == MATRIX_601 { MATRIX_601 } else { MATRIX_709 };
+            Farbe { matrix, voll, ..Farbe::SDR }
         }
+    }
+
+    /// Die Zahlen, mit denen ein SDR-Bild dieser Farbe nach R'G'B' geht
+    /// (16.16, Cr -> R, Cb -> G, Cr -> G, Cb -> B): BT.601 oder BT.709.
+    pub fn sdr_koeffizienten(&self) -> [i32; 4] {
+        if self.matrix == MATRIX_601 { SDR_KOEFF_601 } else { SDR_KOEFF_709 }
     }
 
     pub fn ist_pq(&self) -> bool {
@@ -154,7 +178,8 @@ impl Farbe {
             PRIMAER_2020 => "BT.2020".to_string(),
             p => format!("Primaerfarben {p}"),
         };
-        format!("{t}/{p}{}", if self.voll { "" } else { " begrenzt" })
+        let m = if self.matrix == MATRIX_601 && !self.ist_pq() { ", Matrix BT.601" } else { "" };
+        format!("{t}/{p}{m}{}", if self.voll { "" } else { " begrenzt" })
     }
 }
 
@@ -1288,19 +1313,49 @@ mod tests {
         assert!(!nur_bit7.schirm_hdr() && !nur_bit7.darstellung());
     }
 
-    /// Die Farbe aus dem VUI: nur PQ traegt Matrix und Bereich weiter, alles
-    /// andere ist SDR BT.709 voll (auch das BT.601-begrenzt-VUI des bgra-Wegs).
+    /// Die Farbe aus dem VUI: PQ traegt alles weiter; SDR Matrix (BT.601
+    /// oder BT.709) und Bereich - das BT.601-begrenzt-VUI des bgra-Wegs ist
+    /// genau das, was nvenc gerechnet hat. Fehlt die Angabe, gilt BT.709 voll.
     #[test]
     fn farbe_aus_dem_vui() {
         assert_eq!(Farbe::aus_vui(16, 9, 9, true), Farbe::PQ);
         assert_eq!(Farbe::aus_vui(16, 9, 9, false), Farbe { voll: false, ..Farbe::PQ });
-        assert_eq!(Farbe::aus_vui(6, 5, 6, false), Farbe::SDR);
-        assert_eq!(Farbe::aus_vui(2, 2, 2, false), Farbe::SDR);
+        // Der bgra-Weg: VUI BT.470BG (5) bzw. SMPTE 170M (6), begrenzt.
+        let bt601 = Farbe { matrix: MATRIX_601, voll: false, ..Farbe::SDR };
+        assert_eq!(Farbe::aus_vui(1, 1, 5, false), bt601);
+        assert_eq!(Farbe::aus_vui(6, 5, 6, false), bt601);
+        assert_eq!(Farbe::aus_vui(2, 2, 5, true), Farbe { matrix: MATRIX_601, ..Farbe::SDR });
+        // Dieser Host und der Mac-Host: BT.709 voll; ohne VUI (2 = nicht
+        // angegeben, Bereich nicht MPEG) ebenso.
+        assert_eq!(Farbe::aus_vui(1, 1, 1, true), Farbe::SDR);
+        assert_eq!(Farbe::aus_vui(2, 2, 2, true), Farbe::SDR);
+        assert_eq!(Farbe::aus_vui(2, 2, 2, false), Farbe { voll: false, ..Farbe::SDR });
+        assert_eq!(Farbe::aus_vui(1, 1, 9, true), Farbe::SDR, "SDR mit Matrix BT.2020: gerechnet wird BT.709");
         assert_eq!(Farbe::aus_vui(18, 9, 9, true), Farbe::SDR, "HLG nicht in 0.2.0");
         assert_eq!(Farbe::PQ.text(), "PQ/BT.2020");
         assert_eq!(Farbe::SDR.text(), "SDR/BT.709");
+        assert_eq!(bt601.text(), "SDR/BT.709, Matrix BT.601 begrenzt");
+        assert_eq!(Farbe::SDR.sdr_koeffizienten(), SDR_KOEFF_709);
+        assert_eq!(bt601.sdr_koeffizienten(), SDR_KOEFF_601);
         assert_eq!(transfer_text(0), "SDR");
         assert_eq!(transfer_text(16), "PQ");
+    }
+
+    /// Die SDR-Zahlen aus Kr und Kb (H.273): BT.601 gerundet auf 16.16,
+    /// BT.709 die alten Zahlen - hoechstens 2/65536 neben der Formel (Cr ->
+    /// G), damit jedes BT.709-Bild bitgleich bleibt.
+    #[test]
+    fn sdr_koeffizienten_aus_kr_und_kb() {
+        let formel = |kr: f64, kb: f64| {
+            let kg = 1.0 - kr - kb;
+            [2.0 * (1.0 - kr), 2.0 * kb * (1.0 - kb) / kg, 2.0 * kr * (1.0 - kr) / kg, 2.0 * (1.0 - kb)].map(|v| v * 65536.0)
+        };
+        for (k, f) in SDR_KOEFF_601.iter().zip(formel(0.299, 0.114)) {
+            assert_eq!(*k, f.round() as i32);
+        }
+        for (k, f) in SDR_KOEFF_709.iter().zip(formel(0.2126, 0.0722)) {
+            assert!((*k as f64 - f).abs() <= 2.1, "{k} gegen {f}");
+        }
     }
 
     // ------------------------------------------ der C-Spiegel (host/hdr.c)

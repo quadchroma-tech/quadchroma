@@ -1038,7 +1038,11 @@ or "Anzeige: Rueckfall auf Software: <Grund>" followed by "Anzeige:
 Software" (while running, for example "Anzeige: Rueckfall auf Software:
 Metal zeigt nichts - am sichtbaren Fenster kam kein Bild auf dem Schirm
 an"). Streams in limited range (VideoToolbox then delivers x444,
-444v, x420 or 420v) are stretched to full range on both paths.
+444v, x420 or 420v) are stretched to full range on both paths, and an SDR
+stream is converted with the matrix its VUI names - BT.709, or BT.601 for a
+Windows host that hands BGRA to NVENC (see --encoderweg in the Windows host
+section; the VideoToolbox line then reads "SDR/BT.709, Matrix BT.601
+begrenzt").
 
     ./target/release/quadchroma --anzeigetest /tmp/anzeigetest
 
@@ -2264,9 +2268,9 @@ new size and a keyframe, like a display switch; the pointer shape gets
 the new scale. If the new codec does not open, the old one comes back at
 the old size. The Mac captures directly at the fitted size
 (ScreenCaptureKit scales); the Windows host role scales on the CPU
-(area average, "Null-Kopien-Weg: der fuer H.264 eingepasste Strom wird
-auf dem Prozessor skaliert - Prozessorweg (bgra)" when zero-copy was
-chosen). The capability probe opens H.264 at 4096x2304 too ("H.264 High
+(area average, "Weg auf der Karte: der fuer H.264 eingepasste Strom wird
+auf dem Prozessor skaliert - Prozessorweg bgra (...)" when the card path
+was chosen). The capability probe opens H.264 at 4096x2304 too ("H.264 High
 ja (Hardware), bis 4096x2304 geprueft - groessere Bildschirme werden
 eingepasst"); if the encoder refuses that size, the limit becomes
 1920x1080 and larger streams are fitted into it.
@@ -3503,14 +3507,22 @@ started as administrator (see "Starting (Windows)" at the beginning).
                                        --mitschnitt C:\qc\qc.hevc
                     (one command line, wrapped here).
     --encoderweg    how the picture gets into the encoder: bgra (BGRA from
-                    main memory into NVENC, which converts on the card; 10-bit
-                    candidates are converted on the CPU), yuv444 (own
-                    conversion on the CPU), d3d11 (the picture stays on the
-                    card: the 8-bit candidates as textures without a copy, the
-                    10-bit candidates converted on the card - the same
-                    integer arithmetic as the CPU conversion - and handed to
-                    NVENC through CUDA) or auto. auto is the default: the
-                    decision from messung.txt if --messen wrote one, otherwise
+                    main memory into NVENC, which converts on the card - to
+                    BT.601 in limited range, and the stream says so in its
+                    VUI (BT.470BG); 10-bit candidates are converted on the
+                    CPU), yuv444 (own conversion on the CPU, BT.709 full
+                    range), d3d11 (the picture stays on the card: every
+                    candidate is converted on the card - YUV444P or NV12 for
+                    8 bit, YUV444P16LE or P010 for 10 bit, BT.709 full range
+                    with the same integer arithmetic as the CPU conversion -
+                    and handed to NVENC through CUDA) or auto. Clients after
+                    0.2.0 show both the BT.709 full-range streams and the
+                    BT.601 limited-range ones of the bgra path correctly (they
+                    read matrix and range from the VUI); clients up to 0.2.0
+                    read every SDR stream as BT.709 full range and show the
+                    bgra path washed out (black comes out as 16 of 255, white
+                    as 235). auto is the default: the decision from
+                    messung.txt if --messen wrote one, otherwise
                     d3d11 when the output is connected to the NVIDIA card that
                     encodes, otherwise bgra. The log says which and why
                     ("Encoderweg: d3d11 (das Bild bleibt auf der Karte)
@@ -3523,26 +3535,33 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     card, and d3d11 from the command line or messung.txt
                     becomes bgra there ("... statt d3d11 ... haengt nicht an
                     einer NVIDIA-Karte ..."). The encoder line shows the
-                    input: "Eingabe d3d11/bgra ohne Kopie" (8 bit) or
-                    "Eingabe cuda/yuv444p16le aus dem Wandler auf der Karte"
-                    (10 bit; p010le for 4:2:0) on the card, otherwise the
-                    format in main memory ("Eingabe yuv444p16le"). If the
-                    card path cannot be set up for a candidate (no CUDA, an
-                    older driver), that candidate takes the CPU path for the
-                    rest of the run, with the reason logged once ("Encoder:
-                    Kandidat N ...: der Weg auf der Karte (...) geht nicht auf
-                    (...) - Prozessorweg (...) fuer diesen Lauf"); if it fails
-                    while running, the session is reopened on the CPU path
-                    right away ("... versagt im Betrieb ..."). Media
-                    Foundation and rotated outputs always go through the CPU;
-                    the host switches the source itself ("Aufnahme: Quelle
-                    auf Prozessorweg umgestellt ..." or "Null-Kopien-Weg:
-                    gedrehter Ausgang ... - Prozessorweg (bgra)", i.e.
-                    switched to the CPU path). The size does not matter: a
-                    4K output takes the same paths as a smaller one - except
-                    while a stream is fitted for H.264, which is scaled on the
-                    CPU ("Null-Kopien-Weg: der fuer H.264 eingepasste Strom
-                    wird auf dem Prozessor skaliert - Prozessorweg (bgra)").
+                    input and the color: "Eingabe cuda/yuv444p aus dem
+                    Wandler auf der Karte, BT.709" (HEVC 4:4:4 8 bit; nv12
+                    for HEVC 4:2:0 8 bit and H.264, yuv444p16le and p010le for
+                    10 bit) on the card, otherwise the format in main memory
+                    ("Eingabe nv12 (mit Umrechnung), BT.709", or "Eingabe
+                    bgra, BT.601 begrenzt (nvenc rechnet aus BGRA um, VUI
+                    BT.470BG)" on the bgra path). If the card path cannot be
+                    set up for a candidate (no CUDA, an older driver), that
+                    candidate takes the CPU path with the conversion on the
+                    CPU for the rest of the run - the same values, BT.709
+                    full range, but at a much higher CPU cost (see
+                    --encodermessung) - with the reason logged once
+                    ("Encoder: Kandidat N ...: der Weg auf der Karte (...)
+                    geht nicht auf (...) - Prozessorweg (yuv444p) fuer diesen
+                    Lauf"); if it fails while running, the session is
+                    reopened on the CPU path right away ("... versagt im
+                    Betrieb ..."). Media Foundation and rotated outputs
+                    always go through the CPU; the host switches the source
+                    itself ("Aufnahme: Quelle auf Prozessorweg umgestellt
+                    ..." or "Weg auf der Karte: gedrehter Ausgang wird noch
+                    nicht auf der Karte gedreht - Prozessorweg bgra (...)",
+                    i.e. switched to the bgra path). The size does not
+                    matter: a 4K output takes the same paths as a smaller
+                    one - except while a stream is fitted for H.264, which is
+                    scaled on the CPU ("Weg auf der Karte: der fuer H.264
+                    eingepasste Strom wird auf dem Prozessor skaliert -
+                    Prozessorweg bgra (...)").
     --list          cards, outputs (each with identifier, name and Hz) and
                     what this computer can encode (hevc_nvenc and h264_nvenc
                     per candidate via avcodec_open2; without an NVIDIA driver
@@ -3570,21 +3589,28 @@ started as administrator (see "Starting (Windows)" at the beginning).
                     (crop) line for 4K outputs, measured when the stream was
                     still halved there; auto ignores it and goes by the
                     full-size line - measure again for a current verdict.
-    --encodermessung   old against new path into the encoder, without a
-                    screen (it also runs while the screen is locked, and over
-                    SSH): on the NVIDIA card it plays the test pattern as the
-                    desktop and runs every candidate once on the CPU path
-                    (bgra: staging into main memory, 10 bit converted on the
-                    CPU) and once on the card (d3d11), each for --bilder
-                    frames (300) at each size of --groessen (1920x1080 and
-                    3840x2160), with the real encoder session. Per run: time
-                    per frame from the copy to the finished packet (median,
-                    95 %), CPU time of the process per frame, and the time to
-                    open the session. Then both paths are compared - they get
-                    the same frames, so the packets must be the same ("Bitstrom
-                    gleich", SHA-256); at the first size also the side paths
-                    (test pattern, BGRA from main memory, repeat) and the
-                    color bars after the software decoder. --last N adds N
+    --encodermessung   the paths into the encoder against each other,
+                    without a screen (it also runs while the screen is
+                    locked, and over SSH): on the NVIDIA card it plays the
+                    test pattern as the desktop and runs every candidate on
+                    each of its paths - "bgra" (8 bit only: staging into main
+                    memory, NVENC converts), "Prozessor" (staging, conversion
+                    on the CPU - the fallback of the card path) and "Karte"
+                    (d3d11: the converter on the card and CUDA) - each for
+                    --bilder frames (300) at each size of --groessen
+                    (1920x1080 and 3840x2160), with the real encoder session.
+                    Per run: time per frame from the copy to the finished
+                    packet (median, 95 %), CPU time of the process per frame,
+                    and the time to open the session. Then Prozessor and
+                    Karte are compared - they get the same frames and compute
+                    the same planes, so the packets must be the same
+                    ("Bitstrom gleich", SHA-256); at the first size also the
+                    side paths (test pattern, BGRA from main memory, repeat)
+                    and the color of every path: the color bars after the
+                    software decoder against BT.709 full range, and the
+                    picture as a client shows it (matrix and range from the
+                    VUI) against the RGB of the test pattern ("hoechstens 2
+                    Stufen neben dem RGB des Testbilds"). --last N adds N
                     threads that compute without a pause next to it (roughly
                     the CPU next to a game). Result on the console and in
                     %APPDATA%\QuadChroma\encodermessung.txt - never in

@@ -34,7 +34,7 @@
 // von Windows (150 %) aendert daran nichts. Nichts wird halbiert, nur ein
 // ungerader Rand faellt weg. Damit braucht kein Weg einen Skalierer, und
 // ein 4K-Ausgang nimmt dieselben Wege wie ein kleinerer (bgra in NVENC,
-// Null-Kopien, wo er erlaubt ist). Die einzige Ausnahme ist H.264 ueber
+// den Wandler auf der Karte). Die einzige Ausnahme ist H.264 ueber
 // seiner Grenze (encoder::h264_grenze, 4096 je Seite, 4096x2304): dann
 // passt stromplan_codec den Strom darin ein, bei gleichem
 // Seitenverhaeltnis, flaechengemittelt auf dem Prozessor (bgra_einpassen) -
@@ -1722,12 +1722,15 @@ fn strom_anpassen(a: &Ausgang, dw: i32, dh: i32, idx: usize) -> ((i32, i32, bool
     ((w, h, ein), alt != (w, h))
 }
 
-/// Der Encoderweg fuer eine Aufnahme: der Null-Kopien-Weg (d3d11) kennt
+/// Der Encoderweg fuer eine Aufnahme: der Weg auf der Karte (d3d11) kennt
 /// weder Drehung noch Skalierer - ein gedrehter Ausgang und ein fuer H.264
 /// eingepasster Strom (`eingepasst`) nehmen dann den Prozessorweg (bgra,
-/// gedreht und eingepasst wird beim Einlesen). Sonst spielt die Groesse
+/// gedreht und eingepasst wird beim Einlesen; 8 Bit rechnet nvenc nach
+/// BT.601 begrenzt um und sagt es im VUI, 10 Bit der Prozessor - die
+/// Umrechnung auf dem Prozessor kostete fuer 8 Bit ein Vielfaches: gemessen
+/// 4K 4:4:4 60 statt 13 ms Prozessorzeit je Bild). Sonst spielt die Groesse
 /// keine Rolle: der Strom ist nativ, auch ab 3840 Breite, und die Textur
-/// geht ohne Skalierer in den Pool.
+/// geht ohne Skalierer in den Wandler.
 pub fn weg_fuer_aufnahme(weg: Weg, drehung: Drehung, eingepasst: bool) -> Weg {
     if weg == Weg::D3d11 && (drehung != Drehung::Keine || eingepasst) { Weg::Bgra } else { weg }
 }
@@ -1919,7 +1922,7 @@ impl Aufnahme {
     fn quelle_anlegen(&mut self, texturen: bool, pq: Option<bool>, w: i32, h: i32) -> Result<bool, String> {
         let (dw, dh) = (self.dup.breite, self.dup.hoehe);
         if let Some(chroma444) = pq {
-            let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, drehung: self.dup.drehung, chroma444 };
+            let plan = PqPlan { w: w.max(0) as u32, h: h.max(0) as u32, drehung: self.dup.drehung, chroma444, acht: false };
             self.staging = None;
             self.kopie = None;
             self.ram = Vec::new();
@@ -2169,7 +2172,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                 }
                 // Die Quelle (Textur oder STAGING) richtet sich nach dem, was
                 // der Encoder des laufenden Kandidaten nimmt, nicht nach dem
-                // Weg allein; der Null-Kopien-Weg kennt noch keine Drehung
+                // Weg allein; der Weg auf der Karte kennt noch keine Drehung
                 // (weg_fuer_aufnahme). Ein anderer Bildschirm als der zuletzt
                 // gestreamte ist ein Wechsel (1.4): der Encoderweg wird fuer
                 // ihn neu entschieden, und nach dem Aufbau gehen Switch 7
@@ -2241,7 +2244,7 @@ fn sitzung(stand: &mut Bildschirmstand) {
                             gestreamt = Some(a.kennung.clone());
                             let weg_hier = weg_fuer_aufnahme(weg, d.drehung, false);
                             if weg_hier != weg {
-                                log("Null-Kopien-Weg: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg (bgra)");
+                                log(format!("Weg auf der Karte: gedrehter Ausgang wird noch nicht auf der Karte gedreht - Prozessorweg {}", weg_hier.name()));
                                 weg = weg_hier;
                             }
                             if verlustmeldung.aufgebaut() {
@@ -2740,13 +2743,13 @@ fn oeffnen_in_farbe(idx: usize, pq: bool, w: i32, h: i32, weg: Weg, geraet: Opti
 
 /// Der Weg, mit dem ein Encoder geoeffnet wird: der entschiedene, ausser der
 /// Strom ist fuer H.264 eingepasst - dann skaliert der Prozessor, und der
-/// Null-Kopien-Weg (d3d11) wird zu bgra (weg_fuer_aufnahme). Eine Zeile beim
-/// ersten Mal.
+/// Weg auf der Karte (d3d11) wird zu bgra (weg_fuer_aufnahme). Eine Zeile
+/// beim ersten Mal.
 fn weg_im_betrieb(weg: Weg, eingepasst: bool) -> Weg {
     let w = weg_fuer_aufnahme(weg, Drehung::Keine, eingepasst);
     static GEMELDET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if w != weg && !GEMELDET.swap(true, Ordering::Relaxed) {
-        log("Null-Kopien-Weg: der fuer H.264 eingepasste Strom wird auf dem Prozessor skaliert - Prozessorweg (bgra)");
+        log(format!("Weg auf der Karte: der fuer H.264 eingepasste Strom wird auf dem Prozessor skaliert - Prozessorweg {}", w.name()));
     }
     w
 }
@@ -3246,23 +3249,26 @@ mod tests {
             assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, d, false), Weg::Yuv444);
         }
         assert_eq!(weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, true), Weg::Bgra);
+        assert_eq!(weg_fuer_aufnahme(Weg::Bgra, Drehung::Keine, true), Weg::Bgra);
         assert_eq!(weg_fuer_aufnahme(Weg::Yuv444, Drehung::Keine, true), Weg::Yuv444);
-        // Auch die 10-Bit-Kandidaten: gedreht oder fuer H.264 eingepasst
-        // gehen alle auf den Prozessorweg (Umrechnung auf dem Prozessor),
-        // sonst bleiben sie auf der Karte.
+        // Gedreht oder fuer H.264 eingepasst geht jeder Kandidat auf den
+        // Prozessorweg (10 Bit mit der Umrechnung auf dem Prozessor, 8 Bit
+        // als BGRA in nvenc), sonst bleibt er auf der Karte.
         use encoder::Eingabe;
         use ffmpeg_next::sys::AVPixelFormat::*;
         let eingabe = |idx: usize, d: Drehung, ein: bool| encoder::eingabe_waehlen(idx, weg_fuer_aufnahme(Weg::D3d11, d, ein), "hevc_nvenc", false, false);
         assert_eq!(eingabe(0, Drehung::Keine, false), Eingabe::Karte(AV_PIX_FMT_YUV444P16LE));
         assert_eq!(eingabe(2, Drehung::Keine, false), Eingabe::Karte(AV_PIX_FMT_P010LE));
-        assert_eq!(eingabe(1, Drehung::Keine, false), Eingabe::Textur);
+        assert_eq!(eingabe(1, Drehung::Keine, false), Eingabe::Karte(AV_PIX_FMT_YUV444P));
+        assert_eq!(eingabe(3, Drehung::Keine, false), Eingabe::Karte(AV_PIX_FMT_NV12));
         for d in [Drehung::Grad90, Drehung::Grad180, Drehung::Grad270] {
             assert_eq!(eingabe(0, d, false), Eingabe::Ram(AV_PIX_FMT_YUV444P16LE), "{d:?}");
             assert_eq!(eingabe(2, d, false), Eingabe::Ram(AV_PIX_FMT_P010LE), "{d:?}");
             assert_eq!(eingabe(1, d, false), Eingabe::Ram(AV_PIX_FMT_BGRA), "{d:?}");
+            assert_eq!(eingabe(3, d, false), Eingabe::Ram(AV_PIX_FMT_BGRA), "{d:?}");
         }
         assert_eq!(encoder::eingabe_waehlen(4, weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, true), "h264_nvenc", false, false), Eingabe::Ram(AV_PIX_FMT_BGRA), "H.264 eingepasst");
-        assert_eq!(encoder::eingabe_waehlen(4, weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, false), "h264_nvenc", false, false), Eingabe::Textur, "H.264 nativ");
+        assert_eq!(encoder::eingabe_waehlen(4, weg_fuer_aufnahme(Weg::D3d11, Drehung::Keine, false), "h264_nvenc", false, false), Eingabe::Karte(AV_PIX_FMT_NV12), "H.264 nativ");
     }
 
     #[test]

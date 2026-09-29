@@ -289,6 +289,14 @@ pub fn ausgabeformat(art: Option<Bildart>, voll: bool) -> u32 {
     }
 }
 
+/// Der Code eines Farbwerts ohne eigenen Namen bei CoreMedia ("YCbCrMatrix#5",
+/// "ColorPrimaries#22"): die Zahl hinter dem letzten "#", wenn sie ein Code
+/// nach H.273 ist.
+pub fn h273_aus_text(text: &str) -> Option<u8> {
+    let (_, zahl) = text.rsplit_once('#')?;
+    zahl.parse::<u8>().ok()
+}
+
 /// Aufbau der Ebenen eines Ausgabeformats - dieselbe Tabelle wie
 /// `ebenen_format` fuer FFmpegs Formate: alle zweiebenig (Y, dann U/V als
 /// Paare), 10 Bit oben buendig in 16 Bit wie P010. Die Formate ohne "f"
@@ -501,6 +509,9 @@ pub(crate) mod ffi {
         pub fn CFDictionarySetValue(d: CFMutableDictionaryRef, schluessel: *const c_void, wert: *const c_void);
         pub fn CFNumberCreate(alloc: *const c_void, typ: isize, wert: *const c_void) -> CFTypeRef;
         pub fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
+        pub fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        pub fn CFStringGetTypeID() -> usize;
+        pub fn CFStringGetCString(s: CFTypeRef, puffer: *mut std::ffi::c_char, groesse: isize, kodierung: u32) -> u8;
     }
 
     #[link(name = "CoreMedia", kind = "framework")]
@@ -518,6 +529,7 @@ pub(crate) mod ffi {
         pub static kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ: CFStringRef;
         pub static kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG: CFStringRef;
         pub static kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2: CFStringRef;
+        pub static kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4: CFStringRef;
         pub static kCMFormatDescriptionYCbCrMatrix_ITU_R_2020: CFStringRef;
         pub static kCMTimeInvalid: CMTime;
         pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
@@ -590,6 +602,7 @@ pub(crate) mod ffi {
         pub static kCVImageBufferColorPrimaries_ITU_R_2020: CFStringRef;
         pub static kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ: CFStringRef;
         pub static kCVImageBufferYCbCrMatrix_ITU_R_2020: CFStringRef;
+        pub static kCVImageBufferYCbCrMatrix_ITU_R_601_4: CFStringRef;
         /// Liefert einen eigenen Griff (oder NULL).
         pub fn CVBufferCopyAttachment(puffer: CVPixelBufferRef, schluessel: CFStringRef, modus: *mut u32) -> CFTypeRef;
         pub fn CVBufferSetAttachment(puffer: CVPixelBufferRef, schluessel: CFStringRef, wert: CFTypeRef, modus: u32);
@@ -709,6 +722,13 @@ pub(crate) mod ffi {
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, ANHANG_WEITERGEBEN);
     }
 
+    /// Einen Puffer mit der Matrix BT.601 kennzeichnen, wie VideoToolbox ein
+    /// Bild aus einem Strom mit VUI BT.470BG/SMPTE 170M kennzeichnet (der
+    /// bgra-Weg eines Windows-Hosts) - fuer die Probebilder.
+    pub unsafe fn bt601_kennzeichnen(pb: CVPixelBufferRef) {
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, ANHANG_WEITERGEBEN);
+    }
+
     pub fn wahr(b: bool) -> CFBooleanRef {
         unsafe {
             if b {
@@ -770,19 +790,34 @@ mod mac {
     }
 
     /// Ein Farbwert von CoreMedia/CoreVideo (CFString) als Code nach H.273,
-    /// ueber die Tabelle (Konstante, Code); was sie nicht kennt, ist 2
-    /// ("nicht angegeben"), ein fehlender Wert ebenso.
+    /// ueber die Tabelle (Konstante, Code); ein Code ohne eigenen Namen steht
+    /// als "YCbCrMatrix#5" da (so nennt CoreMedia BT.470BG, das VUI des
+    /// bgra-Wegs eines Windows-Hosts - ITU_R_601_4 ist SMPTE 170M, 6). Was
+    /// beides nicht trifft, ist 2 ("nicht angegeben"), ein fehlender Wert ebenso.
     unsafe fn h273(wert: CFTypeRef, tabelle: &[(CFStringRef, u8)]) -> u8 {
         if wert.is_null() {
             return 2;
         }
-        tabelle.iter().find(|(k, _)| CFEqual(wert, *k) != 0).map_or(2, |&(_, c)| c)
+        if let Some(&(_, c)) = tabelle.iter().find(|(k, _)| CFEqual(wert, *k) != 0) {
+            return c;
+        }
+        if CFGetTypeID(wert) != CFStringGetTypeID() {
+            return 2;
+        }
+        let mut puffer = [0 as std::ffi::c_char; 64];
+        // kCFStringEncodingUTF8.
+        if CFStringGetCString(wert, puffer.as_mut_ptr(), puffer.len() as isize, 0x0800_0100) == 0 {
+            return 2;
+        }
+        let text = std::ffi::CStr::from_ptr(puffer.as_ptr()).to_string_lossy();
+        super::h273_aus_text(&text).unwrap_or(2)
     }
 
     /// Die Farbe aus Primaerfarben, Transfer und Matrix, wie CoreMedia sie
     /// nennt (Formatbeschreibung) oder CoreVideo sie anhaengt (Puffer) - die
-    /// Namen sind dieselben. Nur PQ zaehlt mit Matrix und Bereich, alles
-    /// andere ist SDR BT.709 voll (hdr::Farbe::aus_vui).
+    /// Namen sind dieselben. PQ zaehlt mit Matrix und Bereich, SDR mit
+    /// Matrix (BT.709 oder BT.601) und Bereich (hdr::Farbe::aus_vui).
+    /// CoreMedia nennt SMPTE 170M ITU_R_601_4 und BT.470BG "YCbCrMatrix#5" (h273).
     unsafe fn farbe_aus(prim: CFTypeRef, tf: CFTypeRef, mat: CFTypeRef, voll: bool) -> crate::hdr::Farbe {
         use crate::hdr;
         let p = h273(prim, &[
@@ -797,6 +832,7 @@ mod mac {
         ]);
         let m = h273(mat, &[
             (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2, hdr::MATRIX_709),
+            (kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4, hdr::MATRIX_601),
             (kCMFormatDescriptionYCbCrMatrix_ITU_R_2020, hdr::MATRIX_2020_NCL),
         ]);
         hdr::Farbe::aus_vui(t, p, m, voll)
@@ -1167,8 +1203,8 @@ mod mac {
 
         /// Die Farbe des Bildes nach H.273 aus dem VUI (ueber die
         /// Formatbeschreibung der Sitzung): PQ mit Primaerfarben, Matrix und
-        /// Bereich, alles andere SDR BT.709 voll. Die Anzeige entscheidet je
-        /// Bild danach.
+        /// Bereich, SDR mit Matrix (BT.709 oder BT.601) und Bereich. Die
+        /// Anzeige entscheidet je Bild danach.
         pub fn farbe(&self) -> crate::hdr::Farbe {
             self.farbe
         }
@@ -1509,6 +1545,13 @@ mod tests {
     /// Hardware-Encoder mit probe::hevc_444_10_farbe (M1, macOS 27).
     const SPS_444_10_PQ: &str = "42 01 01 04 08 00 00 03 00 bc 08 00 00 03 00 00 78 90 00 78 10 02 20 f8 96 c4 0b dc 8b 02 97 fe 5c fe 27 f5 37 09 10 09 00 80";
     const PPS_444_10_PQ: &str = "44 01 c0 60 4d 18 aa 48";
+    /// HEVC Main 4:2:0 8 Bit, 256x128, mit dem VUI, das nvenc aus BGRA
+    /// schreibt (der bgra-Weg eines Windows-Hosts): Primaerfarben und
+    /// Transfer BT.709, Matrix BT.470BG (5), begrenzter Bereich (libx265
+    /// mit colormatrix=bt470bg:range=limited).
+    const VPS_420_8_BT601: &str = "40 01 0c 01 ff ff 01 60 00 00 03 00 90 00 00 03 00 00 03 00 1e 95 98 09";
+    const SPS_420_8_BT601: &str = "42 01 01 01 60 00 00 03 00 90 00 00 03 00 00 03 00 1e a0 08 08 08 16 59 59 a4 93 2b c0 5a 80 80 82 82 00 00 03 00 02 00 00 03 00 02 10";
+    const PPS_420_8_BT601: &str = "44 01 c1 72 b4 62 40";
 
     fn mit_startcode(nal: &[u8], lang: bool) -> Vec<u8> {
         let mut v = if lang { vec![0, 0, 0, 1] } else { vec![0, 0, 1] };
@@ -1700,6 +1743,16 @@ mod tests {
         assert_eq!(hevc_sps_lesen(&hevc(&riesig)), None);
     }
 
+    /// Farbwerte ohne eigenen Namen bei CoreMedia: die Zahl hinter "#".
+    #[test]
+    fn h273_aus_dem_namen() {
+        assert_eq!(h273_aus_text("YCbCrMatrix#5"), Some(5));
+        assert_eq!(h273_aus_text("ColorPrimaries#22"), Some(22));
+        assert_eq!(h273_aus_text("ITU_R_709_2"), None);
+        assert_eq!(h273_aus_text("YCbCrMatrix#"), None);
+        assert_eq!(h273_aus_text("YCbCrMatrix#999"), None);
+    }
+
     #[test]
     fn fehlertext() {
         let f = Fehler { was: "VTDecompressionSessionCreate", status: -12906 };
@@ -1758,14 +1811,21 @@ mod tests {
 
     /// Die Farbe kommt aus dem VUI des SPS, ueber die Formatbeschreibung:
     /// die Saetze des Hardware-Encoders mit 2020/PQ/2020 (HDR10, wie der
-    /// Mac-Host bei HDR) ergeben PQ, die heutigen SDR-Saetze SDR. Braucht
-    /// nur CoreMedia, keinen Encoder.
+    /// Mac-Host bei HDR) ergeben PQ, die heutigen SDR-Saetze SDR, die des
+    /// bgra-Wegs eines Windows-Hosts BT.601 begrenzt. Braucht nur
+    /// CoreMedia, keinen Encoder.
     #[cfg(target_os = "macos")]
     #[test]
     fn farbe_aus_den_parametersaetzen() {
         let saetze = |v: &str, s: &str, p: &str| Parametersaetze { vps: vec![hex(v)], sps: vec![hex(s)], pps: vec![hex(p)] };
         assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10, PPS_444_10)), Ok(crate::hdr::Farbe::SDR));
         assert_eq!(farbe_der_saetze(&saetze(VPS_444_10, SPS_444_10_PQ, PPS_444_10_PQ)), Ok(crate::hdr::Farbe::PQ));
+        // Das VUI des bgra-Wegs: CoreMedia nennt BT.470BG ITU_R_601_4, der
+        // Bereich ist begrenzt - so rechnet die Anzeige BT.601 begrenzt.
+        assert_eq!(
+            farbe_der_saetze(&saetze(VPS_420_8_BT601, SPS_420_8_BT601, PPS_420_8_BT601)),
+            Ok(crate::hdr::Farbe { matrix: crate::hdr::MATRIX_601, voll: false, ..crate::hdr::Farbe::SDR })
+        );
         // Das PQ-SPS liest sich wie das SDR-SPS: 4:4:4 10 Bit, also xf44.
         assert_eq!(hevc_sps_lesen(&hex(SPS_444_10_PQ)), Some(Bildart { chroma: 3, bits: 10, profil: 4 }));
     }
@@ -1863,10 +1923,11 @@ mod tests {
             for x in (0..b).filter(|x| (4..probe::BLOCK - 4).contains(&(x % probe::BLOCK))) {
                 let (sy, scb, scr) = probe::muster(x, y, h);
                 let (yr, ur, vr) = ((sy << 6).to_le_bytes(), (scb << 6).to_le_bytes(), (scr << 6).to_le_bytes());
+                let k = crate::hdr::SDR_KOEFF_709;
                 if bild.format() == X444 {
-                    crate::zeile_rgb::<false, 16, false, true>(&mut soll, &yr, &ur, &vr);
+                    crate::zeile_rgb::<false, 16, false, true>(&mut soll, &yr, &ur, &vr, &k);
                 } else {
-                    crate::zeile_rgb::<false, 16, false, false>(&mut soll, &yr, &ur, &vr);
+                    crate::zeile_rgb::<false, 16, false, false>(&mut soll, &yr, &ur, &vr, &k);
                 }
                 let ist = rgb.pixels[(y * b + x) as usize];
                 for s in [16, 8, 0] {
