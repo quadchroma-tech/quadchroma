@@ -332,6 +332,17 @@ static BOOL profile_supported(VTCompressionSessionRef s, CFStringRef profile) {
 // Geprueft wird vor jedem Bild, das in den Encoder soll, und zusaetzlich im
 // 5-s-Takt des Dienstes: bei stillem Bildschirm kommt kein Bild mehr an.
 #define QC_STAU_FRIST_US (2 * 1000000ull)
+// Abnahme in Schueben: macOS meldet freien Platz beim Empfaenger nicht
+// laufend, sondern erst, wenn dort ein grosser Teil des Empfangspuffers frei
+// ist (gemessen am 29.09.2026, macOS 27.0.1, Leser mit 1 Mbit/s ueber
+// Loopback: rund 220 KB alle 1,8-2,1 s, SO_RCVBUF wird dabei uebergangen).
+// Ein lebender, langsamer Zuschauer nimmt dann laenger als QC_STAU_FRIST_US
+// scheinbar nichts ab. Deshalb gilt im Stau das Doppelte der laengsten
+// Luecke zwischen zwei Abnahmen, solange ununterbrochen mehr als
+// QC_SCHUB_AB im Kernel lag - mindestens QC_STAU_FRIST_US, hoechstens
+// QC_STAU_FRIST_MAX_US. Wer nie etwas abnahm, ist nach QC_STAU_FRIST_US weg.
+#define QC_SCHUB_AB (64 * 1024)
+#define QC_STAU_FRIST_MAX_US (8 * 1000000ull)
 
 static _Atomic int g_client_fd = -1;
 static _Atomic int g_force_key = 0;
@@ -359,6 +370,15 @@ static uint64_t g_sitzung = 0;              // durch g_send_mtx geschuetzt
 static uint64_t g_stau_seit = 0;
 static int g_stau_rueckstand = 0;
 static uint64_t g_stau_gesendet = 0;
+// Abnahme in Schueben (QC_SCHUB_AB): Rueckstand und gesendete Bytes beim
+// letzten Blick, Zeit der letzten Abnahme oder des letzten Blicks mit wenig
+// Rueckstand (0 = noch keiner), die laengste Luecke dazwischen und seit wann
+// ununterbrochen wenig im Kernel liegt (0 = gerade nicht). Unter g_send_mtx.
+static int g_schub_rueckstand = 0;
+static uint64_t g_schub_gesendet = 0;
+static uint64_t g_schub_zuletzt = 0;
+static uint64_t g_schub_luecke = 0;
+static uint64_t g_schub_frei_seit = 0;
 static _Atomic int g_in_fd = -1;            // Eingabekanal der laufenden Sitzung; gesetzt unter g_send_mtx
 static uint64_t g_in_kanal = 0;             // seine Nummer; unter g_send_mtx
 // Dateien (dateien.m): was der aktuelle Eingabekanal an Faehigkeiten gemeldet
@@ -1772,6 +1792,9 @@ static void bild_verbindung(qc_platz *platz, int fd, const struct sockaddr_in *v
     int abgeloest = zuschauer_abloesen(fd, fp_alt);
     g_vid = chan;
     g_stau_seit = 0;                    // ein Stau des Vorgaengers zaehlt nicht fuer ihn
+    g_schub_zuletzt = 0;
+    g_schub_luecke = 0;
+    g_schub_frei_seit = 0;
     g_ton_stau_seit = 0;
     memcpy(g_vid_hh, chan->hh, QC_HASHLEN);
     memcpy(g_vid_peer, chan->peer, 32);
@@ -3365,15 +3388,48 @@ static void codec_wechseln(int idx) {
 // Encoder - wie beim vollen Encoder: lieber ein Auslasser als eine
 // Warteschlange. Der Encoder sieht dann nur weniger Bilder, jedes codierte
 // hat sein Bezugsbild, und es braucht kein erzwungenes Vollbild.
-// Nimmt der Zuschauer im Stau QC_STAU_FRIST_US lang gar nichts ab, gilt er
-// als weg; sonst liefe fuer eine eingefrorene Gegenstelle alles weiter.
+// Nimmt der Zuschauer im Stau so lange gar nichts ab (stau_frist_us), gilt
+// er als weg; sonst liefe fuer eine eingefrorene Gegenstelle alles weiter.
 // YES = dieses Bild auslassen.
+
+// Die Abstaende, in denen der Zuschauer abnimmt, solange mehr als
+// QC_SCHUB_AB im Kernel liegt (siehe dort). Bei jedem Blick, auch ohne Stau.
+// Nur unter g_send_mtx.
+static void schuebe_verfolgen(int rueckstand, uint64_t gesendet, uint64_t jetzt) {
+    if (rueckstand <= QC_SCHUB_AB) {
+        // Kaum etwas liegt im Kernel: der Zuschauer haelt nichts zurueck, eine
+        // Luecke beginnt fruehestens jetzt. Ein Schub, der den Rueckstand kurz
+        // leert, beendet also nur die laufende Luecke. Bleibt es so lange so
+        // wie die hoechste Frist, zaehlen alte Luecken nicht mehr.
+        if (!g_schub_frei_seit) g_schub_frei_seit = jetzt;
+        else if (jetzt - g_schub_frei_seit >= QC_STAU_FRIST_MAX_US) g_schub_luecke = 0;
+        g_schub_zuletzt = jetzt;
+    } else {
+        g_schub_frei_seit = 0;
+        int64_t abgenommen = (int64_t)(gesendet - g_schub_gesendet) - ((int64_t)rueckstand - g_schub_rueckstand);
+        if (abgenommen > 0) {
+            if (g_schub_zuletzt && jetzt - g_schub_zuletzt > g_schub_luecke) g_schub_luecke = jetzt - g_schub_zuletzt;
+            g_schub_zuletzt = jetzt;
+        }
+    }
+    g_schub_gesendet = gesendet;
+    g_schub_rueckstand = rueckstand;
+}
+
+// Frist im Stau: das Doppelte der laengsten Luecke zwischen zwei Abnahmen,
+// mindestens QC_STAU_FRIST_US, hoechstens QC_STAU_FRIST_MAX_US.
+static uint64_t stau_frist_us(void) {
+    uint64_t f = 2 * g_schub_luecke;
+    return f < QC_STAU_FRIST_US ? QC_STAU_FRIST_US : f > QC_STAU_FRIST_MAX_US ? QC_STAU_FRIST_MAX_US : f;
+}
+
 static BOOL stau_vor_dem_encoder(void) {
     BOOL stau = NO;
     pthread_mutex_lock(&g_send_mtx);
     int fd = atomic_load(&g_client_fd);
     if (fd >= 0 && atomic_load(&g_vid_ready) && g_vid) {
         int rueckstand = backlog_bytes(fd);
+        schuebe_verfolgen(rueckstand, g_vid->gesendet, now_us());
         if (rueckstand > (atomic_load(&g_cur_gaming) ? QC_BACKLOG_LIMIT / 4 : QC_BACKLOG_LIMIT)) {
             stau = YES;
             // Fortschritt heisst: seit dem letzten Blick hat die Gegenstelle
@@ -3391,9 +3447,9 @@ static BOOL stau_vor_dem_encoder(void) {
             g_stau_rueckstand = rueckstand;
             if (neu) {
                 g_stau_seit = jetzt;
-            } else if (jetzt - g_stau_seit >= QC_STAU_FRIST_US) {
-                logf_(@"Zuschauer weg: nimmt seit %llu s nichts mehr ab (%d Byte im Stau)",
-                      QC_STAU_FRIST_US / 1000000ull, rueckstand);
+            } else if (jetzt - g_stau_seit >= stau_frist_us()) {
+                logf_(@"Zuschauer weg: nimmt seit %.1f s nichts mehr ab (%d Byte im Stau, laengste Luecke vorher %.1f s)",
+                      (double)(jetzt - g_stau_seit) / 1e6, rueckstand, (double)g_schub_luecke / 1e6);
                 atomic_store(&g_vid_ready, 0);
                 atomic_store(&g_client_fd, -1);
                 stream_herunterfahren_anstossen();

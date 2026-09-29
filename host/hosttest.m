@@ -167,6 +167,9 @@ static void zuschauer_setzen(int host_fd, qc_chan *c) {
     g_vid = c;
     memset(g_vid_peer, 0x77, sizeof g_vid_peer);
     g_stau_seit = 0;
+    g_schub_zuletzt = 0;                  // wie im Host: jeder Zuschauer faengt frisch an
+    g_schub_luecke = 0;
+    g_schub_frei_seit = 0;
     g_ton_stau_seit = 0;
     atomic_store(&g_force_key, 1);
     atomic_store(&g_wait_key, 1);
@@ -469,6 +472,7 @@ typedef struct {
     int fd;
     double rate;
     _Atomic int stop;
+    _Atomic int frieren;    // ab jetzt liest er nichts mehr
 } abnehmer;
 
 static void *abnehmen(void *arg) {
@@ -478,7 +482,7 @@ static void *abnehmen(void *arg) {
     double t_alt = sek(), guthaben = 0;
     while (!atomic_load(&a->stop)) {
         usleep(1000);
-        if (a->rate <= 0) continue;
+        if (a->rate <= 0 || atomic_load(&a->frieren)) continue;
         double t = sek();
         guthaben += (t - t_alt) * a->rate;
         t_alt = t;
@@ -523,6 +527,7 @@ typedef struct {
     double pause_s;         // vor der Ablage so lange kein Bild (stiller Bildschirm)
     int still;              // nach Staubeginn kein Bild mehr, nur noch die Frist im Takt
     int ton;                // Ton im Dauerlauf (3 Mbit/s, wie ScreenCaptureKit liefert)
+    double einfrieren_s;    // nach so vielen Sekunden liest die Gegenstelle nichts mehr, 0 = nie
 } strom;
 
 typedef struct {
@@ -534,6 +539,7 @@ typedef struct {
     long ton_verworfen;
     long gesendet_spaet;             // Bilder in der zweiten Haelfte des Laufs
     int blicke;                      // stiller Bildschirm: Blicke im Takt bis zum Austragen
+    double weg_nach_frieren_s;       // einfrieren_s: so lange danach ausgetragen
 } ergebnis;
 
 static _Atomic int g_ton_lauf = 0;
@@ -558,6 +564,8 @@ static ergebnis strom_fahren(const strom *s) {
     atomic_store(&g_cur_gaming, s->spiel);
     abnehmer ab = { .fd = c, .rate = s->leitung_mbit * 1e6 / 8 };
     atomic_store(&ab.stop, 0);
+    atomic_store(&ab.frieren, 0);
+    double gefroren = 0;
     pthread_t t;
     pthread_create(&t, NULL, abnehmen, &ab);
 
@@ -629,7 +637,12 @@ static ergebnis strom_fahren(const strom *s) {
         if (atomic_load(&g_client_fd) < 0) {
             e.weg = 1;
             e.weg_nach_stau_s = erster_stau ? sek() - erster_stau : -1;
+            e.weg_nach_frieren_s = gefroren ? sek() - gefroren : -1;
             break;
+        }
+        if (s->einfrieren_s > 0 && !gefroren && sek() - t0 >= s->einfrieren_s) {
+            atomic_store(&ab.frieren, 1);
+            gefroren = sek();
         }
         double soll = t0 + (double)(i + 1) / s->fps, jetzt = sek();
         if (soll > jetzt) usleep((useconds_t)((soll - jetzt) * 1e6));
@@ -734,11 +747,25 @@ static void stau_pruefen(void) {
     printf("\n-- Ton im Stau\n");
     // Leitung unter der Tonrate: der Ton allein fuellte den Puffer, kein Bild
     // kaeme mehr durch. Im Spielmodus (512 KB), damit der Lauf kurz bleibt.
-    strom tl = { "Spielmodus, Ton 3 Mbit/s, Bild 0,5 Mbit/s, Leitung 1 Mbit/s", 60, 0.5, 8 * 1024, 1, 1, 0, 8, .ton = 1 };
+    // 14 s: bis der Ton wegfaellt, liegen seit macOS 27.0.1 rund 1,2 MB im
+    // Kernel (vorher rund 0,9 MB), die bei 1 Mbit/s erst abfliessen muessen -
+    // gemessen gut 5 s, bevor wieder ein Bild durchgeht.
+    strom tl = { "Spielmodus, Ton 3 Mbit/s, Bild 0,5 Mbit/s, Leitung 1 Mbit/s", 60, 0.5, 8 * 1024, 1, 1, 0, 14, .ton = 1 };
     ergebnis etl = strom_fahren(&tl);
     printf("         (%ld Tonpakete verworfen, %ld Bilder in der zweiten Haelfte gesendet)\n", etl.ton_verworfen, etl.gesendet_spaet);
+    // Der Leser nimmt hier im Takt ab, der Kernel meldet den freien Platz
+    // aber nur in Schueben (seit macOS 27.0.1 rund 220 KB alle 1,8-2,1 s) -
+    // mit der festen Frist von 2 s galt er deshalb als weg. Die Frist im Stau
+    // richtet sich jetzt nach der laengsten Luecke zwischen zwei Abnahmen.
     pruefe(etl.ton_verworfen > 0 && etl.gesendet_spaet > 0 && !etl.weg,
            "Leitung langsamer als der Ton: Ton faellt weg, das Bild bleibt nicht stehen, der Zuschauer bleibt");
+    // Die laengere Frist darf einen Zuschauer, der danach wirklich einfriert,
+    // nicht ewig halten: hoechstens QC_STAU_FRIST_MAX_US nach der letzten Abnahme.
+    strom tf = { "wie eben, nach 6 s liest die Gegenstelle nichts mehr", 60, 0.5, 8 * 1024, 1, 1, 0, 18, .ton = 1, .einfrieren_s = 6 };
+    ergebnis etf = strom_fahren(&tf);
+    printf("         (Zuschauer weg %.1f s nach dem Einfrieren)\n", etf.weg_nach_frieren_s);
+    pruefe(etf.weg && etf.weg_nach_frieren_s >= 1.9 && etf.weg_nach_frieren_s <= QC_STAU_FRIST_MAX_US / 1e6 + 1.0,
+           "friert er nach Abnahme in Schueben ein, gilt er nach hoechstens 8 s als weg");
     // Gewoehnlicher Stau und gesunde Leitung mit grossen Vollbildern: der
     // Rueckstand liegt nur kurz ueber der Grenze, kein Tonpaket faellt weg.
     strom ts = { "150 Mbit/s auf 100 Mbit/s, mit Ton", 120, 150, K, 100, 0, 0, 4, .ton = 1 };
